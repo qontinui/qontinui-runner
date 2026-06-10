@@ -61,6 +61,7 @@ import {
   useMemo,
   createRef,
   useContext,
+  memo,
   type ReactNode,
   type RefObject,
 } from "react";
@@ -205,7 +206,16 @@ interface PageSessionScopeProps {
  * it via `register`; the lifted provider routes the active page's value into
  * the `TerminalSessionContext` the page tree consumes.
  */
-function PageSessionScope({
+// React.memo so a re-render of the lifted provider (driven by its own
+// `setValues` when ANY page publishes a new value) does NOT cascade back into
+// every scope. Without this, each scope re-renders on every provider render,
+// recomputes its (ref-unstable) `value`, re-`register`s it → `setValues` →
+// provider re-renders → … a self-sustaining infinite render loop (introduced
+// when #476 lifted the provider + added the register feedback path). Props are
+// stable (pageId, the useCallback `register`, and App's memoized nav handlers),
+// so memo short-circuits the cascade; the scope still re-renders normally when
+// its OWN session hooks change.
+const PageSessionScope = memo(function PageSessionScope({
   pageId,
   register,
   onNavigateToBuilder,
@@ -649,7 +659,7 @@ function PageSessionScope({
   // Renders nothing: the lifted provider routes the active page's value into
   // context and renders the (single) page tree.
   return null;
-}
+});
 
 interface TerminalSessionProviderProps {
   /** Every terminal page that should keep live state (all stay mounted). */

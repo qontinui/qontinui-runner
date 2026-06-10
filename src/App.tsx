@@ -397,6 +397,16 @@ function AppContent() {
     return release;
   }, [setActiveTab]);
 
+  // Stable nav handlers — passed into TerminalSessionProvider/PageSessionScope,
+  // which is React.memo'd. Inline arrows here would change identity every
+  // AppContent render, defeating the memo and (via the scope's register →
+  // setValues → provider re-render feedback) driving an infinite render loop.
+  const navigateToBuilder = useCallback(
+    () => setActiveTab("unified-workflow-builder"),
+    [setActiveTab],
+  );
+  const navigateToActive = useCallback(() => setActiveTab("active"), [setActiveTab]);
+
   useEffect(() => {
     if (activeTab === "logs" && activeLogSubTab === "actions") {
       refreshActionLog();
@@ -638,13 +648,13 @@ function AppContent() {
                     <TerminalSessionProvider
                       pages={terminalPages.pages}
                       activePageId={terminalPages.activePageId}
-                      onNavigateToBuilder={() => setActiveTab("unified-workflow-builder")}
-                      onNavigateToActive={() => setActiveTab("active")}
+                      onNavigateToBuilder={navigateToBuilder}
+                      onNavigateToActive={navigateToActive}
                     >
                       <TerminalPageProvider value={terminalPages.activePageId}>
                         <TerminalPage
-                          onNavigateToBuilder={() => setActiveTab("unified-workflow-builder")}
-                          onNavigateToActive={() => setActiveTab("active")}
+                          onNavigateToBuilder={navigateToBuilder}
+                          onNavigateToActive={navigateToActive}
                           onSessionCountChange={setTerminalSessionCount}
                         />
                       </TerminalPageProvider>
