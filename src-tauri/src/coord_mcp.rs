@@ -75,14 +75,11 @@ pub(crate) fn write_coord_mcp_config(primary_wt: &str, jwt: &str) {
         serde_json::to_string_pretty(&mcp_config).unwrap_or_default(),
     ) {
         Ok(()) => {
-            info!(
-                "agent_runtime: wrote .mcp.json for coord-mcp in {}",
-                primary_wt
-            );
+            info!("coord_mcp: wrote .mcp.json for coord-mcp in {}", primary_wt);
         }
         Err(e) => {
             warn!(
-                "agent_runtime: failed to write .mcp.json in {}: {e}",
+                "coord_mcp: failed to write .mcp.json in {}: {e}",
                 primary_wt
             );
         }
@@ -119,7 +116,7 @@ pub(crate) fn provision_coord_mcp_for_session(workdir: &str) {
         Ok(t) if !t.trim().is_empty() => t,
         _ => {
             info!(
-                "agent_runtime: no device JWT in access_token slot — skipping \
+                "coord_mcp: no device JWT in access_token slot — skipping \
                  coord-mcp provisioning for {workdir}"
             );
             return;
@@ -143,7 +140,7 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str) {
         Some("device") | Some("agent") => {}
         other => {
             info!(
-                "agent_runtime: access_token bearer is not a coord device/agent \
+                "coord_mcp: access_token bearer is not a coord device/agent \
                  JWT (sub_type={other:?}) — skipping coord-mcp provisioning for \
                  {workdir} (would 401 against coord's EdDSA verifier)"
             );
@@ -153,7 +150,7 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str) {
 
     if !coord_mcp_safe_to_write(workdir) {
         info!(
-            "agent_runtime: {workdir}/.mcp.json already holds a non-coord-mcp \
+            "coord_mcp: {workdir}/.mcp.json already holds a non-coord-mcp \
              config — leaving it untouched (no coord-mcp provisioning)"
         );
         return;
