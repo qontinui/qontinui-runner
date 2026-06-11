@@ -162,20 +162,22 @@ export function pickLayout(totalTabs: number): string {
  *
  * Rules (all enforced here so the effect stays a thin wrapper, and the test can
  * assert them without React):
- *   - **operator-pinned wins**: when `pinned`, never auto-grow (return null).
  *   - **grow only, never shrink**: only returns a target whose zone count is
  *     STRICTLY GREATER than the current layout's; fewer tabs → null.
  *   - **capacity-driven**: only grows when `tabCount` exceeds the current
  *     layout's zone capacity.
  *   - **capped at `full-grid`** (via `pickLayout`); at 9+ tabs the target is
  *     already `full-grid`, so once there it returns null (no thrash).
+ *
+ * There is deliberately NO operator-pinned escape hatch: every live session
+ * must render in a zone. A pin latch used to suppress growth here, which let
+ * gate-continuation sessions dock as invisible zoneless tabs behind a small
+ * layout — operators ran blind to mid-implementation work for an hour.
  */
 export function computeAutoGrowLayoutId(
   currentLayoutId: string,
   tabCount: number,
-  pinned: boolean,
 ): string | null {
-  if (pinned) return null;
   const current = LAYOUT_PRESETS.find((l) => l.id === currentLayoutId) ?? LAYOUT_PRESETS[0];
   // Only act when live tabs overflow the current capacity.
   if (tabCount <= current.zones.length) return null;
@@ -202,15 +204,9 @@ interface PersistedState {
   layoutId: string;
   assignments: ZoneAssignments;
   focusedZone: number;
-  /**
-   * Operator-pinned latch (Phase 1 auto-grow). True once the operator picks a
-   * layout explicitly (picker UI / keyboard shortcut / `/layout` command /
-   * profile or workspace load). While pinned, the auto-grow effect leaves the
-   * layout alone — the operator's deliberate choice always wins over the
-   * fit-to-tabs heuristic. Programmatic grows (`+ new terminal`, restore
-   * auto-fill) never set it. Persisted so the latch survives a remount/reload.
-   */
-  pinned?: boolean;
+  // NOTE: older builds persisted a `pinned` latch here that suppressed
+  // auto-grow. The concept is removed (it hid live sessions as zoneless
+  // tabs); a stale `pinned` key in storage is simply ignored on load.
 }
 
 // Phase 1 (pop-out windows): pop-out windows share the main window's
@@ -317,22 +313,14 @@ export function useZoneLayout(
   // async restore window; the reservation is cleared once the zone is filled.
   const reservedZonesRef = useRef<Set<number>>(new Set());
 
-  // Operator-pinned latch (Phase 1 auto-grow). Seeded from persisted state so a
-  // pin survives remount/reload. A ref (not state) because nothing renders off
-  // it — only the auto-grow effect reads it, and it must reflect the latest
-  // operator action synchronously within the same commit that calls
-  // `setLayoutId({ pinned: true })`.
-  const userPinnedLayoutRef = useRef<boolean>(persistedState?.pinned ?? false);
-
   const layout = LAYOUT_PRESETS.find((l) => l.id === layoutId) ?? LAYOUT_PRESETS[0];
 
-  // Persist on changes (including the pinned latch).
+  // Persist on changes.
   useEffect(() => {
     persistState(pageId, windowLabel, {
       layoutId,
       assignments,
       focusedZone,
-      pinned: userPinnedLayoutRef.current,
     });
   }, [pageId, windowLabel, layoutId, assignments, focusedZone]);
 
@@ -345,9 +333,7 @@ export function useZoneLayout(
 
   // Shared layout-application logic: switch the preset and redistribute
   // assignments. Used by BOTH the operator-facing `setLayoutId` and the
-  // programmatic auto-grow effect — the ONLY difference between them is whether
-  // they set the operator-pinned latch (auto-grow never does, `setLayoutId`'s
-  // `{ pinned: true }` opt does).
+  // programmatic auto-grow effect.
   const applyLayout = useCallback(
     (id: string) => {
       const newLayout = LAYOUT_PRESETS.find((l) => l.id === id);
@@ -397,26 +383,22 @@ export function useZoneLayout(
   // No render loop: `computeAutoGrowLayoutId` is GROW-ONLY and capacity-gated.
   // After it grows, `layout.zones.length >= tabIds.length`, so the next run of
   // this effect (re-keyed by the new `layoutId`) computes `null` and is inert.
-  // It also bails immediately when the operator has pinned a layout.
   useEffect(() => {
-    const target = computeAutoGrowLayoutId(layoutId, tabIds.length, userPinnedLayoutRef.current);
+    const target = computeAutoGrowLayoutId(layoutId, tabIds.length);
     if (target) {
-      // Programmatic grow — do NOT touch the pinned latch.
       applyLayout(target);
     }
   }, [layoutId, tabIds.length, applyLayout]);
 
   /**
-   * Operator-facing layout switch. `opts.pinned === true` (passed from the
-   * picker UI / keyboard shortcut / `/layout` command / profile + workspace
-   * load) latches the layout so auto-grow stops overriding the operator's
-   * deliberate choice. Programmatic callers (`+ new terminal`) omit the opt and
-   * leave the latch alone.
+   * Operator-facing layout switch (picker UI / keyboard shortcut / `/layout`
+   * command / profile + workspace load). The choice is a STARTING POINT, not a
+   * latch: if live sessions later overflow the chosen layout's capacity,
+   * auto-grow still expands it — every live session must render in a zone.
    */
   const setLayoutId = useCallback(
-    (id: string, opts?: { pinned?: boolean }) => {
+    (id: string) => {
       if (!LAYOUT_PRESETS.some((l) => l.id === id)) return;
-      if (opts?.pinned) userPinnedLayoutRef.current = true;
       applyLayout(id);
     },
     [applyLayout],

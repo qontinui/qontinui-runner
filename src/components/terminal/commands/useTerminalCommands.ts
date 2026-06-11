@@ -430,9 +430,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       // Normalize "six-pack" / "sixpack" → "six-pack"; same for full-grid.
       const normalized = preset.replace(/sixpack/, "six-pack").replace(/fullgrid/, "full-grid");
       if (!normalized) return fail("invalid-preset");
-      // `/layout <preset>` is an explicit operator choice — pin it so auto-grow
-      // stops overriding it.
-      zoneLayout.setLayoutId(normalized, { pinned: true });
+      zoneLayout.setLayoutId(normalized);
       return ok();
     },
   });

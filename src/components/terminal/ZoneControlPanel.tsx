@@ -738,9 +738,7 @@ export const ZoneControlPanel = React.memo(function ZoneControlPanel({
   const onLoadWorkspace = useCallback(
     async (workspace: SavedWorkspace) => {
       if (workspace.layoutId !== zoneLayout.layoutId) {
-        // Loading a saved workspace is a deliberate operator layout choice —
-        // pin it so auto-grow doesn't override the restored arrangement.
-        zoneLayout.setLayoutId(workspace.layoutId, { pinned: true });
+        zoneLayout.setLayoutId(workspace.layoutId);
       }
       for (const session of workspace.sessions) {
         if (session.zoneIndex < 0) {

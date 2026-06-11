@@ -26,7 +26,7 @@ interface UseKeyboardShortcutsParams {
     focusNextNeedsInput: (states: Record<string, SessionState>) => void;
     toggleMaximize: (idx: number) => void;
     setMaximizedZone: (idx: number | null) => void;
-    setLayoutId: (id: string, opts?: { pinned?: boolean }) => void;
+    setLayoutId: (id: string) => void;
     assignTabToZone: (idx: number, tabId: string) => void;
   };
   sessionStates: Record<string, SessionState>;
@@ -157,8 +157,7 @@ export function useKeyboardShortcuts({
         const num = parseInt(e.key, 10);
         const preset = LAYOUT_PRESETS.find((l) => l.shortcutKey === num);
         if (preset) {
-          // Keyboard shortcut is an explicit operator choice — pin it.
-          zoneLayout.setLayoutId(preset.id, { pinned: true });
+          zoneLayout.setLayoutId(preset.id);
         }
         return;
       }
@@ -211,8 +210,7 @@ export function useKeyboardShortcuts({
         e.preventDefault();
         const currentIdx = LAYOUT_PRESETS.findIndex((l) => l.id === zoneLayout.layoutId);
         const nextIdx = (currentIdx + 1) % LAYOUT_PRESETS.length;
-        // Cycle-layout shortcut is an explicit operator choice — pin it.
-        zoneLayout.setLayoutId(LAYOUT_PRESETS[nextIdx].id, { pinned: true });
+        zoneLayout.setLayoutId(LAYOUT_PRESETS[nextIdx].id);
         return;
       }
       if (e.ctrlKey && e.shiftKey && e.key === "K") {
