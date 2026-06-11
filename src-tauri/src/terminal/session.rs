@@ -18,7 +18,7 @@ use tracing::{debug, info, warn};
 
 use super::grid::{Grid, GridPerformer};
 use super::interceptor::OutputInterceptor;
-use super::types::{TerminalExitEvent, TerminalId, TerminalInfo, TerminalOutputEvent};
+use super::types::{TerminalExitEvent, TerminalId, TerminalInfo};
 
 /// Shell integration scripts embedded at compile time.
 #[cfg(target_os = "windows")]
@@ -47,11 +47,22 @@ const SCROLLBACK_CAPACITY: usize = 1_048_576;
 /// the per-session isolation that [`TerminalSession::get_scrollback_buffer`]
 /// reads back depends on each session holding distinct instances, which is
 /// what the distinct-buffers regression test locks in.
+///
+/// Returns the chunk's absolute START offset in the session's output stream
+/// (the counter value before this chunk) — the reader thread stamps it onto
+/// the `terminal-output` event so the frontend can dedup a scrollback-ring
+/// replay against concurrently-delivered live chunks by byte offset.
+///
+/// The counter bump happens INSIDE the ring lock so that a reader of
+/// `(ring contents, total)` under the same lock sees a mutually consistent
+/// pair — [`TerminalSession::get_scrollback_buffer`] relies on this to
+/// compute an exact `end_offset` (off-by-one-chunk here would make the
+/// frontend double-write or drop a chunk at the replay boundary).
 fn tee_into_scrollback(
     scrollback: &Arc<Mutex<VecDeque<u8>>>,
     total_produced: &Arc<AtomicU64>,
     data: &[u8],
-) {
+) -> u64 {
     if let Ok(mut sb) = scrollback.lock() {
         for &byte in data {
             if sb.len() >= SCROLLBACK_CAPACITY {
@@ -59,8 +70,30 @@ fn tee_into_scrollback(
             }
             sb.push_back(byte);
         }
+        total_produced.fetch_add(data.len() as u64, Ordering::Relaxed)
+    } else {
+        // Poisoned ring lock: the chunk was still produced — keep the
+        // monotonic counter truthful even though buffering failed.
+        total_produced.fetch_add(data.len() as u64, Ordering::Relaxed)
     }
-    total_produced.fetch_add(data.len() as u64, Ordering::Relaxed);
+}
+
+/// Tauri `terminal-output` wire shape: the shared `TerminalOutputEvent`
+/// (qontinui-types) is `deny_unknown_fields`, so the extra `offset` rides on
+/// this runner-local struct instead of forcing a schemas version bump. Only
+/// the runner frontend consumes the Tauri event; the backend-relay broadcast
+/// keeps its own offset-free payload.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalOutputWire<'a> {
+    terminal_id: &'a str,
+    data: &'a str,
+    /// Absolute byte offset of this chunk's first byte in the session's
+    /// output stream (the value of `total_bytes_produced` before this chunk
+    /// was teed). Lets the frontend dedup a scrollback-ring replay against
+    /// live chunks — see `terminal_get_scrollback` and the frontend's
+    /// `scrollbackReplay.ts`.
+    offset: u64,
 }
 
 /// ANSI bracketed-paste begin marker.
@@ -395,8 +428,11 @@ impl TerminalSession {
                             // Tee processed output into the per-session
                             // scrollback ring buffer + byte counter. Shared
                             // with the distinct-buffers regression test so
-                            // both drive the identical teeing path.
-                            tee_into_scrollback(&reader_scrollback, &reader_total_bytes, &data);
+                            // both drive the identical teeing path. The
+                            // returned start offset is stamped onto the
+                            // event below for replay dedup.
+                            let chunk_offset =
+                                tee_into_scrollback(&reader_scrollback, &reader_total_bytes, &data);
 
                             // Tee through the VT parser into the per-session cell grid.
                             // Detect the first OSC 0/2 title transition by
@@ -439,9 +475,10 @@ impl TerminalSession {
                             let encoded = STANDARD.encode(&data);
                             // Broadcast to HTTP/SSE subscribers (ignore if no receivers)
                             let _ = reader_output_tx.send(encoded.clone());
-                            let event = TerminalOutputEvent {
-                                terminal_id: reader_id.clone(),
-                                data: encoded,
+                            let event = TerminalOutputWire {
+                                terminal_id: &reader_id,
+                                data: &encoded,
+                                offset: chunk_offset,
                             };
                             if let Err(e) = reader_app.emit("terminal-output", &event) {
                                 warn!(
@@ -992,11 +1029,22 @@ impl TerminalSession {
 
     /// Get the scrollback buffer contents and the byte offset where the data starts.
     /// Returns `(data, start_offset)` where `start_offset = total_bytes_produced - data.len()`.
+    ///
+    /// `total` is read while HOLDING the ring lock: `tee_into_scrollback`
+    /// bumps the counter inside the same lock, so the pair is mutually
+    /// consistent — `start_offset + data.len()` is an exact replay boundary
+    /// for offset-stamped `terminal-output` chunks (no chunk is ever half
+    /// inside the snapshot).
     pub fn get_scrollback_buffer(&self) -> (Vec<u8>, u64) {
-        let total = self.total_bytes_produced.load(Ordering::Relaxed);
-        let data = match self.scrollback_buffer.lock() {
-            Ok(sb) => sb.iter().copied().collect::<Vec<u8>>(),
-            Err(_) => Vec::new(),
+        let (data, total) = match self.scrollback_buffer.lock() {
+            Ok(sb) => (
+                sb.iter().copied().collect::<Vec<u8>>(),
+                self.total_bytes_produced.load(Ordering::Relaxed),
+            ),
+            Err(_) => (
+                Vec::new(),
+                self.total_bytes_produced.load(Ordering::Relaxed),
+            ),
         };
         let start_offset = total.saturating_sub(data.len() as u64);
         (data, start_offset)
@@ -1440,7 +1488,9 @@ mod tests {
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => tee_into_scrollback(&scrollback, &total, &buf[..n]),
+                    Ok(n) => {
+                        tee_into_scrollback(&scrollback, &total, &buf[..n]);
+                    }
                 }
             }
         });
