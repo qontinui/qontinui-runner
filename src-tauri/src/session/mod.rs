@@ -1057,6 +1057,7 @@ mod tests {
             branch: None,
             plan_slug: None,
             correlation_topic: None,
+            page_id: None,
             declared_paths: vec![],
             share_output: false,
             redact_secrets: None,

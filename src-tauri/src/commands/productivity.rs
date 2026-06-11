@@ -1292,6 +1292,7 @@ pub async fn spawn_worker_session(
                 branch: None,
                 plan_slug: None,
                 correlation_topic: None,
+                page_id: None,
                 declared_paths: vec![],
                 share_output: true,
                 redact_secrets: None,

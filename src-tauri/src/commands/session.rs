@@ -49,6 +49,9 @@ impl From<StartSessionArgs> for Intent {
             branch: a.branch,
             plan_slug: a.plan_slug,
             correlation_topic: a.correlation_topic,
+            // Not exposed on `session_start` — page placement is only
+            // meaningful on the gate-continuation terminal create path.
+            page_id: None,
             declared_paths: a.declared_paths,
             share_output: a.share_output,
             redact_secrets: a.redact_secrets,

@@ -54,6 +54,11 @@ pub struct Intent {
     /// rendezvous. Forwarded into `coord.sessions.intent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_topic: Option<String>,
+    /// Optional page tab id the terminal pane was placed on. Set ONLY on
+    /// the gate-continuation create path; a present `page_id` is the
+    /// coord-side marker that the session is a gate continuation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_id: Option<String>,
     /// Paths the session intends to touch. The plan calls this out as the
     /// hook for fine-grained claim narrowing in later phases; for now the
     /// list is persisted verbatim in the intent JSON.
@@ -135,6 +140,7 @@ mod tests {
             branch: None,
             plan_slug: None,
             correlation_topic: None,
+            page_id: None,
             declared_paths: vec![],
             share_output: false,
             redact_secrets: None,
@@ -213,6 +219,7 @@ mod tests {
             branch: Some("main".into()),
             plan_slug: Some("2026-05-22-coord-native-session-coordination".into()),
             correlation_topic: Some("by-correlation-topic/demo".into()),
+            page_id: Some("page-2".into()),
             declared_paths: vec![PathBuf::from("/repo/path")],
             share_output: true,
             redact_secrets: Some(false),
@@ -220,5 +227,21 @@ mod tests {
         let serialized = serde_json::to_string(&i).unwrap();
         let back: Intent = serde_json::from_str(&serialized).unwrap();
         assert_eq!(back, i);
+    }
+
+    #[test]
+    fn page_id_none_omits_key_and_some_round_trips() {
+        // `None` must serialize WITHOUT the key (skip_serializing_if) so
+        // existing coord rows / consumers see no shape change.
+        let serialized = serde_json::to_string(&good_intent()).unwrap();
+        assert!(!serialized.contains("page_id"));
+
+        // A JSON intent carrying `"page_id":"page-2"` round-trips.
+        let mut with_page = good_intent();
+        with_page.page_id = Some("page-2".into());
+        let json = serde_json::to_string(&with_page).unwrap();
+        assert!(json.contains("\"page_id\":\"page-2\""));
+        let back: Intent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, with_page);
     }
 }

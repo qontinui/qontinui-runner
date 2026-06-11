@@ -643,6 +643,7 @@ fn build_child_intent(state: &HandoffState) -> Result<Intent, HandoffError> {
         branch: state.branch.clone(),
         plan_slug,
         correlation_topic,
+        page_id: None,
         declared_paths,
         share_output,
         redact_secrets,

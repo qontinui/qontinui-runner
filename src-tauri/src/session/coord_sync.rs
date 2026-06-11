@@ -1055,6 +1055,7 @@ mod tests {
             branch: Some("feat/coord-sync".into()),
             plan_slug: None,
             correlation_topic: None,
+            page_id: None,
             declared_paths: vec![],
             share_output: false,
             redact_secrets: None,
