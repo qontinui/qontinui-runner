@@ -450,12 +450,11 @@ async fn coord_mcp_proxy_handler(
 
     // Live read — the same fresh device JWT `backend_relay` reads on every
     // use. AuthManager does filesystem I/O, so keep it off the async executor.
-    let bearer = tokio::task::spawn_blocking(|| {
-        crate::auth::AuthManager::new().get_access_token().ok()
-    })
-    .await
-    .ok()
-    .flatten();
+    let bearer =
+        tokio::task::spawn_blocking(|| crate::auth::AuthManager::new().get_access_token().ok())
+            .await
+            .ok()
+            .flatten();
 
     if let Err((status, msg)) =
         crate::coord_mcp::proxy_request_gate(nonce.as_deref(), bearer.as_deref())
@@ -486,10 +485,7 @@ async fn coord_mcp_proxy_handler(
     });
 
     let url = crate::coord_mcp::coord_mcp_url();
-    let mut req = client
-        .post(&url)
-        .bearer_auth(&bearer)
-        .body(body.to_vec());
+    let mut req = client.post(&url).bearer_auth(&bearer).body(body.to_vec());
     for (name, value) in headers.iter() {
         let n = name.as_str();
         // Hop-by-hop / recomputed headers, plus the two we own: the nonce must
