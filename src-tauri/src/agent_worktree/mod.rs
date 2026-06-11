@@ -47,7 +47,7 @@
 //!   `coord.agent_worktrees` rows; pruning the on-disk worktree
 //!   directories is Phase 6+ territory.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -953,6 +953,30 @@ impl From<String> for AllocateError {
     }
 }
 
+/// Re-root coord's suggested worktree path onto this runner's filesystem.
+///
+/// Coord's `suggest_worktree_path` is host-neutral by default: it emits a
+/// RELATIVE `agent-worktrees/<agent_id>/<repo>` suggestion and expects the
+/// consuming runner to anchor it locally. We anchor it under the CANONICAL
+/// checkout — the same directory `git -C <canonical> worktree add <relative>`
+/// would resolve it against, so the absolute path and the materialized
+/// location always agree. An absolute suggestion (a deployment that sets
+/// `COORD_WORKTREE_ROOT`) passes through unchanged.
+///
+/// Recording the relative suggestion verbatim is NOT an option: the recorded
+/// path becomes the spawned session's PTY cwd (plus `--add-dir`,
+/// `QONTINUI_SESSION_WORKTREES`, and the credential-helper target), and a
+/// relative cwd silently resolves against the runner process's ambient cwd —
+/// observed as coord-spawned sessions landing in the user's home dir.
+fn local_worktree_target(canonical: &Path, suggested: &str) -> PathBuf {
+    let p = PathBuf::from(suggested);
+    if p.is_absolute() {
+        p
+    } else {
+        canonical.join(p)
+    }
+}
+
 /// Call coord's `/agents/allocate` and then `git worktree add` for each
 /// returned row.
 ///
@@ -1241,7 +1265,7 @@ pub async fn allocate_and_materialize_with_claim(
         let canonical = repo_canonical_paths.get(&w.repo).ok_or_else(|| {
             AllocateError::Other(format!("missing canonical path for repo '{}'", w.repo))
         })?;
-        let target = PathBuf::from(&w.worktree_path);
+        let target = local_worktree_target(canonical, &w.worktree_path);
 
         // Ensure the parent dir exists. `git worktree add` will create
         // the leaf, but the parent (`D:/qontinui-root.wt/<agent>/`)
@@ -1507,6 +1531,37 @@ mod tests {
         // Bare trailing slash (no `/ws`) is also stripped so callers
         // don't double-slash when appending a path.
         assert_eq!(coord_ws_to_http("ws://h:9870/"), "http://h:9870");
+    }
+
+    #[test]
+    fn local_worktree_target_anchors_relative_suggestion_under_canonical() {
+        // Coord's default host-neutral suggestion — must land under the
+        // canonical checkout (where `git -C <canonical> worktree add`
+        // materializes it), never stay relative (a relative session cwd
+        // resolves against the runner process's ambient cwd at PTY spawn).
+        // A drive-letter path is only absolute on Windows, so pick a
+        // platform-absolute canonical.
+        let canonical = if cfg!(windows) {
+            Path::new("D:/qontinui-root/qontinui-coord")
+        } else {
+            Path::new("/srv/qontinui-root/qontinui-coord")
+        };
+        let got = local_worktree_target(canonical, "agent-worktrees/019e/qontinui-coord");
+        assert!(got.is_absolute(), "must be absolute, got {}", got.display());
+        assert_eq!(got, canonical.join("agent-worktrees/019e/qontinui-coord"));
+    }
+
+    #[test]
+    fn local_worktree_target_passes_absolute_suggestion_through() {
+        // A deployment that sets COORD_WORKTREE_ROOT to a runner-valid
+        // absolute root keeps full control of the layout.
+        let canonical = Path::new("D:/qontinui-root/qontinui-coord");
+        let abs = if cfg!(windows) {
+            "D:/qontinui-root.wt/019e/qontinui-coord"
+        } else {
+            "/srv/qontinui-root.wt/019e/qontinui-coord"
+        };
+        assert_eq!(local_worktree_target(canonical, abs), PathBuf::from(abs));
     }
 
     #[test]
