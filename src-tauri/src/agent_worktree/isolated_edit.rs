@@ -640,8 +640,15 @@ pub async fn acquire_for_terminal(
     // working_dir (worktree-on isolated dir OR worktree-off real cwd); `None` →
     // PTY inherits ambient cwd, deliberately not provisioned. The fn's sub_type +
     // non-clobber guards make this safe. Plan: centralize-coord-mcp-provisioning.
+    // The bound API port (for the device-path loopback proxy URL) is resolved
+    // via the process-global AppHandle's managed AppState — this chokepoint has
+    // no AppState parameter and threading one through its six call sites would
+    // ripple far past the provisioning concern.
     if let Some(wd) = &out.0 {
-        crate::coord_mcp::provision_coord_mcp_for_session(wd);
+        crate::coord_mcp::provision_coord_mcp_for_session(
+            wd,
+            crate::coord_mcp::resolve_bound_api_port(),
+        );
     }
     out
 }
