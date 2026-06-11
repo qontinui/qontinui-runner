@@ -1539,13 +1539,16 @@ mod tests {
         // canonical checkout (where `git -C <canonical> worktree add`
         // materializes it), never stay relative (a relative session cwd
         // resolves against the runner process's ambient cwd at PTY spawn).
-        let canonical = Path::new("D:/qontinui-root/qontinui-coord");
+        // A drive-letter path is only absolute on Windows, so pick a
+        // platform-absolute canonical.
+        let canonical = if cfg!(windows) {
+            Path::new("D:/qontinui-root/qontinui-coord")
+        } else {
+            Path::new("/srv/qontinui-root/qontinui-coord")
+        };
         let got = local_worktree_target(canonical, "agent-worktrees/019e/qontinui-coord");
         assert!(got.is_absolute(), "must be absolute, got {}", got.display());
-        assert_eq!(
-            got,
-            PathBuf::from("D:/qontinui-root/qontinui-coord/agent-worktrees/019e/qontinui-coord")
-        );
+        assert_eq!(got, canonical.join("agent-worktrees/019e/qontinui-coord"));
     }
 
     #[test]
