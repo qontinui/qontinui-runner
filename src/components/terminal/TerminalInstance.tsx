@@ -12,7 +12,18 @@ import { instanceStorage } from "@/lib/instance-storage";
 import { consumeInputChunk } from "./consumeInputChunk";
 import { wheelToLineDelta, DEFAULT_CELL_HEIGHT_PX } from "./wheelScroll";
 import { matchScrollShortcut } from "./scrollKeys";
+import { trimReplayedChunk, type OffsetChunk } from "./scrollbackReplay";
 import { useWindowAssignments } from "./contexts/WindowAssignmentsContext";
+
+/**
+ * The runner's reader thread stamps each `terminal-output` event with the
+ * chunk's absolute byte offset in the session's output stream (a runner-local
+ * extension — the shared `TerminalOutputEvent` schema is deny_unknown_fields,
+ * so the field rides outside it). Used to dedup the scrollback-ring replay
+ * against live chunks; `undefined` (older runner build) degrades to the
+ * pre-replay write-everything behavior.
+ */
+type TerminalOutputPayload = TerminalOutputEvent & { offset?: number };
 
 export interface TerminalInstanceHandle {
   getSelection: () => string;
@@ -358,9 +369,16 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
       // (WASM load + open + key handlers + UI Bridge registration) takes
       // ~200ms; without this buffer we'd silently drop everything Claude
       // emits in that window and xterm would freeze on whatever the grid
-      // contained at bootstrap snapshot time.
-      let pendingBytes: Uint8Array[] = [];
+      // contained at bootstrap snapshot time. Chunks keep their absolute
+      // stream offset so the drain can dedup against the scrollback-ring
+      // replay (see scrollbackReplay.ts).
+      let pendingBytes: OffsetChunk[] = [];
       let backendReady = false;
+      // End offset (exclusive) of the scrollback-ring replay written into
+      // this xterm instance during init. Live/pending chunks below this
+      // boundary are already in the buffer via the ring and must not be
+      // written again.
+      let replayedThrough = 0;
       // Assigned once the backend exists (see Bug A note above). Until then
       // the listener buffers bytes; we can't schedule a repaint that needs
       // the backend.
@@ -384,7 +402,7 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
       };
 
       const buildOutputListener = () =>
-        listen<TerminalOutputEvent>("terminal-output", (event) => {
+        listen<TerminalOutputPayload>("terminal-output", (event) => {
           if (event.payload.terminalId !== terminalId) return;
           const raw = atob(event.payload.data);
           const bytes = new Uint8Array(raw.length);
@@ -395,16 +413,28 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
           if (!backendReady) {
             // Backend not yet created — buffer the bytes; they'll be drained
             // (and the idle timer primed) once the backend init completes.
-            pendingBytes.push(bytes);
+            pendingBytes.push({ bytes, offset: event.payload.offset });
             return;
           }
 
           const b = backendRef.current;
           if (!b) return;
-          try {
-            b.write(bytes);
-          } catch (e) {
-            console.error(`[Terminal ${terminalId}] write error:`, e);
+          // A chunk emitted before the ring snapshot can still be DELIVERED
+          // after the replay (event delivery and invoke responses are not
+          // mutually ordered) — trim it to its unreplayed suffix so the
+          // boundary bytes aren't written twice. onOutput/ack bookkeeping
+          // below stays on the full chunk: the content reached the terminal
+          // either way (via the ring), only the duplicate write is skipped.
+          const unreplayed = trimReplayedChunk(
+            { bytes, offset: event.payload.offset },
+            replayedThrough,
+          );
+          if (unreplayed) {
+            try {
+              b.write(unreplayed);
+            } catch (e) {
+              console.error(`[Terminal ${terminalId}] write error:`, e);
+            }
           }
           if (onOutputRef.current) {
             try {
@@ -763,13 +793,49 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         //      fetch the GridSnapshot and paintGrid. paintGrid uses
         //      absolute CUP per row inside a DECAWM-off bracket — safe to
         //      write concurrently with live bytes.
-        for (const buffered of pendingBytes) {
-          try {
-            backend.write(buffered);
-          } catch (e) {
-            console.error(`[Terminal ${terminalId}] drain write error:`, e);
+        // Replay the Rust-side scrollback ring BEFORE any live/pending bytes
+        // land. TerminalInstance remounts whenever the zone layout reshapes
+        // (maximize / single-view toggle, layout switch, hidden↔assigned
+        // reclassification) and on page reload — each remount discards the
+        // previous xterm buffer, and the grid bootstrap below restores only
+        // the visible rows×cols screen. Without this replay a remounted pane
+        // has an EMPTY scrollback (wheel / Shift+PgUp scroll nothing) until
+        // fresh output accumulates. The ring is written at the backend's
+        // default size; the bootstrap fit below reflows it to the real
+        // viewport, same as the disk-based session-restore path.
+        try {
+          const ring = await invoke<{
+            success: boolean;
+            data: { data: string; startOffset: number; endOffset: number } | null;
+          }>("terminal_get_scrollback", { terminalId });
+          if (disposed) return;
+          if (ring.success && ring.data && ring.data.data) {
+            const rawRing = atob(ring.data.data);
+            const ringBytes = new Uint8Array(rawRing.length);
+            for (let i = 0; i < rawRing.length; i++) {
+              ringBytes[i] = rawRing.charCodeAt(i);
+            }
+            backend.write(ringBytes);
+            replayedThrough = ring.data.endOffset;
           }
-          bytesReceivedRef.current += buffered.length;
+        } catch (e) {
+          // Best-effort: a failed replay degrades to the pre-fix behavior
+          // (screen-only bootstrap), never blocks the live stream.
+          console.warn(`[Terminal ${terminalId}] scrollback replay failed:`, e);
+        }
+
+        for (const buffered of pendingBytes) {
+          // Drop/trim the part of each buffered chunk the ring replay above
+          // already wrote (ack bookkeeping stays on the full chunk).
+          const slice = trimReplayedChunk(buffered, replayedThrough);
+          if (slice) {
+            try {
+              backend.write(slice);
+            } catch (e) {
+              console.error(`[Terminal ${terminalId}] drain write error:`, e);
+            }
+          }
+          bytesReceivedRef.current += buffered.bytes.length;
         }
         pendingBytes = [];
         backendReady = true;

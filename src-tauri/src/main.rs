@@ -1712,6 +1712,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal::terminal_create,
             commands::terminal::terminal_get_grid,
             commands::terminal::terminal_get_saved_scrollback,
+            commands::terminal::terminal_get_scrollback,
             commands::terminal::terminal_grid_diff,
             commands::terminal::terminal_grid_search,
             commands::terminal::terminal_grid_text,

@@ -569,6 +569,42 @@ pub fn terminal_ack(
     })
 }
 
+/// Get the LIVE scrollback ring buffer for a terminal session.
+///
+/// Returns the raw PTY byte history (base64) plus its absolute offset range
+/// `[startOffset, endOffset)` in the session's output stream. The frontend
+/// replays this into a freshly-(re)mounted xterm so scrollback survives the
+/// TerminalInstance remounts that zone-layout changes and page reloads cause
+/// (`terminal_get_grid` only restores the visible rows×cols screen), then
+/// uses `endOffset` to dedup against offset-stamped live `terminal-output`
+/// chunks.
+#[tauri::command]
+pub fn terminal_get_scrollback(
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+    terminal_id: String,
+) -> Result<CommandResponse, String> {
+    let session = terminal_manager
+        .get(&terminal_id)
+        .ok_or_else(|| format!("Terminal not found: {}", terminal_id))?;
+
+    let (data, start_offset) = session.get_scrollback_buffer();
+    let end_offset = start_offset + data.len() as u64;
+    // Reconnecting frontends fetch the full ring; reset backpressure the same
+    // way the WS/HTTP buffer path does so the reader thread doesn't stall.
+    session.reset_flow_control();
+    let encoded = STANDARD.encode(&data);
+
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::json!({
+            "data": encoded,
+            "startOffset": start_offset,
+            "endOffset": end_offset,
+        })),
+    })
+}
+
 /// Save the scrollback buffer for a terminal session to disk.
 ///
 /// Persists the current scrollback buffer to `{app_data}/terminal-scrollback/{terminal_id}.bin`
