@@ -156,6 +156,11 @@ pub fn save_ai_settings(
             timeout_seconds,
             config_dir,
             account_selection_mode: selection_mode,
+            // This command's surface doesn't expose the auto-migration
+            // switch; preserve whatever is currently configured.
+            auto_migrate_on_token_exhaustion: existing_settings
+                .claude_cli
+                .auto_migrate_on_token_exhaustion,
         },
         claude_api: ClaudeApiSettings { model, max_tokens },
         // Preserve existing Gemini settings

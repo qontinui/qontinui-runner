@@ -38,7 +38,6 @@ impl OutputInterceptor {
     }
 
     /// Add a hook to the end of the pipeline.
-    #[allow(dead_code)]
     pub fn add_hook(&self, hook: Box<dyn OutputHook>) {
         if let Ok(mut hooks) = self.hooks.lock() {
             hooks.push(hook);

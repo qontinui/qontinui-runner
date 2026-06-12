@@ -323,7 +323,6 @@ impl TerminalManager {
     }
 
     /// Get a reference to the output interceptor (for adding hooks).
-    #[allow(dead_code)]
     pub fn interceptor(&self) -> &Arc<OutputInterceptor> {
         &self.interceptor
     }
