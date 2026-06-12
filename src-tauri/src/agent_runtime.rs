@@ -1935,7 +1935,14 @@ async fn run_continuation_terminal(
     // continuations (a primary place follow-up gates get registered) had no
     // coord identity and fell back to the operator-bearer stopgap. Uses the
     // runner's own device JWT; guarded against non-verifying bearers + clobber.
-    crate::coord_mcp::provision_coord_mcp_for_session(workdir);
+    // Device-JWT sessions get the loopback live-token PROXY shape, so the
+    // ACTUALLY-BOUND API port is resolved from the managed AppState (the
+    // env-default 9876 is wrong on secondary/temp runners).
+    let bound_port = app
+        .try_state::<Arc<crate::commands::AppState>>()
+        .map(|s| crate::mcp::types::runner_api_port(s.inner()))
+        .unwrap_or_else(crate::mcp::types::get_mcp_api_port);
+    crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port);
 
     let result = crate::commands::terminal::create_terminal_session_backend(
         &terminal_manager,

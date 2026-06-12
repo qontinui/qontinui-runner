@@ -416,6 +416,146 @@ async fn drain_handler(
     Json(summary)
 }
 
+/// `POST /coord-mcp` — runner-local loopback proxy for coord's `/mcp`
+/// streamable-HTTP endpoint, injecting a FRESHLY-READ device JWT per request
+/// (plan 2026-06-09-coord-mcp-live-token-proxy).
+///
+/// Why: coord device JWTs have a ~4h TTL and Claude Code's MCP client reads a
+/// session's `.mcp.json` exactly once at connect — a baked static bearer dies
+/// with its snapshot and re-stamping the file does nothing. Device-provisioned
+/// sessions therefore point at this route (`coord_mcp::write_coord_mcp_proxy_config`)
+/// and authenticate with a per-session nonce; the live bearer is read from
+/// `AuthManager` on every request.
+///
+/// Gate (`coord_mcp::proxy_request_gate`, 401 before any network I/O):
+/// registered `X-Coord-Mcp-Proxy-Key` nonce AND the live bearer decodes
+/// `sub_type == "device"` — the proxy must never attach a non-device token
+/// (agent-spawn sessions carry their own narrower JWT and never route here).
+///
+/// Transport: coord `/mcp` is single-shot `application/json` JSON-RPC per POST
+/// (no SSE, no session machinery), so this is a plain passthrough — forward
+/// the body + non-hop-by-hop request headers, return coord's status + headers
+/// + body bytes verbatim. Generic header passthrough keeps us correct if coord
+/// ever adds SSE negotiation headers, but no streaming machinery is built.
+async fn coord_mcp_proxy_handler(
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let nonce = headers
+        .get(crate::coord_mcp::COORD_MCP_PROXY_KEY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
+    // Live read — the same fresh device JWT `backend_relay` reads on every
+    // use. AuthManager does filesystem I/O, so keep it off the async executor.
+    let bearer =
+        tokio::task::spawn_blocking(|| crate::auth::AuthManager::new().get_access_token().ok())
+            .await
+            .ok()
+            .flatten();
+
+    if let Err((status, msg)) =
+        crate::coord_mcp::proxy_request_gate(nonce.as_deref(), bearer.as_deref())
+    {
+        warn!("coord-mcp proxy: {msg}");
+        return (
+            axum::http::StatusCode::from_u16(status)
+                .unwrap_or(axum::http::StatusCode::UNAUTHORIZED),
+            Json(serde_json::json!({
+                "success": false,
+                "error": msg,
+                "code": "COORD_MCP_PROXY_UNAUTHORIZED",
+            })),
+        )
+            .into_response();
+    }
+    let bearer = bearer.unwrap_or_default(); // gate guarantees Some(non-empty)
+
+    // Shared client: connect fast-fail, generous overall timeout (coord MCP
+    // tool calls can legitimately run long).
+    static COORD_PROXY_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = COORD_PROXY_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .expect("coord-mcp proxy reqwest client")
+    });
+
+    let url = crate::coord_mcp::coord_mcp_url();
+    let mut req = client.post(&url).bearer_auth(&bearer).body(body.to_vec());
+    for (name, value) in headers.iter() {
+        let n = name.as_str();
+        // Hop-by-hop / recomputed headers, plus the two we own: the nonce must
+        // not leak upstream and the Authorization slot is the live bearer.
+        if matches!(
+            n,
+            "host"
+                | "content-length"
+                | "connection"
+                | "transfer-encoding"
+                | "accept-encoding"
+                | "authorization"
+        ) || n == crate::coord_mcp::COORD_MCP_PROXY_KEY_HEADER
+        {
+            continue;
+        }
+        req = req.header(n, value.as_bytes());
+    }
+
+    let upstream = match req.send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            warn!("coord-mcp proxy: forward to {url} failed: {e}");
+            return (
+                axum::http::StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("coord /mcp unreachable: {e}"),
+                    "code": "COORD_MCP_PROXY_UPSTREAM_UNREACHABLE",
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let status = upstream.status().as_u16();
+    let mut builder = axum::http::Response::builder()
+        .status(axum::http::StatusCode::from_u16(status).unwrap_or(axum::http::StatusCode::OK));
+    for (name, value) in upstream.headers() {
+        if matches!(
+            name.as_str(),
+            "content-length" | "transfer-encoding" | "connection"
+        ) {
+            continue;
+        }
+        builder = builder.header(name.as_str(), value.as_bytes());
+    }
+    let bytes = match upstream.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("coord-mcp proxy: reading coord response body failed: {e}");
+            return (
+                axum::http::StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("coord /mcp response read failed: {e}"),
+                    "code": "COORD_MCP_PROXY_UPSTREAM_READ_FAILED",
+                })),
+            )
+                .into_response();
+        }
+    };
+    builder
+        .body(axum::body::Body::from(bytes))
+        .unwrap_or_else(|e| {
+            warn!("coord-mcp proxy: response build failed: {e}");
+            axum::http::StatusCode::BAD_GATEWAY.into_response()
+        })
+}
+
 /// Create the API router
 pub fn create_router(
     app_state: Arc<AppState>,
@@ -1713,6 +1853,11 @@ pub fn create_router(
         // here before its hard taskkill so in-flight turns flush, dirty
         // worktrees are stashed to refs/wip/*, and coord claims persist.
         .route("/drain", post(drain_handler))
+        // Loopback live-token proxy for coord /mcp — device-provisioned
+        // sessions' `.mcp.json` points here so each MCP request carries a
+        // freshly-read device JWT instead of a 4h-TTL snapshot. Nonce-gated
+        // (X-Coord-Mcp-Proxy-Key); see `coord_mcp_proxy_handler`.
+        .route("/coord-mcp", post(coord_mcp_proxy_handler))
         // Relay web-integration diagnostic — exposes the idle-gating state
         // (tier, enabled, device-JWT presence, WS connection, last error) so
         // an operator can see WHY a runner never appears to the cloud/mobile.

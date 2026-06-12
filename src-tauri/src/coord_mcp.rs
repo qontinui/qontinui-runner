@@ -6,10 +6,36 @@
 //! WITHOUT creating a circular dependency: `agent_runtime` already depends on
 //! `agent_worktree`, so `agent_worktree → agent_runtime` would close a cycle.
 //! This module depends only on `crate::auth`, `std::fs`, `serde_json`, `base64`
-//! — a true leaf both callers can share.
+//! (plus read-only port/handle lookups) — a leaf both callers can share.
+//!
+//! # Live-token loopback proxy (plan 2026-06-09-coord-mcp-live-token-proxy)
+//!
+//! Coord device JWTs have a ~4h TTL and Claude Code's MCP client reads
+//! `.mcp.json` exactly once at connect — a static baked bearer dies with the
+//! snapshot, and re-stamping the file does nothing (the client never re-reads).
+//! DEVICE-provisioned sessions therefore get a config pointing at the runner's
+//! own loopback `POST /coord-mcp` route, which injects a freshly-read device
+//! JWT per request (see `mcp_api::coord_mcp_proxy_handler`). Authentication to
+//! the proxy is a per-session nonce ([`COORD_MCP_PROXY_KEY_HEADER`]) held in an
+//! in-memory map — it dies with the runner, and every spawn path rewrites
+//! `.mcp.json`, so a restart self-heals.
+//!
+//! SCOPE-ELEVATION TRAP: agent-spawn sessions deliberately carry a narrower
+//! coord-minted `SubType::Agent` JWT. The proxy attaches the live DEVICE JWT,
+//! so ONLY device-provisioned sessions may route through it — the agent path
+//! keeps the static-bearer shape, and the proxy gate re-checks `sub_type ==
+//! "device"` on every request.
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 use tracing::{info, warn};
+
+/// Header carrying the per-session loopback nonce that authenticates a
+/// session's MCP client to the runner-local `/coord-mcp` proxy route.
+/// Lowercase — HTTP header names are case-insensitive and axum's `HeaderMap`
+/// keys are lowercased; the `.mcp.json` writer emits the canonical-case form.
+pub(crate) const COORD_MCP_PROXY_KEY_HEADER: &str = "x-coord-mcp-proxy-key";
 
 /// Resolve the coord HTTP base: `COORD_HTTP_URL` env first, then the active
 /// profile's `coord_url` (ws→http normalized). `None` when neither is set.
@@ -25,6 +51,116 @@ fn coord_http_base() -> Option<String> {
     }
 }
 
+/// The full coord `/mcp` endpoint URL: `COORD_HTTP_URL` env → active profile's
+/// `coord_url` → localhost fallback, then `/mcp` appended. Shared by the
+/// static-bearer `.mcp.json` writer (agent path) and the loopback proxy
+/// forwarder (`mcp_api::coord_mcp_proxy_handler`) so both resolve the coord
+/// base identically — the proxy must never re-derive it from env alone.
+pub(crate) fn coord_mcp_url() -> String {
+    let coord_url = std::env::var("COORD_HTTP_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(coord_http_base)
+        .unwrap_or_else(|| "http://localhost:9870".to_string());
+    format!("{}/mcp", coord_url.trim_end_matches('/'))
+}
+
+/// In-memory nonce registry for the loopback `/coord-mcp` proxy:
+/// nonce → workdir it was provisioned into. Process-lifetime only by design
+/// (resolved Q2 of the plan): every spawn path rewrites `.mcp.json`, so a
+/// runner restart re-mints nonces and self-heals.
+static PROXY_NONCES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+fn proxy_nonces() -> &'static Mutex<HashMap<String, String>> {
+    PROXY_NONCES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Mint + register a fresh per-session proxy nonce for `workdir`, returning it.
+/// Any prior nonce registered for the same workdir is evicted — a re-provision
+/// rewrites `.mcp.json`, so the old nonce is unreachable and keeping it would
+/// only widen the accept set.
+fn register_proxy_nonce(workdir: &str) -> String {
+    // Two v4 UUIDs (~244 bits of randomness) — v4, NOT v7: the v7 prefix is a
+    // timestamp, which would gut the entropy this nonce exists to provide.
+    let nonce = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
+    map.retain(|_, wd| wd != workdir);
+    map.insert(nonce.clone(), workdir.to_string());
+    nonce
+}
+
+/// True iff `nonce` is a currently-registered per-session proxy key.
+pub(crate) fn proxy_nonce_is_valid(nonce: &str) -> bool {
+    !nonce.is_empty()
+        && proxy_nonces()
+            .lock()
+            .expect("proxy nonce map poisoned")
+            .contains_key(nonce)
+}
+
+/// Pre-forward gate for the loopback `/coord-mcp` proxy route. Pure over its
+/// inputs (no I/O) so the 401 paths are unit-testable without a live coord:
+///
+/// 1. `nonce` must be a registered per-session key ([`proxy_nonce_is_valid`])
+///    — stops other local processes borrowing the runner's coord identity.
+/// 2. `bearer` (the live `AuthManager` access-token read) must be present and
+///    decode `sub_type == "device"` — the same guard as
+///    [`provision_coord_mcp_with_jwt`], re-applied per request so the proxy
+///    can never attach a non-device token (scope-elevation trap: agent
+///    sessions carry their own narrower JWT and never route through here).
+///
+/// `Ok(())` means: forward with `Authorization: Bearer <bearer>`.
+pub(crate) fn proxy_request_gate(
+    nonce: Option<&str>,
+    bearer: Option<&str>,
+) -> Result<(), (u16, String)> {
+    if !proxy_nonce_is_valid(nonce.unwrap_or("")) {
+        return Err((
+            401,
+            "missing or unrecognized X-Coord-Mcp-Proxy-Key".to_string(),
+        ));
+    }
+    let bearer = match bearer {
+        Some(b) if !b.trim().is_empty() => b,
+        _ => {
+            return Err((
+                401,
+                "runner has no live device JWT in its access_token slot".to_string(),
+            ));
+        }
+    };
+    match jwt_unverified_claim(bearer, "sub_type").as_deref() {
+        Some("device") => Ok(()),
+        other => Err((
+            401,
+            format!(
+                "runner access_token bearer is not a coord DEVICE JWT \
+                 (sub_type={other:?}) — refusing to forward"
+            ),
+        )),
+    }
+}
+
+/// Resolve the runner's ACTUALLY-BOUND local API port for loopback URLs:
+/// the managed `AppState.api_port` (set at bind time) via the process-global
+/// `AppHandle`, falling back to [`crate::mcp::types::get_mcp_api_port`] only
+/// when no Tauri runtime / managed state exists (headless or unit-test
+/// contexts that genuinely predate the bind). The env-default 9876 fallback is
+/// wrong on secondary/temp runners, which is why the bound port is preferred.
+pub(crate) fn resolve_bound_api_port() -> u16 {
+    if let Some(app) = crate::tauri_app_handle::current() {
+        use tauri::Manager;
+        if let Some(state) = app.try_state::<std::sync::Arc<crate::commands::AppState>>() {
+            return crate::mcp::types::runner_api_port(state.inner());
+        }
+    }
+    crate::mcp::types::get_mcp_api_port()
+}
+
 /// The coord-native `/mcp` endpoint is live (coord PR #277 Phase-2 cutover),
 /// so this no longer carries the prior "do not deploy" gate. If a target coord
 /// ever lacks the `/mcp` route, agents get an unreachable MCP server: Claude
@@ -38,29 +174,47 @@ fn coord_http_base() -> Option<String> {
 /// `localhost` MCP url into the agent's `.mcp.json`, silently pointing spawned
 /// agents at the wrong coord.
 pub(crate) fn write_coord_mcp_config(primary_wt: &str, jwt: &str) {
-    let coord_url = std::env::var("COORD_HTTP_URL")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .or_else(coord_http_base)
-        .unwrap_or_else(|| "http://localhost:9870".to_string());
-    let mcp_url = format!("{}/mcp", coord_url.trim_end_matches('/'));
-
     let mcp_config = serde_json::json!({
         "mcpServers": {
             "coord-mcp": {
                 "type": "http",
-                "url": mcp_url,
+                "url": coord_mcp_url(),
                 "headers": {
                     "Authorization": format!("Bearer {}", jwt),
                 }
             }
         }
     });
+    write_mcp_json(primary_wt, &mcp_config);
+}
 
+/// Write the DEVICE-path `.mcp.json`: an `http`-transport server pointing at
+/// the runner's own loopback `/coord-mcp` proxy on the ACTUALLY-BOUND API
+/// port, authenticated by a freshly-minted per-session nonce — and NO baked
+/// bearer. The proxy injects a live device JWT per request, so the config
+/// survives the 4h token TTL that kills static-bearer configs in sessions
+/// that outlive their snapshot (the MCP client never re-reads `.mcp.json`).
+pub(crate) fn write_coord_mcp_proxy_config(primary_wt: &str, bound_port: u16) {
+    let nonce = register_proxy_nonce(primary_wt);
+    let mcp_config = serde_json::json!({
+        "mcpServers": {
+            "coord-mcp": {
+                "type": "http",
+                "url": format!("http://127.0.0.1:{bound_port}/coord-mcp"),
+                "headers": {
+                    "X-Coord-Mcp-Proxy-Key": nonce,
+                }
+            }
+        }
+    });
+    write_mcp_json(primary_wt, &mcp_config);
+}
+
+fn write_mcp_json(primary_wt: &str, mcp_config: &serde_json::Value) {
     let mcp_path = Path::new(primary_wt).join(".mcp.json");
     match std::fs::write(
         &mcp_path,
-        serde_json::to_string_pretty(&mcp_config).unwrap_or_default(),
+        serde_json::to_string_pretty(mcp_config).unwrap_or_default(),
     ) {
         Ok(()) => {
             info!("coord_mcp: wrote .mcp.json for coord-mcp in {}", primary_wt);
@@ -99,7 +253,7 @@ pub(crate) fn write_coord_mcp_config(primary_wt: &str, jwt: &str) {
 // last dark runner-spawned session kind (plan
 // 2026-06-09-provision-coord-mcp-operator-tabs). Both modules compile into the
 // runner bin crate, so `pub(crate)` is the minimal visibility that reaches it.
-pub(crate) fn provision_coord_mcp_for_session(workdir: &str) {
+pub(crate) fn provision_coord_mcp_for_session(workdir: &str, bound_port: u16) {
     let jwt = match crate::auth::AuthManager::new().get_access_token() {
         Ok(t) if !t.trim().is_empty() => t,
         _ => {
@@ -111,7 +265,7 @@ pub(crate) fn provision_coord_mcp_for_session(workdir: &str) {
         }
     };
 
-    provision_coord_mcp_with_jwt(workdir, &jwt);
+    provision_coord_mcp_with_jwt(workdir, &jwt, bound_port);
 }
 
 /// Apply an already-resolved bearer to `workdir`'s `.mcp.json`, enforcing the two
@@ -123,8 +277,16 @@ pub(crate) fn provision_coord_mcp_for_session(workdir: &str) {
 /// encrypted `AuthManager` slot, which a unit test cannot seed deterministically
 /// (and which would otherwise make the test pass/fail by whether the host happens
 /// to be paired).
-fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str) {
-    match jwt_unverified_claim(jwt, "sub_type").as_deref() {
+///
+/// Device/agent split (live-token-proxy plan): `sub_type=device` emits the
+/// loopback PROXY shape ([`write_coord_mcp_proxy_config`] on `bound_port`) so
+/// the session reads a live device JWT per request; `sub_type=agent` keeps the
+/// static-bearer shape UNCHANGED — agent JWTs are deliberately narrower than
+/// the device JWT the proxy injects, so an agent session must never be routed
+/// through the proxy (scope elevation).
+fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: u16) {
+    let sub_type = jwt_unverified_claim(jwt, "sub_type");
+    match sub_type.as_deref() {
         Some("device") | Some("agent") => {}
         other => {
             info!(
@@ -144,7 +306,11 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str) {
         return;
     }
 
-    write_coord_mcp_config(workdir, jwt);
+    if sub_type.as_deref() == Some("device") {
+        write_coord_mcp_proxy_config(workdir, bound_port);
+    } else {
+        write_coord_mcp_config(workdir, jwt);
+    }
 }
 
 /// Decode an unverified string claim from a JWT payload. We do NOT verify the
@@ -183,7 +349,9 @@ fn coord_mcp_safe_to_write(workdir: &str) -> bool {
             if servers.len() == 1 && servers.contains_key("coord-mcp") {
                 // Our own coord-mcp config — refreshable, EXCEPT never downgrade an
                 // existing agent JWT (richer scopes) to a device JWT. If the current
-                // bearer decodes sub_type=agent, leave it.
+                // bearer decodes sub_type=agent, leave it. The device-path PROXY
+                // shape (loopback URL + nonce header) has NO Authorization header,
+                // so it deliberately falls through this check as ours-refreshable.
                 let existing_is_agent = parsed
                     .pointer("/mcpServers/coord-mcp/headers/Authorization")
                     .and_then(|v| v.as_str())
@@ -243,6 +411,112 @@ mod tests {
             Some(p) => std::env::set_var("COORD_HTTP_URL", p),
             None => std::env::remove_var("COORD_HTTP_URL"),
         }
+    }
+
+    /// The DEVICE-path proxy shape: loopback URL built from the passed bound
+    /// port, a registered per-session nonce header, and — critically — NO
+    /// baked `Authorization` bearer (the proxy injects a live one per request).
+    #[test]
+    fn write_coord_mcp_proxy_config_emits_loopback_nonce_shape() {
+        let tmp = std::env::temp_dir().join(format!("coord-mcp-proxy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let primary_wt = tmp.to_string_lossy().to_string();
+
+        write_coord_mcp_proxy_config(&primary_wt, 23456);
+
+        let written = std::fs::read_to_string(tmp.join(".mcp.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let server = &v["mcpServers"]["coord-mcp"];
+
+        assert_eq!(server["type"], "http");
+        assert_eq!(
+            server["url"], "http://127.0.0.1:23456/coord-mcp",
+            "URL must target the loopback proxy on the PASSED bound port"
+        );
+
+        // The nonce header is present, non-empty, and live in the registry.
+        let nonce = server["headers"]["X-Coord-Mcp-Proxy-Key"]
+            .as_str()
+            .expect("proxy config must carry the per-session nonce header");
+        assert!(!nonce.is_empty());
+        assert!(
+            proxy_nonce_is_valid(nonce),
+            "the written nonce must be registered for the proxy gate"
+        );
+
+        // NO baked bearer — the whole point is the proxy injects a live one.
+        assert!(
+            server["headers"].get("Authorization").is_none(),
+            "proxy shape must NOT bake a static Authorization bearer: {written}"
+        );
+
+        // Re-provisioning the same workdir evicts the prior nonce.
+        write_coord_mcp_proxy_config(&primary_wt, 23456);
+        assert!(
+            !proxy_nonce_is_valid(nonce),
+            "a re-provision must evict the prior nonce for the same workdir"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The loopback proxy's pre-forward gate: registered nonce + device bearer
+    /// → forward; everything else → 401 before any network I/O. This is the
+    /// scope-elevation backstop — even a valid nonce must never forward a
+    /// non-DEVICE bearer.
+    #[test]
+    fn proxy_request_gate_forwards_only_nonce_plus_device_bearer() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let mk = |sub_type: &str| {
+            let payload =
+                URL_SAFE_NO_PAD.encode(format!(r#"{{"sub_type":"{sub_type}"}}"#).as_bytes());
+            format!("h.{payload}.s")
+        };
+        let dir = std::env::temp_dir().join(format!("coord-mcp-gate-{}", uuid::Uuid::new_v4()));
+        let nonce = register_proxy_nonce(&dir.to_string_lossy());
+        let device = mk("device");
+
+        // Registered nonce + device bearer → forward.
+        assert!(proxy_request_gate(Some(&nonce), Some(&device)).is_ok());
+
+        // Absent / mismatched nonce → 401, regardless of bearer.
+        assert_eq!(proxy_request_gate(None, Some(&device)).unwrap_err().0, 401);
+        assert_eq!(
+            proxy_request_gate(Some("not-a-registered-nonce"), Some(&device))
+                .unwrap_err()
+                .0,
+            401
+        );
+        assert_eq!(
+            proxy_request_gate(Some(""), Some(&device)).unwrap_err().0,
+            401
+        );
+
+        // Valid nonce but no/empty bearer → 401.
+        assert_eq!(proxy_request_gate(Some(&nonce), None).unwrap_err().0, 401);
+        assert_eq!(
+            proxy_request_gate(Some(&nonce), Some(" ")).unwrap_err().0,
+            401
+        );
+
+        // Valid nonce but an AGENT bearer → 401 (scope-elevation trap: the
+        // proxy must only ever attach the runner's DEVICE identity).
+        let agent_err = proxy_request_gate(Some(&nonce), Some(&mk("agent"))).unwrap_err();
+        assert_eq!(agent_err.0, 401);
+        // A non-coord (e.g. Cognito) bearer → 401 too.
+        assert_eq!(
+            proxy_request_gate(Some(&nonce), Some(&mk("access")))
+                .unwrap_err()
+                .0,
+            401
+        );
+        // A non-JWT string → 401, never a panic.
+        assert_eq!(
+            proxy_request_gate(Some(&nonce), Some("not-a-jwt"))
+                .unwrap_err()
+                .0,
+            401
+        );
     }
 
     /// `coord_mcp_safe_to_write` — the non-clobber guard for the continuation
@@ -329,6 +603,19 @@ mod tests {
             "a device-JWT coord-mcp config is ours at the same tier — refreshable"
         );
 
+        // 8. The PROXY shape (loopback URL + nonce header, no Authorization) is
+        //    ours at the device tier — refreshable. This is what every
+        //    device-provisioned session's `.mcp.json` now looks like.
+        std::fs::write(
+            &mcp,
+            r#"{"mcpServers":{"coord-mcp":{"type":"http","url":"http://127.0.0.1:9876/coord-mcp","headers":{"X-Coord-Mcp-Proxy-Key":"abc123"}}}}"#,
+        )
+        .unwrap();
+        assert!(
+            coord_mcp_safe_to_write(&wd),
+            "a proxy-shaped sole-coord-mcp config is ours — refreshable"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -337,8 +624,9 @@ mod tests {
     /// and every `acquire_for_terminal` chokepoint caller run once a bearer is
     /// resolved. Exercised through the JWT-injecting seam so it is deterministic
     /// regardless of whether the host has a real device JWT in its encrypted slot.
-    /// Covers all four branches: device writes, agent writes, a non-coord bearer is
-    /// gated out, and a device bearer never downgrades an existing agent config.
+    /// Covers all four branches: device writes the PROXY shape, agent writes the
+    /// static-bearer shape, a non-coord bearer is gated out, and a device bearer
+    /// never downgrades an existing agent config.
     #[test]
     fn provision_with_jwt_orchestration() {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -357,29 +645,57 @@ mod tests {
         let mcp_of = |d: &std::path::Path| d.join(".mcp.json");
         let dev = mk("device");
 
-        // A) device bearer + clean dir → provisions our coord-mcp config with it.
+        // A) device bearer + clean dir → provisions the loopback PROXY shape on
+        //    the passed bound port: nonce header, NO static bearer.
         let d = new_dir();
-        provision_coord_mcp_with_jwt(&d.to_string_lossy(), &dev);
+        provision_coord_mcp_with_jwt(&d.to_string_lossy(), &dev, 19876);
         let written =
             std::fs::read_to_string(mcp_of(&d)).expect("device bearer must provision .mcp.json");
         let v: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let server = &v["mcpServers"]["coord-mcp"];
         assert_eq!(
-            v["mcpServers"]["coord-mcp"]["headers"]["Authorization"],
-            format!("Bearer {dev}"),
-            "the written bearer must be the resolved device JWT"
+            server["url"], "http://127.0.0.1:19876/coord-mcp",
+            "device path must emit the loopback proxy URL on the passed port"
+        );
+        assert!(
+            server["headers"]["X-Coord-Mcp-Proxy-Key"]
+                .as_str()
+                .is_some_and(|n| proxy_nonce_is_valid(n)),
+            "device path must carry a registered per-session nonce"
+        );
+        assert!(
+            server["headers"].get("Authorization").is_none(),
+            "device path must NOT bake a static bearer (the proxy injects it live)"
         );
         let _ = std::fs::remove_dir_all(&d);
 
-        // B) agent bearer + clean dir → also provisions (agent is allowed).
+        // B) agent bearer + clean dir → provisions the static-bearer shape,
+        //    UNCHANGED (agent JWTs are narrower than the device JWT the proxy
+        //    injects — agent sessions must never route through the proxy).
         let d = new_dir();
-        provision_coord_mcp_with_jwt(&d.to_string_lossy(), &mk("agent"));
-        assert!(mcp_of(&d).exists(), "agent bearer must provision");
+        let agent_jwt = mk("agent");
+        provision_coord_mcp_with_jwt(&d.to_string_lossy(), &agent_jwt, 19876);
+        let written =
+            std::fs::read_to_string(mcp_of(&d)).expect("agent bearer must provision .mcp.json");
+        let v: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let server = &v["mcpServers"]["coord-mcp"];
+        assert_eq!(
+            server["headers"]["Authorization"],
+            format!("Bearer {agent_jwt}"),
+            "agent path keeps the static bearer shape"
+        );
+        assert!(
+            server["url"]
+                .as_str()
+                .is_some_and(|u| !u.contains("/coord-mcp")),
+            "agent path must point at coord /mcp directly, never the proxy"
+        );
         let _ = std::fs::remove_dir_all(&d);
 
         // C) non-coord bearer (e.g. a Cognito access token, sub_type=access) →
         //    sub_type gate skips; no file is written (would 401 coord's verifier).
         let d = new_dir();
-        provision_coord_mcp_with_jwt(&d.to_string_lossy(), &mk("access"));
+        provision_coord_mcp_with_jwt(&d.to_string_lossy(), &mk("access"), 19876);
         assert!(
             !mcp_of(&d).exists(),
             "a non-device/agent bearer must NOT be written"
@@ -394,7 +710,7 @@ mod tests {
             mk("agent")
         );
         std::fs::write(mcp_of(&d), &agent_cfg).unwrap();
-        provision_coord_mcp_with_jwt(&d.to_string_lossy(), &dev);
+        provision_coord_mcp_with_jwt(&d.to_string_lossy(), &dev, 19876);
         assert_eq!(
             std::fs::read_to_string(mcp_of(&d)).unwrap(),
             agent_cfg,
