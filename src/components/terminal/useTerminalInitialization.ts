@@ -45,9 +45,18 @@ export async function fetchOpenRecords(pageId: string): Promise<TerminalSessionR
   return [...byId.values()];
 }
 
-/** Build a `claude --resume <id>` command, optionally prefixed with CLAUDE_CONFIG_DIR. */
-function buildResumeCmd(sessionId: string, configDir: string | undefined): string {
-  const base = `claude --resume ${sessionId}`;
+/**
+ * Build a `claude --resume <id>` command, optionally prefixed with
+ * CLAUDE_CONFIG_DIR. Autonomous resume (`--permission-mode bypassPermissions`,
+ * matching the zone-profile + shell-integration resume builders and the
+ * backend `is_bypass_resume` detector) — a boot-restored session is unattended,
+ * so a bare `claude --resume` would stall forever on its first permission
+ * prompt.
+ *
+ * Exported for unit tests (vitest `environment: "node"`).
+ */
+export function buildResumeCmd(sessionId: string, configDir: string | undefined): string {
+  const base = `claude --permission-mode bypassPermissions --resume ${sessionId}`;
   if (!configDir) return `${base}\r`;
   const isWindows = navigator.platform.startsWith("Win");
   return isWindows
