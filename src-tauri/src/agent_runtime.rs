@@ -1768,8 +1768,17 @@ fn pick_continuation_page(
 }
 
 /// Build the gate-continuation `claude` spawn argv. Pure for unit-testing:
-/// every flag — including the pre-pinned `--session-id` — MUST precede the
-/// trailing positional prompt arg, or the CLI eats it as prompt text.
+/// every flag — including the pre-pinned `--session-id` — precedes a `--`
+/// end-of-options terminator, and the prompt is the sole arg after it.
+///
+/// The `--` terminator is load-bearing: the Claude CLI's `--add-dir
+/// <directories...>` option is VARIADIC and would otherwise consume the
+/// trailing positional prompt as a bogus directory — the session then opens
+/// at an empty interactive REPL with nothing submitted. Only multi-repo
+/// continuations emit `--add-dir` (Phase 2c sibling worktrees), so the bug
+/// surfaced on the first two-repo terminal continuation (2026-06-12, gate
+/// 0e462457). The terminator also keeps a prompt that happens to start with
+/// `-` from being parsed as a flag, so it is emitted unconditionally.
 fn build_continuation_claude_command(
     claude_bin: String,
     pinned_session_id: &str,
@@ -1783,6 +1792,7 @@ fn build_continuation_claude_command(
         pinned_session_id.to_string(),
     ];
     command_vec.extend(add_dir_args);
+    command_vec.push("--".to_string());
     command_vec.push(prompt);
     command_vec
 }
@@ -1871,8 +1881,9 @@ async fn run_continuation_terminal(
     let claude_bin = claude_bin_path();
     // Phase 2c — `--add-dir <sibling>` for each non-cwd worktree of this
     // continuation's context so the launched `claude` can edit sibling repos
-    // that materialized on disk but aren't the process cwd. Flags MUST precede
-    // the trailing positional prompt arg. Empty for single-repo continuations.
+    // that materialized on disk but aren't the process cwd. Empty for
+    // single-repo continuations. See `build_continuation_claude_command` for
+    // why the prompt is separated from the flags by `--`.
     let add_dir_args = ctx
         .as_ref()
         .map(|c| c.claude_add_dir_args())
@@ -2770,6 +2781,55 @@ mod tests {
     }
 
     #[test]
+    fn continuation_command_multi_repo_terminates_add_dir_before_prompt() {
+        // The variadic `--add-dir <dirs...>` must be cut off by `--` so the
+        // positional prompt is never swallowed as a directory.
+        let argv = build_continuation_claude_command(
+            "claude".to_string(),
+            "abc-123",
+            vec!["--add-dir".to_string(), "D:/wt/qontinui-coord".to_string()],
+            "run /implement-plan plans/x.md".to_string(),
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "claude",
+                "--dangerously-skip-permissions",
+                "--session-id",
+                "abc-123",
+                "--add-dir",
+                "D:/wt/qontinui-coord",
+                "--",
+                "run /implement-plan plans/x.md",
+            ],
+            "`--` must sit between the last --add-dir value and the prompt"
+        );
+    }
+
+    #[test]
+    fn continuation_command_single_repo_still_emits_terminator() {
+        // No sibling worktrees → no --add-dir, but the `--` stays so a prompt
+        // starting with `-` can never be parsed as a flag.
+        let argv = build_continuation_claude_command(
+            "claude".to_string(),
+            "abc-123",
+            vec![],
+            "-prompt with dash".to_string(),
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "claude",
+                "--dangerously-skip-permissions",
+                "--session-id",
+                "abc-123",
+                "--",
+                "-prompt with dash",
+            ]
+        );
+    }
+
+    #[test]
     fn pick_continuation_page_default_under_ceiling_picks_default() {
         let counts = [page("default", 3), page("p1", 9)];
         assert_eq!(
@@ -2837,8 +2897,8 @@ mod tests {
     }
 
     /// The pinned `--session-id <uuid>` pair sits among the flags, BEFORE the
-    /// trailing positional prompt (the CLI treats everything after the flags
-    /// as prompt text), with `--add-dir` siblings preserved in between.
+    /// `--` terminator and the trailing positional prompt, with `--add-dir`
+    /// siblings preserved in between.
     #[test]
     fn continuation_command_pins_session_id_before_positional_prompt() {
         let cmd = build_continuation_claude_command(
@@ -2850,7 +2910,7 @@ mod tests {
         assert_eq!(
             cmd.join("|"),
             "claude|--dangerously-skip-permissions|--session-id|abc-123|\
-             --add-dir|D:/wt/sibling|do the thing"
+             --add-dir|D:/wt/sibling|--|do the thing"
         );
     }
 
@@ -3305,16 +3365,25 @@ mod tests {
         let prev = std::env::var("QONTINUI_CLAUDE_BIN").ok();
         std::env::set_var("QONTINUI_CLAUDE_BIN", "/fake/claude");
 
-        // Mirror the construction in `run_continuation_terminal` (a fixed-size
-        // array here — the production path needs an owned `Vec` for the
-        // `Option<Vec<String>>` command override, but the test only inspects).
+        // Exercise the REAL production constructor (not a hand-built mirror,
+        // which historically drifted from the argv the terminal branch hands
+        // to `terminal_create`'s `command` override).
         let claude_bin = claude_bin_path();
         let prompt = "implement phase 2 of the plan".to_string();
-        let command = [claude_bin, prompt.clone()];
+        let command =
+            build_continuation_claude_command(claude_bin, "sess-1", vec![], prompt.clone());
 
         assert_eq!(command[0], "/fake/claude", "uses the resolved claude bin");
-        assert_eq!(command[1], prompt, "prompt is the single positional arg");
-        assert_eq!(command.len(), 2, "no extra flags");
+        assert_eq!(
+            command.last(),
+            Some(&prompt),
+            "prompt is the trailing positional arg"
+        );
+        assert_eq!(
+            command[command.len() - 2],
+            "--",
+            "an end-of-options terminator precedes the prompt"
+        );
         assert!(
             !command.iter().any(|a| a == "--print" || a == "-p"),
             "must NOT use --print/-p: the session must stay interactive"
