@@ -41,7 +41,9 @@ import { setTerminalSessions, type TerminalSessionEntry } from "@/lib/terminal-s
 import { UIBridgeComponentScope } from "@qontinui/ui-bridge";
 import { useCommitState } from "./useCommitState";
 import { useTabSessionIdCapture } from "./useTabSessionIdCapture";
-import { buildSessionOpenArgs } from "./sessionRecordArgs";
+import { buildSessionOpenArgs, type SessionBindOrigin } from "./sessionRecordArgs";
+import { buildAiLaunchCommand } from "./aiLaunchCommand";
+import { rememberSessionId } from "./lastKnownSessionIds";
 import { useRegistryAwareness } from "./useRegistryAwareness";
 import { useMidSessionProbe, useMidSessionProbeEnabled } from "./useMidSessionProbe";
 import { MidSessionToast } from "./MidSessionToast";
@@ -515,7 +517,14 @@ function TerminalPageInner({
    * restore hint, the live session is unaffected.
    */
   const recordSessionOpen = useCallback(
-    (tabId: string, claudeSessionId: string, configDir?: string) => {
+    // Default origin "guessed": the only caller that omits it is the
+    // transcript-capture hook, whose id IS a freshest-mtime guess.
+    (
+      tabId: string,
+      claudeSessionId: string,
+      configDir?: string,
+      bindOrigin: SessionBindOrigin = "guessed",
+    ) => {
       const args = buildSessionOpenArgs({
         assignments: assignmentsRef.current,
         tabs: tabsRef.current,
@@ -523,6 +532,7 @@ function TerminalPageInner({
         claudeSessionId,
         configDir,
         pageId,
+        bindOrigin,
       });
       invoke("terminal_session_record_open", { ...args }).catch((err) => {
         logger.warn(`terminal_session_record_open failed for ${claudeSessionId}: ${err}`);
@@ -819,16 +829,6 @@ function TerminalPageInner({
 
     const isWindows = navigator.platform.startsWith("Win");
     const customCmd = sessionManager.launchCommands?.[configDir];
-    // Default to autonomous mode (`--permission-mode bypassPermissions`),
-    // matching the operator's `clg`/`clh`/`clp` wrappers — runner-spawned
-    // AI sessions are for autonomous development and must not stall on a
-    // permission prompt. An explicit per-account launch command (if
-    // configured in settings) still overrides.
-    const cmd = customCmd
-      ? customCmd
-      : isWindows
-        ? `$env:CLAUDE_CONFIG_DIR="${configDir}"; claude --permission-mode bypassPermissions`
-        : `CLAUDE_CONFIG_DIR="${configDir}" claude --permission-mode bypassPermissions`;
     const dirName = configDir.replace(/\\/g, "/").replace(/\/$/, "").split("/").pop() ?? "";
     const label = customCmd ?? dirName.match(/^\.claude-(.+)$/)?.[1] ?? "claude";
     const createdTabIds: string[] = [];
@@ -839,9 +839,24 @@ function TerminalPageInner({
     if (createdTabIds.length > 0) {
       const spawnAt = Date.now();
       for (const tabId of createdTabIds) {
-        writeWhenReady(tabId, `${cmd}\r`);
-        const tab = tabs.find((t) => t.id === tabId);
-        startSessionIdCapture(tabId, tab?.workingDir ?? "", spawnAt, configDir);
+        // Fresh uuid per tab/retype (a reused --session-id fails loudly) —
+        // the registry records synchronously, no transcript mtime guess.
+        const { command, pinnedSessionId } = buildAiLaunchCommand({
+          configDir,
+          isWindows,
+          customCmd,
+          newSessionId: () => crypto.randomUUID(),
+        });
+        writeWhenReady(tabId, `${command}\r`);
+        if (pinnedSessionId) {
+          updateTab(tabId, { claudeSessionId: pinnedSessionId, claudeConfigDir: configDir });
+          rememberSessionId(tabId, pinnedSessionId, configDir);
+          recordSessionOpen(tabId, pinnedSessionId, configDir, "pinned");
+        } else {
+          // Custom launch command — id unknown; capture poll is the fallback.
+          const tab = tabs.find((t) => t.id === tabId);
+          startSessionIdCapture(tabId, tab?.workingDir ?? "", spawnAt, configDir);
+        }
       }
       if (context) {
         const safeContext = context.replace(/\n/g, " ");
@@ -911,11 +926,7 @@ function TerminalPageInner({
             Visually hidden; not interactive. Lists ALL sessions regardless
             of which zones are currently mounted, so verification never
             depends on the active layout preset. */}
-        <span
-          data-page-element="terminal-session-roster"
-          style={{ display: "none" }}
-          aria-hidden
-        >
+        <span data-page-element="terminal-session-roster" style={{ display: "none" }} aria-hidden>
           {terminalSessionRoster}
         </span>
         {/* Phase 2 — honesty backstop for sessions past the zone ceiling.

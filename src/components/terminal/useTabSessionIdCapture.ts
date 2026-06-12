@@ -2,6 +2,10 @@
  * Post-spawn polling hook that fills in `tab.claudeSessionId` for
  * PTY-launched AI tabs (the `onLaunchAiSession` path in TerminalPage).
  *
+ * FALLBACK ONLY since #548 Phase 1: runner launches pre-pin the id via
+ * `--session-id` and never start a capture; this poll covers only un-pinned
+ * tabs (custom launch commands, hand-typed `claude`), binds origin "guessed".
+ *
  * Today, `useShellIntegration.ts:135` only sets `claudeSessionId` on
  * the resume path (`handleResumeSession`). For initial spawns, the
  * field is never set — which means `useCommitState`'s per-tab probe has

@@ -96,6 +96,11 @@ pub struct TerminalSessionRecord {
     pub closed_at: Option<i64>,
     /// Why the session was closed (e.g. `"poll-dead"`, an explicit reason).
     pub close_reason: Option<String>,
+    /// How `claude_session_id` was bound: `"pinned"` (`--session-id` /
+    /// `--resume` — exact) or `"guessed"` (freshest-transcript mtime guess).
+    /// Records predating the field deserialize as `None` = guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_origin: Option<String>,
 }
 
 /// Durable map of `claude_session_id -> TerminalSessionRecord`. Cheap to
@@ -151,6 +156,11 @@ impl SessionLifecycleStore {
             entry.zone_index = rec.zone_index;
             entry.title = rec.title;
             entry.terminal_id = rec.terminal_id;
+            // Unasserted origin (zone-move backstop / boot re-assert) must
+            // not degrade a pinned binding to guessed — preserve on None.
+            if rec.bind_origin.is_some() {
+                entry.bind_origin = rec.bind_origin;
+            }
             entry.state = "open".to_string();
             entry.closed_at = None;
             entry.close_reason = None;
@@ -418,7 +428,41 @@ mod tests {
             state: "open".to_string(),
             closed_at: None,
             close_reason: None,
+            bind_origin: None,
         }
+    }
+
+    /// Records predating `bindOrigin` must deserialize and read as guessed.
+    #[test]
+    fn pre_bind_origin_record_deserializes_as_guessed() {
+        let json = r#"{"claudeSessionId":"old-sess","configDir":null,"workingDir":"C:/repo",
+            "pageId":"default","zoneIndex":1,"title":"Old","terminalId":"term-old",
+            "openedAt":1,"lastSeenAt":2,"state":"open","closedAt":null,"closeReason":null}"#;
+        let rec: TerminalSessionRecord = serde_json::from_str(json).unwrap();
+        // `None` IS the guessed reading — consumers default absent to "guessed".
+        assert_eq!(rec.bind_origin.as_deref().unwrap_or("guessed"), "guessed");
+    }
+
+    /// Pinned origin survives an unasserted re-record; asserted updates.
+    #[test]
+    fn record_open_preserves_bind_origin_when_unasserted() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let mut pinned = rec("sess-1");
+        pinned.bind_origin = Some("pinned".to_string());
+        store.record_open(pinned);
+        store.record_open(rec("sess-1")); // unasserted (None)
+        assert_eq!(
+            store.open_records()[0].bind_origin.as_deref(),
+            Some("pinned")
+        );
+        let mut guessed = rec("sess-1");
+        guessed.bind_origin = Some("guessed".to_string());
+        store.record_open(guessed);
+        assert_eq!(
+            store.open_records()[0].bind_origin.as_deref(),
+            Some("guessed")
+        );
     }
 
     #[test]

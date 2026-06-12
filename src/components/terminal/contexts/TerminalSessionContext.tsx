@@ -329,6 +329,19 @@ const PageSessionScope = memo(function PageSessionScope({
           claudeSessionId: s.claudeSessionId,
           claudeConfigDir: s.claudeConfigDir,
         });
+        // Durable-registry OPEN at type time (#548 Phase 1): `--resume` names
+        // the exact id in the typed command — no transcript guess.
+        const resumedTab = tabs.find((t) => t.id === tabId);
+        invoke("terminal_session_record_open", {
+          claudeSessionId: s.claudeSessionId,
+          configDir: s.claudeConfigDir,
+          workingDir: resumedTab?.workingDir,
+          pageId,
+          zoneIndex: s.zoneIndex,
+          title: resumedTab?.title,
+          terminalId: tabId,
+          bindOrigin: "pinned",
+        }).catch((err) => console.warn(`[TerminalSession] profile resume record failed:`, err));
         writeWhenReady(
           terminalRefs.current,
           tabId,
@@ -345,7 +358,7 @@ const PageSessionScope = memo(function PageSessionScope({
       }
     }
     pendingProfileSessionsRef.current = remaining.length > 0 ? remaining : null;
-  }, [zoneLayout.assignments, updateTab]);
+  }, [zoneLayout.assignments, updateTab, tabs, pageId]);
 
   // Transcripts are read up here (rather than in the AiFeatures block below)
   // because the debug-gated synthetic-tab seam derives synthetic tabs from
@@ -446,6 +459,7 @@ const PageSessionScope = memo(function PageSessionScope({
     terminalRefs,
     setRightPanelMode: (v) => rightPanelModeSetterRef.current(v as never),
     setSelectedTranscriptSessionId: (v) => selectedSessionSetterRef.current(v as never),
+    pageId,
   });
 
   const getScrollback = useCallback(

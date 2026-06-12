@@ -1767,6 +1767,26 @@ fn pick_continuation_page(
     mint()
 }
 
+/// Build the gate-continuation `claude` spawn argv. Pure for unit-testing:
+/// every flag — including the pre-pinned `--session-id` — MUST precede the
+/// trailing positional prompt arg, or the CLI eats it as prompt text.
+fn build_continuation_claude_command(
+    claude_bin: String,
+    pinned_session_id: &str,
+    add_dir_args: Vec<String>,
+    prompt: String,
+) -> Vec<String> {
+    let mut command_vec = vec![
+        claude_bin,
+        "--dangerously-skip-permissions".to_string(),
+        "--session-id".to_string(),
+        pinned_session_id.to_string(),
+    ];
+    command_vec.extend(add_dir_args);
+    command_vec.push(prompt);
+    command_vec
+}
+
 /// Run a gate continuation as a VISIBLE terminal session (Decision 1/2/3).
 ///
 /// Opens a pop-out terminal window and creates a terminal session whose PTY
@@ -1857,10 +1877,16 @@ async fn run_continuation_terminal(
         .as_ref()
         .map(|c| c.claude_add_dir_args())
         .unwrap_or_default();
-    let mut command_vec = vec![claude_bin, "--dangerously-skip-permissions".to_string()];
-    command_vec.extend(add_dir_args);
-    command_vec.push(payload.initial_prompt.clone());
-    let command = Some(command_vec);
+    // Pre-pin the Claude session id (#548 Phase 1): the registry records
+    // synchronously at spawn instead of mtime-guessing from transcripts.
+    // Fresh uuid per spawn attempt — never reused (CLI fails loudly on reuse).
+    let pinned_session_id = uuid::Uuid::new_v4().to_string();
+    let command = Some(build_continuation_claude_command(
+        claude_bin,
+        &pinned_session_id,
+        add_dir_args,
+        payload.initial_prompt.clone(),
+    ));
 
     // First repo (if any) is the session's intent_repo for coord attribution.
     let intent_repo = payload.repos.first().cloned();
@@ -1927,6 +1953,8 @@ async fn run_continuation_terminal(
         working_dir: workdir.to_string(),
         title: title.clone(),
         page_id: Some(target_page.clone()),
+        // Matches the `--session-id` in the spawn argv → synchronous record.
+        claude_session_id: Some(pinned_session_id),
     });
 
     // Provision `.mcp.json` so this continuation can reach coord coordination
@@ -2805,6 +2833,24 @@ mod tests {
         assert_eq!(
             pick_continuation_page(&counts, 9, || MINTED.to_string()),
             "default"
+        );
+    }
+
+    /// The pinned `--session-id <uuid>` pair sits among the flags, BEFORE the
+    /// trailing positional prompt (the CLI treats everything after the flags
+    /// as prompt text), with `--add-dir` siblings preserved in between.
+    #[test]
+    fn continuation_command_pins_session_id_before_positional_prompt() {
+        let cmd = build_continuation_claude_command(
+            "claude".to_string(),
+            "abc-123",
+            vec!["--add-dir".to_string(), "D:/wt/sibling".to_string()],
+            "do the thing".to_string(),
+        );
+        assert_eq!(
+            cmd.join("|"),
+            "claude|--dangerously-skip-permissions|--session-id|abc-123|\
+             --add-dir|D:/wt/sibling|do the thing"
         );
     }
 

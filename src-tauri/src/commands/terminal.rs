@@ -845,6 +845,7 @@ pub fn terminal_session_record_open(
     zone_index: i32,
     title: Option<String>,
     terminal_id: String,
+    bind_origin: Option<String>,
 ) -> Result<CommandResponse, String> {
     let record = TerminalSessionRecord {
         claude_session_id,
@@ -860,6 +861,8 @@ pub fn terminal_session_record_open(
         state: "open".to_string(),
         closed_at: None,
         close_reason: None,
+        // `None` (origin-unaware callers) preserves any existing origin.
+        bind_origin,
     };
     store.record_open(record);
     Ok(CommandResponse {
@@ -926,6 +929,10 @@ pub(crate) struct SessionCaptureHint {
     /// Page the session should land on (and be durably recorded against) so a
     /// restart re-lands the continuation on its page. `None` → `"default"`.
     pub page_id: Option<String>,
+    /// Pre-pinned Claude session id (`--session-id <uuid>` in the spawn
+    /// argv): `Some(..)` records the OPEN synchronously (origin `"pinned"`)
+    /// and demotes the transcript poller to a verification arm.
+    pub claude_session_id: Option<String>,
 }
 
 /// Backend-task entry point for creating a terminal session + coord row from a
@@ -1097,24 +1104,62 @@ pub(crate) fn create_terminal_session_backend(
                 working_dir,
                 title,
                 page_id: hint_page_id,
+                claude_session_id: pinned_session_id,
             } = hint;
             // Single source of truth for the recorded page: the hint's page_id
             // (set by the caller to the picked page), defaulting to "default".
             let record_page_id = hint_page_id.unwrap_or_else(|| "default".to_string());
-            let since = chrono::Utc::now();
-            let resolver_dir = working_dir.clone();
-            let resolver = move || resolve_latest_claude_session_id(&resolver_dir, since);
-            tokio::spawn(poll_and_record_session(
-                store,
-                resolver,
-                terminal_id,
-                config_dir,
-                working_dir,
-                title,
-                record_page_id,
-                SESSION_CAPTURE_POLL_INTERVAL,
-                SESSION_CAPTURE_TIMEOUT,
-            ));
+            if let Some(pinned) = pinned_session_id {
+                // Pre-pinned id: record synchronously, then verify async that
+                // the transcript appears. NEVER rebinds from transcripts.
+                record_pinned_session_open(
+                    &store,
+                    pinned.clone(),
+                    terminal_id.clone(),
+                    config_dir.clone(),
+                    working_dir.clone(),
+                    title,
+                    record_page_id,
+                );
+                let verify_dirs: Vec<std::path::PathBuf> = config_dir
+                    .iter()
+                    .map(std::path::PathBuf::from)
+                    .chain(crate::terminal::transcript::find_claude_config_dirs())
+                    .collect();
+                let verify_pinned = pinned.clone();
+                let verify = move || {
+                    verify_dirs.iter().any(|dir| {
+                        crate::terminal::transcript::session_transcript_path(
+                            dir,
+                            &working_dir,
+                            &verify_pinned,
+                        )
+                        .exists()
+                    })
+                };
+                tokio::spawn(poll_and_verify_pinned_session(
+                    verify,
+                    terminal_id,
+                    pinned,
+                    SESSION_CAPTURE_POLL_INTERVAL,
+                    SESSION_CAPTURE_TIMEOUT,
+                ));
+            } else {
+                let since = chrono::Utc::now();
+                let resolver_dir = working_dir.clone();
+                let resolver = move || resolve_latest_claude_session_id(&resolver_dir, since);
+                tokio::spawn(poll_and_record_session(
+                    store,
+                    resolver,
+                    terminal_id,
+                    config_dir,
+                    working_dir,
+                    title,
+                    record_page_id,
+                    SESSION_CAPTURE_POLL_INTERVAL,
+                    SESSION_CAPTURE_TIMEOUT,
+                ));
+            }
         } else {
             warn!(
                 terminal_id = %info.id,
@@ -1194,6 +1239,8 @@ async fn poll_and_record_session<F>(
                 state: "open".to_string(),
                 closed_at: None,
                 close_reason: None,
+                // Freshest-transcript mtime guess — may be a foreign session.
+                bind_origin: Some("guessed".to_string()),
             };
             store.record_open(record);
             info!(
@@ -1209,6 +1256,77 @@ async fn poll_and_record_session<F>(
                 working_dir = %working_dir,
                 "create_terminal_session_backend: timed out resolving Claude session id — \
                  continuation session not durably recorded"
+            );
+            return;
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// Durably record a PRE-PINNED session (`--session-id <id>` in the spawn
+/// argv) the instant the PTY exists — no transcript mtime race to lose.
+pub(crate) fn record_pinned_session_open(
+    store: &SessionLifecycleStore,
+    claude_session_id: String,
+    terminal_id: String,
+    config_dir: Option<String>,
+    working_dir: String,
+    title: String,
+    page_id: String,
+) {
+    store.record_open(TerminalSessionRecord {
+        claude_session_id: claude_session_id.clone(),
+        config_dir,
+        working_dir: Some(working_dir),
+        page_id,
+        zone_index: 0,
+        title: Some(title),
+        terminal_id: terminal_id.clone(),
+        // record_open seeds these from `now`; values here are placeholders.
+        opened_at: 0,
+        last_seen_at: 0,
+        state: "open".to_string(),
+        closed_at: None,
+        close_reason: None,
+        bind_origin: Some("pinned".to_string()),
+    });
+    info!(
+        terminal_id = %terminal_id,
+        claude_session = %claude_session_id,
+        "create_terminal_session_backend: pinned session durably recorded at spawn"
+    );
+}
+
+/// Verification arm for a pre-pinned session: poll `verify` (pinned
+/// transcript exists on disk?) until confirmed or `timeout`. Pure
+/// observability — NEVER touches the registry binding; timeout warns loudly.
+async fn poll_and_verify_pinned_session<F>(
+    verify: F,
+    terminal_id: String,
+    claude_session_id: String,
+    interval: std::time::Duration,
+    timeout: std::time::Duration,
+) where
+    F: Fn() -> bool,
+{
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if verify() {
+            info!(
+                terminal_id = %terminal_id,
+                claude_session = %claude_session_id,
+                "pinned session verified: transcript present on disk"
+            );
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            warn!(
+                terminal_id = %terminal_id,
+                claude_session = %claude_session_id,
+                "PINNED SESSION MISMATCH: transcript for the pinned --session-id never \
+                 appeared — claude likely failed to start (session-id collision fails \
+                 loudly in the pane) or wrote to an unexpected config dir. Registry \
+                 binding left as-is; NOT rebinding from transcripts."
             );
             return;
         }
@@ -1366,5 +1484,59 @@ mod tests {
         // Hint absent → poll_and_record_session is never spawned (see
         // create_terminal_session_backend). The store therefore has no rows.
         assert!(store.open_records().is_empty());
+    }
+
+    /// Regression for the 2026-06-12 mis-bind incident: two transcripts in
+    /// the project dir, the FRESHER one foreign. The mtime guess binds the
+    /// foreign id; the pinned path must take NOTHING from transcripts.
+    #[tokio::test]
+    async fn pinned_path_ignores_fresher_foreign_transcript() {
+        use crate::terminal::transcript::{get_latest_session_id, session_transcript_path};
+        let cfg = tempfile::tempdir().unwrap();
+        let project_path = "C:/work/repo";
+        let pinned_id = "11111111-1111-4111-8111-111111111111";
+        let foreign_id = "99999999-9999-4999-8999-999999999999";
+
+        // Lay both transcripts down, the foreign one FRESHER (later mtime).
+        let pinned_path = session_transcript_path(cfg.path(), project_path, pinned_id);
+        std::fs::create_dir_all(pinned_path.parent().unwrap()).unwrap();
+        std::fs::write(&pinned_path, "{\"type\":\"user\"}\n").unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        let foreign_path = session_transcript_path(cfg.path(), project_path, foreign_id);
+        std::fs::write(&foreign_path, "{\"type\":\"user\"}\n").unwrap();
+
+        // Sanity: the incident's guess mechanism really picks the foreign id.
+        let guessed = get_latest_session_id(cfg.path(), project_path, None)
+            .expect("fixture must yield a freshest session");
+        assert_eq!(guessed.session_id, foreign_id, "foreign must be freshest");
+
+        // Pinned path: synchronous record + verification arm.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
+        );
+        record_pinned_session_open(
+            &store,
+            pinned_id.to_string(),
+            "term-pin".to_string(),
+            Some(cfg.path().to_string_lossy().to_string()),
+            project_path.to_string(),
+            "Pinned".to_string(),
+            "default".to_string(),
+        );
+        let verify_cfg = cfg.path().to_path_buf();
+        poll_and_verify_pinned_session(
+            move || session_transcript_path(&verify_cfg, project_path, pinned_id).exists(),
+            "term-pin".to_string(),
+            pinned_id.to_string(),
+            Duration::from_millis(1),
+            Duration::from_millis(50),
+        )
+        .await;
+
+        let open = store.open_records();
+        assert_eq!(open.len(), 1, "exactly one record — nothing guessed in");
+        assert_eq!(open[0].claude_session_id, pinned_id);
+        assert_eq!(open[0].bind_origin.as_deref(), Some("pinned"));
     }
 }
