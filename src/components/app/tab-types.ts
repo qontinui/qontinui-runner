@@ -335,46 +335,72 @@ export const TAB_LABELS: Record<MainTabId, string> = {
 
 /**
  * Logical section a tab belongs to — surfaces in `GET /control/tabs` so
- * agents can navigate the 90+ tab catalog by grouping:
- *   - "nav":      sidebar top-level navigation tabs
- *   - "run":      run-detail sub-tabs (opened from a specific run)
- *   - "monitor":  live-monitor sub-tabs
- *   - "settings": settings panel sub-tabs
- *   - "build":    workflow / spec / state-machine builders
- *   - "config":   configuration tabs (log sources, findings, hooks, triggers, tasks)
- *   - "system":   everything else (help, skills, analytics, debugging views, …)
+ * agents can navigate the 100+ tab catalog by grouping. The vocabulary
+ * mirrors the terminal-centric sidebar IA (see `@qontinui/navigation`
+ * `groups.ts`) so the agent-facing catalog and the human sidebar agree:
+ *   - "workspace": daily entry points (Terminal, Home, Active, Productivity, …)
+ *   - "review":    runs, run-detail sub-tabs, memory, knowledge
+ *   - "spend":     token cost (LLM analytics, cost control)
+ *   - "automate":  scheduled / reactive agents (triggers, tasks, watchers)
+ *   - "build":     workflow / spec / state-machine builders + library
+ *   - "insights":  live monitoring + accumulated analysis (errors, monitor-* …)
+ *   - "configure": configuration tabs (config-*, event history)
+ *   - "dev":       dev-only tooling (generator eval, meta-optimizer, skills, …)
+ *   - "system":    settings panel + help + anything unclassified
  */
-export type TabSection = "nav" | "run" | "monitor" | "settings" | "build" | "config" | "system";
+export type TabSection =
+  | "workspace"
+  | "review"
+  | "spend"
+  | "automate"
+  | "build"
+  | "insights"
+  | "configure"
+  | "dev"
+  | "system";
 
-/**
- * Sidebar top-level navigation tabs. Explicit override — these don't share a
- * common prefix with each other, so we hand-list them rather than try to
- * infer them. Everything not in this set falls through to the prefix rule.
- */
-const NAV_TAB_IDS: ReadonlySet<MainTabId> = new Set<MainTabId>([
+/** WORKSPACE — daily entry points. */
+const WORKSPACE_TAB_IDS: ReadonlySet<MainTabId> = new Set<MainTabId>([
   "prompt-home",
   "gui-automation",
   "workflow-queue",
   "active",
-  "runs",
-  "history",
-  "error-monitor",
-  "processes",
   "terminal",
-  "wrappers",
   "productivity",
-  "regression",
 ]);
 
 /**
- * Workflow / spec / state-machine building tabs. Explicit — these have
- * mixed prefixes (state-*, spec*, capture, library, *-builder, …).
+ * REVIEW — runs and the intelligence reviewed afterwards. The `run-*`
+ * detail sub-tabs are covered by the prefix rule below.
+ */
+const REVIEW_TAB_IDS: ReadonlySet<MainTabId> = new Set<MainTabId>([
+  "runs",
+  "history",
+  "ai",
+  "memory-search",
+  "knowledge-explorer",
+]);
+
+/** SPEND — token cost surfaces. */
+const SPEND_TAB_IDS: ReadonlySet<MainTabId> = new Set<MainTabId>([
+  "llm-analytics",
+  "cost-control",
+]);
+
+/** AUTOMATE — scheduled / reactive agents. */
+const AUTOMATE_TAB_IDS: ReadonlySet<MainTabId> = new Set<MainTabId>([
+  "triggers",
+  "tasks",
+  "watchers",
+]);
+
+/**
+ * BUILD — workflow / spec / state-machine builders and assets. Mixed
+ * prefixes (state-*, spec*, capture, library, *-builder, …), so explicit.
  */
 const BUILD_TAB_IDS: ReadonlySet<MainTabId> = new Set<MainTabId>([
-  "state-machine",
-  "specs",
-  "capture",
-  "library",
+  "unified-workflow-builder",
+  "dag-workflow-editor",
   "step-builders",
   "check-builder",
   "check-group-builder",
@@ -382,30 +408,71 @@ const BUILD_TAB_IDS: ReadonlySet<MainTabId> = new Set<MainTabId>([
   "task-builder",
   "context-builder",
   "playwright-test-builder",
-  "unified-workflow-builder",
-  "dag-workflow-editor",
+  "library",
+  "state-machine",
+  "specs",
+  "capture",
+  "regression",
+  "demo-video",
+  "product-tours",
+  "orchestration-loop",
+  "wrappers",
 ]);
 
 /**
- * Non-prefix-matching config tabs. The `config-*` family is picked up by
- * the prefix rule below; these are misc config-ish tabs without the prefix.
+ * INSIGHTS — live monitoring + accumulated analysis. The `monitor-*`
+ * family is covered by the prefix rule below.
  */
-const CONFIG_TAB_IDS: ReadonlySet<MainTabId> = new Set<MainTabId>(["triggers", "tasks"]);
+const INSIGHTS_TAB_IDS: ReadonlySet<MainTabId> = new Set<MainTabId>([
+  "error-monitor",
+  "processes",
+  "automation-health",
+  "activity-timeline",
+  "reflection",
+  "observations",
+  "architecture",
+  "api-surface",
+  "development-intelligence",
+  "project-explainer",
+  "decision-trail",
+  "session-recap",
+  "logs",
+  "evaluation",
+  "memory-federation",
+]);
+
+/** DEV — dev-only tooling (mostly `hiddenInProd` in the sidebar). */
+const DEV_TAB_IDS: ReadonlySet<MainTabId> = new Set<MainTabId>([
+  "generator-eval",
+  "meta-optimizer",
+  "online-learning",
+  "skills",
+  "image-quality-tests",
+  "accessibility-explorer",
+]);
+
+/** CONFIGURE — misc config tabs without the `config-` prefix. */
+const CONFIGURE_TAB_IDS: ReadonlySet<MainTabId> = new Set<MainTabId>(["event-history"]);
 
 /**
- * Derive the section for a tab id. Prefix rule covers the large families
- * (run-*, monitor-*, settings-*, config-*); the explicit overrides above
- * capture sidebar nav and build/config tabs that don't share a prefix.
+ * Derive the section for a tab id. Explicit sets mirror the sidebar IA
+ * groups; prefix rules cover the large sub-tab families (run-* → review,
+ * monitor-* → insights, settings-* → system, config-* → configure).
  * Unknown ids fall back to "system".
  */
 export function deriveSection(id: MainTabId): TabSection {
-  if (NAV_TAB_IDS.has(id)) return "nav";
+  if (WORKSPACE_TAB_IDS.has(id)) return "workspace";
+  if (REVIEW_TAB_IDS.has(id)) return "review";
+  if (SPEND_TAB_IDS.has(id)) return "spend";
+  if (AUTOMATE_TAB_IDS.has(id)) return "automate";
   if (BUILD_TAB_IDS.has(id)) return "build";
-  if (CONFIG_TAB_IDS.has(id)) return "config";
-  if (id.startsWith("run-")) return "run";
-  if (id.startsWith("monitor-")) return "monitor";
-  if (id.startsWith("settings-") || id === "settings") return "settings";
-  if (id.startsWith("config-")) return "config";
+  if (INSIGHTS_TAB_IDS.has(id)) return "insights";
+  if (DEV_TAB_IDS.has(id)) return "dev";
+  if (CONFIGURE_TAB_IDS.has(id)) return "configure";
+  if (id.startsWith("run-")) return "review";
+  if (id.startsWith("monitor-")) return "insights";
+  if (id.startsWith("config-")) return "configure";
+  if (id.startsWith("settings-") || id === "settings") return "system";
   return "system";
 }
 
