@@ -2,7 +2,8 @@ import { useEffect, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LAYOUT_PRESETS } from "./useZoneLayout";
-import { writeWhenReady } from "./writeWhenReady";
+import type { TerminalRefsMap } from "./writeWhenReady";
+import { typeResumeAndVerify, type TypeAndVerifyOptions } from "./resumeVerification";
 import type { TerminalTab } from "./useTerminalManager";
 import type { TerminalInstanceHandle } from "./TerminalInstance";
 import type { CommandResponse, TerminalSessionRecord } from "./types";
@@ -65,6 +66,53 @@ export function buildResumeCmd(sessionId: string, configDir: string | undefined)
 }
 
 /**
+ * Type the resume command for a restored tab and VERIFY the Claude UI
+ * handshake actually appeared (Phase 3, issue #548): on first failure the
+ * same command is retyped once; on persistent failure the tab is parked in an
+ * explicit `resumeFailed` state (operator-clickable retry via
+ * `ResumeFailedBanner`) and the durable restore-pending marker is left SET so
+ * the backend liveness poll keeps protecting the `open` record. Only a
+ * verified handshake clears the marker and the reconnecting affordance.
+ *
+ * Used by the boot-restore drain below AND by the operator retry path in
+ * `TerminalPage`. Exported (with injectable verify options) so the
+ * verified/failed state machine is unit-testable without booting React.
+ */
+export async function runVerifiedResume(params: {
+  terminalRefs: TerminalRefsMap;
+  tabId: string;
+  claudeSessionId: string;
+  configDir?: string;
+  updateTab: (
+    id: string,
+    updates: Partial<{ isReconnecting?: boolean; resumeFailed?: boolean }>,
+  ) => void;
+  verifyOptions?: TypeAndVerifyOptions;
+}): Promise<"verified" | "failed"> {
+  const { terminalRefs, tabId, claudeSessionId, configDir, updateTab, verifyOptions } = params;
+  const resumeCmd = buildResumeCmd(claudeSessionId, configDir);
+  const outcome = await typeResumeAndVerify(terminalRefs, tabId, resumeCmd, verifyOptions);
+  if (outcome === "verified") {
+    updateTab(tabId, { isReconnecting: false, resumeFailed: false });
+    // Verified handshake — release the liveness-poll restore guard so normal
+    // classification resumes for this session.
+    invoke("terminal_session_clear_restore_pending", { claudeSessionId }).catch((err) => {
+      // Best-effort: the poll self-heals a stale marker on the next
+      // confident-alive tick.
+      console.warn(`[TerminalPage] clear restore-pending failed for ${claudeSessionId}:`, err);
+    });
+  } else {
+    // Resume never landed. Surface an explicit retry affordance and KEEP the
+    // restore-pending marker — the open record must survive for the retry.
+    console.warn(
+      `[TerminalPage] resume verification failed for ${tabId} (session ${claudeSessionId})`,
+    );
+    updateTab(tabId, { isReconnecting: false, resumeFailed: true });
+  }
+  return outcome;
+}
+
+/**
  * Pure guard for the once-per-pageId init backstop (Phase 3 mount-hydration
  * lift). With the session provider lifted above the page, the single
  * `useTerminalInitialization` instance persists across terminal-page switches,
@@ -111,6 +159,7 @@ interface UseTerminalInitializationParams {
       claudeSessionId?: string;
       claudeConfigDir?: string;
       isReconnecting?: boolean;
+      resumeFailed?: boolean;
     }>,
   ) => void;
   zoneLayout: {
@@ -343,6 +392,20 @@ export function useTerminalInitialization({
               claudeSessionId: rec.claudeSessionId,
               claudeConfigDir: safeConfigDir,
             });
+            // Durable, backend-owned restore-pending marker (Phase 3, #548):
+            // from here until the resume handshake is VERIFIED the liveness
+            // poll must never flip this record `poll-dead` — a failed restore
+            // leaves the `open` record intact for the next attempt. Cleared in
+            // `runVerifiedResume` on verified handshake (and self-healed by
+            // the poll once it sees the session confidently alive).
+            invoke("terminal_session_mark_restore_pending", {
+              claudeSessionId: rec.claudeSessionId,
+            }).catch((err) => {
+              console.warn(
+                `[TerminalPage] mark restore-pending failed for ${rec.claudeSessionId}:`,
+                err,
+              );
+            });
           }
 
           // Re-assert the OPEN record under the freshly created terminal id so
@@ -421,28 +484,19 @@ export function useTerminalInitialization({
                   restore.claudeSessionId &&
                   isValidSessionId(restore.claudeSessionId)
                 ) {
-                  try {
-                    const resumeCmd = buildResumeCmd(
-                      restore.claudeSessionId,
-                      restore.claudeConfigDir,
-                    );
-                    await new Promise((r) => setTimeout(r, 500));
-                    writeWhenReady(terminalRefs.current, restore.tabId, resumeCmd, {
-                      onTimeout: (id) =>
-                        console.warn(
-                          `[TerminalPage] resume: terminal ref for ${id} never became ready`,
-                        ),
-                    });
-                  } catch (err) {
-                    console.warn(
-                      `[TerminalPage] Failed to resume Claude session for ${restore.tabId}:`,
-                      err,
-                    );
-                  } finally {
-                    // Resume command issued (or best-effort failed) — drop the
-                    // "resuming" affordance so the live `claude` UI shows.
-                    updateTab(restore.tabId, { isReconnecting: false });
-                  }
+                  await new Promise((r) => setTimeout(r, 500));
+                  // Type the resume and VERIFY the handshake (retry once on
+                  // failure). Fire-and-forget per tab so one slow/failed
+                  // verification (up to ~30s) doesn't serialize the drain;
+                  // `runVerifiedResume` owns clearing `isReconnecting` /
+                  // setting `resumeFailed` and never throws.
+                  void runVerifiedResume({
+                    terminalRefs: terminalRefs.current,
+                    tabId: restore.tabId,
+                    claudeSessionId: restore.claudeSessionId,
+                    configDir: restore.claudeConfigDir,
+                    updateTab,
+                  });
                 }
               }
 

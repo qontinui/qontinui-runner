@@ -1719,7 +1719,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal::terminal_list,
             commands::terminal::terminal_resize,
             commands::terminal::terminal_save_scrollback,
+            commands::terminal::terminal_session_clear_restore_pending,
             commands::terminal::terminal_session_list_open,
+            commands::terminal::terminal_session_mark_restore_pending,
             commands::terminal::terminal_session_record_close,
             commands::terminal::terminal_session_record_open,
             commands::terminal::terminal_set_title,
@@ -2283,11 +2285,30 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 .get(&rec.claude_session_id)
                                 .copied()
                                 .unwrap_or(0);
-                            let action =
-                                classify(live_is_alive, descendant_count, prior, snapshot_ok);
+                            // Restore-pending records (a boot-restore typed
+                            // `claude --resume` whose handshake isn't verified
+                            // yet — or whose restore FAILED and awaits a retry)
+                            // must never flip `poll-dead`: classify Skips them
+                            // unless the session is confidently alive.
+                            let restore_pending = rec.restore_pending_at.is_some();
+                            let action = classify(
+                                live_is_alive,
+                                descendant_count,
+                                prior,
+                                snapshot_ok,
+                                restore_pending,
+                            );
 
                             match action {
                                 PollAction::KeepAlive => {
+                                    // Confidently alive — self-heal a stale
+                                    // restore-pending marker (the frontend's
+                                    // verified-handshake clear may have been
+                                    // lost with a crash).
+                                    if restore_pending {
+                                        poll_lifecycle_store
+                                            .clear_restore_pending(&rec.claude_session_id);
+                                    }
                                     poll_lifecycle_store.touch(&rec.claude_session_id);
                                     consecutive_dead.remove(&rec.claude_session_id);
                                 }

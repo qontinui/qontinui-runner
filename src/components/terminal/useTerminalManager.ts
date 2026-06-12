@@ -21,6 +21,15 @@ export interface TerminalTab {
   planFilePath?: string;
   /** True while the frontend is replaying the scrollback buffer from Rust. */
   isReconnecting?: boolean;
+  /**
+   * True when a boot-restore typed `claude --resume` into this tab but the
+   * Claude UI handshake never appeared (after one retry) — the pane is most
+   * likely still a bare shell. Surfaced as an explicit operator-clickable
+   * "resume failed — retry" affordance (`ResumeFailedBanner`); cleared when a
+   * retry verifies. While set, the durable record keeps its backend
+   * restore-pending marker so the liveness poll can't flip it `poll-dead`.
+   */
+  resumeFailed?: boolean;
   /** Claude Code session ID running in this tab (set on resume). */
   claudeSessionId?: string;
   /** Claude config dir for the session (set on resume). */
@@ -542,6 +551,7 @@ export function useTerminalManager(pageId: string = "default", windowLabel: stri
           | "claudeSessionId"
           | "claudeConfigDir"
           | "isReconnecting"
+          | "resumeFailed"
         >
       >,
     ) => {

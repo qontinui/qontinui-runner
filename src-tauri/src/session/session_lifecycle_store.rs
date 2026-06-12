@@ -101,6 +101,18 @@ pub struct TerminalSessionRecord {
     /// Records predating the field deserialize as `None` = guessed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind_origin: Option<String>,
+    /// Unix millis when a boot-restore began re-typing this session's
+    /// `claude --resume` (set via [`SessionLifecycleStore::mark_restore_pending`],
+    /// cleared via [`SessionLifecycleStore::clear_restore_pending`] once the
+    /// resume handshake is verified). While set, the liveness poll must NEVER
+    /// flip the record `poll-dead` — a restore whose resume command silently
+    /// failed to land needs its durable `open` state intact for the next
+    /// attempt (operator retry or next boot), not destroyed mid-restore. The
+    /// marker is backend-owned and durable so a frontend crash mid-restore
+    /// can't lose it. Self-heals: the poll clears a stale marker the moment it
+    /// observes the session confidently alive (KeepAlive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_pending_at: Option<i64>,
 }
 
 /// Durable map of `claude_session_id -> TerminalSessionRecord`. Cheap to
@@ -209,6 +221,51 @@ impl SessionLifecycleStore {
             match m.get_mut(claude_session_id) {
                 Some(rec) => rec.last_seen_at = now,
                 None => return,
+            }
+            m.clone()
+        };
+        self.persist(&snapshot);
+    }
+
+    /// Mark a present session as restore-pending (a boot-restore is about to
+    /// type / has typed `claude --resume` and the handshake is not yet
+    /// verified). While the marker is set the liveness poll skips the record
+    /// entirely except for a confident-alive observation — see [`classify`].
+    /// No-op (no write) if the session is absent.
+    pub fn mark_restore_pending(&self, claude_session_id: &str) {
+        let now = Utc::now().timestamp_millis();
+        let snapshot = {
+            let mut m = match self.map.lock() {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = %e, "session_lifecycle_store: lock poisoned on mark_restore_pending");
+                    return;
+                }
+            };
+            match m.get_mut(claude_session_id) {
+                Some(rec) => rec.restore_pending_at = Some(now),
+                None => return,
+            }
+            m.clone()
+        };
+        self.persist(&snapshot);
+    }
+
+    /// Clear a session's restore-pending marker (resume handshake verified —
+    /// the session is live again). No-op (no write) if the session is absent
+    /// or the marker is already clear.
+    pub fn clear_restore_pending(&self, claude_session_id: &str) {
+        let snapshot = {
+            let mut m = match self.map.lock() {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = %e, "session_lifecycle_store: lock poisoned on clear_restore_pending");
+                    return;
+                }
+            };
+            match m.get_mut(claude_session_id) {
+                Some(rec) if rec.restore_pending_at.is_some() => rec.restore_pending_at = None,
+                _ => return, // absent or already clear — nothing to flush
             }
             m.clone()
         };
@@ -380,16 +437,26 @@ pub enum PollAction {
 /// - `descendant_count`: number of descendant processes of the shell pid.
 /// - `consecutive_dead`: count of prior consecutive zero-descendant ticks.
 /// - `snapshot_ok`: whether the system-wide process snapshot succeeded.
+/// - `restore_pending`: whether the record carries a restore-pending marker
+///   (a boot-restore typed/queued `claude --resume` whose handshake has not
+///   been verified yet — or the restore FAILED and awaits an operator retry).
+///   A mid-restore record is uncertainty by definition: the restored pane may
+///   be a plain shell whose resume never landed, and flipping it `poll-dead`
+///   would destroy the durable `open` state the next attempt needs. So while
+///   pending, only a confident "alive and busy" (KeepAlive) observation
+///   passes through — which also lets the caller self-heal a stale marker —
+///   and every other outcome becomes Skip.
 pub fn classify(
     live_is_alive: Option<bool>,
     descendant_count: usize,
     consecutive_dead: u32,
     snapshot_ok: bool,
+    restore_pending: bool,
 ) -> PollAction {
     if !snapshot_ok {
         return PollAction::Skip;
     }
-    match live_is_alive {
+    let base = match live_is_alive {
         None => PollAction::Skip,
         Some(false) => PollAction::Close,
         Some(true) => {
@@ -405,7 +472,14 @@ pub fn classify(
                 PollAction::Close
             }
         }
+    };
+    // Restore-pending guard arm (never-close-on-uncertainty): a record mid-
+    // restore (or whose restore failed) must keep its `open` state intact —
+    // never Close, and don't even accumulate NeedsConfirm ticks against it.
+    if restore_pending && base != PollAction::KeepAlive {
+        return PollAction::Skip;
     }
+    base
 }
 
 #[cfg(test)]
@@ -429,6 +503,7 @@ mod tests {
             closed_at: None,
             close_reason: None,
             bind_origin: None,
+            restore_pending_at: None,
         }
     }
 
@@ -691,27 +766,33 @@ mod tests {
     #[test]
     fn classify_skip_on_snapshot_failure() {
         // snapshot_ok=false dominates every other input.
-        assert_eq!(classify(Some(false), 0, 5, false), PollAction::Skip);
-        assert_eq!(classify(Some(true), 3, 0, false), PollAction::Skip);
-        assert_eq!(classify(None, 0, 0, false), PollAction::Skip);
+        assert_eq!(classify(Some(false), 0, 5, false, false), PollAction::Skip);
+        assert_eq!(classify(Some(true), 3, 0, false, false), PollAction::Skip);
+        assert_eq!(classify(None, 0, 0, false, false), PollAction::Skip);
     }
 
     #[test]
     fn classify_skip_on_no_matching_pty() {
-        assert_eq!(classify(None, 0, 0, true), PollAction::Skip);
-        assert_eq!(classify(None, 9, 9, true), PollAction::Skip);
+        assert_eq!(classify(None, 0, 0, true, false), PollAction::Skip);
+        assert_eq!(classify(None, 9, 9, true, false), PollAction::Skip);
     }
 
     #[test]
     fn classify_close_on_dead_shell() {
-        assert_eq!(classify(Some(false), 0, 0, true), PollAction::Close);
-        assert_eq!(classify(Some(false), 5, 0, true), PollAction::Close);
+        assert_eq!(classify(Some(false), 0, 0, true, false), PollAction::Close);
+        assert_eq!(classify(Some(false), 5, 0, true, false), PollAction::Close);
     }
 
     #[test]
     fn classify_keepalive_when_alive_with_descendants() {
-        assert_eq!(classify(Some(true), 1, 0, true), PollAction::KeepAlive);
-        assert_eq!(classify(Some(true), 7, 9, true), PollAction::KeepAlive);
+        assert_eq!(
+            classify(Some(true), 1, 0, true, false),
+            PollAction::KeepAlive
+        );
+        assert_eq!(
+            classify(Some(true), 7, 9, true, false),
+            PollAction::KeepAlive
+        );
     }
 
     #[test]
@@ -721,13 +802,16 @@ mod tests {
         // brief idle lull (the poll-dead race this fix closes).
         for prior in 0..LIVE_SHELL_DEAD_TICKS {
             assert_eq!(
-                classify(Some(true), 0, prior, true),
+                classify(Some(true), 0, prior, true, false),
                 PollAction::NeedsConfirm,
                 "live shell, 0 descendants, {prior} prior ticks must NeedsConfirm"
             );
         }
         // Specifically: the second tick (prior == 1) no longer closes.
-        assert_eq!(classify(Some(true), 0, 1, true), PollAction::NeedsConfirm);
+        assert_eq!(
+            classify(Some(true), 0, 1, true, false),
+            PollAction::NeedsConfirm
+        );
     }
 
     #[test]
@@ -735,12 +819,96 @@ mod tests {
         // Only once we've accumulated LIVE_SHELL_DEAD_TICKS consecutive
         // zero-descendant ticks does a live shell finally close.
         assert_eq!(
-            classify(Some(true), 0, LIVE_SHELL_DEAD_TICKS, true),
+            classify(Some(true), 0, LIVE_SHELL_DEAD_TICKS, true, false),
             PollAction::Close
         );
         assert_eq!(
-            classify(Some(true), 0, LIVE_SHELL_DEAD_TICKS + 5, true),
+            classify(Some(true), 0, LIVE_SHELL_DEAD_TICKS + 5, true, false),
             PollAction::Close
+        );
+    }
+
+    #[test]
+    fn classify_restore_pending_never_closes() {
+        // The incident shape: a restored pane whose resume silently failed.
+        // Dead pty (the restore shell died / was never matched) → Skip, NOT
+        // Close — the durable `open` record must survive for the next attempt.
+        assert_eq!(classify(Some(false), 0, 0, true, true), PollAction::Skip);
+        // Plain shell idling with zero descendants, even past the debounce
+        // ticks (the exact poll-dead flip the incident hit) → Skip.
+        assert_eq!(
+            classify(Some(true), 0, LIVE_SHELL_DEAD_TICKS, true, true),
+            PollAction::Skip
+        );
+        assert_eq!(
+            classify(Some(true), 0, LIVE_SHELL_DEAD_TICKS + 5, true, true),
+            PollAction::Skip
+        );
+        // Below the debounce it must not even accumulate NeedsConfirm ticks.
+        assert_eq!(classify(Some(true), 0, 0, true, true), PollAction::Skip);
+        // No matching pty → Skip (unchanged).
+        assert_eq!(classify(None, 0, 0, true, true), PollAction::Skip);
+    }
+
+    #[test]
+    fn classify_restore_pending_passes_through_confident_alive() {
+        // A confidently-alive session (descendants running) classifies
+        // KeepAlive even while restore-pending — the caller uses this to
+        // self-heal a stale marker.
+        assert_eq!(
+            classify(Some(true), 2, 0, true, true),
+            PollAction::KeepAlive
+        );
+    }
+
+    #[test]
+    fn mark_and_clear_restore_pending_round_trip_and_persist() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.record_open(rec("sess-1"));
+        assert!(store.open_records()[0].restore_pending_at.is_none());
+
+        store.mark_restore_pending("sess-1");
+        assert!(store.open_records()[0].restore_pending_at.is_some());
+
+        // Durable across a "restart" — the marker must survive a frontend /
+        // process crash mid-restore.
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        assert!(store.open_records()[0].restore_pending_at.is_some());
+
+        store.clear_restore_pending("sess-1");
+        assert!(store.open_records()[0].restore_pending_at.is_none());
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        assert!(store.open_records()[0].restore_pending_at.is_none());
+
+        // Absent ids are no-ops (no panic).
+        store.mark_restore_pending("ghost");
+        store.clear_restore_pending("ghost");
+        // Double-clear is a no-op.
+        store.clear_restore_pending("sess-1");
+    }
+
+    #[test]
+    fn record_open_preserves_restore_pending_marker() {
+        // The restore path re-asserts the open record under the fresh terminal
+        // id AFTER marking restore-pending — the re-assert must not wipe the
+        // marker (only a verified handshake / confident-alive poll clears it).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.record_open(rec("sess-1"));
+        store.mark_restore_pending("sess-1");
+
+        let mut r2 = rec("sess-1");
+        r2.terminal_id = "term-new".to_string();
+        store.record_open(r2);
+
+        let open = store.open_records();
+        assert_eq!(open[0].terminal_id, "term-new", "re-assert refreshed");
+        assert!(
+            open[0].restore_pending_at.is_some(),
+            "record_open must preserve the restore-pending marker"
         );
     }
 
