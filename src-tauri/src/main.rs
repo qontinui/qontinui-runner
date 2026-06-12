@@ -790,6 +790,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         api_ready: AtomicBool::new(false),              // Set when MCP API server binds
         frontend_ready: AtomicBool::new(false), // Set on first successful UI Bridge IPC response
         api_port: AtomicU16::new(crate::mcp::types::get_mcp_api_port()), // Updated when server binds
+        api_lan_bound: AtomicBool::new(false), // Derived from the actual bound address when server binds
         ai_pid_tracker: Arc::new(std::sync::Mutex::new(Vec::new())),
         canvas_state: Arc::new(tokio::sync::RwLock::new(
             crate::mcp::canvas::CanvasState::new(),

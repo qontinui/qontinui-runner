@@ -354,6 +354,17 @@ pub struct AppState {
     /// Actual port the HTTP API server bound to.
     /// Set by `mcp_api::start_server` after successful bind.
     pub api_port: AtomicU16,
+    /// Whether the HTTP API server's actual bound address is LAN-reachable
+    /// (i.e. it bound a non-loopback interface). Set by
+    /// `mcp_api::start_server` from the listener's real local address at
+    /// bind time — currently always `false` because `try_bind_port`
+    /// intentionally binds `127.0.0.1` only — but DERIVED rather than
+    /// hardcoded so a future non-loopback bind flips it automatically.
+    /// Forwarded on backend heartbeats as `lan_reachable` so the fleet
+    /// registry stops handing mobile clients an advertised LAN `ip:port`
+    /// the runner does not actually serve (plan
+    /// 2026-06-12-mobile-account-usage-error-recovery, runner P1).
+    pub api_lan_bound: AtomicBool,
     /// Shared PID tracker for spawned AI (Claude CLI) processes.
     /// Shared between AppState (for shutdown cleanup) and ApiState (for stop endpoints).
     pub ai_pid_tracker: Arc<Mutex<Vec<u32>>>,
