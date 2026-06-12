@@ -989,15 +989,15 @@ pub async fn terminal_migrate_session_account(
             }
             d
         }
-        None => crate::ai_provider::pick_migration_target(&src)
-            .ok_or("no usable target account (every other account exhausted/cooled/unauthenticated)")?,
+        None => crate::ai_provider::pick_migration_target(&src).ok_or(
+            "no usable target account (every other account exhausted/cooled/unauthenticated)",
+        )?,
     };
     if dst == src {
         return Err("target account equals the session's current account".to_string());
     }
 
-    let outcome =
-        crate::terminal::account_migration::migrate_session(&app, &record, &src, &dst)?;
+    let outcome = crate::terminal::account_migration::migrate_session(&app, &record, &src, &dst)?;
     Ok(CommandResponse {
         success: true,
         message: Some(format!(

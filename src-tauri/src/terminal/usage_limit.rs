@@ -275,7 +275,9 @@ mod tests {
     #[test]
     fn plain_limit_message_matches() {
         assert_eq!(
-            window_indicates_usage_limit("Claude usage limit reached. Your limit will reset at 3am."),
+            window_indicates_usage_limit(
+                "Claude usage limit reached. Your limit will reset at 3am."
+            ),
             Some("usage limit reached")
         );
         assert_eq!(
@@ -298,8 +300,14 @@ mod tests {
 
     #[test]
     fn ordinary_output_does_not_match() {
-        assert_eq!(window_indicates_usage_limit("cargo build finished in 12s"), None);
-        assert_eq!(window_indicates_usage_limit("approaching usage limit"), None);
+        assert_eq!(
+            window_indicates_usage_limit("cargo build finished in 12s"),
+            None
+        );
+        assert_eq!(
+            window_indicates_usage_limit("approaching usage limit"),
+            None
+        );
     }
 
     #[test]
@@ -323,7 +331,10 @@ mod tests {
         // CSI starts at the end of chunk 1 and finishes at the start of
         // chunk 2 — the fragment must not pollute the text window.
         assert_eq!(h.scan("t1", b"usage \x1b[38;5;"), None);
-        assert_eq!(h.scan("t1", b"196mlimit reached"), Some("usage limit reached"));
+        assert_eq!(
+            h.scan("t1", b"196mlimit reached"),
+            Some("usage limit reached")
+        );
     }
 
     #[test]
@@ -336,7 +347,10 @@ mod tests {
     #[test]
     fn debounce_suppresses_repeat_within_window() {
         let h = hook();
-        assert_eq!(h.scan("t1", b"usage limit reached"), Some("usage limit reached"));
+        assert_eq!(
+            h.scan("t1", b"usage limit reached"),
+            Some("usage limit reached")
+        );
         // Re-rendered message (e.g. TUI repaint) within the debounce window.
         assert_eq!(h.scan("t1", b"usage limit reached"), None);
     }
@@ -344,8 +358,14 @@ mod tests {
     #[test]
     fn debounce_is_per_terminal() {
         let h = hook();
-        assert_eq!(h.scan("t1", b"usage limit reached"), Some("usage limit reached"));
-        assert_eq!(h.scan("t2", b"usage limit reached"), Some("usage limit reached"));
+        assert_eq!(
+            h.scan("t1", b"usage limit reached"),
+            Some("usage limit reached")
+        );
+        assert_eq!(
+            h.scan("t2", b"usage limit reached"),
+            Some("usage limit reached")
+        );
     }
 
     #[test]
@@ -361,7 +381,10 @@ mod tests {
             let st = states.get("t1").unwrap();
             assert!(st.window.len() <= WINDOW_KEEP + 1024);
         }
-        assert_eq!(h.scan("t1", b" weekly limit reached"), Some("weekly limit reached"));
+        assert_eq!(
+            h.scan("t1", b" weekly limit reached"),
+            Some("weekly limit reached")
+        );
     }
 
     #[test]

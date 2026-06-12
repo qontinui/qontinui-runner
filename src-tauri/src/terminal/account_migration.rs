@@ -243,13 +243,8 @@ fn copy_transcript(
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("create {} failed: {e}", parent.display()))?;
     }
-    std::fs::copy(&src, &dst).map_err(|e| {
-        format!(
-            "copy {} -> {} failed: {e}",
-            src.display(),
-            dst.display()
-        )
-    })?;
+    std::fs::copy(&src, &dst)
+        .map_err(|e| format!("copy {} -> {} failed: {e}", src.display(), dst.display()))?;
     Ok(dst)
 }
 
@@ -268,10 +263,9 @@ pub fn migrate_session(
 ) -> Result<MigrationOutcome, String> {
     use tauri::Manager;
 
-    let working_dir = record
-        .working_dir
-        .clone()
-        .ok_or_else(|| "session record has no working_dir — cannot locate transcript".to_string())?;
+    let working_dir = record.working_dir.clone().ok_or_else(|| {
+        "session record has no working_dir — cannot locate transcript".to_string()
+    })?;
 
     let terminal_manager = app
         .try_state::<std::sync::Arc<crate::terminal::TerminalManager>>()
@@ -315,10 +309,12 @@ pub fn migrate_session(
     // 3. Respawn under the target account. Same resume form the boot-restore
     // path uses (post-#547): bypassPermissions so the resumed session doesn't
     // wedge on its first tool-approval prompt with nobody watching.
-    let title = record
-        .title
-        .clone()
-        .unwrap_or_else(|| format!("Resumed {}", &record.claude_session_id[..8.min(record.claude_session_id.len())]));
+    let title = record.title.clone().unwrap_or_else(|| {
+        format!(
+            "Resumed {}",
+            &record.claude_session_id[..8.min(record.claude_session_id.len())]
+        )
+    });
     let command = vec![
         crate::agent_runtime::claude_bin_path(),
         "--permission-mode".to_string(),
@@ -376,12 +372,7 @@ pub fn migrate_session(
     Ok(outcome)
 }
 
-fn emit_skipped(
-    app: &tauri::AppHandle,
-    record: &TerminalSessionRecord,
-    src: &str,
-    reason: &str,
-) {
+fn emit_skipped(app: &tauri::AppHandle, record: &TerminalSessionRecord, src: &str, reason: &str) {
     if let Err(e) = app.emit(
         "session-account-migration-skipped",
         json!({
@@ -410,7 +401,10 @@ mod tests {
             "4th migration within the window must be blocked"
         );
         // Outside the 24h window the old entries age out.
-        assert!(migration_cap_permits(sid, base + MIGRATION_CAP_WINDOW_MS + 4000));
+        assert!(migration_cap_permits(
+            sid,
+            base + MIGRATION_CAP_WINDOW_MS + 4000
+        ));
     }
 
     #[test]
@@ -428,21 +422,16 @@ mod tests {
 
     #[test]
     fn copy_transcript_copies_and_is_idempotent() {
-        let tmp = std::env::temp_dir().join(format!(
-            "qontinui-acctmig-test-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("qontinui-acctmig-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let src_cfg = tmp.join(".claude-hotmail");
         let dst_cfg = tmp.join(".claude-gmail");
         let working_dir = "D:\\qontinui-root";
         let sid = "11111111-2222-3333-4444-555555555555";
 
-        let src_path = crate::terminal::transcript::session_transcript_path(
-            &src_cfg,
-            working_dir,
-            sid,
-        );
+        let src_path =
+            crate::terminal::transcript::session_transcript_path(&src_cfg, working_dir, sid);
         std::fs::create_dir_all(src_path.parent().unwrap()).unwrap();
         std::fs::write(&src_path, b"{\"type\":\"user\"}\n").unwrap();
 
@@ -454,7 +443,10 @@ mod tests {
         )
         .expect("copy should succeed");
         assert!(dst.exists());
-        assert_eq!(std::fs::read(&dst).unwrap(), std::fs::read(&src_path).unwrap());
+        assert_eq!(
+            std::fs::read(&dst).unwrap(),
+            std::fs::read(&src_path).unwrap()
+        );
         // Source untouched.
         assert!(src_path.exists());
 
@@ -473,10 +465,8 @@ mod tests {
 
     #[test]
     fn copy_transcript_missing_source_errors() {
-        let tmp = std::env::temp_dir().join(format!(
-            "qontinui-acctmig-missing-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("qontinui-acctmig-missing-{}", std::process::id()));
         let err = copy_transcript(
             tmp.join("nope-src").to_str().unwrap(),
             tmp.join("nope-dst").to_str().unwrap(),
