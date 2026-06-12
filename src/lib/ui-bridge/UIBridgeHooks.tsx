@@ -21,6 +21,7 @@ import {
 } from "@qontinui/ui-bridge";
 
 import { useVisionCacheInvalidation } from "../../hooks/useVisionCacheInvalidation";
+import { deriveSection, type MainTabId } from "../../components/app/tab-types";
 
 // ---------------------------------------------------------------------------
 // Props — the host component (AppContent) passes live state so hooks can
@@ -40,76 +41,25 @@ export interface UIBridgeHooksProps {
 }
 
 // -------------------------------------------------------------------------
-// Main navigation tab groups — aligned with RunnerPageContext sections.
+// Navigation sections — derived from the shared IA (`deriveSection` in
+// tab-types.ts) so the UI Bridge route-awareness and section states stay in
+// lockstep with the sidebar and the GET /control/tabs catalog, rather than a
+// hand-maintained group map that drifts.
 // -------------------------------------------------------------------------
-const TAB_GROUPS = {
-  run: ["gui-automation", "workflow-queue", "active"],
-  observe: [
-    "runs",
-    "history",
-    "run-recap",
-    "run-actions",
-    "run-image",
-    "run-findings",
-    "run-state-explorer",
-    "run-tests",
-    "run-ai-output",
-    "run-statistics",
-    "run-ai-data",
-    "run-traces",
-  ],
-  build: [
-    "unified-workflow-builder",
-    "step-builders",
-    "library",
-    "capture",
-    "check-builder",
-    "check-group-builder",
-    "shell-command-builder",
-    "task-builder",
-    "context-builder",
-    "playwright-test-builder",
-  ],
-  configure: ["config-findings", "config-hooks", "config-log-sources", "triggers", "tasks"],
-  tools: ["terminal", "specs", "state-machine", "generator-eval", "config-ui-bridge"],
-  system: [
-    "settings",
-    "settings-account",
-    "settings-dev-loop",
-    "settings-ai",
-    "settings-agentic",
-    "settings-self-healing",
-    "settings-world-state-verifier",
-    "settings-playwright",
-    "settings-mobile",
-    "settings-discovery",
-    "settings-backend-connection",
-    "settings-mcp",
-    "settings-log-sources",
-    "settings-execution-variables",
-    "settings-general",
-    "settings-storage",
-    "settings-backup",
-    "settings-instances",
-    "settings-debug",
-    "settings-updates",
-    "help",
-    "error-monitor",
-    "processes",
-    "reflection",
-    "architecture",
-  ],
-} satisfies Record<string, readonly string[]>;
+const NAV_SECTIONS = [
+  "workspace",
+  "review",
+  "spend",
+  "automate",
+  "build",
+  "insights",
+  "configure",
+  "dev",
+  "system",
+] as const;
 
 /** All section state IDs — used as fromStates for cross-section transitions. */
-const ANY_SECTION = [
-  "section-run",
-  "section-observe",
-  "section-build",
-  "section-configure",
-  "section-tools",
-  "section-system",
-] as const;
+const ANY_SECTION = NAV_SECTIONS.map((s) => `section-${s}`);
 
 export function UIBridgeHooks({
   activeTab,
@@ -130,20 +80,12 @@ export function UIBridgeHooks({
   useVisionCacheInvalidation();
 
   const routeInfo = useMemo(() => {
-    // Derive section from TAB_GROUPS
-    let section: string | undefined;
-    for (const [group, tabs] of Object.entries(TAB_GROUPS)) {
-      if (tabs.includes(activeTab) || (group === "system" && activeTab.startsWith("settings"))) {
-        section = group;
-        break;
-      }
-    }
-
+    const section = deriveSection(activeTab as MainTabId);
     return {
       pattern: `/${activeTab}`,
       params: {} as Record<string, string>,
       queryParams: {} as Record<string, string>,
-      routeStack: section ? [`/${section}`, `/${activeTab}`] : [`/${activeTab}`],
+      routeStack: [`/${section}`, `/${activeTab}`],
     };
   }, [activeTab]);
 
@@ -242,59 +184,78 @@ export function UIBridgeHooks({
   // Section states — one for each navigation section
   // -------------------------------------------------------------------------
 
+  // One UI state per IA section. activeWhen compares against deriveSection so
+  // membership never drifts from the sidebar / tab catalog. (Hooks can't be
+  // looped, so the nine sections are registered explicitly.)
+  const currentSection = deriveSection(activeTab as MainTabId);
+
   useUIState({
-    id: "section-run",
-    name: "Run Section Active",
-    activeWhen: () => TAB_GROUPS.run.includes(activeTab),
+    id: "section-workspace",
+    name: "Workspace Section Active",
+    activeWhen: () => currentSection === "workspace",
     group: "nav-section",
   });
 
   useUIState({
-    id: "section-observe",
-    name: "Observe Section Active",
-    activeWhen: () => TAB_GROUPS.observe.includes(activeTab),
+    id: "section-review",
+    name: "Review Section Active",
+    activeWhen: () => currentSection === "review",
+    group: "nav-section",
+  });
+
+  useUIState({
+    id: "section-spend",
+    name: "Spend Section Active",
+    activeWhen: () => currentSection === "spend",
+    group: "nav-section",
+  });
+
+  useUIState({
+    id: "section-automate",
+    name: "Automate Section Active",
+    activeWhen: () => currentSection === "automate",
     group: "nav-section",
   });
 
   useUIState({
     id: "section-build",
     name: "Build Section Active",
-    activeWhen: () => TAB_GROUPS.build.includes(activeTab),
+    activeWhen: () => currentSection === "build",
+    group: "nav-section",
+  });
+
+  useUIState({
+    id: "section-insights",
+    name: "Insights Section Active",
+    activeWhen: () => currentSection === "insights",
     group: "nav-section",
   });
 
   useUIState({
     id: "section-configure",
     name: "Configure Section Active",
-    activeWhen: () => TAB_GROUPS.configure.includes(activeTab),
+    activeWhen: () => currentSection === "configure",
     group: "nav-section",
   });
 
   useUIState({
-    id: "section-tools",
-    name: "Tools Section Active",
-    activeWhen: () => TAB_GROUPS.tools.includes(activeTab),
+    id: "section-dev",
+    name: "Dev Section Active",
+    activeWhen: () => currentSection === "dev",
     group: "nav-section",
   });
 
   useUIState({
     id: "section-system",
     name: "System Section Active",
-    activeWhen: () => TAB_GROUPS.system.includes(activeTab) || activeTab.startsWith("settings"),
+    activeWhen: () => currentSection === "system",
     group: "nav-section",
   });
 
   useUIStateGroup({
     id: "nav-section",
     name: "Navigation Sections",
-    states: [
-      "section-run",
-      "section-observe",
-      "section-build",
-      "section-configure",
-      "section-tools",
-      "section-system",
-    ],
+    states: ANY_SECTION,
   });
 
   // -------------------------------------------------------------------------
@@ -442,7 +403,7 @@ export function UIBridgeHooks({
   useUITransition({
     id: "open-action-modal",
     name: "Open Action Detail Modal",
-    fromStates: ["section-observe"],
+    fromStates: ["section-review"],
     activateStates: ["action-detail-modal"],
     exitStates: [],
   });
@@ -458,7 +419,7 @@ export function UIBridgeHooks({
   useUITransition({
     id: "open-image-modal",
     name: "Open Image Detail Modal",
-    fromStates: ["section-observe"],
+    fromStates: ["section-review"],
     activateStates: ["image-detail-modal"],
     exitStates: [],
   });
