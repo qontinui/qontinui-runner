@@ -64,6 +64,54 @@ use super::canonical_paths::default_canonical_path;
 /// 30s fleet heartbeat. Override via `QONTINUI_WORKTREE_CENSUS_INTERVAL_SECS`.
 const DEFAULT_CENSUS_INTERVAL_SECS: u64 = 300;
 
+// ---------------------------------------------------------------------------
+// Census-before-reclaim boot ordering (the stale-census husk-guard, R3).
+//
+// The boot-time reclaim pull must not race ahead of the boot-time census:
+// coord's view between the two is whatever the LAST census of the previous
+// boot reported, so any worktree deleted while the runner was down generates
+// stale instructions for the whole window. The reclaim poller therefore
+// gates its FIRST pull of each boot on this signal (with a one-interval
+// timeout fallback so a census-disabled config never deadlocks reclaim).
+// ---------------------------------------------------------------------------
+
+/// Set once the first census POST of this boot has succeeded (2xx).
+static FIRST_CENSUS_POSTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Wakes reclaim's boot-ordering wait the moment the flag flips.
+static FIRST_CENSUS_NOTIFY: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+
+fn first_census_notify() -> &'static tokio::sync::Notify {
+    FIRST_CENSUS_NOTIFY.get_or_init(tokio::sync::Notify::new)
+}
+
+/// Record that a census POST landed (called from [`tick_once`] on 2xx).
+fn mark_first_census_posted() {
+    FIRST_CENSUS_POSTED.store(true, std::sync::atomic::Ordering::Release);
+    first_census_notify().notify_waiters();
+}
+
+/// Wait up to `timeout` for the first successful census POST of this boot.
+/// Returns `true` when a census has been posted (possibly before the call),
+/// `false` on timeout (census disabled, no coord configured, or slow walk —
+/// the caller proceeds and relies on coord's staleness degrade).
+pub(super) async fn wait_first_census_posted(timeout: Duration) -> bool {
+    // Register the waiter BEFORE the flag check so a mark between the check
+    // and the await can't be missed (Notify::notified buffers a permit only
+    // for already-registered waiters via notify_waiters).
+    let notified = first_census_notify().notified();
+    if FIRST_CENSUS_POSTED.load(std::sync::atomic::Ordering::Acquire) {
+        return true;
+    }
+    tokio::select! {
+        _ = notified => true,
+        _ = tokio::time::sleep(timeout) => {
+            FIRST_CENSUS_POSTED.load(std::sync::atomic::Ordering::Acquire)
+        }
+    }
+}
+
 /// Windows reparse-point attribute bit (`FILE_ATTRIBUTE_REPARSE_POINT`).
 /// A junction (and a symlink) sets this in the file attributes returned
 /// by `symlink_metadata`. Defined locally so the check needs no winapi
@@ -870,6 +918,9 @@ pub async fn tick_once() -> Result<(), String> {
         let excerpt: String = body.chars().take(200).collect();
         return Err(format!("coord returned {status} for POST {url}: {excerpt}"));
     }
+    // R3 boot ordering: the first successful POST of this boot releases the
+    // reclaim poller's census-before-reclaim gate.
+    mark_first_census_posted();
     debug!(
         "worktree_census: posted device_id={} worktrees={} volumes={}",
         req.device_id,

@@ -188,8 +188,9 @@ pub enum ReclaimStep {
 /// filesystem mutation, no junction *verification* (that happens at
 /// execution time, where we have the real disk). This is the function the
 /// unit tests pin: it guarantees junction-unlinks come before the
-/// worktree removal, that a dirty instruction yields only a `Skip`, and
-/// that an UNARMED action yields only `Skip`s.
+/// worktree removal, that a dirty instruction yields only a `Skip`, that
+/// an UNARMED action yields only `Skip`s, and that an instruction whose
+/// worktree root is ABSENT on disk yields only a `Skip`.
 ///
 /// Arming is per-action (Q1): a `Remove` is destructive only when
 /// `remove_armed`; a `Rejunction` creates junctions only when
@@ -199,12 +200,31 @@ pub enum ReclaimStep {
 /// `canonical_path` is the repo's canonical checkout — the junction target
 /// root for a `rejunction`. `None` when the runner couldn't resolve it
 /// (then a rejunction degrades to a `Skip`).
+///
+/// `root_exists` is the caller's dispatch-time `worktree_path` existence
+/// probe. `false` means coord's instruction is built on a stale census (the
+/// worktree was deleted out-of-band): executing a `Rejunction` against it
+/// would re-materialize the root as an empty husk (the 2026-06-12 incident),
+/// so the ENTIRE instruction is skipped — for `Remove` too, uniformly. The
+/// invariant this pins: a reclaim execution must never create a filesystem
+/// path, except junction reparse points inside an already-existing worktree
+/// root.
 pub fn plan_reclaim(
     instr: &ReclaimInstruction,
     rejunction_armed: bool,
     remove_armed: bool,
     canonical_path: Option<&Path>,
+    root_exists: bool,
 ) -> Vec<ReclaimStep> {
+    // Absent-root guard — a stale instruction for a worktree that no longer
+    // exists must do NOTHING (the next census is the ack that clears it).
+    if !root_exists {
+        return vec![ReclaimStep::Skip(format!(
+            "skipping {} — absent on disk (stale instruction; next census is the ack)",
+            instr.worktree_path
+        ))];
+    }
+
     // Defense in depth #1 — NEVER act on a dirty worktree.
     if instr.is_dirty {
         return vec![ReclaimStep::Skip(format!(
@@ -388,10 +408,17 @@ fn create_junction(link: &Path, target: &Path) -> Result<(), String> {
             link.display()
         ));
     }
+    // A missing parent means the worktree root itself is gone (for the sink
+    // links `<wt>/node_modules` / `<wt>/target`, `link.parent()` IS the
+    // worktree root). The only legitimate parents are created by
+    // `git worktree add`, never by reclaim — creating them here would
+    // re-materialize a deleted worktree as an empty husk.
     if let Some(parent) = link.parent() {
         if !parent.exists() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("rejunction: mkdir {} : {e}", parent.display()))?;
+            return Err(format!(
+                "rejunction: link parent {} missing — refusing to create directories",
+                parent.display()
+            ));
         }
     }
     // `cmd /C mklink /J <link> <target>` — /J = directory junction.
@@ -582,6 +609,19 @@ fn execute_pull(pull: &ReclaimPull) {
     for instr in &pull.instructions {
         let wt = PathBuf::from(&instr.worktree_path);
 
+        // Absent-root probe — once per instruction, at dispatch time. A
+        // worktree deleted out-of-band (operator cleanup, another machine)
+        // leaves coord serving stale instructions until the next census
+        // tick; executing one would re-create the root as an empty husk.
+        let root_exists = wt.exists();
+        if !root_exists {
+            warn!(
+                "worktree_reclaim: skipping {} — absent on disk (stale instruction; \
+                 next census is the ack)",
+                instr.worktree_path
+            );
+        }
+
         // Whether THIS instruction's action is armed (would actually do
         // something destructive/mutating this tick). Skip the execution-time
         // guards entirely for an unarmed (advisory) instruction so the
@@ -633,6 +673,7 @@ fn execute_pull(pull: &ReclaimPull) {
             pull.rejunction_armed,
             pull.remove_armed,
             canonical.as_deref(),
+            root_exists,
         );
         for step in &steps {
             if let Err(e) = execute_step(step) {
@@ -714,6 +755,14 @@ pub async fn tick_once() -> Result<(), String> {
 /// `QONTINUI_WORKTREE_RECLAIM_INTERVAL_SECS` (default 300s, floored 30s).
 /// `MissedTickBehavior::Skip` + warn-and-retry, like
 /// [`super::census::spawn_census`].
+///
+/// Census-before-reclaim boot ordering (R3, the stale-census husk-guard):
+/// the FIRST pull of each boot waits for the census publisher to land ≥1
+/// successful POST, so coord decides from this boot's disk truth rather
+/// than the previous boot's last census (the window where a worktree
+/// deleted while the runner was down draws husk-creating instructions).
+/// Bounded by one reclaim interval so a census-disabled config never
+/// deadlocks the poller.
 pub fn spawn_reclaim() {
     let secs: u64 = std::env::var("QONTINUI_WORKTREE_RECLAIM_INTERVAL_SECS")
         .ok()
@@ -727,6 +776,15 @@ pub fn spawn_reclaim() {
     );
 
     tokio::spawn(async move {
+        if super::census::wait_first_census_posted(Duration::from_secs(secs)).await {
+            debug!("worktree_reclaim: census posted this boot — reclaim pulls may begin");
+        } else {
+            warn!(
+                "worktree_reclaim: no census POST within {secs}s — proceeding without the \
+                 boot-ordering gate (census disabled or slow; coord's staleness degrade is \
+                 the backstop)"
+            );
+        }
         let mut tick = tokio::time::interval(Duration::from_secs(secs));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -761,7 +819,7 @@ mod tests {
     fn remove_unlinks_every_junction_before_removing_worktree() {
         let i = instr(ReclaimAction::Remove, &["target", "node_modules"], false);
         // remove_armed=true.
-        let steps = plan_reclaim(&i, false, true, None);
+        let steps = plan_reclaim(&i, false, true, None, true);
 
         // Exactly: UnlinkJunction(target), UnlinkJunction(node_modules),
         // RemoveWorktree(path) — junctions first, in order.
@@ -790,7 +848,7 @@ mod tests {
             &["a", "b", "c", "node_modules", "target"],
             false,
         );
-        let steps = plan_reclaim(&i, false, true, None);
+        let steps = plan_reclaim(&i, false, true, None, true);
         let remove_idx = steps
             .iter()
             .position(|s| matches!(s, ReclaimStep::RemoveWorktree(_)))
@@ -810,7 +868,7 @@ mod tests {
     #[test]
     fn remove_with_no_junctions_is_just_a_removal() {
         let i = instr(ReclaimAction::Remove, &[], false);
-        let steps = plan_reclaim(&i, false, true, None);
+        let steps = plan_reclaim(&i, false, true, None, true);
         assert_eq!(
             steps,
             vec![ReclaimStep::RemoveWorktree(PathBuf::from(
@@ -823,7 +881,7 @@ mod tests {
     fn dirty_instruction_yields_no_destructive_steps() {
         let i = instr(ReclaimAction::Remove, &["target", "node_modules"], true);
         // Even fully armed, a dirty worktree yields only a Skip.
-        let steps = plan_reclaim(&i, true, true, None);
+        let steps = plan_reclaim(&i, true, true, None, true);
         assert_eq!(steps.len(), 1);
         assert!(matches!(steps[0], ReclaimStep::Skip(_)));
         // No unlink / remove / create anywhere.
@@ -840,7 +898,7 @@ mod tests {
         // remove_armed=false → advisory-only Skip even though it's clean.
         let i = instr(ReclaimAction::Remove, &["target", "node_modules"], false);
         let steps = plan_reclaim(
-            &i, /* rejunction */ false, /* remove */ false, None,
+            &i, /* rejunction */ false, /* remove */ false, None, true,
         );
         assert_eq!(steps.len(), 1);
         assert!(matches!(steps[0], ReclaimStep::Skip(_)));
@@ -857,7 +915,7 @@ mod tests {
         // rejunction_armed=false → advisory-only Skip.
         let i = instr(ReclaimAction::Rejunction, &["target"], false);
         let canonical = PathBuf::from("D:/qontinui-root/qontinui-runner");
-        let steps = plan_reclaim(&i, false, false, Some(&canonical));
+        let steps = plan_reclaim(&i, false, false, Some(&canonical), true);
         assert_eq!(steps.len(), 1);
         assert!(matches!(steps[0], ReclaimStep::Skip(_)));
     }
@@ -868,7 +926,7 @@ mod tests {
         // A Remove instruction is advisory-only...
         let rm = instr(ReclaimAction::Remove, &["target"], false);
         let steps = plan_reclaim(
-            &rm, /* rejunction */ true, /* remove */ false, None,
+            &rm, /* rejunction */ true, /* remove */ false, None, true,
         );
         assert_eq!(steps.len(), 1);
         assert!(matches!(steps[0], ReclaimStep::Skip(_)));
@@ -880,7 +938,7 @@ mod tests {
         // ...while a Rejunction in the SAME tick actually executes.
         let rj = instr(ReclaimAction::Rejunction, &["target"], false);
         let canonical = PathBuf::from("D:/qontinui-root/qontinui-runner");
-        let rj_steps = plan_reclaim(&rj, true, false, Some(&canonical));
+        let rj_steps = plan_reclaim(&rj, true, false, Some(&canonical), true);
         assert_eq!(
             rj_steps,
             vec![ReclaimStep::CreateJunction {
@@ -897,7 +955,7 @@ mod tests {
         for action in [ReclaimAction::Remove, ReclaimAction::Rejunction] {
             let i = instr(action, &["target", "node_modules"], false);
             let canonical = PathBuf::from("D:/qontinui-root/qontinui-runner");
-            let steps = plan_reclaim(&i, false, false, Some(&canonical));
+            let steps = plan_reclaim(&i, false, false, Some(&canonical), true);
             assert_eq!(steps.len(), 1);
             assert!(matches!(steps[0], ReclaimStep::Skip(_)));
             assert!(!steps.iter().any(|s| matches!(
@@ -918,7 +976,7 @@ mod tests {
         );
         let canonical = PathBuf::from("D:/qontinui-root/qontinui-runner");
         // rejunction_armed=true.
-        let steps = plan_reclaim(&i, true, false, Some(&canonical));
+        let steps = plan_reclaim(&i, true, false, Some(&canonical), true);
         assert_eq!(
             steps,
             vec![
@@ -938,7 +996,7 @@ mod tests {
     fn rejunction_without_canonical_path_skips() {
         let i = instr(ReclaimAction::Rejunction, &["target"], false);
         // Armed, but no canonical path → degrades to Skip.
-        let steps = plan_reclaim(&i, true, false, None);
+        let steps = plan_reclaim(&i, true, false, None, true);
         assert_eq!(steps.len(), 1);
         assert!(matches!(steps[0], ReclaimStep::Skip(_)));
     }
@@ -951,9 +1009,57 @@ mod tests {
             false,
         );
         // Even with both flags armed, an unknown action is a no-op Skip.
-        let steps = plan_reclaim(&i, true, true, None);
+        let steps = plan_reclaim(&i, true, true, None, true);
         assert_eq!(steps.len(), 1);
         assert!(matches!(steps[0], ReclaimStep::Skip(_)));
+    }
+
+    #[test]
+    fn absent_root_skips_entire_instruction_for_both_actions() {
+        // The stale-census husk-guard (R1): a worktree missing on disk must
+        // yield ONLY a Skip — for both actions, armed and unarmed — never a
+        // step that could create a filesystem path.
+        let canonical = PathBuf::from("D:/qontinui-root/qontinui-runner");
+        for action in [ReclaimAction::Remove, ReclaimAction::Rejunction] {
+            for (rj_armed, rm_armed) in [(false, false), (true, true)] {
+                let i = instr(action.clone(), &["target", "node_modules"], false);
+                let steps = plan_reclaim(
+                    &i,
+                    rj_armed,
+                    rm_armed,
+                    Some(&canonical),
+                    /* root */ false,
+                );
+                assert_eq!(steps.len(), 1, "{action:?} armed=({rj_armed},{rm_armed})");
+                assert!(
+                    matches!(&steps[0], ReclaimStep::Skip(r) if r.contains("absent on disk")),
+                    "absent root must be a Skip carrying the absent-on-disk reason"
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn create_junction_refuses_to_create_missing_parent() {
+        // R2: a rejunction whose link parent (the worktree root) is missing
+        // must Err and create NOTHING — never re-materialize a husk.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("canonical-node_modules");
+        std::fs::create_dir(&target).unwrap();
+        let missing_parent = dir.path().join("gone-wt");
+        let link = missing_parent.join("node_modules");
+
+        let res = create_junction(&link, &target);
+        assert!(res.is_err(), "missing parent must be an error");
+        assert!(
+            res.unwrap_err().contains("refusing to create directories"),
+            "error must name the refusal"
+        );
+        assert!(
+            !missing_parent.exists(),
+            "the missing parent must NOT be created"
+        );
     }
 
     #[test]
