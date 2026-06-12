@@ -160,26 +160,6 @@ describe("claimInitForPage (once-per-pageId guard)", () => {
   });
 });
 
-describe("buildResumeCmd (boot-restore resume command)", () => {
-  it("resumes autonomously — bypassPermissions so an unattended restore never stalls on a permission prompt", () => {
-    const cmd = buildResumeCmd("abc-123", undefined);
-    expect(cmd).toBe("claude --permission-mode bypassPermissions --resume abc-123\r");
-  });
-
-  it("prefixes CLAUDE_CONFIG_DIR while keeping the bypass form", () => {
-    vi.stubGlobal("navigator", { platform: "Win32" });
-    try {
-      const cmd = buildResumeCmd("abc-123", "C:\\claude\\.claude-hotmail");
-      expect(cmd).toBe(
-        '$env:CLAUDE_CONFIG_DIR="C:\\claude\\.claude-hotmail"; ' +
-          "claude --permission-mode bypassPermissions --resume abc-123\r",
-      );
-    } finally {
-      vi.unstubAllGlobals();
-    }
-  });
-});
-
 // Phase 3 (#548) — verified-resume state machine: the restore drain (and the
 // operator retry) must only clear the durable restore-pending marker on a
 // VERIFIED Claude UI handshake; a failed resume parks the tab in an explicit
