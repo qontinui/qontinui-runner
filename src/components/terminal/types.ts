@@ -41,4 +41,10 @@ export interface TerminalSessionRecord {
   closedAt?: number;
   /** Why the session closed. */
   closeReason?: string;
+  /**
+   * Epoch ms a boot-restore began re-typing this session's resume command
+   * (backend-owned; while set the liveness poll never flips the record
+   * `poll-dead`). Cleared once the resume handshake is verified.
+   */
+  restorePendingAt?: number;
 }

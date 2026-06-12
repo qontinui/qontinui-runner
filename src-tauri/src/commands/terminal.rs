@@ -863,8 +863,47 @@ pub fn terminal_session_record_open(
         close_reason: None,
         // `None` (origin-unaware callers) preserves any existing origin.
         bind_origin,
+        restore_pending_at: None,
     };
     store.record_open(record);
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: None,
+    })
+}
+
+/// Mark a session restore-pending in the lifecycle registry: the boot-restore
+/// drain is about to type `claude --resume` into a freshly-created plain shell
+/// and the handshake is not yet verified. While the marker is set the
+/// backend liveness poll never flips the record `poll-dead` (a failed restore
+/// must leave the durable `open` record intact for the next attempt). The
+/// marker is backend-owned + durable so a frontend crash mid-restore can't
+/// lose it. No-op (still succeeds) if the session is absent.
+#[tauri::command]
+pub fn terminal_session_mark_restore_pending(
+    store: tauri::State<'_, Arc<SessionLifecycleStore>>,
+    claude_session_id: String,
+) -> Result<CommandResponse, String> {
+    store.mark_restore_pending(&claude_session_id);
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: None,
+    })
+}
+
+/// Clear a session's restore-pending marker: the restore drain verified the
+/// Claude UI handshake (the resume actually landed), so normal liveness
+/// classification resumes. No-op (still succeeds) if the session is absent or
+/// the marker is already clear. The backend poll also self-heals a stale
+/// marker when it observes the session confidently alive.
+#[tauri::command]
+pub fn terminal_session_clear_restore_pending(
+    store: tauri::State<'_, Arc<SessionLifecycleStore>>,
+    claude_session_id: String,
+) -> Result<CommandResponse, String> {
+    store.clear_restore_pending(&claude_session_id);
     Ok(CommandResponse {
         success: true,
         message: None,
@@ -1241,6 +1280,7 @@ async fn poll_and_record_session<F>(
                 close_reason: None,
                 // Freshest-transcript mtime guess — may be a foreign session.
                 bind_origin: Some("guessed".to_string()),
+                restore_pending_at: None,
             };
             store.record_open(record);
             info!(
@@ -1289,6 +1329,7 @@ pub(crate) fn record_pinned_session_open(
         closed_at: None,
         close_reason: None,
         bind_origin: Some("pinned".to_string()),
+        restore_pending_at: None,
     });
     info!(
         terminal_id = %terminal_id,
@@ -1358,6 +1399,8 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
             terminal_session_record_open,
             terminal_session_record_close,
             terminal_session_list_open,
+            terminal_session_mark_restore_pending,
+            terminal_session_clear_restore_pending,
         ])
         .build()
 }

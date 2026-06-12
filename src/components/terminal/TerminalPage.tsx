@@ -34,7 +34,8 @@ import { ResultCardProvider, ResultCardMount, useResultCard } from "./result-car
 
 import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
 import { callRegistry, useTerminalCommands } from "./commands";
-import { useTerminalInitialization } from "./useTerminalInitialization";
+import { useTerminalInitialization, runVerifiedResume } from "./useTerminalInitialization";
+import { ResumeFailedBanner } from "./ResumeFailedBanner";
 import { useZoneActions } from "./useZoneActions";
 import { writeWhenReady as writeWhenReadyHelper } from "./writeWhenReady";
 import { setTerminalSessions, type TerminalSessionEntry } from "@/lib/terminal-sessions-registry";
@@ -718,6 +719,27 @@ function TerminalPageInner({
     },
   });
 
+  // Operator-clickable retry for a restored tab whose resume verification
+  // failed (Phase 3, #548): re-run the same type-and-verify path. The durable
+  // restore-pending marker is still set from the failed attempt, so the
+  // liveness poll keeps protecting the open record while this runs.
+  const handleRetryResume = useCallback(
+    (tabId: string) => {
+      const tab = tabsRef.current.find((t) => t.id === tabId);
+      if (!tab?.claudeSessionId) return;
+      updateTab(tabId, { resumeFailed: false, isReconnecting: true });
+      void runVerifiedResume({
+        terminalRefs: terminalRefs.current,
+        tabId,
+        claudeSessionId: tab.claudeSessionId,
+        configDir: tab.claudeConfigDir,
+        updateTab,
+      });
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [updateTab],
+  );
+
   const handleExit = useCallback(
     (terminalId: string, exitCode: number | null) => {
       // Record the durable session CLOSE when a pty backing a Claude session
@@ -1137,6 +1159,12 @@ function TerminalPageInner({
                 `terminalId={zoneTab.id}`). Soft + dismissible; never
                 blocks input. */}
             <CoordWarningBanner activeTerminalId={activeId ?? undefined} />
+
+            {/* Phase 3 (#548) — restored tabs whose `claude --resume` never
+                produced the Claude UI handshake (after one auto-retry) park
+                here with an explicit operator retry instead of silently
+                posing as resumed. Same top-right advisory column. */}
+            <ResumeFailedBanner tabs={tabs} onRetryResume={handleRetryResume} />
           </div>
 
           {/* Phase 2 — `isMultiZone` gate dropped so the Unassigned (N) list

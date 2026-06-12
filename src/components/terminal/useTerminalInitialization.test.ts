@@ -14,7 +14,12 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => mockInvoke(...args),
 }));
 
-import { fetchOpenRecords, claimInitForPage, buildResumeCmd } from "./useTerminalInitialization";
+import {
+  fetchOpenRecords,
+  claimInitForPage,
+  buildResumeCmd,
+  runVerifiedResume,
+} from "./useTerminalInitialization";
 import type { TerminalSessionRecord } from "./types";
 
 const rec = (overrides: Partial<TerminalSessionRecord>): TerminalSessionRecord => ({
@@ -172,5 +177,83 @@ describe("buildResumeCmd (boot-restore resume command)", () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+});
+
+// Phase 3 (#548) — verified-resume state machine: the restore drain (and the
+// operator retry) must only clear the durable restore-pending marker on a
+// VERIFIED Claude UI handshake; a failed resume parks the tab in an explicit
+// `resumeFailed` retry state with the marker left intact.
+describe("runVerifiedResume", () => {
+  const CLAUDE_UI = "╭──────────────╮\n│ > │\n╰──────────────╯\n  ? for shortcuts";
+  const PLAIN_SHELL = "PS C:\\repo> claude --resume sess-1\r\nPS C:\\repo>";
+
+  /** A refs map whose handle accepts writes (the default writeWhenReady path). */
+  const refsWithHandle = (writes: string[]) =>
+    new Map([
+      [
+        "tab-1",
+        { current: { writeToTerminal: (text: string) => void writes.push(text) } },
+      ],
+    ]) as never;
+
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue({ success: true, message: null, data: null });
+  });
+
+  it("verified handshake → clears isReconnecting AND the backend restore-pending marker", async () => {
+    const writes: string[] = [];
+    const updateTab = vi.fn();
+    const out = await runVerifiedResume({
+      terminalRefs: refsWithHandle(writes),
+      tabId: "tab-1",
+      claudeSessionId: "sess-1",
+      updateTab,
+      verifyOptions: {
+        settleMs: 1,
+        timeoutMs: 50,
+        intervalMs: 1,
+        readTail: async () => CLAUDE_UI,
+      },
+    });
+    expect(out).toBe("verified");
+    expect(writes.some((w) => w.includes("--resume sess-1\r"))).toBe(true);
+    expect(updateTab).toHaveBeenCalledWith("tab-1", {
+      isReconnecting: false,
+      resumeFailed: false,
+    });
+    expect(mockInvoke).toHaveBeenCalledWith("terminal_session_clear_restore_pending", {
+      claudeSessionId: "sess-1",
+    });
+  });
+
+  it("persistent failure → parks the tab resumeFailed and does NOT clear the marker", async () => {
+    const writes: string[] = [];
+    const updateTab = vi.fn();
+    const out = await runVerifiedResume({
+      terminalRefs: refsWithHandle(writes),
+      tabId: "tab-1",
+      claudeSessionId: "sess-1",
+      updateTab,
+      verifyOptions: {
+        settleMs: 1,
+        timeoutMs: 5,
+        intervalMs: 1,
+        readTail: async () => PLAIN_SHELL,
+      },
+    });
+    expect(out).toBe("failed");
+    // Retried once: the same command typed exactly twice.
+    expect(writes.filter((w) => w.includes("--resume sess-1\r"))).toHaveLength(2);
+    expect(updateTab).toHaveBeenCalledWith("tab-1", {
+      isReconnecting: false,
+      resumeFailed: true,
+    });
+    // The durable open record must stay poll-protected for the retry.
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "terminal_session_clear_restore_pending",
+      expect.anything(),
+    );
   });
 });
