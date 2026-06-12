@@ -19,6 +19,7 @@ import {
   claimInitForPage,
   buildResumeCmd,
   runVerifiedResume,
+  buildResumeCmd,
 } from "./useTerminalInitialization";
 import type { TerminalSessionRecord } from "./types";
 
@@ -255,5 +256,31 @@ describe("runVerifiedResume", () => {
       "terminal_session_clear_restore_pending",
       expect.anything(),
     );
+  });
+});
+
+// #548 item 3 — the typed resume must suppress the CLI's "Resume from
+// summary?" picker under the default full-resume policy (env thresholds; no
+// CLI flag / settings key short of the global "Don't ask again" exists), and
+// must leave it answerable under the opt-in summary policy.
+describe("buildResumeCmd (resume-size picker policy)", () => {
+  it("default 'full' policy raises both resume thresholds so the picker never shows", () => {
+    const cmd = buildResumeCmd("sess-1", undefined, "full");
+    expect(cmd).toContain('CLAUDE_CODE_RESUME_TOKEN_THRESHOLD="999999999"');
+    expect(cmd).toContain('CLAUDE_CODE_RESUME_THRESHOLD_MINUTES="999999999"');
+    expect(cmd).toContain("claude --resume sess-1\r");
+  });
+
+  it("'summary' policy leaves the thresholds alone (picker shows; the loop answers it)", () => {
+    const cmd = buildResumeCmd("sess-1", undefined, "summary");
+    expect(cmd).not.toContain("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD");
+    expect(cmd).toBe("claude --resume sess-1\r");
+  });
+
+  it("keeps the CLAUDE_CONFIG_DIR prefix alongside the threshold vars", () => {
+    const cmd = buildResumeCmd("sess-1", "C:/claude/.claude-hotmail", "full");
+    expect(cmd).toContain('CLAUDE_CONFIG_DIR="C:/claude/.claude-hotmail"');
+    expect(cmd).toContain("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD");
+    expect(cmd).toContain("claude --resume sess-1\r");
   });
 });

@@ -3,7 +3,13 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LAYOUT_PRESETS } from "./useZoneLayout";
 import type { TerminalRefsMap } from "./writeWhenReady";
-import { typeResumeAndVerify, type TypeAndVerifyOptions } from "./resumeVerification";
+import {
+  typeResumeAndVerify,
+  getResumeSummaryPolicy,
+  buildPickerAnswer,
+  type ResumeSummaryPolicy,
+  type TypeAndVerifyOptions,
+} from "./resumeVerification";
 import type { TerminalTab } from "./useTerminalManager";
 import type { TerminalInstanceHandle } from "./TerminalInstance";
 import type { CommandResponse, TerminalSessionRecord } from "./types";
@@ -48,21 +54,39 @@ export async function fetchOpenRecords(pageId: string): Promise<TerminalSessionR
 
 /**
  * Build a `claude --resume <id>` command, optionally prefixed with
- * CLAUDE_CONFIG_DIR. Autonomous resume (`--permission-mode bypassPermissions`,
- * matching the zone-profile + shell-integration resume builders and the
- * backend `is_bypass_resume` detector) — a boot-restored session is unattended,
- * so a bare `claude --resume` would stall forever on its first permission
- * prompt.
+ * CLAUDE_CONFIG_DIR and (under the default full-resume policy) with the CLI's
+ * resume-size thresholds raised so the interactive "Resume from summary?"
+ * picker never shows — an unattended restore can't answer it, and a wedged
+ * picker reads as a failed resume (#548 item 3). No suppression flag exists;
+ * the CLI consults `CLAUDE_CODE_RESUME_TOKEN_THRESHOLD` (default 100000
+ * estimated tokens) and `CLAUDE_CODE_RESUME_THRESHOLD_MINUTES` (default 70)
+ * before showing it, and skipping it resumes the full session as-is. Scoped
+ * to the typed command (per-process) deliberately: seeding the CLI's global
+ * "Don't ask again" key (`resumeReturnDismissed` in `.claude.json`) would
+ * also kill the picker for the operator's own interactive resumes.
  *
- * Exported for unit tests (vitest `environment: "node"`).
+ * Under the opt-in `"summary"` policy the thresholds are left alone so the
+ * picker appears and the verification loop answers it
+ * (`buildPickerAnswer`). Exported for unit tests.
  */
-export function buildResumeCmd(sessionId: string, configDir: string | undefined): string {
-  const base = `claude --permission-mode bypassPermissions --resume ${sessionId}`;
-  if (!configDir) return `${base}\r`;
-  const isWindows = navigator.platform.startsWith("Win");
+export function buildResumeCmd(
+  sessionId: string,
+  configDir: string | undefined,
+  policy: ResumeSummaryPolicy = getResumeSummaryPolicy(),
+): string {
+  const base = `claude --resume ${sessionId}`;
+  const env: Array<[string, string]> = [];
+  if (configDir) env.push(["CLAUDE_CONFIG_DIR", configDir]);
+  if (policy === "full") {
+    env.push(["CLAUDE_CODE_RESUME_TOKEN_THRESHOLD", "999999999"]);
+    env.push(["CLAUDE_CODE_RESUME_THRESHOLD_MINUTES", "999999999"]);
+  }
+  if (env.length === 0) return `${base}\r`;
+  const isWindows =
+    typeof navigator !== "undefined" && (navigator.platform ?? "").startsWith("Win");
   return isWindows
-    ? `$env:CLAUDE_CONFIG_DIR="${configDir}"; ${base}\r`
-    : `CLAUDE_CONFIG_DIR="${configDir}" ${base}\r`;
+    ? `${env.map(([k, v]) => `$env:${k}="${v}"; `).join("")}${base}\r`
+    : `${env.map(([k, v]) => `${k}="${v}" `).join("")}${base}\r`;
 }
 
 /**
@@ -90,8 +114,15 @@ export async function runVerifiedResume(params: {
   verifyOptions?: TypeAndVerifyOptions;
 }): Promise<"verified" | "failed"> {
   const { terminalRefs, tabId, claudeSessionId, configDir, updateTab, verifyOptions } = params;
-  const resumeCmd = buildResumeCmd(claudeSessionId, configDir);
-  const outcome = await typeResumeAndVerify(terminalRefs, tabId, resumeCmd, verifyOptions);
+  const policy = getResumeSummaryPolicy();
+  const resumeCmd = buildResumeCmd(claudeSessionId, configDir, policy);
+  const outcome = await typeResumeAndVerify(terminalRefs, tabId, resumeCmd, {
+    // Fallback picker answerer (#548 item 3): under the default "full" policy
+    // the env thresholds in `buildResumeCmd` already suppress the picker;
+    // this catches CLI version drift and the opt-in "summary" policy.
+    pickerAnswer: buildPickerAnswer(policy),
+    ...verifyOptions,
+  });
   if (outcome === "verified") {
     updateTab(tabId, { isReconnecting: false, resumeFailed: false });
     // Verified handshake — release the liveness-poll restore guard so normal

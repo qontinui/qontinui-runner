@@ -47,6 +47,13 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
     () => (instanceStorage.getItem("terminal-backend") as "xterm" | "ghostty" | null) || "xterm",
   );
 
+  // Unattended session-restore policy for the Claude CLI's "Resume from
+  // summary?" picker (#548 item 3). Default "full": context loss is silent
+  // and unrecoverable; token cost is visible and /compact-able.
+  const [resumePolicy, setResumePolicy] = useState<"full" | "summary">(() =>
+    instanceStorage.getItem("resume-summary-policy") === "summary" ? "summary" : "full",
+  );
+
   // Device info state
   const [deviceInfo, setDeviceInfo] = useState<DeviceInfo | null>(null);
   const [deviceInfoLoading, setDeviceInfoLoading] = useState(true);
@@ -386,6 +393,44 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
           <div className="text-xs text-muted-foreground">
             <strong className="text-foreground">Tip:</strong> Include your Device ID when reporting
             issues to help identify your runner in the system.
+          </div>
+        </div>
+      </div>
+
+      {/* Session Restore Section */}
+      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+        <h4 className="font-medium text-sm flex items-center gap-2">
+          <RefreshCw className="w-4 h-4 text-primary" />
+          Session Restore
+        </h4>
+
+        <div className="space-y-2 p-3 rounded-lg bg-muted/30">
+          <div className="text-sm font-medium">Large-session resume behavior</div>
+          <div className="text-xs text-muted-foreground mb-2">
+            When the runner auto-resumes a large Claude session after a restart, the CLI can offer
+            to resume from a compacted summary. <strong>Full</strong> (default) resumes the
+            complete conversation as-is — context loss is silent and unrecoverable, while token
+            cost is visible and can be /compact-ed later. <strong>Summary</strong> opts in to the
+            compacted resume for cost-sensitive setups.
+          </div>
+          <div className="flex gap-2">
+            {(["full", "summary"] as const).map((policy) => (
+              <button
+                key={policy}
+                onClick={() => {
+                  setResumePolicy(policy);
+                  instanceStorage.setItem("resume-summary-policy", policy);
+                  onLog("info", `Unattended resume policy set to ${policy}.`);
+                }}
+                className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                  resumePolicy === policy
+                    ? "bg-primary text-primary-foreground"
+                    : "bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground"
+                }`}
+              >
+                {policy === "full" ? "Resume full (default)" : "Resume from summary"}
+              </button>
+            ))}
           </div>
         </div>
       </div>
