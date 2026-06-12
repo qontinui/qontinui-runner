@@ -2361,6 +2361,19 @@ fn runner_panic_handler(err: Box<dyn std::any::Any + Send + 'static>) -> axum::r
         .into_response()
 }
 
+/// Whether a bound socket address is reachable from the LAN: any
+/// non-loopback IP counts (including the unspecified address `0.0.0.0`,
+/// which listens on all interfaces); `127.0.0.1`/`::1` does not.
+///
+/// Used at bind time to populate `AppState.api_lan_bound`, which the
+/// backend heartbeat advertises as `lan_reachable` (plan
+/// 2026-06-12-mobile-account-usage-error-recovery, runner P1). Derived
+/// from the listener's REAL local address so a future non-loopback bind
+/// flips the advertisement without further changes.
+pub(crate) fn lan_reachable_for_bound_addr(addr: &std::net::SocketAddr) -> bool {
+    !addr.ip().is_loopback()
+}
+
 /// Try to bind to a port with SO_REUSEADDR
 fn try_bind_port(port: u16) -> Result<std::net::TcpListener, std::io::Error> {
     // Create socket with SO_REUSEADDR to allow binding even if there are zombie connections
@@ -2418,6 +2431,19 @@ pub async fn start_server(
         info!("MCP API server: try_bind_port({})...", try_port);
         match try_bind_port(try_port) {
             Ok(std_listener) => {
+                // Record whether the ACTUAL bound address is LAN-reachable
+                // (non-loopback). Read from the listener rather than assumed,
+                // so the heartbeat's `lan_reachable` advertisement stays
+                // honest if the bind strategy ever changes. Currently always
+                // false: `try_bind_port` binds 127.0.0.1 only (intentional —
+                // see the comment there).
+                let lan_bound = std_listener
+                    .local_addr()
+                    .map(|addr| lan_reachable_for_bound_addr(&addr))
+                    .unwrap_or(false);
+                api_ready_flag
+                    .api_lan_bound
+                    .store(lan_bound, Ordering::Relaxed);
                 let listener = tokio::net::TcpListener::from_std(std_listener)?;
                 if try_port != port {
                     warn!(

@@ -18,6 +18,18 @@ struct HeartbeatPayload {
     hostname: String,
     ip: String,
     port: u16,
+    /// Reachability honesty (plan
+    /// 2026-06-12-mobile-account-usage-error-recovery, runner P1): whether
+    /// the advertised `ip:port` is actually served on a LAN-reachable
+    /// (non-loopback) interface. Derived at bind time from the API
+    /// listener's REAL local address (`AppState.api_lan_bound`, set in
+    /// `mcp_api::start_server`) — currently always `false` because the
+    /// runner API intentionally binds `127.0.0.1` only
+    /// (`mcp_api::try_bind_port`) while `ip` reports the machine's LAN IP.
+    /// Consumers (backend fleet registry → mobile) should treat `false` as
+    /// "do not dial `ip:port` directly; use a loopback path (adb reverse)
+    /// or a proxy". Additive field — backends that don't know it ignore it.
+    lan_reachable: bool,
     instance_name: Option<String>,
     os: String,
     os_version: Option<String>,
@@ -182,6 +194,7 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                     hostname: hostname.clone(),
                     ip,
                     port,
+                    lan_reachable: app_state.api_lan_bound.load(Ordering::Relaxed),
                     instance_name: instance_name.clone(),
                     os: os.clone(),
                     os_version: None,
@@ -272,4 +285,66 @@ fn get_local_ip() -> Option<String> {
 /// Fallback when PG query fails — returns empty.
 fn get_running_tasks_fallback() -> (u32, Vec<String>) {
     (0, vec![])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Loopback bind ⇒ heartbeat advertises `lan_reachable: false`, with the
+    /// flag DERIVED from a listener's real bound address through the same
+    /// seam `mcp_api::start_server` uses (`lan_reachable_for_bound_addr`),
+    /// not hardcoded. Also asserts the payload stays backward compatible:
+    /// the pre-existing keys are still emitted alongside the new field.
+    #[test]
+    fn payload_serializes_lan_reachable_false_when_bound_to_loopback() {
+        // Bind exactly like the runner API does today: loopback only.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local_addr");
+        let lan_reachable = crate::mcp_api::lan_reachable_for_bound_addr(&addr);
+
+        let payload = HeartbeatPayload {
+            hostname: "test-host".to_string(),
+            // The advertised LAN IP — the half that made the old payload
+            // dishonest when paired with a loopback-only bind.
+            ip: "192.168.8.192".to_string(),
+            port: addr.port(),
+            lan_reachable,
+            instance_name: None,
+            os: "windows".to_string(),
+            os_version: None,
+            running_task_count: 0,
+            running_task_ids: vec![],
+            derived_status: "healthy".to_string(),
+            ui_error: None,
+            recent_crash: None,
+        };
+
+        let json = serde_json::to_value(&payload).expect("payload serializes");
+        assert_eq!(json["lan_reachable"], serde_json::Value::Bool(false));
+        // Backward compatibility: existing wire keys unchanged.
+        assert_eq!(json["ip"], "192.168.8.192");
+        assert_eq!(json["port"], addr.port());
+        assert_eq!(json["hostname"], "test-host");
+        assert_eq!(json["derived_status"], "healthy");
+        assert!(json.as_object().unwrap().contains_key("ui_error"));
+    }
+
+    /// The derivation must flip to `true` for a non-loopback bind (all-
+    /// interfaces or a concrete LAN address) so a future bind-strategy
+    /// change is advertised honestly without touching the heartbeat.
+    #[test]
+    fn lan_reachable_derivation_flips_true_for_non_loopback_bind() {
+        let unspecified: std::net::SocketAddr = "0.0.0.0:9876".parse().unwrap();
+        assert!(crate::mcp_api::lan_reachable_for_bound_addr(&unspecified));
+
+        let lan: std::net::SocketAddr = "192.168.8.192:9876".parse().unwrap();
+        assert!(crate::mcp_api::lan_reachable_for_bound_addr(&lan));
+
+        let loopback: std::net::SocketAddr = "127.0.0.1:9876".parse().unwrap();
+        assert!(!crate::mcp_api::lan_reachable_for_bound_addr(&loopback));
+
+        let v6_loopback: std::net::SocketAddr = "[::1]:9876".parse().unwrap();
+        assert!(!crate::mcp_api::lan_reachable_for_bound_addr(&v6_loopback));
+    }
 }
