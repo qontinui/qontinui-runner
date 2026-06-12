@@ -1357,19 +1357,21 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
 // touches a feature branch's working tree — the /pull-scoped hard rules are
 // invariants enforced here even if a (buggy/spoofed) Decision asked otherwise.
 //
-// GATED OFF by default: set `COORD_PULL_EXECUTOR_ENABLED=1` to opt in. The
-// decision REQUEST is harmless, but the apply mutates the working tree, so an
-// existing runner stays inert until the operator flips the flag (the standing
-// autonomous-pull authorization is per-operator — no-surprise default).
+// ON by default since 2026-06-12 (operator granted standing autonomous-pull
+// authorization fleet-wide after the live-verified rollout): set
+// `COORD_PULL_EXECUTOR_ENABLED=0` to opt a machine out locally. The runtime
+// control plane is coord's per-tenant `repo_pull` autonomy dial — dialing it
+// to `guidance_only` makes every executor surface recommendations without
+// applying them, fleet-wide, without touching machines.
 // =============================================================================
 
-/// Is the auto-pull executor opted in? Off unless `COORD_PULL_EXECUTOR_ENABLED`
-/// is a truthy value (`1`/`true`/`yes`, case-insensitive).
+/// Is the auto-pull executor enabled? On unless `COORD_PULL_EXECUTOR_ENABLED`
+/// is an explicit falsy value (`0`/`false`/`no`, case-insensitive).
 fn pull_executor_enabled() -> bool {
     std::env::var("COORD_PULL_EXECUTOR_ENABLED")
         .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
+        .unwrap_or(true)
 }
 
 /// Resolve a repo's default branch from `origin/HEAD` (`origin/main` -> `main`),
@@ -1967,8 +1969,8 @@ pub async fn publish_tree_state() -> Result<(), String> {
 
         // repo_pull executor (plan §5): once the fresh tree state has landed in
         // coord, for a repo that is behind origin, request the pull verdict and
-        // apply the safe action. Gated OFF by default (opt-in via
-        // COORD_PULL_EXECUTOR_ENABLED) — the apply mutates the working tree.
+        // apply the safe action. ON by default (opt out via
+        // COORD_PULL_EXECUTOR_ENABLED=0) — the apply mutates the working tree.
         if upsert_ok && pull_executor_enabled() && payload.behind_count.unwrap_or(0) > 0 {
             request_and_apply_pull(&client, &base, device_id, path.clone(), &payload).await;
         }
