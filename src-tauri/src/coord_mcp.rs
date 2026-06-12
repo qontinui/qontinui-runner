@@ -51,18 +51,25 @@ fn coord_http_base() -> Option<String> {
     }
 }
 
-/// The full coord `/mcp` endpoint URL: `COORD_HTTP_URL` env → active profile's
-/// `coord_url` → localhost fallback, then `/mcp` appended. Shared by the
-/// static-bearer `.mcp.json` writer (agent path) and the loopback proxy
-/// forwarder (`mcp_api::coord_mcp_proxy_handler`) so both resolve the coord
-/// base identically — the proxy must never re-derive it from env alone.
-pub(crate) fn coord_mcp_url() -> String {
+/// The coord HTTP base (no path, no trailing slash): `COORD_HTTP_URL` env →
+/// active profile's `coord_url` → localhost fallback. Shared by every loopback
+/// proxy forwarder (the `/mcp` JSON-RPC passthrough AND the nonce-gated claims
+/// read passthrough in `mcp_api`) so they all resolve the coord base
+/// identically — a proxy route must never re-derive it from env alone.
+pub(crate) fn coord_base_url() -> String {
     let coord_url = std::env::var("COORD_HTTP_URL")
         .ok()
         .filter(|v| !v.trim().is_empty())
         .or_else(coord_http_base)
         .unwrap_or_else(|| "http://localhost:9870".to_string());
-    format!("{}/mcp", coord_url.trim_end_matches('/'))
+    coord_url.trim_end_matches('/').to_string()
+}
+
+/// The full coord `/mcp` endpoint URL: [`coord_base_url`] with `/mcp` appended.
+/// Shared by the static-bearer `.mcp.json` writer (agent path) and the loopback
+/// proxy forwarder (`mcp_api::coord_mcp_proxy_handler`).
+pub(crate) fn coord_mcp_url() -> String {
+    format!("{}/mcp", coord_base_url())
 }
 
 /// In-memory nonce registry for the loopback `/coord-mcp` proxy:

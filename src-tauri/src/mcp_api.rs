@@ -556,6 +556,201 @@ async fn coord_mcp_proxy_handler(
         })
 }
 
+/// The two — and ONLY two — coord routes the nonce-gated claims read
+/// passthrough may reach (plan 2026-06-11-claims-read-auth-hardening, Phase 2).
+///
+/// Deliberately a closed enum rather than a path parameter: the per-session
+/// proxy nonce authenticates a *session*, not an operator, so its authority
+/// must stay scoped to these two read-only claims endpoints. A generic
+/// `/coord-mcp/proxy/{path}` passthrough would let a leaked nonce reach any
+/// coord route with the runner's device identity — arbitrary paths must be
+/// structurally impossible, not merely unrouted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClaimsReadTarget {
+    /// `GET {coord}/coord/claims/list`
+    List,
+    /// `GET {coord}/coord/claims/by-resource`
+    ByResource,
+}
+
+impl ClaimsReadTarget {
+    fn coord_path(self) -> &'static str {
+        match self {
+            ClaimsReadTarget::List => "/coord/claims/list",
+            ClaimsReadTarget::ByResource => "/coord/claims/by-resource",
+        }
+    }
+}
+
+/// Build the upstream coord URL for a claims read: allowlisted path from the
+/// [`ClaimsReadTarget`] enum + the inbound query string forwarded VERBATIM
+/// (still percent-encoded — `axum::extract::RawQuery` hands us the raw form,
+/// so coord decodes exactly what the session's client encoded).
+fn claims_upstream_url(base: &str, target: ClaimsReadTarget, raw_query: Option<&str>) -> String {
+    let mut url = format!("{}{}", base.trim_end_matches('/'), target.coord_path());
+    if let Some(q) = raw_query {
+        if !q.is_empty() {
+            url.push('?');
+            url.push_str(q);
+        }
+    }
+    url
+}
+
+/// `GET /coord-mcp/claims/list` + `GET /coord-mcp/claims/by-resource` — the
+/// nonce-gated claims READ passthrough for device-provisioned sessions (plan
+/// 2026-06-11-claims-read-auth-hardening, Phase 2).
+///
+/// Why: the claims consumers (PreToolUse hook helper, skill wait-poll) need
+/// plain REST GETs against coord's claims endpoints, but a device session's
+/// `.mcp.json` carries no bearer anymore (live-token proxy, runner #546) —
+/// only the per-session loopback nonce. This route lets those helpers reuse
+/// the nonce: same gate, same live `AuthManager` device-JWT injection, same
+/// coord-base resolution as `coord_mcp_proxy_handler`, but restricted to the
+/// two read-only claims routes in [`ClaimsReadTarget`].
+///
+/// Gate (`coord_mcp::proxy_request_gate`, 401 before any network I/O):
+/// registered `X-Coord-Mcp-Proxy-Key` nonce AND the live bearer decodes
+/// `sub_type == "device"` — absent/wrong nonce or a missing/non-device token
+/// means the request is NEVER forwarded to coord.
+///
+/// Coord's response status + body are returned verbatim (no reshaping) so the
+/// helper sees exactly what coord said; runner-originated failures use the
+/// distinct `COORD_CLAIMS_PROXY_*` codes below so they can't be mistaken for
+/// a coord verdict.
+async fn coord_claims_read_proxy_handler(
+    target: ClaimsReadTarget,
+    headers: axum::http::HeaderMap,
+    raw_query: Option<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let nonce = headers
+        .get(crate::coord_mcp::COORD_MCP_PROXY_KEY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
+    // Live read — the same fresh device JWT the `/coord-mcp` proxy injects.
+    // AuthManager does filesystem I/O, so keep it off the async executor.
+    let bearer =
+        tokio::task::spawn_blocking(|| crate::auth::AuthManager::new().get_access_token().ok())
+            .await
+            .ok()
+            .flatten();
+
+    if let Err((status, msg)) =
+        crate::coord_mcp::proxy_request_gate(nonce.as_deref(), bearer.as_deref())
+    {
+        warn!("coord-mcp claims proxy: {msg}");
+        return (
+            axum::http::StatusCode::from_u16(status)
+                .unwrap_or(axum::http::StatusCode::UNAUTHORIZED),
+            Json(serde_json::json!({
+                "success": false,
+                "error": msg,
+                "code": "COORD_CLAIMS_PROXY_UNAUTHORIZED",
+            })),
+        )
+            .into_response();
+    }
+    let bearer = bearer.unwrap_or_default(); // gate guarantees Some(non-empty)
+
+    let url = claims_upstream_url(
+        &crate::coord_mcp::coord_base_url(),
+        target,
+        raw_query.as_deref(),
+    );
+    forward_claims_get(&url, &bearer).await
+}
+
+/// Forward a claims read to coord and return coord's status + headers + body
+/// verbatim. Split from the handler (URL + bearer as plain params, no
+/// `AuthManager`/env reads) so the forwarding leg is unit-testable against a
+/// local mock coord with a synthetic bearer — the live credential lives in the
+/// encrypted `AuthManager` slot, which a unit test cannot seed.
+async fn forward_claims_get(url: &str, bearer: &str) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    // Shared client: connect fast-fail like the `/coord-mcp` proxy client, but
+    // a much shorter overall timeout — these are bounded REST reads (a hook
+    // helper sits on the response), not long-running MCP tool calls.
+    static COORD_CLAIMS_PROXY_CLIENT: std::sync::OnceLock<reqwest::Client> =
+        std::sync::OnceLock::new();
+    let client = COORD_CLAIMS_PROXY_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("coord claims proxy reqwest client")
+    });
+
+    let upstream = match client.get(url).bearer_auth(bearer).send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            warn!("coord-mcp claims proxy: forward to {url} failed: {e}");
+            return (
+                axum::http::StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("coord claims endpoint unreachable: {e}"),
+                    "code": "COORD_CLAIMS_PROXY_UPSTREAM_UNREACHABLE",
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let status = upstream.status().as_u16();
+    let mut builder = axum::http::Response::builder()
+        .status(axum::http::StatusCode::from_u16(status).unwrap_or(axum::http::StatusCode::OK));
+    for (name, value) in upstream.headers() {
+        if matches!(
+            name.as_str(),
+            "content-length" | "transfer-encoding" | "connection"
+        ) {
+            continue;
+        }
+        builder = builder.header(name.as_str(), value.as_bytes());
+    }
+    let bytes = match upstream.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("coord-mcp claims proxy: reading coord response body failed: {e}");
+            return (
+                axum::http::StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("coord claims response read failed: {e}"),
+                    "code": "COORD_CLAIMS_PROXY_UPSTREAM_READ_FAILED",
+                })),
+            )
+                .into_response();
+        }
+    };
+    builder
+        .body(axum::body::Body::from(bytes))
+        .unwrap_or_else(|e| {
+            warn!("coord-mcp claims proxy: response build failed: {e}");
+            axum::http::StatusCode::BAD_GATEWAY.into_response()
+        })
+}
+
+/// `GET /coord-mcp/claims/list` — see [`coord_claims_read_proxy_handler`].
+async fn coord_claims_list_handler(
+    headers: axum::http::HeaderMap,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+) -> axum::response::Response {
+    coord_claims_read_proxy_handler(ClaimsReadTarget::List, headers, raw_query).await
+}
+
+/// `GET /coord-mcp/claims/by-resource` — see [`coord_claims_read_proxy_handler`].
+async fn coord_claims_by_resource_handler(
+    headers: axum::http::HeaderMap,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+) -> axum::response::Response {
+    coord_claims_read_proxy_handler(ClaimsReadTarget::ByResource, headers, raw_query).await
+}
+
 /// Create the API router
 pub fn create_router(
     app_state: Arc<AppState>,
@@ -1858,6 +2053,16 @@ pub fn create_router(
         // freshly-read device JWT instead of a 4h-TTL snapshot. Nonce-gated
         // (X-Coord-Mcp-Proxy-Key); see `coord_mcp_proxy_handler`.
         .route("/coord-mcp", post(coord_mcp_proxy_handler))
+        // Nonce-gated claims READ passthrough for device sessions' hook
+        // helper + skill wait-poll (plan 2026-06-11-claims-read-auth-hardening
+        // Phase 2). Same gate + live device-JWT injection as /coord-mcp, but
+        // allowlisted to EXACTLY these two read-only coord routes — never a
+        // generic path passthrough (see `ClaimsReadTarget`).
+        .route("/coord-mcp/claims/list", get(coord_claims_list_handler))
+        .route(
+            "/coord-mcp/claims/by-resource",
+            get(coord_claims_by_resource_handler),
+        )
         // Relay web-integration diagnostic — exposes the idle-gating state
         // (tier, enabled, device-JWT presence, WS connection, last error) so
         // an operator can see WHY a runner never appears to the cloud/mobile.
@@ -2276,6 +2481,199 @@ pub async fn start_server(
     Err(Box::new(last_error.unwrap_or_else(|| {
         std::io::Error::other("All ports failed")
     })))
+}
+
+/// Nonce-gated claims read passthrough (plan
+/// 2026-06-11-claims-read-auth-hardening, Phase 2).
+///
+/// Route-level tests build a minimal router with the two real handlers and
+/// assert the gate's 401 paths (missing/wrong nonce — never forwarded; the
+/// 401 is produced before any upstream I/O, structurally guaranteed by
+/// `coord_mcp::proxy_request_gate` running first and separately unit-tested
+/// in `coord_mcp::tests`). The forwarding leg cannot be exercised end-to-end
+/// through the route because the live bearer comes from the encrypted
+/// `AuthManager` slot (not seedable in a unit test), so it is tested through
+/// the `forward_claims_get` seam against a local mock coord with a synthetic
+/// bearer — covering live-bearer injection, verbatim query forwarding, and
+/// verbatim status+body passthrough including non-200 upstream verdicts.
+#[cfg(test)]
+mod coord_claims_proxy_tests {
+    use super::{
+        claims_upstream_url, coord_claims_by_resource_handler, coord_claims_list_handler,
+        forward_claims_get, ClaimsReadTarget,
+    };
+    use axum::{body::Body, http::Request, routing::get, Router};
+    use tower::ServiceExt;
+
+    const CLAIMS_ROUTES: &[&str] = &["/coord-mcp/claims/list", "/coord-mcp/claims/by-resource"];
+
+    fn claims_router() -> Router {
+        Router::new()
+            .route("/coord-mcp/claims/list", get(coord_claims_list_handler))
+            .route(
+                "/coord-mcp/claims/by-resource",
+                get(coord_claims_by_resource_handler),
+            )
+    }
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// The upstream URL is built from the closed enum's allowlisted paths,
+    /// with the inbound query string appended verbatim (still
+    /// percent-encoded) and no dangling `?` when there is no query.
+    #[test]
+    fn claims_upstream_url_allowlists_paths_and_forwards_query_verbatim() {
+        assert_eq!(
+            claims_upstream_url("https://coord.example.test", ClaimsReadTarget::List, None),
+            "https://coord.example.test/coord/claims/list"
+        );
+        // Trailing slash on the base must not double up.
+        assert_eq!(
+            claims_upstream_url(
+                "https://coord.example.test/",
+                ClaimsReadTarget::ByResource,
+                Some("resource=src%2Fmain.rs&repo=qontinui-runner"),
+            ),
+            "https://coord.example.test/coord/claims/by-resource?resource=src%2Fmain.rs&repo=qontinui-runner"
+        );
+        // Empty query → no dangling '?'.
+        assert_eq!(
+            claims_upstream_url("http://127.0.0.1:9870", ClaimsReadTarget::List, Some("")),
+            "http://127.0.0.1:9870/coord/claims/list"
+        );
+    }
+
+    /// Absent `X-Coord-Mcp-Proxy-Key` → 401 from the runner with the claims
+    /// proxy's own error code, on BOTH routes. The gate runs before any
+    /// upstream I/O, so the request is never forwarded to coord.
+    #[tokio::test]
+    async fn claims_routes_missing_nonce_is_401_never_forwarded() {
+        for path in CLAIMS_ROUTES {
+            let resp = claims_router()
+                .oneshot(Request::builder().uri(*path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 401, "{path} without a nonce must 401");
+            let v = body_json(resp).await;
+            assert_eq!(v["success"], false);
+            assert_eq!(v["code"], "COORD_CLAIMS_PROXY_UNAUTHORIZED");
+        }
+    }
+
+    /// A wrong (unregistered) nonce → 401, same code, on BOTH routes —
+    /// query string present to prove the gate fires regardless.
+    #[tokio::test]
+    async fn claims_routes_wrong_nonce_is_401() {
+        for path in CLAIMS_ROUTES {
+            let resp = claims_router()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("{path}?repo=qontinui-runner"))
+                        .header("X-Coord-Mcp-Proxy-Key", "not-a-registered-nonce")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 401, "{path} with a wrong nonce must 401");
+            let v = body_json(resp).await;
+            assert_eq!(v["success"], false);
+            assert_eq!(v["code"], "COORD_CLAIMS_PROXY_UNAUTHORIZED");
+        }
+    }
+
+    /// The forwarding leg against a local mock coord: the bearer is injected
+    /// as `Authorization: Bearer <token>` per request, the query string
+    /// arrives verbatim, and coord's status + body come back unreshaped —
+    /// including a non-200 coord verdict.
+    #[tokio::test]
+    async fn forward_claims_get_injects_bearer_and_passes_through_verbatim() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app: Router = Router::new()
+            .route(
+                "/coord/claims/list",
+                get(
+                    |headers: axum::http::HeaderMap,
+                     axum::extract::RawQuery(q): axum::extract::RawQuery| async move {
+                        let auth = headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        axum::Json(serde_json::json!({"echo_query": q, "echo_auth": auth}))
+                    },
+                ),
+            )
+            .route(
+                "/coord/claims/by-resource",
+                get(|| async {
+                    (
+                        axum::http::StatusCode::FORBIDDEN,
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        r#"{"detail":"tenant_not_resolved"}"#,
+                    )
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let base = format!("http://{addr}");
+
+        // Happy path: query forwarded verbatim, synthetic bearer injected.
+        let url = claims_upstream_url(
+            &base,
+            ClaimsReadTarget::List,
+            Some("repo=qontinui-runner&resource=src%2Fmain.rs"),
+        );
+        let resp = forward_claims_get(&url, "test-device-jwt").await;
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(
+            v["echo_query"],
+            "repo=qontinui-runner&resource=src%2Fmain.rs"
+        );
+        assert_eq!(v["echo_auth"], "Bearer test-device-jwt");
+
+        // Non-200 coord verdict: status + body verbatim, not reshaped.
+        let url = claims_upstream_url(&base, ClaimsReadTarget::ByResource, None);
+        let resp = forward_claims_get(&url, "test-device-jwt").await;
+        assert_eq!(resp.status(), 403);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&bytes).unwrap(),
+            r#"{"detail":"tenant_not_resolved"}"#,
+            "coord's body must come back verbatim"
+        );
+    }
+
+    /// Coord unreachable → 502 from the runner with the distinct upstream
+    /// code, so the hook helper's fail-open path triggers cleanly.
+    #[tokio::test]
+    async fn forward_claims_get_unreachable_coord_is_502() {
+        // Bind then drop a listener so the port actively refuses connections.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let url = claims_upstream_url(
+            &format!("http://127.0.0.1:{port}"),
+            ClaimsReadTarget::List,
+            None,
+        );
+        let resp = forward_claims_get(&url, "test-device-jwt").await;
+        assert_eq!(resp.status(), 502);
+        let v = body_json(resp).await;
+        assert_eq!(v["success"], false);
+        assert_eq!(v["code"], "COORD_CLAIMS_PROXY_UPSTREAM_UNREACHABLE");
+    }
 }
 
 #[cfg(test)]
