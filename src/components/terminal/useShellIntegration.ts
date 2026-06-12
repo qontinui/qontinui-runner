@@ -1,4 +1,5 @@
 import { useCallback, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import type { ShellIntegrationEvent } from "./TerminalInstance";
 import type { TerminalInstanceHandle } from "./TerminalInstance";
 import type { TranscriptSession } from "./useTranscriptSessions";
@@ -38,6 +39,8 @@ interface UseShellIntegrationParams {
     >
   >;
   setSelectedTranscriptSessionId: React.Dispatch<React.SetStateAction<string | null>>;
+  /** Page the resumed tab lands on — recorded in the durable registry. */
+  pageId: string;
 }
 
 interface UseShellIntegrationResult {
@@ -57,6 +60,7 @@ export function useShellIntegration({
   terminalRefs,
   setRightPanelMode,
   setSelectedTranscriptSessionId,
+  pageId,
 }: UseShellIntegrationParams): UseShellIntegrationResult {
   // Shell integration: structured command history per tab
   const [commandHistories, setCommandHistories] = useState<Record<string, CommandHistoryEntry[]>>(
@@ -145,6 +149,18 @@ export function useShellIntegration({
       // Persist durably so the tab stays resumable across a close→reopen even
       // if the live tab object later loses the id.
       rememberSessionId(tabId, session.session_id, session.config_dir);
+      // Durable-registry OPEN at type time (#548 Phase 1): `--resume` names
+      // the exact id. Zone unknown (-1); the zone-move backstop refreshes it.
+      invoke("terminal_session_record_open", {
+        claudeSessionId: session.session_id,
+        configDir: session.config_dir,
+        workingDir: session.project_path,
+        pageId,
+        zoneIndex: -1,
+        title: tabTitle,
+        terminalId: tabId,
+        bindOrigin: "pinned",
+      }).catch((err) => console.warn(`[ShellIntegration] resume record failed:`, err));
 
       // Close the transcript panel so the terminal is visible
       setRightPanelMode(null);
@@ -177,7 +193,14 @@ export function useShellIntegration({
         ref?.current?.writeToTerminal(`${pending.resumeCmd}\r`);
       }, 1500);
     },
-    [createTerminal, updateTab, terminalRefs, setRightPanelMode, setSelectedTranscriptSessionId],
+    [
+      createTerminal,
+      updateTab,
+      terminalRefs,
+      setRightPanelMode,
+      setSelectedTranscriptSessionId,
+      pageId,
+    ],
   );
 
   // ── Auto-naming from first input ──────────────────────────────────────────

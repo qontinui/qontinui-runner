@@ -18,6 +18,13 @@ export interface OpenRecordTab {
   workingDir?: string;
 }
 
+/**
+ * How a tab learned its `claudeSessionId`: `"pinned"` (`--session-id` /
+ * `--resume` — exact) vs `"guessed"` (freshest-transcript mtime guess).
+ * Omitted = unknown; the backend then preserves any existing origin.
+ */
+export type SessionBindOrigin = "pinned" | "guessed";
+
 /** Args for the `terminal_session_record_open` Tauri command. */
 export interface SessionOpenArgs {
   claudeSessionId: string;
@@ -27,6 +34,7 @@ export interface SessionOpenArgs {
   zoneIndex: number;
   title?: string;
   terminalId: string;
+  bindOrigin?: SessionBindOrigin;
 }
 
 /**
@@ -34,10 +42,7 @@ export interface SessionOpenArgs {
  * `zoneIndex → tabId` assignments. Returns -1 (unassigned/hidden) when the tab
  * is in no zone — the same sentinel the backend record uses.
  */
-export function resolveZoneIndex(
-  assignments: Record<number, string>,
-  tabId: string,
-): number {
+export function resolveZoneIndex(assignments: Record<number, string>, tabId: string): number {
   return Number(Object.entries(assignments).find(([, id]) => id === tabId)?.[0] ?? -1);
 }
 
@@ -53,8 +58,9 @@ export function buildSessionOpenArgs(params: {
   claudeSessionId: string;
   configDir: string | undefined;
   pageId: string;
+  bindOrigin?: SessionBindOrigin;
 }): SessionOpenArgs {
-  const { assignments, tabs, tabId, claudeSessionId, configDir, pageId } = params;
+  const { assignments, tabs, tabId, claudeSessionId, configDir, pageId, bindOrigin } = params;
   const tab = tabs.find((t) => t.id === tabId);
   return {
     claudeSessionId,
@@ -64,5 +70,6 @@ export function buildSessionOpenArgs(params: {
     zoneIndex: resolveZoneIndex(assignments, tabId),
     title: tab?.title,
     terminalId: tabId,
+    ...(bindOrigin ? { bindOrigin } : {}),
   };
 }
