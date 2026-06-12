@@ -68,13 +68,19 @@ export async function fetchOpenRecords(pageId: string): Promise<TerminalSessionR
  * Under the opt-in `"summary"` policy the thresholds are left alone so the
  * picker appears and the verification loop answers it
  * (`buildPickerAnswer`). Exported for unit tests.
+ *
+ * Autonomous resume (`--permission-mode bypassPermissions`, matching the
+ * zone-profile + shell-integration resume builders): a boot-restored session
+ * is unattended, so a bare `claude --resume` would stall forever on its first
+ * permission prompt. Aligned with PR #547 — whichever lands second resolves
+ * the textual conflict by keeping this union form.
  */
 export function buildResumeCmd(
   sessionId: string,
   configDir: string | undefined,
   policy: ResumeSummaryPolicy = getResumeSummaryPolicy(),
 ): string {
-  const base = `claude --resume ${sessionId}`;
+  const base = `claude --permission-mode bypassPermissions --resume ${sessionId}`;
   const env: Array<[string, string]> = [];
   if (configDir) env.push(["CLAUDE_CONFIG_DIR", configDir]);
   if (policy === "full") {
