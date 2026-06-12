@@ -276,13 +276,11 @@ pub fn terminal_write(
         )))
     })?;
 
+    // Typed-input observation (L3 git-warn + typed claude resume sniff) is
+    // funneled inside `TerminalSession::write` itself, so every write
+    // surface (this command, HTTP, WS, transports) is covered without
+    // per-caller calls.
     session.write(&bytes)?;
-
-    // L3 (shared-checkout coordination gap fix) — observe typed input for
-    // branch-mutating git so a soft coord-conflict warning can surface
-    // when a peer holds the worktree claim. Best-effort + non-blocking;
-    // runs AFTER the write so it never delays keystroke delivery.
-    session.observe_input_for_warn(&bytes);
 
     Ok(CommandResponse {
         success: true,

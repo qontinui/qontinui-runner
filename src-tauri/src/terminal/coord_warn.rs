@@ -77,9 +77,13 @@ pub struct CoordWarning {
 
 /// Best-effort: resolve the session's repo, ask coord for the live
 /// `worktree` claim holder, and — if a PEER holds it — emit a soft
-/// `terminal-coord-warning` event. Spawns a detached tokio task so the
+/// `terminal-coord-warning` event. Spawns a detached async task so the
 /// caller (the PTY write hot path) never blocks. All failures are
 /// swallowed.
+///
+/// Uses `tauri::async_runtime::spawn` (not bare `tokio::spawn`) because the
+/// observer lives inside `TerminalSession::write` (the single input funnel),
+/// which is reachable from bare OS threads — `tokio::spawn` would panic there.
 ///
 /// `our_session_id` is this terminal's coord session id (if wired); it is
 /// used to distinguish a same-machine peer (different session) from
@@ -91,7 +95,7 @@ pub fn spawn_check_and_warn(
     our_session_id: Option<uuid::Uuid>,
     command: String,
 ) {
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         if let Err(e) = check_and_warn(
             &app_handle,
             &terminal_id,

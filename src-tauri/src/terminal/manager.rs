@@ -343,7 +343,11 @@ impl TerminalManager {
 ///   embedded inside a shell wrapper string (e.g.
 ///   `CLAUDE_CONFIG_DIR=… claude --permission-mode bypassPermissions`) is still
 ///   caught.
-fn command_implies_bypass_permissions(argv: &[String]) -> bool {
+///
+/// `pub(crate)` so the typed-input resume sniff
+/// ([`super::claude_resume_sniff`], #548 Phase 2) reuses the SAME matcher —
+/// one definition of "bypass-implying command" for spawn-argv and typed paths.
+pub(crate) fn command_implies_bypass_permissions(argv: &[String]) -> bool {
     let joined = argv.join(" ");
     joined.contains("--dangerously-skip-permissions")
         || joined.contains("--permission-mode bypassPermissions")

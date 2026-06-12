@@ -139,6 +139,40 @@ pub(crate) fn build_submit_payload(message: &str) -> Vec<u8> {
     out
 }
 
+/// Pure line-assembly core of the typed-input observer
+/// ([`TerminalSession::observe_input`]): walk one chunk of raw keystroke
+/// bytes, mutating the per-terminal line buffer, and return any lines this
+/// chunk completed (CR/LF-submitted, non-blank). Heuristic by design:
+/// backspace/DEL pop one char, printable ASCII accumulates, control bytes
+/// and non-ASCII are dropped. Capped at 4 KiB so a pathological no-newline
+/// stream (e.g. a huge paste) can't grow unbounded.
+fn consume_input_bytes(buf: &mut String, data: &[u8]) -> Vec<String> {
+    let mut completed: Vec<String> = Vec::new();
+    for &b in data {
+        match b {
+            // CR or LF — submit the line.
+            0x0D | 0x0A => {
+                if !buf.trim().is_empty() {
+                    completed.push(std::mem::take(buf));
+                } else {
+                    buf.clear();
+                }
+            }
+            // Backspace / DEL — approximate edit handling.
+            0x08 | 0x7F => {
+                buf.pop();
+            }
+            // Printable ASCII (incl. space).
+            0x20..=0x7E => buf.push(b as char),
+            _ => {}
+        }
+    }
+    if buf.len() > 4096 {
+        buf.clear();
+    }
+    completed
+}
+
 /// A single PTY-backed terminal session.
 pub struct TerminalSession {
     /// Unique identifier for this terminal.
@@ -222,16 +256,16 @@ pub struct TerminalSession {
     /// teardown.
     isolated_edit_ctx:
         Arc<Mutex<Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>>>,
-    /// App handle, retained so the input-line warn hook
-    /// ([`Self::observe_input_for_warn`]) can emit the soft
-    /// `terminal-coord-warning` Tauri event off the PTY write path.
+    /// App handle, retained so the typed-input observer
+    /// ([`Self::observe_input`]) can dispatch its effects (coord warning
+    /// event; lifecycle-store registration + bypass event of the typed
+    /// claude resume sniff) off the PTY write path.
     /// `None` only in unit-test fixtures that don't drive a real app.
     app_handle: Option<AppHandle>,
-    /// L3 (shared-checkout coordination gap fix) — accumulates printable
-    /// keystroke bytes between line submits so a completed line can be
-    /// matched against branch-mutating git. Soft heuristic: backspace is
-    /// handled approximately, control sequences are dropped. Drained on
-    /// CR/LF. Cheap to keep on the hot path (a few bytes per keystroke).
+    /// Accumulates printable keystroke bytes between line submits so
+    /// completed lines can be matched by the typed-input consumers (L3
+    /// branch-mutating-git warn; typed claude resume sniff). Drained on
+    /// CR/LF; see [`consume_input_bytes`]. Cheap on the hot path.
     input_line_buf: Arc<Mutex<String>>,
 }
 
@@ -801,72 +835,79 @@ impl TerminalSession {
     }
 
     /// Write data (keystrokes) to the PTY stdin.
+    ///
+    /// This is the SINGLE funnel for terminal input — every write surface
+    /// (Tauri `terminal_write`, HTTP `write_terminal_handler`, the WS input
+    /// loop, transports, backend relay) routes through here, so the
+    /// typed-input observer ([`Self::observe_input`]) covers every present
+    /// and future write path. Observation happens AFTER the bytes hit the
+    /// PTY and the writer lock is released — it never delays keystrokes.
     pub fn write(&self, data: &[u8]) -> Result<(), String> {
-        let mut writer = self
-            .writer
-            .lock()
-            .map_err(|e| format!("Writer lock poisoned: {}", e))?;
-        writer
-            .write_all(data)
-            .map_err(|e| format!("Failed to write to PTY: {}", e))?;
-        writer
-            .flush()
-            .map_err(|e| format!("Failed to flush PTY: {}", e))?;
+        {
+            let mut writer = self
+                .writer
+                .lock()
+                .map_err(|e| format!("Writer lock poisoned: {}", e))?;
+            writer
+                .write_all(data)
+                .map_err(|e| format!("Failed to write to PTY: {}", e))?;
+            writer
+                .flush()
+                .map_err(|e| format!("Failed to flush PTY: {}", e))?;
+        } // writer lock released before observation
+
+        self.observe_input(data);
         Ok(())
     }
 
-    /// L3 (shared-checkout coordination gap fix) — feed raw keystroke
-    /// bytes through the input-line buffer and, on a completed line
-    /// (CR/LF), evaluate it for a branch-mutating git command. If it
-    /// matches, kick off a best-effort coord lookup that emits a soft
-    /// `terminal-coord-warning` event when a PEER holds the worktree
-    /// claim on this session's repo.
+    /// Observe raw typed input bytes — feed them through the per-terminal
+    /// input-line buffer ([`consume_input_bytes`]) and dispatch each
+    /// completed (CR/LF-submitted) line to the typed-input consumers:
     ///
-    /// SOFT + CHEAP: this NEVER blocks, NEVER affects the actual PTY
-    /// write, and only does the (rare) coord lookup once a line that
-    /// matches the branch-mutating regex is submitted. Backspace handling
-    /// is approximate — this is a heuristic warn, not a parser. Called
-    /// from `terminal_write` AFTER the bytes are written to the PTY.
-    pub fn observe_input_for_warn(&self, data: &[u8]) {
+    /// 1. **L3 git-warn**: a branch-mutating git line kicks off a
+    ///    best-effort coord lookup that emits a soft
+    ///    `terminal-coord-warning` event when a PEER holds this repo's
+    ///    worktree claim.
+    /// 2. **Typed claude resume sniff** (#548 Phase 2): a
+    ///    `claude … --resume <id>` / `--session-id <id>` line registers the
+    ///    session in the durable lifecycle store and — for the bypass form —
+    ///    emits the `terminal-bypass-permissions` event, mirroring the
+    ///    spawn-argv sniff in `TerminalManager::create`.
+    ///
+    /// SOFT + CHEAP: never blocks, never affects the PTY write. Called from
+    /// [`Self::write`] AFTER the bytes are written; all effects run on
+    /// detached async tasks.
+    fn observe_input(&self, data: &[u8]) {
         // Collect any completed lines this chunk produced. We hold the
         // buffer lock only for the cheap byte-walk, then release before
-        // spawning the async lookup.
+        // spawning the async effect tasks.
         let mut completed: Vec<String> = Vec::new();
         if let Ok(mut buf) = self.input_line_buf.lock() {
-            for &b in data {
-                match b {
-                    // CR or LF — submit the line.
-                    0x0D | 0x0A => {
-                        if !buf.trim().is_empty() {
-                            completed.push(std::mem::take(&mut *buf));
-                        } else {
-                            buf.clear();
-                        }
-                    }
-                    // Backspace / DEL — approximate edit handling.
-                    0x08 | 0x7F => {
-                        buf.pop();
-                    }
-                    // Printable ASCII (incl. space). Control chars and
-                    // non-ASCII (escape sequences, arrow keys, UTF-8
-                    // multibyte) are dropped — this is a heuristic over
-                    // simple typed commands, not a full line editor.
-                    0x20..=0x7E => buf.push(b as char),
-                    _ => {}
-                }
-            }
-            // Cap the buffer so a pathological no-newline stream can't grow
-            // unbounded (e.g. a paste of a huge blob). 4 KiB is far beyond
-            // any real command line.
-            if buf.len() > 4096 {
-                buf.clear();
-            }
+            completed = consume_input_bytes(&mut buf, data);
+        }
+        if completed.is_empty() {
+            return;
         }
 
         let Some(app_handle) = self.app_handle.clone() else {
             return;
         };
         for line in completed {
+            if let Some(parsed) = super::claude_resume_sniff::parse_typed_claude_resume(&line) {
+                let title = self
+                    .title
+                    .lock()
+                    .map(|g| g.clone())
+                    .unwrap_or_else(|e| e.into_inner().clone());
+                super::claude_resume_sniff::spawn_register_typed_resume(
+                    app_handle.clone(),
+                    self.id.clone(),
+                    self.working_dir.clone(),
+                    self.page_id.clone(),
+                    title,
+                    parsed,
+                );
+            }
             if super::coord_warn::is_branch_mutating_git(&line) {
                 super::coord_warn::spawn_check_and_warn(
                     app_handle.clone(),
@@ -1417,6 +1458,56 @@ mod tests {
         // Idempotent overwrite.
         session.set_title("Worker 1".to_string());
         assert_eq!(session.info().title, "Worker 1");
+    }
+
+    // --- typed-input observer: line assembly + the write() funnel ----------
+
+    #[test]
+    fn consume_input_bytes_assembles_edits_and_caps_lines() {
+        let mut buf = String::new();
+        // Partial chunk — no completed line, buffer accumulates across calls.
+        assert!(consume_input_bytes(&mut buf, b"claude --re").is_empty());
+        assert_eq!(buf, "claude --re");
+        let done = consume_input_bytes(&mut buf, b"sume abc\r");
+        assert_eq!(done, vec!["claude --resume abc".to_string()]);
+        assert!(buf.is_empty());
+        // LF completes too; blank lines are not emitted.
+        assert!(consume_input_bytes(&mut buf, b"   \n").is_empty());
+        // 0x08 backspace and 0x7F DEL both pop the last char.
+        let done = consume_input_bytes(&mut buf, b"claude -x\x08-resume\r");
+        assert_eq!(done, vec!["claude --resume".to_string()]);
+        let done = consume_input_bytes(&mut buf, b"git statuz\x7Fs\r");
+        assert_eq!(done, vec!["git status".to_string()]);
+        // Escape sequences / non-ASCII bytes are dropped, printables kept.
+        let done = consume_input_bytes(&mut buf, b"ls\x1b\x01\xc3\xa9 -la\r");
+        assert_eq!(done, vec!["ls -la".to_string()]);
+        // > 4 KiB with no newline — buffer cleared, not unbounded growth.
+        assert!(consume_input_bytes(&mut buf, &vec![b'a'; 5000]).is_empty());
+        assert!(buf.is_empty(), "over-cap buffer must be cleared");
+        // Still usable afterwards.
+        let done = consume_input_bytes(&mut buf, b"echo hi\r");
+        assert_eq!(done, vec!["echo hi".to_string()]);
+    }
+
+    #[test]
+    fn write_funnels_input_into_the_observer() {
+        // The observation funnel lives in `TerminalSession::write` itself —
+        // ANY caller of write() feeds the input-line buffer, with no
+        // per-caller observe call (the fixture has no app_handle, so effect
+        // dispatch is skipped but line assembly still runs).
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = make_test_session(buf.clone());
+        session.write(b"claude --re").expect("write failed");
+        assert_eq!(
+            session.input_line_buf.lock().unwrap().as_str(),
+            "claude --re",
+            "write() must feed the typed-input observer"
+        );
+        // Completing the line drains the buffer (the line was dispatched)...
+        session.write(b"sume\r").expect("write failed");
+        assert!(session.input_line_buf.lock().unwrap().is_empty());
+        // ...and the PTY itself still received every byte, unchanged.
+        assert_eq!(buf.lock().unwrap().as_slice(), b"claude --resume\r");
     }
 
     #[test]
