@@ -80,6 +80,69 @@ runner-direct path with an IPC handler.
 (`sdk_manifest_routes_are_exposed_by_runner`) must be updated to allow-list
 the route, otherwise it will fail.
 
+### Runner relay (relay-tab protocol)
+Handler lives in `mcp/ui_bridge/relay.rs` and answers from the in-process
+`RelayRegistry` (`ApiState.ui_bridge_relay`) — **no IPC to the runner's own
+webview and no SDK forward**. This is the runner-hosted implementation of the
+web-relay wire contract that the SDK relay client
+(`ui-bridge/packages/ui-bridge/src/relay/relay-client.ts`) and the injected
+transport (`ui-bridge-inject` CLI) speak, so a temp runner can host injected
+tabs without the prod relay + Cognito dependency (plan
+`2026-06-12-co-pilot-automation-ui-bridge-remediation.md` item 6a).
+
+Routes (all under the `/ui-bridge` base the inject CLI is pointed at via
+`--relay http://127.0.0.1:<port>/ui-bridge`):
+
+- `GET /ui-bridge/commands/stream?tabId=` — SSE command delivery. First event
+  `{"type":"connected","tabId":…}`, then command frames
+  `{commandId, action, payload, timestamp}`; `: heartbeat` comments every 15s.
+- `POST /ui-bridge/commands` — result ingestion
+  (`{commandId, success, result, tabId, error?}`). Registered in
+  `mod.rs::routes()` chained onto the pre-existing GET (invoke-proxy listing);
+  its manifest entry therefore lives in `mod.rs::local_route_entries()`, not
+  `relay.rs::route_entries()`.
+- `POST /ui-bridge/heartbeat` — registry upsert. **Lenient**, unlike the
+  strict web relay: only `tabId` is required; `registrationMetadata`
+  (`{userId, sessionId}`) is stored when present. Response carries
+  `data.tabRegistered` (live SSE listener present) — the client's
+  silent-drop recovery signal.
+- `GET /ui-bridge/tabs` — registry listing,
+  `{success, data:{tabs:[{tabId, connected, isPrimary, lastHeartbeat, …}]}}`;
+  this is what `ui-bridge-headless`'s `waitForUiBridgeRegistration` polls.
+  Stale tabs (no listener + no sign of life for 60s) are evicted lazily.
+- `POST /ui-bridge/relay/dispatch` — runner-side command entry point
+  (`{tabId?, action, payload?, timeoutMs?}`): queues a frame onto the tab's
+  SSE stream and awaits its result POST. With no `tabId` it targets the sole
+  connected tab; errors are structured envelopes — `NO_TAB_CONNECTED` 503,
+  `AMBIGUOUS_TAB` 409, `TAB_NOT_FOUND` 404, `TAB_DISCONNECTED` 502,
+  `TIMEOUT` 504. A pinned dispatch NEVER falls through to another tab (the
+  shared-cache silent-fallback bug class from item 1 of the plan).
+
+These are relay ADAPTER routes: the SDK serves them from its nextjs/express
+adapters, NOT from `UI_BRIDGE_ROUTES`, so `/tabs`, `/commands/stream`,
+`POST /commands`, and `/relay/dispatch` sit in the `runner_only_baseline`
+allow-list of `sdk_manifest_routes_are_exposed_by_runner`. `POST /heartbeat`
+IS in `UI_BRIDGE_ROUTES` and stays in the bidirectional diff.
+
+**Manual verification recipe** (temp runner + inject CLI):
+
+```bash
+# 1. Spawn a temp runner via the supervisor (port 9875), note its port <P>.
+#    The build must include relay.rs — supervisor LKG predating this family
+#    404s on /ui-bridge/tabs.
+# 2. Register an injected tab against it (no auth needed on loopback):
+node ui-bridge/packages/ui-bridge-wrapper/dist/inject-cli.cjs \
+  --url https://example.com --headless \
+  --relay http://127.0.0.1:<P>/ui-bridge
+# 3. Confirm registration (the CLI itself polls this and prints the tabId):
+curl http://127.0.0.1:<P>/ui-bridge/tabs   # data.tabs[0].tabId, connected:true
+# 4. Drive it:
+curl -X POST http://127.0.0.1:<P>/ui-bridge/relay/dispatch \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"discover","payload":{}}'
+# 5. Stop the temp runner via the supervisor when done.
+```
+
 ## When adding a new endpoint
 
 1. Add the route to `UI_BRIDGE_ROUTES` in

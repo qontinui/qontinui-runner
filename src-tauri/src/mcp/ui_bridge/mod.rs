@@ -35,6 +35,7 @@ pub mod misc;
 pub mod network;
 pub mod page;
 pub mod recovery_executor;
+pub mod relay;
 pub mod request;
 pub mod routing;
 pub mod screenshots;
@@ -357,6 +358,7 @@ pub(super) fn route_manifest() -> &'static [(&'static str, &'static str)] {
         all.extend_from_slice(misc::route_entries());
         all.extend_from_slice(network::route_entries());
         all.extend_from_slice(page::route_entries());
+        all.extend_from_slice(relay::route_entries());
         all.extend_from_slice(screenshots::route_entries());
         all.extend_from_slice(sdk_spec_sync::route_entries());
         all.extend_from_slice(state_machine::route_entries());
@@ -376,6 +378,9 @@ fn local_route_entries() -> &'static [(&'static str, &'static str)] {
     &[
         // Phase 3I.1 + 3I.2 — UI Bridge invoke proxy
         ("GET", "/ui-bridge/commands"),
+        // Relay-tab result ingestion (web-relay wire contract — see relay.rs;
+        // shares the path with the GET invoke-proxy listing above).
+        ("POST", "/ui-bridge/commands"),
         ("POST", "/ui-bridge/invoke/{command_name}"),
     ]
 }
@@ -433,6 +438,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .merge(misc::routes())
         .merge(network::routes())
         .merge(page::routes())
+        .merge(relay::routes())
         .merge(screenshots::routes())
         .merge(sdk_spec_sync::routes())
         .merge(state_machine::routes())
@@ -443,10 +449,15 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .merge(vision_routes::routes())
         // Tier 2.1 — safelisted Tauri command proxy
         .merge(crate::mcp::tauri_proxy::routes())
-        // Phase 3I.1 + 3I.2 — UI Bridge invoke proxy (HTTP → Tauri invoke round-trip)
+        // Phase 3I.1 + 3I.2 — UI Bridge invoke proxy (HTTP → Tauri invoke
+        // round-trip) on GET; POST is the relay-tab result ingestion leg of
+        // the web-relay wire contract (`relay.rs`) — the SDK relay client
+        // POSTs `{commandId, success, result, tabId}` to `{basePath}/commands`,
+        // so the two families share this path.
         .route(
             "/ui-bridge/commands",
-            get(crate::mcp::ui_bridge_invoke_handlers::ui_bridge_commands_handler),
+            get(crate::mcp::ui_bridge_invoke_handlers::ui_bridge_commands_handler)
+                .post(relay::ui_bridge_relay_command_result_handler),
         )
         .route(
             "/ui-bridge/invoke/{command_name}",
@@ -716,6 +727,15 @@ mod manifest_drift_tests {
             ("POST", "/ui-bridge/invoke/{}"),
             ("POST", "/ui-bridge/pong"),
             ("POST", "/ui-bridge/ipc-response"),
+            // Relay-tab protocol (plan 2026-06-12-co-pilot-automation item 6a).
+            // These are relay ADAPTER routes — the SDK serves them from its
+            // nextjs/express adapters, not from UI_BRIDGE_ROUTES, so they are
+            // runner-only from the contract diff's point of view. (POST
+            // /heartbeat IS in UI_BRIDGE_ROUTES and stays out of this list.)
+            ("GET", "/ui-bridge/tabs"),
+            ("GET", "/ui-bridge/commands/stream"),
+            ("POST", "/ui-bridge/commands"),
+            ("POST", "/ui-bridge/relay/dispatch"),
             // NOTE: vision/* routes are intentionally NOT in any baseline.
             // ui-bridge@^0.8.0 SDK declares all 13 vision routes AND main's
             // #134/#135/#136 (vision-pipeline Phase 3.3/4/6.3) exposes them
