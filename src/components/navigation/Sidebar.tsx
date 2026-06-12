@@ -823,7 +823,7 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
         if (parsed) {
           return {
             activeItemId: activeTab,
-            expandedGroups: parsed.expandedGroups ?? new Set(["run", "system"]),
+            expandedGroups: parsed.expandedGroups ?? new Set(["workspace", "review", "system"]),
             expandedItems: parsed.expandedItems ?? new Set(),
             secondarySidebar: { isOpen: false, parentId: null, items: [] },
             isCollapsed: collapsed,
