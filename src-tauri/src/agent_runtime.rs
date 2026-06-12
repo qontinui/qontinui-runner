@@ -1770,6 +1770,15 @@ fn pick_continuation_page(
 /// Build the gate-continuation `claude` spawn argv. Pure for unit-testing:
 /// every flag — including the pre-pinned `--session-id` — MUST precede the
 /// trailing positional prompt arg, or the CLI eats it as prompt text.
+///
+/// `add_dir_args` must be ATTACHED-form `--add-dir=<path>` tokens (what
+/// [`crate::agent_worktree::isolated_edit::claude_add_dir_args`] emits).
+/// The space-separated pair form is FORBIDDEN here: `--add-dir` is variadic
+/// (`<directories...>`), so in pair form the dir list would consume the
+/// trailing positional prompt as a bogus extra directory and the spawned
+/// session would idle at an empty REPL — the 2026-06-12 multi-repo
+/// gate-continuation incident (single-repo continuations were immune only
+/// because their `add_dir_args` is empty).
 fn build_continuation_claude_command(
     claude_bin: String,
     pinned_session_id: &str,
@@ -1869,7 +1878,8 @@ async fn run_continuation_terminal(
     // permission prompts — an unattended gate continuation has no operator to
     // answer them.
     let claude_bin = claude_bin_path();
-    // Phase 2c — `--add-dir <sibling>` for each non-cwd worktree of this
+    // Phase 2c — `--add-dir=<sibling>` (attached form — see the
+    // build_continuation_claude_command doc) for each non-cwd worktree of this
     // continuation's context so the launched `claude` can edit sibling repos
     // that materialized on disk but aren't the process cwd. Flags MUST precede
     // the trailing positional prompt arg. Empty for single-repo continuations.
@@ -2838,19 +2848,47 @@ mod tests {
 
     /// The pinned `--session-id <uuid>` pair sits among the flags, BEFORE the
     /// trailing positional prompt (the CLI treats everything after the flags
-    /// as prompt text), with `--add-dir` siblings preserved in between.
+    /// as prompt text), with attached-form `--add-dir=` siblings preserved
+    /// in between.
     #[test]
     fn continuation_command_pins_session_id_before_positional_prompt() {
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",
-            vec!["--add-dir".to_string(), "D:/wt/sibling".to_string()],
+            vec!["--add-dir=D:/wt/sibling".to_string()],
             "do the thing".to_string(),
         );
         assert_eq!(
             cmd.join("|"),
             "claude|--dangerously-skip-permissions|--session-id|abc-123|\
-             --add-dir|D:/wt/sibling|do the thing"
+             --add-dir=D:/wt/sibling|do the thing"
+        );
+    }
+
+    /// Regression for the 2026-06-12 multi-repo gate-continuation incident:
+    /// the variadic `--add-dir <directories...>` (space form) swallows the
+    /// trailing positional prompt as a bogus extra directory, so the argv
+    /// must carry attached-form `--add-dir=` tokens only, with the prompt
+    /// as the final element.
+    #[test]
+    fn continuation_command_add_dir_attached_form_keeps_prompt_positional() {
+        let cmd = build_continuation_claude_command(
+            "claude".to_string(),
+            "abc-123",
+            vec![
+                "--add-dir=D:/wt/coord".to_string(),
+                "--add-dir=D:/wt/web".to_string(),
+            ],
+            "run /implement-plan plans/x.md".to_string(),
+        );
+        assert_eq!(
+            cmd.last().map(String::as_str),
+            Some("run /implement-plan plans/x.md"),
+            "prompt must be the trailing positional"
+        );
+        assert!(
+            !cmd.iter().any(|a| a == "--add-dir"),
+            "bare variadic --add-dir must never appear in the spawn argv: {cmd:?}"
         );
     }
 

@@ -364,8 +364,7 @@ mod tests {
         assert!(command_implies_bypass_permissions(&argv(&[
             "claude",
             "--dangerously-skip-permissions",
-            "--add-dir",
-            "/some/worktree",
+            "--add-dir=/some/worktree",
             "run /implement-plan",
         ])));
     }
