@@ -19,7 +19,6 @@ import {
   claimInitForPage,
   buildResumeCmd,
   runVerifiedResume,
-  buildResumeCmd,
 } from "./useTerminalInitialization";
 import type { TerminalSessionRecord } from "./types";
 
