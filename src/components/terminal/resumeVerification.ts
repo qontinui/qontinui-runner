@@ -17,8 +17,65 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import { instanceStorage } from "@/lib/instance-storage";
 import type { CommandResponse } from "./types";
 import { writeWhenReady, type TerminalRefsMap } from "./writeWhenReady";
+
+// ---------------------------------------------------------------------------
+// "Resume from summary?" picker policy (#548 item 3)
+// ---------------------------------------------------------------------------
+
+/**
+ * What an unattended resume should do when the Claude CLI offers the
+ * resume-size picker for a large session:
+ *
+ * - `"full"` (DEFAULT): resume the full conversation as-is. Context loss is
+ *   silent and unrecoverable; token cost is visible and the operator can
+ *   `/compact` afterwards. NEVER default to "summary".
+ * - `"summary"`: opt-in for cost-sensitive setups — accept the CLI's
+ *   "Resume from summary (recommended)" option.
+ *
+ * Stored under the instance-scoped `resume-summary-policy` key (Settings →
+ * Advanced). Any value other than the literal `"summary"` resolves to
+ * `"full"`.
+ */
+export type ResumeSummaryPolicy = "full" | "summary";
+
+export function getResumeSummaryPolicy(): ResumeSummaryPolicy {
+  try {
+    return instanceStorage.getItem("resume-summary-policy") === "summary" ? "summary" : "full";
+  } catch {
+    return "full";
+  }
+}
+
+/**
+ * Picker frames from Claude Code's resume-size prompt (verified against the
+ * v2.1.175 CLI bundle: options are "Resume from summary (recommended)",
+ * "Resume full session as-is", "Don't ask me again"). Matched against
+ * ANSI-stripped text.
+ */
+const RESUME_PICKER_PATTERNS: RegExp[] = [
+  /Resume from summary/i,
+  /Resume full session as-is/i,
+];
+
+/** True when the pane is showing the CLI's resume-size picker. */
+export function detectResumePicker(text: string): boolean {
+  const stripped = stripAnsi(text);
+  return RESUME_PICKER_PATTERNS.some((p) => p.test(stripped));
+}
+
+/**
+ * Keystrokes that answer the picker for a policy. The CLI's select lists
+ * accept number-key selection; option order in v2.1.175 is
+ * 1) summary (recommended), 2) full as-is, 3) don't ask again. The trailing
+ * Enter is harmless if the digit already submitted (it lands on the now-open
+ * Claude input as an empty submit).
+ */
+export function buildPickerAnswer(policy: ResumeSummaryPolicy): string {
+  return policy === "summary" ? "1\r" : "2\r";
+}
 
 /** Strip ANSI escape sequences so patterns match rendered text. */
 export function stripAnsi(text: string): string {
@@ -121,12 +178,25 @@ export interface TypeAndVerifyOptions extends HandshakeWaitOptions {
   settleMs?: number;
   /** Injectable writer (tests); defaults to {@link writeWhenReady}. */
   write?: (refs: TerminalRefsMap, tabId: string, text: string) => void;
+  /**
+   * Keystrokes to type (at most ONCE per call) when a probe shows the CLI's
+   * "Resume from summary?" picker — see {@link buildPickerAnswer}. This is
+   * the FALLBACK answerer: the typed resume command already suppresses the
+   * picker via env thresholds under the default full-resume policy (see
+   * `buildResumeCmd`), so this only fires on CLI version drift or under the
+   * opt-in "summary" policy. Omit to disable.
+   */
+  pickerAnswer?: string;
 }
 
 /**
  * Type `resumeCmd` into the tab and verify the Claude UI handshake within the
  * timeout; on failure retype the SAME command once and verify again. Resolves
  * `"verified"` on handshake, `"failed"` after all attempts are exhausted.
+ *
+ * When `pickerAnswer` is set and a probe shows the resume-size picker, the
+ * answer is typed once so an unattended resume can't wedge on it. The picker
+ * is itself Claude UI, so the same probe also verifies the handshake.
  */
 export async function typeResumeAndVerify(
   terminalRefs: TerminalRefsMap,
@@ -134,7 +204,22 @@ export async function typeResumeAndVerify(
   resumeCmd: string,
   options: TypeAndVerifyOptions = {},
 ): Promise<"verified" | "failed"> {
-  const { attempts = 2, settleMs = 500, write = writeWhenReady, ...waitOpts } = options;
+  const {
+    attempts = 2,
+    settleMs = 500,
+    write = writeWhenReady,
+    pickerAnswer,
+    onProbe,
+    ...waitOpts
+  } = options;
+  let pickerAnswered = false;
+  const probe = (tail: string) => {
+    onProbe?.(tail);
+    if (pickerAnswer && !pickerAnswered && detectResumePicker(tail)) {
+      pickerAnswered = true;
+      write(terminalRefs, tabId, pickerAnswer);
+    }
+  };
   for (let attempt = 1; attempt <= attempts; attempt++) {
     if (attempt > 1) {
       // Clear any half-typed line from the failed attempt, then retype.
@@ -143,7 +228,7 @@ export async function typeResumeAndVerify(
     }
     write(terminalRefs, tabId, resumeCmd);
     await new Promise((r) => setTimeout(r, settleMs));
-    const outcome = await waitForClaudeHandshake(tabId, waitOpts);
+    const outcome = await waitForClaudeHandshake(tabId, { ...waitOpts, onProbe: probe });
     if (outcome === "verified") return "verified";
     console.warn(
       `[resumeVerification] handshake not observed for ${tabId} (attempt ${attempt}/${attempts})`,

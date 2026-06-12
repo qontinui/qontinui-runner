@@ -160,26 +160,6 @@ describe("claimInitForPage (once-per-pageId guard)", () => {
   });
 });
 
-describe("buildResumeCmd (boot-restore resume command)", () => {
-  it("resumes autonomously — bypassPermissions so an unattended restore never stalls on a permission prompt", () => {
-    const cmd = buildResumeCmd("abc-123", undefined);
-    expect(cmd).toBe("claude --permission-mode bypassPermissions --resume abc-123\r");
-  });
-
-  it("prefixes CLAUDE_CONFIG_DIR while keeping the bypass form", () => {
-    vi.stubGlobal("navigator", { platform: "Win32" });
-    try {
-      const cmd = buildResumeCmd("abc-123", "C:\\claude\\.claude-hotmail");
-      expect(cmd).toBe(
-        '$env:CLAUDE_CONFIG_DIR="C:\\claude\\.claude-hotmail"; ' +
-          "claude --permission-mode bypassPermissions --resume abc-123\r",
-      );
-    } finally {
-      vi.unstubAllGlobals();
-    }
-  });
-});
-
 // Phase 3 (#548) — verified-resume state machine: the restore drain (and the
 // operator retry) must only clear the durable restore-pending marker on a
 // VERIFIED Claude UI handshake; a failed resume parks the tab in an explicit
@@ -255,5 +235,39 @@ describe("runVerifiedResume", () => {
       "terminal_session_clear_restore_pending",
       expect.anything(),
     );
+  });
+});
+
+// #548 item 3 — the typed resume must suppress the CLI's "Resume from
+// summary?" picker under the default full-resume policy (env thresholds; no
+// CLI flag / settings key short of the global "Don't ask again" exists), and
+// must leave it answerable under the opt-in summary policy.
+describe("buildResumeCmd (resume-size picker policy)", () => {
+  it("default 'full' policy raises both resume thresholds so the picker never shows", () => {
+    const cmd = buildResumeCmd("sess-1", undefined, "full");
+    expect(cmd).toContain('CLAUDE_CODE_RESUME_TOKEN_THRESHOLD="999999999"');
+    expect(cmd).toContain('CLAUDE_CODE_RESUME_THRESHOLD_MINUTES="999999999"');
+    expect(cmd).toContain("--resume sess-1\r");
+  });
+
+  it("'summary' policy leaves the thresholds alone (picker shows; the loop answers it)", () => {
+    const cmd = buildResumeCmd("sess-1", undefined, "summary");
+    expect(cmd).not.toContain("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD");
+    expect(cmd).toBe("claude --permission-mode bypassPermissions --resume sess-1\r");
+  });
+
+  it("keeps the CLAUDE_CONFIG_DIR prefix alongside the threshold vars", () => {
+    const cmd = buildResumeCmd("sess-1", "C:/claude/.claude-hotmail", "full");
+    expect(cmd).toContain('CLAUDE_CONFIG_DIR="C:/claude/.claude-hotmail"');
+    expect(cmd).toContain("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD");
+    expect(cmd).toContain("--resume sess-1\r");
+  });
+
+  it("resumes autonomously — bypassPermissions so an unattended restore never stalls on a permission prompt (#547 union)", () => {
+    for (const policy of ["full", "summary"] as const) {
+      expect(buildResumeCmd("abc-123", undefined, policy)).toContain(
+        "claude --permission-mode bypassPermissions --resume abc-123",
+      );
+    }
   });
 });

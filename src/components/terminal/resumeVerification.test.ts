@@ -18,6 +18,8 @@ vi.mock("@tauri-apps/api/core", () => ({
 import {
   stripAnsi,
   detectClaudeHandshake,
+  detectResumePicker,
+  buildPickerAnswer,
   waitForClaudeHandshake,
   typeResumeAndVerify,
 } from "./resumeVerification";
@@ -60,6 +62,27 @@ describe("detectClaudeHandshake", () => {
       "╭──────────────────────────────╮\n" +
       "  Resume from summary (recommended)\n  Resume full session as-is\n  Don't ask me again";
     expect(detectClaudeHandshake(picker)).toBe(true);
+  });
+});
+
+describe("detectResumePicker / buildPickerAnswer", () => {
+  const PICKER =
+    "  Resume from summary (recommended)\n  Resume full session as-is\n  Don't ask me again";
+
+  it("recognizes the CLI's resume-size picker (ANSI-wrapped too)", () => {
+    expect(detectResumePicker(PICKER)).toBe(true);
+    expect(detectResumePicker(`\x1b[36m${PICKER}\x1b[0m`)).toBe(true);
+  });
+
+  it("does NOT match ordinary Claude UI or shell output", () => {
+    expect(detectResumePicker(CLAUDE_UI)).toBe(false);
+    expect(detectResumePicker(PLAIN_SHELL)).toBe(false);
+    expect(detectResumePicker("")).toBe(false);
+  });
+
+  it("answers option 2 (full as-is) for the default policy and 1 for summary", () => {
+    expect(buildPickerAnswer("full")).toBe("2\r");
+    expect(buildPickerAnswer("summary")).toBe("1\r");
   });
 });
 
@@ -132,6 +155,39 @@ describe("typeResumeAndVerify (retry-once state machine)", () => {
     expect(out).toBe("verified");
     // attempt 1: CMD; attempt 2: ESC (clear any half-typed line) + CMD.
     expect(writes).toEqual([CMD, "\x1b", CMD]);
+  });
+
+  it("answers the resume-size picker at most ONCE when pickerAnswer is set", async () => {
+    const PICKER =
+      "╭──────────────╮\n  ❯ Resume from summary (recommended)\n    Resume full session as-is\n    Don't ask me again";
+    const writes: string[] = [];
+    const write = (_refs: never, _tab: string, text: string) => void writes.push(text);
+    const out = await typeResumeAndVerify(new Map() as never, "tab-1", CMD, {
+      write: write as never,
+      settleMs: 1,
+      timeoutMs: 50,
+      intervalMs: 1,
+      pickerAnswer: "2\r",
+      readTail: async () => PICKER,
+    });
+    // The picker IS Claude UI — the resume landed, so this verifies...
+    expect(out).toBe("verified");
+    // ...and the configured answer was typed exactly once.
+    expect(writes.filter((w) => w === "2\r")).toHaveLength(1);
+  });
+
+  it("never types a picker answer when the picker is absent", async () => {
+    const writes: string[] = [];
+    const write = (_refs: never, _tab: string, text: string) => void writes.push(text);
+    await typeResumeAndVerify(new Map() as never, "tab-1", CMD, {
+      write: write as never,
+      settleMs: 1,
+      timeoutMs: 50,
+      intervalMs: 1,
+      pickerAnswer: "2\r",
+      readTail: async () => CLAUDE_UI,
+    });
+    expect(writes).not.toContain("2\r");
   });
 
   it("fails after the retry is exhausted and never falsely verifies", async () => {
