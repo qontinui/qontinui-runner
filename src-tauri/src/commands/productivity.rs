@@ -849,7 +849,7 @@ fn next_worker_title(manager: &TerminalManager) -> String {
     format!("Worker {}", max_n + 1)
 }
 
-/// Phase 2c — splice `--add-dir <sibling>` flags into a `claude` command
+/// Phase 2c — splice `--add-dir=<sibling>` flags into a `claude` command
 /// line built for the interactive shell (the worker/coordinator launch
 /// strings). The flags MUST land BEFORE any trailing positional prompt arg
 /// (claude treats the last positional as the prompt), so they are inserted
@@ -857,22 +857,33 @@ fn next_worker_title(manager: &TerminalManager) -> String {
 /// builders emit. When that anchor is absent (defensive) or there are no
 /// sibling dirs, the command is returned unchanged.
 ///
+/// ATTACHED (`=`) form is load-bearing here, not cosmetic: the CLI's
+/// `--add-dir <directories...>` is variadic, so the space form would
+/// consume the coordinator builder's trailing positional prompt
+/// (`(Get-Content -Raw '…')` expands to it) as a bogus extra directory —
+/// the same swallow as the 2026-06-12 gate-continuation incident.
+///
 /// Each path is single-quoted PowerShell-style (with `'` doubled) so paths
-/// with spaces survive the shell — matching the coordinator builder's own
-/// quoting of the prompt-file path.
+/// with spaces survive the shell — PowerShell concatenates the bare
+/// `--add-dir=` prefix with the adjacent quoted segment into one argv
+/// element. Matches the coordinator builder's own quoting of the
+/// prompt-file path.
 fn append_claude_add_dir(command: String, add_dir_args: &[String]) -> String {
     if add_dir_args.is_empty() {
         return command;
     }
-    // `add_dir_args` is a flat [--add-dir, <path>, --add-dir, <path>, …]
-    // vec (from `claude_add_dir_args`). Re-quote each path value.
+    // `add_dir_args` is a flat [--add-dir=<path>, …] vec of attached-form
+    // tokens (from `claude_add_dir_args`). Re-quote each path value.
     let mut rendered = String::new();
-    let mut it = add_dir_args.iter();
-    while let (Some(flag), Some(path)) = (it.next(), it.next()) {
+    for arg in add_dir_args {
+        let Some((flag, path)) = arg.split_once('=') else {
+            // Defensive: never emit a bare variadic flag into the line.
+            continue;
+        };
         let quoted = path.replace('\'', "''");
         rendered.push(' ');
         rendered.push_str(flag);
-        rendered.push_str(" '");
+        rendered.push_str("='");
         rendered.push_str(&quoted);
         rendered.push('\'');
     }
@@ -2215,15 +2226,16 @@ mod launch_intent_tests {
     #[test]
     fn append_add_dir_inserts_after_skip_permissions_flag() {
         // Coordinator-shape command: a trailing positional prompt arg
-        // (`(Get-Content ...)`) must stay LAST — the --add-dir flags land
-        // immediately after `--dangerously-skip-permissions`.
+        // (`(Get-Content ...)`) must stay LAST — the --add-dir= flags land
+        // immediately after `--dangerously-skip-permissions`, in attached
+        // form so the variadic CLI flag cannot swallow the prompt.
         let cmd =
             "claude --dangerously-skip-permissions (Get-Content -Raw 'C:\\tmp\\p.md')".to_string();
-        let args = vec!["--add-dir".to_string(), "/abs/qontinui-coord".to_string()];
+        let args = vec!["--add-dir=/abs/qontinui-coord".to_string()];
         let out = append_claude_add_dir(cmd, &args);
         assert_eq!(
             out,
-            "claude --dangerously-skip-permissions --add-dir '/abs/qontinui-coord' \
+            "claude --dangerously-skip-permissions --add-dir='/abs/qontinui-coord' \
              (Get-Content -Raw 'C:\\tmp\\p.md')"
         );
     }
@@ -2232,28 +2244,39 @@ mod launch_intent_tests {
     fn append_add_dir_handles_multiple_siblings() {
         let cmd = "claude --dangerously-skip-permissions".to_string();
         let args = vec![
-            "--add-dir".to_string(),
-            "/abs/repo-a".to_string(),
-            "--add-dir".to_string(),
-            "/abs/repo-b".to_string(),
+            "--add-dir=/abs/repo-a".to_string(),
+            "--add-dir=/abs/repo-b".to_string(),
         ];
         let out = append_claude_add_dir(cmd, &args);
         assert_eq!(
             out,
-            "claude --dangerously-skip-permissions --add-dir '/abs/repo-a' --add-dir '/abs/repo-b'"
+            "claude --dangerously-skip-permissions --add-dir='/abs/repo-a' --add-dir='/abs/repo-b'"
         );
     }
 
     #[test]
     fn append_add_dir_quotes_paths_with_spaces_and_quotes() {
         let cmd = "claude --dangerously-skip-permissions".to_string();
-        let args = vec!["--add-dir".to_string(), "/has space/o'brien".to_string()];
+        let args = vec!["--add-dir=/has space/o'brien".to_string()];
         let out = append_claude_add_dir(cmd, &args);
         // Single-quoted, with the embedded `'` doubled (PowerShell escape).
+        // PS concatenates the bare `--add-dir=` prefix with the adjacent
+        // quoted segment into ONE argv element for the claude process.
         assert_eq!(
             out,
-            "claude --dangerously-skip-permissions --add-dir '/has space/o''brien'"
+            "claude --dangerously-skip-permissions --add-dir='/has space/o''brien'"
         );
+    }
+
+    #[test]
+    fn append_add_dir_skips_malformed_bare_flag_tokens() {
+        // Defensive: a bare variadic `--add-dir` token (the pre-fix pair
+        // form) must never be spliced into the line — it would swallow the
+        // coordinator's trailing positional prompt.
+        let cmd = "claude --dangerously-skip-permissions".to_string();
+        let args = vec!["--add-dir".to_string(), "/abs/repo-a".to_string()];
+        let out = append_claude_add_dir(cmd.clone(), &args);
+        assert_eq!(out, cmd, "pair-form tokens are dropped, command unchanged");
     }
 
     #[test]

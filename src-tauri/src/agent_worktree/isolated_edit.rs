@@ -539,24 +539,28 @@ pub fn session_worktrees_env_value(worktrees: &[MaterializedWorktree]) -> Option
     Some(joined)
 }
 
-/// Build the `--add-dir <path>` argument pairs for the SIBLING worktrees of
+/// Build the `--add-dir=<path>` arguments for the SIBLING worktrees of
 /// a launch — every worktree except the first (the first is the process
 /// cwd, which `claude` already roots at, so it needs no `--add-dir`). Used
 /// to append to a `claude` command so a multi-repo session can edit the
 /// non-cwd repos too. Returns an empty vec for single-repo (or empty)
 /// launches.
 ///
+/// ATTACHED (`=`) form, one self-contained token per sibling — NEVER the
+/// space-separated pair. The CLI's `--add-dir <directories...>` is VARIADIC:
+/// in space form it consumes every following non-flag arg up to the next
+/// flag, including a trailing positional prompt — which it then swallows as
+/// a bogus extra "directory", leaving the spawned session idle at an empty
+/// REPL (the 2026-06-12 multi-repo gate-continuation incident). The `=` form
+/// binds exactly one value (live-verified against the CLI: the directory
+/// registers AND a trailing prompt still parses).
+///
 /// Order matches `worktrees[1..]` so the resulting args are deterministic.
 pub fn claude_add_dir_args(worktrees: &[MaterializedWorktree]) -> Vec<String> {
     worktrees
         .iter()
         .skip(1)
-        .flat_map(|w| {
-            [
-                "--add-dir".to_string(),
-                w.worktree_path.display().to_string(),
-            ]
-        })
+        .map(|w| format!("--add-dir={}", w.worktree_path.display()))
         .collect()
 }
 
@@ -979,8 +983,8 @@ mod tests {
 
     #[test]
     fn claude_add_dir_args_skips_the_first_worktree() {
-        // `--add-dir` is appended once per SIBLING (worktrees[1..]); the first
-        // worktree is the process cwd and needs no `--add-dir`.
+        // `--add-dir=` is appended once per SIBLING (worktrees[1..]); the
+        // first worktree is the process cwd and needs no `--add-dir`.
         let (wa, _ca) = repo_fixture("qontinui-runner");
         let (wb, _cb) = repo_fixture("qontinui-coord");
         let worktrees = vec![wa, wb];
@@ -993,9 +997,27 @@ mod tests {
             .to_string();
         assert_eq!(
             args,
-            vec!["--add-dir".to_string(), coord_path],
-            "exactly one --add-dir pair, for the sibling (non-cwd) repo"
+            vec![format!("--add-dir={coord_path}")],
+            "exactly one --add-dir= token, for the sibling (non-cwd) repo"
         );
+    }
+
+    #[test]
+    fn claude_add_dir_args_are_attached_form_never_variadic_pairs() {
+        // The space-separated pair form is FORBIDDEN: the CLI's variadic
+        // `--add-dir <directories...>` swallows a trailing positional prompt
+        // (2026-06-12 gate-continuation incident). Every emitted arg must be
+        // a self-contained `--add-dir=<path>` token.
+        let (wa, _ca) = repo_fixture("qontinui-runner");
+        let (wb, _cb) = repo_fixture("qontinui-coord");
+        let (wc, _cc) = repo_fixture("qontinui-web");
+
+        for arg in claude_add_dir_args(&[wa, wb, wc]) {
+            assert!(
+                arg.starts_with("--add-dir=") && arg.len() > "--add-dir=".len(),
+                "arg {arg:?} must be attached-form --add-dir=<path>"
+            );
+        }
     }
 
     #[test]
