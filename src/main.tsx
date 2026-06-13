@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { setDevelopmentMode } from "@qontinui/navigation";
 import { ProductModeProvider } from "./contexts/ProductModeContext";
+import { AdvancedAutomationProvider } from "./contexts/AdvancedAutomationContext";
 import App from "./App";
 import ErrorBoundary from "./ErrorBoundary";
 import { setScriptEmitter, TauriScriptEmitter } from "./lib/step-output-handlers/script-emitter";
@@ -52,7 +53,9 @@ if (!rootElement) {
     <QueryClientProvider client={queryClient}>
       <ErrorBoundary>
         <ProductModeProvider>
-          <App />
+          <AdvancedAutomationProvider>
+            <App />
+          </AdvancedAutomationProvider>
         </ProductModeProvider>
       </ErrorBoundary>
     </QueryClientProvider>
