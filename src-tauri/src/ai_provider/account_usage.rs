@@ -168,6 +168,73 @@ fn pick_from<'a>(
         .map(|d| (*d).clone())
 }
 
+/// Pick the account a token-exhausted session should MIGRATE to: the best
+/// `(exhausted, headroom)`-ranked account among the configured dirs,
+/// excluding the exhausted source dir.
+///
+/// Unlike [`pick_best_account`] (spawn-time selection, which must always pin
+/// *something*), migration is optional work — moving a session onto another
+/// exhausted or cooldown'd account gains nothing, so this returns `None`
+/// instead of a least-bad fallback. Does NOT touch the global resolved dir;
+/// the caller pins the choice per-spawn via `CLAUDE_CONFIG_DIR`.
+///
+/// Also unlike [`pick_best_account`], this is NOT gated on
+/// `account_selection_mode == LeastUsage`: the migration feature has its own
+/// settings switch (`claude_cli.auto_migrate_on_token_exhaustion`), and a
+/// Manual-mode operator who triggers a manual migration still wants a target.
+pub fn pick_migration_target(exclude_dir: &str) -> Option<String> {
+    let config_dirs: Vec<String> = settings::get_claude_config_dirs()
+        .into_iter()
+        .filter(|d| d != exclude_dir)
+        .collect();
+
+    pick_target_from(
+        &config_dirs,
+        |d| super::oauth_refresh::has_valid_credentials(d),
+        |d| super::config::is_account_cooled_down(d),
+        |d| super::config::usage_rank(d),
+        |d| super::config::account_known_exhausted(d),
+    )
+}
+
+/// Pure core of [`pick_migration_target`], parameterised like [`pick_from`]
+/// so it can be unit-tested without the settings/state singletons. Requires
+/// the chosen dir to have live credentials, be out of cooldown, and not be
+/// known-exhausted; ranks the survivors with a fresh usage sample by
+/// headroom ascending (lowest used-vs-expected delta wins), excluding
+/// fresh-sample-exhausted dirs the staleness-tolerant `known_exhausted`
+/// filter missed.
+fn pick_target_from<'a>(
+    config_dirs: &'a [String],
+    has_valid_creds: impl Fn(&str) -> bool,
+    is_cooled: impl Fn(&str) -> bool,
+    usage: impl Fn(&str) -> Option<(bool, f64)>,
+    known_exhausted: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let candidates: Vec<&'a String> = config_dirs
+        .iter()
+        .filter(|d| has_valid_creds(d) && !is_cooled(d) && !known_exhausted(d))
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Best fresh-sample rank wins; with no fresh samples (cold start), take
+    // the first surviving candidate — it passed the credential / cooldown /
+    // known-exhaustion filters, which is the strongest signal available.
+    candidates
+        .iter()
+        .filter_map(|d| usage(d).map(|rank| (*d, rank)))
+        .filter(|(_, (exhausted, _))| !exhausted)
+        .min_by(|a, b| {
+            a.1 .1
+                .partial_cmp(&b.1 .1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(d, _)| d.clone())
+        .or_else(|| candidates.first().map(|d| (*d).clone()))
+}
+
 fn short_label(config_dir: &str) -> &str {
     Path::new(config_dir)
         .file_name()
@@ -536,5 +603,86 @@ mod tests {
             },
         );
         assert_eq!(chosen.as_deref(), Some("/authed-cooled"));
+    }
+
+    // --- pick_target_from: migration-target selection ------------------------
+    //
+    // Migration differs from spawn-time selection in one key way: it may
+    // return `None`. Moving a session onto another dead account is pure
+    // churn, so exhausted/cooled/credential-less dirs are filtered out
+    // entirely instead of falling back to "least bad".
+
+    #[test]
+    fn migration_target_best_headroom_wins() {
+        let d = dirs(&["/gmail", "/paktis"]);
+        let chosen = pick_target_from(
+            &d,
+            |_| true,
+            |_| false,
+            |x| match x {
+                "/gmail" => Some((false, 0.15)),
+                "/paktis" => Some((false, -0.20)), // furthest under projection
+                _ => None,
+            },
+            |_| false,
+        );
+        assert_eq!(chosen.as_deref(), Some("/paktis"));
+    }
+
+    #[test]
+    fn migration_target_none_when_all_exhausted() {
+        let d = dirs(&["/gmail", "/paktis"]);
+        let chosen = pick_target_from(
+            &d,
+            |_| true,
+            |_| false,
+            |_| Some((true, 0.0)),
+            |_| true, // every candidate known-exhausted
+        );
+        assert_eq!(
+            chosen, None,
+            "migrating onto another exhausted account gains nothing"
+        );
+    }
+
+    #[test]
+    fn migration_target_none_when_all_cooled_or_credentialless() {
+        let d = dirs(&["/no-creds", "/cooled"]);
+        let chosen = pick_target_from(
+            &d,
+            |x| x == "/cooled", // only /cooled is authenticated…
+            |x| x == "/cooled", // …but it's in cooldown
+            |_| None,
+            |_| false,
+        );
+        assert_eq!(chosen, None);
+    }
+
+    #[test]
+    fn migration_target_fresh_exhausted_sample_filtered() {
+        // `known_exhausted` (long TTL) says fine, but the FRESH sample says
+        // exhausted — the fresh signal must win and the dir be skipped.
+        let d = dirs(&["/stale-ok-fresh-dead", "/usable"]);
+        let chosen = pick_target_from(
+            &d,
+            |_| true,
+            |_| false,
+            |x| match x {
+                "/stale-ok-fresh-dead" => Some((true, -0.50)),
+                "/usable" => Some((false, 0.30)),
+                _ => None,
+            },
+            |_| false,
+        );
+        assert_eq!(chosen.as_deref(), Some("/usable"));
+    }
+
+    #[test]
+    fn migration_target_cold_start_takes_first_surviving() {
+        // No fresh usage samples at all: the filters are the only signal —
+        // first survivor wins rather than returning None.
+        let d = dirs(&["/cooled", "/a", "/b"]);
+        let chosen = pick_target_from(&d, |_| true, |x| x == "/cooled", |_| None, |_| false);
+        assert_eq!(chosen.as_deref(), Some("/a"));
     }
 }

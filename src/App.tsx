@@ -52,6 +52,7 @@ import { useGraphDataRefresh } from "./hooks/useGraphDataRefresh";
 import { useObservationServices } from "./hooks/useObservationServices";
 import { useToast } from "./hooks/useToast";
 import { useErrorNotifications } from "./hooks/useErrorNotifications";
+import { useAccountMigrationNotifications } from "./hooks/useAccountMigrationNotifications";
 import { useStateMachineRegistration } from "./hooks/useStateMachineRegistration";
 
 import { ToastContainer } from "./components/ToastContainer";
@@ -286,6 +287,7 @@ function AppContent() {
   const { alerts: canaryAlerts, dismissAlert: dismissCanaryAlert } = useCanaryAlerts();
   const { toasts, showToast, dismissToast } = useToast();
   useErrorNotifications(showToast);
+  useAccountMigrationNotifications(showToast);
 
   // Legacy dev email/password auto-login (and its `test-auto-login-failed`
   // toast) was removed in the Cognito-legacy-auth teardown — sign-in is now

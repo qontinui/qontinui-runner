@@ -305,7 +305,7 @@ fn load_local_device_id() -> Option<uuid::Uuid> {
 /// Path to the `claude` binary. Default: `claude` (PATH-resolved).
 /// Override with `QONTINUI_CLAUDE_BIN` for testing (e.g. the
 /// `mock_claude_cli` fixture in `bin/`).
-fn claude_bin_path() -> String {
+pub(crate) fn claude_bin_path() -> String {
     std::env::var("QONTINUI_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string())
 }
 
@@ -1972,6 +1972,7 @@ async fn run_continuation_terminal(
         page_id: Some(target_page.clone()),
         // Matches the `--session-id` in the spawn argv → synchronous record.
         claude_session_id: Some(pinned_session_id),
+        zone_index: None,
     });
 
     // Provision `.mcp.json` so this continuation can reach coord coordination

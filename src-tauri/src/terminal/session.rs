@@ -339,6 +339,9 @@ impl TerminalSession {
         // `QONTINUI_SESSION_WORKTREES`, the agent-agnostic pointer to every
         // materialized sibling worktree of this session). Set after the
         // built-in runner vars so a caller can intentionally override them.
+        let caller_pinned_config_dir = extra_env
+            .as_ref()
+            .is_some_and(|env| env.iter().any(|(k, _)| k == "CLAUDE_CONFIG_DIR"));
         if let Some(env) = extra_env {
             for (k, v) in env {
                 cmd.env(k, v);
@@ -358,12 +361,19 @@ impl TerminalSession {
         Self::apply_install_intercept_env(&mut cmd, &id);
 
         // Set CLAUDE_CONFIG_DIR so Claude Code uses the resolved account
-        // (multi-account support with auto-rotation on rate-limit).
-        let ai_settings = crate::settings::get_ai_settings();
-        if let Some(config_dir) =
-            crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli)
-        {
-            cmd.env("CLAUDE_CONFIG_DIR", &config_dir);
+        // (multi-account support with auto-rotation on rate-limit) — UNLESS
+        // the caller already pinned an account via `extra_env`. A caller pin
+        // (backend continuation spawns, account-migration respawns) is a
+        // deliberate per-session choice and must not be clobbered by the
+        // process-global resolved dir, which may point at a different (or
+        // freshly-exhausted) account.
+        if !caller_pinned_config_dir {
+            let ai_settings = crate::settings::get_ai_settings();
+            if let Some(config_dir) =
+                crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli)
+            {
+                cmd.env("CLAUDE_CONFIG_DIR", &config_dir);
+            }
         }
 
         // Spawn the child process

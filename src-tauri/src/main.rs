@@ -1718,6 +1718,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal::terminal_grid_search,
             commands::terminal::terminal_grid_text,
             commands::terminal::terminal_list,
+            commands::terminal::terminal_migrate_session_account,
             commands::terminal::terminal_resize,
             commands::terminal::terminal_save_scrollback,
             commands::terminal::terminal_session_clear_restore_pending,
@@ -2236,6 +2237,26 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 let poll_lifecycle_store = lifecycle_store.clone();
                 app.manage(lifecycle_store);
+
+                // Usage-limit watcher: every terminal PTY's output flows
+                // through the interceptor pipeline; this hook spots the
+                // Claude CLI's token-exhaustion messages and hands the
+                // (debounced) hint to the account-migration handler, which
+                // probe-confirms real exhaustion before moving the session to
+                // the account with the most weekly-usage headroom. See
+                // `terminal::account_migration` for the full flow + guards.
+                term_for_session.interceptor().add_hook(Box::new(
+                    terminal::usage_limit::UsageLimitWatchHook::new(Box::new(
+                        |terminal_id, pattern| {
+                            tauri::async_runtime::spawn(
+                                terminal::account_migration::handle_usage_limit_hint(
+                                    terminal_id,
+                                    pattern,
+                                ),
+                            );
+                        },
+                    )),
+                ));
 
                 // Infrequent liveness poll for lazy close-detection. Every
                 // 45s it snapshots open lifecycle records against the live

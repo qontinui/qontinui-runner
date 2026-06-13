@@ -80,6 +80,18 @@ pub struct ClaudeCliSettings {
     /// How to select which account to use when multiple config dirs exist
     #[serde(default)]
     pub account_selection_mode: AccountSelectionMode,
+    /// Automatically migrate a terminal Claude session to another configured
+    /// account when its account runs out of tokens: a usage-limit message in
+    /// the PTY output, confirmed by a fresh usage probe, triggers a
+    /// transcript copy + `claude --resume` respawn under the account with the
+    /// most weekly-usage headroom (see `terminal::account_migration`).
+    /// No-op when fewer than two accounts are configured.
+    #[serde(default = "default_auto_migrate_on_token_exhaustion")]
+    pub auto_migrate_on_token_exhaustion: bool,
+}
+
+fn default_auto_migrate_on_token_exhaustion() -> bool {
+    true
 }
 
 impl Default for ClaudeCliSettings {
@@ -90,6 +102,7 @@ impl Default for ClaudeCliSettings {
             timeout_seconds: 600,
             config_dir: None,
             account_selection_mode: AccountSelectionMode::LeastUsage,
+            auto_migrate_on_token_exhaustion: default_auto_migrate_on_token_exhaustion(),
         }
     }
 }

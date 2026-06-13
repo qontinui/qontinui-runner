@@ -957,6 +957,61 @@ pub fn terminal_session_list_open(
     })
 }
 
+/// Manually migrate a Claude terminal session to a different configured
+/// account: copy its transcript into the target account's project dir, close
+/// the old pane, and respawn `claude --resume` under the target account (see
+/// `terminal::account_migration` — this is the operator-clicked form of the
+/// automatic token-exhaustion migration; the click IS the confirmation, so
+/// no usage probe gates it).
+///
+/// `target_config_dir: None` auto-picks the configured account with the most
+/// weekly-usage headroom, excluding the session's current account.
+#[tauri::command]
+pub async fn terminal_migrate_session_account(
+    app: tauri::AppHandle,
+    store: tauri::State<'_, Arc<SessionLifecycleStore>>,
+    claude_session_id: String,
+    target_config_dir: Option<String>,
+) -> Result<CommandResponse, String> {
+    let record = store
+        .get(&claude_session_id)
+        .ok_or_else(|| format!("unknown session: {claude_session_id}"))?;
+    let src = record
+        .config_dir
+        .clone()
+        .or_else(crate::ai_provider::get_resolved_config_dir)
+        .ok_or("the session's current account is unknown — cannot migrate")?;
+
+    let dst = match target_config_dir {
+        Some(d) => {
+            if !crate::settings::get_claude_config_dirs().contains(&d) {
+                return Err(format!("'{d}' is not a configured claude_config_dir"));
+            }
+            d
+        }
+        None => crate::ai_provider::pick_migration_target(&src).ok_or(
+            "no usable target account (every other account exhausted/cooled/unauthenticated)",
+        )?,
+    };
+    if dst == src {
+        return Err("target account equals the session's current account".to_string());
+    }
+
+    let outcome = crate::terminal::account_migration::migrate_session(&app, &record, &src, &dst)?;
+    Ok(CommandResponse {
+        success: true,
+        message: Some(format!(
+            "migrated session {claude_session_id} to {}",
+            outcome.to_config_dir
+        )),
+        data: Some(serde_json::json!({
+            "newTerminalId": outcome.new_terminal_id,
+            "fromConfigDir": outcome.from_config_dir,
+            "toConfigDir": outcome.to_config_dir,
+        })),
+    })
+}
+
 /// Optional hint asking [`create_terminal_session_backend`] to durably record
 /// the new session in the lifecycle store once its Claude session id can be
 /// resolved from the on-disk transcript. Backend-spawned continuation
@@ -978,9 +1033,14 @@ pub(crate) struct SessionCaptureHint {
     /// restart re-lands the continuation on its page. `None` → `"default"`.
     pub page_id: Option<String>,
     /// Pre-pinned Claude session id (`--session-id <uuid>` in the spawn
-    /// argv): `Some(..)` records the OPEN synchronously (origin `"pinned"`)
-    /// and demotes the transcript poller to a verification arm.
+    /// argv, or `--resume <uuid>` for an account-migration respawn — both
+    /// name the exact id): `Some(..)` records the OPEN synchronously (origin
+    /// `"pinned"`) and demotes the transcript poller to a verification arm.
     pub claude_session_id: Option<String>,
+    /// Grid zone to durably record (account-migration respawns preserve the
+    /// migrated session's tile placement). `None` → zone 0 (the historical
+    /// continuation behavior — wrong zone beats a lost session).
+    pub zone_index: Option<i32>,
 }
 
 /// Backend-task entry point for creating a terminal session + coord row from a
@@ -1153,10 +1213,12 @@ pub(crate) fn create_terminal_session_backend(
                 title,
                 page_id: hint_page_id,
                 claude_session_id: pinned_session_id,
+                zone_index: hint_zone_index,
             } = hint;
             // Single source of truth for the recorded page: the hint's page_id
             // (set by the caller to the picked page), defaulting to "default".
             let record_page_id = hint_page_id.unwrap_or_else(|| "default".to_string());
+            let record_zone_index = hint_zone_index.unwrap_or(0);
             if let Some(pinned) = pinned_session_id {
                 // Pre-pinned id: record synchronously, then verify async that
                 // the transcript appears. NEVER rebinds from transcripts.
@@ -1168,6 +1230,7 @@ pub(crate) fn create_terminal_session_backend(
                     working_dir.clone(),
                     title,
                     record_page_id,
+                    record_zone_index,
                 );
                 let verify_dirs: Vec<std::path::PathBuf> = config_dir
                     .iter()
@@ -1204,6 +1267,7 @@ pub(crate) fn create_terminal_session_backend(
                     working_dir,
                     title,
                     record_page_id,
+                    record_zone_index,
                     SESSION_CAPTURE_POLL_INTERVAL,
                     SESSION_CAPTURE_TIMEOUT,
                 ));
@@ -1253,8 +1317,9 @@ fn resolve_latest_claude_session_id(
 ///
 /// The resolver is injected so this loop is unit-testable without a real
 /// on-disk transcript. On the first resolve it builds a [`TerminalSessionRecord`]
-/// (restored into zone 0 / the default page — wrong zone beats a lost session)
-/// and records it; on timeout it `warn!`s and gives up without recording.
+/// (restored into `zone_index` / the hint page — callers without a meaningful
+/// zone pass 0; wrong zone beats a lost session) and records it; on timeout
+/// it `warn!`s and gives up without recording.
 #[allow(clippy::too_many_arguments)]
 async fn poll_and_record_session<F>(
     store: Arc<SessionLifecycleStore>,
@@ -1264,6 +1329,7 @@ async fn poll_and_record_session<F>(
     working_dir: String,
     title: String,
     page_id: String,
+    zone_index: i32,
     interval: std::time::Duration,
     timeout: std::time::Duration,
 ) where
@@ -1277,7 +1343,7 @@ async fn poll_and_record_session<F>(
                 config_dir: config_dir.clone(),
                 working_dir: Some(working_dir.clone()),
                 page_id: page_id.clone(),
-                zone_index: 0,
+                zone_index,
                 title: Some(title.clone()),
                 terminal_id: terminal_id.clone(),
                 // record_open seeds these from `now`; values here are placeholders
@@ -1312,8 +1378,10 @@ async fn poll_and_record_session<F>(
     }
 }
 
-/// Durably record a PRE-PINNED session (`--session-id <id>` in the spawn
-/// argv) the instant the PTY exists — no transcript mtime race to lose.
+/// Durably record a PRE-PINNED session (`--session-id <id>` /
+/// account-migration `--resume <id>` in the spawn argv) the instant the PTY
+/// exists — no transcript mtime race to lose.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_pinned_session_open(
     store: &SessionLifecycleStore,
     claude_session_id: String,
@@ -1322,13 +1390,14 @@ pub(crate) fn record_pinned_session_open(
     working_dir: String,
     title: String,
     page_id: String,
+    zone_index: i32,
 ) {
     store.record_open(TerminalSessionRecord {
         claude_session_id: claude_session_id.clone(),
         config_dir,
         working_dir: Some(working_dir),
         page_id,
-        zone_index: 0,
+        zone_index,
         title: Some(title),
         terminal_id: terminal_id.clone(),
         // record_open seeds these from `now`; values here are placeholders.
@@ -1438,6 +1507,7 @@ mod tests {
             "/work/dir".to_string(),
             "My Continuation".to_string(),
             "default".to_string(),
+            0,
             Duration::from_millis(1),
             Duration::from_secs(5),
         )
@@ -1474,6 +1544,7 @@ mod tests {
             "/work/dir".to_string(),
             "Overflow Continuation".to_string(),
             "page-7".to_string(),
+            4,
             Duration::from_millis(1),
             Duration::from_secs(5),
         )
@@ -1482,6 +1553,10 @@ mod tests {
         let open = store.open_records();
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].page_id, "page-7");
+        assert_eq!(
+            open[0].zone_index, 4,
+            "caller-supplied zone (account-migration respawn) is durably recorded"
+        );
     }
 
     /// When the resolver never yields an id, the poller gives up after the
@@ -1507,6 +1582,7 @@ mod tests {
             "/work/dir".to_string(),
             "Never Resolves".to_string(),
             "default".to_string(),
+            0,
             Duration::from_millis(1),
             Duration::from_millis(20),
         )
@@ -1575,6 +1651,7 @@ mod tests {
             project_path.to_string(),
             "Pinned".to_string(),
             "default".to_string(),
+            0,
         );
         let verify_cfg = cfg.path().to_path_buf();
         poll_and_verify_pinned_session(

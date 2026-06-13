@@ -295,6 +295,33 @@ impl SessionLifecycleStore {
         self.persist(&snapshot);
     }
 
+    /// Clone of the open record currently hosted by `terminal_id`, if any.
+    /// Terminal ids are fresh per PTY spawn, so at most one OPEN record can
+    /// reference a given terminal at a time.
+    pub fn find_open_by_terminal(&self, terminal_id: &str) -> Option<TerminalSessionRecord> {
+        match self.map.lock() {
+            Ok(m) => m
+                .values()
+                .find(|r| r.state == "open" && r.terminal_id == terminal_id)
+                .cloned(),
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on find_open_by_terminal");
+                None
+            }
+        }
+    }
+
+    /// Clone of the record for `claude_session_id`, open or closed.
+    pub fn get(&self, claude_session_id: &str) -> Option<TerminalSessionRecord> {
+        match self.map.lock() {
+            Ok(m) => m.get(claude_session_id).cloned(),
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on get");
+                None
+            }
+        }
+    }
+
     /// Clone of every record whose `state == "open"`.
     pub fn open_records(&self) -> Vec<TerminalSessionRecord> {
         match self.map.lock() {
