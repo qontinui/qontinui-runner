@@ -1883,6 +1883,30 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .setup(|app| {
             info!("Tauri application setup starting");
 
+            // Boot-restore remediation item 1 — classify THIS boot (crash
+            // recovery vs planned restart) exactly once, synchronously,
+            // BEFORE the API server / frontend restore can race it.
+            // `classify_boot` reads the PRIOR shutdown marker, stashes the
+            // classification in a process-wide OnceLock, and immediately
+            // re-marks the marker `clean:false` for the now-running process.
+            // Consumers (`resume_ai_sessions` via mcp_api.rs, the terminal
+            // restore path via `terminal_session_list_open`) read the stash —
+            // a command-time file read would ALWAYS see `clean:false` after
+            // this point and permanently classify "crash".
+            {
+                let marker_path = session::shutdown_marker::marker_path(
+                    crate::mcp::types::get_mcp_api_port(),
+                );
+                let boot = session::shutdown_marker::classify_boot(&marker_path);
+                if boot.crash_recovery {
+                    warn!(
+                        "boot classification: previous shutdown was NOT clean — crash recovery"
+                    );
+                } else {
+                    info!("boot classification: previous shutdown was clean — planned restart");
+                }
+            }
+
             // Plan 2026-05-18-agent-spawn-coordination Phase 3 — stash a
             // global AppHandle so background tokio tasks (e.g. claim
             // heartbeats from `agent_claims`) can emit Tauri events
@@ -2230,6 +2254,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // claudeSessionId -> consecutive zero-descendant ticks,
                     // carried across ticks to debounce `NeedsConfirm`.
                     let mut consecutive_dead: StdHashMap<String, u32> = StdHashMap::new();
+                    // claudeSessionId -> consecutive NO-MATCHING-TERMINAL
+                    // ticks, carried across ticks to debounce the orphan
+                    // close (`CloseNoTerminal`): a record matching nothing
+                    // in this instance for ~4 ticks is an orphan, not
+                    // uncertainty — without this it stays `open` for up to
+                    // 7 days and re-qualifies for restore at every boot.
+                    let mut consecutive_no_match: StdHashMap<String, u32> = StdHashMap::new();
 
                     loop {
                         tokio::time::sleep(Duration::from_secs(45)).await;
@@ -2238,6 +2269,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         if open.is_empty() {
                             // Forget any stale counters and prune, then idle.
                             consecutive_dead.clear();
+                            consecutive_no_match.clear();
                             poll_lifecycle_store
                                 .prune(chrono::Utc::now().timestamp_millis());
                             continue;
@@ -2286,16 +2318,24 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 .get(&rec.claude_session_id)
                                 .copied()
                                 .unwrap_or(0);
+                            let prior_no_match = consecutive_no_match
+                                .get(&rec.claude_session_id)
+                                .copied()
+                                .unwrap_or(0);
                             // Restore-pending records (a boot-restore typed
                             // `claude --resume` whose handshake isn't verified
                             // yet — or whose restore FAILED and awaits a retry)
-                            // must never flip `poll-dead`: classify Skips them
-                            // unless the session is confidently alive.
+                            // must never flip `poll-dead` / `no-terminal`:
+                            // classify Skips them (and accumulates no ticks)
+                            // unless the session is confidently alive. A mid-
+                            // restore record keeps its OLD terminal_id until
+                            // the re-assert, so it naturally matches nothing.
                             let restore_pending = rec.restore_pending_at.is_some();
                             let action = classify(
                                 live_is_alive,
                                 descendant_count,
                                 prior,
+                                prior_no_match,
                                 snapshot_ok,
                                 restore_pending,
                             );
@@ -2312,10 +2352,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     poll_lifecycle_store.touch(&rec.claude_session_id);
                                     consecutive_dead.remove(&rec.claude_session_id);
+                                    consecutive_no_match.remove(&rec.claude_session_id);
                                 }
                                 PollAction::NeedsConfirm => {
                                     consecutive_dead
                                         .insert(rec.claude_session_id.clone(), prior + 1);
+                                    // A terminal matched this tick — any
+                                    // no-match streak is broken.
+                                    consecutive_no_match.remove(&rec.claude_session_id);
                                     tracing::debug!(
                                         claude_session = %rec.claude_session_id,
                                         "session lifecycle poll: zero descendants — confirming before close"
@@ -2325,13 +2369,46 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     poll_lifecycle_store
                                         .record_close(&rec.claude_session_id, "poll-dead");
                                     consecutive_dead.remove(&rec.claude_session_id);
+                                    consecutive_no_match.remove(&rec.claude_session_id);
                                     tracing::info!(
                                         claude_session = %rec.claude_session_id,
                                         "session lifecycle poll: closing dead session"
                                     );
                                 }
+                                PollAction::NoMatchWait => {
+                                    consecutive_no_match
+                                        .insert(rec.claude_session_id.clone(), prior_no_match + 1);
+                                    // A no-match tick breaks any zero-
+                                    // descendant streak (the streaks are
+                                    // mutually exclusive — a stale dead
+                                    // counter must not survive terminal
+                                    // churn and trigger an early poll-dead
+                                    // close when the terminal re-matches).
+                                    consecutive_dead.remove(&rec.claude_session_id);
+                                    tracing::debug!(
+                                        claude_session = %rec.claude_session_id,
+                                        terminal = %rec.terminal_id,
+                                        ticks = prior_no_match + 1,
+                                        "session lifecycle poll: no matching terminal — debouncing before orphan close"
+                                    );
+                                }
+                                PollAction::CloseNoTerminal => {
+                                    // No matching terminal for several
+                                    // consecutive ticks — an orphan row (e.g.
+                                    // a ghost inherited from a prior process).
+                                    // `"no-terminal"` is non-restorable.
+                                    poll_lifecycle_store
+                                        .record_close(&rec.claude_session_id, "no-terminal");
+                                    consecutive_dead.remove(&rec.claude_session_id);
+                                    consecutive_no_match.remove(&rec.claude_session_id);
+                                    tracing::info!(
+                                        claude_session = %rec.claude_session_id,
+                                        terminal = %rec.terminal_id,
+                                        "session lifecycle poll: closing orphan session (no matching terminal)"
+                                    );
+                                }
                                 PollAction::Skip => {
-                                    // Uncertain — do NOT touch the counter.
+                                    // Uncertain — do NOT touch the counters.
                                 }
                             }
                         }

@@ -30,6 +30,7 @@
 //! rather over-report a crash banner than silently hide a real crash).
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -61,6 +62,30 @@ pub fn marker_path(api_port: u16) -> PathBuf {
         .join(file_name)
 }
 
+/// Read the prior marker from disk. `None` when absent, unreadable, or
+/// corrupt (a corrupt marker is logged).
+fn read_marker(path: &Path) -> Option<ShutdownMarker> {
+    match std::fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice::<ShutdownMarker>(&bytes) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "shutdown_marker: corrupt marker — treating as unclean (crash recovery)"
+                );
+                None
+            }
+        },
+        // Absent (first ever boot, or the file was never written) — treat as
+        // unclean is the SAFE default, but the very first boot legitimately
+        // has no marker. We still report crash-recovery=true; the recovery
+        // summary only surfaces a banner when there are sessions to resume,
+        // so a clean first boot with zero sessions shows nothing.
+        Err(_) => None,
+    }
+}
+
 /// Read the prior marker and decide whether this boot is crash recovery.
 ///
 /// Returns `true` (crash recovery) when the marker is absent, unreadable,
@@ -70,25 +95,57 @@ pub fn marker_path(api_port: u16) -> PathBuf {
 /// This must be called BEFORE [`mark_running`] overwrites the marker for the
 /// current process.
 pub fn was_unclean_shutdown(path: &Path) -> bool {
-    match std::fs::read(path) {
-        Ok(bytes) => match serde_json::from_slice::<ShutdownMarker>(&bytes) {
-            Ok(m) => !m.clean,
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    path = %path.display(),
-                    "shutdown_marker: corrupt marker — treating as unclean (crash recovery)"
-                );
-                true
-            }
-        },
-        // Absent (first ever boot, or the file was never written) — treat as
-        // unclean is the SAFE default, but the very first boot legitimately
-        // has no marker. We still report crash-recovery=true; the recovery
-        // summary only surfaces a banner when there are sessions to resume,
-        // so a clean first boot with zero sessions shows nothing.
-        Err(_) => true,
+    classify_prior_marker(read_marker(path).as_ref()).crash_recovery
+}
+
+/// The one-shot classification of THIS boot, derived from the PRIOR
+/// process's shutdown marker. Captured exactly once per process by
+/// [`classify_boot`] — a later marker file read is USELESS for
+/// classification because [`mark_running`] immediately rewrites the marker
+/// `clean:false` for the now-running process (any command-time read would
+/// permanently classify "crash").
+#[derive(Debug, Clone, Copy)]
+pub struct BootClassification {
+    /// `true` iff the previous shutdown was NOT clean (marker absent,
+    /// corrupt, or `clean:false`) ⇒ this boot is crash recovery.
+    pub crash_recovery: bool,
+    /// `at` of the PRIOR marker, if one was readable. On a clean shutdown
+    /// this is the shutdown instant; on a crash it is the crashed process's
+    /// boot instant. Used as one input to the restore path's anchored
+    /// recency rule (the registry's "last moment of life").
+    pub prior_marker_at: Option<i64>,
+}
+
+/// Pure classification core for [`classify_boot`] (testable without the
+/// process-wide [`OnceLock`]).
+fn classify_prior_marker(prior: Option<&ShutdownMarker>) -> BootClassification {
+    BootClassification {
+        crash_recovery: prior.map(|m| !m.clean).unwrap_or(true),
+        prior_marker_at: prior.map(|m| m.at),
     }
+}
+
+static BOOT_CLASSIFICATION: OnceLock<BootClassification> = OnceLock::new();
+
+/// Classify this boot EXACTLY ONCE: read the prior marker, stash the
+/// classification process-wide, and immediately (re)write the marker
+/// `clean:false` for the now-running process. Idempotent — every call after
+/// the first returns the stashed classification without touching disk, so
+/// call-site ordering (synchronous boot in `main.rs` setup vs the delayed
+/// AI-session resume spawn) cannot double-classify or double-overwrite.
+pub fn classify_boot(path: &Path) -> BootClassification {
+    *BOOT_CLASSIFICATION.get_or_init(|| {
+        let classification = classify_prior_marker(read_marker(path).as_ref());
+        mark_running(path);
+        classification
+    })
+}
+
+/// The stashed boot classification, if [`classify_boot`] has run. Consumers
+/// that must never trigger a marker write (e.g. `terminal_session_list_open`)
+/// read this instead of calling [`classify_boot`].
+pub fn boot_classification() -> Option<BootClassification> {
+    BOOT_CLASSIFICATION.get().copied()
 }
 
 /// Write the marker for the NOW-running process as `clean:false`. Call once,
@@ -203,6 +260,31 @@ mod tests {
 
         // Boot 3: prior marker is still clean:false → crash recovery.
         assert!(was_unclean_shutdown(&path));
+    }
+
+    #[test]
+    fn classify_prior_marker_covers_all_marker_shapes() {
+        // Absent marker → crash recovery, no anchor.
+        let absent = classify_prior_marker(None);
+        assert!(absent.crash_recovery);
+        assert!(absent.prior_marker_at.is_none());
+
+        // Clean marker → planned restart, anchor = shutdown instant.
+        let clean = classify_prior_marker(Some(&ShutdownMarker {
+            clean: true,
+            at: 1_000,
+        }));
+        assert!(!clean.crash_recovery);
+        assert_eq!(clean.prior_marker_at, Some(1_000));
+
+        // Running (clean:false) marker left by a crash → crash recovery, but
+        // the prior `at` (the crashed process's boot instant) still anchors.
+        let crashed = classify_prior_marker(Some(&ShutdownMarker {
+            clean: false,
+            at: 2_000,
+        }));
+        assert!(crashed.crash_recovery);
+        assert_eq!(crashed.prior_marker_at, Some(2_000));
     }
 
     #[test]

@@ -197,6 +197,50 @@ internal sub-tab state whenever that prop changes.
 
 ---
 
+## Reading terminal pane content: `GET /terminals/{id}/buffer?format=text`
+
+xterm renders terminal panes to a **canvas** — UI Bridge
+`snapshot`/`read-value`/DOM walks return empty text for them. To verify
+what a pane actually shows, do NOT scrape the DOM; read the live
+scrollback ring over the runner API instead (same port as the routes
+above; this is a runner API route, not a `/ui-bridge/*` one):
+
+```bash
+# 1. Find the terminal id (and its page/title/workingDir).
+curl http://localhost:9876/terminals
+
+# 2. Read the pane's scrollback as plain text (UTF-8, ANSI/OSC stripped).
+curl "http://localhost:9876/terminals/<id>/buffer?format=text"
+```
+
+Response shape with `format=text`:
+
+```json
+{
+  "success": true,
+  "data": {
+    "data": { "text": "...full scrollback text..." },
+    "start_offset": 0,
+    "total_bytes_produced": 12345
+  }
+}
+```
+
+Query forms (all on the same handler; `GET /terminals/{id}/output` is an
+alias for `/buffer`):
+
+| Query              | Returns                                                                         |
+| ------------------ | ------------------------------------------------------------------------------- |
+| `?format=text`     | Canonical: UTF-8 lossy decode + ANSI/OSC stripped, nested `{ data: { text } }`   |
+| `?decoded=true`    | UTF-8 lossy decode, ANSI escape codes left intact (top-level string `data`)      |
+| `?strip_ansi=true` | Implies `decoded=true`; strips CSI/OSC + control bytes (top-level string `data`) |
+| _(none)_           | Base64-encoded raw PTY bytes — byte-fidelity for replays / WS scrollback         |
+
+Source: `src-tauri/src/mcp/terminals.rs` (`BufferQuery`,
+`get_buffer_handler`, route registration in `routes()`).
+
+---
+
 ## Behind the scenes
 
 ### Invoke proxy wire flow
