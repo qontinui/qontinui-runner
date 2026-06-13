@@ -2180,6 +2180,26 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // runner (9877+) would read the primary's open records and
                 // try to `claude --resume` the primary's live sessions.
                 let lifecycle_api_port = crate::mcp::types::get_mcp_api_port();
+
+                // Classify this boot (crash recovery vs planned restart) from
+                // the shutdown marker SYNCHRONOUSLY, before the API server /
+                // webview exists — a frontend restore calling
+                // `terminal_session_list_open` must never race the
+                // classification. `classify_boot` is single-read by
+                // construction (OnceLock): it reads the prior marker,
+                // immediately re-marks `clean:false` for this process, and
+                // stashes the result for every later consumer (the AI-session
+                // resume in mcp_api.rs and the terminal restore path).
+                let boot = session::shutdown_marker::classify_boot(
+                    &session::shutdown_marker::marker_path(lifecycle_api_port),
+                );
+                if boot.crash_recovery {
+                    tracing::warn!(
+                        prior_marker_at = ?boot.prior_marker_at,
+                        "boot classification: previous shutdown was NOT clean — crash recovery"
+                    );
+                }
+
                 let lifecycle_file_name = if lifecycle_api_port == 9876 {
                     "terminal-sessions.json".to_string()
                 } else {
@@ -2225,11 +2245,19 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     use std::collections::HashMap as StdHashMap;
                     use std::time::Duration;
 
-                    use session::session_lifecycle_store::{classify, PollAction};
+                    use session::session_lifecycle_store::{
+                        classify, classify_no_match, PollAction,
+                    };
 
                     // claudeSessionId -> consecutive zero-descendant ticks,
                     // carried across ticks to debounce `NeedsConfirm`.
                     let mut consecutive_dead: StdHashMap<String, u32> = StdHashMap::new();
+                    // claudeSessionId -> consecutive ticks with NO matching
+                    // live terminal in this instance. An orphaned record (its
+                    // terminal long gone) accumulates these and closes
+                    // `no-terminal` — without it the row stays `open` for up
+                    // to 7 days and re-qualifies for restore every restart.
+                    let mut no_match_ticks: StdHashMap<String, u32> = StdHashMap::new();
 
                     loop {
                         tokio::time::sleep(Duration::from_secs(45)).await;
@@ -2238,6 +2266,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         if open.is_empty() {
                             // Forget any stale counters and prune, then idle.
                             consecutive_dead.clear();
+                            no_match_ticks.clear();
                             poll_lifecycle_store
                                 .prune(chrono::Utc::now().timestamp_millis());
                             continue;
@@ -2246,6 +2275,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         let live = poll_tm.list();
 
                         for rec in &open {
+                            // Restore-pending records (a boot-restore typed
+                            // `claude --resume` whose handshake isn't verified
+                            // yet — or whose restore FAILED and awaits a retry)
+                            // must never flip `poll-dead`/`no-terminal`:
+                            // classification Skips them unless the session is
+                            // confidently alive. A mid-restore record keeps
+                            // its OLD terminal_id until the verified re-assert,
+                            // so it always misses the live-terminal match.
+                            let restore_pending = rec.restore_pending_at.is_some();
+
                             // Match the live terminal: by id first, then the
                             // (page_id, title, working_dir) triple as fallback.
                             let info = live
@@ -2267,31 +2306,65 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     })
                                 });
 
-                            let (live_is_alive, descendant_count, snapshot_ok) = match info {
-                                None => (None, 0usize, true),
-                                Some(info) => {
-                                    let pid = info.pid.unwrap_or(0);
-                                    let (descendants, parent_map) =
-                                        crate::process_capture::process_tree::discover_descendants_with_parent_map(pid)
-                                            .await;
-                                    // A totally-empty system parent_map means
-                                    // the snapshot helper failed → Skip.
-                                    let snapshot_ok = !parent_map.is_empty();
-                                    let alive = crate::process_capture::health::pid_alive(pid);
-                                    (Some(alive), descendants.len(), snapshot_ok)
+                            // No matching terminal in THIS instance: not the
+                            // same uncertainty `classify` Skips on — count
+                            // consecutive no-match ticks and close the orphan
+                            // `no-terminal` (non-restorable) once confirmed.
+                            let Some(info) = info else {
+                                consecutive_dead.remove(&rec.claude_session_id);
+                                let prior = no_match_ticks
+                                    .get(&rec.claude_session_id)
+                                    .copied()
+                                    .unwrap_or(0);
+                                match classify_no_match(prior, restore_pending) {
+                                    PollAction::Close => {
+                                        poll_lifecycle_store.record_close(
+                                            &rec.claude_session_id,
+                                            "no-terminal",
+                                        );
+                                        no_match_ticks.remove(&rec.claude_session_id);
+                                        tracing::info!(
+                                            claude_session = %rec.claude_session_id,
+                                            terminal_id = %rec.terminal_id,
+                                            "session lifecycle poll: closing orphaned record — no matching terminal"
+                                        );
+                                    }
+                                    PollAction::NeedsConfirm => {
+                                        no_match_ticks
+                                            .insert(rec.claude_session_id.clone(), prior + 1);
+                                        tracing::debug!(
+                                            claude_session = %rec.claude_session_id,
+                                            ticks = prior + 1,
+                                            "session lifecycle poll: no matching terminal — confirming before orphan close"
+                                        );
+                                    }
+                                    // Skip (restore-pending) — leave the
+                                    // counter untouched.
+                                    _ => {}
                                 }
+                                continue;
+                            };
+
+                            // Matched a live terminal — the record is not an
+                            // orphan; reset its no-match streak.
+                            no_match_ticks.remove(&rec.claude_session_id);
+
+                            let (live_is_alive, descendant_count, snapshot_ok) = {
+                                let pid = info.pid.unwrap_or(0);
+                                let (descendants, parent_map) =
+                                    crate::process_capture::process_tree::discover_descendants_with_parent_map(pid)
+                                        .await;
+                                // A totally-empty system parent_map means
+                                // the snapshot helper failed → Skip.
+                                let snapshot_ok = !parent_map.is_empty();
+                                let alive = crate::process_capture::health::pid_alive(pid);
+                                (Some(alive), descendants.len(), snapshot_ok)
                             };
 
                             let prior = consecutive_dead
                                 .get(&rec.claude_session_id)
                                 .copied()
                                 .unwrap_or(0);
-                            // Restore-pending records (a boot-restore typed
-                            // `claude --resume` whose handshake isn't verified
-                            // yet — or whose restore FAILED and awaits a retry)
-                            // must never flip `poll-dead`: classify Skips them
-                            // unless the session is confidently alive.
-                            let restore_pending = rec.restore_pending_at.is_some();
                             let action = classify(
                                 live_is_alive,
                                 descendant_count,

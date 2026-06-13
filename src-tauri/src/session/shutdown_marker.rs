@@ -30,6 +30,7 @@
 //! rather over-report a crash banner than silently hide a real crash).
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -70,25 +71,73 @@ pub fn marker_path(api_port: u16) -> PathBuf {
 /// This must be called BEFORE [`mark_running`] overwrites the marker for the
 /// current process.
 pub fn was_unclean_shutdown(path: &Path) -> bool {
+    match read_prior(path) {
+        Some(m) => !m.clean,
+        // Absent (first ever boot, or the file was never written) — treat as
+        // unclean is the SAFE default, but the very first boot legitimately
+        // has no marker. We still report crash-recovery=true; the recovery
+        // summary only surfaces a banner when there are sessions to resume,
+        // so a clean first boot with zero sessions shows nothing.
+        None => true,
+    }
+}
+
+/// Read the prior marker verbatim, if present and well-formed. Corrupt and
+/// absent markers both read as `None` (and classify as unclean).
+fn read_prior(path: &Path) -> Option<ShutdownMarker> {
     match std::fs::read(path) {
         Ok(bytes) => match serde_json::from_slice::<ShutdownMarker>(&bytes) {
-            Ok(m) => !m.clean,
+            Ok(m) => Some(m),
             Err(e) => {
                 warn!(
                     error = %e,
                     path = %path.display(),
                     "shutdown_marker: corrupt marker — treating as unclean (crash recovery)"
                 );
-                true
+                None
             }
         },
-        // Absent (first ever boot, or the file was never written) — treat as
-        // unclean is the SAFE default, but the very first boot legitimately
-        // has no marker. We still report crash-recovery=true; the recovery
-        // summary only surfaces a banner when there are sessions to resume,
-        // so a clean first boot with zero sessions shows nothing.
-        Err(_) => true,
+        Err(_) => None,
     }
+}
+
+/// The single boot-time shutdown-marker classification, captured exactly once
+/// per process by [`classify_boot`].
+#[derive(Debug, Clone, Copy)]
+pub struct BootClassification {
+    /// `true` iff the previous shutdown was NOT clean (marker absent, corrupt,
+    /// or `clean:false`) — this boot is crash recovery.
+    pub crash_recovery: bool,
+    /// `at` of the PRIOR marker (before this boot overwrote it): the previous
+    /// process's last recorded moment of life — its clean-shutdown time, or
+    /// its own boot time if it crashed. `None` when the marker was absent or
+    /// corrupt. Feeds the restore path's anchored-recency rule.
+    pub prior_marker_at: Option<i64>,
+}
+
+static BOOT_CLASSIFICATION: OnceLock<BootClassification> = OnceLock::new();
+
+/// Classify this boot from the on-disk marker, exactly once per process.
+///
+/// The marker is single-read by construction: the first call reads the prior
+/// marker, immediately overwrites it `clean:false` for the NOW-running
+/// process ([`mark_running`]), and stashes the result; every later call (any
+/// consumer, any thread) returns the stashed classification without touching
+/// the file. A command-time re-read would always see the `clean:false` we
+/// just wrote and misclassify every boot as a crash.
+///
+/// Call this from a synchronous boot site (before the API server / frontend
+/// can race it); consumers read the stash via this same function.
+pub fn classify_boot(path: &Path) -> BootClassification {
+    *BOOT_CLASSIFICATION.get_or_init(|| {
+        let prior = read_prior(path);
+        let classification = BootClassification {
+            crash_recovery: prior.as_ref().map(|m| !m.clean).unwrap_or(true),
+            prior_marker_at: prior.map(|m| m.at),
+        };
+        mark_running(path);
+        classification
+    })
 }
 
 /// Write the marker for the NOW-running process as `clean:false`. Call once,
@@ -203,6 +252,33 @@ mod tests {
 
         // Boot 3: prior marker is still clean:false → crash recovery.
         assert!(was_unclean_shutdown(&path));
+    }
+
+    /// The single test allowed to touch the process-wide `BOOT_CLASSIFICATION`
+    /// OnceLock — a second such test would read this one's stash.
+    #[test]
+    fn classify_boot_single_read_semantics() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("last-shutdown.json");
+        mark_clean_shutdown(&path);
+
+        let first = classify_boot(&path);
+        assert!(
+            !first.crash_recovery,
+            "prior clean marker → planned restart"
+        );
+        assert!(first.prior_marker_at.is_some(), "prior at captured");
+
+        // classify_boot immediately re-marked the file `clean:false` for the
+        // now-running process — a naive re-READ would misclassify as crash...
+        assert!(was_unclean_shutdown(&path));
+        // ...but a second consumer gets the boot-time STASH, not the file.
+        let second = classify_boot(&path);
+        assert!(
+            !second.crash_recovery,
+            "stash survives the marker overwrite"
+        );
+        assert_eq!(second.prior_marker_at, first.prior_marker_at);
     }
 
     #[test]

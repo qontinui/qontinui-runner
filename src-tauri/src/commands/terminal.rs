@@ -929,20 +929,29 @@ pub fn terminal_session_record_close(
 /// The grid hydrates its session tiles from this on boot instead of
 /// `localStorage`.
 ///
-/// Returns the restorable superset (see `restorable_records`): all `open`
-/// records (hard-crash case) PLUS `closed`/`pty-exit` records still within the
+/// Returns the restorable superset (see `restorable_records`): `open` records
+/// whose `last_seen_at` is fresh relative to the registry's anchor (hard-crash
+/// and unflushed-close cases) PLUS `closed`/`pty-exit` records still within the
 /// grace window (graceful-restart case, where `handleExit` flipped every live
-/// PTY to `closed`). User-closed and stale records are excluded so the restore
-/// path resurrects exactly the sessions that died with the runner.
+/// PTY to `closed`). User-closed, orphan-closed (`no-terminal`), and stale
+/// records are excluded so the restore path resurrects exactly the sessions
+/// that were on screen when the runner died.
 #[tauri::command]
 pub fn terminal_session_list_open(
     store: tauri::State<'_, Arc<SessionLifecycleStore>>,
 ) -> Result<CommandResponse, String> {
     let now = chrono::Utc::now().timestamp_millis();
+    // The boot-time stash (single-read; main.rs setup populated it before the
+    // webview could issue this command) — the prior marker's `at` anchors the
+    // recency rule when every registry row is stale.
+    let marker_at = crate::session::shutdown_marker::classify_boot(
+        &crate::session::shutdown_marker::marker_path(crate::mcp::types::get_mcp_api_port()),
+    )
+    .prior_marker_at;
     Ok(CommandResponse {
         success: true,
         message: None,
-        data: Some(serde_json::json!({ "sessions": store.restorable_records(now) })),
+        data: Some(serde_json::json!({ "sessions": store.restorable_records(now, marker_at) })),
     })
 }
 

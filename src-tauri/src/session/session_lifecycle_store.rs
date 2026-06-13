@@ -54,6 +54,15 @@ const RESTORABLE_PTY_EXIT_MS: i64 = 600_000;
 /// NOT restorable (a genuinely abandoned session should not resurrect days
 /// later). 10 minutes in millis.
 const RESTORABLE_POLL_DEAD_MS: i64 = 600_000;
+/// An `open` record is restorable only if its `last_seen_at` is within this
+/// window of the registry's ANCHOR — the registry's last recorded moment of
+/// life (`max(all last_seen_at, all closed_at, prior shutdown-marker at)`) —
+/// NOT of wall-clock now. Anchor-relative recency survives arbitrary downtime
+/// (a crash followed by an hours-later boot still restores the rows that were
+/// fresh at crash time) while excluding stale ghosts (an `open` row whose
+/// terminal died days before the rest of the registry last breathed) on every
+/// boot kind. 10 minutes in millis.
+const RESTORABLE_OPEN_ANCHOR_MS: i64 = 600_000;
 /// Number of consecutive zero-descendant ticks a *live* shell (`Some(true)`)
 /// must accumulate before the poll closes it `poll-dead`. A live Claude
 /// session routinely idles with zero descendants between tool calls / while
@@ -64,6 +73,17 @@ const RESTORABLE_POLL_DEAD_MS: i64 = 600_000;
 /// shell still closes immediately — that path is unambiguous and bypasses
 /// this debounce entirely.
 const LIVE_SHELL_DEAD_TICKS: u32 = 3;
+/// Number of consecutive ticks an `open` record must have NO matching live
+/// terminal in THIS instance before the poll closes it `"no-terminal"`.
+/// A single no-match tick is ambiguous (a terminal mid-create / a registry
+/// write racing the poll), but no-match for several consecutive ticks
+/// (≈ N × 45s) is not uncertainty — it is an orphan: the terminal is gone and
+/// only the registry row remains. Without this close the row stays `open` for
+/// up to 7 days ([`OPEN_STALE_MS`]) and re-qualifies for restore at every
+/// restart. `"no-terminal"` is deliberately NOT a grace-window reason in
+/// [`SessionLifecycleStore::restorable_records`], so a closed orphan never
+/// restores.
+const NO_TERMINAL_CLOSE_TICKS: u32 = 4;
 
 /// One persisted terminal-session lifecycle record, keyed by
 /// `claude_session_id`. Timestamps are unix epoch millis.
@@ -284,9 +304,17 @@ impl SessionLifecycleStore {
     }
 
     /// Clone of every record that should be RESTORED on boot. This is the
-    /// superset of [`Self::open_records`] used by the restore path:
+    /// subset of records used by the restore path:
     ///
-    /// - every `state == "open"` record (a hard crash leaves records open), PLUS
+    /// - every `state == "open"` record whose `last_seen_at` is within
+    ///   [`RESTORABLE_OPEN_ANCHOR_MS`] of the registry ANCHOR — the registry's
+    ///   last recorded moment of life,
+    ///   `max(all last_seen_at, all closed_at, marker_at)`. A hard crash
+    ///   leaves on-screen records `open` with fresh `last_seen_at` (≈ anchor),
+    ///   so they restore even after hours of downtime; a stale ghost (terminal
+    ///   long gone, `last_seen_at` days behind the anchor) is excluded on
+    ///   every boot kind. An unflushed `pty-exit` close on a clean shutdown
+    ///   also leaves a fresh `open` row — same rule restores it. PLUS
     /// - every `state == "closed"` record whose `close_reason == "pty-exit"`
     ///   (its PTY died — the case a GRACEFUL restart produces by firing
     ///   `handleExit` on every live PTY) that closed within the
@@ -297,35 +325,53 @@ impl SessionLifecycleStore {
     ///   uncertain (the shell pty was still alive), so an immediate restart
     ///   should bring the session back rather than silently drop it.
     ///
-    /// Records closed for any other reason (explicit user close), or `pty-exit`
-    /// / `poll-dead` closes older than their grace windows, are excluded — a
-    /// user who closes a tab does not want it resurrected, and a long-dead
-    /// close is stale.
-    pub fn restorable_records(&self, now_ms: i64) -> Vec<TerminalSessionRecord> {
+    /// Records closed for any other reason (explicit user close, the poll's
+    /// `no-terminal` orphan close), or `pty-exit` / `poll-dead` closes older
+    /// than their grace windows, are excluded — a user who closes a tab does
+    /// not want it resurrected, and a long-dead close is stale.
+    ///
+    /// `marker_at` is the prior shutdown-marker timestamp
+    /// ([`crate::session::shutdown_marker::BootClassification::prior_marker_at`]):
+    /// the previous process's last moment of life. It anchors a registry whose
+    /// rows are ALL stale (e.g. one lone ghost row) — without it the freshest
+    /// ghost would anchor itself in.
+    pub fn restorable_records(
+        &self,
+        now_ms: i64,
+        marker_at: Option<i64>,
+    ) -> Vec<TerminalSessionRecord> {
         match self.map.lock() {
-            Ok(m) => m
-                .values()
-                .filter(|r| {
-                    if r.state == "open" {
-                        return true;
-                    }
-                    if r.state == "closed" {
-                        let grace = match r.close_reason.as_deref() {
-                            Some("pty-exit") => Some(RESTORABLE_PTY_EXIT_MS),
-                            Some("poll-dead") => Some(RESTORABLE_POLL_DEAD_MS),
-                            _ => None,
-                        };
-                        if let Some(grace_ms) = grace {
-                            return match r.closed_at {
-                                Some(closed_at) => now_ms - closed_at <= grace_ms,
-                                None => false,
-                            };
+            Ok(m) => {
+                let anchor = m
+                    .values()
+                    .flat_map(|r| [Some(r.last_seen_at), r.closed_at])
+                    .flatten()
+                    .chain(marker_at)
+                    .max()
+                    .unwrap_or(now_ms);
+                m.values()
+                    .filter(|r| {
+                        if r.state == "open" {
+                            return anchor - r.last_seen_at <= RESTORABLE_OPEN_ANCHOR_MS;
                         }
-                    }
-                    false
-                })
-                .cloned()
-                .collect(),
+                        if r.state == "closed" {
+                            let grace = match r.close_reason.as_deref() {
+                                Some("pty-exit") => Some(RESTORABLE_PTY_EXIT_MS),
+                                Some("poll-dead") => Some(RESTORABLE_POLL_DEAD_MS),
+                                _ => None,
+                            };
+                            if let Some(grace_ms) = grace {
+                                return match r.closed_at {
+                                    Some(closed_at) => now_ms - closed_at <= grace_ms,
+                                    None => false,
+                                };
+                            }
+                        }
+                        false
+                    })
+                    .cloned()
+                    .collect()
+            }
             Err(e) => {
                 warn!(error = %e, "session_lifecycle_store: lock poisoned on restorable_records");
                 Vec::new()
@@ -480,6 +526,32 @@ pub fn classify(
         return PollAction::Skip;
     }
     base
+}
+
+/// Pure classification for an open record with NO matching live terminal in
+/// this instance ([`classify`]'s `live_is_alive: None` arm Skips by design —
+/// it cannot distinguish a transient miss from an orphan, so the caller
+/// counts consecutive no-match ticks and feeds them here).
+///
+/// - `prior_no_match`: count of prior consecutive no-match ticks.
+/// - `restore_pending`: a mid-restore record keeps its OLD `terminal_id`
+///   until the verified-resume re-assert, so it ALWAYS misses the live-
+///   terminal match — it must never accumulate no-match ticks, let alone
+///   close. The guard lives here (not in [`classify`]) because `classify`
+///   Skips a `None` match regardless and the counter is caller-owned.
+///
+/// Returns `NeedsConfirm` (caller increments its counter) until
+/// [`NO_TERMINAL_CLOSE_TICKS`] consecutive no-match ticks accumulate, then
+/// `Close` — the caller closes with reason `"no-terminal"` (non-restorable).
+pub fn classify_no_match(prior_no_match: u32, restore_pending: bool) -> PollAction {
+    if restore_pending {
+        return PollAction::Skip;
+    }
+    if prior_no_match + 1 >= NO_TERMINAL_CLOSE_TICKS {
+        PollAction::Close
+    } else {
+        PollAction::NeedsConfirm
+    }
 }
 
 #[cfg(test)]
@@ -657,7 +729,7 @@ mod tests {
         let store = SessionLifecycleStore::open(&path).unwrap();
 
         let mut ids: Vec<String> = store
-            .restorable_records(now)
+            .restorable_records(now, None)
             .into_iter()
             .map(|r| r.claude_session_id)
             .collect();
@@ -912,6 +984,146 @@ mod tests {
         );
     }
 
+    /// The on-page repro: a stale `open` ghost (terminal long gone, last_seen
+    /// 72h behind the rest of the registry) must NOT restore, while the fresh
+    /// `open` rows that were actually on screen at shutdown DO.
+    #[test]
+    fn restorable_records_excludes_stale_open_ghost_via_anchor() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.record_open(rec("onscreen-1"));
+        store.record_open(rec("onscreen-2"));
+        store.record_open(rec("ghost"));
+
+        let now = Utc::now().timestamp_millis();
+        // Age the ghost's last_seen 72h behind the fresh rows (the anchor).
+        {
+            let raw = std::fs::read(&path).unwrap();
+            let mut m: HashMap<String, TerminalSessionRecord> =
+                serde_json::from_slice(&raw).unwrap();
+            m.get_mut("ghost").unwrap().last_seen_at = now - 72 * 3_600_000;
+            let bytes = serde_json::to_vec_pretty(&m).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+        }
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        let mut ids: Vec<String> = store
+            .restorable_records(now, None)
+            .into_iter()
+            .map(|r| r.claude_session_id)
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["onscreen-1".to_string(), "onscreen-2".to_string()],
+            "fresh open rows restore; the 72h ghost is excluded"
+        );
+    }
+
+    /// Anchor-relative recency must survive arbitrary downtime: a crash
+    /// followed by an hours-later boot still restores the rows that were
+    /// fresh at crash time (wall-clock `now - last_seen` would drop them).
+    #[test]
+    fn restorable_records_open_rows_survive_long_downtime() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.record_open(rec("crashed-fresh"));
+        store.record_open(rec("crashed-ghost"));
+
+        let crash_at = Utc::now().timestamp_millis();
+        // Simulate boot 6h after the crash; the ghost was already 72h stale
+        // AT crash time.
+        let now = crash_at + 6 * 3_600_000;
+        {
+            let raw = std::fs::read(&path).unwrap();
+            let mut m: HashMap<String, TerminalSessionRecord> =
+                serde_json::from_slice(&raw).unwrap();
+            m.get_mut("crashed-ghost").unwrap().last_seen_at = crash_at - 72 * 3_600_000;
+            let bytes = serde_json::to_vec_pretty(&m).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+        }
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        let ids: Vec<String> = store
+            .restorable_records(now, None)
+            .into_iter()
+            .map(|r| r.claude_session_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["crashed-fresh".to_string()],
+            "rows fresh at crash time restore after multi-hour downtime; stale ghost stays out"
+        );
+    }
+
+    /// A registry whose rows are ALL stale must not let the freshest ghost
+    /// anchor itself in — the prior shutdown-marker timestamp out-anchors it.
+    #[test]
+    fn restorable_records_marker_at_anchors_lone_ghost_out() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.record_open(rec("lone-ghost"));
+
+        let now = Utc::now().timestamp_millis();
+        {
+            let raw = std::fs::read(&path).unwrap();
+            let mut m: HashMap<String, TerminalSessionRecord> =
+                serde_json::from_slice(&raw).unwrap();
+            m.get_mut("lone-ghost").unwrap().last_seen_at = now - 72 * 3_600_000;
+            let bytes = serde_json::to_vec_pretty(&m).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+        }
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        // Without a marker the lone ghost anchors itself → restores (the
+        // marker is virtually always present in practice).
+        assert_eq!(store.restorable_records(now, None).len(), 1);
+        // With the prior marker's timestamp (clean shutdown just before now)
+        // the ghost is 72h behind the anchor → excluded.
+        assert!(
+            store.restorable_records(now, Some(now - 30_000)).is_empty(),
+            "marker_at must out-anchor a lone stale ghost"
+        );
+    }
+
+    // --- classify_no_match() — every branch ---------------------------------
+
+    #[test]
+    fn classify_no_match_confirms_before_close() {
+        // Below the threshold: keep confirming (caller increments).
+        for prior in 0..NO_TERMINAL_CLOSE_TICKS - 1 {
+            assert_eq!(
+                classify_no_match(prior, false),
+                PollAction::NeedsConfirm,
+                "{prior} prior no-match ticks must NeedsConfirm"
+            );
+        }
+        // The Nth consecutive no-match tick closes the orphan.
+        assert_eq!(
+            classify_no_match(NO_TERMINAL_CLOSE_TICKS - 1, false),
+            PollAction::Close
+        );
+        assert_eq!(
+            classify_no_match(NO_TERMINAL_CLOSE_TICKS + 5, false),
+            PollAction::Close
+        );
+    }
+
+    #[test]
+    fn classify_no_match_restore_pending_always_skips() {
+        // A mid-restore record keeps its OLD terminal_id until the verified
+        // re-assert, so it ALWAYS misses the live-terminal match — it must
+        // never accumulate ticks, let alone close.
+        assert_eq!(classify_no_match(0, true), PollAction::Skip);
+        assert_eq!(
+            classify_no_match(NO_TERMINAL_CLOSE_TICKS + 5, true),
+            PollAction::Skip
+        );
+    }
+
     #[test]
     fn restorable_records_includes_in_grace_poll_dead() {
         let dir = tempdir().unwrap();
@@ -944,7 +1156,7 @@ mod tests {
         let store = SessionLifecycleStore::open(&path).unwrap();
 
         let ids: Vec<String> = store
-            .restorable_records(now)
+            .restorable_records(now, None)
             .into_iter()
             .map(|r| r.claude_session_id)
             .collect();
