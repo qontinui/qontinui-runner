@@ -5,12 +5,15 @@
 //! with proper environment for running Claude CLI and other dev tools.
 
 pub mod account_migration;
+pub mod auto_response;
+pub mod auto_response_fleet;
 pub mod claude_resume_sniff;
 pub mod commit_report;
 pub mod coord_warn;
 pub mod grid;
 pub mod interceptor;
 pub mod manager;
+pub mod output_scan;
 pub mod session;
 pub mod transcript;
 pub mod transcript_watcher;

@@ -107,6 +107,65 @@ impl Default for ClaudeCliSettings {
     }
 }
 
+/// Per-rule exponential-backoff schedule for the fleet auto-response feature.
+///
+/// When a terminal Claude session's PTY output matches an auto-response rule's
+/// regex, the runner submits the rule's prompt back into that same live session
+/// after a delay that grows exponentially per consecutive match
+/// (`initial_delay_secs * multiplier^attempts`). This throttles the recovery so
+/// a session that keeps re-emitting the matched line (e.g. the transient "Server
+/// is temporarily limiting requests" rate-limit message) is nudged with backoff
+/// rather than hammered. By default the growth is UNBOUNDED (`max_delay_secs`
+/// is `None`); set a cap to clamp the delay.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BackoffConfig {
+    #[serde(default = "default_backoff_initial_secs")]
+    pub initial_delay_secs: u64,
+    #[serde(default = "default_backoff_multiplier")]
+    pub multiplier: f64,
+    #[serde(default)]
+    pub max_delay_secs: Option<u64>,
+}
+fn default_backoff_initial_secs() -> u64 {
+    60
+}
+fn default_backoff_multiplier() -> f64 {
+    2.0
+}
+impl Default for BackoffConfig {
+    fn default() -> Self {
+        Self {
+            initial_delay_secs: default_backoff_initial_secs(),
+            multiplier: default_backoff_multiplier(),
+            max_delay_secs: None,
+        }
+    }
+}
+
+/// One fleet-configured auto-response rule (fetch/cache wire shape).
+///
+/// Rules are fetched from the qontinui-web backend (device-JWT auth) and cached
+/// locally; this struct is ONLY that wire/cache shape — it is not part of the
+/// runner's persisted `Settings`. The server seeds and owns the rule set (the
+/// recovery rule for the transient "Server is temporarily limiting requests"
+/// rate-limit message ships server-side), so the runner never defaults a rule.
+/// When `pattern` (a regex) matches a live session's ANSI-stripped output, the
+/// runner submits `prompt` back into that session after the rule's `backoff`.
+/// Only `enabled` rules are acted on (the backend only returns enabled rules,
+/// so `enabled` defaults to `true`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AutoResponseRule {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    pub pattern: String,
+    pub prompt: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub backoff: BackoffConfig,
+}
+
 /// Settings for Claude API (direct HTTP calls)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaudeApiSettings {

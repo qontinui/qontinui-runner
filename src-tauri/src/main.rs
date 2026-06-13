@@ -595,6 +595,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // periodic publishers begin their cadences.
                 fleet::publish_on_startup(&fleet_publish_pg, fleet::MachineRole::Agent).await;
 
+                // Fleet auto-response rules: arm from the on-disk cache first
+                // (so a session that hit the transient rate-limit message during
+                // a restart is recovered before the first network fetch), then
+                // start the periodic fetch loop that refreshes the rule set from
+                // the qontinui-web backend. Best-effort: a coord/web outage
+                // leaves the cached rules in place. See
+                // `terminal::auto_response_fleet`.
+                terminal::auto_response_fleet::reload_from_cache_at_boot();
+                terminal::auto_response_fleet::spawn_fetch_loop();
+
                 // Plan 2026-05-19-coordinator-production-readiness.md
                 // Phase 1 — periodic primary-tree state publisher. These
                 // four tasks share one worker thread; they're all
@@ -2256,6 +2266,18 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             );
                         },
                     )),
+                ));
+
+                // Fleet auto-response watcher: every terminal PTY's output also
+                // flows through this hook, which matches fleet-configured regex
+                // rules against the (ANSI-stripped) output and submits each
+                // rule's prompt back into the SAME live session after a per-rule
+                // exponential backoff. Recovers a session stranded by the
+                // transient "Server is temporarily limiting requests" rate-limit
+                // message (distinct from a usage limit, handled above). See
+                // `terminal::auto_response` for the engine + scheduler.
+                term_for_session.interceptor().add_hook(Box::new(
+                    terminal::auto_response::AutoResponseWatchHook::new(),
                 ));
 
                 // Infrequent liveness poll for lazy close-detection. Every
