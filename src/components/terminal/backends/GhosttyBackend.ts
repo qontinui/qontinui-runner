@@ -5,6 +5,7 @@ import type {
   IDisposable,
   ITerminalBackend,
   ITerminalLinkProvider,
+  ITerminalTheme,
   TerminalBackendOptions,
 } from "./types";
 
@@ -70,11 +71,16 @@ export class GhosttyBackend implements ITerminalBackend {
     this.term.focus();
   }
 
-  write(data: Uint8Array | string): void {
+  write(data: Uint8Array | string, onRendered?: () => void): void {
     // Scan for OSC 633 sequences BEFORE writing to the terminal.
     // The interceptor is read-only — it never modifies the data.
     this.oscInterceptor.scan(data);
     this.term.write(data);
+    // ghostty-web's write has no async completion signal, so the chunk is
+    // considered rendered as soon as the synchronous write returns. Fire the
+    // render-completion callback immediately to keep the render-based ack
+    // (see TerminalInstance) accounting consistent across backends.
+    onRendered?.();
   }
 
   onData(cb: (data: string) => void): IDisposable {
@@ -112,6 +118,21 @@ export class GhosttyBackend implements ITerminalBackend {
     // GhosttyBackend wraps an xterm Terminal too, so the same in-place trim
     // applies (see XtermBackend.setScrollback).
     this.term.options.scrollback = lines;
+  }
+
+  setFontSize(px: number): void {
+    // ghostty-web is Canvas-only with no glyph texture atlas (so no
+    // clearTextureAtlas equivalent is needed). Set the option best-effort;
+    // guard so a build lacking it degrades to a no-op rather than throwing.
+    const o = this.term.options as { fontSize?: number };
+    o.fontSize = px;
+  }
+
+  setTheme(theme: ITerminalTheme): void {
+    // Canvas-only renderer — no atlas to invalidate. Set the option
+    // best-effort (see setFontSize).
+    const o = this.term.options as { theme?: ITerminalTheme };
+    o.theme = theme;
   }
 
   fit(): void {

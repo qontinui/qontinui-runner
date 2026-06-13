@@ -10,6 +10,7 @@ import type {
   IDisposable,
   ITerminalBackend,
   ITerminalLinkProvider,
+  ITerminalTheme,
   TerminalBackendOptions,
   TerminalSearchOptions,
   TerminalSearchResults,
@@ -35,8 +36,20 @@ export class XtermBackend implements ITerminalBackend {
   private container: HTMLElement | null = null;
   /** OSC 633;A prompt-start markers, in registration (= buffer) order. */
   private promptMarkers: IMarker[] = [];
+  /** `"auto"` loads the WebGL/Canvas renderer; `"dom"` forces the DOM renderer. */
+  private readonly gpuAcceleration: "auto" | "dom";
+  /**
+   * Active GPU renderer once `open()` has run. `null` means the DOM renderer
+   * is active (either forced via `gpuAcceleration: "dom"` or after all GPU
+   * addons failed to load) — the DOM renderer has no glyph texture atlas, so
+   * `clearGlyphAtlas()` is a no-op in that state.
+   */
+  private gpuRenderer: WebglAddon | CanvasAddon | null = null;
+  /** `matchMedia` DPR listener teardown — see `open()`. */
+  private dprCleanup: (() => void) | null = null;
 
   constructor(options: TerminalBackendOptions = {}) {
+    this.gpuAcceleration = options.gpuAcceleration ?? "auto";
     this.term = new Terminal({
       fontSize: options.fontSize,
       fontFamily: options.fontFamily,
@@ -47,6 +60,9 @@ export class XtermBackend implements ITerminalBackend {
       theme: options.theme,
       altClickMovesCursor: options.altClickMovesCursor,
       wordSeparator: options.wordSeparator,
+      // Opaque cells avoid the thin/ghosted-text WebGL artifact that appears
+      // when xterm composites glyphs over a transparent background.
+      allowTransparency: false,
       allowProposedApi: true,
     });
 
@@ -81,35 +97,83 @@ export class XtermBackend implements ITerminalBackend {
     this.container = container;
     this.term.open(container);
 
-    // Load rendering addons BEFORE WebLinksAddon so the renderer's
-    // onShowLinkUnderline / onHideLinkUnderline are available when
-    // the link decorator initialises.
-    try {
-      const webgl = new WebglAddon();
-      webgl.onContextLoss(() => {
-        console.warn("[XtermBackend] WebGL context lost, falling back to Canvas");
-        webgl.dispose();
-        // Fall back to canvas renderer on context loss
+    // gpuAcceleration "dom": skip the GPU addons entirely → pure DOM renderer.
+    // The DOM renderer has no glyph texture atlas and therefore can never
+    // ghost; this is the user escape hatch / force-DOM diagnostic lever.
+    if (this.gpuAcceleration === "auto") {
+      // Load rendering addons BEFORE WebLinksAddon so the renderer's
+      // onShowLinkUnderline / onHideLinkUnderline are available when
+      // the link decorator initialises.
+      try {
+        const webgl = new WebglAddon();
+        webgl.onContextLoss(() => {
+          console.warn("[XtermBackend] WebGL context lost, falling back to Canvas");
+          webgl.dispose();
+          this.gpuRenderer = null;
+          // Fall back to canvas renderer on context loss
+          try {
+            const canvas = new CanvasAddon();
+            this.term.loadAddon(canvas);
+            this.gpuRenderer = canvas;
+          } catch {
+            // DOM renderer is the final fallback — already active
+          }
+        });
+        this.term.loadAddon(webgl);
+        this.gpuRenderer = webgl;
+      } catch {
+        // WebGL not available, try canvas
         try {
-          this.term.loadAddon(new CanvasAddon());
+          const canvas = new CanvasAddon();
+          this.term.loadAddon(canvas);
+          this.gpuRenderer = canvas;
         } catch {
           // DOM renderer is the final fallback — already active
         }
-      });
-      this.term.loadAddon(webgl);
-    } catch {
-      // WebGL not available, try canvas
-      try {
-        this.term.loadAddon(new CanvasAddon());
-      } catch {
-        // DOM renderer is the final fallback — already active
       }
     }
 
     this.term.loadAddon(new WebLinksAddon());
+
+    // Clear the glyph texture atlas when the device pixel ratio changes
+    // (window dragged between monitors of different scaling, OS zoom change).
+    // A DPR change re-rasterises glyphs at a new size; an atlas keyed to the
+    // old DPR leaves stale, mis-scaled glyphs composited under new ones —
+    // a ghosting source. No-op on the DOM renderer (no atlas). Tracked via a
+    // re-armed `matchMedia` query since `resolution` MediaQueryLists fire
+    // once and then need re-subscribing at the new ratio.
+    if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
+      let mql: MediaQueryList | null = null;
+      const onDprChange = () => {
+        this.clearGlyphAtlas();
+        arm();
+      };
+      const arm = () => {
+        if (mql) mql.removeEventListener("change", onDprChange);
+        mql = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+        mql.addEventListener("change", onDprChange);
+      };
+      arm();
+      this.dprCleanup = () => {
+        if (mql) mql.removeEventListener("change", onDprChange);
+        mql = null;
+      };
+    }
+  }
+
+  /**
+   * Clear the active GPU renderer's glyph texture atlas. No-op on the DOM
+   * renderer (`gpuRenderer === null`). Called on DPR / font-size / theme
+   * changes — each invalidates cached glyphs and a stale atlas ghosts.
+   */
+  private clearGlyphAtlas(): void {
+    this.gpuRenderer?.clearTextureAtlas();
   }
 
   dispose(): void {
+    this.dprCleanup?.();
+    this.dprCleanup = null;
+    this.gpuRenderer = null;
     this.term.dispose();
   }
 
@@ -121,8 +185,11 @@ export class XtermBackend implements ITerminalBackend {
     this.term.focus();
   }
 
-  write(data: Uint8Array | string): void {
-    this.term.write(data);
+  write(data: Uint8Array | string, onRendered?: () => void): void {
+    // xterm invokes the callback once the chunk is parsed and the resulting
+    // frame is rendered (its write queue drains), which is the render-completion
+    // signal the render-based ack relies on.
+    this.term.write(data, onRendered);
   }
 
   onData(cb: (data: string) => void): IDisposable {
@@ -157,6 +224,18 @@ export class XtermBackend implements ITerminalBackend {
     // xterm trims the active buffer to the new cap on assignment when it is
     // lowered, so this frees the dead pane's retained cell storage in place.
     this.term.options.scrollback = lines;
+  }
+
+  setFontSize(px: number): void {
+    this.term.options.fontSize = px;
+    // New cell metrics ⇒ the cached glyphs are the wrong size; invalidate.
+    this.clearGlyphAtlas();
+  }
+
+  setTheme(theme: ITerminalTheme): void {
+    this.term.options.theme = theme;
+    // Cached glyphs are colored, so a theme swap must invalidate the atlas.
+    this.clearGlyphAtlas();
   }
 
   fit(): void {

@@ -8,11 +8,13 @@ import { createTerminalBackend } from "./backends";
 import type { BackendType, ITerminalBackend, TerminalSearchResults } from "./backends";
 import { TerminalFindBar } from "./TerminalFindBar";
 import { paintGrid, type GridSnapshot } from "./paintGrid";
+import { getTerminalDebug, recordPaintGrid } from "./terminalDebug";
 import { instanceStorage } from "@/lib/instance-storage";
 import { consumeInputChunk } from "./consumeInputChunk";
 import { wheelToLineDelta, DEFAULT_CELL_HEIGHT_PX } from "./wheelScroll";
 import { matchScrollShortcut } from "./scrollKeys";
 import { trimReplayedChunk, type OffsetChunk } from "./scrollbackReplay";
+import { RenderAckAccumulator, ACK_FLOOR_INTERVAL_MS } from "./flowControl";
 import { useWindowAssignments } from "./contexts/WindowAssignmentsContext";
 
 /**
@@ -73,9 +75,10 @@ interface TerminalInstanceProps {
   onOutput?: (text: string) => void;
   /**
    * Called with the latest OSC 0 / OSC 2 title observed by the Rust grid.
-   * Fires after each `paintGrid` whenever the snapshot's `title` field
-   * differs from the previous value. Layer 4 polish wiring per
-   * `plans/terminal-grid-bootstrap-redesign.md`.
+   * Fires from the bootstrap paint and from the ~1s ack-timer title poll
+   * whenever the grid's `title` differs from the previous value. (The poll
+   * replaced the retired periodic idle paint as the title source — Phase 2 of
+   * `plans/2026-06-13-terminal-rendering-robustness.md`.)
    */
   onTitleChange?: (title: string) => void;
 }
@@ -177,10 +180,14 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
     const backendType: BackendType =
       backendTypeProp ??
       ((instanceStorage.getItem("terminal-backend") as BackendType | null) || "xterm");
+    // Resolve GPU acceleration policy (xterm only): instanceStorage > "auto".
+    // "dom" forces the pure-DOM renderer (never ghosts) — user escape hatch
+    // and the force-DOM diagnostic lever for the ghosting investigation.
+    const gpuAcceleration: "auto" | "dom" =
+      instanceStorage.getItem("terminal-gpu-acceleration") === "dom" ? "dom" : "auto";
     const containerRef = useRef<HTMLDivElement>(null);
     const backendRef = useRef<ITerminalBackend | null>(null);
     const bytesReceivedRef = useRef(0);
-    const lastAckedRef = useRef(0);
     // Stable refs for callbacks to avoid effect re-runs
     const onExitRef = useRef(onExit);
     onExitRef.current = onExit;
@@ -209,7 +216,7 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
     isOwnedRef.current = isOwned(terminalId);
     /**
      * Most-recently reported title — guards `onTitleChange` against firing on
-     * every paintGrid (200ms idle cadence) when the title is unchanged.
+     * every title poll (~1s ack-timer cadence) when the title is unchanged.
      */
     const lastTitleRef = useRef<string | null>(null);
     const outputDecoderRef = useRef(new TextDecoder());
@@ -359,11 +366,9 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
       let observer: ResizeObserver | null = null;
       let blockNativePaste: ((e: Event) => void) | null = null;
       let wheelScrollOverride: ((e: WheelEvent) => void) | null = null;
-      // Layer 2 bootstrap: idle-debounced grid re-paint. The live listener
-      // resets this timer on every received byte; when the stream goes
-      // quiet for IDLE_REPAINT_MS we re-fetch the Rust grid and overlay
-      // it via paintGrid so xterm and the grid stay in sync.
-      let idleTimer: ReturnType<typeof setTimeout> | null = null;
+      // Ensure the dev instrumentation hook (window.__qontinuiTerminal) exists
+      // so it's discoverable from the console even before any paint fires.
+      getTerminalDebug();
       // Bytes received before the backend finishes async init. Tauri does
       // NOT queue events before listen() resolves, and createTerminalBackend
       // (WASM load + open + key handlers + UI Bridge registration) takes
@@ -379,16 +384,114 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
       // boundary are already in the buffer via the ring and must not be
       // written again.
       let replayedThrough = 0;
-      // Assigned once the backend exists (see Bug A note above). Until then
-      // the listener buffers bytes; we can't schedule a repaint that needs
-      // the backend.
-      let scheduleIdleRepaint: (() => void) | null = null;
+      // Phase 3 — render-based flow control. Tracks bytes the backend has
+      // actually RENDERED (its `write` completion callback fired), not bytes
+      // merely received off the wire, and decides when to ack the Rust reader
+      // (every ~AckSize rendered bytes; the floor timer below drains a trailing
+      // remainder). This replaces the old 250ms byte-count ack so a burst can't
+      // outrun xterm's ~50MB input buffer (which silently drops overflow)
+      // before backpressure engages.
+      const renderAck = new RenderAckAccumulator();
+      const sendAck = (bytes: number) => {
+        if (bytes <= 0) return;
+        invoke("terminal_ack", { terminalId, bytesAcked: bytes }).catch(() => {});
+      };
+      // Phase 4 — write coalescing. Per `terminal-output` event we trim the
+      // chunk against the ring-replay boundary and stage the unreplayed suffix
+      // here; a microtask flush concatenates everything staged into a SINGLE
+      // `backend.write()`. xterm's own RenderDebouncer then batches one reflow
+      // per frame — we add no rAF loop around xterm. The render-ack callback
+      // fires once for the whole coalesced write and accounts its full length.
+      let coalesceQueue: Uint8Array[] = [];
+      let coalesceLen = 0;
+      let flushScheduled = false;
+      const flushCoalesced = () => {
+        flushScheduled = false;
+        if (coalesceLen === 0) return;
+        const b = backendRef.current;
+        if (!b) {
+          coalesceQueue = [];
+          coalesceLen = 0;
+          return;
+        }
+        let merged: Uint8Array;
+        if (coalesceQueue.length === 1) {
+          merged = coalesceQueue[0];
+        } else {
+          merged = new Uint8Array(coalesceLen);
+          let at = 0;
+          for (const c of coalesceQueue) {
+            merged.set(c, at);
+            at += c.length;
+          }
+        }
+        const writtenLen = merged.length;
+        coalesceQueue = [];
+        coalesceLen = 0;
+        renderAck.onWriteIssued(writtenLen);
+        try {
+          b.write(merged, () => {
+            sendAck(renderAck.onRendered(writtenLen));
+          });
+        } catch (e) {
+          console.error(`[Terminal ${terminalId}] write error:`, e);
+          // The render callback won't fire for a failed write — settle the
+          // in-flight bytes so the accumulator and reader backpressure don't
+          // wedge on a permanently-unrendered chunk.
+          sendAck(renderAck.onRendered(writtenLen));
+        }
+      };
+      const scheduleFlush = () => {
+        if (flushScheduled) return;
+        flushScheduled = true;
+        queueMicrotask(flushCoalesced);
+      };
+      /**
+       * Apply a one-shot bootstrap paint of the Rust `GridSnapshot` into the
+       * backend, with the Phase-2 alt-screen guard.
+       *
+       * The periodic idle reconciliation paint was RETIRED in Phase 2: the
+       * Rust grid is single-buffer and can't model the alt screen that
+       * Claude's TUI lives on, so a periodic full-screen overlay could never
+       * be made safe. The live `terminal-output` stream is authoritative for
+       * forward motion; offset-dedup + remount ring-replay are the recovery
+       * path for missed chunks. paintGrid now runs ONLY for the two one-shot
+       * bootstraps (mount-gap + reconnect), and even those hard-skip when the
+       * snapshot reports the alt screen is active — overlaying a single-buffer
+       * snapshot that holds alt content onto a freshly-mounted xterm can
+       * mis-place rows. In that case we let the live stream + ring-replay
+       * populate instead.
+       *
+       * Title reporting is decoupled from the paint (see the ack timer) so
+       * titles still flow up even when the paint is skipped.
+       */
+      const bootstrapPaint = (
+        snapshot: GridSnapshot,
+        reason: "mount-bootstrap" | "reconnect-bootstrap",
+      ) => {
+        const b = backendRef.current;
+        if (!b) return;
+        const altScreen = snapshot.alt_screen === true;
+        const applied = !altScreen;
+        if (applied) {
+          paintGrid(b, snapshot);
+        }
+        reportTitleFromSnapshot(snapshot.title);
+        recordPaintGrid({
+          terminalId,
+          reason,
+          altScreen,
+          applied,
+          bytesWritten: bytesReceivedRef.current,
+          ts: Date.now(),
+        });
+      };
 
       /**
        * Emit `onTitleChange` if the snapshot's OSC 0/2 title is non-empty AND
-       * differs from the last reported value. Called after every paintGrid
-       * (initial bootstrap + every idle repaint) so the latest title from the
-       * Rust grid flows up to the tab title without spamming the callback.
+       * differs from the last reported value. Called from the bootstrap paint
+       * and from the ack-timer title poll so the latest title from the Rust
+       * grid flows up to the tab title without spamming the callback.
        */
       const reportTitleFromSnapshot = (title: string | undefined | null) => {
         if (!title) return;
@@ -417,8 +520,7 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
             return;
           }
 
-          const b = backendRef.current;
-          if (!b) return;
+          if (!backendRef.current) return;
           // A chunk emitted before the ring snapshot can still be DELIVERED
           // after the replay (event delivery and invoke responses are not
           // mutually ordered) — trim it to its unreplayed suffix so the
@@ -430,11 +532,13 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
             replayedThrough,
           );
           if (unreplayed) {
-            try {
-              b.write(unreplayed);
-            } catch (e) {
-              console.error(`[Terminal ${terminalId}] write error:`, e);
-            }
+            // Phase 4: stage the unreplayed suffix and flush once per microtask
+            // into a single coalesced backend.write() (offset-dedup already
+            // applied above, before coalescing). The render-ack accounts the
+            // coalesced length when its completion callback fires.
+            coalesceQueue.push(unreplayed);
+            coalesceLen += unreplayed.length;
+            scheduleFlush();
           }
           if (onOutputRef.current) {
             try {
@@ -445,7 +549,6 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
             }
           }
           bytesReceivedRef.current += bytes.length;
-          scheduleIdleRepaint?.();
         });
 
       // Cold-mount path: attach the live `terminal-output` listener IMMEDIATELY
@@ -471,7 +574,10 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
 
       // Async init because backend creation may require WASM loading
       (async () => {
-        const backend = await createTerminalBackend(backendType, TERMINAL_OPTIONS);
+        const backend = await createTerminalBackend(backendType, {
+          ...TERMINAL_OPTIONS,
+          gpuAcceleration,
+        });
         if (disposed) {
           backend.dispose();
           return;
@@ -784,15 +890,14 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         //      top of this effect, BEFORE createTerminalBackend. Bytes that
         //      arrived during async init were buffered into pendingBytes —
         //      drain them here now that the backend exists.
-        //   2. Every received byte resets a 200ms idle timer (defined
-        //      below). On idle we re-fetch the grid and paint — Claude's
-        //      TUI repaints always end with [?2026l + silence, so paint-
-        //      on-idle reconciles divergence accumulated during the burst.
+        //   2. Forward motion is owned ENTIRELY by the live `terminal-output`
+        //      stream (with offset-dedup + remount ring-replay as the recovery
+        //      path). The periodic idle reconciliation paint was retired in
+        //      Phase 2 — see `bootstrapPaint` above for why.
         //   3. After waiting for the container to have non-zero dims, fit
-        //      + terminal_resize + brief 50ms wait for SIGWINCH, then
-        //      fetch the GridSnapshot and paintGrid. paintGrid uses
-        //      absolute CUP per row inside a DECAWM-off bracket — safe to
-        //      write concurrently with live bytes.
+        //      + terminal_resize + brief 50ms wait for SIGWINCH, then fetch
+        //      the GridSnapshot for the one-shot mount-gap bootstrap paint
+        //      (alt-screen-guarded via bootstrapPaint).
         // Replay the Rust-side scrollback ring BEFORE any live/pending bytes
         // land. TerminalInstance remounts whenever the zone layout reshapes
         // (maximize / single-view toggle, layout switch, hidden↔assigned
@@ -839,31 +944,6 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         }
         pendingBytes = [];
         backendReady = true;
-
-        // Define the idle repaint scheduler now that the backend exists.
-        // The early-attached listener has been writing into pendingBytes
-        // and reading scheduleIdleRepaint via closure — we wire the
-        // implementation here.
-        const IDLE_REPAINT_MS = 200;
-        scheduleIdleRepaint = () => {
-          if (idleTimer) clearTimeout(idleTimer);
-          idleTimer = setTimeout(async () => {
-            if (disposed) return;
-            try {
-              const r = await invoke<{ success: boolean; data: GridSnapshot | null }>(
-                "terminal_get_grid",
-                { terminalId },
-              );
-              const b = backendRef.current;
-              if (r.success && r.data && b && !disposed) {
-                paintGrid(b, r.data);
-                reportTitleFromSnapshot(r.data.title);
-              }
-            } catch {
-              /* idle repaint best-effort; ignore failures */
-            }
-          }, IDLE_REPAINT_MS);
-        };
 
         // Wait for the container to have non-zero dimensions before
         // fitting. On fast initial mount the layout is already done; on
@@ -930,8 +1010,10 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
             { terminalId },
           );
           if (result.success && result.data && !disposed) {
-            paintGrid(backend, result.data);
-            reportTitleFromSnapshot(result.data.title);
+            bootstrapPaint(
+              result.data,
+              isReconnecting ? "reconnect-bootstrap" : "mount-bootstrap",
+            );
           }
         } catch (err) {
           console.warn(`[Terminal ${terminalId}] grid bootstrap failed:`, err);
@@ -957,11 +1039,10 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         }
         if (disposed) return;
 
-        // Prime the idle re-paint heartbeat once after bootstrap, so the
-        // timer ticks even when zero live events arrive (e.g. Claude
-        // already finished its initial render before the listener
-        // attached and no further bytes are coming for a while).
-        scheduleIdleRepaint?.();
+        // (Phase 2) The periodic idle re-paint heartbeat that used to be
+        // primed here was retired — forward motion is owned by the live
+        // `terminal-output` stream. The one-shot bootstrap paint above is the
+        // only paintGrid that runs now.
 
         // Reconnect callback fires only on actual reconnects (not first
         // mount), preserving the prior semantic.
@@ -988,18 +1069,42 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         observer = new ResizeObserver(() => fitTerminal());
         observer.observe(container);
 
-        // Flow control: periodically ack received bytes
+        // Flow control floor + title poll. The primary ack is RENDER-based
+        // (Phase 3): the coalesced write's completion callback acks every
+        // ~AckSize rendered bytes. This timer is the floor — it drains a
+        // trailing sub-AckSize remainder so the last bytes of a burst still
+        // ack and the Rust reader resumes even when no further output arrives
+        // to trip the AckSize threshold.
+        //
+        // It also carries the lightweight title poll (Phase 2): title
+        // reporting used to ride on the retired periodic idle paint, so it now
+        // piggybacks this timer. Every ~1s (every 4th tick) — and only when
+        // there is an `onTitleChange` consumer — we fetch the cheap text
+        // snapshot (`terminal_grid_text` does NOT clone the cell buffer, unlike
+        // `terminal_get_grid`) and report any new OSC 0/2 title.
+        // `reportTitle` already dedups against the last value, so unchanged
+        // titles are free.
+        let titlePollTick = 0;
         ackTimer = setInterval(() => {
-          const received = bytesReceivedRef.current;
-          const delta = received - lastAckedRef.current;
-          if (delta > 0) {
-            lastAckedRef.current = received;
-            invoke("terminal_ack", {
-              terminalId,
-              bytesAcked: delta,
-            }).catch(() => {});
+          // Drain any rendered-but-sub-AckSize remainder.
+          sendAck(renderAck.flush());
+
+          titlePollTick = (titlePollTick + 1) % 4;
+          if (titlePollTick === 0 && onTitleChangeRef.current) {
+            invoke<{ success: boolean; data: { title?: string | null } | null }>(
+              "terminal_grid_text",
+              { terminalId },
+            )
+              .then((r) => {
+                if (!disposed && r.success && r.data) {
+                  reportTitleFromSnapshot(r.data.title);
+                }
+              })
+              .catch(() => {
+                /* title poll best-effort; ignore failures */
+              });
           }
-        }, 250);
+        }, ACK_FLOOR_INTERVAL_MS);
 
         // OSC 633 shell integration handler
         disposables.push(
@@ -1024,8 +1129,11 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
       // Cleanup
       return () => {
         disposed = true;
+        // Flush any microtask-staged coalesced write synchronously so trailing
+        // bytes reach the (about-to-be-disposed) backend rather than being
+        // dropped. Harmless if nothing is staged.
+        if (flushScheduled) flushCoalesced();
         if (ackTimer) clearInterval(ackTimer);
-        if (idleTimer) clearTimeout(idleTimer);
         if (fitTimerRef.current) clearTimeout(fitTimerRef.current);
         observer?.disconnect();
         if (wheelScrollOverride) {

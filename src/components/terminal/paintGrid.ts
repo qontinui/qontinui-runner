@@ -1,11 +1,11 @@
 /**
  * paintGrid — render a Rust-side `GridSnapshot` into an `ITerminalBackend`.
  *
- * Used by the Layer 2 live-first bootstrap as a "catch-up" mechanism, NOT
- * as the source of truth. The live `terminal-output` listener is
- * authoritative for forward motion; paintGrid fills the gap between mount
- * and listener attach (those bytes are dropped by Tauri but live in the
- * Rust grid) and re-syncs on idle.
+ * Used by the live-first bootstrap as a "catch-up" mechanism, NOT as the
+ * source of truth. The live `terminal-output` listener is authoritative for
+ * forward motion; paintGrid fills the gap between mount and listener attach
+ * (those bytes are dropped by Tauri but live in the Rust grid). The periodic
+ * idle re-sync was retired in Phase 2 — see the `paintGrid` doc below.
  *
  * Design constraints:
  *   - DECAWM-off (`\x1b[?7l` / `\x1b[?7h`) wraps the whole paint to prevent
@@ -65,6 +65,14 @@ export interface GridSnapshot {
   cursor: GridCursor;
   /** Optional OSC 0/2 title. */
   title?: string;
+  /**
+   * True when the Rust grid is on the alternate screen (DEC `?1049h`). The
+   * grid is single-buffer, so a snapshot taken in this state holds alt-screen
+   * content; the bootstrap paint hard-skips when this is true rather than
+   * overlay it onto a freshly-mounted xterm. Always present from the current
+   * runner build; optional so an older build (no field) degrades to `false`.
+   */
+  alt_screen?: boolean;
   /** Row-major: cells[row * cols + col]. Length === rows * cols. */
   cells: GridCell[];
 }
@@ -144,9 +152,15 @@ function safeChar(ch: string): string {
 
 /**
  * Paint a `GridSnapshot` into `backend`. Issues a single `backend.write()`.
- * Safe to call concurrently with live `backend.write()` from the
- * `terminal-output` listener — DECAWM-off + absolute CUP per row makes
- * this an idempotent overlay.
+ *
+ * DECAWM-off + absolute CUP per row makes this an idempotent overlay. As of
+ * Phase 2 (`plans/2026-06-13-terminal-rendering-robustness.md`) this is used
+ * ONLY for the two one-shot bootstraps (mount-gap + reconnect) in
+ * `TerminalInstance`, and the caller hard-skips it when the snapshot reports
+ * the alt screen is active. The periodic idle reconciliation that re-painted
+ * concurrently with the live stream was retired — the single-buffer grid
+ * cannot model the alt screen, so a concurrent full-screen overlay could not
+ * be made safe for a TUI like Claude.
  */
 export function paintGrid(backend: ITerminalBackend, snapshot: GridSnapshot): void {
   const { cols, rows, cells, cursor } = snapshot;
