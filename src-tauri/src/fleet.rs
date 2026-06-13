@@ -1407,6 +1407,17 @@ struct PullOutcome {
     git_op: Option<(String, Option<String>)>, // (op_kind, message)
 }
 
+/// The `restore_default` verdict's payload fields (chkguard Phase 3 — restore
+/// a clean primary checkout parked on a merged-PR branch). Parsed from the
+/// coord Decision; every field is re-verified against live git at apply time.
+struct RestoreParams {
+    parked_branch: String,
+    /// The merged PR's head SHA — the local HEAD must STILL equal it.
+    expected_head_sha: String,
+    /// The merged PR number (log/audit context only).
+    pr_number: Option<i64>,
+}
+
 /// Apply one safe verdict to one repo's working tree. Blocking git via the
 /// caller's `spawn_blocking`. Returns the outcome to record. NEVER performs an
 /// unsafe op regardless of the verdict (defense in depth, plan §5).
@@ -1415,6 +1426,7 @@ fn apply_pull_verdict_blocking(
     verdict_kind: &str,
     timing_now: bool,
     hold_reason: Option<&str>,
+    restore: Option<RestoreParams>,
 ) -> PullOutcome {
     use std::process::Command;
     let default_branch = resolve_default_branch(repo_path);
@@ -1565,11 +1577,235 @@ fn apply_pull_verdict_blocking(
                 },
             }
         }
+        "restore_default" => {
+            // chkguard Phase 3 — restore a clean primary checkout parked on a
+            // merged-PR branch: switch <default> && merge --ff-only
+            // origin/<default> && delete the parked branch. Every predicate
+            // coord evaluated is re-verified against LIVE git first; any
+            // mismatch → no action (the staleness alert keeps paging).
+            if !timing_now {
+                return PullOutcome {
+                    chosen_option: "deferred".to_string(),
+                    reasoning:
+                        "coord verdict RestoreDefault but timing=Defer — re-evaluate next tick"
+                            .to_string(),
+                    git_op: None,
+                };
+            }
+            let Some(p) = restore else {
+                return PullOutcome {
+                    chosen_option: "restore_malformed".to_string(),
+                    reasoning: "restore_default verdict missing parked_branch/expected_head_sha"
+                        .to_string(),
+                    git_op: None,
+                };
+            };
+            apply_restore_default_blocking(repo_path, repo_str, &default_branch, &p)
+        }
         other => PullOutcome {
             chosen_option: "unknown_verdict".to_string(),
             reasoning: format!("unrecognized verdict kind `{other}` — no action"),
             git_op: None,
         },
+    }
+}
+
+/// Execute one verified `restore_default`: apply-time re-verification, then
+/// fetch → switch → ff-only merge → delete the parked branch. Each step
+/// aborts on failure with a distinct outcome (idempotent — the next publish
+/// tick re-evaluates whatever state the tree was left in; every intermediate
+/// state is a valid git state strictly no staler than the parked one).
+fn apply_restore_default_blocking(
+    repo_path: &std::path::Path,
+    repo_str: &str,
+    default_branch: &str,
+    p: &RestoreParams,
+) -> PullOutcome {
+    use std::process::Command;
+    let pr = p
+        .pr_number
+        .map(|n| format!("#{n}"))
+        .unwrap_or_else(|| "(unknown)".to_string());
+
+    // Apply-time re-verification — the verdict may be a tick stale.
+    // (1) PRIMARY checkout only: a linked worktree's `.git` is a file.
+    if !repo_path.join(".git").is_dir() {
+        return PullOutcome {
+            chosen_option: "restore_skipped_recheck".to_string(),
+            reasoning: "not a primary checkout (.git is not a directory) — refusing restore"
+                .to_string(),
+            git_op: None,
+        };
+    }
+    // (2) Still on the parked branch coord decided about.
+    let cur_branch = Command::new("git")
+        .args(["-C", repo_str, "symbolic-ref", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    if cur_branch.as_deref() != Some(p.parked_branch.as_str()) {
+        return PullOutcome {
+            chosen_option: "restore_skipped_recheck".to_string(),
+            reasoning: format!(
+                "tree moved since the verdict (on {:?}, expected parked branch `{}`) — not restoring",
+                cur_branch, p.parked_branch
+            ),
+            git_op: None,
+        };
+    }
+    // (3) Still porcelain-clean (includes untracked).
+    let clean = Command::new("git")
+        .args(["-C", repo_str, "status", "--porcelain=v1"])
+        .output()
+        .ok()
+        .map(|o| o.status.success() && o.stdout.is_empty())
+        .unwrap_or(false);
+    if !clean {
+        return PullOutcome {
+            chosen_option: "restore_skipped_recheck".to_string(),
+            reasoning: "tree dirty at apply time — not restoring (never touch WIP)".to_string(),
+            git_op: None,
+        };
+    }
+    // (4) Local HEAD still equals the merged PR's head SHA — the zero-work-loss
+    //     proof. A new local commit since the verdict fails this and aborts.
+    let head = Command::new("git")
+        .args(["-C", repo_str, "rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    if head.as_deref() != Some(p.expected_head_sha.as_str()) {
+        return PullOutcome {
+            chosen_option: "restore_skipped_recheck".to_string(),
+            reasoning: format!(
+                "HEAD {:?} != merged PR {pr} head {} — local work may exist; not restoring",
+                head, p.expected_head_sha
+            ),
+            git_op: None,
+        };
+    }
+
+    // Fetch the default ref first so the ff-only merge lands on CURRENT main
+    // (the parked tree's origin/<default> may be arbitrarily stale).
+    let fetch = Command::new("git")
+        .args(["-C", repo_str, "fetch", "origin", default_branch])
+        .output();
+    if !fetch.as_ref().map(|o| o.status.success()).unwrap_or(false) {
+        let err = fetch
+            .map(|o| {
+                String::from_utf8_lossy(&o.stderr)
+                    .trim()
+                    .chars()
+                    .take(200)
+                    .collect()
+            })
+            .unwrap_or_else(|e| format!("spawn failed: {e}"));
+        return PullOutcome {
+            chosen_option: "restore_fetch_failed".to_string(),
+            reasoning: format!("git fetch origin {default_branch} failed: {err}"),
+            git_op: None,
+        };
+    }
+    let switch = Command::new("git")
+        .args(["-C", repo_str, "switch", default_branch])
+        .output();
+    if !switch.as_ref().map(|o| o.status.success()).unwrap_or(false) {
+        let err = switch
+            .map(|o| {
+                String::from_utf8_lossy(&o.stderr)
+                    .trim()
+                    .chars()
+                    .take(200)
+                    .collect()
+            })
+            .unwrap_or_else(|e| format!("spawn failed: {e}"));
+        return PullOutcome {
+            chosen_option: "restore_switch_failed".to_string(),
+            reasoning: format!("git switch {default_branch} failed: {err}"),
+            git_op: None,
+        };
+    }
+    let merge = Command::new("git")
+        .args([
+            "-C",
+            repo_str,
+            "merge",
+            "--ff-only",
+            &format!("origin/{default_branch}"),
+        ])
+        .output();
+    if !merge.as_ref().map(|o| o.status.success()).unwrap_or(false) {
+        // Switched but couldn't ff (local default diverged). The tree is on
+        // the default branch at its old position — strictly less stale than
+        // parked; the ordinary repo_pull ladder (Diverged → escalate) takes
+        // over next tick. The parked branch is kept for the audit trail.
+        let err = merge
+            .map(|o| {
+                String::from_utf8_lossy(&o.stderr)
+                    .trim()
+                    .chars()
+                    .take(200)
+                    .collect()
+            })
+            .unwrap_or_else(|e| format!("spawn failed: {e}"));
+        return PullOutcome {
+            chosen_option: "restored_ff_failed".to_string(),
+            reasoning: format!(
+                "switched to {default_branch} but ff-only merge failed (local default \
+                 diverged?): {err} — parked branch `{}` kept",
+                p.parked_branch
+            ),
+            git_op: Some((
+                "restore".to_string(),
+                Some(format!("switch {default_branch} (ff failed)")),
+            )),
+        };
+    }
+    // Delete the parked branch. -D, not -d: a squash-merged branch tip is not
+    // an ancestor of the default branch, so -d always refuses it — and the
+    // (re-verified) HEAD == merged-PR-head equality above is the actual
+    // safety proof (the content is on GitHub as the PR head regardless).
+    let del = Command::new("git")
+        .args(["-C", repo_str, "branch", "-D", &p.parked_branch])
+        .output();
+    let del_note = if del.as_ref().map(|o| o.status.success()).unwrap_or(false) {
+        format!("deleted parked branch `{}`", p.parked_branch)
+    } else {
+        format!(
+            "branch -D `{}` failed (left in place): {}",
+            p.parked_branch,
+            del.map(|o| String::from_utf8_lossy(&o.stderr)
+                .trim()
+                .chars()
+                .take(120)
+                .collect())
+                .unwrap_or_else(|e| format!("spawn failed: {e}"))
+        )
+    };
+    let new_head = Command::new("git")
+        .args(["-C", repo_str, "rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    PullOutcome {
+        chosen_option: "restored".to_string(),
+        reasoning: format!(
+            "restored from merged PR {pr} branch `{}` to {default_branch} \
+             (HEAD={}); {del_note}",
+            p.parked_branch,
+            &new_head[..new_head.len().min(12)],
+        ),
+        git_op: Some((
+            "restore".to_string(),
+            Some(format!(
+                "parked merged branch `{}` -> {default_branch}",
+                p.parked_branch
+            )),
+        )),
     }
 }
 
@@ -1697,6 +1933,24 @@ async fn request_and_apply_pull(
         .get("reason")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    // chkguard Phase 3: the restore_default verdict's payload. Both fields
+    // required — a partial payload parses to None and the apply arm reports
+    // restore_malformed instead of guessing.
+    let restore_params = if verdict_kind == "restore_default" {
+        match (
+            verdict.get("parked_branch").and_then(|v| v.as_str()),
+            verdict.get("expected_head_sha").and_then(|v| v.as_str()),
+        ) {
+            (Some(b), Some(sha)) if !b.is_empty() && !sha.is_empty() => Some(RestoreParams {
+                parked_branch: b.to_string(),
+                expected_head_sha: sha.to_string(),
+                pr_number: verdict.get("pr_number").and_then(|v| v.as_i64()),
+            }),
+            _ => None,
+        }
+    } else {
+        None
+    };
 
     // 3. Honor the autonomy dial: guidance_only surfaces the recommendation
     //    without mutating the tree.
@@ -1723,7 +1977,7 @@ async fn request_and_apply_pull(
     let vk = verdict_kind.clone();
     let hr = hold_reason.clone();
     let outcome = match tokio::task::spawn_blocking(move || {
-        apply_pull_verdict_blocking(&rp, &vk, timing_now, hr.as_deref())
+        apply_pull_verdict_blocking(&rp, &vk, timing_now, hr.as_deref(), restore_params)
     })
     .await
     {
@@ -1737,7 +1991,10 @@ async fn request_and_apply_pull(
         }
     };
 
-    if outcome.chosen_option == "pulled" || outcome.chosen_option == "default_ref_sync" {
+    if outcome.chosen_option == "pulled"
+        || outcome.chosen_option == "default_ref_sync"
+        || outcome.chosen_option == "restored"
+    {
         info!(
             "fleet::pull_executor: {} -> {} ({})",
             payload.repo, outcome.chosen_option, outcome.reasoning
@@ -1971,7 +2228,23 @@ pub async fn publish_tree_state() -> Result<(), String> {
         // coord, for a repo that is behind origin, request the pull verdict and
         // apply the safe action. ON by default (opt out via
         // COORD_PULL_EXECUTOR_ENABLED=0) — the apply mutates the working tree.
-        if upsert_ok && pull_executor_enabled() && payload.behind_count.unwrap_or(0) > 0 {
+        //
+        // chkguard Phase 3: ALSO request a verdict for a clean PRIMARY checkout
+        // parked on a non-default named branch — the restore-candidate shape.
+        // Such a tree reads behind_count 0 against its own (merged) branch's
+        // static remote ref, so the behind>0 trigger alone never consults
+        // coord about it. Primary-only (`.git` is a DIRECTORY): a linked
+        // worktree shares the branch namespace with the primary, so a restore
+        // switch there could collide with the primary's checked-out branch.
+        let restore_candidate = !payload.dirty
+            && !payload.head_detached.unwrap_or(false)
+            && payload.branch != "main"
+            && payload.branch != "master"
+            && path.join(".git").is_dir();
+        if upsert_ok
+            && pull_executor_enabled()
+            && (payload.behind_count.unwrap_or(0) > 0 || restore_candidate)
+        {
             request_and_apply_pull(&client, &base, device_id, path.clone(), &payload).await;
         }
     }
@@ -2015,6 +2288,174 @@ pub fn spawn_tree_publisher() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- chkguard Phase 3 — restore_default executor (real temp git) ----
+
+    /// Run git in `dir`, asserting success. Identity pinned per-invocation so
+    /// the temp repos commit without global config.
+    fn tgit(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {args:?} in {dir:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A parked-on-squash-merged-branch fixture: a bare origin whose `main`
+    /// advanced past the merge while the work tree sits clean on `feat/x`.
+    /// Returns `(tempdir, work_path, feat_head_sha)`.
+    fn parked_fixture(name: &str) -> (std::path::PathBuf, std::path::PathBuf, String) {
+        let base = std::env::temp_dir().join(format!(
+            "chkguard-restore-{name}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let origin = base.join("origin.git");
+        let work = base.join("work");
+        std::fs::create_dir_all(&origin).unwrap();
+        tgit(&base, &["init", "--bare", "-b", "main", "origin.git"]);
+        std::fs::create_dir_all(&work).unwrap();
+        tgit(
+            &base,
+            &["clone", origin.to_str().unwrap(), work.to_str().unwrap()],
+        );
+        std::fs::write(work.join("a.txt"), "a").unwrap();
+        tgit(&work, &["add", "."]);
+        tgit(&work, &["commit", "-m", "A"]);
+        tgit(&work, &["push", "origin", "HEAD:main"]);
+        // Feature branch with one commit (the PR head).
+        tgit(&work, &["switch", "-c", "feat/x"]);
+        std::fs::write(work.join("b.txt"), "b").unwrap();
+        tgit(&work, &["add", "."]);
+        tgit(&work, &["commit", "-m", "B"]);
+        let feat_head = tgit(&work, &["rev-parse", "HEAD"]);
+        // Simulate the squash-merge landing on origin/main (content of B as a
+        // single new commit C), pushed from a scratch clone so the work tree
+        // stays parked on feat/x with a stale origin/main ref.
+        let scratch = base.join("scratch");
+        tgit(
+            &base,
+            &["clone", origin.to_str().unwrap(), scratch.to_str().unwrap()],
+        );
+        std::fs::write(scratch.join("b.txt"), "b").unwrap();
+        tgit(&scratch, &["add", "."]);
+        tgit(&scratch, &["commit", "-m", "C (squash of feat/x)"]);
+        tgit(&scratch, &["push", "origin", "HEAD:main"]);
+        (base, work, feat_head)
+    }
+
+    fn restore_params(feat_head: &str) -> RestoreParams {
+        RestoreParams {
+            parked_branch: "feat/x".to_string(),
+            expected_head_sha: feat_head.to_string(),
+            pr_number: Some(42),
+        }
+    }
+
+    #[test]
+    fn restore_default_happy_path_switches_ffs_and_deletes_branch() {
+        let (base, work, feat_head) = parked_fixture("happy");
+        let out = apply_restore_default_blocking(
+            &work,
+            work.to_str().unwrap(),
+            "main",
+            &restore_params(&feat_head),
+        );
+        assert_eq!(
+            out.chosen_option, "restored",
+            "reasoning: {}",
+            out.reasoning
+        );
+        // On main, fast-forwarded to the squash-merge commit.
+        assert_eq!(tgit(&work, &["symbolic-ref", "--short", "HEAD"]), "main");
+        assert_eq!(
+            tgit(&work, &["rev-parse", "HEAD"]),
+            tgit(&work, &["rev-parse", "origin/main"])
+        );
+        // Parked branch safe-deleted (-D: squash-merged tips never pass -d).
+        let branches = tgit(&work, &["branch", "--list", "feat/x"]);
+        assert!(
+            branches.is_empty(),
+            "feat/x must be deleted, got {branches:?}"
+        );
+        // The squashed content is present.
+        assert!(work.join("b.txt").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn restore_default_refuses_on_head_sha_mismatch() {
+        // The 4/26 calibration shape: local head != merged PR head (e.g. a
+        // commit landed on the parked branch after the PR merged).
+        let (base, work, _feat_head) = parked_fixture("shamismatch");
+        let p = restore_params("0000000000000000000000000000000000000000");
+        let out = apply_restore_default_blocking(&work, work.to_str().unwrap(), "main", &p);
+        assert_eq!(out.chosen_option, "restore_skipped_recheck");
+        // Untouched: still parked on feat/x.
+        assert_eq!(tgit(&work, &["symbolic-ref", "--short", "HEAD"]), "feat/x");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn restore_default_refuses_dirty_tree() {
+        let (base, work, feat_head) = parked_fixture("dirty");
+        std::fs::write(work.join("wip.txt"), "uncommitted").unwrap();
+        let out = apply_restore_default_blocking(
+            &work,
+            work.to_str().unwrap(),
+            "main",
+            &restore_params(&feat_head),
+        );
+        assert_eq!(out.chosen_option, "restore_skipped_recheck");
+        assert_eq!(tgit(&work, &["symbolic-ref", "--short", "HEAD"]), "feat/x");
+        assert!(work.join("wip.txt").exists(), "WIP must never be touched");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn restore_default_refuses_branch_moved_since_verdict() {
+        let (base, work, feat_head) = parked_fixture("moved");
+        tgit(&work, &["switch", "-c", "other-branch"]);
+        let out = apply_restore_default_blocking(
+            &work,
+            work.to_str().unwrap(),
+            "main",
+            &restore_params(&feat_head),
+        );
+        assert_eq!(out.chosen_option, "restore_skipped_recheck");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn restore_default_refuses_non_primary_checkout() {
+        // A linked worktree's `.git` is a FILE — restore must refuse before
+        // any git call (branch switches there collide with the primary).
+        let base = std::env::temp_dir().join(format!(
+            "chkguard-restore-wt-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join(".git"), "gitdir: ../somewhere/.git/worktrees/x").unwrap();
+        let p = restore_params("abc");
+        let out = apply_restore_default_blocking(&base, base.to_str().unwrap(), "main", &p);
+        assert_eq!(out.chosen_option, "restore_skipped_recheck");
+        assert!(out.reasoning.contains("not a primary checkout"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// Phase 2 unknown-tenant warn-once dedupe: across N successive
     /// invocations the gate must return `true` exactly once (the first
