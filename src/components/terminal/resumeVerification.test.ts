@@ -19,6 +19,7 @@ import {
   stripAnsi,
   detectClaudeHandshake,
   detectResumePicker,
+  detectResumeFailure,
   buildPickerAnswer,
   waitForClaudeHandshake,
   typeResumeAndVerify,
@@ -86,7 +87,48 @@ describe("detectResumePicker / buildPickerAnswer", () => {
   });
 });
 
+// Item 4 (boot-restore remediation) — "Claude TUI appeared" ≠ "the requested
+// session resumed". The CLI's explicit rejection text must refute the
+// verification even when TUI frames are also present.
+describe("detectResumeFailure", () => {
+  // Captured from a real bogus `claude --resume <uuid>` (v2.1.x).
+  const NOT_FOUND = "No conversation found with session ID: 00000000-dead-beef";
+  const PRINT_MODE_ERR =
+    "Error: --resume requires a valid session ID or session title when used with --print.";
+
+  it.each([
+    ["not-found rejection", NOT_FOUND],
+    ["print-mode arg error", PRINT_MODE_ERR],
+    ["ANSI-wrapped rejection", `\x1b[31m${NOT_FOUND}\x1b[0m`],
+    ["rejection followed by a fresh-session TUI", `${NOT_FOUND}\n${CLAUDE_UI}`],
+  ])("recognizes the CLI rejecting the resume: %s", (_name, text) => {
+    expect(detectResumeFailure(text)).toBe(true);
+  });
+
+  it.each([
+    ["ordinary Claude UI", CLAUDE_UI],
+    ["bare shell", PLAIN_SHELL],
+    ["empty buffer", ""],
+  ])("does NOT match healthy output: %s", (_name, text) => {
+    expect(detectResumeFailure(text)).toBe(false);
+  });
+});
+
 describe("waitForClaudeHandshake", () => {
+  it("refutes (checked BEFORE the handshake) when the CLI rejected the resume", async () => {
+    // The incident shape: rejection text and Claude UI frames in the same
+    // tail — the wrong-content pane must NOT verify.
+    const readTail = vi.fn(
+      async () => `No conversation found with session ID: ghost-1\n${CLAUDE_UI}`,
+    );
+    const out = await waitForClaudeHandshake("tab-1", {
+      timeoutMs: 500,
+      intervalMs: 1,
+      readTail,
+    });
+    expect(out).toBe("refuted");
+  });
+
   it("verifies as soon as a probe shows the Claude UI", async () => {
     const tails = [PLAIN_SHELL, PLAIN_SHELL, CLAUDE_UI];
     const readTail = vi.fn(async () => tails.shift() ?? CLAUDE_UI);
@@ -203,5 +245,21 @@ describe("typeResumeAndVerify (retry-once state machine)", () => {
     expect(out).toBe("failed");
     // Exactly two typed attempts — the spec is retry ONCE, not retry forever.
     expect(writes.filter((w) => w === CMD)).toHaveLength(2);
+  });
+
+  it("fails WITHOUT retrying when the CLI explicitly rejected the resume", async () => {
+    // A deterministic rejection ("No conversation found...") can't change on
+    // a retype — burn no retry and park as failed immediately.
+    const writes: string[] = [];
+    const write = (_refs: never, _tab: string, text: string) => void writes.push(text);
+    const out = await typeResumeAndVerify(new Map() as never, "tab-1", CMD, {
+      write: write as never,
+      settleMs: 1,
+      timeoutMs: 500,
+      intervalMs: 1,
+      readTail: async () => "No conversation found with session ID: abc-123",
+    });
+    expect(out).toBe("failed");
+    expect(writes.filter((w) => w === CMD)).toHaveLength(1);
   });
 });

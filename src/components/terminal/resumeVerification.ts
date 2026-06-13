@@ -107,6 +107,34 @@ export function detectClaudeHandshake(text: string): boolean {
   return CLAUDE_HANDSHAKE_PATTERNS.some((p) => p.test(stripped));
 }
 
+/**
+ * Negative markers: the CLI explicitly REJECTED the resume. "Claude TUI
+ * appeared" is not "the requested session resumed" — a `--resume` with a
+ * stale/bogus id can print an error (and, on some CLI versions, fall through
+ * to a fresh session / session picker whose frames still match the handshake
+ * patterns above). These are checked BEFORE the handshake patterns so wrong
+ * content can never verify as a successful restore.
+ *
+ * Strings captured from a real bogus `claude --resume <uuid>` (v2.1.x):
+ *   `No conversation found with session ID: <id>`
+ * and the print-mode arg error:
+ *   `Error: --resume requires a valid session ID ...`
+ *
+ * Kept deliberately specific (full sentence fragments, not bare words) — the
+ * scan runs over the scrollback tail, and an overly broad pattern could match
+ * legit conversation content.
+ */
+const CLAUDE_RESUME_FAILURE_PATTERNS: RegExp[] = [
+  /No conversation found with session ID/i,
+  /--resume requires a valid session ID/i,
+];
+
+/** True when the pane's recent output shows the CLI rejecting the resume. */
+export function detectResumeFailure(text: string): boolean {
+  const stripped = stripAnsi(text);
+  return CLAUDE_RESUME_FAILURE_PATTERNS.some((p) => p.test(stripped));
+}
+
 /** How many trailing characters of the (decoded) ring to scan per probe. */
 const TAIL_SCAN_CHARS = 16_000;
 
@@ -145,19 +173,23 @@ export interface HandshakeWaitOptions {
 }
 
 /**
- * Poll the pane's scrollback until the Claude UI handshake appears or the
- * timeout elapses. Resolves `"verified"` or `"timeout"`; never throws.
+ * Poll the pane's scrollback until the Claude UI handshake appears, the CLI
+ * explicitly rejects the resume, or the timeout elapses. Resolves
+ * `"verified"`, `"refuted"` (negative pattern seen — checked FIRST, so a
+ * fresh-session fallback whose TUI frames match the handshake can never
+ * read as success), or `"timeout"`; never throws.
  */
 export async function waitForClaudeHandshake(
   tabId: string,
   options: HandshakeWaitOptions = {},
-): Promise<"verified" | "timeout"> {
+): Promise<"verified" | "refuted" | "timeout"> {
   const { timeoutMs = 15_000, intervalMs = 1_000, readTail = readScrollbackTail, onProbe } = options;
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const tail = await readTail(tabId);
     if (tail !== null) {
       onProbe?.(tail);
+      if (detectResumeFailure(tail)) return "refuted";
       if (detectClaudeHandshake(tail)) return "verified";
     }
     if (Date.now() >= deadline) return "timeout";
@@ -230,6 +262,14 @@ export async function typeResumeAndVerify(
     await new Promise((r) => setTimeout(r, settleMs));
     const outcome = await waitForClaudeHandshake(tabId, { ...waitOpts, onProbe: probe });
     if (outcome === "verified") return "verified";
+    if (outcome === "refuted") {
+      // The CLI deterministically rejected the session id — retyping the
+      // same command cannot change the answer. Park as failed immediately.
+      console.warn(
+        `[resumeVerification] resume explicitly rejected for ${tabId} (attempt ${attempt}/${attempts})`,
+      );
+      return "failed";
+    }
     console.warn(
       `[resumeVerification] handshake not observed for ${tabId} (attempt ${attempt}/${attempts})`,
     );

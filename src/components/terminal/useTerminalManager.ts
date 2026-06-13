@@ -30,6 +30,15 @@ export interface TerminalTab {
    * restore-pending marker so the liveness poll can't flip it `poll-dead`.
    */
   resumeFailed?: boolean;
+  /**
+   * True when this tab was cold-restored from a registry record whose
+   * `bindOrigin` is NOT `"pinned"` (mtime-guessed or pre-field) — the binding
+   * may belong to a foreign session, so no resume command is typed. Surfaced
+   * as a per-pane operator confirm (`ResumeConfirmBanner`): confirming runs
+   * the verified resume, declining closes the record. While set, the durable
+   * record keeps its backend restore-pending marker.
+   */
+  resumeNeedsConfirm?: boolean;
   /** Claude Code session ID running in this tab (set on resume). */
   claudeSessionId?: string;
   /** Claude config dir for the session (set on resume). */
@@ -552,6 +561,7 @@ export function useTerminalManager(pageId: string = "default", windowLabel: stri
           | "claudeConfigDir"
           | "isReconnecting"
           | "resumeFailed"
+          | "resumeNeedsConfirm"
         >
       >,
     ) => {

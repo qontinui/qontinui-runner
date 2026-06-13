@@ -36,6 +36,7 @@ import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
 import { callRegistry, useTerminalCommands } from "./commands";
 import { useTerminalInitialization, runVerifiedResume } from "./useTerminalInitialization";
 import { ResumeFailedBanner } from "./ResumeFailedBanner";
+import { ResumeConfirmBanner } from "./ResumeConfirmBanner";
 import { useZoneActions } from "./useZoneActions";
 import { writeWhenReady as writeWhenReadyHelper } from "./writeWhenReady";
 import { setTerminalSessions, type TerminalSessionEntry } from "@/lib/terminal-sessions-registry";
@@ -719,6 +720,23 @@ function TerminalPageInner({
     },
   });
 
+  // Re-assert payload for the verified-resume path: the registry record is
+  // re-marked open under the live tab id only AFTER the handshake verifies
+  // (item 3 of the boot-restore remediation — never refresh a ghost's
+  // lastSeenAt on an unproven resume). Zone comes from the live assignments.
+  const buildReassertPayload = useCallback(
+    (tab: { id: string; title: string; workingDir?: string; claudeConfigDir?: string }) => ({
+      pageId,
+      zoneIndex: Number(
+        Object.entries(zoneLayout.assignments).find(([, id]) => id === tab.id)?.[0] ?? -1,
+      ),
+      title: tab.title,
+      workingDir: tab.workingDir,
+      configDir: tab.claudeConfigDir,
+    }),
+    [pageId, zoneLayout.assignments],
+  );
+
   // Operator-clickable retry for a restored tab whose resume verification
   // failed (Phase 3, #548): re-run the same type-and-verify path. The durable
   // restore-pending marker is still set from the failed attempt, so the
@@ -734,6 +752,53 @@ function TerminalPageInner({
         claudeSessionId: tab.claudeSessionId,
         configDir: tab.claudeConfigDir,
         updateTab,
+        reassert: buildReassertPayload(tab),
+      });
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [updateTab, buildReassertPayload],
+  );
+
+  // Operator confirmed a quarantined (mtime-guessed) binding — run the same
+  // verified-resume path the pinned restore uses (item 5 of the boot-restore
+  // remediation). The restore-pending marker has been set since boot.
+  const handleConfirmResume = useCallback(
+    (tabId: string) => {
+      const tab = tabsRef.current.find((t) => t.id === tabId);
+      if (!tab?.claudeSessionId) return;
+      updateTab(tabId, { resumeNeedsConfirm: false, isReconnecting: true });
+      void runVerifiedResume({
+        terminalRefs: terminalRefs.current,
+        tabId,
+        claudeSessionId: tab.claudeSessionId,
+        configDir: tab.claudeConfigDir,
+        updateTab,
+        reassert: buildReassertPayload(tab),
+      });
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [updateTab, buildReassertPayload],
+  );
+
+  // Operator declined a quarantined binding — the session id likely belongs
+  // to another window (the mis-bound VS Code case). Close the registry record
+  // so it stops resurrecting; the pane stays as a plain shell.
+  const handleDeclineResume = useCallback(
+    (tabId: string) => {
+      const tab = tabsRef.current.find((t) => t.id === tabId);
+      if (!tab?.claudeSessionId) return;
+      updateTab(tabId, { resumeNeedsConfirm: false });
+      const claudeSessionId = tab.claudeSessionId;
+      invoke("terminal_session_clear_restore_pending", { claudeSessionId }).catch((err) => {
+        logger.warn(`clear restore-pending (declined) failed for ${claudeSessionId}: ${err}`);
+      });
+      invoke("terminal_session_record_close", {
+        claudeSessionId,
+        reason: "operator-declined-resume",
+      }).catch((err) => {
+        logger.warn(
+          `terminal_session_record_close (operator-declined-resume) failed for ${claudeSessionId}: ${err}`,
+        );
       });
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1165,6 +1230,15 @@ function TerminalPageInner({
                 here with an explicit operator retry instead of silently
                 posing as resumed. Same top-right advisory column. */}
             <ResumeFailedBanner tabs={tabs} onRetryResume={handleRetryResume} />
+            {/* Item 5 (boot-restore remediation) — cold-restored tabs whose
+                registry binding is mtime-guessed (bindOrigin !== "pinned")
+                wait here for an explicit operator confirm instead of blindly
+                resuming possibly-foreign content. */}
+            <ResumeConfirmBanner
+              tabs={tabs}
+              onConfirmResume={handleConfirmResume}
+              onDeclineResume={handleDeclineResume}
+            />
           </div>
 
           {/* Phase 2 — `isMultiZone` gate dropped so the Unassigned (N) list

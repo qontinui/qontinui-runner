@@ -236,6 +236,96 @@ describe("runVerifiedResume", () => {
       expect.anything(),
     );
   });
+
+  // Item 3 (boot-restore remediation) — the registry re-assert is deferred
+  // until the handshake VERIFIES. Re-asserting at tab creation refreshed
+  // ghosts' lastSeenAt before anything was proven (ghost immortality).
+  it("verified + reassert → re-asserts the open record under the live tab id", async () => {
+    const updateTab = vi.fn();
+    const out = await runVerifiedResume({
+      terminalRefs: refsWithHandle([]),
+      tabId: "tab-new",
+      claudeSessionId: "sess-1",
+      configDir: "C:/cfg",
+      updateTab,
+      reassert: {
+        pageId: "default",
+        zoneIndex: 3,
+        title: "Claude 1",
+        workingDir: "C:/repo",
+        configDir: "C:/cfg",
+      },
+      verifyOptions: {
+        settleMs: 1,
+        timeoutMs: 50,
+        intervalMs: 1,
+        readTail: async () => CLAUDE_UI,
+      },
+    });
+    expect(out).toBe("verified");
+    expect(mockInvoke).toHaveBeenCalledWith("terminal_session_record_open", {
+      claudeSessionId: "sess-1",
+      configDir: "C:/cfg",
+      workingDir: "C:/repo",
+      pageId: "default",
+      zoneIndex: 3,
+      title: "Claude 1",
+      terminalId: "tab-new",
+    });
+  });
+
+  it("failed resume → never re-asserts the record (original lastSeenAt ages normally)", async () => {
+    const updateTab = vi.fn();
+    const out = await runVerifiedResume({
+      terminalRefs: refsWithHandle([]),
+      tabId: "tab-new",
+      claudeSessionId: "ghost-1",
+      updateTab,
+      reassert: { pageId: "default", zoneIndex: 2, title: "Ghost" },
+      verifyOptions: {
+        settleMs: 1,
+        timeoutMs: 5,
+        intervalMs: 1,
+        readTail: async () => PLAIN_SHELL,
+      },
+    });
+    expect(out).toBe("failed");
+    expect(mockInvoke).not.toHaveBeenCalledWith("terminal_session_record_open", expect.anything());
+  });
+
+  // Item 4 — a CLI rejection ("No conversation found...") must park the tab
+  // as failed even though Claude TUI frames may also be present, and must
+  // not waste the retry (the answer is deterministic).
+  it("explicit CLI rejection → failed without retry, marker kept", async () => {
+    const writes: string[] = [];
+    const updateTab = vi.fn();
+    const out = await runVerifiedResume({
+      terminalRefs: refsWithHandle(writes),
+      tabId: "tab-1",
+      claudeSessionId: "bogus-1",
+      updateTab,
+      verifyOptions: {
+        settleMs: 1,
+        timeoutMs: 50,
+        intervalMs: 1,
+        // The incident shape: error text AND Claude UI frames both visible.
+        readTail: async () =>
+          `No conversation found with session ID: bogus-1\n${CLAUDE_UI}`,
+      },
+    });
+    expect(out).toBe("failed");
+    // No retry: the same command typed exactly once.
+    expect(writes.filter((w) => w.includes("--resume bogus-1\r"))).toHaveLength(1);
+    expect(updateTab).toHaveBeenCalledWith("tab-1", {
+      isReconnecting: false,
+      resumeFailed: true,
+    });
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "terminal_session_clear_restore_pending",
+      expect.anything(),
+    );
+    expect(mockInvoke).not.toHaveBeenCalledWith("terminal_session_record_open", expect.anything());
+  });
 });
 
 // #548 item 3 — the typed resume must suppress the CLI's "Resume from

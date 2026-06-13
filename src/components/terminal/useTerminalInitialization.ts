@@ -96,16 +96,35 @@ export function buildResumeCmd(
 }
 
 /**
+ * Re-assert payload for [`runVerifiedResume`]'s verified branch: the durable
+ * registry record is re-marked `open` under the NEW terminal id only AFTER
+ * the resume handshake verifies. Re-asserting at tab creation (the old
+ * behavior) refreshed `lastSeenAt` on every cold-restored record — including
+ * ghosts whose resume then failed — resetting both the prune clock and the
+ * restore recency cap, so a ghost restored forever ("ghost immortality").
+ */
+export interface ReassertRecordPayload {
+  pageId: string;
+  zoneIndex: number;
+  title?: string;
+  workingDir?: string;
+  configDir?: string;
+}
+
+/**
  * Type the resume command for a restored tab and VERIFY the Claude UI
  * handshake actually appeared (Phase 3, issue #548): on first failure the
  * same command is retyped once; on persistent failure the tab is parked in an
  * explicit `resumeFailed` state (operator-clickable retry via
  * `ResumeFailedBanner`) and the durable restore-pending marker is left SET so
  * the backend liveness poll keeps protecting the `open` record. Only a
- * verified handshake clears the marker and the reconnecting affordance.
+ * verified handshake clears the marker and the reconnecting affordance — and
+ * only a verified handshake re-asserts the registry record under the new
+ * terminal id (`reassert`); on failure the original row is left untouched
+ * (original `lastSeenAt`, old `terminalId`), so it ages and prunes normally.
  *
- * Used by the boot-restore drain below AND by the operator retry path in
- * `TerminalPage`. Exported (with injectable verify options) so the
+ * Used by the boot-restore drain below AND by the operator retry/confirm
+ * paths in `TerminalPage`. Exported (with injectable verify options) so the
  * verified/failed state machine is unit-testable without booting React.
  */
 export async function runVerifiedResume(params: {
@@ -117,9 +136,12 @@ export async function runVerifiedResume(params: {
     id: string,
     updates: Partial<{ isReconnecting?: boolean; resumeFailed?: boolean }>,
   ) => void;
+  /** When set, the verified branch re-asserts the record under `tabId`. */
+  reassert?: ReassertRecordPayload;
   verifyOptions?: TypeAndVerifyOptions;
 }): Promise<"verified" | "failed"> {
-  const { terminalRefs, tabId, claudeSessionId, configDir, updateTab, verifyOptions } = params;
+  const { terminalRefs, tabId, claudeSessionId, configDir, updateTab, reassert, verifyOptions } =
+    params;
   const policy = getResumeSummaryPolicy();
   const resumeCmd = buildResumeCmd(claudeSessionId, configDir, policy);
   const outcome = await typeResumeAndVerify(terminalRefs, tabId, resumeCmd, {
@@ -131,8 +153,27 @@ export async function runVerifiedResume(params: {
   });
   if (outcome === "verified") {
     updateTab(tabId, { isReconnecting: false, resumeFailed: false });
-    // Verified handshake — release the liveness-poll restore guard so normal
-    // classification resumes for this session.
+    // Verified handshake — NOW re-assert the open record under the freshly
+    // created terminal id so the registry's `terminalId` tracks the live tab
+    // (the next restart reconnect-matches on this id). Deliberately deferred
+    // past verification: a failed resume must leave the original row's
+    // `lastSeenAt` untouched so a ghost ages and prunes instead of restoring
+    // forever.
+    if (reassert) {
+      invoke("terminal_session_record_open", {
+        claudeSessionId,
+        configDir: reassert.configDir,
+        workingDir: reassert.workingDir,
+        pageId: reassert.pageId,
+        zoneIndex: reassert.zoneIndex,
+        title: reassert.title,
+        terminalId: tabId,
+      }).catch((err) => {
+        console.warn(`[TerminalPage] re-record open failed for ${claudeSessionId}:`, err);
+      });
+    }
+    // Release the liveness-poll restore guard so normal classification
+    // resumes for this session.
     invoke("terminal_session_clear_restore_pending", { claudeSessionId }).catch((err) => {
       // Best-effort: the poll self-heals a stale marker on the next
       // confident-alive tick.
@@ -197,6 +238,7 @@ interface UseTerminalInitializationParams {
       claudeConfigDir?: string;
       isReconnecting?: boolean;
       resumeFailed?: boolean;
+      resumeNeedsConfirm?: boolean;
     }>,
   ) => void;
   zoneLayout: {
@@ -316,6 +358,7 @@ export function useTerminalInitialization({
       isClaudeSession?: boolean;
       claudeSessionId?: string;
       claudeConfigDir?: string;
+      reassert?: ReassertRecordPayload;
     }> = [];
 
     (async () => {
@@ -403,20 +446,34 @@ export function useTerminalInitialization({
 
           // b) Cold restart (no live pty): recreate the tab, bind its recorded
           //    zone, attach the session id, and queue a `claude --resume` via
-          //    the existing drain loop. Re-assert the OPEN record under the new
-          //    ephemeral terminal id so the registry tracks the live tab.
+          //    the existing drain loop. The OPEN record is re-asserted under
+          //    the new terminal id only AFTER the resume handshake verifies
+          //    (`runVerifiedResume`) — re-asserting here refreshed ghosts'
+          //    `lastSeenAt` before anything was proven, making them immortal.
           const tabId = await createTerminal(rec.title, rec.workingDir);
           if (!tabId) continue;
           if (rec.zoneIndex >= 0) {
             zoneLayout.assignTabToZone(rec.zoneIndex, tabId);
             applyZoneCosmetics(rec.zoneIndex);
           }
+
+          // bindOrigin quarantine: only a `pinned` binding (`--session-id` /
+          // `--resume` — exact) may auto-type `claude --resume`. A `guessed`
+          // (or pre-field absent) binding came from the freshest-transcript
+          // mtime race and may belong to a FOREIGN session (e.g. a VS Code
+          // CLI session in the same project) — surface a one-click operator
+          // confirm instead of blindly resuming wrong content. The tab is
+          // still created so the screen layout is preserved.
+          const pinned = rec.bindOrigin === "pinned";
+
           updateTab(tabId, {
             claudeSessionId: rec.claudeSessionId,
             claudeConfigDir: safeConfigDir,
-            // Show a "resuming" affordance until `claude --resume` lands;
-            // cleared in the drain loop after the resume command is written.
-            isReconnecting: true,
+            // Pinned: show the "resuming" affordance until the verified
+            // resume drains. Guessed: park awaiting operator confirm.
+            ...(pinned && validSessionId
+              ? { isReconnecting: true }
+              : { resumeNeedsConfirm: validSessionId }),
           });
           rememberSessionId(tabId, rec.claudeSessionId, safeConfigDir);
 
@@ -425,16 +482,27 @@ export function useTerminalInitialization({
               tabId,
               scrollbackPath:
                 rec.zoneIndex >= 0 ? cosmeticsByZone.get(rec.zoneIndex)?.scrollbackPath : undefined,
-              isClaudeSession: true,
+              // Auto-resume only proven (pinned) bindings; quarantined tabs
+              // still get their scrollback restored by the drain.
+              isClaudeSession: pinned,
               claudeSessionId: rec.claudeSessionId,
               claudeConfigDir: safeConfigDir,
+              reassert: {
+                pageId,
+                zoneIndex: rec.zoneIndex,
+                title: rec.title,
+                workingDir: rec.workingDir,
+                configDir: rec.configDir,
+              },
             });
             // Durable, backend-owned restore-pending marker (Phase 3, #548):
-            // from here until the resume handshake is VERIFIED the liveness
-            // poll must never flip this record `poll-dead` — a failed restore
-            // leaves the `open` record intact for the next attempt. Cleared in
-            // `runVerifiedResume` on verified handshake (and self-healed by
-            // the poll once it sees the session confidently alive).
+            // from here until the resume handshake is VERIFIED (or the
+            // operator confirms/declines a quarantined binding) the liveness
+            // poll must never flip this record `poll-dead`/`no-terminal` — a
+            // failed restore leaves the `open` record intact for the next
+            // attempt. Cleared in `runVerifiedResume` on verified handshake
+            // (and self-healed by the poll once it sees the session
+            // confidently alive).
             invoke("terminal_session_mark_restore_pending", {
               claudeSessionId: rec.claudeSessionId,
             }).catch((err) => {
@@ -444,21 +512,6 @@ export function useTerminalInitialization({
               );
             });
           }
-
-          // Re-assert the OPEN record under the freshly created terminal id so
-          // the registry's `terminalId` tracks the live tab (the next restart
-          // reconnect-matches on this id).
-          invoke("terminal_session_record_open", {
-            claudeSessionId: rec.claudeSessionId,
-            configDir: rec.configDir,
-            workingDir: rec.workingDir,
-            pageId,
-            zoneIndex: rec.zoneIndex,
-            title: rec.title,
-            terminalId: tabId,
-          }).catch((err) => {
-            console.warn(`[TerminalPage] re-record open failed for ${rec.claudeSessionId}:`, err);
-          });
         }
 
         // 4) Plan tabs are cosmetic-only state held in the snapshot (no PTY, no
@@ -533,6 +586,7 @@ export function useTerminalInitialization({
                     claudeSessionId: restore.claudeSessionId,
                     configDir: restore.claudeConfigDir,
                     updateTab,
+                    reassert: restore.reassert,
                   });
                 }
               }
