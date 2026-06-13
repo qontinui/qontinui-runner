@@ -54,6 +54,31 @@ interface TranscriptSessionPayload {
   config_dir: string;
   project_path: string;
   last_modified: string; // ISO 8601
+  /** Working dir the CLI recorded in the transcript (absent on old payloads). */
+  cwd?: string | null;
+}
+
+/**
+ * True when a candidate transcript's recorded `cwd` CONTRADICTS the pane's
+ * known working dir — the freshest-mtime guess picked a session launched
+ * somewhere else (item 6 of the boot-restore remediation: the capture's
+ * `workingDir` can fall back to the broad workspace root, letting a
+ * foreign-dir session win the mtime race). Unknown on either side → `false`
+ * (can't discriminate; the timeout-unbound mitigation still applies).
+ * Windows-tolerant equality: slashes normalized, trailing separators
+ * trimmed, case-insensitive. Exported for unit tests.
+ */
+export function cwdConflicts(
+  tabWorkingDir: string | undefined,
+  candidateCwd: string | null | undefined,
+): boolean {
+  if (!tabWorkingDir || !candidateCwd) return false;
+  const norm = (p: string) =>
+    p
+      .replace(/\\/g, "/")
+      .replace(/\/+$/, "")
+      .toLowerCase();
+  return norm(tabWorkingDir) !== norm(candidateCwd);
 }
 
 const POLL_INTERVAL_MS = 500;
@@ -236,6 +261,21 @@ export function useTabSessionIdCapture({
           const data = resp.success ? (resp.data as TranscriptSessionPayload | null) : null;
           if (!data) {
             if (debug()) logger.debug("[tabSidCapture] probe-null", { tabId });
+          } else if (cwdConflicts(tab.workingDir, data.cwd)) {
+            // The candidate transcript was recorded in a DIFFERENT directory
+            // than this pane — a foreign session won the mtime race (the
+            // capture's workingDir may have been the broad workspace-root
+            // fallback). Reject and keep polling; staying unbound is better
+            // than binding wrong content. `tab` is re-read every tick, so a
+            // late shell-integration cwd event sharpens this check mid-poll.
+            if (debug()) {
+              logger.debug("[tabSidCapture] cwd-mismatch", {
+                tabId,
+                sessionId: data.session_id,
+                tabWorkingDir: tab.workingDir,
+                candidateCwd: data.cwd,
+              });
+            }
           } else if (claimedSessionIds.current.has(data.session_id)) {
             if (debug()) {
               logger.debug("[tabSidCapture] already-claimed", {

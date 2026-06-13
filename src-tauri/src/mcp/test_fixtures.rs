@@ -352,6 +352,7 @@ pub fn project_test_session(
         first_message_preview: Some(session.name.clone()),
         has_plans: false,
         display_name: session.name.clone(),
+        cwd: None,
         injected_live_status,
         injected_tab,
     }
@@ -1165,6 +1166,7 @@ mod tests {
             first_message_preview: Some("hello".to_string()),
             has_plans: false,
             display_name: "Real one".to_string(),
+            cwd: None,
             injected_live_status: None,
             injected_tab: None,
         };

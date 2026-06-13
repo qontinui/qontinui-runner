@@ -31,16 +31,21 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => mockInvoke(...args),
 }));
 
+import { cwdConflicts } from "./useTabSessionIdCapture";
+
 interface TranscriptSessionPayload {
   session_id: string;
   config_dir: string;
   project_path: string;
   last_modified: string;
+  cwd?: string | null;
 }
 
 // Decision helper that mirrors the hook's per-tick claim logic.
 // Freshness (last_modified > spawnTimestamp) is enforced backend-side
-// via `sinceMs`; the hook trusts any non-null payload it receives.
+// via `sinceMs`; the hook trusts any non-null payload it receives —
+// except a candidate whose recorded cwd CONTRADICTS the pane's known
+// working dir (item 6, the workspace-root-fallback mis-bind).
 function decideClaim(
   tab: TerminalTab | undefined,
   payload: TranscriptSessionPayload | null,
@@ -49,6 +54,7 @@ function decideClaim(
   if (!tab) return null;
   if (tab.claudeSessionId) return null;
   if (!payload) return null;
+  if (cwdConflicts(tab.workingDir, payload.cwd)) return null;
   if (alreadyClaimed.has(payload.session_id)) return null;
   return {
     claudeSessionId: payload.session_id,
@@ -97,6 +103,67 @@ describe("decideClaim — happy path", () => {
       claimed,
     );
     expect(result).toBeNull();
+  });
+});
+
+// Item 6 (boot-restore remediation) — the freshest-mtime race: a foreign
+// session (e.g. a VS Code CLI in another directory) writes its JSONL after
+// the pane spawn and wins the mtime sort. When the transcript records a cwd
+// that contradicts the pane's working dir, the candidate must be rejected —
+// better unregistered than mis-bound.
+describe("decideClaim — foreign-cwd mtime race (item 6)", () => {
+  const payloadWithCwd = (sessionId: string, cwd: string | null): TranscriptSessionPayload => ({
+    session_id: sessionId,
+    config_dir: "C:/claude/.claude-default",
+    project_path: "D:/repo",
+    last_modified: new Date().toISOString(),
+    cwd,
+  });
+
+  it("rejects a candidate recorded in a different directory", () => {
+    const result = decideClaim(
+      tab("tab-1", "D:/repo/sub"),
+      payloadWithCwd("foreign-session", "D:/elsewhere"),
+      new Set(),
+    );
+    expect(result).toBeNull();
+  });
+
+  it("binds the matching-cwd candidate (Windows-tolerant path equality)", () => {
+    const result = decideClaim(
+      tab("tab-1", "D:/repo/sub"),
+      payloadWithCwd("own-session", "d:\\repo\\sub\\"),
+      new Set(),
+    );
+    expect(result?.claudeSessionId).toBe("own-session");
+  });
+
+  it("cannot discriminate when either side is unknown — claims (legacy behavior)", () => {
+    // No cwd on the payload (old backend) and no workingDir on the tab: the
+    // check must not regress the pre-field behavior.
+    expect(
+      decideClaim(tab("tab-1", "D:/repo"), payloadWithCwd("s-1", null), new Set()),
+    ).not.toBeNull();
+    expect(
+      decideClaim(tab("tab-1", ""), payloadWithCwd("s-2", "D:/elsewhere"), new Set()),
+    ).not.toBeNull();
+  });
+});
+
+describe("cwdConflicts", () => {
+  it("normalizes slashes, trailing separators, and case", () => {
+    expect(cwdConflicts("D:/repo/sub", "d:\\repo\\sub\\")).toBe(false);
+    expect(cwdConflicts("D:/repo/sub", "D:/repo/sub")).toBe(false);
+    expect(cwdConflicts("D:/repo/sub", "D:/repo/other")).toBe(true);
+    // Subdirectory is NOT equality — a parent/child mismatch is a conflict.
+    expect(cwdConflicts("D:/repo", "D:/repo/sub")).toBe(true);
+  });
+
+  it("returns false (no conflict) when either side is unknown", () => {
+    expect(cwdConflicts(undefined, "D:/x")).toBe(false);
+    expect(cwdConflicts("", "D:/x")).toBe(false);
+    expect(cwdConflicts("D:/x", null)).toBe(false);
+    expect(cwdConflicts("D:/x", undefined)).toBe(false);
   });
 });
 

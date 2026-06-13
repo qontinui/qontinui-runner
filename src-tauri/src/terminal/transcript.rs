@@ -25,6 +25,15 @@ pub struct TranscriptSession {
     pub first_message_preview: Option<String>, // first ~80 chars of first user message
     pub has_plans: bool,                       // true if any message has planContent
     pub display_name: String,                  // human-readable title derived from content
+    /// Working directory the CLI recorded in the transcript (the top-level
+    /// `cwd` field on JSONL records). `None` when no early record carries
+    /// one. Lets the session-id capture poll reject a freshest-mtime
+    /// candidate whose cwd contradicts the pane's actual working dir (item 6
+    /// of the boot-restore remediation — the workspace-root-fallback
+    /// mis-bind). Omitted from the serialized JSON when absent to preserve
+    /// the legacy wire shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     /// Optional override for the frontend's computed `liveStatus`.
     ///
     /// `None` for real on-disk transcripts (the field is omitted from the
@@ -327,6 +336,7 @@ pub fn list_sessions(
 
         // Extract started_at from first record's timestamp
         let started_at = extract_first_timestamp(&content);
+        let cwd = extract_cwd(&content);
 
         let session = TranscriptSession {
             session_id,
@@ -338,6 +348,7 @@ pub fn list_sessions(
             first_message_preview,
             has_plans,
             display_name,
+            cwd,
             // Real on-disk sessions never carry a status override; the
             // frontend computes `liveStatus` from tab/digest correlation.
             injected_live_status: None,
@@ -825,6 +836,7 @@ pub fn get_latest_session_id(
                         let has_plans = content.contains("\"planContent\"");
                         let first_message_preview = extract_first_user_preview(&content);
                         let started_at = extract_first_timestamp(&content);
+                        let cwd = extract_cwd(&content);
                         let display_name =
                             generate_display_name(&first_message_preview, &last_modified);
 
@@ -838,6 +850,7 @@ pub fn get_latest_session_id(
                             first_message_preview,
                             has_plans,
                             display_name,
+                            cwd,
                             // Real on-disk session — no override.
                             injected_live_status: None,
                             injected_tab: None,
@@ -1001,6 +1014,27 @@ fn strip_generic_prefix(text: &str) -> &str {
         }
     }
     text
+}
+
+/// Extract the working directory from the first records of a JSONL
+/// transcript (the top-level `cwd` field Claude Code stamps on every
+/// user/assistant record). Scans the same early window as
+/// [`extract_first_timestamp`].
+fn extract_cwd(content: &str) -> Option<String> {
+    for line in content.lines().take(10) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(record) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(cwd) = record.get("cwd").and_then(|c| c.as_str()) {
+                if !cwd.is_empty() {
+                    return Some(cwd.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Extract the timestamp from the first record in a JSONL transcript.
@@ -1526,6 +1560,20 @@ mod tests {
         let preview = extract_first_user_preview(&content).unwrap();
         assert!(preview.len() <= 84); // 80 chars + "..."
         assert!(preview.ends_with("..."));
+    }
+
+    #[test]
+    fn test_extract_cwd_from_early_records() {
+        let content = r#"{"type":"system","uuid":"s1","timestamp":"2026-01-01T00:00:00Z"}
+{"type":"user","uuid":"u1","cwd":"D:\\qontinui-root\\sub","timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":"hi"}}"#;
+        assert_eq!(
+            extract_cwd(content),
+            Some("D:\\qontinui-root\\sub".to_string())
+        );
+        // No cwd anywhere → None (the capture poll then can't discriminate
+        // and falls back to the timeout-unbound mitigation).
+        assert_eq!(extract_cwd(minimal_user_jsonl()), None);
+        assert_eq!(extract_cwd(""), None);
     }
 
     #[test]
