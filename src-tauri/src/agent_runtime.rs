@@ -1981,12 +1981,15 @@ async fn run_continuation_terminal(
     // coord identity and fell back to the operator-bearer stopgap. Uses the
     // runner's own device JWT; guarded against non-verifying bearers + clobber.
     // Device-JWT sessions get the loopback live-token PROXY shape, so the
-    // ACTUALLY-BOUND API port is resolved from the managed AppState (the
-    // env-default 9876 is wrong on secondary/temp runners).
+    // ACTUALLY-BOUND API port must come from the managed AppState. Phase 3a:
+    // when AppState isn't reachable we pass `None` (fail-closed) rather than the
+    // env-default 9876 — that default is wrong on secondary/temp runners and
+    // writes a dead-but-valid-looking proxy config (the F1 root cause).
+    // Provisioning then refuses the device-path write + drops a degraded
+    // breadcrumb instead of pointing the session at a port nothing serves.
     let bound_port = app
         .try_state::<Arc<crate::commands::AppState>>()
-        .map(|s| crate::mcp::types::runner_api_port(s.inner()))
-        .unwrap_or_else(crate::mcp::types::get_mcp_api_port);
+        .map(|s| crate::mcp::types::runner_api_port(s.inner()));
     crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port);
 
     let result = crate::commands::terminal::create_terminal_session_backend(

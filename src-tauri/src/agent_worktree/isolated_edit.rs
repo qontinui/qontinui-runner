@@ -647,7 +647,11 @@ pub async fn acquire_for_terminal(
     // The bound API port (for the device-path loopback proxy URL) is resolved
     // via the process-global AppHandle's managed AppState — this chokepoint has
     // no AppState parameter and threading one through its six call sites would
-    // ripple far past the provisioning concern.
+    // ripple far past the provisioning concern. `resolve_bound_api_port()` now
+    // returns `Option<u16>`: `None` (no managed AppState) means the device path
+    // FAILS CLOSED inside provisioning (no dead-port config written + a degraded
+    // breadcrumb) rather than silently substituting the bootstrap default — the
+    // F1 root cause. We pass it through unchanged.
     if let Some(wd) = &out.0 {
         crate::coord_mcp::provision_coord_mcp_for_session(
             wd,

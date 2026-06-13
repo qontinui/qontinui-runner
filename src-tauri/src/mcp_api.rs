@@ -1471,6 +1471,51 @@ pub fn create_router(
         });
     }
 
+    // Restore persisted coord-mcp proxy nonces + reconcile session configs to
+    // the current bound port (plan 2026-06-13 Phases 3b + 3c). 3b makes an
+    // already-written `.mcp.json` keep validating across a restart (the nonce
+    // is a loopback-only key, persisted at rest under COORD_MCP_PERSIST_NONCES);
+    // 3c rewrites any live session whose proxy URL names a stale port back to
+    // the instance's current bound port. Ordered AFTER the restore so a rewrite
+    // reuses the restored map where possible, and guarded by
+    // `coord_mcp_safe_to_write` so it never clobbers an agent-spawn config.
+    {
+        let reconcile_app_handle = app_handle.clone();
+        let reconcile_bound_port = api_state
+            .app_state
+            .api_port
+            .load(std::sync::atomic::Ordering::Relaxed);
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            // Phase 3b — restore the persisted nonce map FIRST (run-once).
+            crate::coord_mcp::restore_proxy_nonces_from_store();
+
+            // Phase 3c — reconcile live session `.mcp.json` ports. Pull the live
+            // session workdirs from the managed lifecycle store (open records).
+            use tauri::Manager;
+            let workdirs: Vec<String> = match reconcile_app_handle
+                .try_state::<std::sync::Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>(
+                ) {
+                Some(store) => store
+                    .inner()
+                    .open_records()
+                    .into_iter()
+                    .filter_map(|r| r.working_dir)
+                    .collect(),
+                None => Vec::new(),
+            };
+            if !workdirs.is_empty() {
+                let rewritten =
+                    crate::coord_mcp::reconcile_session_configs(workdirs, reconcile_bound_port);
+                if rewritten > 0 {
+                    info!(
+                        "coord_mcp boot reconcile: rewrote {rewritten} session config(s) to bound port :{reconcile_bound_port}"
+                    );
+                }
+            }
+        });
+    }
+
     // Sync workflows from web backend on startup (background task)
     {
         let sync_pg_db = api_state.app_state.pg_db.clone();

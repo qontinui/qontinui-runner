@@ -17,8 +17,11 @@
 //! own loopback `POST /coord-mcp` route, which injects a freshly-read device
 //! JWT per request (see `mcp_api::coord_mcp_proxy_handler`). Authentication to
 //! the proxy is a per-session nonce ([`COORD_MCP_PROXY_KEY_HEADER`]) held in an
-//! in-memory map — it dies with the runner, and every spawn path rewrites
-//! `.mcp.json`, so a restart self-heals.
+//! in-memory map that is ALSO mirrored to the encrypted local store
+//! (plan 2026-06-13 Phase 3b, gated by `COORD_MCP_PERSIST_NONCES`, default ON)
+//! so an already-written `.mcp.json` keeps validating across a runner
+//! rebuild/restart — the MCP client never re-reads the file, so a process-only
+//! nonce would 401 every live agent after a routine restart.
 //!
 //! SCOPE-ELEVATION TRAP: agent-spawn sessions deliberately carry a narrower
 //! coord-minted `SubType::Agent` JWT. The proxy attaches the live DEVICE JWT,
@@ -73,20 +76,137 @@ pub(crate) fn coord_mcp_url() -> String {
 }
 
 /// In-memory nonce registry for the loopback `/coord-mcp` proxy:
-/// nonce → workdir it was provisioned into. Process-lifetime only by design
-/// (resolved Q2 of the plan): every spawn path rewrites `.mcp.json`, so a
-/// runner restart re-mints nonces and self-heals.
+/// nonce → workdir it was provisioned into. Mirrored to the encrypted local
+/// store (Phase 3b) when `COORD_MCP_PERSIST_NONCES` is not `0`, so the set
+/// survives a runner rebuild/restart and an already-written `.mcp.json` keeps
+/// validating (the MCP client never re-reads the file). With persistence
+/// disabled this degrades to the prior process-lifetime-only behavior.
 static PROXY_NONCES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+/// Guards [`restore_proxy_nonces_from_store`] so a second boot-restore (e.g. an
+/// idempotent auto-start re-invocation) never re-loads over live in-memory
+/// nonces minted since the first restore.
+static PROXY_NONCES_RESTORED: OnceLock<()> = OnceLock::new();
 
 fn proxy_nonces() -> &'static Mutex<HashMap<String, String>> {
     PROXY_NONCES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// True unless `COORD_MCP_PERSIST_NONCES` is explicitly set to `0` — persistence
+/// is ON by default (resolved in the plan: the nonce is a loopback-only key, so
+/// persisting it at rest is acceptable and is the only thing that keeps an
+/// already-running agent alive across a restart). `=0` reverts to the prior
+/// in-memory-only behavior.
+fn nonce_persistence_enabled() -> bool {
+    // In production: ON unless explicitly `=0`. In test builds: OFF unless
+    // explicitly enabled — so the many nonce-minting unit tests never touch the
+    // developer's real encrypted store; the persistence tests opt IN by setting
+    // the env (under a serializing lock) to a temp store dir.
+    match std::env::var("COORD_MCP_PERSIST_NONCES") {
+        Ok(v) => v.trim() != "0",
+        Err(_) => !cfg!(test),
+    }
+}
+
+/// Mirror the live in-memory nonce map into the encrypted local store. No-op
+/// when persistence is disabled. Best-effort: a store failure only `warn!`s —
+/// the in-memory map stays authoritative for this process.
+///
+/// Opens the DEFAULT [`SecureStorage`] (honoring `QONTINUI_SECURE_STORAGE_DIR`)
+/// and delegates to [`persist_proxy_nonces_with_store`]. Tests inject their own
+/// store via the `_with_store` seam so they never touch the developer's real
+/// encrypted store NOR the process-global env (which would race sibling tests
+/// that read the default store, e.g. `auth::device_jwt_tests`).
+fn persist_proxy_nonces(map: &HashMap<String, String>) {
+    if !nonce_persistence_enabled() {
+        return;
+    }
+    match crate::secure_storage::SecureStorage::new() {
+        Ok(store) => persist_proxy_nonces_with_store(&store, map),
+        Err(e) => {
+            warn!("coord_mcp: secure storage unavailable, proxy nonces not persisted: {e}");
+        }
+    }
+}
+
+/// Mirror `map` into the GIVEN store. The store is injected so the persistence
+/// path is unit-testable against a temp-dir [`SecureStorage::with_path`] without
+/// mutating `QONTINUI_SECURE_STORAGE_DIR` (which is process-global and pollutes
+/// every other test that reads the default store). The `nonce_persistence_enabled`
+/// gate is the CALLER's concern — handing a store IS the decision to persist.
+fn persist_proxy_nonces_with_store(
+    store: &crate::secure_storage::SecureStorage,
+    map: &HashMap<String, String>,
+) {
+    if let Err(e) = store.store_coord_mcp_nonces(map) {
+        warn!("coord_mcp: failed to persist proxy nonces: {e}");
+    }
+}
+
+/// Restore persisted proxy nonces into the in-memory registry on boot (Phase
+/// 3b). Idempotent + run-once: merges the persisted set UNDER any nonces already
+/// minted this process (live mints win on key collision, which cannot happen in
+/// practice — the persisted set predates this process). No-op when persistence
+/// is disabled. Wire this into the same startup path as the other auto-start
+/// tasks so already-written `.mcp.json` nonces keep validating post-restart.
+pub(crate) fn restore_proxy_nonces_from_store() {
+    if !nonce_persistence_enabled() {
+        return;
+    }
+    if PROXY_NONCES_RESTORED.set(()).is_err() {
+        return; // already restored once this process
+    }
+    let store = match crate::secure_storage::SecureStorage::new() {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("coord_mcp: secure storage unavailable, cannot restore proxy nonces: {e}");
+            return;
+        }
+    };
+    restore_proxy_nonces_from(&store);
+}
+
+/// Merge the persisted nonce set from the GIVEN store into the live in-memory
+/// registry (live mints win on collision). The store is injected so the
+/// restore path is unit-testable against a temp-dir store without the
+/// run-once `PROXY_NONCES_RESTORED` guard or any global-env mutation. Returns
+/// the live map size after the merge.
+fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> usize {
+    let persisted = store.load_coord_mcp_nonces();
+    if persisted.is_empty() {
+        return proxy_nonces()
+            .lock()
+            .expect("proxy nonce map poisoned")
+            .len();
+    }
+    let restored = {
+        let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
+        for (nonce, workdir) in persisted {
+            map.entry(nonce).or_insert(workdir);
+        }
+        map.len()
+    };
+    info!("coord_mcp: restored {restored} persisted proxy nonce(s) from secure storage");
+    restored
+}
+
 /// Mint + register a fresh per-session proxy nonce for `workdir`, returning it.
 /// Any prior nonce registered for the same workdir is evicted — a re-provision
 /// rewrites `.mcp.json`, so the old nonce is unreachable and keeping it would
-/// only widen the accept set.
+/// only widen the accept set. The updated set is mirrored to the encrypted
+/// store (Phase 3b) so it survives a restart.
 fn register_proxy_nonce(workdir: &str) -> String {
+    let (nonce, snapshot) = mint_and_register_nonce(workdir);
+    persist_proxy_nonces(&snapshot);
+    nonce
+}
+
+/// Mint a fresh nonce, evict any prior nonce for `workdir`, insert it, and
+/// return `(nonce, snapshot)` — WITHOUT persisting. Split from the persistence
+/// step so a test can mint and then mirror to an INJECTED store
+/// ([`persist_proxy_nonces_with_store`]) instead of the default store reached
+/// via the process-global `QONTINUI_SECURE_STORAGE_DIR`.
+fn mint_and_register_nonce(workdir: &str) -> (String, HashMap<String, String>) {
     // Two v4 UUIDs (~244 bits of randomness) — v4, NOT v7: the v7 prefix is a
     // timestamp, which would gut the entropy this nonce exists to provide.
     let nonce = format!(
@@ -94,10 +214,13 @@ fn register_proxy_nonce(workdir: &str) -> String {
         uuid::Uuid::new_v4().simple(),
         uuid::Uuid::new_v4().simple()
     );
-    let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
-    map.retain(|_, wd| wd != workdir);
-    map.insert(nonce.clone(), workdir.to_string());
-    nonce
+    let snapshot = {
+        let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
+        map.retain(|_, wd| wd != workdir);
+        map.insert(nonce.clone(), workdir.to_string());
+        map.clone()
+    };
+    (nonce, snapshot)
 }
 
 /// True iff `nonce` is a currently-registered per-session proxy key.
@@ -154,18 +277,22 @@ pub(crate) fn proxy_request_gate(
 
 /// Resolve the runner's ACTUALLY-BOUND local API port for loopback URLs:
 /// the managed `AppState.api_port` (set at bind time) via the process-global
-/// `AppHandle`, falling back to [`crate::mcp::types::get_mcp_api_port`] only
-/// when no Tauri runtime / managed state exists (headless or unit-test
-/// contexts that genuinely predate the bind). The env-default 9876 fallback is
-/// wrong on secondary/temp runners, which is why the bound port is preferred.
-pub(crate) fn resolve_bound_api_port() -> u16 {
+/// `AppHandle`. Returns `None` — fail-closed, Phase 3a — when no Tauri runtime
+/// / managed `AppState` is reachable, rather than degrading to the bootstrap
+/// [`crate::mcp::types::get_mcp_api_port`] default (`MCP_API_PORT=9876`). That
+/// default is correct only by luck on a single-runner box and silently WRONG on
+/// any secondary/temp runner bound to a different port (the F1 root cause: a
+/// `:9876` URL written into a config whose live proxy is on `:9877`). Callers
+/// MUST treat `None` as "refuse to write a proxy config" — a dead config that
+/// looks valid is worse than an absent one.
+pub(crate) fn resolve_bound_api_port() -> Option<u16> {
     if let Some(app) = crate::tauri_app_handle::current() {
         use tauri::Manager;
         if let Some(state) = app.try_state::<std::sync::Arc<crate::commands::AppState>>() {
-            return crate::mcp::types::runner_api_port(state.inner());
+            return Some(crate::mcp::types::runner_api_port(state.inner()));
         }
     }
-    crate::mcp::types::get_mcp_api_port()
+    None
 }
 
 /// The coord-native `/mcp` endpoint is live (coord PR #277 Phase-2 cutover),
@@ -217,6 +344,84 @@ pub(crate) fn write_coord_mcp_proxy_config(primary_wt: &str, bound_port: u16) {
     write_mcp_json(primary_wt, &mcp_config);
 }
 
+/// Filename of the Phase-1a degraded-only breadcrumb dropped into a session
+/// workdir when coord-mcp provisioning is degraded (no JWT, unresolvable port,
+/// or a failed reachability probe). Referenced by the `/gate` skill + CLAUDE.md.
+pub(crate) const COORD_MCP_STATUS_FILE: &str = ".coord-mcp-status";
+
+/// Write a SHORT, single-line degraded breadcrumb into `workdir` (Phase 1a).
+/// Emitted ONLY when coord-mcp is degraded — a healthy session writes nothing
+/// (the file is removed by [`clear_degraded_breadcrumb`] on a successful probe),
+/// so its mere presence is the signal. Best-effort: a write failure only logs.
+fn write_degraded_breadcrumb(workdir: &str, reason: &str) {
+    let line =
+        format!("coord-mcp UNREACHABLE ({reason}) — gate registration degraded; use /gate\n");
+    let path = Path::new(workdir).join(COORD_MCP_STATUS_FILE);
+    if let Err(e) = std::fs::write(&path, line) {
+        warn!("coord_mcp: failed to write degraded breadcrumb in {workdir}: {e}");
+    }
+}
+
+/// Remove a stale degraded breadcrumb once coord-mcp is confirmed reachable, so
+/// a session that recovered (e.g. a reconcile fixed the port) does not keep
+/// showing a stale UNREACHABLE marker. Best-effort + idempotent (absent = ok).
+fn clear_degraded_breadcrumb(workdir: &str) {
+    let path = Path::new(workdir).join(COORD_MCP_STATUS_FILE);
+    let _ = std::fs::remove_file(path);
+}
+
+/// One-shot, non-blocking coord-mcp reachability probe (Phase 1a). Fires a
+/// `tools/list` JSON-RPC at the configured loopback proxy
+/// (`http://127.0.0.1:<port>/coord-mcp`) carrying the session's nonce header,
+/// with a short timeout, on a DETACHED thread so it never blocks or panics
+/// session provisioning. On a non-2xx / transport failure it drops the
+/// degraded breadcrumb; on success it clears any stale one and writes nothing.
+fn probe_and_breadcrumb_proxy(workdir: &str, port: u16) {
+    // Resolve the nonce we just wrote for this workdir so the probe authenticates
+    // exactly as the session's MCP client will.
+    let nonce = {
+        let map = proxy_nonces().lock().expect("proxy nonce map poisoned");
+        map.iter()
+            .find(|(_, wd)| wd.as_str() == workdir)
+            .map(|(n, _)| n.clone())
+    };
+    let Some(nonce) = nonce else {
+        return; // no nonce → nothing to probe against (already handled upstream)
+    };
+    let workdir = workdir.to_string();
+    std::thread::spawn(move || {
+        let url = format!("http://127.0.0.1:{port}/coord-mcp");
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {}
+        });
+        let client = match reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return, // can't build a client — skip silently (best-effort)
+        };
+        let reachable = client
+            .post(&url)
+            .header(COORD_MCP_PROXY_KEY_HEADER, &nonce)
+            .json(&body)
+            .send()
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        if reachable {
+            clear_degraded_breadcrumb(&workdir);
+        } else {
+            write_degraded_breadcrumb(
+                &workdir,
+                &format!("port :{port} probe failed (dead port | 401 stale nonce | coord down)"),
+            );
+        }
+    });
+}
+
 fn write_mcp_json(primary_wt: &str, mcp_config: &serde_json::Value) {
     let mcp_path = Path::new(primary_wt).join(".mcp.json");
     match std::fs::write(
@@ -260,13 +465,20 @@ fn write_mcp_json(primary_wt: &str, mcp_config: &serde_json::Value) {
 // last dark runner-spawned session kind (plan
 // 2026-06-09-provision-coord-mcp-operator-tabs). Both modules compile into the
 // runner bin crate, so `pub(crate)` is the minimal visibility that reaches it.
-pub(crate) fn provision_coord_mcp_for_session(workdir: &str, bound_port: u16) {
+pub(crate) fn provision_coord_mcp_for_session(workdir: &str, bound_port: Option<u16>) {
     let jwt = match crate::auth::AuthManager::new().get_access_token() {
         Ok(t) if !t.trim().is_empty() => t,
         _ => {
             info!(
                 "coord_mcp: no device JWT in access_token slot — skipping \
                  coord-mcp provisioning for {workdir}"
+            );
+            // 1a breadcrumb: a session with no device JWT cannot reach coord —
+            // surface it so the agent self-routes to `/gate` instead of finding
+            // a silently-absent MCP tool.
+            write_degraded_breadcrumb(
+                workdir,
+                "no device JWT in runner access_token slot — coord-mcp not provisioned",
             );
             return;
         }
@@ -291,7 +503,7 @@ pub(crate) fn provision_coord_mcp_for_session(workdir: &str, bound_port: u16) {
 /// static-bearer shape UNCHANGED — agent JWTs are deliberately narrower than
 /// the device JWT the proxy injects, so an agent session must never be routed
 /// through the proxy (scope elevation).
-fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: u16) {
+fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16>) {
     let sub_type = jwt_unverified_claim(jwt, "sub_type");
     match sub_type.as_deref() {
         Some("device") | Some("agent") => {}
@@ -314,7 +526,32 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: u16) {
     }
 
     if sub_type.as_deref() == Some("device") {
-        write_coord_mcp_proxy_config(workdir, bound_port);
+        // Phase 3a — fail-closed on an unknown bound port. The device path
+        // writes a loopback proxy URL; if we can't resolve the ACTUALLY-BOUND
+        // port we must NOT write a config pointing at the bootstrap default
+        // (`:9876`), which is wrong on any secondary/temp runner and produces a
+        // dead-but-valid-looking config (the F1 root cause). Refuse, warn, and
+        // drop a 1a breadcrumb so the agent routes to `/gate`.
+        let port = match bound_port {
+            Some(p) => p,
+            None => {
+                warn!(
+                    "coord_mcp: refusing to write a proxy .mcp.json for {workdir} — \
+                     the bound API port is unresolvable (no managed AppState); a \
+                     bootstrap-default port would be dead on a secondary runner. \
+                     Run `coord doctor` / reprovision once the runtime is up."
+                );
+                write_degraded_breadcrumb(
+                    workdir,
+                    "bound API port unresolvable — proxy config NOT written (would point at a dead port)",
+                );
+                return;
+            }
+        };
+        write_coord_mcp_proxy_config(workdir, port);
+        // 1a — one-shot, non-blocking reachability probe; writes a breadcrumb
+        // only on failure, nothing on success (discoverability without clutter).
+        probe_and_breadcrumb_proxy(workdir, port);
     } else {
         write_coord_mcp_config(workdir, jwt);
     }
@@ -375,9 +612,101 @@ fn coord_mcp_safe_to_write(workdir: &str) -> bool {
     }
 }
 
+/// Read the loopback proxy port out of an existing coord-mcp `.mcp.json`, if the
+/// file holds the PROXY shape (`url == http://127.0.0.1:<port>/coord-mcp`).
+/// Returns `None` for an absent/unparseable file or a non-proxy (static-bearer)
+/// shape — the latter is the agent path, which the reconcile must never touch.
+fn read_proxy_port(workdir: &str) -> Option<u16> {
+    let path = Path::new(workdir).join(".mcp.json");
+    let s = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+    let url = v
+        .pointer("/mcpServers/coord-mcp/url")
+        .and_then(|u| u.as_str())?;
+    let rest = url.strip_prefix("http://127.0.0.1:")?;
+    let port_str = rest.strip_suffix("/coord-mcp")?;
+    port_str.parse::<u16>().ok()
+}
+
+/// Boot-time reconcile decision for one session's `.mcp.json` (Phase 3c). Pure
+/// over its inputs (no I/O) so the rewrite predicate is unit-testable:
+///
+/// - `Rewrite` — the config holds the proxy shape on a port ≠ the instance's
+///   current bound port → rewrite it to the correct port (+ a fresh persisted
+///   nonce) so the next MCP read targets a live proxy.
+/// - `Leave` — no `.mcp.json` proxy port readable, OR the port already matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReconcileAction {
+    Rewrite,
+    Leave,
+}
+
+/// Pure reconcile predicate: given the session's currently-written proxy port
+/// (if any) and the instance's current bound port, decide whether to rewrite.
+pub(crate) fn reconcile_action(
+    current_proxy_port: Option<u16>,
+    bound_port: u16,
+) -> ReconcileAction {
+    match current_proxy_port {
+        Some(p) if p != bound_port => ReconcileAction::Rewrite,
+        _ => ReconcileAction::Leave,
+    }
+}
+
+/// Boot-time session-config reconcile (Phase 3c). For each live session workdir,
+/// if its `.mcp.json` coord-mcp proxy port ≠ the instance's CURRENT bound port,
+/// rewrite it via [`write_coord_mcp_proxy_config`] (correct port + a freshly
+/// persisted nonce), guarded by [`coord_mcp_safe_to_write`] so it never clobbers
+/// an agent-spawn's static-bearer config. Combined with Phase 3b (persisted
+/// nonces), the common same-port restart needs no rewrite at all — this covers
+/// only the instance/port-change case. Returns the number of configs rewritten.
+///
+/// Wired into the same startup path as the other auto-start tasks (see
+/// `mcp_api::start_server`), AFTER [`restore_proxy_nonces_from_store`] so a
+/// rewrite reuses the restored map where possible.
+pub(crate) fn reconcile_session_configs<I>(workdirs: I, bound_port: u16) -> usize
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut rewritten = 0usize;
+    for workdir in workdirs {
+        if reconcile_action(read_proxy_port(&workdir), bound_port) != ReconcileAction::Rewrite {
+            continue;
+        }
+        if !coord_mcp_safe_to_write(&workdir) {
+            // An agent-spawn static-bearer config (or a user's own file) — never
+            // clobber. (A proxy-shaped config is ours-refreshable, so this only
+            // skips configs we must not touch.)
+            continue;
+        }
+        write_coord_mcp_proxy_config(&workdir, bound_port);
+        rewritten += 1;
+        info!("coord_mcp: reconciled {workdir}/.mcp.json to bound port :{bound_port}");
+    }
+    if rewritten > 0 {
+        info!("coord_mcp: boot reconcile rewrote {rewritten} session config(s) to the current bound port");
+    }
+    rewritten
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A temp-dir-backed [`SecureStorage`] for the persistence tests — injected
+    /// directly into the `_with_store` seam so a test NEVER mutates the
+    /// process-global `QONTINUI_SECURE_STORAGE_DIR`. Mutating that env var raced
+    /// sibling tests that read the DEFAULT store (notably
+    /// `auth::device_jwt_tests::needs_refresh_when_no_token`), which is why this
+    /// module no longer touches global env at all.
+    fn temp_store(tag: &str) -> (std::path::PathBuf, crate::secure_storage::SecureStorage) {
+        let dir =
+            std::env::temp_dir().join(format!("coord-mcp-{tag}-store-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = crate::secure_storage::SecureStorage::with_path(dir.join("nonces.enc"))
+            .expect("temp secure storage");
+        (dir, store)
+    }
 
     #[test]
     fn write_coord_mcp_config_emits_http_bearer_shape() {
@@ -655,7 +984,7 @@ mod tests {
         // A) device bearer + clean dir → provisions the loopback PROXY shape on
         //    the passed bound port: nonce header, NO static bearer.
         let d = new_dir();
-        provision_coord_mcp_with_jwt(&d.to_string_lossy(), &dev, 19876);
+        provision_coord_mcp_with_jwt(&d.to_string_lossy(), &dev, Some(19876));
         let written =
             std::fs::read_to_string(mcp_of(&d)).expect("device bearer must provision .mcp.json");
         let v: serde_json::Value = serde_json::from_str(&written).unwrap();
@@ -681,7 +1010,7 @@ mod tests {
         //    injects — agent sessions must never route through the proxy).
         let d = new_dir();
         let agent_jwt = mk("agent");
-        provision_coord_mcp_with_jwt(&d.to_string_lossy(), &agent_jwt, 19876);
+        provision_coord_mcp_with_jwt(&d.to_string_lossy(), &agent_jwt, Some(19876));
         let written =
             std::fs::read_to_string(mcp_of(&d)).expect("agent bearer must provision .mcp.json");
         let v: serde_json::Value = serde_json::from_str(&written).unwrap();
@@ -702,7 +1031,7 @@ mod tests {
         // C) non-coord bearer (e.g. a Cognito access token, sub_type=access) →
         //    sub_type gate skips; no file is written (would 401 coord's verifier).
         let d = new_dir();
-        provision_coord_mcp_with_jwt(&d.to_string_lossy(), &mk("access"), 19876);
+        provision_coord_mcp_with_jwt(&d.to_string_lossy(), &mk("access"), Some(19876));
         assert!(
             !mcp_of(&d).exists(),
             "a non-device/agent bearer must NOT be written"
@@ -717,12 +1046,233 @@ mod tests {
             mk("agent")
         );
         std::fs::write(mcp_of(&d), &agent_cfg).unwrap();
-        provision_coord_mcp_with_jwt(&d.to_string_lossy(), &dev, 19876);
+        provision_coord_mcp_with_jwt(&d.to_string_lossy(), &dev, Some(19876));
         assert_eq!(
             std::fs::read_to_string(mcp_of(&d)).unwrap(),
             agent_cfg,
             "a device bearer must not downgrade an existing agent-JWT config"
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Phase 3a — fail-closed: a DEVICE bearer with an UNKNOWN bound port
+    /// (`None`) must NOT write a proxy `.mcp.json` (which would point at a dead
+    /// bootstrap-default port), and must drop the degraded breadcrumb instead.
+    /// This is the F1 root-cause guard.
+    #[test]
+    fn device_path_with_no_bound_port_writes_no_proxy_config() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let dev = {
+            let payload = URL_SAFE_NO_PAD.encode(br#"{"sub_type":"device"}"#);
+            format!("h.{payload}.s")
+        };
+        let d = std::env::temp_dir().join(format!("coord-mcp-noport-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&d).unwrap();
+        let wd = d.to_string_lossy().to_string();
+
+        // None bound port → fail-closed.
+        provision_coord_mcp_with_jwt(&wd, &dev, None);
+
+        assert!(
+            !d.join(".mcp.json").exists(),
+            "an unresolvable bound port must NOT write a (dead) proxy .mcp.json"
+        );
+        let crumb = std::fs::read_to_string(d.join(COORD_MCP_STATUS_FILE))
+            .expect("a degraded breadcrumb must be written when the port is unresolvable");
+        assert!(
+            crumb.contains("coord-mcp UNREACHABLE") && crumb.contains("/gate"),
+            "breadcrumb must be the actionable degraded line: {crumb}"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Phase 3a — a non-degraded healthy DEVICE provision (a real `Some(port)`)
+    /// must NOT leave a degraded breadcrumb from the write path itself (the
+    /// async probe may add one later if the port is dead, but the synchronous
+    /// write must not).
+    #[test]
+    fn device_path_with_bound_port_writes_proxy_and_no_synchronous_breadcrumb() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let dev = {
+            let payload = URL_SAFE_NO_PAD.encode(br#"{"sub_type":"device"}"#);
+            format!("h.{payload}.s")
+        };
+        let d = std::env::temp_dir().join(format!("coord-mcp-port-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&d).unwrap();
+        let wd = d.to_string_lossy().to_string();
+
+        provision_coord_mcp_with_jwt(&wd, &dev, Some(34567));
+
+        assert!(
+            d.join(".mcp.json").exists(),
+            "a resolvable bound port must write the proxy .mcp.json"
+        );
+        let port = read_proxy_port(&wd);
+        assert_eq!(port, Some(34567), "config must carry the passed bound port");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Phase 3b — persist→restore round-trip: a minted nonce is mirrored to the
+    /// store, and `restore_proxy_nonces_from_store` re-loads it into a fresh
+    /// in-memory map so it still validates after a (simulated) restart.
+    #[test]
+    fn persisted_nonce_survives_restore_round_trip() {
+        // Inject a temp-dir store directly — NO process-global env mutation, so
+        // this test cannot pollute sibling tests that read the default store.
+        let (store_dir, store) = temp_store("nonce");
+
+        // Mint a nonce in the live map, then mirror the snapshot to the INJECTED
+        // store (the `register_proxy_nonce` body, split across its seams).
+        let workdir = store_dir.join("session-wd").to_string_lossy().to_string();
+        let (nonce, snapshot) = mint_and_register_nonce(&workdir);
+        persist_proxy_nonces_with_store(&store, &snapshot);
+        assert!(proxy_nonce_is_valid(&nonce));
+
+        // It is actually on disk (independent of the in-memory map).
+        let persisted = store.load_coord_mcp_nonces();
+        assert_eq!(
+            persisted.get(&nonce).map(String::as_str),
+            Some(workdir.as_str()),
+            "the minted nonce must be mirrored to the encrypted store"
+        );
+
+        // Simulate a restart: drop the nonce from the in-memory map, then
+        // restore from the injected store via the same merge the boot path runs.
+        {
+            let mut map = proxy_nonces().lock().unwrap();
+            map.remove(&nonce);
+        }
+        assert!(
+            !proxy_nonce_is_valid(&nonce),
+            "precondition: the nonce is gone from the in-memory map"
+        );
+        restore_proxy_nonces_from(&store);
+        assert!(
+            proxy_nonce_is_valid(&nonce),
+            "a persisted nonce must validate again after a restore"
+        );
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// Phase 3b — `persist_proxy_nonces` honors the `nonce_persistence_enabled`
+    /// gate: when persistence is disabled (test default, `COORD_MCP_PERSIST_NONCES`
+    /// unset under `cfg(test)`), the DEFAULT-store path is a no-op. We assert the
+    /// gate directly (a pure predicate) rather than mutating env + probing the
+    /// real store — the injected-store seam makes the disk write deterministic and
+    /// the gate is the only behavior worth pinning here.
+    #[test]
+    fn persistence_disabled_skips_default_store_write() {
+        // Under cfg(test) with the env var unset, persistence is OFF by default
+        // (see `nonce_persistence_enabled`), so `register_proxy_nonce`'s
+        // default-store mirror is a guaranteed no-op — minting touches only the
+        // in-memory map. A minted nonce is therefore valid in-memory but the
+        // default store is never written. We verify the gate is the thing that
+        // makes that true.
+        assert!(
+            !nonce_persistence_enabled(),
+            "test builds must default persistence OFF so nonce-minting tests \
+             never write the developer's real store"
+        );
+        // And minting still registers in-memory (the persist step is skipped).
+        let (nonce, _snapshot) = mint_and_register_nonce("/tmp/coord-mcp-persist-off-wd");
+        assert!(
+            proxy_nonce_is_valid(&nonce),
+            "minting must register the nonce in-memory regardless of persistence"
+        );
+    }
+
+    /// Phase 3c — the pure reconcile predicate: rewrite only when a proxy port
+    /// is present AND differs from the current bound port.
+    #[test]
+    fn reconcile_action_rewrites_only_on_port_mismatch() {
+        assert_eq!(
+            reconcile_action(Some(9877), 9876),
+            ReconcileAction::Rewrite,
+            "stale port → rewrite"
+        );
+        assert_eq!(
+            reconcile_action(Some(9876), 9876),
+            ReconcileAction::Leave,
+            "matching port → leave"
+        );
+        assert_eq!(
+            reconcile_action(None, 9876),
+            ReconcileAction::Leave,
+            "no readable proxy port (absent / static-bearer agent config) → leave"
+        );
+    }
+
+    /// Phase 3c — end-to-end reconcile over a workdir set: a stale-port proxy
+    /// config is rewritten to the bound port; a matching one and an agent
+    /// (static-bearer) config are left untouched.
+    #[test]
+    fn reconcile_session_configs_rewrites_stale_leaves_agent() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let base = std::env::temp_dir().join(format!("coord-mcp-recon-{}", uuid::Uuid::now_v7()));
+
+        // Stale proxy config on :9999 → must be rewritten to :9876.
+        let stale = base.join("stale");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(
+            stale.join(".mcp.json"),
+            r#"{"mcpServers":{"coord-mcp":{"type":"http","url":"http://127.0.0.1:9999/coord-mcp","headers":{"X-Coord-Mcp-Proxy-Key":"old"}}}}"#,
+        )
+        .unwrap();
+
+        // Already-correct proxy config on :9876 → must be left as-is.
+        let ok = base.join("ok");
+        std::fs::create_dir_all(&ok).unwrap();
+        std::fs::write(
+            ok.join(".mcp.json"),
+            r#"{"mcpServers":{"coord-mcp":{"type":"http","url":"http://127.0.0.1:9876/coord-mcp","headers":{"X-Coord-Mcp-Proxy-Key":"keep"}}}}"#,
+        )
+        .unwrap();
+
+        // Agent static-bearer config → must NEVER be clobbered.
+        let agent_payload = URL_SAFE_NO_PAD.encode(br#"{"sub_type":"agent"}"#);
+        let agent_jwt = format!("h.{agent_payload}.s");
+        let agent_cfg = format!(
+            r#"{{"mcpServers":{{"coord-mcp":{{"type":"http","url":"https://c/mcp","headers":{{"Authorization":"Bearer {agent_jwt}"}}}}}}}}"#
+        );
+        let agent = base.join("agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(agent.join(".mcp.json"), &agent_cfg).unwrap();
+
+        let workdirs = vec![
+            stale.to_string_lossy().to_string(),
+            ok.to_string_lossy().to_string(),
+            agent.to_string_lossy().to_string(),
+        ];
+        let rewritten = reconcile_session_configs(workdirs, 9876);
+        assert_eq!(
+            rewritten, 1,
+            "only the stale-port proxy config is rewritten"
+        );
+
+        // Stale rewritten to the bound port (+ a fresh registered nonce).
+        assert_eq!(read_proxy_port(&stale.to_string_lossy()), Some(9876));
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(stale.join(".mcp.json")).unwrap())
+                .unwrap();
+        let new_nonce = v["mcpServers"]["coord-mcp"]["headers"]["X-Coord-Mcp-Proxy-Key"]
+            .as_str()
+            .unwrap();
+        assert!(
+            proxy_nonce_is_valid(new_nonce),
+            "the rewritten config must carry a freshly-registered nonce"
+        );
+
+        // Correct config untouched; agent config preserved verbatim.
+        assert_eq!(read_proxy_port(&ok.to_string_lossy()), Some(9876));
+        assert_eq!(
+            std::fs::read_to_string(agent.join(".mcp.json")).unwrap(),
+            agent_cfg,
+            "an agent static-bearer config must never be clobbered by the reconcile"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

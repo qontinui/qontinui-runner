@@ -125,11 +125,23 @@ impl AuthManager {
     }
 
     /// Creates an AuthManager with a custom SecureStorage for testing.
+    ///
+    /// Uses a UNIQUE per-instance keychain `service_name` so parallel tests do
+    /// NOT collide on the single process-/OS-global keychain slot. The file
+    /// store is already isolated via [`SecureStorage::with_path`], but the
+    /// keychain backup (`store_tokens_in_keychain` / the `get_access_token`
+    /// fallback) writes/reads `Entry::new(service_name, "access_token")` — a
+    /// FIXED slot under the real `SERVICE_NAME`. Two parallel tests that both
+    /// store/clear tokens would otherwise stomp that one shared slot, so a test
+    /// expecting an empty slot reads a sibling's keychain token (the flaky
+    /// `needs_refresh_when_no_token` / `test_token_storage` cross-test
+    /// pollution). A per-test service name makes the keychain backup as isolated
+    /// as the file store.
     #[cfg(test)]
     pub fn with_storage(secure_storage: SecureStorage) -> Self {
         Self {
             secure_storage,
-            service_name: SERVICE_NAME.to_string(),
+            service_name: format!("com.qontinui.runner.test.{}", uuid::Uuid::now_v7()),
         }
     }
 

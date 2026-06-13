@@ -112,6 +112,205 @@ pub(crate) fn next_action(tier: RunnerTier, needs_refresh: bool) -> Decision {
     Decision::Pair
 }
 
+// ===========================================================================
+// Phase 1b — coord-credential health signal (runner publishes; coord derives
+// the fleet alert in `evaluate()`).
+// ===========================================================================
+
+/// Outcome of the `Pair` arm as seen by the health-mapping fn. The arm can
+/// either bail before re-minting (no bearer / no tenant / pair-cli failure
+/// leaving an EXPIRED jwt behind) or complete (a fresh `Replaced`, or a
+/// `KeptExisting`/`PersistFailed` whose existing JWT is still valid). Factored
+/// out so [`coord_credential_health`] is a pure fn over an enum the loop can
+/// construct at each arm without re-deriving any state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PairProgress {
+    /// `Decision::Pair` reached but the loop bailed before re-minting because
+    /// no Cognito/device bearer was resolvable. The string is the specific
+    /// failing source for the operator-facing `reason`.
+    BailNoBearer,
+    /// `Decision::Pair` reached but no `tenant_id` resolved from any source
+    /// (OAuth claim → outgoing device-JWT → machine.json). Gate-blocking.
+    BailNoTenant,
+    /// `Decision::Pair` ran `try_refresh_once`, which returned a non-2xx
+    /// (`KeptExisting`) or a persist failure (`PersistFailed`), AND the JWT
+    /// still in the slot is EXPIRED (or absent) — the runner is now
+    /// credential-dark even though it tried. Degraded, not gate-blocking-by-
+    /// config: the tenant resolved, the mint just failed.
+    BailRefreshFailedExpired,
+    /// The `Pair` arm completed with a usable JWT — either a fresh `Replaced`
+    /// or a `KeptExisting`/`PersistFailed` whose existing JWT is still valid.
+    Healthy,
+}
+
+/// Compact coord-credential health the runner stamps into its
+/// `coord.device_status.details` on every heartbeat (plan 2026-06-13 Phase 1b).
+/// Coord's `fleet_health::evaluate()` reads this to derive the device-scoped
+/// `coord_credentials_missing` alert; the runner itself never touches coord's
+/// alert machinery.
+///
+/// Wire shape (under `details.coord_credential`):
+/// `{ "ok": <bool>, "reason": <string|null> }`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct CoordCredentialHealth {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl CoordCredentialHealth {
+    fn ok() -> Self {
+        Self {
+            ok: true,
+            reason: None,
+        }
+    }
+    fn bad(reason: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            reason: Some(reason.into()),
+        }
+    }
+}
+
+/// Pure map: refresher decision (plus, for `Pair`, how far the arm got) →
+/// the `coord_credential` health the heartbeat publishes. No I/O — the loop
+/// constructs the `PairProgress` at each arm and calls this so the mapping is
+/// unit-testable in the same style as [`next_action`].
+///
+/// - [`Decision::Idle`] (JWT fresh)            → `{ok:true,  reason:null}`.
+/// - [`Decision::IdleWrongTier`]               → `{ok:false, reason:"runner tier is not Qontinui account"}`.
+/// - [`Decision::Pair`] + [`PairProgress::Healthy`]               → `{ok:true}`.
+/// - [`Decision::Pair`] + bail variants        → `{ok:false, reason:<specific failing source>}`.
+///
+/// `pair_progress` is only consulted for [`Decision::Pair`]; callers pass
+/// `None` for the idle arms.
+pub(crate) fn coord_credential_health(
+    decision: Decision,
+    pair_progress: Option<PairProgress>,
+) -> CoordCredentialHealth {
+    match decision {
+        Decision::Idle => CoordCredentialHealth::ok(),
+        Decision::IdleWrongTier => {
+            CoordCredentialHealth::bad("runner tier is not Qontinui account")
+        }
+        Decision::Pair => match pair_progress {
+            Some(PairProgress::Healthy) | None => CoordCredentialHealth::ok(),
+            Some(PairProgress::BailNoBearer) => CoordCredentialHealth::bad(
+                "no Cognito session and access_token slot empty — user must sign in",
+            ),
+            Some(PairProgress::BailNoTenant) => CoordCredentialHealth::bad(
+                "no resolvable tenant_id (OAuth claim, outgoing device-JWT, or \
+                 machine.json::active_tenant_id all absent)",
+            ),
+            Some(PairProgress::BailRefreshFailedExpired) => CoordCredentialHealth::bad(
+                "device-JWT re-mint failed (coord non-2xx or persist error) and the \
+                 existing JWT is expired — runner is credential-dark",
+            ),
+        },
+    }
+}
+
+/// True iff the device-JWT in the `access_token` slot is absent, opaque
+/// (no decodable `exp`), or its `exp` is already in the past. Used to decide
+/// whether a failed re-mint left the runner credential-DARK
+/// ([`PairProgress::BailRefreshFailedExpired`]) vs. merely hit a transient
+/// coord error while still holding a valid (not-yet-expired) JWT.
+fn slot_jwt_is_expired_or_absent(auth_manager: &crate::auth::AuthManager) -> bool {
+    match auth_manager.access_token_exp() {
+        Some(exp) => chrono::Utc::now().timestamp() >= exp,
+        None => true, // absent or opaque/undecodable → treat as not-live
+    }
+}
+
+/// Best-effort publish of the coord-credential health into the runner's
+/// `coord.device_status.details.coord_credential` via the existing
+/// `POST {coord}/coord/status` upsert path (the same endpoint
+/// `qontinui_profile`/coord-sync use; we reuse it rather than invent a new
+/// route). Resolves `device_id`/`tenant_id`/coord-base exactly like the rest of
+/// the runner:
+///   - coord base: `COORD_HTTP_URL` env → active profile (`coord_base_url`),
+///   - device_id: `QONTINUI_MACHINE_ID` env → `machine.json::device_id`,
+///   - tenant_id: `resolve_active_tenant_id()` (machine.json::active_tenant_id),
+///     falling back to the outgoing device-JWT's `tenant_id` claim.
+///
+/// A publish failure ONLY `warn!`s — it must never break the refresher loop
+/// (the loop's job is keeping the JWT fresh; telemetry is strictly best-effort).
+async fn publish_coord_credential_status(
+    auth_manager: &crate::auth::AuthManager,
+    health: &CoordCredentialHealth,
+) {
+    // device_id: env override first (multi-instance / test), else machine.json.
+    let device_id = std::env::var("QONTINUI_MACHINE_ID")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string())
+        .or_else(|| qontinui_runner_lib::pair::read_device_id_from_disk().ok());
+    let Some(device_id) = device_id else {
+        // No stable identity → coord can't key the row; skip silently-ish.
+        warn!(
+            "device_jwt_refresher: cannot publish coord_credential status — \
+             no device_id (QONTINUI_MACHINE_ID unset, machine.json unreadable)"
+        );
+        return;
+    };
+    let Ok(device_uuid) = uuid::Uuid::parse_str(device_id.trim()) else {
+        warn!(
+            "device_jwt_refresher: device_id {device_id} is not a UUID — skipping status publish"
+        );
+        return;
+    };
+
+    // tenant_id: machine.json::active_tenant_id, then the outgoing device-JWT
+    // claim (still parseable when expired). NULL is acceptable on the wire
+    // (coord's StatusUpsert.tenant_id is Option), but we send it when known so
+    // the row is tenant-scoped.
+    let tenant_id = crate::session::dual_write::resolve_active_tenant_id().or_else(|| {
+        auth_manager
+            .get_access_token()
+            .ok()
+            .as_deref()
+            .and_then(qontinui_runner_lib::pair::tenant_id_from_oauth_claim)
+            .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
+    });
+
+    let base = crate::coord_mcp::coord_base_url();
+    let url = format!("{base}/coord/status");
+    let mut body = serde_json::json!({
+        "device_id": device_uuid,
+        "details": { "coord_credential": health },
+    });
+    if let Some(t) = tenant_id {
+        body["tenant_id"] = serde_json::json!(t);
+    }
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("device_jwt_refresher: status-publish client build failed: {e}");
+            return;
+        }
+    };
+    match client.post(&url).json(&body).send().await {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) => {
+            warn!(
+                "device_jwt_refresher: coord_credential status publish got HTTP {} \
+                 (best-effort; loop continues)",
+                resp.status()
+            );
+        }
+        Err(e) => {
+            warn!(
+                "device_jwt_refresher: coord_credential status publish failed: {e} (best-effort)"
+            );
+        }
+    }
+}
+
 /// State for the device-JWT refresher task. Owns the watch channels for
 /// shutdown + kick and the join handle so callers can stop / re-kick.
 pub struct RefresherState {
@@ -459,6 +658,14 @@ async fn refresher_loop(
 
         match decision {
             Decision::IdleWrongTier => {
+                // Phase 1b: publish the credential-dark signal so coord's
+                // fleet `evaluate()` lights up a device-scoped alert. Best-
+                // effort — never blocks the idle wait below.
+                publish_coord_credential_status(
+                    &auth_manager,
+                    &coord_credential_health(decision, None),
+                )
+                .await;
                 // Nothing to do until tier changes. Block on shutdown or
                 // kick (set_runner_tier kicks us on every transition).
                 tokio::select! {
@@ -470,6 +677,13 @@ async fn refresher_loop(
                 }
             }
             Decision::Idle => {
+                // Phase 1b: a fresh JWT → publish ok so any stale alert self-
+                // clears on coord's next firing-set reconcile.
+                publish_coord_credential_status(
+                    &auth_manager,
+                    &coord_credential_health(decision, None),
+                )
+                .await;
                 // JWT is fresh — sleep until next check or wake on kick.
                 if wait_with_signals(REFRESH_CHECK_INTERVAL, &mut shutdown_rx, &mut kick_rx).await {
                     return;
@@ -494,6 +708,15 @@ async fn refresher_loop(
                                 "device_jwt_refresher: no Cognito session and access_token slot \
                                  empty — user must sign in to Qontinui before the refresher can pair"
                             );
+                            // Phase 1b: credential-dark (not signed in).
+                            publish_coord_credential_status(
+                                &auth_manager,
+                                &coord_credential_health(
+                                    decision,
+                                    Some(PairProgress::BailNoBearer),
+                                ),
+                            )
+                            .await;
                             if wait_with_signals(
                                 REFRESH_CHECK_INTERVAL,
                                 &mut shutdown_rx,
@@ -552,6 +775,12 @@ async fn refresher_loop(
                             "device_jwt_refresher: paired_user.json missing — \
                              runner not paired yet (refresher idling until kick)"
                         );
+                        // Phase 1b: not paired → credential-dark (not signed in).
+                        publish_coord_credential_status(
+                            &auth_manager,
+                            &coord_credential_health(decision, Some(PairProgress::BailNoBearer)),
+                        )
+                        .await;
                         if wait_with_signals(REFRESH_CHECK_INTERVAL, &mut shutdown_rx, &mut kick_rx)
                             .await
                         {
@@ -560,6 +789,18 @@ async fn refresher_loop(
                         continue;
                     }
                 };
+
+                // Phase 1b: resolve the tenant ONCE up front so the post-outcome
+                // health mapping can distinguish "no tenant resolved" (gate-
+                // blocking config) from "tenant fine, the mint just failed"
+                // (degraded). `try_refresh_once` re-resolves internally; the two
+                // resolutions agree because both call `resolve_active_tenant_id`
+                // + the same OAuth/outgoing-JWT fallback chain.
+                let machine_tenant = crate::session::dual_write::resolve_active_tenant_id();
+                let outgoing_jwt = auth_manager.get_access_token().ok();
+                let tenant_resolved =
+                    resolve_pair_tenant_id(&bearer_token, outgoing_jwt.as_deref(), machine_tenant)
+                        .is_some();
 
                 // Phase 5.2: try_refresh_once encapsulates the
                 // pair-cli HTTP call + JWT persistence. It preserves
@@ -570,10 +811,10 @@ async fn refresher_loop(
                     &bearer_token,
                     &device_id,
                     &user_id,
-                    crate::session::dual_write::resolve_active_tenant_id(),
+                    machine_tenant,
                 )
                 .await;
-                match outcome {
+                let progress = match &outcome {
                     RefreshOutcome::Replaced { new_jwt } => {
                         info!(
                             "device_jwt_refresher: device-JWT refreshed (len={})",
@@ -581,15 +822,32 @@ async fn refresher_loop(
                         );
                         // Wake the relay so it reconnects with the new JWT.
                         crate::mcp::backend_relay::commands::kick_cloud_relay().await;
+                        PairProgress::Healthy
                     }
-                    RefreshOutcome::KeptExisting => {
-                        // Coord error (401 / 503 / etc.) or transport failure —
-                        // existing JWT preserved. Will retry next tick.
+                    RefreshOutcome::KeptExisting | RefreshOutcome::PersistFailed(_) => {
+                        if let RefreshOutcome::PersistFailed(e) = &outcome {
+                            warn!("device_jwt_refresher: persist new JWT failed: {e}");
+                        }
+                        // The mint did NOT advance the slot. Classify why:
+                        //   - no tenant resolvable → gate-blocking config red,
+                        //   - tenant fine but the slot JWT is now expired/absent
+                        //     → degraded "credential-dark" red,
+                        //   - tenant fine and the slot JWT is still valid →
+                        //     healthy (a transient coord 5xx we'll retry).
+                        if !tenant_resolved {
+                            PairProgress::BailNoTenant
+                        } else if slot_jwt_is_expired_or_absent(&auth_manager) {
+                            PairProgress::BailRefreshFailedExpired
+                        } else {
+                            PairProgress::Healthy
+                        }
                     }
-                    RefreshOutcome::PersistFailed(e) => {
-                        warn!("device_jwt_refresher: persist new JWT failed: {e}");
-                    }
-                }
+                };
+                publish_coord_credential_status(
+                    &auth_manager,
+                    &coord_credential_health(decision, Some(progress)),
+                )
+                .await;
 
                 // Brief sleep before next iteration (success or failure)
                 // so we don't hammer coord on persistent errors.
@@ -707,6 +965,88 @@ mod tests {
         // Even with no needs-refresh signal, wrong-tier still wins.
         let d3 = next_action(RunnerTier::LocalProvider, false);
         assert_eq!(d3, Decision::IdleWrongTier);
+    }
+
+    // ---- coord_credential_health mapping (pure, Phase 1b) ----
+
+    #[test]
+    fn health_idle_is_ok() {
+        let h = coord_credential_health(Decision::Idle, None);
+        assert!(h.ok);
+        assert_eq!(h.reason, None);
+    }
+
+    #[test]
+    fn health_wrong_tier_is_red_with_tier_reason() {
+        let h = coord_credential_health(Decision::IdleWrongTier, None);
+        assert!(!h.ok);
+        assert_eq!(
+            h.reason.as_deref(),
+            Some("runner tier is not Qontinui account")
+        );
+    }
+
+    #[test]
+    fn health_pair_healthy_is_ok() {
+        // A successful Replaced / still-valid KeptExisting → ok.
+        let h = coord_credential_health(Decision::Pair, Some(PairProgress::Healthy));
+        assert!(h.ok);
+        assert_eq!(h.reason, None);
+        // And `None` progress (defensive default) is also ok, never a false red.
+        let h2 = coord_credential_health(Decision::Pair, None);
+        assert!(h2.ok);
+    }
+
+    #[test]
+    fn health_pair_bail_no_bearer_is_red_signin() {
+        let h = coord_credential_health(Decision::Pair, Some(PairProgress::BailNoBearer));
+        assert!(!h.ok);
+        assert!(
+            h.reason.as_deref().unwrap().contains("sign in"),
+            "no-bearer reason must name the sign-in failing source, got {:?}",
+            h.reason
+        );
+    }
+
+    #[test]
+    fn health_pair_bail_no_tenant_is_red_tenant() {
+        let h = coord_credential_health(Decision::Pair, Some(PairProgress::BailNoTenant));
+        assert!(!h.ok);
+        assert!(
+            h.reason.as_deref().unwrap().contains("tenant"),
+            "no-tenant reason must name the tenant failing source, got {:?}",
+            h.reason
+        );
+    }
+
+    #[test]
+    fn health_pair_bail_refresh_failed_expired_is_red_dark() {
+        let h =
+            coord_credential_health(Decision::Pair, Some(PairProgress::BailRefreshFailedExpired));
+        assert!(!h.ok);
+        assert!(
+            h.reason.as_deref().unwrap().contains("credential-dark"),
+            "failed-mint-expired reason must flag credential-dark, got {:?}",
+            h.reason
+        );
+    }
+
+    #[test]
+    fn health_serializes_to_ok_reason_shape() {
+        // Wire contract: `{ "ok": <bool>, "reason": <string|null> }`. The
+        // `ok` case skips `reason` (Option::is_none), which deserializes back
+        // to null on the coord side — the consumer treats absent == null.
+        let ok = serde_json::to_value(coord_credential_health(Decision::Idle, None)).unwrap();
+        assert_eq!(ok["ok"], serde_json::Value::Bool(true));
+        assert!(ok.get("reason").is_none(), "ok health omits reason");
+
+        let red =
+            serde_json::to_value(coord_credential_health(Decision::IdleWrongTier, None)).unwrap();
+        assert_eq!(red["ok"], serde_json::Value::Bool(false));
+        assert!(
+            red["reason"].is_string(),
+            "red health carries a reason string"
+        );
     }
 
     // ---- resolve_pair_tenant_id ordering (pure, no disk / no AuthManager) ----

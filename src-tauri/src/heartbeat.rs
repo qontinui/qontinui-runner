@@ -180,12 +180,30 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
             // Read the /health-driven embedding probe cache. `None` (probe
             // hasn't run yet) collapses to "healthy" so a pre-probe heartbeat
             // doesn't flap to "degraded" on boot.
-            let derived_status = crate::ui_error::compute_derived_status(
+            let base_status = crate::ui_error::compute_derived_status(
                 ui_error_snapshot.is_some(),
                 recent_crash_snapshot.is_some(),
                 crate::mcp_api::embedding_reachable_cached(),
-            )
-            .to_string();
+            );
+
+            // Phase 5 — provisioning completeness gate. A runner is
+            // provisioning-complete only once it holds a live coord device JWT
+            // (doctor check 5). ADVISORY by default: surface + log loudly but
+            // never withhold ready (a hard block could brick a runner
+            // mid-provision). `QONTINUI_PROVISIONING_GATE_ENFORCE` flips it to
+            // ENFORCING, where readiness is withheld until check 5 passes. The
+            // device-JWT predicate is REUSED from `coord_doctor` (not
+            // re-implemented); the credential-gap is ALSO surfaced to the fleet
+            // by `device_jwt_refresher`'s Phase-1b coord_credential status, so
+            // the same `runner_coord_credentials_missing` alert lights up — we
+            // do not invent a second signal here.
+            let check5 = qontinui_runner_lib::coord_doctor::device_jwt_live_check();
+            let readiness = qontinui_runner_lib::coord_doctor::provisioning_readiness(
+                check5.ok,
+                qontinui_runner_lib::coord_doctor::provisioning_gate_enforce_enabled(),
+            );
+            let derived_status =
+                provisioning_gated_status(base_status, readiness, &check5.detail).to_string();
 
             // Send to web backend every 30s (every other tick)
             if tick_count.is_multiple_of(2) {
@@ -273,6 +291,64 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
     });
 }
 
+/// The heartbeat `derived_status` value a runner reports when it is
+/// provisioning-incomplete under the ENFORCING gate: it has not yet met the
+/// completeness bar (a live coord device JWT) so it withholds a "ready"
+/// (healthy) status. Distinct from `errored`/`degraded` so consumers can tell
+/// "still provisioning" apart from "broke at runtime".
+pub(crate) const PROVISIONING_INCOMPLETE_STATUS: &str = "provisioning_incomplete";
+
+/// Apply the Phase-5 provisioning gate to the base derived status.
+///
+/// Pure over its inputs (the side-effecting log is the one exception, and is
+/// the loud-surface the plan asks for) so the status decision is unit-testable.
+///
+/// - [`ProvisioningReadiness::Ready`] ⇒ pass the base status through unchanged.
+/// - [`ProvisioningReadiness::IncompleteAdvisory`] ⇒ log loudly, but DO NOT
+///   change the status (advisory never withholds ready / never bricks a runner
+///   mid-provision).
+/// - [`ProvisioningReadiness::IncompleteEnforced`] ⇒ withhold ready by
+///   overriding to [`PROVISIONING_INCOMPLETE_STATUS`] — UNLESS the base status
+///   is already a worse signal (`errored`/`degraded`), which must win so a real
+///   runtime fault is never masked by the provisioning state.
+fn provisioning_gated_status(
+    base_status: &'static str,
+    readiness: qontinui_runner_lib::coord_doctor::ProvisioningReadiness,
+    check_detail: &str,
+) -> &'static str {
+    use qontinui_runner_lib::coord_doctor::ProvisioningReadiness;
+    match readiness {
+        ProvisioningReadiness::Ready => base_status,
+        ProvisioningReadiness::IncompleteAdvisory => {
+            tracing::warn!(
+                "provisioning gate (advisory): runner has NO live coord device JWT \
+                 (doctor check device_jwt_live: {check_detail}). Reporting ready anyway; \
+                 set {} to withhold ready until a device JWT is live. \
+                 Run `coord doctor` for the failing link + fix.",
+                qontinui_runner_lib::coord_doctor::PROVISIONING_GATE_ENFORCE_ENV,
+            );
+            base_status
+        }
+        ProvisioningReadiness::IncompleteEnforced => {
+            // A real runtime fault must still win over "still provisioning".
+            if base_status == "errored" || base_status == "degraded" {
+                tracing::warn!(
+                    "provisioning gate (enforcing): runner has NO live coord device JWT \
+                     ({check_detail}), but a worse status ({base_status}) wins."
+                );
+                base_status
+            } else {
+                tracing::warn!(
+                    "provisioning gate (enforcing): WITHHOLDING ready — runner has no live \
+                     coord device JWT ({check_detail}). Reporting {PROVISIONING_INCOMPLETE_STATUS}. \
+                     Run `coord doctor` for the fix."
+                );
+                PROVISIONING_INCOMPLETE_STATUS
+            }
+        }
+    }
+}
+
 /// Get the local IP address (non-loopback).
 fn get_local_ip() -> Option<String> {
     // Use a UDP socket trick to find the local IP without actually sending data
@@ -346,5 +422,63 @@ mod tests {
 
         let v6_loopback: std::net::SocketAddr = "[::1]:9876".parse().unwrap();
         assert!(!crate::mcp_api::lan_reachable_for_bound_addr(&v6_loopback));
+    }
+
+    // ---- Phase 5 — provisioning gate applied to derived_status ----
+
+    use qontinui_runner_lib::coord_doctor::ProvisioningReadiness;
+
+    #[test]
+    fn provisioning_gate_ready_passes_base_status_through() {
+        // A live device JWT ⇒ no change to whatever the base status was.
+        assert_eq!(
+            provisioning_gated_status("healthy", ProvisioningReadiness::Ready, "ok"),
+            "healthy"
+        );
+        assert_eq!(
+            provisioning_gated_status("degraded", ProvisioningReadiness::Ready, "ok"),
+            "degraded"
+        );
+    }
+
+    #[test]
+    fn provisioning_gate_advisory_does_not_change_status() {
+        // Advisory surfaces (logs) but never withholds ready — base passes through.
+        assert_eq!(
+            provisioning_gated_status(
+                "healthy",
+                ProvisioningReadiness::IncompleteAdvisory,
+                "no device JWT in the access-token slot",
+            ),
+            "healthy",
+            "advisory must NOT withhold ready"
+        );
+    }
+
+    #[test]
+    fn provisioning_gate_enforced_withholds_ready() {
+        // Enforcing + incomplete + otherwise-healthy ⇒ provisioning_incomplete.
+        assert_eq!(
+            provisioning_gated_status(
+                "healthy",
+                ProvisioningReadiness::IncompleteEnforced,
+                "no device JWT in the access-token slot",
+            ),
+            PROVISIONING_INCOMPLETE_STATUS
+        );
+    }
+
+    #[test]
+    fn provisioning_gate_enforced_lets_worse_status_win() {
+        // A real runtime fault (errored/degraded) must NOT be masked by the
+        // provisioning-incomplete override.
+        assert_eq!(
+            provisioning_gated_status("errored", ProvisioningReadiness::IncompleteEnforced, "x"),
+            "errored"
+        );
+        assert_eq!(
+            provisioning_gated_status("degraded", ProvisioningReadiness::IncompleteEnforced, "x"),
+            "degraded"
+        );
     }
 }
