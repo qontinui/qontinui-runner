@@ -192,6 +192,10 @@ pub struct ApiState {
     pub ui_bridge_console_error_count: Arc<std::sync::atomic::AtomicU64>,
     /// Render log entries for diagnostics (in-memory)
     pub ui_bridge_render_log: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
+    /// Relay-tab registry: injected/SDK relay clients that registered against
+    /// THIS runner's `/ui-bridge` relay surface (SSE command stream + result
+    /// POST + heartbeat). See `mcp/ui_bridge/relay.rs`.
+    pub ui_bridge_relay: Arc<crate::mcp::ui_bridge::relay::RelayRegistry>,
     /// Web extraction state tracking
     pub extraction_state: Arc<crate::mcp::extraction::ExtractionState>,
     /// SDK app connections manager (supports multiple simultaneous connections)
