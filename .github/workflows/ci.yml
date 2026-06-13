@@ -2,7 +2,21 @@ name: CI
 
 on:
   push:
-    branches: [main, develop]
+    # `merge-candidate/**` etc.: the coord merge engine validates a proposal by
+    # pushing the rebased tip to `refs/heads/merge-candidate/<proposal_id>` and
+    # waiting for that ref's CI to go green before landing. Without these globs
+    # a candidate push matched no trigger, so runner CI never ran for a
+    # candidate → coord's awaiting-ci poll of `coord.pr_check_runs` stayed empty
+    # → proposals livelocked (the 2026-06-13 runner #566 incident). coord/web
+    # already trigger on these; runner was never wired. Runner's CI has no
+    # `paths:` filter, so adding the branches here suffices (no separate
+    # workflow needed — see plan 2026-06-13-merge-candidate-ci-coverage-...).
+    branches:
+      - main
+      - develop
+      - 'merge-candidate/**'
+      - 'merge-candidate-spec/**'
+      - 'merge-candidate-batch/**'
   pull_request:
     branches: [main, develop]
 
