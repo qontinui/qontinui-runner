@@ -18,6 +18,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 import {
   stripAnsi,
   detectClaudeHandshake,
+  detectResumeFailure,
   detectResumePicker,
   buildPickerAnswer,
   waitForClaudeHandshake,
@@ -27,6 +28,15 @@ import {
 const CLAUDE_UI =
   "╭──────────────────────────────╮\n│ > │\n╰──────────────────────────────╯\n  ? for shortcuts";
 const PLAIN_SHELL = "PS C:\\repo> claude --resume abc-123\r\nPS C:\\repo>";
+// A bogus `--resume` that fell through: the CLI's unknown-session error is
+// rendered INSIDE Claude-UI frames, so the positive handshake patterns match
+// the same tail (the item-4 false-positive being fixed).
+const BOGUS_RESUME_ERROR =
+  "╭──────────────────────────────╮\n" +
+  "│ No conversation found with session ID: fixture-ghost-0004 │\n" +
+  "╰──────────────────────────────╯\n  ? for shortcuts";
+const SESSION_PICKER =
+  "Select a session to resume\n  1. fix the tests (2h ago)\n  2. refactor zone grid (1d ago)";
 
 describe("stripAnsi", () => {
   it("removes CSI sequences so patterns match rendered text", () => {
@@ -62,6 +72,36 @@ describe("detectClaudeHandshake", () => {
       "╭──────────────────────────────╮\n" +
       "  Resume from summary (recommended)\n  Resume full session as-is\n  Don't ask me again";
     expect(detectClaudeHandshake(picker)).toBe(true);
+  });
+});
+
+// Item 4 (boot-restore remediation): "the Claude TUI appeared" is not "the
+// requested session resumed" — definitive failure frames must be recognized
+// and must WIN over the positive handshake patterns.
+describe("detectResumeFailure", () => {
+  it.each([
+    ["unknown-session error inside TUI frames", BOGUS_RESUME_ERROR],
+    ["bare unknown-session error", "No conversation found with session ID: abc-123"],
+    ["empty-history variant", "No conversations found"],
+    ["interactive session picker", SESSION_PICKER],
+    ["ANSI-wrapped error", `\x1b[31mNo conversation found\x1b[0m`],
+  ])("recognizes a definitive resume failure: %s", (_name, text) => {
+    expect(detectResumeFailure(text)).toBe(true);
+  });
+
+  it.each([
+    ["healthy Claude UI", CLAUDE_UI],
+    ["plain shell", PLAIN_SHELL],
+    ["resume-size picker (a LANDED resume)", "  Resume from summary (recommended)"],
+    ["empty buffer", ""],
+  ])("does NOT flag non-failure output: %s", (_name, text) => {
+    expect(detectResumeFailure(text)).toBe(false);
+  });
+
+  it("the bogus-resume tail ALSO matches the positive handshake (why negative-first matters)", () => {
+    // Documents the false positive: without the negative check, this tail
+    // verifies. The wait loop must therefore evaluate failure first.
+    expect(detectClaudeHandshake(BOGUS_RESUME_ERROR)).toBe(true);
   });
 });
 
@@ -117,6 +157,26 @@ describe("waitForClaudeHandshake", () => {
       readTail,
     });
     expect(out).toBe("timeout");
+  });
+
+  it("returns 'failed' when failure frames show — even though TUI frames are in the same tail", async () => {
+    const readTail = vi.fn(async () => BOGUS_RESUME_ERROR);
+    const out = await waitForClaudeHandshake("tab-1", {
+      timeoutMs: 500,
+      intervalMs: 1,
+      readTail,
+    });
+    expect(out).toBe("failed");
+  });
+
+  it("returns 'failed' on the interactive session picker (resume fell through)", async () => {
+    const readTail = vi.fn(async () => SESSION_PICKER);
+    const out = await waitForClaudeHandshake("tab-1", {
+      timeoutMs: 500,
+      intervalMs: 1,
+      readTail,
+    });
+    expect(out).toBe("failed");
   });
 });
 
@@ -188,6 +248,24 @@ describe("typeResumeAndVerify (retry-once state machine)", () => {
       readTail: async () => CLAUDE_UI,
     });
     expect(writes).not.toContain("2\r");
+  });
+
+  it("a bogus --resume (definitive failure frames) fails FAST — no pointless retype", async () => {
+    const writes: string[] = [];
+    const write = (_refs: never, _tab: string, text: string) => void writes.push(text);
+    const out = await typeResumeAndVerify(new Map() as never, "tab-1", CMD, {
+      write: write as never,
+      settleMs: 1,
+      timeoutMs: 50,
+      intervalMs: 1,
+      readTail: async () => BOGUS_RESUME_ERROR,
+    });
+    // The pane shows Claude UI frames, but the negative patterns win: the
+    // requested session did NOT resume.
+    expect(out).toBe("failed");
+    // Definitive CLI answer ⇒ exactly ONE typed attempt (the retry exists
+    // for lost keystrokes, not for a CLI that answered).
+    expect(writes.filter((w) => w === CMD)).toHaveLength(1);
   });
 
   it("fails after the retry is exhausted and never falsely verifies", async () => {

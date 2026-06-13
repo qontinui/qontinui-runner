@@ -101,6 +101,37 @@ const CLAUDE_HANDSHAKE_PATTERNS: RegExp[] = [
   /[╭╰]─{3,}/, // rounded input-box / dialog frame
 ];
 
+/**
+ * Definitive evidence that the REQUESTED session did NOT resume — evaluated
+ * BEFORE the handshake patterns on every probe. "The Claude TUI appeared" is
+ * not the same claim as "the requested session resumed": a
+ * `claude --resume <bogus-id>` can fall through to an error dialog, a fresh
+ * session, or the interactive session picker, all of which still render
+ * Claude-UI frames and previously read as a VERIFIED restore (boot-restore
+ * remediation item 4). Matching any of these parks the tab `resumeFailed`
+ * with the durable restore-pending marker kept.
+ *
+ * Wording sourced from the Claude Code CLI's unknown-session error and the
+ * `--resume` session-picker frames; extend from real scrollback if a real
+ * failed resume ever verifies (same maintenance rule as the picker patterns
+ * above).
+ */
+const RESUME_FAILURE_PATTERNS: RegExp[] = [
+  /No conversation found/i, // `--resume <unknown-id>` error
+  /No conversations? (?:found|to resume)/i, // empty-history variants
+  /Select a (?:session|conversation) to resume/i, // interactive session picker frame
+];
+
+/**
+ * True when the pane's recent output shows a definitive resume FAILURE
+ * (unknown session id / fell through to the session picker). Checked before
+ * {@link detectClaudeHandshake} — failure frames are themselves Claude UI.
+ */
+export function detectResumeFailure(text: string): boolean {
+  const stripped = stripAnsi(text);
+  return RESUME_FAILURE_PATTERNS.some((p) => p.test(stripped));
+}
+
 /** True when the pane's recent output shows the Claude Code UI. */
 export function detectClaudeHandshake(text: string): boolean {
   const stripped = stripAnsi(text);
@@ -145,19 +176,25 @@ export interface HandshakeWaitOptions {
 }
 
 /**
- * Poll the pane's scrollback until the Claude UI handshake appears or the
- * timeout elapses. Resolves `"verified"` or `"timeout"`; never throws.
+ * Poll the pane's scrollback until the Claude UI handshake appears, a
+ * definitive resume failure shows, or the timeout elapses. Resolves
+ * `"verified"`, `"failed"` (negative patterns — checked FIRST, since failure
+ * frames are themselves Claude UI), or `"timeout"`; never throws.
  */
 export async function waitForClaudeHandshake(
   tabId: string,
   options: HandshakeWaitOptions = {},
-): Promise<"verified" | "timeout"> {
+): Promise<"verified" | "failed" | "timeout"> {
   const { timeoutMs = 15_000, intervalMs = 1_000, readTail = readScrollbackTail, onProbe } = options;
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const tail = await readTail(tabId);
     if (tail !== null) {
       onProbe?.(tail);
+      // Negative evidence wins over positive: an error dialog / session
+      // picker renders TUI frames too, so the handshake check alone would
+      // false-positive exactly the wrong-content case being fixed.
+      if (detectResumeFailure(tail)) return "failed";
       if (detectClaudeHandshake(tail)) return "verified";
     }
     if (Date.now() >= deadline) return "timeout";
@@ -230,6 +267,16 @@ export async function typeResumeAndVerify(
     await new Promise((r) => setTimeout(r, settleMs));
     const outcome = await waitForClaudeHandshake(tabId, { ...waitOpts, onProbe: probe });
     if (outcome === "verified") return "verified";
+    if (outcome === "failed") {
+      // Definitive negative evidence (unknown session id / session picker):
+      // retyping the same command can only reproduce it, and the failure
+      // frames persist in the scrollback tail anyway — fail fast. The retry
+      // exists for LOST keystrokes (timeout), not for a CLI that answered.
+      console.warn(
+        `[resumeVerification] resume FAILURE frames observed for ${tabId} (attempt ${attempt}/${attempts})`,
+      );
+      return "failed";
+    }
     console.warn(
       `[resumeVerification] handshake not observed for ${tabId} (attempt ${attempt}/${attempts})`,
     );

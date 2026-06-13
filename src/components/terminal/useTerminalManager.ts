@@ -30,6 +30,16 @@ export interface TerminalTab {
    * restore-pending marker so the liveness poll can't flip it `poll-dead`.
    */
   resumeFailed?: boolean;
+  /**
+   * True when a boot-restore re-created this tab for a registry record whose
+   * `bindOrigin` is NOT `"pinned"` (mtime-guessed or pre-bindOrigin row). The
+   * resume command is deliberately NOT auto-typed — a guessed binding can be
+   * a foreign (e.g. VS Code) session, and auto-resuming it resurrects the
+   * mis-bind. Surfaced as a one-click operator confirm (`ResumeFailedBanner`);
+   * cleared when the operator confirms (which runs the normal verified
+   * resume). The durable record keeps its restore-pending marker meanwhile.
+   */
+  resumeQuarantined?: boolean;
   /** Claude Code session ID running in this tab (set on resume). */
   claudeSessionId?: string;
   /** Claude config dir for the session (set on resume). */
@@ -552,6 +562,7 @@ export function useTerminalManager(pageId: string = "default", windowLabel: stri
           | "claudeConfigDir"
           | "isReconnecting"
           | "resumeFailed"
+          | "resumeQuarantined"
         >
       >,
     ) => {

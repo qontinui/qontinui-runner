@@ -19,8 +19,10 @@ import {
   claimInitForPage,
   buildResumeCmd,
   runVerifiedResume,
+  classifyRestoreAction,
 } from "./useTerminalInitialization";
 import type { TerminalSessionRecord } from "./types";
+import type { SessionOpenArgs } from "./sessionRecordArgs";
 
 const rec = (overrides: Partial<TerminalSessionRecord>): TerminalSessionRecord => ({
   claudeSessionId: "sid",
@@ -235,6 +237,122 @@ describe("runVerifiedResume", () => {
       "terminal_session_clear_restore_pending",
       expect.anything(),
     );
+  });
+
+  // Item 3 (boot-restore remediation): the registry re-assert moved from
+  // tab-creation time into the VERIFIED branch. A failed resume must leave
+  // the original row untouched (original lastSeenAt ⇒ ages out normally).
+  const RECORD_OPEN: SessionOpenArgs = {
+    claudeSessionId: "sess-1",
+    configDir: "C:/claude/.claude-hotmail",
+    workingDir: "D:/repo",
+    pageId: "default",
+    zoneIndex: 3,
+    title: "Claude 1",
+    terminalId: "tab-1",
+  };
+
+  it("verified handshake → re-asserts the OPEN record under the new terminal id (recordOpen)", async () => {
+    const writes: string[] = [];
+    const updateTab = vi.fn();
+    const out = await runVerifiedResume({
+      terminalRefs: refsWithHandle(writes),
+      tabId: "tab-1",
+      claudeSessionId: "sess-1",
+      updateTab,
+      recordOpen: RECORD_OPEN,
+      verifyOptions: {
+        settleMs: 1,
+        timeoutMs: 50,
+        intervalMs: 1,
+        readTail: async () => CLAUDE_UI,
+      },
+    });
+    expect(out).toBe("verified");
+    expect(mockInvoke).toHaveBeenCalledWith("terminal_session_record_open", RECORD_OPEN);
+  });
+
+  it("failed verification → NEVER re-asserts (ghost row keeps its original lastSeenAt)", async () => {
+    const writes: string[] = [];
+    const updateTab = vi.fn();
+    const out = await runVerifiedResume({
+      terminalRefs: refsWithHandle(writes),
+      tabId: "tab-1",
+      claudeSessionId: "sess-1",
+      updateTab,
+      recordOpen: RECORD_OPEN,
+      verifyOptions: {
+        settleMs: 1,
+        timeoutMs: 5,
+        intervalMs: 1,
+        readTail: async () => PLAIN_SHELL,
+      },
+    });
+    expect(out).toBe("failed");
+    // No record_open ⇒ the registry row's lastSeenAt is untouched and the
+    // prune clock / recency cap keep running — ghosts are no longer immortal.
+    expect(mockInvoke).not.toHaveBeenCalledWith("terminal_session_record_open", expect.anything());
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "terminal_session_clear_restore_pending",
+      expect.anything(),
+    );
+  });
+
+  it("bogus session id (failure frames inside Claude UI) → failed, marker kept, no re-assert (item 4)", async () => {
+    const BOGUS =
+      "╭──────────────╮\n│ No conversation found with session ID: sess-1 │\n╰──────────────╯\n  ? for shortcuts";
+    const writes: string[] = [];
+    const updateTab = vi.fn();
+    const out = await runVerifiedResume({
+      terminalRefs: refsWithHandle(writes),
+      tabId: "tab-1",
+      claudeSessionId: "sess-1",
+      updateTab,
+      recordOpen: RECORD_OPEN,
+      verifyOptions: {
+        settleMs: 1,
+        timeoutMs: 50,
+        intervalMs: 1,
+        readTail: async () => BOGUS,
+      },
+    });
+    expect(out).toBe("failed");
+    expect(updateTab).toHaveBeenCalledWith("tab-1", {
+      isReconnecting: false,
+      resumeFailed: true,
+    });
+    expect(mockInvoke).not.toHaveBeenCalledWith("terminal_session_record_open", expect.anything());
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "terminal_session_clear_restore_pending",
+      expect.anything(),
+    );
+  });
+});
+
+// Item 5 (boot-restore remediation): restore must consult `bindOrigin`. Only
+// pinned bindings auto-resume; guessed/absent rows are quarantined behind a
+// one-click operator confirm (no resume typed).
+describe("classifyRestoreAction (bindOrigin quarantine gate)", () => {
+  it("pinned binding with a valid id auto-resumes", () => {
+    expect(classifyRestoreAction({ claudeSessionId: "sess-1", bindOrigin: "pinned" })).toBe(
+      "auto-resume",
+    );
+  });
+
+  it("guessed binding is quarantined (mtime guess can name a foreign VS Code session)", () => {
+    expect(classifyRestoreAction({ claudeSessionId: "sess-1", bindOrigin: "guessed" })).toBe(
+      "quarantine",
+    );
+  });
+
+  it("absent bindOrigin (pre-field record) reads as guessed ⇒ quarantined", () => {
+    expect(classifyRestoreAction({ claudeSessionId: "sess-1" })).toBe("quarantine");
+  });
+
+  it("shell-unsafe session ids are skipped outright, never typed or quarantined", () => {
+    expect(
+      classifyRestoreAction({ claudeSessionId: "bad; rm -rf /", bindOrigin: "pinned" }),
+    ).toBe("skip-invalid");
   });
 });
 

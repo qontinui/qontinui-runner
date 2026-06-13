@@ -1,10 +1,32 @@
 import { useState, useRef, useEffect } from "react";
 import { ChevronDown, Pin, Filter, ArrowDownToLine, Zap } from "lucide-react";
+import { useUIElement } from "@qontinui/ui-bridge";
 import type { TerminalTab } from "../useTerminalManager";
 import type { ZoneAssignments, SessionState } from "../useZoneLayout";
 import { STATE_BORDER_COLORS } from "./constants";
 import { isNonDurablePty, NON_DURABLE_TOOLTIP, NON_DURABLE_LABEL } from "../sessionDurability";
 import { useTerminalWindowActions } from "../useTerminalWindowActions";
+
+/**
+ * UI Bridge registration spec for a zone header (boot-restore remediation
+ * item 8): session/zone identity was previously only observable through a
+ * debug DOM text node — `ai/find "<session title>"` resolved nothing. The
+ * header element registers with the session title as its label and carries
+ * the binding as data attributes (`data-claude-session-id`,
+ * `data-zone-index`, `data-resume-failed`) so UI Bridge clients can verify
+ * session↔zone placement without scraping internals.
+ *
+ * Pure + exported for unit tests (the hook call itself needs a DOM).
+ */
+export function zoneHeaderElementSpec(
+  zoneIndex: number,
+  title: string,
+): { id: string; label: string } {
+  return {
+    id: `terminal-zone-header-${zoneIndex}`,
+    label: `Zone ${zoneIndex + 1}: ${title}`,
+  };
+}
 
 export function ZoneLabel({
   tab,
@@ -47,6 +69,16 @@ export function ZoneLabel({
   const selectorRef = useRef<HTMLDivElement>(null);
   const { popOutTab } = useTerminalWindowActions();
 
+  // Item 8: expose session/zone identity to UI Bridge clients. The label is
+  // the session title so `ai/find` by title resolves to this header; the
+  // session binding rides as data attributes on the registered node.
+  const headerSpec = zoneHeaderElementSpec(zoneIndex, tab.title);
+  const { ref: headerRef } = useUIElement({
+    id: headerSpec.id,
+    type: "generic",
+    label: headerSpec.label,
+  });
+
   useEffect(() => {
     if (!showSelector) return;
     const handleClick = (e: MouseEvent) => {
@@ -60,6 +92,10 @@ export function ZoneLabel({
 
   return (
     <div
+      ref={headerRef}
+      data-claude-session-id={tab.claudeSessionId ?? undefined}
+      data-zone-index={zoneIndex}
+      data-resume-failed={tab.resumeFailed ? "true" : undefined}
       className="absolute top-0 left-0 right-0 flex items-center gap-1.5 px-2 py-0.5 bg-[#13141f]/80 backdrop-blur-sm z-10 cursor-grab active:cursor-grabbing"
       draggable
       onDragStart={(e) => {
