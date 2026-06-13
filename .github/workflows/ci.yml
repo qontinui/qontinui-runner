@@ -110,6 +110,31 @@ jobs:
             libatspi2.0-dev \
             at-spi2-core
 
+      # Hosted ubuntu runners ship only ~14 GB free on /. This workspace's
+      # Rust dep tree (atspi/zbus, image codecs, tree-sitter, sentry) plus the
+      # 12 GB swapfile below and the cargo target cache exhaust it — the test
+      # compile died writing rmeta with "No space left on device" (2026-06-13,
+      # PR #572 first run). Reclaim the preinstalled toolchains we never use
+      # (~25-30 GB) BEFORE the swapfile + cache restore so both have headroom.
+      # tool-cache/swap-storage/large-packages left intact: setup-node/setup-rust
+      # use the tool cache; the swapfile step manages swap itself; and
+      # `large-packages: true` cascade-removes GTK/GDK apt libs that the runner's
+      # webkit build links against (observed: "system library gdk-3.0 required by
+      # crate gdk-sys was not found" — gdk-sys compile fails). android + dotnet +
+      # haskell + docker-images alone reclaim ~20 GB, which is ample headroom
+      # without touching the apt libs installed above.
+      - name: Free disk space (Ubuntu)
+        if: matrix.platform == 'ubuntu-22.04'
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
       # Hosted ubuntu-22.04 / windows-latest both ship with 16 GB RAM and a
       # small default pagefile/swap. `cargo test` peak codegen memory on
       # this workspace exceeds that and the rustc/LLVM allocator dies (on
