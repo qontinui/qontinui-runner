@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import { ChevronDown, Pin, Filter, ArrowDownToLine, Zap } from "lucide-react";
+import { useUIElement } from "@qontinui/ui-bridge";
 import type { TerminalTab } from "../useTerminalManager";
 import type { ZoneAssignments, SessionState } from "../useZoneLayout";
 import { STATE_BORDER_COLORS } from "./constants";
@@ -47,6 +48,18 @@ export function ZoneLabel({
   const selectorRef = useRef<HTMLDivElement>(null);
   const { popOutTab } = useTerminalWindowActions();
 
+  // Item 8 (boot-restore remediation) — session↔zone identity as a UI Bridge
+  // element. Without this, `ai/find <session title>` resolved nothing (zone
+  // headers were unregistered) and verifying which session occupies which
+  // zone required walking debug DOM text. The label carries the tab title so
+  // title-based find resolves; the data attributes expose the binding
+  // (`claudeSessionId` / `zoneIndex` / `resumeFailed`) to snapshot readers.
+  const { ref: headerRef } = useUIElement({
+    id: `terminal-zone-header-${zoneIndex}`,
+    type: "generic",
+    label: `Zone ${zoneIndex + 1} session header: ${tab.title}`,
+  });
+
   useEffect(() => {
     if (!showSelector) return;
     const handleClick = (e: MouseEvent) => {
@@ -60,6 +73,11 @@ export function ZoneLabel({
 
   return (
     <div
+      ref={headerRef}
+      data-claude-session-id={tab.claudeSessionId ?? undefined}
+      data-zone-index={zoneIndex}
+      data-resume-failed={tab.resumeFailed ? "true" : undefined}
+      data-resume-needs-confirm={tab.resumeNeedsConfirm ? "true" : undefined}
       className="absolute top-0 left-0 right-0 flex items-center gap-1.5 px-2 py-0.5 bg-[#13141f]/80 backdrop-blur-sm z-10 cursor-grab active:cursor-grabbing"
       draggable
       onDragStart={(e) => {

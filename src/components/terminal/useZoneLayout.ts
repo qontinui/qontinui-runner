@@ -189,6 +189,35 @@ export function computeAutoGrowLayoutId(
   return targetId;
 }
 
+/**
+ * Decide whether the layout must GROW so that `zoneIndex` is renderable,
+ * returning the target layout id or `null` when the zone already fits (or no
+ * larger preset exists). Pure sibling of [`computeAutoGrowLayoutId`], keyed by
+ * a zone INDEX instead of the tab count (item 10 of the boot-restore
+ * remediation): when restore excludes a record, the surviving records' zone
+ * indices have GAPS (e.g. rows at zones 0 and 3 with 2 tabs), so the
+ * count-based grow can pick a layout too small for the highest recorded zone
+ * and `applyLayout` would silently compact it — breaking the operator's
+ * spatial memory. Same grow-only / uniform-preset / `full-grid`-cap rules as
+ * the count-based path; a zone index beyond the 9-zone ceiling stays
+ * un-growable (the caller's compaction is then the honest fallback).
+ */
+export function computeZoneCapacityGrowth(
+  currentLayoutId: string,
+  zoneIndex: number,
+): string | null {
+  const current = LAYOUT_PRESETS.find((l) => l.id === currentLayoutId) ?? LAYOUT_PRESETS[0];
+  if (zoneIndex < current.zones.length) return null;
+  const targetId = pickLayout(zoneIndex + 1);
+  const target = LAYOUT_PRESETS.find((l) => l.id === targetId);
+  if (!target) return null;
+  // Grow only — and only when the target actually renders the zone.
+  if (target.zones.length <= current.zones.length || zoneIndex >= target.zones.length) {
+    return null;
+  }
+  return targetId;
+}
+
 // ── Zone Assignment ────────────────────────────────────────────────────────
 
 /** Maps zone index → tab ID */
@@ -404,33 +433,45 @@ export function useZoneLayout(
     [applyLayout],
   );
 
-  const assignTabToZone = useCallback((zoneIndex: number, tabId: string) => {
-    // Reserve the zone so the creation-order auto-fill can't steal it while the
-    // tab is mid-creation (restore path). Cleared in the setter below once the
-    // zone holds its intended tab.
-    if (zoneIndex >= 0) reservedZonesRef.current.add(zoneIndex);
-    setAssignments((prev) => {
-      const next = { ...prev };
-      // If this tab is already in another zone, swap
-      for (const [idx, id] of Object.entries(next)) {
-        if (id === tabId && Number(idx) !== zoneIndex) {
-          // Swap: put the displaced tab into the old slot
-          const displaced = next[zoneIndex];
-          if (displaced) {
-            next[Number(idx)] = displaced;
-          } else {
-            delete next[Number(idx)];
+  const assignTabToZone = useCallback(
+    (zoneIndex: number, tabId: string) => {
+      // A recorded zone beyond the current layout's capacity must GROW the
+      // layout so the binding survives (item 10 — restore with gaps: excluded
+      // records leave the surviving zone indices sparse, so the count-based
+      // auto-grow alone can pick a layout too small for the highest recorded
+      // zone and the assignment would compact away). Beyond the full-grid
+      // ceiling there is nothing to grow into — the reconcile/compaction
+      // fallback then applies.
+      const growTarget = computeZoneCapacityGrowth(layoutId, zoneIndex);
+      if (growTarget) applyLayout(growTarget);
+      // Reserve the zone so the creation-order auto-fill can't steal it while the
+      // tab is mid-creation (restore path). Cleared in the setter below once the
+      // zone holds its intended tab.
+      if (zoneIndex >= 0) reservedZonesRef.current.add(zoneIndex);
+      setAssignments((prev) => {
+        const next = { ...prev };
+        // If this tab is already in another zone, swap
+        for (const [idx, id] of Object.entries(next)) {
+          if (id === tabId && Number(idx) !== zoneIndex) {
+            // Swap: put the displaced tab into the old slot
+            const displaced = next[zoneIndex];
+            if (displaced) {
+              next[Number(idx)] = displaced;
+            } else {
+              delete next[Number(idx)];
+            }
+            break;
           }
-          break;
         }
-      }
-      next[zoneIndex] = tabId;
-      // The zone now holds its intended tab — drop the reservation so a later
-      // genuine vacancy can be auto-filled normally.
-      reservedZonesRef.current.delete(zoneIndex);
-      return next;
-    });
-  }, []);
+        next[zoneIndex] = tabId;
+        // The zone now holds its intended tab — drop the reservation so a later
+        // genuine vacancy can be auto-filled normally.
+        reservedZonesRef.current.delete(zoneIndex);
+        return next;
+      });
+    },
+    [layoutId, applyLayout],
+  );
 
   const focusedTabId = assignments[focusedZone] ?? null;
 

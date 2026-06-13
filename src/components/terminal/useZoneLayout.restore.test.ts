@@ -20,6 +20,7 @@ import {
   reconcileAssignments,
   pickLayout,
   computeAutoGrowLayoutId,
+  computeZoneCapacityGrowth,
   LAYOUT_PRESETS,
 } from "./useZoneLayout";
 
@@ -132,5 +133,53 @@ describe("Phase 1 auto-grow — layout grows to fit live tabs across ALL ingest 
     // Grew to full-grid for 9 tabs; now only 2 remain. Auto-grow returns null
     // (shrinking is out of scope — grow only).
     expect(computeAutoGrowLayoutId("full-grid", 2)).toBeNull();
+  });
+});
+
+// Item 10 (boot-restore remediation) — recorded zone bindings must survive a
+// restore even when excluded records leave GAPS in the zone indices. The
+// count-based auto-grow alone can pick a layout too small for the highest
+// recorded zone (2 surviving records at zones 0 and 3 → pickLayout(2) =
+// "split", zone 3 unrenderable), and `applyLayout` then compacts the zone-3
+// binding into the first empty slot — drifting the operator's spatial memory.
+// `assignTabToZone` now grows by zone INDEX via this pure helper.
+describe("computeZoneCapacityGrowth — gap-preserving restore growth", () => {
+  it("grows 'split' so a recorded zone 3 stays at zone 3 (the fixture repro)", () => {
+    const target = computeZoneCapacityGrowth("split", 3);
+    expect(target).toBe("quad");
+    expect(zoneCount(target!)).toBeGreaterThan(3);
+  });
+
+  it("returns null when the zone already fits", () => {
+    expect(computeZoneCapacityGrowth("quad", 3)).toBeNull();
+    expect(computeZoneCapacityGrowth("full-grid", 8)).toBeNull();
+    expect(computeZoneCapacityGrowth("single", 0)).toBeNull();
+  });
+
+  it("picks the smallest uniform preset that renders the zone", () => {
+    expect(computeZoneCapacityGrowth("single", 1)).toBe("split");
+    expect(computeZoneCapacityGrowth("split", 4)).toBe("six-pack");
+    expect(computeZoneCapacityGrowth("six-pack", 7)).toBe("full-grid");
+  });
+
+  it("returns null beyond the full-grid ceiling (compaction is the honest fallback)", () => {
+    expect(computeZoneCapacityGrowth("full-grid", 9)).toBeNull();
+    expect(computeZoneCapacityGrowth("split", 42)).toBeNull();
+  });
+
+  it("restored records at zones 0 and 3 both render after index-driven growth", () => {
+    // The plan's verification fixture: rows at zones 0 and 3, nothing else.
+    // Count-based growth alone would stay at 'split' (2 tabs); index-driven
+    // growth reaches 'quad' so reconcile preserves both recorded bindings.
+    const target = computeZoneCapacityGrowth("split", 3)!;
+    const afterRecordBind = { 0: "claudeA", 3: "claudeB" };
+    const next = reconcileAssignments(
+      afterRecordBind,
+      ["claudeA", "claudeB"],
+      zoneCount(target),
+      new Set([0, 3]),
+    );
+    expect(next[0]).toBe("claudeA");
+    expect(next[3]).toBe("claudeB");
   });
 });
