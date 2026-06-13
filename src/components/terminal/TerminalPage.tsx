@@ -720,24 +720,38 @@ function TerminalPageInner({
   });
 
   // Operator-clickable retry for a restored tab whose resume verification
-  // failed (Phase 3, #548): re-run the same type-and-verify path. The durable
-  // restore-pending marker is still set from the failed attempt, so the
-  // liveness poll keeps protecting the open record while this runs.
+  // failed (Phase 3, #548) AND the one-click confirm for quarantined
+  // guessed-binding tabs (boot-restore item 5): re-run the same
+  // type-and-verify path. The durable restore-pending marker is still set
+  // from the restore, so the liveness poll keeps protecting the open record
+  // while this runs. On VERIFIED handshake the OPEN record is re-asserted
+  // under this live terminal id (item 3 — the restore no longer re-asserts
+  // before verification, so the verified branch owns it).
   const handleRetryResume = useCallback(
     (tabId: string) => {
       const tab = tabsRef.current.find((t) => t.id === tabId);
       if (!tab?.claudeSessionId) return;
-      updateTab(tabId, { resumeFailed: false, isReconnecting: true });
+      updateTab(tabId, { resumeFailed: false, resumeQuarantined: false, isReconnecting: true });
       void runVerifiedResume({
         terminalRefs: terminalRefs.current,
         tabId,
         claudeSessionId: tab.claudeSessionId,
         configDir: tab.claudeConfigDir,
         updateTab,
+        // Re-assert payload for the verified branch — no bindOrigin, so the
+        // backend preserves the record's existing origin.
+        recordOpen: buildSessionOpenArgs({
+          assignments: assignmentsRef.current,
+          tabs: tabsRef.current,
+          tabId,
+          claudeSessionId: tab.claudeSessionId,
+          configDir: tab.claudeConfigDir,
+          pageId,
+        }),
       });
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [updateTab],
+    [updateTab, pageId],
   );
 
   const handleExit = useCallback(

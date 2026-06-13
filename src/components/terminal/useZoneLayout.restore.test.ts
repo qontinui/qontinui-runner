@@ -18,6 +18,7 @@
 import { describe, it, expect } from "vitest";
 import {
   reconcileAssignments,
+  applyLayoutAssignments,
   pickLayout,
   computeAutoGrowLayoutId,
   LAYOUT_PRESETS,
@@ -76,6 +77,70 @@ describe("reconcileAssignments — registry zones win over creation-order shells
     const next = reconcileAssignments({ 0: "claudeA" }, ["claudeA", "shell-1"], 6, new Set());
     expect(next[0]).toBe("claudeA");
     expect(next[1]).toBe("shell-1");
+  });
+});
+
+/**
+ * Item 10 (boot-restore remediation) — restored zone bindings must survive
+ * layout application even when an excluded row leaves a gap. The drift
+ * ("record z3 rendered z2") came from `applyLayout`'s old inline reducer
+ * dropping any assignment whose tab was missing from its (possibly STALE)
+ * `tabIds` closure during the async restore drain; the auto-fill then
+ * re-placed the tab into the first empty zone. The extracted
+ * `applyLayoutAssignments` preserves every in-range assignment exactly and
+ * compacts ONLY assignments whose zone exceeds the layout's zone count.
+ */
+describe("applyLayoutAssignments — recorded zones survive restore gaps (item 10)", () => {
+  it("fixture rows at z0/z3 restore to z0/z3 — the z2 gap is NOT compacted away", () => {
+    // Registry rows at zones 0 and 3 (the zone-2 row was excluded). Quad
+    // layout (4 zones): both recorded zones fit and must be preserved.
+    const prev = { 0: "claudeA", 3: "claudeB" };
+    const next = applyLayoutAssignments(prev, ["claudeA", "claudeB"], zoneCount("quad"));
+    expect(next[0]).toBe("claudeA");
+    expect(next[3]).toBe("claudeB");
+    expect(next[2]).toBeUndefined();
+  });
+
+  it("preserves recorded zones even when tabIds is STALE/empty (the restore-drain race)", () => {
+    // The old reducer required `tabIds.includes(tabId)` — a stale closure
+    // dropped the z3 binding and the auto-fill later re-placed the tab at
+    // z2. The fix never drops an in-range assignment.
+    const prev = { 0: "claudeA", 3: "claudeB" };
+    const next = applyLayoutAssignments(prev, [], zoneCount("quad"));
+    expect(next).toEqual({ 0: "claudeA", 3: "claudeB" });
+  });
+
+  it("compacts ONLY when the recorded zone exceeds the layout's zone count", () => {
+    // z5 doesn't exist in quad (4 zones) — that tab compacts into the
+    // lowest empty zone; the in-range z0 binding is untouched.
+    const prev = { 0: "claudeA", 5: "claudeB" };
+    const next = applyLayoutAssignments(prev, ["claudeA", "claudeB"], zoneCount("quad"));
+    expect(next[0]).toBe("claudeA");
+    expect(next[1]).toBe("claudeB");
+  });
+
+  it("still fills remaining empty zones with unassigned tabs in creation order", () => {
+    const prev = { 3: "claudeB" };
+    const next = applyLayoutAssignments(prev, ["shell-1", "claudeB", "shell-2"], zoneCount("quad"));
+    expect(next[3]).toBe("claudeB");
+    expect(next[0]).toBe("shell-1");
+    expect(next[1]).toBe("shell-2");
+  });
+
+  it("grow path keeps gapped bindings: split → quad after a third tab lands", () => {
+    // Auto-grow applies a bigger layout while records own z0/z3; growing
+    // must not reshuffle them.
+    expect(computeAutoGrowLayoutId("split", 3)).toBe("quad");
+    const prev = { 0: "claudeA", 3: "claudeB" };
+    const next = applyLayoutAssignments(
+      prev,
+      ["claudeA", "claudeB", "shell-1"],
+      zoneCount("quad"),
+    );
+    expect(next[0]).toBe("claudeA");
+    expect(next[3]).toBe("claudeB");
+    // The plain shell fills a remaining empty zone — never a recorded one.
+    expect([next[1], next[2]]).toContain("shell-1");
   });
 });
 

@@ -287,6 +287,70 @@ export function reconcileAssignments(
   return next;
 }
 
+/**
+ * Pure reducer behind `applyLayout` (layout switch / auto-grow). Boot-restore
+ * remediation item 10: a restored session's RECORDED zone must survive layout
+ * application — compaction is allowed ONLY for assignments whose zone index
+ * exceeds the new layout's zone count.
+ *
+ * The previous inline version kept an assignment only when
+ * `tabIds.includes(prev[z])` — but `applyLayout` closes over `tabIds`, and
+ * during the async restore drain that closure can be STALE (the tab exists
+ * but isn't in the captured list yet). The assignment was silently dropped
+ * and the creation-order auto-fill later re-placed the tab into the first
+ * empty zone — the "record z3 rendered z2" drift. Dead-tab cleanup is NOT
+ * this reducer's job: `reconcileAssignments` runs right after every layout
+ * change with fresh `tabIds` and owns dropping dead assignments.
+ *
+ * Rules:
+ *   - in-range assignments (`zone < zoneCount`) are preserved EXACTLY;
+ *   - out-of-range assignments are compacted into the lowest empty zones
+ *     (they had recorded zones, so they outrank plain unassigned tabs);
+ *   - remaining empty zones are filled with unassigned tabs in creation
+ *     order (same behavior as before).
+ *
+ * Exported so the restore regression test can assert the binding without
+ * booting React (`useZoneLayout.restore.test.ts`).
+ */
+export function applyLayoutAssignments(
+  prev: ZoneAssignments,
+  tabIds: string[],
+  zoneCount: number,
+): ZoneAssignments {
+  const next: ZoneAssignments = {};
+  const overflow: string[] = [];
+  const usedTabs = new Set<string>();
+
+  for (const [z, tabId] of Object.entries(prev)) {
+    const zone = Number(z);
+    if (zone < zoneCount) {
+      next[zone] = tabId;
+      usedTabs.add(tabId);
+    } else {
+      overflow.push(tabId);
+    }
+  }
+
+  // Compact ONLY the out-of-range tabs into the lowest empty zones.
+  for (let z = 0; z < zoneCount && overflow.length > 0; z++) {
+    if (!(z in next)) {
+      const tabId = overflow.shift()!;
+      next[z] = tabId;
+      usedTabs.add(tabId);
+    }
+  }
+
+  // Fill remaining zones with unassigned tabs (creation order).
+  const unassigned = tabIds.filter((id) => !usedTabs.has(id));
+  for (let z = 0; z < zoneCount && unassigned.length > 0; z++) {
+    if (!(z in next)) {
+      next[z] = unassigned.shift()!;
+    }
+  }
+
+  return next;
+}
+
 // ── Hook ───────────────────────────────────────────────────────────────────
 
 export function useZoneLayout(
@@ -342,29 +406,12 @@ export function useZoneLayout(
       setLayoutIdState(id);
       setMaximizedZone(null);
 
-      // Reassign: keep existing assignments where zones exist, redistribute
-      setAssignments((prev) => {
-        const next: ZoneAssignments = {};
-        const usedTabs = new Set<string>();
-
-        // Keep assignments that fit in the new layout
-        for (let z = 0; z < newLayout.zones.length; z++) {
-          if (prev[z] && tabIds.includes(prev[z])) {
-            next[z] = prev[z];
-            usedTabs.add(prev[z]);
-          }
-        }
-
-        // Fill remaining zones with unassigned tabs
-        const unassigned = tabIds.filter((id) => !usedTabs.has(id));
-        for (let z = 0; z < newLayout.zones.length && unassigned.length > 0; z++) {
-          if (!(z in next)) {
-            next[z] = unassigned.shift()!;
-          }
-        }
-
-        return next;
-      });
+      // Reassign: preserve every in-range assignment exactly; compact only
+      // out-of-range ones; fill remaining zones with unassigned tabs. See
+      // `applyLayoutAssignments` (item 10 — recorded zones must survive
+      // layout application; dead-tab cleanup belongs to
+      // `reconcileAssignments`, which runs with fresh tabIds).
+      setAssignments((prev) => applyLayoutAssignments(prev, tabIds, newLayout.zones.length));
 
       // Clamp focused zone
       setFocusedZone((prev) => (prev >= newLayout.zones.length ? 0 : prev));

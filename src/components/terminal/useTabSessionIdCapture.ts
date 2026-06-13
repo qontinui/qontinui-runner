@@ -64,6 +64,44 @@ const POLL_INTERVAL_MS = 500;
 // is bound, so a longer ceiling costs nothing in the common (fast) case.
 const POLL_TIMEOUT_MS = 45_000;
 
+/**
+ * The working directory a capture tick may probe with (boot-restore
+ * remediation item 6). Prefers the tab's LIVE cwd (the shell-integration
+ * `cwd` event often fires after capture start) over the dir snapshotted at
+ * `startCapture` time. Returns `""` when neither is known — the tick must
+ * then SKIP the probe entirely rather than let the backend fall back to the
+ * broad workspace root, where a concurrent foreign-dir session (e.g. VS
+ * Code) can win the freshest-mtime race. Timing out unbound is strictly
+ * better than binding a foreign session id into the registry.
+ *
+ * Pure + exported for unit tests.
+ */
+export function effectiveCaptureDir(
+  tabWorkingDir: string | undefined,
+  startDir: string | undefined,
+): string {
+  return tabWorkingDir || startDir || "";
+}
+
+/** Normalize a path for equality: separators, trailing slash, Windows case. */
+function normalizePath(p: string): string {
+  return p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
+/**
+ * True when a transcript payload's `project_path` matches the directory the
+ * probe asked for. Defense-in-depth behind the projectPath request filter:
+ * if the backend ever answers from a broader scope (fallback path), a
+ * foreign-dir session is rejected here and the poll keeps ticking — worst
+ * case the capture times out unbound (preferred over a mis-bind).
+ *
+ * Pure + exported for unit tests.
+ */
+export function projectPathMatches(payloadProjectPath: string, workingDir: string): boolean {
+  if (!payloadProjectPath || !workingDir) return false;
+  return normalizePath(payloadProjectPath) === normalizePath(workingDir);
+}
+
 interface CaptureParams {
   updateTab: (
     id: string,
@@ -220,15 +258,33 @@ export function useTabSessionIdCapture({
           return;
         }
 
+        // Item 6 (boot-restore remediation): NEVER probe with the broad
+        // workspace-root fallback. Without a known cwd the backend's
+        // freshest-mtime answer can name a concurrent foreign-dir session
+        // (VS Code in another project) and the wrong id poisons the durable
+        // registry. Prefer the tab's live cwd (shell-integration event may
+        // fire after capture start); if no cwd is known yet, skip this tick
+        // and keep polling — timing out unbound beats binding a mis-guess.
+        const captureDir = effectiveCaptureDir(tab.workingDir, workingDir);
+        if (!captureDir) {
+          if (debug()) logger.debug("[tabSidCapture] no-cwd-yet", { tabId });
+          setTimeout(() => {
+            void tick();
+          }, POLL_INTERVAL_MS);
+          return;
+        }
+
         try {
-          // Pass workingDir + configDir when known, plus sinceMs so the
-          // backend can drop pre-spawn JSONLs before answering. Both
-          // workingDir/configDir fall back server-side: empty workingDir
-          // → workspace project path; missing configDir → scan all known
-          // config dirs (the bug path that motivated adding configDir —
-          // see hook docstring).
-          const args: Record<string, string | number> = { sinceMs: spawnTimestamp };
-          if (workingDir) args.projectPath = workingDir;
+          // Pass workingDir + configDir, plus sinceMs so the backend can
+          // drop pre-spawn JSONLs before answering. configDir falls back
+          // server-side: missing configDir → scan all known config dirs
+          // (the bug path that motivated adding configDir — see hook
+          // docstring). projectPath is now ALWAYS sent (see captureDir gate
+          // above).
+          const args: Record<string, string | number> = {
+            sinceMs: spawnTimestamp,
+            projectPath: captureDir,
+          };
           if (configDir) args.configDir = configDir;
           const resp = await invoke<CommandResponse>("transcript_get_latest", args);
           if (handle.cancelled) return;
@@ -236,6 +292,16 @@ export function useTabSessionIdCapture({
           const data = resp.success ? (resp.data as TranscriptSessionPayload | null) : null;
           if (!data) {
             if (debug()) logger.debug("[tabSidCapture] probe-null", { tabId });
+          } else if (!projectPathMatches(data.project_path, captureDir)) {
+            // Backend answered from a different project (fallback/broad
+            // scope) — reject and keep polling (item 6 narrowing).
+            if (debug()) {
+              logger.debug("[tabSidCapture] project-mismatch", {
+                tabId,
+                payloadProjectPath: data.project_path,
+                captureDir,
+              });
+            }
           } else if (claimedSessionIds.current.has(data.session_id)) {
             if (debug()) {
               logger.debug("[tabSidCapture] already-claimed", {

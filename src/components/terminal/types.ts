@@ -42,6 +42,13 @@ export interface TerminalSessionRecord {
   /** Why the session closed. */
   closeReason?: string;
   /**
+   * How `claudeSessionId` was bound: `"pinned"` (`--session-id` / `--resume`
+   * — exact) or `"guessed"` (freshest-transcript mtime guess). Absent on
+   * records predating the field — read as guessed. Restore quarantines
+   * non-pinned rows behind an operator confirm instead of auto-resuming.
+   */
+  bindOrigin?: string;
+  /**
    * Epoch ms a boot-restore began re-typing this session's resume command
    * (backend-owned; while set the liveness poll never flips the record
    * `poll-dead`). Cleared once the resume handshake is verified.

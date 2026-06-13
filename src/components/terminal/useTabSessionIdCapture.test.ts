@@ -31,6 +31,8 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => mockInvoke(...args),
 }));
 
+import { effectiveCaptureDir, projectPathMatches } from "./useTabSessionIdCapture";
+
 interface TranscriptSessionPayload {
   session_id: string;
   config_dir: string;
@@ -236,6 +238,67 @@ describe("invoke contract", () => {
  * accept" is unchanged — what matters is that the backend now returns
  * the right payload because the wrong-account ones are filtered out.
  */
+/**
+ * Item 6 (boot-restore remediation) — the freshest-mtime guess must never
+ * probe with the broad workspace-root fallback, and a payload answered from
+ * a different project is rejected. "Prefer timeout-unbound over mis-bound":
+ * a record left absent is recoverable; a foreign (VS Code) session id bound
+ * into the durable registry resurrects on every restart.
+ */
+describe("capture narrowing — effectiveCaptureDir / projectPathMatches (item 6)", () => {
+  it("prefers the tab's LIVE cwd over the dir snapshotted at startCapture", () => {
+    expect(effectiveCaptureDir("D:/repo/sub", "D:/repo")).toBe("D:/repo/sub");
+  });
+
+  it("falls back to the startCapture dir when the cwd event hasn't fired yet", () => {
+    expect(effectiveCaptureDir(undefined, "D:/repo")).toBe("D:/repo");
+    expect(effectiveCaptureDir("", "D:/repo")).toBe("D:/repo");
+  });
+
+  it("returns '' when no cwd is known — the tick must SKIP the probe (timeout-unbound)", () => {
+    expect(effectiveCaptureDir(undefined, "")).toBe("");
+    expect(effectiveCaptureDir("", undefined)).toBe("");
+  });
+
+  it("accepts a payload whose project_path matches the probed dir (separator/case tolerant)", () => {
+    expect(projectPathMatches("D:/repo", "D:/repo")).toBe(true);
+    expect(projectPathMatches("D:\\Repo\\", "d:/repo")).toBe(true);
+  });
+
+  it("rejects a foreign-dir payload (workspace-root fallback answered broadly)", () => {
+    expect(projectPathMatches("D:/other-project", "D:/repo")).toBe(false);
+    expect(projectPathMatches("", "D:/repo")).toBe(false);
+  });
+
+  it("mtime race: a fresher FOREIGN-dir session never binds; only the matching-cwd id does", () => {
+    const claimed = new Set<string>();
+    const paneDir = "D:/repo";
+
+    // A concurrent VS Code session in another project has the freshest
+    // mtime; a broad backend answer would surface it first.
+    const foreign: TranscriptSessionPayload = {
+      session_id: "session-vscode-foreign",
+      config_dir: "C:/claude/.claude-default",
+      project_path: "D:/other-project",
+      last_modified: new Date(Date.now() + 1000).toISOString(),
+    };
+    // The narrowing gate rejects it BEFORE decideClaim ever runs.
+    expect(projectPathMatches(foreign.project_path, paneDir)).toBe(false);
+
+    // The pane's own session (older mtime, matching dir) is the only
+    // payload that passes the gate and binds.
+    const own: TranscriptSessionPayload = {
+      session_id: "session-pane",
+      config_dir: "C:/claude/.claude-default",
+      project_path: "D:/repo",
+      last_modified: new Date().toISOString(),
+    };
+    expect(projectPathMatches(own.project_path, paneDir)).toBe(true);
+    const claim = decideClaim(tab("tab-1", paneDir), own, claimed);
+    expect(claim?.claudeSessionId).toBe("session-pane");
+  });
+});
+
 describe("decideClaim — cross-config-dir scope (P0 fix)", () => {
   it("accepts a session whose config_dir matches the launching account", () => {
     // Backend was called with configDir filter, so it returns ONLY
