@@ -914,6 +914,284 @@ async fn seed_scenario_handler(
 }
 
 // =============================================================================
+// /ui-bridge/test/seed-lifecycle-store  (+ clear, + list-open read-back)
+// =============================================================================
+//
+// The StatusStrip seam above seeds the *transcript-list* render path. It has no
+// way to exercise the session-RESTORE path, which reads the durable
+// `SessionLifecycleStore` (`<home>/.qontinui/runner/terminal-sessions[-<port>].json`)
+// at boot and resurrects every restorable row. Restore tests otherwise have to
+// hand-write a port-namespaced JSON file with exact camelCase keys and compute
+// the anchor/last-seen offset math by hand. These routes give them a seam:
+//
+//   - POST /ui-bridge/test/seed-lifecycle-store  — write a port-namespaced
+//     store from a JSON body of `{ records: [ {sessionId, state, lastSeenOffsetMs,
+//     closeReason?, ...} ] }`. `lastSeenOffsetMs` is relative to "now" (negative
+//     = the past), so a body can place open/ghost/closed rows at precise ages
+//     without the caller knowing the wall clock. 400 on a malformed body.
+//   - POST /ui-bridge/test/clear-lifecycle-store — delete the port-namespaced
+//     store file. Returns whether a file was removed.
+//   - POST /ui-bridge/test/list-lifecycle-open — read the port-namespaced store
+//     back and return the `state == "open"` session ids (the StatusStrip
+//     restore consumer's input), so a test can assert the seed round-tripped
+//     without reaching into the filesystem.
+//
+// The store path is namespaced by the runner's actually-bound API port,
+// mirroring `main.rs`'s `lifecycle_store` wiring (port 9876 → base name, every
+// other port → `-<port>` suffix), so a temp runner seeds/reads its OWN file
+// and never the primary's live sessions.
+
+use crate::session::session_lifecycle_store::{SessionLifecycleStore, TerminalSessionRecord};
+use std::path::Path;
+
+/// One record in a seed-lifecycle-store body. Timestamps are expressed as an
+/// offset from "now" in millis (`last_seen_offset_ms`, negative = the past) so
+/// a caller can place a row at a precise age without knowing the wall clock;
+/// the handler resolves them against `Utc::now()` at write time.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeedLifecycleRecord {
+    pub session_id: String,
+    /// `"open"` | `"closed"`.
+    pub state: String,
+    /// Offset from now (millis); negative places the touch/close in the past.
+    #[serde(default)]
+    pub last_seen_offset_ms: i64,
+    /// Offset from now (millis) for `closed_at`; only meaningful when
+    /// `state == "closed"`. Defaults to `last_seen_offset_ms`.
+    #[serde(default)]
+    pub closed_at_offset_ms: Option<i64>,
+    /// Close reason (`"pty-exit"` / `"poll-dead"` / `"explicit"` / …). Only
+    /// meaningful when `state == "closed"`.
+    #[serde(default)]
+    pub close_reason: Option<String>,
+    /// Optional grid placement; defaults keep the row renderable.
+    #[serde(default)]
+    pub page_id: Option<String>,
+    #[serde(default)]
+    pub zone_index: Option<i32>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub working_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SeedLifecycleRequest {
+    pub records: Vec<SeedLifecycleRecord>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SeedLifecycleResponse {
+    pub success: bool,
+    pub seeded: usize,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ListLifecycleOpenResponse {
+    pub success: bool,
+    pub open_session_ids: Vec<String>,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClearLifecycleResponse {
+    pub success: bool,
+    pub removed: bool,
+    pub path: String,
+}
+
+/// Resolve the port-namespaced lifecycle-store path for the runner bound to
+/// `api_port`, mirroring `main.rs`'s wiring exactly: port 9876 → base name,
+/// any other port → `-<port>` suffix; under `<home>/.qontinui/runner`.
+fn lifecycle_store_path_for_port(api_port: u16) -> std::path::PathBuf {
+    let file_name = if api_port == 9876 {
+        "terminal-sessions.json".to_string()
+    } else {
+        format!("terminal-sessions-{}.json", api_port)
+    };
+    dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".qontinui")
+        .join("runner")
+        .join(file_name)
+}
+
+/// Build a full `TerminalSessionRecord` from a seed spec resolved against
+/// `now_ms`. Returns an error string on an invalid `state`.
+fn record_from_seed(
+    seed: &SeedLifecycleRecord,
+    now_ms: i64,
+) -> Result<TerminalSessionRecord, String> {
+    if seed.session_id.trim().is_empty() {
+        return Err("each record needs a non-empty sessionId".to_string());
+    }
+    let state = match seed.state.as_str() {
+        "open" | "closed" => seed.state.clone(),
+        other => {
+            return Err(format!(
+                "record state must be \"open\" or \"closed\", got {other:?}"
+            ))
+        }
+    };
+    let last_seen_at = now_ms + seed.last_seen_offset_ms;
+    let (closed_at, close_reason) = if state == "closed" {
+        let closed_at = now_ms + seed.closed_at_offset_ms.unwrap_or(seed.last_seen_offset_ms);
+        (Some(closed_at), seed.close_reason.clone())
+    } else {
+        (None, None)
+    };
+    Ok(TerminalSessionRecord {
+        claude_session_id: seed.session_id.clone(),
+        config_dir: None,
+        working_dir: seed.working_dir.clone().or(Some("C:/repo".to_string())),
+        page_id: seed
+            .page_id
+            .clone()
+            .unwrap_or_else(|| "default".to_string()),
+        zone_index: seed.zone_index.unwrap_or(0),
+        title: seed.title.clone().or_else(|| Some(seed.session_id.clone())),
+        terminal_id: format!("term-{}", seed.session_id),
+        opened_at: last_seen_at - 1_000,
+        last_seen_at,
+        state,
+        closed_at,
+        close_reason,
+        bind_origin: None,
+        restore_pending_at: None,
+    })
+}
+
+/// Core seed logic, path-injectable so it's unit-testable without an
+/// `ApiState`. Writes the port-namespaced map file the store reads on
+/// `open()` directly (clear-then-seed: the whole file is overwritten) so the
+/// caller's precise now-relative ages survive — `record_open` would re-stamp
+/// them. Returns the number of records written, or a `(status, message)` error.
+fn seed_lifecycle_store_at(
+    path: &Path,
+    req: &SeedLifecycleRequest,
+    now_ms: i64,
+) -> Result<usize, (StatusCode, String)> {
+    if req.records.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "seed body must contain at least one record".to_string(),
+        ));
+    }
+    let mut records = Vec::with_capacity(req.records.len());
+    for seed in &req.records {
+        match record_from_seed(seed, now_ms) {
+            Ok(rec) => records.push(rec),
+            Err(e) => return Err((StatusCode::BAD_REQUEST, e)),
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to create lifecycle store dir: {e}"),
+            )
+        })?;
+    }
+    let map: HashMap<String, TerminalSessionRecord> = records
+        .into_iter()
+        .map(|r| (r.claude_session_id.clone(), r))
+        .collect();
+    let seeded = map.len();
+    let bytes = serde_json::to_vec_pretty(&map).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to serialize seeded store: {e}"),
+        )
+    })?;
+    std::fs::write(path, &bytes).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to write lifecycle store: {e}"),
+        )
+    })?;
+    Ok(seeded)
+}
+
+/// Core read-back: the `state == "open"` session ids in the store at `path`
+/// (sorted). A missing/unreadable store reads as empty.
+fn list_lifecycle_open_at(path: &Path) -> Vec<String> {
+    match SessionLifecycleStore::open(path) {
+        Ok(store) => {
+            let mut ids: Vec<String> = store
+                .open_records()
+                .into_iter()
+                .map(|r| r.claude_session_id)
+                .collect();
+            ids.sort();
+            ids
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+async fn seed_lifecycle_store_handler(
+    axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
+    Json(req): Json<SeedLifecycleRequest>,
+) -> Result<Json<SeedLifecycleResponse>, (StatusCode, Json<InjectSessionError>)> {
+    let api_port = crate::mcp::types::runner_api_port(&state.app_state);
+    let path = lifecycle_store_path_for_port(api_port);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    match seed_lifecycle_store_at(&path, &req, now_ms) {
+        Ok(seeded) => {
+            info!(
+                "test_fixtures: seeded lifecycle store path={} records={}",
+                path.display(),
+                seeded,
+            );
+            Ok(Json(SeedLifecycleResponse {
+                success: true,
+                seeded,
+                path: path.display().to_string(),
+            }))
+        }
+        Err((code, error)) => Err((
+            code,
+            Json(InjectSessionError {
+                success: false,
+                error,
+            }),
+        )),
+    }
+}
+
+async fn list_lifecycle_open_handler(
+    axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
+) -> Json<ListLifecycleOpenResponse> {
+    let api_port = crate::mcp::types::runner_api_port(&state.app_state);
+    let path = lifecycle_store_path_for_port(api_port);
+    Json(ListLifecycleOpenResponse {
+        success: true,
+        open_session_ids: list_lifecycle_open_at(&path),
+        path: path.display().to_string(),
+    })
+}
+
+async fn clear_lifecycle_store_handler(
+    axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
+) -> Json<ClearLifecycleResponse> {
+    let api_port = crate::mcp::types::runner_api_port(&state.app_state);
+    let path = lifecycle_store_path_for_port(api_port);
+    let removed = std::fs::remove_file(&path).is_ok();
+    info!(
+        "test_fixtures: cleared lifecycle store path={} removed={}",
+        path.display(),
+        removed,
+    );
+    Json(ClearLifecycleResponse {
+        success: true,
+        removed,
+        path: path.display().to_string(),
+    })
+}
+
+// =============================================================================
 // Routes
 // =============================================================================
 
@@ -940,6 +1218,18 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route(
             "/ui-bridge/test/seed-terminal-scenario",
             post(seed_scenario_handler),
+        )
+        .route(
+            "/ui-bridge/test/seed-lifecycle-store",
+            post(seed_lifecycle_store_handler),
+        )
+        .route(
+            "/ui-bridge/test/list-lifecycle-open",
+            post(list_lifecycle_open_handler),
+        )
+        .route(
+            "/ui-bridge/test/clear-lifecycle-store",
+            post(clear_lifecycle_store_handler),
         )
 }
 
@@ -1050,6 +1340,9 @@ mod tests {
             "/ui-bridge/test/clear-sessions",
             "/ui-bridge/test/clear-injected",
             "/ui-bridge/test/seed-terminal-scenario",
+            "/ui-bridge/test/seed-lifecycle-store",
+            "/ui-bridge/test/list-lifecycle-open",
+            "/ui-bridge/test/clear-lifecycle-store",
         ] {
             assert!(
                 src.contains(&format!("\"{route}\"")),
@@ -1731,5 +2024,168 @@ mod tests {
         );
 
         let _ = clear_sessions_handler().await;
+    }
+
+    // =========================================================================
+    // Item 4: lifecycle-store restore seam (seed → list_open → clear)
+    // =========================================================================
+
+    /// Seeding 3 open + 1 ghost(open, far-past) + 1 closed via the path-level
+    /// core, then reading back `list_lifecycle_open_at`, returns exactly the 3
+    /// fresh open ids; clearing removes the file so the read-back is empty.
+    #[test]
+    fn seed_lifecycle_store_round_trip_list_open_and_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions-9999.json");
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let req = SeedLifecycleRequest {
+            records: vec![
+                SeedLifecycleRecord {
+                    session_id: "open-a".to_string(),
+                    state: "open".to_string(),
+                    last_seen_offset_ms: -5_000,
+                    closed_at_offset_ms: None,
+                    close_reason: None,
+                    page_id: None,
+                    zone_index: None,
+                    title: None,
+                    working_dir: None,
+                },
+                SeedLifecycleRecord {
+                    session_id: "open-b".to_string(),
+                    state: "open".to_string(),
+                    last_seen_offset_ms: -10_000,
+                    closed_at_offset_ms: None,
+                    close_reason: None,
+                    page_id: None,
+                    zone_index: None,
+                    title: None,
+                    working_dir: None,
+                },
+                SeedLifecycleRecord {
+                    session_id: "open-c".to_string(),
+                    state: "open".to_string(),
+                    last_seen_offset_ms: -1_000,
+                    closed_at_offset_ms: None,
+                    close_reason: None,
+                    page_id: None,
+                    zone_index: None,
+                    title: None,
+                    working_dir: None,
+                },
+                // A ghost open row aged far into the past — still `state==open`,
+                // so list_open returns it (open_records is strict-open; the
+                // anchor/restore math is the store's job, exercised elsewhere).
+                SeedLifecycleRecord {
+                    session_id: "ghost".to_string(),
+                    state: "open".to_string(),
+                    last_seen_offset_ms: -(72 * 3_600_000),
+                    closed_at_offset_ms: None,
+                    close_reason: None,
+                    page_id: None,
+                    zone_index: None,
+                    title: None,
+                    working_dir: None,
+                },
+                // A closed row — must NOT appear in list_open.
+                SeedLifecycleRecord {
+                    session_id: "closed-1".to_string(),
+                    state: "closed".to_string(),
+                    last_seen_offset_ms: -2_000,
+                    closed_at_offset_ms: Some(-2_000),
+                    close_reason: Some("pty-exit".to_string()),
+                    page_id: None,
+                    zone_index: None,
+                    title: None,
+                    working_dir: None,
+                },
+            ],
+        };
+
+        let seeded = seed_lifecycle_store_at(&path, &req, now).expect("seed should succeed");
+        assert_eq!(seeded, 5, "all 5 records written");
+        assert!(path.exists(), "store file written at the namespaced path");
+
+        // list_open returns only the open rows (3 fresh + the ghost), never the
+        // closed one.
+        let open = list_lifecycle_open_at(&path);
+        assert_eq!(
+            open,
+            vec![
+                "ghost".to_string(),
+                "open-a".to_string(),
+                "open-b".to_string(),
+                "open-c".to_string(),
+            ],
+            "list_open returns every open row (incl. ghost), excludes closed"
+        );
+
+        // The seeded ages survived exactly (record_open would have re-stamped
+        // them); confirm via the store directly.
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        let recs = store.open_records();
+        let ghost = recs
+            .iter()
+            .find(|r| r.claude_session_id == "ghost")
+            .unwrap();
+        assert_eq!(
+            ghost.last_seen_at,
+            now - 72 * 3_600_000,
+            "the seeded now-relative age is preserved verbatim"
+        );
+
+        // Closed row carries its reason for restore-grace tests.
+        let store_path_raw: HashMap<String, TerminalSessionRecord> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            store_path_raw
+                .get("closed-1")
+                .unwrap()
+                .close_reason
+                .as_deref(),
+            Some("pty-exit"),
+        );
+
+        // Clear: deleting the file makes the read-back empty.
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            list_lifecycle_open_at(&path).is_empty(),
+            "after clear the read-back is empty"
+        );
+    }
+
+    /// A malformed seed body (empty records / bad state) is a 400.
+    #[test]
+    fn seed_lifecycle_store_rejects_malformed_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions-9999.json");
+        let now = chrono::Utc::now().timestamp_millis();
+
+        // Empty records list → 400.
+        let empty = SeedLifecycleRequest { records: vec![] };
+        let err = seed_lifecycle_store_at(&path, &empty, now).expect_err("empty body rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        // Bad `state` → 400, and nothing is written.
+        let bad_state = SeedLifecycleRequest {
+            records: vec![SeedLifecycleRecord {
+                session_id: "x".to_string(),
+                state: "bogus".to_string(),
+                last_seen_offset_ms: 0,
+                closed_at_offset_ms: None,
+                close_reason: None,
+                page_id: None,
+                zone_index: None,
+                title: None,
+                working_dir: None,
+            }],
+        };
+        let err = seed_lifecycle_store_at(&path, &bad_state, now).expect_err("bad state rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(
+            !path.exists(),
+            "a rejected seed must not write the store file"
+        );
     }
 }

@@ -469,24 +469,81 @@ fn load_map(path: &Path) -> HashMap<String, TerminalSessionRecord> {
     if !path.exists() {
         return HashMap::new();
     }
-    match std::fs::read(path) {
-        Ok(bytes) => match serde_json::from_slice::<HashMap<String, TerminalSessionRecord>>(&bytes)
-        {
-            Ok(m) => m,
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(error = %e, "session_lifecycle_store: read failed — starting empty");
+            return HashMap::new();
+        }
+    };
+    // Two-stage parse so ONE malformed record can't discard the whole store.
+    // A real boot loads a registry that may hold a row written by an older /
+    // newer schema or a partially-corrupted entry; the original
+    // `from_slice::<HashMap<_, Record>>` failed the entire deserialize on the
+    // first bad value, silently wiping every restorable on-screen session.
+    // Instead: parse to a generic `HashMap<String, Value>` (only the top-level
+    // object shape must be intact), then `from_value` each entry individually,
+    // KEEPING the good rows and warn+dropping the bad ones.
+    let raw: HashMap<String, serde_json::Value> = match serde_json::from_slice(&bytes) {
+        Ok(raw) => raw,
+        Err(e) => {
+            // The file isn't even a JSON object map — unrecoverable; start empty.
+            warn!(
+                error = %e,
+                path = %path.display(),
+                "session_lifecycle_store: corrupt map file (not a JSON object) — starting empty"
+            );
+            return HashMap::new();
+        }
+    };
+
+    let mut map = HashMap::with_capacity(raw.len());
+    let mut dropped: Vec<(String, serde_json::Value)> = Vec::new();
+    for (key, value) in raw {
+        match serde_json::from_value::<TerminalSessionRecord>(value.clone()) {
+            Ok(rec) => {
+                map.insert(key, rec);
+            }
             Err(e) => {
                 warn!(
                     error = %e,
+                    key = %key,
                     path = %path.display(),
-                    "session_lifecycle_store: corrupt map file — starting empty"
+                    "session_lifecycle_store: malformed record — dropped, keeping the rest"
                 );
-                HashMap::new()
+                dropped.push((key, value));
             }
-        },
-        Err(e) => {
-            warn!(error = %e, "session_lifecycle_store: read failed — starting empty");
-            HashMap::new()
         }
     }
+
+    if !dropped.is_empty() {
+        warn!(
+            dropped = dropped.len(),
+            kept = map.len(),
+            path = %path.display(),
+            "session_lifecycle_store: dropped malformed record(s); preserved the valid rows"
+        );
+        // Best-effort `.corrupt` side-car with the raw dropped entries so the
+        // dropped data is inspectable after the fact. Never fails the load.
+        let sidecar: HashMap<String, serde_json::Value> = dropped.into_iter().collect();
+        let sidecar_path = path.with_extension("json.corrupt");
+        match serde_json::to_vec_pretty(&sidecar) {
+            Ok(side_bytes) => {
+                if let Err(e) = std::fs::write(&sidecar_path, &side_bytes) {
+                    warn!(
+                        error = %e,
+                        path = %sidecar_path.display(),
+                        "session_lifecycle_store: failed to write .corrupt side-car for dropped records"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: failed to serialize dropped records side-car");
+            }
+        }
+    }
+
+    map
 }
 
 fn write_map(path: &Path, map: &HashMap<String, TerminalSessionRecord>) -> std::io::Result<()> {
@@ -872,6 +929,80 @@ mod tests {
         // Still usable after recovery.
         store.record_open(rec("sess-1"));
         assert_eq!(store.open_records().len(), 1);
+    }
+
+    /// Item-1: one malformed record must NOT discard the whole store. A real
+    /// boot loads a registry whose object shape is intact but one entry fails
+    /// to deserialize (schema skew / partial corruption); the load must KEEP
+    /// the valid rows and warn+drop only the bad one — the original
+    /// whole-map deserialize wiped everything on the first bad value, silently
+    /// losing every restorable on-screen session.
+    #[test]
+    fn malformed_record_drops_only_that_row_and_keeps_the_rest() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        // Two valid records + one malformed (wrong type for `zoneIndex`, which
+        // is a required `i32`, so `from_value` rejects just this entry).
+        let file = r#"{
+            "good-1": {
+                "claudeSessionId":"good-1","configDir":null,"workingDir":"C:/repo",
+                "pageId":"default","zoneIndex":1,"title":"Good 1","terminalId":"term-1",
+                "openedAt":100,"lastSeenAt":200,"state":"open","closedAt":null,"closeReason":null
+            },
+            "bad-1": {
+                "claudeSessionId":"bad-1","configDir":null,"workingDir":"C:/repo",
+                "pageId":"default","zoneIndex":"NOT-AN-INT","title":"Bad","terminalId":"term-bad",
+                "openedAt":100,"lastSeenAt":200,"state":"open","closedAt":null,"closeReason":null
+            },
+            "good-2": {
+                "claudeSessionId":"good-2","configDir":null,"workingDir":"C:/repo",
+                "pageId":"default","zoneIndex":2,"title":"Good 2","terminalId":"term-2",
+                "openedAt":300,"lastSeenAt":400,"state":"open","closedAt":null,"closeReason":null
+            }
+        }"#;
+        std::fs::write(&path, file).unwrap();
+
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        let mut ids: Vec<String> = store
+            .open_records()
+            .into_iter()
+            .map(|r| r.claude_session_id)
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["good-1".to_string(), "good-2".to_string()],
+            "the two valid rows must survive; only the malformed row is dropped"
+        );
+
+        // The dropped raw entry is preserved in a `.corrupt` side-car.
+        let sidecar = path.with_extension("json.corrupt");
+        assert!(
+            sidecar.exists(),
+            "a .corrupt side-car must capture the drop"
+        );
+        let side: HashMap<String, serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+        assert!(side.contains_key("bad-1"), "side-car holds the dropped row");
+        assert!(!side.contains_key("good-1"), "side-car excludes good rows");
+
+        // Store stays usable; a fresh write persists the kept-plus-new set.
+        store.record_open(rec("new-1"));
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        let mut ids2: Vec<String> = store
+            .open_records()
+            .into_iter()
+            .map(|r| r.claude_session_id)
+            .collect();
+        ids2.sort();
+        assert_eq!(
+            ids2,
+            vec![
+                "good-1".to_string(),
+                "good-2".to_string(),
+                "new-1".to_string()
+            ],
+        );
     }
 
     // --- classify() — every branch -----------------------------------------
