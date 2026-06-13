@@ -1388,18 +1388,19 @@ pub fn create_router(
             // Wait a bit longer than unified workflows to let the server fully start
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
-            // Phase 4 — classify this boot as crash recovery vs a planned
-            // restart from the on-disk shutdown marker, BEFORE we overwrite
-            // it. A missing / `clean:false` / corrupt marker ⇒ the previous
-            // shutdown was NOT clean ⇒ crash recovery. We then immediately
-            // (re)write the marker `clean:false` for the NOW-running process
-            // so that if THIS process crashes the next boot detects it. The
-            // clean drain / exit seam flips it back to `clean:true`.
+            // Phase 4 — crash recovery vs planned restart. The classification
+            // is captured EXACTLY ONCE per process by `classify_boot` (which
+            // reads the prior marker, stashes the result, and re-marks the
+            // marker `clean:false` for the NOW-running process so a crash of
+            // THIS process is detected next boot; the clean drain / exit seam
+            // flips it back to `clean:true`). `main.rs` setup performs the
+            // classification synchronously at boot; this call is idempotent
+            // and simply reads the stash (OnceLock) — re-reading the marker
+            // file here would ALWAYS classify "crash" post-`mark_running`.
             let marker_path =
                 crate::session::shutdown_marker::marker_path(crate::mcp::types::get_mcp_api_port());
             let crash_recovery =
-                crate::session::shutdown_marker::was_unclean_shutdown(&marker_path);
-            crate::session::shutdown_marker::mark_running(&marker_path);
+                crate::session::shutdown_marker::classify_boot(&marker_path).crash_recovery;
             if crash_recovery {
                 warn!("Startup recovery: previous shutdown was NOT clean — this is crash recovery");
             }

@@ -929,20 +929,31 @@ pub fn terminal_session_record_close(
 /// The grid hydrates its session tiles from this on boot instead of
 /// `localStorage`.
 ///
-/// Returns the restorable superset (see `restorable_records`): all `open`
-/// records (hard-crash case) PLUS `closed`/`pty-exit` records still within the
-/// grace window (graceful-restart case, where `handleExit` flipped every live
-/// PTY to `closed`). User-closed and stale records are excluded so the restore
-/// path resurrects exactly the sessions that died with the runner.
+/// Returns the restorable set (see `restorable_records`): `open` records
+/// whose `last_seen_at` is recent relative to the registry's ANCHOR (its last
+/// moment of life — max of every row's timestamps plus the prior shutdown
+/// marker's `at`), PLUS `closed`/`pty-exit` and `closed`/`poll-dead` records
+/// still within their grace windows (graceful-restart case, where
+/// `handleExit` flipped every live PTY to `closed`). User-closed, orphan
+/// (`no-terminal`) and stale-ghost records are excluded so the restore path
+/// resurrects exactly the sessions that died with the runner.
 #[tauri::command]
 pub fn terminal_session_list_open(
     store: tauri::State<'_, Arc<SessionLifecycleStore>>,
 ) -> Result<CommandResponse, String> {
     let now = chrono::Utc::now().timestamp_millis();
+    // The prior shutdown marker's `at` is one input to the anchor. It is
+    // captured ONCE at boot (main.rs setup, before this command can run) —
+    // the on-disk marker itself already says `clean:false` for the NOW-
+    // running process and must never be re-read for restore decisions.
+    let prior_marker_at =
+        crate::session::shutdown_marker::boot_classification().and_then(|c| c.prior_marker_at);
     Ok(CommandResponse {
         success: true,
         message: None,
-        data: Some(serde_json::json!({ "sessions": store.restorable_records(now) })),
+        data: Some(
+            serde_json::json!({ "sessions": store.restorable_records(now, prior_marker_at) }),
+        ),
     })
 }
 
