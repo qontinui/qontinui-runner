@@ -85,7 +85,11 @@ pub struct Grid {
     cur_fg: u32,
     cur_bg: u32,
     cur_attrs: u16,
-    /// DEC private mode flags we observe but do not gate on.
+    /// DEC private mode flags we observe but the grid itself does not gate
+    /// cell mutation on. `sync_output` (DEC 2026) is read by the session
+    /// reader thread via [`Grid::sync_output`] to coalesce a multi-read frame
+    /// into one emit; `alt_screen` (DEC 1049) is surfaced in the snapshot for
+    /// the bootstrap-paint guard.
     sync_output: bool,
     alt_screen: bool,
     dirty: bool,
@@ -129,6 +133,17 @@ impl Grid {
     }
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
+    }
+
+    /// Whether the VT stream is currently inside a DEC mode 2026
+    /// (synchronized output) block — i.e. a `?2026h` was seen with no
+    /// matching `?2026l` yet. Full-screen TUIs (Claude Code) bracket a
+    /// whole-frame redraw in `?2026h … ?2026l` so the terminal can swap the
+    /// frame atomically. The reader thread reads this at the emit boundary to
+    /// coalesce a multi-read frame into a single `terminal-output` event,
+    /// killing mid-frame overdraw. Observe-only in the grid itself.
+    pub fn sync_output(&self) -> bool {
+        self.sync_output
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
@@ -201,6 +216,7 @@ impl Grid {
             rows: self.rows,
             cursor: self.cursor,
             title: self.title.clone(),
+            alt_screen: self.alt_screen,
             cells: self.cells.clone(),
         }
     }
@@ -398,6 +414,12 @@ pub struct GridSnapshot {
     pub cursor: Cursor,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// True when the grid is currently on the alternate screen (DEC `?1049h`).
+    /// The grid is single-buffer (no save/swap), so a snapshot taken while
+    /// this is true holds alt-screen content; the frontend bootstrap paint
+    /// hard-skips in that case rather than overlay alt content onto a fresh
+    /// xterm. See `paintGrid.ts` / `TerminalInstance.tsx`.
+    pub alt_screen: bool,
     pub cells: Vec<Cell>,
 }
 
@@ -944,6 +966,21 @@ mod tests {
         assert_eq!(cells[3].ch, 'D');
         assert_eq!(cells[4].ch, 'E');
         assert_eq!(cells[5].ch, 'F');
+    }
+
+    #[test]
+    fn sync_output_getter_tracks_dec_2026_open_and_close() {
+        let mut grid = Grid::new(80, 24);
+        assert!(!grid.sync_output(), "starts closed");
+        // Open the synchronized-output block.
+        feed(&mut grid, b"\x1b[?2026h");
+        assert!(grid.sync_output(), "open after ?2026h");
+        // Bytes inside the block keep it open (mid-frame).
+        feed(&mut grid, b"PARTIAL");
+        assert!(grid.sync_output(), "still open mid-frame");
+        // Close it.
+        feed(&mut grid, b"\x1b[?2026l");
+        assert!(!grid.sync_output(), "closed after ?2026l");
     }
 
     #[test]

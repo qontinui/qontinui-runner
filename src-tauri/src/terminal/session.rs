@@ -78,6 +78,113 @@ fn tee_into_scrollback(
     }
 }
 
+/// Flow-control watermarks (bytes), mirroring VS Code's `FlowControlConstants`
+/// (High=100000, Low=5000 chars). The reader pauses once the unacked gap
+/// (`bytes_sent − bytes_acked`) exceeds [`FLOW_HIGH_WATERMARK`] and resumes
+/// only once it drops back below [`FLOW_LOW_WATERMARK`] — hysteresis so we
+/// don't thrash pause/resume one byte at a time. The frontend acks
+/// render-completed bytes in ~5000-byte units (see `flowControl.ts`), so the
+/// Low watermark matches one ack quantum.
+const FLOW_HIGH_WATERMARK: u64 = 100_000;
+const FLOW_LOW_WATERMARK: u64 = 5_000;
+
+/// Byte cap for a held DEC-2026 (synchronized-output) frame: flush the
+/// accumulated frame once it reaches this size even if `?2026l` hasn't
+/// arrived, so a runaway/never-closed `?2026h` block can't buffer unbounded.
+const SYNC_FLUSH_BYTE_CAP: usize = 256 * 1024;
+/// Time cap for a held sync frame: flush once the block has been open this
+/// long, so a slow producer mid-frame can't stall output past ~one frame.
+const SYNC_FLUSH_TIME_CAP: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Synchronized-output (DEC 2026) frame coalescer for the reader thread.
+///
+/// Full-screen TUIs (Claude Code) bracket each whole-frame redraw in
+/// `?2026h … ?2026l`. Emitting per-PTY-read would split a frame across
+/// several `terminal-output` events, so xterm paints partial frames —
+/// mid-frame overdraw (symptom a). This accumulates the processed bytes of a
+/// frame that spans multiple reads and emits the whole frame as ONE event so
+/// xterm receives it in a single write (its RenderDebouncer then paints one
+/// reflow). The common case — a whole frame in one read — never holds: the
+/// parser's `sync_output` is already false post-advance, so [`Self::feed`]
+/// emits immediately.
+///
+/// `feed` is called once per read with the post-interceptor `data`, that
+/// data's stamped stream offset, and the live `sync_output` parser state
+/// observed AFTER the data was advanced into the grid. The `emit` callback
+/// receives `(payload, offset)` to broadcast as one event; `offset` is the
+/// absolute stream offset of the payload's first byte (a correct replay
+/// boundary — the first held byte's offset for a coalesced frame).
+struct SyncFrameCoalescer {
+    pending: Vec<u8>,
+    pending_offset: u64,
+    started_at: Option<std::time::Instant>,
+}
+
+impl SyncFrameCoalescer {
+    fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+            pending_offset: 0,
+            started_at: None,
+        }
+    }
+
+    /// Feed one read's processed `data` (stamped at `offset`) plus the live
+    /// `in_sync` parser state observed right after advancing it into the grid.
+    /// Emits zero or one coalesced event via `emit`.
+    fn feed<F: FnMut(&[u8], u64)>(&mut self, data: &[u8], offset: u64, in_sync: bool, mut emit: F) {
+        if in_sync {
+            // Mid-frame: hold this chunk. Stamp the held frame's offset on the
+            // FIRST held byte (a correct replay boundary).
+            if self.pending.is_empty() {
+                self.pending_offset = offset;
+                self.started_at = Some(std::time::Instant::now());
+            }
+            self.pending.extend_from_slice(data);
+            // Byte-cap a runaway/never-closed block.
+            if self.pending.len() >= SYNC_FLUSH_BYTE_CAP {
+                emit(&self.pending, self.pending_offset);
+                self.pending.clear();
+                self.started_at = None;
+            }
+        } else if self.pending.is_empty() {
+            // Common case: no open frame, nothing held — emit immediately.
+            emit(data, offset);
+        } else {
+            // The block just closed in this read (it carried `?2026l`): emit
+            // the held prefix + this chunk as the single frame, stamped at the
+            // held frame's start offset.
+            self.pending.extend_from_slice(data);
+            emit(&self.pending, self.pending_offset);
+            self.pending.clear();
+            self.started_at = None;
+        }
+    }
+
+    /// Flush a held frame if it has been open at least [`SYNC_FLUSH_TIME_CAP`].
+    /// Called before each (blocking) read so a slow producer mid-frame still
+    /// flushes within ~one frame rather than waiting for the next byte.
+    fn flush_if_timed_out<F: FnMut(&[u8], u64)>(&mut self, mut emit: F) {
+        if let Some(started) = self.started_at {
+            if started.elapsed() >= SYNC_FLUSH_TIME_CAP && !self.pending.is_empty() {
+                emit(&self.pending, self.pending_offset);
+                self.pending.clear();
+                self.started_at = None;
+            }
+        }
+    }
+
+    /// Flush any remaining held frame (reader exit on EOF / read error) so the
+    /// last frame of a never-closed block isn't lost.
+    fn flush_remaining<F: FnMut(&[u8], u64)>(&mut self, mut emit: F) {
+        if !self.pending.is_empty() {
+            emit(&self.pending, self.pending_offset);
+            self.pending.clear();
+            self.started_at = None;
+        }
+    }
+}
+
 /// Tauri `terminal-output` wire shape: the shared `TerminalOutputEvent`
 /// (qontinui-types) is `deny_unknown_fields`, so the extra `offset` rides on
 /// this runner-local struct instead of forcing a schemas version bump. Only
@@ -447,19 +554,92 @@ impl TerminalSession {
             .spawn(move || {
                 let mut parser = vte::Parser::new();
                 let mut buf = [0u8; 8192];
+                // Phase 4 — sync-output (DEC 2026) frame coalescing. While the
+                // VT parser is inside a `?2026h … ?2026l` block (Claude's TUI
+                // brackets each full-frame redraw this way), accumulate the
+                // processed bytes here instead of emitting per-read. Once the
+                // block closes — or a safety cap trips so a never-closed block
+                // can't stall output — emit the whole frame as ONE
+                // `terminal-output` event so xterm receives the frame in a
+                // single write and its RenderDebouncer paints one reflow.
+                //
+                // The common case (a whole frame in one read) is unaffected:
+                // `sync_output` is already false post-advance, so we emit
+                // immediately with no holding. Only frames that span multiple
+                // reads are held.
+                let mut coalescer = SyncFrameCoalescer::new();
+                // Flow-control hysteresis state: once the unacked gap crosses
+                // the High watermark we stay paused until it falls back under
+                // Low (see FLOW_HIGH_WATERMARK / FLOW_LOW_WATERMARK).
+                let mut paused = false;
+
+                // Emit one `terminal-output` event for `payload` stamped at
+                // absolute `offset`, mirror it to SSE + the backend relay, and
+                // advance the flow-control "sent" counter by the emitted length
+                // (so backpressure tracks bytes actually delivered to the
+                // frontend, not bytes still held in the coalescer).
+                let emit_chunk = |payload: &[u8], offset: u64| {
+                    let encoded = STANDARD.encode(payload);
+                    // Broadcast to HTTP/SSE subscribers (ignore if no receivers)
+                    let _ = reader_output_tx.send(encoded.clone());
+                    let event = TerminalOutputWire {
+                        terminal_id: &reader_id,
+                        data: &encoded,
+                        offset,
+                    };
+                    if let Err(e) = reader_app.emit("terminal-output", &event) {
+                        warn!(
+                            terminal_id = %reader_id,
+                            error = %e,
+                            "Failed to emit terminal output event"
+                        );
+                    }
+                    // Broadcast to backend relay for remote mobile access
+                    crate::event_system::broadcast_ws_notification(
+                        &reader_app,
+                        "terminal-output",
+                        &serde_json::json!({
+                            "terminal_id": &reader_id,
+                            "data": &event.data,
+                        }),
+                    );
+                    reader_bytes_sent.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                };
+
                 loop {
                     if !reader_alive.load(Ordering::Relaxed) {
                         break;
                     }
 
-                    // Flow control: pause if frontend is too far behind
+                    // Flow control (Phase 3): char-count watermarks with
+                    // hysteresis, mirroring VS Code. The gap is measured
+                    // against EMITTED bytes (a held frame in the coalescer
+                    // hasn't been sent yet), so a held frame doesn't trip
+                    // backpressure on its own. Pause once the unacked gap
+                    // exceeds High; resume only once it drops below Low — so a
+                    // burst that overruns xterm's input buffer is throttled at
+                    // the producer until the renderer's acks catch up.
                     let sent = reader_bytes_sent.load(Ordering::Relaxed);
                     let acked = reader_bytes_acked.load(Ordering::Relaxed);
-                    if sent > acked + 1_048_576 {
-                        // 1MB backpressure threshold
+                    let gap = sent.saturating_sub(acked);
+                    if paused {
+                        if gap > FLOW_LOW_WATERMARK {
+                            thread::sleep(std::time::Duration::from_millis(10));
+                            continue;
+                        }
+                        paused = false;
+                    } else if gap > FLOW_HIGH_WATERMARK {
+                        paused = true;
                         thread::sleep(std::time::Duration::from_millis(10));
                         continue;
                     }
+
+                    // Time-cap a held sync block: if the block has been open ≥
+                    // SYNC_FLUSH_TIME_CAP, flush it now rather than waiting for
+                    // the next read to return. (The read below blocks, so a
+                    // slow PTY mid-frame could otherwise hold a frame past one
+                    // frame interval until the next byte arrives.)
+                    coalescer.flush_if_timed_out(&emit_chunk);
 
                     match reader.read(&mut buf) {
                         Ok(0) => {
@@ -516,31 +696,22 @@ impl TerminalSession {
                                 }
                             }
 
-                            let encoded = STANDARD.encode(&data);
-                            // Broadcast to HTTP/SSE subscribers (ignore if no receivers)
-                            let _ = reader_output_tx.send(encoded.clone());
-                            let event = TerminalOutputWire {
-                                terminal_id: &reader_id,
-                                data: &encoded,
-                                offset: chunk_offset,
-                            };
-                            if let Err(e) = reader_app.emit("terminal-output", &event) {
-                                warn!(
-                                    terminal_id = %reader_id,
-                                    error = %e,
-                                    "Failed to emit terminal output event"
-                                );
-                            }
-                            // Broadcast to backend relay for remote mobile access
-                            crate::event_system::broadcast_ws_notification(
-                                &reader_app,
-                                "terminal-output",
-                                &serde_json::json!({
-                                    "terminal_id": &reader_id,
-                                    "data": &event.data,
-                                }),
-                            );
-                            reader_bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
+                            // Sync-output-aware emit (Phase 4). Read the live
+                            // DEC-2026 state straight after the advance above:
+                            // if a `?2026h` is still open we're mid-frame, so
+                            // accumulate and defer the emit; otherwise flush
+                            // (any held prefix + this chunk) as one event.
+                            let in_sync = reader_grid
+                                .lock()
+                                .ok()
+                                .map(|g| g.sync_output())
+                                .unwrap_or(false);
+
+                            // Coalesce sync-output frames (Phase 4). The
+                            // scrollback ring + total counter were already fed
+                            // per-read above, so total-byte accounting stays
+                            // correct whether or not the coalescer holds.
+                            coalescer.feed(&data, chunk_offset, in_sync, &emit_chunk);
                         }
                         Err(e) => {
                             // On Windows, the PTY reader returns an error when the child exits
@@ -549,6 +720,10 @@ impl TerminalSession {
                         }
                     }
                 }
+                // Flush any frame still held in a never-closed sync block so
+                // the last frame isn't lost when the reader exits (EOF / read
+                // error on child exit).
+                coalescer.flush_remaining(&emit_chunk);
                 debug!(terminal_id = %reader_id, "Reader thread exiting");
             })
             .map_err(|e| format!("Failed to spawn reader thread: {}", e))?;
@@ -1362,6 +1537,90 @@ mod tests {
             app_handle: None,
             input_line_buf: Arc::new(Mutex::new(String::new())),
         }
+    }
+
+    /// Drive a `SyncFrameCoalescer` across a sequence of `(data, offset,
+    /// in_sync)` reads and return the emitted `(payload, offset)` events.
+    fn run_coalescer(reads: &[(&[u8], u64, bool)]) -> Vec<(Vec<u8>, u64)> {
+        let mut c = SyncFrameCoalescer::new();
+        let emitted = Arc::new(Mutex::new(Vec::<(Vec<u8>, u64)>::new()));
+        for (data, offset, in_sync) in reads {
+            let sink = emitted.clone();
+            c.feed(data, *offset, *in_sync, move |p, o| {
+                sink.lock().unwrap().push((p.to_vec(), o));
+            });
+        }
+        let sink = emitted.clone();
+        c.flush_remaining(move |p, o| sink.lock().unwrap().push((p.to_vec(), o)));
+        Arc::try_unwrap(emitted).unwrap().into_inner().unwrap()
+    }
+
+    #[test]
+    fn whole_frame_in_one_read_emits_immediately() {
+        // sync_output already false post-advance → no holding, one event.
+        let events = run_coalescer(&[(b"\x1b[?2026hFRAME\x1b[?2026l", 0, false)]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, b"\x1b[?2026hFRAME\x1b[?2026l");
+        assert_eq!(events[0].1, 0);
+    }
+
+    #[test]
+    fn multi_read_sync_frame_coalesces_into_one_emit() {
+        // A frame split across three reads: open (in_sync), middle (in_sync),
+        // close (in_sync flips false in the read that carried `?2026l`).
+        // Offsets are the absolute stream positions of each read.
+        let events = run_coalescer(&[
+            (b"\x1b[?2026hPART1", 10, true),
+            (b"PART2", 23, true),
+            (b"PART3\x1b[?2026l", 28, false),
+        ]);
+        assert_eq!(events.len(), 1, "the frame must coalesce into ONE event");
+        assert_eq!(events[0].0, b"\x1b[?2026hPART1PART2PART3\x1b[?2026l");
+        // Offset must be the FIRST held byte's offset (the replay boundary).
+        assert_eq!(events[0].1, 10);
+    }
+
+    #[test]
+    fn non_sync_chunks_each_emit_separately() {
+        let events = run_coalescer(&[(b"alpha", 0, false), (b"beta", 5, false)]);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0], (b"alpha".to_vec(), 0));
+        assert_eq!(events[1], (b"beta".to_vec(), 5));
+    }
+
+    #[test]
+    fn byte_cap_flushes_a_never_closed_sync_block() {
+        let mut c = SyncFrameCoalescer::new();
+        let emitted = Arc::new(Mutex::new(Vec::<(Vec<u8>, u64)>::new()));
+        // First read opens the block and is under the cap.
+        let big = vec![b'x'; SYNC_FLUSH_BYTE_CAP];
+        {
+            let sink = emitted.clone();
+            c.feed(b"\x1b[?2026h", 0, true, move |p, o| {
+                sink.lock().unwrap().push((p.to_vec(), o));
+            });
+        }
+        // Second read pushes the held buffer past the byte cap → forced flush
+        // even though `?2026l` never arrived.
+        {
+            let sink = emitted.clone();
+            c.feed(&big, 8, true, move |p, o| {
+                sink.lock().unwrap().push((p.to_vec(), o));
+            });
+        }
+        let events = emitted.lock().unwrap();
+        assert_eq!(events.len(), 1, "byte cap must force a flush");
+        assert_eq!(events[0].1, 0, "flush keeps the first held byte's offset");
+        assert!(events[0].0.len() >= SYNC_FLUSH_BYTE_CAP);
+    }
+
+    #[test]
+    fn flush_remaining_emits_a_held_unclosed_frame_on_exit() {
+        // Reader exits (EOF) mid-frame — the held prefix must still be emitted.
+        let events = run_coalescer(&[(b"\x1b[?2026hHALF", 100, true)]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, b"\x1b[?2026hHALF");
+        assert_eq!(events[0].1, 100);
     }
 
     #[test]

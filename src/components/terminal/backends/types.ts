@@ -79,6 +79,16 @@ export interface TerminalBackendOptions {
   altClickMovesCursor?: boolean;
   /** Word-boundary characters for double-click selection (VS Code parity). */
   wordSeparator?: string;
+  /**
+   * GPU acceleration policy for the renderer (xterm only):
+   * - `"auto"` (default): load the WebGL renderer, falling back to Canvas then
+   *   DOM (the existing behavior).
+   * - `"dom"`: skip the WebGL/Canvas addons entirely → pure DOM renderer. The
+   *   DOM renderer has no glyph texture atlas, so it can never ghost. This is
+   *   both a user escape hatch and the force-DOM diagnostic lever for the
+   *   ghosting investigation. No-op on ghostty (Canvas-only, no WebGL).
+   */
+  gpuAcceleration?: "auto" | "dom";
 }
 
 // ---------------------------------------------------------------------------
@@ -128,8 +138,19 @@ export interface ITerminalBackend {
   focus(): void;
 
   // -- I/O ------------------------------------------------------------------
-  /** Write data to the terminal display (does NOT send to PTY). */
-  write(data: Uint8Array | string): void;
+  /**
+   * Write data to the terminal display (does NOT send to PTY).
+   *
+   * `onRendered`, when supplied, is invoked once the chunk has been parsed
+   * and rendered by the backend. This is the render-completion signal that
+   * drives the render-based flow-control ack (see `TerminalInstance`): we
+   * ack bytes the renderer has actually drained, not bytes merely received
+   * off the wire, so a burst can't outrun xterm's input buffer (~50MB cap,
+   * silently drops overflow) before backpressure engages. Mirrors xterm's
+   * `write(data, callback)`. Backends with no async completion signal call
+   * it synchronously right after their own write.
+   */
+  write(data: Uint8Array | string, onRendered?: () => void): void;
   /** Subscribe to user keyboard input. */
   onData(cb: (data: string) => void): IDisposable;
   /** Subscribe to binary input (e.g. paste with special chars). Optional — may be a no-op. */
@@ -153,6 +174,19 @@ export interface ITerminalBackend {
    * runtime scrollback control may no-op.
    */
   setScrollback(lines: number): void;
+  /**
+   * Change the rendered font size (px). On GPU-accelerated renderers this also
+   * clears the glyph texture atlas — a stale atlas keyed to the old cell
+   * metrics is a ghosting source. Backends without runtime font control may
+   * no-op.
+   */
+  setFontSize(px: number): void;
+  /**
+   * Swap the color theme. On GPU-accelerated renderers this also clears the
+   * glyph texture atlas (cached glyphs are colored, so a theme change must
+   * invalidate them). Backends without runtime theme control may no-op.
+   */
+  setTheme(theme: ITerminalTheme): void;
 
   // -- Layout ---------------------------------------------------------------
   /** Fit the terminal to its container. */
