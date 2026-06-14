@@ -30,6 +30,7 @@ import { SuggestionsProvider } from "./suggestions";
 import { StatusStrip } from "./StatusStrip";
 import { UnzonedChip } from "./UnzonedChip";
 import { pickLayout } from "./useZoneLayout";
+import { buildCreatePlainTerminalAction } from "./createPlainTerminalAction";
 import { ResultCardProvider, ResultCardMount, useResultCard } from "./result-card";
 
 import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
@@ -128,6 +129,15 @@ function TerminalPageInner({
           await createTerminal();
         },
       },
+      // Discoverable, named plain-terminal launcher on the now-primary
+      // `terminal-page` surface. Unlike `create-terminal` (raw createTerminal,
+      // no zone assignment / layout growth), this routes through the same
+      // `createAndAssignTerminal` mount path the launch menu's `create-plain`
+      // uses, so a single invocation reliably yields a mounted xterm — even
+      // from a fresh page. The inner arrow defers the `createAndAssignTerminal`
+      // read to invocation time (it's declared below, same as the
+      // `terminal-launch-menu` handlers that close over later consts).
+      buildCreatePlainTerminalAction((title) => createAndAssignTerminal(title)),
       {
         id: "list-terminals",
         label: "List Terminals",
