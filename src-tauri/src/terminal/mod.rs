@@ -19,6 +19,7 @@ pub mod transcript;
 pub mod transcript_watcher;
 pub mod types;
 pub mod usage_limit;
+pub mod vt_sanitize;
 
 pub use manager::TerminalManager;
 
