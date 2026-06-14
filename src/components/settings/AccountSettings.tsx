@@ -24,7 +24,16 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { LogIn, LogOut, UserCircle2, Loader2, AlertCircle } from "lucide-react";
+import {
+  LogIn,
+  LogOut,
+  UserCircle2,
+  Loader2,
+  AlertCircle,
+  Stethoscope,
+  CheckCircle2,
+  XCircle,
+} from "lucide-react";
 
 import { useRunnerTier } from "@/hooks/useRunnerTier";
 import { useAuth } from "@/components/AuthProvider";
@@ -36,6 +45,19 @@ interface AccountSettingsProps {
 }
 
 const DEFAULT_BACKEND_URL = "https://api.qontinui.io";
+
+// Wire shape of the `coord_doctor_run` Tauri command's `DoctorReport`
+// (serde-serialized snake_case from `qontinui_runner_lib::coord_doctor`).
+interface DoctorCheck {
+  name: string;
+  ok: boolean;
+  detail: string;
+  fix: string;
+}
+interface DoctorReport {
+  checks: DoctorCheck[];
+  overall_ok: boolean;
+}
 
 export function AccountSettings({ onLog }: AccountSettingsProps) {
   const { tier, loading: tierLoading, refresh: refreshTier } = useRunnerTier();
@@ -49,6 +71,34 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
   // sign-in (and browser SSO) are the only sign-in paths.
   const [credBackendUrl, setCredBackendUrl] = useState(DEFAULT_BACKEND_URL);
   const [cognitoState, setCognitoState] = useState<"idle" | "signing-in">("idle");
+
+  // --- Coord Doctor self-check (plan 2026-06-13 Phase 4) --------------------
+  // Invokes the `coord_doctor_run` Tauri command, which runs the 7 ordered
+  // checks (claude account → tier → paired/signed-in → tenant → device JWT →
+  // .mcp.json valid → coord reachable), stops at the first red, and names the
+  // fix. This is the in-app surface for "why can't this runner set gates?".
+  const [doctor, setDoctor] = useState<DoctorReport | null>(null);
+  const [doctorRunning, setDoctorRunning] = useState(false);
+
+  const runCoordDoctor = useCallback(async () => {
+    setDoctorRunning(true);
+    try {
+      const report = await invoke<DoctorReport>("coord_doctor_run");
+      setDoctor(report);
+      const firstFail = report.checks.find((c) => !c.ok);
+      onLog(
+        report.overall_ok ? "success" : "info",
+        report.overall_ok
+          ? "Coord Doctor: all checks passed — this runner can set gates"
+          : `Coord Doctor: '${firstFail?.name ?? "a check"}' failed — ${firstFail?.fix ?? "see report"}`,
+      );
+    } catch (err) {
+      const msg = typeof err === "string" ? err : String(err);
+      onLog("error", `Coord Doctor failed to run: ${msg}`);
+    } finally {
+      setDoctorRunning(false);
+    }
+  }, [onLog]);
 
   const isTier2 = tier === "qontinui_account";
 
@@ -157,6 +207,73 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
         }
         icon={<UserCircle2 />}
       />
+
+      <div className="space-y-3 rounded-lg border border-border bg-card/50 p-4">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+              <Stethoscope className="w-4 h-4" />
+              Coord Doctor
+            </div>
+            <div className="text-xs text-muted-foreground mt-0.5">
+              Diagnose whether this runner can reach coord and set gates — runs 7
+              ordered checks and names the first thing to fix.
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={runCoordDoctor}
+            disabled={doctorRunning}
+            className="inline-flex items-center gap-2 rounded bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors shrink-0"
+          >
+            {doctorRunning ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <Stethoscope className="w-4 h-4" />
+            )}
+            {doctorRunning ? "Running…" : "Run Coord Doctor"}
+          </button>
+        </div>
+
+        {doctor && (
+          <div className="space-y-2">
+            <div
+              className={`text-sm font-medium ${
+                doctor.overall_ok ? "text-green-400" : "text-amber-300"
+              }`}
+            >
+              {doctor.overall_ok
+                ? "All checks passed — this runner can set gates."
+                : "Provisioning incomplete — fix the first failing check below."}
+            </div>
+            <ul className="space-y-1.5">
+              {doctor.checks.map((c) => (
+                <li
+                  key={c.name}
+                  className="flex items-start gap-2 rounded border border-border/60 bg-background/40 p-2 text-xs"
+                >
+                  {c.ok ? (
+                    <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0 text-green-400" />
+                  ) : (
+                    <XCircle className="w-4 h-4 mt-0.5 shrink-0 text-red-400" />
+                  )}
+                  <div className="min-w-0">
+                    <div className="font-mono text-foreground">{c.name}</div>
+                    <div className="text-muted-foreground break-words">
+                      {c.detail}
+                    </div>
+                    {!c.ok && (
+                      <div className="mt-0.5 text-amber-300/90 break-words">
+                        Fix: {c.fix}
+                      </div>
+                    )}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
 
       {flowError && (
         <div className="flex items-start gap-2 rounded border border-red-500/40 bg-red-500/10 p-3 text-sm text-red-200">
