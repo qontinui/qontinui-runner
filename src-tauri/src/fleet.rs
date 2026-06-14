@@ -1015,6 +1015,14 @@ struct TreeStatePayload {
     /// the `rev-list` fails (e.g. `origin/<default>` unresolved locally).
     #[serde(skip_serializing_if = "Option::is_none")]
     behind_default_count: Option<i32>,
+    /// Total count of dirty (porcelain) entries BEFORE the
+    /// MAX_DIRTY_FILES_REPORTED truncation applied to `dirty_files`. Lets
+    /// coord's WIP-attribution clear path distinguish a COMPLETE dirty_files
+    /// list (dirty_total <= reported len) from a capped sample (dirty_total >
+    /// reported len) so it never wrongly clears a still-dirty file dropped from
+    /// the truncated sample. `None` only if status couldn't be determined.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dirty_total: Option<i32>,
 }
 
 /// Maximum number of dirty paths included per row (the column is unbounded
@@ -1134,6 +1142,11 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
         })
         .take(MAX_DIRTY_FILES_REPORTED)
         .collect();
+    // Total dirty entries BEFORE the MAX_DIRTY_FILES_REPORTED truncation,
+    // counted with the SAME entry-recognition predicate (len >= 4) used to
+    // build `dirty_files`. coord compares this against the reported sample
+    // length to know whether the list is complete or capped.
+    let dirty_total_count = status_str.lines().filter(|line| line.len() >= 4).count() as i32;
     let dirty = !dirty_files.is_empty() || !status_str.lines().next().unwrap_or("").is_empty();
 
     // last_edit_at — newest mtime among the dirty files OR (when clean)
@@ -1335,6 +1348,7 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
         untracked_count,
         local_ahead,
         behind_default_count,
+        dirty_total: Some(dirty_total_count),
     })
 }
 
@@ -2807,6 +2821,7 @@ mod tests {
             untracked_count: Some(0),
             local_ahead: Some(0),
             behind_default_count: None,
+            dirty_total: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert!(
@@ -2832,6 +2847,7 @@ mod tests {
             untracked_count: Some(0),
             local_ahead: Some(0),
             behind_default_count: Some(42),
+            dirty_total: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
