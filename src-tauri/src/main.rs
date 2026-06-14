@@ -2251,6 +2251,25 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 let poll_lifecycle_store = lifecycle_store.clone();
                 app.manage(lifecycle_store);
 
+                // VT output sanitizer: terminal output is UNTRUSTED (whatever a
+                // child process / remote host / `cat`'d file emits). This hook
+                // runs FIRST on every PTY chunk — before the grid parser, the
+                // scrollback tee, and the frontend emit — and strips OSC 52
+                // (clipboard set/query, the headline security fix) and scrubs
+                // control bytes out of OSC 0/1/2 (title) + OSC 8 (hyperlink)
+                // payloads, while passing everything else (OSC 633 shell
+                // integration, DEC ?2026 sync output, SGR/colors, bracketed
+                // paste, …) through untouched. See `terminal::vt_sanitize`.
+                //
+                // Default-ON; set env `QONTINUI_TERMINAL_SANITIZE=0|false|off`
+                // to disable (e.g. to inspect a raw stream for debugging) — in
+                // that case the hook is simply not registered.
+                if terminal::vt_sanitize::sanitize_enabled() {
+                    term_for_session.interceptor().add_hook(Box::new(
+                        terminal::vt_sanitize::VtSanitizeHook::new(),
+                    ));
+                }
+
                 // Usage-limit watcher: every terminal PTY's output flows
                 // through the interceptor pipeline; this hook spots the
                 // Claude CLI's token-exhaustion messages and hands the
