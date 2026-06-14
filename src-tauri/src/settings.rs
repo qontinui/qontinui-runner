@@ -142,29 +142,11 @@ impl Default for BackoffConfig {
     }
 }
 
-/// One fleet-configured auto-response rule (fetch/cache wire shape).
-///
-/// Rules are fetched from the qontinui-web backend (device-JWT auth) and cached
-/// locally; this struct is ONLY that wire/cache shape — it is not part of the
-/// runner's persisted `Settings`. The server seeds and owns the rule set (the
-/// recovery rule for the transient "Server is temporarily limiting requests"
-/// rate-limit message ships server-side), so the runner never defaults a rule.
-/// When `pattern` (a regex) matches a live session's ANSI-stripped output, the
-/// runner submits `prompt` back into that session after the rule's `backoff`.
-/// Only `enabled` rules are acted on (the backend only returns enabled rules,
-/// so `enabled` defaults to `true`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AutoResponseRule {
-    pub id: String,
-    #[serde(default)]
-    pub name: String,
-    pub pattern: String,
-    pub prompt: String,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default)]
-    pub backoff: BackoffConfig,
-}
+// NOTE: the old `AutoResponseRule` wire/cache struct was removed in Phase 4
+// (unified-automation). The rule source moved from the qontinui-web backend to
+// coord, whose projection (`FleetRule` with a tagged `action`) lives in
+// `terminal::auto_response_fleet`. `BackoffConfig` (above) is still the shared
+// backoff shape consumed by that projection.
 
 /// Settings for Claude API (direct HTTP calls)
 #[derive(Debug, Clone, Serialize, Deserialize)]
