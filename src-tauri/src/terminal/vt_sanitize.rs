@@ -52,6 +52,19 @@ const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
 const ST_FINAL: u8 = b'\\'; // the `\` of a String Terminator (ESC \)
 
+/// Cap on the bytes we hold for a single in-progress (not-yet-terminated)
+/// escape sequence. Real OSC/CSI sequences are tiny (a title, a hyperlink, a
+/// base64 clipboard blob); only pathological or non-VT input — e.g. `cat`-ing a
+/// binary file, which routinely contains a lone `ESC [`/`ESC ]` followed by a
+/// long run of non-terminator bytes — would accumulate past this. Without the
+/// cap the per-terminal carry could grow unboundedly (a memory-DoS surface that
+/// this hook, processing UNTRUSTED output, would otherwise introduce). On
+/// overflow we FLUSH the buffered bytes as pass-through (see `process`): that
+/// matches the pre-hook behavior for binary garbage (no data loss / no
+/// regression), and an unterminated, over-cap OSC 52 still cannot set the
+/// clipboard — xterm caps OSC payloads too, so the strip guarantee holds.
+const MAX_PENDING: usize = 1 << 20; // 1 MiB
+
 /// Default-ON env gate (mirrors `commit_report::report_enabled`). Any of
 /// `0` / `false` / `off` (case-insensitive) disables sanitization; anything
 /// else (including unset) leaves it ON. Read once at hook construction in
@@ -109,8 +122,22 @@ impl OutputHook for VtSanitizeHook {
 
         let entry = carries.entry(terminal_id.to_string()).or_default();
         let pending = std::mem::take(&mut entry.pending);
-        let (out, new_pending) = sanitize_chunk(&pending, data);
-        entry.pending = new_pending;
+        let (mut out, new_pending) = sanitize_chunk(&pending, data);
+        if new_pending.len() > MAX_PENDING {
+            // Pathologically long unterminated sequence (e.g. binary `cat`).
+            // Flush as pass-through to bound memory; reset to ground. See
+            // `MAX_PENDING` for why this preserves both the no-regression and
+            // the no-leak properties.
+            tracing::debug!(
+                terminal_id,
+                len = new_pending.len(),
+                "vt_sanitize: flushing over-cap unterminated sequence as pass-through"
+            );
+            out.extend_from_slice(&new_pending);
+            entry.pending = Vec::new();
+        } else {
+            entry.pending = new_pending;
+        }
         out
     }
 }
@@ -647,5 +674,21 @@ mod tests {
         // default-unset branch via a name that won't be set.)
         std::env::remove_var("QONTINUI_TERMINAL_SANITIZE");
         assert!(sanitize_enabled());
+    }
+
+    #[test]
+    fn over_cap_unterminated_sequence_is_flushed_not_unbounded() {
+        let hook = VtSanitizeHook::new();
+        // An OSC 52 that never terminates, longer than MAX_PENDING. Without the
+        // cap this would accumulate without bound in the per-terminal carry
+        // (the realistic trigger is `cat`-ing a binary file).
+        let mut data = b"\x1b]52;c;".to_vec();
+        data.resize(data.len() + MAX_PENDING + 1024, b'A');
+        let out = hook.process("t1", &data);
+        // Over-cap → flushed as pass-through (bounded memory), not silently eaten.
+        assert!(!out.is_empty());
+        // Carry was reset to ground: a subsequent plain write emits verbatim and
+        // is NOT swallowed as a continuation of the abandoned sequence.
+        assert_eq!(hook.process("t1", b"hello\n"), b"hello\n");
     }
 }
