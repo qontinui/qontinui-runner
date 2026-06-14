@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Settings as SettingsIcon, FileText } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
+import { useAdvancedAutomation } from "@/contexts/AdvancedAutomationContext";
 import type { AppSettings, LogFunction } from "./types";
 
 interface TauriResult<T> {
@@ -37,6 +38,11 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
   // solution for overnight scheduled tasks: the OS auto-starts the runner at
   // login, so scheduled tasks fire even if the user closed the runner.
   const [autostartEnabled, setAutostartEnabled] = useState<boolean>(false);
+
+  // "Show advanced automation features" — persisted in localStorage via the
+  // AdvancedAutomationContext and consumed reactively by the Sidebar, which
+  // calls setShowHiddenItems() to reveal the workflow-authoring nav items.
+  const { showAdvancedAutomation, setShowAdvancedAutomation } = useAdvancedAutomation();
 
   const loadAppSettings = async () => {
     try {
@@ -140,6 +146,12 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
     }
   };
 
+  const handleToggleShowAdvancedAutomation = () => {
+    const newValue = !showAdvancedAutomation;
+    setShowAdvancedAutomation(newValue);
+    onLog("success", `Advanced automation features ${newValue ? "shown" : "hidden"}`);
+  };
+
   const handleToggleIncludeSummaryStep = async () => {
     const newValue = !includeSummaryStep;
     setIncludeSummaryStep(newValue);
@@ -235,6 +247,29 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
         </h4>
 
         <div className="space-y-2">
+          <label className="flex items-center justify-between cursor-pointer p-3 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
+            <div className="space-y-1">
+              <div className="text-sm font-medium">Show advanced automation features</div>
+              <div className="text-xs text-muted-foreground">
+                Reveals the workflow-authoring tools (Workflow Builder, DAG Editor, Orchestration
+                loop, Step Builders) in the sidebar. The Terminal is the primary way to run AI work;
+                these are advanced surfaces for building reusable, gated, scheduled workflows.
+              </div>
+            </div>
+            <button
+              onClick={handleToggleShowAdvancedAutomation}
+              className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                showAdvancedAutomation ? "bg-primary" : "bg-muted"
+              }`}
+            >
+              <span
+                className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                  showAdvancedAutomation ? "translate-x-4" : "translate-x-1"
+                }`}
+              />
+            </button>
+          </label>
+
           <label className="flex items-center justify-between cursor-pointer p-3 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
             <div className="space-y-1">
               <div className="text-sm font-medium">Include AI Summary in New Workflows</div>

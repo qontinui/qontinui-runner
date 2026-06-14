@@ -108,6 +108,7 @@ import {
   getRunnerNavigation,
   getChildrenForPlatform,
   setProductMode,
+  setShowHiddenItems,
   STORAGE_KEYS,
   createInitialState,
   navigationReducer,
@@ -118,6 +119,7 @@ import {
   useNavigationItem,
 } from "@qontinui/navigation";
 import { useProductMode, type ProductMode } from "@/contexts/ProductModeContext";
+import { useAdvancedAutomation } from "@/contexts/AdvancedAutomationContext";
 
 // ============================================================================
 // Icon Mapping
@@ -842,11 +844,18 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
   // Product mode filtering
   const { mode: productMode, setMode: setProductModeState } = useProductMode();
 
-  // Sync product mode to shared navigation package and rebuild groups
+  // "Show advanced automation features" — reveals the workflow-authoring nav
+  // items flagged `hidden: true` in @qontinui/navigation when enabled.
+  const { showAdvancedAutomation } = useAdvancedAutomation();
+
+  // Sync product mode + hidden-item visibility to shared navigation package and
+  // rebuild groups. Both must run before buildNavigationGroups() so the freshly
+  // built groups reflect the current toggle states.
   const navigationGroups = useMemo(() => {
     setProductMode(productMode);
+    setShowHiddenItems(showAdvancedAutomation);
     return buildNavigationGroups();
-  }, [productMode]);
+  }, [productMode, showAdvancedAutomation]);
 
   // Flyout state
   const [openFlyout, setOpenFlyout] = useState<{
