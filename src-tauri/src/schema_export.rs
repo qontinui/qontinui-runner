@@ -33,12 +33,13 @@ use serde_json::{Map, Value};
 /// canonical types directly so there is no duplication.
 pub fn export_all_schemas() -> Value {
     use qontinui_types::{
-        accessibility as qa, ai_workflows as qaw, app_events as qae, apps as qap, config as qcfg,
-        constraints as qc, discovery as qdc, execution as qe, findings as qfn, geometry as qg,
-        git_ops as qgo, ir as qir, mcp_config as qmc, memory as qmem, orchestration_config as qoc,
-        process_management as qpm, rag as qr, runner as qrn, scheduler as qs,
-        spec_api_events as qsae, spec_check as qsc, state_machine as qsm, targets as qt,
-        task_run as qtr, terminal as qtm, ticket_system as qts, tree_events as qte,
+        accessibility as qa, ai_workflows as qaw, app_events as qae, apps as qap,
+        completeness_verdict as qcv, config as qcfg, constraints as qc, discovery as qdc,
+        execution as qe, findings as qfn, functional_spec as qfs, geometry as qg, git_ops as qgo,
+        ir as qir, mcp_config as qmc, memory as qmem, orchestration_config as qoc,
+        priorities_profile as qpp, process_management as qpm, rag as qr, runner as qrn,
+        scheduler as qs, spec_api_events as qsae, spec_check as qsc, state_machine as qsm,
+        targets as qt, task_run as qtr, terminal as qtm, ticket_system as qts, tree_events as qte,
         ui_bridge as qub, verification as qv, worker_output as qwo, workflow as qw,
         workflow_step as qws,
     };
@@ -690,6 +691,43 @@ pub fn export_all_schemas() -> Value {
     add!("ConjunctEvaluation", qsc::ConjunctEvaluation);
     add!("PolicyStatus", qsc::PolicyStatus);
 
+    // ── qontinui-types: functional_spec / priorities_profile / completeness_verdict
+    // (functional-spec-contract keystone — 2026-06-13-functional-spec-contract.md).
+    // Three frozen v0 artifacts: the backend-agnostic Functional Spec (Artifact 1),
+    // the Priorities Profile (Artifact 3), and the Completeness Rubric/Verdict
+    // (Artifact 2). The spec's ui_states/navigation reuse qir::{IrState, IrTransition}
+    // (registered above), and CompletenessVerdict embeds qsc::SpecCheckResult for the
+    // UI dimension — those nested types are NOT re-registered here. `SpecProvenance`
+    // is named distinctly so it does not collide with the two existing `Confidence`
+    // titles. ──
+    // Artifact 1 — Functional Spec (13)
+    add!("FunctionalSpec", qfs::FunctionalSpec);
+    add!("SpecTarget", qfs::SpecTarget);
+    add!("SpecProvenance", qfs::SpecProvenance);
+    add!("Entity", qfs::Entity);
+    add!("EntityField", qfs::EntityField);
+    add!("Relationship", qfs::Relationship);
+    add!("Operation", qfs::Operation);
+    add!("OperationInput", qfs::OperationInput);
+    add!("ValidationRule", qfs::ValidationRule);
+    add!("OperationEffect", qfs::OperationEffect);
+    add!("AuthModel", qfs::AuthModel);
+    add!("AuthRole", qfs::AuthRole);
+    add!("AssumptionEntry", qfs::AssumptionEntry);
+    // Artifact 3 — Priorities Profile (5)
+    add!("Profile", qpp::Profile);
+    add!("BackendProfile", qpp::BackendProfile);
+    add!("ApiStyle", qpp::ApiStyle);
+    add!("ArchitectureProfile", qpp::ArchitectureProfile);
+    add!("EnforcementProfile", qpp::EnforcementProfile);
+    // Artifact 2 — Completeness Rubric / Verdict (6)
+    add!("CompletenessVerdict", qcv::CompletenessVerdict);
+    add!("SectionVerdict", qcv::SectionVerdict);
+    add!("SpecSection", qcv::SpecSection);
+    add!("ProvenanceMix", qcv::ProvenanceMix);
+    add!("CoverageGap", qcv::CoverageGap);
+    add!("GapReason", qcv::GapReason);
+
     // ── qontinui-types: spec_api_events (Plan 06 broadcast taxonomy) ──
     add!("SpecApiEvent", qsae::SpecApiEvent);
 
@@ -801,7 +839,7 @@ mod tests {
             obj.contains_key("SpecApiEvent"),
             "Missing SpecApiEvent schema (Plan 06)"
         );
-        assert_eq!(obj.len(), 499, "Expected 499 schema entries");
+        assert_eq!(obj.len(), 523, "Expected 523 schema entries");
 
         // Sanity-check that qontinui_types re-exports are present
         assert!(
