@@ -269,6 +269,14 @@ path = "src/bin/qontinui_specs.rs"
 name = "qontinui-git-credential"
 path = "src/bin/qontinui_git_credential.rs"
 
+# `coord doctor` headless self-check (plan 2026-06-13 Phase 4). Reuses the
+# lib-crate `coord_doctor` module (driver + 7-check wiring) so it produces the
+# same report as the in-app Tauri command. Runnable on any machine to diagnose
+# "no credentials / can't set gates" with the one failing link + its fix.
+[[bin]]
+name = "coord_doctor"
+path = "src/bin/coord_doctor.rs"
+
 # Install-interception Windows `.exe` shadow stub (plan §6). The materializer
 # copies this binary into the per-terminal shim dir as cargo.exe/pip.exe/pip3.exe
 # so it can shadow the real `.exe` under PowerShell/cmd (a `.cmd` cannot — `.EXE`

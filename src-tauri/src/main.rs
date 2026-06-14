@@ -45,6 +45,7 @@ mod config_storage;
 mod constraint_engine;
 mod container;
 mod context;
+mod coord_doctor_cmd;
 mod coord_http;
 mod coord_mcp;
 mod coord_questions;
@@ -1165,6 +1166,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::cost_dashboard::get_active_budget_status,
             commands::cost_dashboard::get_cost_dashboard,
             crash_dumps::dismiss_recent_crash,
+            coord_doctor_cmd::coord_doctor_run,
+            coord_doctor_cmd::coord_doctor_text,
             commands::dag_workflows::export_dag_workflow,
             commands::dag_workflows::import_dag_workflow,
             commands::dag_workflows::import_dag_workflows_from_project,

@@ -68,6 +68,15 @@ struct StoredTokens {
     oauth_refresh_token: Option<String>,
     #[serde(default)]
     oauth_expires_at: Option<i64>,
+    /// Persisted coord-mcp loopback proxy nonces: nonce → workdir it was
+    /// provisioned into (plan 2026-06-13 Phase 3b). The nonce is a
+    /// **loopback-only** proxy key (127.0.0.1) — NOT a bearer — so persisting it
+    /// at rest leaks nothing exploitable off-box, and it is the only way an
+    /// already-running agent's already-read `.mcp.json` keeps validating across a
+    /// runner rebuild/restart (the MCP client never re-reads the file). Carries
+    /// `#[serde(default)]` so a pre-Phase-3b `.enc` deserializes.
+    #[serde(default)]
+    coord_mcp_nonces: std::collections::HashMap<String, String>,
 }
 
 /// Secure file-based storage manager.
@@ -358,6 +367,32 @@ impl SecureStorage {
         self.save_tokens(&tokens)?;
         info!("Cognito (oauth) tokens cleared from secure file storage");
         Ok(())
+    }
+
+    /// Persist the full coord-mcp loopback proxy nonce map (nonce → workdir),
+    /// replacing any prior persisted set (plan 2026-06-13 Phase 3b). Called by
+    /// the in-memory `PROXY_NONCES` registry on every mint/eviction so the
+    /// durable copy tracks the live set. Best-effort: a write failure is
+    /// surfaced to the caller, which logs and continues (the in-memory map
+    /// remains authoritative for this process lifetime).
+    pub fn store_coord_mcp_nonces(
+        &self,
+        nonces: &std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        let mut tokens = self.load_tokens().unwrap_or_default();
+        tokens.coord_mcp_nonces = nonces.clone();
+        self.save_tokens(&tokens)?;
+        Ok(())
+    }
+
+    /// Load the persisted coord-mcp loopback proxy nonce map (nonce → workdir).
+    /// Returns an empty map when the store is absent / unreadable / pre-Phase-3b
+    /// — a missing nonce simply 401s and the next provisioning re-mints, so an
+    /// empty restore is the safe default (today's in-memory-only behavior).
+    pub fn load_coord_mcp_nonces(&self) -> std::collections::HashMap<String, String> {
+        self.load_tokens()
+            .map(|t| t.coord_mcp_nonces)
+            .unwrap_or_default()
     }
 
     /// Deletes the storage file entirely.
