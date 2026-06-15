@@ -751,6 +751,283 @@ async fn coord_claims_by_resource_handler(
     coord_claims_read_proxy_handler(ClaimsReadTarget::ByResource, headers, raw_query).await
 }
 
+/// The two — and ONLY two — coord WRITE routes the nonce-gated device-JWT
+/// forwarder may reach (plan 2026-06-15-coord-mcp-live-token-write-forwarder,
+/// Phase 1). The write sibling of [`ClaimsReadTarget`].
+///
+/// Deliberately a closed enum carrying a *validated* dynamic segment rather
+/// than a free path parameter, for exactly the security boundary documented on
+/// [`ClaimsReadTarget`] at mcp_api.rs:559-567: the per-session proxy nonce
+/// authenticates a *session*, not an operator, so its authority must stay
+/// scoped to these two device-authed write endpoints. A generic
+/// `/coord-mcp/proxy/{path}` POST passthrough would let a leaked nonce reach
+/// any coord write route with the runner's device identity — arbitrary paths
+/// must be structurally impossible, not merely unrouted. The dynamic segment
+/// (`slug` / `gate_id`) is validated to a safe charset before any URL is built,
+/// so it can never smuggle a path (`..`, `/`, `%2f`, …) past the fixed route
+/// template.
+///
+/// Note: coord's continuation-cancel route is operator/`TenantId`-only (not
+/// device-authed), so it is deliberately excluded — a `ContinuationCancel`
+/// variant would never authenticate through this device-JWT path anyway.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CoordWriteTarget {
+    /// `POST {coord}/coord/plans/{slug}/register-gate`
+    RegisterPlanGate { slug: String },
+    /// `POST {coord}/coord/gates/{gate_id}/attest`
+    AttestGate { gate_id: String },
+}
+
+/// A coord plan slug stem: lowercase alphanumeric + hyphens, must start with an
+/// alphanumeric (`^[a-z0-9][a-z0-9-]*$`). Rejects `/`, `.`, `%`, whitespace, and
+/// uppercase, so a slug can never carry a path separator or escape sequence into
+/// the fixed coord route template.
+fn slug_is_valid(slug: &str) -> bool {
+    let mut chars = slug.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// A coord gate id: a canonical UUID (8-4-4-4-12 hex, length 36). Parsed via the
+/// `uuid` crate (already a dependency) so only a real UUID — never a path
+/// fragment — can reach the fixed `/coord/gates/{gate_id}/attest` template.
+fn gate_id_is_valid(gate_id: &str) -> bool {
+    uuid::Uuid::parse_str(gate_id).is_ok()
+}
+
+impl CoordWriteTarget {
+    /// Validate the dynamic segment. Returns `Err((status, code, msg))` on a bad
+    /// shape so the caller can emit a runner-originated 400 (the segment is
+    /// rejected before any coord URL is built — a bad path can never be smuggled).
+    fn validate(&self) -> Result<(), (u16, &'static str, String)> {
+        match self {
+            CoordWriteTarget::RegisterPlanGate { slug } => {
+                if slug_is_valid(slug) {
+                    Ok(())
+                } else {
+                    Err((
+                        400,
+                        "COORD_WRITE_PROXY_BAD_TARGET",
+                        format!("invalid plan slug: {slug:?}"),
+                    ))
+                }
+            }
+            CoordWriteTarget::AttestGate { gate_id } => {
+                if gate_id_is_valid(gate_id) {
+                    Ok(())
+                } else {
+                    Err((
+                        400,
+                        "COORD_WRITE_PROXY_BAD_TARGET",
+                        format!("invalid gate id (must be a UUID): {gate_id:?}"),
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// Build the upstream coord URL for a write: a FIXED coord route template with
+/// the (already-validated) dynamic segment interpolated. The constant template
+/// is the whole point — the validated charset means plain interpolation cannot
+/// alter the path structure.
+///
+/// Callers MUST have called [`CoordWriteTarget::validate`] first (the handler
+/// does); this builder assumes the segment is already safe.
+fn write_upstream_url(base: &str, target: &CoordWriteTarget) -> String {
+    let base = base.trim_end_matches('/');
+    match target {
+        CoordWriteTarget::RegisterPlanGate { slug } => {
+            format!("{base}/coord/plans/{slug}/register-gate")
+        }
+        CoordWriteTarget::AttestGate { gate_id } => {
+            format!("{base}/coord/gates/{gate_id}/attest")
+        }
+    }
+}
+
+/// `POST /coord-mcp/gates/register-plan/{slug}` +
+/// `POST /coord-mcp/gates/{gate_id}/attest` — the nonce-gated device-JWT WRITE
+/// forwarder for device-provisioned sessions (plan
+/// 2026-06-15-coord-mcp-live-token-write-forwarder, Phase 1).
+///
+/// Why: a device session's `.mcp.json` carries no bearer anymore (live-token
+/// proxy, runner #546) — only the per-session loopback nonce. The plan-ready
+/// and gate-attest flows need to POST against coord's two device-authed write
+/// routes, so this lets those callers reuse the nonce: same gate, same live
+/// `AuthManager` device-JWT injection, same coord-base resolution as
+/// `coord_mcp_proxy_handler`, but restricted to the two write routes in
+/// [`CoordWriteTarget`] with a validated dynamic segment.
+///
+/// Gate (`coord_mcp::proxy_request_gate`, 401 before any network I/O):
+/// registered `X-Coord-Mcp-Proxy-Key` nonce AND the live bearer decodes
+/// `sub_type == "device"` — absent/wrong nonce or a missing/non-device token
+/// means the request is NEVER forwarded to coord.
+///
+/// Coord's response status + body are returned verbatim (no reshaping) so the
+/// caller sees exactly what coord said; runner-originated failures use the
+/// distinct `COORD_WRITE_PROXY_*` codes so they can't be mistaken for a coord
+/// verdict.
+async fn coord_write_proxy_handler(
+    target: CoordWriteTarget,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let nonce = headers
+        .get(crate::coord_mcp::COORD_MCP_PROXY_KEY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
+    // Live read — the same fresh device JWT the `/coord-mcp` proxy injects.
+    // AuthManager does filesystem I/O, so keep it off the async executor.
+    let bearer =
+        tokio::task::spawn_blocking(|| crate::auth::AuthManager::new().get_access_token().ok())
+            .await
+            .ok()
+            .flatten();
+
+    if let Err((status, msg)) =
+        crate::coord_mcp::proxy_request_gate(nonce.as_deref(), bearer.as_deref())
+    {
+        warn!("coord-mcp write proxy: {msg}");
+        return (
+            axum::http::StatusCode::from_u16(status)
+                .unwrap_or(axum::http::StatusCode::UNAUTHORIZED),
+            Json(serde_json::json!({
+                "success": false,
+                "error": msg,
+                "code": "COORD_WRITE_PROXY_UNAUTHORIZED",
+            })),
+        )
+            .into_response();
+    }
+    let bearer = bearer.unwrap_or_default(); // gate guarantees Some(non-empty)
+
+    // Validate the dynamic segment BEFORE building any coord URL — a bad shape
+    // is a runner-originated 400, never forwarded.
+    if let Err((status, code, msg)) = target.validate() {
+        warn!("coord-mcp write proxy: {msg}");
+        return (
+            axum::http::StatusCode::from_u16(status).unwrap_or(axum::http::StatusCode::BAD_REQUEST),
+            Json(serde_json::json!({
+                "success": false,
+                "error": msg,
+                "code": code,
+            })),
+        )
+            .into_response();
+    }
+
+    let url = write_upstream_url(&crate::coord_mcp::coord_base_url(), &target);
+    forward_coord_write_post(&url, &bearer, body).await
+}
+
+/// Forward a write POST to coord and return coord's status + headers + body
+/// verbatim. Split from the handler (URL + bearer + body as plain params, no
+/// `AuthManager`/env reads) so the forwarding leg is unit-testable against a
+/// local mock coord with a synthetic bearer — the live credential lives in the
+/// encrypted `AuthManager` slot, which a unit test cannot seed.
+async fn forward_coord_write_post(
+    url: &str,
+    bearer: &str,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    // Shared client: connect fast-fail like the claims proxy client, with a
+    // short overall timeout — these are bounded REST writes (a caller sits on
+    // the response), not long-running MCP tool calls.
+    static COORD_WRITE_PROXY_CLIENT: std::sync::OnceLock<reqwest::Client> =
+        std::sync::OnceLock::new();
+    let client = COORD_WRITE_PROXY_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("coord write proxy reqwest client")
+    });
+
+    let upstream = match client
+        .post(url)
+        .bearer_auth(bearer)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(body.to_vec())
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            warn!("coord-mcp write proxy: forward to {url} failed: {e}");
+            return (
+                axum::http::StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("coord write endpoint unreachable: {e}"),
+                    "code": "COORD_WRITE_PROXY_UPSTREAM_UNREACHABLE",
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let status = upstream.status().as_u16();
+    let mut builder = axum::http::Response::builder()
+        .status(axum::http::StatusCode::from_u16(status).unwrap_or(axum::http::StatusCode::OK));
+    for (name, value) in upstream.headers() {
+        if matches!(
+            name.as_str(),
+            "content-length" | "transfer-encoding" | "connection"
+        ) {
+            continue;
+        }
+        builder = builder.header(name.as_str(), value.as_bytes());
+    }
+    let bytes = match upstream.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("coord-mcp write proxy: reading coord response body failed: {e}");
+            return (
+                axum::http::StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("coord write response read failed: {e}"),
+                    "code": "COORD_WRITE_PROXY_UPSTREAM_READ_FAILED",
+                })),
+            )
+                .into_response();
+        }
+    };
+    builder
+        .body(axum::body::Body::from(bytes))
+        .unwrap_or_else(|e| {
+            warn!("coord-mcp write proxy: response build failed: {e}");
+            axum::http::StatusCode::BAD_GATEWAY.into_response()
+        })
+}
+
+/// `POST /coord-mcp/gates/register-plan/{slug}` — see [`coord_write_proxy_handler`].
+async fn coord_register_plan_gate_handler(
+    axum::extract::Path(slug): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    coord_write_proxy_handler(CoordWriteTarget::RegisterPlanGate { slug }, headers, body).await
+}
+
+/// `POST /coord-mcp/gates/{gate_id}/attest` — see [`coord_write_proxy_handler`].
+async fn coord_attest_gate_handler(
+    axum::extract::Path(gate_id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    coord_write_proxy_handler(CoordWriteTarget::AttestGate { gate_id }, headers, body).await
+}
+
 /// Create the API router
 pub fn create_router(
     app_state: Arc<AppState>,
@@ -2110,6 +2387,20 @@ pub fn create_router(
             "/coord-mcp/claims/by-resource",
             get(coord_claims_by_resource_handler),
         )
+        // Nonce-gated device-JWT WRITE forwarder for device sessions
+        // (plan 2026-06-15-coord-mcp-live-token-write-forwarder Phase 1).
+        // Same gate + live device-JWT injection as /coord-mcp, but allowlisted
+        // to EXACTLY these two device-authed coord write routes with a validated
+        // dynamic segment — never a generic path passthrough (see
+        // `CoordWriteTarget`).
+        .route(
+            "/coord-mcp/gates/register-plan/{slug}",
+            post(coord_register_plan_gate_handler),
+        )
+        .route(
+            "/coord-mcp/gates/{gate_id}/attest",
+            post(coord_attest_gate_handler),
+        )
         // Relay web-integration diagnostic — exposes the idle-gating state
         // (tier, enabled, device-JWT presence, WS connection, last error) so
         // an operator can see WHY a runner never appears to the cloud/mobile.
@@ -2753,6 +3044,292 @@ mod coord_claims_proxy_tests {
         let v = body_json(resp).await;
         assert_eq!(v["success"], false);
         assert_eq!(v["code"], "COORD_CLAIMS_PROXY_UPSTREAM_UNREACHABLE");
+    }
+}
+
+/// Nonce-gated device-JWT WRITE forwarder (plan
+/// 2026-06-15-coord-mcp-live-token-write-forwarder, Phase 1).
+///
+/// Same shape as `coord_claims_proxy_tests`: the gate's 401 paths are asserted
+/// through the real route handlers (missing/wrong nonce — never forwarded; the
+/// 401 is produced before any upstream I/O, structurally guaranteed by
+/// `coord_mcp::proxy_request_gate` running first and separately unit-tested in
+/// `coord_mcp::tests`). The dynamic-segment validators and the URL builder are
+/// pure functions tested directly. The forwarding leg cannot be exercised
+/// end-to-end through the route (the live device bearer comes from the encrypted
+/// `AuthManager` slot, not seedable in a unit test), so it is tested through the
+/// `forward_coord_write_post` seam against a local mock coord with a synthetic
+/// bearer — covering live-bearer injection, JSON content-type, verbatim body
+/// forwarding, and verbatim status+body passthrough including non-200 verdicts.
+#[cfg(test)]
+mod coord_write_proxy_tests {
+    use super::{
+        coord_attest_gate_handler, coord_register_plan_gate_handler, forward_coord_write_post,
+        gate_id_is_valid, slug_is_valid, write_upstream_url, CoordWriteTarget,
+    };
+    use axum::{body::Body, http::Request, routing::post, Router};
+    use tower::ServiceExt;
+
+    // Concrete route templates (axum 0.8 `{param}` form) registered in the real router.
+    const WRITE_ROUTES: &[&str] = &[
+        "/coord-mcp/gates/register-plan/{slug}",
+        "/coord-mcp/gates/{gate_id}/attest",
+    ];
+    // Concrete request paths used to hit those routes in tests.
+    const WRITE_REQUEST_PATHS: &[&str] = &[
+        "/coord-mcp/gates/register-plan/2026-06-15-some-plan",
+        "/coord-mcp/gates/123e4567-e89b-12d3-a456-426614174000/attest",
+    ];
+
+    fn write_router() -> Router {
+        Router::new()
+            .route(WRITE_ROUTES[0], post(coord_register_plan_gate_handler))
+            .route(WRITE_ROUTES[1], post(coord_attest_gate_handler))
+    }
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// The slug validator: accepts a real plan stem, rejects path-smuggling and
+    /// out-of-charset shapes.
+    #[test]
+    fn slug_validator_accepts_plan_stems_rejects_path_smuggling() {
+        assert!(slug_is_valid("2026-06-15-some-plan"));
+        assert!(slug_is_valid("a"));
+        assert!(slug_is_valid("plan-1"));
+        // Rejections: path separators, dot-dot, uppercase, percent-encoding,
+        // whitespace, empty, leading hyphen.
+        assert!(!slug_is_valid("../etc"));
+        assert!(!slug_is_valid("a/b"));
+        assert!(!slug_is_valid("A"));
+        assert!(!slug_is_valid("a%2f"));
+        assert!(!slug_is_valid("a.b"));
+        assert!(!slug_is_valid("a b"));
+        assert!(!slug_is_valid(""));
+        assert!(!slug_is_valid("-leading"));
+    }
+
+    /// The gate-id validator: accepts a canonical UUID, rejects anything else.
+    #[test]
+    fn gate_id_validator_accepts_uuid_rejects_non_uuid() {
+        assert!(gate_id_is_valid("123e4567-e89b-12d3-a456-426614174000"));
+        assert!(!gate_id_is_valid("not-a-uuid"));
+        assert!(!gate_id_is_valid("123e4567-e89b-12d3-a456")); // too short
+        assert!(!gate_id_is_valid("../../etc/passwd"));
+        assert!(!gate_id_is_valid(""));
+    }
+
+    /// The upstream URL is built from the closed enum's FIXED route template
+    /// with the validated dynamic segment interpolated — and no double slash on
+    /// a trailing-slash base.
+    #[test]
+    fn write_upstream_url_builds_fixed_coord_routes() {
+        assert_eq!(
+            write_upstream_url(
+                "https://coord.example.test",
+                &CoordWriteTarget::RegisterPlanGate {
+                    slug: "2026-06-15-some-plan".to_string()
+                },
+            ),
+            "https://coord.example.test/coord/plans/2026-06-15-some-plan/register-gate"
+        );
+        assert_eq!(
+            write_upstream_url(
+                "https://coord.example.test/",
+                &CoordWriteTarget::AttestGate {
+                    gate_id: "123e4567-e89b-12d3-a456-426614174000".to_string()
+                },
+            ),
+            "https://coord.example.test/coord/gates/123e4567-e89b-12d3-a456-426614174000/attest"
+        );
+    }
+
+    /// `validate()` returns the runner-originated 400 code for a bad segment and
+    /// `Ok` for a good one.
+    #[test]
+    fn target_validate_rejects_bad_segments() {
+        assert!(CoordWriteTarget::RegisterPlanGate {
+            slug: "2026-06-15-some-plan".to_string()
+        }
+        .validate()
+        .is_ok());
+        let err = CoordWriteTarget::RegisterPlanGate {
+            slug: "../etc".to_string(),
+        }
+        .validate()
+        .unwrap_err();
+        assert_eq!(err.0, 400);
+        assert_eq!(err.1, "COORD_WRITE_PROXY_BAD_TARGET");
+
+        assert!(CoordWriteTarget::AttestGate {
+            gate_id: "123e4567-e89b-12d3-a456-426614174000".to_string()
+        }
+        .validate()
+        .is_ok());
+        let err = CoordWriteTarget::AttestGate {
+            gate_id: "not-a-uuid".to_string(),
+        }
+        .validate()
+        .unwrap_err();
+        assert_eq!(err.0, 400);
+        assert_eq!(err.1, "COORD_WRITE_PROXY_BAD_TARGET");
+    }
+
+    /// Absent `X-Coord-Mcp-Proxy-Key` → 401 from the runner with the write
+    /// proxy's own error code, on BOTH routes. The gate runs before any upstream
+    /// I/O (and before segment validation), so nothing is forwarded.
+    #[tokio::test]
+    async fn write_routes_missing_nonce_is_401_never_forwarded() {
+        for path in WRITE_REQUEST_PATHS {
+            let resp = write_router()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(*path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 401, "{path} without a nonce must 401");
+            let v = body_json(resp).await;
+            assert_eq!(v["success"], false);
+            assert_eq!(v["code"], "COORD_WRITE_PROXY_UNAUTHORIZED");
+        }
+    }
+
+    /// A wrong (unregistered) nonce → 401, same code, on BOTH routes.
+    #[tokio::test]
+    async fn write_routes_wrong_nonce_is_401() {
+        for path in WRITE_REQUEST_PATHS {
+            let resp = write_router()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(*path)
+                        .header("X-Coord-Mcp-Proxy-Key", "not-a-registered-nonce")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 401, "{path} with a wrong nonce must 401");
+            let v = body_json(resp).await;
+            assert_eq!(v["success"], false);
+            assert_eq!(v["code"], "COORD_WRITE_PROXY_UNAUTHORIZED");
+        }
+    }
+
+    /// The forwarding leg against a local mock coord: the bearer is injected as
+    /// `Authorization: Bearer <token>`, the body arrives verbatim with a JSON
+    /// content-type, and coord's status + body come back unreshaped — including
+    /// a non-200 coord verdict.
+    #[tokio::test]
+    async fn forward_coord_write_post_injects_bearer_and_passes_through_verbatim() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app: Router = Router::new()
+            .route(
+                "/coord/plans/{slug}/register-gate",
+                post(
+                    |headers: axum::http::HeaderMap, body: axum::body::Bytes| async move {
+                        let auth = headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        let ct = headers
+                            .get("content-type")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        let body = String::from_utf8_lossy(&body).to_string();
+                        axum::Json(serde_json::json!({
+                            "echo_auth": auth,
+                            "echo_ct": ct,
+                            "echo_body": body,
+                        }))
+                    },
+                ),
+            )
+            .route(
+                "/coord/gates/{gate_id}/attest",
+                post(|| async {
+                    (
+                        axum::http::StatusCode::FORBIDDEN,
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        r#"{"detail":"tenant_not_resolved"}"#,
+                    )
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let base = format!("http://{addr}");
+
+        // Happy path: body forwarded verbatim, synthetic bearer + JSON ct injected.
+        let url = write_upstream_url(
+            &base,
+            &CoordWriteTarget::RegisterPlanGate {
+                slug: "2026-06-15-some-plan".to_string(),
+            },
+        );
+        let resp = forward_coord_write_post(
+            &url,
+            "test-device-jwt",
+            axum::body::Bytes::from_static(br#"{"resource_key":"plans/p"}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["echo_auth"], "Bearer test-device-jwt");
+        assert_eq!(v["echo_ct"], "application/json");
+        assert_eq!(v["echo_body"], r#"{"resource_key":"plans/p"}"#);
+
+        // Non-200 coord verdict: status + body verbatim, not reshaped.
+        let url = write_upstream_url(
+            &base,
+            &CoordWriteTarget::AttestGate {
+                gate_id: "123e4567-e89b-12d3-a456-426614174000".to_string(),
+            },
+        );
+        let resp =
+            forward_coord_write_post(&url, "test-device-jwt", axum::body::Bytes::new()).await;
+        assert_eq!(resp.status(), 403);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&bytes).unwrap(),
+            r#"{"detail":"tenant_not_resolved"}"#,
+            "coord's body must come back verbatim"
+        );
+    }
+
+    /// Coord unreachable → 502 from the runner with the distinct upstream code.
+    #[tokio::test]
+    async fn forward_coord_write_post_unreachable_coord_is_502() {
+        // Bind then drop a listener so the port actively refuses connections.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let url = write_upstream_url(
+            &format!("http://127.0.0.1:{port}"),
+            &CoordWriteTarget::RegisterPlanGate {
+                slug: "2026-06-15-some-plan".to_string(),
+            },
+        );
+        let resp =
+            forward_coord_write_post(&url, "test-device-jwt", axum::body::Bytes::new()).await;
+        assert_eq!(resp.status(), 502);
+        let v = body_json(resp).await;
+        assert_eq!(v["success"], false);
+        assert_eq!(v["code"], "COORD_WRITE_PROXY_UPSTREAM_UNREACHABLE");
     }
 }
 
