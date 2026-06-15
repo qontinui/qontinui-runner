@@ -1,0 +1,41 @@
+# Runtime-verification harness (Fork B) for a generated backend — DEFERRED in Phase 1.
+#
+# This compose file is the run target the plan's Phase 1 step 3 calls for: bring the
+# generated backend up against a throwaway postgres under uvicorn so the verify-phase
+# can hit the live endpoint. It is intentionally NOT wired into CI in Phase 1 because
+# the generated handler body is a deterministic stub and no alembic migrations are
+# emitted yet (those are Phase 2/3, LLM-filled). It is checked in as the honest,
+# ready-to-use run scaffold — see ./README.md for what remains before it boots a real
+# server.
+#
+# Usage (once the Phase-2 migration + handler bodies land):
+#   1. Generate + materialize a backend into ./generated/ (see runtime_integration.rs).
+#   2. docker compose -f run/docker-compose.yml up --build
+#   3. The app serves on http://localhost:8000 ; POST /api/v1/devices/pair-confirm.
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: app
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    # No host port published: the app reaches it over the compose network.
+
+  app:
+    build:
+      context: ./generated
+      dockerfile: ../Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/app
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
