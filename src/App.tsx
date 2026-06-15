@@ -74,6 +74,7 @@ import { TerminalPage } from "./components/terminal";
 import { TerminalPageTabBar } from "./components/terminal/TerminalPageTabBar";
 import { SessionRecoveryBanner } from "./components/terminal/SessionRecoveryBanner";
 import { useTerminalPages } from "./components/terminal/useTerminalPages";
+import { useTerminalWindowActions } from "./components/terminal/useTerminalWindowActions";
 import { TerminalPageProvider } from "./components/terminal/TerminalPageContext";
 import { TerminalSessionProvider } from "./components/terminal/contexts";
 import { WindowAssignmentsProvider } from "./components/terminal/contexts/WindowAssignmentsContext";
@@ -155,6 +156,7 @@ function AppContent() {
   } = useAppNavigation();
 
   const terminalPages = useTerminalPages();
+  const { popOutPage } = useTerminalWindowActions();
   const [showReorganize, setShowReorganize] = useState(false);
 
   const handleReorganize = useCallback(
@@ -598,6 +600,7 @@ function AppContent() {
                   onRemovePage={terminalPages.removePage}
                   onRenamePage={terminalPages.renamePage}
                   onReorganize={() => setShowReorganize(true)}
+                  isPinned={terminalPages.isPinned}
                   onPopOut={() => {
                     // Open a new pop-out OS window (same process) that hosts its
                     // own terminal tabs — the visible counterpart to the
@@ -605,6 +608,13 @@ function AppContent() {
                     // created in that window belong to it (window_assignments).
                     void invoke("open_terminal_window", { placement: null }).catch((err) =>
                       console.error("Failed to open pop-out window:", err),
+                    );
+                  }}
+                  onPopOutPage={(pageId) => {
+                    // Detach the whole page (all its terminals + zone layout)
+                    // into its own bound pop-out window.
+                    void popOutPage(pageId).catch((err) =>
+                      console.error("Failed to pop out page:", err),
                     );
                   }}
                 />

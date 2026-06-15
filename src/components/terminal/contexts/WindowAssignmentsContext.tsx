@@ -29,11 +29,20 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { setPageBindings } from "@/lib/pageBindings";
 
 export const MAIN_WINDOW_LABEL = "main";
 
 /** Map of sessionId/terminalId → owning window label. */
 export type SessionOwnerMap = Record<string, string>;
+
+/** Minimal mirror of the Rust `WindowRecord` — only fields the UI needs. */
+interface WindowRecordLite {
+  label: string;
+  kind?: "main" | "pop_out";
+  /** The terminal page this window hosts as a whole (pop-out-page feature). */
+  bound_page?: string | null;
+}
 
 interface WindowAssignmentsValue {
   /** This window's own label ("main" | "term-N"). */
@@ -44,6 +53,10 @@ interface WindowAssignmentsValue {
   ownerOf: (sessionId: string) => string;
   /** Whether a session is owned by THIS window. */
   isOwned: (sessionId: string) => boolean;
+  /** The window hosting a whole detached page, or null when the page is docked. */
+  windowForPage: (pageId: string) => string | null;
+  /** The page THIS window is bound to (pop-out-page windows only), else null. */
+  boundPage: string | null;
 }
 
 function readWindowLabel(): string {
@@ -65,6 +78,16 @@ interface SessionAssignmentChanged {
 
 interface WindowAssignmentsSnapshot {
   session_owner?: SessionOwnerMap;
+  windows?: Record<string, WindowRecordLite>;
+}
+
+/** Derive the `pageId → windowLabel` map from the window registry. */
+function bindingsFromWindows(windows: Record<string, WindowRecordLite>): Record<string, string> {
+  const map: Record<string, string> = {};
+  for (const rec of Object.values(windows)) {
+    if (rec.bound_page) map[rec.bound_page] = rec.label;
+  }
+  return map;
 }
 
 export function WindowAssignmentsProvider({ children }: { children: ReactNode }) {
@@ -72,21 +95,34 @@ export function WindowAssignmentsProvider({ children }: { children: ReactNode })
   // a plain render-safe value).
   const [windowLabel] = useState<string>(readWindowLabel);
   const [assignments, setAssignments] = useState<SessionOwnerMap>({});
+  // `pageId → windowLabel` for pages detached into a pop-out (pop-out-page
+  // feature). Sourced from the Rust window registry; also mirrored to
+  // `localStorage` so `useTerminalPages` can read it synchronously at boot.
+  const [pageBindings, setPageBindingsState] = useState<Record<string, string>>({});
 
   useEffect(() => {
     let mounted = true;
 
-    // Hydrate from the persisted snapshot.
-    invoke<WindowAssignmentsSnapshot>("get_window_assignments")
-      .then((snap) => {
-        if (mounted && snap?.session_owner) setAssignments(snap.session_owner);
-      })
-      .catch(() => {
-        // Command unavailable (older backend) — stay single-window safe.
-      });
+    // Recompute the window registry from the Rust snapshot and refresh both the
+    // in-context state and the synchronous localStorage mirror. Called on mount
+    // and whenever a window opens/closes (those events carry no full registry).
+    const refresh = () =>
+      invoke<WindowAssignmentsSnapshot>("get_window_assignments")
+        .then((snap) => {
+          if (!mounted) return;
+          if (snap?.session_owner) setAssignments(snap.session_owner);
+          const bindings = bindingsFromWindows(snap?.windows ?? {});
+          setPageBindingsState(bindings);
+          setPageBindings(bindings); // sync the localStorage mirror to Rust truth
+        })
+        .catch(() => {
+          // Command unavailable (older backend) — stay single-window safe.
+        });
 
-    // Track moves. "to === main" means the entry is cleared (default rule).
-    const unlistenPromise = listen<SessionAssignmentChanged>(
+    void refresh();
+
+    // Track per-terminal moves. "to === main" means the entry is cleared.
+    const unlistenAssign = listen<SessionAssignmentChanged>(
       "session-assignment-changed",
       (event) => {
         if (!mounted) return;
@@ -103,9 +139,20 @@ export function WindowAssignmentsProvider({ children }: { children: ReactNode })
       },
     );
 
+    // A window opening/closing changes the page-binding map — re-pull the
+    // registry so `windowForPage` (and the mirror) stay current in EVERY window.
+    const unlistenOpened = listen("window-opened", () => {
+      if (mounted) void refresh();
+    });
+    const unlistenClosed = listen("window-closed", () => {
+      if (mounted) void refresh();
+    });
+
     return () => {
       mounted = false;
-      unlistenPromise.then((un) => un()).catch(() => {});
+      unlistenAssign.then((un) => un()).catch(() => {});
+      unlistenOpened.then((un) => un()).catch(() => {});
+      unlistenClosed.then((un) => un()).catch(() => {});
     };
   }, []);
 
@@ -119,9 +166,21 @@ export function WindowAssignmentsProvider({ children }: { children: ReactNode })
     [ownerOf, windowLabel],
   );
 
+  const windowForPage = useCallback(
+    (pageId: string): string | null => pageBindings[pageId] ?? null,
+    [pageBindings],
+  );
+
+  const boundPage = useMemo<string | null>(() => {
+    for (const [pid, label] of Object.entries(pageBindings)) {
+      if (label === windowLabel) return pid;
+    }
+    return null;
+  }, [pageBindings, windowLabel]);
+
   const value = useMemo<WindowAssignmentsValue>(
-    () => ({ windowLabel, assignments, ownerOf, isOwned }),
-    [windowLabel, assignments, ownerOf, isOwned],
+    () => ({ windowLabel, assignments, ownerOf, isOwned, windowForPage, boundPage }),
+    [windowLabel, assignments, ownerOf, isOwned, windowForPage, boundPage],
   );
 
   return (
@@ -142,6 +201,8 @@ export function useWindowAssignments(): WindowAssignmentsValue {
       assignments: {},
       ownerOf: () => MAIN_WINDOW_LABEL,
       isOwned: () => true,
+      windowForPage: () => null,
+      boundPage: null,
     }),
     [],
   );

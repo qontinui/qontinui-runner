@@ -1,5 +1,8 @@
 import { useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { instanceStorage } from "@/lib/instance-storage";
+import { setPageBinding } from "@/lib/pageBindings";
+import { zoneLayoutStorageKey } from "./useZoneLayout";
 
 /**
  * A runner-owned OS window (the main window or a `term-N` pop-out), as
@@ -39,5 +42,39 @@ export function useTerminalWindowActions() {
     return await invoke<RunnerWindowRecord[]>("list_runner_windows");
   }, []);
 
-  return { popOutTab, moveTabToWindow, listWindows };
+  /**
+   * Detach an ENTIRE page into its own pop-out window (the "pop out page"
+   * feature). Opens a window BOUND to `pageId` (so its terminals are claimed by
+   * page, survive restarts, and vanish from the main window), copies the page's
+   * zone layout so the grid looks identical, and records the binding in the
+   * synchronous mirror so the main window hides the page immediately. Returns
+   * the new window's label.
+   *
+   * No per-terminal `assign_session_to_window` calls are needed: page-binding
+   * (`WindowRecord.bound_page`) is what routes every one of the page's tabs to
+   * the new window.
+   */
+  const popOutPage = useCallback(async (pageId: string): Promise<string> => {
+    const rec = await invoke<{ label: string }>("open_terminal_window", {
+      placement: null,
+      boundPage: pageId,
+    });
+    // Preserve the visual grid: clone the page's main-window layout into the
+    // pop-out's per-(page, window) key BEFORE its React app reads it on boot.
+    try {
+      const srcKey = zoneLayoutStorageKey(pageId, "main");
+      const layout = instanceStorage.getJSON<unknown>(srcKey, null);
+      if (layout !== null) {
+        instanceStorage.setJSON(zoneLayoutStorageKey(pageId, rec.label), layout);
+      }
+    } catch {
+      // Layout copy is best-effort — the pop-out falls back to auto-layout.
+    }
+    // Optimistic mirror update so the main window hides + switches off the page
+    // without waiting for the Rust snapshot refresh (window-opened) to arrive.
+    setPageBinding(pageId, rec.label);
+    return rec.label;
+  }, []);
+
+  return { popOutTab, moveTabToWindow, listWindows, popOutPage };
 }

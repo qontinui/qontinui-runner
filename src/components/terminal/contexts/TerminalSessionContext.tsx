@@ -226,7 +226,7 @@ const PageSessionScope = memo(function PageSessionScope({
   // `tabs === allTabs` and every downstream consumer behaves byte-identically.
   // Read first so the window label flows into the terminal manager below
   // (Phase 2: the create-time pane key is tagged with the owning window).
-  const { windowLabel: myWindowLabel, isOwned } = useWindowAssignments();
+  const { windowLabel: myWindowLabel, isOwned, windowForPage } = useWindowAssignments();
 
   // ---- TerminalCore ----
   const terminalManager = useTerminalManager(pageId, myWindowLabel);
@@ -238,7 +238,18 @@ const PageSessionScope = memo(function PageSessionScope({
     renameTab,
     createTerminal,
   } = terminalManager;
-  const tabs = useMemo(() => allTabs.filter((t) => isOwned(t.id)), [allTabs, isOwned]);
+  // Pop-out-page binding takes precedence over the per-terminal owner map: when
+  // this whole page is detached into a window, that window renders ALL of the
+  // page's tabs and every other window renders NONE of them. Otherwise fall
+  // back to the per-terminal `isOwned` filter (single-terminal "send to
+  // window"; everything stays on "main" in the common single-window case).
+  const boundWindow = windowForPage(pageId);
+  const tabs = useMemo(() => {
+    if (boundWindow) {
+      return boundWindow === myWindowLabel ? allTabs : [];
+    }
+    return allTabs.filter((t) => isOwned(t.id));
+  }, [allTabs, isOwned, boundWindow, myWindowLabel]);
 
   // A terminal created in a pop-out window must belong to THAT window, not the
   // default "main". Assign it immediately after creation (the broadcast event

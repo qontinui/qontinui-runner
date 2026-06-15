@@ -218,6 +218,16 @@ function storageKey(pageId: string, windowLabel: string = "main"): string {
   return windowLabel === "main" ? base : `${base}:window:${windowLabel}`;
 }
 
+/**
+ * Public form of the per-(page, window) zone-layout storage key. Exported so the
+ * pop-out-page action can COPY a page's layout from the main window's key to the
+ * new pop-out window's key, preserving the grid preset + zone assignments when a
+ * whole page is detached. Keep in lockstep with {@link storageKey}.
+ */
+export function zoneLayoutStorageKey(pageId: string, windowLabel: string = "main"): string {
+  return storageKey(pageId, windowLabel);
+}
+
 function loadPersistedState(pageId: string, windowLabel?: string): PersistedState | null {
   return instanceStorage.getJSON<PersistedState | null>(storageKey(pageId, windowLabel), null);
 }

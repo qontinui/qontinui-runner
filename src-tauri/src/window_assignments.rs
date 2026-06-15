@@ -78,6 +78,16 @@ pub struct WindowRecord {
     /// Last-known geometry, for Phase-2 restore. Optional today.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub geometry: Option<WindowGeometry>,
+    /// The terminal PAGE this window is bound to, when it hosts a whole
+    /// detached page (the "pop out page" feature) rather than an ad-hoc set of
+    /// individually-moved terminals. Page ids are STABLE across process
+    /// restarts (unlike terminal ids, which are regenerated each launch), so a
+    /// page-bound pop-out is the only kind of pop-out that can survive a reboot:
+    /// its terminals are re-bound by `page_id`, not by the stale `session_owner`
+    /// map. A page-bound window is restored on boot (and skipped by the empty-
+    /// pop-out prune) even though it owns no `session_owner` entries.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub bound_page: Option<String>,
     /// Unix-millis creation time.
     pub created_at: i64,
 }
@@ -147,6 +157,7 @@ impl WindowAssignments {
                     kind: WindowKind::Main,
                     title: None,
                     geometry: None,
+                    bound_page: None,
                     created_at: now_ms,
                 },
             );
@@ -163,6 +174,7 @@ impl WindowAssignments {
         &self,
         title: Option<String>,
         geometry: Option<WindowGeometry>,
+        bound_page: Option<String>,
         now_ms: i64,
     ) -> WindowRecord {
         let (record, snapshot) = {
@@ -179,6 +191,7 @@ impl WindowAssignments {
                         kind: WindowKind::PopOut,
                         title,
                         geometry,
+                        bound_page,
                         created_at: now_ms,
                     };
                 }
@@ -189,6 +202,7 @@ impl WindowAssignments {
                 kind: WindowKind::PopOut,
                 title,
                 geometry,
+                bound_page,
                 created_at: now_ms,
             };
             s.windows.insert(label, record.clone());
@@ -394,10 +408,21 @@ impl WindowAssignments {
             };
             let owned: std::collections::HashSet<&str> =
                 s.session_owner.values().map(|v| v.as_str()).collect();
+            // A PAGE-BOUND pop-out is intentionally retained even with no
+            // `session_owner` entry: its terminals are claimed by `page_id`
+            // (stable across restarts), not by the per-terminal owner map. The
+            // boot orphan sweep clears `session_owner` (all stale), which would
+            // otherwise make every page-bound window look empty and prune it —
+            // defeating page restore. Per-id pop-outs (no `bound_page`) still
+            // prune when empty, exactly as before.
             let empties: Vec<WindowLabel> = s
                 .windows
                 .values()
-                .filter(|r| r.kind == WindowKind::PopOut && !owned.contains(r.label.as_str()))
+                .filter(|r| {
+                    r.kind == WindowKind::PopOut
+                        && r.bound_page.is_none()
+                        && !owned.contains(r.label.as_str())
+                })
                 .map(|r| r.label.clone())
                 .collect();
             if empties.is_empty() {
@@ -545,8 +570,8 @@ mod tests {
     fn create_window_allocates_monotonic_term_labels() {
         let (_d, wa) = store();
         wa.ensure_main(1);
-        let a = wa.create_window(None, None, 10);
-        let b = wa.create_window(None, None, 20);
+        let a = wa.create_window(None, None, None, 10);
+        let b = wa.create_window(None, None, None, 20);
         assert_eq!(a.label, "term-1");
         assert_eq!(b.label, "term-2");
         assert_eq!(a.kind, WindowKind::PopOut);
@@ -572,7 +597,7 @@ mod tests {
     fn close_window_reassigns_all_its_sessions_to_main() {
         let (_d, wa) = store();
         wa.ensure_main(1);
-        let w = wa.create_window(None, None, 10);
+        let w = wa.create_window(None, None, None, 10);
         wa.assign_session("sess-A", &w.label);
         wa.assign_session("sess-B", &w.label);
         wa.assign_session("sess-C", "term-2"); // a different window
@@ -607,21 +632,21 @@ mod tests {
         {
             let wa = WindowAssignments::open(&path).unwrap();
             wa.ensure_main(1);
-            let w = wa.create_window(Some("Pop 1".into()), None, 10);
+            let w = wa.create_window(Some("Pop 1".into()), None, None, 10);
             wa.assign_session("sess-A", &w.label);
         }
         let wa = WindowAssignments::open(&path).unwrap();
         assert_eq!(wa.owner_of("sess-A"), "term-1");
         assert!(wa.snapshot().windows.contains_key("term-1"));
         // Next allocation continues monotonically after restore.
-        assert_eq!(wa.create_window(None, None, 20).label, "term-2");
+        assert_eq!(wa.create_window(None, None, None, 20).label, "term-2");
     }
 
     #[test]
     fn update_geometry_persists_only_on_change() {
         let (_d, wa) = store();
         wa.ensure_main(1);
-        let w = wa.create_window(None, None, 10);
+        let w = wa.create_window(None, None, None, 10);
         let g = WindowGeometry {
             x: 100,
             y: 200,
@@ -648,8 +673,8 @@ mod tests {
     fn pop_out_records_excludes_main() {
         let (_d, wa) = store();
         wa.ensure_main(1);
-        wa.create_window(None, None, 10);
-        wa.create_window(None, None, 20);
+        wa.create_window(None, None, None, 10);
+        wa.create_window(None, None, None, 20);
         let pops = wa.pop_out_records();
         assert_eq!(pops.len(), 2);
         assert!(pops.iter().all(|r| r.kind == WindowKind::PopOut));
@@ -660,7 +685,7 @@ mod tests {
     fn reconcile_orphans_reassigns_dangling_owners_to_main() {
         let (_d, wa) = store();
         wa.ensure_main(1);
-        let w = wa.create_window(None, None, 10); // term-1 exists
+        let w = wa.create_window(None, None, None, 10); // term-1 exists
         wa.assign_session("sess-live", &w.label); // valid owner
         wa.assign_session("sess-orphan", "term-7"); // term-7 never existed
         let reassigned = wa.reconcile_orphans();
@@ -675,7 +700,7 @@ mod tests {
     fn has_assigned_sessions_reflects_owner_map() {
         let (_d, wa) = store();
         wa.ensure_main(1);
-        let w = wa.create_window(None, None, 10); // term-1, no sessions yet
+        let w = wa.create_window(None, None, None, 10); // term-1, no sessions yet
         assert!(
             !wa.has_assigned_sessions(&w.label),
             "a freshly-created pop-out owns no sessions"
@@ -698,9 +723,9 @@ mod tests {
     fn prune_empty_pop_outs_removes_only_session_less_popouts() {
         let (_d, wa) = store();
         wa.ensure_main(1);
-        let empty1 = wa.create_window(None, None, 10); // term-1, empty
-        let live = wa.create_window(None, None, 20); // term-2, will hold a session
-        let empty2 = wa.create_window(None, None, 30); // term-3, empty
+        let empty1 = wa.create_window(None, None, None, 10); // term-1, empty
+        let live = wa.create_window(None, None, None, 20); // term-2, will hold a session
+        let empty2 = wa.create_window(None, None, None, 30); // term-3, empty
         wa.assign_session("sess-live", &live.label);
 
         let mut pruned = wa.prune_empty_pop_outs();
@@ -722,8 +747,8 @@ mod tests {
     fn clear_session_owners_then_prune_removes_all_popouts_on_boot() {
         let (_d, wa) = store();
         wa.ensure_main(1);
-        let a = wa.create_window(None, None, 10);
-        let b = wa.create_window(None, None, 20);
+        let a = wa.create_window(None, None, None, 10);
+        let b = wa.create_window(None, None, None, 20);
         // Simulate the persisted (now-stale) owner map from a prior session.
         wa.assign_session("dead-tid-1", &a.label);
         wa.assign_session("dead-tid-2", &b.label);
@@ -750,12 +775,54 @@ mod tests {
     fn prune_empty_pop_outs_noop_when_all_have_sessions() {
         let (_d, wa) = store();
         wa.ensure_main(1);
-        let a = wa.create_window(None, None, 10);
-        let b = wa.create_window(None, None, 20);
+        let a = wa.create_window(None, None, None, 10);
+        let b = wa.create_window(None, None, None, 20);
         wa.assign_session("s1", &a.label);
         wa.assign_session("s2", &b.label);
         assert!(wa.prune_empty_pop_outs().is_empty());
         assert_eq!(wa.pop_out_records().len(), 2);
+    }
+
+    #[test]
+    fn prune_keeps_page_bound_popouts_but_removes_empty_per_id_ones() {
+        let (_d, wa) = store();
+        wa.ensure_main(1);
+        // A page-bound pop-out owns NO session_owner entry (it claims terminals
+        // by page_id) yet must survive the prune.
+        let bound = wa.create_window(None, None, Some("page-A".into()), 10);
+        // A per-id pop-out with no sessions is genuinely empty → pruned.
+        let empty = wa.create_window(None, None, None, 20);
+
+        let pruned = wa.prune_empty_pop_outs();
+        assert_eq!(pruned, vec![empty.label.clone()]);
+        let remaining: std::collections::HashSet<String> =
+            wa.pop_out_records().into_iter().map(|r| r.label).collect();
+        assert_eq!(remaining, [bound.label.clone()].into());
+    }
+
+    #[test]
+    fn page_bound_window_survives_boot_sweep_and_persists_binding() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("window-assignments.json");
+        {
+            let wa = WindowAssignments::open(&path).unwrap();
+            wa.ensure_main(1);
+            wa.create_window(None, None, Some("page-A".into()), 10); // page-bound
+            wa.create_window(None, None, None, 20); // per-id, will be empty on boot
+                                                    // Simulate the prior session's (now-stale) owner map.
+            wa.assign_session("dead-tid", "term-2");
+        }
+        // Reopen (process restart) and run the boot sweep order from
+        // `restore_pop_out_windows`: clear stale owners, then prune empties.
+        let wa = WindowAssignments::open(&path).unwrap();
+        assert_eq!(wa.clear_session_owners(), 1);
+        wa.prune_empty_pop_outs();
+        // The page-bound window survives with its binding intact; the per-id
+        // window is gone.
+        let pops = wa.pop_out_records();
+        assert_eq!(pops.len(), 1, "only the page-bound pop-out survives");
+        assert_eq!(pops[0].label, "term-1");
+        assert_eq!(pops[0].bound_page.as_deref(), Some("page-A"));
     }
 
     #[test]
