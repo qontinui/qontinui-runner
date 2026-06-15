@@ -6328,6 +6328,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "qontinui-app-generator"
+version = "0.1.0"
+dependencies = [
+ "qontinui-spec-check",
+ "qontinui-types",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "qontinui-code-graph"
 version = "0.1.0"
 dependencies = [
