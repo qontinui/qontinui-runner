@@ -6353,6 +6353,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "qontinui-comprehension"
+version = "0.1.0"
+dependencies = [
+ "qontinui-types",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "qontinui-db"
 version = "0.1.0"
 dependencies = [
