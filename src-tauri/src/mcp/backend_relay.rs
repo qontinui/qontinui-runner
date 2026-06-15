@@ -220,8 +220,42 @@ async fn relay_kick_handler() -> axum::response::Json<Value> {
 
 /// Router exposing the relay's web-integration diagnostic + control
 /// endpoints. Merged into the base router in `mcp_api::start_server`.
+/// Debug-only forced-panic trip switch for the relay loop. Flipped to `true`
+/// by [`relay_force_panic_handler`]; consumed (swapped back to `false`) at the
+/// top of [`relay_loop`], where it triggers a `panic!`. This is the external
+/// trigger needed to prove `task_supervisor::spawn_supervised` respawns the
+/// relay after a panic on a LIVE runner (relay-supervision fix, brief step 3:
+/// "induce the failure and prove self-heal WITHOUT a process restart"). Never
+/// compiled into release builds.
+#[cfg(debug_assertions)]
+static FORCE_RELAY_PANIC: AtomicBool = AtomicBool::new(false);
+
+/// `POST /web-integration/relay/__debug/force-panic` (debug builds only) —
+/// arm the relay loop's forced-panic trip switch and kick it so the loop
+/// wakes, re-iterates, and panics on its next pass. The supervisor should
+/// then respawn the loop (after its backoff) and the relay reconnects on its
+/// own — observable as `ws_connected` flipping `true → false → true` with no
+/// process restart. Localhost-bound + unauthenticated like the rest of the
+/// runner's local API; absent entirely from release builds.
+#[cfg(debug_assertions)]
+async fn relay_force_panic_handler() -> axum::response::Json<Value> {
+    FORCE_RELAY_PANIC.store(true, Ordering::SeqCst);
+    commands::kick_cloud_relay().await;
+    axum::response::Json(serde_json::json!({
+        "ok": true,
+        "armed": true,
+        "note": "relay loop will panic on its next iteration; the task \
+                 supervisor should respawn it and reconnect",
+    }))
+}
+
+// In release builds the `#[cfg(debug_assertions)]` route below is absent, so
+// `router` is bound then returned directly — clippy's `let_and_return` would
+// fire on that path only. The binding is intentional (it's conditionally
+// extended in debug builds), so the lint is allowed for both configs.
+#[allow(clippy::let_and_return)]
 pub fn routes() -> axum::Router<Arc<ApiState>> {
-    axum::Router::new()
+    let router = axum::Router::new()
         .route(
             "/web-integration/status",
             axum::routing::get(web_integration_status_handler),
@@ -229,7 +263,17 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         .route(
             "/web-integration/relay/kick",
             axum::routing::post(relay_kick_handler),
-        )
+        );
+
+    // Debug-only forced-panic endpoint (relay-supervisor self-heal proof).
+    // Stripped from release builds along with its handler + trip switch.
+    #[cfg(debug_assertions)]
+    let router = router.route(
+        "/web-integration/relay/__debug/force-panic",
+        axum::routing::post(relay_force_panic_handler),
+    );
+
+    router
 }
 
 /// Return true iff `e` is a tungstenite handshake error with HTTP 401
@@ -399,6 +443,17 @@ async fn relay_loop(
         if *shutdown_rx.borrow() {
             info!("Backend relay shutting down");
             return;
+        }
+
+        // Debug-only forced-panic trip switch. When armed via
+        // `POST /web-integration/relay/__debug/force-panic` (also debug-only),
+        // panic here so the live-runner self-heal of
+        // `task_supervisor::spawn_supervised` can be exercised end-to-end
+        // (relay loop dies → supervisor catch_unwind → respawn → reconnect),
+        // the one proof a unit test can't give. Compiled out of release builds.
+        #[cfg(debug_assertions)]
+        if FORCE_RELAY_PANIC.swap(false, Ordering::SeqCst) {
+            panic!("forced debug panic — relay-supervisor self-heal verification");
         }
 
         // Re-read settings on every iteration so backend URL / token
