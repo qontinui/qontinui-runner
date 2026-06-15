@@ -68,10 +68,21 @@ struct SessionAssignmentChanged {
 fn build_pop_out_webview(
     app: &tauri::AppHandle,
     label: &str,
+    bound_page: Option<&str>,
 ) -> Result<tauri::WebviewWindow, String> {
     // Same embedded bundle; the boot hint makes it render Terminal-only and
     // adopt `term-N` as its window identity (via getCurrentWindow().label).
-    let url = tauri::WebviewUrl::App(format!("index.html?view=terminal&window={}", label).into());
+    // A page-bound pop-out also carries `&page=<id>` so the frontend pins
+    // itself to that one terminal page (ignoring the shared active-page) and
+    // renders only that page's grid.
+    // Page ids are always `"default"` or a v4 UUID (see `useTerminalPages`
+    // `addPage`), both URL-safe — no percent-encoding needed.
+    let url = match bound_page {
+        Some(page) => tauri::WebviewUrl::App(
+            format!("index.html?view=terminal&window={}&page={}", label, page).into(),
+        ),
+        None => tauri::WebviewUrl::App(format!("index.html?view=terminal&window={}", label).into()),
+    };
 
     let mut builder = tauri::WebviewWindowBuilder::new(app, label, url)
         .title(format!("Qontinui Terminal — {}", label))
@@ -101,11 +112,12 @@ pub async fn open_terminal_window(
     app: tauri::AppHandle,
     assignments: tauri::State<'_, Arc<WindowAssignments>>,
     placement: Option<SpawnPlacement>,
+    bound_page: Option<String>,
 ) -> Result<WindowRecord, String> {
-    let record = assignments.create_window(None, None, now_ms());
+    let record = assignments.create_window(None, None, bound_page.clone(), now_ms());
     let label = record.label.clone();
 
-    let window = build_pop_out_webview(&app, &label)?;
+    let window = build_pop_out_webview(&app, &label, bound_page.as_deref())?;
 
     // Apply placement (physical global coords) when provided; otherwise let the
     // OS place it (cascaded near the focused window).
@@ -154,11 +166,18 @@ pub fn restore_pop_out_windows(
     // P2 (orphan sweep): a persisted pop-out's PTYs never survive the process
     // restart — terminal ids are a fresh uuid per launch and are never
     // recreated — so EVERY persisted `session_owner` entry is stale on boot and
-    // every `term-N` record is genuinely empty (no live tab can claim it).
-    // Restoring them just produces empty, un-closable windows whose monotonic
-    // `term-N` counter keeps climbing (the observed orphan-accumulation loop,
-    // `term-19`). So FIRST clear the stale owner map, THEN prune the now-empty
-    // pop-out records, so we neither restore them nor resurrect them next boot.
+    // every PER-ID `term-N` record is genuinely empty (no live tab can claim
+    // it). Restoring those just produces empty, un-closable windows whose
+    // monotonic `term-N` counter keeps climbing (the observed orphan-
+    // accumulation loop, `term-19`). So FIRST clear the stale owner map, THEN
+    // prune the now-empty pop-out records, so we neither restore them nor
+    // resurrect them next boot.
+    //
+    // PAGE-BOUND pop-outs are the exception and are deliberately PRESERVED by
+    // `prune_empty_pop_outs` (they claim terminals by stable `page_id`, not the
+    // cleared owner map). They fall through to the restore loop below and are
+    // rebuilt with their `&page=` boot hint; the page's sessions re-attach there
+    // via the pinned page's normal restore path.
     let cleared = assignments.clear_session_owners();
     let pruned = assignments.prune_empty_pop_outs();
     if cleared > 0 || !pruned.is_empty() {
@@ -176,7 +195,7 @@ pub fn restore_pop_out_windows(
         if app.get_webview_window(&label).is_some() {
             continue; // already open — don't double-build
         }
-        let window = match build_pop_out_webview(app, &label) {
+        let window = match build_pop_out_webview(app, &label, record.bound_page.as_deref()) {
             Ok(w) => w,
             Err(e) => {
                 tracing::warn!(window = %label, error = %e, "restore_pop_out_windows: build failed — skipping");
@@ -223,8 +242,10 @@ pub fn sweep_empty_pop_out_windows(
     let mut swept: Vec<String> = Vec::new();
     for record in assignments.pop_out_records() {
         let label = &record.label;
-        if assignments.has_assigned_sessions(label) {
-            continue; // still hosts a tab — leave it
+        if assignments.has_assigned_sessions(label) || record.bound_page.is_some() {
+            // Still hosts a tab, OR is a page-bound window (claims terminals by
+            // page_id, not the session_owner map) — leave it.
+            continue;
         }
         // Destroy (not close) the live OS window if one is open (best-effort):
         // close() leaves WebView2 pop-outs visible; destroy() forces teardown.

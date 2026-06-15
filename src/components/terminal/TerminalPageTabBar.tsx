@@ -12,6 +12,13 @@ interface TerminalPageTabBarProps {
   onReorganize?: () => void;
   /** Open a new pop-out OS window (same process) hosting its own terminals. */
   onPopOut?: () => void;
+  /** Detach an entire page (all its terminals + layout) into its own window. */
+  onPopOutPage?: (pageId: string) => void;
+  /**
+   * True in a page-pinned pop-out window — it shows ONE fixed page, so render a
+   * minimal static title bar instead of the interactive multi-page tab strip.
+   */
+  isPinned?: boolean;
 }
 
 export function TerminalPageTabBar({
@@ -23,6 +30,8 @@ export function TerminalPageTabBar({
   onRenamePage,
   onReorganize,
   onPopOut,
+  onPopOutPage,
+  isPinned,
 }: TerminalPageTabBarProps) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
@@ -52,6 +61,18 @@ export function TerminalPageTabBar({
     const name = `Page ${pages.length + 1}`;
     onAddPage(name);
   };
+
+  // Page-pinned pop-out window: one fixed page, no tab strip — just a label.
+  if (isPinned) {
+    const page = pages[0];
+    return (
+      <div className="flex items-center gap-2 px-3 py-1 bg-[#13141f] border-b border-[#2a2d3d] shrink-0">
+        <SquareArrowOutUpRight className="w-3 h-3 text-[#7aa2f7]" />
+        <span className="text-[11px] text-[#c0caf5] truncate">{page?.name ?? "Terminal"}</span>
+        <span className="text-[9px] text-[#565f89] uppercase tracking-wider">detached page</span>
+      </div>
+    );
+  }
 
   return (
     <div className="flex items-center gap-0.5 px-2 py-1 bg-[#13141f] border-b border-[#2a2d3d] shrink-0">
@@ -100,6 +121,26 @@ export function TerminalPageTabBar({
             title={`Switch to ${page.name}`}
           >
             <span className="truncate max-w-[120px]">{page.name}</span>
+            {onPopOutPage && (
+              <span
+                role="button"
+                tabIndex={0}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onPopOutPage(page.id);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.stopPropagation();
+                    onPopOutPage(page.id);
+                  }
+                }}
+                className="p-0.5 rounded opacity-0 group-hover:opacity-100 text-[#565f89] hover:text-[#7aa2f7] hover:bg-[#7aa2f7]/10 transition-all"
+                title="Pop out this page into its own window"
+              >
+                <SquareArrowOutUpRight className="w-3 h-3" />
+              </span>
+            )}
             {pages.length > 1 && (
               <span
                 role="button"

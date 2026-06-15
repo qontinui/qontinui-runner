@@ -6,6 +6,7 @@ import { TerminalNotification } from "./TerminalNotification";
 import { FileConflictBanner } from "./FileConflictBanner";
 import { SessionManagerPanel } from "./SessionManagerPanel";
 import { ZoneGrid } from "./ZoneGrid";
+import { useTerminalWindowActions } from "./useTerminalWindowActions";
 import { ZoneLayoutPicker } from "./ZoneLayoutPicker";
 import { DocFinderModal } from "./DocFinderModal";
 import { ZoneMinimap } from "./ZoneMinimap";
@@ -113,6 +114,9 @@ function TerminalPageInner({
   // (see line ~71). `/metrics` + `/history` slash actions pop a card here.
   const { showCard } = useResultCard();
 
+  // Per-page / per-terminal window detach actions (pop-out-page UI Bridge action).
+  const { popOutPage } = useTerminalWindowActions();
+
   // Register page-level UI Bridge actions so AI agents can discover
   // and invoke terminal operations without knowing element IDs.
   useUIComponent({
@@ -177,6 +181,19 @@ function TerminalPageInner({
             windowLabel: rec.label,
           });
           return { window: rec.label, terminalId: activeId };
+        },
+      },
+      {
+        id: "pop-out-page",
+        label: "Pop Out Page",
+        description:
+          "Detach an ENTIRE terminal page (all its terminals + zone layout) into its own pop-out window bound to the page. Params: { pageId?: string } (defaults to the active page). Returns { window, pageId }.",
+        paramSchema: { pageId: "string (optional; defaults to the active page)" },
+        handler: async (params?: unknown) => {
+          const { pageId: target } = (params ?? {}) as { pageId?: string };
+          const pid = target || pageId;
+          const label = await popOutPage(pid);
+          return { window: label, pageId: pid };
         },
       },
       {

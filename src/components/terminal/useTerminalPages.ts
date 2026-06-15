@@ -1,7 +1,8 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { instanceStorage } from "@/lib/instance-storage";
+import { getPageBindings, subscribePageBindings } from "@/lib/pageBindings";
 
 export interface TerminalPageConfig {
   id: string;
@@ -11,6 +12,21 @@ export interface TerminalPageConfig {
 
 const STORAGE_KEY = "qontinui-terminal-pages";
 const ACTIVE_PAGE_KEY = "qontinui-terminal-active-page";
+
+/**
+ * A page-pinned pop-out window carries `?page=<id>` (set by the pop-out-page
+ * boot hint in `terminal_windows.rs`). Such a window shows ONLY that one page,
+ * fixes it as active, and never mutates the shared page list / active-page key —
+ * it is a read-only detached view of one page. Returns null in the main window.
+ */
+function readPinnedPageId(): string | null {
+  try {
+    const v = new URLSearchParams(window.location.search).get("page");
+    return v && v.trim() ? v : null;
+  } catch {
+    return null;
+  }
+}
 
 function loadPages(): TerminalPageConfig[] {
   const pages = instanceStorage.getJSON<TerminalPageConfig[]>(STORAGE_KEY, []);
@@ -93,15 +109,42 @@ export function reconcilePages(
 }
 
 export function useTerminalPages() {
-  const [pages, setPages] = useState<TerminalPageConfig[]>(loadPages);
-  const [activePageId, setActivePageIdState] = useState<string>(
-    () => instanceStorage.getItem(ACTIVE_PAGE_KEY) || "default",
+  // A page-pinned pop-out window is fixed to one page for its whole lifetime.
+  const [pinnedPageId] = useState<string | null>(readPinnedPageId);
+  const isPinned = pinnedPageId !== null;
+
+  const [allPages, setPages] = useState<TerminalPageConfig[]>(loadPages);
+  const [activePageId, setActivePageIdState] = useState<string>(() =>
+    isPinned ? pinnedPageId! : instanceStorage.getItem(ACTIVE_PAGE_KEY) || "default",
   );
 
-  const setActivePageId = useCallback((id: string) => {
-    setActivePageIdState(id);
-    instanceStorage.setItem(ACTIVE_PAGE_KEY, id);
-  }, []);
+  // `pageId → windowLabel` for pages currently detached into a pop-out. Read
+  // synchronously from the localStorage mirror so the FIRST render already
+  // hides detached pages (and never picks one as active) — avoiding the
+  // boot race where main would briefly restore a page the pop-out owns.
+  // `WindowAssignmentsContext` keeps the mirror in sync with the Rust truth.
+  const [boundPages, setBoundPages] = useState<Record<string, string>>(getPageBindings);
+  useEffect(() => subscribePageBindings(() => setBoundPages(getPageBindings())), []);
+
+  const setActivePageId = useCallback(
+    (id: string) => {
+      if (isPinned) return; // pinned window: active page is fixed
+      setActivePageIdState(id);
+      instanceStorage.setItem(ACTIVE_PAGE_KEY, id);
+    },
+    [isPinned],
+  );
+
+  // The pages this window should surface: a pinned pop-out shows ONLY its page;
+  // the main window shows every page NOT detached into a pop-out (those live in
+  // their own window). Memoized so the normalize-active effect below is stable.
+  const pages = useMemo<TerminalPageConfig[]>(() => {
+    if (isPinned) {
+      const found = allPages.find((p) => p.id === pinnedPageId);
+      return [found ?? { id: pinnedPageId!, name: "Terminal", createdAt: 0 }];
+    }
+    return allPages.filter((p) => !boundPages[p.id]);
+  }, [isPinned, pinnedPageId, allPages, boundPages]);
 
   const addPage = useCallback(
     (name: string) => {
@@ -259,6 +302,10 @@ export function useTerminalPages() {
   // Run reconciliation once on mount and on a debounced `terminal-created`
   // event (a burst of continuations collapses to a single reconcile).
   useEffect(() => {
+    // A pinned pop-out renders one fixed page and must not touch the shared
+    // page list — skip reconciliation entirely.
+    if (isPinned) return;
+
     let unlisten: (() => void) | null = null;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let disposed = false;
@@ -289,7 +336,29 @@ export function useTerminalPages() {
       if (timer) clearTimeout(timer);
       unlisten?.();
     };
-  }, [reconcile]);
+  }, [reconcile, isPinned]);
+
+  // Keep the active page valid for the MAIN window: when the active page gets
+  // detached into a pop-out (or otherwise disappears from the visible set),
+  // fall back to the first visible page. If EVERY page is detached, mint a
+  // fresh docked page so the main window always has something to show.
+  useEffect(() => {
+    if (isPinned) return;
+    const visibleIds = pages.map((p) => p.id);
+    if (visibleIds.length === 0) {
+      // Intentional sync from an EXTERNAL system (page bindings written by other
+      // windows): the active page was detached out from under us with no docked
+      // page left, so mint one. Rare, idempotent (a fresh page is never bound),
+      // and converges in one extra render — same exception the reconcile effect
+      // above relies on.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      addPage("Terminal");
+      return;
+    }
+    if (!visibleIds.includes(activePageId)) {
+      setActivePageId(visibleIds[0]);
+    }
+  }, [isPinned, pages, activePageId, addPage, setActivePageId]);
 
   return {
     pages,
@@ -299,5 +368,7 @@ export function useTerminalPages() {
     openPage,
     removePage,
     renamePage,
+    /** True in a page-pinned pop-out window (shows one fixed page, minimal chrome). */
+    isPinned,
   };
 }
