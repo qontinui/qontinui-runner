@@ -505,6 +505,281 @@ pub async fn cleanup_finished_loops(states: SharedLoopStates) {
     }
 }
 
+// ============================================================================
+// Approach-D Conductor (Phase 3) — orchestration-run management
+// ============================================================================
+
+use super::conductor::{self, AiSessionDispatcher, ManagerSignalSource, OrchestrationRunConfig};
+use super::ledger::Run;
+use crate::database::pg::PgDb;
+use uuid::Uuid;
+
+/// Status payload for one conductor run: the run row + its subtask DAG + the
+/// live loop phase. This is the data Phase-5's status strip renders.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OrchestrationRunStatus {
+    pub run: Run,
+    pub subtasks: Vec<super::ledger::Subtask>,
+    pub loop_phase: LoopPhase,
+    pub loop_running: bool,
+    pub error: Option<String>,
+    pub tick: u32,
+}
+
+/// Start a conductor run: create the run row, register a per-run [`LoopState`]
+/// in the [`MultiLoopManager`] keyed by `run_id`, and spawn the stateless
+/// reconciler background task ([`conductor::run_orchestration`]).
+///
+/// `goal`/`recipe`/`phases` seed the `orchestration.runs` row. The caller is
+/// expected to have already persisted the DESIGN-origin subtasks (Phase 5's
+/// `/orchestrate` does this); a run with no subtasks simply ticks to `done`.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_orchestration_run(
+    states: SharedLoopStates,
+    app_handle: tauri::AppHandle,
+    pg: Arc<PgDb>,
+    run_id: Uuid,
+    goal: &str,
+    recipe: Option<&str>,
+    phases: &[String],
+    config: OrchestrationRunConfig,
+) -> Result<Run, String> {
+    let loop_id = run_id.to_string();
+
+    // Refuse to double-start the same run.
+    {
+        let mgr = states.lock().await;
+        if let Some(existing) = mgr.loops.get(&loop_id) {
+            let st = existing.lock().await;
+            if st.running {
+                return Err(format!("Orchestration run {run_id} is already running"));
+            }
+        }
+    }
+
+    // Create the run row (status=running).
+    let run = pg
+        .create_run(run_id, goal, recipe, phases, "running")
+        .await?;
+
+    // DESIGN bootstrap (Phase 4): a run with no subtasks yet runs the Planning
+    // phase's design pass to produce the initial org-chart, written via the
+    // SAME `splice_org_chart` path harvest uses (`produced_by = None`). This is
+    // idempotent + best-effort: a run that already has subtasks (Phase-5
+    // `/orchestrate` pre-seeded it, or a restart re-entered here) skips the
+    // pass; a design failure leaves the run with zero subtasks and the
+    // conductor simply ticks to `done` (the operator can re-issue).
+    if let Err(e) = run_design_bootstrap(&app_handle, &pg, run_id, goal, phases).await {
+        warn!("start_orchestration_run: DESIGN bootstrap for {run_id} failed (continuing with whatever subtasks exist): {e}");
+    }
+
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let loop_state = Arc::new(Mutex::new(LoopState::new()));
+    {
+        let mut st = loop_state.lock().await;
+        st.running = true;
+        st.phase = LoopPhase::Reconciling;
+        st.started_at = Some(Utc::now());
+        st.stop_tx = Some(stop_tx);
+    }
+    {
+        let mut mgr = states.lock().await;
+        mgr.loops.insert(loop_id.clone(), loop_state.clone());
+        mgr.metadata.insert(
+            loop_id.clone(),
+            LoopMetadata {
+                label: Some(format!("orchestration:{run_id}")),
+                stop_all_on_error: false,
+            },
+        );
+    }
+
+    // Build live dispatcher + signal source and spawn the conductor.
+    let session_mgr = {
+        use tauri::Manager;
+        app_handle
+            .try_state::<Arc<crate::claude_session::manager::SessionManager>>()
+            .map(|s| s.inner().clone())
+    };
+    let Some(session_mgr) = session_mgr else {
+        // Roll back the registration + run row marker.
+        {
+            let mut mgr = states.lock().await;
+            mgr.loops.remove(&loop_id);
+            mgr.metadata.remove(&loop_id);
+        }
+        let _ = pg.set_run_status(run_id, "failed").await;
+        return Err("start_orchestration_run: SessionManager state not available".to_string());
+    };
+
+    let dispatcher = AiSessionDispatcher {
+        app_handle: app_handle.clone(),
+        pg: pg.clone(),
+    };
+    let signals = ManagerSignalSource { session_mgr };
+    // Phase 6: the live coord gate client reuses `coord_mcp` for the base URL +
+    // device JWT (no hand-rolled auth). Best-effort — a coord outage never wedges.
+    let gate_client = super::coord_gate::LiveCoordGateClient::new();
+
+    let loop_state_clone = loop_state.clone();
+    tokio::spawn(async move {
+        conductor::run_orchestration(
+            loop_state_clone,
+            run_id,
+            pg,
+            dispatcher,
+            signals,
+            gate_client,
+            config,
+            stop_rx,
+        )
+        .await;
+    });
+
+    info!("start_orchestration_run: run {run_id} launched");
+    Ok(run)
+}
+
+/// DESIGN bootstrap (Phase 4): the run's initial org-chart, produced by the
+/// Planning phase and spliced via the SAME `splice_org_chart` path harvest
+/// uses (`produced_by = None`).
+///
+/// Skips entirely (returns `Ok(())`) when the run already has subtasks — so a
+/// pre-seeded run (Phase-5 `/orchestrate`) or a restart that re-enters here is
+/// never re-designed (idempotent: the splice is insert-if-not-exists anyway,
+/// but skipping avoids a wasted AI call).
+///
+/// **Billing constraint (MANDATORY — `feedback_no_anthropic_api`):** the design
+/// call is FORCED onto `AiProvider::ClaudeCli` via
+/// [`run_prompt_via_claude_cli`] (subscription-billed `claude --print`), NOT
+/// the metered Anthropic Messages API and NOT the interactive
+/// `agent_runtime.rs` worker spawn. The prompt is built by
+/// [`task_decomposer::build_org_chart_prompt`] (contract §3 shape) and parsed
+/// by [`task_decomposer::parse_org_chart_response`].
+async fn run_design_bootstrap(
+    _app_handle: &tauri::AppHandle,
+    pg: &Arc<PgDb>,
+    run_id: Uuid,
+    goal: &str,
+    phases: &[String],
+) -> Result<(), String> {
+    // Idempotency / resume guard: never re-design a run that already has rows.
+    let existing = pg.list_subtasks(run_id).await?;
+    if !existing.is_empty() {
+        info!(
+            "run_design_bootstrap: run {run_id} already has {} subtask(s); skipping DESIGN pass",
+            existing.len()
+        );
+        return Ok(());
+    }
+
+    let config = DecomposerConfig::default();
+    let prompt = task_decomposer::build_org_chart_prompt(goal, phases, &config);
+
+    // The provider call is blocking (a `claude --print` subprocess); run it on
+    // the blocking pool so we don't stall the async runtime. Forced ClaudeCli.
+    let response = tokio::task::spawn_blocking(move || {
+        crate::ai_provider::routing::run_prompt_via_claude_cli(&prompt, None, None)
+    })
+    .await
+    .map_err(|e| format!("run_design_bootstrap: spawn_blocking join error: {e}"))?;
+
+    if !response.success {
+        return Err(format!(
+            "run_design_bootstrap: design AI call failed: {}",
+            response
+                .error
+                .unwrap_or_else(|| "unknown error".to_string())
+        ));
+    }
+
+    let seeds = task_decomposer::parse_org_chart_response(&response.output, phases, &config)?;
+    let inserted = super::org_chart::splice_org_chart(pg, run_id, &seeds, None).await?;
+    info!(
+        "run_design_bootstrap: run {run_id} DESIGN spliced {inserted} initial subtask(s) (produced_by=None)"
+    );
+    Ok(())
+}
+
+/// Stop a conductor run (signals the reconciler to exit; marks the run row
+/// `stopped`).
+pub async fn stop_orchestration_run(
+    states: SharedLoopStates,
+    pg: &Arc<PgDb>,
+    run_id: Uuid,
+) -> Result<(), String> {
+    let loop_id = run_id.to_string();
+    let loop_state = {
+        let mgr = states.lock().await;
+        mgr.loops.get(&loop_id).cloned()
+    };
+    if let Some(ls) = loop_state {
+        let st = ls.lock().await;
+        if let Some(tx) = &st.stop_tx {
+            let _ = tx.send(true);
+        }
+    }
+    // Best-effort run-row status (the reconciler also flips its own phase).
+    let _ = pg.set_run_status(run_id, "stopped").await;
+    Ok(())
+}
+
+/// Status of a conductor run: the run row, its subtasks, and the live loop
+/// phase (if the reconciler is still registered). Reads the durable ledger so
+/// it works even after the background task has exited.
+pub async fn orchestration_run_status(
+    states: SharedLoopStates,
+    pg: &Arc<PgDb>,
+    run_id: Uuid,
+) -> Result<OrchestrationRunStatus, String> {
+    let run = pg
+        .get_run(run_id)
+        .await?
+        .ok_or_else(|| format!("No orchestration run {run_id}"))?;
+    let subtasks = pg.list_subtasks(run_id).await?;
+
+    let loop_id = run_id.to_string();
+    let (loop_phase, loop_running, error, tick) = {
+        let mgr = states.lock().await;
+        match mgr.loops.get(&loop_id) {
+            Some(ls) => {
+                let st = ls.lock().await;
+                (
+                    st.phase.clone(),
+                    st.running,
+                    st.error.clone(),
+                    st.current_iteration,
+                )
+            }
+            // Not registered (never started in this process, or cleaned up):
+            // derive a terminal phase from the persisted run status.
+            None => {
+                let phase = match run.status.as_str() {
+                    "complete" => LoopPhase::Complete,
+                    "failed" => LoopPhase::Error,
+                    "stopped" => LoopPhase::Stopped,
+                    _ => LoopPhase::Idle,
+                };
+                (phase, false, None, 0)
+            }
+        }
+    };
+
+    Ok(OrchestrationRunStatus {
+        run,
+        subtasks,
+        loop_phase,
+        loop_running,
+        error,
+        tick,
+    })
+}
+
+/// List all conductor runs (durable ledger), newest first.
+pub async fn list_orchestration_runs(pg: &Arc<PgDb>) -> Result<Vec<Run>, String> {
+    pg.list_runs().await
+}
+
 /// The main loop implementation.
 async fn run_loop(
     loop_state: SharedLoopState,

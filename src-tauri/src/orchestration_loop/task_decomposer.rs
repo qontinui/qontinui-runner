@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use super::org_chart::OrgChartSeed;
 use super::types::DecomposerConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,6 +180,173 @@ pub fn parse_decomposition_response(
     })
 }
 
+// ============================================================================
+// Approach-D org-chart planner (DESIGN step) — contract §3 shape
+// ============================================================================
+//
+// The conductor's DESIGN bootstrap (Phase 4) reuses the decomposition idiom
+// but emits the richer §3 org-chart seed shape (`phase`/`repo`/`emits_subtasks`
+// in addition to `id`/`title`/`brief`/`depends_on`/`expected_output`). The
+// shared `super::org_chart::splice_org_chart` then materializes these into
+// ledger rows with `produced_by = None`. The AI call MUST route through
+// `AiProvider::ClaudeCli` (subscription-billed) per the §3 CONSTRAINT — see
+// `loop_engine::run_design_bootstrap`.
+
+/// Build the org-chart DESIGN prompt. Like [`build_decomposition_prompt`] but
+/// asks for the contract §3 shape so each seed carries `phase`, `repo`, and
+/// `emits_subtasks` (progressive-elaboration flag). `phases` is the run's
+/// ordered phase list (e.g. `["plan","implement","test"]`) — each seed's
+/// `phase` MUST be one of these.
+pub fn build_org_chart_prompt(goal: &str, phases: &[String], config: &DecomposerConfig) -> String {
+    let phases_list = phases.join(", ");
+    format!(
+        "You are an orchestration planner producing an ORG-CHART of subtasks for a \
+        multi-phase run. Decompose the goal into {}-{} dependency-ordered subtasks \
+        spanning the phases: [{}].\n\
+        \n\
+        Goal: {}\n\
+        \n\
+        Requirements:\n\
+        - Order subtasks by dependency (a subtask lists upstream ids in depends_on).\n\
+        - Each subtask names the phase it belongs to (one of: {}).\n\
+        - `repo` is the worktree target repository, or null for read-only tasks.\n\
+        - `brief` is the FULL prompt/instructions handed to the worker for that subtask.\n\
+        - `expected_output` is the success criterion / artifact contract.\n\
+        - Set `emits_subtasks: true` ONLY for an *elaborating* subtask (e.g. a \
+          comprehension/spec pass) whose own output will later produce more \
+          subtasks; otherwise false. A run whose downstream work cannot be \
+          enumerated until an upstream comprehension subtask finishes SHOULD mark \
+          that comprehension subtask emits_subtasks: true and omit the not-yet-\
+          knowable downstream subtasks (they will be added later).\n\
+        \n\
+        Respond with a JSON object:\n\
+        {{\n\
+          \"goal_summary\": \"one-line summary\",\n\
+          \"subtasks\": [\n\
+            {{\n\
+              \"id\": \"st-001\",\n\
+              \"title\": \"short title\",\n\
+              \"brief\": \"full instructions for the worker\",\n\
+              \"phase\": \"implement\",\n\
+              \"depends_on\": [],\n\
+              \"expected_output\": \"what success looks like\",\n\
+              \"repo\": \"qontinui-runner\",\n\
+              \"emits_subtasks\": false\n\
+            }}\n\
+          ]\n\
+        }}",
+        config.min_subtasks, config.max_subtasks, phases_list, goal, phases_list
+    )
+}
+
+/// Parse an org-chart DESIGN response into [`OrgChartSeed`]s (contract §3
+/// shape). Reuses [`extract_json_from_response`] for the markdown-fence-tolerant
+/// extraction. Tolerant of the existing decomposer field name `description` as
+/// an alias for `brief` (so the simpler [`build_decomposition_prompt`] output
+/// also parses); fills sensible defaults for absent optional fields.
+///
+/// Enforces `config.min_subtasks` like [`parse_decomposition_response`] and
+/// caps at `config.max_subtasks`. Returns `Err` on un-extractable JSON or a
+/// missing `subtasks` array.
+pub fn parse_org_chart_response(
+    response: &str,
+    phases: &[String],
+    config: &DecomposerConfig,
+) -> Result<Vec<OrgChartSeed>, String> {
+    let json_str = extract_json_from_response(response)?;
+    let parsed: serde_json::Value = serde_json::from_str(&json_str)
+        .map_err(|e| format!("Failed to parse org-chart response as JSON: {}", e))?;
+
+    let subtasks_arr = parsed
+        .get("subtasks")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "Missing 'subtasks' array in org-chart response".to_string())?;
+
+    if subtasks_arr.len() < config.min_subtasks as usize {
+        return Err(format!(
+            "Too few subtasks in org-chart: got {}, minimum {}",
+            subtasks_arr.len(),
+            config.min_subtasks
+        ));
+    }
+
+    // Default phase = first declared phase, or "implement" if none supplied.
+    let default_phase = phases
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "implement".to_string());
+
+    let mut seeds: Vec<OrgChartSeed> = Vec::new();
+    for (i, item) in subtasks_arr.iter().enumerate() {
+        if i >= config.max_subtasks as usize {
+            break;
+        }
+        let default_id = format!("st-{:03}", i + 1);
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&default_id)
+            .to_string();
+        let title = item
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Untitled subtask")
+            .to_string();
+        // `brief` is canonical; accept `description` as the §3 alias.
+        let brief = item
+            .get("brief")
+            .or_else(|| item.get("description"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let phase = item
+            .get("phase")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&default_phase)
+            .to_string();
+        let depends_on: Vec<String> = item
+            .get("depends_on")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let expected_output = item
+            .get("expected_output")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let repo = item
+            .get("repo")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let emits_subtasks = item
+            .get("emits_subtasks")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        seeds.push(OrgChartSeed {
+            id,
+            title,
+            brief,
+            phase,
+            depends_on,
+            expected_output,
+            repo,
+            emits_subtasks,
+        });
+    }
+
+    info!(
+        "Parsed org-chart into {} seeds (elaborators: {})",
+        seeds.len(),
+        seeds.iter().filter(|s| s.emits_subtasks).count()
+    );
+    Ok(seeds)
+}
+
 /// Extract JSON object from a response that may contain markdown code fences.
 fn extract_json_from_response(response: &str) -> Result<String, String> {
     // Try direct parse first
@@ -317,6 +485,86 @@ mod tests {
         let response = "Here is the result: {\"key\": \"value\"} and that's it.";
         let result = extract_json_from_response(response).unwrap();
         assert_eq!(result, "{\"key\": \"value\"}");
+    }
+
+    // --- org-chart DESIGN prompt + parse (contract §3 shape) ---------------
+
+    #[test]
+    fn build_org_chart_prompt_includes_phases_and_emits_subtasks() {
+        let config = test_config();
+        let phases = vec![
+            "plan".to_string(),
+            "implement".to_string(),
+            "test".to_string(),
+        ];
+        let prompt = build_org_chart_prompt("Regenerate the app", &phases, &config);
+        assert!(prompt.contains("Regenerate the app"));
+        assert!(prompt.contains("plan, implement, test"));
+        assert!(prompt.contains("emits_subtasks"));
+        assert!(prompt.contains("\"phase\""));
+        assert!(prompt.contains("\"repo\""));
+    }
+
+    #[test]
+    fn parse_org_chart_response_full_shape() {
+        let config = test_config();
+        let phases = vec!["plan".to_string(), "implement".to_string()];
+        let response = r#"{
+            "goal_summary": "Regenerate",
+            "subtasks": [
+                {"id": "st-001", "title": "Comprehend", "brief": "read the site",
+                 "phase": "plan", "depends_on": [], "expected_output": "a spec",
+                 "repo": null, "emits_subtasks": true},
+                {"id": "st-002", "title": "Implement", "brief": "build it",
+                 "phase": "implement", "depends_on": ["st-001"],
+                 "expected_output": "a green PR", "repo": "qontinui-mobile"}
+            ]
+        }"#;
+        let seeds = parse_org_chart_response(response, &phases, &config).unwrap();
+        assert_eq!(seeds.len(), 2);
+        assert_eq!(seeds[0].id, "st-001");
+        assert!(
+            seeds[0].emits_subtasks,
+            "comprehension seed is an elaborator"
+        );
+        assert_eq!(seeds[0].phase, "plan");
+        assert!(seeds[0].repo.is_none());
+        assert_eq!(seeds[1].depends_on, vec!["st-001".to_string()]);
+        assert_eq!(seeds[1].repo.as_deref(), Some("qontinui-mobile"));
+        assert!(!seeds[1].emits_subtasks, "default false");
+    }
+
+    #[test]
+    fn parse_org_chart_response_accepts_description_alias_and_defaults_phase() {
+        // A response using the simpler decomposer `description` field + omitting
+        // phase/repo/emits_subtasks must still parse (brief ← description,
+        // phase ← first declared phase, emits_subtasks ← false).
+        let config = test_config();
+        let phases = vec!["implement".to_string(), "test".to_string()];
+        let response = r#"{
+            "goal_summary": "x",
+            "subtasks": [
+                {"id": "a", "title": "A", "description": "do a", "depends_on": [], "expected_output": "x"},
+                {"id": "b", "title": "B", "description": "do b", "depends_on": ["a"], "expected_output": "y"}
+            ]
+        }"#;
+        let seeds = parse_org_chart_response(response, &phases, &config).unwrap();
+        assert_eq!(seeds.len(), 2);
+        assert_eq!(seeds[0].brief, "do a", "description aliases brief");
+        assert_eq!(
+            seeds[0].phase, "implement",
+            "phase defaults to first declared"
+        );
+        assert!(!seeds[0].emits_subtasks);
+        assert!(seeds[0].repo.is_none());
+    }
+
+    #[test]
+    fn parse_org_chart_response_rejects_too_few() {
+        let config = test_config(); // min 2
+        let phases = vec!["implement".to_string()];
+        let response = r#"{"subtasks":[{"id":"a","title":"A","brief":"b","phase":"implement","depends_on":[],"expected_output":"x"}]}"#;
+        assert!(parse_org_chart_response(response, &phases, &config).is_err());
     }
 
     #[test]

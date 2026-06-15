@@ -50,6 +50,7 @@ pub mod meta_optimizer;
 pub mod misc_crud;
 pub mod observations;
 pub mod online_learning;
+pub mod orchestration;
 pub mod orchestration_loop;
 pub mod phase_results;
 pub mod pipeline_traces;
@@ -415,6 +416,62 @@ impl PgDb {
         )
         .await
         .map_err(|e| format!("Stream E.1 proposal_events.app_id self-heal failed: {}", e))?;
+
+        // Approach-D Conductor/Engine Phase 1 — runner-owned `orchestration`
+        // schema (durable run + subtask DAG ledger).
+        //
+        // Authored declaratively in `atlas/schema.hcl`; mirrored here as a
+        // CREATE SCHEMA / CREATE TABLE IF NOT EXISTS self-heal (same idiom as
+        // `project.apps` above) so a fresh PG without Atlas applied still boots
+        // the conductor loop. This is a runner-owned namespace — NOT a coord.*
+        // table — so there is no alembic migration and no `require_table` here;
+        // the runner heals the shape itself.
+        //
+        // `subtasks.artifact` stores a serde-serialized `CompletionReport`
+        // (see `database/pg/completion_reports.rs`); `produced_by` is the
+        // elaborating parent task_id (null for DESIGN-origin rows) and is the
+        // idempotent splice key used by progressive elaboration (Phase 4).
+        conn.batch_execute(
+            "CREATE SCHEMA IF NOT EXISTS orchestration; \
+             CREATE TABLE IF NOT EXISTS orchestration.runs ( \
+                 run_id     UUID PRIMARY KEY, \
+                 goal       TEXT NOT NULL, \
+                 recipe     TEXT, \
+                 phases     TEXT[] NOT NULL DEFAULT '{}', \
+                 status     TEXT NOT NULL, \
+                 created_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now() \
+             ); \
+             CREATE TABLE IF NOT EXISTS orchestration.subtasks ( \
+                 task_id         TEXT NOT NULL, \
+                 run_id          UUID NOT NULL REFERENCES orchestration.runs(run_id) ON DELETE CASCADE, \
+                 idx             INTEGER NOT NULL, \
+                 title           TEXT NOT NULL, \
+                 brief           TEXT NOT NULL, \
+                 phase           TEXT NOT NULL, \
+                 repo            TEXT, \
+                 depends_on      TEXT[] NOT NULL DEFAULT '{}', \
+                 expected_output TEXT NOT NULL, \
+                 emits_subtasks  BOOLEAN NOT NULL DEFAULT false, \
+                 state           TEXT NOT NULL, \
+                 task_run_id     UUID, \
+                 artifact        JSONB, \
+                 produced_by     TEXT, \
+                 gate_id         TEXT, \
+                 gate_status     TEXT, \
+                 created_at      TIMESTAMPTZ NOT NULL DEFAULT now(), \
+                 updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(), \
+                 PRIMARY KEY (run_id, task_id) \
+             ); \
+             ALTER TABLE orchestration.subtasks ADD COLUMN IF NOT EXISTS gate_id TEXT; \
+             ALTER TABLE orchestration.subtasks ADD COLUMN IF NOT EXISTS gate_status TEXT; \
+             CREATE INDEX IF NOT EXISTS idx_orchestration_subtasks_run \
+                 ON orchestration.subtasks (run_id, idx); \
+             CREATE INDEX IF NOT EXISTS idx_orchestration_subtasks_produced_by \
+                 ON orchestration.subtasks (run_id, produced_by);",
+        )
+        .await
+        .map_err(|e| format!("Phase 1 orchestration schema self-heal failed: {}", e))?;
 
         info!("PostgreSQL connected (deadpool, max_size=8, schema=runner)");
 

@@ -45,3 +45,18 @@ export type { PaletteActionLike } from "./palette-projection";
 
 export { interpretCommand, normalizeInterpretKey } from "./interpret";
 export type { InterpretMatch, InterpretOptions } from "./interpret";
+
+export {
+  useOrchestrateCommand,
+  planOrchestration,
+  splitOrchestrateArg,
+  TERMINAL_OPEN_PAGE_EVENT,
+} from "./orchestrateCommand";
+export type { TerminalOpenPageDetail } from "./orchestrateCommand";
+
+export {
+  RECIPES,
+  resolveRecipe,
+  fillTemplate,
+} from "./recipes";
+export type { OrchestrationRecipe, ResolvedRecipe } from "./recipes";

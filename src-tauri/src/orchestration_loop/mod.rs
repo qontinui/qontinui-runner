@@ -20,12 +20,17 @@
 //! The orchestrating runner is never restarted — only the target runner is.
 //! This cleanly separates the orchestrator from the execution target.
 
+pub mod ai_session_executor;
 pub mod commands;
+pub mod conductor;
 pub mod context_summarizer;
+pub mod coord_gate;
 pub mod diagnostician;
 pub mod fix_agent;
 pub mod intervention;
+pub mod ledger;
 pub mod loop_engine;
+pub mod org_chart;
 pub mod remote_client;
 pub mod stall_detector;
 pub mod subtask_executor;

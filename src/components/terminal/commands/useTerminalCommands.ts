@@ -48,6 +48,7 @@ import type { ResultCardSpec } from "../result-card";
 import { buildMetricsCardSpec, buildHistoryCardSpec } from "../result-card";
 import type { CommandAction, CommandResult, ResolverContext } from "./types";
 import { useCommandAction } from "./useCommandAction";
+import { useOrchestrateCommand } from "./orchestrateCommand";
 
 /**
  * Inputs that can't be read from the existing React contexts — handed in
@@ -1055,6 +1056,16 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       return ok();
     },
   });
+
+  // ── Approach-D Conductor (Phase 5) — /orchestrate ───────────────────
+  // Registers `/orchestrate <goal>` (or `/orchestrate <recipe-id> <args…>`)
+  // as a SINGLE CommandAction via the same useCommandAction path. No
+  // resolver/parser change — it surfaces in the palette + CommandBar
+  // automatically (registry-driven). Workers spawn into the run's zone grid
+  // (page_id = run_id). Kept as its own hook so the recipe seam +
+  // conductor-run wiring live in `orchestrateCommand.ts` rather than
+  // bloating this file.
+  useOrchestrateCommand();
 
   // Mark unused vars so linters don't trip on the resolver-context
   // signature placeholder (handlers below don't consult `ctx` directly

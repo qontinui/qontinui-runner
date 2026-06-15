@@ -173,6 +173,42 @@ export function useTerminalPages() {
     });
   }, []);
 
+  /**
+   * Open + activate a page by an EXPLICIT id (unlike {@link addPage}, which
+   * mints a random uuid). Used by `/orchestrate` to navigate to a run's page
+   * where `pageId === run_id`: workers dispatched by the conductor land on
+   * that page (durably recorded with `page_id = run_id`), so activating it
+   * shows the org-chart zone grid fill in. Idempotent — re-opening an
+   * existing run page just re-activates it (never duplicates the tab).
+   */
+  const openPage = useCallback(
+    (id: string, name: string) => {
+      if (!id) return;
+      setPages((prev) => {
+        if (prev.some((p) => p.id === id)) return prev; // already present — just activate below
+        const updated = [...prev, { id, name, createdAt: Date.now() }];
+        savePages(updated);
+        return updated;
+      });
+      setActivePageId(id);
+    },
+    [setActivePageId],
+  );
+
+  // `/orchestrate` (and any future explicit-page navigator) dispatches a
+  // `terminal-open-page` window CustomEvent rather than prop-drilling a page
+  // setter through App → providers → command ctx. Mirrors the existing
+  // event-based navigation idiom (`ui-bridge-navigate`, `navigate-to-active`).
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<{ pageId?: string; name?: string }>).detail;
+      if (!detail?.pageId) return;
+      openPage(detail.pageId, detail.name ?? `Run ${detail.pageId.slice(0, 8)}`);
+    };
+    window.addEventListener("terminal-open-page", handler as EventListener);
+    return () => window.removeEventListener("terminal-open-page", handler as EventListener);
+  }, [openPage]);
+
   // Reconcile backend-known page_ids into the tab list. A backend-spawned gate
   // continuation can land on a freshly-minted page_id that isn't in the
   // persisted tab list, so without this it would render nowhere. We union the
@@ -260,6 +296,7 @@ export function useTerminalPages() {
     activePageId,
     setActivePageId,
     addPage,
+    openPage,
     removePage,
     renamePage,
   };

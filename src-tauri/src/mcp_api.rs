@@ -2135,6 +2135,13 @@ pub fn create_router(
         .merge(crate::mcp::plans::routes())
         .merge(crate::mcp::coordinator::routes())
         .merge(crate::mcp::completion_reports::routes())
+        // Approach-D Conductor/Engine Phase 2 §3 — the `orchestration_report_subtask`
+        // MCP tool (POST /orchestration/report-subtask). Mounted alongside the
+        // other completion-report route modules.
+        .merge(crate::mcp::orchestration_report::routes())
+        // Approach-D Conductor/Engine Phase 3 — orchestration-run control
+        // surface (start/list/status/stop). Mirrors orchestration_loop_api.
+        .merge(crate::mcp::orchestration_run_api::routes())
         .merge(crate::mcp::completion_sources::routes())
         .merge(crate::mcp::reflection::routes())
         .merge(crate::mcp::sessions::routes())

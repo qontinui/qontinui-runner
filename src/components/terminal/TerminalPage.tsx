@@ -28,6 +28,7 @@ import { TerminalOverlays } from "./TerminalOverlays";
 import { CommandBar } from "./CommandBar";
 import { SuggestionsProvider } from "./suggestions";
 import { StatusStrip } from "./StatusStrip";
+import { ConductorStatusStrip } from "./ConductorStatusStrip";
 import { UnzonedChip } from "./UnzonedChip";
 import { pickLayout } from "./useZoneLayout";
 import { buildCreatePlainTerminalAction } from "./createPlainTerminalAction";
@@ -964,6 +965,13 @@ function TerminalPageInner({
             mounted directly below this); the registry + CommandBar +
             ZoneHoverActions + StatusStrip now cover its surface. */}
         <StatusStrip />
+        {/* Approach-D Conductor (Phase 5) — conductor run status strip.
+            Mounted with the active page id; when that page id is a live
+            conductor run (page_id == run_id, where /orchestrate's workers
+            land), it polls `orchestration_run_status` and surfaces the live
+            LoopPhase + per-subtask state summary + the DAG. Self-hides on any
+            non-run page (a plain terminal page yields not-found → null). */}
+        <ConductorStatusStrip runId={pageId} />
         {/* Layout-independent terminal-session roster marker (UI Bridge
             ground truth). Its textContent is the JSON census of every
             tracked session — read via `POST
