@@ -71,6 +71,40 @@ pub fn run_prompt_sync(prompt: &str, doctor_handle: Option<&DoctorHandle>) -> Ai
     })
 }
 
+/// Run a single-shot prompt FORCED onto the subscription-billed Claude CLI
+/// (`run_claude_cli`, the `claude --print` path), regardless of the user's
+/// configured `AiProvider`.
+///
+/// This exists for the Approach-D conductor DESIGN/elaboration org-chart pass,
+/// which carries a MANDATORY billing constraint (`feedback_no_anthropic_api`):
+/// the structured planning call MUST route through the subscription CLI and
+/// MUST NOT touch the metered Anthropic Messages API (`ClaudeApi`) nor the
+/// long-lived interactive agentic worker spawn (`agent_runtime.rs`). Routing
+/// on `settings.provider` (as `run_prompt_sync` does) could land on `ClaudeApi`
+/// if the operator configured it, so the conductor calls THIS instead to make
+/// the constraint structural, not configuration-dependent.
+///
+/// `model_override` is optional (use the CLI's configured default when `None`).
+pub fn run_prompt_via_claude_cli(
+    prompt: &str,
+    model_override: Option<&str>,
+    doctor_handle: Option<&DoctorHandle>,
+) -> AiResponse {
+    let ai_settings = settings::get_ai_settings();
+    info!(
+        "Running AI prompt via FORCED Claude CLI (subscription-billed; prompt length: {} chars)",
+        prompt.len()
+    );
+    retry_with_backoff_tracked("AI prompt (claude-cli forced)", Some("claude_cli"), || {
+        run_claude_cli(
+            prompt,
+            &ai_settings.claude_cli,
+            model_override,
+            doctor_handle,
+        )
+    })
+}
+
 /// Run an AI prompt with intelligent routing based on task complexity.
 ///
 /// This function assesses the complexity of the task based on the provided context

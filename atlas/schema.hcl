@@ -23,7 +23,7 @@
 //     arigaio/atlas:latest schema apply \
 //     --url 'postgres://qontinui_user:PASSWORD@localhost:5433/qontinui_db?sslmode=disable' \
 //     --to file:///workspace/atlas/schema.hcl \
-//     --schema project --schema coord \
+//     --schema project --schema coord --schema orchestration \
 //     --dev-url 'docker://postgres/16/dev'
 //
 // To verify zero-diff:
@@ -31,11 +31,15 @@
 //     arigaio/atlas:latest schema diff \
 //     --from 'postgres://...?sslmode=disable' \
 //     --to file:///workspace/atlas/schema.hcl \
-//     --schema project --schema coord \
+//     --schema project --schema coord --schema orchestration \
 //     --dev-url 'docker://postgres/16/dev'
 
 schema "project" {}
 schema "coord" {}
+// Runner-owned orchestration ledger (Approach-D Conductor/Engine, Phase 1).
+// Self-healed imperatively in `database/pg/mod.rs::verify_and_provision` as
+// well, so a fresh PG without Atlas applied still boots the conductor loop.
+schema "orchestration" {}
 
 // ---------------------------------------------------------------
 // project.regression_* — UI Bridge regression substrate (Section 11 / Phase A2)
@@ -504,5 +508,166 @@ table "apps" {
       column = column.last_seen_at_ms
       desc   = true
     }
+  }
+}
+
+// ---------------------------------------------------------------
+// orchestration.runs / orchestration.subtasks — Approach-D Conductor/Engine
+// Phase 1 durable ledger.
+//
+// `runs` is one row per `/orchestrate` invocation; `subtasks` is the growing
+// subtask DAG for that run. A later (Phase 3) reconciler is stateless over
+// these two tables, so every transition the conductor makes must be durable
+// here first.
+//
+// `subtasks.artifact` is a serde-serialized `CompletionReport` (see
+// `database/pg/completion_reports.rs`). `subtasks.produced_by` is the
+// elaborating parent task_id (null for DESIGN-origin rows) and is the
+// idempotent splice key used by progressive elaboration (Phase 4).
+//
+// Runner-owned: ALSO self-healed imperatively in
+// `database/pg/mod.rs::verify_and_provision`. No alembic migration — this is
+// not a coord.* table.
+// ---------------------------------------------------------------
+
+table "runs" {
+  schema = schema.orchestration
+  column "run_id" {
+    null = false
+    type = uuid
+  }
+  column "goal" {
+    null = false
+    type = text
+  }
+  column "recipe" {
+    null = true
+    type = text
+  }
+  column "phases" {
+    null    = false
+    type    = sql("text[]")
+    default = sql("'{}'")
+  }
+  column "status" {
+    null = false
+    type = text
+  }
+  column "created_at" {
+    null    = false
+    type    = timestamptz
+    default = sql("now()")
+  }
+  column "updated_at" {
+    null    = false
+    type    = timestamptz
+    default = sql("now()")
+  }
+  primary_key {
+    columns = [column.run_id]
+  }
+}
+
+table "subtasks" {
+  schema = schema.orchestration
+  column "task_id" {
+    null = false
+    type = text
+  }
+  column "run_id" {
+    null = false
+    type = uuid
+  }
+  column "idx" {
+    null = false
+    type = integer
+  }
+  column "title" {
+    null = false
+    type = text
+  }
+  column "brief" {
+    null = false
+    type = text
+  }
+  column "phase" {
+    null = false
+    type = text
+  }
+  column "repo" {
+    null = true
+    type = text
+  }
+  column "depends_on" {
+    null    = false
+    type    = sql("text[]")
+    default = sql("'{}'")
+  }
+  column "expected_output" {
+    null = false
+    type = text
+  }
+  column "emits_subtasks" {
+    null    = false
+    type    = boolean
+    default = false
+  }
+  column "state" {
+    null = false
+    type = text
+  }
+  column "task_run_id" {
+    null = true
+    type = uuid
+  }
+  column "artifact" {
+    null = true
+    type = jsonb
+  }
+  column "produced_by" {
+    null = true
+    type = text
+  }
+  // Phase 6 coord-gate association. `gate_id` is the coord gate that gates
+  // this subtask's dispatch (CI-green / PR-merged / deploy-healthy); `gate_status`
+  // mirrors the last-polled coord verdict (open|cleared|failed). Both nullable —
+  // a subtask without an observable external pre-condition carries neither. The
+  // gate row is the DURABLE record a restart re-attaches to (no re-registration).
+  column "gate_id" {
+    null = true
+    type = text
+  }
+  column "gate_status" {
+    null = true
+    type = text
+  }
+  column "created_at" {
+    null    = false
+    type    = timestamptz
+    default = sql("now()")
+  }
+  column "updated_at" {
+    null    = false
+    type    = timestamptz
+    default = sql("now()")
+  }
+  primary_key {
+    columns = [column.run_id, column.task_id]
+  }
+  foreign_key "subtasks_run_id_fkey" {
+    columns     = [column.run_id]
+    ref_columns = [table.runs.column.run_id]
+    on_delete   = CASCADE
+  }
+  index "idx_orchestration_subtasks_run" {
+    on {
+      column = column.run_id
+    }
+    on {
+      column = column.idx
+    }
+  }
+  index "idx_orchestration_subtasks_produced_by" {
+    columns = [column.run_id, column.produced_by]
   }
 }

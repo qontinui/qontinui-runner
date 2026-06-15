@@ -91,6 +91,8 @@ pub mod monitors;
 pub mod observations_api;
 pub mod online_learning_api;
 pub mod orchestration_loop_api;
+pub mod orchestration_report;
+pub mod orchestration_run_api;
 pub mod otel_status;
 pub mod pg_guard;
 pub mod physical_device;
