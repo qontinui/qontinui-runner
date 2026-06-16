@@ -84,13 +84,28 @@ fn find_setup_mcp_src_dir() -> Option<std::path::PathBuf> {
         }
     }
 
-    // Check each candidate for the setup-mcp package
+    // Check each candidate (and its bundled-resource subdir) for the package.
+    // Dev/workspace layout: `<root>/qontinui-setup-mcp/src`. Packaged apps place
+    // bundled resources under a platform dir (macOS `<App>.app/Contents/Resources`,
+    // Windows next to the exe), so also probe `Resources/` at each level so an
+    // out-of-the-box install finds the source without a pip install.
     for candidate in &candidates {
-        let src_dir = candidate.join("qontinui-setup-mcp").join("src");
-        let module_init = src_dir.join("qontinui_setup_mcp").join("__init__.py");
-        if module_init.exists() {
-            info!("Found qontinui-setup-mcp source at: {}", src_dir.display());
-            return Some(src_dir);
+        for base in [
+            candidate.clone(),
+            // Vendored in-repo copy (dev builds, no sibling checkout needed):
+            // `<runner>/src-tauri/resources/qontinui-setup-mcp/src`.
+            candidate.join("src-tauri").join("resources"),
+            candidate.join("resources"),
+            // Packaged-app resource dirs (macOS `.app/Contents/Resources`,
+            // Linux/Windows `resources/`).
+            candidate.join("Resources"),
+        ] {
+            let src_dir = base.join("qontinui-setup-mcp").join("src");
+            let module_init = src_dir.join("qontinui_setup_mcp").join("__init__.py");
+            if module_init.exists() {
+                info!("Found qontinui-setup-mcp source at: {}", src_dir.display());
+                return Some(src_dir);
+            }
         }
     }
 
@@ -112,12 +127,51 @@ fn find_setup_mcp_src_dir() -> Option<std::path::PathBuf> {
     None
 }
 
+/// Resolve a Python 3.12+ interpreter for the setup CLI.
+///
+/// End-user machines vary: some have `python`, some only `python3`, some a
+/// versioned `python3.12`, and macOS ships an old `/usr/bin/python3` (3.9) that
+/// must be skipped. Probe a preference-ordered candidate list and return the
+/// first that reports >= 3.12. `QONTINUI_PYTHON` overrides the search so an
+/// operator can pin a specific interpreter (or a bundled one).
+fn resolve_python() -> Option<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Ok(p) = std::env::var("QONTINUI_PYTHON") {
+        if !p.is_empty() {
+            candidates.push(p);
+        }
+    }
+    for c in ["python3.13", "python3.12", "python3", "python"] {
+        candidates.push(c.to_string());
+    }
+    candidates.into_iter().find(|cand| {
+        crate::process_helpers::no_window(cand)
+            .args([
+                "-c",
+                "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
 /// Run a qontinui-setup-mcp CLI command and return parsed JSON output.
 ///
 /// Automatically sets PYTHONPATH to include the qontinui-setup-mcp source
 /// directory so the module can be found without requiring pip installation.
 fn run_setup_cli(args: &[&str]) -> Result<Value, String> {
-    let mut cmd = crate::process_helpers::no_window("python");
+    let python = resolve_python().ok_or_else(|| {
+        String::from(AppError::ProcessError(
+            "No Python 3.12+ interpreter found (tried $QONTINUI_PYTHON, \
+             python3.13, python3.12, python3, python). Install Python 3.12+ \
+             or set QONTINUI_PYTHON to its path."
+                .to_string(),
+        ))
+    })?;
+    let mut cmd = crate::process_helpers::no_window(&python);
     cmd.args(
         std::iter::once("-m")
             .chain(std::iter::once("qontinui_setup_mcp.cli"))
@@ -129,10 +183,15 @@ fn run_setup_cli(args: &[&str]) -> Result<Value, String> {
     // Set PYTHONPATH so the module can be found from source
     if let Some(src_dir) = find_setup_mcp_src_dir() {
         let src_dir_str = src_dir.to_string_lossy().to_string();
-        // Prepend to existing PYTHONPATH if set, otherwise just use the src dir
+        // Prepend to existing PYTHONPATH if set, otherwise just use the src dir.
+        // Use the platform PYTHONPATH separator (':' on Unix, ';' on Windows) —
+        // a hardcoded ';' silently broke source resolution on macOS/Linux
+        // whenever PYTHONPATH was already set (e.g. under Anaconda), forcing a
+        // fallback to a pip-installed copy that out-of-the-box users don't have.
         let python_path = match std::env::var("PYTHONPATH") {
             Ok(existing) if !existing.is_empty() => {
-                format!("{};{}", src_dir_str, existing)
+                let sep = if cfg!(windows) { ';' } else { ':' };
+                format!("{}{}{}", src_dir_str, sep, existing)
             }
             _ => src_dir_str,
         };
