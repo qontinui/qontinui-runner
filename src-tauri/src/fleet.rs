@@ -1030,6 +1030,81 @@ struct TreeStatePayload {
 /// this is silently truncated; `dirty=true` still flags the tree.
 const MAX_DIRTY_FILES_REPORTED: usize = 50;
 
+/// Machine-local artifacts the runner drops into a managed repo's working
+/// tree: the per-session coord-mcp proxy `.mcp.json` (holds device-scoped
+/// proxy keys — must never be committed) and the `agent-worktrees/` /
+/// `.agent-worktrees/` checkout roots. Left untracked they make `capture_tree`
+/// report `dirty=true`, which on a default branch yields a permanent
+/// `wip_on_default` Hold from the pull-decision watcher — silently wedging the
+/// repo-pull executor. We exclude them per-repo via `.git/info/exclude` (see
+/// [`ensure_repo_info_exclude`]) rather than a committed `.gitignore`, so the
+/// heal is machine-local (no per-repo PR) and a secrets file never enters git
+/// history at all.
+const MANAGED_REPO_EXCLUDES: &[&str] = &[".mcp.json", "agent-worktrees/", ".agent-worktrees/"];
+
+/// Header line bracketing the runner-managed block in a repo's
+/// `.git/info/exclude` — lets the operator see who added the entries.
+const MANAGED_EXCLUDE_MARKER: &str = "# qontinui-runner: machine-local artifacts (auto-excluded)";
+
+/// Idempotently ensure `<repo>/.git/info/exclude` ignores the runner's
+/// machine-local artifacts ([`MANAGED_REPO_EXCLUDES`]). `.git/info/exclude` is
+/// git's per-repo, NON-tracked ignore file: it hides matching UNTRACKED paths
+/// exactly like `.gitignore` but without a tracked edit (which would itself
+/// dirty the tree). Because exclusion applies to any matching untracked path
+/// regardless of when it appeared, calling this every publish cycle also heals
+/// repos that ALREADY have the stray files — so no `.gitignore` sweep is needed.
+///
+/// Only PRIMARY checkouts (`.git` is a directory) are handled; a linked
+/// worktree's `.git` is a file pointing elsewhere, so we skip it (the publisher
+/// walks primary trees anyway). Best-effort: any IO error is swallowed — a
+/// missed exclude just means the tree reads dirty for one more cycle, never a
+/// panic.
+fn ensure_repo_info_exclude(repo_path: &std::path::Path) {
+    // `.git` as a directory == primary checkout. Skip worktree `.git` files
+    // and bare/odd layouts.
+    if !repo_path.join(".git").is_dir() {
+        return;
+    }
+    let info_dir = repo_path.join(".git").join("info");
+    let exclude_path = info_dir.join("exclude");
+    let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+
+    // Match on whole (trimmed) lines so a substring like `.mcp.json.bak` never
+    // counts as already-covered.
+    let present: std::collections::HashSet<&str> = existing.lines().map(|l| l.trim()).collect();
+    let missing: Vec<&str> = MANAGED_REPO_EXCLUDES
+        .iter()
+        .copied()
+        .filter(|pat| !present.contains(*pat))
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    // Capture marker presence before `existing` is moved into `out` below;
+    // `missing` holds 'static patterns so it doesn't borrow `existing`.
+    let marker_present = present.contains(MANAGED_EXCLUDE_MARKER);
+
+    if let Err(e) = std::fs::create_dir_all(&info_dir) {
+        debug!("fleet::ensure_repo_info_exclude: create_dir_all {info_dir:?} failed: {e}");
+        return;
+    }
+    let mut out = existing;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if !marker_present {
+        out.push_str(MANAGED_EXCLUDE_MARKER);
+        out.push('\n');
+    }
+    for pat in missing {
+        out.push_str(pat);
+        out.push('\n');
+    }
+    if let Err(e) = std::fs::write(&exclude_path, out) {
+        debug!("fleet::ensure_repo_info_exclude: write {exclude_path:?} failed: {e}");
+    }
+}
+
 /// Resolve the root directory the publisher walks for qontinui-* repos.
 /// `QONTINUI_ROOT` env override → `D:/qontinui-root` on Windows →
 /// `$HOME/qontinui-root` on unix. Returns `None` if neither resolves to
@@ -2196,10 +2271,17 @@ pub async fn publish_tree_state() -> Result<(), String> {
         // closure surfaces as a JoinError → treated as a skip, same as
         // capture_tree returning None.
         let capture_path = path.clone();
-        let mut payload = match tokio::task::spawn_blocking(move || capture_tree(&capture_path))
-            .await
-            .ok()
-            .flatten()
+        let mut payload = match tokio::task::spawn_blocking(move || {
+            // Heal machine-local artifacts into `.git/info/exclude` BEFORE
+            // capturing, so this cycle's dirty/verdict already reflects it —
+            // otherwise the stray `.mcp.json` would pin the tree to a
+            // `wip_on_default` Hold and the pull below would never fire.
+            ensure_repo_info_exclude(&capture_path);
+            capture_tree(&capture_path)
+        })
+        .await
+        .ok()
+        .flatten()
         {
             Some(p) => p,
             None => {
@@ -2328,6 +2410,61 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn ensure_repo_info_exclude_heals_existing_untracked_artifacts() {
+        let dir =
+            std::env::temp_dir().join(format!("fleet-exclude-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        tgit(&dir, &["init", "-b", "main"]);
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        tgit(&dir, &["add", "."]);
+        tgit(&dir, &["commit", "-m", "A"]);
+
+        // The stray machine artifacts already present BEFORE we exclude — the
+        // retroactive-heal case that obviates a `.gitignore` sweep.
+        std::fs::write(dir.join(".mcp.json"), "{}").unwrap();
+        std::fs::create_dir_all(dir.join("agent-worktrees")).unwrap();
+        std::fs::write(dir.join("agent-worktrees").join("x"), "x").unwrap();
+        assert!(
+            tgit(&dir, &["status", "--porcelain"]).contains(".mcp.json"),
+            "precondition: artifacts make the tree dirty before excluding"
+        );
+
+        ensure_repo_info_exclude(&dir);
+
+        assert!(
+            tgit(&dir, &["status", "--porcelain"]).is_empty(),
+            "tree must read clean once artifacts are excluded"
+        );
+        let exclude =
+            std::fs::read_to_string(dir.join(".git").join("info").join("exclude")).unwrap();
+        assert!(exclude.contains(".mcp.json") && exclude.contains("agent-worktrees/"));
+
+        // Idempotent: a second pass changes nothing (no duplicate lines/marker).
+        let first = exclude;
+        ensure_repo_info_exclude(&dir);
+        let second =
+            std::fs::read_to_string(dir.join(".git").join("info").join("exclude")).unwrap();
+        assert_eq!(first, second, "second call must be a no-op");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_repo_info_exclude_skips_linked_worktree() {
+        // A dir whose `.git` is a FILE (linked-worktree shape) is skipped so we
+        // never write into a shared/foreign git dir.
+        let dir = std::env::temp_dir().join(format!(
+            "fleet-exclude-wt-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".git"), "gitdir: /somewhere/else").unwrap();
+        ensure_repo_info_exclude(&dir); // must not panic
+        assert!(!dir.join(".git").join("info").join("exclude").exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A parked-on-squash-merged-branch fixture: a bare origin whose `main`
