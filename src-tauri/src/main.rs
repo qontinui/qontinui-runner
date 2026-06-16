@@ -149,6 +149,7 @@ mod security;
 mod semantic_conventions;
 mod server_mode;
 mod session; // Plan 2026-05-22-coord-native-session-coordination Phase 2 — unified Session primitive
+mod session_bus; // Session Bus Phase 3b — gated directed-message delivery executor
 mod settings;
 // `startup_panic` is a minimal, dep-free panic-hook installer called from
 // the very top of `main()` so early-init crashes (DB connect, Tauri builder,
@@ -613,6 +614,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // each other (unlike the heartbeat above, which feeds
                 // coord's 120s liveness TTL and must never be starved).
                 fleet::spawn_tree_publisher();
+                // Session Bus Phase 3b — directed-message delivery executor.
+                // No-op unless COORD_SESSION_BUS_ENABLED is set (opt-in): it
+                // injects coord-queued messages into live session terminals.
+                session_bus::spawn_session_bus_executor();
                 // Ξ_Worktree census (Phase 1) — periodic disk-footprint
                 // + junction-status + volume-free-space census of every
                 // on-disk git worktree, POSTed to
