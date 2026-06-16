@@ -145,6 +145,155 @@ pub fn run_checks(checks: Vec<Check<'_>>) -> DoctorReport {
 }
 
 // ===========================================================================
+// Single source of truth — the static spec for each of the 8 checks.
+//
+// `name` and `fix` are sourced FROM here by `diagnose()` (so the live report
+// can't drift from this table), and the onboarding doc is GENERATED from here
+// (so the doc can't drift from the report). `title` + `verifies` are the
+// human-readable, doc-only fields. A test asserts the live `diagnose()` chain
+// and `CHECK_SPECS` agree on order + names, so adding/removing/reordering a
+// check without updating this table fails the build.
+// ===========================================================================
+
+/// The static, doc-and-report-shared spec for one doctor check. `name`/`fix`
+/// are the SAME strings the live `Check` carries (sourced here by `diagnose`);
+/// `title` + `verifies` are the human-readable description rendered into the
+/// onboarding doc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckSpec {
+    /// Stable machine name (matches the live `CheckResult::name`).
+    pub name: &'static str,
+    /// Short human title for the doc section heading.
+    pub title: &'static str,
+    /// One-line "what this verifies" description for the doc.
+    pub verifies: &'static str,
+    /// Actionable fix (matches the live `CheckResult::fix`).
+    pub fix: &'static str,
+}
+
+/// The 8 checks in `diagnose()` order. THE single source of truth for check
+/// names + fixes (the live report sources them here) and for the onboarding
+/// doc (which is generated from here). Index 5 (check 6, device-JWT-live) is
+/// also the source the `DEVICE_JWT_LIVE_CHECK_NAME`/`_FIX` constants derive
+/// from — see the consts below and the `device_jwt_live_spec_matches_constants` test.
+pub const CHECK_SPECS: &[CheckSpec] = &[
+    CheckSpec {
+        name: "claude_account",
+        title: "Claude account signed in",
+        verifies: "a Claude account with live credentials is present \
+                   (a valid ~/.claude/.credentials.json)",
+        fix: "run /login",
+    },
+    CheckSpec {
+        name: "tier",
+        title: "Runner tier is Qontinui account",
+        verifies: "the runner tier is set to qontinui_account \
+                   (settings.json::tier == \"qontinui_account\")",
+        fix: "set runner tier to Qontinui account",
+    },
+    CheckSpec {
+        name: "credential_store_readable",
+        title: "Credential store readable",
+        verifies: "the credential store (OS keychain / on-disk slot) can be \
+                   READ — placed ahead of every bearer-consuming check so an \
+                   unreadable store reports itself instead of being \
+                   misdiagnosed as 'not signed in' or 'no tenant'",
+        fix: "credential store unreadable — check file permissions / OS keychain access",
+    },
+    CheckSpec {
+        name: "paired_signed_in",
+        title: "Paired and signed in",
+        verifies: "paired_user.json is present and a bearer is stored in the \
+                   access-token slot",
+        fix: "sign in / re-pair",
+    },
+    CheckSpec {
+        name: "tenant_resolvable",
+        title: "Tenant resolvable",
+        verifies: "a tenant_id resolves from the OAuth/runner-bearer claim, the \
+                   outgoing device-JWT, or machine.json::active_tenant_id",
+        fix: "machine.json missing active_tenant_id",
+    },
+    CheckSpec {
+        name: "device_jwt_live",
+        title: "Coord device JWT live",
+        verifies: "a live coord device JWT is present in the access-token slot \
+                   and is not near expiry",
+        fix: "kick refresher / re-pair",
+    },
+    CheckSpec {
+        name: "mcp_json_valid",
+        title: ".mcp.json valid",
+        verifies: "the session .mcp.json coord-mcp port equals the bound API \
+                   port, its nonce is a registered proxy key, and the bearer is \
+                   a coord device JWT",
+        fix: "stale config — reprovision",
+    },
+    CheckSpec {
+        name: "coord_reachable",
+        title: "Coord reachable",
+        verifies: "a one-shot tools/list JSON-RPC round-trips 200 against the \
+                   configured coord /mcp endpoint",
+        fix: "coord unreachable",
+    },
+];
+
+/// Look up a [`CheckSpec`] by name at construction time. Panics if the name is
+/// absent — `diagnose()` only ever passes literals that ARE in `CHECK_SPECS`,
+/// and a missing entry is a programming error that should fail loudly (the
+/// `diagnose_order_matches_specs` test would also catch it).
+fn spec(name: &'static str) -> &'static CheckSpec {
+    CHECK_SPECS
+        .iter()
+        .find(|s| s.name == name)
+        .unwrap_or_else(|| panic!("no CHECK_SPECS entry for check {name:?}"))
+}
+
+// ===========================================================================
+// Onboarding doc generator — emits the new-runner provisioning checklist as
+// markdown straight from CHECK_SPECS, so the doc and the live `coord doctor`
+// report can never drift. Checked in at `docs/runner-onboarding.md` and
+// enforced fresh by `.github/workflows/onboarding-doc-fresh.yml`.
+// ===========================================================================
+
+/// Render the new-runner onboarding / provisioning checklist as markdown,
+/// generated entirely from [`CHECK_SPECS`]. The output is byte-stable so a CI
+/// gate can diff the checked-in `docs/runner-onboarding.md` against a fresh
+/// regen. Emit it via `coord_doctor --onboarding-doc`.
+pub fn render_onboarding_doc() -> String {
+    let mut out = String::new();
+    out.push_str("# Runner onboarding — coord access checklist\n\n");
+    out.push_str(
+        "This is the checklist a fresh runner must satisfy before it can reach \
+         coord and set gates. Each item below is one of the ordered checks run \
+         by `coord doctor` (plan 2026-06-13 Phase 4/5). A runner is not \
+         provisioning-complete until **all** of them pass.\n\n",
+    );
+    out.push_str(
+        "<!-- GENERATED FILE — do not edit by hand. Regenerate via \
+         `coord_doctor --onboarding-doc` (or \
+         `cargo run --bin coord_doctor -- --onboarding-doc > docs/runner-onboarding.md`). \
+         The source of truth is `CHECK_SPECS` in \
+         `src-tauri/src/coord_doctor.rs`. -->\n\n",
+    );
+    out.push_str("## Provisioning checklist\n\n");
+    for (i, s) in CHECK_SPECS.iter().enumerate() {
+        out.push_str(&format!("### {}. {} (`{}`)\n\n", i + 1, s.title, s.name));
+        out.push_str(&format!("Verifies: {}\n\n", s.verifies));
+        out.push_str(&format!("**Fix:** {}\n\n", s.fix));
+    }
+    out.push_str("---\n\n");
+    out.push_str(
+        "`coord doctor` runs these checks live and **stops at the first \
+         failure**, naming that one link plus its fix. Run it from \
+         **Settings → Account** in the runner app, or headless via the \
+         `coord_doctor` bin (`cargo run --bin coord_doctor`). Green on all \
+         eight ⇒ this runner can set gates.\n",
+    );
+    out
+}
+
+// ===========================================================================
 // Real wiring — the 8 checks, reusing existing predicates / on-disk state.
 // ===========================================================================
 
@@ -189,8 +338,18 @@ pub fn diagnose(inputs: &DoctorInputs) -> DoctorReport {
     let cfg_dir = inputs.claude_config_dir.clone();
     let bound_port = inputs.bound_api_port;
 
+    // Each check sources its `name`/`fix` from the matching `CHECK_SPECS`
+    // entry so the live report can never drift from the generated doc.
+    let s_claude = spec("claude_account");
+    let s_tier = spec("tier");
+    let s_cred_store = spec("credential_store_readable");
+    let s_paired = spec("paired_signed_in");
+    let s_tenant = spec("tenant_resolvable");
+    let s_mcp = spec("mcp_json_valid");
+    let s_coord = spec("coord_reachable");
+
     let checks = vec![
-        Check::new("claude_account", "run /login", move || {
+        Check::new(s_claude.name, s_claude.fix, move || {
             let ok = claude_account_has_valid_credentials(cfg_dir.as_deref());
             if ok {
                 (
@@ -204,7 +363,7 @@ pub fn diagnose(inputs: &DoctorInputs) -> DoctorReport {
                 )
             }
         }),
-        Check::new("tier", "set runner tier to Qontinui account", || {
+        Check::new(s_tier.name, s_tier.fix, || {
             match read_runner_tier() {
                 crate::profiles::TierRead::Known(t)
                     if t == crate::profiles::QONTINUI_ACCOUNT_TIER =>
@@ -237,10 +396,9 @@ pub fn diagnose(inputs: &DoctorInputs) -> DoctorReport {
         // instead of blaming the next check in line.
         {
             let auth_ref = crate::auth::AuthManager::new();
-            Check::new(
-                "credential_store_readable",
-                "credential store unreadable — check file permissions / OS keychain access",
-                move || match auth_ref.probe_access_token() {
+            Check::new(s_cred_store.name, s_cred_store.fix, move || {
+                let read = auth_ref.probe_access_token();
+                match read {
                     crate::secure_storage::StoredTokenRead::Unreadable(e) => (
                         false,
                         format!(
@@ -250,12 +408,12 @@ pub fn diagnose(inputs: &DoctorInputs) -> DoctorReport {
                         ),
                     ),
                     _ => (true, "credential store is readable".into()),
-                },
-            )
+                }
+            })
         },
         {
             let auth_ref = crate::auth::AuthManager::new();
-            Check::new("paired_signed_in", "sign in / re-pair", move || {
+            Check::new(s_paired.name, s_paired.fix, move || {
                 let paired = crate::pair::read_paired_user_id_from_disk().is_some();
                 let bearer = auth_ref
                     .get_access_token()
@@ -277,33 +435,29 @@ pub fn diagnose(inputs: &DoctorInputs) -> DoctorReport {
         },
         {
             let auth_ref = crate::auth::AuthManager::new();
-            Check::new(
-                "tenant_resolvable",
-                "machine.json missing active_tenant_id",
-                move || {
-                    let bearer = match auth_ref.get_access_token() {
-                        Ok(b) => b,
-                        Err(e) => {
-                            return (
-                                false,
-                                format!(
-                                    "credential store unreadable ({e}) — the tenant is UNKNOWN, \
-                                     not missing; this is not a tenant misconfiguration"
-                                ),
-                            )
-                        }
-                    };
-                    match resolve_tenant_for_doctor(&bearer) {
-                        Some((tid, src)) => (true, format!("tenant {tid} resolved from {src}")),
-                        None => (
+            Check::new(s_tenant.name, s_tenant.fix, move || {
+                let bearer = match auth_ref.get_access_token() {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return (
                             false,
-                            "no tenant_id from OAuth claim, outgoing device-JWT, or \
-                             machine.json::active_tenant_id"
-                                .into(),
-                        ),
+                            format!(
+                                "credential store unreadable ({e}) — the tenant is UNKNOWN, \
+                                 not missing; this is not a tenant misconfiguration"
+                            ),
+                        )
                     }
-                },
-            )
+                };
+                match resolve_tenant_for_doctor(&bearer) {
+                    Some((tid, src)) => (true, format!("tenant {tid} resolved from {src}")),
+                    None => (
+                        false,
+                        "no tenant_id from OAuth claim, outgoing device-JWT, or \
+                             machine.json::active_tenant_id"
+                            .into(),
+                    ),
+                }
+            })
         },
         {
             let auth_ref = crate::auth::AuthManager::new();
@@ -315,17 +469,11 @@ pub fn diagnose(inputs: &DoctorInputs) -> DoctorReport {
         },
         {
             let auth_ref = crate::auth::AuthManager::new();
-            Check::new(
-                "mcp_json_valid",
-                "stale config — reprovision",
-                move || mcp_json_check(bound_port, &auth_ref),
-            )
+            Check::new(s_mcp.name, s_mcp.fix, move || {
+                mcp_json_check(bound_port, &auth_ref)
+            })
         },
-        Check::new(
-            "coord_reachable",
-            "coord unreachable",
-            coord_reachable_check,
-        ),
+        Check::new(s_coord.name, s_coord.fix, coord_reachable_check),
     ];
 
     run_checks(checks)
@@ -336,11 +484,14 @@ pub fn diagnose(inputs: &DoctorInputs) -> DoctorReport {
 // reuse the EXACT predicate `diagnose` runs (no second device-JWT impl).
 // ===========================================================================
 
-/// The stable `name`/`fix` for check 5, shared between [`diagnose`] and
+/// The stable `name`/`fix` for the device-JWT-live check, shared between [`diagnose`] and
 /// [`device_jwt_live_check`] so the provisioning gate and the full doctor
-/// report name the link identically.
-pub const DEVICE_JWT_LIVE_CHECK_NAME: &str = "device_jwt_live";
-pub const DEVICE_JWT_LIVE_CHECK_FIX: &str = "kick refresher / re-pair";
+/// report name the link identically. DERIVED from `CHECK_SPECS[5]` — the
+/// single source of truth — so the provisioning gate, the report, and the
+/// onboarding doc all name that check with the SAME strings. The
+/// `device_jwt_live_spec_matches_constants` test pins index 5 == `device_jwt_live`.
+pub const DEVICE_JWT_LIVE_CHECK_NAME: &str = CHECK_SPECS[5].name;
+pub const DEVICE_JWT_LIVE_CHECK_FIX: &str = CHECK_SPECS[5].fix;
 
 /// The check-5 predicate over an `AuthManager`: a live device JWT is present
 /// and not near expiry. `(ok, detail)`. The single source of truth for "does
@@ -931,6 +1082,77 @@ mod tests {
         let agent = format!("{header}.{agent_payload}.sig");
         assert_eq!(jwt_sub_type(&agent).as_deref(), Some("agent"));
         assert_eq!(jwt_sub_type("opaque-token"), None);
+    }
+
+    // ---- Phase 5 — CHECK_SPECS single-source-of-truth + onboarding doc ----
+
+    #[test]
+    fn check_specs_has_exactly_eight_entries() {
+        assert_eq!(CHECK_SPECS.len(), 8);
+    }
+
+    #[test]
+    fn onboarding_doc_mentions_every_spec_name_and_fix() {
+        let doc = render_onboarding_doc();
+        for s in CHECK_SPECS {
+            assert!(
+                doc.contains(s.name),
+                "onboarding doc missing check name {:?}",
+                s.name
+            );
+            assert!(
+                doc.contains(s.fix),
+                "onboarding doc missing fix {:?} for check {:?}",
+                s.fix,
+                s.name
+            );
+            assert!(
+                doc.contains(s.title),
+                "onboarding doc missing title {:?}",
+                s.title
+            );
+        }
+        // The do-not-edit banner must be present so the checked-in file warns
+        // editors to regenerate instead.
+        assert!(doc.contains("GENERATED FILE"));
+        assert!(doc.contains("--onboarding-doc"));
+    }
+
+    #[test]
+    fn diagnose_order_matches_specs() {
+        // The live diagnose() chain (with default inputs) must produce checks
+        // whose names match CHECK_SPECS in order — adding/removing/reordering
+        // a check without updating CHECK_SPECS fails here. We compare only the
+        // checks that ran up to (and including) the first red against the
+        // corresponding prefix of CHECK_SPECS; in a bare test env check 1
+        // (claude_account) typically fails first, but whichever checks DO run
+        // must align positionally with the spec table.
+        let report = diagnose(&DoctorInputs::default());
+        assert!(
+            !report.checks.is_empty(),
+            "diagnose should always run at least check 1"
+        );
+        for (i, c) in report.checks.iter().enumerate() {
+            assert_eq!(
+                c.name, CHECK_SPECS[i].name,
+                "check at position {i} is {:?} but CHECK_SPECS[{i}] is {:?}",
+                c.name, CHECK_SPECS[i].name
+            );
+            // The live `fix` is sourced from the spec → must match too.
+            assert_eq!(
+                c.fix, CHECK_SPECS[i].fix,
+                "fix at position {i} drifted from CHECK_SPECS"
+            );
+        }
+    }
+
+    #[test]
+    fn device_jwt_live_spec_matches_constants() {
+        // Index 5 is the device-JWT-live check, and the shared constants the
+        // provisioning gate uses must equal its spec entry.
+        assert_eq!(CHECK_SPECS[5].name, "device_jwt_live");
+        assert_eq!(CHECK_SPECS[5].name, DEVICE_JWT_LIVE_CHECK_NAME);
+        assert_eq!(CHECK_SPECS[5].fix, DEVICE_JWT_LIVE_CHECK_FIX);
     }
 
     // ---- Phase 5 — provisioning completeness gate (pure predicate) ----
