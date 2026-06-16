@@ -1,9 +1,9 @@
 //! `coord_doctor` — headless runner self-check for coord access + gate
 //! registration (plan 2026-06-13 Phase 4).
 //!
-//! Runs the SAME seven ordered checks as the in-app `coord_doctor` Tauri
+//! Runs the SAME eight ordered checks as the in-app `coord_doctor` Tauri
 //! command (both delegate to `qontinui_runner_lib::coord_doctor`), STOPS at the
-//! first red, and prints the link + its fix. Green on all seven ⇒ "this runner
+//! first red, and prints the link + its fix. Green on all eight ⇒ "this runner
 //! can set gates."
 //!
 //! ## Bound-port caveat
@@ -18,15 +18,24 @@
 //! ## Usage
 //!
 //! ```text
-//! coord_doctor          # human-readable report; exit 0 = can set gates, 1 = blocked
-//! coord_doctor --json   # machine-readable DoctorReport JSON
+//! coord_doctor                   # human-readable report; exit 0 = can set gates, 1 = blocked
+//! coord_doctor --json            # machine-readable DoctorReport JSON
+//! coord_doctor --onboarding-doc  # emit the generated onboarding checklist (markdown), exit 0
 //! ```
 
 use std::process::ExitCode;
 
-use qontinui_runner_lib::coord_doctor::{diagnose, DoctorInputs};
+use qontinui_runner_lib::coord_doctor::{diagnose, render_onboarding_doc, DoctorInputs};
 
 fn main() -> ExitCode {
+    // Doc-emit mode: print the onboarding checklist generated from CHECK_SPECS
+    // and exit 0 WITHOUT running any live check. The CI freshness gate uses
+    // this to regenerate `docs/runner-onboarding.md` and diff it.
+    if std::env::args().any(|a| a == "--onboarding-doc") {
+        print!("{}", render_onboarding_doc());
+        return ExitCode::SUCCESS;
+    }
+
     let json = std::env::args().any(|a| a == "--json");
 
     let inputs = DoctorInputs {

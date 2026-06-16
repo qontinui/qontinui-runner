@@ -69,7 +69,12 @@ docs/TESTING_CHECKLIST.md
 python-bridge/test_*.py
 test_python_executor.sh
 python-bridge/test_full_communication.py
-docs/
+# Ignore docs/ contents (use docs/* not docs/ so a single file can be
+# re-included — git can't re-include under an excluded *directory*).
+docs/*
+# ...but the generated runner onboarding checklist IS tracked (Phase-5
+# anti-drift gate diffs it against a fresh `coord_doctor --onboarding-doc`).
+!docs/runner-onboarding.md
 
 # Configuration files
 configs/
