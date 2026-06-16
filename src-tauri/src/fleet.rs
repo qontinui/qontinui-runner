@@ -128,9 +128,9 @@ pub fn detect_resources() -> Resources {
 /// machine.json (which used the old field name) still deserializes
 /// without manual migration.
 #[derive(Debug, Clone, Deserialize)]
-struct DeviceFile {
+pub(crate) struct DeviceFile {
     #[serde(alias = "machine_id")]
-    device_id: String,
+    pub(crate) device_id: String,
     hostname: String,
 }
 
@@ -138,7 +138,7 @@ fn device_file_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".qontinui").join("machine.json"))
 }
 
-fn load_device_file() -> Option<DeviceFile> {
+pub(crate) fn load_device_file() -> Option<DeviceFile> {
     let path = device_file_path()?;
     let bytes = std::fs::read(&path).ok()?;
     serde_json::from_slice(&bytes).ok()
@@ -308,7 +308,7 @@ fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
 /// Unlike those resolvers this deliberately returns `None` (rather than
 /// defaulting to `http://localhost:9870`) when nothing is configured, so the
 /// heartbeat cleanly skips instead of spamming connection errors every tick.
-fn coord_http_base() -> Option<String> {
+pub(crate) fn coord_http_base() -> Option<String> {
     // Delegates to the shared resolver, preserving the deliberate `None`
     // (rather than localhost) when nothing is configured, so the heartbeat
     // cleanly skips instead of spamming connection errors every tick.
