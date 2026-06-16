@@ -149,6 +149,10 @@ mod security;
 mod semantic_conventions;
 mod server_mode;
 mod session; // Plan 2026-05-22-coord-native-session-coordination Phase 2 — unified Session primitive
+             // Hook-free, runner-side WIP-attribution capture (mirrors fleet::tree_publisher).
+             // Reads each hosted session's transcript and POSTs file-edit attribution to
+             // coord. Gated OFF by default (COORD_SESSION_ATTRIBUTION_ENABLED).
+mod session_attribution;
 mod settings;
 // `startup_panic` is a minimal, dep-free panic-hook installer called from
 // the very top of `main()` so early-init crashes (DB connect, Tauri builder,
@@ -613,6 +617,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // each other (unlike the heartbeat above, which feeds
                 // coord's 120s liveness TTL and must never be starved).
                 fleet::spawn_tree_publisher();
+                // Hook-free, runner-side WIP-attribution capture (sibling of
+                // the tree publisher above). Reads each hosted session's Claude
+                // transcript forward-only and POSTs file-edit attribution to
+                // coord's /coord/wip-attribution. Gated OFF by default
+                // (COORD_SESSION_ATTRIBUTION_ENABLED) — no live consumer yet, so
+                // it's a no-op until armed. See `session_attribution`.
+                session_attribution::spawn_session_attribution();
                 // Ξ_Worktree census (Phase 1) — periodic disk-footprint
                 // + junction-status + volume-free-space census of every
                 // on-disk git worktree, POSTed to
