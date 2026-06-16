@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "base_sha": "a491fdb7a5d5652fcb78c049c0970dedb44bba6e",
+  "ours_sha": "d1e3bb752eff6bba117da8acea346ec00ff223a0",
+  "theirs_sha": "06a9e6322edbba8d4311d8dae73eb8dd54fa3701",
+  "entries": [
+    {
+      "path": "Cargo.lock",
+      "base_oid": "a0a339ca66422d05189c2a5b7290f94165a2be1d",
+      "ours_oid": "3b10e2ceb161ce2929fdfa002221a9928494fcad",
+      "theirs_oid": "97347e162b144a1f9983a41c227d1595c76e36ce",
+      "base_path": "Cargo.lock.base",
+      "ours_path": "Cargo.lock.ours",
+      "theirs_path": "Cargo.lock.theirs",
+      "hunks": [
+        "<<<<<<< HEAD\nname = \"qontinui-app-generator\"\nversion = \"0.1.0\"\ndependencies = [\n \"qontinui-spec-check\",\n=======\nname = \"qontinui-backend-generator\"\nversion = \"0.1.0\"\ndependencies = [\n>>>>>>> d1e3bb75 (feat(backend-generator): Phase 1 deterministic spec→FastAPI seam (one entity + one op))\n"
+      ]
+    },
+    {
+      "path": "Cargo.toml",
+      "base_oid": "4c270c4f7755b8c7f3b9aacd9f2dbb081532c8a9",
+      "ours_oid": "25db4f671708692bcc44ffe087e61a077b051cd3",
+      "theirs_oid": "14eb7273a5614119e48afd0adab8b83bcffe6ce1",
+      "base_path": "Cargo.toml.base",
+      "ours_path": "Cargo.toml.ours",
+      "theirs_path": "Cargo.toml.theirs",
+      "hunks": [
+        "<<<<<<< HEAD\nmembers = [\"src-tauri\", \"src-tauri/clorinde\", \"crates/spec-check\", \"crates/qontinui-app-generator\"]\n=======\nmembers = [\"src-tauri\", \"src-tauri/clorinde\", \"crates/spec-check\", \"crates/qontinui-backend-generator\"]\n>>>>>>> d1e3bb75 (feat(backend-generator): Phase 1 deterministic spec→FastAPI seam (one entity + one op))\n"
+      ]
+    }
+  ]
+}

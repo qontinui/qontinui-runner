@@ -6328,22 +6328,6 @@ dependencies = [
 ]
 
 [[package]]
-<<<<<<< HEAD
-name = "qontinui-app-generator"
-version = "0.1.0"
-dependencies = [
- "qontinui-spec-check",
-=======
-name = "qontinui-backend-generator"
-version = "0.1.0"
-dependencies = [
->>>>>>> d1e3bb75 (feat(backend-generator): Phase 1 deterministic spec→FastAPI seam (one entity + one op))
- "qontinui-types",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "qontinui-code-graph"
 version = "0.1.0"
 dependencies = [
