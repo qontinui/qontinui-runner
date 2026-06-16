@@ -24,15 +24,56 @@
 //! nonce would 401 every live agent after a routine restart.
 //!
 //! SCOPE-ELEVATION TRAP: agent-spawn sessions deliberately carry a narrower
-//! coord-minted `SubType::Agent` JWT. The proxy attaches the live DEVICE JWT,
-//! so ONLY device-provisioned sessions may route through it — the agent path
-//! keeps the static-bearer shape, and the proxy gate re-checks `sub_type ==
-//! "device"` on every request.
+//! coord-minted `SubType::Agent` JWT. The DEVICE proxy attaches the live DEVICE
+//! JWT, so an agent session must NEVER route through the device proxy. Instead,
+//! agent sessions get their OWN per-agent proxy ([`ProxyPrincipal::Agent`]) that
+//! injects THEIR OWN refreshed agent JWT — held in [`AGENT_TOKENS`], a
+//! process-global `SharedToken` slot refreshed proactively from the agent's
+//! heartbeat loop so the 4h TTL never expires for a live agent. The proxy gate
+//! structurally binds nonce→principal→`sub_type`: a device nonce can only ever
+//! forward a `sub_type == "device"` bearer, and an agent nonce a
+//! `sub_type == "agent"` bearer — neither can elevate into the other.
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use tracing::{info, warn};
+use uuid::Uuid;
+
+/// Which identity a registered proxy nonce is bound to. The nonce→principal
+/// binding is the structural backstop against the scope-elevation trap: the
+/// pre-forward gate ([`proxy_request_gate`]) requires the injected bearer's
+/// `sub_type` claim to match the principal, so a device nonce can never forward
+/// an agent token (or vice-versa).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ProxyPrincipal {
+    /// The runner's own device identity — the bearer is the live device JWT read
+    /// from `AuthManager` per request.
+    Device,
+    /// A specific spawned agent — the bearer is THAT agent's own refreshed JWT,
+    /// looked up from [`AGENT_TOKENS`] by `agent_id` per request.
+    Agent { agent_id: Uuid },
+}
+
+impl ProxyPrincipal {
+    /// The `sub_type` claim value a forwarded bearer must carry for this
+    /// principal. The gate rejects any bearer whose `sub_type` differs.
+    fn expected_sub_type(&self) -> &'static str {
+        match self {
+            ProxyPrincipal::Device => "device",
+            ProxyPrincipal::Agent { .. } => "agent",
+        }
+    }
+}
+
+/// What a registered proxy nonce maps to: the session workdir it was provisioned
+/// into PLUS the identity ([`ProxyPrincipal`]) whose bearer the proxy may inject
+/// for it.
+#[derive(Clone, Debug)]
+struct NonceBinding {
+    workdir: String,
+    principal: ProxyPrincipal,
+}
 
 /// Header carrying the per-session loopback nonce that authenticates a
 /// session's MCP client to the runner-local `/coord-mcp` proxy route.
@@ -46,8 +87,8 @@ pub(crate) const COORD_MCP_PROXY_KEY_HEADER: &str = "x-coord-mcp-proxy-key";
 /// module does NOT depend on `agent_runtime` (which depends back on us).
 fn coord_http_base() -> Option<String> {
     // Delegates to the shared resolver. `None` when nothing is configured; the
-    // localhost fallback for the `.mcp.json` write is applied by the caller
-    // (`write_coord_mcp_config`), unchanged.
+    // localhost fallback for the `.mcp.json` write is applied downstream by
+    // `coord_base_url`, unchanged.
     match qontinui_runner_lib::profiles::resolve_coord_base() {
         qontinui_runner_lib::profiles::CoordBase::Configured(base) => Some(base),
         _ => None,
@@ -76,20 +117,80 @@ pub(crate) fn coord_mcp_url() -> String {
 }
 
 /// In-memory nonce registry for the loopback `/coord-mcp` proxy:
-/// nonce → workdir it was provisioned into. Mirrored to the encrypted local
-/// store (Phase 3b) when `COORD_MCP_PERSIST_NONCES` is not `0`, so the set
-/// survives a runner rebuild/restart and an already-written `.mcp.json` keeps
-/// validating (the MCP client never re-reads the file). With persistence
-/// disabled this degrades to the prior process-lifetime-only behavior.
-static PROXY_NONCES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+/// nonce → [`NonceBinding`] (the workdir it was provisioned into + the
+/// [`ProxyPrincipal`] whose bearer it may inject). DEVICE bindings are mirrored
+/// to the encrypted local store (Phase 3b) when `COORD_MCP_PERSIST_NONCES` is
+/// not `0`, so the device set survives a runner rebuild/restart and an
+/// already-written `.mcp.json` keeps validating (the MCP client never re-reads
+/// the file). AGENT bindings are NEVER persisted (OQ3): a restarted runner has
+/// no live agent session, so a restored agent nonce MUST hard-fail closed — the
+/// handler 401s on the absent [`AGENT_TOKENS`] slot (process-global, never
+/// persisted). With persistence disabled this degrades to the prior
+/// process-lifetime-only behavior for device nonces too.
+static PROXY_NONCES: OnceLock<Mutex<HashMap<String, NonceBinding>>> = OnceLock::new();
+
+/// Per-agent live-token registry for the agent-proxy path: `agent_id` →
+/// the agent's [`crate::agent_token::SharedToken`] slot. Built fresh at the
+/// agent spawn site from the launch payload's JWT (there is no other live owner
+/// — `agent_daemons::spawn_for_agent` has no production caller), refreshed
+/// proactively from the agent's heartbeat loop, and dropped on teardown. A nonce
+/// bound to [`ProxyPrincipal::Agent`] whose `agent_id` has no slot here is a
+/// hard 401 — which is exactly what makes a restart (or a torn-down agent)
+/// fail closed.
+static AGENT_TOKENS: OnceLock<Mutex<HashMap<Uuid, crate::agent_token::SharedToken>>> =
+    OnceLock::new();
+
+fn agent_tokens() -> &'static Mutex<HashMap<Uuid, crate::agent_token::SharedToken>> {
+    AGENT_TOKENS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Register (or replace) the live-token slot for `agent_id`. Called at the agent
+/// spawn site after building the slot from the launch payload's JWT.
+pub(crate) fn register_agent_token(agent_id: Uuid, slot: crate::agent_token::SharedToken) {
+    agent_tokens()
+        .lock()
+        .expect("agent token map poisoned")
+        .insert(agent_id, slot);
+}
+
+/// Look up the live-token slot for `agent_id` (clones the `Arc` out so the lock
+/// is released immediately). `None` after teardown / before registration → the
+/// proxy handler 401s, failing closed.
+pub(crate) fn lookup_agent_token(agent_id: Uuid) -> Option<crate::agent_token::SharedToken> {
+    agent_tokens()
+        .lock()
+        .expect("agent token map poisoned")
+        .get(&agent_id)
+        .cloned()
+}
+
+/// Drop the live-token slot for `agent_id` on teardown so a torn-down agent's
+/// nonce hard-fails closed. Idempotent.
+pub(crate) fn remove_agent_token(agent_id: Uuid) {
+    agent_tokens()
+        .lock()
+        .expect("agent token map poisoned")
+        .remove(&agent_id);
+}
 
 /// Guards [`restore_proxy_nonces_from_store`] so a second boot-restore (e.g. an
 /// idempotent auto-start re-invocation) never re-loads over live in-memory
 /// nonces minted since the first restore.
 static PROXY_NONCES_RESTORED: OnceLock<()> = OnceLock::new();
 
-fn proxy_nonces() -> &'static Mutex<HashMap<String, String>> {
+fn proxy_nonces() -> &'static Mutex<HashMap<String, NonceBinding>> {
     PROXY_NONCES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Project the live nonce map down to the DEVICE-only `nonce → workdir` shape
+/// the encrypted store persists (OQ3): agent bindings are dropped so they never
+/// reach disk. The store contract is unchanged (`HashMap<String, String>`), so
+/// the persistence/restore seams and their tests stay green.
+fn device_nonce_snapshot(map: &HashMap<String, NonceBinding>) -> HashMap<String, String> {
+    map.iter()
+        .filter(|(_, b)| b.principal == ProxyPrincipal::Device)
+        .map(|(n, b)| (n.clone(), b.workdir.clone()))
+        .collect()
 }
 
 /// True unless `COORD_MCP_PERSIST_NONCES` is explicitly set to `0` — persistence
@@ -117,7 +218,7 @@ fn nonce_persistence_enabled() -> bool {
 /// store via the `_with_store` seam so they never touch the developer's real
 /// encrypted store NOR the process-global env (which would race sibling tests
 /// that read the default store, e.g. `auth::device_jwt_tests`).
-fn persist_proxy_nonces(map: &HashMap<String, String>) {
+fn persist_proxy_nonces(map: &HashMap<String, NonceBinding>) {
     if !nonce_persistence_enabled() {
         return;
     }
@@ -136,9 +237,11 @@ fn persist_proxy_nonces(map: &HashMap<String, String>) {
 /// gate is the CALLER's concern — handing a store IS the decision to persist.
 fn persist_proxy_nonces_with_store(
     store: &crate::secure_storage::SecureStorage,
-    map: &HashMap<String, String>,
+    map: &HashMap<String, NonceBinding>,
 ) {
-    if let Err(e) = store.store_coord_mcp_nonces(map) {
+    // OQ3: persist DEVICE bindings only — agent nonces must never reach disk.
+    let device_only = device_nonce_snapshot(map);
+    if let Err(e) = store.store_coord_mcp_nonces(&device_only) {
         warn!("coord_mcp: failed to persist proxy nonces: {e}");
     }
 }
@@ -182,7 +285,14 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> us
     let restored = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
         for (nonce, workdir) in persisted {
-            map.entry(nonce).or_insert(workdir);
+            // Only DEVICE bindings are ever persisted (OQ3), so a restored entry
+            // is unconditionally a Device principal. An agent nonce can never be
+            // restored — its slot is process-global and gone after a restart, so
+            // it would hard-fail closed anyway.
+            map.entry(nonce).or_insert(NonceBinding {
+                workdir,
+                principal: ProxyPrincipal::Device,
+            });
         }
         map.len()
     };
@@ -196,7 +306,21 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> us
 /// only widen the accept set. The updated set is mirrored to the encrypted
 /// store (Phase 3b) so it survives a restart.
 fn register_proxy_nonce(workdir: &str) -> String {
-    let (nonce, snapshot) = mint_and_register_nonce(workdir);
+    let (nonce, snapshot) = mint_and_register_nonce(workdir, ProxyPrincipal::Device);
+    persist_proxy_nonces(&snapshot);
+    nonce
+}
+
+/// Mint + register a fresh per-session proxy nonce bound to a specific AGENT for
+/// `workdir`. Unlike [`register_proxy_nonce`] this is NOT persisted (OQ3) — an
+/// agent nonce must hard-fail closed across a restart, which is automatic since
+/// [`persist_proxy_nonces`] drops non-device bindings. The per-request bearer
+/// comes from the agent's own [`AGENT_TOKENS`] slot, never the device JWT.
+fn register_agent_proxy_nonce(workdir: &str, agent_id: Uuid) -> String {
+    let (nonce, snapshot) = mint_and_register_nonce(workdir, ProxyPrincipal::Agent { agent_id });
+    // Mirror to the store as a no-op for the agent entry (device entries in the
+    // same snapshot, if any, are still persisted) — `persist_proxy_nonces`
+    // filters agent bindings out, so this never writes the agent nonce to disk.
     persist_proxy_nonces(&snapshot);
     nonce
 }
@@ -206,7 +330,10 @@ fn register_proxy_nonce(workdir: &str) -> String {
 /// step so a test can mint and then mirror to an INJECTED store
 /// ([`persist_proxy_nonces_with_store`]) instead of the default store reached
 /// via the process-global `QONTINUI_SECURE_STORAGE_DIR`.
-fn mint_and_register_nonce(workdir: &str) -> (String, HashMap<String, String>) {
+fn mint_and_register_nonce(
+    workdir: &str,
+    principal: ProxyPrincipal,
+) -> (String, HashMap<String, NonceBinding>) {
     // Two v4 UUIDs (~244 bits of randomness) — v4, NOT v7: the v7 prefix is a
     // timestamp, which would gut the entropy this nonce exists to provide.
     let nonce = format!(
@@ -216,8 +343,14 @@ fn mint_and_register_nonce(workdir: &str) -> (String, HashMap<String, String>) {
     );
     let snapshot = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
-        map.retain(|_, wd| wd != workdir);
-        map.insert(nonce.clone(), workdir.to_string());
+        map.retain(|_, b| b.workdir != workdir);
+        map.insert(
+            nonce.clone(),
+            NonceBinding {
+                workdir: workdir.to_string(),
+                principal,
+            },
+        );
         map.clone()
     };
     (nonce, snapshot)
@@ -232,21 +365,43 @@ pub(crate) fn proxy_nonce_is_valid(nonce: &str) -> bool {
             .contains_key(nonce)
 }
 
+/// Resolve the [`ProxyPrincipal`] a registered nonce is bound to. `None` for an
+/// empty or unregistered nonce — the handler treats that as a 401. The handler
+/// resolves the principal BEFORE reading any bearer, so the bearer it injects is
+/// chosen by the binding (device JWT vs the agent's own JWT) rather than the
+/// other way around.
+pub(crate) fn proxy_principal_for_nonce(nonce: &str) -> Option<ProxyPrincipal> {
+    if nonce.is_empty() {
+        return None;
+    }
+    proxy_nonces()
+        .lock()
+        .expect("proxy nonce map poisoned")
+        .get(nonce)
+        .map(|b| b.principal.clone())
+}
+
 /// Pre-forward gate for the loopback `/coord-mcp` proxy route. Pure over its
 /// inputs (no I/O) so the 401 paths are unit-testable without a live coord:
 ///
 /// 1. `nonce` must be a registered per-session key ([`proxy_nonce_is_valid`])
 ///    — stops other local processes borrowing the runner's coord identity.
-/// 2. `bearer` (the live `AuthManager` access-token read) must be present and
-///    decode `sub_type == "device"` — the same guard as
-///    [`provision_coord_mcp_with_jwt`], re-applied per request so the proxy
-///    can never attach a non-device token (scope-elevation trap: agent
-///    sessions carry their own narrower JWT and never route through here).
+/// 2. `bearer` (the resolved per-request token — the live device JWT for a
+///    [`ProxyPrincipal::Device`] nonce, the agent's own refreshed JWT for an
+///    [`ProxyPrincipal::Agent`] nonce) must be present and decode a `sub_type`
+///    matching the bound `principal` ([`ProxyPrincipal::expected_sub_type`]).
+///
+/// The `nonce → principal → sub_type` chain is the structural backstop against
+/// the scope-elevation trap: a device nonce can only ever forward a device
+/// token and an agent nonce only ever an agent token — neither can elevate into
+/// the other. The handler resolves `principal` from the nonce BEFORE picking the
+/// bearer, so this gate only re-validates that pairing.
 ///
 /// `Ok(())` means: forward with `Authorization: Bearer <bearer>`.
 pub(crate) fn proxy_request_gate(
     nonce: Option<&str>,
     bearer: Option<&str>,
+    principal: &ProxyPrincipal,
 ) -> Result<(), (u16, String)> {
     if !proxy_nonce_is_valid(nonce.unwrap_or("")) {
         return Err((
@@ -259,17 +414,18 @@ pub(crate) fn proxy_request_gate(
         _ => {
             return Err((
                 401,
-                "runner has no live device JWT in its access_token slot".to_string(),
+                "no live JWT available for this proxy session".to_string(),
             ));
         }
     };
+    let expected = principal.expected_sub_type();
     match jwt_unverified_claim(bearer, "sub_type").as_deref() {
-        Some("device") => Ok(()),
+        Some(st) if st == expected => Ok(()),
         other => Err((
             401,
             format!(
-                "runner access_token bearer is not a coord DEVICE JWT \
-                 (sub_type={other:?}) — refusing to forward"
+                "proxy bearer sub_type={other:?} does not match the nonce's \
+                 bound principal (expected {expected:?}) — refusing to forward"
             ),
         )),
     }
@@ -295,33 +451,6 @@ pub(crate) fn resolve_bound_api_port() -> Option<u16> {
     None
 }
 
-/// The coord-native `/mcp` endpoint is live (coord PR #277 Phase-2 cutover),
-/// so this no longer carries the prior "do not deploy" gate. If a target coord
-/// ever lacks the `/mcp` route, agents get an unreachable MCP server: Claude
-/// Code degrades gracefully and runs *without* coord tools (a silent
-/// coordination regression) — so always sequence a coord `/mcp` deploy ahead
-/// of pointing runners at a new coord.
-///
-/// Coord base resolution: `COORD_HTTP_URL` env → active profile's `coord_url`
-/// → localhost fallback. Previously this read ONLY the env var, so a
-/// profile-configured runner (production → `coord.qontinui.io`) wrote a
-/// `localhost` MCP url into the agent's `.mcp.json`, silently pointing spawned
-/// agents at the wrong coord.
-pub(crate) fn write_coord_mcp_config(primary_wt: &str, jwt: &str) {
-    let mcp_config = serde_json::json!({
-        "mcpServers": {
-            "coord-mcp": {
-                "type": "http",
-                "url": coord_mcp_url(),
-                "headers": {
-                    "Authorization": format!("Bearer {}", jwt),
-                }
-            }
-        }
-    });
-    write_mcp_json(primary_wt, &mcp_config);
-}
-
 /// Write the DEVICE-path `.mcp.json`: an `http`-transport server pointing at
 /// the runner's own loopback `/coord-mcp` proxy on the ACTUALLY-BOUND API
 /// port, authenticated by a freshly-minted per-session nonce — and NO baked
@@ -330,6 +459,37 @@ pub(crate) fn write_coord_mcp_config(primary_wt: &str, jwt: &str) {
 /// that outlive their snapshot (the MCP client never re-reads `.mcp.json`).
 pub(crate) fn write_coord_mcp_proxy_config(primary_wt: &str, bound_port: u16) {
     let nonce = register_proxy_nonce(primary_wt);
+    let mcp_config = serde_json::json!({
+        "mcpServers": {
+            "coord-mcp": {
+                "type": "http",
+                "url": format!("http://127.0.0.1:{bound_port}/coord-mcp"),
+                "headers": {
+                    "X-Coord-Mcp-Proxy-Key": nonce,
+                }
+            }
+        }
+    });
+    write_mcp_json(primary_wt, &mcp_config);
+}
+
+/// Write the AGENT-path `.mcp.json`: identical shape to
+/// [`write_coord_mcp_proxy_config`] (loopback proxy URL on the bound port + a
+/// per-session nonce header, NO baked bearer), but the nonce is bound to
+/// [`ProxyPrincipal::Agent`] for `agent_id` — so the proxy injects THAT agent's
+/// own refreshed JWT (from [`AGENT_TOKENS`]) per request, never the device JWT.
+/// This is what lets an agent session outlive the 4h agent-JWT TTL (the static
+/// bake at the old spawn site silently lost coord-mcp at expiry).
+///
+/// The caller MUST register the agent's [`crate::agent_token::SharedToken`] via
+/// [`register_agent_token`] (and drive proactive refresh) — an agent nonce with
+/// no live slot hard-fails closed (401).
+pub(crate) fn write_coord_mcp_agent_proxy_config(
+    primary_wt: &str,
+    bound_port: u16,
+    agent_id: Uuid,
+) {
+    let nonce = register_agent_proxy_nonce(primary_wt, agent_id);
     let mcp_config = serde_json::json!({
         "mcpServers": {
             "coord-mcp": {
@@ -353,7 +513,7 @@ pub(crate) const COORD_MCP_STATUS_FILE: &str = ".coord-mcp-status";
 /// Emitted ONLY when coord-mcp is degraded — a healthy session writes nothing
 /// (the file is removed by [`clear_degraded_breadcrumb`] on a successful probe),
 /// so its mere presence is the signal. Best-effort: a write failure only logs.
-fn write_degraded_breadcrumb(workdir: &str, reason: &str) {
+pub(crate) fn write_degraded_breadcrumb(workdir: &str, reason: &str) {
     let line =
         format!("coord-mcp UNREACHABLE ({reason}) — gate registration degraded; use /gate\n");
     let path = Path::new(workdir).join(COORD_MCP_STATUS_FILE);
@@ -376,13 +536,13 @@ fn clear_degraded_breadcrumb(workdir: &str) {
 /// with a short timeout, on a DETACHED thread so it never blocks or panics
 /// session provisioning. On a non-2xx / transport failure it drops the
 /// degraded breadcrumb; on success it clears any stale one and writes nothing.
-fn probe_and_breadcrumb_proxy(workdir: &str, port: u16) {
+pub(crate) fn probe_and_breadcrumb_proxy(workdir: &str, port: u16) {
     // Resolve the nonce we just wrote for this workdir so the probe authenticates
     // exactly as the session's MCP client will.
     let nonce = {
         let map = proxy_nonces().lock().expect("proxy nonce map poisoned");
         map.iter()
-            .find(|(_, wd)| wd.as_str() == workdir)
+            .find(|(_, b)| b.workdir.as_str() == workdir)
             .map(|(n, _)| n.clone())
     };
     let Some(nonce) = nonce else {
@@ -553,7 +713,51 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16
         // only on failure, nothing on success (discoverability without clutter).
         probe_and_breadcrumb_proxy(workdir, port);
     } else {
-        write_coord_mcp_config(workdir, jwt);
+        // AGENT path. In production this arm is effectively unreachable: the
+        // only callers (`provision_coord_mcp_for_session` ← gate-continuation +
+        // the `acquire_for_terminal` terminal chokepoint) read the bearer from
+        // the runner's DEVICE access_token slot, which never holds an agent JWT
+        // (agent JWTs are minted by coord and delivered in `LaunchPayload.jwt`,
+        // provisioned at the spawn site, not here). It is kept defensively and
+        // is exercised only by `provision_with_jwt_orchestration`.
+        //
+        // Even so we use the per-agent PROXY shape (delete-over-deprecate): bake
+        // a `SharedToken` from the JWT claims, register it, and write the agent
+        // proxy config. LIMITATION: this path has NO heartbeat driver, so the
+        // slot is refreshed ONLY lazily on the request path (`maybe_refresh` in
+        // the handler). For a steadily-used MCP client that is sufficient (the
+        // 30-min margin ≫ inter-call gap); an idle agent that goes >TTL between
+        // coord-mcp calls could still expire (coord's refresh endpoint rejects
+        // an already-expired token — OQ4). The spawn-site path (with the 30s
+        // heartbeat refresh) is the one that matters and never expires.
+        let agent_id = jwt_unverified_claim(jwt, "sub")
+            .and_then(|s| Uuid::parse_str(&s).ok())
+            .unwrap_or_else(Uuid::nil);
+        let exp = jwt_unverified_claim(jwt, "exp")
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+        let port = match bound_port {
+            Some(p) => p,
+            None => {
+                warn!(
+                    "coord_mcp: refusing to write an AGENT proxy .mcp.json for {workdir} — \
+                     the bound API port is unresolvable (no managed AppState)."
+                );
+                write_degraded_breadcrumb(
+                    workdir,
+                    "bound API port unresolvable — agent proxy config NOT written (would point at a dead port)",
+                );
+                return;
+            }
+        };
+        let slot = std::sync::Arc::new(tokio::sync::RwLock::new(crate::agent_token::TokenSlot {
+            token: jwt.to_string(),
+            jti: Uuid::nil(),
+            exp,
+        }));
+        register_agent_token(agent_id, slot);
+        write_coord_mcp_agent_proxy_config(workdir, port, agent_id);
+        probe_and_breadcrumb_proxy(workdir, port);
     }
 }
 
@@ -708,47 +912,6 @@ mod tests {
         (dir, store)
     }
 
-    #[test]
-    fn write_coord_mcp_config_emits_http_bearer_shape() {
-        let tmp = std::env::temp_dir().join(format!("coord-mcp-cfg-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let primary_wt = tmp.to_string_lossy().to_string();
-
-        let prev = std::env::var("COORD_HTTP_URL").ok();
-        std::env::set_var("COORD_HTTP_URL", "https://coord.example.test/");
-
-        write_coord_mcp_config(&primary_wt, "header.payload.sig");
-
-        let written = std::fs::read_to_string(tmp.join(".mcp.json")).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&written).unwrap();
-        let server = &v["mcpServers"]["coord-mcp"];
-
-        // HTTP transport pointing at coord /mcp, Bearer-authenticated.
-        assert_eq!(server["type"], "http");
-        assert_eq!(server["url"], "https://coord.example.test/mcp");
-        assert_eq!(
-            server["headers"]["Authorization"],
-            "Bearer header.payload.sig"
-        );
-
-        // No Node-sidecar/subprocess residue, and no identity env vars
-        // (identity is derived server-side from the JWT claims).
-        assert!(server.get("command").is_none(), "must not spawn a command");
-        assert!(server.get("args").is_none(), "must not pass node args");
-        assert!(server.get("env").is_none(), "identity must come from JWT");
-        assert!(
-            !written.contains("node") && !written.contains("coord-mcp.mjs"),
-            "config must not reference the Node sidecar: {written}"
-        );
-
-        // Cleanup.
-        let _ = std::fs::remove_dir_all(&tmp);
-        match prev {
-            Some(p) => std::env::set_var("COORD_HTTP_URL", p),
-            None => std::env::remove_var("COORD_HTTP_URL"),
-        }
-    }
-
     /// The DEVICE-path proxy shape: loopback URL built from the passed bound
     /// port, a registered per-session nonce header, and — critically — NO
     /// baked `Authorization` bearer (the proxy injects a live one per request).
@@ -796,10 +959,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// The loopback proxy's pre-forward gate: registered nonce + device bearer
-    /// → forward; everything else → 401 before any network I/O. This is the
-    /// scope-elevation backstop — even a valid nonce must never forward a
-    /// non-DEVICE bearer.
+    /// The loopback proxy's pre-forward gate over a DEVICE-bound nonce:
+    /// registered nonce + device bearer → forward; everything else → 401 before
+    /// any network I/O. This is the scope-elevation backstop — a device nonce
+    /// must never forward a non-device bearer.
     #[test]
     fn proxy_request_gate_forwards_only_nonce_plus_device_bearer() {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -811,48 +974,173 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("coord-mcp-gate-{}", uuid::Uuid::new_v4()));
         let nonce = register_proxy_nonce(&dir.to_string_lossy());
         let device = mk("device");
+        let dev_p = ProxyPrincipal::Device;
+
+        // The nonce resolves to a Device principal.
+        assert_eq!(
+            proxy_principal_for_nonce(&nonce),
+            Some(ProxyPrincipal::Device)
+        );
 
         // Registered nonce + device bearer → forward.
-        assert!(proxy_request_gate(Some(&nonce), Some(&device)).is_ok());
+        assert!(proxy_request_gate(Some(&nonce), Some(&device), &dev_p).is_ok());
 
         // Absent / mismatched nonce → 401, regardless of bearer.
-        assert_eq!(proxy_request_gate(None, Some(&device)).unwrap_err().0, 401);
         assert_eq!(
-            proxy_request_gate(Some("not-a-registered-nonce"), Some(&device))
+            proxy_request_gate(None, Some(&device), &dev_p)
                 .unwrap_err()
                 .0,
             401
         );
         assert_eq!(
-            proxy_request_gate(Some(""), Some(&device)).unwrap_err().0,
+            proxy_request_gate(Some("not-a-registered-nonce"), Some(&device), &dev_p)
+                .unwrap_err()
+                .0,
+            401
+        );
+        assert_eq!(
+            proxy_request_gate(Some(""), Some(&device), &dev_p)
+                .unwrap_err()
+                .0,
             401
         );
 
         // Valid nonce but no/empty bearer → 401.
-        assert_eq!(proxy_request_gate(Some(&nonce), None).unwrap_err().0, 401);
         assert_eq!(
-            proxy_request_gate(Some(&nonce), Some(" ")).unwrap_err().0,
+            proxy_request_gate(Some(&nonce), None, &dev_p)
+                .unwrap_err()
+                .0,
+            401
+        );
+        assert_eq!(
+            proxy_request_gate(Some(&nonce), Some(" "), &dev_p)
+                .unwrap_err()
+                .0,
             401
         );
 
-        // Valid nonce but an AGENT bearer → 401 (scope-elevation trap: the
-        // proxy must only ever attach the runner's DEVICE identity).
-        let agent_err = proxy_request_gate(Some(&nonce), Some(&mk("agent"))).unwrap_err();
+        // Valid device nonce but an AGENT bearer → 401 (scope-elevation trap:
+        // a device nonce must only ever attach the runner's DEVICE identity).
+        let agent_err = proxy_request_gate(Some(&nonce), Some(&mk("agent")), &dev_p).unwrap_err();
         assert_eq!(agent_err.0, 401);
         // A non-coord (e.g. Cognito) bearer → 401 too.
         assert_eq!(
-            proxy_request_gate(Some(&nonce), Some(&mk("access")))
+            proxy_request_gate(Some(&nonce), Some(&mk("access")), &dev_p)
                 .unwrap_err()
                 .0,
             401
         );
         // A non-JWT string → 401, never a panic.
         assert_eq!(
-            proxy_request_gate(Some(&nonce), Some("not-a-jwt"))
+            proxy_request_gate(Some(&nonce), Some("not-a-jwt"), &dev_p)
                 .unwrap_err()
                 .0,
             401
         );
+    }
+
+    /// The AGENT-bound nonce arm of the gate + the cross-binding rejections in
+    /// BOTH directions (the structural scope-elevation backstop):
+    ///  - an agent nonce resolves to `ProxyPrincipal::Agent` and forwards an
+    ///    agent bearer, but REJECTS a device bearer;
+    ///  - a device nonce REJECTS an agent bearer (covered above too, repeated
+    ///    here for symmetry).
+    #[test]
+    fn proxy_request_gate_binds_agent_nonce_to_agent_bearer() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let mk = |sub_type: &str| {
+            let payload =
+                URL_SAFE_NO_PAD.encode(format!(r#"{{"sub_type":"{sub_type}"}}"#).as_bytes());
+            format!("h.{payload}.s")
+        };
+        let agent_id = uuid::Uuid::new_v4();
+        let dir = std::env::temp_dir().join(format!("coord-mcp-agate-{}", uuid::Uuid::new_v4()));
+        let agent_nonce = register_agent_proxy_nonce(&dir.to_string_lossy(), agent_id);
+
+        // The nonce resolves to an Agent principal carrying the agent_id.
+        assert_eq!(
+            proxy_principal_for_nonce(&agent_nonce),
+            Some(ProxyPrincipal::Agent { agent_id })
+        );
+
+        let agent_p = ProxyPrincipal::Agent { agent_id };
+        let device_p = ProxyPrincipal::Device;
+
+        // Agent nonce + agent bearer → forward.
+        assert!(proxy_request_gate(Some(&agent_nonce), Some(&mk("agent")), &agent_p).is_ok());
+
+        // Agent nonce + DEVICE bearer → 401 (an agent nonce can never inject the
+        // device token — the reverse scope-elevation direction).
+        assert_eq!(
+            proxy_request_gate(Some(&agent_nonce), Some(&mk("device")), &agent_p)
+                .unwrap_err()
+                .0,
+            401
+        );
+
+        // And a device principal must reject an agent bearer.
+        let dev_dir =
+            std::env::temp_dir().join(format!("coord-mcp-dgate-{}", uuid::Uuid::new_v4()));
+        let dev_nonce = register_proxy_nonce(&dev_dir.to_string_lossy());
+        assert_eq!(
+            proxy_request_gate(Some(&dev_nonce), Some(&mk("agent")), &device_p)
+                .unwrap_err()
+                .0,
+            401
+        );
+    }
+
+    /// `AGENT_TOKENS` register / lookup / remove round-trip.
+    #[test]
+    fn agent_token_registry_round_trip() {
+        let agent_id = uuid::Uuid::new_v4();
+        assert!(lookup_agent_token(agent_id).is_none());
+        let slot = std::sync::Arc::new(tokio::sync::RwLock::new(crate::agent_token::TokenSlot {
+            token: "tok".into(),
+            jti: uuid::Uuid::nil(),
+            exp: 0,
+        }));
+        register_agent_token(agent_id, slot);
+        assert!(lookup_agent_token(agent_id).is_some());
+        remove_agent_token(agent_id);
+        assert!(
+            lookup_agent_token(agent_id).is_none(),
+            "lookup after remove must be None (fail-closed)"
+        );
+    }
+
+    /// The agent-proxy `.mcp.json` shape matches the device proxy shape:
+    /// loopback URL + nonce header, no baked Authorization bearer. Only the
+    /// nonce's bound principal differs (Agent vs Device).
+    #[test]
+    fn write_coord_mcp_agent_proxy_config_emits_agent_bound_loopback_shape() {
+        let tmp = std::env::temp_dir().join(format!("coord-mcp-aproxy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let wd = tmp.to_string_lossy().to_string();
+        let agent_id = uuid::Uuid::new_v4();
+
+        write_coord_mcp_agent_proxy_config(&wd, 31337, agent_id);
+
+        let written = std::fs::read_to_string(tmp.join(".mcp.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let server = &v["mcpServers"]["coord-mcp"];
+        assert_eq!(server["type"], "http");
+        assert_eq!(server["url"], "http://127.0.0.1:31337/coord-mcp");
+        let nonce = server["headers"]["X-Coord-Mcp-Proxy-Key"]
+            .as_str()
+            .expect("agent proxy config must carry the nonce header");
+        assert!(!nonce.is_empty());
+        assert!(
+            server["headers"].get("Authorization").is_none(),
+            "agent proxy shape must NOT bake a static bearer: {written}"
+        );
+        // The nonce is bound to THIS agent.
+        assert_eq!(
+            proxy_principal_for_nonce(nonce),
+            Some(ProxyPrincipal::Agent { agent_id })
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// `coord_mcp_safe_to_write` — the non-clobber guard for the continuation
@@ -960,17 +1248,26 @@ mod tests {
     /// and every `acquire_for_terminal` chokepoint caller run once a bearer is
     /// resolved. Exercised through the JWT-injecting seam so it is deterministic
     /// regardless of whether the host has a real device JWT in its encrypted slot.
-    /// Covers all four branches: device writes the PROXY shape, agent writes the
-    /// static-bearer shape, a non-coord bearer is gated out, and a device bearer
-    /// never downgrades an existing agent config.
+    /// Covers all four branches: device writes the device PROXY shape, agent
+    /// writes the per-AGENT proxy shape (+ registers a live-token slot), a
+    /// non-coord bearer is gated out, and a device bearer never downgrades an
+    /// existing baked-agent-JWT config.
     #[test]
     fn provision_with_jwt_orchestration() {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         // Build an unsigned JWT (`h.<payload>.s`) carrying just the `sub_type`
-        // claim — all the orchestration inspects.
+        // claim — all the device-arm orchestration inspects.
         let mk = |sub_type: &str| {
             let payload =
                 URL_SAFE_NO_PAD.encode(format!(r#"{{"sub_type":"{sub_type}"}}"#).as_bytes());
+            format!("h.{payload}.s")
+        };
+        // An agent JWT additionally carries `sub` (= agent_id) + `exp` so the
+        // converted agent arm can build the live-token slot.
+        let mk_agent = |agent_id: uuid::Uuid| {
+            let payload = URL_SAFE_NO_PAD.encode(
+                format!(r#"{{"sub_type":"agent","sub":"{agent_id}","exp":9999999999}}"#).as_bytes(),
+            );
             format!("h.{payload}.s")
         };
         let new_dir = || {
@@ -1005,27 +1302,40 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&d);
 
-        // B) agent bearer + clean dir → provisions the static-bearer shape,
-        //    UNCHANGED (agent JWTs are narrower than the device JWT the proxy
-        //    injects — agent sessions must never route through the proxy).
+        // B) agent bearer + clean dir → provisions the per-AGENT PROXY shape
+        //    (loopback URL + nonce, NO baked bearer) and registers the agent's
+        //    live-token slot. The nonce is bound to THIS agent_id, and the proxy
+        //    injects the agent's own refreshed token per request — never a static
+        //    bearer, never the device token.
         let d = new_dir();
-        let agent_jwt = mk("agent");
+        let agent_id = uuid::Uuid::new_v4();
+        let agent_jwt = mk_agent(agent_id);
         provision_coord_mcp_with_jwt(&d.to_string_lossy(), &agent_jwt, Some(19876));
         let written =
             std::fs::read_to_string(mcp_of(&d)).expect("agent bearer must provision .mcp.json");
         let v: serde_json::Value = serde_json::from_str(&written).unwrap();
         let server = &v["mcpServers"]["coord-mcp"];
         assert_eq!(
-            server["headers"]["Authorization"],
-            format!("Bearer {agent_jwt}"),
-            "agent path keeps the static bearer shape"
+            server["url"], "http://127.0.0.1:19876/coord-mcp",
+            "agent path now emits the per-agent loopback proxy URL"
         );
         assert!(
-            server["url"]
-                .as_str()
-                .is_some_and(|u| !u.contains("/coord-mcp")),
-            "agent path must point at coord /mcp directly, never the proxy"
+            server["headers"].get("Authorization").is_none(),
+            "agent path must NOT bake a static bearer (the proxy injects it live)"
         );
+        let nonce = server["headers"]["X-Coord-Mcp-Proxy-Key"]
+            .as_str()
+            .expect("agent path must carry a per-session nonce");
+        assert_eq!(
+            proxy_principal_for_nonce(nonce),
+            Some(ProxyPrincipal::Agent { agent_id }),
+            "the nonce must be bound to this agent_id"
+        );
+        assert!(
+            lookup_agent_token(agent_id).is_some(),
+            "the agent arm must register a live-token slot"
+        );
+        remove_agent_token(agent_id);
         let _ = std::fs::remove_dir_all(&d);
 
         // C) non-coord bearer (e.g. a Cognito access token, sub_type=access) →
@@ -1126,7 +1436,7 @@ mod tests {
         // Mint a nonce in the live map, then mirror the snapshot to the INJECTED
         // store (the `register_proxy_nonce` body, split across its seams).
         let workdir = store_dir.join("session-wd").to_string_lossy().to_string();
-        let (nonce, snapshot) = mint_and_register_nonce(&workdir);
+        let (nonce, snapshot) = mint_and_register_nonce(&workdir, ProxyPrincipal::Device);
         persist_proxy_nonces_with_store(&store, &snapshot);
         assert!(proxy_nonce_is_valid(&nonce));
 
@@ -1157,6 +1467,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
+    /// OQ3 — an AGENT nonce is NEVER mirrored to the persisted store, while a
+    /// DEVICE nonce in the same snapshot still is. A restarted runner thus has
+    /// no live agent session AND no restored agent nonce, so an agent nonce
+    /// hard-fails closed across a restart.
+    #[test]
+    fn agent_nonce_is_not_persisted_device_nonce_is() {
+        let (store_dir, store) = temp_store("agent-nonce");
+
+        // Mint an AGENT nonce, then persist the snapshot to the injected store.
+        let agent_id = uuid::Uuid::new_v4();
+        let agent_wd = store_dir.join("agent-wd").to_string_lossy().to_string();
+        let (agent_nonce, snapshot) =
+            mint_and_register_nonce(&agent_wd, ProxyPrincipal::Agent { agent_id });
+        persist_proxy_nonces_with_store(&store, &snapshot);
+
+        // Also mint a DEVICE nonce and persist.
+        let dev_wd = store_dir.join("dev-wd").to_string_lossy().to_string();
+        let (dev_nonce, snapshot) = mint_and_register_nonce(&dev_wd, ProxyPrincipal::Device);
+        persist_proxy_nonces_with_store(&store, &snapshot);
+
+        let persisted = store.load_coord_mcp_nonces();
+        assert!(
+            !persisted.contains_key(&agent_nonce),
+            "an agent nonce must NEVER be persisted to the encrypted store"
+        );
+        assert_eq!(
+            persisted.get(&dev_nonce).map(String::as_str),
+            Some(dev_wd.as_str()),
+            "a device nonce in the same map must still be persisted"
+        );
+
+        // Cleanup the in-memory map entries.
+        {
+            let mut map = proxy_nonces().lock().unwrap();
+            map.remove(&agent_nonce);
+            map.remove(&dev_nonce);
+        }
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
     /// Phase 3b — `persist_proxy_nonces` honors the `nonce_persistence_enabled`
     /// gate: when persistence is disabled (test default, `COORD_MCP_PERSIST_NONCES`
     /// unset under `cfg(test)`), the DEFAULT-store path is a no-op. We assert the
@@ -1177,7 +1527,8 @@ mod tests {
              never write the developer's real store"
         );
         // And minting still registers in-memory (the persist step is skipped).
-        let (nonce, _snapshot) = mint_and_register_nonce("/tmp/coord-mcp-persist-off-wd");
+        let (nonce, _snapshot) =
+            mint_and_register_nonce("/tmp/coord-mcp-persist-off-wd", ProxyPrincipal::Device);
         assert!(
             proxy_nonce_is_valid(&nonce),
             "minting must register the nonce in-memory regardless of persistence"

@@ -448,16 +448,74 @@ async fn coord_mcp_proxy_handler(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
 
-    // Live read — the same fresh device JWT `backend_relay` reads on every
-    // use. AuthManager does filesystem I/O, so keep it off the async executor.
-    let bearer =
-        tokio::task::spawn_blocking(|| crate::auth::AuthManager::new().get_access_token().ok())
-            .await
-            .ok()
-            .flatten();
+    // Resolve the principal FROM THE NONCE first — the binding (not the bearer)
+    // decides which identity's token this session may inject. An unregistered /
+    // absent nonce 401s before any token I/O.
+    let principal = match nonce
+        .as_deref()
+        .and_then(crate::coord_mcp::proxy_principal_for_nonce)
+    {
+        Some(p) => p,
+        None => {
+            warn!("coord-mcp proxy: missing or unrecognized X-Coord-Mcp-Proxy-Key");
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": "missing or unrecognized X-Coord-Mcp-Proxy-Key",
+                    "code": "COORD_MCP_PROXY_UNAUTHORIZED",
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Pick the bearer by principal:
+    //  - Device → the live device JWT read from AuthManager (filesystem I/O, so
+    //    off the async executor), the same fresh token `backend_relay` reads.
+    //  - Agent  → THAT agent's own refreshed JWT from its AGENT_TOKENS slot; a
+    //    belt-and-suspenders `maybe_refresh` keeps it live on the request path
+    //    too. An absent slot (torn-down / restarted agent) is a hard 401.
+    let bearer = match &principal {
+        crate::coord_mcp::ProxyPrincipal::Device => {
+            tokio::task::spawn_blocking(|| crate::auth::AuthManager::new().get_access_token().ok())
+                .await
+                .ok()
+                .flatten()
+        }
+        crate::coord_mcp::ProxyPrincipal::Agent { agent_id } => {
+            match crate::coord_mcp::lookup_agent_token(*agent_id) {
+                Some(slot) => {
+                    let _ = crate::agent_token::maybe_refresh(
+                        &slot,
+                        &crate::coord_mcp::coord_base_url(),
+                        *agent_id,
+                        "agent_mcp",
+                    )
+                    .await;
+                    Some(slot.read().await.token.clone())
+                }
+                None => {
+                    warn!(
+                        "coord-mcp proxy: no live token slot for agent_id={agent_id} \
+                         (torn-down or restarted agent) — failing closed"
+                    );
+                    return (
+                        axum::http::StatusCode::UNAUTHORIZED,
+                        Json(serde_json::json!({
+                            "success": false,
+                            "error": "no live agent token for this proxy session",
+                            "code": "COORD_MCP_PROXY_AGENT_GONE",
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    };
 
     if let Err((status, msg)) =
-        crate::coord_mcp::proxy_request_gate(nonce.as_deref(), bearer.as_deref())
+        crate::coord_mcp::proxy_request_gate(nonce.as_deref(), bearer.as_deref(), &principal)
     {
         warn!("coord-mcp proxy: {msg}");
         return (
@@ -630,6 +688,28 @@ async fn coord_claims_read_proxy_handler(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
 
+    // This route injects the DEVICE bearer, so it serves DEVICE-bound nonces
+    // only — reject an agent nonce up front so it can never borrow the device
+    // identity (the scope-elevation trap on this passthrough).
+    match nonce
+        .as_deref()
+        .and_then(crate::coord_mcp::proxy_principal_for_nonce)
+    {
+        Some(crate::coord_mcp::ProxyPrincipal::Device) => {}
+        _ => {
+            warn!("coord-mcp claims proxy: missing/non-device X-Coord-Mcp-Proxy-Key");
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": "missing or non-device X-Coord-Mcp-Proxy-Key",
+                    "code": "COORD_CLAIMS_PROXY_UNAUTHORIZED",
+                })),
+            )
+                .into_response();
+        }
+    }
+
     // Live read — the same fresh device JWT the `/coord-mcp` proxy injects.
     // AuthManager does filesystem I/O, so keep it off the async executor.
     let bearer =
@@ -638,9 +718,11 @@ async fn coord_claims_read_proxy_handler(
             .ok()
             .flatten();
 
-    if let Err((status, msg)) =
-        crate::coord_mcp::proxy_request_gate(nonce.as_deref(), bearer.as_deref())
-    {
+    if let Err((status, msg)) = crate::coord_mcp::proxy_request_gate(
+        nonce.as_deref(),
+        bearer.as_deref(),
+        &crate::coord_mcp::ProxyPrincipal::Device,
+    ) {
         warn!("coord-mcp claims proxy: {msg}");
         return (
             axum::http::StatusCode::from_u16(status)
@@ -883,6 +965,28 @@ async fn coord_write_proxy_handler(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
 
+    // This route injects the DEVICE bearer, so it serves DEVICE-bound nonces
+    // only — reject an agent nonce up front so it can never borrow the device
+    // identity (the scope-elevation trap on this passthrough).
+    match nonce
+        .as_deref()
+        .and_then(crate::coord_mcp::proxy_principal_for_nonce)
+    {
+        Some(crate::coord_mcp::ProxyPrincipal::Device) => {}
+        _ => {
+            warn!("coord-mcp write proxy: missing/non-device X-Coord-Mcp-Proxy-Key");
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": "missing or non-device X-Coord-Mcp-Proxy-Key",
+                    "code": "COORD_WRITE_PROXY_UNAUTHORIZED",
+                })),
+            )
+                .into_response();
+        }
+    }
+
     // Live read — the same fresh device JWT the `/coord-mcp` proxy injects.
     // AuthManager does filesystem I/O, so keep it off the async executor.
     let bearer =
@@ -891,9 +995,11 @@ async fn coord_write_proxy_handler(
             .ok()
             .flatten();
 
-    if let Err((status, msg)) =
-        crate::coord_mcp::proxy_request_gate(nonce.as_deref(), bearer.as_deref())
-    {
+    if let Err((status, msg)) = crate::coord_mcp::proxy_request_gate(
+        nonce.as_deref(),
+        bearer.as_deref(),
+        &crate::coord_mcp::ProxyPrincipal::Device,
+    ) {
         warn!("coord-mcp write proxy: {msg}");
         return (
             axum::http::StatusCode::from_u16(status)
