@@ -200,12 +200,20 @@ export class XtermBackend implements ITerminalBackend {
     return this.term.onBinary(cb);
   }
 
+  get bracketedPasteMode(): boolean {
+    return this.term.modes.bracketedPasteMode;
+  }
+
   getSelection(): string {
     return this.term.getSelection();
   }
 
   hasSelection(): boolean {
     return this.term.hasSelection();
+  }
+
+  clearSelection(): void {
+    this.term.clearSelection();
   }
 
   onSelectionChange(cb: () => void): IDisposable {

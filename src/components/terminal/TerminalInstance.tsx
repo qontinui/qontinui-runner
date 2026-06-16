@@ -11,6 +11,7 @@ import { paintGrid, type GridSnapshot } from "./paintGrid";
 import { getTerminalDebug, recordPaintGrid } from "./terminalDebug";
 import { instanceStorage } from "@/lib/instance-storage";
 import { consumeInputChunk } from "./consumeInputChunk";
+import { preparePasteData } from "./preparePaste";
 import { wheelToLineDelta, DEFAULT_CELL_HEIGHT_PX } from "./wheelScroll";
 import { matchScrollShortcut } from "./scrollKeys";
 import { trimReplayedChunk, type OffsetChunk } from "./scrollbackReplay";
@@ -366,6 +367,7 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
       let observer: ResizeObserver | null = null;
       let blockNativePaste: ((e: Event) => void) | null = null;
       let wheelScrollOverride: ((e: WheelEvent) => void) | null = null;
+      let contextMenuCopyPaste: ((e: MouseEvent) => void) | null = null;
       // Ensure the dev instrumentation hook (window.__qontinuiTerminal) exists
       // so it's discoverable from the console even before any paint fires.
       getTerminalDebug();
@@ -672,8 +674,14 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
               .then((text) => {
                 if (text) {
                   // Write directly to PTY instead of paste to avoid double
-                  // paste when WebView2 also fires a native paste event.
-                  const bytes = encoder.encode(text);
+                  // paste when WebView2 also fires a native paste event. Run
+                  // the clipboard text through the same bracketed-paste +
+                  // newline normalization xterm's own paste would apply — a raw
+                  // write breaks multi-line paste into TUIs that enable
+                  // bracketed paste mode (Claude Code, vim, fzf). See
+                  // `preparePaste.ts`.
+                  const prepared = preparePasteData(text, backend.bracketedPasteMode);
+                  const bytes = encoder.encode(prepared);
                   invoke("terminal_write", { terminalId, data: uint8ToBase64(bytes) }).catch(
                     () => {},
                   );
@@ -763,6 +771,40 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         };
         inputEl?.addEventListener("paste", blockNativePaste, true);
 
+        // Right-click copy/paste (VS Code `terminal.integrated.rightClickBehavior:
+        // "copyPaste"` parity): with a selection, right-click copies it (and
+        // clears the highlight as feedback); with no selection, it pastes the
+        // clipboard. We preventDefault + stopPropagation so neither the WebView2
+        // context menu nor the enclosing zone's `onContextMenu` (which opens the
+        // zone menu) fires — inside the terminal body, right-click belongs to
+        // copy/paste.
+        contextMenuCopyPaste = (e: MouseEvent) => {
+          const b = backendRef.current;
+          if (!b) return;
+          e.preventDefault();
+          e.stopPropagation();
+          if (b.hasSelection()) {
+            const selection = b.getSelection();
+            if (selection) {
+              navigator.clipboard.writeText(selection).catch(() => {});
+              b.clearSelection();
+            }
+            return;
+          }
+          // No selection → paste, mirroring the Ctrl+V path (bracketed-paste +
+          // newline normalization; see `preparePaste.ts`).
+          navigator.clipboard
+            .readText()
+            .then((text) => {
+              if (!text) return;
+              const prepared = preparePasteData(text, b.bracketedPasteMode);
+              const bytes = encoder.encode(prepared);
+              invoke("terminal_write", { terminalId, data: uint8ToBase64(bytes) }).catch(() => {});
+            })
+            .catch(() => {});
+        };
+        container.addEventListener("contextmenu", contextMenuCopyPaste);
+
         // Register terminal input with UI Bridge for external automation.
         const bridgeRegistry = uiBridge?.registry;
         if (bridgeRegistry && inputEl) {
@@ -804,12 +846,30 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
                 handler: async () => {
                   const text = await navigator.clipboard.readText().catch(() => "");
                   if (text) {
-                    const bytes = encoder.encode(text);
+                    // Same bracketed-paste + newline normalization as the
+                    // Ctrl+V path (see `preparePaste.ts`).
+                    const prepared = preparePasteData(text, backend.bracketedPasteMode);
+                    const bytes = encoder.encode(prepared);
                     invoke("terminal_write", {
                       terminalId: termId,
                       data: uint8ToBase64(bytes),
                     }).catch(() => {});
                   }
+                },
+              },
+              pasteText: {
+                id: "pasteText",
+                description:
+                  "Paste literal text through the Ctrl+V path (bracketed-paste aware); no clipboard/keyboard. For automated tests.",
+                handler: (params?: unknown) => {
+                  const { text } = (params || {}) as { text?: string };
+                  if (!text) return;
+                  const b = backendRef.current;
+                  const prepared = preparePasteData(text, b?.bracketedPasteMode ?? false);
+                  const bytes = encoder.encode(prepared);
+                  invoke("terminal_write", { terminalId: termId, data: uint8ToBase64(bytes) }).catch(
+                    () => {},
+                  );
                 },
               },
               getScrollback: {
@@ -1138,6 +1198,9 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         observer?.disconnect();
         if (wheelScrollOverride) {
           container.removeEventListener("wheel", wheelScrollOverride, { capture: true });
+        }
+        if (contextMenuCopyPaste) {
+          container.removeEventListener("contextmenu", contextMenuCopyPaste);
         }
         for (const d of disposables) d.dispose();
         const inputEl = backendRef.current?.getInputElement();

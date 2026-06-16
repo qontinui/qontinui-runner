@@ -155,10 +155,20 @@ export interface ITerminalBackend {
   onData(cb: (data: string) => void): IDisposable;
   /** Subscribe to binary input (e.g. paste with special chars). Optional — may be a no-op. */
   onBinary(cb: (data: string) => void): IDisposable;
+  /**
+   * Whether the foreground app has enabled bracketed paste mode (DEC mode
+   * 2004). The runner intercepts Ctrl+V and writes to the PTY itself, so it
+   * must replicate the bracketing/normalization xterm's own paste would do —
+   * this exposes the mode state needed to decide. False on backends that don't
+   * track it. See `preparePaste.ts`.
+   */
+  readonly bracketedPasteMode: boolean;
 
   // -- Selection ------------------------------------------------------------
   getSelection(): string;
   hasSelection(): boolean;
+  /** Clear the active text selection (e.g. after a right-click copy). */
+  clearSelection(): void;
   onSelectionChange(cb: () => void): IDisposable;
 
   // -- Buffer access --------------------------------------------------------
