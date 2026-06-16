@@ -78,7 +78,12 @@ struct PendingResponse {
 fn enabled() -> bool {
     std::env::var("COORD_SESSION_BUS_ENABLED")
         .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -170,11 +175,28 @@ async fn deliver_once() -> anyhow::Result<()> {
             continue; // unresolved address (Phase 4) — not this executor's job
         };
         let Some(rec) = open.iter().find(|r| r.claude_session_id == to_session) else {
-            debug!(
-                "session_bus: target session {to_session} not live on this device — \
-                 leaving msg {} pending (retry next tick)",
-                msg.message_id
-            );
+            // Target not live on this device. PASSIVE closed-session delivery
+            // (plan Phase 4): leave the message pending — when that session is
+            // next spawned/resumed, the runner's Session Bus spawn preamble
+            // drives it to call coord_inbox and it pulls this message itself. We
+            // deliberately do NOT proactively spawn/resume here: a fleet event
+            // (e.g. a merge wave red-ing many PRs) could otherwise spawn a fleet,
+            // so the PROACTIVE wake is deferred until it carries the fleet-wide
+            // spawn-rate-cap from plan review items 6/19. A blocking message is
+            // logged at info so the wait is observable meanwhile.
+            if msg.priority == "blocking" {
+                info!(
+                    "session_bus: BLOCKING msg {} for session {to_session} which is not live on \
+                     this device — pending until it next opens (preamble→coord_inbox delivers it)",
+                    msg.message_id
+                );
+            } else {
+                debug!(
+                    "session_bus: msg {} target session {to_session} not live — pending \
+                     (delivered on its next open)",
+                    msg.message_id
+                );
+            }
             continue;
         };
 
