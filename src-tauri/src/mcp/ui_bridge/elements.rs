@@ -711,6 +711,52 @@ pub(crate) fn extract_supported_actions(elem_data: &serde_json::Value) -> Option
     Some(names)
 }
 
+/// Extract the element's registered **custom-action** names from a
+/// `get_element` / discover payload.
+///
+/// The SDK serializes registered elements with a separate `customActions`
+/// field (see `@qontinui/ui-bridge`'s `serializeRegisteredElement` —
+/// `customActions: el.customActions ? Object.keys(el.customActions) : void 0`),
+/// distinct from the built-in `actions` array. These are arbitrary
+/// per-element handlers (e.g. `pasteText`, `getScrollback`, `sendKeys` on a
+/// `terminal-input-<id>` element) that the frontend's control-event handler
+/// dispatches via `registered.customActions[action].handler(params)` — they
+/// are NOT in `SUPPORTED_ACTION_NAMES` and never will be (the runner can't
+/// enumerate app-defined actions ahead of time).
+///
+/// Returns `None` when the field is absent OR present but not an array
+/// (mirrors `extract_supported_actions` — `None` = "we don't know"); an
+/// explicit empty array → `Some(vec![])`. Entries are accepted as bare
+/// strings (the canonical SDK shape) or `{ name | action }` objects for
+/// parity with `extract_supported_actions`.
+///
+/// Used by the `/control/element/{id}/action` handler so a registered custom
+/// action (a) passes the action-name gate instead of a blanket 400
+/// "Unknown action", and (b) is folded into the advertised-actions list so
+/// `is_action_advertised` accepts it — matching the SDK route, whose frontend
+/// dispatcher already merges `customActions` into its allowed-actions check
+/// (`useControlEvents.ts`).
+pub(crate) fn extract_custom_actions(elem_data: &serde_json::Value) -> Option<Vec<String>> {
+    let arr = elem_data.get("customActions").and_then(|v| v.as_array())?;
+    let names: Vec<String> = arr
+        .iter()
+        .filter_map(|entry| {
+            if let Some(s) = entry.as_str() {
+                Some(s.to_string())
+            } else if let Some(obj) = entry.as_object() {
+                obj.get("name")
+                    .or_else(|| obj.get("action"))
+                    .or_else(|| obj.get("id"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    Some(names)
+}
+
 /// True when the element advertises an explicit supported-actions list AND
 /// the requested action is not in it. `None` (we don't know) → returns
 /// `false` (don't accuse — degrade gracefully).
@@ -927,27 +973,27 @@ pub async fn ui_bridge_execute_action_handler(
         }
     }
 
-    // ── Invalid-action gate ─────────────────────────────────────────────
-    // Reject unknown action names BEFORE the registry lookup, the
+    // ── Invalid-action gate (built-in vs. custom) ──────────────────────
+    // Reject genuinely unknown action names BEFORE the registry lookup, the
     // stale-registry retry, and the Phase 5 RecoveryExecutor. Without this
     // gate a typo (e.g. `"press"`) reached `execute_action` -> IPC failure
     // -> RecoveryExecutor::llm_fallback, which synthesized a click on a
     // random "Active" button and returned HTTP 200 `success:true`
     // (verified empirically 2026-05-21). Mirrors the `tab/activate`
     // -> `knownTabs` 400 envelope shape; see `validate_action_name`.
-    if let Err(detail) = validate_action_name(&request.action) {
-        warn!(
-            "execute_action: rejecting unknown action '{}' on element {} (supported: {})",
-            request.action,
-            id,
-            SUPPORTED_ACTION_NAMES.join(", ")
-        );
-        let msg = detail.message.clone();
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(api_error_detailed(msg, detail)),
-        ));
-    }
+    //
+    // BUT: `SUPPORTED_ACTION_NAMES` only enumerates the built-in dispatcher
+    // vocabulary — it cannot know about app-registered **custom actions**
+    // (e.g. `pasteText`/`getScrollback`/`sendKeys` on a `terminal-input-<id>`
+    // element). The SDK route (`/sdk/element/{id}/action`) skips this gate
+    // entirely and forwards straight to the frontend custom-action
+    // dispatcher, so custom actions worked there but were 400'd here. We now
+    // mirror the SDK/frontend behavior: a non-built-in name is NOT rejected
+    // outright; instead we defer to the per-element check below, which fetches
+    // the element's `customActions` and rejects ("Unknown action") only when
+    // the name is neither a built-in nor a registered custom action on THIS
+    // element. Built-in behavior is unchanged.
+    let action_is_builtin = validate_action_name(&request.action).is_ok();
 
     // ── Type-action param-shape gate ────────────────────────────────────
     // Reject `{action:"type", params:{value:"foo"}}` and `{action:"type",
@@ -1100,6 +1146,16 @@ pub async fn ui_bridge_execute_action_handler(
     // requested action against the element's metadata without an extra
     // IPC round-trip. None on fetch failure → the discriminator skips
     // (we never invent a supported list).
+    //
+    // We fold the element's registered **custom actions** (the separate
+    // `customActions` field the SDK serializes — `pasteText`, `getScrollback`,
+    // `sendKeys`, …) into the same supported list so `is_action_advertised`
+    // treats them as first-class, exactly as the frontend's control-event
+    // dispatcher does (`useControlEvents.ts` merges builtins + customActions).
+    // `action_is_registered_custom` records whether the requested name is one
+    // of THIS element's custom actions, which drives the deferred
+    // "Unknown action" rejection below for non-built-in names.
+    let mut action_is_registered_custom = false;
     let element_supported_actions: Option<Vec<String>> = match ui_bridge_request_sync(
         &state,
         "get_element",
@@ -1162,10 +1218,60 @@ pub async fn ui_bridge_execute_action_handler(
                 }));
             }
 
-            extract_supported_actions(&elem_data)
+            // Merge built-in advertised actions with registered custom-action
+            // names. `customActions` is the SDK's separate field; absent → no
+            // custom actions on this element. Record whether the requested name
+            // is one of them for the deferred unknown-action gate below.
+            let custom = extract_custom_actions(&elem_data);
+            if let Some(ref custom_names) = custom {
+                if custom_names.iter().any(|c| c == &action_name) {
+                    action_is_registered_custom = true;
+                }
+            }
+            match (extract_supported_actions(&elem_data), custom) {
+                (Some(mut builtin), Some(custom_names)) => {
+                    builtin.extend(custom_names);
+                    Some(builtin)
+                }
+                (Some(builtin), None) => Some(builtin),
+                // No advertised `actions` but custom actions present: surface
+                // the custom names so `is_action_advertised` can accept them
+                // (otherwise a custom-only element would advertise nothing).
+                (None, Some(custom_names)) => Some(custom_names),
+                (None, None) => None,
+            }
         }
         Err(_) => None,
     };
+
+    // ── Deferred unknown-action gate ────────────────────────────────────
+    // Now that we know the element's registered custom actions, reject a
+    // non-built-in name only when it is ALSO not a custom action on this
+    // element — the same "Unknown action" 400 the whitelist used to emit
+    // eagerly, but no longer firing on legitimate custom actions that the
+    // SDK route already accepts. A non-built-in name on an element whose
+    // metadata we couldn't fetch (`element_supported_actions == None`) is
+    // allowed through to IPC: we never manufacture a rejection from a failed
+    // probe (mirrors the permissive `None` semantics of `is_action_advertised`).
+    if !action_is_builtin && !action_is_registered_custom && element_supported_actions.is_some() {
+        let detail = validate_action_name(&request.action)
+            .err()
+            .unwrap_or_else(|| {
+                UiBridgeError::invalid_action(&request.action, SUPPORTED_ACTION_NAMES)
+            });
+        warn!(
+            "execute_action: rejecting unknown action '{}' on element {} — \
+             not a built-in and not a registered custom action (built-ins: {})",
+            request.action,
+            id,
+            SUPPORTED_ACTION_NAMES.join(", ")
+        );
+        let msg = detail.message.clone();
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error_detailed(msg, detail)),
+        ));
+    }
 
     // ── Pre-IPC ACTION_NOT_SUPPORTED gate ──────────────────────────────
     //
@@ -4946,7 +5052,9 @@ mod action_not_supported_tests {
     //! `serde_json::json!{...}` recipe the handler uses — if the body
     //! template changes here, this test must change in lockstep, which
     //! is exactly the regression guard we want.
-    use super::{extract_supported_actions, is_action_advertised, UiBridgeError};
+    use super::{
+        extract_custom_actions, extract_supported_actions, is_action_advertised, UiBridgeError,
+    };
     use crate::mcp::types::ApiResponse;
     use crate::mcp::ui_bridge::recovery_executor::{RecoveryOutcome, RecoveryVia};
     use serde_json::json;
@@ -5017,6 +5125,79 @@ mod action_not_supported_tests {
     fn is_action_advertised_unknown_supported_list_is_permissive() {
         // None → we don't know what the element supports; never accuse.
         assert!(is_action_advertised("setValue", &None));
+    }
+
+    // ── Custom-action reachability via the /control/ route ──────────────
+    // The control route used to 400 "Unknown action" for app-registered
+    // custom actions (pasteText/getScrollback/sendKeys on terminal-input)
+    // even though the SDK route + frontend dispatcher accept them. These
+    // tests lock down the two pure helpers that make the control route now
+    // reach + advertise custom actions.
+
+    #[test]
+    fn extract_custom_actions_from_string_array() {
+        // The SDK serializes `customActions` as a bare string array
+        // (`Object.keys(el.customActions)`), distinct from `actions`.
+        let elem = json!({
+            "id": "terminal-input-abc",
+            "actions": ["focus", "blur"],
+            "customActions": ["sendKeys", "pasteText", "getScrollback"],
+        });
+        let got = extract_custom_actions(&elem).expect("present array");
+        assert_eq!(got, vec!["sendKeys", "pasteText", "getScrollback"]);
+    }
+
+    #[test]
+    fn extract_custom_actions_from_object_array() {
+        // Accept `{ name | action | id }` objects for parity with
+        // extract_supported_actions.
+        let elem = json!({
+            "id": "terminal-input-abc",
+            "customActions": [
+                { "id": "pasteText" },
+                { "name": "getScrollback" },
+                { "action": "sendKeys" },
+            ],
+        });
+        let got = extract_custom_actions(&elem).expect("present array");
+        assert_eq!(got, vec!["pasteText", "getScrollback", "sendKeys"]);
+    }
+
+    #[test]
+    fn extract_custom_actions_absent_is_none() {
+        let elem = json!({ "id": "btn-1", "actions": ["click"] });
+        assert!(extract_custom_actions(&elem).is_none());
+    }
+
+    #[test]
+    fn extract_custom_actions_non_array_is_none() {
+        let elem = json!({ "id": "btn-1", "customActions": "pasteText" });
+        assert!(extract_custom_actions(&elem).is_none());
+    }
+
+    #[test]
+    fn custom_action_advertised_once_folded_into_supported_list() {
+        // Reproduce the handler's fold: built-in `actions` + `customActions`
+        // → one supported list. `is_action_advertised` must then ACCEPT a
+        // registered custom action (pasteText) the same way it accepts a
+        // built-in, while still REJECTING a genuinely unknown action.
+        let elem = json!({
+            "id": "terminal-input-abc",
+            "actions": ["focus", "blur"],
+            "customActions": ["sendKeys", "pasteText", "getScrollback"],
+        });
+        let mut builtin = extract_supported_actions(&elem).expect("actions present");
+        builtin.extend(extract_custom_actions(&elem).expect("customActions present"));
+        let supported = Some(builtin);
+
+        // Built-in still accepted.
+        assert!(is_action_advertised("focus", &supported));
+        // Custom actions now accepted (the bug: these were 400'd before).
+        assert!(is_action_advertised("pasteText", &supported));
+        assert!(is_action_advertised("getScrollback", &supported));
+        assert!(is_action_advertised("sendKeys", &supported));
+        // A truly unknown action is still rejected.
+        assert!(!is_action_advertised("teleport", &supported));
     }
 
     #[test]
