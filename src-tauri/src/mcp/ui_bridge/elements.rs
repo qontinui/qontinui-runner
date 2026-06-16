@@ -757,6 +757,89 @@ pub(crate) fn extract_custom_actions(elem_data: &serde_json::Value) -> Option<Ve
     Some(names)
 }
 
+/// Fold an element's registered `customActions` into its advertised `actions`
+/// array, IN PLACE, so a single element JSON object advertises both built-in
+/// and custom actions in the one list that discover/snapshot consumers read.
+///
+/// Background: the SDK serializes an element with built-in actions in `actions`
+/// (a string array) and registered custom actions in a SEPARATE `customActions`
+/// string array (`Object.keys(el.customActions)` — see
+/// `serializeRegisteredElement` in `@qontinui/ui-bridge`). An agent inspecting
+/// the discover/snapshot output's `actions` list therefore could NOT see
+/// `pasteText`/`getScrollback` on a `terminal-input-<id>` element even though
+/// the `/control/element/{id}/action` route dispatches them. This mirrors the
+/// frontend control-event dispatcher (`useControlEvents.ts`), which merges
+/// `builtinActions + customActions` when deciding which actions are allowed.
+///
+/// Behavior:
+///   - Custom-action names already present in `actions` are NOT duplicated.
+///   - `customActions` itself is left untouched (additive — clients that read
+///     the dedicated field keep working).
+///   - An element with no `customActions`, or no `actions`/non-array `actions`,
+///     is left unchanged (when `actions` is absent but custom actions exist, we
+///     create an `actions` array from the custom names so the element advertises
+///     them at all).
+fn fold_custom_actions_into_element(elem: &mut serde_json::Value) {
+    let custom = match extract_custom_actions(elem) {
+        Some(c) if !c.is_empty() => c,
+        _ => return,
+    };
+    let obj = match elem.as_object_mut() {
+        Some(o) => o,
+        None => return,
+    };
+    // Take the existing `actions` array (if it is one); else start empty.
+    let mut actions: Vec<serde_json::Value> = obj
+        .get("actions")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    // Existing string entries — used to avoid duplicating a custom name the
+    // SDK already enumerated in `actions`.
+    let existing: std::collections::HashSet<String> = actions
+        .iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect();
+    for name in custom {
+        if !existing.contains(&name) {
+            actions.push(serde_json::Value::String(name));
+        }
+    }
+    obj.insert("actions".to_string(), serde_json::Value::Array(actions));
+}
+
+/// Walk a discover/snapshot IPC payload and fold every element's
+/// `customActions` into its advertised `actions` array (see
+/// [`fold_custom_actions_into_element`]). Handles the three element-array
+/// layouts the SDK emits — identical to `count_elements_in_discover_payload`:
+///   - a bare top-level array,
+///   - `{ elements: [...] }` (discover + snapshot),
+///   - `{ data: { elements: [...] } }`.
+///
+/// Pure + idempotent: applying it twice yields the same result (the dedup in
+/// `fold_custom_actions_into_element` makes the second pass a no-op).
+fn advertise_custom_actions_in_payload(data: &mut serde_json::Value) {
+    fn fold_array(arr: &mut [serde_json::Value]) {
+        for elem in arr.iter_mut() {
+            fold_custom_actions_into_element(elem);
+        }
+    }
+    if let Some(arr) = data.as_array_mut() {
+        fold_array(arr);
+        return;
+    }
+    if let Some(arr) = data.get_mut("elements").and_then(|v| v.as_array_mut()) {
+        fold_array(arr);
+    }
+    if let Some(arr) = data
+        .get_mut("data")
+        .and_then(|d| d.get_mut("elements"))
+        .and_then(|v| v.as_array_mut())
+    {
+        fold_array(arr);
+    }
+}
+
 /// True when the element advertises an explicit supported-actions list AND
 /// the requested action is not in it. `None` (we don't know) → returns
 /// `false` (don't accuse — degrade gracefully).
@@ -2241,6 +2324,16 @@ pub async fn ui_bridge_discover_handler(
 
     match ui_bridge_request_sync(&state, "discover", payload).await {
         Ok(mut data) => {
+            // Fold each element's registered `customActions` into its
+            // advertised `actions` array so a discover consumer sees e.g.
+            // `pasteText`/`getScrollback` on a `terminal-input-<id>` element
+            // (which the `/control/element/{id}/action` route already
+            // dispatches). Mirrors the frontend dispatcher's
+            // `builtinActions + customActions` merge in `useControlEvents.ts`.
+            // Applied BEFORE caching so `/control/last-discovered` advertises
+            // them too.
+            advertise_custom_actions_in_payload(&mut data);
+
             // Populate the last-discovered cache. Best-effort — never
             // block the response on a write lock.
             let element_count = count_elements_in_discover_payload(&data);
@@ -2455,6 +2548,13 @@ pub async fn ui_bridge_get_snapshot_handler(
 
     match snapshot_result {
         Ok(mut data) => {
+            // Fold each element's registered `customActions` into its
+            // advertised `actions` array (same as the discover handler) so a
+            // snapshot consumer sees custom actions like `pasteText` /
+            // `getScrollback` alongside the built-ins. Applied before the
+            // post-fetch filters so the filtered output carries them too.
+            advertise_custom_actions_in_payload(&mut data);
+
             // Apply post-fetch filters. We do this before enrichment so the
             // architecture summary still attaches to the filtered response.
             //
@@ -5053,7 +5153,8 @@ mod action_not_supported_tests {
     //! template changes here, this test must change in lockstep, which
     //! is exactly the regression guard we want.
     use super::{
-        extract_custom_actions, extract_supported_actions, is_action_advertised, UiBridgeError,
+        advertise_custom_actions_in_payload, extract_custom_actions, extract_supported_actions,
+        fold_custom_actions_into_element, is_action_advertised, UiBridgeError,
     };
     use crate::mcp::types::ApiResponse;
     use crate::mcp::ui_bridge::recovery_executor::{RecoveryOutcome, RecoveryVia};
@@ -5198,6 +5299,161 @@ mod action_not_supported_tests {
         assert!(is_action_advertised("sendKeys", &supported));
         // A truly unknown action is still rejected.
         assert!(!is_action_advertised("teleport", &supported));
+    }
+
+    // ── Discover/snapshot serialization fold (the advertisement gap) ────
+    // These exercise the ACTUAL response-serialization path the discover and
+    // snapshot handlers run on the IPC payload — not just the extract_*
+    // helpers — proving a registered custom action now appears in the
+    // advertised `actions` array a discover consumer reads.
+
+    #[test]
+    fn fold_appends_custom_actions_into_element_actions() {
+        let mut elem = json!({
+            "id": "terminal-input-abc",
+            "actions": ["focus", "blur"],
+            "customActions": ["pasteText", "getScrollback"],
+        });
+        fold_custom_actions_into_element(&mut elem);
+        let actions = extract_supported_actions(&elem).expect("actions present");
+        // Built-ins preserved, custom actions now ALSO advertised in `actions`.
+        assert!(actions.contains(&"focus".to_string()));
+        assert!(actions.contains(&"blur".to_string()));
+        assert!(
+            actions.contains(&"pasteText".to_string()),
+            "pasteText must now appear in advertised actions: {actions:?}"
+        );
+        assert!(
+            actions.contains(&"getScrollback".to_string()),
+            "getScrollback must now appear in advertised actions: {actions:?}"
+        );
+        // The dedicated `customActions` field is left intact (additive).
+        assert!(elem
+            .get("customActions")
+            .and_then(|v| v.as_array())
+            .is_some());
+    }
+
+    #[test]
+    fn fold_does_not_duplicate_already_listed_action() {
+        // If the SDK already enumerated a name in `actions`, folding must not
+        // produce a duplicate.
+        let mut elem = json!({
+            "id": "x",
+            "actions": ["focus", "pasteText"],
+            "customActions": ["pasteText", "getScrollback"],
+        });
+        fold_custom_actions_into_element(&mut elem);
+        let actions = extract_supported_actions(&elem).expect("actions present");
+        let paste_count = actions.iter().filter(|a| *a == "pasteText").count();
+        assert_eq!(
+            paste_count, 1,
+            "pasteText must not be duplicated: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn fold_synthesizes_actions_when_only_custom_present() {
+        // Element with NO built-in `actions` array but custom actions present:
+        // create an `actions` list from the custom names so it advertises them.
+        let mut elem = json!({
+            "id": "x",
+            "customActions": ["pasteText"],
+        });
+        fold_custom_actions_into_element(&mut elem);
+        let actions = extract_supported_actions(&elem).expect("actions synthesized");
+        assert_eq!(actions, vec!["pasteText".to_string()]);
+    }
+
+    #[test]
+    fn fold_leaves_element_without_custom_actions_unchanged() {
+        let mut elem = json!({ "id": "btn", "actions": ["click", "focus"] });
+        let before = elem.clone();
+        fold_custom_actions_into_element(&mut elem);
+        assert_eq!(elem, before);
+    }
+
+    #[test]
+    fn advertise_custom_actions_walks_elements_array_shape() {
+        // The discover/snapshot `{ elements: [...] }` payload shape — the one
+        // the handlers actually receive from the SDK. Prove the terminal-input
+        // element advertises pasteText/getScrollback after the fold.
+        let mut payload = json!({
+            "elements": [
+                {
+                    "id": "terminal-input-term-1",
+                    "type": "input",
+                    "actions": ["focus", "blur"],
+                    "customActions": ["sendKeys", "pasteText", "getScrollback"],
+                },
+                { "id": "btn-save", "actions": ["click", "focus", "blur"] },
+            ],
+            "count": 2,
+        });
+        advertise_custom_actions_in_payload(&mut payload);
+
+        let elems = payload["elements"].as_array().expect("elements array");
+        let term = &elems[0];
+        let term_actions = extract_supported_actions(term).expect("actions present");
+        assert!(
+            term_actions.contains(&"pasteText".to_string()),
+            "{term_actions:?}"
+        );
+        assert!(
+            term_actions.contains(&"getScrollback".to_string()),
+            "{term_actions:?}"
+        );
+        assert!(
+            term_actions.contains(&"sendKeys".to_string()),
+            "{term_actions:?}"
+        );
+        assert!(
+            term_actions.contains(&"focus".to_string()),
+            "{term_actions:?}"
+        );
+
+        // A plain button without custom actions is untouched.
+        let btn_actions = extract_supported_actions(&elems[1]).expect("actions present");
+        assert_eq!(
+            btn_actions,
+            vec!["click".to_string(), "focus".to_string(), "blur".to_string()]
+        );
+    }
+
+    #[test]
+    fn advertise_custom_actions_walks_nested_data_elements_shape() {
+        // The `{ data: { elements: [...] } }` layout (one of the three the
+        // discover cache-count helper recognizes).
+        let mut payload = json!({
+            "data": { "elements": [
+                {
+                    "id": "terminal-input-term-1",
+                    "actions": ["focus"],
+                    "customActions": ["pasteText"],
+                },
+            ]},
+        });
+        advertise_custom_actions_in_payload(&mut payload);
+        let term = &payload["data"]["elements"][0];
+        let actions = extract_supported_actions(term).expect("actions present");
+        assert!(actions.contains(&"pasteText".to_string()), "{actions:?}");
+    }
+
+    #[test]
+    fn advertise_custom_actions_is_idempotent() {
+        let mut payload = json!({
+            "elements": [
+                {
+                    "id": "terminal-input-term-1",
+                    "actions": ["focus", "blur"],
+                    "customActions": ["pasteText", "getScrollback"],
+                },
+            ],
+        });
+        advertise_custom_actions_in_payload(&mut payload);
+        let once = payload.clone();
+        advertise_custom_actions_in_payload(&mut payload);
+        assert_eq!(payload, once, "fold must be idempotent");
     }
 
     #[test]
