@@ -27,6 +27,34 @@ use tracing::{debug, info, warn};
 /// Default poll interval. Floored at 5s.
 const DEFAULT_INTERVAL_SECS: u64 = 20;
 
+/// The inter-session coordination preamble (Session Bus plan Phase 1), injected
+/// into the initial prompt of every runner-SPAWNED session.
+///
+/// This is the **fleet-portable** home for the overlap/inbox/findings nudge: the
+/// runner is the only component on every fleet host, so a preamble it splices
+/// into the spawn prompt runs everywhere, unlike a `qontinui-claude-config`
+/// SessionStart hook which fires ONLY on the operator's machine (memory
+/// `feedback_fleet_wide_capabilities_belong_in_runner_not_claude_config`; same
+/// non-portability that bit `wip_attribution`, re-homed in runner #589). The
+/// claude-config hook remains a best-effort cover for operator-local *manual*
+/// terminals; this preamble covers the fleet-spawned sessions it can't reach.
+pub const COORDINATION_PREAMBLE: &str = "<system-reminder>Inter-session coordination (Session Bus): \
+other Claude sessions may be working this repo concurrently. BEFORE you start editing files or \
+writing a plan: (1) call coord_inbox to pick up directed messages other sessions left for you \
+(ack each with coord_ack_message); (2) call coord_who_is_working_on with your target paths/globs \
+(and/or a short intent) to see peers whose declared intent overlaps and any live claim holders, \
+each with a {session_id, session_label}; (3) call coord_recent_findings for those paths/subsystem \
+to learn from a concurrent session's recent investigation before redoing it. Then call \
+coord_declare_intent to announce your scope so peers see you, and coord_post_finding when you \
+finish an investigation worth sharing. To reach a specific peer, coord_send_message to their \
+session. This is advisory; the merge train remains the authoritative conflict gate.</system-reminder>";
+
+/// Prepend [`COORDINATION_PREAMBLE`] to a spawn prompt (blank line between), so
+/// the spawned session reads the coordination nudge first, then its task.
+pub fn prepend_coordination_preamble(prompt: &str) -> String {
+    format!("{COORDINATION_PREAMBLE}\n\n{prompt}")
+}
+
 /// One pending message as returned by `GET /coord/session-messages/pending`.
 /// Only the fields the executor needs are deserialized.
 #[derive(Debug, Deserialize)]
