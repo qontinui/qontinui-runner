@@ -255,6 +255,41 @@ Typical action sequence when the user wants to integrate a project:
 Pick only the checkboxes the user asked for — do not toggle options they didn't request.
 "#;
 
+/// Runner-specific component-action catalog. Emitted ONLY in the fallback path
+/// (runner-owned component ids). Component actions are programmatic affordances
+/// registered via `useUIComponent` — they are NOT clickable on-screen elements,
+/// so the planner must invoke them with a `component-action` step (componentId +
+/// actionId), never with a `find`/`action` step that names a non-existent button.
+///
+/// The seed entry is the `terminal-launch-menu` component, whose
+/// `create-best-account` action spawns a live Claude Code AI session using the
+/// account with the lowest current utilization (no configDir needed). This is
+/// the REAL "open an AI session" affordance: there is no "Claude Code" button to
+/// click. Mirrors `useUIComponent({ id: "terminal-launch-menu", … })` in
+/// `qontinui-runner/src/components/terminal/TerminalPage.tsx`.
+const SYSTEM_PROMPT_RUNNER_COMPONENT_ACTIONS: &str = r#"
+=== Component actions (programmatic affordances — NOT clickable elements) ===
+Some capabilities are exposed as registered COMPONENT ACTIONS, not as buttons on
+the screen. To use one, emit a "component-action" step with the exact
+`componentId` + `actionId` below. Do NOT try to "click" these — there is no
+visible button for them, and naming a fake button (e.g. a "Claude Code" button)
+will fail.
+
+| componentId | actionId | what it does | params |
+|-------------|----------|--------------|--------|
+| terminal-launch-menu | create-best-account | Spawn a live AI coding session (Claude Code) using the AI account with the lowest current utilization. This IS how you "open an AI session" / "start Claude" — there is no Claude Code button to click. | { "count": number (optional, default 1), "context": string (optional initial prompt auto-typed after claude starts) } |
+| terminal-launch-menu | create-plain | Spawn N blank terminals using the user's default shell. | { "count": number (optional, default 1) } |
+| terminal-launch-menu | create-with-command | Spawn N terminals and auto-type the given shell command into each. | { "count": number (optional, default 1), "command": string (required) } |
+
+The `terminal-launch-menu` component is on page-terminal. When the user asks to
+"open an AI session", "start Claude / Claude Code", or "open an ai session in the
+terminal page", plan:
+  1. { "type": "navigate", "target": "page-terminal", "explanation": "..." }
+  2. { "type": "component-action", "componentId": "terminal-launch-menu", "actionId": "create-best-account", "params": { "count": 1 }, "explanation": "..." }
+Do NOT add an extra "action" step that clicks a "Claude Code" button — that
+button does not exist; create-best-account is the entire spawn affordance.
+"#;
+
 /// The "Respond with valid JSON only…" instruction + Rules block. Always
 /// emitted last (before suffix/disclosure/catalog). Generic — caller-agnostic.
 const SYSTEM_PROMPT_RULES: &str = r#"
@@ -263,19 +298,34 @@ Respond with valid JSON only, no markdown fences:
   "summary": "Brief description of what you'll do",
   "steps": [
     { "type": "navigate", "target": "page-xxx", "explanation": "Why navigating here" },
-    { "type": "action", "instruction": "click the 'Save' button", "explanation": "Why doing this" }
+    { "type": "action", "instruction": "click the 'Save' button", "explanation": "Why doing this" },
+    { "type": "component-action", "componentId": "some-component", "actionId": "some-action", "params": { "key": "value" }, "explanation": "Why invoking this component action" }
   ]
 }
 
 Rules:
 - Use "navigate" steps to change pages via the state machine
 - Use "action" steps for interacting with elements (click, type, select, etc.)
+- Use "component-action" steps to invoke a registered COMPONENT action (a named
+  programmatic affordance that is NOT a clickable on-screen element). These are
+  listed in the "Component actions" section below when available. A
+  component-action step MUST set "componentId" and "actionId" to ids that appear
+  verbatim in that section, plus an optional "params" object. NEVER emit a
+  component-action whose ids are not listed.
 - Action instructions should be natural language like "type 'hello' in the search field" or "click the Submit button"
 - For simple navigation requests ("show me X"), just use a single navigate step
 - For complex tasks, break into navigate + action steps
 - When a page element catalog is provided below, prefer the exact labels from
   the catalog when naming buttons/inputs in action instructions. Do not invent
   generic names if a real one is listed.
+- CRITICAL — never invent an element label, button name, or component/action id
+  that does not appear in the page lists, the Component actions section, the
+  Disclosure widgets registry, or the Page Element Catalog below. If the
+  affordance you want is not listed, it almost certainly does not exist as a
+  clickable element — look for a "component-action" instead (e.g. spawning an
+  AI / Claude Code session), or navigate to the page that owns it. Do NOT
+  fabricate a "Claude Code" (or similar) button: launching an AI coding session
+  is a component-action, not a clickable button (see Component actions below).
 - When the user asks to open / expand / reveal / show a hidden section
   ("open advanced", "expand details", "show options", "click the Advanced
   details toggle", etc.), consult the Disclosure widgets registry below.
@@ -364,6 +414,18 @@ pub struct PlanStep {
     pub target: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instruction: Option<String>,
+    /// For `component-action` steps: the registered `useUIComponent` id whose
+    /// action to invoke (e.g. `terminal-launch-menu`).
+    #[serde(rename = "componentId", skip_serializing_if = "Option::is_none")]
+    pub component_id: Option<String>,
+    /// For `component-action` steps: the action id on that component (e.g.
+    /// `create-best-account`).
+    #[serde(rename = "actionId", skip_serializing_if = "Option::is_none")]
+    pub action_id: Option<String>,
+    /// For `component-action` steps: optional params object passed verbatim to
+    /// the component action handler.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
     pub explanation: String,
 }
 
@@ -420,6 +482,7 @@ fn build_system_prompt(
             out.push_str(SYSTEM_PROMPT_RUNNER_PAGES);
             out.push_str(SYSTEM_PROMPT_PAGES_FOOTER);
             out.push_str(SYSTEM_PROMPT_RUNNER_INTEGRATION);
+            out.push_str(SYSTEM_PROMPT_RUNNER_COMPONENT_ACTIONS);
         }
     }
 
@@ -705,6 +768,7 @@ mod tests {
         assert!(prompt.contains("page-gui-automation"));
         assert!(prompt.contains("page-prompt-home"));
         assert!(prompt.contains("=== Integration workflow on page-config-ui-bridge ==="));
+        assert!(prompt.contains("=== Component actions"));
     }
 
     /// An empty (but `Some`) page list falls back to the runner list (treated
@@ -740,6 +804,68 @@ mod tests {
         assert!(
             !prompt.contains("Advanced: per-stage controls"),
             "caller-disclosure prompt leaked the static runner registry row"
+        );
+    }
+
+    /// The fallback prompt must teach the planner the REAL spawn affordance:
+    /// the `terminal-launch-menu` / `create-best-account` component action, and
+    /// must forbid inventing a "Claude Code" button. Guards the D-NL1 root-cause
+    /// fix (planner invented a non-existent "Claude Code" clickable button).
+    #[test]
+    fn fallback_prompt_teaches_terminal_component_action() {
+        let prompt = fallback_prompt();
+        assert!(
+            prompt.contains("terminal-launch-menu"),
+            "fallback prompt missing the terminal-launch-menu component"
+        );
+        assert!(
+            prompt.contains("create-best-account"),
+            "fallback prompt missing the create-best-account action"
+        );
+        assert!(
+            prompt.contains("component-action"),
+            "fallback prompt missing the component-action step type"
+        );
+        // Must explicitly disabuse the planner of the non-existent button.
+        assert!(
+            prompt.contains("Claude Code") && prompt.contains("does not exist"),
+            "fallback prompt must explicitly forbid the invented 'Claude Code' button"
+        );
+    }
+
+    /// Caller-supplied pages must NOT leak the runner-only component-action
+    /// catalog (it references runner component ids).
+    #[test]
+    fn caller_pages_omit_runner_component_actions() {
+        let pages = vec![PageDef {
+            id: "page-dashboard".to_string(),
+            description: "Dashboard".to_string(),
+        }];
+        let prompt = build_system_prompt(false, Some(&pages), None, None);
+        assert!(
+            !prompt.contains("terminal-launch-menu"),
+            "caller-pages prompt leaked the runner-only component-action catalog"
+        );
+    }
+
+    /// A `component-action` plan step round-trips through serde with the
+    /// camelCase wire names the planner emits (`componentId`/`actionId`).
+    #[test]
+    fn component_action_step_deserializes() {
+        let json = r#"{
+            "type": "component-action",
+            "componentId": "terminal-launch-menu",
+            "actionId": "create-best-account",
+            "params": { "count": 1 },
+            "explanation": "spawn a Claude Code session"
+        }"#;
+        let step: PlanStep = serde_json::from_str(json).expect("component-action step parses");
+        assert_eq!(step.step_type, "component-action");
+        assert_eq!(step.component_id.as_deref(), Some("terminal-launch-menu"));
+        assert_eq!(step.action_id.as_deref(), Some("create-best-account"));
+        assert_eq!(
+            step.params.as_ref().and_then(|p| p.get("count")),
+            Some(&serde_json::json!(1))
         );
     }
 
