@@ -819,6 +819,8 @@ fn spawn_run_task(payload: LaunchPayload) {
         // Drop the agent's live-token slot so its proxy nonce hard-fails closed
         // (the agent process is gone; any lingering `.mcp.json` nonce must 401).
         crate::coord_mcp::remove_agent_token(agent_id);
+        // Stop the per-agent durability + observability daemons (pusher/poller).
+        crate::agent_daemons::stop_for_agent(agent_id);
     });
 }
 
@@ -2309,6 +2311,35 @@ async fn run_continuation_headless(
 // Subprocess lifecycle
 // =============================================================================
 
+/// Map a coord-delivered LaunchPayload onto the AllocateResult shape the
+/// per-agent daemons (agent_pusher / dirty_poller) consume. The daemons'
+/// stable contract is AllocateResult (also produced by the isolated_edit
+/// path); this keeps spawn_for_agent's signature untouched.
+fn payload_to_allocate_result(payload: &LaunchPayload) -> crate::agent_worktree::AllocateResult {
+    use crate::agent_worktree::{AllocateResult, MaterializedWorktree};
+    AllocateResult {
+        agent_id: payload.agent_id.to_string(),
+        worktrees: payload
+            .worktrees
+            .iter()
+            .map(|w| MaterializedWorktree {
+                repo: w.repo.clone(),
+                branch: w.branch.clone(),
+                parent_sha: w.parent_sha.clone(),
+                worktree_path: std::path::PathBuf::from(&w.worktree_path),
+                push_ref: w
+                    .push_ref
+                    .clone()
+                    .unwrap_or_else(|| crate::agent_worktree::remote_agent_ref(&w.branch)),
+            })
+            .collect(),
+        token: payload.jwt.clone(),
+        token_jti: uuid::Uuid::nil(), // bookkeeping only; maybe_refresh sends the bearer, not the jti
+        token_exp: payload.jwt_exp,
+        active_claims: Vec::new(), // unread by either daemon
+    }
+}
+
 /// End-to-end run of one agent subprocess:
 /// 1. `git worktree add` each allocated worktree.
 /// 2. Spawn `claude` CLI in the first worktree with the initial prompt.
@@ -2374,7 +2405,7 @@ async fn run_agent_subprocess(
             jti: uuid::Uuid::nil(),
             exp: payload.jwt_exp,
         }));
-        crate::coord_mcp::register_agent_token(payload.agent_id, slot);
+        crate::coord_mcp::register_agent_token(payload.agent_id, slot.clone());
         match crate::coord_mcp::resolve_bound_api_port() {
             Some(port) => {
                 crate::coord_mcp::write_coord_mcp_agent_proxy_config(
@@ -2397,6 +2428,24 @@ async fn run_agent_subprocess(
                 crate::coord_mcp::write_degraded_breadcrumb(
                     &primary_wt,
                     "bound API port unresolvable — agent proxy config NOT written (would point at a dead port)",
+                );
+            }
+        }
+
+        // Wire the per-agent durability (agent_pusher) + observability (dirty_poller)
+        // daemons onto the SAME refreshing token slot registered in AGENT_TOKENS, so
+        // the proxy, heartbeat, pusher, and poller all read one slot (single-slot
+        // invariant — agent_token/mod.rs:1). Best-effort: skipped without a JWT or a
+        // configured coord base (dev/no-coord), and each daemon self-skips when it has
+        // no work (no push targets / no worktrees).
+        if !payload.jwt.is_empty() {
+            if let Some(base) = coord_http_base() {
+                let allocate = payload_to_allocate_result(&payload);
+                crate::agent_daemons::spawn_for_agent_with_token(
+                    &allocate,
+                    base,
+                    payload.target_device_id,
+                    slot.clone(),
                 );
             }
         }

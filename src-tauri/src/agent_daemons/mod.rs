@@ -68,6 +68,23 @@ pub fn spawn_for_agent(allocate: &AllocateResult, coord_http_base: String, machi
         );
         return;
     };
+    spawn_for_agent_with_token(allocate, coord_http_base, machine_id, token);
+}
+
+/// Spawn (and retain) the pusher + poller for one agent against a
+/// **caller-supplied** token slot — the live coord-driven spawn path
+/// ([`crate::agent_runtime::run_agent_subprocess`]) hands in the SAME
+/// [`SharedToken`] it already registered in `coord_mcp::AGENT_TOKENS`,
+/// so the proxy, heartbeat, pusher, and poller all read one slot
+/// (single-slot invariant — `agent_token/mod.rs:1`). Callers that don't
+/// already own a slot use [`spawn_for_agent`], which builds one from the
+/// allocation and delegates here.
+pub fn spawn_for_agent_with_token(
+    allocate: &AllocateResult,
+    coord_http_base: String,
+    machine_id: Uuid,
+    token: crate::agent_token::SharedToken,
+) {
     let agent_id = match Uuid::parse_str(&allocate.agent_id) {
         Ok(id) => id,
         Err(e) => {
@@ -97,6 +114,27 @@ pub fn spawn_for_agent(allocate: &AllocateResult, coord_http_base: String, machi
         g.insert(agent_id, daemons);
         info!(
             "agent_daemons: agent_id={agent_id} pusher+poller live (agents tracked={})",
+            g.len()
+        );
+    }
+}
+
+/// Stop both per-agent daemons by removing the agent's entry from the
+/// registry — dropping the [`AgentDaemons`] signals each handle's task
+/// to exit on its next tick. Called from the spawn-wrapper completion
+/// path when the agent process is gone. Best-effort and defensive: a
+/// no-op if the registry is uninitialized (nothing was ever spawned) or
+/// the lock is poisoned (a teardown failure must never panic the runner).
+pub fn stop_for_agent(agent_id: Uuid) {
+    let Some(reg) = REGISTRY.get() else {
+        return;
+    };
+    let Ok(mut g) = reg.lock() else {
+        return;
+    };
+    if g.remove(&agent_id).is_some() {
+        info!(
+            "agent_daemons: agent_id={agent_id} pusher+poller stopped (agents tracked={})",
             g.len()
         );
     }
@@ -184,5 +222,14 @@ mod tests {
             1,
             "re-allocation of the same agent must replace, not accumulate"
         );
+        // Teardown removes the entry (dropping it stops both daemons).
+        stop_for_agent(id);
+        assert!(
+            !tracked_contains(id),
+            "stop_for_agent must untrack the agent"
+        );
+        // Idempotent: stopping an already-stopped agent is a no-op.
+        stop_for_agent(id);
+        assert!(!tracked_contains(id));
     }
 }
