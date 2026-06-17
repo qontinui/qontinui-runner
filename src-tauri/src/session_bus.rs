@@ -38,16 +38,40 @@ const DEFAULT_INTERVAL_SECS: u64 = 20;
 /// non-portability that bit `wip_attribution`, re-homed in runner #589). The
 /// claude-config hook remains a best-effort cover for operator-local *manual*
 /// terminals; this preamble covers the fleet-spawned sessions it can't reach.
+///
+/// IMPORTANT — keep this preamble in lockstep with what is actually LIVE on
+/// coord's deployed main. Because the runner can deploy to the fleet ahead of
+/// coord (separate repos, separate deploy timing), the preamble must only name
+/// coord MCP tools that exist on coord origin/main — otherwise every spawned
+/// session is nudged to call tools that 404. As of 2026-06-17 the only
+/// Session-Bus tool merged + deployed is `coord_declare_intent` (its coord-main
+/// contract: derive likely globs server-side, record your scope so peers see
+/// you, return any peers whose declared intent OVERLAPS yours). The richer
+/// surface (`coord_who_is_working_on`, `coord_inbox`/`coord_ack_message`,
+/// `coord_recent_findings`, `coord_post_finding`, `coord_send_message`) lives
+/// on this same branch's unmerged coord counterpart (`feat/session-bus-phase01`,
+/// Phases 1–4a). As each phase lands + deploys to coord main, fold its tool
+/// into the preamble below — verify with `git grep '"coord_<tool>"'` against
+/// coord origin/main `src/mcp/tools.rs` BEFORE adding it.
 pub const COORDINATION_PREAMBLE: &str = "<system-reminder>Inter-session coordination (Session Bus): \
 other Claude sessions may be working this repo concurrently. BEFORE you start editing files or \
-writing a plan: (1) call coord_inbox to pick up directed messages other sessions left for you \
-(ack each with coord_ack_message); (2) call coord_who_is_working_on with your target paths/globs \
-(and/or a short intent) to see peers whose declared intent overlaps and any live claim holders, \
-each with a {session_id, session_label}; (3) call coord_recent_findings for those paths/subsystem \
-to learn from a concurrent session's recent investigation before redoing it. Then call \
-coord_declare_intent to announce your scope so peers see you, and coord_post_finding when you \
-finish an investigation worth sharing. To reach a specific peer, coord_send_message to their \
-session. This is advisory; the merge train remains the authoritative conflict gate.</system-reminder>";
+writing a plan, call coord_declare_intent with a short free-text description of what you're about \
+to work on. Coord derives the likely file globs server-side, records your scope so concurrent peers \
+see you, and returns any peers whose declared intent overlaps yours — so you can coordinate or \
+sequence around them instead of colliding at claim/merge time. This is advisory; the merge train \
+remains the authoritative conflict gate.</system-reminder>";
+
+// FULL-SURFACE preamble — DO NOT enable wholesale. As each Session-Bus phase
+// lands + deploys to coord main, fold the matching step into COORDINATION_PREAMBLE
+// above (and retire this note once the surface is fully shipped):
+//   - coord_who_is_working_on(paths?/intent?)  [Phase 1] read-only "who else is on these files", {session_id, session_label}
+//   - coord_inbox / coord_ack_message          [Phase 3a] pick up + ack directed peer messages
+//   - coord_recent_findings(paths)             [Phase 2] learn from a peer's recent investigation before redoing it
+//   - coord_post_finding(...)                  [Phase 2] publish an investigation worth sharing
+//   - coord_send_message(session_id, ...)      [Phase 3a] reach a specific peer
+// (The push-executor below still references coord_inbox/coord_ack_message in its
+// own delivery-message strings; those are self-gating — they only fire when a
+// message actually exists in the bus, i.e. once coord supports messaging.)
 
 /// Prepend [`COORDINATION_PREAMBLE`] to a spawn prompt (blank line between), so
 /// the spawned session reads the coordination nudge first, then its task.
