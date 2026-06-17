@@ -190,14 +190,28 @@ export function usePromptExecution(): UsePromptExecutionReturn {
             // invoking; only surface the not-found error after the bounded
             // wait elapses. This is generic — it covers ANY component reached
             // immediately after a navigate, not just the terminal launcher.
-            await waitForComponentRegistered(bridge, step.componentId, i + 1);
-            const compResult = await bridge.executeComponentAction(step.componentId, {
+            await waitForComponentRegistered(bridge, step.componentId, i + 1, step.actionId);
+            // Iter-6 — resolve the effective target component. The planner
+            // names `terminal-launch-menu` for the AI-spawn flow, but that
+            // surface is only the terminal page's initial/empty-state menu;
+            // once a session has been created and closed it is no longer
+            // mounted. The same spawn actions are now ALSO registered on the
+            // always-mounted `terminal-page` component, so when the named
+            // component isn't registered we retarget to a sibling that exposes
+            // the requested action. `waitForComponentRegistered` already
+            // accepted whichever of the two appeared first.
+            const effectiveComponentId = resolveComponentForAction(
+              bridge,
+              step.componentId,
+              step.actionId,
+            );
+            const compResult = await bridge.executeComponentAction(effectiveComponentId, {
               action: step.actionId,
               params: step.params,
             });
             if (!compResult.success) {
               throw new Error(
-                `Step ${i + 1} failed: ${compResult.error ?? "component action failed"} — could not invoke ${step.componentId}/${step.actionId}`,
+                `Step ${i + 1} failed: ${compResult.error ?? "component action failed"} — could not invoke ${effectiveComponentId}/${step.actionId}`,
               );
             }
             // Give the spawn handler time to mount the new pane (a Claude Code
@@ -411,8 +425,58 @@ function summarizeCandidateLabels(elements: readonly DiscoveredLike[]): string {
 /** The object returned by `useUIBridge` — typed structurally so this helper
  * stays decoupled from the SDK's exported type name. We only read
  * `getComponent`, the synchronous registry lookup that returns the component
- * record (or undefined when it isn't currently registered). */
-type BridgeLike = Pick<ReturnType<typeof useUIBridge>, "getComponent">;
+ * record (or undefined when it isn't currently registered). The record's
+ * `actions` array is read to detect a sibling component that exposes the same
+ * action id (iter-6 fallback). */
+type BridgeLike = {
+  getComponent: (id: string) => { actions?: Array<{ id: string }> } | undefined;
+};
+
+/**
+ * Iter-6 — sibling-component fallback map for component-action steps.
+ *
+ * Some spawn affordances are registered on more than one component: the NL
+ * planner names the user-facing surface (`terminal-launch-menu`, the terminal
+ * page's initial/empty-state menu), but the SAME registry-backed actions are
+ * also hoisted onto the always-mounted `terminal-page` component so they stay
+ * reachable in EVERY terminal-page state (including after a session was created
+ * and then closed, when the launch menu is no longer mounted). When the named
+ * component isn't registered, we retarget to a sibling here that exposes the
+ * requested action.
+ *
+ * Keyed by the planner-named component id → ordered list of fallback component
+ * ids to try (most-specific first).
+ */
+const COMPONENT_FALLBACKS: Readonly<Record<string, readonly string[]>> = {
+  "terminal-launch-menu": ["terminal-page"],
+};
+
+/**
+ * Resolve which registered component should receive `actionId`. Prefers the
+ * planner-named `componentId` when it's registered AND exposes the action;
+ * otherwise returns the first registered fallback sibling that exposes the
+ * action. Falls back to the original `componentId` when nothing better is
+ * found, so the caller's dispatch still surfaces the SDK's own not-found error.
+ */
+function resolveComponentForAction(
+  bridge: BridgeLike,
+  componentId: string,
+  actionId: string,
+): string {
+  const hasAction = (id: string): boolean => {
+    const comp = bridge.getComponent(id);
+    if (!comp) return false;
+    // A component with no declared actions array is treated as exposing the
+    // action (defensive — older registrations may omit it); dispatch then
+    // surfaces any real error.
+    return !comp.actions || comp.actions.some((a) => a.id === actionId);
+  };
+  if (hasAction(componentId)) return componentId;
+  for (const fallback of COMPONENT_FALLBACKS[componentId] ?? []) {
+    if (hasAction(fallback)) return fallback;
+  }
+  return componentId;
+}
 
 /**
  * D-RACE1 — bounded wait for a `useUIComponent` registration to appear in the
@@ -426,6 +490,11 @@ type BridgeLike = Pick<ReturnType<typeof useUIBridge>, "getComponent">;
  * a clear, actionable step error (the caller would otherwise hit the SDK's
  * opaque "Component not found" with no indication a race was the cause).
  *
+ * Iter-6 — the wait also succeeds as soon as a fallback sibling that exposes
+ * `actionId` is registered (e.g. `terminal-page` for a `terminal-launch-menu`
+ * spawn action), so the spawn affordance is considered reachable whenever the
+ * terminal page is active, independent of whether the launch menu is mounted.
+ *
  * Generic by design: any component reached immediately after a navigate
  * benefits, not just `terminal-launch-menu`.
  */
@@ -433,16 +502,29 @@ async function waitForComponentRegistered(
   bridge: BridgeLike,
   componentId: string,
   stepNumber: number,
+  actionId?: string,
   timeoutMs = 8000,
   pollMs = 100,
 ): Promise<void> {
+  const reachable = (): boolean => {
+    if (bridge.getComponent(componentId)) return true;
+    // Fallback siblings only count when they actually expose the action.
+    if (!actionId) return false;
+    for (const fallback of COMPONENT_FALLBACKS[componentId] ?? []) {
+      const comp = bridge.getComponent(fallback);
+      if (comp && (!comp.actions || comp.actions.some((a) => a.id === actionId))) {
+        return true;
+      }
+    }
+    return false;
+  };
   const deadline = Date.now() + timeoutMs;
-  // Fast path — already registered (e.g. the page was already active from an
+  // Fast path — already reachable (e.g. the page was already active from an
   // earlier navigation), skip the poll entirely.
-  if (bridge.getComponent(componentId)) return;
+  if (reachable()) return;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, pollMs));
-    if (bridge.getComponent(componentId)) return;
+    if (reachable()) return;
   }
   throw new Error(
     `Step ${stepNumber} failed: component "${componentId}" never registered within ` +
