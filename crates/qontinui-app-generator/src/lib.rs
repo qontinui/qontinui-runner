@@ -6,7 +6,7 @@
 //! website->mobile regeneration program
 //! (`plans/2026-06-14-app-generator-ir-inversion.md`, node #1).
 //!
-//! ## Phase 1 scope (this crate, deterministic core)
+//! ## Phase 1 scope (per-screen observability seam, deterministic core)
 //!
 //! - [`screen::generate_screen`] — `IrState` -> [`screen::ScreenArtifact`] (the emitted
 //!   `.tsx` + the structured instrumentation manifest). Pure-deterministic; no LLM.
@@ -19,6 +19,22 @@
 //!   golden test can run the real `qontinui_spec_check::evaluate` matcher and prove the
 //!   mapping is matcher-correct **deterministically**, without an Expo render.
 //!
+//! ## Phase 2 scope (whole-page inversion, deterministic core)
+//!
+//! - [`app::generate_app`] — `FunctionalSpec` + `Profile` -> [`app::GeneratedApp`]: one
+//!   instrumented screen per `IrState` (reusing the Phase-1 renderer verbatim), one
+//!   navigator edge per `IrTransition` whose press handler is resolved to a **real**
+//!   source-screen element, and one data-layer service method per `Operation` whose URL is
+//!   derived by the **shared** [`qontinui_types::endpoint_for::endpoint_for`] (the single
+//!   #1<->#2 contract — never re-derived). The whole-page golden test
+//!   (`tests/golden_full_app.rs`) runs the real matcher over **every** state and asserts a
+//!   `FullMatch`, lifting the Phase-1 per-screen proof to the entire connect-runner page.
+//! - Deferred (honestly): the **LLM presentational fill** (layout/styling via
+//!   `run_claude_cli`) and the **on-device render+snapshot** verify leg — there is no
+//!   generated-screen render harness (the device runs a fixed production Expo build, not a
+//!   dev-client that can load an arbitrary emitted `.tsx`). See the deferred test for the
+//!   precise gap + the harness proposal.
+//!
 //! ## Runtime-deferred (NOT in this crate)
 //!
 //! The full verify loop the plan describes (run the emitted screen under the UI Bridge
@@ -27,10 +43,12 @@
 //! toolchain. The crate leaves the wiring in place via [`snapshot_element_from`] and
 //! documents the deferral in `tests/runtime_render_deferred.rs`.
 
+pub mod app;
 pub mod criteria;
 pub mod instrument;
 pub mod screen;
 
+pub use app::{generate_app, GeneratedApp, NavEdge, ServiceMethod};
 pub use criteria::ParsedCriteria;
 pub use instrument::InstrumentedElement;
 pub use screen::{generate_screen, ScreenArtifact};

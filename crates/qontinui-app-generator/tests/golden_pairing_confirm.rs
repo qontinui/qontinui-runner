@@ -100,8 +100,10 @@ fn each_assertion_yields_a_correspondingly_instrumented_element() {
         "emitted screen renders the Connect visible text"
     );
 
-    // The authorization-copy assertion (criteria {text_contains: authorize}, snake_case
-    // in the fixture) → a text element whose visible copy CONTAINS "authorize".
+    // The authorization-copy assertion (criteria {textContains: authorize}, now camelCase
+    // in the fixture) → a text element whose visible copy CONTAINS "authorize". (The
+    // generator's tolerant ParsedCriteria honors either casing; the fixture having moved to
+    // camelCase means the MATCHER now reads this assertion too — see the note below.)
     let copy = artifact
         .elements
         .iter()
@@ -169,14 +171,13 @@ fn inverted_state_scores_full_match_against_the_real_matcher() {
         .find(|s| s.state_id == "pairing-confirm")
         .expect("matcher returns a result for pairing-confirm");
 
-    // NOTE on the fixture's snake_case `text_contains`: the MATCHER drops snake_case
-    // criteria keys (it parses strict camelCase IrElementCriteria), so the
-    // authorization-copy assertion's criteria is read as EMPTY by the matcher and
-    // matches vacuously (passes). The GENERATOR honors snake_case and instruments the
-    // copy element regardless. Either way the connect-button assertion (camelCase-clean
-    // {role, text}) is the load-bearing one and matches a real element — so the state
-    // scores 1.0. The cross-crate reconciliation (comprehension emit camelCase) is
-    // surfaced in the report; this assert pins the current behavior.
+    // NOTE: the fixture now writes the authorization-copy criteria as camelCase
+    // `textContains` (the cross-crate reconciliation §8.4 landed), so the MATCHER reads it
+    // too — the copy assertion matches a REAL authorize-bearing element (no longer vacuous).
+    // Both the connect-button assertion ({role, text}) and the copy assertion ({textContains})
+    // resolve to real instrumented elements, so the state scores 1.0 on substance, not on a
+    // vacuous pass. The generator's tolerant ParsedCriteria still honors snake_case for
+    // resilience against any pre-reconciliation fixtures; this assert pins the behavior.
     assert_eq!(
         sr.match_rate, 1.0,
         "pairing-confirm scores a full per-state match"
