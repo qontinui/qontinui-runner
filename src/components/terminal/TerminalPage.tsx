@@ -32,6 +32,7 @@ import { ConductorStatusStrip } from "./ConductorStatusStrip";
 import { UnzonedChip } from "./UnzonedChip";
 import { pickLayout } from "./useZoneLayout";
 import { buildCreatePlainTerminalAction } from "./createPlainTerminalAction";
+import { buildRegistrySpawnActions } from "./registrySpawnActions";
 import { ResultCardProvider, ResultCardMount, useResultCard } from "./result-card";
 
 import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
@@ -139,6 +140,18 @@ function TerminalPageInner({
       // read to invocation time (it's declared below, same as the
       // `terminal-launch-menu` handlers that close over later consts).
       buildCreatePlainTerminalAction((title) => createAndAssignTerminal(title)),
+      // Iter-6 root-cause fix — hoist the registry-backed spawn actions
+      // (`create-plain` / `create-best-account` / `create-with-command`) onto
+      // the ALWAYS-mounted `terminal-page` component. They previously lived
+      // only on `terminal-launch-menu`, which headless automation could not
+      // reach once a session had been created and then closed (the page
+      // renders a non-launch-menu view in that state). `terminal-page`
+      // registers in EVERY page state — including the `!initialized`
+      // early-return path — so the AI-spawn affordance the NL planner relies on
+      // (`create-best-account`) is now reachable regardless of prior page
+      // state, without any menu needing to be open. Same source of truth as
+      // the `terminal-launch-menu` registration below (shared factory).
+      ...buildRegistrySpawnActions(callRegistry),
       {
         id: "list-terminals",
         label: "List Terminals",
@@ -242,24 +255,12 @@ function TerminalPageInner({
       "Creates plain terminals and AI sessions. Use create-plain, create-ai-session, " +
       "create-best-account, or create-with-command to launch terminals programmatically.",
     actions: [
-      {
-        id: "create-plain",
-        label: "Create Plain Terminal",
-        description: "Spawn N blank terminals using the user's default shell.",
-        paramSchema: { count: "number (>= 1, defaults to 1)" },
-        handler: async (params?: unknown) => {
-          const { count = 1 } = (params ?? {}) as { count?: number };
-          if (typeof count !== "number" || count < 1) {
-            throw new Error("create-plain requires { count: number } where count >= 1");
-          }
-          const tabIds = await callRegistry<string[]>("terminal.spawn", { count });
-          return {
-            success: true,
-            tab_ids: tabIds,
-            task_run_ids: [] as Array<string | null>,
-          };
-        },
-      },
+      // `create-plain`, `create-best-account`, `create-with-command` — the
+      // registry-backed spawn actions, sourced from the shared factory so this
+      // surface and the always-mounted `terminal-page` surface stay in lockstep.
+      // `create-ai-session` below is NOT in the factory: it closes over the
+      // page-local `handleLaunchAiSession` and so stays inline here.
+      ...buildRegistrySpawnActions(callRegistry),
       {
         id: "create-ai-session",
         label: "Create AI Session",
@@ -297,79 +298,6 @@ function TerminalPageInner({
             success: true,
             tab_ids: tabIds,
             task_run_ids: tabIds.map(() => null) as Array<string | null>,
-          };
-        },
-      },
-      {
-        id: "create-best-account",
-        label: "Create AI Session with Best Account",
-        description:
-          "Like create-ai-session, but picks the AI account with the lowest current utilization. Fails if no accounts are configured.",
-        paramSchema: {
-          count: "number (>= 1, defaults to 1)",
-          context: "string (optional initial prompt auto-typed after claude starts)",
-        },
-        handler: async (params?: unknown) => {
-          const { count = 1, context } = (params ?? {}) as {
-            count?: number;
-            context?: string;
-          };
-          if (typeof count !== "number" || count < 1) {
-            throw new Error("create-best-account: count must be a positive number");
-          }
-          // Delegate to registry `terminal.spawn-ai` with the literal
-          // `account: "best"`. The registry handler does the lowest-
-          // utilization lookup; we rethrow `no-account` as the original
-          // "No AI accounts available" wording so existing automation
-          // regexes keep matching.
-          let tabIds: string[];
-          try {
-            tabIds = await callRegistry<string[]>("terminal.spawn-ai", {
-              count,
-              account: "best",
-              context,
-            });
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            if (msg.includes("no-account") || msg.toLowerCase().includes("no matching")) {
-              throw new Error("No AI accounts available", { cause: err });
-            }
-            throw err;
-          }
-          return {
-            success: true,
-            tab_ids: tabIds,
-            task_run_ids: tabIds.map(() => null) as Array<string | null>,
-          };
-        },
-      },
-      {
-        id: "create-with-command",
-        label: "Create Terminal with Command",
-        description:
-          "Spawn N terminals and auto-type the given shell command into each after the prompt renders.",
-        paramSchema: {
-          count: "number (>= 1, defaults to 1)",
-          command: "string (the shell command to type + Enter, required)",
-        },
-        handler: async (params?: unknown) => {
-          const { count = 1, command } = (params ?? {}) as {
-            count?: number;
-            command?: string;
-          };
-          if (!command)
-            throw new Error("create-with-command requires { count?: number, command: string }");
-          if (typeof count !== "number" || count < 1) {
-            throw new Error("create-with-command: count must be a positive number");
-          }
-          const tabIds = await callRegistry<string[]>("terminal.spawn-with", {
-            count,
-            command,
-          });
-          return {
-            success: true,
-            tab_ids: tabIds,
-            task_run_ids: [] as Array<string | null>,
           };
         },
       },
