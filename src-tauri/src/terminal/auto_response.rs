@@ -12,31 +12,36 @@
 //! - [`reload_rules`] compiles the coord-projected fleet rule set (bad regexes
 //!   are warned-and-skipped, never fatal) into [`COMPILED_RULES`], carrying each
 //!   rule's [`CompiledAction`] (fixed text vs. coord scoring-resolve).
-//! - [`AutoResponseWatchHook`] is an [`super::interceptor::OutputHook`]
-//!   installed on every terminal's interceptor pipeline. It ANSI-strips +
-//!   normalizes a bounded rolling window per terminal (sharing
-//!   [`super::output_scan`] with the usage-limit hook) and, for each rule
-//!   whose regex matches, hands the match to the [`scheduler`].
+//! - [`scan_grids_once`] / [`spawn_grid_scan_loop`] poll every live terminal's
+//!   *rendered* VT cell grid ([`super::session::TerminalSession::grid`]) on a
+//!   debounced tick. Scanning the rendered grid — not the raw byte stream —
+//!   is what lets the engine see text inside a full-screen TUI like Claude
+//!   Code, which paints each whole frame as one synchronized-output update: a
+//!   small rolling byte-window only ever retains the *bottom* of such a frame
+//!   (input box / status line), so the error text rendered mid-screen is
+//!   trimmed out before it can match. The grid always reflects what is on
+//!   screen. The scan is EDGE-triggered (see [`GRID_EDGE`]): a rule fires once
+//!   when its pattern first appears and not again while the same text stays
+//!   painted, re-arming once it leaves the screen.
 //! - [`scheduler`] tracks per `(terminal, rule)` backoff state and, after the
 //!   computed delay, submits the rule's prompt into the live session via
 //!   [`super::session::TerminalSession::submit_prompt`]. No max-retry cap —
 //!   the backoff grows unbounded by default so a persistently-rate-limited
 //!   session is nudged ever-more-gently rather than abandoned.
 //!
-//! Hot-path discipline: `process` runs on the PTY reader thread for every
-//! chunk. It early-outs to a single atomic-ish [`RwLock`] read when no rules
-//! are loaded, and never holds the per-terminal state lock across the
-//! scheduler call.
+//! Cost discipline: every scan early-outs to a single [`RwLock`] read when no
+//! rules are loaded; otherwise it is one `text_snapshot` + regex pass per live
+//! terminal per tick (~1.5s), and the scheduler is dispatched with no scan
+//! locks held.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
 use super::auto_response_fleet::{FleetRule, RuleAction};
-use super::interceptor::OutputHook;
-use super::output_scan::{normalize, AnsiStripper, WINDOW_KEEP};
+use super::output_scan::normalize;
 use crate::settings::BackoffConfig;
 
 /// The compiled, hot-path form of a rule's action.
@@ -117,97 +122,126 @@ fn rules_active() -> bool {
         .unwrap_or(false)
 }
 
-// ── The hook ────────────────────────────────────────────────────────────────
+// ── Grid scanner ─────────────────────────────────────────────────────────────
 
-struct TermScanState {
-    stripper: AnsiStripper,
-    window: String,
-}
+/// Per `(terminal_id, rule_id)` "was matching on the previous scan" flag, so
+/// the grid scanner is EDGE-triggered: a rule fires once when its pattern first
+/// appears on screen and NOT again while the same text stays painted (a
+/// full-screen TUI keeps the rate-limit error on screen until the next turn).
+/// It re-arms once the text leaves the screen, so a genuinely fresh occurrence
+/// fires again. Without this, a persistently-visible error would re-fire on
+/// every backoff completion and spam the session.
+///
+/// Option-wrapped so the static is const-initializable (mirrors
+/// [`scheduler::STATE`]). Outer key: terminal id; inner: rule id -> matching.
+static GRID_EDGE: Mutex<Option<HashMap<String, HashMap<String, bool>>>> = Mutex::new(None);
 
-impl Default for TermScanState {
-    fn default() -> Self {
-        Self {
-            stripper: AnsiStripper::default(),
-            window: String::with_capacity(WINDOW_KEEP * 2),
+/// Pure edge-detection core: given a terminal's normalized screen text, the
+/// compiled rules, and that terminal's prior per-rule match flags, return the
+/// indices of rules that just transitioned no-match -> match (rising edges),
+/// updating the flags in place. Pure + total — the unit-test seam for the
+/// fire-once-per-appearance behavior.
+fn collect_rising_edges(
+    normalized: &str,
+    rules: &[CompiledRule],
+    prev: &mut HashMap<String, bool>,
+) -> Vec<usize> {
+    let mut fired = Vec::new();
+    for (i, rule) in rules.iter().enumerate() {
+        let matching = rule.regex.is_match(normalized);
+        if matching && !prev.get(&rule.id).copied().unwrap_or(false) {
+            fired.push(i);
         }
+        prev.insert(rule.id.clone(), matching);
     }
+    fired
 }
 
-/// Output hook that fires the auto-response scheduler whenever a fleet rule's
-/// regex matches a PTY's recent (ANSI-stripped, normalized) output. Pure
-/// pass-through for the data itself — it never modifies the stream.
-pub struct AutoResponseWatchHook {
-    states: Mutex<HashMap<String, TermScanState>>,
-}
+/// One grid-scan pass over every live terminal: for each rule whose pattern is
+/// *freshly* visible on a terminal's rendered screen, schedule a backed-off
+/// response via the shared [`scheduler`]. Cheap no-op when no rules are loaded.
+pub fn scan_grids_once() {
+    use tauri::Manager;
 
-impl AutoResponseWatchHook {
-    pub fn new() -> Self {
-        Self {
-            states: Mutex::new(HashMap::new()),
-        }
+    if !rules_active() {
+        return;
     }
-}
+    let Some(app) = crate::tauri_app_handle::current() else {
+        return;
+    };
+    let Some(tm) = app.try_state::<Arc<crate::terminal::TerminalManager>>() else {
+        return;
+    };
+    let sessions = tm.sessions_snapshot();
 
-impl Default for AutoResponseWatchHook {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl OutputHook for AutoResponseWatchHook {
-    fn process(&self, terminal_id: &str, data: &[u8]) -> Vec<u8> {
-        // Hot-path early-out: nothing to do when no rules are loaded.
-        if !rules_active() {
-            return data.to_vec();
-        }
-
-        // Feed + normalize the per-terminal window, then collect the matches.
-        // Unlike the usage-limit hook this does NOT clear the window on a match:
-        // backoff/no-stack live in the scheduler, and clearing would drop the
-        // tail of a chunk that contained the match.
-        let matches: Vec<(String, CompiledAction, BackoffConfig, String)> = {
-            let Ok(mut states) = self.states.lock() else {
-                return data.to_vec();
+    // Collect rising-edge matches under the rule + edge locks, then dispatch to
+    // the scheduler with NO locks held (the scheduler spawns + locks its own
+    // state).
+    let mut to_fire: Vec<(String, String, CompiledAction, BackoffConfig, String)> = Vec::new();
+    {
+        let Ok(rules) = COMPILED_RULES.read() else {
+            return;
+        };
+        let mut edge = GRID_EDGE.lock().unwrap_or_else(|e| e.into_inner());
+        let map = edge.get_or_insert_with(HashMap::new);
+        for (tid, session) in &sessions {
+            // Read the *rendered* screen text (rows joined by `\n`) — the grid
+            // is the VT-parsed cell buffer, so this is immune to the
+            // synchronized-output frame batching that hides text from a raw
+            // byte-stream scan in a full-screen TUI.
+            let text = {
+                let grid = session.grid();
+                let guard = grid.lock().unwrap_or_else(|e| e.into_inner());
+                guard.text_snapshot().text
             };
-            let st = states.entry(terminal_id.to_string()).or_default();
-            st.stripper.feed(data, &mut st.window);
-
-            // Bound the rolling window without splitting a UTF-8 char.
-            if st.window.len() > WINDOW_KEEP {
-                let cut = st.window.len() - WINDOW_KEEP;
-                let cut = (cut..st.window.len())
-                    .find(|i| st.window.is_char_boundary(*i))
-                    .unwrap_or(0);
-                st.window.drain(..cut);
+            let normalized = normalize(&text);
+            let prev = map.entry(tid.clone()).or_default();
+            for idx in collect_rising_edges(&normalized, &rules, prev) {
+                let rule = &rules[idx];
+                to_fire.push((
+                    tid.clone(),
+                    rule.id.clone(),
+                    rule.action.clone(),
+                    rule.backoff.clone(),
+                    normalized.clone(),
+                ));
             }
-
-            let normalized = normalize(&st.window);
-            let Ok(rules) = COMPILED_RULES.read() else {
-                return data.to_vec();
-            };
-            // Carry the matched normalized window as the resolve context — the
-            // scheduler passes it to coord verbatim for the scoring decision.
-            rules
-                .iter()
-                .filter(|r| r.regex.is_match(&normalized))
-                .map(|r| {
-                    (
-                        r.id.clone(),
-                        r.action.clone(),
-                        r.backoff.clone(),
-                        normalized.clone(),
-                    )
-                })
-                .collect()
-        }; // states + rules locks released here
-
-        // Dispatch to the scheduler with NO hook locks held.
-        for (rule_id, action, backoff, context) in matches {
-            scheduler::on_match(terminal_id, &rule_id, &action, &backoff, &context);
         }
+        // Drop edge state for terminals that have gone away.
+        let live: std::collections::HashSet<&String> = sessions.iter().map(|(t, _)| t).collect();
+        map.retain(|tid, _| live.contains(tid));
+    } // rules + edge locks released
 
-        data.to_vec()
+    for (tid, rid, action, backoff, context) in to_fire {
+        scheduler::on_match(&tid, &rid, &action, &backoff, &context);
     }
+}
+
+/// Grid-scan interval. Overridable via
+/// `QONTINUI_AUTO_RESPONSE_SCAN_INTERVAL_MS` (floored at 200ms). 1.5s is well
+/// under the default 60s backoff, so the (idle, on-screen) rate-limit error is
+/// caught promptly while costing a trivial regex pass per terminal per tick.
+fn scan_interval() -> Duration {
+    let ms = std::env::var("QONTINUI_AUTO_RESPONSE_SCAN_INTERVAL_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n >= 200)
+        .unwrap_or(1500);
+    Duration::from_millis(ms)
+}
+
+/// Spawn the periodic grid scanner for the process lifetime. Detached; each
+/// tick is best-effort and the loop never exits.
+pub fn spawn_grid_scan_loop() {
+    tauri::async_runtime::spawn(async move {
+        let mut ticker = tokio::time::interval(scan_interval());
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        info!("auto_response: grid-scan loop started");
+        loop {
+            ticker.tick().await;
+            scan_grids_once();
+        }
+    });
 }
 
 // ── Scheduler ────────────────────────────────────────────────────────────────
@@ -354,8 +388,6 @@ mod scheduler {
     /// session is gone (closed during the backoff), log and return — the
     /// scheduler state is reaped lazily by the next reload / process anyway.
     async fn submit_to_session(tid: &str, prompt: &str) {
-        use std::sync::Arc;
-
         use tauri::Manager;
 
         let Some(app) = crate::tauri_app_handle::current() else {
@@ -605,27 +637,70 @@ mod tests {
         );
     }
 
+    /// A compiled rule built directly (no fleet round-trip) for grid-scan tests.
+    fn crule(id: &str, pattern: &str) -> CompiledRule {
+        CompiledRule {
+            id: id.to_string(),
+            regex: regex::Regex::new(pattern).unwrap(),
+            action: CompiledAction::Fixed("please continue".to_string()),
+            backoff: BackoffConfig::default(),
+        }
+    }
+
     #[test]
-    fn hook_matches_regex_over_ansi_window_split_across_calls() {
-        let _guard = RULES_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        reload_rules(vec![rule("rl", "rate limited")]);
-        let hook = AutoResponseWatchHook::new();
-        // A normalized window must collect the match even when the phrase and
-        // an ANSI color code are split across two process() calls. We assert on
-        // the normalized window match directly (the scheduler spawn needs a
-        // tauri runtime, which a unit test lacks) by re-deriving it the same
-        // way the hook does.
-        let _ = OutputHook::process(&hook, "t1", b"API Error: Server is rate \x1b[31m");
-        let _ = OutputHook::process(&hook, "t1", b"limited now");
-        let states = hook.states.lock().unwrap();
-        let window = &states.get("t1").unwrap().window;
-        assert!(
-            normalize(window).contains("rate limited"),
-            "window did not contain the phrase: {:?}",
-            normalize(window)
+    fn grid_scan_is_edge_triggered_fire_once_per_appearance() {
+        // The seeded rate-limit rule, matched against rendered screen text.
+        let rules = vec![crule("rl", "(?i)server is temporarily limiting requests")];
+        let mut prev: HashMap<String, bool> = HashMap::new();
+
+        // Not on screen -> no fire.
+        assert!(collect_rising_edges("PS D:\\> echo hi   hi", &rules, &mut prev).is_empty());
+        // Error appears -> fires once (rising edge).
+        assert_eq!(
+            collect_rising_edges(
+                "API Error: Server is temporarily limiting requests   continue?",
+                &rules,
+                &mut prev
+            ),
+            vec![0]
         );
-        drop(states);
-        reload_rules(vec![]);
+        // Still painted on the next tick -> does NOT re-fire (no spam while the
+        // full-screen TUI keeps the error on screen).
+        assert!(collect_rising_edges(
+            "server is temporarily limiting requests   ❯",
+            &rules,
+            &mut prev
+        )
+        .is_empty());
+        // Scrolled off / screen cleared -> no fire, and the edge re-arms.
+        assert!(
+            collect_rising_edges("I'm ready to help — what's next?", &rules, &mut prev).is_empty()
+        );
+        // A genuinely fresh occurrence later -> fires again.
+        assert_eq!(
+            collect_rising_edges(
+                "again — server is temporarily limiting requests",
+                &rules,
+                &mut prev
+            ),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn grid_scan_multiple_rules_independent_edges() {
+        let rules = vec![crule("a", "rate limited"), crule("b", "overloaded")];
+        let mut prev: HashMap<String, bool> = HashMap::new();
+        // Only rule b visible -> fires index 1 only.
+        assert_eq!(
+            collect_rising_edges("server overloaded", &rules, &mut prev),
+            vec![1]
+        );
+        // Now both visible -> only the newly-appeared rule a (index 0) fires.
+        assert_eq!(
+            collect_rising_edges("rate limited and overloaded", &rules, &mut prev),
+            vec![0]
+        );
     }
 
     #[test]
