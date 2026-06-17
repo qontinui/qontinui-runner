@@ -730,9 +730,28 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16
         // coord-mcp calls could still expire (coord's refresh endpoint rejects
         // an already-expired token — OQ4). The spawn-site path (with the 30s
         // heartbeat refresh) is the one that matters and never expires.
-        let agent_id = jwt_unverified_claim(jwt, "sub")
-            .and_then(|s| Uuid::parse_str(&s).ok())
-            .unwrap_or_else(Uuid::nil);
+        // Fail closed on a missing/unparseable `sub` (the agent_id): registering a
+        // `Uuid::nil()`-keyed slot would let two malformed-JWT provisions collide on
+        // the same nil key (the second overwriting the first's slot). The trusted
+        // spawn site (`agent_runtime::run_agent_subprocess`) keys on `payload.agent_id`
+        // and never reaches here; this arm only ever sees a well-formed agent JWT in
+        // tests, so a nil `sub` means a malformed token — refuse rather than register
+        // an ambiguous slot.
+        let agent_id = match jwt_unverified_claim(jwt, "sub").and_then(|s| Uuid::parse_str(&s).ok())
+        {
+            Some(id) => id,
+            None => {
+                warn!(
+                    "coord_mcp: refusing to write an AGENT proxy .mcp.json for {workdir} — \
+                     the agent JWT has no parseable `sub` (agent_id) claim."
+                );
+                write_degraded_breadcrumb(
+                    workdir,
+                    "agent JWT missing a parseable `sub` (agent_id) — proxy config NOT written",
+                );
+                return;
+            }
+        };
         let exp = jwt_unverified_claim(jwt, "exp")
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0);
