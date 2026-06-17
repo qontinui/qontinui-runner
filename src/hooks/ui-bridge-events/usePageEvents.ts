@@ -734,7 +734,14 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
 
         case "read_value": {
           try {
-            const { selector } = (payload.params || {}) as { selector?: string };
+            // D5 — CSP-safe value read: pure DOM traversal, no eval. The
+            // Rust `read-value` route now dispatches here instead of
+            // building a JS string for `eval`/`new Function`, so the route
+            // works on a CSP-hardened build (no `unsafe-eval`).
+            const { selector, index } = (payload.params || {}) as {
+              selector?: string;
+              index?: number;
+            };
             if (!selector) {
               await sendResponse({
                 requestId,
@@ -745,8 +752,8 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               });
               return true;
             }
-            const el = document.querySelector<HTMLElement>(selector);
-            if (!el) {
+            const matches = Array.from(document.querySelectorAll<HTMLElement>(selector));
+            if (matches.length === 0) {
               await sendResponse({
                 requestId,
                 type,
@@ -756,12 +763,37 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               });
               return true;
             }
-            const value = "value" in el ? (el as HTMLInputElement).value : (el.textContent ?? null);
+            const idx = typeof index === "number" && index >= 0 ? index : 0;
+            if (idx >= matches.length) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: `Index ${idx} out of range (${matches.length} matches)`,
+                timestamp: Date.now(),
+              });
+              return true;
+            }
+            const el = matches[idx];
+            // Prefer a form control's `.value`; fall back to trimmed text
+            // content for non-input elements (e.g. the hidden
+            // `command-bar-result` JSON node read by the spawn-AI flow).
+            const rawValue =
+              "value" in el && (el as HTMLInputElement).value !== ""
+                ? (el as HTMLInputElement).value
+                : (el.textContent?.trim() ?? "");
             await sendResponse({
               requestId,
               type,
               success: true,
-              data: { value, length: value?.length ?? 0 },
+              data: {
+                value: rawValue,
+                length: rawValue.length,
+                tag: el.tagName,
+                type: (el as HTMLInputElement).type || null,
+                index: idx,
+                totalMatches: matches.length,
+              },
               timestamp: Date.now(),
             });
           } catch (err) {
@@ -1023,6 +1055,26 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
                 detail: { tab: tabId as MainTabId },
               }),
             );
+            // D6 — sync the URL to the activated tab. `tab_activate` used to
+            // flip `activeTab` (and thus the activeTab-derived `page.route`)
+            // without touching `window.location`, so the URL bar drifted out
+            // of sync with the active surface: a snapshot taken after
+            // `navigate /terminal` reported `activeTab:"terminal"` while
+            // `window.location.pathname` was still the previously-loaded path.
+            // `page_navigate` already pushState's; mirror that here so both
+            // tab-switch entry points leave route + activeTab consistent.
+            // Canonical path = "/<tabId>" (matches page_navigate's tab→path
+            // convention); pushState only (no reload) keeps injected window
+            // state intact, same as soft navigation.
+            try {
+              const canonicalPath = `/${tabId}`;
+              if (window.location.pathname !== canonicalPath) {
+                window.history.pushState({}, "", canonicalPath);
+              }
+            } catch {
+              // Non-fatal: the tab still switched via the event above; only
+              // the URL-bar mirror failed (e.g. a sandboxed history).
+            }
             // Persist immediately so that `tabs_list` polled right after sees
             // the new value (the React effect in `useAppNavigation` would also
             // persist on the next render, but agents may read back before that).
@@ -1034,6 +1086,7 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               data: {
                 activeTab: tabId,
                 previousTab,
+                route: { pattern: tabId, id: tabId, path: `/${tabId}` },
               },
               timestamp: Date.now(),
             });

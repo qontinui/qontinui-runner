@@ -77,6 +77,60 @@ interface StatusLine {
   text: string;
 }
 
+/**
+ * Durable, machine-readable record of the LAST command execution. Unlike
+ * `StatusLine` (which renders a transient 3s toast and is gated on
+ * `!focused`), this is mirrored into a hidden `data-page-element=
+ * "command-bar-result"` node whose `textContent` is JSON. It is set on
+ * EVERY execute (success or failure) and is NOT auto-cleared, so a
+ * headless UI-Bridge driver can read *why* a command did or didn't do
+ * what it asked — e.g. `/spawn-ai best` returning `code:"no-account"`
+ * when no Claude account is configured. Before this, the only signal of
+ * that failure was a 3s status line the driver almost always missed,
+ * leaving the spawn-AI flow looking like a success (`click` → success:
+ * true) with no session and no observable reason. (D1)
+ */
+export interface CommandResultRecord {
+  /** `true` when the action's CommandResult was `ok`. */
+  ok: boolean;
+  /** The action's slash form, e.g. `/spawn-ai`. */
+  slash: string;
+  /** Registry action id, e.g. `terminal.spawn-ai`. */
+  actionId: string;
+  /** How the command was triggered. */
+  source: "slash" | "ai";
+  /** Failure code from `CommandResult.code` (absent on success). */
+  code?: string;
+  /** Human-readable failure message (absent on success). */
+  message?: string;
+  /** ms-epoch the record was written — lets a driver detect freshness. */
+  at: number;
+}
+
+/**
+ * Build the durable {@link CommandResultRecord} from an action + its
+ * `CommandResult`. Pure (modulo the injected `now`) so the D1 durable-
+ * record contract — especially the `/spawn-ai best` → `no-account` shape
+ * a headless driver reads — is unit-testable under the runner's node
+ * vitest env without rendering JSX.
+ */
+export function buildCommandResultRecord(
+  action: Pick<CommandAction, "id" | "slash">,
+  result: CommandResult,
+  source: "slash" | "ai",
+  now: number = Date.now(),
+): CommandResultRecord {
+  return {
+    ok: result.ok,
+    slash: action.slash,
+    actionId: action.id,
+    source,
+    code: result.ok ? undefined : result.code,
+    message: result.ok ? undefined : result.message,
+    at: now,
+  };
+}
+
 /** Subscribe to the registry via useSyncExternalStore so the suggestion
  *  list rebuilds when `useTerminalCommands` registers / unregisters. */
 function useRegistrySnapshot(): readonly CommandAction[] {
@@ -100,6 +154,10 @@ export function CommandBar() {
   const [focused, setFocused] = useState(false);
   const [selectedIdx, setSelectedIdx] = useState(0);
   const [status, setStatus] = useState<StatusLine | null>(null);
+  // Durable last-result record (D1). Mirrored to a hidden DOM node so an
+  // external UI-Bridge driver can read the outcome AFTER the 3s status
+  // toast has cleared.
+  const [lastResult, setLastResult] = useState<CommandResultRecord | null>(null);
   const [recents, setRecents] = useState<string[]>(() =>
     instanceStorage.getJSON<string[]>(RECENTS_STORAGE_KEY, []),
   );
@@ -290,17 +348,31 @@ export function CommandBar() {
       // verbatim rather than re-parsing positionally (positional parse
       // on "spawn 3 best" against /spawn's 1-field schema would silently
       // mis-bind).
+      const source: "slash" | "ai" = tier === "ai" ? "ai" : "slash";
       const args = presetArgs ?? parseArgs(rawInput, action);
       let result: CommandResult;
       try {
-        result = await action.handler(args, {
-          source: tier === "ai" ? "ai" : "slash",
-        });
+        result = await action.handler(args, { source });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         setStatus({ kind: "error", text: `${action.slash}: ${message}` });
+        // D1 — a thrown handler is just as much a durable failure as a
+        // `{ok:false}` return; record it so the driver sees it too.
+        setLastResult({
+          ok: false,
+          slash: action.slash,
+          actionId: action.id,
+          source,
+          code: "exception",
+          message,
+          at: Date.now(),
+        });
         return;
       }
+      // D1 — durable record on every outcome. For failures this is the
+      // signal a headless driver reads to learn that e.g. `/spawn-ai best`
+      // failed with `no-account` rather than silently doing nothing.
+      setLastResult(buildCommandResultRecord(action, result, source));
       if (result.ok) {
         persistRecent(action.id);
         // Result.value may be `undefined` (action just ran) — render the
@@ -420,6 +492,24 @@ export function CommandBar() {
 
   return (
     <div data-page-element="command-bar" className="relative z-40 w-full shrink-0">
+      {/* D1 — durable, machine-readable last-result mirror. Visually
+          hidden (never affects layout), but its `textContent` is the JSON
+          {@link CommandResultRecord} for the LAST execute. A headless
+          UI-Bridge driver reads it via
+          `POST /ui-bridge/control/page/read-value
+          {"selector":"[data-page-element=command-bar-result]"}` to learn
+          whether — and why — a command actually succeeded. Empty until the
+          first execute. */}
+      <span
+        data-page-element="command-bar-result"
+        data-testid="command-bar-result"
+        data-result-ok={lastResult ? String(lastResult.ok) : undefined}
+        data-result-code={lastResult?.code}
+        style={{ display: "none" }}
+        aria-hidden
+      >
+        {lastResult ? JSON.stringify(lastResult) : ""}
+      </span>
       {/* Status line + suggestion dropdown float in an overlay anchored
           ABOVE the docked footer (`bottom-full`) so they never change the
           bar's own height or push the terminal grid while the operator
@@ -496,6 +586,9 @@ export function CommandBar() {
                     <button
                       key={m.action.id}
                       type="button"
+                      data-page-element="command-bar-suggestion"
+                      data-testid={`command-bar-suggestion-${m.action.id}`}
+                      data-action-id={m.action.id}
                       onMouseDown={(e) => e.preventDefault() /* keep input focus */}
                       onClick={() => handleSuggestionClick(m.action, idx, m.presetArgs, m.tier)}
                       onMouseEnter={() => setSelectedIdx(idx)}
@@ -547,6 +640,8 @@ export function CommandBar() {
         <span className="text-[10px] text-[#565f89] font-mono select-none">›</span>
         <input
           ref={inputRef}
+          data-page-element="command-bar-input"
+          data-testid="command-bar-input"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onFocus={handleFocus}

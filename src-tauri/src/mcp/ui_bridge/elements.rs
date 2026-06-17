@@ -3449,40 +3449,51 @@ pub async fn ui_bridge_read_value_handler(
         ));
     }
 
-    let escaped_selector = selector.replace('\\', "\\\\").replace('\'', "\\'");
-
-    let js = format!(
-        r#"(() => {{
-            const matches = Array.from(document.querySelectorAll('{selector}'));
-            if (matches.length === 0) return JSON.stringify({{ found: false, error: 'No elements match selector' }});
-            const idx = {index};
-            if (idx >= matches.length) return JSON.stringify({{ found: false, error: 'Index out of range' }});
-            const el = matches[idx];
-            return JSON.stringify({{
-                found: true,
-                tag: el.tagName,
-                type: el.type || null,
-                value: el.value || el.textContent?.trim() || '',
-                length: (el.value || el.textContent || '').length,
-                placeholder: el.placeholder || null,
-                disabled: el.disabled || false,
-                readOnly: el.readOnly || false,
-                index: idx,
-                totalMatches: matches.length
-            }});
-        }})()"#,
-        selector = escaped_selector,
-        index = index
-    );
-
-    // Optional `windowLabel` scopes the read to a pop-out window (Phase 4 of
-    // plan 2026-06-07-multi-window-sdk-automation); omit -> main window.
+    // D5 — CSP-safe read. Previously this built a JS string and ran it via
+    // `evaluate_js_expression_in_window`, whose fallback path is a webview
+    // `eval(...)` (and whose IPC fast-path uses `new Function(...)`); both
+    // require CSP `unsafe-eval`, so on a CSP-hardened build this route was
+    // blocked outright. There is no need for arbitrary evaluation here:
+    // read-value only locates an element by selector and reads its fields.
+    // Route through the dedicated `read_value` IPC request type, whose
+    // frontend handler (`usePageEvents.ts`) does pure DOM traversal
+    // (`querySelectorAll` + field reads) with zero eval.
+    //
+    // The optional `windowLabel` is preserved on the payload so
+    // `ui_bridge_request_sync` (via `split_target_window`) still scopes the
+    // read to a pop-out window; omit -> main window.
     let window_label = read_window_label(&body);
-    match evaluate_js_expression_in_window(&state, &js, window_label).await {
-        Ok(result) => {
-            let parsed: serde_json::Value = serde_json::from_str(&result)
-                .unwrap_or(serde_json::json!({"found": false, "error": "Parse error"}));
-            Ok(Json(ApiResponse::success(parsed)))
+    let mut params = serde_json::json!({ "selector": selector, "index": index });
+    let payload = if window_label.is_empty() {
+        serde_json::json!({ "params": params })
+    } else {
+        params["windowLabel"] = serde_json::Value::String(window_label.to_string());
+        serde_json::json!({ "params": params, "windowLabel": window_label })
+    };
+
+    match ui_bridge_request_sync(&state, "read_value", payload).await {
+        Ok(data) => {
+            // The CSP-safe frontend handler reports failures as
+            // `{ success: false, error }`; map those onto the `found:false`
+            // shape this route has always returned so callers don't change.
+            if data.get("success") == Some(&serde_json::Value::Bool(false)) {
+                let err = data
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("read failed")
+                    .to_string();
+                return Ok(Json(ApiResponse::success(
+                    serde_json::json!({ "found": false, "error": err }),
+                )));
+            }
+            // Frontend returns `{ value, length, ... }` (optionally nested
+            // under `data`). Normalize to `{ found: true, ... }`.
+            let inner = data.get("data").unwrap_or(&data);
+            let mut out = inner.clone();
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert("found".to_string(), serde_json::Value::Bool(true));
+            }
+            Ok(Json(ApiResponse::success(out)))
         }
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
     }

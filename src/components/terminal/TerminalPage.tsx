@@ -946,13 +946,26 @@ function TerminalPageInner({
   });
 
   if (!initialized) {
+    // D4 — keep the `terminal-page` UI Bridge scope mounted even during
+    // the pre-init loading state. Previously this early-return dropped
+    // `UIBridgeComponentScope`, so after navigating to /terminal the
+    // active component scope went unregistered until init finished and a
+    // driver's element/action calls 404'd against terminal-page. The
+    // CommandBar mounts here too so its actions + durable result node are
+    // reachable the moment the page is on screen, not only after the PTY
+    // roster hydrates.
     return (
-      <div className="h-full flex items-center justify-center bg-[#1a1b26]">
-        <div className="flex flex-col items-center gap-3">
-          <div className="w-8 h-8 border-2 border-[#7aa2f7] border-t-transparent rounded-full animate-spin" />
-          <span className="text-[12px] text-[#565f89]">Loading terminals...</span>
+      <UIBridgeComponentScope componentId="terminal-page">
+        <div className="h-full flex flex-col bg-[#1a1b26]">
+          <div className="flex-1 flex items-center justify-center">
+            <div className="flex flex-col items-center gap-3">
+              <div className="w-8 h-8 border-2 border-[#7aa2f7] border-t-transparent rounded-full animate-spin" />
+              <span className="text-[12px] text-[#565f89]">Loading terminals...</span>
+            </div>
+          </div>
+          <CommandBar />
         </div>
-      </div>
+      </UIBridgeComponentScope>
     );
   }
 
