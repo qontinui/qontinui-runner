@@ -1187,11 +1187,14 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     };
 
     // behind_count: commits HEAD is behind `origin/<branch>` (or
-    // `origin/main` when detached/no branch). Uses last-fetched remote
-    // state — no `git fetch` is performed here (publisher runs every
-    // 60s; an implicit fetch every cycle would be too aggressive).
-    // The operator's normal `git fetch` / `pull-all` cadence keeps the
-    // remote refs current.
+    // `origin/main` when detached/no branch). Uses remote-tracking refs
+    // (`origin/*`) — `capture_tree` itself performs no `git fetch`, so it
+    // stays pure and fast. Freshness is the publisher's job: it runs an
+    // explicit periodic `git fetch origin` (no refspec — touches only
+    // `origin/*`, never the working tree) BEFORE this capture, gated by
+    // `COORD_TREE_FETCH_INTERVAL_SECS` (see `publish_tree_state`). On a
+    // no-manual-coding machine that explicit fetch is what keeps these
+    // behind-counts honest.
     let remote_ref = if head_detached.unwrap_or(false) || branch == "(detached)" {
         "origin/main".to_string()
     } else {
@@ -1386,6 +1389,99 @@ fn pull_executor_enabled() -> bool {
         .ok()
         .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
         .unwrap_or(true)
+}
+
+// =============================================================================
+// Always-on safe remote-ref refresh (repo-freshness plan, Layer 1)
+//
+// `capture_tree`'s behind-counts are computed against remote-tracking refs
+// (`origin/*`). On a machine where nobody runs `git fetch`/`pull-all` by hand,
+// those refs go stale and every behind-count silently reads 0. The publisher
+// therefore runs a best-effort `git fetch origin` (NO refspec — updates only
+// `origin/*` remote-tracking refs; never touches the working tree or any local
+// branch ref) before each repo's `capture_tree`. `--prune` drops deleted remote
+// branches so stale `origin/<merged-feature>` refs don't linger.
+//
+// Frequency is gated by `COORD_TREE_FETCH_INTERVAL_SECS` (defaults to the
+// publish interval `COORD_TREE_PUBLISH_INTERVAL_SECS`, default 60, floor 5) so
+// an operator can throttle fetch independently of publication. The gate is a
+// real throttle, not a kill switch — the default fetches every publish cycle.
+// =============================================================================
+
+/// Resolve the per-repo fetch interval. Reads `COORD_TREE_FETCH_INTERVAL_SECS`,
+/// falling back to `COORD_TREE_PUBLISH_INTERVAL_SECS`, then 60; floored at 5s.
+fn tree_fetch_interval() -> Duration {
+    let secs: u64 = std::env::var("COORD_TREE_FETCH_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| {
+            std::env::var("COORD_TREE_PUBLISH_INTERVAL_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(60)
+        .max(5);
+    Duration::from_secs(secs)
+}
+
+/// Process-global per-repo last-fetch timestamps for the interval gate.
+fn last_fetch_at(
+) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, std::time::Instant>> {
+    static LAST_FETCH: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    LAST_FETCH.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// True when `repo_path` is due a fetch (never fetched, or last fetch is at
+/// least `tree_fetch_interval()` ago). Records `now` as the attempt time when
+/// it returns true, so concurrent/back-to-back ticks don't double-fetch.
+fn fetch_due(repo_path: &std::path::Path, now: std::time::Instant) -> bool {
+    let interval = tree_fetch_interval();
+    let mut map = match last_fetch_at().lock() {
+        Ok(m) => m,
+        Err(p) => p.into_inner(),
+    };
+    let due = match map.get(repo_path) {
+        Some(prev) => now.duration_since(*prev) >= interval,
+        None => true,
+    };
+    if due {
+        map.insert(repo_path.to_path_buf(), now);
+    }
+    due
+}
+
+/// Best-effort `git -C <path> fetch origin --prune` (no refspec). Blocking git;
+/// call from a blocking context. Non-zero/spawn errors `warn!` and return — a
+/// stale ref is no worse than skipping the fetch entirely.
+fn fetch_remote_refs_blocking(repo_path: &std::path::Path) {
+    use std::process::Command;
+    let path_str = match repo_path.to_str() {
+        Some(s) => s,
+        None => return,
+    };
+    match Command::new("git")
+        .args(["-C", path_str, "fetch", "origin", "--prune"])
+        .output()
+    {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let excerpt: String = stderr.trim().chars().take(200).collect();
+            warn!(
+                "fleet::tree_publisher: git fetch origin in {} failed ({}): {excerpt}",
+                repo_path.display(),
+                o.status
+            );
+        }
+        Err(e) => {
+            warn!(
+                "fleet::tree_publisher: git fetch origin in {} could not spawn: {e}",
+                repo_path.display()
+            );
+        }
+    }
 }
 
 /// Resolve a repo's default branch from `origin/HEAD` (`origin/main` -> `main`),
@@ -2195,6 +2291,17 @@ pub async fn publish_tree_state() -> Result<(), String> {
         // this removes the starvation at its source). A panic inside the
         // closure surfaces as a JoinError → treated as a skip, same as
         // capture_tree returning None.
+        // Always-on safe remote-ref refresh: refresh `origin/*` (no refspec,
+        // working tree untouched) before capturing so behind-counts are honest
+        // on machines with no manual `git fetch` cadence. Interval-gated by
+        // COORD_TREE_FETCH_INTERVAL_SECS; best-effort (failures warn, never
+        // fail the cycle). Runs on the blocking pool like capture_tree below.
+        if fetch_due(&path, std::time::Instant::now()) {
+            let fetch_path = path.clone();
+            let _ =
+                tokio::task::spawn_blocking(move || fetch_remote_refs_blocking(&fetch_path)).await;
+        }
+
         let capture_path = path.clone();
         let mut payload = match tokio::task::spawn_blocking(move || capture_tree(&capture_path))
             .await
@@ -2255,9 +2362,16 @@ pub async fn publish_tree_state() -> Result<(), String> {
             && payload.branch != "main"
             && payload.branch != "master"
             && path.join(".git").is_dir();
+        // behind_default_count covers the feature-branch-behind-origin/main
+        // case: a checkout parked on a (possibly merged) named branch reads
+        // behind_count 0 against its own static remote ref yet may be far
+        // behind origin/<default>. coord answers that with a safe DefaultRefSync
+        // (`git fetch origin <default>:<default>`, working tree untouched).
         if upsert_ok
             && pull_executor_enabled()
-            && (payload.behind_count.unwrap_or(0) > 0 || restore_candidate)
+            && (payload.behind_count.unwrap_or(0) > 0
+                || payload.behind_default_count.unwrap_or(0) > 0
+                || restore_candidate)
         {
             request_and_apply_pull(&client, &base, device_id, path.clone(), &payload).await;
         }
@@ -2302,6 +2416,37 @@ pub fn spawn_tree_publisher() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- repo-freshness Layer 1 — fetch interval gate ----
+
+    #[test]
+    fn fetch_due_first_call_true_then_immediate_false() {
+        // Unique path so the process-global last-fetch map can't collide with
+        // another test. The interval is >= 5s for any env config, so an
+        // immediately-following call is never due regardless of the knob.
+        let p = std::path::PathBuf::from(format!(
+            "/tmp/freshness-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let t0 = std::time::Instant::now();
+        // Never-fetched repo is due, and records the attempt.
+        assert!(fetch_due(&p, t0), "first call should be due");
+        // A call right after (well inside the >=5s interval) is not due.
+        assert!(
+            !fetch_due(&p, std::time::Instant::now()),
+            "immediate re-call should not be due"
+        );
+    }
+
+    #[test]
+    fn tree_fetch_interval_floored_at_5s() {
+        // Even with no env set the default is 60s; the floor guarantees >= 5s.
+        assert!(tree_fetch_interval() >= Duration::from_secs(5));
+    }
 
     // ---- chkguard Phase 3 — restore_default executor (real temp git) ----
 
