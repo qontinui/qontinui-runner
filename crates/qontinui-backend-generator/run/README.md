@@ -1,47 +1,57 @@
-# Runtime-verification harness (Fork B) — DEFERRED in Phase 1
+# Runtime-verification harness (Fork B) — REAL in Phase 2
 
-This directory is the **run target** the plan's Phase 1 steps 3–5 call for: bring a
-generated backend up in a throwaway container (disposable postgres + uvicorn), run
-migrations, then have the verify-phase hit the live endpoint and assemble a
+This directory is the **run target** the plan's Phase 1–2 steps call for: bring a
+generated backend up in a throwaway container (disposable postgres + uvicorn), create the
+schema, then have the verify-phase hit the live endpoint and assemble a
 `CoverageEvidence` from the running server's behavior.
 
-## What ships in Phase 1 (deterministic, verified)
+## What ships now (Phase 2 — runnable + observed)
 
-The crate emits the backend **source** deterministically and the golden test
-(`tests/golden_phase1.rs`, 3 passing tests) proves the spec→routes/schema seam:
+`generate_runnable(spec, profile, BreakMode::None)` emits a backend that **really
+persists and behaves**:
 
-- the emitted `pairConfirm` route's method+path is byte-equal to the shared
-  `endpoint_for(pairConfirm, profile)` == `POST /api/v1/devices/pair-confirm`
-  (the #1↔#2 agreement proof), and
-- the emitted `Device` model has one column per spec field.
+- a synchronous SQLAlchemy 2.0 stack over **psycopg** whose `Base.metadata.create_all`
+  runs on startup (FastAPI lifespan), so the `devices` table truly exists;
+- a `pairConfirm` handler that **inserts a `Device` row** and returns a token-shaped body
+  with `201` — route method/path still come **only** from the shared `endpoint_for`
+  (`POST /api/v1/devices/pair-confirm`), never re-derived;
+- a `/healthz` probe used as the compose healthcheck.
 
-## What is honestly deferred (NOT proven in Phase 1)
+The integration test `tests/runtime_integration.rs` (gated `#[ignore]`, needs Docker)
+materializes this tree, boots the stack via the compose file below, POSTs a valid pairing,
+reads the **real** HTTP status + body, **introspects the live `devices` table**, and
+builds a `CoverageEvidence` from those observations — then asserts via the real
+`evaluate_completeness` that the `entities.Device` refs + `operations.pairConfirm` are
+covered and `operations.pairConfirm.effect` is filled. A deliberately-broken variant
+(`BreakMode::DropColumn`) drops the live `callback` column and the verdict surfaces
+`entities.Device.fields.callback` as a gap — proving the evidence reflects the running
+server, not the generator's claims.
 
-The plan's "coverage observed from a running server" premise requires:
-
-1. **A real handler body.** Phase 1 emits a deterministic typed *stub*
-   (`return {"deviceToken": ""}`). The real effect ("persists the pairing and returns a
-   device token") is authored by the `claude` CLI codegen subprocess
-   (`run_prompt_sync`, Fork A) — that is Phase 2/3, not the deterministic core.
-2. **Alembic migrations.** Phase 1 emits no `alembic/versions/*`, so there is no
-   `alembic upgrade` to create the `devices` table at boot.
-
-Because both are absent, bringing this compose stack up would NOT exercise a real
-pairing endpoint — wiring a hand-written migration + handler just to make it boot would
-be faking the runtime verification this phase explicitly must not fake. So the harness
-is checked in **ready but unexercised**, and the integration test
-(`tests/runtime_integration.rs`) is `#[ignore]`d with a body that documents exactly
-what it will assert once the Phase-2 bodies + migrations land.
-
-Docker *is* available on this machine (daemon reachable), but availability is not the
-blocker — the missing LLM-filled handler and migrations are.
-
-## Bringing it up (after Phase 2 lands)
+## Bringing it up
 
 ```sh
-# 1. materialize a generated backend into ./generated (see runtime_integration.rs)
-# 2. boot it
-docker compose -f run/docker-compose.yml up --build
-# 3. hit the live endpoint
-curl -i -X POST http://localhost:8000/api/v1/devices/pair-confirm
+# Run the gated integration test (it materializes + boots + probes + tears down):
+cargo test -p qontinui-backend-generator -- --ignored runtime_pair_confirm_observed_from_live_server
+
+# Or by hand (port 8000 is taken on the dev host, so publish on 8010):
+#   1. materialize a generated backend into ./generated (BreakMode::None)
+#   2. boot it
+APP_HOST_PORT=8010 docker compose -f run/docker-compose.yml up --build -d
+#   3. hit the live endpoint
+curl -i -X POST http://localhost:8010/api/v1/devices/pair-confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"device_name":"dev","device_id":"d1","state":"s","callback":"https://x/y"}'
+#   4. tear down
+docker compose -f run/docker-compose.yml down -v
 ```
+
+## Still deferred (Phase 3)
+
+- **LLM-authored handler bodies** (Fork A, `run_prompt_sync`). Phase 2 uses a correct
+  deterministic persisting handler — preferable to an unverified LLM call for the
+  runtime-verification milestone.
+- **Alembic migrations.** Phase 2 creates the schema with `create_all` on startup (the
+  simplest thing that really creates the table); alembic `upgrade head` is a Phase-3
+  refinement.
+- The full multi-entity/all-operations walk, generated pytest tiers + coverage gate, and
+  the enforcement (`code-reviewer`/`security-scan`) loop.

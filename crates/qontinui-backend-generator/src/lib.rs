@@ -20,15 +20,24 @@
 //!
 //! ## Honesty boundary
 //!
-//! This crate emits **source files as strings** ([`GeneratedBackend`]). It does NOT
-//! run the backend, migrate a database, or hit a live endpoint — that runtime
-//! verification (docker-compose postgres + uvicorn) is the integration tier and is
-//! deferred (see the crate's `tests/` and the `run/` scaffold). Coverage observed
-//! "from a running server" (the plan's premise) is therefore NOT proven here; only
-//! the deterministic generation core is.
+//! This crate emits **source files as strings** ([`GeneratedBackend`]); it does not run
+//! anything itself. Two generation tiers exist:
+//!
+//! - [`scaffold::generate_phase1`] — the deterministic spec→source seam (stub handler,
+//!   no persistence); its golden test proves the route/schema mapping without running.
+//! - [`runtime::generate_runnable`] — a **runnable** backend that really persists (sync
+//!   SQLAlchemy/psycopg, `create_all` on startup, a `pairConfirm` handler that inserts a
+//!   `Device` and returns a token). The gated integration test
+//!   (`tests/runtime_integration.rs`, `#[ignore]`d — needs Docker) brings it up under
+//!   docker-compose, hits the live endpoint, introspects the live schema, and assembles
+//!   a `CoverageEvidence` from those observations. So "coverage observed from a running
+//!   server" (the plan's premise) **is** proven — but only when that `--ignored` test is
+//!   run on a host with a Docker daemon (CI has none).
 
 pub mod route_map;
+pub mod runtime;
 pub mod scaffold;
 
 pub use route_map::{openapi_document, route_for, RouteBinding};
+pub use runtime::{generate_runnable, BreakMode};
 pub use scaffold::{generate_phase1, EmittedModel, EmittedRoute, GeneratedBackend};
