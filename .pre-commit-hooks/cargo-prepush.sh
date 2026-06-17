@@ -28,7 +28,33 @@ if remote_ref=$(git rev-parse --symbolic-full-name @{u} 2>/dev/null); then
   fi
 fi
 
-cd "$(git rev-parse --show-toplevel)/src-tauri"
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT/src-tauri"
+
+# A path dependency on a sibling repo (e.g. qontinui-schemas/rust) that sits
+# ahead of the version pinned in the committed Cargo.lock makes every cargo
+# invocation rewrite Cargo.lock. That churn is environment-local — it depends
+# on which ref the sibling checkout is parked at (a feature branch cut before
+# a sibling version bump, a sibling that's been pulled ahead, etc.) — and must
+# NOT be committed. But pre-commit reports the hook as Failed whenever it
+# leaves a tracked file modified, even when the gate itself passed. Snapshot
+# Cargo.lock and restore it on exit so the gate is non-mutating regardless of
+# local skew. A Cargo.lock change the developer actually intends rides in their
+# own staged diff (which pre-commit hands us as the baseline), so this never
+# reverts an intended update.
+LOCK="$ROOT/Cargo.lock"
+LOCK_BAK=""
+if [[ -f "$LOCK" ]]; then
+  LOCK_BAK="$(mktemp)"
+  cp -p "$LOCK" "$LOCK_BAK"
+fi
+restore_lock() {
+  if [[ -n "$LOCK_BAK" ]]; then
+    cp -p "$LOCK_BAK" "$LOCK"
+    rm -f "$LOCK_BAK"
+  fi
+}
+trap restore_lock EXIT
 
 echo "[pre-push] cargo fmt -- --check"
 if ! cargo fmt -- --check; then
