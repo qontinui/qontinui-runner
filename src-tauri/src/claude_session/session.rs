@@ -142,6 +142,12 @@ pub struct ClaudeSession {
     /// sessions and sessions that resumed into the shared checkout.
     isolated_edit_ctx:
         Arc<Mutex<Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>>>,
+    /// Interactive-agent log emitter (Phase 1b/1c). When `Some`, the stdout
+    /// reader streams each line to coord's `agent_logs` ingest and the waiter
+    /// thread emits the terminal `session_closed` line + final flush. `None`
+    /// when the `QONTINUI_AGENT_LOGS_FROM_SESSIONS` gate is OFF (default) or
+    /// the coord session id / device id couldn't be resolved — a strict no-op.
+    agent_log_emitter: Option<super::coord_register::AgentLogEmitter>,
 }
 
 // SAFETY: ClaudeSession contains a raw Windows handle (RawHandle = *mut c_void) for the stdout
@@ -172,6 +178,7 @@ impl ClaudeSession {
         worktree: Option<WorktreeInfo>,
         tool_policy: Option<&crate::workflow::dag_schema::ToolPolicy>,
         cli_session_ctx: Option<&crate::claude_session::runner::CliSessionContext>,
+        agent_log_emitter: Option<super::coord_register::AgentLogEmitter>,
     ) -> Result<Self, String> {
         info!(
             "Spawning interactive Claude session: {} in {}",
@@ -569,6 +576,10 @@ impl ClaudeSession {
         } else {
             None
         };
+        // Interactive-agent log emitter (Phase 1b) — clone the handle into the
+        // stdout reader so each line streams to coord. `None` when the gate is
+        // OFF (the common case); the reader then never touches it.
+        let agent_log_emitter_for_stdout = agent_log_emitter.clone();
 
         let stdout_handle = thread::spawn(move || {
             let mut all_text = String::new();
@@ -602,6 +613,13 @@ impl ClaudeSession {
                                 .unwrap_or_default()
                                 .as_secs();
                             last_activity_stdout.store(now, Ordering::Relaxed);
+
+                            // Phase 1b — stream the raw stdout line to coord's
+                            // agent_logs (batched/throttled inside the emitter).
+                            // No-op unless the gate is ON and the emitter built.
+                            if let Some(emitter) = agent_log_emitter_for_stdout.as_ref() {
+                                emitter.stream_line(&line);
+                            }
 
                             if let Some(text) = dispatcher::dispatch_line(
                                 &line,
@@ -1018,6 +1036,9 @@ impl ClaudeSession {
         // waiter so reconcile fires when the subprocess actually exits
         // (NOT when `spawn()` returns, which is just after init).
         let federation_ctx_for_waiter = federation_ctx.clone();
+        // Interactive-agent log emitter (Phase 1b) — the waiter emits the
+        // terminal `session_closed` line + final flush when the CLI exits.
+        let agent_log_emitter_for_waiter = agent_log_emitter.clone();
 
         thread::spawn(move || {
             // Wait for the child process to exit
@@ -1108,6 +1129,13 @@ impl ClaudeSession {
                 "Session {} process exited, state -> Closed (rate_limited={})",
                 session_id_for_waiter, is_rate_limited
             );
+
+            // Phase 1b — terminal coord agent_logs milestone + final flush.
+            // No-op unless the emitter was built (gate ON). Done last so the
+            // `session_closed` row reflects the real process-exit moment.
+            if let Some(emitter) = agent_log_emitter_for_waiter.as_ref() {
+                emitter.close();
+            }
         });
 
         // Wait briefly for the init handshake to complete
@@ -1157,6 +1185,13 @@ impl ClaudeSession {
             .map(|c| c.session_name.clone())
             .unwrap_or_else(|| session_id.to_string());
 
+        // Phase 1b — `session_started` milestone (no-op unless gate ON). Emit
+        // once the init handshake has completed so the line reflects a live,
+        // ready session rather than one that may still fail to initialize.
+        if let Some(emitter) = agent_log_emitter.as_ref() {
+            emitter.started(&holder_name);
+        }
+
         Ok(Self {
             session_id: session_id.to_string(),
             holder_name,
@@ -1184,6 +1219,7 @@ impl ClaudeSession {
             worktree,
             federation_ctx,
             isolated_edit_ctx: Arc::new(Mutex::new(None)),
+            agent_log_emitter,
         })
     }
 
@@ -1699,6 +1735,10 @@ impl ClaudeSession {
             Some(info.clone()),
             None, // tool_policy — worktree promotion preserves the original spawn's policy state
             None, // cli_session_ctx — promotion changes cwd + does its own replay; no --resume
+            // Carry the agent_logs emitter (same coord agent_id) across the
+            // respawn so promotion is continuous on the dashboard. The handle is
+            // a cheap clone over the same drain thread; `None` stays a no-op.
+            self.agent_log_emitter.clone(),
         )
         .map_err(|e| format!("promote_to_worktree: respawn failed: {}", e))?;
 
@@ -1798,6 +1838,10 @@ impl ClaudeSession {
             None, // worktree (rate-limit restart preserves the original cwd)
             None, // tool_policy (rate-limit restart preserves the original policy-less spawn)
             None, // cli_session_ctx — in-process restart does its own replay; no --resume
+            // agent_log_emitter — this associated fn has no `self` handle to the
+            // emitter; a rate-limit restart is a fresh process and the prior
+            // waiter already emitted `session_closed`. No-op here.
+            None,
         ) {
             Ok(new_session) => {
                 let new_session = Arc::new(new_session);

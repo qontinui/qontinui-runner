@@ -167,6 +167,7 @@ async fn spawn_session(
             None,
             None, // tool_policy
             None, // cli_session_ctx
+            None, // agent_log_emitter — mcp session path, no coord agent_logs
         ) {
             Ok(s) => Arc::new(s),
             Err(e) => return Err(format!("spawn failed: {}", e)),

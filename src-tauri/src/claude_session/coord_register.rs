@@ -59,7 +59,9 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use serde::Serialize;
 use serde_json::json;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -78,6 +80,19 @@ fn registration_enabled() -> bool {
         ),
         Err(_) => true,
     }
+}
+
+/// Default-OFF env gate for streaming interactive-session activity to coord's
+/// `agent_logs` ingest (Phase 1c). ONLY a truthy value — `1` / `true` / `on` /
+/// `yes` (case-insensitive) — turns it ON; anything else (including unset)
+/// leaves it OFF, so the emitter is a strict no-op by default and never adds
+/// always-on coord traffic.
+pub fn agent_logs_from_sessions_enabled() -> bool {
+    matches!(
+        std::env::var("QONTINUI_AGENT_LOGS_FROM_SESSIONS")
+            .map(|v| v.trim().to_ascii_lowercase()),
+        Ok(ref v) if matches!(v.as_str(), "1" | "true" | "on" | "yes")
+    )
 }
 
 /// Registers authenticated `ClaudeSession`s into `coord.sessions` and owns the
@@ -361,6 +376,321 @@ impl AiCoordRegistrar {
 
 use crate::session::SessionKind;
 
+// ============================================================================
+// Interactive-agent log emitter (Phase 1b/1c)
+// ============================================================================
+//
+// Interactive / runner-managed Claude sessions register into `coord.sessions`
+// (Live Sessions panel) but emit no `coord.agent_logs` rows, so they are
+// invisible on the `/admin/coord/agents` dashboard. This emitter streams a
+// session's activity to coord's existing log ingest `POST /agents/:id/log`,
+// tagging each entry with the runner's `device_id` so coord's Phase-1a
+// fallback resolves the tenant from `coord.devices`.
+//
+// Wire shape is coord's [`LogEntry`] (`qontinui-coord/src/agent_logs.rs`):
+// `level` + `event` are REQUIRED and non-empty (coord 400s otherwise);
+// `payload` / `agent_session_id` / `device_id` / `occurred_at` are optional.
+// `agent_id` goes in the URL path, never the body.
+//
+// Identity: the coord session UUIDv7 is BOTH the URL `agent_id` AND the body
+// `agent_session_id` (one identity shared with Live Sessions). The runner's
+// `device_id` is read once from `~/.qontinui/machine.json`.
+//
+// Batching: a `std::sync::mpsc` channel feeds a background flush thread that
+// drains the queue into a single `Vec<LogEntry>` and POSTs the whole array in
+// one request (≤ `MAX_AGENT_LOG_BATCH`, mirroring coord's `MAX_BATCH_SIZE`).
+// A 5s periodic flush + try-immediate-then-requeue-on-failure + a final flush
+// on close mirror `agent_runtime::pump_subprocess`'s shape, but batched.
+//
+// Everything here is gated on [`agent_logs_from_sessions_enabled`] (default
+// OFF) at the construction site, so an OFF gate means no emitter is ever built
+// and zero coord traffic is added.
+
+/// Max entries per `POST /agents/:id/log` batch. Mirrors coord's
+/// `agent_logs::MAX_BATCH_SIZE`; coord 400s a larger batch.
+const MAX_AGENT_LOG_BATCH: usize = 500;
+
+/// Periodic flush cadence for the background drain thread.
+const AGENT_LOG_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Upper bound on buffered entries when coord is unreachable. Older entries
+/// drop FIFO so an offline coord can't grow the queue without bound. Generous
+/// (10×batch) since each entry is small.
+const AGENT_LOG_QUEUE_CAP: usize = MAX_AGENT_LOG_BATCH * 10;
+
+/// One `coord.agent_logs` row in coord's wire shape. `level` + `event` MUST be
+/// non-empty or coord rejects the whole batch with 400.
+#[derive(Debug, Clone, Serialize)]
+pub struct LogEntry {
+    pub level: String,
+    pub event: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_session_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub occurred_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Messages the session pushes to the emitter's background drain thread.
+enum EmitMsg {
+    /// A fully-formed log entry to enqueue.
+    Entry(LogEntry),
+    /// Close signal — drain the queue one final time, then stop.
+    Close,
+}
+
+/// Cheap-to-clone handle the session threads push log entries into. The actual
+/// HTTP work happens on a single background drain thread; pushing is a
+/// non-blocking channel send. Dropping the last handle (or calling
+/// [`AgentLogEmitter::close`]) ends the drain thread after a final flush.
+#[derive(Clone)]
+pub struct AgentLogEmitter {
+    tx: std::sync::mpsc::Sender<EmitMsg>,
+    /// The coord session id — both the URL `agent_id` and the body
+    /// `agent_session_id`. Carried so emit helpers can stamp it without the
+    /// caller re-threading it.
+    agent_id: Uuid,
+    device_id: Option<Uuid>,
+}
+
+impl AgentLogEmitter {
+    /// Build an emitter for the coord session `agent_id`, reading `device_id`
+    /// once from `~/.qontinui/machine.json`. Returns `None` (no emitter, no
+    /// thread) when the gate is OFF or `device_id` is unreadable — both are
+    /// fail-safe no-ops: coord's Phase-1a tenant fallback needs the
+    /// `device_id`, so emitting without it is pointless.
+    pub fn start(agent_id: Uuid) -> Option<Self> {
+        if !agent_logs_from_sessions_enabled() {
+            return None;
+        }
+        let device_id = match read_device_id_uuid() {
+            Some(d) => d,
+            None => {
+                debug!(
+                    "agent_log_emitter: no readable device_id for agent {} — skipping emission",
+                    agent_id
+                );
+                return None;
+            }
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel::<EmitMsg>();
+        std::thread::Builder::new()
+            .name(format!("agent-log-emit-{agent_id}"))
+            .spawn(move || drain_loop(agent_id, rx))
+            .map_err(|e| warn!("agent_log_emitter: failed to spawn drain thread: {e}"))
+            .ok()?;
+
+        info!(
+            "agent_log_emitter: streaming session {} to coord agent_logs",
+            agent_id
+        );
+        Some(Self {
+            tx,
+            agent_id,
+            device_id: Some(device_id),
+        })
+    }
+
+    /// Build a `LogEntry` stamped with this emitter's identity (agent session
+    /// id + device id), letting coord stamp `occurred_at`.
+    fn entry(&self, level: &str, event: &str, payload: Option<serde_json::Value>) -> LogEntry {
+        LogEntry {
+            level: level.to_string(),
+            event: event.to_string(),
+            payload,
+            agent_session_id: Some(self.agent_id),
+            device_id: self.device_id,
+            occurred_at: None,
+        }
+    }
+
+    /// `session_started` milestone — one line at session start.
+    pub fn started(&self, purpose: &str) {
+        let _ = self.tx.send(EmitMsg::Entry(self.entry(
+            "info",
+            "session_started",
+            Some(json!({ "purpose": purpose })),
+        )));
+    }
+
+    /// Per-stdout-line activity. Empty lines are dropped (no signal, and an
+    /// empty `event` would never happen here but an empty `text` is just
+    /// noise). `event` is the constant `"stdout"`; the raw line rides in
+    /// `payload.text`.
+    pub fn stream_line(&self, line: &str) {
+        if line.trim().is_empty() {
+            return;
+        }
+        let _ = self.tx.send(EmitMsg::Entry(self.entry(
+            "info",
+            "stdout",
+            Some(json!({ "text": line })),
+        )));
+    }
+
+    /// Terminal `session_closed` milestone, then signal the drain thread to do
+    /// its final flush and stop. Idempotent-safe: a second close just enqueues
+    /// another (harmless) terminal line if the channel is still open.
+    pub fn close(&self) {
+        let _ = self
+            .tx
+            .send(EmitMsg::Entry(self.entry("info", "session_closed", None)));
+        let _ = self.tx.send(EmitMsg::Close);
+    }
+}
+
+/// Read `device_id` from `~/.qontinui/machine.json` and parse it as a `Uuid`.
+/// Reuses the canonical disk reader in [`crate::pair`]. Any failure (missing
+/// file, unparseable, non-UUID) yields `None` — the emitter then skips.
+fn read_device_id_uuid() -> Option<Uuid> {
+    // `pair` lives in the `qontinui_runner_lib` crate (this module compiles into
+    // both the lib and the bin target, so the bin can't reach it via `crate::`).
+    let raw = qontinui_runner_lib::pair::read_device_id_from_disk().ok()?;
+    Uuid::parse_str(raw.trim()).ok()
+}
+
+/// Background drain loop: owns the reqwest client + the FIFO queue. Wakes on a
+/// channel recv with a `AGENT_LOG_FLUSH_INTERVAL` timeout so an idle session
+/// still flushes within ~5s. Drains the queue into one `Vec<LogEntry>`
+/// (≤ batch cap) and POSTs the whole array; on POST failure the un-sent tail
+/// is requeued (capped FIFO) for the next tick. Ends on `Close` or when all
+/// `AgentLogEmitter` handles drop (channel disconnect), with a final flush.
+fn drain_loop(agent_id: Uuid, rx: std::sync::mpsc::Receiver<EmitMsg>) {
+    let mut queue: std::collections::VecDeque<LogEntry> = std::collections::VecDeque::new();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .ok();
+
+    loop {
+        match rx.recv_timeout(AGENT_LOG_FLUSH_INTERVAL) {
+            Ok(EmitMsg::Entry(e)) => {
+                if queue.len() >= AGENT_LOG_QUEUE_CAP {
+                    queue.pop_front();
+                }
+                queue.push_back(e);
+                // Coalesce a burst: pull any other immediately-ready entries
+                // without blocking, so a flurry of stdout lines POSTs as ONE
+                // batch rather than one request per line.
+                while let Ok(EmitMsg::Entry(e)) = rx.try_recv() {
+                    if queue.len() >= AGENT_LOG_QUEUE_CAP {
+                        queue.pop_front();
+                    }
+                    queue.push_back(e);
+                }
+                if queue.len() >= MAX_AGENT_LOG_BATCH {
+                    flush_batch(client.as_ref(), agent_id, &mut queue);
+                }
+            }
+            Ok(EmitMsg::Close) => {
+                flush_batch(client.as_ref(), agent_id, &mut queue);
+                break;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                flush_batch(client.as_ref(), agent_id, &mut queue);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                flush_batch(client.as_ref(), agent_id, &mut queue);
+                break;
+            }
+        }
+    }
+    debug!("agent_log_emitter: drain thread for {} stopped", agent_id);
+}
+
+/// Drain up to `MAX_AGENT_LOG_BATCH` entries from the front of `queue` and POST
+/// them as one array. On failure (no client, no coord base, HTTP error) the
+/// drained slice is pushed back to the FRONT in order so nothing is lost and
+/// the next tick retries — bounded by the caller's queue cap. Best-effort:
+/// never panics, never blocks the session.
+fn flush_batch(
+    client: Option<&reqwest::blocking::Client>,
+    agent_id: Uuid,
+    queue: &mut std::collections::VecDeque<LogEntry>,
+) {
+    if queue.is_empty() {
+        return;
+    }
+    let Some(client) = client else {
+        return; // client build failed earlier — keep buffering (capped).
+    };
+    let Some(base) = coord_http_base() else {
+        return; // coord not configured — keep buffering (capped).
+    };
+
+    let take = queue.len().min(MAX_AGENT_LOG_BATCH);
+    let batch: Vec<LogEntry> = queue.drain(..take).collect();
+
+    // Best-effort bearer auth (mirrors the federation report path). The ingest
+    // route resolves the tenant from the body `device_id`, so a missing token
+    // is non-fatal — we just omit the header.
+    let token = crate::auth::AuthManager::new()
+        .get_access_token()
+        .ok()
+        .filter(|t| !t.is_empty());
+
+    let url = format!("{base}/agents/{agent_id}/log");
+    let mut req = client.post(&url).json(&batch);
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+
+    match req.send() {
+        Ok(resp) if resp.status().is_success() => {
+            debug!(
+                "agent_log_emitter: flushed {} entries for {}",
+                batch.len(),
+                agent_id
+            );
+        }
+        Ok(resp) => {
+            warn!(
+                "agent_log_emitter: POST /agents/{}/log returned {} — requeueing {} entries",
+                agent_id,
+                resp.status(),
+                batch.len()
+            );
+            requeue_front(queue, batch);
+        }
+        Err(e) => {
+            debug!(
+                "agent_log_emitter: POST /agents/{}/log failed ({e}) — requeueing {} entries",
+                agent_id,
+                batch.len()
+            );
+            requeue_front(queue, batch);
+        }
+    }
+}
+
+/// Push a failed batch back to the FRONT of the queue in original order,
+/// trimming the tail to honor `AGENT_LOG_QUEUE_CAP` (drop oldest on overflow).
+fn requeue_front(queue: &mut std::collections::VecDeque<LogEntry>, batch: Vec<LogEntry>) {
+    for e in batch.into_iter().rev() {
+        queue.push_front(e);
+    }
+    while queue.len() > AGENT_LOG_QUEUE_CAP {
+        queue.pop_back();
+    }
+}
+
+/// Resolve the coord HTTP base (env `COORD_HTTP_URL` → active profile
+/// `coord_url`). `None` when nothing is configured — the emitter then keeps
+/// buffering (capped) rather than dropping, matching the other resolvers'
+/// no-localhost-fallback posture.
+fn coord_http_base() -> Option<String> {
+    match qontinui_runner_lib::profiles::resolve_coord_base() {
+        qontinui_runner_lib::profiles::CoordBase::Configured(base) => {
+            Some(base.trim_end_matches('/').to_string())
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,6 +876,79 @@ mod tests {
         reg.report_commits("o/r", "main", vec!["a".into()]);
         assert!(reg.inner.outbox.pending().unwrap().is_empty());
         std::env::remove_var("QONTINUI_COMMIT_LINEAGE_REPORT");
+    }
+
+    #[test]
+    fn agent_logs_gate_defaults_off_and_only_truthy_enables() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_AGENT_LOGS_FROM_SESSIONS");
+        // Default (unset) is OFF — strict no-op posture.
+        assert!(!agent_logs_from_sessions_enabled());
+
+        for off in ["0", "false", "off", "", "no", "garbage"] {
+            std::env::set_var("QONTINUI_AGENT_LOGS_FROM_SESSIONS", off);
+            assert!(
+                !agent_logs_from_sessions_enabled(),
+                "value {off:?} must NOT enable the gate"
+            );
+        }
+        for on in ["1", "true", "on", "yes", "TRUE", "On", "Yes"] {
+            std::env::set_var("QONTINUI_AGENT_LOGS_FROM_SESSIONS", on);
+            assert!(
+                agent_logs_from_sessions_enabled(),
+                "value {on:?} must enable the gate"
+            );
+        }
+        std::env::remove_var("QONTINUI_AGENT_LOGS_FROM_SESSIONS");
+    }
+
+    #[test]
+    fn emitter_off_gate_yields_no_emitter() {
+        let _env = env_lock();
+        std::env::set_var("QONTINUI_AGENT_LOGS_FROM_SESSIONS", "0");
+        assert!(AgentLogEmitter::start(Uuid::new_v4()).is_none());
+        std::env::remove_var("QONTINUI_AGENT_LOGS_FROM_SESSIONS");
+    }
+
+    #[test]
+    fn log_entry_serializes_to_coord_wire_shape() {
+        let agent = Uuid::new_v4();
+        let device = Uuid::new_v4();
+        let entry = LogEntry {
+            level: "info".to_string(),
+            event: "stdout".to_string(),
+            payload: Some(json!({ "text": "hello" })),
+            agent_session_id: Some(agent),
+            device_id: Some(device),
+            occurred_at: None,
+        };
+        let v = serde_json::to_value(&entry).unwrap();
+        // Required non-empty fields coord validates.
+        assert_eq!(v["level"], json!("info"));
+        assert_eq!(v["event"], json!("stdout"));
+        assert_eq!(v["payload"]["text"], json!("hello"));
+        assert_eq!(v["agent_session_id"], json!(agent));
+        assert_eq!(v["device_id"], json!(device));
+        // `occurred_at` omitted (skip_serializing_if None) so coord stamps now().
+        assert!(v.get("occurred_at").is_none());
+    }
+
+    #[test]
+    fn requeue_front_preserves_order_and_honors_cap() {
+        let mk = |n: usize| LogEntry {
+            level: "info".to_string(),
+            event: format!("e{n}"),
+            payload: None,
+            agent_session_id: None,
+            device_id: None,
+            occurred_at: None,
+        };
+        let mut q: std::collections::VecDeque<LogEntry> = std::collections::VecDeque::new();
+        q.push_back(mk(100)); // an existing tail entry
+                              // Requeue a failed batch [1,2,3] — must land at the FRONT in order.
+        requeue_front(&mut q, vec![mk(1), mk(2), mk(3)]);
+        let events: Vec<String> = q.iter().map(|e| e.event.clone()).collect();
+        assert_eq!(events, vec!["e1", "e2", "e3", "e100"]);
     }
 
     #[test]
