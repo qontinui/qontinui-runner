@@ -178,6 +178,19 @@ export function usePromptExecution(): UsePromptExecutionReturn {
                 `Step ${i + 1} failed: component-action step missing componentId or actionId (componentId="${step.componentId ?? ""}", actionId="${step.actionId ?? ""}")`,
               );
             }
+            // D-RACE1 — bridge a post-navigate async-mount race. A preceding
+            // `navigate` step switches the active tab, but the target page's
+            // `useUIComponent` registration (e.g. `terminal-launch-menu`) runs
+            // in a mount effect that may not have fired by the time this step
+            // dispatches — `executeComponentAction` then 404s with
+            // "Component … not found. Components are only available when their
+            // page is active." The fixed 500ms post-navigate settle above is
+            // not enough on a clean run (first navigation, heavy page tree).
+            // Poll the live registry for the component to appear before
+            // invoking; only surface the not-found error after the bounded
+            // wait elapses. This is generic — it covers ANY component reached
+            // immediately after a navigate, not just the terminal launcher.
+            await waitForComponentRegistered(bridge, step.componentId, i + 1);
             const compResult = await bridge.executeComponentAction(step.componentId, {
               action: step.actionId,
               params: step.params,
@@ -393,6 +406,50 @@ function summarizeCandidateLabels(elements: readonly DiscoveredLike[]): string {
   const shown = unique.slice(0, MAX);
   const overflow = unique.length > MAX ? ` (+${unique.length - MAX} more)` : "";
   return `Candidate labels on this page (${unique.length}): ${shown.map((l) => `"${l}"`).join(", ")}${overflow}.`;
+}
+
+/** The object returned by `useUIBridge` — typed structurally so this helper
+ * stays decoupled from the SDK's exported type name. We only read
+ * `getComponent`, the synchronous registry lookup that returns the component
+ * record (or undefined when it isn't currently registered). */
+type BridgeLike = Pick<ReturnType<typeof useUIBridge>, "getComponent">;
+
+/**
+ * D-RACE1 — bounded wait for a `useUIComponent` registration to appear in the
+ * live registry after a navigate. `executeComponentAction` looks the registry
+ * up exactly once and 404s if the target page's mount effect hasn't run yet;
+ * on a clean run (first navigation to a heavy page like the terminal
+ * workspace) the registration lands a few hundred ms after the tab becomes
+ * active — well after the fixed 500ms post-navigate settle. Poll
+ * `bridge.getComponent(id)` on a short interval until it resolves, then return
+ * so the caller can dispatch. If it never registers within `timeoutMs`, throw
+ * a clear, actionable step error (the caller would otherwise hit the SDK's
+ * opaque "Component not found" with no indication a race was the cause).
+ *
+ * Generic by design: any component reached immediately after a navigate
+ * benefits, not just `terminal-launch-menu`.
+ */
+async function waitForComponentRegistered(
+  bridge: BridgeLike,
+  componentId: string,
+  stepNumber: number,
+  timeoutMs = 8000,
+  pollMs = 100,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  // Fast path — already registered (e.g. the page was already active from an
+  // earlier navigation), skip the poll entirely.
+  if (bridge.getComponent(componentId)) return;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, pollMs));
+    if (bridge.getComponent(componentId)) return;
+  }
+  throw new Error(
+    `Step ${stepNumber} failed: component "${componentId}" never registered within ` +
+      `${Math.round(timeoutMs / 1000)} s after navigation — the page that owns it may not have ` +
+      `mounted, or its useUIComponent registration is gated on a UI state (e.g. a menu being open) ` +
+      `that headless automation can't reach.`,
+  );
 }
 
 /**
