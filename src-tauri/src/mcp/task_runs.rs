@@ -2313,6 +2313,7 @@ pub async fn create_ai_session(
         None, // worktree
         None, // tool_policy
         None, // cli_session_ctx
+        None, // agent_log_emitter — mcp task-run path, no coord agent_logs
     ) {
         Ok(session) => {
             let session = Arc::new(session);

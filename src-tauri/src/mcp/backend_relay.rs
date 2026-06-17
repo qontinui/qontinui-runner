@@ -1922,6 +1922,7 @@ async fn handle_chat_create(api_state: &Arc<ApiState>, data: &Value) -> Option<V
             None,
             None, // tool_policy
             None, // cli_session_ctx
+            None, // agent_log_emitter — relay path, no coord agent_logs
         ) {
             Ok(session) => {
                 let session = Arc::new(session);

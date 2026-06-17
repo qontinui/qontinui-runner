@@ -458,6 +458,24 @@ pub async fn create_ai_session(
         });
     }
 
+    // Session-automation Phase 0 (R1) — register the authenticated session into
+    // coord.sessions carrying its task_run_id, so it is visible + addressable +
+    // correctly stale to coord. Best-effort: a registration failure never
+    // blocks the live AI session.
+    //
+    // Done BEFORE spawn (it only needs the task_run_id) so the minted coord
+    // session id is available to seed the Phase-1b agent_logs emitter, which the
+    // stdout reader + waiter threads need at spawn time. The R6 idempotency
+    // guard means this is the single Started write; the later (post-spawn)
+    // success re-register is a no-op.
+    let coord_session_id = ai_coord_registrar.register_session(&task_run_id, &name, None);
+
+    // Phase 1b/1c — build the interactive-agent log emitter when the
+    // `QONTINUI_AGENT_LOGS_FROM_SESSIONS` gate is ON and the coord session id
+    // resolved. `None` (the default) is a strict no-op threaded through spawn.
+    let agent_log_emitter =
+        coord_session_id.and_then(crate::claude_session::coord_register::AgentLogEmitter::start);
+
     // 2. Spawn and wait for session to be ready.
     // ClaudeSession::spawn blocks until the CLI completes its init handshake,
     // so the session is Ready when this returns. This prevents a race condition
@@ -499,6 +517,7 @@ pub async fn create_ai_session(
             None,              // worktree
             None,              // tool_policy
             Some(&cli_session_ctx),
+            agent_log_emitter, // Phase 1b/1c agent_logs emitter (None unless gated)
         ) {
             Ok(session) => {
                 let session = Arc::new(session);
@@ -541,12 +560,9 @@ pub async fn create_ai_session(
                 task_run_id, e
             );
         }
-
-        // Session-automation Phase 0 (R1) — register the authenticated session
-        // into coord.sessions carrying its task_run_id, so it is visible +
-        // addressable + correctly stale to coord. Best-effort: a registration
-        // failure never blocks the live AI session.
-        ai_coord_registrar.register_session(&task_run_id, &name, None);
+        // NOTE: coord.sessions registration already happened above (pre-spawn,
+        // so the minted session id could seed the agent_logs emitter); the R6
+        // idempotency guard makes a re-register here unnecessary.
     }
 
     // 4. Return result
@@ -1814,6 +1830,18 @@ pub async fn resume_ai_sessions(
         // register, so its Drop releases the claim when the session ends.
         let reacquired_ctx_for_spawn = reacquired_ctx;
 
+        // R2 — re-register the resumed session with coord BEFORE spawn (the R6
+        // idempotency guard makes the later post-spawn register a no-op), so
+        // the minted coord session id can seed the Phase-1b agent_logs emitter
+        // the spawn's stdout/waiter threads consume. `None` registrar → no id.
+        let coord_session_id = ai_coord_registrar
+            .as_ref()
+            .and_then(|reg| reg.register_session(&task_run_id, &task_name, None));
+        // Phase 1b/1c emitter — `None` (default) unless the
+        // `QONTINUI_AGENT_LOGS_FROM_SESSIONS` gate is ON and the id resolved.
+        let agent_log_emitter = coord_session_id
+            .and_then(crate::claude_session::coord_register::AgentLogEmitter::start);
+
         let spawn_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
             let session_ctx = AiSessionContext::setup(&trid, &name_for_ctx);
 
@@ -1838,6 +1866,7 @@ pub async fn resume_ai_sessions(
                 None, // worktree
                 None, // tool_policy
                 Some(&cli_session_ctx),
+                agent_log_emitter, // Phase 1b/1c agent_logs emitter (None unless gated)
             )
             .map_err(|e| format!("spawn failed: {}", e))?;
 
@@ -1893,12 +1922,9 @@ pub async fn resume_ai_sessions(
                     task_run_id, e
                 );
             }
-
-            // R2 — re-register the resumed session with coord (idempotent;
-            // a fresh coord row is minted carrying the same task_run_id).
-            if let Some(reg) = ai_coord_registrar.as_ref() {
-                reg.register_session(&task_run_id, &task_name, None);
-            }
+            // NOTE: coord.sessions re-registration already happened above
+            // (pre-spawn, to seed the agent_logs emitter); R6 idempotency makes
+            // a re-register here unnecessary.
         }
 
         match spawn_result {

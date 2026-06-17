@@ -290,6 +290,7 @@ pub async fn dispatch_subtask(
             None, // worktree (cwd already points at the worktree path)
             None, // tool_policy
             Some(&cli_session_ctx),
+            None, // agent_log_emitter — orchestration path, no coord agent_logs
         )?;
         let session = Arc::new(session);
 
