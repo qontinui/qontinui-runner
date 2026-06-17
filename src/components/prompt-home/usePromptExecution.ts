@@ -6,9 +6,15 @@ import { isValidTabId, type MainTabId } from "@/components/app/tab-types";
 import { buildPageCatalog } from "./pageCatalog";
 
 export interface PlanStep {
-  type: "navigate" | "action";
+  type: "navigate" | "action" | "component-action";
   target?: string;
   instruction?: string;
+  /** For `component-action` steps: the registered `useUIComponent` id. */
+  componentId?: string;
+  /** For `component-action` steps: the action id on that component. */
+  actionId?: string;
+  /** For `component-action` steps: optional params passed to the handler. */
+  params?: Record<string, unknown>;
   explanation: string;
 }
 
@@ -160,6 +166,30 @@ export function usePromptExecution(): UsePromptExecutionReturn {
             }
             // Wait for page to settle
             await new Promise((r) => setTimeout(r, 500));
+          } else if (step.type === "component-action") {
+            // Component actions are registered programmatic affordances
+            // (useUIComponent) — NOT clickable elements. The canonical example
+            // is `terminal-launch-menu` / `create-best-account`, the REAL
+            // "open an AI session" spawn affordance (there is no "Claude Code"
+            // button to click). Dispatch straight through the bridge, the same
+            // path the WS `execute_component_action` handler uses.
+            if (!step.componentId || !step.actionId) {
+              throw new Error(
+                `Step ${i + 1} failed: component-action step missing componentId or actionId (componentId="${step.componentId ?? ""}", actionId="${step.actionId ?? ""}")`,
+              );
+            }
+            const compResult = await bridge.executeComponentAction(step.componentId, {
+              action: step.actionId,
+              params: step.params,
+            });
+            if (!compResult.success) {
+              throw new Error(
+                `Step ${i + 1} failed: ${compResult.error ?? "component action failed"} — could not invoke ${step.componentId}/${step.actionId}`,
+              );
+            }
+            // Give the spawn handler time to mount the new pane (a Claude Code
+            // session takes a beat to render its banner).
+            await new Promise((r) => setTimeout(r, 500));
           } else if (step.type === "action" && step.instruction) {
             // P20 — direct dispatch for "<verb> element <id>" forms.
             //
@@ -220,8 +250,17 @@ export function usePromptExecution(): UsePromptExecutionReturn {
 
               const result = await executor.execute({ instruction: step.instruction });
               if (!result.success) {
+                // D-NL2 — no-match observability. NLActionExecutor returns a
+                // bestMatch-null failure with an opaque message that hides WHY
+                // it gave up: the planner named a label/element that is not in
+                // the discovered set (planner-target drift). Surface the
+                // attempted instruction + the candidate labels the executor
+                // actually saw so the drift is diagnosable from the step error
+                // alone, without re-running with a debugger.
+                const candidates = summarizeCandidateLabels(discovered.elements);
                 throw new Error(
-                  `Step ${i + 1} failed: ${result.error ?? result.errorCode ?? "action failed"} — could not ${step.instruction}`,
+                  `Step ${i + 1} failed: ${result.error ?? result.errorCode ?? "action failed"} — could not ${step.instruction}. ` +
+                    `No element matched (chosen: none). ${candidates}`,
                 );
               }
             }
@@ -313,6 +352,48 @@ const _PIPELINE_TRIGGER_IDS = new Set<string>([
   "ui-bridge-analyze-button",
   "ui-bridge-generate-button",
 ]);
+
+/**
+ * Minimal shape of a discovered element we read for the D-NL2 no-match
+ * diagnostic. Matches the relevant fields of the SDK's `DiscoveredElement`
+ * without importing the full type (keeps this helper decoupled).
+ */
+interface DiscoveredLike {
+  id?: string;
+  label?: string;
+  accessibleName?: string;
+  type?: string;
+}
+
+/**
+ * D-NL2 — build a human-readable list of the candidate element labels the NL
+ * executor actually saw, for inclusion in a no-match step error. When the
+ * planner names a label/element that doesn't exist (target drift), the raw
+ * executor error is opaque ("bestMatch null"); listing what WAS available makes
+ * the drift obvious. Caps the list so the error stays bounded.
+ */
+function summarizeCandidateLabels(elements: readonly DiscoveredLike[]): string {
+  const MAX = 25;
+  const labels = elements
+    .map((e) => e.label ?? e.accessibleName ?? e.id ?? "")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  // De-dup while preserving order.
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const l of labels) {
+    if (!seen.has(l)) {
+      seen.add(l);
+      unique.push(l);
+    }
+  }
+  if (unique.length === 0) {
+    return "No interactive elements were discovered on the current page (is the right page loaded?).";
+  }
+  const shown = unique.slice(0, MAX);
+  const overflow = unique.length > MAX ? ` (+${unique.length - MAX} more)` : "";
+  return `Candidate labels on this page (${unique.length}): ${shown.map((l) => `"${l}"`).join(", ")}${overflow}.`;
+}
 
 /**
  * Result of parsing a direct-id instruction. When non-null, the caller
