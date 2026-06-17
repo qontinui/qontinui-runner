@@ -38,23 +38,31 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use super::auto_response_fleet::{FleetRule, RuleAction};
+use super::auto_response_fleet::{FleetRule, RuleAction, ScoringOption};
 use super::output_scan::normalize;
 use crate::settings::BackoffConfig;
 
 /// The compiled, hot-path form of a rule's action.
 ///
 /// `Fixed` is the fully-offline auto-continue (submit a fixed text). `Resolve`
-/// defers the response text to coord's resolve endpoint for the given
-/// `policy_id` — and injects nothing when coord can't confidently resolve.
+/// scores the policy's options on each dimension via the runner's own
+/// authenticated Claude CLI and POSTs the scores to coord's pure-composition
+/// resolve endpoint — injecting nothing when the scorer is unavailable or coord
+/// can't confidently resolve.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CompiledAction {
     /// Submit this fixed text into the matched session (offline-capable).
     Fixed(String),
-    /// Resolve the response via coord's scoring endpoint for this policy id.
-    Resolve(String),
+    /// Score this policy's options/dimensions via the local Claude CLI, then
+    /// resolve the winning text via coord. Carries everything the scorer needs:
+    /// the coord policy id, the scoreable options, and the scoring dimensions.
+    Resolve {
+        policy_id: String,
+        options: Vec<ScoringOption>,
+        dimensions: Vec<String>,
+    },
 }
 
 /// A fleet rule with its `pattern` pre-compiled to a [`regex::Regex`].
@@ -88,9 +96,15 @@ pub fn reload_rules(rules: Vec<FleetRule>) {
             Ok(regex) => {
                 let action = match rule.action {
                     RuleAction::SubmitPrompt { text } => CompiledAction::Fixed(text),
-                    RuleAction::ResolveByScoring { policy_id } => {
-                        CompiledAction::Resolve(policy_id)
-                    }
+                    RuleAction::ResolveByScoring {
+                        policy_id,
+                        options,
+                        dimensions,
+                    } => CompiledAction::Resolve {
+                        policy_id,
+                        options,
+                        dimensions,
+                    },
                 };
                 compiled.push(CompiledRule {
                     id: rule.id,
@@ -336,10 +350,12 @@ mod scheduler {
     /// rule. No-op when a response is already pending for this pair.
     ///
     /// `Fixed` actions submit the fixed text after the backoff (fully offline).
-    /// `Resolve` actions, after the backoff, call coord's resolve endpoint with
-    /// `context` and submit ONLY the confidently-resolved `response_text`; on
-    /// `resolved:false`, a coord error, or judge-unavailable they inject NOTHING
-    /// and let the next match retry under backoff.
+    /// `Resolve` actions, after the backoff, score the policy's options on each
+    /// dimension via the runner's own authenticated Claude CLI, POST the scores
+    /// to coord's pure-composition resolve endpoint with `context`, and submit
+    /// ONLY the confidently-resolved `response_text`; on a scorer failure
+    /// (`None` scores), `resolved:false`, a coord error, or no options they
+    /// inject NOTHING and let the next match retry under backoff.
     pub(super) fn on_match(
         tid: &str,
         rid: &str,
@@ -366,13 +382,18 @@ mod scheduler {
                 CompiledAction::Fixed(text) => {
                     submit_to_session(&tid, &text).await;
                 }
-                CompiledAction::Resolve(policy_id) => {
-                    match resolve_response(&policy_id, &context).await {
+                CompiledAction::Resolve {
+                    policy_id,
+                    options,
+                    dimensions,
+                } => {
+                    match resolve_scored_response(&policy_id, &context, &options, &dimensions).await
+                    {
                         Some(text) => submit_to_session(&tid, &text).await,
                         None => info!(
                             terminal_id = %tid,
                             rule_id = %rid,
-                            "auto_response: coord did not resolve — injecting nothing"
+                            "auto_response: not resolved (no scores / coord unresolved) — injecting nothing"
                         ),
                     }
                 }
@@ -412,13 +433,205 @@ mod scheduler {
         }
     }
 
-    /// Call coord's resolve endpoint for `policy_id` with `context`. Returns
-    /// `Some(response_text)` ONLY when coord returns `resolved:true`; returns
-    /// `None` on `resolved:false`, any network/parse error, a missing coord
-    /// base, or judge-unavailable — the caller injects nothing in every `None`
-    /// case (NEVER a fallback/guess).
-    pub(super) async fn resolve_response(policy_id: &str, context: &str) -> Option<String> {
-        super::resolve::resolve_via_coord(policy_id, context).await
+    /// Score the policy's options via the local Claude CLI, then resolve the
+    /// winning text via coord. Returns `Some(response_text)` ONLY when scoring
+    /// produced a score map AND coord returned `resolved:true` with non-empty
+    /// text. Every other outcome (no options, scorer unavailable / timeout /
+    /// unparseable, `resolved:false`, network/parse error, missing coord base)
+    /// yields `None` — the caller injects nothing (NEVER a fallback/guess).
+    pub(super) async fn resolve_scored_response(
+        policy_id: &str,
+        context: &str,
+        options: &[ScoringOption],
+        dimensions: &[String],
+    ) -> Option<String> {
+        decide_resolution_with(
+            policy_id,
+            context,
+            options,
+            dimensions,
+            // CLI scorer seam: build the prompt + run the one-shot CLI.
+            |ctx, opts, dims| {
+                let prompt = super::scoring::build_scoring_prompt(ctx, opts, dims);
+                async move { super::scoring::run_cli_scorer(prompt).await }
+            },
+            // Coord resolve seam.
+            |pid, ctx, scores| {
+                let pid = pid.to_string();
+                let ctx = ctx.to_string();
+                async move { super::resolve::resolve_via_coord(&pid, &ctx, scores).await }
+            },
+        )
+        .await
+    }
+
+    /// Generic firing core for the `Resolve` branch with the CLI scorer and the
+    /// coord POST injected as seams, so the full fail-safe decision logic is
+    /// unit-testable without a live `claude` or coord. Fail-safe branches:
+    ///   * no options                → `None` (nothing to score)
+    ///   * scorer returns `None`     → `None` (CLI unavailable/timeout/garbage)
+    ///   * coord returns `None`      → `None` (`resolved:false`/network/empty)
+    /// Only a scorer `Some` AND a coord `Some(text)` yields `Some(text)`.
+    pub(super) async fn decide_resolution_with<ScoreFut, PostFut, ScoreFn, PostFn>(
+        policy_id: &str,
+        context: &str,
+        options: &[ScoringOption],
+        dimensions: &[String],
+        score: ScoreFn,
+        post: PostFn,
+    ) -> Option<String>
+    where
+        ScoreFut: std::future::Future<Output = Option<serde_json::Value>>,
+        PostFut: std::future::Future<Output = Option<String>>,
+        ScoreFn: FnOnce(&str, &[ScoringOption], &[String]) -> ScoreFut,
+        PostFn: FnOnce(&str, &str, serde_json::Value) -> PostFut,
+    {
+        // Fail-safe no-op when coord projected no options (e.g. an older coord
+        // that doesn't send them, or a misconfigured policy): nothing to score.
+        if options.is_empty() {
+            debug!(
+                policy_id,
+                "auto_response: resolve rule has no options — injecting nothing"
+            );
+            return None;
+        }
+        // Score via the seam; `None` on any CLI failure → inject nothing.
+        let scores = score(context, options, dimensions).await?;
+        // Resolve via coord; `None` on unresolved/error → inject nothing.
+        post(policy_id, context, scores).await
+    }
+}
+
+/// Local Claude-CLI option scorer for `resolve_by_scoring` rules. The prompt
+/// builder and JSON parser are pure (unit-tested); [`run_cli_scorer`] is the
+/// only impure piece (spawns the one-shot CLI on a blocking thread).
+mod scoring {
+    use super::ScoringOption;
+    use std::time::Duration;
+    use tracing::{debug, warn};
+
+    /// Bounded wall-clock for the one-shot scoring CLI call. Overridable via
+    /// `QONTINUI_AUTO_RESPONSE_SCORE_TIMEOUT_SECS` (floored at 5s). 60s default
+    /// is generous for a single short scoring turn while still bounding a wedged
+    /// CLI so the scheduler task can't hang forever.
+    fn score_timeout() -> Duration {
+        let secs = std::env::var("QONTINUI_AUTO_RESPONSE_SCORE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&n| n >= 5)
+            .unwrap_or(60);
+        Duration::from_secs(secs)
+    }
+
+    /// Build the deterministic scoring prompt instructing the CLI to score each
+    /// option on each dimension in `0.0..1.0` and emit STRICT JSON
+    /// `{"<option_id>":{"<dimension>":0.0,...},...}` with no prose. Pure — the
+    /// unit-test seam for prompt content.
+    pub(super) fn build_scoring_prompt(
+        context: &str,
+        options: &[ScoringOption],
+        dimensions: &[String],
+    ) -> String {
+        let mut s = String::new();
+        s.push_str(
+            "You are scoring response options for an automation policy. A terminal \
+             session is waiting for input. Below is the on-screen terminal context, \
+             a list of candidate response options, and the dimensions to score each \
+             option on.\n\n",
+        );
+        s.push_str("=== TERMINAL CONTEXT ===\n");
+        s.push_str(context);
+        s.push_str("\n=== END TERMINAL CONTEXT ===\n\n");
+
+        s.push_str("=== OPTIONS ===\n");
+        for opt in options {
+            s.push_str("- id=\"");
+            s.push_str(&opt.id);
+            s.push_str("\" label=\"");
+            s.push_str(&opt.label);
+            s.push_str("\"\n");
+        }
+        s.push('\n');
+
+        s.push_str("=== DIMENSIONS ===\n");
+        if dimensions.is_empty() {
+            // No dimensions configured: still ask for a single overall score so
+            // coord has something to compose; keeps the JSON shape consistent.
+            s.push_str("- overall\n");
+        } else {
+            for dim in dimensions {
+                s.push_str("- ");
+                s.push_str(dim);
+                s.push('\n');
+            }
+        }
+        s.push('\n');
+
+        s.push_str(
+            "Score EVERY option on EVERY dimension. Each score is a number from 0.0 \
+             (worst fit) to 1.0 (best fit) given the terminal context.\n\n\
+             Respond with STRICT JSON ONLY — no prose, no markdown, no code fences. \
+             The JSON must be an object keyed by option id, whose value is an object \
+             keyed by dimension name with a number value. Example shape:\n\
+             {\"<option_id>\":{\"<dimension>\":0.0}}\n",
+        );
+        s
+    }
+
+    /// Parse the CLI's stdout into a scores map. Tolerant: strips Markdown code
+    /// fences (```json … ```), then parses the remainder as a JSON object.
+    /// Returns `None` on anything that is not a JSON object (garbage / prose /
+    /// array / scalar). Pure — the unit-test seam for parse robustness.
+    pub(super) fn parse_scores(raw: &str) -> Option<serde_json::Value> {
+        let cleaned = strip_code_fences(raw);
+        let value: serde_json::Value = serde_json::from_str(cleaned.trim()).ok()?;
+        if value.is_object() {
+            Some(value)
+        } else {
+            None
+        }
+    }
+
+    /// Strip a single leading/trailing Markdown code fence pair if present,
+    /// tolerating an optional language tag (```json). Returns the inner content;
+    /// if no fence is found, returns the input unchanged.
+    fn strip_code_fences(raw: &str) -> String {
+        let t = raw.trim();
+        if let Some(rest) = t.strip_prefix("```") {
+            // Drop the optional language tag up to the first newline.
+            let after_tag = match rest.find('\n') {
+                Some(nl) => &rest[nl + 1..],
+                None => rest,
+            };
+            let inner = after_tag.strip_suffix("```").unwrap_or(after_tag);
+            // Also handle a trailing fence on its own line.
+            return inner.trim_end_matches('`').trim().to_string();
+        }
+        t.to_string()
+    }
+
+    /// Run the one-shot CLI scorer on a blocking thread (it spawns + waits on a
+    /// subprocess) and parse its output. `None` on a missing binary, nonzero
+    /// exit, timeout, or unparseable output — every failure fails closed.
+    pub(super) async fn run_cli_scorer(prompt: String) -> Option<serde_json::Value> {
+        let timeout = score_timeout();
+        let raw = tokio::task::spawn_blocking(move || {
+            let settings = crate::settings::load_settings();
+            crate::ai_provider::score_options_via_cli(&prompt, &settings.ai.claude_cli, timeout)
+        })
+        .await
+        .ok()
+        .flatten()?;
+        match parse_scores(&raw) {
+            Some(v) => {
+                debug!("auto_response scorer: parsed scores from CLI");
+                Some(v)
+            }
+            None => {
+                warn!("auto_response scorer: CLI output not parseable as score JSON — no scores");
+                None
+            }
+        }
     }
 }
 
@@ -431,10 +644,15 @@ mod resolve {
     use tracing::{debug, warn};
 
     /// POST body for `{coord_base}/coord/policies/resolve`.
+    ///
+    /// `scores` is the runner-computed `{option_id:{dimension:0.0..1.0}}` map
+    /// from the local CLI scorer; coord does pure composition over it (no judge
+    /// of its own) to pick a confident winner.
     #[derive(Serialize)]
     struct ResolveRequest<'a> {
         policy_id: &'a str,
         context: &'a str,
+        scores: serde_json::Value,
     }
 
     /// Response from `{coord_base}/coord/policies/resolve` (always HTTP 200).
@@ -474,15 +692,23 @@ mod resolve {
         }
     }
 
-    /// POST the resolve request and return the text to inject, or `None` on any
-    /// unresolved / error condition.
-    pub(super) async fn resolve_via_coord(policy_id: &str, context: &str) -> Option<String> {
+    /// POST the resolve request (with the runner-computed `scores`) and return
+    /// the text to inject, or `None` on any unresolved / error condition.
+    pub(super) async fn resolve_via_coord(
+        policy_id: &str,
+        context: &str,
+        scores: serde_json::Value,
+    ) -> Option<String> {
         let url = resolve_endpoint_url()?;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .ok()?;
-        let body = ResolveRequest { policy_id, context };
+        let body = ResolveRequest {
+            policy_id,
+            context,
+            scores,
+        };
         // Device-JWT bearer on a POST — the same write-path attach the coord
         // producers use (collapses to anonymous when unpaired).
         let req = qontinui_runner_lib::auth::attach_device_auth(client.post(&url));
@@ -559,6 +785,17 @@ mod tests {
         r.case_insensitive = true;
         r.action = RuleAction::ResolveByScoring {
             policy_id: "pol-1".to_string(),
+            options: vec![
+                ScoringOption {
+                    id: "a".to_string(),
+                    label: "Approve".to_string(),
+                },
+                ScoringOption {
+                    id: "b".to_string(),
+                    label: "Reject".to_string(),
+                },
+            ],
+            dimensions: vec!["safety".to_string()],
         };
         reload_rules(vec![r]);
         let guard = COMPILED_RULES.read().unwrap();
@@ -567,7 +804,20 @@ mod tests {
         assert!(guard[0].regex.is_match("rate limited"));
         assert_eq!(
             guard[0].action,
-            CompiledAction::Resolve("pol-1".to_string())
+            CompiledAction::Resolve {
+                policy_id: "pol-1".to_string(),
+                options: vec![
+                    ScoringOption {
+                        id: "a".to_string(),
+                        label: "Approve".to_string(),
+                    },
+                    ScoringOption {
+                        id: "b".to_string(),
+                        label: "Reject".to_string(),
+                    },
+                ],
+                dimensions: vec!["safety".to_string()],
+            }
         );
         drop(guard);
         reload_rules(vec![]);
@@ -635,6 +885,164 @@ mod tests {
                 reason: Some("judge_unavailable".to_string()),
             }
         );
+    }
+
+    // ── Scoring prompt builder + parser (pure) ────────────────────────────────
+
+    fn opts() -> Vec<ScoringOption> {
+        vec![
+            ScoringOption {
+                id: "opt-a".to_string(),
+                label: "Yes, proceed with the deploy".to_string(),
+            },
+            ScoringOption {
+                id: "opt-b".to_string(),
+                label: "No, cancel".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn scoring_prompt_includes_options_dimensions_context_and_demands_json() {
+        let dims = vec!["safety".to_string(), "intent_fit".to_string()];
+        let prompt = super::scoring::build_scoring_prompt(
+            "Coordinator: should I deploy to prod? (y/n)",
+            &opts(),
+            &dims,
+        );
+        // Context is carried verbatim.
+        assert!(prompt.contains("should I deploy to prod? (y/n)"));
+        // Both option ids + labels present.
+        assert!(prompt.contains("opt-a"));
+        assert!(prompt.contains("Yes, proceed with the deploy"));
+        assert!(prompt.contains("opt-b"));
+        assert!(prompt.contains("No, cancel"));
+        // Both dimensions present.
+        assert!(prompt.contains("safety"));
+        assert!(prompt.contains("intent_fit"));
+        // Demands STRICT JSON, no prose.
+        assert!(prompt.contains("STRICT JSON"));
+        assert!(prompt.to_lowercase().contains("no prose"));
+        // The 0.0..1.0 score range is specified.
+        assert!(prompt.contains("0.0") && prompt.contains("1.0"));
+    }
+
+    #[test]
+    fn scoring_prompt_with_no_dimensions_asks_for_overall() {
+        let prompt = super::scoring::build_scoring_prompt("ctx", &opts(), &[]);
+        assert!(prompt.contains("overall"));
+    }
+
+    #[test]
+    fn parse_scores_clean_json() {
+        let raw =
+            r#"{"opt-a":{"safety":0.9,"intent_fit":0.8},"opt-b":{"safety":0.2,"intent_fit":0.1}}"#;
+        let v = super::scoring::parse_scores(raw).expect("clean JSON parses");
+        assert_eq!(v["opt-a"]["safety"], serde_json::json!(0.9));
+        assert_eq!(v["opt-b"]["intent_fit"], serde_json::json!(0.1));
+    }
+
+    #[test]
+    fn parse_scores_code_fenced_json() {
+        let raw = "```json\n{\"opt-a\":{\"safety\":1.0}}\n```";
+        let v = super::scoring::parse_scores(raw).expect("code-fenced JSON parses");
+        assert_eq!(v["opt-a"]["safety"], serde_json::json!(1.0));
+
+        // Bare fence with no language tag also works.
+        let raw2 = "```\n{\"opt-b\":{\"x\":0.5}}\n```";
+        let v2 = super::scoring::parse_scores(raw2).expect("bare-fenced JSON parses");
+        assert_eq!(v2["opt-b"]["x"], serde_json::json!(0.5));
+    }
+
+    #[test]
+    fn parse_scores_garbage_is_none() {
+        // Prose.
+        assert!(super::scoring::parse_scores("I think option A is best.").is_none());
+        // Empty.
+        assert!(super::scoring::parse_scores("").is_none());
+        // JSON but not an object (array / scalar).
+        assert!(super::scoring::parse_scores("[1, 2, 3]").is_none());
+        assert!(super::scoring::parse_scores("42").is_none());
+        // Truncated / invalid JSON.
+        assert!(super::scoring::parse_scores("{\"opt-a\": {").is_none());
+    }
+
+    // ── Resolve firing flow (seams mocked — no live claude / coord) ───────────
+
+    #[tokio::test]
+    async fn resolve_fires_submits_when_scorer_and_coord_agree() {
+        // Scorer favors A; mocked coord composes A's text.
+        let options = opts();
+        let got = scheduler::decide_resolution_with(
+            "pol-1",
+            "ctx",
+            &options,
+            &["safety".to_string()],
+            |_ctx, _opts, _dims| async {
+                Some(serde_json::json!({"opt-a": {"safety": 0.9}, "opt-b": {"safety": 0.1}}))
+            },
+            |_pid, _ctx, scores| async move {
+                // Coord saw the runner-computed scores and returns A's text.
+                assert_eq!(scores["opt-a"]["safety"], serde_json::json!(0.9));
+                Some("Yes, proceed with the deploy".to_string())
+            },
+        )
+        .await;
+        assert_eq!(got, Some("Yes, proceed with the deploy".to_string()));
+    }
+
+    #[tokio::test]
+    async fn resolve_no_op_when_scorer_returns_none() {
+        let options = opts();
+        let mut posted = false;
+        let got = scheduler::decide_resolution_with(
+            "pol-1",
+            "ctx",
+            &options,
+            &["safety".to_string()],
+            |_c, _o, _d| async { None }, // scorer unavailable
+            |_p, _c, _s| {
+                posted = true;
+                async { Some("should not happen".to_string()) }
+            },
+        )
+        .await;
+        assert_eq!(got, None, "scorer None must inject nothing");
+        assert!(!posted, "coord must not be called when scoring failed");
+    }
+
+    #[tokio::test]
+    async fn resolve_no_op_when_coord_unresolved() {
+        let options = opts();
+        let got = scheduler::decide_resolution_with(
+            "pol-1",
+            "ctx",
+            &options,
+            &["safety".to_string()],
+            |_c, _o, _d| async { Some(serde_json::json!({"opt-a": {"safety": 0.5}})) },
+            |_p, _c, _s| async { None }, // coord resolved:false / error
+        )
+        .await;
+        assert_eq!(got, None, "coord None must inject nothing");
+    }
+
+    #[tokio::test]
+    async fn resolve_no_op_when_no_options() {
+        let mut scored = false;
+        let got = scheduler::decide_resolution_with(
+            "pol-1",
+            "ctx",
+            &[], // no options projected → fail-safe no-op
+            &["safety".to_string()],
+            |_c, _o, _d| {
+                scored = true;
+                async { Some(serde_json::json!({})) }
+            },
+            |_p, _c, _s| async { Some("nope".to_string()) },
+        )
+        .await;
+        assert_eq!(got, None, "no options must inject nothing");
+        assert!(!scored, "scorer must not run when there are no options");
     }
 
     /// A compiled rule built directly (no fleet round-trip) for grid-scan tests.
