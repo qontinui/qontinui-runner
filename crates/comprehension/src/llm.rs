@@ -48,13 +48,28 @@ downgrade over-confident nodes, so over-claiming only loses you credibility.";
 /// The caller assembles the prompt (snapshot + discovery + manifest context)
 /// and selects the model (`opus` / `sonnet` for comprehension, vs the exemplar's
 /// `haiku` router).
+///
+/// ## Why the curated schema, not `schema_for!(FunctionalSpec)`
+///
+/// The `claude` CLI's `--json-schema` structured-output path (CLI v2.1.x) only
+/// engages — i.e. populates `.structured_output` — for **flat, `$ref`-free**
+/// schemas. The full `schema_for!(FunctionalSpec)` schema is ~17 KB with 37
+/// `$ref`s into `$defs`; against it the CLI silently degrades to free-form prose
+/// in `.result` and leaves `.structured_output` absent (verified live, runner
+/// repo PR — the runtime-verification finding that drove this change). Even a
+/// fully ref-inlined 30 KB variant fails the same way. A hand-curated, flat
+/// schema covering exactly the **entities / operations / auth** subset the LLM
+/// is asked to infer (the IR + ledger are owned by the deterministic substrate,
+/// not the model) DOES engage structured output, and its result deserializes
+/// cleanly into a `FunctionalSpec` because the frozen type is `#[serde(default)]`
+/// throughout (no `deny_unknown_fields`). See [`comprehension_schema_json`].
 pub fn comprehension_argv(prompt: &str, model: &str) -> Vec<String> {
     vec![
         "-p".into(),
         "--output-format".into(),
         "json".into(),
         "--json-schema".into(),
-        functional_spec_schema_json(),
+        comprehension_schema_json(),
         "--system-prompt".into(),
         SYSTEM_PROMPT.into(),
         // A comprehension call observes; it must not edit/exec.
@@ -67,11 +82,129 @@ pub fn comprehension_argv(prompt: &str, model: &str) -> Vec<String> {
 }
 
 /// The `FunctionalSpec` JSON Schema, emitted by `schemars` from the frozen Rust
-/// type. Passed to `claude --json-schema` so the model's `.structured_output`
-/// parses back into a `FunctionalSpec`.
+/// type. This is the *canonical* schema (the contract reference) — but it is NOT
+/// what the CLI `--json-schema` flag receives, because its `$ref`/`$defs` shape
+/// defeats the CLI structured-output path (see [`comprehension_argv`]). Retained
+/// for documentation / downstream validation use.
 pub fn functional_spec_schema_json() -> String {
     let schema = schema_for!(FunctionalSpec);
     serde_json::to_string(&schema).expect("FunctionalSpec schema serializes")
+}
+
+/// The provenance enum values, shared by every confidence node in the curated
+/// schema.
+const PROVENANCE_ENUM: &str = r#"{"type":"string","enum":["observed","inferred","assumed"]}"#;
+
+/// A **flat, `$ref`-free** JSON Schema covering the `entities` / `operations` /
+/// `auth` subset of `FunctionalSpec` that the LLM infers. This is the schema
+/// actually passed to `claude --json-schema` — it engages the CLI's
+/// structured-output path (which the full `schema_for!` schema does not; see
+/// [`comprehension_argv`]) and its output deserializes into a `FunctionalSpec`
+/// (the absent `uiStates`/`navigation`/`assumptions` are filled by the
+/// deterministic substrate downstream).
+///
+/// The field names are camelCase to match the frozen type's serde renames
+/// (`sourceUrl`, `type`, etc.), so `serde_json::from_value::<FunctionalSpec>`
+/// over the structured output succeeds directly.
+pub fn comprehension_schema_json() -> String {
+    let p = PROVENANCE_ENUM;
+    format!(
+        r#"{{
+  "type": "object",
+  "properties": {{
+    "specVersion": {{ "type": "string" }},
+    "target": {{
+      "type": "object",
+      "properties": {{
+        "sourceUrl": {{ "type": "string" }},
+        "observedAt": {{ "type": "string" }}
+      }},
+      "required": ["sourceUrl"]
+    }},
+    "entities": {{
+      "type": "array",
+      "items": {{
+        "type": "object",
+        "properties": {{
+          "name": {{ "type": "string" }},
+          "confidence": {p},
+          "provenance": {{ "type": "string" }},
+          "credibility": {{ "type": "number" }},
+          "fields": {{
+            "type": "array",
+            "items": {{
+              "type": "object",
+              "properties": {{
+                "name": {{ "type": "string" }},
+                "type": {{ "type": "string" }},
+                "confidence": {p},
+                "provenance": {{ "type": "string" }},
+                "credibility": {{ "type": "number" }}
+              }},
+              "required": ["name", "type", "confidence"]
+            }}
+          }}
+        }},
+        "required": ["name", "confidence"]
+      }}
+    }},
+    "operations": {{
+      "type": "array",
+      "items": {{
+        "type": "object",
+        "properties": {{
+          "name": {{ "type": "string" }},
+          "verb": {{ "type": "string" }},
+          "entity": {{ "type": "string" }},
+          "confidence": {p},
+          "provenance": {{ "type": "string" }},
+          "inputs": {{
+            "type": "array",
+            "items": {{
+              "type": "object",
+              "properties": {{
+                "field": {{ "type": "string" }},
+                "required": {{ "type": "boolean" }},
+                "validation": {{
+                  "type": "object",
+                  "properties": {{
+                    "rule": {{ "type": "string" }},
+                    "confidence": {p},
+                    "provenance": {{ "type": "string" }}
+                  }},
+                  "required": ["rule", "confidence"]
+                }}
+              }},
+              "required": ["field"]
+            }}
+          }},
+          "effect": {{
+            "type": "object",
+            "properties": {{
+              "confidence": {p},
+              "assumption": {{ "type": "string" }},
+              "provenance": {{ "type": "string" }}
+            }},
+            "required": ["confidence"]
+          }}
+        }},
+        "required": ["name", "verb", "confidence"]
+      }}
+    }},
+    "auth": {{
+      "type": "object",
+      "properties": {{
+        "model": {{ "type": "string" }},
+        "confidence": {p},
+        "provenance": {{ "type": "string" }},
+        "credibility": {{ "type": "number" }}
+      }},
+      "required": ["model", "confidence"]
+    }}
+  }},
+  "required": ["specVersion", "target", "entities", "operations"]
+}}"#
+    )
 }
 
 /// Parse the `claude` CLI envelope (`{ is_error, structured_output, … }`) into a
