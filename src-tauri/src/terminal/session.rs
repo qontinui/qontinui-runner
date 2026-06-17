@@ -25,12 +25,25 @@ use super::types::{TerminalExitEvent, TerminalId, TerminalInfo};
 const PS1_INTEGRATION: &str = include_str!("../../resources/shell-integration.ps1");
 #[cfg(not(target_os = "windows"))]
 const BASH_INTEGRATION: &str = include_str!("../../resources/shell-integration.bash");
+const ZSH_INTEGRATION: &str = include_str!("../../resources/shell-integration.zsh");
 
 /// Write a shell integration script to a temp file, returning the path on success.
 fn write_integration_script(content: &str, name: &str) -> Option<std::path::PathBuf> {
     let path = std::env::temp_dir().join(name);
     std::fs::write(&path, content).ok()?;
     Some(path)
+}
+
+/// Write the zsh integration as `<dir>/.zshrc` and return `<dir>` for use as
+/// `ZDOTDIR`. zsh has no `--rcfile`; pointing `ZDOTDIR` at a dir makes zsh
+/// source `$ZDOTDIR/.zshrc` instead of `~/.zshrc` (our script re-sources the
+/// user's real `~/.z*` files). Returns `None` so the caller can fall back to a
+/// plain shell if the temp dir can't be created.
+fn write_zsh_zdotdir(content: &str) -> Option<std::path::PathBuf> {
+    let dir = std::env::temp_dir().join("qontinui-zsh-integration");
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::write(dir.join(".zshrc"), content).ok()?;
+    Some(dir)
 }
 
 /// Maximum scrollback buffer capacity (1 MB).
@@ -936,17 +949,40 @@ impl TerminalSession {
         #[cfg(not(target_os = "windows"))]
         {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+            let shell_name = std::path::Path::new(&shell)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
             let mut cmd = CommandBuilder::new(&shell);
-            // Use --rcfile to source our integration script (which re-sources ~/.bashrc internally).
-            // Fall back to --login if the script can't be written.
-            if let Some(script_path) =
-                write_integration_script(BASH_INTEGRATION, "qontinui-shell-integration.bash")
-            {
-                let rcfile = script_path.to_string_lossy().into_owned();
-                cmd.arg("--rcfile");
-                cmd.arg(rcfile.as_str());
-            } else {
-                cmd.arg("--login");
+            // Shell integration is shell-specific. `--rcfile` is a BASH flag —
+            // passing it to zsh (the macOS default) fails with
+            // "no such option: rcfile", so each shell needs its own mechanism.
+            match shell_name {
+                "zsh" => {
+                    // zsh: point ZDOTDIR at a dir whose `.zshrc` is our
+                    // integration (it re-sources the user's ~/.z* files). If we
+                    // can't write it, fall through to a plain zsh that sources
+                    // ~/.zshrc normally (no OSC 633, but a working terminal).
+                    if let Some(zdotdir) = write_zsh_zdotdir(ZSH_INTEGRATION) {
+                        cmd.env("ZDOTDIR", zdotdir.to_string_lossy().as_ref());
+                    }
+                }
+                // bash (and the empty/unknown-path default) keep the --rcfile
+                // path, with --login as the no-script fallback.
+                "bash" | "" => {
+                    if let Some(script_path) = write_integration_script(
+                        BASH_INTEGRATION,
+                        "qontinui-shell-integration.bash",
+                    ) {
+                        cmd.arg("--rcfile");
+                        cmd.arg(script_path.to_string_lossy().as_ref());
+                    } else {
+                        cmd.arg("--login");
+                    }
+                }
+                // Any other shell (fish, etc.): launch it plainly — never pass
+                // bash-only flags it would reject.
+                _ => {}
             }
             cmd
         }

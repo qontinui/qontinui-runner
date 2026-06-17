@@ -214,8 +214,21 @@ pub fn get_default_dev_services(workspace: &Path) -> Vec<ProcessConfig> {
         services.push(ProcessConfig {
             id: dev_service_id(workspace, EMBEDDING_SERVICE_ID_SUFFIX),
             name: "Embedding Service (MiniLM-L6-v2)".to_string(),
-            command: "python".to_string(),
-            args: vec![embedding_script.to_string_lossy().to_string()],
+            // Launch under Poetry (like the backend service above), NOT bare
+            // `python`. uvicorn/fastapi/pydantic/sentence-transformers and the
+            // qontinui package live in the python-bridge Poetry env, not in
+            // the system interpreter that bare `python` resolves to — so
+            // `python embedding_server.py` dies at import with
+            // `ModuleNotFoundError: No module named 'uvicorn'`, never binds
+            // 8001, and the runner reports derived_status=degraded. `poetry
+            // run` (cwd = python-bridge, which owns the pyproject/poetry.lock)
+            // resolves the right interpreter.
+            command: "poetry".to_string(),
+            args: vec![
+                "run".to_string(),
+                "python".to_string(),
+                embedding_script.to_string_lossy().to_string(),
+            ],
             cwd: runner_dir
                 .join("python-bridge")
                 .to_string_lossy()
@@ -232,9 +245,11 @@ pub fn get_default_dev_services(workspace: &Path) -> Vec<ProcessConfig> {
             // and its sentence-transformers dependency are available.
             start_group: 2,
             dev_only: false, // embeddings are needed in production too
-            rebuild_enabled: false,
-            build_command: None,
-            build_args: vec![],
+            // Provision the python-bridge Poetry env on rebuild, mirroring the
+            // backend service's `poetry install`.
+            rebuild_enabled: true,
+            build_command: Some("poetry".to_string()),
+            build_args: vec!["install".to_string()],
         });
     }
 
@@ -403,11 +418,47 @@ mod tests {
         let frontend = web.join("frontend");
         fs::create_dir_all(&backend).unwrap();
         fs::create_dir_all(&frontend).unwrap();
-        fs::create_dir_all(root.join("qontinui-runner")).unwrap();
+        let python_bridge = root.join("qontinui-runner").join("python-bridge");
+        fs::create_dir_all(&python_bridge).unwrap();
         fs::write(web.join("docker-compose.yml"), "services: {}\n").unwrap();
         fs::write(backend.join("pyproject.toml"), "[project]\n").unwrap();
         fs::write(frontend.join("package.json"), "{}\n").unwrap();
+        // Embedding service is only emitted when this script exists.
+        fs::write(python_bridge.join("embedding_server.py"), "# stub\n").unwrap();
         tmp
+    }
+
+    /// The embedding service MUST launch under Poetry, not bare `python`. Its
+    /// deps (uvicorn/fastapi/sentence-transformers + the qontinui package) live
+    /// in the python-bridge Poetry env; bare `python` resolves to the system
+    /// interpreter, which lacks them — the service then dies at import and never
+    /// binds 8001 (runner goes derived_status=degraded). Mirrors the backend.
+    #[test]
+    fn embedding_service_uses_poetry() {
+        let tmp = make_workspace();
+        let services = get_default_dev_services(tmp.path());
+
+        let embedding = services
+            .iter()
+            .find(|s| s.health_port == Some(8001))
+            .expect("embedding dev service should be emitted when embedding_server.py exists");
+
+        assert_eq!(
+            embedding.command, "poetry",
+            "embedding service must launch via poetry, not bare python; got {:?}",
+            embedding.command
+        );
+        // `poetry run python <script>` — run/python must precede the script path.
+        assert_eq!(embedding.args.first().map(String::as_str), Some("run"));
+        assert_eq!(embedding.args.get(1).map(String::as_str), Some("python"));
+        assert!(
+            embedding
+                .args
+                .last()
+                .is_some_and(|a| a.ends_with("embedding_server.py")),
+            "last arg must be the embedding_server.py path; got {:?}",
+            embedding.args
+        );
     }
 
     /// The frontend dev server MUST be told to listen on 3001 — Next's

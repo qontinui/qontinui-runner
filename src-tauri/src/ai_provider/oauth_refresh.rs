@@ -215,10 +215,36 @@ pub(crate) fn has_valid_credentials(config_dir: &str) -> bool {
 /// Spawn paths use this to decide whether an unset-`CLAUDE_CONFIG_DIR` spawn
 /// would land on a real login or 401-zombie under a dead default.
 pub(crate) fn default_location_has_valid_credentials() -> bool {
-    match find_creds_path(None) {
-        Some(path) => creds_path_is_valid(&path),
-        None => false,
+    if let Some(path) = find_creds_path(None) {
+        if creds_path_is_valid(&path) {
+            return true;
+        }
     }
+    // macOS keeps Claude Code's OAuth credentials in the login Keychain
+    // (service "Claude Code-credentials"), NOT in ~/.claude/.credentials.json.
+    // Without this, a logged-in macOS operator with an empty account roster
+    // trips the spawn-path "no authenticated Claude account — run /login" abort
+    // (e.g. `/spawn-ai`) even though a `claude` subprocess inheriting the unset
+    // CLAUDE_CONFIG_DIR would authenticate fine via the Keychain.
+    #[cfg(target_os = "macos")]
+    {
+        if macos_keychain_has_claude_credentials() {
+            return true;
+        }
+    }
+    false
+}
+
+/// True iff the macOS login Keychain holds a Claude Code credentials item.
+/// Attribute-only query (no `-w`/`-g`), so it never reads the secret and never
+/// triggers a Keychain access-control prompt.
+#[cfg(target_os = "macos")]
+fn macos_keychain_has_claude_credentials() -> bool {
+    std::process::Command::new("security")
+        .args(["find-generic-password", "-s", "Claude Code-credentials"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// Shared validity core: an existing creds file that is unexpired, or expired

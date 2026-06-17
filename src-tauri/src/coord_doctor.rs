@@ -459,10 +459,38 @@ fn creds_path_is_valid(creds_path: &Path) -> bool {
 }
 
 fn claude_account_has_valid_credentials(config_dir: Option<&str>) -> bool {
-    match find_creds_path(config_dir) {
-        Some(path) => creds_path_is_valid(&path),
-        None => false,
+    if let Some(path) = find_creds_path(config_dir) {
+        if creds_path_is_valid(&path) {
+            return true;
+        }
     }
+    // macOS stores Claude Code's OAuth credentials in the login Keychain
+    // (service "Claude Code-credentials"), NOT in ~/.claude/.credentials.json —
+    // so the file-only check above reports a logged-in operator as
+    // unauthenticated, telling them to "run /login" when they already have.
+    // Accept the Keychain item as proof of a Claude account.
+    #[cfg(target_os = "macos")]
+    {
+        if macos_keychain_has_claude_credentials() {
+            return true;
+        }
+    }
+    false
+}
+
+/// True iff the macOS login Keychain holds a Claude Code credentials item.
+///
+/// Queries item ATTRIBUTES only (no `-w`/`-g`), so it never reads the secret
+/// and therefore never triggers a Keychain access-control prompt. Presence of
+/// the item means the operator has completed `/login` on this machine (Claude
+/// Code refreshes the token itself, so on-disk expiry isn't meaningful here).
+#[cfg(target_os = "macos")]
+fn macos_keychain_has_claude_credentials() -> bool {
+    std::process::Command::new("security")
+        .args(["find-generic-password", "-s", "Claude Code-credentials"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------

@@ -149,6 +149,10 @@ mod security;
 mod semantic_conventions;
 mod server_mode;
 mod session; // Plan 2026-05-22-coord-native-session-coordination Phase 2 — unified Session primitive
+// Hook-free, runner-side WIP-attribution capture (mirrors fleet::tree_publisher).
+// Reads each hosted session's transcript and POSTs file-edit attribution to
+// coord. Gated OFF by default (COORD_SESSION_ATTRIBUTION_ENABLED).
+mod session_attribution;
 mod session_bus; // Session Bus Phase 3b — gated directed-message delivery executor
 mod settings;
 // `startup_panic` is a minimal, dep-free panic-hook installer called from
@@ -607,6 +611,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 terminal::auto_response_fleet::reload_from_cache_at_boot();
                 terminal::auto_response_fleet::spawn_fetch_loop();
 
+                // Fleet auto-response matcher: a debounced poll of every live
+                // terminal's RENDERED VT grid. Scanning the rendered screen
+                // (not the raw byte stream) is what lets the engine see the
+                // rate-limit error inside a full-screen TUI like Claude Code,
+                // which paints each whole frame as one synchronized-output
+                // update; on a fresh on-screen match it submits the rule's
+                // prompt into that session after a per-rule backoff. See
+                // `terminal::auto_response`.
+                terminal::auto_response::spawn_grid_scan_loop();
+
                 // Plan 2026-05-19-coordinator-production-readiness.md
                 // Phase 1 — periodic primary-tree state publisher. These
                 // four tasks share one worker thread; they're all
@@ -618,6 +632,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // No-op unless COORD_SESSION_BUS_ENABLED is set (opt-in): it
                 // injects coord-queued messages into live session terminals.
                 session_bus::spawn_session_bus_executor();
+                // Hook-free, runner-side WIP-attribution capture (sibling of
+                // the tree publisher above). Reads each hosted session's Claude
+                // transcript forward-only and POSTs file-edit attribution to
+                // coord's /coord/wip-attribution. Gated OFF by default
+                // (COORD_SESSION_ATTRIBUTION_ENABLED) — no live consumer yet, so
+                // it's a no-op until armed. See `session_attribution`.
+                session_attribution::spawn_session_attribution();
                 // Ξ_Worktree census (Phase 1) — periodic disk-footprint
                 // + junction-status + volume-free-space census of every
                 // on-disk git worktree, POSTed to
@@ -2299,17 +2320,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     )),
                 ));
 
-                // Fleet auto-response watcher: every terminal PTY's output also
-                // flows through this hook, which matches fleet-configured regex
-                // rules against the (ANSI-stripped) output and submits each
-                // rule's prompt back into the SAME live session after a per-rule
-                // exponential backoff. Recovers a session stranded by the
-                // transient "Server is temporarily limiting requests" rate-limit
-                // message (distinct from a usage limit, handled above). See
-                // `terminal::auto_response` for the engine + scheduler.
-                term_for_session.interceptor().add_hook(Box::new(
-                    terminal::auto_response::AutoResponseWatchHook::new(),
-                ));
+                // (The fleet auto-response matcher is a grid-scan poller spawned
+                // earlier alongside the fleet fetch loop — it scans the rendered
+                // VT grid rather than this raw byte stream, so it can see text
+                // inside a full-screen TUI like Claude Code. See
+                // `terminal::auto_response::spawn_grid_scan_loop`.)
 
                 // Infrequent liveness poll for lazy close-detection. Every
                 // 45s it snapshots open lifecycle records against the live

@@ -128,9 +128,9 @@ pub fn detect_resources() -> Resources {
 /// machine.json (which used the old field name) still deserializes
 /// without manual migration.
 #[derive(Debug, Clone, Deserialize)]
-struct DeviceFile {
+pub(crate) struct DeviceFile {
     #[serde(alias = "machine_id")]
-    device_id: String,
+    pub(crate) device_id: String,
     hostname: String,
 }
 
@@ -138,7 +138,7 @@ fn device_file_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".qontinui").join("machine.json"))
 }
 
-fn load_device_file() -> Option<DeviceFile> {
+pub(crate) fn load_device_file() -> Option<DeviceFile> {
     let path = device_file_path()?;
     let bytes = std::fs::read(&path).ok()?;
     serde_json::from_slice(&bytes).ok()
@@ -308,7 +308,7 @@ fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
 /// Unlike those resolvers this deliberately returns `None` (rather than
 /// defaulting to `http://localhost:9870`) when nothing is configured, so the
 /// heartbeat cleanly skips instead of spamming connection errors every tick.
-fn coord_http_base() -> Option<String> {
+pub(crate) fn coord_http_base() -> Option<String> {
     // Delegates to the shared resolver, preserving the deliberate `None`
     // (rather than localhost) when nothing is configured, so the heartbeat
     // cleanly skips instead of spamming connection errors every tick.
@@ -1030,6 +1030,81 @@ struct TreeStatePayload {
 /// this is silently truncated; `dirty=true` still flags the tree.
 const MAX_DIRTY_FILES_REPORTED: usize = 50;
 
+/// Machine-local artifacts the runner drops into a managed repo's working
+/// tree: the per-session coord-mcp proxy `.mcp.json` (holds device-scoped
+/// proxy keys — must never be committed) and the `agent-worktrees/` /
+/// `.agent-worktrees/` checkout roots. Left untracked they make `capture_tree`
+/// report `dirty=true`, which on a default branch yields a permanent
+/// `wip_on_default` Hold from the pull-decision watcher — silently wedging the
+/// repo-pull executor. We exclude them per-repo via `.git/info/exclude` (see
+/// [`ensure_repo_info_exclude`]) rather than a committed `.gitignore`, so the
+/// heal is machine-local (no per-repo PR) and a secrets file never enters git
+/// history at all.
+const MANAGED_REPO_EXCLUDES: &[&str] = &[".mcp.json", "agent-worktrees/", ".agent-worktrees/"];
+
+/// Header line bracketing the runner-managed block in a repo's
+/// `.git/info/exclude` — lets the operator see who added the entries.
+const MANAGED_EXCLUDE_MARKER: &str = "# qontinui-runner: machine-local artifacts (auto-excluded)";
+
+/// Idempotently ensure `<repo>/.git/info/exclude` ignores the runner's
+/// machine-local artifacts ([`MANAGED_REPO_EXCLUDES`]). `.git/info/exclude` is
+/// git's per-repo, NON-tracked ignore file: it hides matching UNTRACKED paths
+/// exactly like `.gitignore` but without a tracked edit (which would itself
+/// dirty the tree). Because exclusion applies to any matching untracked path
+/// regardless of when it appeared, calling this every publish cycle also heals
+/// repos that ALREADY have the stray files — so no `.gitignore` sweep is needed.
+///
+/// Only PRIMARY checkouts (`.git` is a directory) are handled; a linked
+/// worktree's `.git` is a file pointing elsewhere, so we skip it (the publisher
+/// walks primary trees anyway). Best-effort: any IO error is swallowed — a
+/// missed exclude just means the tree reads dirty for one more cycle, never a
+/// panic.
+fn ensure_repo_info_exclude(repo_path: &std::path::Path) {
+    // `.git` as a directory == primary checkout. Skip worktree `.git` files
+    // and bare/odd layouts.
+    if !repo_path.join(".git").is_dir() {
+        return;
+    }
+    let info_dir = repo_path.join(".git").join("info");
+    let exclude_path = info_dir.join("exclude");
+    let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+
+    // Match on whole (trimmed) lines so a substring like `.mcp.json.bak` never
+    // counts as already-covered.
+    let present: std::collections::HashSet<&str> = existing.lines().map(|l| l.trim()).collect();
+    let missing: Vec<&str> = MANAGED_REPO_EXCLUDES
+        .iter()
+        .copied()
+        .filter(|pat| !present.contains(*pat))
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    // Capture marker presence before `existing` is moved into `out` below;
+    // `missing` holds 'static patterns so it doesn't borrow `existing`.
+    let marker_present = present.contains(MANAGED_EXCLUDE_MARKER);
+
+    if let Err(e) = std::fs::create_dir_all(&info_dir) {
+        debug!("fleet::ensure_repo_info_exclude: create_dir_all {info_dir:?} failed: {e}");
+        return;
+    }
+    let mut out = existing;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if !marker_present {
+        out.push_str(MANAGED_EXCLUDE_MARKER);
+        out.push('\n');
+    }
+    for pat in missing {
+        out.push_str(pat);
+        out.push('\n');
+    }
+    if let Err(e) = std::fs::write(&exclude_path, out) {
+        debug!("fleet::ensure_repo_info_exclude: write {exclude_path:?} failed: {e}");
+    }
+}
+
 /// Resolve the root directory the publisher walks for qontinui-* repos.
 /// `QONTINUI_ROOT` env override → `D:/qontinui-root` on Windows →
 /// `$HOME/qontinui-root` on unix. Returns `None` if neither resolves to
@@ -1187,11 +1262,14 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     };
 
     // behind_count: commits HEAD is behind `origin/<branch>` (or
-    // `origin/main` when detached/no branch). Uses last-fetched remote
-    // state — no `git fetch` is performed here (publisher runs every
-    // 60s; an implicit fetch every cycle would be too aggressive).
-    // The operator's normal `git fetch` / `pull-all` cadence keeps the
-    // remote refs current.
+    // `origin/main` when detached/no branch). Uses remote-tracking refs
+    // (`origin/*`) — `capture_tree` itself performs no `git fetch`, so it
+    // stays pure and fast. Freshness is the publisher's job: it runs an
+    // explicit periodic `git fetch origin` (no refspec — touches only
+    // `origin/*`, never the working tree) BEFORE this capture, gated by
+    // `COORD_TREE_FETCH_INTERVAL_SECS` (see `publish_tree_state`). On a
+    // no-manual-coding machine that explicit fetch is what keeps these
+    // behind-counts honest.
     let remote_ref = if head_detached.unwrap_or(false) || branch == "(detached)" {
         "origin/main".to_string()
     } else {
@@ -1386,6 +1464,99 @@ fn pull_executor_enabled() -> bool {
         .ok()
         .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
         .unwrap_or(true)
+}
+
+// =============================================================================
+// Always-on safe remote-ref refresh (repo-freshness plan, Layer 1)
+//
+// `capture_tree`'s behind-counts are computed against remote-tracking refs
+// (`origin/*`). On a machine where nobody runs `git fetch`/`pull-all` by hand,
+// those refs go stale and every behind-count silently reads 0. The publisher
+// therefore runs a best-effort `git fetch origin` (NO refspec — updates only
+// `origin/*` remote-tracking refs; never touches the working tree or any local
+// branch ref) before each repo's `capture_tree`. `--prune` drops deleted remote
+// branches so stale `origin/<merged-feature>` refs don't linger.
+//
+// Frequency is gated by `COORD_TREE_FETCH_INTERVAL_SECS` (defaults to the
+// publish interval `COORD_TREE_PUBLISH_INTERVAL_SECS`, default 60, floor 5) so
+// an operator can throttle fetch independently of publication. The gate is a
+// real throttle, not a kill switch — the default fetches every publish cycle.
+// =============================================================================
+
+/// Resolve the per-repo fetch interval. Reads `COORD_TREE_FETCH_INTERVAL_SECS`,
+/// falling back to `COORD_TREE_PUBLISH_INTERVAL_SECS`, then 60; floored at 5s.
+fn tree_fetch_interval() -> Duration {
+    let secs: u64 = std::env::var("COORD_TREE_FETCH_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| {
+            std::env::var("COORD_TREE_PUBLISH_INTERVAL_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(60)
+        .max(5);
+    Duration::from_secs(secs)
+}
+
+/// Process-global per-repo last-fetch timestamps for the interval gate.
+fn last_fetch_at(
+) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, std::time::Instant>> {
+    static LAST_FETCH: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    LAST_FETCH.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// True when `repo_path` is due a fetch (never fetched, or last fetch is at
+/// least `tree_fetch_interval()` ago). Records `now` as the attempt time when
+/// it returns true, so concurrent/back-to-back ticks don't double-fetch.
+fn fetch_due(repo_path: &std::path::Path, now: std::time::Instant) -> bool {
+    let interval = tree_fetch_interval();
+    let mut map = match last_fetch_at().lock() {
+        Ok(m) => m,
+        Err(p) => p.into_inner(),
+    };
+    let due = match map.get(repo_path) {
+        Some(prev) => now.duration_since(*prev) >= interval,
+        None => true,
+    };
+    if due {
+        map.insert(repo_path.to_path_buf(), now);
+    }
+    due
+}
+
+/// Best-effort `git -C <path> fetch origin --prune` (no refspec). Blocking git;
+/// call from a blocking context. Non-zero/spawn errors `warn!` and return — a
+/// stale ref is no worse than skipping the fetch entirely.
+fn fetch_remote_refs_blocking(repo_path: &std::path::Path) {
+    use std::process::Command;
+    let path_str = match repo_path.to_str() {
+        Some(s) => s,
+        None => return,
+    };
+    match Command::new("git")
+        .args(["-C", path_str, "fetch", "origin", "--prune"])
+        .output()
+    {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let excerpt: String = stderr.trim().chars().take(200).collect();
+            warn!(
+                "fleet::tree_publisher: git fetch origin in {} failed ({}): {excerpt}",
+                repo_path.display(),
+                o.status
+            );
+        }
+        Err(e) => {
+            warn!(
+                "fleet::tree_publisher: git fetch origin in {} could not spawn: {e}",
+                repo_path.display()
+            );
+        }
+    }
 }
 
 /// Resolve a repo's default branch from `origin/HEAD` (`origin/main` -> `main`),
@@ -2195,11 +2366,29 @@ pub async fn publish_tree_state() -> Result<(), String> {
         // this removes the starvation at its source). A panic inside the
         // closure surfaces as a JoinError → treated as a skip, same as
         // capture_tree returning None.
+        // Always-on safe remote-ref refresh: refresh `origin/*` (no refspec,
+        // working tree untouched) before capturing so behind-counts are honest
+        // on machines with no manual `git fetch` cadence. Interval-gated by
+        // COORD_TREE_FETCH_INTERVAL_SECS; best-effort (failures warn, never
+        // fail the cycle). Runs on the blocking pool like capture_tree below.
+        if fetch_due(&path, std::time::Instant::now()) {
+            let fetch_path = path.clone();
+            let _ =
+                tokio::task::spawn_blocking(move || fetch_remote_refs_blocking(&fetch_path)).await;
+        }
+
         let capture_path = path.clone();
-        let mut payload = match tokio::task::spawn_blocking(move || capture_tree(&capture_path))
-            .await
-            .ok()
-            .flatten()
+        let mut payload = match tokio::task::spawn_blocking(move || {
+            // Heal machine-local artifacts into `.git/info/exclude` BEFORE
+            // capturing, so this cycle's dirty/verdict already reflects it —
+            // otherwise the stray `.mcp.json` would pin the tree to a
+            // `wip_on_default` Hold and the pull below would never fire.
+            ensure_repo_info_exclude(&capture_path);
+            capture_tree(&capture_path)
+        })
+        .await
+        .ok()
+        .flatten()
         {
             Some(p) => p,
             None => {
@@ -2255,9 +2444,16 @@ pub async fn publish_tree_state() -> Result<(), String> {
             && payload.branch != "main"
             && payload.branch != "master"
             && path.join(".git").is_dir();
+        // behind_default_count covers the feature-branch-behind-origin/main
+        // case: a checkout parked on a (possibly merged) named branch reads
+        // behind_count 0 against its own static remote ref yet may be far
+        // behind origin/<default>. coord answers that with a safe DefaultRefSync
+        // (`git fetch origin <default>:<default>`, working tree untouched).
         if upsert_ok
             && pull_executor_enabled()
-            && (payload.behind_count.unwrap_or(0) > 0 || restore_candidate)
+            && (payload.behind_count.unwrap_or(0) > 0
+                || payload.behind_default_count.unwrap_or(0) > 0
+                || restore_candidate)
         {
             request_and_apply_pull(&client, &base, device_id, path.clone(), &payload).await;
         }
@@ -2303,6 +2499,37 @@ pub fn spawn_tree_publisher() {
 mod tests {
     use super::*;
 
+    // ---- repo-freshness Layer 1 — fetch interval gate ----
+
+    #[test]
+    fn fetch_due_first_call_true_then_immediate_false() {
+        // Unique path so the process-global last-fetch map can't collide with
+        // another test. The interval is >= 5s for any env config, so an
+        // immediately-following call is never due regardless of the knob.
+        let p = std::path::PathBuf::from(format!(
+            "/tmp/freshness-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let t0 = std::time::Instant::now();
+        // Never-fetched repo is due, and records the attempt.
+        assert!(fetch_due(&p, t0), "first call should be due");
+        // A call right after (well inside the >=5s interval) is not due.
+        assert!(
+            !fetch_due(&p, std::time::Instant::now()),
+            "immediate re-call should not be due"
+        );
+    }
+
+    #[test]
+    fn tree_fetch_interval_floored_at_5s() {
+        // Even with no env set the default is 60s; the floor guarantees >= 5s.
+        assert!(tree_fetch_interval() >= Duration::from_secs(5));
+    }
+
     // ---- chkguard Phase 3 — restore_default executor (real temp git) ----
 
     /// Run git in `dir`, asserting success. Identity pinned per-invocation so
@@ -2328,6 +2555,61 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn ensure_repo_info_exclude_heals_existing_untracked_artifacts() {
+        let dir =
+            std::env::temp_dir().join(format!("fleet-exclude-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        tgit(&dir, &["init", "-b", "main"]);
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        tgit(&dir, &["add", "."]);
+        tgit(&dir, &["commit", "-m", "A"]);
+
+        // The stray machine artifacts already present BEFORE we exclude — the
+        // retroactive-heal case that obviates a `.gitignore` sweep.
+        std::fs::write(dir.join(".mcp.json"), "{}").unwrap();
+        std::fs::create_dir_all(dir.join("agent-worktrees")).unwrap();
+        std::fs::write(dir.join("agent-worktrees").join("x"), "x").unwrap();
+        assert!(
+            tgit(&dir, &["status", "--porcelain"]).contains(".mcp.json"),
+            "precondition: artifacts make the tree dirty before excluding"
+        );
+
+        ensure_repo_info_exclude(&dir);
+
+        assert!(
+            tgit(&dir, &["status", "--porcelain"]).is_empty(),
+            "tree must read clean once artifacts are excluded"
+        );
+        let exclude =
+            std::fs::read_to_string(dir.join(".git").join("info").join("exclude")).unwrap();
+        assert!(exclude.contains(".mcp.json") && exclude.contains("agent-worktrees/"));
+
+        // Idempotent: a second pass changes nothing (no duplicate lines/marker).
+        let first = exclude;
+        ensure_repo_info_exclude(&dir);
+        let second =
+            std::fs::read_to_string(dir.join(".git").join("info").join("exclude")).unwrap();
+        assert_eq!(first, second, "second call must be a no-op");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_repo_info_exclude_skips_linked_worktree() {
+        // A dir whose `.git` is a FILE (linked-worktree shape) is skipped so we
+        // never write into a shared/foreign git dir.
+        let dir = std::env::temp_dir().join(format!(
+            "fleet-exclude-wt-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".git"), "gitdir: /somewhere/else").unwrap();
+        ensure_repo_info_exclude(&dir); // must not panic
+        assert!(!dir.join(".git").join("info").join("exclude").exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A parked-on-squash-merged-branch fixture: a bare origin whose `main`

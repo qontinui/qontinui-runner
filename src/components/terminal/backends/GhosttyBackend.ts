@@ -94,12 +94,28 @@ export class GhosttyBackend implements ITerminalBackend {
     return { dispose() {} };
   }
 
+  get bracketedPasteMode(): boolean {
+    // ghostty-web mirrors xterm's `modes` object on builds that expose it;
+    // guard so a build without it degrades to unbracketed paste instead of
+    // throwing.
+    const t = this.term as unknown as { modes?: { bracketedPasteMode?: boolean } };
+    return t.modes?.bracketedPasteMode ?? false;
+  }
+
   getSelection(): string {
     return this.term.getSelection();
   }
 
   hasSelection(): boolean {
     return this.term.hasSelection();
+  }
+
+  clearSelection(): void {
+    // Guard: degrade to a no-op on a ghostty-web build without clearSelection
+    // rather than throwing (the right-click copy still lands; only the visual
+    // deselect is skipped).
+    const t = this.term as unknown as { clearSelection?: () => void };
+    t.clearSelection?.();
   }
 
   onSelectionChange(cb: () => void): IDisposable {
