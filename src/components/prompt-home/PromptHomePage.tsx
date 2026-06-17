@@ -150,6 +150,16 @@ export function PromptHomePage() {
           <input
             ref={inputRef}
             type="text"
+            // D3 — the visible command-entry affordance on the home
+            // surface. The TerminalPage CommandBar footer is `display:none`
+            // (bbox 0x0) whenever the terminal tab isn't active, so on
+            // prompt-home it can't be the command input a driver targets.
+            // This search box IS the home command input; tagging it
+            // `command-input` makes a UI-Bridge snapshot on prompt-home
+            // surface a visible (bbox>0) command input — e.g. for the NL
+            // flow "open an ai session in the terminal page".
+            data-page-element="command-input"
+            data-testid="command-input"
             value={input}
             onChange={(e) => setInput(e.target.value)}
             placeholder="What would you like to do?"
