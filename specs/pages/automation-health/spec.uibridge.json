@@ -119,7 +119,7 @@
         }
       ],
       "category": "element-presence",
-      "description": "The dashboard is accessible via the 'Automation Health' item in the OBSERVE sidebar group. It appears alongside LLM Analytics, Reflection, and other observability views. The sidebar item shows an Activity icon with green accent (#10B981).",
+      "description": "The dashboard is accessible via the 'Automation Health' item in the INSIGHTS sidebar group, alongside Reflection and other analysis views. As of the 2026-06 lean IA it is demoted behind the 'Show advanced automation features' toggle (Settings → General) and is not in the default sidebar. The sidebar item shows an Activity icon with green accent (#10B981).",
       "id": "health-navigation",
       "name": "Navigation and Tab Access",
       "source": "migrated"
@@ -899,7 +899,7 @@
         "transitions": []
       },
       {
-        "description": "The dashboard is accessible via the 'Automation Health' item in the OBSERVE sidebar group. It appears alongside LLM Analytics, Reflection, and other observability views. The sidebar item shows an Activity icon with green accent (#10B981).",
+        "description": "The dashboard is accessible via the 'Automation Health' item in the INSIGHTS sidebar group, alongside Reflection and other analysis views. As of the 2026-06 lean IA it is demoted behind the 'Show advanced automation features' toggle (Settings → General) and is not in the default sidebar. The sidebar item shows an Activity icon with green accent (#10B981).",
         "elements": [
           {
             "role": "button",

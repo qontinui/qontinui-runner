@@ -6,7 +6,7 @@
                    {
                        "id":  "timeline-navigation",
                        "name":  "Page Navigation",
-                       "description":  "The Activity Timeline lives under the Observe sidebar group and is a runner-only page. Users navigate to it by clicking \u0027Activity Timeline\u0027 in the sidebar.",
+                       "description":  "The Activity Timeline is a runner-only page in the INSIGHTS sidebar group, demoted behind the advanced-automation toggle in the lean default sidebar. Users navigate to it by clicking \u0027Activity Timeline\u0027 in the sidebar.",
                        "provenance":  {
                                           "source":  "migrated"
                                       },
@@ -262,7 +262,7 @@
                    {
                        "id":  "timeline-implementation",
                        "name":  "Implementation Details",
-                       "description":  "Frontend: ActivityTimelinePanel (React, components/activity-timeline/ActivityTimelinePanel.tsx) uses useState for query, results, stats, loading, searched, showFilters, appFilter, sourceFilter. Search invokes Tauri command \u0027search_activity_timeline\u0027 or \u0027search_activity_timeline_filtered\u0027 depending on filter state. Stats fetched via \u0027get_activity_timeline_stats\u0027. Results rendered as bordered cards with color-coded source badges (blue=ui_bridge, green=accessibility, amber=ocr). The component is lazy-loaded in TabContent.tsx. Tab ID \u0027activity-timeline\u0027 registered in tab-types.ts. Sidebar item in qontinui-navigation/src/groups.ts under OBSERVE_ITEMS with Activity icon and #06B6D4 cyan color. BackgroundObserver service (services/background-observer-service.ts) wraps BackgroundObserver class, calls getGlobalRegistry().captureSnapshot() for control snapshots, and invokes insert_activity_entry Tauri command to persist captures. Hash computation uses crypto.subtle SHA-256 with FNV-1a fallback for non-secure (HTTP) contexts.",
+                       "description":  "Frontend: ActivityTimelinePanel (React, components/activity-timeline/ActivityTimelinePanel.tsx) uses useState for query, results, stats, loading, searched, showFilters, appFilter, sourceFilter. Search invokes Tauri command \u0027search_activity_timeline\u0027 or \u0027search_activity_timeline_filtered\u0027 depending on filter state. Stats fetched via \u0027get_activity_timeline_stats\u0027. Results rendered as bordered cards with color-coded source badges (blue=ui_bridge, green=accessibility, amber=ocr). The component is lazy-loaded in TabContent.tsx. Tab ID \u0027activity-timeline\u0027 registered in tab-types.ts. Sidebar item in qontinui-navigation/src/groups.ts under INSIGHTS_ITEMS (hidden: true — revealed by the 'Show advanced automation features' toggle) with Activity icon and #06B6D4 cyan color. BackgroundObserver service (services/background-observer-service.ts) wraps BackgroundObserver class, calls getGlobalRegistry().captureSnapshot() for control snapshots, and invokes insert_activity_entry Tauri command to persist captures. Hash computation uses crypto.subtle SHA-256 with FNV-1a fallback for non-secure (HTTP) contexts.",
                        "provenance":  {
                                           "source":  "migrated"
                                       },

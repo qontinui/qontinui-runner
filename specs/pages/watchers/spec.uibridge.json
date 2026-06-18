@@ -22,7 +22,7 @@
         }
       ],
       "category": "element-presence",
-      "description": "The Watchers page is under the Observe sidebar group, adjacent to Activity Timeline. It is a runner-only page.",
+      "description": "The Watchers page is in the AUTOMATE sidebar group (alongside Scheduled Tasks and Triggers). As of the 2026-06 lean IA it is demoted behind the 'Show advanced automation features' toggle (Settings → General) and is not in the default sidebar. It is a runner-only page.",
       "id": "watchers-navigation",
       "name": "Page Navigation",
       "source": "migrated"
@@ -671,7 +671,7 @@
     {
       "assertions": [],
       "category": "element-presence",
-      "description": "Frontend: WatcherManagementPanel (React, components/activity-timeline/WatcherManagementPanel.tsx) uses useState for watchers list, showForm toggle, form data, editingId, and loading state. useEffect calls loadWatchers() on mount via list_watchers Tauri command. Form defaults: name='', timelineQuery='', scheduleInterval='5 minutes', lookbackWindow='15 minutes', actionType='LogOnly', reasoningPrompt=default template with placeholders. Create calls create_watcher with JSON-serialized schedule ({type:'interval',value:scheduleInterval}) and action ({type:actionType}). Toggle calls set_watcher_enabled with inverted boolean. Delete calls delete_watcher. All mutations call loadWatchers() after completion. The component is lazy-loaded in TabContent.tsx. Tab ID 'watchers' registered in tab-types.ts. Sidebar item in qontinui-navigation/src/groups.ts under OBSERVE_ITEMS with Eye icon and #06B6D4 cyan color, runner-only platform. Watcher cards rendered with border-border, hover:bg-accent/50. Enabled toggle uses ToggleRight (text-green-500), disabled uses ToggleLeft (default muted). Delete button uses hover:text-destructive. Query displayed in code element with bg-muted.",
+      "description": "Frontend: WatcherManagementPanel (React, components/activity-timeline/WatcherManagementPanel.tsx) uses useState for watchers list, showForm toggle, form data, editingId, and loading state. useEffect calls loadWatchers() on mount via list_watchers Tauri command. Form defaults: name='', timelineQuery='', scheduleInterval='5 minutes', lookbackWindow='15 minutes', actionType='LogOnly', reasoningPrompt=default template with placeholders. Create calls create_watcher with JSON-serialized schedule ({type:'interval',value:scheduleInterval}) and action ({type:actionType}). Toggle calls set_watcher_enabled with inverted boolean. Delete calls delete_watcher. All mutations call loadWatchers() after completion. The component is lazy-loaded in TabContent.tsx. Tab ID 'watchers' registered in tab-types.ts. Sidebar item in qontinui-navigation/src/groups.ts under AUTOMATE_ITEMS (hidden: true — revealed by the 'Show advanced automation features' toggle) with Eye icon and #06B6D4 cyan color, runner-only platform. Watcher cards rendered with border-border, hover:bg-accent/50. Enabled toggle uses ToggleRight (text-green-500), disabled uses ToggleLeft (default muted). Delete button uses hover:text-destructive. Query displayed in code element with bg-muted.",
       "id": "watchers-implementation",
       "name": "Implementation Details",
       "source": "migrated"
@@ -679,7 +679,7 @@
     {
       "assertions": [],
       "category": "element-presence",
-      "description": "Watchers depend entirely on the activity timeline for their data source. A watcher's timeline_query is executed against the same activity_timeline PostgreSQL table that the Activity Timeline page searches. The three capture sources that feed the timeline (BackgroundObserver, Python bridge, BackgroundCaptureService) indirectly feed watchers. The lookback_window determines how far back a watcher searches, preventing it from reasoning over stale data. Watchers and the Activity Timeline share the same Observe sidebar group and are positioned adjacent to each other in the navigation.",
+      "description": "Watchers depend entirely on the activity timeline for their data source. A watcher's timeline_query is executed against the same activity_timeline PostgreSQL table that the Activity Timeline page searches. The three capture sources that feed the timeline (BackgroundObserver, Python bridge, BackgroundCaptureService) indirectly feed watchers. The lookback_window determines how far back a watcher searches, preventing it from reasoning over stale data. Watchers and the Activity Timeline are both demoted behind the advanced-automation toggle in the lean default sidebar (Watchers in AUTOMATE, Activity Timeline in INSIGHTS).",
       "id": "watchers-relationship-to-timeline",
       "name": "Relationship to Activity Timeline",
       "source": "migrated"
@@ -698,7 +698,7 @@
   "stateMachine": {
     "states": [
       {
-        "description": "The Watchers page is under the Observe sidebar group, adjacent to Activity Timeline. It is a runner-only page.",
+        "description": "The Watchers page is in the AUTOMATE sidebar group (alongside Scheduled Tasks and Triggers). As of the 2026-06 lean IA it is demoted behind the 'Show advanced automation features' toggle (Settings → General) and is not in the default sidebar. It is a runner-only page.",
         "elements": [
           {
             "textContent": "Watchers"
@@ -847,7 +847,7 @@
         "transitions": []
       },
       {
-        "description": "Frontend: WatcherManagementPanel (React, components/activity-timeline/WatcherManagementPanel.tsx) uses useState for watchers list, showForm toggle, form data, editingId, and loading state. useEffect calls loadWatchers() on mount via list_watchers Tauri command. Form defaults: name='', timelineQuery='', scheduleInterval='5 minutes', lookbackWindow='15 minutes', actionType='LogOnly', reasoningPrompt=default template with placeholders. Create calls create_watcher with JSON-serialized schedule ({type:'interval',value:scheduleInterval}) and action ({type:actionType}). Toggle calls set_watcher_enabled with inverted boolean. Delete calls delete_watcher. All mutations call loadWatchers() after completion. The component is lazy-loaded in TabContent.tsx. Tab ID 'watchers' registered in tab-types.ts. Sidebar item in qontinui-navigation/src/groups.ts under OBSERVE_ITEMS with Eye icon and #06B6D4 cyan color, runner-only platform. Watcher cards rendered with border-border, hover:bg-accent/50. Enabled toggle uses ToggleRight (text-green-500), disabled uses ToggleLeft (default muted). Delete button uses hover:text-destructive. Query displayed in code element with bg-muted.",
+        "description": "Frontend: WatcherManagementPanel (React, components/activity-timeline/WatcherManagementPanel.tsx) uses useState for watchers list, showForm toggle, form data, editingId, and loading state. useEffect calls loadWatchers() on mount via list_watchers Tauri command. Form defaults: name='', timelineQuery='', scheduleInterval='5 minutes', lookbackWindow='15 minutes', actionType='LogOnly', reasoningPrompt=default template with placeholders. Create calls create_watcher with JSON-serialized schedule ({type:'interval',value:scheduleInterval}) and action ({type:actionType}). Toggle calls set_watcher_enabled with inverted boolean. Delete calls delete_watcher. All mutations call loadWatchers() after completion. The component is lazy-loaded in TabContent.tsx. Tab ID 'watchers' registered in tab-types.ts. Sidebar item in qontinui-navigation/src/groups.ts under AUTOMATE_ITEMS (hidden: true — revealed by the 'Show advanced automation features' toggle) with Eye icon and #06B6D4 cyan color, runner-only platform. Watcher cards rendered with border-border, hover:bg-accent/50. Enabled toggle uses ToggleRight (text-green-500), disabled uses ToggleLeft (default muted). Delete button uses hover:text-destructive. Query displayed in code element with bg-muted.",
         "elements": [],
         "id": "watchers-implementation",
         "isInitial": false,
@@ -855,7 +855,7 @@
         "transitions": []
       },
       {
-        "description": "Watchers depend entirely on the activity timeline for their data source. A watcher's timeline_query is executed against the same activity_timeline PostgreSQL table that the Activity Timeline page searches. The three capture sources that feed the timeline (BackgroundObserver, Python bridge, BackgroundCaptureService) indirectly feed watchers. The lookback_window determines how far back a watcher searches, preventing it from reasoning over stale data. Watchers and the Activity Timeline share the same Observe sidebar group and are positioned adjacent to each other in the navigation.",
+        "description": "Watchers depend entirely on the activity timeline for their data source. A watcher's timeline_query is executed against the same activity_timeline PostgreSQL table that the Activity Timeline page searches. The three capture sources that feed the timeline (BackgroundObserver, Python bridge, BackgroundCaptureService) indirectly feed watchers. The lookback_window determines how far back a watcher searches, preventing it from reasoning over stale data. Watchers and the Activity Timeline are both demoted behind the advanced-automation toggle in the lean default sidebar (Watchers in AUTOMATE, Activity Timeline in INSIGHTS).",
         "elements": [],
         "id": "watchers-relationship-to-timeline",
         "isInitial": false,

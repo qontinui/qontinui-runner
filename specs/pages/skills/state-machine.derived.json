@@ -104,7 +104,7 @@
                                               "enabled":  true
                                           }
                                       ],
-                       "description":  "The Skills page is reachable from the runner sidebar under the OBSERVE navigation group, positioned after Meta-Optimizer. The sidebar entry uses a Zap icon with amber (#F59E0B) color. The tab ID is \u0027skills\u0027 and the page is lazy-loaded via React.lazy.",
+                       "description":  "The Skills page is reachable from the runner sidebar under the DEV navigation group (dev-only, hiddenInProd), positioned after Meta-Optimizer. The sidebar entry uses a Zap icon with amber (#F59E0B) color. The tab ID is \u0027skills\u0027 and the page is lazy-loaded via React.lazy.",
                        "provenance":  {
                                           "source":  "migrated"
                                       }
