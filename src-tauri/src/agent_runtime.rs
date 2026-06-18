@@ -2261,6 +2261,14 @@ async fn run_agent_subprocess(
     // blind overwrite is safe here (no pre-existing user config to clobber).
     crate::coord_mcp::write_coord_mcp_config(&primary_wt, &payload.jwt);
 
+    // Provision the named-subagent defs into the spawned worktree's cwd so the
+    // headless `claude` can resolve subagents the spawn prompt references
+    // (merge-specialist, repo-auditor, ...). Fail-soft: a copy error here must
+    // not abort an otherwise-launchable spawn — the agent just lacks subagents.
+    if let Err(e) = provision_agent_definitions(&primary_wt) {
+        warn!("agent_runtime: agent-def provisioning errored (continuing spawn): {e:#}");
+    }
+
     let log_path = agent_log_path(payload.agent_id);
 
     // Step 2: heartbeat task — runs for the agent's whole life.
@@ -2438,6 +2446,100 @@ async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
             wt.repo, wt.worktree_path
         );
     }
+    Ok(())
+}
+
+/// Provision the named-subagent definitions (`.claude/agents/*.md`) into a
+/// freshly-materialized agent worktree so headless `claude` (cwd = the
+/// worktree) can resolve the subagents an auto-spawned review prompt references
+/// (e.g. "Invoke the `merge-specialist` subagent").
+///
+/// Without this, a spawned agent worktree is a bare `git worktree add` with no
+/// `.claude/agents/` dir; `claude` cannot resolve the named subagent → the
+/// review never runs → coord ages the PR out as `specialist_timeout`. This
+/// affects ALL auto-spawned agents (merge-specialist, repo-auditor, ...).
+///
+/// Source: `<qontinui_root>/qontinui-claude-config/.claude/agents/*.md`. We
+/// COPY (not symlink) — this runs on Windows where symlink creation needs
+/// privilege/dev-mode; a copy is robust cross-platform. We copy ONLY the agent
+/// `*.md` defs, NOT the whole `.claude` tree (avoid pulling in settings/hooks/
+/// mcp that could alter spawn behavior).
+///
+/// Fail-soft: if the source dir is missing we `warn` and return Ok — the agent
+/// then simply lacks subagents (same as before this fix; no regression). The
+/// fleet-portability follow-up is to BUNDLE these defs into the runner binary
+/// (`include_str!`) so non-operator devices without a `qontinui-claude-config`
+/// checkout still get them; this copy-from-checkout path unblocks the current
+/// operator fleet.
+fn provision_agent_definitions(worktree_cwd: &str) -> anyhow::Result<()> {
+    let Some(root) = qontinui_root_dir() else {
+        warn!(
+            "agent_runtime: no qontinui-root resolved; skipping .claude/agents \
+             provisioning for {worktree_cwd} (auto-spawned subagents will not resolve)"
+        );
+        return Ok(());
+    };
+    provision_agent_definitions_from_root(&root, worktree_cwd)
+}
+
+/// Core of [`provision_agent_definitions`] with the qontinui-root passed in
+/// explicitly (so tests can drive it deterministically without mutating the
+/// process-global `QONTINUI_ROOT` env). See that wrapper for full rationale.
+fn provision_agent_definitions_from_root(root: &Path, worktree_cwd: &str) -> anyhow::Result<()> {
+    let src_dir = root
+        .join("qontinui-claude-config")
+        .join(".claude")
+        .join("agents");
+    if !src_dir.is_dir() {
+        warn!(
+            "agent_runtime: claude-config agents dir not found at {}; skipping \
+             .claude/agents provisioning (auto-spawned subagents will not resolve)",
+            src_dir.display()
+        );
+        return Ok(());
+    }
+    let dst_dir = Path::new(worktree_cwd).join(".claude").join("agents");
+    std::fs::create_dir_all(&dst_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "create {} for agent-def provisioning: {e}",
+            dst_dir.display()
+        )
+    })?;
+    let mut copied = 0usize;
+    for entry in std::fs::read_dir(&src_dir)
+        .map_err(|e| anyhow::anyhow!("read agents dir {}: {e}", src_dir.display()))?
+    {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("agent_runtime: skipping unreadable agents entry: {e}");
+                continue;
+            }
+        };
+        let path = entry.path();
+        // Only the agent-def `*.md` files; ignore subdirs and other files.
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        let dst = dst_dir.join(name);
+        // Idempotent: overwrite is fine (std::fs::copy truncates the target).
+        if let Err(e) = std::fs::copy(&path, &dst) {
+            warn!(
+                "agent_runtime: failed to copy agent def {} -> {}: {e}",
+                path.display(),
+                dst.display()
+            );
+            continue;
+        }
+        copied += 1;
+    }
+    info!(
+        "agent_runtime: provisioned {copied} subagent def(s) into {}",
+        dst_dir.display()
+    );
     Ok(())
 }
 
@@ -3272,6 +3374,64 @@ mod tests {
         let p = local_worktree_path(root, uuid::Uuid::nil(), "qontinui/qontinui-runner");
         assert!(p.ends_with(Path::new("qontinui-runner")));
         assert!(p.to_string_lossy().contains(".agent-worktrees"));
+    }
+
+    #[test]
+    fn provision_agent_defs_copies_md_files() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root
+            .path()
+            .join("qontinui-claude-config")
+            .join(".claude")
+            .join("agents");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("merge-specialist.md"), "# merge-specialist").unwrap();
+        std::fs::write(src.join("repo-auditor.md"), "# repo-auditor").unwrap();
+        // A non-md file must NOT be copied.
+        std::fs::write(src.join("settings.json"), "{}").unwrap();
+
+        let wt = tempfile::tempdir().unwrap();
+        let wt_cwd = wt.path().to_string_lossy().into_owned();
+
+        provision_agent_definitions_from_root(root.path(), &wt_cwd).unwrap();
+
+        let dst = wt.path().join(".claude").join("agents");
+        assert!(
+            dst.join("merge-specialist.md").is_file(),
+            "merge-specialist.md must be provisioned"
+        );
+        assert!(
+            dst.join("repo-auditor.md").is_file(),
+            "all agent *.md defs must be copied"
+        );
+        assert!(
+            !dst.join("settings.json").exists(),
+            "non-md files must NOT be copied"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("merge-specialist.md")).unwrap(),
+            "# merge-specialist"
+        );
+
+        // Idempotent: a second run over the same dst overwrites cleanly.
+        provision_agent_definitions_from_root(root.path(), &wt_cwd).unwrap();
+        assert!(dst.join("merge-specialist.md").is_file());
+    }
+
+    #[test]
+    fn provision_agent_defs_missing_source_is_soft() {
+        // qontinui-root exists but has no qontinui-claude-config/.claude/agents:
+        // must log+continue (Ok), creating nothing — no regression vs today.
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let wt_cwd = wt.path().to_string_lossy().into_owned();
+
+        let res = provision_agent_definitions_from_root(root.path(), &wt_cwd);
+        assert!(res.is_ok(), "missing source dir must fail soft (Ok)");
+        assert!(
+            !wt.path().join(".claude").exists(),
+            "no .claude tree should be created when source is missing"
+        );
     }
 
     #[test]
