@@ -2062,6 +2062,8 @@ async fn run_continuation_terminal(
         // Matches the `--session-id` in the spawn argv → synchronous record.
         claude_session_id: Some(pinned_session_id),
         zone_index: None,
+        // Autonomous gate continuation → pin the agent git identity on the PTY.
+        inject_agent_git_identity: true,
     });
 
     // Provision `.mcp.json` so this continuation can reach coord coordination
@@ -2735,6 +2737,106 @@ fn local_worktree_path(root: &Path, agent_id: uuid::Uuid, repo: &str) -> PathBuf
         .join(local_repo_name(repo))
 }
 
+/// Resolve the git author/committer identity used for AUTONOMOUS agent commits
+/// (headless workers + gate continuations), so they no longer land under the
+/// ambient host placeholder — a cloud runner whose global git config was an
+/// unconfigured `x <x@x>` stub produced commits authored by `x <x@x>`.
+///
+/// Resolution (first usable value wins, independently for name and email):
+///   1. `QONTINUI_AGENT_GIT_NAME` / `QONTINUI_AGENT_GIT_EMAIL` — the per-runner
+///      OWNER override. Set these in a shared/cloud runner's env to attribute
+///      its autonomous commits to whoever owns that runner.
+///   2. The host's EXPLICIT `git config user.name` / `user.email`. On a dev-box
+///      runner this is the operator's real identity, so autonomous commits
+///      attribute to them with zero config. Placeholders (`x`, `x@x`, empty)
+///      are rejected.
+///   3. A clearly-marked default: `Qontinui Agent <agent@qontinui.dev>`.
+///
+/// Committer is still rewritten to `qontinui-coord` when coord rebase-lands the
+/// PR; this controls the AUTHOR (and the pre-land committer). Cached: resolved
+/// once per process (boot-time host config / env).
+pub(crate) fn autonomous_git_identity() -> (String, String) {
+    static CACHE: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let (host_name, host_email) = host_git_identity();
+            pick_autonomous_git_identity(
+                std::env::var("QONTINUI_AGENT_GIT_NAME").ok(),
+                std::env::var("QONTINUI_AGENT_GIT_EMAIL").ok(),
+                host_name,
+                host_email,
+            )
+        })
+        .clone()
+}
+
+/// The author + committer env pairs that pin a spawned agent process's git
+/// identity. Applied to autonomous spawns ONLY (this process and its children),
+/// so the operator's own git config is never mutated.
+pub(crate) fn agent_git_identity_env() -> Vec<(String, String)> {
+    let (name, email) = autonomous_git_identity();
+    vec![
+        ("GIT_AUTHOR_NAME".to_string(), name.clone()),
+        ("GIT_AUTHOR_EMAIL".to_string(), email.clone()),
+        ("GIT_COMMITTER_NAME".to_string(), name),
+        ("GIT_COMMITTER_EMAIL".to_string(), email),
+    ]
+}
+
+/// Best-effort read of the host's EXPLICITLY-configured git identity. `git
+/// config --get` prints nothing when a key is unset (git's implicit
+/// `user@host` value is never stored), so a `Some` here means a human
+/// deliberately configured it.
+///
+/// Prefers the EFFECTIVE value (local|global), but when that resolves to the
+/// `x`/`x@x` placeholder — some runner clones carry a stub LOCAL `user.email`
+/// that shadows a real GLOBAL one — it falls back to the GLOBAL value so a dev
+/// box still attributes autonomous commits to its owner with zero config.
+fn host_git_identity() -> (Option<String>, Option<String>) {
+    fn get(args: &[&str]) -> Option<String> {
+        std::process::Command::new("git")
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+    // A placeholder effective value is treated as "no usable identity" so the
+    // global fallback gets a chance (the `clean()` in the pure resolver also
+    // rejects it — this just lets the global tier win over a stub local).
+    fn real(v: Option<String>) -> Option<String> {
+        v.filter(|s| !s.eq_ignore_ascii_case("x") && s != "x@x")
+    }
+    let name = real(get(&["config", "--get", "user.name"]))
+        .or_else(|| get(&["config", "--global", "--get", "user.name"]));
+    let email = real(get(&["config", "--get", "user.email"]))
+        .or_else(|| get(&["config", "--global", "--get", "user.email"]));
+    (name, email)
+}
+
+/// Pure identity selection (testable). Rejects empty/placeholder values so the
+/// `x <x@x>` stub can never win.
+fn pick_autonomous_git_identity(
+    env_name: Option<String>,
+    env_email: Option<String>,
+    host_name: Option<String>,
+    host_email: Option<String>,
+) -> (String, String) {
+    fn clean(v: Option<String>) -> Option<String> {
+        v.map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("x") && s != "x@x")
+    }
+    let name = clean(env_name)
+        .or_else(|| clean(host_name))
+        .unwrap_or_else(|| "Qontinui Agent".to_string());
+    let email = clean(env_email)
+        .or_else(|| clean(host_email))
+        .unwrap_or_else(|| "agent@qontinui.dev".to_string());
+    (name, email)
+}
+
 /// Spawn `claude` CLI as a tokio child. `initial_prompt` is piped to
 /// stdin. stdout/stderr are inherited as pipes so the caller can stream
 /// them.
@@ -2773,6 +2875,13 @@ async fn spawn_claude_child(workdir: &str, initial_prompt: &str) -> anyhow::Resu
             // None + ambient default has live creds → inherit it (single-account
             // / unset-CLAUDE_CONFIG_DIR default — unchanged behavior).
         }
+    }
+    // Pin the autonomous-agent git author/committer for this headless worker so
+    // its commits land with a meaningful name/email instead of the ambient host
+    // placeholder (`x <x@x>`). Scoped to this child process — the operator's own
+    // git config is untouched.
+    for (k, v) in agent_git_identity_env() {
+        cmd.env(k, v);
     }
     // `-p` / `--print` means "single-shot prompt mode" for Claude Code
     // CLI; not all versions support stdin-as-prompt cleanly, so we send
@@ -3078,6 +3187,73 @@ mod tests {
     /// Sentinel returned by the test mint closure so a mint outcome is
     /// unambiguous and deterministic (no uuid in tests).
     const MINTED: &str = "MINTED";
+
+    fn s(v: &str) -> Option<String> {
+        Some(v.to_string())
+    }
+
+    #[test]
+    fn agent_identity_env_override_wins() {
+        let (n, e) = pick_autonomous_git_identity(
+            s("Ada Lovelace"),
+            s("ada@example.com"),
+            s("Host Name"),
+            s("host@example.com"),
+        );
+        assert_eq!(n, "Ada Lovelace");
+        assert_eq!(e, "ada@example.com");
+    }
+
+    #[test]
+    fn agent_identity_falls_back_to_real_host_config() {
+        // No env override → a dev box's real git identity is used (zero config).
+        let (n, e) =
+            pick_autonomous_git_identity(None, None, s("Joshua Spinak"), s("jspinak@example.com"));
+        assert_eq!(n, "Joshua Spinak");
+        assert_eq!(e, "jspinak@example.com");
+    }
+
+    #[test]
+    fn agent_identity_rejects_x_placeholder_and_defaults() {
+        // The observed `x <x@x>` stub must never win → marked default instead.
+        let (n, e) = pick_autonomous_git_identity(None, None, s("x"), s("x@x"));
+        assert_eq!(n, "Qontinui Agent");
+        assert_eq!(e, "agent@qontinui.dev");
+    }
+
+    #[test]
+    fn agent_identity_rejects_empty_and_whitespace() {
+        let (n, e) = pick_autonomous_git_identity(s("  "), s(""), None, None);
+        assert_eq!(n, "Qontinui Agent");
+        assert_eq!(e, "agent@qontinui.dev");
+    }
+
+    #[test]
+    fn agent_identity_env_overrides_placeholder_host() {
+        // A cloud runner (host stub) names its owner via env.
+        let (n, e) = pick_autonomous_git_identity(
+            s("Fleet Owner"),
+            s("owner@qontinui.dev"),
+            s("x"),
+            s("x@x"),
+        );
+        assert_eq!(n, "Fleet Owner");
+        assert_eq!(e, "owner@qontinui.dev");
+    }
+
+    #[test]
+    fn agent_identity_env_pairs_pin_author_and_committer() {
+        // All four pairs must be present so the raw commit (pre coord-rebase)
+        // is fully attributed, not just the author.
+        let pairs = agent_git_identity_env();
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains(&"GIT_AUTHOR_NAME"));
+        assert!(keys.contains(&"GIT_AUTHOR_EMAIL"));
+        assert!(keys.contains(&"GIT_COMMITTER_NAME"));
+        assert!(keys.contains(&"GIT_COMMITTER_EMAIL"));
+        // Never the placeholder.
+        assert!(pairs.iter().all(|(_, v)| v != "x" && v != "x@x"));
+    }
 
     /// Phase 4b — a PR number is derived ONLY from a `refs/pull/<n>/...` ref;
     /// every other ref shape (the common agent push ref) leaves `pr` absent so
