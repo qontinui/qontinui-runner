@@ -508,6 +508,20 @@ impl AgentLogEmitter {
         }
     }
 
+    /// Emit an arbitrary `LogEntry` with the given `level` / `event` /
+    /// `payload`, stamped with this emitter's identity. Used by callers that
+    /// produce non-`stdout` events (e.g. the transcript watcher's `assistant` /
+    /// `tool_use` lines). Empty `event` is dropped — coord 400s an empty event,
+    /// so swallowing it here keeps the batch valid.
+    pub fn emit(&self, level: &str, event: &str, payload: Option<serde_json::Value>) {
+        if event.trim().is_empty() {
+            return;
+        }
+        let _ = self
+            .tx
+            .send(EmitMsg::Entry(self.entry(level, event, payload)));
+    }
+
     /// `session_started` milestone — one line at session start.
     pub fn started(&self, purpose: &str) {
         let _ = self.tx.send(EmitMsg::Entry(self.entry(

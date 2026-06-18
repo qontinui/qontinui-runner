@@ -26,6 +26,7 @@
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use once_cell::sync::OnceCell;
+use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -35,10 +36,10 @@ use tokio::sync::{mpsc, Mutex as TokioMutex, Notify};
 use tracing::{debug, info, warn};
 
 use super::transcript::{
-    find_claude_config_dirs, is_workflow_session_marker, list_sessions,
-    parse_line_for_touched_files,
+    find_claude_config_dirs, is_workflow_session_marker, list_sessions, parse_line_for_agent_log,
+    parse_line_for_touched_files, AgentLogObs,
 };
-use crate::claude_session::coord_register::AiCoordRegistrar;
+use crate::claude_session::coord_register::{AgentLogEmitter, AiCoordRegistrar};
 
 /// Ceiling for "recent enough to schedule a tail task on startup". Older
 /// JSONLs are skipped — they belong to closed sessions whose tabs the user
@@ -399,6 +400,28 @@ async fn tail_session(
     let mut workflow_check_buf = String::new();
     let mut did_workflow_recheck = false;
 
+    // ── Interactive-agent log emitter (Phase 2) ───────────────────────────────
+    //
+    // Stream this PTY CLI session's assistant text + tool_use activity to
+    // coord's `agent_logs` ingest so it appears on `/admin/coord/agents`. The
+    // emitter is keyed on the transcript's own session UUID (the `.jsonl`
+    // stem); coord's Phase-1a fallback resolves the tenant from the `device_id`
+    // the emitter stamps, so there is NO separate `coord.sessions` registration
+    // step here. `start()` is a strict no-op (returns `None`, spawns no thread)
+    // when the gate `QONTINUI_AGENT_LOGS_FROM_SESSIONS` is OFF, the `device_id`
+    // is unreadable, or `session_id` isn't a UUID — so the per-line emit below
+    // costs nothing in the common (gate-off) case. Held for the tail's
+    // lifetime; the drain thread flushes on channel disconnect at function exit
+    // (RAII) — we deliberately emit NO `session_closed` milestone since a tail
+    // teardown (cancel / rotation / workflow re-check) isn't a reliable
+    // CLI-session-end signal.
+    let agent_log_emitter = uuid::Uuid::parse_str(&session_id)
+        .ok()
+        .and_then(AgentLogEmitter::start);
+    if let Some(em) = agent_log_emitter.as_ref() {
+        em.started("interactive CLI session");
+    }
+
     debug!(
         "transcript_watcher: tail started for {} at offset {} ({})",
         session_id,
@@ -513,6 +536,29 @@ async fn tail_session(
                     tauri::async_runtime::spawn_blocking(move || {
                         super::commit_report::handle_push_observation(&obs, &reg);
                     });
+                }
+            }
+
+            // ── Interactive-agent log emit (Phase 2) ──────────────────────
+            //
+            // Stream assistant text + tool_use observations from this
+            // transcript line to coord. Pushing is a non-blocking channel
+            // send (safe from async); the gate/device-id check already
+            // happened in `start()`, so this is a strict no-op when off.
+            if let Some(em) = agent_log_emitter.as_ref() {
+                for obs in parse_line_for_agent_log(&line) {
+                    match obs {
+                        AgentLogObs::Assistant { text } => {
+                            em.emit("info", "assistant", Some(json!({ "text": text })));
+                        }
+                        AgentLogObs::ToolUse { tool, input } => {
+                            let mut payload = json!({ "tool": tool });
+                            if let Some(input) = input {
+                                payload["input"] = json!(input);
+                            }
+                            em.emit("info", "tool_use", Some(payload));
+                        }
+                    }
                 }
             }
         }
