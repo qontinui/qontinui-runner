@@ -77,6 +77,7 @@ mod fixer;
 // (was `coord.machines` pre-Phase-3-Unified-Devices-Registry) so
 // `GET /coord/fleet` can answer "where do I have agent capacity?".
 mod fleet;
+mod fleet_commands;
 mod flow_control;
 mod follow_up;
 mod fs_atomic;
