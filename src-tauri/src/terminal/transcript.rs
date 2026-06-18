@@ -703,6 +703,115 @@ pub fn parse_line_for_touched_files(
     ))
 }
 
+// ── Agent-log Extraction (Phase 2 — transcript → coord.agent_logs) ───────────
+//
+// These helpers walk an `{type:"assistant"}` JSONL record and emit the
+// meaningful conversational content — assistant text + tool_use invocations —
+// as `AgentLogObs` rows. The transcript watcher converts each into a
+// `coord.agent_logs` entry so PTY-launched CLI Claude sessions become visible
+// on the `/admin/coord/agents` dashboard (the runner-managed-session path is
+// covered separately by the `AgentLogEmitter` Phase-1 milestones). Pure (no
+// I/O); shares the same `serde_json::Value` walking style as
+// `extract_touched_files_from_assistant_record`.
+
+/// Cap on emitted payload text (assistant text and serialized tool input). Keeps
+/// per-line coord traffic bounded for verbose assistant turns / large tool
+/// inputs; the watcher streams a continuous tail, not a one-shot snapshot.
+const AGENT_LOG_TEXT_CAP: usize = 8 * 1024;
+
+/// One meaningful observation extracted from an assistant transcript record,
+/// ready to become a `coord.agent_logs` entry. The watcher maps each to an
+/// `AgentLogEmitter::emit(level, event, payload)` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentLogObs {
+    /// An assistant text block. `event:"assistant"`, `payload:{text}`.
+    Assistant { text: String },
+    /// A tool invocation. `event:"tool_use"`, `payload:{tool, input?}`.
+    ToolUse {
+        tool: String,
+        /// Compact-serialized, truncated tool input (omitted when absent).
+        input: Option<String>,
+    },
+}
+
+/// Truncate `s` to at most `AGENT_LOG_TEXT_CAP` bytes on a char boundary,
+/// appending an ellipsis marker when it was cut. Bounds per-line volume.
+fn truncate_for_log(s: &str) -> String {
+    if s.len() <= AGENT_LOG_TEXT_CAP {
+        return s.to_string();
+    }
+    let mut end = AGENT_LOG_TEXT_CAP;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[truncated]", &s[..end])
+}
+
+/// Walk `content[]` of an `{type:"assistant"}` record and emit an `AgentLogObs`
+/// for each text block (assistant turn) and each `tool_use` block (tool
+/// invocation), in document order. Skips `thinking`, `tool_result`, and other
+/// noise. Non-assistant records and missing/blank text yield nothing.
+pub fn extract_agent_log_obs_from_assistant_record(record: &serde_json::Value) -> Vec<AgentLogObs> {
+    let Some(content) = record
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for block in content {
+        let block_type = block
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default();
+        match block_type {
+            "text" => {
+                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                    if !text.trim().is_empty() {
+                        out.push(AgentLogObs::Assistant {
+                            text: truncate_for_log(text),
+                        });
+                    }
+                }
+            }
+            "tool_use" => {
+                let Some(tool) = block.get("name").and_then(|n| n.as_str()) else {
+                    continue;
+                };
+                let input = block
+                    .get("input")
+                    .filter(|i| !i.is_null())
+                    .map(|i| truncate_for_log(&serde_json::to_string(i).unwrap_or_default()));
+                out.push(AgentLogObs::ToolUse {
+                    tool: tool.to_string(),
+                    input,
+                });
+            }
+            _ => {} // thinking / tool_result / etc. — skip.
+        }
+    }
+    out
+}
+
+/// Convenience wrapper: parse one JSONL line, dispatch by `type`, and return
+/// agent-log observations (empty for non-assistant or malformed records — the
+/// watcher tolerates noise and never fails on a single bad line).
+pub fn parse_line_for_agent_log(line: &str) -> Vec<AgentLogObs> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let Ok(record) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return Vec::new();
+    };
+    if record.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+        return Vec::new();
+    }
+    extract_agent_log_obs_from_assistant_record(&record)
+}
+
 /// Test-only re-export of `is_workflow_session` so the `transcript_watcher`
 /// module can apply the same first-5-lines filter without duplicating the
 /// logic. The function itself stays private to this module.
@@ -1778,6 +1887,66 @@ mod tests {
         assert_eq!(touched[0].tool, ToolKind::Write);
         assert_eq!(touched[0].file_path, "/new/file.rs");
         assert_eq!(touched[0].session_id, "sess-I");
+    }
+
+    // ── Agent-log extraction (Phase 2) ───────────────────────────────────────
+
+    #[test]
+    fn test_parse_line_for_agent_log_assistant_and_tool_use_in_order() {
+        // An assistant record carrying a text block followed by a tool_use
+        // block yields both observations in document order.
+        let line = r#"{"type":"assistant","uuid":"a-1","timestamp":"2026-05-09T01:02:03Z","message":{"role":"assistant","content":[{"type":"text","text":"Reading the file now."},{"type":"tool_use","id":"t","name":"Read","input":{"file_path":"/a/b.rs"}}]}}"#;
+        let obs = parse_line_for_agent_log(line);
+        assert_eq!(
+            obs,
+            vec![
+                AgentLogObs::Assistant {
+                    text: "Reading the file now.".to_string()
+                },
+                AgentLogObs::ToolUse {
+                    tool: "Read".to_string(),
+                    input: Some(r#"{"file_path":"/a/b.rs"}"#.to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_line_for_agent_log_skips_user_lines() {
+        // A `user` record (and other non-assistant noise) produces no
+        // observations — the watcher only streams assistant activity.
+        let user = r#"{"type":"user","uuid":"u1","timestamp":"2026-05-09T00:00:01Z","message":{"role":"user","content":"hi"}}"#;
+        assert!(parse_line_for_agent_log(user).is_empty());
+
+        // Empty / malformed lines are tolerated (no panic, no output).
+        assert!(parse_line_for_agent_log("").is_empty());
+        assert!(parse_line_for_agent_log("   ").is_empty());
+        assert!(parse_line_for_agent_log("{not json").is_empty());
+    }
+
+    #[test]
+    fn test_parse_line_for_agent_log_skips_thinking_and_empty_text() {
+        // `thinking` blocks and blank text blocks are skipped; a tool_use with
+        // no input emits a ToolUse with `input: None`.
+        let line = r#"{"type":"assistant","uuid":"a-2","timestamp":"2026-05-09T01:02:03Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"   "},{"type":"tool_use","id":"t","name":"TodoWrite"}]}}"#;
+        let obs = parse_line_for_agent_log(line);
+        assert_eq!(
+            obs,
+            vec![AgentLogObs::ToolUse {
+                tool: "TodoWrite".to_string(),
+                input: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_truncate_for_log_caps_oversized_text() {
+        let big = "x".repeat(AGENT_LOG_TEXT_CAP + 100);
+        let out = truncate_for_log(&big);
+        assert!(out.len() < big.len());
+        assert!(out.ends_with("…[truncated]"));
+        // Small text is passed through verbatim.
+        assert_eq!(truncate_for_log("small"), "small");
     }
 
     // ── get_latest_session_id `since` filter (Phase 1.5) ─────────────────────
