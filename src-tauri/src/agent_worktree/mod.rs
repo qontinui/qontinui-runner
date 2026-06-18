@@ -953,28 +953,134 @@ impl From<String> for AllocateError {
     }
 }
 
-/// Re-root coord's suggested worktree path onto this runner's filesystem.
+/// Resolve the runner-local target for one agent worktree, OUTSIDE the
+/// project tree.
 ///
-/// Coord's `suggest_worktree_path` is host-neutral by default: it emits a
-/// RELATIVE `agent-worktrees/<agent_id>/<repo>` suggestion and expects the
-/// consuming runner to anchor it locally. We anchor it under the CANONICAL
-/// checkout — the same directory `git -C <canonical> worktree add <relative>`
-/// would resolve it against, so the absolute path and the materialized
-/// location always agree. An absolute suggestion (a deployment that sets
-/// `COORD_WORKTREE_ROOT`) passes through unchanged.
+/// Coord's `suggest_worktree_path` is host-neutral and its absolute form is
+/// computed for coord's OWN host, so neither is usable here. The runner owns
+/// its on-disk layout: the worktree lands at
+/// `agent_worktree_root(canonical)/<agent_id>/<repo_name>` — a sibling of the
+/// project root by default (see [`canonical_paths::agent_worktree_root`]),
+/// NOT under `canonical`. Materializing INSIDE the checkout caused Windows
+/// watcher deletion-locks, dirty-tree pollution, and editor noise; relocating
+/// outside fixes all three.
 ///
-/// Recording the relative suggestion verbatim is NOT an option: the recorded
-/// path becomes the spawned session's PTY cwd (plus `--add-dir`,
-/// `QONTINUI_SESSION_WORKTREES`, and the credential-helper target), and a
-/// relative cwd silently resolves against the runner process's ambient cwd —
-/// observed as coord-spawned sessions landing in the user's home dir.
-fn local_worktree_target(canonical: &Path, suggested: &str) -> PathBuf {
-    let p = PathBuf::from(suggested);
-    if p.is_absolute() {
-        p
-    } else {
-        canonical.join(p)
+/// The env escape hatch now lives in the resolver (an *absolute*
+/// `QONTINUI_WORKTREE_ROOT` / `COORD_WORKTREE_ROOT`); this fn no longer
+/// passes a coord-suggested path through, because a relative cwd silently
+/// resolves against the runner process's ambient cwd at PTY spawn (observed
+/// as coord-spawned sessions landing in the user's home dir).
+fn local_worktree_target(canonical: &Path, agent_id: &str, repo_name: &str) -> PathBuf {
+    canonical_paths::agent_worktree_root(canonical)
+        .join(agent_id)
+        .join(repo_name)
+}
+
+/// Re-root coord's per-agent Cargo override (`cc.path` + the `paths = [ … ]`
+/// body in `cc.contents`) from coord's host agent-root onto this runner's
+/// local agent-root.
+///
+/// Coord's [`render`](../../../qontinui-coord/src/cargo_overrides.rs) computes
+/// `cc.path = <coord_agent_root>/.cargo/config.toml` and lists each sibling
+/// worktree under `<coord_agent_root>/<repo>`. After the runner relocates its
+/// worktrees, BOTH are stale. This rewrites every occurrence of coord's
+/// agent-root prefix to `local_agent_root`, preserving coord's eligibility
+/// allowlist decision (we relocate, never re-derive). Returns
+/// `(rerooted_path, rerooted_contents)`.
+///
+/// - coord's agent-root is recovered as `parent(parent(cc.path))` (since
+///   `cc.path` ends in `<agent_root>/.cargo/config.toml`).
+/// - If coord emitted a RELATIVE path (no `COORD_WORKTREE_ROOT` set), or its
+///   agent-root cannot be recovered, the prefix replacement is best-effort: we
+///   still force `cc.path` under the local agent-root and rewrite contents by
+///   the recovered (possibly relative) prefix where possible.
+///
+/// All comparisons are on forward-slash-normalized strings so the Windows
+/// `D:\…` and POSIX `/…` shapes both match. The emitted paths use forward
+/// slashes (Cargo + the local target builder both accept them).
+fn reroot_cargo_override(
+    cc_path: &str,
+    cc_contents: &str,
+    local_agent_root: &Path,
+    agent_id: &str,
+) -> (String, String) {
+    let local_root = local_agent_root.to_string_lossy().replace('\\', "/");
+    let local_root = local_root.trim_end_matches('/').to_string();
+
+    let norm_path = cc_path.replace('\\', "/");
+    // coord agent-root = parent of parent of cc.path
+    // (`<root>/.cargo/config.toml`).
+    let coord_root = std::path::Path::new(&norm_path)
+        .parent() // <root>/.cargo
+        .and_then(|p| p.parent()) // <root>
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .map(|s| s.trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty());
+
+    let new_path = format!("{local_root}/.cargo/config.toml");
+
+    // Normalize the body's backslashes to forward slashes so the prefix match
+    // is shape-agnostic (coord emits forward slashes today, but be robust).
+    let norm_contents = cc_contents.replace('\\', "/");
+
+    let new_contents = match &coord_root {
+        // Robust path: replace coord's agent-root prefix everywhere in the
+        // body. This covers BOTH the absolute (`COORD_WORKTREE_ROOT` set) and
+        // the relative (host-neutral `agent-worktrees/<agent_id>`) shapes,
+        // since `parent(parent(cc.path))` recovers the same relative or
+        // absolute prefix that the `paths` entries are built from. Preserves
+        // the `<repo>` tail coord chose per eligible crate.
+        Some(root) => norm_contents.replace(root, &local_root),
+        // Degenerate: cc.path had no recoverable agent-root (fewer than two
+        // path components). Re-anchor by the `/<agent_id>/` segment if present;
+        // otherwise warn and keep the body unmodified (file still relocated).
+        None => {
+            let anchor = format!("/{agent_id}/");
+            if !agent_id.is_empty() && norm_contents.contains(&anchor) {
+                // Replace `<anything>/<agent_id>/` prefixes with
+                // `<local_root>/<agent_id>/` — coord always emits
+                // `<root>/<agent_id>/<repo>`, so cut at the agent_id segment.
+                reanchor_by_agent_id(&norm_contents, agent_id, &local_root)
+            } else {
+                warn!(
+                    "phase5 cargo override: could not recover coord agent-root \
+                     from path {cc_path:?}; contents written unmodified \
+                     (best-effort), file relocated to {new_path}"
+                );
+                norm_contents
+            }
+        }
+    };
+
+    (new_path, new_contents)
+}
+
+/// Degenerate-case fallback for [`reroot_cargo_override`]: rewrite each
+/// `"<prefix>/<agent_id>/<rest>"` token to `"<local_root>/<agent_id>/<rest>"`
+/// by re-anchoring at the `/<agent_id>/` segment. Operates on
+/// already-forward-slash-normalized `contents`.
+fn reanchor_by_agent_id(contents: &str, agent_id: &str, local_root: &str) -> String {
+    let anchor = format!("/{agent_id}/");
+    let mut out = String::with_capacity(contents.len());
+    for line in contents.lines() {
+        if let Some(idx) = line.find(&anchor) {
+            // Keep everything from the anchor onward; the path token starts
+            // after the opening quote. Find the quote that opens this path.
+            let before = &line[..idx];
+            let quote_pos = before.rfind('"').map(|q| q + 1).unwrap_or(0);
+            out.push_str(&line[..quote_pos]);
+            out.push_str(local_root);
+            out.push_str(&line[idx..]); // begins with `/<agent_id>/...`
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
     }
+    // Preserve the trailing-newline shape of the original (lines() drops it).
+    if !contents.ends_with('\n') {
+        out.pop();
+    }
+    out
 }
 
 /// Call coord's `/agents/allocate` and then `git worktree add` for each
@@ -1265,7 +1371,11 @@ pub async fn allocate_and_materialize_with_claim(
         let canonical = repo_canonical_paths.get(&w.repo).ok_or_else(|| {
             AllocateError::Other(format!("missing canonical path for repo '{}'", w.repo))
         })?;
-        let target = local_worktree_target(canonical, &w.worktree_path);
+        // Bare repo name (`qontinui/qontinui-runner` -> `qontinui-runner`) for
+        // the relocated, out-of-tree worktree layout.
+        let repo_name = canonical_paths::canonical_segment(&w.repo)
+            .map_err(|e| AllocateError::Other(format!("repo slug for '{}': {e}", w.repo)))?;
+        let target = local_worktree_target(canonical, &coord_resp.agent_id, &repo_name);
 
         // Ensure the parent dir exists. `git worktree add` will create
         // the leaf, but the parent (`D:/qontinui-root.wt/<agent>/`)
@@ -1360,15 +1470,44 @@ pub async fn allocate_and_materialize_with_claim(
 
     // Coordination Phase 5 / Row 5 — write coord's per-agent Cargo
     // path-dep override. It lands at
-    // <COORD_WORKTREE_ROOT>/<agent_id>/.cargo/config.toml, i.e. the
-    // PARENT of the per-repo worktree dirs — outside every git repo,
-    // so it never merges and pre-commit cargo hooks never see it
-    // (feedback_worktree_path_dep_hooks). Best-effort: a write
-    // failure logs + continues (the agent then builds against the
-    // canonical sibling, i.e. today's non-deterministic behaviour —
-    // degraded, not broken).
+    // <local_agent_root>/.cargo/config.toml, i.e. the PARENT of the
+    // per-repo worktree dirs — outside every git repo, so it never
+    // merges and pre-commit cargo hooks never see it
+    // (feedback_worktree_path_dep_hooks).
+    //
+    // Post-relocation the override is RE-ROOTED onto the runner's external
+    // worktree root: coord computes `cc.path` AND the `paths = [ … ]` body
+    // for ITS OWN host's agent-root, so after relocating the worktrees both
+    // go stale (the file lands where Cargo's upward search misses it, and the
+    // `paths` entries point at non-existent dirs). We preserve coord's
+    // eligibility decision and only relocate the prefix. Best-effort: a write
+    // failure logs + continues (the agent then builds against the canonical
+    // sibling — degraded, not broken).
     if let Some(cc) = &coord_resp.cargo_config {
-        if let Some(parent) = std::path::Path::new(&cc.path).parent() {
+        // The local agent-root: `agent_worktree_root(<primary canonical>)/<agent_id>`.
+        // The primary repo is the first materialized worktree (the consumer
+        // whose PTY opens), matching coord's `render(primary_repo)`.
+        let local_agent_root = materialized
+            .first()
+            .and_then(|primary| repo_canonical_paths.get(&primary.repo))
+            .map(|canonical| {
+                canonical_paths::agent_worktree_root(canonical).join(&coord_resp.agent_id)
+            });
+
+        let (write_path, write_contents) = match &local_agent_root {
+            Some(root) => reroot_cargo_override(&cc.path, &cc.contents, root, &coord_resp.agent_id),
+            None => {
+                warn!(
+                    "phase5 cargo override: no primary canonical for re-root; \
+                     writing coord-emitted path verbatim (may miss on Cargo's \
+                     upward search): {}",
+                    cc.path
+                );
+                (cc.path.clone(), cc.contents.clone())
+            }
+        };
+
+        if let Some(parent) = std::path::Path::new(&write_path).parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
                 warn!(
                     "phase5 cargo override: mkdir {} failed: {e}",
@@ -1376,13 +1515,13 @@ pub async fn allocate_and_materialize_with_claim(
                 );
             }
         }
-        match std::fs::write(&cc.path, &cc.contents) {
+        match std::fs::write(&write_path, &write_contents) {
             Ok(()) => info!(
-                "phase5 cargo override written: {} ({} bytes)",
-                cc.path,
-                cc.contents.len()
+                "phase5 cargo override written (re-rooted): {} ({} bytes)",
+                write_path,
+                write_contents.len()
             ),
-            Err(e) => warn!("phase5 cargo override: write {} failed: {e}", cc.path),
+            Err(e) => warn!("phase5 cargo override: write {write_path} failed: {e}"),
         }
     }
 
@@ -1534,34 +1673,116 @@ mod tests {
     }
 
     #[test]
-    fn local_worktree_target_anchors_relative_suggestion_under_canonical() {
-        // Coord's default host-neutral suggestion — must land under the
-        // canonical checkout (where `git -C <canonical> worktree add`
-        // materializes it), never stay relative (a relative session cwd
-        // resolves against the runner process's ambient cwd at PTY spawn).
-        // A drive-letter path is only absolute on Windows, so pick a
-        // platform-absolute canonical.
+    fn local_worktree_target_lands_outside_canonical_at_external_root() {
+        // Post-relocation: the worktree must land at the EXTERNAL root
+        // `agent_worktree_root(canonical)/<agent_id>/<repo>` — a sibling of
+        // the project root, NOT inside the checkout (which caused Windows
+        // watcher deletion-locks + dirty-tree pollution). A drive-letter
+        // path is only absolute on Windows, so pick a platform-absolute
+        // canonical.
         let canonical = if cfg!(windows) {
             Path::new("D:/qontinui-root/qontinui-coord")
         } else {
             Path::new("/srv/qontinui-root/qontinui-coord")
         };
-        let got = local_worktree_target(canonical, "agent-worktrees/019e/qontinui-coord");
+        let got = local_worktree_target(canonical, "019e", "qontinui-coord");
         assert!(got.is_absolute(), "must be absolute, got {}", got.display());
-        assert_eq!(got, canonical.join("agent-worktrees/019e/qontinui-coord"));
+        // Outside canonical — the whole point of the relocation.
+        assert!(
+            !got.starts_with(canonical),
+            "worktree must NOT be under the checkout: {}",
+            got.display()
+        );
+        let expected = canonical_paths::agent_worktree_root(canonical)
+            .join("019e")
+            .join("qontinui-coord");
+        assert_eq!(got, expected);
     }
 
     #[test]
-    fn local_worktree_target_passes_absolute_suggestion_through() {
-        // A deployment that sets COORD_WORKTREE_ROOT to a runner-valid
-        // absolute root keeps full control of the layout.
-        let canonical = Path::new("D:/qontinui-root/qontinui-coord");
-        let abs = if cfg!(windows) {
-            "D:/qontinui-root.wt/019e/qontinui-coord"
+    fn reroot_cargo_override_relocates_path_and_paths_body() {
+        // Coord computed the override for ITS OWN host's agent-root. After
+        // relocation, both cc.path and every `paths` entry must move onto the
+        // runner's local agent-root, and the file must sit OUTSIDE any git repo
+        // (= directly under the local agent-root, parent of the per-repo dirs).
+        let coord_root = "/root/qontinui-root.wt/AG";
+        let cc_path = format!("{coord_root}/.cargo/config.toml");
+        let cc_contents = format!(
+            "# header\n\npaths = [\n    \"{coord_root}/qontinui-runner-client\",\n    \"{coord_root}/qontinui-types\",\n]\n"
+        );
+
+        let local_agent_root = if cfg!(windows) {
+            Path::new("D:/qontinui-root/qontinui-worktrees/AG")
         } else {
-            "/srv/qontinui-root.wt/019e/qontinui-coord"
+            Path::new("/srv/qontinui-root/qontinui-worktrees/AG")
         };
-        assert_eq!(local_worktree_target(canonical, abs), PathBuf::from(abs));
+        let (path, contents) =
+            reroot_cargo_override(&cc_path, &cc_contents, local_agent_root, "AG");
+
+        let local_root_str = local_agent_root.to_string_lossy().replace('\\', "/");
+        // cc.path moved under the local agent-root.
+        assert_eq!(path, format!("{local_root_str}/.cargo/config.toml"));
+        // Every paths entry re-rooted; none still point at coord's root.
+        assert!(
+            !contents.contains(coord_root),
+            "stale coord root remains:\n{contents}"
+        );
+        assert!(contents.contains(&format!("{local_root_str}/qontinui-types")));
+        assert!(contents.contains(&format!("{local_root_str}/qontinui-runner-client")));
+
+        // The override file lives OUTSIDE every git repo: it is directly under
+        // the agent-root (parent of the per-repo worktree dirs), and the
+        // per-repo dirs are its children — so the config dir is not under any
+        // per-repo checkout. Assert it is NOT under a per-repo worktree path.
+        let per_repo = format!("{local_root_str}/qontinui-types");
+        assert!(
+            !path.starts_with(&per_repo),
+            "override must not live inside a per-repo worktree: {path}"
+        );
+        // And it is under the agent-root (the safe out-of-repo parent).
+        assert!(path.starts_with(&local_root_str));
+    }
+
+    #[test]
+    fn reroot_cargo_override_relative_coord_path() {
+        // Host-neutral coord (no COORD_WORKTREE_ROOT): emits a relative
+        // `agent-worktrees/<agent_id>/...` override. parent(parent(path))
+        // recovers the relative prefix, so the same prefix replacement applies.
+        let cc_path = "agent-worktrees/AG/.cargo/config.toml";
+        let cc_contents = "paths = [\n    \"agent-worktrees/AG/qontinui-types\",\n]\n".to_string();
+        let local_agent_root = if cfg!(windows) {
+            Path::new("D:/qontinui-root/qontinui-worktrees/AG")
+        } else {
+            Path::new("/srv/qontinui-root/qontinui-worktrees/AG")
+        };
+        let (path, contents) = reroot_cargo_override(cc_path, &cc_contents, local_agent_root, "AG");
+        let local_root_str = local_agent_root.to_string_lossy().replace('\\', "/");
+        assert_eq!(path, format!("{local_root_str}/.cargo/config.toml"));
+        assert!(contents.contains(&format!("{local_root_str}/qontinui-types")));
+        assert!(
+            !contents.contains("agent-worktrees/AG"),
+            "relative root remains:\n{contents}"
+        );
+    }
+
+    #[test]
+    fn local_worktree_target_threads_agent_id_and_repo_under_root() {
+        // The composed target is exactly `<root>/<agent_id>/<repo>` where
+        // `<root>` is whatever the resolver returns (env-independent assertion
+        // — compares against the resolver itself, not a hardcoded sibling, so
+        // it stays green even if a CI env sets an absolute *_WORKTREE_ROOT).
+        let canonical = if cfg!(windows) {
+            Path::new("D:/qontinui-root/qontinui-coord")
+        } else {
+            Path::new("/srv/qontinui-root/qontinui-coord")
+        };
+        let got = local_worktree_target(canonical, "agent-xyz", "qontinui-types");
+        assert_eq!(
+            got,
+            canonical_paths::agent_worktree_root(canonical)
+                .join("agent-xyz")
+                .join("qontinui-types")
+        );
     }
 
     #[test]

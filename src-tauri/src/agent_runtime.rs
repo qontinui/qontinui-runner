@@ -2353,14 +2353,35 @@ async fn run_agent_subprocess(
     // `worktree_path` for COORD's OWN host (a Linux `/root/qontinui-root.wt/...`
     // path) — neither is valid on this runner's filesystem. The runner owns its
     // local worktree layout, so rewrite every path to a local, platform-correct
-    // one (`<QONTINUI_ROOT>/.agent-worktrees/<agent_id>/<repo-name>`) before
-    // materializing or using it as the agent's cwd.
+    // one OUTSIDE the project tree:
+    // `agent_worktree_root(<canonical>)/<agent_id>/<repo-name>` (a sibling of
+    // the project root by default). This is the IDENTICAL resolver Site 2
+    // (`agent_worktree::local_worktree_target`) uses, so a worktree
+    // materialized here and one allocated via the coord HTTP path land at the
+    // same on-disk location.
     let agent_id = payload.agent_id;
-    if let Some(root) = qontinui_root_dir() {
-        for wt in &mut payload.worktrees {
-            wt.worktree_path = local_worktree_path(&root, agent_id, &wt.repo)
-                .to_string_lossy()
-                .into_owned();
+    for wt in &mut payload.worktrees {
+        // Reuse the canonical-checkout resolver (do NOT re-derive `root/name`).
+        match crate::agent_worktree::canonical_paths::default_canonical_path(&wt.repo) {
+            Ok(canonical) => {
+                let repo_name = local_repo_name(&wt.repo);
+                wt.worktree_path =
+                    crate::agent_worktree::canonical_paths::agent_worktree_root(&canonical)
+                        .join(agent_id.to_string())
+                        .join(repo_name)
+                        .to_string_lossy()
+                        .into_owned();
+            }
+            Err(e) => {
+                // Skip rewriting this worktree (keep coord's emitted path) and
+                // log — better degraded than a panic. materialize_worktrees
+                // will surface a clear error if the path is unusable.
+                warn!(
+                    "agent_runtime: cannot resolve canonical path for repo {:?}: {e}; \
+                     leaving coord-emitted worktree_path unchanged",
+                    wt.repo
+                );
+            }
         }
     }
 
@@ -2765,25 +2786,6 @@ fn local_repo_name(repo: &str) -> &str {
         .next()
         .filter(|s| !s.is_empty())
         .unwrap_or(repo)
-}
-
-/// The local worktree path the runner materializes for an agent's repo. The
-/// runner owns this layout; coord's emitted `worktree_path` (computed for its
-/// own host) is ignored. Scheme:
-/// `<QONTINUI_ROOT>/.agent-worktrees/<agent_id>/<repo-name>`.
-///
-/// Phase 2b note (launch-provisioning): the per-spawn `<agent_id>` directory
-/// is already per-session-unique — each spawn mints a fresh `agent_id` — so
-/// this layout satisfies the §3.6 `.agent-worktrees/<session>/<repo>` model
-/// without re-keying. Cross-restart STABLE reuse (a worktree the same logical
-/// session reattaches to after a runner restart) is intentionally deferred to
-/// the restart-resilience plan; do NOT re-key this dir on a stable
-/// session id here — doing so would orphan the per-spawn worktrees the live
-/// claim bookkeeping already tracks under `<agent_id>`.
-fn local_worktree_path(root: &Path, agent_id: uuid::Uuid, repo: &str) -> PathBuf {
-    root.join(".agent-worktrees")
-        .join(agent_id.to_string())
-        .join(local_repo_name(repo))
 }
 
 /// Resolve the git author/committer identity used for AUTONOMOUS agent commits
@@ -3874,10 +3876,27 @@ mod tests {
             "qontinui-runner"
         );
         assert_eq!(local_repo_name("qontinui-runner"), "qontinui-runner");
-        let root = Path::new("D:/qontinui-root");
-        let p = local_worktree_path(root, uuid::Uuid::nil(), "qontinui/qontinui-runner");
+
+        // Site 1's relocated worktree path: outside the project tree, at
+        // `agent_worktree_root(<canonical>)/<agent_id>/<repo>`. This must equal
+        // what Site 2 (`agent_worktree::local_worktree_target`) produces, so
+        // both spawn sites land identically.
+        let canonical = crate::agent_worktree::canonical_paths::default_canonical_path(
+            "qontinui/qontinui-runner",
+        )
+        .unwrap();
+        let agent_id = uuid::Uuid::nil();
+        let p = crate::agent_worktree::canonical_paths::agent_worktree_root(&canonical)
+            .join(agent_id.to_string())
+            .join(local_repo_name("qontinui/qontinui-runner"));
         assert!(p.ends_with(Path::new("qontinui-runner")));
-        assert!(p.to_string_lossy().contains(".agent-worktrees"));
+        // Relocated OUTSIDE the canonical checkout (the whole point).
+        assert!(
+            !p.starts_with(&canonical),
+            "worktree must be outside the repo: {}",
+            p.display()
+        );
+        assert!(p.to_string_lossy().contains("qontinui-worktrees"));
     }
 
     #[test]

@@ -78,6 +78,49 @@ pub fn default_canonical_path(repo: &str) -> Result<PathBuf, String> {
     Ok(PathBuf::from(format!("{home}/qontinui-root/{segment}")))
 }
 
+/// Resolve the external root under which all agent worktrees for `canonical`
+/// live. Order: explicit env override (absolute only) -> sibling of the
+/// project root.
+///
+/// Pre-relocation the runner materialized worktrees INSIDE the repo checkout
+/// (`<canonical>/agent-worktrees/<id>/<repo>`), which caused Windows watcher
+/// deletion-locks, dirty-tree pollution, and editor noise. This resolver
+/// moves them OUTSIDE the project tree — by default a sibling directory
+/// `qontinui-worktrees` next to the project root (e.g.
+/// `D:/qontinui-root/qontinui-coord` -> `D:/qontinui-root/qontinui-worktrees`).
+///
+/// The final worktree path for one repo is
+/// `agent_worktree_root(canonical).join(agent_id).join(repo_name)`.
+pub fn agent_worktree_root(canonical: &Path) -> PathBuf {
+    // Honor BOTH knobs: the new runner-owned QONTINUI_WORKTREE_ROOT first, then
+    // fall back to the EXISTING COORD_WORKTREE_ROOT so the documented escape
+    // hatch is not silently broken. Only an *absolute* override is honored — a
+    // relative value would reintroduce the ambient-cwd bug that the resolver
+    // (and the old local_worktree_target) exists to prevent.
+    let override_val = ["QONTINUI_WORKTREE_ROOT", "COORD_WORKTREE_ROOT"]
+        .into_iter()
+        .find_map(|var| std::env::var(var).ok());
+    agent_worktree_root_inner(canonical, override_val.as_deref())
+}
+
+/// Pure core of [`agent_worktree_root`]: env reading is lifted to the public
+/// wrapper so this can be unit-tested deterministically without mutating the
+/// process-global environment (which would be flaky under parallel tests).
+/// `override_val` is the first present env value (or `None`); only an
+/// *absolute* value is honored.
+fn agent_worktree_root_inner(canonical: &Path, override_val: Option<&str>) -> PathBuf {
+    if let Some(s) = override_val {
+        let p = PathBuf::from(s.trim());
+        if p.is_absolute() {
+            return p;
+        }
+    }
+    canonical
+        .parent()
+        .unwrap_or(canonical)
+        .join("qontinui-worktrees")
+}
+
 /// Reverse of [`default_canonical_path`]: given an absolute filesystem
 /// `path`, return the bare repo slug whose canonical checkout owns it, or
 /// `None` if `path` is not under any known canonical checkout in the
@@ -286,6 +329,68 @@ mod tests {
         // must still resolve against the `D:/` canonical path.
         let p = PathBuf::from("d:/qontinui-root/qontinui-runner/src-tauri");
         assert_eq!(repo_slug_for_path(&p), Some("qontinui-runner".to_string()));
+    }
+
+    #[test]
+    fn agent_worktree_root_end_user_single_project() {
+        // End-user single-project layout: the project root has no sibling
+        // repos — the worktree root is a sibling `qontinui-worktrees` dir,
+        // OUTSIDE the project checkout (never under it).
+        let canonical = Path::new("C:/Users/alice/myapp");
+        let got = agent_worktree_root_inner(canonical, None);
+        assert_eq!(got, PathBuf::from("C:/Users/alice/qontinui-worktrees"));
+        assert!(!got.starts_with(canonical), "must be outside the project");
+    }
+
+    #[test]
+    fn agent_worktree_root_operator_multi_repo() {
+        // Operator multi-repo layout: many sibling checkouts under
+        // D:/qontinui-root — all agents' worktrees share one sibling root.
+        let canonical = Path::new("D:/qontinui-root/qontinui-coord");
+        let got = agent_worktree_root_inner(canonical, None);
+        assert_eq!(got, PathBuf::from("D:/qontinui-root/qontinui-worktrees"));
+        assert!(!got.starts_with(canonical), "must be outside the repo");
+    }
+
+    #[test]
+    fn agent_worktree_root_honors_absolute_override() {
+        // An absolute env override takes full control of the root.
+        let canonical = Path::new("D:/qontinui-root/qontinui-coord");
+        let abs = if cfg!(windows) {
+            "E:/custom-wt-root"
+        } else {
+            "/srv/custom-wt-root"
+        };
+        assert_eq!(
+            agent_worktree_root_inner(canonical, Some(abs)),
+            PathBuf::from(abs)
+        );
+    }
+
+    #[test]
+    fn agent_worktree_root_ignores_relative_override() {
+        // A RELATIVE override is ignored (it would reintroduce the
+        // ambient-cwd bug) — falls back to the sibling default.
+        let canonical = Path::new("D:/qontinui-root/qontinui-coord");
+        assert_eq!(
+            agent_worktree_root_inner(canonical, Some("relative/wt")),
+            PathBuf::from("D:/qontinui-root/qontinui-worktrees")
+        );
+    }
+
+    #[test]
+    fn agent_worktree_root_full_path_is_outside_canonical() {
+        // The composed worktree path
+        // `<root>/<agent_id>/<repo>` must not sit under canonical.
+        let canonical = Path::new("D:/qontinui-root/qontinui-coord");
+        let full = agent_worktree_root_inner(canonical, None)
+            .join("019e-agent")
+            .join("qontinui-types");
+        assert!(!full.starts_with(canonical));
+        assert_eq!(
+            full,
+            PathBuf::from("D:/qontinui-root/qontinui-worktrees/019e-agent/qontinui-types")
+        );
     }
 
     #[test]
