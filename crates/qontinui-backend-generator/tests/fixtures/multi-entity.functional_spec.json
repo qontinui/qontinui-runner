@@ -1,0 +1,76 @@
+{
+  "specVersion": "0",
+  "target": {
+    "sourceUrl": "https://app.example.test/workspace",
+    "observedAt": "2026-06-18T00:00:00Z"
+  },
+  "entities": [
+    {
+      "name": "Project",
+      "fields": [
+        { "name": "title", "type": "string", "confidence": "observed", "provenance": "project title shown in the header" },
+        { "name": "homepage", "type": "string", "confidence": "inferred", "provenance": "project homepage URL", "credibility": 0.7 }
+      ],
+      "confidence": "observed",
+      "provenance": "the workspace lists projects"
+    },
+    {
+      "name": "Member",
+      "fields": [
+        { "name": "email", "type": "string", "confidence": "observed", "provenance": "member email shown in the roster" },
+        { "name": "role", "type": "string", "confidence": "observed", "provenance": "member role badge" }
+      ],
+      "confidence": "observed",
+      "provenance": "the workspace lists members"
+    }
+  ],
+  "operations": [
+    {
+      "name": "createProject",
+      "verb": "create",
+      "entity": "Project",
+      "inputs": [
+        {
+          "field": "homepage",
+          "required": true,
+          "validation": {
+            "rule": "https allowlisted host",
+            "confidence": "observed",
+            "provenance": "client rejects non-https homepage"
+          }
+        }
+      ],
+      "effect": {
+        "confidence": "assumed",
+        "assumption": "persists the project and returns a creation token (REST 201)"
+      },
+      "confidence": "observed",
+      "provenance": "Create Project POSTs the project"
+    },
+    {
+      "name": "inviteMember",
+      "verb": "create",
+      "entity": "Member",
+      "inputs": [],
+      "effect": {
+        "confidence": "assumed",
+        "assumption": "persists the member invite and returns a token (REST 201)"
+      },
+      "confidence": "observed",
+      "provenance": "Invite Member POSTs the invite"
+    }
+  ],
+  "uiStates": [],
+  "navigation": [],
+  "auth": {
+    "model": "session",
+    "confidence": "inferred",
+    "roles": [],
+    "provenance": "the workspace sits behind the authenticated app shell",
+    "credibility": 0.5
+  },
+  "assumptions": [
+    { "ref": "operations.createProject.effect", "defaultApplied": "persists + returns token", "overridable": true },
+    { "ref": "operations.inviteMember.effect", "defaultApplied": "persists + returns token", "overridable": true }
+  ]
+}
