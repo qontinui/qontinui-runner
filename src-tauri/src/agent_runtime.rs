@@ -2166,6 +2166,12 @@ async fn run_continuation_headless(
     // config dir that `spawn_claude_child` reads). spawn_blocking: the selector
     // reads settings + cooldown state.
     let _ = tokio::task::spawn_blocking(crate::ai_provider::pick_best_account).await;
+    // Provision coord-mcp for the headless session so it receives coord's
+    // session-start `instructions` preamble and can call coord_declare_intent —
+    // parity with the terminal continuation path (which provisions the bound_port
+    // proxy shape). Headless has no bound port → `None` selects the device-JWT
+    // static-bearer shape.
+    crate::coord_mcp::provision_coord_mcp_for_session(workdir, None);
     match spawn_claude_child(workdir, initial_prompt).await {
         Ok(mut child) => {
             let pid = child.id().map(|p| p as i64);
