@@ -25,6 +25,8 @@ import type { useProjectSelection } from "@/hooks/useProjectSelection";
 import type { MainTabId, LogSubTab } from "./tab-types";
 import type { ErrorMonitorScope } from "./useAppNavigation";
 import { LogSourcesConfigTab } from "./LogSourcesConfigTab";
+import { buildRegistrySpawnActions } from "@/components/terminal/registrySpawnActions";
+import { callRegistry } from "@/components/terminal/commands";
 
 import { LogsTab } from "@/components/LogsTab";
 import { CaptureTab } from "@/components/CaptureTab";
@@ -154,17 +156,33 @@ const MemoryFederationPage = lazy(() =>
   })),
 );
 
-/** Register the active page with UI Bridge for AI discoverability */
+/** Register the active page with UI Bridge for AI discoverability.
+ *
+ * `actions` defaults to none. The terminal tab supplies the registry-backed
+ * spawn actions here (see `case "terminal"`) because — unlike most pages —
+ * the terminal page tree is rendered in an always-mounted, CSS-hidden block
+ * OUTSIDE this switch, and its in-tree `useUIComponent("terminal-page")`
+ * registration does NOT reliably land in the live registry (observed on the
+ * primary runner: `terminal-page` / `terminal-launch-menu` register 0
+ * components while this active-tab `page-<id>` registration path DOES land —
+ * e.g. `page-prompt-home`). Registering the spawn affordance on the
+ * active-tab `page-terminal` component routes it through the proven path, so
+ * the homepage NL planner's `create-best-account` flow is reachable whenever
+ * the terminal tab is active. Handlers delegate to the terminal command
+ * registry (`callRegistry`), which the always-mounted terminal tree populates
+ * via `useTerminalCommands`. */
 function PageRegistration({
   id,
   name,
   description,
+  actions,
 }: {
   id: string;
   name: string;
   description: string;
+  actions?: Parameters<typeof useUIComponent>[0]["actions"];
 }) {
-  useUIComponent({ id: `page-${id}`, name, description, actions: [] });
+  useUIComponent({ id: `page-${id}`, name, description, actions: actions ?? [] });
   return null;
 }
 
@@ -1076,7 +1094,25 @@ export function TabContent({
       );
 
     case "terminal":
-      return null;
+      // The terminal page tree itself is rendered in an always-mounted,
+      // CSS-hidden block in App.tsx (not through this switch), so this case
+      // renders no page UI. It DOES, however, register the `page-terminal`
+      // UI Bridge component carrying the registry-backed spawn actions
+      // (`create-plain` / `create-best-account` / `create-with-command`) on
+      // the active-tab registration path that is observed to reliably land in
+      // the live registry — unlike the in-tree `terminal-page` /
+      // `terminal-launch-menu` registrations, which do not. This is the
+      // headless-reachable AI-spawn affordance the homepage NL planner relies
+      // on. The handlers are pure delegations to `callRegistry`, populated by
+      // the always-mounted terminal tree's `useTerminalCommands`.
+      return (
+        <PageRegistration
+          id="terminal"
+          name="Terminal"
+          description="Multi-terminal workspace. Spawn plain shells or AI (claude) sessions: use create-best-account to open an AI session with the lowest-utilization account."
+          actions={buildRegistrySpawnActions(callRegistry)}
+        />
+      );
 
     case "automation-health":
       return (
