@@ -851,6 +851,20 @@ fn read_proxy_port(workdir: &str) -> Option<u16> {
     port_str.parse::<u16>().ok()
 }
 
+/// Read the per-session proxy NONCE out of an existing coord-mcp `.mcp.json`, if
+/// the file holds the PROXY shape (an `X-Coord-Mcp-Proxy-Key` header). Returns
+/// `None` for an absent/unparseable file or a non-proxy shape. Used by the
+/// root-config self-heal: a nonce no longer in the live registry (evicted on a
+/// re-provision, or simply never restored) means the config would 401 the
+/// proxy, so it must be rewritten even when the port still matches.
+fn read_proxy_nonce(config_path: &Path) -> Option<String> {
+    let s = std::fs::read_to_string(config_path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+    v.pointer("/mcpServers/coord-mcp/headers/X-Coord-Mcp-Proxy-Key")
+        .and_then(|n| n.as_str())
+        .map(String::from)
+}
+
 /// Boot-time reconcile decision for one session's `.mcp.json` (Phase 3c). Pure
 /// over its inputs (no I/O) so the rewrite predicate is unit-testable:
 ///
@@ -876,13 +890,103 @@ pub(crate) fn reconcile_action(
     }
 }
 
-/// Boot-time session-config reconcile (Phase 3c). For each live session workdir,
-/// if its `.mcp.json` coord-mcp proxy port ≠ the instance's CURRENT bound port,
-/// rewrite it via [`write_coord_mcp_proxy_config`] (correct port + a freshly
-/// persisted nonce), guarded by [`coord_mcp_safe_to_write`] so it never clobbers
-/// an agent-spawn's static-bearer config. Combined with Phase 3b (persisted
-/// nonces), the common same-port restart needs no rewrite at all — this covers
-/// only the instance/port-change case. Returns the number of configs rewritten.
+/// Resolve the `qontinui-root` directory the checked-in repo-root `.mcp.json`
+/// lives in. Mirror of `agent_runtime::qontinui_root_dir`, inlined so this leaf
+/// module does NOT depend on `agent_runtime` (which depends back on us — the
+/// cycle this module was extracted to break). `QONTINUI_ROOT` env first, then
+/// the Windows `D:/qontinui-root` well-known path, then `~/qontinui-root`.
+fn qontinui_root_dir() -> Option<std::path::PathBuf> {
+    if let Ok(s) = std::env::var("QONTINUI_ROOT") {
+        let p = std::path::PathBuf::from(s);
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let p = std::path::PathBuf::from("D:/qontinui-root");
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    dirs::home_dir()
+        .map(|h| h.join("qontinui-root"))
+        .filter(|p| p.is_dir())
+}
+
+/// True iff the root `.mcp.json` at `root_dir` holds a coord-mcp PROXY config
+/// that is STALE for the current `bound_port` — its proxy port differs OR its
+/// nonce is not in the live registry. Either case 401s/misroutes a spawned
+/// agent that inherits the root file, so it must be rewritten. Returns `false`
+/// (leave it) for an absent file, a non-proxy (static-bearer) shape, or a
+/// proxy config whose port matches AND whose nonce is currently registered.
+///
+/// Split out as a pure-over-its-inputs predicate so the self-heal decision is
+/// unit-testable without env or the process-global nonce map mutation order.
+fn root_config_is_stale(root_dir: &Path, bound_port: u16) -> bool {
+    let path = root_dir.join(".mcp.json");
+    let Some(port) = read_proxy_port(&root_dir.to_string_lossy()) else {
+        // Absent, unparseable, or a static-bearer (agent) shape — not ours to
+        // refresh here. (The session reconcile's `coord_mcp_safe_to_write`
+        // guard owns the agent-config-protection contract; we never touch one.)
+        return false;
+    };
+    if port != bound_port {
+        return true;
+    }
+    // Port matches: the only remaining staleness is an evicted/unrestored nonce
+    // the live proxy would 401.
+    match read_proxy_nonce(&path) {
+        Some(nonce) => !proxy_nonce_is_valid(&nonce),
+        None => true,
+    }
+}
+
+/// Boot-time self-heal of the CHECKED-IN repo-root `.mcp.json` (Phase 5b),
+/// resolving the root dir from the environment. Delegates to
+/// [`reconcile_root_config_at`] — split so the rewrite is unit-testable against
+/// an explicit temp dir WITHOUT mutating the process-global `QONTINUI_ROOT`
+/// (the module deliberately avoids global-env mutation; see the test helpers).
+fn reconcile_root_config(bound_port: u16) -> bool {
+    match qontinui_root_dir() {
+        Some(root_dir) => reconcile_root_config_at(&root_dir, bound_port),
+        None => false,
+    }
+}
+
+/// Self-heal the repo-root `.mcp.json` under `root_dir` (Phase 5b). The root
+/// config is the loopback PROXY shape (port + per-session nonce); a spawned
+/// agent that inherits it (cwd up the tree, no per-worktree config) breaks if
+/// the nonce was evicted or the port moved across a restart/instance change.
+/// When [`root_config_is_stale`] flags it, rewrite via the SAME
+/// [`write_coord_mcp_proxy_config`] helper the session path uses (fresh
+/// registered nonce + the current bound port) — guarded by
+/// [`coord_mcp_safe_to_write`] so a hand-rolled static-bearer root file is never
+/// clobbered. Returns `true` iff the root file was rewritten.
+fn reconcile_root_config_at(root_dir: &Path, bound_port: u16) -> bool {
+    if !root_config_is_stale(root_dir, bound_port) {
+        return false;
+    }
+    let root = root_dir.to_string_lossy().to_string();
+    if !coord_mcp_safe_to_write(&root) {
+        return false;
+    }
+    write_coord_mcp_proxy_config(&root, bound_port);
+    info!("coord_mcp: boot self-heal rewrote root {root}/.mcp.json to bound port :{bound_port}");
+    true
+}
+
+/// Boot-time session-config reconcile (Phase 3c) + root-config self-heal
+/// (Phase 5b). For each live session workdir, if its `.mcp.json` coord-mcp proxy
+/// port ≠ the instance's CURRENT bound port, rewrite it via
+/// [`write_coord_mcp_proxy_config`] (correct port + a freshly persisted nonce),
+/// guarded by [`coord_mcp_safe_to_write`] so it never clobbers an agent-spawn's
+/// static-bearer config. Combined with Phase 3b (persisted nonces), the common
+/// same-port restart needs no rewrite at all — this covers only the
+/// instance/port-change case. ALSO self-heals the checked-in repo-root
+/// `.mcp.json` (see [`reconcile_root_config`]) so a spawned agent inheriting the
+/// root file is never broken by an evicted nonce / stale port. Returns the
+/// number of configs rewritten (sessions + the root file).
 ///
 /// Wired into the same startup path as the other auto-start tasks (see
 /// `mcp_api::start_server`), AFTER [`restore_proxy_nonces_from_store`] so a
@@ -906,8 +1010,12 @@ where
         rewritten += 1;
         info!("coord_mcp: reconciled {workdir}/.mcp.json to bound port :{bound_port}");
     }
+    // Belt-and-braces: self-heal the checked-in repo-root config too (Phase 5b).
+    if reconcile_root_config(bound_port) {
+        rewritten += 1;
+    }
     if rewritten > 0 {
-        info!("coord_mcp: boot reconcile rewrote {rewritten} session config(s) to the current bound port");
+        info!("coord_mcp: boot reconcile rewrote {rewritten} config(s) to the current bound port");
     }
     rewritten
 }
@@ -1583,6 +1691,13 @@ mod tests {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         let base = std::env::temp_dir().join(format!("coord-mcp-recon-{}", uuid::Uuid::now_v7()));
 
+        // Point the root-config self-heal (Phase 5b) at `base` — which holds no
+        // `.mcp.json` — so this test exercises ONLY the session path and never
+        // touches the operator's real `qontinui-root/.mcp.json`. Restored below.
+        std::fs::create_dir_all(&base).unwrap();
+        let prev_root = std::env::var("QONTINUI_ROOT").ok();
+        std::env::set_var("QONTINUI_ROOT", &base);
+
         // Stale proxy config on :9999 → must be rewritten to :9876.
         let stale = base.join("stale");
         std::fs::create_dir_all(&stale).unwrap();
@@ -1644,5 +1759,118 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+        match prev_root {
+            Some(p) => std::env::set_var("QONTINUI_ROOT", p),
+            None => std::env::remove_var("QONTINUI_ROOT"),
+        }
+    }
+
+    /// Phase 5b — the boot self-heal rewrites a stale ROOT `.mcp.json` (the
+    /// checked-in repo-root coord-mcp config) to the current bound port + a
+    /// freshly-registered nonce, so a spawned agent inheriting the root file is
+    /// never broken by an evicted nonce / stale port. Drives the env-free
+    /// `reconcile_root_config_at` so it neither mutates `QONTINUI_ROOT` nor
+    /// touches the operator's real root config. Covers all three staleness
+    /// dimensions: wrong port, dead nonce (right port), and the leave-alone
+    /// cases (matching port + live nonce, absent file, foreign static-bearer).
+    #[test]
+    fn reconcile_root_config_self_heals_stale_root_mcp_json() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+        // --- Case 1: stale PORT → rewrite. ---
+        let root = std::env::temp_dir().join(format!("coord-mcp-root-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(".mcp.json"),
+            r#"{"mcpServers":{"coord-mcp":{"type":"http","url":"http://127.0.0.1:9999/coord-mcp","headers":{"X-Coord-Mcp-Proxy-Key":"deadnonce"}}}}"#,
+        )
+        .unwrap();
+        assert!(root_config_is_stale(&root, 9876), "wrong port is stale");
+        assert!(
+            reconcile_root_config_at(&root, 9876),
+            "a stale-port root config must be rewritten"
+        );
+        // Rewritten to the bound port with a freshly-registered nonce.
+        assert_eq!(read_proxy_port(&root.to_string_lossy()), Some(9876));
+        let new_nonce = read_proxy_nonce(&root.join(".mcp.json")).unwrap();
+        assert!(
+            proxy_nonce_is_valid(&new_nonce),
+            "the rewritten root config must carry a freshly-registered nonce"
+        );
+        assert_ne!(new_nonce, "deadnonce");
+        // And NO baked Authorization bearer (proxy shape).
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join(".mcp.json")).unwrap())
+                .unwrap();
+        assert!(v["mcpServers"]["coord-mcp"]["headers"]
+            .get("Authorization")
+            .is_none());
+
+        // --- Case 2: matching port + LIVE nonce → leave (no rewrite). ---
+        // The case-1 rewrite left a live nonce on port 9876; a second pass is a
+        // no-op and must NOT mint a new nonce.
+        assert!(
+            !root_config_is_stale(&root, 9876),
+            "matching port + live nonce is not stale"
+        );
+        assert!(
+            !reconcile_root_config_at(&root, 9876),
+            "a fresh root config must not be rewritten again"
+        );
+        assert_eq!(
+            read_proxy_nonce(&root.join(".mcp.json")).unwrap(),
+            new_nonce
+        );
+
+        // --- Case 3: matching port but DEAD nonce → rewrite. ---
+        let dead = std::env::temp_dir().join(format!("coord-mcp-root-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dead).unwrap();
+        std::fs::write(
+            dead.join(".mcp.json"),
+            r#"{"mcpServers":{"coord-mcp":{"type":"http","url":"http://127.0.0.1:9876/coord-mcp","headers":{"X-Coord-Mcp-Proxy-Key":"notregistered"}}}}"#,
+        )
+        .unwrap();
+        assert!(
+            root_config_is_stale(&dead, 9876),
+            "right port but an unregistered nonce is stale"
+        );
+        assert!(reconcile_root_config_at(&dead, 9876));
+        assert!(proxy_nonce_is_valid(
+            &read_proxy_nonce(&dead.join(".mcp.json")).unwrap()
+        ));
+
+        // --- Case 4: absent root file → leave. ---
+        let empty = std::env::temp_dir().join(format!("coord-mcp-root-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(
+            !root_config_is_stale(&empty, 9876),
+            "absent file is not stale"
+        );
+        assert!(!reconcile_root_config_at(&empty, 9876));
+        assert!(!empty.join(".mcp.json").exists());
+
+        // --- Case 5: foreign STATIC-BEARER (agent) root → never clobbered. ---
+        let agent_payload = URL_SAFE_NO_PAD.encode(br#"{"sub_type":"agent"}"#);
+        let agent_jwt = format!("h.{agent_payload}.s");
+        let agent_cfg = format!(
+            r#"{{"mcpServers":{{"coord-mcp":{{"type":"http","url":"https://c/mcp","headers":{{"Authorization":"Bearer {agent_jwt}"}}}}}}}}"#
+        );
+        let agent = std::env::temp_dir().join(format!("coord-mcp-root-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(agent.join(".mcp.json"), &agent_cfg).unwrap();
+        // A static-bearer shape has no proxy URL → not flagged stale (and even if
+        // it were, `coord_mcp_safe_to_write` would refuse the rewrite).
+        assert!(!root_config_is_stale(&agent, 9876));
+        assert!(!reconcile_root_config_at(&agent, 9876));
+        assert_eq!(
+            std::fs::read_to_string(agent.join(".mcp.json")).unwrap(),
+            agent_cfg,
+            "a static-bearer root config must never be clobbered"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dead);
+        let _ = std::fs::remove_dir_all(&empty);
+        let _ = std::fs::remove_dir_all(&agent);
     }
 }
