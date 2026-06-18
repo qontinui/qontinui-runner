@@ -2081,6 +2081,9 @@ async fn run_continuation_terminal(
         .try_state::<Arc<crate::commands::AppState>>()
         .map(|s| crate::mcp::types::runner_api_port(s.inner()));
     crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port);
+    // Bundle /vet-plan and /implement-plan into the session cwd so they resolve
+    // as project slash commands regardless of the device's ~/.claude.
+    crate::fleet_commands::provision_fleet_commands_for_session(workdir);
 
     let result = crate::commands::terminal::create_terminal_session_backend(
         &terminal_manager,
@@ -2404,6 +2407,9 @@ async fn run_agent_subprocess(
     if let Err(e) = provision_agent_definitions(&primary_wt) {
         warn!("agent_runtime: agent-def provisioning errored (continuing spawn): {e:#}");
     }
+    // Bundle /vet-plan and /implement-plan into the spawned worktree cwd so they
+    // resolve as project slash commands regardless of the device's ~/.claude.
+    crate::fleet_commands::provision_fleet_commands_for_session(&primary_wt);
 
     let log_path = agent_log_path(payload.agent_id);
 
