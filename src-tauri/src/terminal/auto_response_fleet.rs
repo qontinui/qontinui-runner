@@ -40,8 +40,33 @@ use crate::settings::BackoffConfig;
 pub enum RuleAction {
     /// Submit a fixed text into the matched session. Offline-capable.
     SubmitPrompt { text: String },
-    /// Resolve the response via coord's scoring/judge endpoint for `policy_id`.
-    ResolveByScoring { policy_id: String },
+    /// Resolve the response via coord's pure-composition resolve endpoint for
+    /// `policy_id`.
+    ///
+    /// Coord no longer runs an LLM judge itself (judge-rework Phase 1): it now
+    /// projects the policy's `options` (each `{id,label}`) and scoring
+    /// `dimensions`, the runner scores every option on every dimension via its
+    /// own authenticated Claude CLI, and POSTs the scores back for pure
+    /// composition. `options`/`dimensions` are `#[serde(default)]` so an older
+    /// coord that omits them still deserializes — but with no options the
+    /// scorer has nothing to score and the rule is a fail-safe no-op.
+    ResolveByScoring {
+        policy_id: String,
+        #[serde(default)]
+        options: Vec<ScoringOption>,
+        #[serde(default)]
+        dimensions: Vec<String>,
+    },
+}
+
+/// One scoreable option projected by coord for a `resolve_by_scoring` rule.
+/// `id` keys the score map sent back to coord; `label` is the human-meaningful
+/// choice text fed to the CLI scorer (and is what coord maps the winning
+/// `option_id` back to a `response_text`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ScoringOption {
+    pub id: String,
+    pub label: String,
 }
 
 /// A fleet rule as projected by `GET /coord/policies/runner-rules`.
@@ -334,7 +359,15 @@ mod tests {
                 {
                     "id": "needs-judge",
                     "pattern": "which option",
-                    "action": {"kind": "resolve_by_scoring", "policy_id": "11111111-1111-1111-1111-111111111111"}
+                    "action": {
+                        "kind": "resolve_by_scoring",
+                        "policy_id": "11111111-1111-1111-1111-111111111111",
+                        "options": [
+                            {"id": "a", "label": "Yes, proceed"},
+                            {"id": "b", "label": "No, stop"}
+                        ],
+                        "dimensions": ["safety", "intent_fit"]
+                    }
                 }
             ]
         }"#;
@@ -357,7 +390,42 @@ mod tests {
         assert_eq!(
             parsed.rules[1].action,
             RuleAction::ResolveByScoring {
-                policy_id: "11111111-1111-1111-1111-111111111111".to_string()
+                policy_id: "11111111-1111-1111-1111-111111111111".to_string(),
+                options: vec![
+                    ScoringOption {
+                        id: "a".to_string(),
+                        label: "Yes, proceed".to_string(),
+                    },
+                    ScoringOption {
+                        id: "b".to_string(),
+                        label: "No, stop".to_string(),
+                    },
+                ],
+                dimensions: vec!["safety".to_string(), "intent_fit".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_by_scoring_tolerates_omitted_options_and_dimensions() {
+        // An older coord that doesn't yet project options/dimensions still
+        // deserializes (serde defaults), leaving the scorer a fail-safe no-op.
+        let body = r#"{
+            "rules": [
+                {
+                    "id": "needs-judge",
+                    "pattern": "which option",
+                    "action": {"kind": "resolve_by_scoring", "policy_id": "pol-old"}
+                }
+            ]
+        }"#;
+        let parsed: FleetRulesResponse = serde_json::from_str(body).expect("coord body parses");
+        assert_eq!(
+            parsed.rules[0].action,
+            RuleAction::ResolveByScoring {
+                policy_id: "pol-old".to_string(),
+                options: vec![],
+                dimensions: vec![],
             }
         );
     }

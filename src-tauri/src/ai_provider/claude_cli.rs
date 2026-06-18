@@ -262,6 +262,158 @@ fn run_claude_cli_with_arg(
     }
 }
 
+// ── One-shot option scorer (terminal auto-response judge-rework Phase 2) ──────
+//
+// The terminal auto-response engine's `resolve_by_scoring` rules need each
+// policy option scored on each dimension *before* coord composes a winner.
+// Rather than coord running an LLM, the runner scores via its OWN authenticated
+// Claude CLI — same binary resolution + config-dir/auth/env discipline as
+// `run_claude_cli` above, but as a non-interactive `claude -p <prompt>` print
+// call with a bounded timeout that returns the raw stdout (the scores JSON) and
+// fails closed (`None`) on a nonzero exit / timeout / missing binary. The
+// caller (`terminal::auto_response`) builds the prompt, parses the JSON, and is
+// the one that fails-safe-injects-nothing on a `None`.
+
+use crate::settings::ClaudeCliSettings;
+use std::process::Stdio;
+use std::time::Duration;
+
+/// Path to the `claude` binary for the one-shot scorer. Honors
+/// `QONTINUI_CLAUDE_BIN` (the same override the agent runtime + mock fixture
+/// use) first, then the user's configured `custom_path`, then PATH `claude` —
+/// so the scorer runs the SAME CLI the runner already uses.
+fn scorer_claude_program(settings: &ClaudeCliSettings) -> String {
+    std::env::var("QONTINUI_CLAUDE_BIN")
+        .ok()
+        .or_else(|| settings.custom_path.clone())
+        .unwrap_or_else(|| "claude".to_string())
+}
+
+/// Run `claude -p <prompt>` (non-interactive print mode) once and return its
+/// trimmed stdout, or `None` on any failure (spawn error / missing binary /
+/// nonzero exit / timeout). Fail-closed by design — the auto-response caller
+/// injects NOTHING on `None`.
+///
+/// Auth/config reuse: resolves the effective config dir the same way the rest
+/// of the CLI provider does ([`get_effective_config_dir`]) and exports it as
+/// `CLAUDE_CONFIG_DIR`, refreshing OAuth credentials first — so the one-shot
+/// authenticates as the SAME account the runner's sessions use. `CLAUDECODE` is
+/// removed so a runner already running inside Claude Code can still spawn the
+/// nested print call (mirrors [`process::spawn_and_wait_with_doctor`]).
+///
+/// Bounded by `timeout`: the child is killed and `None` returned if it does not
+/// exit in time, so a wedged CLI never strands the scheduler task.
+pub(crate) fn score_options_via_cli(
+    prompt: &str,
+    settings: &ClaudeCliSettings,
+    timeout: Duration,
+) -> Option<String> {
+    let program = scorer_claude_program(settings);
+    let config_dir = get_effective_config_dir(settings);
+
+    // Refresh OAuth before spawning, same as run_claude_cli.
+    super::oauth_refresh::try_ensure_valid_credentials(config_dir.as_deref());
+
+    // Build the command. On Windows route through cmd.exe /c (so a `.cmd`/`.ps1`
+    // shim on PATH resolves), elsewhere invoke the program directly. The prompt
+    // is piped over STDIN (not passed as a `-p` argv) — the scoring prompt is
+    // long + multi-line + JSON-heavy, and cmd.exe corrupts special chars
+    // (", %, ^, &, |, <, >) in arguments (the exact reason `run_claude_cli`
+    // always pipes on Windows). `claude --print` reads the prompt from stdin
+    // when no positional prompt is given.
+    let mut cmd = if std::env::consts::OS == "windows" {
+        let mut c = crate::process_helpers::cmd_no_window();
+        c.args(["/c", &program, "--print"]);
+        c
+    } else {
+        let mut c = crate::process_helpers::no_window(&program);
+        c.arg("--print");
+        c
+    };
+    if let Some(dir) = config_dir.as_deref() {
+        cmd.env("CLAUDE_CONFIG_DIR", dir);
+    }
+    cmd.env_remove("CLAUDECODE");
+    cmd.env("QONTINUI_TRACE_ID", uuid::Uuid::new_v4().to_string());
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "auto_response scorer: failed to spawn claude CLI — no scores");
+            return None;
+        }
+    };
+
+    // Write the prompt to the child's stdin and close it so the CLI sees EOF
+    // and starts producing output. Failure to write → fail closed. The scoring
+    // prompt is a few KB (terminal context + a handful of options/dimensions),
+    // well under the OS pipe buffer, so a single blocking write-before-read
+    // can't deadlock against the child filling its stdout pipe.
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        if let Err(e) = stdin.write_all(prompt.as_bytes()) {
+            warn!(error = %e, "auto_response scorer: writing prompt to stdin failed — no scores");
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        // Drop closes stdin (EOF).
+    }
+
+    // Bounded wait: poll for exit up to `timeout`, then kill + fail closed.
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    warn!(
+                        timeout_secs = timeout.as_secs(),
+                        "auto_response scorer: claude CLI timed out — killing, no scores"
+                    );
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => {
+                warn!(error = %e, "auto_response scorer: wait failed — no scores");
+                let _ = child.kill();
+                return None;
+            }
+        }
+    }
+
+    let output = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => {
+            warn!(error = %e, "auto_response scorer: collecting output failed — no scores");
+            return None;
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!(
+            exit = ?output.status.code(),
+            stderr = %truncate_str(&stderr, 300),
+            "auto_response scorer: claude CLI nonzero exit — no scores"
+        );
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        debug!("auto_response scorer: claude CLI produced empty stdout — no scores");
+        return None;
+    }
+    Some(stdout)
+}
+
 /// Process CLI output into AiResponse
 ///
 /// Note: CLI providers don't expose token counts in their output,
