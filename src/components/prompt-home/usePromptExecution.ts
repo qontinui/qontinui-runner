@@ -447,8 +447,18 @@ type BridgeLike = {
  * Keyed by the planner-named component id → ordered list of fallback component
  * ids to try (most-specific first).
  */
-const COMPONENT_FALLBACKS: Readonly<Record<string, readonly string[]>> = {
-  "terminal-launch-menu": ["terminal-page"],
+export const COMPONENT_FALLBACKS: Readonly<Record<string, readonly string[]>> = {
+  // The planner names `terminal-launch-menu` for the AI-spawn flow. The same
+  // registry-backed spawn actions are exposed on the always-mounted
+  // `terminal-page` component AND on the active-tab `page-terminal` component.
+  // `page-terminal` is registered through the active-tab `PageRegistration`
+  // path (TabContent), which reliably lands in the live registry — unlike the
+  // in-terminal-tree `terminal-page` / `terminal-launch-menu` registrations,
+  // which were observed NOT to register at runtime. Order is most-reliable
+  // first so the retarget lands on `page-terminal` when present.
+  "terminal-launch-menu": ["page-terminal", "terminal-page"],
+  // Direct alias in case the planner names `terminal-page` itself.
+  "terminal-page": ["page-terminal"],
 };
 
 /**
@@ -458,7 +468,7 @@ const COMPONENT_FALLBACKS: Readonly<Record<string, readonly string[]>> = {
  * action. Falls back to the original `componentId` when nothing better is
  * found, so the caller's dispatch still surfaces the SDK's own not-found error.
  */
-function resolveComponentForAction(
+export function resolveComponentForAction(
   bridge: BridgeLike,
   componentId: string,
   actionId: string,
