@@ -1695,9 +1695,7 @@ async fn run_gate_continuation_inner(
             info!("agent_runtime: gate-continuation presentation=headless agent_id={agent_id}");
             // `ctx` is held until this `.await` resolves (the subprocess exits),
             // matching the agent-spawn path's heartbeat-then-release lifecycle.
-            // Same fleet-portable Session Bus preamble as the terminal branch.
-            let prompt = crate::session_bus::prepend_coordination_preamble(&payload.initial_prompt);
-            let res = run_continuation_headless(agent_id, &workdir, &prompt).await;
+            let res = run_continuation_headless(agent_id, &workdir, &payload.initial_prompt).await;
             drop(ctx);
             res
         }
@@ -1904,10 +1902,7 @@ async fn run_continuation_terminal(
         claude_bin,
         &pinned_session_id,
         add_dir_args,
-        // Fleet-portable Session Bus boot preamble (Phase 1): spliced into the
-        // spawn prompt here in the runner so it runs on EVERY fleet host, not
-        // just where the operator's claude-config SessionStart hook lives.
-        crate::session_bus::prepend_coordination_preamble(&payload.initial_prompt),
+        payload.initial_prompt.clone(),
     ));
 
     // First repo (if any) is the session's intent_repo for coord attribution.
