@@ -1041,6 +1041,13 @@ pub(crate) struct SessionCaptureHint {
     /// migrated session's tile placement). `None` → zone 0 (the historical
     /// continuation behavior — wrong zone beats a lost session).
     pub zone_index: Option<i32>,
+    /// When `true`, inject the autonomous-agent git author/committer identity
+    /// (`GIT_AUTHOR_*`/`GIT_COMMITTER_*`) into the spawned PTY's env so the
+    /// agent's commits land with a meaningful author instead of the ambient
+    /// host placeholder (`x <x@x>`). Set ONLY for autonomous spawns (gate
+    /// continuations); the operator's own terminals leave it `false` and keep
+    /// their host git identity. See `crate::agent_runtime::agent_git_identity_env`.
+    pub inject_agent_git_identity: bool,
 }
 
 /// Backend-task entry point for creating a terminal session + coord row from a
@@ -1095,6 +1102,16 @@ pub(crate) fn create_terminal_session_backend(
     // command instead; this is the backend-spawn equivalent.
     if let Some(dir) = capture_hint.as_ref().and_then(|h| h.config_dir.clone()) {
         env_pairs.push(("CLAUDE_CONFIG_DIR".to_string(), dir));
+    }
+    // Autonomous-agent git identity: opt-in per caller (gate continuations).
+    // Overrides the ambient host git config (which may be a placeholder like
+    // `x <x@x>`) for THIS PTY only, so the agent's commits get a meaningful
+    // author. Operator-opened terminals never set the flag and are untouched.
+    if capture_hint
+        .as_ref()
+        .is_some_and(|h| h.inject_agent_git_identity)
+    {
+        env_pairs.extend(crate::agent_runtime::agent_git_identity_env());
     }
     let extra_env = if env_pairs.is_empty() {
         None
@@ -1214,6 +1231,8 @@ pub(crate) fn create_terminal_session_backend(
                 page_id: hint_page_id,
                 claude_session_id: pinned_session_id,
                 zone_index: hint_zone_index,
+                // Consumed earlier (env injection at spawn); not needed here.
+                inject_agent_git_identity: _,
             } = hint;
             // Single source of truth for the recorded page: the hint's page_id
             // (set by the caller to the picked page), defaulting to "default".

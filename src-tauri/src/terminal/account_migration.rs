@@ -331,6 +331,9 @@ pub fn migrate_session(
         // record (same row, new terminal/account/zone) + verification arm.
         claude_session_id: Some(record.claude_session_id.clone()),
         zone_index: Some(record.zone_index),
+        // A migration respawn preserves the original session's nature (operator
+        // or autonomous); don't force the agent identity onto an unknown session.
+        inject_agent_git_identity: false,
     };
     let (new_terminal_id, _coord_id) = crate::commands::terminal::create_terminal_session_backend(
         &terminal_manager,
