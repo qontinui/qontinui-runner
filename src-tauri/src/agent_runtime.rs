@@ -730,6 +730,9 @@ fn spawn_run_task(payload: LaunchPayload) {
         }
         // Drop the registry entry once the run task is fully done.
         agent_stops().lock().unwrap().remove(&agent_id);
+        // Drop the agent's live-token slot so its proxy nonce hard-fails closed
+        // (the agent process is gone; any lingering `.mcp.json` nonce must 401).
+        crate::coord_mcp::remove_agent_token(agent_id);
     });
 }
 
@@ -2255,11 +2258,48 @@ async fn run_agent_subprocess(
         .worktree_path
         .clone();
 
-    // Write .mcp.json so the spawned claude process auto-discovers
-    // the coord MCP server for coordination tooling. Agent-spawns carry a
-    // coord-minted agent JWT and land in a freshly-allocated worktree, so the
-    // blind overwrite is safe here (no pre-existing user config to clobber).
-    crate::coord_mcp::write_coord_mcp_config(&primary_wt, &payload.jwt);
+    // Write .mcp.json so the spawned claude process auto-discovers the coord MCP
+    // server. Agent-spawns carry a coord-minted agent JWT with a ~4h TTL, and
+    // Claude Code's MCP client reads `.mcp.json` exactly once at connect — a
+    // STATIC baked bearer silently dies at expiry (the bug this fixes). Instead
+    // we register the agent's JWT in a process-global live-token slot and write
+    // the per-agent PROXY shape: the loopback `/coord-mcp` route injects THIS
+    // agent's own refreshed token per request (never the device token — the
+    // scope-elevation trap). The heartbeat loop (below) drives proactive
+    // refresh so the slot never expires for a live agent.
+    {
+        let slot = std::sync::Arc::new(tokio::sync::RwLock::new(crate::agent_token::TokenSlot {
+            token: payload.jwt.clone(),
+            jti: uuid::Uuid::nil(),
+            exp: payload.jwt_exp,
+        }));
+        crate::coord_mcp::register_agent_token(payload.agent_id, slot);
+        match crate::coord_mcp::resolve_bound_api_port() {
+            Some(port) => {
+                crate::coord_mcp::write_coord_mcp_agent_proxy_config(
+                    &primary_wt,
+                    port,
+                    payload.agent_id,
+                );
+                crate::coord_mcp::probe_and_breadcrumb_proxy(&primary_wt, port);
+            }
+            None => {
+                // Fail-closed exactly like the device arm: a bootstrap-default
+                // port is dead on a secondary/temp runner, and a dead-but-valid
+                // config is worse than an absent one. Drop a 1a breadcrumb so the
+                // agent self-routes to /gate.
+                warn!(
+                    "agent_runtime: refusing to write an agent proxy .mcp.json for \
+                     agent_id={} — bound API port unresolvable (no managed AppState)",
+                    payload.agent_id
+                );
+                crate::coord_mcp::write_degraded_breadcrumb(
+                    &primary_wt,
+                    "bound API port unresolvable — agent proxy config NOT written (would point at a dead port)",
+                );
+            }
+        }
+    }
 
     // Provision the named-subagent defs into the spawned worktree's cwd so the
     // headless `claude` can resolve subagents the spawn prompt references
@@ -2787,6 +2827,21 @@ async fn run_heartbeat_loop(payload: LaunchPayload) {
                 "agent_runtime: heartbeat agent_id={} failed: {e:#}",
                 payload.agent_id
             );
+        }
+        // Proactively refresh the agent's coord-mcp proxy token (OQ4). The 30s
+        // tick ≪ the 30-min refresh margin, so the per-agent JWT in AGENT_TOKENS
+        // is renewed well before its 4h TTL — independent of coord-mcp call
+        // activity. Coord's /agents/:id/refresh-token rejects an ALREADY-expired
+        // token, so a live agent must never let it lapse; the request-path
+        // refresh alone is insufficient for an idle agent. Best-effort: a
+        // refresh failure (maybe_refresh logs + returns Ok) never breaks the
+        // heartbeat loop.
+        if let Some(slot) = crate::coord_mcp::lookup_agent_token(payload.agent_id) {
+            if let Some(base) = coord_http_base() {
+                let _ =
+                    crate::agent_token::maybe_refresh(&slot, &base, payload.agent_id, "agent_mcp")
+                        .await;
+            }
         }
     }
 }
