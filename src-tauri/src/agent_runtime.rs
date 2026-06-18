@@ -168,10 +168,77 @@ pub struct GateContinuationPayload {
 /// The `source` discriminator coord stamps on a gate-continuation spawn frame.
 const GATE_CONTINUATION_SOURCE: &str = "gate_continuation";
 
+/// Typed spawn lifecycle phase coord keys an outcome to. The runner emits ONLY
+/// phases it can observe from its own subprocess bookkeeping — never
+/// `subagent_resolved`, which lives inside `claude` and the runner cannot see.
+///
+/// `launched` accompanies a `spawn-complete` (the child process started);
+/// `exited` accompanies a `spawn-failed` (the child failed to start, exited
+/// non-zero, or a dispatch was refused). Serialized snake_case so coord's
+/// ingest can match a string discriminator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SpawnPhase {
+    Launched,
+    Exited,
+}
+
+/// PR/head context coord uses to key a spawn outcome to a specific change.
+/// `push_ref` is the agent worktree's push target (a git ref); `pr` is the PR
+/// number when it is derivable from that ref (e.g. `refs/pull/123/head`) and
+/// `None` otherwise — the runner never guesses a PR it cannot read off the ref.
+///
+/// Skipped entirely from the wire when both fields are absent so a spawn with
+/// no PR context (gate continuations) serializes the legacy body verbatim.
+#[derive(Debug, Clone, Default, Serialize)]
+struct SpawnPrContext {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    push_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pr: Option<u64>,
+}
+
+impl SpawnPrContext {
+    /// True iff there is no PR context to emit — used to skip the whole
+    /// `push_ref`/`pr` block from the body when empty (legacy-shape parity).
+    fn is_empty(&self) -> bool {
+        self.push_ref.is_none() && self.pr.is_none()
+    }
+
+    /// Build a context from an optional push ref, deriving `pr` when the ref
+    /// carries a `refs/pull/<n>/...` segment (the only ref shape from which a
+    /// PR number is unambiguous). All other ref shapes leave `pr` absent.
+    fn from_push_ref(push_ref: Option<&str>) -> Self {
+        let pr = push_ref.and_then(pr_number_from_push_ref);
+        SpawnPrContext {
+            push_ref: push_ref.map(|s| s.to_string()),
+            pr,
+        }
+    }
+}
+
+/// Extract a PR number from a `refs/pull/<n>/head` (or `/merge`) push ref.
+/// Returns `None` for any ref that is not in the GitHub pull-ref shape — the
+/// runner only reports a PR it can read directly off the ref, never one it
+/// would have to infer.
+fn pr_number_from_push_ref(push_ref: &str) -> Option<u64> {
+    let rest = push_ref.strip_prefix("refs/pull/")?;
+    let (num, _) = rest.split_once('/')?;
+    num.parse::<u64>().ok()
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct SpawnCompleteBody {
     pid: Option<i64>,
     note: Option<String>,
+    /// Phase 4b: typed lifecycle phase (`launched`). Skipped when the enriched
+    /// telemetry flag is off so the body is byte-identical to the legacy shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<SpawnPhase>,
+    /// Phase 4b: PR/head context. Flattened so `push_ref`/`pr` sit at the top
+    /// level alongside `phase`; skipped entirely when empty.
+    #[serde(flatten, skip_serializing_if = "SpawnPrContext::is_empty")]
+    pr_context: SpawnPrContext,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -179,6 +246,25 @@ struct SpawnFailedBody {
     reason: String,
     exit_code: Option<i64>,
     restarts_attempted: Option<u32>,
+    /// Phase 4b: typed lifecycle phase (`exited`). Skipped when the enriched
+    /// telemetry flag is off so the body is byte-identical to the legacy shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<SpawnPhase>,
+    /// Phase 4b: PR/head context. Flattened so `push_ref`/`pr` sit at the top
+    /// level alongside `phase`; skipped entirely when empty.
+    #[serde(flatten, skip_serializing_if = "SpawnPrContext::is_empty")]
+    pr_context: SpawnPrContext,
+}
+
+/// Env flag (default ON) gating Phase 4b's enriched spawn-outcome telemetry.
+/// When unset or any value other than `"0"`, `report_spawn_complete` /
+/// `report_spawn_failed` stamp the typed `phase` + `push_ref`/`pr` context onto
+/// their existing POST bodies (additive — coord ingest tolerates the extra
+/// keys). Set `QONTINUI_SPAWN_OUTCOME_ENABLED=0` for a clean revert: the bodies
+/// then serialize byte-identical to the pre-4b shape (`phase`/`push_ref`/`pr`
+/// all skipped) so a coord that has not yet learned the new keys is unaffected.
+fn spawn_outcome_enrichment_enabled() -> bool {
+    std::env::var("QONTINUI_SPAWN_OUTCOME_ENABLED").as_deref() != Ok("0")
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1602,7 +1688,7 @@ async fn run_gate_continuation_inner(
             // re-delivered once a cap slot frees, OR cancelled by the operator /
             // takeover path. The `spawn-failed` agent post above is the operator
             // signal; the gate's continuation lifecycle is intentionally untouched.
-            report_spawn_failed(uuid::Uuid::now_v7(), &reason, None, 0).await;
+            report_spawn_failed(uuid::Uuid::now_v7(), &reason, None, 0, None).await;
             return Ok(());
         }
     }
@@ -1840,7 +1926,7 @@ async fn run_continuation_terminal(
             let reason = "no Tauri AppHandle (runner has no webview runtime) — \
                           cannot open a visible terminal";
             warn!("agent_runtime: gate-continuation terminal: {reason}");
-            report_spawn_failed(agent_id, reason, None, 0).await;
+            report_spawn_failed(agent_id, reason, None, 0, None).await;
             return Err(anyhow::anyhow!(reason));
         }
     };
@@ -1851,7 +1937,7 @@ async fn run_continuation_terminal(
         None => {
             let reason = "TerminalManager state not managed — cannot create terminal session";
             warn!("agent_runtime: gate-continuation terminal: {reason}");
-            report_spawn_failed(agent_id, reason, None, 0).await;
+            report_spawn_failed(agent_id, reason, None, 0, None).await;
             return Err(anyhow::anyhow!(reason));
         }
     };
@@ -1860,7 +1946,7 @@ async fn run_continuation_terminal(
         None => {
             let reason = "SessionRegistry state not managed — cannot register terminal session";
             warn!("agent_runtime: gate-continuation terminal: {reason}");
-            report_spawn_failed(agent_id, reason, None, 0).await;
+            report_spawn_failed(agent_id, reason, None, 0, None).await;
             return Err(anyhow::anyhow!(reason));
         }
     };
@@ -1936,7 +2022,7 @@ async fn run_continuation_terminal(
             "no authenticated Claude account on this runner — run /login (instance={instance})"
         );
         warn!("agent_runtime: gate-continuation terminal aborted — {reason}");
-        report_spawn_failed(agent_id, &reason, None, 0).await;
+        report_spawn_failed(agent_id, &reason, None, 0, None).await;
         return Err(anyhow::anyhow!(reason));
     }
 
@@ -2029,7 +2115,7 @@ async fn run_continuation_terminal(
             // window is not yanked to this tab — `terminal-created` is a global
             // broadcast, but a focus action must target only `main`.
             emit_terminal_focus_request(&app, &terminal_id);
-            report_spawn_complete(agent_id, None, Some("gate continuation (terminal)")).await;
+            report_spawn_complete(agent_id, None, Some("gate continuation (terminal)"), None).await;
             Ok(())
         }
         Err(e) => {
@@ -2038,6 +2124,7 @@ async fn run_continuation_terminal(
                 &format!("terminal session create failed: {e}"),
                 None,
                 0,
+                None,
             )
             .await;
             Err(anyhow::anyhow!(e))
@@ -2175,7 +2262,7 @@ async fn run_continuation_headless(
     match spawn_claude_child(workdir, initial_prompt).await {
         Ok(mut child) => {
             let pid = child.id().map(|p| p as i64);
-            report_spawn_complete(agent_id, pid, Some("gate continuation")).await;
+            report_spawn_complete(agent_id, pid, Some("gate continuation"), None).await;
             let exit = pump_subprocess(agent_id, &mut child, log_path.as_deref()).await;
             match exit {
                 Ok(0) => {
@@ -2191,18 +2278,20 @@ async fn run_continuation_headless(
                         &format!("non-zero exit code {code}"),
                         Some(code),
                         0,
+                        None,
                     )
                     .await;
                     Ok(())
                 }
                 Err(e) => {
-                    report_spawn_failed(agent_id, &format!("pump failure: {e}"), None, 0).await;
+                    report_spawn_failed(agent_id, &format!("pump failure: {e}"), None, 0, None)
+                        .await;
                     Err(e)
                 }
             }
         }
         Err(e) => {
-            report_spawn_failed(agent_id, &format!("spawn failure: {e}"), None, 0).await;
+            report_spawn_failed(agent_id, &format!("spawn failure: {e}"), None, 0, None).await;
             Err(e)
         }
     }
@@ -2236,6 +2325,12 @@ async fn run_agent_subprocess(
         }
     }
 
+    // Phase 4b: the primary worktree's push_ref is the PR/head this spawn works
+    // against — thread it into every lifecycle post so coord can key the spawn
+    // outcome to a specific PR. The path rewrite above does not touch push_ref,
+    // so read it once here and reuse for all of this spawn's reports.
+    let primary_push_ref = payload.worktrees.first().and_then(|wt| wt.push_ref.clone());
+
     // Step 1: materialize worktrees.
     if let Err(e) = materialize_worktrees(&payload).await {
         report_spawn_failed(
@@ -2243,6 +2338,7 @@ async fn run_agent_subprocess(
             &format!("worktree materialization failed: {e:#}"),
             None,
             0,
+            primary_push_ref.as_deref(),
         )
         .await;
         return Err(e);
@@ -2298,7 +2394,8 @@ async fn run_agent_subprocess(
                 let pid = child.id().map(|p| p as i64);
                 // First successful spawn = post spawn-complete with pid.
                 if restarts == 0 {
-                    report_spawn_complete(payload.agent_id, pid, None).await;
+                    report_spawn_complete(payload.agent_id, pid, None, primary_push_ref.as_deref())
+                        .await;
                 } else {
                     info!(
                         "agent_runtime: restart {restarts} succeeded agent_id={}",
@@ -2389,6 +2486,7 @@ async fn run_agent_subprocess(
             .unwrap_or("subprocess exited with no recorded reason"),
         final_exit_code,
         restarts,
+        primary_push_ref.as_deref(),
     )
     .await;
     Ok(())
@@ -2816,13 +2914,28 @@ async fn heartbeat_once(payload: &LaunchPayload) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn report_spawn_complete(agent_id: uuid::Uuid, pid: Option<i64>, note: Option<&str>) {
+async fn report_spawn_complete(
+    agent_id: uuid::Uuid,
+    pid: Option<i64>,
+    note: Option<&str>,
+    push_ref: Option<&str>,
+) {
     let Some(base) = coord_http_base() else {
         return;
+    };
+    let (phase, pr_context) = if spawn_outcome_enrichment_enabled() {
+        (
+            Some(SpawnPhase::Launched),
+            SpawnPrContext::from_push_ref(push_ref),
+        )
+    } else {
+        (None, SpawnPrContext::default())
     };
     let body = SpawnCompleteBody {
         pid,
         note: note.map(|s| s.to_string()),
+        phase,
+        pr_context,
     };
     let url = format!("{base}/agents/{agent_id}/spawn-complete");
     let client = match reqwest::Client::builder()
@@ -2851,14 +2964,25 @@ async fn report_spawn_failed(
     reason: &str,
     exit_code: Option<i64>,
     restarts_attempted: u32,
+    push_ref: Option<&str>,
 ) {
     let Some(base) = coord_http_base() else {
         return;
+    };
+    let (phase, pr_context) = if spawn_outcome_enrichment_enabled() {
+        (
+            Some(SpawnPhase::Exited),
+            SpawnPrContext::from_push_ref(push_ref),
+        )
+    } else {
+        (None, SpawnPrContext::default())
     };
     let body = SpawnFailedBody {
         reason: reason.to_string(),
         exit_code,
         restarts_attempted: Some(restarts_attempted),
+        phase,
+        pr_context,
     };
     let url = format!("{base}/agents/{agent_id}/spawn-failed");
     let client = match reqwest::Client::builder()
@@ -2893,6 +3017,100 @@ mod tests {
     /// Sentinel returned by the test mint closure so a mint outcome is
     /// unambiguous and deterministic (no uuid in tests).
     const MINTED: &str = "MINTED";
+
+    /// Phase 4b — a PR number is derived ONLY from a `refs/pull/<n>/...` ref;
+    /// every other ref shape (the common agent push ref) leaves `pr` absent so
+    /// the runner never reports a PR it would have to guess.
+    #[test]
+    fn pr_number_derived_only_from_pull_ref() {
+        assert_eq!(pr_number_from_push_ref("refs/pull/614/head"), Some(614));
+        assert_eq!(pr_number_from_push_ref("refs/pull/12/merge"), Some(12));
+        // Agent push refs and branch refs carry no PR number.
+        assert_eq!(pr_number_from_push_ref("refs/agent/abc-def"), None);
+        assert_eq!(pr_number_from_push_ref("refs/heads/main"), None);
+        // Malformed pull refs: no number segment / non-numeric.
+        assert_eq!(pr_number_from_push_ref("refs/pull/"), None);
+        assert_eq!(pr_number_from_push_ref("refs/pull/notanum/head"), None);
+    }
+
+    /// Phase 4b — the EXACT wire shape coord's ingest must match. The enriched
+    /// `spawn-complete` body carries `phase: "launched"` plus `push_ref` (and a
+    /// derived `pr` when the ref is a pull ref), additive to the legacy
+    /// `pid`/`note`. Coord keys the outcome off these keys.
+    #[test]
+    fn spawn_complete_body_enriched_shape() {
+        let body = SpawnCompleteBody {
+            pid: Some(4321),
+            note: None,
+            phase: Some(SpawnPhase::Launched),
+            pr_context: SpawnPrContext::from_push_ref(Some("refs/pull/614/head")),
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["pid"], 4321);
+        assert_eq!(v["phase"], "launched");
+        assert_eq!(v["push_ref"], "refs/pull/614/head");
+        assert_eq!(v["pr"], 614);
+    }
+
+    /// Phase 4b — the enriched `spawn-failed` body carries `phase: "exited"`
+    /// alongside the existing `reason`/`exit_code`/`restarts_attempted`, plus a
+    /// `push_ref` with NO `pr` key when the ref is not a pull ref.
+    #[test]
+    fn spawn_failed_body_enriched_shape() {
+        let body = SpawnFailedBody {
+            reason: "non-zero exit code 1".to_string(),
+            exit_code: Some(1),
+            restarts_attempted: Some(2),
+            phase: Some(SpawnPhase::Exited),
+            pr_context: SpawnPrContext::from_push_ref(Some("refs/agent/abc-def")),
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["reason"], "non-zero exit code 1");
+        assert_eq!(v["exit_code"], 1);
+        assert_eq!(v["restarts_attempted"], 2);
+        assert_eq!(v["phase"], "exited");
+        assert_eq!(v["push_ref"], "refs/agent/abc-def");
+        // No PR derivable from an agent ref → `pr` is omitted entirely.
+        assert!(
+            v.get("pr").is_none(),
+            "pr must be absent for a non-pull ref"
+        );
+    }
+
+    /// Phase 4b — with the enrichment fields cleared (the revert / flag-off
+    /// shape), the body serializes byte-identical to the legacy pre-4b shape:
+    /// `phase`, `push_ref`, and `pr` are all skipped.
+    #[test]
+    fn spawn_body_legacy_shape_when_unenriched() {
+        let body = SpawnCompleteBody {
+            pid: Some(7),
+            note: Some("gate continuation".to_string()),
+            phase: None,
+            pr_context: SpawnPrContext::default(),
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj.len(), 2, "only the legacy pid+note keys: {v}");
+        assert!(obj.contains_key("pid"));
+        assert!(obj.contains_key("note"));
+
+        let failed = SpawnFailedBody {
+            reason: "x".to_string(),
+            exit_code: None,
+            restarts_attempted: Some(0),
+            phase: None,
+            pr_context: SpawnPrContext::default(),
+        };
+        let fv = serde_json::to_value(&failed).unwrap();
+        let fobj = fv.as_object().unwrap();
+        assert_eq!(
+            fobj.len(),
+            3,
+            "only the legacy reason+exit_code+restarts_attempted keys: {fv}"
+        );
+        assert!(!fobj.contains_key("phase"));
+        assert!(!fobj.contains_key("push_ref"));
+    }
 
     fn page(id: &str, n: usize) -> (String, usize) {
         (id.to_string(), n)
