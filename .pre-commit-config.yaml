@@ -15,12 +15,6 @@ repos:
 
   - repo: local
     hooks:
-      - id: block-claude-attribution
-        name: Block Claude Attribution
-        entry: bash .pre-commit-hooks/block-claude-attribution.sh
-        language: system
-        stages: [commit-msg]
-
       # Drift guard for the Tauri event payload TypeScript bindings.
       # Triggers when any of the source-of-truth Rust files change. The hook
       # regenerates `qontinui-schemas/ts/src/generated/` + the `tauri-events`
