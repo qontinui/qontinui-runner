@@ -1,40 +1,53 @@
-//! Usage-limit detection over raw terminal PTY output.
+//! Usage-limit detection over the rendered terminal grid.
 //!
-//! [`UsageLimitWatchHook`] is an [`OutputHook`] installed on the terminal
-//! manager's interceptor pipeline. It watches every PTY's output stream for
+//! A periodic poller ([`scan_grids_once`] / [`spawn_grid_scan_loop`]) reads each
+//! live terminal's *rendered* VT grid (not its raw byte stream) and watches for
 //! the Claude CLI's token-exhaustion messages ("Claude usage limit reached",
-//! "5-hour limit reached ∙ resets …", …) and fires a callback hint when one
-//! appears.
+//! "5-hour limit reached ∙ resets …", …). When one appears it hands a
+//! (debounced) hint to [`super::account_migration::handle_usage_limit_hint`].
 //!
-//! The hint is deliberately a HINT, not a verdict: conversation text can echo
-//! these phrases (a diff of this very file, a quoted error in a log review…),
-//! and a TUI repaint after `claude --resume` can re-render a *historical*
-//! limit message. The downstream handler
-//! (`terminal::account_migration::handle_usage_limit_hint`) therefore
-//! re-probes the account's real usage and only acts when the probe confirms
-//! exhaustion. This module only has to be cheap, tolerant, and debounced.
+//! ## Why scan the grid, not the byte stream
 //!
-//! Hot-path discipline: `process` runs on the PTY reader thread for every
-//! chunk. Work per chunk is one pass of a byte-level ANSI-strip state machine
-//! plus a bounded substring scan over a small rolling window — no regex, no
-//! allocation growth, no locks held across the callback (the callback is
-//! invoked after the state lock is released).
+//! This watcher used to be an [`super::interceptor::OutputHook`] over a small
+//! raw-byte rolling window. That misses messages painted by a full-screen TUI:
+//! Claude Code's Ink renderer emits whole-frame *synchronized output* updates
+//! (DEC `?2026h … ?2026l`), so the limit phrase can be batched and trimmed out
+//! of a small byte window before a substring scan ever sees it. The VT-parsed
+//! grid is the resolved on-screen text, immune to that batching — the same fix
+//! the fleet auto-response matcher uses (`terminal::auto_response`).
+//!
+//! ## Why a HINT, not a verdict
+//!
+//! Conversation text can echo these phrases (a diff of this very file, a quoted
+//! error in a log review…), and a TUI repaint after `claude --resume` can
+//! re-render a *historical* limit message. The downstream handler re-probes the
+//! account's real usage and only acts when the probe confirms exhaustion. This
+//! module only has to be cheap, tolerant, and debounced.
+//!
+//! ## Firing policy
+//!
+//! Level-triggered with a per-terminal debounce ([`HINT_DEBOUNCE`], 300s): while
+//! a limit message stays visible the hint re-fires at most once per debounce
+//! window, so a persistently-painted error keeps the (probe-guarded) migration
+//! path armed without hammering it. This preserves the original hook's effective
+//! behavior (where TUI repaints re-fed the bytes under the same debounce).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tracing::{debug, info};
 
-use super::interceptor::OutputHook;
-use super::output_scan::{normalize, AnsiStripper, WINDOW_KEEP};
+use super::output_scan::normalize;
 
 /// Lowercased substrings that indicate the Claude CLI hit a usage limit.
 ///
-/// Matched against an ANSI-stripped, lowercased, whitespace-collapsed rolling
-/// window of recent output. Generous on purpose — a false hint costs one
-/// (rate-limited) usage probe downstream, while a missed hint strands a
-/// session on a dead account.
+/// Matched against a lowercased, whitespace-collapsed snapshot of the rendered
+/// screen (the VT grid is already ANSI-resolved). Generous on purpose — a false
+/// hint costs one
+/// (rate-limited) usage probe downstream, while a missed hint strands a session
+/// on a dead account.
 const USAGE_LIMIT_PATTERNS: &[&str] = &[
     "usage limit reached",
     "5-hour limit reached",
@@ -44,139 +57,139 @@ const USAGE_LIMIT_PATTERNS: &[&str] = &[
     "session limit reached",
 ];
 
-/// Minimum gap between two hint firings for the same terminal. A limit
-/// message that keeps re-rendering (TUI repaints on resize/scroll) must not
-/// hammer the probe path.
+/// Minimum gap between two hint firings for the same terminal. A limit message
+/// that stays painted (full-screen TUI) must not hammer the probe path.
 const HINT_DEBOUNCE: Duration = Duration::from_secs(300);
 
 // ── Pattern matching ────────────────────────────────────────────────────────
 
-/// First matching usage-limit pattern in the (raw, un-normalized) window,
-/// if any.
-pub fn window_indicates_usage_limit(window: &str) -> Option<&'static str> {
-    let normalized = normalize(window);
+/// First matching usage-limit pattern in ALREADY-normalized screen text, if any.
+fn normalized_indicates_usage_limit(normalized: &str) -> Option<&'static str> {
     USAGE_LIMIT_PATTERNS
         .iter()
         .find(|p| normalized.contains(*p))
         .copied()
 }
 
-// ── The hook ────────────────────────────────────────────────────────────────
-
-struct TermWatchState {
-    stripper: AnsiStripper,
-    window: String,
-    last_fired: Option<Instant>,
+/// First matching usage-limit pattern in a raw (un-normalized) screen/window.
+/// Normalizes then delegates — the public matcher seam used by the unit tests.
+pub fn window_indicates_usage_limit(window: &str) -> Option<&'static str> {
+    normalized_indicates_usage_limit(&normalize(window))
 }
 
-impl Default for TermWatchState {
-    fn default() -> Self {
-        Self {
-            stripper: AnsiStripper::default(),
-            window: String::with_capacity(WINDOW_KEEP * 2),
-            last_fired: None,
-        }
-    }
-}
+// ── Firing policy (per-terminal debounce) ─────────────────────────────────────
 
-/// Callback type: `(terminal_id, matched_pattern)`.
-pub type UsageLimitHintFn = Box<dyn Fn(String, &'static str) + Send + Sync>;
+/// Per-terminal last-hint-fired instant (`None` = never fired). The outer
+/// `Option` makes the static const-initializable (mirrors the auto-response
+/// edge map).
+static FIRE_STATE: Mutex<Option<HashMap<String, Option<Instant>>>> = Mutex::new(None);
 
-/// Output hook that fires `on_hint` (debounced per terminal) whenever a
-/// usage-limit message appears in a PTY's output. Pass-through for the data
-/// itself — it never modifies the stream.
-pub struct UsageLimitWatchHook {
-    states: Mutex<HashMap<String, TermWatchState>>,
-    on_hint: UsageLimitHintFn,
+/// Pure firing decision: given the matched pattern (if any), the terminal's
+/// last-fired time, and `now`, return the pattern iff a hint should fire and
+/// update `last_fired`. Debounce-gated level trigger. The unit-test seam.
+fn should_fire(
+    matched: Option<&'static str>,
+    last_fired: &mut Option<Instant>,
+    now: Instant,
     debounce: Duration,
+) -> Option<&'static str> {
+    let pattern = matched?;
+    if let Some(prev) = *last_fired {
+        if now.duration_since(prev) < debounce {
+            return None;
+        }
+    }
+    *last_fired = Some(now);
+    Some(pattern)
 }
 
-impl UsageLimitWatchHook {
-    pub fn new(on_hint: UsageLimitHintFn) -> Self {
-        Self::with_debounce(on_hint, HINT_DEBOUNCE)
-    }
+// ── Grid scanner ─────────────────────────────────────────────────────────────
 
-    fn with_debounce(on_hint: UsageLimitHintFn, debounce: Duration) -> Self {
-        Self {
-            states: Mutex::new(HashMap::new()),
-            on_hint,
-            debounce,
-        }
-    }
+/// One scan pass over every live terminal: read its rendered screen, and for
+/// any terminal showing a usage-limit message (debounce-permitting) spawn the
+/// account-migration hint. Cheap: one `text_snapshot` + substring scan per live
+/// terminal per tick.
+pub fn scan_grids_once() {
+    use tauri::Manager;
 
-    /// Feed a chunk for `terminal_id`; returns the matched pattern when a
-    /// (debounce-permitted) hint should fire. Split out from
-    /// [`OutputHook::process`] so tests can drive chunking/debounce without a
-    /// callback.
-    fn scan(&self, terminal_id: &str, data: &[u8]) -> Option<&'static str> {
-        let mut states = self.states.lock().ok()?;
-        let st = states.entry(terminal_id.to_string()).or_default();
+    let Some(app) = crate::tauri_app_handle::current() else {
+        return;
+    };
+    let Some(tm) = app.try_state::<Arc<crate::terminal::TerminalManager>>() else {
+        return;
+    };
+    let sessions = tm.sessions_snapshot();
 
-        st.stripper.feed(data, &mut st.window);
-
-        let matched = window_indicates_usage_limit(&st.window);
-
-        // Trim the rolling window AFTER matching. On a match, clear it
-        // entirely so the same rendered message doesn't re-match on the next
-        // chunk (the debounce also guards this, but a cleared window keeps
-        // the state machine honest).
-        if matched.is_some() {
-            st.window.clear();
-        } else if st.window.len() > WINDOW_KEEP {
-            let cut = st.window.len() - WINDOW_KEEP;
-            // Avoid splitting a UTF-8 char (window may hold lossy bytes but
-            // `normalize` already tolerates garbage; keep it valid anyway).
-            let cut = (cut..st.window.len())
-                .find(|i| st.window.is_char_boundary(*i))
-                .unwrap_or(0);
-            st.window.drain(..cut);
-        }
-
-        let pattern = matched?;
+    // Decide under the fire-state lock, then dispatch with NO lock held (the
+    // hint handler is async + re-locks its own state).
+    let mut to_fire: Vec<(String, &'static str)> = Vec::new();
+    {
+        let mut state = FIRE_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let map = state.get_or_insert_with(HashMap::new);
         let now = Instant::now();
-        if let Some(prev) = st.last_fired {
-            if now.duration_since(prev) < self.debounce {
-                debug!(
-                    terminal_id,
-                    pattern, "usage-limit message re-seen within debounce — suppressed"
-                );
-                return None;
+        for (tid, session) in &sessions {
+            // Read the *rendered* screen text (rows joined by `\n`). The grid is
+            // the VT-parsed cell buffer, so this sees text inside a full-screen
+            // TUI that synchronized-output batching hides from a byte scan.
+            let text = {
+                let grid = session.grid();
+                let guard = grid.lock().unwrap_or_else(|e| e.into_inner());
+                guard.text_snapshot().text
+            };
+            let matched = normalized_indicates_usage_limit(&normalize(&text));
+            // `entry` defaults to "never fired" → the first appearance fires
+            // immediately; thereafter the debounce gates re-fires.
+            let last_fired = map.entry(tid.clone()).or_insert(None);
+            if let Some(pattern) = should_fire(matched, last_fired, now, HINT_DEBOUNCE) {
+                to_fire.push((tid.clone(), pattern));
             }
         }
-        st.last_fired = Some(now);
-        Some(pattern)
-    }
+        // Drop state for terminals that have gone away.
+        let live: HashSet<&String> = sessions.iter().map(|(t, _)| t).collect();
+        map.retain(|tid, _| live.contains(tid));
+    } // fire-state lock released
 
-    /// Drop per-terminal state for a closed terminal (best-effort hygiene;
-    /// stale entries are bounded by terminal count anyway).
-    #[allow(dead_code)]
-    pub fn forget(&self, terminal_id: &str) {
-        if let Ok(mut states) = self.states.lock() {
-            states.remove(terminal_id);
-        }
+    for (tid, pattern) in to_fire {
+        info!(
+            terminal_id = %tid,
+            pattern, "usage-limit message detected on terminal screen"
+        );
+        tauri::async_runtime::spawn(super::account_migration::handle_usage_limit_hint(
+            tid, pattern,
+        ));
     }
 }
 
-impl OutputHook for UsageLimitWatchHook {
-    fn process(&self, terminal_id: &str, data: &[u8]) -> Vec<u8> {
-        if let Some(pattern) = self.scan(terminal_id, data) {
-            info!(
-                terminal_id,
-                pattern, "usage-limit message detected in terminal output"
-            );
-            (self.on_hint)(terminal_id.to_string(), pattern);
+/// Grid-scan interval. Overridable via `QONTINUI_USAGE_LIMIT_SCAN_INTERVAL_MS`
+/// (floored at 200ms). 1.5s is far under the 300s debounce, so a freshly-painted
+/// limit message is caught promptly while costing a trivial substring pass per
+/// terminal per tick.
+fn scan_interval() -> Duration {
+    let ms = std::env::var("QONTINUI_USAGE_LIMIT_SCAN_INTERVAL_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n >= 200)
+        .unwrap_or(1500);
+    Duration::from_millis(ms)
+}
+
+/// Spawn the periodic usage-limit grid scanner for the process lifetime.
+/// Detached; each tick is best-effort and the loop never exits.
+pub fn spawn_grid_scan_loop() {
+    tauri::async_runtime::spawn(async move {
+        let mut ticker = tokio::time::interval(scan_interval());
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        debug!("usage_limit: grid-scan loop started");
+        loop {
+            ticker.tick().await;
+            scan_grids_once();
         }
-        data.to_vec()
-    }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn hook() -> UsageLimitWatchHook {
-        UsageLimitWatchHook::with_debounce(Box::new(|_, _| {}), Duration::from_secs(300))
-    }
 
     #[test]
     fn plain_limit_message_matches() {
@@ -217,87 +230,92 @@ mod tests {
     }
 
     #[test]
-    fn ansi_codes_inside_message_are_stripped() {
-        let h = hook();
-        // Color change mid-phrase must not break the match.
-        let chunk = b"\x1b[31musage \x1b[1mlimit\x1b[0m reached\x1b[0m";
-        assert_eq!(h.scan("t1", chunk), Some("usage limit reached"));
-    }
-
-    #[test]
-    fn message_split_across_chunks_matches_on_second_chunk() {
-        let h = hook();
-        assert_eq!(h.scan("t1", b"Claude usage li"), None);
-        assert_eq!(h.scan("t1", b"mit reached."), Some("usage limit reached"));
-    }
-
-    #[test]
-    fn escape_sequence_split_across_chunks_is_consumed() {
-        let h = hook();
-        // CSI starts at the end of chunk 1 and finishes at the start of
-        // chunk 2 — the fragment must not pollute the text window.
-        assert_eq!(h.scan("t1", b"usage \x1b[38;5;"), None);
+    fn matches_across_wrapped_grid_rows() {
+        // The grid is already VT-resolved (no escape codes), but a message can
+        // be split across rows joined by `\n` and padded — normalize collapses
+        // that whitespace so the phrase still matches.
         assert_eq!(
-            h.scan("t1", b"196mlimit reached"),
+            window_indicates_usage_limit(
+                "…banner…\n  Claude usage   limit\n  reached ∙ resets 3am"
+            ),
             Some("usage limit reached")
         );
     }
 
     #[test]
-    fn osc_title_sequence_is_stripped() {
-        let h = hook();
-        let chunk = b"\x1b]0;my terminal title\x07usage limit reached";
-        assert_eq!(h.scan("t1", chunk), Some("usage limit reached"));
+    fn first_appearance_fires_immediately() {
+        let now = Instant::now();
+        let mut last = None;
+        assert_eq!(
+            should_fire(
+                Some("usage limit reached"),
+                &mut last,
+                now,
+                Duration::from_secs(300)
+            ),
+            Some("usage limit reached")
+        );
+        assert_eq!(last, Some(now));
+    }
+
+    #[test]
+    fn no_match_never_fires() {
+        let now = Instant::now();
+        let mut last = None;
+        assert_eq!(
+            should_fire(None, &mut last, now, Duration::from_secs(300)),
+            None
+        );
+        assert_eq!(last, None);
     }
 
     #[test]
     fn debounce_suppresses_repeat_within_window() {
-        let h = hook();
+        let t0 = Instant::now();
+        let mut last = None;
+        assert!(should_fire(
+            Some("usage limit reached"),
+            &mut last,
+            t0,
+            Duration::from_secs(300)
+        )
+        .is_some());
+        // Same message still painted 100s later — within the 300s window.
+        let t1 = t0 + Duration::from_secs(100);
         assert_eq!(
-            h.scan("t1", b"usage limit reached"),
-            Some("usage limit reached")
+            should_fire(
+                Some("usage limit reached"),
+                &mut last,
+                t1,
+                Duration::from_secs(300)
+            ),
+            None
         );
-        // Re-rendered message (e.g. TUI repaint) within the debounce window.
-        assert_eq!(h.scan("t1", b"usage limit reached"), None);
+        // Last-fired must NOT advance on a suppressed hint.
+        assert_eq!(last, Some(t0));
     }
 
     #[test]
-    fn debounce_is_per_terminal() {
-        let h = hook();
+    fn debounce_refires_after_window() {
+        let t0 = Instant::now();
+        let mut last = None;
+        assert!(should_fire(
+            Some("usage limit reached"),
+            &mut last,
+            t0,
+            Duration::from_secs(300)
+        )
+        .is_some());
+        let t1 = t0 + Duration::from_secs(301);
         assert_eq!(
-            h.scan("t1", b"usage limit reached"),
+            should_fire(
+                Some("usage limit reached"),
+                &mut last,
+                t1,
+                Duration::from_secs(300)
+            ),
             Some("usage limit reached")
         );
-        assert_eq!(
-            h.scan("t2", b"usage limit reached"),
-            Some("usage limit reached")
-        );
-    }
-
-    #[test]
-    fn window_is_bounded() {
-        let h = hook();
-        // Feed lots of non-matching output; window must stay bounded and a
-        // later message must still match.
-        for _ in 0..100 {
-            assert_eq!(h.scan("t1", &[b'x'; 1024]), None);
-        }
-        {
-            let states = h.states.lock().unwrap();
-            let st = states.get("t1").unwrap();
-            assert!(st.window.len() <= WINDOW_KEEP + 1024);
-        }
-        assert_eq!(
-            h.scan("t1", b" weekly limit reached"),
-            Some("weekly limit reached")
-        );
-    }
-
-    #[test]
-    fn passthrough_returns_data_unchanged() {
-        let h = UsageLimitWatchHook::new(Box::new(|_, _| {}));
-        let data = b"\x1b[31musage limit reached\x1b[0m".to_vec();
-        let out = OutputHook::process(&h, "t1", &data);
-        assert_eq!(out, data);
+        assert_eq!(last, Some(t1));
     }
 }

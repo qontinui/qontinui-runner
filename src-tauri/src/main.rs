@@ -620,6 +620,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // `terminal::auto_response`.
                 terminal::auto_response::spawn_grid_scan_loop();
 
+                // Usage-limit watcher: the same grid-scan approach for the
+                // Claude CLI's token-exhaustion messages. A debounced poll of
+                // every live terminal's rendered screen hands a (probe-guarded)
+                // hint to `account_migration` when a session's account is
+                // exhausted. Scanning the grid (not the raw byte stream) is what
+                // lets it see the limit message inside a full-screen TUI. See
+                // `terminal::usage_limit`.
+                terminal::usage_limit::spawn_grid_scan_loop();
+
                 // Plan 2026-05-19-coordinator-production-readiness.md
                 // Phase 1 — periodic primary-tree state publisher. These
                 // four tasks share one worker thread; they're all
@@ -2295,30 +2304,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     ));
                 }
 
-                // Usage-limit watcher: every terminal PTY's output flows
-                // through the interceptor pipeline; this hook spots the
-                // Claude CLI's token-exhaustion messages and hands the
-                // (debounced) hint to the account-migration handler, which
-                // probe-confirms real exhaustion before moving the session to
-                // the account with the most weekly-usage headroom. See
-                // `terminal::account_migration` for the full flow + guards.
-                term_for_session.interceptor().add_hook(Box::new(
-                    terminal::usage_limit::UsageLimitWatchHook::new(Box::new(
-                        |terminal_id, pattern| {
-                            tauri::async_runtime::spawn(
-                                terminal::account_migration::handle_usage_limit_hint(
-                                    terminal_id,
-                                    pattern,
-                                ),
-                            );
-                        },
-                    )),
-                ));
-
-                // (The fleet auto-response matcher is a grid-scan poller spawned
-                // earlier alongside the fleet fetch loop — it scans the rendered
-                // VT grid rather than this raw byte stream, so it can see text
+                // (The usage-limit watcher and the fleet auto-response matcher
+                // are both grid-scan pollers spawned once at startup alongside
+                // the fleet fetch loop — they scan each terminal's rendered VT
+                // grid rather than this raw byte stream, so they can see text
                 // inside a full-screen TUI like Claude Code. See
+                // `terminal::usage_limit::spawn_grid_scan_loop` and
                 // `terminal::auto_response::spawn_grid_scan_loop`.)
 
                 // Infrequent liveness poll for lazy close-detection. Every
