@@ -1,3 +1,0 @@
-# ArchitectureView
-
-_(notes)_
