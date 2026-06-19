@@ -154,6 +154,7 @@ mod session; // Plan 2026-05-22-coord-native-session-coordination Phase 2 — un
              // Reads each hosted session's transcript and POSTs file-edit attribution to
              // coord. Gated OFF by default (COORD_SESSION_ATTRIBUTION_ENABLED).
 mod session_attribution;
+mod session_bus; // Session Bus Phase 3b — gated directed-message delivery executor
 mod settings;
 // `startup_panic` is a minimal, dep-free panic-hook installer called from
 // the very top of `main()` so early-init crashes (DB connect, Tauri builder,
@@ -637,6 +638,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // each other (unlike the heartbeat above, which feeds
                 // coord's 120s liveness TTL and must never be starved).
                 fleet::spawn_tree_publisher();
+                // Session Bus Phase 3b — directed-message delivery executor.
+                // No-op unless COORD_SESSION_BUS_ENABLED is set (opt-in): it
+                // injects coord-queued messages into live session terminals.
+                session_bus::spawn_session_bus_executor();
                 // Hook-free, runner-side WIP-attribution capture (sibling of
                 // the tree publisher above). Reads each hosted session's Claude
                 // transcript forward-only and POSTs file-edit attribution to
