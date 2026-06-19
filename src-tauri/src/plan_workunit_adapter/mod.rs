@@ -35,7 +35,15 @@
 //! module; they are deliberately absent until the P1 work-unit API lands.
 
 pub mod parser;
+pub mod push;
+pub mod trigger;
+
+// Phase 4 parity proof — `#[cfg(test)]` only (a proof, not shipped code).
+#[cfg(test)]
+mod parity;
 
 pub use parser::{
     parse_work_unit, slug_from_filename, ParsedPhase, ParsedWorkUnit, PlanConvention,
 };
+pub use push::{push_work_unit, HttpWorkUnitSink, PushOutcome, WorkUnitSink};
+pub use trigger::{adapter_metrics, spawn_if_configured, MetricsSnapshot, ReconcileSummary};
