@@ -10,17 +10,21 @@
  * state machines):
  *
  *   - **N need input · Tab to cycle** — clickable, focuses the next
- *     needs-input zone via `zoneLayout.focusNextNeedsInput`.
+ *     needs-input zone via `zoneLayout.focusNextNeedsInput`. Followed
+ *     inline by `BatchActions` (Approve all / Reject all / Broadcast /
+ *     Select) — the bulk controls that used to float over the grid as
+ *     `BatchOperationsBar`, now co-located with the count they act on.
  *   - **N stuck on lock Xm** — count + max age of `kind:"waiting"`
  *     entries in `fileLockStates`. Clicking focuses the longest-stuck
  *     waiter's zone.
  *   - **N errors** — clickable, cycles to the next errored zone (an
  *     inline mirror of `focusNextNeedsInput`'s walk for `state ==="error"`,
  *     since `useZoneLayout` doesn't expose a dedicated cycler).
- *   - **N wrapper tools** — read from `useWrapperTools`; informational
- *     count (no click target until the registry grows a wrappers-page
- *     action). Hides at zero — same self-hide rule the existing
- *     `WrapperToolsBadge` uses.
+ *   - **Wrapper tools** — an icon-only affordance (click → popover list),
+ *     read from `useWrapperTools`. The raw count is deliberately NOT shown
+ *     as text and does NOT keep the strip open (see `hasContent`): it is
+ *     low-signal and present almost every session. The number stays on
+ *     hover and in the popover header.
  *
  * Deferred from the plan's pill list:
  *
@@ -30,11 +34,6 @@
  *     it here would mean either lifting the state into a context
  *     (cross-cutting, out of Phase-6 scope) or duplicating the fetch
  *     (drift risk). Skip until the profile state is lifted.
- *
- * The existing `WrapperToolsBadge` inside `TerminalTabBar` stays in
- * place during this phase — the plan's "replaces `WrapperToolsBadge`"
- * note belongs to Phase 9 demolition. Operators see both during the
- * transition.
  *
  * 1Hz heartbeat drives the "Xm" duration text so the value advances
  * without external state changes (mirrors `useNow1Hz` from
@@ -57,6 +56,7 @@ import type { SessionState } from "./useZoneLayout";
 
 import { useTerminalSession } from "./contexts";
 import { useWrapperTools } from "@/hooks/useWrapperTools";
+import { BatchActions } from "./BatchActions";
 
 const HEARTBEAT_MS = 1_000;
 
@@ -97,7 +97,7 @@ function Pill({ icon, text, color, onClick, title }: PillProps) {
   return (
     <span className={baseClass} style={{ color }} title={title}>
       {icon}
-      <span>{text}</span>
+      {text && <span>{text}</span>}
     </span>
   );
 }
@@ -134,10 +134,7 @@ export function StatusStrip() {
   useEffect(() => {
     if (!showWrapperPopover) return;
     const handler = (e: MouseEvent) => {
-      if (
-        wrapperPopoverRef.current &&
-        !wrapperPopoverRef.current.contains(e.target as Node)
-      ) {
+      if (wrapperPopoverRef.current && !wrapperPopoverRef.current.contains(e.target as Node)) {
         setShowWrapperPopover(false);
       }
     };
@@ -216,11 +213,15 @@ export function StatusStrip() {
   // Auto-hide gate — when nothing requires attention AND nothing
   // informational is worth showing either, the strip disappears
   // entirely so the top of viewport is fully clean.
+  // NOTE: `wrapperCount` is deliberately NOT a reason to show the strip.
+  // Wrapper tools are present almost every session, so gating on them kept
+  // the strip permanently pinned open — defeating the auto-hide-when-idle
+  // principle. The wrapper affordance now only renders when the strip is
+  // already up for a genuine signal (attention, multi-zone, or a plan).
   const hasContent =
     needsInputCount > 0 ||
     errorCount > 0 ||
     stuckLocks > 0 ||
-    wrapperCount > 0 ||
     isMultiZone ||
     planFileName !== null ||
     isPlanLoading;
@@ -269,15 +270,21 @@ export function StatusStrip() {
       aria-label="Terminal page status"
     >
       {needsInputCount > 0 && (
-        <Pill
-          icon={
-            <span className="w-1.5 h-1.5 rounded-full bg-[#e0af68] animate-pulse" aria-hidden />
-          }
-          text={`${needsInputCount} need input · Tab to cycle`}
-          color="#e0af68"
-          onClick={focusNextNeedsInput}
-          title="Click here or press Ctrl+Shift+N to focus the next session waiting on input"
-        />
+        <>
+          <Pill
+            icon={
+              <span className="w-1.5 h-1.5 rounded-full bg-[#e0af68] animate-pulse" aria-hidden />
+            }
+            text={`${needsInputCount} need input · Tab to cycle`}
+            color="#e0af68"
+            onClick={focusNextNeedsInput}
+            title="Click here or press Ctrl+Shift+N to focus the next session waiting on input"
+          />
+          {/* Bulk Approve/Reject/Broadcast for the waiting sessions —
+              co-located with the count instead of floating over the grid
+              (formerly the `BatchOperationsBar`). */}
+          <BatchActions />
+        </>
       )}
       {errorCount > 0 && (
         <Pill
@@ -301,9 +308,12 @@ export function StatusStrip() {
       )}
       {wrapperCount > 0 && (
         <div className="relative" ref={wrapperPopoverRef}>
+          {/* Icon-only affordance — the raw count is low-signal and rarely
+              actionable in the moment, so it no longer occupies the strip as
+              text. The number stays on hover and in the popover header. */}
           <Pill
             icon={<Package className="w-2.5 h-2.5" />}
-            text={`${wrapperCount} wrapper tool${wrapperCount === 1 ? "" : "s"}`}
+            text=""
             color="#7aa2f7"
             onClick={() => setShowWrapperPopover((v) => !v)}
             title={`${wrapperCount} wrapper tool${
@@ -351,9 +361,7 @@ export function StatusStrip() {
                           <span className="text-[11px] font-mono text-[#7aa2f7] truncate">
                             {tool.name}
                           </span>
-                          <span className="text-[9px] text-[#565f89] shrink-0">
-                            {wrapperName}
-                          </span>
+                          <span className="text-[9px] text-[#565f89] shrink-0">{wrapperName}</span>
                         </div>
                         {tool.description && (
                           <p className="text-[10px] text-[#a9b1d6] mt-0.5 line-clamp-2">

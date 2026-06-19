@@ -35,8 +35,6 @@ export interface UseStateTransitionEffectsReturn {
   autoRestartCount: number;
   pendingRestarts: Record<number, number>;
   cancelPendingRestart: (zoneIndex: number) => void;
-  batchBarDismissed: boolean;
-  setBatchBarDismissed: React.Dispatch<React.SetStateAction<boolean>>;
 }
 
 export function useStateTransitionEffects(
@@ -60,7 +58,6 @@ export function useStateTransitionEffects(
 
   const [flashingTabs, setFlashingTabs] = useState<Set<string>>(new Set());
   const [unseenNeedsInput, setUnseenNeedsInput] = useState<Set<string>>(new Set());
-  const [batchBarDismissed, setBatchBarDismissed] = useState(false);
 
   const [autoApprovePatterns, setAutoApprovePatternsState] = useState<string[]>(() =>
     instanceStorage.getJSON<string[]>("zone-auto-approve-patterns", []),
@@ -90,8 +87,6 @@ export function useStateTransitionEffects(
   const [desktopNotify, setDesktopNotify] = useState(
     () => instanceStorage.getItem("zone-desktop-notify") === "true",
   );
-
-  const prevNeedsInputCountRef = useRef(0);
 
   // ── Callbacks ─────────────────────────────────────────────────────────────
 
@@ -143,16 +138,6 @@ export function useStateTransitionEffects(
   useEffect(() => {
     instanceStorage.setJSON("zone-auto-approve-patterns", autoApprovePatterns);
   }, [autoApprovePatterns]);
-
-  // Un-dismiss batch bar when needs-input count increases
-  const needsInputCount = Object.values(sessionStates).filter((s) => s === "needs-input").length;
-
-  useEffect(() => {
-    if (needsInputCount > prevNeedsInputCountRef.current) {
-      setBatchBarDismissed(false);
-    }
-    prevNeedsInputCountRef.current = needsInputCount;
-  }, [needsInputCount]);
 
   // ── Main state transition effect ──────────────────────────────────────────
 
@@ -374,7 +359,5 @@ export function useStateTransitionEffects(
     autoRestartCount,
     pendingRestarts,
     cancelPendingRestart,
-    batchBarDismissed,
-    setBatchBarDismissed,
   };
 }

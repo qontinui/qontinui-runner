@@ -12,7 +12,7 @@ export { useZoneLayout, LAYOUT_PRESETS } from "./useZoneLayout";
 export type { LayoutPreset, SessionState } from "./useZoneLayout";
 export { ZoneGrid } from "./ZoneGrid";
 export { ZoneLayoutPicker } from "./ZoneLayoutPicker";
-export { BatchOperationsBar } from "./BatchOperationsBar";
+export { BatchActions } from "./BatchActions";
 export { KeyboardShortcutsOverlay } from "./KeyboardShortcutsOverlay";
 export { ZoneControlPanel } from "./ZoneControlPanel";
 export { useSessionPersistence } from "./useSessionPersistence";
