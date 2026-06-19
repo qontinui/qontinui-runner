@@ -34,10 +34,18 @@
 //!   server" (the plan's premise) **is** proven — but only when that `--ignored` test is
 //!   run on a host with a Docker daemon (CI has none).
 
+pub mod codegen;
+pub mod enforcement;
+pub mod quality;
 pub mod route_map;
 pub mod runtime;
 pub mod scaffold;
 
+pub use codegen::{build_prompt, llm_author_handler, LlmOutcome};
+pub use enforcement::{
+    run_enforcement, run_enforcement_with, EnforcementGate, EnforcementReport, Finding,
+};
+pub use quality::{generate_phase3, min_coverage_pct, DEFAULT_MIN_COVERAGE_PCT};
 pub use route_map::{openapi_document, route_for, RouteBinding};
 pub use runtime::{generate_runnable, BreakMode};
 pub use scaffold::{generate_phase1, EmittedModel, EmittedRoute, GeneratedBackend};

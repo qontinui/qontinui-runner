@@ -1,0 +1,23 @@
+{
+  "profileVersion": "0",
+  "backend": {
+    "language": "python",
+    "framework": "fastapi",
+    "datastore": "postgres",
+    "apiStyle": "rest",
+    "auth": "session"
+  },
+  "architecture": {
+    "pattern": "layered",
+    "testingBar": "unit+integration",
+    "minCoveragePct": 80
+  },
+  "conventions": {
+    "naming": "snake_case",
+    "entityToTable": "pluralize"
+  },
+  "enforcement": {
+    "run": ["code-reviewer", "security-scan"],
+    "blockOn": ["security"]
+  }
+}
