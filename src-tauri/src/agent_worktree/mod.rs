@@ -8,11 +8,11 @@
 //! paths so the caller (PTY-spawn, slash-command, UI) can use them as
 //! CWD.
 //!
-//! Gated behind the `QONTINUI_AGENT_WORKTREE_MODE` env var (default off).
-//! When off, this module is dead code — the existing shared-tree spawn
-//! path stays exclusively active. Reversible per the plan's Phase 7
-//! commit ("feature-flag-flip the new spawn path on for everyone,
-//! monitor a week, then delete").
+//! Controlled by the `QONTINUI_AGENT_WORKTREE_MODE` env var — **default ON**
+//! (repo-freshness Phase 2b): every session forks an isolated worktree from
+//! coord's authoritative base (Phase 2a). Set the var to a falsy value
+//! (`0`/`false`/`no`) to opt a machine out (operator escape hatch); when off,
+//! the existing shared-tree spawn path stays exclusively active.
 //!
 //! ## Scope (Phase 1)
 //!
@@ -66,8 +66,8 @@ pub mod isolated_edit;
 pub mod maintenance_executor;
 pub mod reclaim;
 
-/// Env var that turns the new spawn path on. Default off — `feature
-/// flag agent_worktree_mode` per plan §5 Phase 1.
+/// Env var that controls the worktree-per-session spawn path. **Default ON**
+/// (Phase 2b); set to a falsy value (`0`/`false`/`no`) to opt a machine out.
 const FLAG_ENV: &str = "QONTINUI_AGENT_WORKTREE_MODE";
 
 // =============================================================================
@@ -645,14 +645,18 @@ pub async fn release_claim_best_effort(
     }
 }
 
-/// Returns true iff the worktree-per-agent spawn mode is enabled.
-/// Accepts the usual truthy values; anything else (including unset) is
-/// false.
+/// Returns true iff the worktree-per-session mode is enabled.
+///
+/// Phase 2b: **default ON** — every session (agent + operator/interactive
+/// edit-declaring terminal) forks an isolated worktree from coord's
+/// authoritative base (Phase 2a). Disabled only when `QONTINUI_AGENT_WORKTREE_MODE`
+/// is an explicit falsy value (`0`/`false`/`no`, case-insensitive) — the
+/// operator escape hatch. Mirrors `pull_executor_enabled()` in `fleet.rs`.
 pub fn worktree_mode_enabled() -> bool {
-    matches!(
-        std::env::var(FLAG_ENV).ok().as_deref(),
-        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
-    )
+    std::env::var(FLAG_ENV)
+        .ok()
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
+        .unwrap_or(true)
 }
 
 /// A repo the caller wants a worktree for, paired with the commit the
@@ -1497,15 +1501,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn flag_off_by_default() {
-        // Tests run with no env var set unless tested explicitly. We
-        // don't mutate process env here because the runner test
-        // harness mutates env globally (memory
-        // `feedback_env_var_tests_serialize`); this assertion holds
-        // as long as no test sets QONTINUI_AGENT_WORKTREE_MODE before
-        // this runs.
+    fn flag_on_by_default() {
+        // Phase 2b: worktree mode is ON unless explicitly disabled. We
+        // don't mutate process env here because the runner test harness
+        // mutates env globally (memory `feedback_env_var_tests_serialize`);
+        // this assertion holds as long as no test sets
+        // QONTINUI_AGENT_WORKTREE_MODE to a falsy value before this runs.
         if std::env::var(FLAG_ENV).is_err() {
-            assert!(!worktree_mode_enabled());
+            assert!(worktree_mode_enabled());
         }
     }
 
