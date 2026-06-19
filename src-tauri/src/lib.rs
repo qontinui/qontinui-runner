@@ -40,6 +40,14 @@ pub mod cognito;
 // command produce an identical report.
 pub mod coord_doctor;
 
+// Harness markdown -> work-unit adapter (plan
+// `2026-06-18-harness-markdown-to-workunit-adapter`, P2 of the plan-decoupling
+// program). Phase 1 = the pure parser that turns operator plan markdown into a
+// structured work-unit (slug + opaque status + phase sub-units + dependency
+// edges), richer than coord's old slug+status projection. Later phases add the
+// push client + trigger as siblings under this module.
+pub mod plan_workunit_adapter;
+
 // ============================================================================
 // Main window label abstraction
 // ============================================================================
