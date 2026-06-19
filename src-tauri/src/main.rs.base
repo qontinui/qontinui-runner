@@ -77,7 +77,6 @@ mod fixer;
 // (was `coord.machines` pre-Phase-3-Unified-Devices-Registry) so
 // `GET /coord/fleet` can answer "where do I have agent capacity?".
 mod fleet;
-mod fleet_commands;
 mod flow_control;
 mod follow_up;
 mod fs_atomic;
@@ -150,14 +149,6 @@ mod security;
 mod semantic_conventions;
 mod server_mode;
 mod session; // Plan 2026-05-22-coord-native-session-coordination Phase 2 — unified Session primitive
-<<<<<<< HEAD
-             // Hook-free, runner-side WIP-attribution capture (mirrors fleet::tree_publisher).
-             // Reads each hosted session's transcript and POSTs file-edit attribution to
-             // coord. Gated OFF by default (COORD_SESSION_ATTRIBUTION_ENABLED).
-mod session_attribution;
-=======
-mod session_bus; // Session Bus Phase 3b — gated directed-message delivery executor
->>>>>>> dbfc9ed0 (feat: session-bus Phase 3b (runner side) — gated message delivery executor)
 mod settings;
 // `startup_panic` is a minimal, dep-free panic-hook installer called from
 // the very top of `main()` so early-init crashes (DB connect, Tauri builder,
@@ -615,25 +606,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 terminal::auto_response_fleet::reload_from_cache_at_boot();
                 terminal::auto_response_fleet::spawn_fetch_loop();
 
-                // Fleet auto-response matcher: a debounced poll of every live
-                // terminal's RENDERED VT grid. Scanning the rendered screen
-                // (not the raw byte stream) is what lets the engine see the
-                // rate-limit error inside a full-screen TUI like Claude Code,
-                // which paints each whole frame as one synchronized-output
-                // update; on a fresh on-screen match it submits the rule's
-                // prompt into that session after a per-rule backoff. See
-                // `terminal::auto_response`.
-                terminal::auto_response::spawn_grid_scan_loop();
-
-                // Usage-limit watcher: the same grid-scan approach for the
-                // Claude CLI's token-exhaustion messages. A debounced poll of
-                // every live terminal's rendered screen hands a (probe-guarded)
-                // hint to `account_migration` when a session's account is
-                // exhausted. Scanning the grid (not the raw byte stream) is what
-                // lets it see the limit message inside a full-screen TUI. See
-                // `terminal::usage_limit`.
-                terminal::usage_limit::spawn_grid_scan_loop();
-
                 // Plan 2026-05-19-coordinator-production-readiness.md
                 // Phase 1 — periodic primary-tree state publisher. These
                 // four tasks share one worker thread; they're all
@@ -641,20 +613,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // each other (unlike the heartbeat above, which feeds
                 // coord's 120s liveness TTL and must never be starved).
                 fleet::spawn_tree_publisher();
-<<<<<<< HEAD
-                // Hook-free, runner-side WIP-attribution capture (sibling of
-                // the tree publisher above). Reads each hosted session's Claude
-                // transcript forward-only and POSTs file-edit attribution to
-                // coord's /coord/wip-attribution. Gated OFF by default
-                // (COORD_SESSION_ATTRIBUTION_ENABLED) — no live consumer yet, so
-                // it's a no-op until armed. See `session_attribution`.
-                session_attribution::spawn_session_attribution();
-=======
-                // Session Bus Phase 3b — directed-message delivery executor.
-                // No-op unless COORD_SESSION_BUS_ENABLED is set (opt-in): it
-                // injects coord-queued messages into live session terminals.
-                session_bus::spawn_session_bus_executor();
->>>>>>> dbfc9ed0 (feat: session-bus Phase 3b (runner side) — gated message delivery executor)
                 // Ξ_Worktree census (Phase 1) — periodic disk-footprint
                 // + junction-status + volume-free-space census of every
                 // on-disk git worktree, POSTed to
@@ -2316,13 +2274,37 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     ));
                 }
 
-                // (The usage-limit watcher and the fleet auto-response matcher
-                // are both grid-scan pollers spawned once at startup alongside
-                // the fleet fetch loop — they scan each terminal's rendered VT
-                // grid rather than this raw byte stream, so they can see text
-                // inside a full-screen TUI like Claude Code. See
-                // `terminal::usage_limit::spawn_grid_scan_loop` and
-                // `terminal::auto_response::spawn_grid_scan_loop`.)
+                // Usage-limit watcher: every terminal PTY's output flows
+                // through the interceptor pipeline; this hook spots the
+                // Claude CLI's token-exhaustion messages and hands the
+                // (debounced) hint to the account-migration handler, which
+                // probe-confirms real exhaustion before moving the session to
+                // the account with the most weekly-usage headroom. See
+                // `terminal::account_migration` for the full flow + guards.
+                term_for_session.interceptor().add_hook(Box::new(
+                    terminal::usage_limit::UsageLimitWatchHook::new(Box::new(
+                        |terminal_id, pattern| {
+                            tauri::async_runtime::spawn(
+                                terminal::account_migration::handle_usage_limit_hint(
+                                    terminal_id,
+                                    pattern,
+                                ),
+                            );
+                        },
+                    )),
+                ));
+
+                // Fleet auto-response watcher: every terminal PTY's output also
+                // flows through this hook, which matches fleet-configured regex
+                // rules against the (ANSI-stripped) output and submits each
+                // rule's prompt back into the SAME live session after a per-rule
+                // exponential backoff. Recovers a session stranded by the
+                // transient "Server is temporarily limiting requests" rate-limit
+                // message (distinct from a usage limit, handled above). See
+                // `terminal::auto_response` for the engine + scheduler.
+                term_for_session.interceptor().add_hook(Box::new(
+                    terminal::auto_response::AutoResponseWatchHook::new(),
+                ));
 
                 // Infrequent liveness poll for lazy close-detection. Every
                 // 45s it snapshots open lifecycle records against the live
@@ -2338,7 +2320,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                     use session::session_lifecycle_store::{classify, PollAction};
 
-                    // claudeSessionId -> consecutive claude-absent ticks,
+                    // claudeSessionId -> consecutive zero-descendant ticks,
                     // carried across ticks to debounce `NeedsConfirm`.
                     let mut consecutive_dead: StdHashMap<String, u32> = StdHashMap::new();
                     // claudeSessionId -> consecutive NO-MATCHING-TERMINAL
@@ -2386,32 +2368,18 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     })
                                 });
 
-                            let (live_is_alive, claude_present, snapshot_ok) = match info {
-                                None => (None, false, true),
+                            let (live_is_alive, descendant_count, snapshot_ok) = match info {
+                                None => (None, 0usize, true),
                                 Some(info) => {
                                     let pid = info.pid.unwrap_or(0);
-                                    // Take the FULL process snapshot: the
-                                    // claude-present signal needs image names
-                                    // and the PID-reuse guard needs creation
-                                    // times — neither of which
-                                    // discover_descendants_with_parent_map
-                                    // hands back.
-                                    let snap = crate::process_capture::process_tree::snapshot_process_table_public().await;
+                                    let (descendants, parent_map) =
+                                        crate::process_capture::process_tree::discover_descendants_with_parent_map(pid)
+                                            .await;
                                     // A totally-empty system parent_map means
                                     // the snapshot helper failed → Skip.
-                                    let snapshot_ok = !snap.parent_map.is_empty();
+                                    let snapshot_ok = !parent_map.is_empty();
                                     let alive = crate::process_capture::health::pid_alive(pid);
-                                    // Liveness = "is a live Claude present in
-                                    // this PID's inclusive subtree?" — correct
-                                    // for both the operator (claude is a child
-                                    // of the shell) and agent (tracked PID *is*
-                                    // claude, idle with zero children) shapes.
-                                    let claude_present = crate::process_capture::process_tree::claude_present_in_inclusive_subtree(
-                                        pid,
-                                        &snap,
-                                        rec.opened_at,
-                                    );
-                                    (Some(alive), claude_present, snapshot_ok)
+                                    (Some(alive), descendants.len(), snapshot_ok)
                                 }
                             };
 
@@ -2434,7 +2402,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             let restore_pending = rec.restore_pending_at.is_some();
                             let action = classify(
                                 live_is_alive,
-                                claude_present,
+                                descendant_count,
                                 prior,
                                 prior_no_match,
                                 snapshot_ok,
@@ -2463,7 +2431,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     consecutive_no_match.remove(&rec.claude_session_id);
                                     tracing::debug!(
                                         claude_session = %rec.claude_session_id,
-                                        "session lifecycle poll: no claude in subtree — confirming before close"
+                                        "session lifecycle poll: zero descendants — confirming before close"
                                     );
                                 }
                                 PollAction::Close => {

@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "base_sha": "81af18f933433141aaa8580defebab80e255ad84",
+  "ours_sha": "b927928c6303f5d8f98befa073f810c4ce339dbc",
+  "theirs_sha": "54c3449a4e1658df63c7077d3629f56e6ed45f2e",
+  "entries": [
+    {
+      "path": "src-tauri/src/main.rs",
+      "base_oid": "e29f5210a513235bbcb5d4ddffaa318e06f27181",
+      "ours_oid": "ee37e6c33f6f20d905146294e92bf9d0d345ed3a",
+      "theirs_oid": "ff8d7d8e02a8b5e9ba516de8628cf9bafecec473",
+      "base_path": "src-tauri/src/main.rs.base",
+      "ours_path": "src-tauri/src/main.rs.ours",
+      "theirs_path": "src-tauri/src/main.rs.theirs",
+      "hunks": [
+        "<<<<<<< HEAD\n             // Hook-free, runner-side WIP-attribution capture (mirrors fleet::tree_publisher).\n             // Reads each hosted session's transcript and POSTs file-edit attribution to\n             // coord. Gated OFF by default (COORD_SESSION_ATTRIBUTION_ENABLED).\nmod session_attribution;\n=======\nmod session_bus; // Session Bus Phase 3b — gated directed-message delivery executor\n>>>>>>> dbfc9ed0 (feat: session-bus Phase 3b (runner side) — gated message delivery executor)\n",
+        "<<<<<<< HEAD\n                // Hook-free, runner-side WIP-attribution capture (sibling of\n                // the tree publisher above). Reads each hosted session's Claude\n                // transcript forward-only and POSTs file-edit attribution to\n                // coord's /coord/wip-attribution. Gated OFF by default\n                // (COORD_SESSION_ATTRIBUTION_ENABLED) — no live consumer yet, so\n                // it's a no-op until armed. See `session_attribution`.\n                session_attribution::spawn_session_attribution();\n=======\n                // Session Bus Phase 3b — directed-message delivery executor.\n                // No-op unless COORD_SESSION_BUS_ENABLED is set (opt-in): it\n                // injects coord-queued messages into live session terminals.\n                session_bus::spawn_session_bus_executor();\n>>>>>>> dbfc9ed0 (feat: session-bus Phase 3b (runner side) — gated message delivery executor)\n"
+      ]
+    }
+  ]
+}

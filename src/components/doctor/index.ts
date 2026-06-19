@@ -1,1 +1,0 @@
-export { DoctorHealthBadge } from "./DoctorHealthBadge";
