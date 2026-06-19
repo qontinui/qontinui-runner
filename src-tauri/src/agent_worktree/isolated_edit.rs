@@ -425,20 +425,19 @@ async fn materialize_repos(
         canonical_paths.insert(repo.clone(), path);
     }
 
-    let mut repo_reqs: Vec<RepoRequest> = Vec::with_capacity(repos.len());
-    for repo in repos {
-        let canonical = canonical_paths
-            .get(repo)
-            .ok_or_else(|| AllocateError::Other(format!("no canonical path for repo '{repo}'")))?;
-        let parent_sha = resolve_head_sha(canonical)
-            .map_err(|e| AllocateError::Other(format!("git rev-parse HEAD on {repo}: {e}")))?;
-        repo_reqs.push(RepoRequest {
+    // Phase 2a: do NOT pin the primary checkout's HEAD. Send `parent_sha:
+    // None` and let coord's `decide_parent_sha` return its authoritative
+    // webhook-fresh `coord_main_sha` — the correct base even when this
+    // runner's primary is parked on a stale feature branch.
+    let repo_reqs: Vec<RepoRequest> = repos
+        .iter()
+        .map(|repo| RepoRequest {
             repo: repo.clone(),
-            parent_sha,
-        });
-    }
+            parent_sha: None,
+        })
+        .collect();
 
-    let outcome = allocate_and_materialize_with_claim(
+    let outcome = match allocate_and_materialize_with_claim(
         coord_http_base,
         &device_id,
         agent_session_id,
@@ -449,7 +448,51 @@ async fn materialize_repos(
         plan_id,
         phase,
     )
-    .await?;
+    .await
+    {
+        Ok(o) => {
+            info!("materialize_repos: coord-decided parent_sha path");
+            o
+        }
+        // coord could not decide a base (repo not in coord.canonical_repos →
+        // HTTP 409). Retry ONCE pinning every repo's local `origin/<default>`
+        // SHA so an unregistered repo still forks off a fresh base instead of
+        // failing the spawn (and never off the primary's possibly-stale HEAD).
+        Err(AllocateError::RepoNotRegistered(repo)) => {
+            info!(
+                "materialize_repos: coord cannot decide base for repo '{repo}' \
+                 (repo_not_registered) — retrying with local origin/<default> fallback"
+            );
+            let mut fallback_reqs: Vec<RepoRequest> = Vec::with_capacity(repos.len());
+            for r in repos {
+                let canonical = canonical_paths.get(r).ok_or_else(|| {
+                    AllocateError::Other(format!("no canonical path for repo '{r}'"))
+                })?;
+                let sha = super::resolve_origin_default_sha(canonical).map_err(|e| {
+                    AllocateError::Other(format!(
+                        "local origin/<default> fallback for repo '{r}': {e}"
+                    ))
+                })?;
+                fallback_reqs.push(RepoRequest {
+                    repo: r.clone(),
+                    parent_sha: Some(sha),
+                });
+            }
+            allocate_and_materialize_with_claim(
+                coord_http_base,
+                &device_id,
+                agent_session_id,
+                &fallback_reqs,
+                intent,
+                declared_overlap_paths,
+                &canonical_paths,
+                plan_id,
+                phase,
+            )
+            .await?
+        }
+        Err(e) => return Err(e),
+    };
 
     match outcome {
         MaterializeOutcome::Worktrees(r) => Ok(r),
@@ -677,28 +720,6 @@ fn read_device_id() -> Result<uuid::Uuid, String> {
         .and_then(|s| s.as_str())
         .ok_or_else(|| format!("{}: missing device_id (or machine_id)", path.display()))?;
     uuid::Uuid::parse_str(id_str).map_err(|e| format!("invalid UUID: {e}"))
-}
-
-fn resolve_head_sha(canonical: &Path) -> Result<String, String> {
-    use std::process::Command;
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(canonical)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .map_err(|e| format!("spawn git: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "git rev-parse HEAD failed ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if sha.is_empty() {
-        return Err("git rev-parse HEAD: empty SHA".into());
-    }
-    Ok(sha)
 }
 
 #[cfg(test)]
