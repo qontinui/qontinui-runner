@@ -10,9 +10,11 @@
 //! / `service_pid`; Phase 2 reads `service_pid` to detect inner-worker death.
 //!
 //! Windows uses `Get-CimInstance Win32_Process` via PowerShell to snapshot
-//! `(ProcessId, ParentProcessId, CreationDate)` for every running process,
-//! then BFS in Rust. Unix reads `/proc/<pid>/task/<pid>/children` recursively
-//! and `/proc/<pid>/stat` for the start time.
+//! `(ProcessId, ParentProcessId, CreationDate, Name)` for every running
+//! process, then BFS in Rust. Unix reads `/proc/<pid>/stat` for the parent and
+//! start time and `/proc/<pid>/comm` for the image name. The `Name`/`comm`
+//! image powers [`claude_present_in_inclusive_subtree`], the session-liveness
+//! signal.
 
 use std::collections::HashMap;
 
@@ -35,11 +37,74 @@ pub struct PidWithSpawnedAt {
 /// `parent_map[parent_pid] -> [child_pid, ...]` is the BFS index;
 /// `creation_times[pid] -> unix_secs` carries the lookup table built from
 /// the same snapshot so Phase 4 can sanity-filter persisted PIDs without
-/// re-querying WMI.
+/// re-querying WMI; `names[pid] -> image_name` carries each process's image
+/// (e.g. `claude.exe` on Windows, `comm` on Unix) so the session liveness
+/// poll can ask "is a live Claude process present in this subtree?" — the
+/// signal [`claude_present_in_inclusive_subtree`] reads.
 #[derive(Debug, Default)]
 pub struct ProcessSnapshot {
     pub parent_map: HashMap<u32, Vec<u32>>,
     pub creation_times: HashMap<u32, i64>,
+    pub names: HashMap<u32, String>,
+}
+
+/// Skew tolerance (millis) for the PID-reuse creation-time vs `opened_at`
+/// comparison in [`claude_present_in_inclusive_subtree`]. Creation times come
+/// from WMI at second granularity (and `opened_at` is wall-clock millis at
+/// session open), so a freshly-spawned Claude can legitimately show a creation
+/// time a beat after its session record's `opened_at`. Only treat a tracked
+/// PID as reused when its creation predates the open by more than this slack.
+const PID_REUSE_SKEW_MS: i64 = 5_000;
+
+/// True iff a live Claude process is present in the **inclusive** subtree
+/// rooted at `root_pid` — i.e. `root_pid`'s own image is `claude*`, OR any
+/// descendant's image is `claude*`. This is the liveness signal the terminal-
+/// session poll uses: a session is alive iff there is a live Claude here, which
+/// is the correct question for **both** session shapes:
+/// - **Operator session:** tracked PID is the shell; `claude` is a child →
+///   present via a descendant.
+/// - **Agent / gate-continuation session:** tracked PID *is* `claude` (it is the
+///   portable-pty child) → present via the root, even when idle with zero
+///   children (the bug the old `descendant_count > 0` heuristic mis-closed).
+///
+/// `opened_at_unix_millis` guards PID reuse: if the tracked `root_pid`'s
+/// creation time predates the session's open time (beyond [`PID_REUSE_SKEW_MS`]),
+/// the kernel recycled that PID into an unrelated process — its image name must
+/// not be trusted, so the subtree is treated as claude-absent. The comparison
+/// normalizes units: `creation_times` is epoch **seconds**, `opened_at` is
+/// epoch **millis**.
+pub fn claude_present_in_inclusive_subtree(
+    root_pid: u32,
+    snapshot: &ProcessSnapshot,
+    opened_at_unix_millis: i64,
+) -> bool {
+    // PID-reuse guard on the tracked root (seconds → millis before comparing).
+    if let Some(&created_secs) = snapshot.creation_times.get(&root_pid) {
+        if created_secs > 0 && created_secs * 1000 + PID_REUSE_SKEW_MS < opened_at_unix_millis {
+            return false;
+        }
+    }
+    if is_claude_image(snapshot.names.get(&root_pid)) {
+        return true;
+    }
+    bfs_descendants_from(root_pid, &snapshot.parent_map, &snapshot.creation_times)
+        .iter()
+        .any(|d| is_claude_image(snapshot.names.get(&d.pid)))
+}
+
+/// Case-insensitive basename match on `claude` / `claude.exe`. Tolerates a
+/// path-qualified name (takes the basename) and a trailing `.exe`.
+fn is_claude_image(name: Option<&String>) -> bool {
+    let Some(name) = name else {
+        return false;
+    };
+    let base = name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(name)
+        .to_ascii_lowercase();
+    let stem = base.strip_suffix(".exe").unwrap_or(&base);
+    stem == "claude"
 }
 
 /// Discover every descendant of `root_pid` (NOT including the root itself).
@@ -209,7 +274,7 @@ fn collect_descendants_from_snapshot(
 async fn snapshot_process_table() -> ProcessSnapshot {
     // ConvertTo-Json on a single row drops the array; force an array with @().
     const SCRIPT: &str = "$ErrorActionPreference='SilentlyContinue'; \
-        @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate) | \
+        @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate,Name) | \
         ConvertTo-Json -Compress -Depth 3";
 
     let output = match tokio::task::spawn_blocking(|| {
@@ -251,6 +316,8 @@ struct WmiProcessRow {
     parent_process_id: Option<u32>,
     #[serde(rename = "CreationDate", default)]
     creation_date: Option<serde_json::Value>,
+    #[serde(rename = "Name", default)]
+    name: Option<String>,
 }
 
 #[cfg(windows)]
@@ -276,6 +343,9 @@ fn parse_powershell_snapshot(json: &str) -> ProcessSnapshot {
             .map(parse_wmi_creation_date)
             .unwrap_or(0);
         snap.creation_times.insert(row.process_id, secs);
+        if let Some(name) = row.name {
+            snap.names.insert(row.process_id, name);
+        }
     }
     snap
 }
@@ -391,6 +461,21 @@ fn snapshot_process_table_sync() -> ProcessSnapshot {
         };
         snap.parent_map.entry(ppid).or_default().push(pid);
         snap.creation_times.insert(pid, spawned_at_unix);
+        // Image name for the claude-present liveness signal. `/proc/<pid>/comm`
+        // is the kernel's `TASK_COMM` (≤15 chars, no path) — `claude` fits.
+        // Fall back to the `comm` field already parsed out of `stat` (the text
+        // between the first '(' and last ')') if the dedicated file is gone.
+        let name = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                let open = stat.find('(')?;
+                Some(stat[open + 1..close].to_string())
+            });
+        if let Some(name) = name {
+            snap.names.insert(pid, name);
+        }
     }
     snap
 }
@@ -464,6 +549,103 @@ mod tests {
         let creation_times: HashMap<u32, i64> = HashMap::new();
         let out = bfs_descendants_from(42, &parent_map, &creation_times);
         assert!(out.is_empty());
+    }
+
+    fn snap_with(
+        parent_map: &[(u32, &[u32])],
+        creation: &[(u32, i64)],
+        names: &[(u32, &str)],
+    ) -> ProcessSnapshot {
+        let mut s = ProcessSnapshot::default();
+        for (p, kids) in parent_map {
+            s.parent_map.insert(*p, kids.to_vec());
+        }
+        for (pid, t) in creation {
+            s.creation_times.insert(*pid, *t);
+        }
+        for (pid, n) in names {
+            s.names.insert(*pid, n.to_string());
+        }
+        s
+    }
+
+    // `opened_at` (millis) is ≈ when the session's process spawned, so a
+    // non-reused PID has `creation_secs * 1000 >= opened_at` (minus skew). The
+    // alive fixtures below use creation 1_000s (== 1_000_000ms) with an
+    // `opened_at` at/just-before that instant so the PID-reuse guard is a no-op
+    // and the tests exercise the image-name logic, not reuse.
+    const OPEN_AT_FRESH: i64 = 1_000_000;
+
+    #[test]
+    fn claude_present_root_is_claude() {
+        // Agent / gate-continuation session: tracked PID *is* claude, zero
+        // children — the exact idle shape the old descendant-count heuristic
+        // mis-closed as poll-dead.
+        let snap = snap_with(&[], &[(100, 1_000)], &[(100, "claude.exe")]);
+        assert!(claude_present_in_inclusive_subtree(
+            100,
+            &snap,
+            OPEN_AT_FRESH
+        ));
+        // Case-insensitive, no extension, path-qualified — all match.
+        let snap2 = snap_with(&[], &[(100, 1_000)], &[(100, "C:/bin/Claude")]);
+        assert!(claude_present_in_inclusive_subtree(
+            100,
+            &snap2,
+            OPEN_AT_FRESH
+        ));
+    }
+
+    #[test]
+    fn claude_present_descendant_is_claude() {
+        // Operator session: tracked PID is the shell; claude is a child.
+        let snap = snap_with(
+            &[(200, &[201])],
+            &[(200, 1_000), (201, 1_001)],
+            &[(200, "powershell.exe"), (201, "claude")],
+        );
+        assert!(claude_present_in_inclusive_subtree(
+            200,
+            &snap,
+            OPEN_AT_FRESH
+        ));
+    }
+
+    #[test]
+    fn claude_present_false_when_no_claude() {
+        // Bare shell, operator quit claude: no claude anywhere in the subtree
+        // → genuine poll-dead (the cleanup Option B preserves). `opened_at` is
+        // fresh so this exercises genuine absence, not the reuse guard.
+        let snap = snap_with(
+            &[(300, &[301])],
+            &[(300, 1_000), (301, 1_001)],
+            &[(300, "pwsh.exe"), (301, "node.exe")],
+        );
+        assert!(!claude_present_in_inclusive_subtree(
+            300,
+            &snap,
+            OPEN_AT_FRESH
+        ));
+    }
+
+    #[test]
+    fn claude_present_false_on_pid_reuse() {
+        // Tracked PID's image says claude, but its creation time predates the
+        // session open by more than the skew → the kernel reused the PID →
+        // don't trust the name. (1_000s == 1_000_000ms, opened_at 2_000_000ms.)
+        let reused = snap_with(&[], &[(400, 1_000)], &[(400, "claude.exe")]);
+        assert!(!claude_present_in_inclusive_subtree(
+            400, &reused, 2_000_000
+        ));
+        // Within the skew window (3ms later) it is NOT reuse — a freshly
+        // spawned claude whose creation rounds just past opened_at.
+        let fresh = snap_with(&[], &[(400, 1_000)], &[(400, "claude.exe")]);
+        assert!(claude_present_in_inclusive_subtree(400, &fresh, 1_000_003));
+        // Unresolved creation time (0) must never count as reuse.
+        let unknown = snap_with(&[], &[(400, 0)], &[(400, "claude.exe")]);
+        assert!(claude_present_in_inclusive_subtree(
+            400, &unknown, 2_000_000
+        ));
     }
 
     #[test]
@@ -555,5 +737,28 @@ mod tests {
             Some(&[3u32][..])
         );
         assert_eq!(snap.creation_times.get(&2).copied(), Some(1715911100));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parse_powershell_snapshot_captures_name() {
+        let json = r#"[
+            {"ProcessId":10,"ParentProcessId":0,"CreationDate":"/Date(1715911000000)/","Name":"powershell.exe"},
+            {"ProcessId":11,"ParentProcessId":10,"CreationDate":"/Date(1715911000000)/","Name":"claude.exe"}
+        ]"#;
+        let snap = parse_powershell_snapshot(json);
+        assert_eq!(
+            snap.names.get(&10).map(|s| s.as_str()),
+            Some("powershell.exe")
+        );
+        assert_eq!(snap.names.get(&11).map(|s| s.as_str()), Some("claude.exe"));
+        // End-to-end: the inclusive-subtree helper sees claude under the shell.
+        // opened_at == the shell's creation in millis so the reuse guard is a
+        // no-op (creation does not predate open).
+        assert!(claude_present_in_inclusive_subtree(
+            10,
+            &snap,
+            1_715_911_000_000
+        ));
     }
 }

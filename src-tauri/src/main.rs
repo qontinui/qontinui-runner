@@ -2327,7 +2327,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                     use session::session_lifecycle_store::{classify, PollAction};
 
-                    // claudeSessionId -> consecutive zero-descendant ticks,
+                    // claudeSessionId -> consecutive claude-absent ticks,
                     // carried across ticks to debounce `NeedsConfirm`.
                     let mut consecutive_dead: StdHashMap<String, u32> = StdHashMap::new();
                     // claudeSessionId -> consecutive NO-MATCHING-TERMINAL
@@ -2375,18 +2375,32 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     })
                                 });
 
-                            let (live_is_alive, descendant_count, snapshot_ok) = match info {
-                                None => (None, 0usize, true),
+                            let (live_is_alive, claude_present, snapshot_ok) = match info {
+                                None => (None, false, true),
                                 Some(info) => {
                                     let pid = info.pid.unwrap_or(0);
-                                    let (descendants, parent_map) =
-                                        crate::process_capture::process_tree::discover_descendants_with_parent_map(pid)
-                                            .await;
+                                    // Take the FULL process snapshot: the
+                                    // claude-present signal needs image names
+                                    // and the PID-reuse guard needs creation
+                                    // times — neither of which
+                                    // discover_descendants_with_parent_map
+                                    // hands back.
+                                    let snap = crate::process_capture::process_tree::snapshot_process_table_public().await;
                                     // A totally-empty system parent_map means
                                     // the snapshot helper failed → Skip.
-                                    let snapshot_ok = !parent_map.is_empty();
+                                    let snapshot_ok = !snap.parent_map.is_empty();
                                     let alive = crate::process_capture::health::pid_alive(pid);
-                                    (Some(alive), descendants.len(), snapshot_ok)
+                                    // Liveness = "is a live Claude present in
+                                    // this PID's inclusive subtree?" — correct
+                                    // for both the operator (claude is a child
+                                    // of the shell) and agent (tracked PID *is*
+                                    // claude, idle with zero children) shapes.
+                                    let claude_present = crate::process_capture::process_tree::claude_present_in_inclusive_subtree(
+                                        pid,
+                                        &snap,
+                                        rec.opened_at,
+                                    );
+                                    (Some(alive), claude_present, snapshot_ok)
                                 }
                             };
 
@@ -2409,7 +2423,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             let restore_pending = rec.restore_pending_at.is_some();
                             let action = classify(
                                 live_is_alive,
-                                descendant_count,
+                                claude_present,
                                 prior,
                                 prior_no_match,
                                 snapshot_ok,
@@ -2438,7 +2452,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     consecutive_no_match.remove(&rec.claude_session_id);
                                     tracing::debug!(
                                         claude_session = %rec.claude_session_id,
-                                        "session lifecycle poll: zero descendants — confirming before close"
+                                        "session lifecycle poll: no claude in subtree — confirming before close"
                                     );
                                 }
                                 PollAction::Close => {

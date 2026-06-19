@@ -66,15 +66,16 @@ const RESTORABLE_POLL_DEAD_MS: i64 = 600_000;
 /// live sessions are touched every ~45s by the poll, so anything on screen
 /// at shutdown sits well inside it).
 const RESTORABLE_OPEN_ANCHOR_GRACE_MS: i64 = 600_000;
-/// Number of consecutive zero-descendant ticks a *live* shell (`Some(true)`)
-/// must accumulate before the poll closes it `poll-dead`. A live Claude
-/// session routinely idles with zero descendants between tool calls / while
-/// waiting on the user, so closing on a single confirm tick (~90s) races a
-/// restart into dropping a still-live session. Requiring several ticks
-/// (≈ N × 45s poll interval) only closes shells that are idle-with-no-children
-/// for an extended, unambiguous stretch. A `Some(false)` (pty actually dead)
-/// shell still closes immediately — that path is unambiguous and bypasses
-/// this debounce entirely.
+/// Number of consecutive claude-absent ticks a *live* shell (`Some(true)` with
+/// no Claude in its inclusive subtree) must accumulate before the poll closes
+/// it `poll-dead`. A live Claude in the subtree is KeepAlive immediately and
+/// never reaches this debounce. The debounce only governs the claude-absent
+/// case: it absorbs a transient process-snapshot miss and gives an in-flight
+/// relaunch a window, so a momentary blip doesn't drop a session. Requiring
+/// several ticks (≈ N × 45s poll interval) only closes shells that are
+/// claude-absent for an extended, unambiguous stretch (operator quit claude;
+/// bare shell lingers). A `Some(false)` (pty actually dead) shell still closes
+/// immediately — that path is unambiguous and bypasses this debounce entirely.
 const LIVE_SHELL_DEAD_TICKS: u32 = 3;
 /// Number of consecutive NO-MATCHING-TERMINAL ticks an open record must
 /// accumulate before the poll closes it `"no-terminal"`. A record whose
@@ -563,9 +564,10 @@ fn write_map(path: &Path, map: &HashMap<String, TerminalSessionRecord>) -> std::
 pub enum PollAction {
     /// The session is alive and busy — refresh its `last_seen_at`.
     KeepAlive,
-    /// The session's shell is alive but has zero descendants and has not yet
-    /// reached [`LIVE_SHELL_DEAD_TICKS`] consecutive zero-descendant ticks —
-    /// wait more ticks before closing (debounce idle lulls between tool calls).
+    /// The session's shell pty is alive but no live Claude is present in its
+    /// inclusive subtree, and it has not yet reached [`LIVE_SHELL_DEAD_TICKS`]
+    /// consecutive claude-absent ticks — wait more ticks before closing
+    /// (debounce a transient snapshot miss / an in-flight relaunch).
     NeedsConfirm,
     /// The session is dead — flip it to `closed` (reason `"poll-dead"`).
     Close,
@@ -588,8 +590,16 @@ pub enum PollAction {
 ///
 /// - `live_is_alive`: `Some(true)` shell pty alive, `Some(false)` dead,
 ///   `None` no matching pty for this session.
-/// - `descendant_count`: number of descendant processes of the shell pid.
-/// - `consecutive_dead`: count of prior consecutive zero-descendant ticks.
+/// - `claude_present`: whether a live Claude process is present in the tracked
+///   PID's *inclusive* subtree (the tracked PID's own image is `claude*`, or any
+///   descendant's is). This replaces the old `descendant_count > 0` heuristic,
+///   which mis-closed an idle **agent** session whose tracked PID *is* `claude`
+///   (it spawns zero children while parked on a gate). The invariant: the
+///   `Some(true)` arm never reaches `Close` while `claude_present` — a live
+///   Claude here is the normal state, never a dead signal. `Close` is reachable
+///   from `Some(true)` only when claude is ABSENT for `LIVE_SHELL_DEAD_TICKS`
+///   (the preserved bare-shell cleanup: operator quit claude, shell PID lingers).
+/// - `consecutive_dead`: count of prior consecutive claude-absent ticks.
 /// - `consecutive_no_match`: count of prior consecutive ticks where NO live
 ///   terminal matched this record. "No matching terminal in THIS instance
 ///   for many consecutive ticks" is not uncertainty — it is an orphan that
@@ -610,7 +620,7 @@ pub enum PollAction {
 ///   `NoMatchWait`.
 pub fn classify(
     live_is_alive: Option<bool>,
-    descendant_count: usize,
+    claude_present: bool,
     consecutive_dead: u32,
     consecutive_no_match: u32,
     snapshot_ok: bool,
@@ -629,15 +639,19 @@ pub fn classify(
         }
         Some(false) => PollAction::Close,
         Some(true) => {
-            if descendant_count > 0 {
+            if claude_present {
+                // A live Claude in the inclusive subtree — KeepAlive
+                // unconditionally, no matter how long it has idled. This is the
+                // floor that fixes the false poll-dead close of idle agents.
                 PollAction::KeepAlive
             } else if consecutive_dead < LIVE_SHELL_DEAD_TICKS {
-                // A live shell idling with no children is the normal between-
-                // tool-calls state of a Claude session — debounce several
-                // ticks before treating it as dead, so a restart in this
+                // No Claude present, but debounce several ticks before closing:
+                // absorbs a transient snapshot miss, and a restart in this
                 // window does not drop a still-live session.
                 PollAction::NeedsConfirm
             } else {
+                // Claude absent for the full debounce — genuine poll-dead (e.g.
+                // operator quit claude and only the bare shell PID lingers).
                 PollAction::Close
             }
         }
@@ -1011,18 +1025,18 @@ mod tests {
     fn classify_skip_on_snapshot_failure() {
         // snapshot_ok=false dominates every other input.
         assert_eq!(
-            classify(Some(false), 0, 5, 0, false, false),
+            classify(Some(false), false, 5, 0, false, false),
             PollAction::Skip
         );
         assert_eq!(
-            classify(Some(true), 3, 0, 0, false, false),
+            classify(Some(true), true, 0, 0, false, false),
             PollAction::Skip
         );
-        assert_eq!(classify(None, 0, 0, 0, false, false), PollAction::Skip);
+        assert_eq!(classify(None, false, 0, 0, false, false), PollAction::Skip);
         // Even a no-match streak past the orphan threshold must Skip (not
         // CloseNoTerminal) when the snapshot failed.
         assert_eq!(
-            classify(None, 0, 0, NO_TERMINAL_ORPHAN_TICKS + 5, false, false),
+            classify(None, false, 0, NO_TERMINAL_ORPHAN_TICKS + 5, false, false),
             PollAction::Skip
         );
     }
@@ -1034,14 +1048,14 @@ mod tests {
         // NOT close on a brief registration race.
         for prior in 0..NO_TERMINAL_ORPHAN_TICKS {
             assert_eq!(
-                classify(None, 0, 0, prior, true, false),
+                classify(None, false, 0, prior, true, false),
                 PollAction::NoMatchWait,
                 "no match, {prior} prior no-match ticks must NoMatchWait"
             );
         }
-        // descendant/dead-tick inputs are irrelevant to the no-match arm.
+        // claude_present/dead-tick inputs are irrelevant to the no-match arm.
         assert_eq!(
-            classify(None, 9, 9, 0, true, false),
+            classify(None, true, 9, 0, true, false),
             PollAction::NoMatchWait
         );
     }
@@ -1052,54 +1066,102 @@ mod tests {
         // orphan — close it with the (non-restorable) "no-terminal" reason.
         // With a 45s poll the close lands on the 4th consecutive tick ≈ 3min.
         assert_eq!(
-            classify(None, 0, 0, NO_TERMINAL_ORPHAN_TICKS, true, false),
+            classify(None, false, 0, NO_TERMINAL_ORPHAN_TICKS, true, false),
             PollAction::CloseNoTerminal
         );
         assert_eq!(
-            classify(None, 0, 0, NO_TERMINAL_ORPHAN_TICKS + 5, true, false),
+            classify(None, false, 0, NO_TERMINAL_ORPHAN_TICKS + 5, true, false),
             PollAction::CloseNoTerminal
         );
     }
 
     #[test]
     fn classify_close_on_dead_shell() {
+        // A dead pty closes regardless of claude_present — the unambiguous
+        // confident-dead signal.
         assert_eq!(
-            classify(Some(false), 0, 0, 0, true, false),
+            classify(Some(false), false, 0, 0, true, false),
             PollAction::Close
         );
         assert_eq!(
-            classify(Some(false), 5, 0, 0, true, false),
+            classify(Some(false), true, 0, 0, true, false),
             PollAction::Close
         );
     }
 
     #[test]
-    fn classify_keepalive_when_alive_with_descendants() {
+    fn classify_keepalive_when_claude_present() {
+        // Claude present in the inclusive subtree ⇒ KeepAlive immediately —
+        // even with zero prior dead ticks (the idle-agent bug) and even after
+        // a long prior claude-absent streak (claude came back).
         assert_eq!(
-            classify(Some(true), 1, 0, 0, true, false),
+            classify(Some(true), true, 0, 0, true, false),
             PollAction::KeepAlive
         );
         assert_eq!(
-            classify(Some(true), 7, 9, 0, true, false),
+            classify(Some(true), true, 9, 0, true, false),
             PollAction::KeepAlive
+        );
+    }
+
+    #[test]
+    fn classify_idle_agent_session_is_kept_alive() {
+        // Regression for the live incident (2026-06-19): an idle agent /
+        // gate-continuation session whose tracked PID *is* claude spawns zero
+        // children while parked on a gate. Under the old `descendant_count > 0`
+        // heuristic this read as dead and was closed `poll-dead` in ~135s while
+        // perfectly alive. With `claude_present` the answer is KeepAlive on the
+        // very first tick, forever, no matter how long it idles.
+        assert_eq!(
+            classify(Some(true), true, 0, 0, true, false),
+            PollAction::KeepAlive
+        );
+        assert_eq!(
+            classify(
+                Some(true),
+                true,
+                LIVE_SHELL_DEAD_TICKS + 100,
+                0,
+                true,
+                false
+            ),
+            PollAction::KeepAlive
+        );
+    }
+
+    #[test]
+    fn classify_operator_quit_claude_closes_after_debounce() {
+        // The preserved bare-shell cleanup: operator quits claude, the shell
+        // PID stays alive but no claude remains in its subtree → NeedsConfirm
+        // through the debounce, then Close. (prior < LIVE_SHELL_DEAD_TICKS is
+        // NeedsConfirm, NOT Close — the plan's test-plan "prior=2 ⇒ Close" bullet
+        // predated keeping the 3-tick debounce; Change #2 keeps it, so Close
+        // requires the full streak.)
+        assert_eq!(
+            classify(Some(true), false, LIVE_SHELL_DEAD_TICKS - 1, 0, true, false),
+            PollAction::NeedsConfirm
+        );
+        assert_eq!(
+            classify(Some(true), false, LIVE_SHELL_DEAD_TICKS, 0, true, false),
+            PollAction::Close
         );
     }
 
     #[test]
     fn classify_needs_confirm_while_below_live_shell_dead_ticks() {
-        // A live shell with zero descendants stays in NeedsConfirm for every
+        // A live shell with NO claude present stays in NeedsConfirm for every
         // tick strictly below LIVE_SHELL_DEAD_TICKS — it must NOT close on a
-        // brief idle lull (the poll-dead race this fix closes).
+        // brief blip (a transient snapshot miss / in-flight relaunch).
         for prior in 0..LIVE_SHELL_DEAD_TICKS {
             assert_eq!(
-                classify(Some(true), 0, prior, 0, true, false),
+                classify(Some(true), false, prior, 0, true, false),
                 PollAction::NeedsConfirm,
-                "live shell, 0 descendants, {prior} prior ticks must NeedsConfirm"
+                "live shell, claude absent, {prior} prior ticks must NeedsConfirm"
             );
         }
         // Specifically: the second tick (prior == 1) no longer closes.
         assert_eq!(
-            classify(Some(true), 0, 1, 0, true, false),
+            classify(Some(true), false, 1, 0, true, false),
             PollAction::NeedsConfirm
         );
     }
@@ -1107,13 +1169,14 @@ mod tests {
     #[test]
     fn classify_close_only_after_live_shell_dead_ticks_reached() {
         // Only once we've accumulated LIVE_SHELL_DEAD_TICKS consecutive
-        // zero-descendant ticks does a live shell finally close.
+        // claude-absent ticks does a live shell finally close (operator quit
+        // claude; the bare shell PID lingers).
         assert_eq!(
-            classify(Some(true), 0, LIVE_SHELL_DEAD_TICKS, 0, true, false),
+            classify(Some(true), false, LIVE_SHELL_DEAD_TICKS, 0, true, false),
             PollAction::Close
         );
         assert_eq!(
-            classify(Some(true), 0, LIVE_SHELL_DEAD_TICKS + 5, 0, true, false),
+            classify(Some(true), false, LIVE_SHELL_DEAD_TICKS + 5, 0, true, false),
             PollAction::Close
         );
     }
@@ -1123,38 +1186,44 @@ mod tests {
         // The incident shape: a restored pane whose resume silently failed.
         // Dead pty (the restore shell died / was never matched) → Skip, NOT
         // Close — the durable `open` record must survive for the next attempt.
-        assert_eq!(classify(Some(false), 0, 0, 0, true, true), PollAction::Skip);
-        // Plain shell idling with zero descendants, even past the debounce
-        // ticks (the exact poll-dead flip the incident hit) → Skip.
         assert_eq!(
-            classify(Some(true), 0, LIVE_SHELL_DEAD_TICKS, 0, true, true),
+            classify(Some(false), false, 0, 0, true, true),
+            PollAction::Skip
+        );
+        // Plain shell with no claude present, even past the debounce ticks
+        // (the exact poll-dead flip the incident hit) → Skip.
+        assert_eq!(
+            classify(Some(true), false, LIVE_SHELL_DEAD_TICKS, 0, true, true),
             PollAction::Skip
         );
         assert_eq!(
-            classify(Some(true), 0, LIVE_SHELL_DEAD_TICKS + 5, 0, true, true),
+            classify(Some(true), false, LIVE_SHELL_DEAD_TICKS + 5, 0, true, true),
             PollAction::Skip
         );
         // Below the debounce it must not even accumulate NeedsConfirm ticks.
-        assert_eq!(classify(Some(true), 0, 0, 0, true, true), PollAction::Skip);
+        assert_eq!(
+            classify(Some(true), false, 0, 0, true, true),
+            PollAction::Skip
+        );
         // No matching pty → Skip, NOT NoMatchWait: a mid-restore row keeps
         // its OLD terminal_id until the re-assert and must never accumulate
         // no-match ticks toward an orphan close.
-        assert_eq!(classify(None, 0, 0, 0, true, true), PollAction::Skip);
+        assert_eq!(classify(None, false, 0, 0, true, true), PollAction::Skip);
         // Even a streak past the orphan threshold must not close while the
         // restore-pending marker is set.
         assert_eq!(
-            classify(None, 0, 0, NO_TERMINAL_ORPHAN_TICKS + 1, true, true),
+            classify(None, false, 0, NO_TERMINAL_ORPHAN_TICKS + 1, true, true),
             PollAction::Skip
         );
     }
 
     #[test]
     fn classify_restore_pending_passes_through_confident_alive() {
-        // A confidently-alive session (descendants running) classifies
-        // KeepAlive even while restore-pending — the caller uses this to
-        // self-heal a stale marker.
+        // A confidently-alive session (claude present) classifies KeepAlive
+        // even while restore-pending — the caller uses this to self-heal a
+        // stale marker.
         assert_eq!(
-            classify(Some(true), 2, 0, 0, true, true),
+            classify(Some(true), true, 0, 0, true, true),
             PollAction::KeepAlive
         );
     }
