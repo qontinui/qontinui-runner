@@ -2358,6 +2358,18 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                         let live = poll_tm.list();
 
+                        // One system-wide process snapshot per tick, shared by
+                        // every open record below. The process table is
+                        // consistent within a tick, so taking it once per record
+                        // was N redundant PowerShell/`/proc` scans; `pid_alive`
+                        // stays the only per-record syscall. The claude-present
+                        // signal needs image names and the PID-reuse guard needs
+                        // creation times — both carried on the snapshot.
+                        let snap = crate::process_capture::process_tree::snapshot_process_table_public().await;
+                        // A totally-empty system parent_map means the snapshot
+                        // helper failed → classify Skips every matched record.
+                        let tick_snapshot_ok = !snap.parent_map.is_empty();
+
                         for rec in &open {
                             // Match the live terminal: by id first, then the
                             // (page_id, title, working_dir) triple as fallback.
@@ -2381,19 +2393,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 });
 
                             let (live_is_alive, claude_present, snapshot_ok) = match info {
+                                // No matching terminal — orphan detection is
+                                // independent of the process snapshot, so keep
+                                // snapshot_ok=true here (unchanged behavior).
                                 None => (None, false, true),
                                 Some(info) => {
                                     let pid = info.pid.unwrap_or(0);
-                                    // Take the FULL process snapshot: the
-                                    // claude-present signal needs image names
-                                    // and the PID-reuse guard needs creation
-                                    // times — neither of which
-                                    // discover_descendants_with_parent_map
-                                    // hands back.
-                                    let snap = crate::process_capture::process_tree::snapshot_process_table_public().await;
-                                    // A totally-empty system parent_map means
-                                    // the snapshot helper failed → Skip.
-                                    let snapshot_ok = !snap.parent_map.is_empty();
                                     let alive = crate::process_capture::health::pid_alive(pid);
                                     // Liveness = "is a live Claude present in
                                     // this PID's inclusive subtree?" — correct
@@ -2405,7 +2410,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                         &snap,
                                         rec.opened_at,
                                     );
-                                    (Some(alive), claude_present, snapshot_ok)
+                                    (Some(alive), claude_present, tick_snapshot_ok)
                                 }
                             };
 
