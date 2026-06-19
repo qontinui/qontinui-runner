@@ -655,14 +655,23 @@ pub fn worktree_mode_enabled() -> bool {
     )
 }
 
-/// A repo the caller wants a worktree for, paired with the commit the
-/// worktree should branch off of. The runner is the host so it
-/// resolves `parent_sha` from its own checkout — coord doesn't
-/// re-resolve.
+/// A repo the caller wants a worktree for, optionally paired with the
+/// commit the worktree should branch off of.
+///
+/// `parent_sha` is `Option`:
+/// - `None` (the default, omitted from the wire JSON via
+///   `skip_serializing_if`) → coord deserializes it as `None` and runs
+///   `decide_parent_sha`, returning its authoritative webhook-fresh
+///   `coord_main_sha`. This is the right base even when this runner's
+///   primary checkout is parked on a stale feature branch.
+/// - `Some(sha)` → coord honors it verbatim (no re-resolve). Used only as
+///   the local-`origin/<default>` fallback when coord can't decide a base
+///   (repo not registered → HTTP 409 [`AllocateError::RepoNotRegistered`]).
 #[derive(Debug, Clone, Serialize)]
 pub struct RepoRequest {
     pub repo: String,
-    pub parent_sha: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_sha: Option<String>,
 }
 
 /// A single materialized worktree as returned by
@@ -693,6 +702,40 @@ pub struct MaterializedWorktree {
 pub fn remote_agent_ref(branch: &str) -> String {
     let rest = branch.strip_prefix("agent/").unwrap_or(branch);
     format!("refs/agent/{rest}")
+}
+
+/// Resolve a repo's local default branch from `origin/HEAD`, falling back
+/// to `main`. Mirrors `fleet::resolve_default_branch` (kept local — the
+/// allocation path must not cross-module-import fleet internals). Reads
+/// `git -C <canonical> symbolic-ref --short refs/remotes/origin/HEAD` and
+/// strips the `origin/` prefix.
+fn resolve_local_default_branch(canonical: &Path) -> String {
+    run_git_command(
+        canonical,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    )
+    .ok()
+    .and_then(|s| {
+        let s = s.trim();
+        s.strip_prefix("origin/").map(|b| b.to_string())
+    })
+    .unwrap_or_else(|| "main".to_string())
+}
+
+/// Resolve the local `origin/<default>` SHA for `canonical` — the base used
+/// as the local fallback when coord can't decide a parent
+/// ([`AllocateError::RepoNotRegistered`]). Forking off `origin/<default>`
+/// (not the primary checkout's possibly-stale HEAD) is the whole point of
+/// Phase 2a. `<default>` is resolved via [`resolve_local_default_branch`].
+fn resolve_origin_default_sha(canonical: &Path) -> Result<String, String> {
+    let default = resolve_local_default_branch(canonical);
+    let sha = run_git_command(canonical, &["rev-parse", &format!("origin/{default}")])
+        .map_err(|e| format!("git rev-parse origin/{default}: {e}"))?;
+    let sha = sha.trim().to_string();
+    if sha.is_empty() {
+        return Err(format!("git rev-parse origin/{default}: empty SHA"));
+    }
+    Ok(sha)
 }
 
 /// Result of a full allocate + materialize round-trip.
@@ -929,6 +972,13 @@ pub enum AllocateError {
     /// ConflictModal listens for `agent-claim-conflict` events with
     /// this payload.
     ClaimConflict(ClaimConflict),
+    /// Coord's `decide_parent_sha` returned `RepoNotRegistered` (HTTP 409,
+    /// body `{"error":"repo_not_registered","repo":<repo>}`): the repo is
+    /// not in `coord.canonical_repos` so coord has no authoritative base to
+    /// branch off and no `parent_sha` was supplied. The String is the
+    /// offending repo slug. The caller retries ONCE pinning the local
+    /// `origin/<default>` SHA so the worktree still forks off a fresh base.
+    RepoNotRegistered(String),
     /// Anything else — config errors, transport failures, coord 5xx,
     /// `git worktree add` failures, etc.
     Other(String),
@@ -941,6 +991,10 @@ impl std::fmt::Display for AllocateError {
                 f,
                 "claim already held: kind={} resource_key={} current_holder={}",
                 c.kind, c.resource_key, c.current_holder
+            ),
+            AllocateError::RepoNotRegistered(repo) => write!(
+                f,
+                "repo {repo} not registered in coord.canonical_repos and no parent_sha supplied"
             ),
             AllocateError::Other(s) => f.write_str(s),
         }
@@ -1105,12 +1159,15 @@ pub async fn allocate_and_materialize_with_claim(
     // `coord.machines → coord.devices` rename. The runner-side variable
     // stays `machine_id` for symmetry with claims acquire/heartbeat/release,
     // which coord's `claims.rs` still expects as `machine_id`.
+    // Serialize each RepoRequest directly so its `skip_serializing_if` on
+    // `parent_sha` drops the key entirely when `None` — coord then
+    // deserializes `parent_sha: None` and runs `decide_parent_sha`. A
+    // hand-built `json!({ "parent_sha": r.parent_sha })` would instead emit
+    // an explicit `null`, which is still `None` to coord but loses the
+    // skip-on-none contract the serialization test pins.
     let body = serde_json::json!({
         "device_id": machine_id.to_string(),
-        "repos": repos.iter().map(|r| serde_json::json!({
-            "repo": r.repo,
-            "parent_sha": r.parent_sha,
-        })).collect::<Vec<_>>(),
+        "repos": repos,
         "intent": intent,
         "declared_overlap_paths": declared_overlap_paths,
     });
@@ -1123,6 +1180,23 @@ pub async fn allocate_and_materialize_with_claim(
     let status = resp.status();
     if !status.is_success() {
         let body_text = resp.text().await.unwrap_or_default();
+        // Coord's `decide_parent_sha` → RepoNotRegistered surfaces as a
+        // 409 with body `{"error":"repo_not_registered","repo":<repo>}`.
+        // Surface it typed so the caller can retry once pinning the local
+        // `origin/<default>` base instead of failing the spawn.
+        if status == reqwest::StatusCode::CONFLICT {
+            if let Some(repo) = serde_json::from_str::<serde_json::Value>(&body_text)
+                .ok()
+                .filter(|v| v.get("error").and_then(|e| e.as_str()) == Some("repo_not_registered"))
+                .and_then(|v| {
+                    v.get("repo")
+                        .and_then(|r| r.as_str())
+                        .map(|s| s.to_string())
+                })
+            {
+                return Err(AllocateError::RepoNotRegistered(repo));
+            }
+        }
         return Err(AllocateError::Other(format!(
             "POST {url} returned {} — body: {}",
             status.as_u16(),
@@ -1279,6 +1353,26 @@ pub async fn allocate_and_materialize_with_claim(
                     e
                 ))
             })?;
+        }
+
+        // Locality fetch (Phase 2a): coord's decided base
+        // (`coord_main_sha`) may be a commit this local repo hasn't fetched
+        // yet, which would make the `worktree add` below fail with a missing
+        // object. Best-effort fetch the default branch (NOT the raw SHA —
+        // servers commonly reject `git fetch origin <sha>`); fetching the
+        // default branch brings `coord_main_sha` (its tip or an ancestor)
+        // into the local object store. On failure, warn and still attempt
+        // the add — it errors clearly if the object is truly absent.
+        let default_branch = resolve_local_default_branch(canonical);
+        match run_git_command(canonical, &["fetch", "origin", &default_branch]) {
+            Ok(_) => debug!(
+                "locality fetch ok: repo={} origin/{}",
+                w.repo, default_branch
+            ),
+            Err(e) => warn!(
+                "locality fetch failed (continuing): repo={} origin/{}: {e}",
+                w.repo, default_branch
+            ),
         }
 
         // `git -C <canonical> worktree add <target> -b <branch> <parent_sha>`.
@@ -1562,6 +1656,126 @@ mod tests {
             "/srv/qontinui-root.wt/019e/qontinui-coord"
         };
         assert_eq!(local_worktree_target(canonical, abs), PathBuf::from(abs));
+    }
+
+    #[test]
+    fn repo_request_omits_parent_sha_when_none() {
+        // Phase 2a wire contract: `parent_sha: None` MUST NOT appear in the
+        // serialized allocate item — coord deserializes the missing key as
+        // `None` and runs `decide_parent_sha`. An explicit `null` would also
+        // be `None` to coord, but the skip-on-none keeps the request minimal
+        // and is what the allocate body builder relies on.
+        let none_req = RepoRequest {
+            repo: "qontinui-coord".to_string(),
+            parent_sha: None,
+        };
+        let v = serde_json::to_value(&none_req).unwrap();
+        assert_eq!(v["repo"], "qontinui-coord");
+        assert!(
+            v.get("parent_sha").is_none(),
+            "parent_sha key must be ABSENT when None, got: {v}"
+        );
+
+        // `Some(sha)` (the local-fallback path) DOES carry the key verbatim.
+        let some_req = RepoRequest {
+            repo: "qontinui-web".to_string(),
+            parent_sha: Some("abc123".to_string()),
+        };
+        let v = serde_json::to_value(&some_req).unwrap();
+        assert_eq!(v["parent_sha"], "abc123");
+    }
+
+    #[test]
+    fn resolve_local_default_branch_prefers_origin_head_over_parked_branch() {
+        // The Phase 2a fallback resolver must read origin/HEAD (origin/main),
+        // NOT the branch the checkout is currently parked on. Build a temp
+        // repo on `main`, point origin/HEAD at main, then park the checkout
+        // on a feature branch and assert the resolver still returns `main`,
+        // and that `resolve_origin_default_sha` returns origin/main's tip
+        // (not the feature tip).
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let p = path.to_str().unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args([&["-C", p], args].concat())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(path.join("a.txt"), b"x").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-q", "-m", "c1"]);
+        let main_sha = String::from_utf8(
+            Command::new("git")
+                .args(["-C", p, "rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        // Simulate a remote: a self-referential `origin` pointing at this
+        // repo, mirror-fetched so `origin/main` and `origin/HEAD` exist.
+        git(&["remote", "add", "origin", p]);
+        git(&["fetch", "-q", "origin"]);
+        git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ]);
+
+        // Park the checkout on a feature branch with a NEW commit so its tip
+        // differs from origin/main — the stale-feature-tip scenario.
+        git(&["checkout", "-q", "-b", "feature/parked"]);
+        std::fs::write(path.join("b.txt"), b"y").unwrap();
+        git(&["add", "b.txt"]);
+        git(&["commit", "-q", "-m", "c2"]);
+        let feature_sha = String::from_utf8(
+            Command::new("git")
+                .args(["-C", p, "rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        assert_ne!(main_sha, feature_sha, "feature tip must differ from main");
+
+        // Resolver returns the default branch from origin/HEAD, not the
+        // parked branch.
+        assert_eq!(resolve_local_default_branch(path), "main");
+
+        // And the fallback SHA is origin/main's tip, NOT the feature tip.
+        let resolved = resolve_origin_default_sha(path).unwrap();
+        assert_eq!(resolved, main_sha);
+        assert_ne!(resolved, feature_sha);
+    }
+
+    #[test]
+    fn resolve_local_default_branch_falls_back_to_main() {
+        // No origin/HEAD ref (fresh local-only repo) → the resolver must
+        // fall back to "main" rather than erroring.
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let p = path.to_str().unwrap();
+        Command::new("git")
+            .args(["-C", p, "init", "-q", "-b", "trunk"])
+            .output()
+            .unwrap();
+        assert_eq!(resolve_local_default_branch(path), "main");
     }
 
     #[test]
