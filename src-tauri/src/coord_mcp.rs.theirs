@@ -730,7 +730,6 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16
         // coord-mcp calls could still expire (coord's refresh endpoint rejects
         // an already-expired token — OQ4). The spawn-site path (with the 30s
         // heartbeat refresh) is the one that matters and never expires.
-<<<<<<< HEAD
         // Fail closed on a missing/unparseable `sub` (the agent_id): registering a
         // `Uuid::nil()`-keyed slot would let two malformed-JWT provisions collide on
         // the same nil key (the second overwriting the first's slot). The trusted
@@ -753,11 +752,6 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16
                 return;
             }
         };
-=======
-        let agent_id = jwt_unverified_claim(jwt, "sub")
-            .and_then(|s| Uuid::parse_str(&s).ok())
-            .unwrap_or_else(Uuid::nil);
->>>>>>> 5d04ba2f (feat(coord-mcp): per-agent live-token loopback proxy for spawned agents)
         let exp = jwt_unverified_claim(jwt, "exp")
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0);

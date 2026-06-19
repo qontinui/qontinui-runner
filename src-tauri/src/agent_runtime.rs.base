@@ -168,77 +168,10 @@ pub struct GateContinuationPayload {
 /// The `source` discriminator coord stamps on a gate-continuation spawn frame.
 const GATE_CONTINUATION_SOURCE: &str = "gate_continuation";
 
-/// Typed spawn lifecycle phase coord keys an outcome to. The runner emits ONLY
-/// phases it can observe from its own subprocess bookkeeping — never
-/// `subagent_resolved`, which lives inside `claude` and the runner cannot see.
-///
-/// `launched` accompanies a `spawn-complete` (the child process started);
-/// `exited` accompanies a `spawn-failed` (the child failed to start, exited
-/// non-zero, or a dispatch was refused). Serialized snake_case so coord's
-/// ingest can match a string discriminator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum SpawnPhase {
-    Launched,
-    Exited,
-}
-
-/// PR/head context coord uses to key a spawn outcome to a specific change.
-/// `push_ref` is the agent worktree's push target (a git ref); `pr` is the PR
-/// number when it is derivable from that ref (e.g. `refs/pull/123/head`) and
-/// `None` otherwise — the runner never guesses a PR it cannot read off the ref.
-///
-/// Skipped entirely from the wire when both fields are absent so a spawn with
-/// no PR context (gate continuations) serializes the legacy body verbatim.
-#[derive(Debug, Clone, Default, Serialize)]
-struct SpawnPrContext {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    push_ref: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pr: Option<u64>,
-}
-
-impl SpawnPrContext {
-    /// True iff there is no PR context to emit — used to skip the whole
-    /// `push_ref`/`pr` block from the body when empty (legacy-shape parity).
-    fn is_empty(&self) -> bool {
-        self.push_ref.is_none() && self.pr.is_none()
-    }
-
-    /// Build a context from an optional push ref, deriving `pr` when the ref
-    /// carries a `refs/pull/<n>/...` segment (the only ref shape from which a
-    /// PR number is unambiguous). All other ref shapes leave `pr` absent.
-    fn from_push_ref(push_ref: Option<&str>) -> Self {
-        let pr = push_ref.and_then(pr_number_from_push_ref);
-        SpawnPrContext {
-            push_ref: push_ref.map(|s| s.to_string()),
-            pr,
-        }
-    }
-}
-
-/// Extract a PR number from a `refs/pull/<n>/head` (or `/merge`) push ref.
-/// Returns `None` for any ref that is not in the GitHub pull-ref shape — the
-/// runner only reports a PR it can read directly off the ref, never one it
-/// would have to infer.
-fn pr_number_from_push_ref(push_ref: &str) -> Option<u64> {
-    let rest = push_ref.strip_prefix("refs/pull/")?;
-    let (num, _) = rest.split_once('/')?;
-    num.parse::<u64>().ok()
-}
-
 #[derive(Debug, Clone, Serialize)]
 struct SpawnCompleteBody {
     pid: Option<i64>,
     note: Option<String>,
-    /// Phase 4b: typed lifecycle phase (`launched`). Skipped when the enriched
-    /// telemetry flag is off so the body is byte-identical to the legacy shape.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    phase: Option<SpawnPhase>,
-    /// Phase 4b: PR/head context. Flattened so `push_ref`/`pr` sit at the top
-    /// level alongside `phase`; skipped entirely when empty.
-    #[serde(flatten, skip_serializing_if = "SpawnPrContext::is_empty")]
-    pr_context: SpawnPrContext,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -246,25 +179,6 @@ struct SpawnFailedBody {
     reason: String,
     exit_code: Option<i64>,
     restarts_attempted: Option<u32>,
-    /// Phase 4b: typed lifecycle phase (`exited`). Skipped when the enriched
-    /// telemetry flag is off so the body is byte-identical to the legacy shape.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    phase: Option<SpawnPhase>,
-    /// Phase 4b: PR/head context. Flattened so `push_ref`/`pr` sit at the top
-    /// level alongside `phase`; skipped entirely when empty.
-    #[serde(flatten, skip_serializing_if = "SpawnPrContext::is_empty")]
-    pr_context: SpawnPrContext,
-}
-
-/// Env flag (default ON) gating Phase 4b's enriched spawn-outcome telemetry.
-/// When unset or any value other than `"0"`, `report_spawn_complete` /
-/// `report_spawn_failed` stamp the typed `phase` + `push_ref`/`pr` context onto
-/// their existing POST bodies (additive — coord ingest tolerates the extra
-/// keys). Set `QONTINUI_SPAWN_OUTCOME_ENABLED=0` for a clean revert: the bodies
-/// then serialize byte-identical to the pre-4b shape (`phase`/`push_ref`/`pr`
-/// all skipped) so a coord that has not yet learned the new keys is unaffected.
-fn spawn_outcome_enrichment_enabled() -> bool {
-    std::env::var("QONTINUI_SPAWN_OUTCOME_ENABLED").as_deref() != Ok("0")
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -816,9 +730,6 @@ fn spawn_run_task(payload: LaunchPayload) {
         }
         // Drop the registry entry once the run task is fully done.
         agent_stops().lock().unwrap().remove(&agent_id);
-        // Drop the agent's live-token slot so its proxy nonce hard-fails closed
-        // (the agent process is gone; any lingering `.mcp.json` nonce must 401).
-        crate::coord_mcp::remove_agent_token(agent_id);
     });
 }
 
@@ -1691,7 +1602,7 @@ async fn run_gate_continuation_inner(
             // re-delivered once a cap slot frees, OR cancelled by the operator /
             // takeover path. The `spawn-failed` agent post above is the operator
             // signal; the gate's continuation lifecycle is intentionally untouched.
-            report_spawn_failed(uuid::Uuid::now_v7(), &reason, None, 0, None).await;
+            report_spawn_failed(uuid::Uuid::now_v7(), &reason, None, 0).await;
             return Ok(());
         }
     }
@@ -1929,7 +1840,7 @@ async fn run_continuation_terminal(
             let reason = "no Tauri AppHandle (runner has no webview runtime) — \
                           cannot open a visible terminal";
             warn!("agent_runtime: gate-continuation terminal: {reason}");
-            report_spawn_failed(agent_id, reason, None, 0, None).await;
+            report_spawn_failed(agent_id, reason, None, 0).await;
             return Err(anyhow::anyhow!(reason));
         }
     };
@@ -1940,7 +1851,7 @@ async fn run_continuation_terminal(
         None => {
             let reason = "TerminalManager state not managed — cannot create terminal session";
             warn!("agent_runtime: gate-continuation terminal: {reason}");
-            report_spawn_failed(agent_id, reason, None, 0, None).await;
+            report_spawn_failed(agent_id, reason, None, 0).await;
             return Err(anyhow::anyhow!(reason));
         }
     };
@@ -1949,7 +1860,7 @@ async fn run_continuation_terminal(
         None => {
             let reason = "SessionRegistry state not managed — cannot register terminal session";
             warn!("agent_runtime: gate-continuation terminal: {reason}");
-            report_spawn_failed(agent_id, reason, None, 0, None).await;
+            report_spawn_failed(agent_id, reason, None, 0).await;
             return Err(anyhow::anyhow!(reason));
         }
     };
@@ -2025,7 +1936,7 @@ async fn run_continuation_terminal(
             "no authenticated Claude account on this runner — run /login (instance={instance})"
         );
         warn!("agent_runtime: gate-continuation terminal aborted — {reason}");
-        report_spawn_failed(agent_id, &reason, None, 0, None).await;
+        report_spawn_failed(agent_id, &reason, None, 0).await;
         return Err(anyhow::anyhow!(reason));
     }
 
@@ -2062,8 +1973,6 @@ async fn run_continuation_terminal(
         // Matches the `--session-id` in the spawn argv → synchronous record.
         claude_session_id: Some(pinned_session_id),
         zone_index: None,
-        // Autonomous gate continuation → pin the agent git identity on the PTY.
-        inject_agent_git_identity: true,
     });
 
     // Provision `.mcp.json` so this continuation can reach coord coordination
@@ -2083,9 +1992,6 @@ async fn run_continuation_terminal(
         .try_state::<Arc<crate::commands::AppState>>()
         .map(|s| crate::mcp::types::runner_api_port(s.inner()));
     crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port);
-    // Bundle /vet-plan and /implement-plan into the session cwd so they resolve
-    // as project slash commands regardless of the device's ~/.claude.
-    crate::fleet_commands::provision_fleet_commands_for_session(workdir);
 
     let result = crate::commands::terminal::create_terminal_session_backend(
         &terminal_manager,
@@ -2123,7 +2029,7 @@ async fn run_continuation_terminal(
             // window is not yanked to this tab — `terminal-created` is a global
             // broadcast, but a focus action must target only `main`.
             emit_terminal_focus_request(&app, &terminal_id);
-            report_spawn_complete(agent_id, None, Some("gate continuation (terminal)"), None).await;
+            report_spawn_complete(agent_id, None, Some("gate continuation (terminal)")).await;
             Ok(())
         }
         Err(e) => {
@@ -2132,7 +2038,6 @@ async fn run_continuation_terminal(
                 &format!("terminal session create failed: {e}"),
                 None,
                 0,
-                None,
             )
             .await;
             Err(anyhow::anyhow!(e))
@@ -2261,16 +2166,10 @@ async fn run_continuation_headless(
     // config dir that `spawn_claude_child` reads). spawn_blocking: the selector
     // reads settings + cooldown state.
     let _ = tokio::task::spawn_blocking(crate::ai_provider::pick_best_account).await;
-    // Provision coord-mcp for the headless session so it receives coord's
-    // session-start `instructions` preamble and can call coord_declare_intent —
-    // parity with the terminal continuation path (which provisions the bound_port
-    // proxy shape). Headless has no bound port → `None` selects the device-JWT
-    // static-bearer shape.
-    crate::coord_mcp::provision_coord_mcp_for_session(workdir, None);
     match spawn_claude_child(workdir, initial_prompt).await {
         Ok(mut child) => {
             let pid = child.id().map(|p| p as i64);
-            report_spawn_complete(agent_id, pid, Some("gate continuation"), None).await;
+            report_spawn_complete(agent_id, pid, Some("gate continuation")).await;
             let exit = pump_subprocess(agent_id, &mut child, log_path.as_deref()).await;
             match exit {
                 Ok(0) => {
@@ -2286,20 +2185,18 @@ async fn run_continuation_headless(
                         &format!("non-zero exit code {code}"),
                         Some(code),
                         0,
-                        None,
                     )
                     .await;
                     Ok(())
                 }
                 Err(e) => {
-                    report_spawn_failed(agent_id, &format!("pump failure: {e}"), None, 0, None)
-                        .await;
+                    report_spawn_failed(agent_id, &format!("pump failure: {e}"), None, 0).await;
                     Err(e)
                 }
             }
         }
         Err(e) => {
-            report_spawn_failed(agent_id, &format!("spawn failure: {e}"), None, 0, None).await;
+            report_spawn_failed(agent_id, &format!("spawn failure: {e}"), None, 0).await;
             Err(e)
         }
     }
@@ -2333,12 +2230,6 @@ async fn run_agent_subprocess(
         }
     }
 
-    // Phase 4b: the primary worktree's push_ref is the PR/head this spawn works
-    // against — thread it into every lifecycle post so coord can key the spawn
-    // outcome to a specific PR. The path rewrite above does not touch push_ref,
-    // so read it once here and reuse for all of this spawn's reports.
-    let primary_push_ref = payload.worktrees.first().and_then(|wt| wt.push_ref.clone());
-
     // Step 1: materialize worktrees.
     if let Err(e) = materialize_worktrees(&payload).await {
         report_spawn_failed(
@@ -2346,7 +2237,6 @@ async fn run_agent_subprocess(
             &format!("worktree materialization failed: {e:#}"),
             None,
             0,
-            primary_push_ref.as_deref(),
         )
         .await;
         return Err(e);
@@ -2359,62 +2249,11 @@ async fn run_agent_subprocess(
         .worktree_path
         .clone();
 
-    // Write .mcp.json so the spawned claude process auto-discovers the coord MCP
-    // server. Agent-spawns carry a coord-minted agent JWT with a ~4h TTL, and
-    // Claude Code's MCP client reads `.mcp.json` exactly once at connect — a
-    // STATIC baked bearer silently dies at expiry (the bug this fixes). Instead
-    // we register the agent's JWT in a process-global live-token slot and write
-    // the per-agent PROXY shape: the loopback `/coord-mcp` route injects THIS
-    // agent's own refreshed token per request (never the device token — the
-    // scope-elevation trap). The heartbeat loop (below) drives proactive
-    // refresh so the slot never expires for a live agent.
-    {
-        let slot = std::sync::Arc::new(tokio::sync::RwLock::new(crate::agent_token::TokenSlot {
-            token: payload.jwt.clone(),
-            jti: uuid::Uuid::nil(),
-            exp: payload.jwt_exp,
-        }));
-        crate::coord_mcp::register_agent_token(payload.agent_id, slot);
-        match crate::coord_mcp::resolve_bound_api_port() {
-            Some(port) => {
-                crate::coord_mcp::write_coord_mcp_agent_proxy_config(
-                    &primary_wt,
-                    port,
-                    payload.agent_id,
-                );
-                crate::coord_mcp::probe_and_breadcrumb_proxy(&primary_wt, port);
-            }
-            None => {
-                // Fail-closed exactly like the device arm: a bootstrap-default
-                // port is dead on a secondary/temp runner, and a dead-but-valid
-                // config is worse than an absent one. Drop a 1a breadcrumb so the
-                // agent self-routes to /gate.
-                warn!(
-                    "agent_runtime: refusing to write an agent proxy .mcp.json for \
-                     agent_id={} — bound API port unresolvable (no managed AppState)",
-                    payload.agent_id
-                );
-                crate::coord_mcp::write_degraded_breadcrumb(
-                    &primary_wt,
-                    "bound API port unresolvable — agent proxy config NOT written (would point at a dead port)",
-                );
-            }
-        }
-    }
-<<<<<<< HEAD
-
-    // Provision the named-subagent defs into the spawned worktree's cwd so the
-    // headless `claude` can resolve subagents the spawn prompt references
-    // (merge-specialist, repo-auditor, ...). Fail-soft: a copy error here must
-    // not abort an otherwise-launchable spawn — the agent just lacks subagents.
-    if let Err(e) = provision_agent_definitions(&primary_wt) {
-        warn!("agent_runtime: agent-def provisioning errored (continuing spawn): {e:#}");
-    }
-    // Bundle /vet-plan and /implement-plan into the spawned worktree cwd so they
-    // resolve as project slash commands regardless of the device's ~/.claude.
-    crate::fleet_commands::provision_fleet_commands_for_session(&primary_wt);
-=======
->>>>>>> 5d04ba2f (feat(coord-mcp): per-agent live-token loopback proxy for spawned agents)
+    // Write .mcp.json so the spawned claude process auto-discovers
+    // the coord MCP server for coordination tooling. Agent-spawns carry a
+    // coord-minted agent JWT and land in a freshly-allocated worktree, so the
+    // blind overwrite is safe here (no pre-existing user config to clobber).
+    crate::coord_mcp::write_coord_mcp_config(&primary_wt, &payload.jwt);
 
     let log_path = agent_log_path(payload.agent_id);
 
@@ -2445,8 +2284,7 @@ async fn run_agent_subprocess(
                 let pid = child.id().map(|p| p as i64);
                 // First successful spawn = post spawn-complete with pid.
                 if restarts == 0 {
-                    report_spawn_complete(payload.agent_id, pid, None, primary_push_ref.as_deref())
-                        .await;
+                    report_spawn_complete(payload.agent_id, pid, None).await;
                 } else {
                     info!(
                         "agent_runtime: restart {restarts} succeeded agent_id={}",
@@ -2537,7 +2375,6 @@ async fn run_agent_subprocess(
             .unwrap_or("subprocess exited with no recorded reason"),
         final_exit_code,
         restarts,
-        primary_push_ref.as_deref(),
     )
     .await;
     Ok(())
@@ -2598,100 +2435,6 @@ async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Provision the named-subagent definitions (`.claude/agents/*.md`) into a
-/// freshly-materialized agent worktree so headless `claude` (cwd = the
-/// worktree) can resolve the subagents an auto-spawned review prompt references
-/// (e.g. "Invoke the `merge-specialist` subagent").
-///
-/// Without this, a spawned agent worktree is a bare `git worktree add` with no
-/// `.claude/agents/` dir; `claude` cannot resolve the named subagent → the
-/// review never runs → coord ages the PR out as `specialist_timeout`. This
-/// affects ALL auto-spawned agents (merge-specialist, repo-auditor, ...).
-///
-/// Source: `<qontinui_root>/qontinui-claude-config/.claude/agents/*.md`. We
-/// COPY (not symlink) — this runs on Windows where symlink creation needs
-/// privilege/dev-mode; a copy is robust cross-platform. We copy ONLY the agent
-/// `*.md` defs, NOT the whole `.claude` tree (avoid pulling in settings/hooks/
-/// mcp that could alter spawn behavior).
-///
-/// Fail-soft: if the source dir is missing we `warn` and return Ok — the agent
-/// then simply lacks subagents (same as before this fix; no regression). The
-/// fleet-portability follow-up is to BUNDLE these defs into the runner binary
-/// (`include_str!`) so non-operator devices without a `qontinui-claude-config`
-/// checkout still get them; this copy-from-checkout path unblocks the current
-/// operator fleet.
-fn provision_agent_definitions(worktree_cwd: &str) -> anyhow::Result<()> {
-    let Some(root) = qontinui_root_dir() else {
-        warn!(
-            "agent_runtime: no qontinui-root resolved; skipping .claude/agents \
-             provisioning for {worktree_cwd} (auto-spawned subagents will not resolve)"
-        );
-        return Ok(());
-    };
-    provision_agent_definitions_from_root(&root, worktree_cwd)
-}
-
-/// Core of [`provision_agent_definitions`] with the qontinui-root passed in
-/// explicitly (so tests can drive it deterministically without mutating the
-/// process-global `QONTINUI_ROOT` env). See that wrapper for full rationale.
-fn provision_agent_definitions_from_root(root: &Path, worktree_cwd: &str) -> anyhow::Result<()> {
-    let src_dir = root
-        .join("qontinui-claude-config")
-        .join(".claude")
-        .join("agents");
-    if !src_dir.is_dir() {
-        warn!(
-            "agent_runtime: claude-config agents dir not found at {}; skipping \
-             .claude/agents provisioning (auto-spawned subagents will not resolve)",
-            src_dir.display()
-        );
-        return Ok(());
-    }
-    let dst_dir = Path::new(worktree_cwd).join(".claude").join("agents");
-    std::fs::create_dir_all(&dst_dir).map_err(|e| {
-        anyhow::anyhow!(
-            "create {} for agent-def provisioning: {e}",
-            dst_dir.display()
-        )
-    })?;
-    let mut copied = 0usize;
-    for entry in std::fs::read_dir(&src_dir)
-        .map_err(|e| anyhow::anyhow!("read agents dir {}: {e}", src_dir.display()))?
-    {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                warn!("agent_runtime: skipping unreadable agents entry: {e}");
-                continue;
-            }
-        };
-        let path = entry.path();
-        // Only the agent-def `*.md` files; ignore subdirs and other files.
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-        let Some(name) = path.file_name() else {
-            continue;
-        };
-        let dst = dst_dir.join(name);
-        // Idempotent: overwrite is fine (std::fs::copy truncates the target).
-        if let Err(e) = std::fs::copy(&path, &dst) {
-            warn!(
-                "agent_runtime: failed to copy agent def {} -> {}: {e}",
-                path.display(),
-                dst.display()
-            );
-            continue;
-        }
-        copied += 1;
-    }
-    info!(
-        "agent_runtime: provisioned {copied} subagent def(s) into {}",
-        dst_dir.display()
-    );
-    Ok(())
-}
-
 fn qontinui_root_dir() -> Option<PathBuf> {
     if let Ok(s) = std::env::var("QONTINUI_ROOT") {
         let p = PathBuf::from(s);
@@ -2740,106 +2483,6 @@ fn local_worktree_path(root: &Path, agent_id: uuid::Uuid, repo: &str) -> PathBuf
         .join(local_repo_name(repo))
 }
 
-/// Resolve the git author/committer identity used for AUTONOMOUS agent commits
-/// (headless workers + gate continuations), so they no longer land under the
-/// ambient host placeholder — a cloud runner whose global git config was an
-/// unconfigured `x <x@x>` stub produced commits authored by `x <x@x>`.
-///
-/// Resolution (first usable value wins, independently for name and email):
-///   1. `QONTINUI_AGENT_GIT_NAME` / `QONTINUI_AGENT_GIT_EMAIL` — the per-runner
-///      OWNER override. Set these in a shared/cloud runner's env to attribute
-///      its autonomous commits to whoever owns that runner.
-///   2. The host's EXPLICIT `git config user.name` / `user.email`. On a dev-box
-///      runner this is the operator's real identity, so autonomous commits
-///      attribute to them with zero config. Placeholders (`x`, `x@x`, empty)
-///      are rejected.
-///   3. A clearly-marked default: `Qontinui Agent <agent@qontinui.dev>`.
-///
-/// Committer is still rewritten to `qontinui-coord` when coord rebase-lands the
-/// PR; this controls the AUTHOR (and the pre-land committer). Cached: resolved
-/// once per process (boot-time host config / env).
-pub(crate) fn autonomous_git_identity() -> (String, String) {
-    static CACHE: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            let (host_name, host_email) = host_git_identity();
-            pick_autonomous_git_identity(
-                std::env::var("QONTINUI_AGENT_GIT_NAME").ok(),
-                std::env::var("QONTINUI_AGENT_GIT_EMAIL").ok(),
-                host_name,
-                host_email,
-            )
-        })
-        .clone()
-}
-
-/// The author + committer env pairs that pin a spawned agent process's git
-/// identity. Applied to autonomous spawns ONLY (this process and its children),
-/// so the operator's own git config is never mutated.
-pub(crate) fn agent_git_identity_env() -> Vec<(String, String)> {
-    let (name, email) = autonomous_git_identity();
-    vec![
-        ("GIT_AUTHOR_NAME".to_string(), name.clone()),
-        ("GIT_AUTHOR_EMAIL".to_string(), email.clone()),
-        ("GIT_COMMITTER_NAME".to_string(), name),
-        ("GIT_COMMITTER_EMAIL".to_string(), email),
-    ]
-}
-
-/// Best-effort read of the host's EXPLICITLY-configured git identity. `git
-/// config --get` prints nothing when a key is unset (git's implicit
-/// `user@host` value is never stored), so a `Some` here means a human
-/// deliberately configured it.
-///
-/// Prefers the EFFECTIVE value (local|global), but when that resolves to the
-/// `x`/`x@x` placeholder — some runner clones carry a stub LOCAL `user.email`
-/// that shadows a real GLOBAL one — it falls back to the GLOBAL value so a dev
-/// box still attributes autonomous commits to its owner with zero config.
-fn host_git_identity() -> (Option<String>, Option<String>) {
-    fn get(args: &[&str]) -> Option<String> {
-        std::process::Command::new("git")
-            .args(args)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    }
-    // A placeholder effective value is treated as "no usable identity" so the
-    // global fallback gets a chance (the `clean()` in the pure resolver also
-    // rejects it — this just lets the global tier win over a stub local).
-    fn real(v: Option<String>) -> Option<String> {
-        v.filter(|s| !s.eq_ignore_ascii_case("x") && s != "x@x")
-    }
-    let name = real(get(&["config", "--get", "user.name"]))
-        .or_else(|| get(&["config", "--global", "--get", "user.name"]));
-    let email = real(get(&["config", "--get", "user.email"]))
-        .or_else(|| get(&["config", "--global", "--get", "user.email"]));
-    (name, email)
-}
-
-/// Pure identity selection (testable). Rejects empty/placeholder values so the
-/// `x <x@x>` stub can never win.
-fn pick_autonomous_git_identity(
-    env_name: Option<String>,
-    env_email: Option<String>,
-    host_name: Option<String>,
-    host_email: Option<String>,
-) -> (String, String) {
-    fn clean(v: Option<String>) -> Option<String> {
-        v.map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("x") && s != "x@x")
-    }
-    let name = clean(env_name)
-        .or_else(|| clean(host_name))
-        .unwrap_or_else(|| "Qontinui Agent".to_string());
-    let email = clean(env_email)
-        .or_else(|| clean(host_email))
-        .unwrap_or_else(|| "agent@qontinui.dev".to_string());
-    (name, email)
-}
-
 /// Spawn `claude` CLI as a tokio child. `initial_prompt` is piped to
 /// stdin. stdout/stderr are inherited as pipes so the caller can stream
 /// them.
@@ -2878,13 +2521,6 @@ async fn spawn_claude_child(workdir: &str, initial_prompt: &str) -> anyhow::Resu
             // None + ambient default has live creds → inherit it (single-account
             // / unset-CLAUDE_CONFIG_DIR default — unchanged behavior).
         }
-    }
-    // Pin the autonomous-agent git author/committer for this headless worker so
-    // its commits land with a meaningful name/email instead of the ambient host
-    // placeholder (`x <x@x>`). Scoped to this child process — the operator's own
-    // git config is untouched.
-    for (k, v) in agent_git_identity_env() {
-        cmd.env(k, v);
     }
     // `-p` / `--print` means "single-shot prompt mode" for Claude Code
     // CLI; not all versions support stdin-as-prompt cleanly, so we send
@@ -3044,21 +2680,6 @@ async fn run_heartbeat_loop(payload: LaunchPayload) {
                 payload.agent_id
             );
         }
-        // Proactively refresh the agent's coord-mcp proxy token (OQ4). The 30s
-        // tick ≪ the 30-min refresh margin, so the per-agent JWT in AGENT_TOKENS
-        // is renewed well before its 4h TTL — independent of coord-mcp call
-        // activity. Coord's /agents/:id/refresh-token rejects an ALREADY-expired
-        // token, so a live agent must never let it lapse; the request-path
-        // refresh alone is insufficient for an idle agent. Best-effort: a
-        // refresh failure (maybe_refresh logs + returns Ok) never breaks the
-        // heartbeat loop.
-        if let Some(slot) = crate::coord_mcp::lookup_agent_token(payload.agent_id) {
-            if let Some(base) = coord_http_base() {
-                let _ =
-                    crate::agent_token::maybe_refresh(&slot, &base, payload.agent_id, "agent_mcp")
-                        .await;
-            }
-        }
     }
 }
 
@@ -3087,28 +2708,13 @@ async fn heartbeat_once(payload: &LaunchPayload) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn report_spawn_complete(
-    agent_id: uuid::Uuid,
-    pid: Option<i64>,
-    note: Option<&str>,
-    push_ref: Option<&str>,
-) {
+async fn report_spawn_complete(agent_id: uuid::Uuid, pid: Option<i64>, note: Option<&str>) {
     let Some(base) = coord_http_base() else {
         return;
-    };
-    let (phase, pr_context) = if spawn_outcome_enrichment_enabled() {
-        (
-            Some(SpawnPhase::Launched),
-            SpawnPrContext::from_push_ref(push_ref),
-        )
-    } else {
-        (None, SpawnPrContext::default())
     };
     let body = SpawnCompleteBody {
         pid,
         note: note.map(|s| s.to_string()),
-        phase,
-        pr_context,
     };
     let url = format!("{base}/agents/{agent_id}/spawn-complete");
     let client = match reqwest::Client::builder()
@@ -3137,25 +2743,14 @@ async fn report_spawn_failed(
     reason: &str,
     exit_code: Option<i64>,
     restarts_attempted: u32,
-    push_ref: Option<&str>,
 ) {
     let Some(base) = coord_http_base() else {
         return;
-    };
-    let (phase, pr_context) = if spawn_outcome_enrichment_enabled() {
-        (
-            Some(SpawnPhase::Exited),
-            SpawnPrContext::from_push_ref(push_ref),
-        )
-    } else {
-        (None, SpawnPrContext::default())
     };
     let body = SpawnFailedBody {
         reason: reason.to_string(),
         exit_code,
         restarts_attempted: Some(restarts_attempted),
-        phase,
-        pr_context,
     };
     let url = format!("{base}/agents/{agent_id}/spawn-failed");
     let client = match reqwest::Client::builder()
@@ -3190,167 +2785,6 @@ mod tests {
     /// Sentinel returned by the test mint closure so a mint outcome is
     /// unambiguous and deterministic (no uuid in tests).
     const MINTED: &str = "MINTED";
-
-    fn s(v: &str) -> Option<String> {
-        Some(v.to_string())
-    }
-
-    #[test]
-    fn agent_identity_env_override_wins() {
-        let (n, e) = pick_autonomous_git_identity(
-            s("Ada Lovelace"),
-            s("ada@example.com"),
-            s("Host Name"),
-            s("host@example.com"),
-        );
-        assert_eq!(n, "Ada Lovelace");
-        assert_eq!(e, "ada@example.com");
-    }
-
-    #[test]
-    fn agent_identity_falls_back_to_real_host_config() {
-        // No env override → a dev box's real git identity is used (zero config).
-        let (n, e) =
-            pick_autonomous_git_identity(None, None, s("Joshua Spinak"), s("jspinak@example.com"));
-        assert_eq!(n, "Joshua Spinak");
-        assert_eq!(e, "jspinak@example.com");
-    }
-
-    #[test]
-    fn agent_identity_rejects_x_placeholder_and_defaults() {
-        // The observed `x <x@x>` stub must never win → marked default instead.
-        let (n, e) = pick_autonomous_git_identity(None, None, s("x"), s("x@x"));
-        assert_eq!(n, "Qontinui Agent");
-        assert_eq!(e, "agent@qontinui.dev");
-    }
-
-    #[test]
-    fn agent_identity_rejects_empty_and_whitespace() {
-        let (n, e) = pick_autonomous_git_identity(s("  "), s(""), None, None);
-        assert_eq!(n, "Qontinui Agent");
-        assert_eq!(e, "agent@qontinui.dev");
-    }
-
-    #[test]
-    fn agent_identity_env_overrides_placeholder_host() {
-        // A cloud runner (host stub) names its owner via env.
-        let (n, e) = pick_autonomous_git_identity(
-            s("Fleet Owner"),
-            s("owner@qontinui.dev"),
-            s("x"),
-            s("x@x"),
-        );
-        assert_eq!(n, "Fleet Owner");
-        assert_eq!(e, "owner@qontinui.dev");
-    }
-
-    #[test]
-    fn agent_identity_env_pairs_pin_author_and_committer() {
-        // All four pairs must be present so the raw commit (pre coord-rebase)
-        // is fully attributed, not just the author.
-        let pairs = agent_git_identity_env();
-        let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
-        assert!(keys.contains(&"GIT_AUTHOR_NAME"));
-        assert!(keys.contains(&"GIT_AUTHOR_EMAIL"));
-        assert!(keys.contains(&"GIT_COMMITTER_NAME"));
-        assert!(keys.contains(&"GIT_COMMITTER_EMAIL"));
-        // Never the placeholder.
-        assert!(pairs.iter().all(|(_, v)| v != "x" && v != "x@x"));
-    }
-
-    /// Phase 4b — a PR number is derived ONLY from a `refs/pull/<n>/...` ref;
-    /// every other ref shape (the common agent push ref) leaves `pr` absent so
-    /// the runner never reports a PR it would have to guess.
-    #[test]
-    fn pr_number_derived_only_from_pull_ref() {
-        assert_eq!(pr_number_from_push_ref("refs/pull/614/head"), Some(614));
-        assert_eq!(pr_number_from_push_ref("refs/pull/12/merge"), Some(12));
-        // Agent push refs and branch refs carry no PR number.
-        assert_eq!(pr_number_from_push_ref("refs/agent/abc-def"), None);
-        assert_eq!(pr_number_from_push_ref("refs/heads/main"), None);
-        // Malformed pull refs: no number segment / non-numeric.
-        assert_eq!(pr_number_from_push_ref("refs/pull/"), None);
-        assert_eq!(pr_number_from_push_ref("refs/pull/notanum/head"), None);
-    }
-
-    /// Phase 4b — the EXACT wire shape coord's ingest must match. The enriched
-    /// `spawn-complete` body carries `phase: "launched"` plus `push_ref` (and a
-    /// derived `pr` when the ref is a pull ref), additive to the legacy
-    /// `pid`/`note`. Coord keys the outcome off these keys.
-    #[test]
-    fn spawn_complete_body_enriched_shape() {
-        let body = SpawnCompleteBody {
-            pid: Some(4321),
-            note: None,
-            phase: Some(SpawnPhase::Launched),
-            pr_context: SpawnPrContext::from_push_ref(Some("refs/pull/614/head")),
-        };
-        let v = serde_json::to_value(&body).unwrap();
-        assert_eq!(v["pid"], 4321);
-        assert_eq!(v["phase"], "launched");
-        assert_eq!(v["push_ref"], "refs/pull/614/head");
-        assert_eq!(v["pr"], 614);
-    }
-
-    /// Phase 4b — the enriched `spawn-failed` body carries `phase: "exited"`
-    /// alongside the existing `reason`/`exit_code`/`restarts_attempted`, plus a
-    /// `push_ref` with NO `pr` key when the ref is not a pull ref.
-    #[test]
-    fn spawn_failed_body_enriched_shape() {
-        let body = SpawnFailedBody {
-            reason: "non-zero exit code 1".to_string(),
-            exit_code: Some(1),
-            restarts_attempted: Some(2),
-            phase: Some(SpawnPhase::Exited),
-            pr_context: SpawnPrContext::from_push_ref(Some("refs/agent/abc-def")),
-        };
-        let v = serde_json::to_value(&body).unwrap();
-        assert_eq!(v["reason"], "non-zero exit code 1");
-        assert_eq!(v["exit_code"], 1);
-        assert_eq!(v["restarts_attempted"], 2);
-        assert_eq!(v["phase"], "exited");
-        assert_eq!(v["push_ref"], "refs/agent/abc-def");
-        // No PR derivable from an agent ref → `pr` is omitted entirely.
-        assert!(
-            v.get("pr").is_none(),
-            "pr must be absent for a non-pull ref"
-        );
-    }
-
-    /// Phase 4b — with the enrichment fields cleared (the revert / flag-off
-    /// shape), the body serializes byte-identical to the legacy pre-4b shape:
-    /// `phase`, `push_ref`, and `pr` are all skipped.
-    #[test]
-    fn spawn_body_legacy_shape_when_unenriched() {
-        let body = SpawnCompleteBody {
-            pid: Some(7),
-            note: Some("gate continuation".to_string()),
-            phase: None,
-            pr_context: SpawnPrContext::default(),
-        };
-        let v = serde_json::to_value(&body).unwrap();
-        let obj = v.as_object().unwrap();
-        assert_eq!(obj.len(), 2, "only the legacy pid+note keys: {v}");
-        assert!(obj.contains_key("pid"));
-        assert!(obj.contains_key("note"));
-
-        let failed = SpawnFailedBody {
-            reason: "x".to_string(),
-            exit_code: None,
-            restarts_attempted: Some(0),
-            phase: None,
-            pr_context: SpawnPrContext::default(),
-        };
-        let fv = serde_json::to_value(&failed).unwrap();
-        let fobj = fv.as_object().unwrap();
-        assert_eq!(
-            fobj.len(),
-            3,
-            "only the legacy reason+exit_code+restarts_attempted keys: {fv}"
-        );
-        assert!(!fobj.contains_key("phase"));
-        assert!(!fobj.contains_key("push_ref"));
-    }
 
     fn page(id: &str, n: usize) -> (String, usize) {
         (id.to_string(), n)
@@ -3832,64 +3266,6 @@ mod tests {
         let p = local_worktree_path(root, uuid::Uuid::nil(), "qontinui/qontinui-runner");
         assert!(p.ends_with(Path::new("qontinui-runner")));
         assert!(p.to_string_lossy().contains(".agent-worktrees"));
-    }
-
-    #[test]
-    fn provision_agent_defs_copies_md_files() {
-        let root = tempfile::tempdir().unwrap();
-        let src = root
-            .path()
-            .join("qontinui-claude-config")
-            .join(".claude")
-            .join("agents");
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("merge-specialist.md"), "# merge-specialist").unwrap();
-        std::fs::write(src.join("repo-auditor.md"), "# repo-auditor").unwrap();
-        // A non-md file must NOT be copied.
-        std::fs::write(src.join("settings.json"), "{}").unwrap();
-
-        let wt = tempfile::tempdir().unwrap();
-        let wt_cwd = wt.path().to_string_lossy().into_owned();
-
-        provision_agent_definitions_from_root(root.path(), &wt_cwd).unwrap();
-
-        let dst = wt.path().join(".claude").join("agents");
-        assert!(
-            dst.join("merge-specialist.md").is_file(),
-            "merge-specialist.md must be provisioned"
-        );
-        assert!(
-            dst.join("repo-auditor.md").is_file(),
-            "all agent *.md defs must be copied"
-        );
-        assert!(
-            !dst.join("settings.json").exists(),
-            "non-md files must NOT be copied"
-        );
-        assert_eq!(
-            std::fs::read_to_string(dst.join("merge-specialist.md")).unwrap(),
-            "# merge-specialist"
-        );
-
-        // Idempotent: a second run over the same dst overwrites cleanly.
-        provision_agent_definitions_from_root(root.path(), &wt_cwd).unwrap();
-        assert!(dst.join("merge-specialist.md").is_file());
-    }
-
-    #[test]
-    fn provision_agent_defs_missing_source_is_soft() {
-        // qontinui-root exists but has no qontinui-claude-config/.claude/agents:
-        // must log+continue (Ok), creating nothing — no regression vs today.
-        let root = tempfile::tempdir().unwrap();
-        let wt = tempfile::tempdir().unwrap();
-        let wt_cwd = wt.path().to_string_lossy().into_owned();
-
-        let res = provision_agent_definitions_from_root(root.path(), &wt_cwd);
-        assert!(res.is_ok(), "missing source dir must fail soft (Ok)");
-        assert!(
-            !wt.path().join(".claude").exists(),
-            "no .claude tree should be created when source is missing"
-        );
     }
 
     #[test]

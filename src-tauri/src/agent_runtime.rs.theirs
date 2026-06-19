@@ -2401,7 +2401,6 @@ async fn run_agent_subprocess(
             }
         }
     }
-<<<<<<< HEAD
 
     // Provision the named-subagent defs into the spawned worktree's cwd so the
     // headless `claude` can resolve subagents the spawn prompt references
@@ -2413,8 +2412,6 @@ async fn run_agent_subprocess(
     // Bundle /vet-plan and /implement-plan into the spawned worktree cwd so they
     // resolve as project slash commands regardless of the device's ~/.claude.
     crate::fleet_commands::provision_fleet_commands_for_session(&primary_wt);
-=======
->>>>>>> 5d04ba2f (feat(coord-mcp): per-agent live-token loopback proxy for spawned agents)
 
     let log_path = agent_log_path(payload.agent_id);
 

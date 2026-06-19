@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "base_sha": "06a9e6322edbba8d4311d8dae73eb8dd54fa3701",
+  "ours_sha": "66e71dc84d5e54593bd74ed01756dd7540b25acc",
+  "theirs_sha": "1c20bcdf47f38b0d76d5b684c8ffcf3f9c84bdae",
+  "entries": [
+    {
+      "path": "src-tauri/src/agent_runtime.rs",
+      "base_oid": "aaca3b728778a5c80c9114bc5a3aa9418153633f",
+      "ours_oid": "0edfa1d6429ff6c07d106971cc260228309a4901",
+      "theirs_oid": "a3c9d65f6b001854599eafd098f5710ca388a95e",
+      "base_path": "src-tauri/src/agent_runtime.rs.base",
+      "ours_path": "src-tauri/src/agent_runtime.rs.ours",
+      "theirs_path": "src-tauri/src/agent_runtime.rs.theirs",
+      "hunks": [
+        "<<<<<<< HEAD\n\n    // Provision the named-subagent defs into the spawned worktree's cwd so the\n    // headless `claude` can resolve subagents the spawn prompt references\n    // (merge-specialist, repo-auditor, ...). Fail-soft: a copy error here must\n    // not abort an otherwise-launchable spawn — the agent just lacks subagents.\n    if let Err(e) = provision_agent_definitions(&primary_wt) {\n        warn!(\"agent_runtime: agent-def provisioning errored (continuing spawn): {e:#}\");\n    }\n    // Bundle /vet-plan and /implement-plan into the spawned worktree cwd so they\n    // resolve as project slash commands regardless of the device's ~/.claude.\n    crate::fleet_commands::provision_fleet_commands_for_session(&primary_wt);\n=======\n>>>>>>> 5d04ba2f (feat(coord-mcp): per-agent live-token loopback proxy for spawned agents)\n"
+      ]
+    },
+    {
+      "path": "src-tauri/src/coord_mcp.rs",
+      "base_oid": "d84810125dd64cf5e064e52ccd3e6018bb08ca13",
+      "ours_oid": "0a3f7ce772f660b10c94c6ee05c4048c13e26980",
+      "theirs_oid": "6134a30374878351b486b460e8e5ddc15997b255",
+      "base_path": "src-tauri/src/coord_mcp.rs.base",
+      "ours_path": "src-tauri/src/coord_mcp.rs.ours",
+      "theirs_path": "src-tauri/src/coord_mcp.rs.theirs",
+      "hunks": [
+        "<<<<<<< HEAD\n        // Fail closed on a missing/unparseable `sub` (the agent_id): registering a\n        // `Uuid::nil()`-keyed slot would let two malformed-JWT provisions collide on\n        // the same nil key (the second overwriting the first's slot). The trusted\n        // spawn site (`agent_runtime::run_agent_subprocess`) keys on `payload.agent_id`\n        // and never reaches here; this arm only ever sees a well-formed agent JWT in\n        // tests, so a nil `sub` means a malformed token — refuse rather than register\n        // an ambiguous slot.\n        let agent_id = match jwt_unverified_claim(jwt, \"sub\").and_then(|s| Uuid::parse_str(&s).ok())\n        {\n            Some(id) => id,\n            None => {\n                warn!(\n                    \"coord_mcp: refusing to write an AGENT proxy .mcp.json for {workdir} — \\\n                     the agent JWT has no parseable `sub` (agent_id) claim.\"\n                );\n                write_degraded_breadcrumb(\n                    workdir,\n                    \"agent JWT missing a parseable `sub` (agent_id) — proxy config NOT written\",\n                );\n                return;\n            }\n        };\n=======\n        let agent_id = jwt_unverified_claim(jwt, \"sub\")\n            .and_then(|s| Uuid::parse_str(&s).ok())\n            .unwrap_or_else(Uuid::nil);\n>>>>>>> 5d04ba2f (feat(coord-mcp): per-agent live-token loopback proxy for spawned agents)\n"
+      ]
+    }
+  ]
+}
