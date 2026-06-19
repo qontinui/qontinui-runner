@@ -700,6 +700,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // on coord WS and supervises the resulting `claude` CLI
                 // child processes. No-op when no profile is configured.
                 agent_runtime::spawn_runtime();
+                // Harness markdown→work-unit adapter (plan
+                // 2026-06-18-harness-markdown-to-workunit-adapter, P2 of the
+                // plan-decoupling program) — periodic reconcile scan of the
+                // operator's plans/ dir, pushing each plan's parsed work-unit
+                // to coord's /coord/work-units API (edge-triggered, idempotent,
+                // loud conflict surfacing). Opt-in + operator-private: no-ops
+                // unless QONTINUI_PLAN_ADAPTER_DIR is set AND a coord base is
+                // configured, so a plain fleet runner never scans. See
+                // `plan_workunit_adapter::trigger`.
+                qontinui_runner_lib::plan_workunit_adapter::trigger::spawn_if_configured();
                 // Park this thread's runtime forever so the spawned
                 // interval task keeps ticking for the runner's lifetime.
                 std::future::pending::<()>().await;
