@@ -23,9 +23,12 @@
 //!    tier runs `pytest --cov` **inside the container** and asserts real line coverage
 //!    ≥ `min_coverage_pct`; a below-bar node surfaces as a [`CoverageGap`] (re-dispatch
 //!    signal), never a silent pass.
-//! 4. **Enforcement hook** (Fork D): [`crate::enforcement`] wires `code-reviewer` +
-//!    `security-scan` as post-generation gates structurally (honestly flagged as
-//!    structurally-present, see that module).
+//! 4. **Enforcement hook** (Fork D): [`crate::enforcement`] runs `security-scan` as a
+//!    **real scanner subprocess** (`bandit`) over the materialized generated backend — a
+//!    `security` finding (per `block_on`) blocks, feeds back into the next codegen prompt
+//!    (bounded retries), and an unresolved blocker surfaces as a re-dispatch
+//!    [`CoverageGap`]. `code-reviewer` is wired as an advisory LLM gate (opt-in). See
+//!    that module.
 
 use std::collections::BTreeMap;
 

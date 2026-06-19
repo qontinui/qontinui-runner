@@ -43,7 +43,9 @@ pub mod scaffold;
 
 pub use codegen::{build_prompt, llm_author_handler, LlmOutcome};
 pub use enforcement::{
-    run_enforcement, run_enforcement_with, EnforcementGate, EnforcementReport, Finding,
+    default_gates, enforce_with_feedback, gates_with_review, run_enforcement, run_enforcement_with,
+    unresolved_blocker_gap, BuiltinStaticGate, EnforcementGate, EnforcementReport, Finding,
+    SubprocessReviewGate, SubprocessSecurityGate, DEFAULT_ENFORCEMENT_RETRIES,
 };
 pub use quality::{generate_phase3, min_coverage_pct, DEFAULT_MIN_COVERAGE_PCT};
 pub use route_map::{openapi_document, route_for, RouteBinding};
