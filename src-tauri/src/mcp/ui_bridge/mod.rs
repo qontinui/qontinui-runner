@@ -18,6 +18,7 @@ pub mod analytics;
 pub mod bookmarks;
 pub mod capabilities;
 pub mod circuit_breaker;
+pub mod cloud_snapshot;
 pub mod component_errors;
 pub mod design;
 pub mod design_eval;
@@ -345,6 +346,7 @@ pub(super) fn route_manifest() -> &'static [(&'static str, &'static str)] {
         all.extend_from_slice(analytics::route_entries());
         all.extend_from_slice(bookmarks::route_entries());
         all.extend_from_slice(capabilities::route_entries());
+        all.extend_from_slice(cloud_snapshot::route_entries());
         all.extend_from_slice(design::route_entries());
         all.extend_from_slice(design_eval::route_entries());
         all.extend_from_slice(effects::route_entries());
@@ -425,6 +427,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .merge(analytics::routes())
         .merge(bookmarks::routes())
         .merge(capabilities::routes())
+        .merge(cloud_snapshot::routes())
         .merge(design::routes())
         .merge(design_eval::routes())
         .merge(effects::routes())
@@ -736,6 +739,12 @@ mod manifest_drift_tests {
             ("GET", "/ui-bridge/commands/stream"),
             ("POST", "/ui-bridge/commands"),
             ("POST", "/ui-bridge/relay/dispatch"),
+            // Device-bridge snapshot consumer — capture a cloud-relayed device's
+            // UI Bridge snapshot by deviceId (mcp/ui_bridge/cloud_snapshot.rs).
+            // Runner-only: the SDK contract has no "reach a cloud device by id"
+            // analog — the runner is the relay client that owns the tunnel.
+            ("GET", "/ui-bridge/cloud-devices"),
+            ("GET", "/ui-bridge/cloud-snapshot"),
             // NOTE: vision/* routes are intentionally NOT in any baseline.
             // ui-bridge@^0.8.0 SDK declares all 13 vision routes AND main's
             // #134/#135/#136 (vision-pipeline Phase 3.3/4/6.3) exposes them
