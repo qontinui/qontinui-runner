@@ -277,12 +277,17 @@ pub async fn tick_once(state: &Arc<PusherState>) -> Result<()> {
     };
     for target in &state.targets {
         match push_one(state, target, &token_clone.token).await {
-            Ok(true) => info!(
+            Ok(PushOutcome::Pushed) => info!(
                 "agent_pusher: agent_id={} repo={} branch={} pushed",
                 state.agent_id, target.repo, target.branch
             ),
-            Ok(false) => debug!(
+            Ok(PushOutcome::UpToDate) => debug!(
                 "agent_pusher: agent_id={} repo={} branch={} up-to-date",
+                state.agent_id, target.repo, target.branch
+            ),
+            Ok(PushOutcome::Transient(msg)) => debug!(
+                "agent_pusher: agent_id={} repo={} branch={} transient push \
+                 failure (best-effort, will retry next tick): {msg}",
                 state.agent_id, target.repo, target.branch
             ),
             Err(e) => warn!(
@@ -295,10 +300,15 @@ pub async fn tick_once(state: &Arc<PusherState>) -> Result<()> {
 }
 
 /// Push one branch to coord-origin via `git push`. Returns
-/// `Ok(true)` if anything was pushed, `Ok(false)` for "already up to
-/// date", and `Err` for actual failures.
-async fn push_one(state: &Arc<PusherState>, target: &PushTarget, token: &str) -> Result<bool> {
-    let origin_url = build_origin_url(&state.coord_http_base, &target.repo, token)?;
+/// [`PushOutcome::Pushed`] if anything moved, [`PushOutcome::UpToDate`]
+/// for a no-op, [`PushOutcome::Transient`] for a retryable failure, and
+/// `Err` for a permanent one (see [`is_transient_push_error`]).
+async fn push_one(
+    state: &Arc<PusherState>,
+    target: &PushTarget,
+    token: &str,
+) -> Result<PushOutcome> {
+    let origin_url = build_origin_url(&state.coord_http_base, &target.repo)?;
     // Coordination Phase 5 / Row 4: push the local branch
     // (`refs/heads/<branch>` — a normal checked-out branch in the
     // worktree) to the non-`heads` remote ref `refs/agent/<m>-<a>`.
@@ -316,9 +326,14 @@ async fn push_one(state: &Arc<PusherState>, target: &PushTarget, token: &str) ->
         refspec,
         target.worktree_path.display()
     );
+    // coord's git-http gate is Bearer-only and rejects basic-auth, so the
+    // agent JWT goes in an `Authorization: Bearer` header (not the URL).
+    // `-c http.extraHeader=...` scopes the header to this one push.
     let out = Command::new("git")
         .arg("-C")
         .arg(&target.worktree_path)
+        .arg("-c")
+        .arg(format!("http.extraHeader=Authorization: Bearer {token}"))
         .arg("push")
         .arg("--porcelain")
         .arg("--no-verify")
@@ -332,9 +347,13 @@ async fn push_one(state: &Arc<PusherState>, target: &PushTarget, token: &str) ->
         // Exit code 1 with "Everything up-to-date" is normal in some
         // git versions — treat as success-no-op.
         if stderr.contains("Everything up-to-date") {
-            return Ok(false);
+            return Ok(PushOutcome::UpToDate);
         }
-        anyhow::bail!("git push exited {:?}: {}", out.status.code(), stderr.trim());
+        let msg = stderr.trim().to_string();
+        if is_transient_push_error(&stderr) {
+            return Ok(PushOutcome::Transient(msg));
+        }
+        anyhow::bail!("git push exited {:?}: {}", out.status.code(), msg);
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     // Same parsing rule as outbound_mirror — count lines whose first
@@ -343,13 +362,28 @@ async fn push_one(state: &Arc<PusherState>, target: &PushTarget, token: &str) ->
         let l = l.trim_start();
         !l.is_empty() && !l.starts_with('=') && !l.starts_with("To ") && !l.starts_with("Done")
     });
-    Ok(pushed)
+    Ok(if pushed {
+        PushOutcome::Pushed
+    } else {
+        PushOutcome::UpToDate
+    })
 }
 
-/// `<base>/git/<repo>.git` → `<authed-base>/git/<repo>.git`. Token is
-/// injected as the `x-access-token` basic-auth user, matching coord's
-/// outbound_mirror::inject_token convention.
-pub fn build_origin_url(base: &str, repo: &str, token: &str) -> Result<String> {
+/// The coord git-origin URL for `repo`: `<base>/git/<basename>.git`.
+///
+/// **Auth is NOT injected here.** coord's git-http gate is Bearer-only and
+/// rejects GitHub-style `x-access-token:<jwt>@host` basic-auth in the URL
+/// (qontinui-coord `src/git_replication.rs`: "must NOT use GitHub-style
+/// Basic auth — coord's git-http gate rejects it (401)"). The agent JWT is
+/// instead handed to git as an `Authorization: Bearer` header via
+/// `-c http.extraHeader` in [`push_one`], so the URL stays credential-free.
+///
+/// The repo path is the **basename** (`qontinui/qontinui-coord` →
+/// `qontinui-coord`): coord's `/git/:repo/...` route captures a single path
+/// segment and its origin hosts repos under their basename, so an
+/// org-prefixed name would split into two segments and miss the route
+/// entirely (falling through to an unrelated operator-gated handler).
+pub fn build_origin_url(base: &str, repo: &str) -> Result<String> {
     let base = base.trim_end_matches('/');
     let prefix = if let Some(rest) = base.strip_prefix("https://") {
         ("https://", rest)
@@ -358,11 +392,53 @@ pub fn build_origin_url(base: &str, repo: &str, token: &str) -> Result<String> {
     } else {
         anyhow::bail!("coord_http_base must be http[s]://, got {base:?}");
     };
-    let repo_path = repo.strip_suffix(".git").unwrap_or(repo);
-    Ok(format!(
-        "{}x-access-token:{}@{}/git/{}.git",
-        prefix.0, token, prefix.1, repo_path
-    ))
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    let basename = repo.rsplit('/').next().unwrap_or(repo);
+    Ok(format!("{}{}/git/{}.git", prefix.0, prefix.1, basename))
+}
+
+/// Outcome of one [`push_one`] attempt. `Transient` carries the git
+/// stderr of a best-effort-retryable failure (coord write-proxy /
+/// replication hiccups, network faults) — logged quietly and retried on
+/// the next tick. Permanent failures (auth / scope / allowlist 4xx, or
+/// anything unrecognized) come back as `Err` and are surfaced loudly.
+enum PushOutcome {
+    Pushed,
+    UpToDate,
+    Transient(String),
+}
+
+/// Classify a `git push` failure as transient (worth a quiet retry) vs
+/// permanent. Transient = coord's git write-proxy / replication being
+/// momentarily unavailable (5xx, "leader unreachable") and ordinary
+/// network faults (DNS / connection / TLS / timeout); these self-heal, so
+/// the best-effort pusher retries next tick without a warn. Everything
+/// else — auth (401), scope/allowlist (400/403/404), and unrecognized
+/// errors — is treated as permanent and surfaced at `warn` so it gets
+/// attention instead of silently retrying forever.
+fn is_transient_push_error(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    const TRANSIENT: &[&str] = &[
+        "error: 500",
+        "error: 502",
+        "error: 503",
+        "error: 504",
+        "502 bad gateway",
+        "503 service",
+        "leader unreachable",
+        "write-proxy",
+        "could not resolve host",
+        "couldn't resolve host",
+        "connection refused",
+        "connection reset",
+        "connection timed out",
+        "timed out",
+        "operation timed out",
+        "temporary failure",
+        "ssl",
+        "tls",
+    ];
+    TRANSIENT.iter().any(|needle| s.contains(needle))
 }
 
 /// Pick a sleep duration in `[interval - jitter, interval + jitter]`.
@@ -409,27 +485,58 @@ mod tests {
     }
 
     #[test]
-    fn build_origin_url_injects_token_https() {
-        let url = build_origin_url("https://coord.example/", "qontinui-coord", "abc123").unwrap();
-        assert_eq!(
-            url,
-            "https://x-access-token:abc123@coord.example/git/qontinui-coord.git"
+    fn build_origin_url_is_credential_free() {
+        // coord's git gate is Bearer-only; the URL must carry NO basic-auth
+        // (the JWT goes in an http.extraHeader instead).
+        let url = build_origin_url("https://coord.example/", "qontinui-coord").unwrap();
+        assert_eq!(url, "https://coord.example/git/qontinui-coord.git");
+        assert!(
+            !url.contains("x-access-token"),
+            "url must not embed creds: {url}"
         );
+        assert!(!url.contains('@'), "url must not embed creds: {url}");
     }
 
     #[test]
-    fn build_origin_url_strips_dot_git_suffix() {
-        let url = build_origin_url("http://h:9870", "qontinui-coord.git", "tk").unwrap();
-        assert_eq!(
-            url,
-            "http://x-access-token:tk@h:9870/git/qontinui-coord.git"
-        );
+    fn build_origin_url_uses_basename_strips_dot_git_and_org_prefix() {
+        // org-prefixed canonical name → single-segment basename, so the
+        // `/git/:repo/...` route matches (an org prefix would split into
+        // two path segments and miss the route).
+        let url = build_origin_url("http://h:9870", "qontinui/qontinui-coord.git").unwrap();
+        assert_eq!(url, "http://h:9870/git/qontinui-coord.git");
     }
 
     #[test]
     fn build_origin_url_rejects_non_http() {
-        assert!(build_origin_url("ws://h:9870", "qontinui-coord", "x").is_err());
-        assert!(build_origin_url("ftp://h", "r", "t").is_err());
+        assert!(build_origin_url("ws://h:9870", "qontinui-coord").is_err());
+        assert!(build_origin_url("ftp://h", "r").is_err());
+    }
+
+    #[test]
+    fn transient_vs_permanent_push_errors() {
+        // coord write-proxy / replication + network faults → transient.
+        assert!(is_transient_push_error(
+            "remote: write-proxy: leader unreachable\nfatal: ...: The requested URL returned error: 502"
+        ));
+        assert!(is_transient_push_error(
+            "fatal: unable to access '...': The requested URL returned error: 503"
+        ));
+        assert!(is_transient_push_error(
+            "fatal: Could not resolve host: coord.qontinui.io"
+        ));
+        assert!(is_transient_push_error(
+            "fatal: unable to access '...': Connection timed out"
+        ));
+        // auth / scope / allowlist + unknown → permanent (surfaced loudly).
+        assert!(!is_transient_push_error(
+            "fatal: Authentication failed for '...'"
+        ));
+        assert!(!is_transient_push_error(
+            "error: 403 Forbidden: no git_push scope on token"
+        ));
+        assert!(!is_transient_push_error(
+            "remote: repo not in allowlist\n... error: 400"
+        ));
     }
 
     #[test]
