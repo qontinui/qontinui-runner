@@ -258,15 +258,17 @@ Rules:
 - If the existing block is already `IN PROGRESS`, refresh the date and append your session marker — multiple agents may pick up the same plan; keep the trail.
 - If the existing block is `SHIPPED` / `SUPERSEDED` / `OBSOLETE`, STOP — implementing a shipped plan is almost certainly a mistake. Confirm with the user before proceeding.
 
-**Push the stamp under ingest-scanned roots.** IN PROGRESS / SHIPPED stamps drive
-`plan_status` gates via coord's plan-ingest worker, which mirrors
-`qontinui-dev-notes/plans/` origin/main into `coord.plans` every ~60s — a registry
-upsert alone is reverted by the next tick (coord #564). When the plan file lives
-under an ingest-scanned root, commit + push the stamped file (for SHIPPED, the
-Step-6 archive commit already does this). Workspace-root `plans/` on dev boxes is
-typically NOT prod-ingested — the push matters only for ingest-scanned roots.
-(claude-config is NOT a coord sole-authority repo — its PRs land via normal
-GitHub flow.)
+**Set the work-unit status directly.** IN PROGRESS / SHIPPED transitions drive
+`unit_status` gates via coord's work-unit registry — there is no longer a
+plan-ingest worker mirroring `qontinui-dev-notes/plans/` file edges into
+`coord.plans`. Transition the work unit explicitly:
+`POST $COORD_HTTP_URL/coord/work-units/<plan stem>/transition`
+`{to_status:"in_progress", by_actor:"<session>"}` (the device-authed registry
+route). The plan .md stamp + archive still apply (commit + push the stamped file
+when archiving — the markdown artifact, its stamps, and the archive step all STAY);
+only the coord-registry transition moved from "push a file edge" to "call the
+transition route". (claude-config is NOT a coord sole-authority repo — its PRs
+land via normal GitHub flow.)
 
 #### Single-stamp invariant — applies to Step 0.5 and Step 6
 
@@ -389,17 +391,17 @@ snake_case-tagged. Parse it:
 #### Cancel a pending continuation on takeover
 
 Taking the phase claim directly means THIS session is doing the work a
-`plan_ready` gate's continuation may have queued as a fresh runner-terminal
+`unit_ready` gate's continuation may have queued as a fresh runner-terminal
 spawn. Leaving that pending continuation alive means the runner spawns a
 **redundant terminal** on its next WS reconnect (its in-process dedupe set is
 forgotten across restarts, and the pending row survives up to 24h). So,
 **best-effort, right after the FIRST phase claim of this run succeeds** (do it
 once per run, not per phase):
 
-1. Resolve the `plan_id` for this plan-stem via
-   `GET $COORD_HTTP_URL/coord/plans/<plan-stem>` (or the upsert used elsewhere).
-2. Query the plan's gates for a pending continuation:
-   `GET $COORD_HTTP_URL/coord/gates?plan_id=<id>` → rows where
+1. Resolve the `work_unit_id` for this plan-stem via
+   `GET $COORD_HTTP_URL/coord/work-units/<plan-stem>` (or the upsert used elsewhere).
+2. Query the work unit's gates for a pending continuation:
+   `GET $COORD_HTTP_URL/coord/gates?work_unit_id=<id>` → rows where
    `continuation_dispatched_at != null ∧ continuation_consumed_at == null ∧
    continuation_cancelled_at == null`.
 3. For each such gate, fire (operator/`TenantId` bearer — same auth layer as
@@ -1091,7 +1093,7 @@ Once Steps 1–5 land cleanly:
 
    Use a plain `mv plans/<name>.md qontinui-dev-notes/plans/<name>.md`. The plan's followup file (if any) stays in whichever location matches its own state — completed plans go to dev-notes, plans with open items stay at the workspace root.
 
-3. **Commit the archived plan in dev-notes.** Single commit with message like `plans: archive <plan-name> as shipped (<commit-sha-summary>)`. Push. This push is also what durably transitions the `coord.plans` registry row for `plan_status` gates (the ingest worker mirrors dev-notes origin/main; a registry upsert alone is reverted by the next tick — coord #564) — don't skip it.
+3. **Commit the archived plan in dev-notes.** Single commit with message like `plans: archive <plan-name> as shipped (<commit-sha-summary>)`. Push. The archive commit is the durable record of the markdown artifact; it no longer drives the coord registry (the ingest worker is gone). Transition the work unit's status to SHIPPED explicitly via `POST $COORD_HTTP_URL/coord/work-units/<plan stem>/transition {to_status:"shipped", by_actor:"<session>"}` so any `unit_status` gate clears — don't skip either.
 
 4. **If the plan was already authored inside `qontinui-dev-notes/plans/`** (e.g. it was vetted there from the start), skip the move; just edit the status block in place and commit.
 
@@ -1118,27 +1120,28 @@ observable trigger (open-ended TODO) is NOT a gate — skip those.
   gate?`, options Register / Skip), showing the derived anchor, predicate kind,
   and human-readable condition. Under opt-in auto mode (env `QONTINUI_AUTO_GATE=1`)
   register WITHOUT asking and report what was registered (gate_id + predicate).
-- **Anchor (zero user input):** `plan_id` from `POST $COORD_HTTP_URL/coord/plans/upsert`
-  with the plan stem as `slug` (or `GET /coord/plans/<slug>`); `phase_name` from
-  the phase heading. Anchor = (plan_id, phase_name). Claim-bound deferrals use the
-  claim-anchored shape (`claim_kind`+`resource_key`) instead.
+- **Anchor (zero user input):** `work_unit_id` from
+  `POST $COORD_HTTP_URL/coord/work-units/upsert` with the plan stem as `slug`
+  (or `GET /coord/work-units/<slug>`); `phase_name` from the phase heading. Anchor
+  = (work_unit_id, phase_name). Claim-bound deferrals use the claim-anchored shape
+  (`claim_kind`+`resource_key`) instead.
 - **Register:** prefer MCP `coord_register_gate` (kinds: `pr_merged`,
   `deploy_healthy`, `claim_terminal`, `operator_approval`, `ci_green`,
-  `ref_exists`, `metric_threshold`, `time_elapsed`, `plan_ready`,
+  `ref_exists`, `metric_threshold`, `time_elapsed`, `unit_ready`,
   `migration_at_head`, `infra_drift_clear`, `file_exists`, `sql_count`,
-  `plan_status`, `gate_cleared`; optional
+  `unit_status`, `gate_cleared`; optional
   `continuation_prompt` e.g. `run /implement-phase <stem> "Phase N"` for
-  auto-resume). **HTTP fallback** when MCP is unavailable — for a plan-anchored gate
-  walk the transport cascade, first reachable wins: (1) the **device loopback
-  write-forwarder** `POST http://127.0.0.1:{runner_port}/coord-mcp/gates/register-plan/<slug>`
-  with header `X-Coord-Mcp-Proxy-Key: <nonce from the live .mcp.json>`, no body
-  bearer (proxy injects the device JWT) — the **only `plan_ready`-capable device
-  door** (`{runner_port}` parsed from the live `.mcp.json` proxy URL, NOT `:9876`);
-  (2) the direct device-authed `POST $COORD_HTTP_URL/coord/plans/<slug>/register-gate`
-  when a raw device JWT is held (resolves tenant from the device JWT + upserts the
-  plan by slug + registers in one call — the operator-only `/coord/gates/register` +
-  `/coord/plans/upsert` 403 `tenant_not_resolved` for a device JWT); (3) MCP only
-  when a `plan_id` is already known; else (claim-anchored, or no device identity)
+  auto-resume). **HTTP fallback** when MCP is unavailable — for a work-unit-anchored
+  gate it is a **TWO-call flow** (the register route never upserts the work unit,
+  and 404s `work_unit_not_found` if the slug isn't present): (1) first
+  `POST $COORD_HTTP_URL/coord/work-units/upsert {slug, title?, status?}` and
+  capture `work_unit_id` from the response; (2) then
+  `POST $COORD_HTTP_URL/coord/work-units/<slug>/register-gate` with a raw device JWT
+  (resolves tenant from the device JWT; body omits `slug`/`work_unit_id`, which come
+  from the path + the predicate). All work-unit routes are device-authed
+  (`require_jwt`), so a device session reaches them directly; the operator-only
+  `/coord/gates/register` is not used for a work-unit anchor. For a claim-anchored
+  gate (no work unit) or with no device identity, fall back to
   `POST $COORD_HTTP_URL/coord/gates/register` (default `https://coord.qontinui.io`).
   Tenant derives server-side — never pass it.
 - **`clearance_audience`:** set `agent` for agent-verifiable facts ("/vet-plan
@@ -1150,14 +1153,14 @@ observable trigger (open-ended TODO) is NOT a gate — skip those.
   `deploy_healthy`; wait-on-CI → `ci_green`; burn-in / wait-N-days →
   `time_elapsed`; metric condition → `metric_threshold` (explicit `labels` — e.g.
   `coord_ci_runner_count` MUST filter `{status:"idle"}`); a vetted plan that is
-  ready, dispatchable work → `plan_ready` (**NOT** `operator_approval` —
-  `operator_approval` is for genuine human decisions, not a work queue);
-  schema/alembic-at-head → `migration_at_head` `{schema}`; infra drift cleared →
-  `infra_drift_clear`; a repo file/workflow existing → `file_exists`
+  ready, dispatchable work → `unit_ready` `{work_unit_id, ready_status}` (**NOT**
+  `operator_approval` — `operator_approval` is for genuine human decisions, not a
+  work queue); schema/alembic-at-head → `migration_at_head` `{schema}`; infra drift
+  cleared → `infra_drift_clear`; a repo file/workflow existing → `file_exists`
   `{repo,path,on_ref?}` (contents, not refs); a coord data count crossing a bound
   → `sql_count` `{query_id,op,n}` (whitelisted `query_id`, never raw SQL); an
-  umbrella plan reaching a status → `plan_status` `{plan_slug,status}`; another
-  cross-anchor gate clearing → `gate_cleared` `{gate_id}`;
+  umbrella work unit reaching a status → `unit_status` `{work_unit_id, status}`;
+  another cross-anchor gate clearing → `gate_cleared` `{gate_id}`;
   needs-human → `operator_approval`. Anything **security / credential / billing /
   strategy-sensitive** registers as `operator_approval` + notify — never an
   auto-resuming gate, never silently auto-registered.
@@ -1176,7 +1179,7 @@ session gated now finishes), it MUST attest that gate — otherwise an agent-fac
 gate rots open until a human clicks it.
 
 - **Find the gate:** by the `gate_id` recorded at registration, or by lookup
-  `GET $COORD_HTTP_URL/coord/gates?plan_id=<id>&phase_name=<name>` — the OPEN
+  `GET $COORD_HTTP_URL/coord/gates?work_unit_id=<id>&phase_name=<name>` — the OPEN
   gate whose condition the completed work satisfies.
 - **Attest:** prefer MCP `coord_attest_gate` (pass `gate_id` — works from a device
   session since attest takes no plan upsert); fall back to the device loopback
@@ -1192,18 +1195,17 @@ gate rots open until a human clicks it.
 - **Honesty:** NEVER report a deferred item as done without EITHER a cleared
   `gate_id` OR an explicit "gate not found" note.
 
-**Continuation cancel (refresh + takeover).** A CLEARED `plan_ready` gate may have
+**Continuation cancel (refresh + takeover).** A CLEARED `unit_ready` gate may have
 dispatched a pending runner-terminal continuation. If you **re-register** a gate
-for the same plan/anchor, or this run **directly takes over** the work a pending
-continuation was queued for (the active takeover wiring lives in Step 0.6), first
-cancel that pending continuation so the runner does not spawn a redundant
-terminal: find it via `GET $COORD_HTTP_URL/coord/gates?plan_id=<id>` (rows with
+for the same work-unit/anchor, or this run **directly takes over** the work a
+pending continuation was queued for (the active takeover wiring lives in Step 0.6),
+first cancel that pending continuation so the runner does not spawn a redundant
+terminal: find it via `GET $COORD_HTTP_URL/coord/gates?work_unit_id=<id>` (rows with
 `continuation_dispatched_at != null ∧ continuation_consumed_at == null ∧
 continuation_cancelled_at == null`), then
 `POST $COORD_HTTP_URL/coord/gates/:gate_id/continuation-cancel`
-`{cancelled_by, reason}` (`TenantId` auth — **NOT** available over the device
-loopback write-forwarder, which serves only `register-plan` + `attest`; cancel
-stays on the operator/`TenantId` path, unchanged). Best-effort, never blocking:
+`{cancelled_by, reason}` (`TenantId` auth, on the operator/`TenantId` path,
+unchanged). Best-effort, never blocking:
 404 = nothing pending; **409 `already_consumed` = a spawn already happened, report
 it honestly** rather than claiming the cancel landed. Narrate the cancelled
 `gate_id`. (canonical spec: `_gate-registration` → "Continuation cancel + refresh".)
