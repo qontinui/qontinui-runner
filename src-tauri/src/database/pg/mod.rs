@@ -364,7 +364,8 @@ impl PgDb {
         // applied still boots cleanly. The runner's spec API depends on this
         // table being present from the first /apps/* request.
         conn.batch_execute(
-            "CREATE TABLE IF NOT EXISTS project.apps ( \
+            "CREATE SCHEMA IF NOT EXISTS project; \
+             CREATE TABLE IF NOT EXISTS project.apps ( \
                  app_id          TEXT PRIMARY KEY, \
                  repo_root       TEXT NOT NULL, \
                  ui_bridge_url   TEXT NOT NULL, \

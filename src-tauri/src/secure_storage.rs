@@ -77,6 +77,15 @@ struct StoredTokens {
     /// `#[serde(default)]` so a pre-Phase-3b `.enc` deserializes.
     #[serde(default)]
     coord_mcp_nonces: std::collections::HashMap<String, String>,
+    /// Per-machine API key for the dev-environment capture agent
+    /// (`mk_<token>`), minted ONCE by the qontinui-web enroll endpoint
+    /// (`POST /api/v1/devenv/agent/enroll`). Sent as the `X-Machine-Key`
+    /// header on every config push. This is a bearer credential (NOT a
+    /// loopback-only nonce), so it lives in the encrypted store alongside the
+    /// device JWT. `#[serde(default)]` keeps a pre-env-agent `.enc`
+    /// deserializing.
+    #[serde(default)]
+    agent_machine_key: Option<String>,
 }
 
 /// Secure file-based storage manager.
@@ -395,6 +404,35 @@ impl SecureStorage {
             .unwrap_or_default()
     }
 
+    /// Store the dev-environment capture agent's per-machine API key
+    /// (`mk_<token>`). Minted ONCE by the enroll endpoint; overwrites any
+    /// prior key. Leaves all other slots untouched.
+    pub fn store_agent_machine_key(&self, key: &str) -> Result<()> {
+        let mut tokens = self.load_tokens().unwrap_or_default();
+        tokens.agent_machine_key = Some(key.to_string());
+        self.save_tokens(&tokens)?;
+        info!("env-agent machine key stored in secure file storage");
+        Ok(())
+    }
+
+    /// Retrieve the dev-environment capture agent's per-machine API key, if
+    /// present. `Ok(None)` when the machine has never enrolled (vs an `Err`
+    /// only on a decrypt/parse failure of an existing store).
+    pub fn get_agent_machine_key(&self) -> Result<Option<String>> {
+        let tokens = self.load_tokens()?;
+        Ok(tokens.agent_machine_key)
+    }
+
+    /// Clear the dev-environment capture agent's per-machine API key, leaving
+    /// all other slots intact. Used when re-enrolling or unenrolling.
+    pub fn clear_agent_machine_key(&self) -> Result<()> {
+        let mut tokens = self.load_tokens().unwrap_or_default();
+        tokens.agent_machine_key = None;
+        self.save_tokens(&tokens)?;
+        info!("env-agent machine key cleared from secure file storage");
+        Ok(())
+    }
+
     /// Deletes the storage file entirely.
     #[allow(dead_code)]
     pub fn delete_storage(&self) -> Result<()> {
@@ -488,6 +526,30 @@ mod tests {
         assert_eq!(parsed.access_token.as_deref(), Some("a"));
         assert!(parsed.oauth_access_token.is_none());
         assert!(parsed.oauth_expires_at.is_none());
+    }
+
+    #[test]
+    fn test_agent_machine_key_round_trip_and_isolation() {
+        let storage = create_test_storage("test_agent_machine_key");
+
+        // Absent before any store.
+        assert!(storage.get_agent_machine_key().unwrap().is_none());
+
+        // A device JWT in the access_token slot must NOT be clobbered by the
+        // machine-key write (slot isolation).
+        storage.store_tokens("device.jwt", "").unwrap();
+        storage.store_agent_machine_key("mk_abc123").unwrap();
+
+        assert_eq!(
+            storage.get_agent_machine_key().unwrap().as_deref(),
+            Some("mk_abc123")
+        );
+        assert_eq!(storage.get_access_token().unwrap(), "device.jwt");
+
+        // Clearing only the machine key leaves the device JWT intact.
+        storage.clear_agent_machine_key().unwrap();
+        assert!(storage.get_agent_machine_key().unwrap().is_none());
+        assert_eq!(storage.get_access_token().unwrap(), "device.jwt");
     }
 
     #[test]

@@ -122,6 +122,47 @@ enum Cmd {
         #[command(subcommand)]
         sub: DeviceCmd,
     },
+    /// Manage the machine-side dev-environment capture agent
+    /// (feat/devenv-environments). `enroll` binds this machine to a web
+    /// environment via a per-machine API key; `capture` pushes a secret-free
+    /// config envelope; `show` prints enrollment state.
+    Env {
+        #[command(subcommand)]
+        sub: EnvCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum EnvCmd {
+    /// Enroll this machine into a web environment via an enrollment code.
+    /// POSTs `{enrollment_code, machine_id, hostname}` to
+    /// `{backend}/api/v1/devenv/agent/enroll`; on success stores the returned
+    /// `mk_<token>` machine key in secure storage and writes
+    /// `~/.qontinui/env-agent.json` with the RESPONSE environment_id.
+    Enroll {
+        /// The enrollment code minted by the web dashboard.
+        #[arg(long)]
+        code: String,
+        /// Override the backend base URL. Falls back to `QONTINUI_WEB_BASE`,
+        /// then a web base derived from the active profile's coord_url.
+        #[arg(long)]
+        backend: Option<String>,
+        /// Reserved override for the target environment id. Normally the
+        /// environment is assigned by the enroll response; this is only used
+        /// for diagnostics / re-enroll against a specific environment.
+        #[arg(long)]
+        environment: Option<String>,
+    },
+    /// Capture the current dev-environment config and push it to the backend.
+    /// `--dry-run` assembles + pretty-prints the envelope WITHOUT pushing.
+    Capture {
+        /// Assemble + print the envelope without POSTing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Print enrollment state (from env-agent.json) + whether a machine key is
+    /// stored.
+    Show,
 }
 
 #[derive(Subcommand, Debug)]
@@ -201,6 +242,15 @@ fn main() -> ExitCode {
                 browser,
                 tenant_id.as_deref(),
             ),
+        },
+        Cmd::Env { sub } => match sub {
+            EnvCmd::Enroll {
+                code,
+                backend,
+                environment,
+            } => cmd_env_enroll(&code, backend.as_deref(), environment.as_deref()),
+            EnvCmd::Capture { dry_run } => cmd_env_capture(dry_run),
+            EnvCmd::Show => cmd_env_show(),
         },
     }
 }
@@ -1074,6 +1124,249 @@ fn active_profile_dsn() -> Result<String, String> {
         .map_err(|e| format!("active profile has no database_url: {}", e))
 }
 
+// ============================================================================
+// env subcommand — machine-side dev-environment capture agent
+// ============================================================================
+//
+// `env enroll` binds this machine to a web environment via a per-machine API
+// key (`mk_<token>`), stored in the encrypted secure storage. `env capture`
+// pushes a SECRET-FREE config envelope. `env show` prints enrollment state.
+//
+// The capture/push logic + envelope assembly live in
+// `qontinui_runner_lib::env_agent` so the runner GUI's background task and this
+// CLI share one code path.
+
+/// Wire shape of the enroll request body. Conforms EXACTLY to the backend
+/// contract: `{ enrollment_code, machine_id?, hostname? }`.
+#[derive(Debug, Serialize)]
+struct EnrollRequest {
+    enrollment_code: String,
+    machine_id: Option<String>,
+    hostname: Option<String>,
+}
+
+/// Wire shape of the enroll response. The backend returns the machine key ONCE
+/// — we store it immediately. `environment_id` is sourced from HERE, never
+/// hardcoded.
+#[derive(Debug, Deserialize)]
+struct EnrollResponse {
+    machine_id: String,
+    machine_key: String,
+    #[serde(default)]
+    environment_id: Option<String>,
+}
+
+/// Resolve the web backend base URL for the enroll POST. Order:
+/// `--backend` → `QONTINUI_WEB_BASE` → web base derived from the active
+/// profile's coord_url (`derive_web_base_from_coord(coord_http_base())`).
+fn resolve_env_backend_base(backend_arg: Option<&str>) -> Result<String, String> {
+    if let Some(b) = backend_arg {
+        let t = b.trim();
+        if !t.is_empty() {
+            return Ok(t.trim_end_matches('/').to_string());
+        }
+    }
+    if let Ok(v) = std::env::var("QONTINUI_WEB_BASE") {
+        let t = v.trim();
+        if !t.is_empty() {
+            return Ok(t.trim_end_matches('/').to_string());
+        }
+    }
+    let coord_base = coord_http_base()
+        .map_err(|e| format!("could not resolve a backend URL (no --backend, no QONTINUI_WEB_BASE, and coord_url unavailable: {e})"))?;
+    Ok(derive_web_base_from_coord(&coord_base))
+}
+
+fn cmd_env_enroll(code: &str, backend_arg: Option<&str>, environment_arg: Option<&str>) -> ExitCode {
+    if code.trim().is_empty() {
+        eprintln!("error: --code requires a non-empty enrollment code");
+        return ExitCode::from(2);
+    }
+
+    let backend = match resolve_env_backend_base(backend_arg) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // machine_id + hostname come from the existing device-file reader. A
+    // machine.json is expected (run `qontinui_profile device init` first), but
+    // we tolerate its absence by sending nulls — the backend may assign a
+    // machine_id.
+    let path = device_file_path();
+    let (machine_id, hostname): (Option<String>, Option<String>) = match path {
+        Some(p) if p.exists() => match read_device_file(&p) {
+            Ok(f) => (Some(f.device_id), Some(f.hostname)),
+            Err(e) => {
+                eprintln!(
+                    "warning: machine.json unreadable ({e}); enrolling with null machine_id/hostname"
+                );
+                (None, None)
+            }
+        },
+        _ => {
+            eprintln!(
+                "note: no ~/.qontinui/machine.json — enrolling with null machine_id/hostname \
+                 (run `qontinui_profile device init` first for a stable identity)"
+            );
+            (None, None)
+        }
+    };
+
+    let body = EnrollRequest {
+        enrollment_code: code.trim().to_string(),
+        machine_id,
+        hostname,
+    };
+    let url = format!("{}/api/v1/devenv/agent/enroll", backend);
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: reqwest client build failed: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let resp = match client.post(&url).json(&body).send() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: POST {url} failed (backend unreachable?): {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        let body_text = resp
+            .text()
+            .unwrap_or_else(|_| "<unable to read response body>".to_string());
+        eprintln!("error: enroll failed — POST {url} -> HTTP {status}: {body_text}");
+        // Write NOTHING on failure.
+        return ExitCode::from(1);
+    }
+    let parsed: EnrollResponse = match resp.json() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: enroll succeeded but decoding the response failed: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // environment_id ALWAYS comes from the response. The --environment flag is
+    // a diagnostic override only; the response value wins when present.
+    let environment_id = parsed
+        .environment_id
+        .clone()
+        .or_else(|| environment_arg.map(|s| s.to_string()));
+    let environment_id = match environment_id {
+        Some(e) if !e.trim().is_empty() => e,
+        _ => {
+            eprintln!(
+                "error: enroll response did not include an environment_id and none was supplied \
+                 via --environment; refusing to write a half-enrolled config"
+            );
+            return ExitCode::from(1);
+        }
+    };
+
+    // Store the machine key in secure storage FIRST — it is the credential.
+    let storage = match qontinui_runner_lib::secure_storage::SecureStorage::new() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: could not open secure storage: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    if let Err(e) = storage.store_agent_machine_key(&parsed.machine_key) {
+        eprintln!("error: failed to store machine key: {e}");
+        return ExitCode::from(2);
+    }
+
+    // Then write env-agent.json with the RESPONSE environment_id.
+    let cfg = qontinui_runner_lib::env_agent::config::EnvAgentConfig {
+        backend_url: backend.clone(),
+        machine_id: parsed.machine_id.clone(),
+        environment_id: environment_id.clone(),
+        enrolled_at: Some(chrono::Utc::now().to_rfc3339()),
+    };
+    if let Err(e) = cfg.save() {
+        eprintln!("error: enrolled + key stored, but writing env-agent.json failed: {e}");
+        return ExitCode::from(2);
+    }
+
+    println!(
+        "enrolled: machine_id={} environment_id={} backend={} (machine key stored)",
+        parsed.machine_id, environment_id, backend
+    );
+    ExitCode::SUCCESS
+}
+
+fn cmd_env_capture(dry_run: bool) -> ExitCode {
+    if dry_run {
+        match qontinui_runner_lib::env_agent::build_envelope_blocking() {
+            Ok(envelope) => match serde_json::to_string_pretty(&envelope) {
+                Ok(s) => {
+                    println!("{s}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: serialize envelope failed: {e}");
+                    ExitCode::from(2)
+                }
+            },
+            Err(e) => {
+                eprintln!("error: building envelope failed: {e}");
+                ExitCode::from(2)
+            }
+        }
+    } else {
+        match qontinui_runner_lib::env_agent::capture_and_push_blocking() {
+            Ok(()) => {
+                println!("capture pushed (or skipped — machine not enrolled)");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: capture/push failed: {e}");
+                ExitCode::from(1)
+            }
+        }
+    }
+}
+
+fn cmd_env_show() -> ExitCode {
+    let cfg = qontinui_runner_lib::env_agent::config::EnvAgentConfig::load();
+    let key_stored = qontinui_runner_lib::secure_storage::SecureStorage::new()
+        .ok()
+        .and_then(|s| s.get_agent_machine_key().ok().flatten())
+        .map(|k| !k.is_empty())
+        .unwrap_or(false);
+
+    let out = match cfg {
+        Some(c) => json!({
+            "enrolled": c.is_enrolled() && key_stored,
+            "backend_url": c.backend_url,
+            "machine_id": c.machine_id,
+            "environment_id": c.environment_id,
+            "enrolled_at": c.enrolled_at,
+            "machine_key_stored": key_stored,
+            "config_path": qontinui_runner_lib::env_agent::config::EnvAgentConfig::path()
+                .map(|p| p.display().to_string()),
+        }),
+        None => json!({
+            "enrolled": false,
+            "machine_key_stored": key_stored,
+            "config_path": qontinui_runner_lib::env_agent::config::EnvAgentConfig::path()
+                .map(|p| p.display().to_string()),
+            "note": "no env-agent.json — run `qontinui_profile env enroll --code <code>`",
+        }),
+    };
+    println!("{}", serde_json::to_string_pretty(&out).unwrap());
+    ExitCode::SUCCESS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1392,5 +1685,76 @@ mod tests {
     fn use_requires_name() {
         let err = Cli::try_parse_from(["qontinui_profile", "use"]).expect_err("requires name");
         assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    // ------------------------------------------------------------------
+    // env subcommand — capture agent CLI surface.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn env_enroll_help_short_circuits() {
+        assert_help(&["qontinui_profile", "env", "enroll", "--help"]);
+    }
+
+    #[test]
+    fn env_capture_help_short_circuits() {
+        assert_help(&["qontinui_profile", "env", "capture", "--help"]);
+    }
+
+    #[test]
+    fn env_enroll_requires_code() {
+        let err =
+            Cli::try_parse_from(["qontinui_profile", "env", "enroll"]).expect_err("requires --code");
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn env_enroll_parses_with_code_and_backend() {
+        let cli = Cli::try_parse_from([
+            "qontinui_profile",
+            "env",
+            "enroll",
+            "--code",
+            "ABC123",
+            "--backend",
+            "http://localhost:8000",
+        ])
+        .expect("parses");
+        match cli.cmd {
+            Some(Cmd::Env {
+                sub:
+                    EnvCmd::Enroll {
+                        code,
+                        backend,
+                        environment,
+                    },
+            }) => {
+                assert_eq!(code, "ABC123");
+                assert_eq!(backend.as_deref(), Some("http://localhost:8000"));
+                assert!(environment.is_none());
+            }
+            other => panic!("expected Env::Enroll, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn env_capture_parses_with_dry_run() {
+        let cli = Cli::try_parse_from(["qontinui_profile", "env", "capture", "--dry-run"])
+            .expect("parses");
+        match cli.cmd {
+            Some(Cmd::Env {
+                sub: EnvCmd::Capture { dry_run },
+            }) => assert!(dry_run),
+            other => panic!("expected Env::Capture {{dry_run}}, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn env_show_parses() {
+        let cli = Cli::try_parse_from(["qontinui_profile", "env", "show"]).expect("parses");
+        match cli.cmd {
+            Some(Cmd::Env { sub: EnvCmd::Show }) => {}
+            other => panic!("expected Env::Show, got {:?}", other),
+        }
     }
 }

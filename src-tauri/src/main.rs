@@ -638,6 +638,19 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // each other (unlike the heartbeat above, which feeds
                 // coord's 120s liveness TTL and must never be starved).
                 fleet::spawn_tree_publisher();
+                // Machine-side dev-environment capture agent
+                // (feat/devenv-environments). Publishes the live PG pool so the
+                // lib-side `db_schema` collector can reach it, then spawns the
+                // periodic capture task. Both are best-effort: the task no-ops
+                // until the machine is enrolled (`qontinui_profile env enroll`),
+                // gates enrollment INSIDE its loop (so a mid-session enroll is
+                // picked up), and logs+swallows push failures. NEVER awaited
+                // synchronously — kept off the boot critical path like the
+                // sibling publishers above.
+                qontinui_runner_lib::env_agent::publish_pg_pool(
+                    fleet_publish_pg.pool().clone(),
+                );
+                qontinui_runner_lib::env_agent::spawn_env_capture();
                 // Session Bus Phase 3b directed-message delivery executor is
                 // RETIRED in favor of `mcp::session_message_poller` (in-session
                 // continuation delivery, plan 2026-06-21 Phase 2), which adds
