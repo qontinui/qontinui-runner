@@ -22,6 +22,14 @@ pub mod tauri_event_payloads;
 pub mod auth;
 pub mod secure_storage;
 
+// Machine-side dev-environment capture agent (feat/devenv-environments). Runs
+// on a developer's machine, captures that machine's real dev-environment
+// configuration (SECRET-FREE), and POSTs it to the qontinui-web backend so the
+// server computes drift vs a canonical machine. Auth is a per-machine API key
+// (`X-Machine-Key: mk_<token>`), NOT a user JWT. Lives in the lib crate so both
+// the `qontinui_profile env` CLI and the Tauri runner GUI share one code path.
+pub mod env_agent;
+
 // Device-pairing flow (headless + browser-mediated). Lifted out of
 // `bin/qontinui_profile.rs` so both the CLI and the Tauri runner GUI
 // share one code path. See `pair.rs` for the canonical wire shapes.
