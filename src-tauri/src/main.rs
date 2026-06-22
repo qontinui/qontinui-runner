@@ -638,16 +638,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // each other (unlike the heartbeat above, which feeds
                 // coord's 120s liveness TTL and must never be starved).
                 fleet::spawn_tree_publisher();
-                // Session Bus Phase 3b — directed-message delivery executor.
-                // No-op unless COORD_SESSION_BUS_ENABLED is set (opt-in): it
-                // injects coord-queued messages into live session terminals.
-                session_bus::spawn_session_bus_executor();
-                // Hook-free, runner-side WIP-attribution capture (sibling of
-                // the tree publisher above). Reads each hosted session's Claude
-                // transcript forward-only and POSTs file-edit attribution to
-                // coord's /coord/wip-attribution. Gated OFF by default
-                // (COORD_SESSION_ATTRIBUTION_ENABLED) — no live consumer yet, so
-                // it's a no-op until armed. See `session_attribution`.
+                // Session Bus Phase 3b directed-message delivery executor is
+                // RETIRED in favor of `mcp::session_message_poller` (in-session
+                // continuation delivery, plan 2026-06-21 Phase 2), which adds
+                // the PTY idle gate (never clobber a mid-turn session), dedup +
+                // per-session cooldown, and reuses the in-process injection
+                // primitive. The new poller is spawned device-scoped in
+                // `mcp_api::start_server`. We do NOT spawn the old executor here
+                // — two consumers of the same mailbox would double-inject.
+                let _ = session_bus::spawn_session_bus_executor; // keep module live
+                                                                 // Hook-free, runner-side WIP-attribution capture (sibling of
+                                                                 // the tree publisher above). Reads each hosted session's Claude
+                                                                 // transcript forward-only and POSTs file-edit attribution to
+                                                                 // coord's /coord/wip-attribution. Gated OFF by default
+                                                                 // (COORD_SESSION_ATTRIBUTION_ENABLED) — no live consumer yet, so
+                                                                 // it's a no-op until armed. See `session_attribution`.
                 session_attribution::spawn_session_attribution();
                 // Ξ_Worktree census (Phase 1) — periodic disk-footprint
                 // + junction-status + volume-free-space census of every

@@ -1854,6 +1854,27 @@ pub fn create_router(
         });
     }
 
+    // Auto-start the in-session continuation delivery poller (Phase 2 of
+    // `2026-06-21-in-session-continuation-delivery.md`). Device-scoped: it
+    // consumes coord's directed-message mailbox and injects each message as a
+    // prompt into the live LOCAL session it targets — SDK sessions queue safely
+    // mid-turn; PTY sessions are gated on terminal idle so a running turn is
+    // never clobbered. It no-ops while unpaired (no device JWT) and parks under
+    // the `RUNNER_SESSION_MESSAGE_DELIVERY_DISABLED` kill-switch, so spawning
+    // unconditionally is harmless. Supersedes the retired `session_bus`
+    // executor (its spawn is removed in main.rs) so only ONE consumer races the
+    // mailbox.
+    {
+        let poller_api_state = api_state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            crate::mcp::session_message_poller::commands::auto_start_session_message_poller(
+                poller_api_state,
+            )
+            .await;
+        });
+    }
+
     // Restore persisted coord-mcp proxy nonces + reconcile session configs to
     // the current bound port (plan 2026-06-13 Phases 3b + 3c). 3b makes an
     // already-written `.mcp.json` keep validating across a restart (the nonce
