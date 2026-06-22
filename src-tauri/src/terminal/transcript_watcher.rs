@@ -412,15 +412,24 @@ async fn tail_session(
     // is unreadable, or `session_id` isn't a UUID — so the per-line emit below
     // costs nothing in the common (gate-off) case. Held for the tail's
     // lifetime; the drain thread flushes on channel disconnect at function exit
-    // (RAII) — we deliberately emit NO `session_closed` milestone since a tail
-    // teardown (cancel / rotation / workflow re-check) isn't a reliable
-    // CLI-session-end signal.
+    // (RAII).
+    //
+    // We emit NEITHER a `session_started` NOR a `session_closed` milestone here:
+    // a single real CLI session produces MANY `tail_session` invocations (file
+    // rotation/truncation re-opens the cursor, the discovery loop reschedules a
+    // torn-down tail on the next `Modify`, a runner restart re-discovers every
+    // live transcript), so neither a tail start nor a tail teardown is a
+    // reliable session-lifecycle signal — emitting `started()` per tail floods
+    // `coord.agent_logs` with duplicate `session_started` rows (~one per tail
+    // re-spawn). The per-line `assistant` / `tool_use` emits below ARE the
+    // activity signal, and they are inherently de-duplicated by the byte cursor
+    // (only lines past `cursor` emit), so re-invocation never double-counts
+    // content. The once-per-session `session_started` milestone belongs to the
+    // UI-interactive spawn path (`session.rs`), which fires exactly once per
+    // genuine `ClaudeSession::spawn`.
     let agent_log_emitter = uuid::Uuid::parse_str(&session_id)
         .ok()
         .and_then(AgentLogEmitter::start);
-    if let Some(em) = agent_log_emitter.as_ref() {
-        em.started("interactive CLI session");
-    }
 
     debug!(
         "transcript_watcher: tail started for {} at offset {} ({})",
