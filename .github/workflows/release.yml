@@ -23,9 +23,13 @@ env:
   SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
 
 jobs:
-  # Build Python executor for bundling (optional)
+  # Build Python executor for bundling (optional). Opt-in via workflow_dispatch
+  # only — tag releases skip it to cut build-failure surface (the macOS Python
+  # dependency install is flaky and the bundled executor is optional; the runner
+  # falls back to a system Python). The `build` job already tolerates its absence
+  # via the conditional "Download Python executor" step.
   build-python-executor:
-    if: ${{ github.event.inputs.include_bundled_python != 'false' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.include_bundled_python != 'false' }}
     uses: ./.github/workflows/build-python-executor.yml
     with:
       include_cuda: ${{ github.event.inputs.include_cuda == 'true' }}
@@ -91,6 +95,9 @@ jobs:
     # Run even if build-python-executor was skipped (when include_bundled_python is false)
     if: ${{ always() && needs.create-release.result == 'success' }}
     strategy:
+      # Don't let one platform's failure cancel the others — a broken macOS leg
+      # must not take down healthy Windows/Linux builds.
+      fail-fast: false
       matrix:
         include:
           - platform: ubuntu-22.04
@@ -107,6 +114,12 @@ jobs:
             name: windows-x64
 
     runs-on: ${{ matrix.platform }}
+    # macOS builds are currently broken (x86_64 cross-compile + Python deps);
+    # tolerate their failure so the release still ships Windows + Linux. The
+    # `build` job stays a hard gate for Windows/Linux, so publish-update-json
+    # only runs when those succeed (never an empty/assetless release). Tracked
+    # as a follow-up to repair macOS and drop continue-on-error.
+    continue-on-error: ${{ startsWith(matrix.platform, 'macos') }}
 
     steps:
       - uses: actions/checkout@v5
