@@ -337,3 +337,18 @@ jobs:
           files: update.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # All platform installers, checksums, and the update manifest are now
+      # uploaded to the draft release. Flip it to published + non-prerelease as
+      # the final step so it resolves as GitHub's "latest" release (which the
+      # qontinui.io download endpoints query) and the auto-updater can see it.
+      # Doing this last means users never see a release with missing assets.
+      # The "(Beta)" label stays in the release title.
+      - name: Publish release (un-draft, mark as latest)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "v${{ needs.create-release.outputs.release_version }}" \
+            --repo "${{ github.repository }}" \
+            --draft=false \
+            --prerelease=false
