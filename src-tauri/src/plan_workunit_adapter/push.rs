@@ -120,6 +120,20 @@ pub struct PushOutcome {
     pub conflict: bool,
 }
 
+/// Outcome of a [`WorkUnitSink::set_deps`] call. Distinguishes the benign
+/// "table not migrated yet" 503 (the edge table hasn't landed — the
+/// `metadata.depends_on` JSONB fallback covers it, so this is NOT an error)
+/// from a real applied write or a hard error (returned as `Err`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetDepsOutcome {
+    /// Edges were set (2xx). `edges_set` is coord's reported count.
+    Ok { edges_set: u64 },
+    /// Coord returned 503 — the `work_unit_deps` table is not yet migrated.
+    /// Benign: the JSONB fallback in `metadata.depends_on` covers dependencies
+    /// until the migration lands.
+    TableNotMigrated,
+}
+
 /// The coord side of a push, abstracted so [`push_work_unit`] is testable
 /// without live HTTP. Implemented by [`HttpWorkUnitSink`] in production and a
 /// fake in tests.
@@ -129,6 +143,11 @@ pub trait WorkUnitSink: Send + Sync {
     async fn current_status(&self, slug: &str) -> Result<Option<String>>;
     async fn upsert(&self, body: &UpsertBody) -> Result<()>;
     async fn transition(&self, slug: &str, body: &TransitionBody) -> Result<()>;
+    /// Replace the complete upstream dependency set of `slug` in coord's
+    /// first-class edge table (`POST /coord/work-units/:slug/deps`). This is a
+    /// REPLACE-SET: `depends_on` is the full upstream set; `&[]` clears all.
+    /// Idempotent, so re-sending an unchanged set is harmless.
+    async fn set_deps(&self, slug: &str, depends_on: &[String]) -> Result<SetDepsOutcome>;
 }
 
 /// Push one parsed work-unit through the edge-trigger + conflict logic.
@@ -315,6 +334,31 @@ impl WorkUnitSink for HttpWorkUnitSink {
         }
         Ok(())
     }
+
+    async fn set_deps(&self, slug: &str, depends_on: &[String]) -> Result<SetDepsOutcome> {
+        let url = format!("{}/coord/work-units/{}/deps", self.base, slug);
+        let body = serde_json::json!({ "depends_on": depends_on });
+        let resp = crate::auth::attach_device_auth(self.client.post(&url).json(&body))
+            .send()
+            .await
+            .context("POST /coord/work-units/:slug/deps")?;
+        let status = resp.status();
+        // 503 => the edge table hasn't been migrated yet; benign, the JSONB
+        // fallback in metadata.depends_on covers it.
+        if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            return Ok(SetDepsOutcome::TableNotMigrated);
+        }
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("set_deps {} -> {} {}", slug, status, text);
+        }
+        let parsed: serde_json::Value = resp.json().await.unwrap_or_default();
+        let edges_set = parsed
+            .get("edges_set")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(depends_on.len() as u64);
+        Ok(SetDepsOutcome::Ok { edges_set })
+    }
 }
 
 #[cfg(test)]
@@ -380,6 +424,7 @@ mod tests {
         remote: Option<String>,
         upserts: Mutex<Vec<UpsertBody>>,
         transitions: Mutex<Vec<(String, TransitionBody)>>,
+        deps_calls: Mutex<Vec<(String, Vec<String>)>>,
     }
 
     #[async_trait::async_trait]
@@ -398,6 +443,29 @@ mod tests {
                 .push((slug.to_string(), body.clone()));
             Ok(())
         }
+        async fn set_deps(&self, slug: &str, depends_on: &[String]) -> Result<SetDepsOutcome> {
+            self.deps_calls
+                .lock()
+                .unwrap()
+                .push((slug.to_string(), depends_on.to_vec()));
+            Ok(SetDepsOutcome::Ok {
+                edges_set: depends_on.len() as u64,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_sink_set_deps_records_call_and_returns_ok() {
+        let sink = FakeSink::default();
+        let out = sink
+            .set_deps("p4", &["p1".to_string(), "p2".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(out, SetDepsOutcome::Ok { edges_set: 2 });
+        let calls = sink.deps_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "p4");
+        assert_eq!(calls[0].1, vec!["p1".to_string(), "p2".to_string()]);
     }
 
     #[tokio::test]

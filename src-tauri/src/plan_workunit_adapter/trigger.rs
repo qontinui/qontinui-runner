@@ -24,7 +24,7 @@
 //! that env set no-ops entirely (it never scans, never pushes).
 
 use super::parser::{parse_work_unit, slug_from_filename, ParsedWorkUnit, PlanConvention};
-use super::push::{push_work_unit, PushOutcomeKind, WorkUnitSink};
+use super::push::{push_work_unit, PushOutcomeKind, SetDepsOutcome, WorkUnitSink};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,6 +45,16 @@ pub struct AdapterMetrics {
     pub conflicts_total: AtomicU64,
     /// Total per-unit push errors (counter).
     pub errors_total: AtomicU64,
+    /// Total dependency-edge replace-sets applied to coord's edge table
+    /// (`POST /coord/work-units/:slug/deps` 2xx) (counter).
+    pub deps_set_total: AtomicU64,
+    /// Total dep-set calls skipped because coord returned 503 (edge table not
+    /// yet migrated — benign, JSONB fallback covers it) (counter).
+    pub deps_skipped_unmigrated_total: AtomicU64,
+    /// Total dep-set calls that hard-errored (counter). Best-effort: an error
+    /// here does NOT fail the reconcile — the unit's upsert already succeeded
+    /// and edges are additive.
+    pub deps_errors_total: AtomicU64,
 }
 
 /// A point-in-time read of [`AdapterMetrics`].
@@ -55,6 +65,9 @@ pub struct MetricsSnapshot {
     pub cycles_total: u64,
     pub conflicts_total: u64,
     pub errors_total: u64,
+    pub deps_set_total: u64,
+    pub deps_skipped_unmigrated_total: u64,
+    pub deps_errors_total: u64,
 }
 
 impl AdapterMetrics {
@@ -65,6 +78,11 @@ impl AdapterMetrics {
             cycles_total: self.cycles_total.load(Ordering::Relaxed),
             conflicts_total: self.conflicts_total.load(Ordering::Relaxed),
             errors_total: self.errors_total.load(Ordering::Relaxed),
+            deps_set_total: self.deps_set_total.load(Ordering::Relaxed),
+            deps_skipped_unmigrated_total: self
+                .deps_skipped_unmigrated_total
+                .load(Ordering::Relaxed),
+            deps_errors_total: self.deps_errors_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -82,6 +100,14 @@ pub struct ReconcileSummary {
     pub transitions: u64,
     pub conflicts: u64,
     pub errors: u64,
+    /// Dependency-edge replace-sets applied to coord's edge table this cycle.
+    pub deps_set: u64,
+    /// Dep-set calls skipped because coord's edge table isn't migrated yet.
+    pub deps_skipped_unmigrated: u64,
+    /// Dep-set calls that hard-errored (does not count toward `errors`, which
+    /// is reserved for the unit upsert/transition path — a dep-edge failure is
+    /// non-fatal and additive).
+    pub deps_errors: u64,
 }
 
 /// Read + parse every `*.md` in `dir` (non-recursive — the plans dir is flat,
@@ -124,6 +150,7 @@ pub fn read_plan_dir(dir: &Path, conv: &PlanConvention) -> Vec<ParsedWorkUnit> {
 pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
     parsed_units: &[ParsedWorkUnit],
     last_applied: &mut HashMap<String, String>,
+    last_deps: &mut HashMap<String, Vec<String>>,
     sink: &S,
     metrics: &AdapterMetrics,
 ) -> ReconcileSummary {
@@ -145,6 +172,53 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
                 }
                 // Record what we just applied so the next cycle is edge-triggered.
                 last_applied.insert(u.slug.clone(), u.status.clone());
+
+                // After the unit's upsert/transition succeeded, ALSO push its
+                // dependency set to coord's first-class edge table (additive to
+                // the metadata.depends_on JSONB fallback the upsert already
+                // wrote). Best-effort: a 503 (table not migrated) is benign and
+                // a hard error does NOT fail the reconcile — the unit already
+                // landed and edges are additive. Edge-triggered: only re-send
+                // when the dep set changed since we last applied it (the
+                // replace-set is idempotent, so this is purely an optimization).
+                if !u.depends_on.is_empty() && last_deps.get(&u.slug) != Some(&u.depends_on) {
+                    match sink.set_deps(&u.slug, &u.depends_on).await {
+                        Ok(SetDepsOutcome::Ok { edges_set }) => {
+                            summary.deps_set += 1;
+                            metrics.deps_set_total.fetch_add(1, Ordering::Relaxed);
+                            last_deps.insert(u.slug.clone(), u.depends_on.clone());
+                            tracing::debug!(
+                                slug = %u.slug,
+                                edges_set,
+                                "plan adapter: dep edges set on coord edge table"
+                            );
+                        }
+                        Ok(SetDepsOutcome::TableNotMigrated) => {
+                            summary.deps_skipped_unmigrated += 1;
+                            metrics
+                                .deps_skipped_unmigrated_total
+                                .fetch_add(1, Ordering::Relaxed);
+                            // Do NOT cache last_deps: the table isn't there yet,
+                            // so we want to retry the edge write next cycle once
+                            // the migration lands.
+                            tracing::debug!(
+                                slug = %u.slug,
+                                "plan adapter: dep edge table not yet migrated; \
+                                 JSONB fallback covers deps, will retry"
+                            );
+                        }
+                        Err(e) => {
+                            summary.deps_errors += 1;
+                            metrics.deps_errors_total.fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!(
+                                slug = %u.slug,
+                                error = %format!("{e:#}"),
+                                "plan adapter: dep-edge set failed (non-fatal; \
+                                 unit upsert succeeded, edges are additive)"
+                            );
+                        }
+                    }
+                }
             }
             Err(e) => {
                 summary.errors += 1;
@@ -162,18 +236,23 @@ async fn run_loop<S: WorkUnitSink + ?Sized>(dir: PathBuf, sink: &S, interval_sec
     let conv = PlanConvention::operator_default();
     let metrics = adapter_metrics();
     let mut last_applied: HashMap<String, String> = HashMap::new();
+    let mut last_deps: HashMap<String, Vec<String>> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
     tracing::info!(dir = %dir.display(), interval_secs, "plan adapter: reconcile loop started");
     loop {
         tick.tick().await;
         let units = read_plan_dir(&dir, &conv);
-        let summary = reconcile_once(&units, &mut last_applied, sink, metrics).await;
+        let summary =
+            reconcile_once(&units, &mut last_applied, &mut last_deps, sink, metrics).await;
         metrics.cycles_total.fetch_add(1, Ordering::Relaxed);
         tracing::info!(
             scanned = summary.scanned,
             transitions = summary.transitions,
             conflicts = summary.conflicts,
             errors = summary.errors,
+            deps_set = summary.deps_set,
+            deps_skipped_unmigrated = summary.deps_skipped_unmigrated,
+            deps_errors = summary.deps_errors,
             "plan adapter: reconcile cycle complete"
         );
     }
@@ -209,27 +288,42 @@ pub fn spawn_if_configured() -> Option<tokio::task::JoinHandle<()>> {
 #[cfg(test)]
 mod tests {
     use super::super::parser::ParsedWorkUnit;
-    use super::super::push::{TransitionBody, UpsertBody};
+    use super::super::push::{SetDepsOutcome, TransitionBody, UpsertBody};
     use super::*;
     use anyhow::Result;
     use std::sync::Mutex;
 
     fn unit(slug: &str, status: &str) -> ParsedWorkUnit {
+        unit_with_deps(slug, status, vec![])
+    }
+
+    fn unit_with_deps(slug: &str, status: &str, depends_on: Vec<String>) -> ParsedWorkUnit {
         ParsedWorkUnit {
             slug: slug.to_string(),
             title: None,
             status: status.to_string(),
-            depends_on: vec![],
+            depends_on,
             phases: vec![],
             source_path: format!("plans/{slug}.md"),
             content: String::new(),
         }
     }
 
+    /// How the fake sink should answer `set_deps`.
+    #[derive(Clone, Copy, Default)]
+    enum DepsBehavior {
+        #[default]
+        Ok,
+        TableNotMigrated,
+        Error,
+    }
+
     #[derive(Default)]
     struct FakeSink {
         statuses: Mutex<HashMap<String, String>>,
         transitions: Mutex<u64>,
+        deps_behavior: DepsBehavior,
+        deps_calls: Mutex<Vec<(String, Vec<String>)>>,
     }
     #[async_trait::async_trait]
     impl WorkUnitSink for FakeSink {
@@ -253,6 +347,19 @@ mod tests {
                 .insert(slug.to_string(), body.to_status.clone());
             Ok(())
         }
+        async fn set_deps(&self, slug: &str, depends_on: &[String]) -> Result<SetDepsOutcome> {
+            self.deps_calls
+                .lock()
+                .unwrap()
+                .push((slug.to_string(), depends_on.to_vec()));
+            match self.deps_behavior {
+                DepsBehavior::Ok => Ok(SetDepsOutcome::Ok {
+                    edges_set: depends_on.len() as u64,
+                }),
+                DepsBehavior::TableNotMigrated => Ok(SetDepsOutcome::TableNotMigrated),
+                DepsBehavior::Error => anyhow::bail!("simulated deps endpoint failure"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -260,16 +367,17 @@ mod tests {
         let sink = FakeSink::default();
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
         let units = vec![unit("a", "vetted"), unit("b", "draft")];
 
         // First cycle: both created, no transitions.
-        let s1 = reconcile_once(&units, &mut mem, &sink, &metrics).await;
+        let s1 = reconcile_once(&units, &mut mem, &mut deps, &sink, &metrics).await;
         assert_eq!(s1.scanned, 2);
         assert_eq!(s1.transitions, 0);
         assert_eq!(*sink.transitions.lock().unwrap(), 0);
 
         // Second cycle, unchanged corpus: NO phantom transitions.
-        let s2 = reconcile_once(&units, &mut mem, &sink, &metrics).await;
+        let s2 = reconcile_once(&units, &mut mem, &mut deps, &sink, &metrics).await;
         assert_eq!(s2.scanned, 2);
         assert_eq!(s2.transitions, 0);
         assert_eq!(*sink.transitions.lock().unwrap(), 0);
@@ -280,13 +388,119 @@ mod tests {
         let sink = FakeSink::default();
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
 
-        reconcile_once(&[unit("a", "vetted")], &mut mem, &sink, &metrics).await;
+        reconcile_once(&[unit("a", "vetted")], &mut mem, &mut deps, &sink, &metrics).await;
         // Plan edited: vetted -> shipped.
-        let s = reconcile_once(&[unit("a", "shipped")], &mut mem, &sink, &metrics).await;
+        let s = reconcile_once(
+            &[unit("a", "shipped")],
+            &mut mem,
+            &mut deps,
+            &sink,
+            &metrics,
+        )
+        .await;
         assert_eq!(s.transitions, 1);
         assert_eq!(*sink.transitions.lock().unwrap(), 1);
         assert_eq!(metrics.snapshot().transitions_total, 1);
+    }
+
+    #[tokio::test]
+    async fn unit_with_deps_pushes_dep_edges_with_right_args() {
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
+        let u = unit_with_deps("p4", "vetted", vec!["p1".to_string(), "p2".to_string()]);
+
+        let s = reconcile_once(&[u], &mut mem, &mut deps, &sink, &metrics).await;
+        assert_eq!(s.deps_set, 1);
+        assert_eq!(s.errors, 0);
+        let calls = sink.deps_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "p4");
+        assert_eq!(calls[0].1, vec!["p1".to_string(), "p2".to_string()]);
+        assert_eq!(metrics.snapshot().deps_set_total, 1);
+    }
+
+    #[tokio::test]
+    async fn empty_deps_unit_makes_no_dep_call_and_no_error() {
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
+
+        let s = reconcile_once(&[unit("a", "vetted")], &mut mem, &mut deps, &sink, &metrics).await;
+        assert_eq!(s.deps_set, 0);
+        assert_eq!(s.deps_errors, 0);
+        assert_eq!(s.errors, 0);
+        assert!(sink.deps_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dep_edges_are_edge_triggered_across_cycles() {
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
+        let u = unit_with_deps("p4", "vetted", vec!["p1".to_string()]);
+
+        // First cycle sends deps.
+        reconcile_once(&[u.clone()], &mut mem, &mut deps, &sink, &metrics).await;
+        // Second cycle, unchanged dep set: no re-send (idempotent edge-trigger).
+        let s2 = reconcile_once(&[u], &mut mem, &mut deps, &sink, &metrics).await;
+        assert_eq!(s2.deps_set, 0);
+        assert_eq!(sink.deps_calls.lock().unwrap().len(), 1);
+
+        // Dep set changed -> re-send.
+        let u2 = unit_with_deps("p4", "vetted", vec!["p1".to_string(), "p3".to_string()]);
+        let s3 = reconcile_once(&[u2], &mut mem, &mut deps, &sink, &metrics).await;
+        assert_eq!(s3.deps_set, 1);
+        assert_eq!(sink.deps_calls.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn table_not_migrated_does_not_fail_reconcile_and_retries() {
+        let sink = FakeSink {
+            deps_behavior: DepsBehavior::TableNotMigrated,
+            ..Default::default()
+        };
+        let metrics = AdapterMetrics::default();
+        let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
+        let u = unit_with_deps("p4", "vetted", vec!["p1".to_string()]);
+
+        let s = reconcile_once(&[u.clone()], &mut mem, &mut deps, &sink, &metrics).await;
+        // 503 is benign: no reconcile error, the unit upsert still succeeded.
+        assert_eq!(s.errors, 0);
+        assert_eq!(s.deps_errors, 0);
+        assert_eq!(s.deps_set, 0);
+        assert_eq!(s.deps_skipped_unmigrated, 1);
+        assert_eq!(metrics.snapshot().deps_skipped_unmigrated_total, 1);
+
+        // last_deps NOT cached on 503 -> next cycle retries the edge write.
+        let s2 = reconcile_once(&[u], &mut mem, &mut deps, &sink, &metrics).await;
+        assert_eq!(s2.deps_skipped_unmigrated, 1);
+        assert_eq!(sink.deps_calls.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn dep_edge_hard_error_is_non_fatal() {
+        let sink = FakeSink {
+            deps_behavior: DepsBehavior::Error,
+            ..Default::default()
+        };
+        let metrics = AdapterMetrics::default();
+        let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
+        let u = unit_with_deps("p4", "vetted", vec!["p1".to_string()]);
+
+        let s = reconcile_once(&[u], &mut mem, &mut deps, &sink, &metrics).await;
+        // A dep-edge failure does NOT fail the reconcile (unit upsert landed).
+        assert_eq!(s.errors, 0);
+        assert_eq!(s.deps_errors, 1);
+        assert_eq!(s.deps_set, 0);
+        assert_eq!(metrics.snapshot().deps_errors_total, 1);
     }
 
     #[test]
