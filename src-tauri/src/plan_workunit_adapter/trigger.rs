@@ -446,7 +446,14 @@ mod tests {
         let u = unit_with_deps("p4", "vetted", vec!["p1".to_string()]);
 
         // First cycle sends deps.
-        reconcile_once(&[u.clone()], &mut mem, &mut deps, &sink, &metrics).await;
+        reconcile_once(
+            std::slice::from_ref(&u),
+            &mut mem,
+            &mut deps,
+            &sink,
+            &metrics,
+        )
+        .await;
         // Second cycle, unchanged dep set: no re-send (idempotent edge-trigger).
         let s2 = reconcile_once(&[u], &mut mem, &mut deps, &sink, &metrics).await;
         assert_eq!(s2.deps_set, 0);
@@ -470,7 +477,14 @@ mod tests {
         let mut deps = HashMap::new();
         let u = unit_with_deps("p4", "vetted", vec!["p1".to_string()]);
 
-        let s = reconcile_once(&[u.clone()], &mut mem, &mut deps, &sink, &metrics).await;
+        let s = reconcile_once(
+            std::slice::from_ref(&u),
+            &mut mem,
+            &mut deps,
+            &sink,
+            &metrics,
+        )
+        .await;
         // 503 is benign: no reconcile error, the unit upsert still succeeded.
         assert_eq!(s.errors, 0);
         assert_eq!(s.deps_errors, 0);
