@@ -112,6 +112,12 @@ jobs:
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
             name: windows-x64
+            # NSIS only: the WiX/MSI bundler fails on the GitHub windows-latest
+            # image with a bare "cannot find the file specified (os error 2)" at
+            # bundle start (tool not found). NSIS is self-contained and produces
+            # the -setup.exe installer the download page offers. Re-add msi once
+            # WiX is fixed.
+            bundles: nsis
 
     runs-on: ${{ matrix.platform }}
     # v1.0.0 ships WINDOWS-ONLY. macOS (x86_64 cross-compile) and Linux release
@@ -231,7 +237,7 @@ jobs:
         # --verbose surfaces the exact bundler step/file if bundling fails
         # (the terse "cannot find the file specified (os error 2)" otherwise
         # hides which resource/tool Tauri couldn't resolve).
-        run: pnpm run tauri build --verbose -- --target ${{ matrix.target }}
+        run: pnpm run tauri build --verbose ${{ matrix.bundles && format('--bundles {0}', matrix.bundles) || '' }} -- --target ${{ matrix.target }}
 
       # - name: Sign Windows executable
       #   if: runner.os == 'Windows'
@@ -270,8 +276,8 @@ jobs:
           elif [[ "${{ matrix.platform }}" == "macos-latest" ]]; then
             shasum -a 256 dmg/*.dmg > checksums-${{ matrix.name }}.txt
           elif [[ "${{ matrix.platform }}" == "windows-latest" ]]; then
-            certutil -hashfile msi/*.msi SHA256 > checksums-${{ matrix.name }}.txt
-            certutil -hashfile nsis/*.exe SHA256 >> checksums-${{ matrix.name }}.txt
+            # NSIS-only build (see matrix.bundles) — no msi/ dir is produced.
+            certutil -hashfile nsis/*.exe SHA256 > checksums-${{ matrix.name }}.txt
           fi
 
       - name: Upload release assets (Linux)
@@ -306,7 +312,6 @@ jobs:
           draft: true
           prerelease: true
           files: |
-            src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi
             src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe
             src-tauri/target/${{ matrix.target }}/release/bundle/checksums-${{ matrix.name }}.txt
         env:
