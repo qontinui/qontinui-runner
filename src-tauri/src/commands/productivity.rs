@@ -1307,6 +1307,9 @@ pub async fn spawn_worker_session(
                 declared_paths: vec![],
                 share_output: true,
                 redact_secrets: None,
+                // Worker sessions launch the Claude CLI — provider is known
+                // at spawn. Forwarded to coord.sessions.provider.
+                provider: Some("claude".to_string()),
             };
             match registry.register_external(intent) {
                 Ok(coord_id) => {

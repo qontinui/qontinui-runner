@@ -171,6 +171,10 @@ pub async fn terminal_create(
             .collect(),
         share_output: true,
         redact_secrets: None,
+        // A plain terminal shell has no AI-CLI provider at create time — the
+        // provider is only known once a CLI is launched in the pane and its
+        // SessionStart hook confirms it. `None` here; coord tolerates absence.
+        provider: None,
     };
     // R2 — RESUME the pane's prior coord session if one is persisted,
     // otherwise register fresh. Resuming PATCHes the EXISTING coord row
@@ -1172,6 +1176,9 @@ pub(crate) fn create_terminal_session_backend(
         declared_paths: vec![std::path::PathBuf::from(&working_dir)],
         share_output: true,
         redact_secrets: None,
+        // Gate-continuation shell — provider unknown until a CLI launches in
+        // the pane and confirms via its SessionStart hook. `None` here.
+        provider: None,
     };
 
     let mut coord_session_id: Option<uuid::Uuid> = None;

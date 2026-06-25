@@ -748,6 +748,17 @@ fn rebuild_create_body(rec: &OutboxRecord) -> JsonValue {
             body["task_run_id"] = trid.clone();
         }
     }
+    // Phase 6 (session-restore redesign) — forward the AI-CLI provider hosting
+    // the session (`"claude"`, `"codex"`, …) so coord persists
+    // `coord.sessions.provider`. The started outbox payload carries it as a
+    // top-level `provider` key (threaded from `TerminalSessionRecord.provider`
+    // via the session intent). Omitted when absent/null; coord's
+    // `CreateSessionRequest.provider` is `#[serde(default)]`.
+    if let Some(provider) = rec.payload.get("provider") {
+        if !provider.is_null() {
+            body["provider"] = provider.clone();
+        }
+    }
     body
 }
 
@@ -1059,6 +1070,7 @@ mod tests {
             declared_paths: vec![],
             share_output: false,
             redact_secrets: None,
+            provider: None,
         }
     }
 
@@ -1286,9 +1298,55 @@ mod tests {
         assert_eq!(body["intent"]["purpose"], "coord-sync test");
         assert!(body["id"].as_str().is_some(), "id present");
         assert!(body["device_id"].as_str().is_some(), "device_id present");
+        // make_test_intent carries no provider → the key is omitted from the
+        // create body (mirrors the parent_session_id omit-when-absent rule).
+        assert!(
+            body.get("provider").is_none(),
+            "provider omitted when the intent carries none"
+        );
 
         drop(g);
         // Outbox row was ACKed.
+        wait_until(Duration::from_secs(3), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_forwards_provider_in_create_body() {
+        // Phase 6 — when the session intent carries a provider, the create
+        // body forwards it as a top-level `provider` field so coord populates
+        // `coord.sessions.provider`.
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let registry = build_registry(coord.clone());
+        let mut intent = make_test_intent();
+        intent.provider = Some("codex".to_string());
+        let _handle = registry.start(intent).unwrap();
+        let _drain = coord.start_drain_task();
+
+        wait_until(Duration::from_secs(5), || {
+            let r = rec.try_lock();
+            r.map(|g| !g.posts.is_empty()).unwrap_or(false)
+        })
+        .await;
+
+        let g = rec.lock().await;
+        assert_eq!(g.posts.len(), 1, "exactly one POST /sessions");
+        let body = &g.posts[0];
+        assert_eq!(
+            body["provider"], "codex",
+            "provider forwarded to the create body when the intent carries it"
+        );
+        drop(g);
         wait_until(Duration::from_secs(3), || {
             outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
         })
