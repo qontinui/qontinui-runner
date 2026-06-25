@@ -1087,7 +1087,9 @@ mod tests {
         let store = SessionLifecycleStore::open(&path).unwrap();
         assert!(store.get("phantom").is_none(), "stays removed after reload");
         assert!(
-            store.restorable_records(Utc::now().timestamp_millis(), None).is_empty(),
+            store
+                .restorable_records(Utc::now().timestamp_millis(), None)
+                .is_empty(),
             "a removed phantom is never restorable"
         );
         // Absent id — no panic, no write.

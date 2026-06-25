@@ -255,8 +255,7 @@ pub fn run_reconcile<I: TranscriptIndex>(
     snapshot: &ProcessSnapshot,
     index: &I,
 ) -> Vec<ReconcileAction> {
-    let live_terminal_ids: HashSet<String> =
-        live.iter().map(|p| p.terminal_id.clone()).collect();
+    let live_terminal_ids: HashSet<String> = live.iter().map(|p| p.terminal_id.clone()).collect();
     let mut actions = Vec::new();
 
     // 1) Reconcile live PTYs lacking a confirmed record.
@@ -267,8 +266,7 @@ pub fn run_reconcile<I: TranscriptIndex>(
             .and_then(|pid| snapshot.creation_times.get(&pid).copied())
             .unwrap_or(0);
         let candidates = index.candidates_for(&pty.working_dir);
-        let action =
-            decide_for_live_pty(pty, existing.as_ref(), process_start_unix, &candidates);
+        let action = decide_for_live_pty(pty, existing.as_ref(), process_start_unix, &candidates);
         match &action {
             ReconcileAction::Reconcile {
                 session_id,
@@ -345,10 +343,7 @@ impl TranscriptIndex for DiskTranscriptIndex {
                 out.push(TranscriptCandidate {
                     session_id: s.session_id,
                     config_dir: s.config_dir,
-                    started_at_unix: s
-                        .started_at
-                        .as_deref()
-                        .and_then(parse_iso_to_unix_secs),
+                    started_at_unix: s.started_at.as_deref().and_then(parse_iso_to_unix_secs),
                 });
             }
         }
@@ -380,8 +375,7 @@ pub async fn run_at_boot(store: &SessionLifecycleStore, live: Vec<LivePty>) {
     if live.is_empty() && store.open_records().is_empty() {
         return; // nothing to do
     }
-    let snapshot =
-        crate::process_capture::process_tree::snapshot_process_table_public().await;
+    let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
     let index = DiskTranscriptIndex::discover();
     let actions = run_reconcile(store, &live, &snapshot, &index);
     let reconciled = actions
@@ -502,7 +496,10 @@ mod tests {
     #[test]
     fn decide_degrades_to_freshest_when_start_unknown() {
         let p = pty("term-1", None, "C:/repo");
-        let candidates = vec![cand("a", "C:/cfg", Some(500)), cand("b", "C:/cfg", Some(900))];
+        let candidates = vec![
+            cand("a", "C:/cfg", Some(500)),
+            cand("b", "C:/cfg", Some(900)),
+        ];
         let action = decide_for_live_pty(&p, None, 0, &candidates);
         assert_eq!(
             action,
@@ -583,7 +580,10 @@ mod tests {
         );
         // The phantom has NO transcript; the reconciled one does.
         let existing_ids: HashSet<String> = ["real-sess".to_string()].into_iter().collect();
-        let index = FakeIndex { by_wd, existing_ids };
+        let index = FakeIndex {
+            by_wd,
+            existing_ids,
+        };
 
         let actions = run_reconcile(&store, &live, &snapshot, &index);
 
@@ -626,7 +626,10 @@ mod tests {
             vec![cand("real-sess", "C:/cfg", Some(1_500))],
         );
         let existing_ids: HashSet<String> = ["real-sess".to_string()].into_iter().collect();
-        let index = FakeIndex { by_wd, existing_ids };
+        let index = FakeIndex {
+            by_wd,
+            existing_ids,
+        };
 
         run_reconcile(&store, &live, &snapshot, &index);
         // The reconciled record now carries the LIVE terminal id, so the 2nd
