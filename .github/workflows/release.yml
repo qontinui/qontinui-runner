@@ -114,12 +114,14 @@ jobs:
             name: windows-x64
 
     runs-on: ${{ matrix.platform }}
-    # macOS builds are currently broken (x86_64 cross-compile + Python deps);
-    # tolerate their failure so the release still ships Windows + Linux. The
-    # `build` job stays a hard gate for Windows/Linux, so publish-update-json
-    # only runs when those succeed (never an empty/assetless release). Tracked
-    # as a follow-up to repair macOS and drop continue-on-error.
-    continue-on-error: ${{ startsWith(matrix.platform, 'macos') }}
+    # v1.0.0 ships WINDOWS-ONLY. macOS (x86_64 cross-compile) and Linux release
+    # bundles are currently broken; tolerate their failure so the Windows
+    # installers still publish. Windows is the only platform v0.1.0 ever shipped,
+    # and the download page shows build-from-source for the rest. Only
+    # windows-latest is a hard gate, so publish-update-json runs iff the Windows
+    # installers build (never an empty/assetless release). Tracked as a follow-up
+    # to repair macOS + Linux and drop continue-on-error.
+    continue-on-error: ${{ matrix.platform != 'windows-latest' }}
 
     steps:
       - uses: actions/checkout@v5
@@ -226,7 +228,10 @@ jobs:
         # env:
         #   TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: pnpm run tauri build -- --target ${{ matrix.target }}
+        # --verbose surfaces the exact bundler step/file if bundling fails
+        # (the terse "cannot find the file specified (os error 2)" otherwise
+        # hides which resource/tool Tauri couldn't resolve).
+        run: pnpm run tauri build --verbose -- --target ${{ matrix.target }}
 
       # - name: Sign Windows executable
       #   if: runner.os == 'Windows'
