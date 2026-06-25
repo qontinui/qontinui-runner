@@ -105,6 +105,36 @@ describe("detectResumeFailure", () => {
   });
 });
 
+// Phase 4 (provider-agnostic verification): when per-adapter HandshakePatterns
+// are supplied, detection matches THOSE substrings (case-insensitive,
+// ANSI-stripped) instead of the built-in Claude regex sets — so a non-Claude
+// provider's resume verifies against its own banners.
+describe("detectClaudeHandshake / detectResumeFailure (per-adapter patterns)", () => {
+  const gemini = {
+    success: ["gemini ready", "type your message"],
+    failure: ["session not found", "no session to resume"],
+  };
+
+  it("matches the adapter's success substrings (and not Claude's)", () => {
+    expect(detectClaudeHandshake("\x1b[32mGemini Ready\x1b[0m — type your message", gemini)).toBe(
+      true,
+    );
+    // A Claude-only marker does NOT verify under the Gemini pattern set.
+    expect(detectClaudeHandshake("? for shortcuts", gemini)).toBe(false);
+  });
+
+  it("matches the adapter's failure substrings (and not Claude's)", () => {
+    expect(detectResumeFailure("Error: session not found", gemini)).toBe(true);
+    // Claude's "No conversation found" is not a Gemini failure marker.
+    expect(detectResumeFailure("No conversation found", gemini)).toBe(false);
+  });
+
+  it("an empty pattern list never matches (degrade safely, not false-positive)", () => {
+    expect(detectClaudeHandshake("anything at all", { success: [], failure: [] })).toBe(false);
+    expect(detectResumeFailure("anything at all", { success: [], failure: [] })).toBe(false);
+  });
+});
+
 describe("detectResumePicker / buildPickerAnswer", () => {
   const PICKER =
     "  Resume from summary (recommended)\n  Resume full session as-is\n  Don't ask me again";

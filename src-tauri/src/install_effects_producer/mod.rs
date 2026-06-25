@@ -119,10 +119,152 @@ pub fn routes() -> Router<Arc<ApiState>> {
         // the real install, to close the declare→observe→verify loop for an
         // install that was declared+gated via `mode:"intercept"` on /run.
         .route("/install-effects/observe-verify", post(post_observe_verify))
+        // Session-restore registration endpoint (session-restore-redesign plan
+        // §3b/Phase 1): the always-on identity shim's SessionStart hook POSTs
+        // `{terminal_id, session_id, source, provider, config_dir, cwd}` here
+        // on startup AND `--resume` to CONFIRM the runner-pinned id (identity
+        // is already deterministic from the spawn-time pin; this is the
+        // confirmation/liveness signal). Reuses the existing loopback server —
+        // the shim already reaches it on the seam-injected port.
+        .route("/control/session-open", post(post_session_open))
         // Phase 4: private-registry credential CRUD. Mounted alongside the
         // Phase-1 run route so a single `install_effects_producer::routes()`
         // merge in `mcp_api.rs` covers the whole producer surface.
         .merge(registry_routes::routes())
+}
+
+/// Body of `POST /control/session-open` — the session-restore registration
+/// payload the always-on identity shim / SessionStart hook POSTs. `config_dir`
+/// and `cwd` are optional (a provider that doesn't expose them omits them).
+#[derive(Debug, serde::Deserialize)]
+pub struct SessionOpenRequest {
+    /// The per-PTY terminal id the runner injected as `QONTINUI_TERMINAL_ID`.
+    pub terminal_id: String,
+    /// The provider session id (the runner-pinned `QONTINUI_PINNED_SESSION_ID`,
+    /// echoed back by the hook for confirmation).
+    pub session_id: String,
+    /// `"startup"` | `"resume"` — the hook's source signal (liveness only).
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Which provider owns the session (`"claude"`, `"gemini"`). Defaults to
+    /// claude when the hook omits it (back-compat / Claude-only deployments).
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// The provider config dir, if the hook reports it.
+    #[serde(default)]
+    pub config_dir: Option<String>,
+    /// The session working dir, if the hook reports it.
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+/// `POST /control/session-open`. Synchronously records the session
+/// AUTHORITATIVELY in the durable lifecycle store via the same writer the spawn
+/// path uses ([`crate::commands::terminal::record_pinned_session_open`]), then
+/// returns 200. The record carries `origin:"authoritative"` and the posted
+/// `provider`.
+///
+/// The lifecycle store is shared in Tauri state (`Arc<SessionLifecycleStore>`,
+/// managed in `main.rs`). When it isn't reachable (unit-test app handle / a
+/// boot window before `app.manage`) the route degrades to 200 with a warn — the
+/// hook is best-effort confirmation, not a hard dependency, and must never wedge
+/// the provider's startup.
+async fn post_session_open(
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<SessionOpenRequest>,
+) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
+    use crate::session::session_lifecycle_store::{SessionLifecycleStore, DEFAULT_PROVIDER};
+    use tauri::Manager;
+
+    if req.terminal_id.trim().is_empty() || req.session_id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(
+                "session-open requires non-empty terminal_id and session_id".to_string(),
+            )),
+        ));
+    }
+
+    let provider = req
+        .provider
+        .clone()
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_PROVIDER.to_string());
+
+    // The session-restore lifecycle store, shared in Tauri state by main.rs.
+    let store = state
+        .app_handle
+        .try_state::<Arc<SessionLifecycleStore>>()
+        .map(|s| s.inner().clone());
+
+    match store {
+        Some(store) => {
+            record_session_open_into(&store, &req, &provider);
+            info!(
+                terminal_id = %req.terminal_id,
+                session_id = %req.session_id,
+                provider = %provider,
+                source = %req.source.as_deref().unwrap_or("?"),
+                "control/session-open: session recorded authoritatively"
+            );
+            Ok(Json(ApiResponse::success(())))
+        }
+        None => {
+            warn!(
+                terminal_id = %req.terminal_id,
+                session_id = %req.session_id,
+                "control/session-open: lifecycle store not in Tauri state — \
+                 hook confirmation dropped (best-effort), identity still pinned at spawn"
+            );
+            // 200: the hook is confirmation-only; never wedge provider startup.
+            Ok(Json(ApiResponse::success(())))
+        }
+    }
+}
+
+/// Store-write half of [`post_session_open`], factored out so the route logic is
+/// unit-testable against a real [`crate::session::session_lifecycle_store::SessionLifecycleStore`]
+/// without a Tauri `ApiState`. Records the session authoritatively (the same
+/// writer the spawn path uses), with the page/zone defaulted and the title
+/// derived from the cwd basename.
+fn record_session_open_into(
+    store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
+    req: &SessionOpenRequest,
+    provider: &str,
+) {
+    // Resolve title from the cwd basename (best-effort) so the grid tile has a
+    // label; default page/zone — boot-restore rebuilds the layout from the live
+    // PTY set, and an authoritative record beats a precise zone. `record_open`
+    // dedups by session id, so a confirming hook on an already-recorded id just
+    // refreshes the row.
+    let working_dir = req.cwd.clone().unwrap_or_default();
+    let title = req
+        .cwd
+        .as_deref()
+        .and_then(|c| c.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(provider)
+        .to_string();
+    crate::commands::terminal::record_pinned_session_open(
+        store,
+        req.session_id.clone(),
+        req.terminal_id.clone(),
+        req.config_dir.clone(),
+        working_dir,
+        title,
+        "default".to_string(),
+        0,
+        provider.to_string(),
+    );
+    // CONFIRM the record (session-restore-redesign Phase 2 coordinator
+    // refinement). This route is hit ONLY by a provider's SessionStart hook,
+    // which fires only when a REAL provider session actually started in this
+    // terminal — so a POST here is the observable proof that flips the
+    // (provisional, spawn-time) record to confirmed. The spawn-time writer in
+    // `apply_identity_seam` leaves it provisional; a plain shell that never runs
+    // a provider therefore never gets a hook and stays provisional, so Phase 4's
+    // restore classifier won't try to `--resume` a phantom shell "session".
+    store.confirm_session(&req.session_id);
 }
 
 /// `POST /install-effects/run`.
@@ -1071,6 +1213,85 @@ mod tests {
         assert_eq!(repo_basename("/a/b/widget/"), "widget");
         assert_eq!(repo_basename("widget"), "widget");
         assert_eq!(repo_basename("C:\\repos\\widget"), "widget");
+    }
+
+    // -------------------------------------------------------------------
+    // /control/session-open store-write (session-restore-redesign Phase 1)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn session_open_records_authoritatively_into_store() {
+        use crate::session::session_lifecycle_store::{
+            SessionLifecycleStore, ORIGIN_AUTHORITATIVE,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+
+        let req = SessionOpenRequest {
+            terminal_id: "term-77".to_string(),
+            session_id: "sess-deadbeef".to_string(),
+            source: Some("startup".to_string()),
+            provider: Some("claude".to_string()),
+            config_dir: Some("C:/cfg".to_string()),
+            cwd: Some("C:/repos/widget".to_string()),
+        };
+        record_session_open_into(&store, &req, "claude");
+
+        let open = store.open_records();
+        assert_eq!(open.len(), 1, "exactly one record written");
+        let rec = &open[0];
+        assert_eq!(rec.claude_session_id, "sess-deadbeef");
+        assert_eq!(rec.terminal_id, "term-77");
+        assert_eq!(rec.provider, "claude");
+        assert_eq!(
+            rec.origin.as_deref(),
+            Some(ORIGIN_AUTHORITATIVE),
+            "hook-registered session is authoritative"
+        );
+        assert_eq!(rec.config_dir.as_deref(), Some("C:/cfg"));
+        assert_eq!(rec.working_dir.as_deref(), Some("C:/repos/widget"));
+        // Title derives from the cwd basename.
+        assert_eq!(rec.title.as_deref(), Some("widget"));
+        // The hook POST CONFIRMS the record (Phase 2): a real provider started
+        // here, so the (provisional) spawn-time row is flipped to confirmed.
+        assert!(
+            rec.confirmed_at.is_some(),
+            "a SessionStart-hook-sourced write confirms the record"
+        );
+
+        // A confirming hook on the SAME id (e.g. a later --resume) dedups by key
+        // and refreshes the row rather than duplicating it.
+        let mut resume = req;
+        resume.source = Some("resume".to_string());
+        record_session_open_into(&store, &resume, "claude");
+        assert_eq!(
+            store.open_records().len(),
+            1,
+            "same session id dedups (no duplicate on the confirming hook)"
+        );
+    }
+
+    #[test]
+    fn session_open_defaults_provider_when_cwd_missing() {
+        use crate::session::session_lifecycle_store::SessionLifecycleStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let req = SessionOpenRequest {
+            terminal_id: "t".to_string(),
+            session_id: "s".to_string(),
+            source: None,
+            provider: None,
+            config_dir: None,
+            cwd: None,
+        };
+        // The handler computes `provider`; mirror its default here.
+        record_session_open_into(&store, &req, "claude");
+        let rec = store.get("s").unwrap();
+        // No cwd ⇒ title falls back to the provider name.
+        assert_eq!(rec.title.as_deref(), Some("claude"));
+        assert_eq!(rec.working_dir.as_deref(), Some(""));
     }
 
     // -------------------------------------------------------------------

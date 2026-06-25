@@ -56,6 +56,7 @@
 //! coexist with the old ones, and Phase 9 cleans up once the new path
 //! has fully absorbed the old surface.
 
+pub mod claude_hook;
 pub mod coord_sync;
 pub mod dual_write;
 pub mod handoff;
@@ -63,6 +64,8 @@ pub mod intent;
 pub mod local_store;
 pub mod output_pipe;
 pub mod pane_store;
+pub mod provider_adapter;
+pub mod reconcile;
 pub mod session_lifecycle_store;
 pub mod shutdown_marker;
 pub mod transport;

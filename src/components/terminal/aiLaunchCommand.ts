@@ -5,7 +5,8 @@
  * same-cwd session can win. The CLI fails LOUDLY on a reused id (verified
  * 2026-06-12), so call once per typed command — fresh uuid per tab/retry. A
  * custom launch command (possibly an alias that drops extra args) is left
- * untouched and keeps the capture fallback ("guessed").
+ * untouched and keeps the last-resort mtime-capture fallback (origin
+ * "reconciled" — formerly "guessed").
  */
 
 export interface AiLaunchCommand {

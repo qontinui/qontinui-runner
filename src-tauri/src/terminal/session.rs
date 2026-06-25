@@ -468,16 +468,27 @@ impl TerminalSession {
             }
         }
 
+        // ---- ALWAYS-ON session-restore identity seam (plan §3b) -------------
+        // NOT gated by any flag — the out-of-box session-restore guarantee
+        // (Principle 2) must apply to every user with zero setup. Generates a
+        // per-terminal session UUID, injects it + the terminal id as env,
+        // materializes the always-on `claude`/`gemini` identity shims and
+        // prepends their dir to PATH, and records the session AUTHORITATIVELY at
+        // spawn (zero transcript race — the §3b determinism mechanism). Runs
+        // AFTER caller `extra_env` so the identity dir wins on PATH. Fail-open:
+        // any failure injects nothing and the terminal still spawns.
+        Self::apply_identity_seam(&mut cmd, &id, &app_handle, &cwd, &title, &page_id);
+
         // ---- Install-interception PATH-shim seam (plan §4 Phase 1) ----------
         // Behind the master flag `QONTINUI_INSTALL_INTERCEPT_ENABLED` (default
-        // OFF — ships dark). When OFF this whole block is a no-op and the child
-        // env is byte-identical to before. When ON, materialize the per-terminal
-        // shim bin dir and prepend it to PATH + set the loopback port/mode so an
-        // agent that types `npm install …` is transparently declared/observed.
-        // The bound port comes from the process-global the server records at
-        // bind (NOT the bootstrap default — plan §6). Fail-open: any materialize
-        // failure injects nothing. Runs AFTER caller `extra_env` so the shim
-        // dir wins on PATH even if a caller also set PATH.
+        // OFF — ships dark). SEPARATE from the always-on identity seam above:
+        // they SHARE the materializer/seam/loopback plumbing but NOT the master
+        // enable flag (robustness — the out-of-box guarantee cannot ride a
+        // default-dark flag). When OFF this block is a no-op. When ON,
+        // materialize the per-terminal install-shim bin dir and prepend it to
+        // PATH + set the loopback port/mode so an agent that types `npm install …`
+        // is transparently declared/observed. Fail-open: any materialize failure
+        // injects nothing.
         Self::apply_install_intercept_env(&mut cmd, &id);
 
         // Set CLAUDE_CONFIG_DIR so Claude Code uses the resolved account
@@ -1038,6 +1049,122 @@ impl TerminalSession {
             mode = %seam.mode,
             "install-intercept: shim dir injected onto terminal PATH"
         );
+    }
+
+    /// Always-on session-restore identity seam (plan §3b). NOT gated by any
+    /// flag — the out-of-box guarantee. For EVERY terminal:
+    ///
+    /// 1. Generate a per-terminal session UUID (`QONTINUI_PINNED_SESSION_ID`).
+    /// 2. Inject it + `QONTINUI_TERMINAL_ID` + the bound loopback port into the
+    ///    child env (the identity shim reads them to pin + confirm).
+    /// 3. Materialize the always-on `claude`/`gemini` identity shims and prepend
+    ///    their dir to `PATH` so a hand-started provider is pinned to the id.
+    /// 4. Record the session AUTHORITATIVELY at spawn via
+    ///    [`crate::commands::terminal::record_pinned_session_open`] — identity is
+    ///    fixed with zero round-trip; the hook POST is confirmation/liveness
+    ///    only (§3b determinism mechanism).
+    ///
+    /// Fail-open at every step: a materialize failure injects nothing (the
+    /// terminal still spawns un-shimmed); a missing lifecycle store skips the
+    /// record (the confirming hook still records via `/control/session-open`).
+    fn apply_identity_seam(
+        cmd: &mut CommandBuilder,
+        terminal_id: &str,
+        app_handle: &AppHandle,
+        cwd: &str,
+        title: &str,
+        page_id: &str,
+    ) {
+        use crate::install_effects_producer::intercept::shim_materializer;
+        use tauri::Manager;
+
+        // 1. Per-terminal pinned session id (the runner KNOWS it up front).
+        let pinned = uuid::Uuid::new_v4().to_string();
+
+        // 2. Identity env — ALWAYS injected (zero-setup capture).
+        cmd.env(shim_materializer::TERMINAL_ID_ENV, terminal_id);
+        cmd.env(shim_materializer::PINNED_SESSION_ID_ENV, &pinned);
+        // The identity shim's confirmation POST targets the runner loopback on
+        // this port. Inject it even when install-interception is OFF so the
+        // confirmation works out of the box (the var is shared but harmless when
+        // install interception is dark — no install shims are on PATH then).
+        let port = crate::install_effects_producer::intercept::bound_port();
+        cmd.env(shim_materializer::PORT_ENV, port.to_string());
+
+        // ---- Claude SessionStart hook delivery (plan §4, Phase 2) -----------
+        // Materialize the bundled `--settings` hook into the runner's OWN
+        // app-data dir (~/.qontinui/runner/session-restore/) — NEVER ~/.claude —
+        // and inject its absolute path. The identity shim's `claude` wrapper
+        // appends `--settings $that` (additive: Claude merges the hook on top of
+        // any ~/.claude config WITHOUT writing to it). The SessionStart hook then
+        // POSTs a confirmation/liveness signal to /control/session-open on
+        // startup AND --resume. Fail-open: a materialize failure injects nothing
+        // (identity still rides the spawn-time --session-id pin; only the
+        // confirmation hook is absent).
+        let hook_dir = crate::session::claude_hook::session_restore_dir();
+        match crate::session::claude_hook::materialize(&hook_dir) {
+            Some(settings_path) => {
+                cmd.env(
+                    crate::session::claude_hook::CLAUDE_SETTINGS_ENV,
+                    settings_path.to_string_lossy().as_ref(),
+                );
+            }
+            None => {
+                // Hook delivery off for this terminal — identity is still pinned
+                // + recorded at spawn below; only the confirmation hook is absent.
+            }
+        }
+
+        // 3. Materialize the always-on identity shims + prepend their dir.
+        let base_dir = std::env::temp_dir();
+        match shim_materializer::materialize_identity(&base_dir, terminal_id) {
+            Some(identity_dir) => {
+                let current_path = std::env::var("PATH").ok();
+                let new_path =
+                    shim_materializer::prepend_path(&identity_dir, current_path.as_deref());
+                cmd.env("PATH", new_path);
+                // The identity shim reads this to skip its own dir in the
+                // real-tool scan (reusing the install shim's env contract).
+                cmd.env(
+                    "QONTINUI_INSTALL_INTERCEPT_SHIM_DIR",
+                    identity_dir.to_string_lossy().as_ref(),
+                );
+                info!(
+                    terminal_id = %terminal_id,
+                    identity_dir = %identity_dir.display(),
+                    "session-restore: always-on identity shim dir injected onto terminal PATH"
+                );
+            }
+            None => {
+                // Fail-open: env vars are still set so a directly-invoked
+                // provider could still be pinned by a future absolute-path
+                // wrapper, but no PATH shim this terminal.
+            }
+        }
+
+        // 4. Record AUTHORITATIVELY at spawn (zero transcript race). The
+        // lifecycle store is shared in Tauri state by main.rs; absent in test
+        // fixtures / a boot window — then the confirming hook records instead.
+        if let Some(store) = app_handle
+            .try_state::<std::sync::Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+        {
+            crate::commands::terminal::record_pinned_session_open(
+                store.inner(),
+                pinned.clone(),
+                terminal_id.to_string(),
+                None, // config dir resolved by the hook / reconcile if needed
+                cwd.to_string(),
+                title.to_string(),
+                page_id.to_string(),
+                0,
+                crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
+            );
+            info!(
+                terminal_id = %terminal_id,
+                session_id = %pinned,
+                "session-restore: session recorded authoritatively at spawn"
+            );
+        }
     }
 
     /// Assign a process to the Windows Job Object for crash safety.
