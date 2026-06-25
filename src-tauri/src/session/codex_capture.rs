@@ -14,14 +14,17 @@
 //! parses the id out of its line-1 meta — actuating
 //! [`crate::session::provider_adapter::IdentityCapture::SessionFile`].
 //!
-//! ## Why "newest post-spawn under CODEX_HOME" is deterministic
+//! ## Why cwd + post-spawn-mtime (NOT isolation) disambiguates
 //!
-//! The runner isolates `CODEX_HOME` per account
-//! ([`crate::session::provider_adapter::CodexAdapter::account_isolation`]), so the
-//! sessions tree under it is not polluted by other accounts' concurrent codex
-//! activity. The single rollout written at/after this terminal's spawn names THIS
-//! session. (A shared, un-isolated CODEX_HOME would make this racy — hence the
-//! isolation is load-bearing, not just a config nicety.)
+//! The runner deliberately does NOT relocate `CODEX_HOME` for a hand-started
+//! codex — the user's `codex login` auth lives there, so relocating it would
+//! break codex out of the box. The read-back therefore scans the user's REAL
+//! (shared, un-isolated) codex home, which a concurrent same-account codex
+//! session could also write into. The line-1 `session_meta.cwd` (matched against
+//! the cwd the identity shim POSTed) PLUS the post-spawn mtime filter together
+//! name THIS terminal's session: the cwd pins which session, the mtime drops the
+//! pre-existing rollouts. That pair is the disambiguator — not directory
+//! isolation. (See [`capture_session_id_by_cwd`] / [`effective_codex_home`].)
 //!
 //! ## Deterministic + fail-open
 //!
@@ -210,11 +213,32 @@ pub fn parse_session_meta_from_line1(
 
 /// Normalize a path for a tolerant cwd compare: forward-slash separators, no
 /// trailing separator, lowercased (Windows path-insensitivity + codex sometimes
-/// reporting a drive-letter casing that differs from the shell's `$PWD`). Pure.
+/// reporting a drive-letter casing that differs from the shell's `$PWD`), and
+/// the MSYS/Git-Bash drive form folded to the Windows form. Pure.
+///
+/// The drive fold is load-bearing: codex (a Windows binary) records its cwd as
+/// `C:\Users\…` in the rollout `session_meta`, but the bash identity shim's
+/// `$PWD` is the mingw `/c/Users/…` form. Without folding `/c/…` ⇒ `c:/…` the
+/// two never compare equal and the cwd-match silently misses (degrading every
+/// git-bash-hosted codex session to the reconcile backstop). The shim ALSO now
+/// prefers `pwd -W` so it emits the Windows form directly; this fold is the
+/// defense-in-depth half so ANY caller's mingw path still matches.
 fn normalize_path_for_compare(p: &str) -> String {
-    let unified = p.replace('\\', "/");
-    let trimmed = unified.trim_end_matches('/');
-    trimmed.to_ascii_lowercase()
+    let unified = p.replace('\\', "/").to_ascii_lowercase();
+    // `/c/users/…` ⇒ `c:/users/…` (and bare `/c` ⇒ `c:`). Guarded so a real
+    // POSIX single-letter top dir is only folded when it looks like a drive
+    // (single ascii letter between the leading slash and the next slash / EOS).
+    let b = unified.as_bytes();
+    let drive_fixed = if b.len() >= 2
+        && b[0] == b'/'
+        && b[1].is_ascii_lowercase()
+        && (b.len() == 2 || b[2] == b'/')
+    {
+        format!("{}:{}", &unified[1..2], &unified[2..])
+    } else {
+        unified
+    };
+    drive_fixed.trim_end_matches('/').to_string()
 }
 
 /// Whether two paths refer to the same directory under the tolerant compare.
@@ -641,6 +665,13 @@ mod tests {
         assert!(cwd_matches("C:\\Repos\\Widget", "c:/repos/widget/"));
         assert!(cwd_matches("/home/u/proj/", "/home/u/proj"));
         assert!(!cwd_matches("C:/repos/widget", "C:/repos/other"));
+        // MSYS/Git-Bash `$PWD` drive form vs the Windows form codex records —
+        // MUST match (the defect the temp-runner-style probe surfaced).
+        assert!(cwd_matches("/c/users/jspin/proj", "C:\\Users\\jspin\\proj"));
+        assert!(cwd_matches("/c/repos/widget", "c:/repos/widget"));
+        // A real POSIX path is NOT mangled into a different one.
+        assert!(cwd_matches("/home/u/proj", "/home/u/proj"));
+        assert!(!cwd_matches("/c/repos/widget", "/d/repos/widget"));
     }
 
     /// REAL-HOME match: among several post-spawn rollouts, the one whose line-1

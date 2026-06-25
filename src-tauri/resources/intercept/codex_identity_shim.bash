@@ -87,8 +87,16 @@ notify_session_open() {
   local term="${QONTINUI_TERMINAL_ID:-}"
   [ -z "$port" ] && return 0
   command -v curl >/dev/null 2>&1 || return 0
+  # Report the cwd in the SAME frame codex records it (Windows form). In
+  # Git-Bash `$PWD` is the mingw `/c/...` form but codex (a Windows binary)
+  # writes `C:\...` into the rollout session_meta — so `pwd -W` (MSYS Windows
+  # form `C:/...`) is what makes the runner's cwd-match succeed. Falls back to
+  # `$PWD` on a shell without `pwd -W` (real Unix). The runner ALSO folds the
+  # mingw form defensively, but emitting the Windows form here is the primary.
+  local cwd_raw
+  cwd_raw="$(pwd -W 2>/dev/null || printf '%s' "$PWD")"
   local cwd_json
-  cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  cwd_json=$(printf '%s' "$cwd_raw" | sed 's/\\/\\\\/g; s/"/\\"/g')
   local body
   body="{\"terminal_id\":\"$term\",\"provider\":\"$TOOL\",\"source\":\"startup\",\"cwd\":\"$cwd_json\"}"
   curl -fsS --connect-timeout 3 --max-time 10 \
