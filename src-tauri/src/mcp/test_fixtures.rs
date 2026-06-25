@@ -1058,7 +1058,8 @@ fn record_from_seed(
         state,
         closed_at,
         close_reason,
-        bind_origin: None,
+        provider: crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
+        origin: None,
         restore_pending_at: None,
     })
 }

@@ -159,7 +159,7 @@ export function useShellIntegration({
         zoneIndex: -1,
         title: tabTitle,
         terminalId: tabId,
-        bindOrigin: "pinned",
+        origin: "authoritative",
       }).catch((err) => console.warn(`[ShellIntegration] resume record failed:`, err));
 
       // Close the transcript panel so the terminal is visible

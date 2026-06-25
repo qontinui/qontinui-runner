@@ -147,7 +147,7 @@ export async function runVerifiedResume(params: {
     // Verified handshake — NOW re-assert the OPEN record under the live
     // terminal id so the registry tracks this tab (the next restart
     // reconnect-matches on it). Deliberately after verification, never
-    // before: see `recordOpen` docs. No `bindOrigin` is sent, so the
+    // before: see `recordOpen` docs. No `origin` is sent, so the
     // backend preserves the existing origin (unasserted re-record).
     if (recordOpen) {
       invoke("terminal_session_record_open", { ...recordOpen }).catch((err) => {
@@ -201,14 +201,15 @@ function isValidSessionId(id: string): boolean {
  * What the cold-restore path does with a registry record (boot-restore
  * remediation item 5):
  *
- * - `"auto-resume"`: `bindOrigin === "pinned"` — the id came from
- *   `--session-id` / `--resume` (exact), safe to type `claude --resume`
- *   unattended.
- * - `"quarantine"`: any other origin (`"guessed"`, or absent on rows
- *   predating the field — both mean a freshest-transcript mtime GUESS that
- *   can name a foreign VS Code session). The tab is still created so the
- *   screen layout is preserved, but no resume is typed; the operator
- *   confirms via a one-click `ResumeFailedBanner` affordance.
+ * - `"auto-resume"`: `origin === "authoritative"` — the runner KNOWS the id
+ *   (`--session-id` / `--resume` / a provider hook), safe to type
+ *   `claude --resume` unattended.
+ * - `"quarantine"`: any other origin (`"reconciled"`, or absent on rows
+ *   predating the field — both mean a backstop-recovered id that can name a
+ *   foreign session). The tab is still created so the screen layout is
+ *   preserved, but no resume is typed; the operator confirms via a one-click
+ *   `ResumeFailedBanner` affordance. (Phase 4 reworks this so authoritative
+ *   rows auto-resume without an operator click.)
  * - `"skip-invalid"`: the recorded id fails shell-safety validation — never
  *   typed, never quarantined (nothing actionable).
  *
@@ -217,10 +218,10 @@ function isValidSessionId(id: string): boolean {
 export type RestoreAction = "auto-resume" | "quarantine" | "skip-invalid";
 
 export function classifyRestoreAction(
-  rec: Pick<TerminalSessionRecord, "claudeSessionId" | "bindOrigin">,
+  rec: Pick<TerminalSessionRecord, "claudeSessionId" | "origin">,
 ): RestoreAction {
   if (!isValidSessionId(rec.claudeSessionId)) return "skip-invalid";
-  return rec.bindOrigin === "pinned" ? "auto-resume" : "quarantine";
+  return rec.origin === "authoritative" ? "auto-resume" : "quarantine";
 }
 
 /** Validate config dir paths — reject shell metacharacters. */
@@ -470,8 +471,8 @@ export function useTerminalInitialization({
             claudeConfigDir: safeConfigDir,
             // Show a "resuming" affordance until `claude --resume` lands;
             // cleared in the drain loop after the resume command is written.
-            // Quarantined rows are NOT auto-resumed (item 5): a non-pinned
-            // bindOrigin is an mtime guess that can name a foreign VS Code
+            // Quarantined rows are NOT auto-resumed (item 5): a non-authoritative
+            // origin is a backstop guess that can name a foreign VS Code
             // session — surface a one-click confirm instead.
             isReconnecting: restoreAction === "auto-resume",
             resumeQuarantined: restoreAction === "quarantine",
@@ -508,8 +509,8 @@ export function useTerminalInitialization({
               claudeSessionId: rec.claudeSessionId,
               claudeConfigDir: safeConfigDir,
               // Deferred re-assert payload: applied by `runVerifiedResume`
-              // on VERIFIED handshake only. No `bindOrigin` — the backend
-              // preserves the existing (pinned) origin on unasserted writes.
+              // on VERIFIED handshake only. No `origin` — the backend
+              // preserves the existing (authoritative) origin on unasserted writes.
               recordOpen:
                 restoreAction === "auto-resume"
                   ? {

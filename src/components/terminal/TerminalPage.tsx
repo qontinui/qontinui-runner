@@ -43,7 +43,7 @@ import { setTerminalSessions, type TerminalSessionEntry } from "@/lib/terminal-s
 import { UIBridgeComponentScope } from "@qontinui/ui-bridge";
 import { useCommitState } from "./useCommitState";
 import { useTabSessionIdCapture } from "./useTabSessionIdCapture";
-import { buildSessionOpenArgs, type SessionBindOrigin } from "./sessionRecordArgs";
+import { buildSessionOpenArgs, type SessionOrigin } from "./sessionRecordArgs";
 import { buildAiLaunchCommand } from "./aiLaunchCommand";
 import { rememberSessionId } from "./lastKnownSessionIds";
 import { useRegistryAwareness } from "./useRegistryAwareness";
@@ -528,13 +528,13 @@ function TerminalPageInner({
    * restore hint, the live session is unaffected.
    */
   const recordSessionOpen = useCallback(
-    // Default origin "guessed": the only caller that omits it is the
-    // transcript-capture hook, whose id IS a freshest-mtime guess.
+    // Default origin "reconciled": the only caller that omits it is the
+    // transcript-capture hook, whose id IS a freshest-mtime backstop guess.
     (
       tabId: string,
       claudeSessionId: string,
       configDir?: string,
-      bindOrigin: SessionBindOrigin = "guessed",
+      origin: SessionOrigin = "reconciled",
     ) => {
       const args = buildSessionOpenArgs({
         assignments: assignmentsRef.current,
@@ -543,7 +543,7 @@ function TerminalPageInner({
         claudeSessionId,
         configDir,
         pageId,
-        bindOrigin,
+        origin,
       });
       invoke("terminal_session_record_open", { ...args }).catch((err) => {
         logger.warn(`terminal_session_record_open failed for ${claudeSessionId}: ${err}`);
@@ -748,7 +748,7 @@ function TerminalPageInner({
         claudeSessionId: tab.claudeSessionId,
         configDir: tab.claudeConfigDir,
         updateTab,
-        // Re-assert payload for the verified branch — no bindOrigin, so the
+        // Re-assert payload for the verified branch — no origin, so the
         // backend preserves the record's existing origin.
         recordOpen: buildSessionOpenArgs({
           assignments: assignmentsRef.current,
@@ -897,7 +897,7 @@ function TerminalPageInner({
         if (pinnedSessionId) {
           updateTab(tabId, { claudeSessionId: pinnedSessionId, claudeConfigDir: configDir });
           rememberSessionId(tabId, pinnedSessionId, configDir);
-          recordSessionOpen(tabId, pinnedSessionId, configDir, "pinned");
+          recordSessionOpen(tabId, pinnedSessionId, configDir, "authoritative");
         } else {
           // Custom launch command — id unknown; capture poll is the fallback.
           const tab = tabs.find((t) => t.id === tabId);
