@@ -764,6 +764,18 @@ function TerminalPageInner({
     [updateTab, pageId],
   );
 
+  // Dismiss the informational "fresh conversation" (terminal-only) restore note
+  // for a tab (Phase 5 honest tiers). There is nothing to resume — the terminal
+  // was restored but the provider can't bring the conversation back by id — so
+  // the only affordance is acknowledging the note; clearing the flag drops the
+  // tab from the banner's terminal-only list.
+  const handleDismissTerminalOnly = useCallback(
+    (tabId: string) => {
+      updateTab(tabId, { restoreTerminalOnly: false });
+    },
+    [updateTab],
+  );
+
   const handleExit = useCallback(
     (terminalId: string, exitCode: number | null) => {
       // Record the durable session CLOSE when a pty backing a Claude session
@@ -899,7 +911,12 @@ function TerminalPageInner({
           rememberSessionId(tabId, pinnedSessionId, configDir);
           recordSessionOpen(tabId, pinnedSessionId, configDir, "authoritative");
         } else {
-          // Custom launch command — id unknown; capture poll is the fallback.
+          // Custom launch command (an alias that may drop the runner's
+          // `--session-id` pin) — the id is unknown up front, so fall back to
+          // the mtime-capture poll. This is the ONE remaining last-resort caller
+          // of `startSessionIdCapture`; it binds origin "reconciled" (a
+          // freshest-mtime guess), so restore quarantines it rather than
+          // auto-resuming. Every pinned path above records authoritatively.
           const tab = tabs.find((t) => t.id === tabId);
           startSessionIdCapture(tabId, tab?.workingDir ?? "", spawnAt, configDir);
         }
@@ -1191,11 +1208,17 @@ function TerminalPageInner({
                 blocks input. */}
             <CoordWarningBanner activeTerminalId={activeId ?? undefined} />
 
-            {/* Phase 3 (#548) — restored tabs whose `claude --resume` never
-                produced the Claude UI handshake (after one auto-retry) park
-                here with an explicit operator retry instead of silently
-                posing as resumed. Same top-right advisory column. */}
-            <ResumeFailedBanner tabs={tabs} onRetryResume={handleRetryResume} />
+            {/* Honest restore-status banner (Phase 5 + #548): restored tabs
+                whose `--resume` failed (operator retry), reconciled best-effort
+                matches (one-click confirm), and terminal-only / fresh-
+                conversation restores (informational, dismissible) — instead of
+                any of these silently posing as a fully resumed conversation.
+                Same top-right advisory column. */}
+            <ResumeFailedBanner
+              tabs={tabs}
+              onRetryResume={handleRetryResume}
+              onDismissTerminalOnly={handleDismissTerminalOnly}
+            />
           </div>
 
           {/* Phase 2 — `isMultiZone` gate dropped so the Unassigned (N) list

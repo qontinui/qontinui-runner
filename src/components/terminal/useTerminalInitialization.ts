@@ -235,21 +235,29 @@ function isValidSessionId(id: string): boolean {
  * autonomous restore).
  *
  * - `"auto-resume"`: the record is `origin === "authoritative"` AND
- *   CONFIRMED (`confirmedAt` set). The runner KNOWS the id (it pre-pinned
- *   `--session-id`) AND a provider's SessionStart hook (or the process-start-
- *   anchored reconcile backstop) observed a REAL provider session start here —
- *   so the resume command is typed unattended, with NO operator click. This
- *   removes the old `guessed→quarantine` gate for authoritative records.
- * - `"terminal-only"`: an authoritative-but-PROVISIONAL record — the spawn-time
- *   pin wrote a provisional record for EVERY terminal, including plain shells
- *   that never ran a provider (a "phantom shell"). Auto-`--resume`-ing it would
- *   manufacture a failed resume against an unused uuid. The tab + cwd are
- *   restored (layout preserved) but NO resume is typed and NO operator-confirm
- *   banner is shown — there is no conversation to resume. The backend reconcile
- *   normally PRUNES these phantoms before the frontend ever classifies (it
- *   confirms the ones that have a real transcript, drops the rest); this branch
- *   is the frontend's defense-in-depth for a cold-boot phantom the reconcile
- *   couldn't reach (no live PTY).
+ *   CONFIRMED (`confirmedAt` set) AND its provider's `restoreTier()` is
+ *   `"full"`. The runner KNOWS the id (it pre-pinned `--session-id`) AND a
+ *   provider's SessionStart hook (or the process-start-anchored reconcile
+ *   backstop) observed a REAL provider session start here — so the resume
+ *   command is typed unattended, with NO operator click. This removes the old
+ *   `guessed→quarantine` gate for authoritative records.
+ * - `"terminal-only"`: restore terminal+cwd+launch-command, but type NO resume
+ *   and show NO operator-confirm banner — there is no conversation to bring
+ *   back, and the UI is HONEST about it ("fresh conversation"). Two distinct
+ *   sources land here:
+ *     1. an authoritative-but-PROVISIONAL record — the spawn-time pin wrote a
+ *        provisional record for EVERY terminal, including plain shells that
+ *        never ran a provider (a "phantom shell"); auto-`--resume`-ing it would
+ *        manufacture a failed resume against an unused uuid. The backend
+ *        reconcile normally PRUNES these before the frontend ever classifies
+ *        (it confirms the ones with a real transcript, drops the rest); this
+ *        branch is the frontend's defense-in-depth for a cold-boot phantom the
+ *        reconcile couldn't reach (no live PTY).
+ *     2. a CONFIRMED authoritative record whose provider declares
+ *        `restoreTier() === "terminal-only"` (Phase 5 honest tiers) — the
+ *        provider can re-open the terminal at the right cwd/launch-command but
+ *        CANNOT deterministically resume the conversation by id. The terminal
+ *        is restored; the UI notes the conversation is fresh.
  * - `"quarantine"`: a `"reconciled"` (or pre-field) origin — a backstop-
  *   recovered id that can name a FOREIGN session. The tab is created so layout
  *   is preserved, but no resume is typed; the operator confirms via a one-click
@@ -269,14 +277,22 @@ function isValidSessionId(id: string): boolean {
 export type RestoreAction = "auto-resume" | "terminal-only" | "quarantine" | "skip-invalid";
 
 export function classifyRestoreAction(
-  rec: Pick<TerminalSessionRecord, "claudeSessionId" | "origin" | "confirmedAt">,
+  rec: Pick<TerminalSessionRecord, "claudeSessionId" | "origin" | "confirmedAt" | "provider">,
 ): RestoreAction {
   if (!isValidSessionId(rec.claudeSessionId)) return "skip-invalid";
   if (rec.origin === "authoritative") {
-    // Confirmed authoritative ⇒ auto-resume (no operator click). An
-    // authoritative-but-unconfirmed record is a phantom shell — restore the
-    // terminal only, never auto-resume a session that may never have existed.
-    return rec.confirmedAt != null ? "auto-resume" : "terminal-only";
+    // Authoritative-but-unconfirmed ⇒ phantom shell — restore the terminal
+    // only, never auto-resume a session that may never have existed.
+    if (rec.confirmedAt == null) return "terminal-only";
+    // Confirmed authoritative ⇒ auto-resume (no operator click) — but ONLY when
+    // the provider can deterministically resume the FULL conversation by id
+    // (`restoreTier() === "full"`). A `terminal-only`-tier provider can re-open
+    // the terminal but not the chat, so a CONFIRMED authoritative row of that
+    // provider restores terminal-only (honest "fresh conversation"), never a
+    // resume typed against an id the provider can't resume by `--resume`.
+    return providerDescriptorFor(rec.provider).restoreTier() === "full"
+      ? "auto-resume"
+      : "terminal-only";
   }
   // Reconciled / pre-field origin: a backstop guess that can name a foreign
   // session — quarantine behind the one-click confirm.
@@ -307,6 +323,7 @@ interface UseTerminalInitializationParams {
       isReconnecting?: boolean;
       resumeFailed?: boolean;
       resumeQuarantined?: boolean;
+      restoreTerminalOnly?: boolean;
     }>,
   ) => void;
   zoneLayout: {
@@ -532,13 +549,22 @@ export function useTerminalInitialization({
             claudeConfigDir: safeConfigDir,
             // Show a "resuming" affordance until the resume lands; cleared in
             // the drain loop after the resume command is written. Phase 4:
-            // CONFIRMED authoritative rows auto-resume with NO operator click.
-            // A `terminal-only` row (authoritative but PROVISIONAL — a phantom
-            // shell that never ran a provider) restores terminal+cwd only: no
-            // resume, no quarantine banner. Quarantined (reconciled) rows can
-            // name a foreign session — surface a one-click confirm instead.
+            // CONFIRMED authoritative rows of a FULL-tier provider auto-resume
+            // with NO operator click. A `terminal-only` row restores
+            // terminal+cwd only — no resume, no quarantine banner — and is
+            // surfaced HONESTLY (Phase 5) via the `restoreTerminalOnly` flag so
+            // the user sees the conversation was NOT restored (phantom shell, or
+            // a terminal-only-tier provider). Quarantined (reconciled) rows can
+            // name a foreign session — surface a one-click best-effort confirm.
             isReconnecting: restoreAction === "auto-resume",
             resumeQuarantined: restoreAction === "quarantine",
+            // Honest "fresh conversation" note (Phase 5) ONLY for a CONFIRMED
+            // terminal-only restore — i.e. a real provider session existed here
+            // but its provider can't `--resume` the chat by id (terminal-only
+            // tier). An UNCONFIRMED terminal-only row is a phantom shell that
+            // never hosted a conversation, so restoring it as a plain terminal
+            // (no note) is the honest, clutter-free outcome.
+            restoreTerminalOnly: restoreAction === "terminal-only" && rec.confirmedAt != null,
           });
           rememberSessionId(tabId, rec.claudeSessionId, safeConfigDir);
 

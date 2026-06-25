@@ -1345,6 +1345,19 @@ fn resolve_latest_claude_session_id(
 /// Poll `resolve` until it yields a Claude session id (or `timeout` elapses),
 /// then durably record the session via [`SessionLifecycleStore::record_open`].
 ///
+/// LAST-RESORT BACKSTOP (session-restore redesign Phase 4/5): this is the
+/// DEMOTED mtime-race recorder, no longer the primary identity path. The
+/// primary path is the spawn-time pre-pinned `--session-id`
+/// ([`record_pinned_session_open`], recorded synchronously + authoritatively)
+/// plus the provider SessionStart hook, with [`crate::session::reconcile`] as
+/// the process-start-anchored on-disk backstop. The ONE remaining live caller
+/// is `create_terminal_session_backend`'s continuation branch for a
+/// backend-spawned session whose id was NOT pre-pinned (no `--session-id` in the
+/// hint) — there the id only appears once the child writes its first transcript,
+/// so this poll is the only recourse. It records with origin `"reconciled"` (a
+/// freshest-mtime guess that may be foreign — quarantined on restore, never
+/// auto-resumed). Do NOT add new callers; pin the id at spawn instead.
+///
 /// The resolver is injected so this loop is unit-testable without a real
 /// on-disk transcript. On the first resolve it builds a [`TerminalSessionRecord`]
 /// (restored into `zone_index` / the hint page — callers without a meaningful

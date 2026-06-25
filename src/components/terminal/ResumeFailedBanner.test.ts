@@ -7,7 +7,11 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { failedResumeTabs, quarantinedResumeTabs } from "./ResumeFailedBanner";
+import {
+  failedResumeTabs,
+  quarantinedResumeTabs,
+  terminalOnlyRestoreTabs,
+} from "./ResumeFailedBanner";
 import type { TerminalTab } from "./useTerminalManager";
 
 const tab = (id: string, overrides: Partial<TerminalTab> = {}): TerminalTab => ({
@@ -54,5 +58,37 @@ describe("failedResumeTabs / quarantinedResumeTabs", () => {
     const tabs = [tab("t-1"), tab("t-2", { claudeSessionId: "sess-pinned" })];
     expect(quarantinedResumeTabs(tabs)).toEqual([]);
     expect(failedResumeTabs(tabs)).toEqual([]);
+    expect(terminalOnlyRestoreTabs(tabs)).toEqual([]);
+  });
+});
+
+// Phase 5 (honest capability tiers): a terminal-only restore (terminal + cwd
+// back, conversation NOT resumed) surfaces in its own informational list — the
+// user must SEE the conversation is fresh, never have it silently posed as
+// resumed. It is the lowest-priority section: an actionable failed/quarantine
+// state on the SAME tab wins so a tab appears in exactly one section.
+describe("terminalOnlyRestoreTabs (Phase 5 honest tiers)", () => {
+  it("a terminal-only tab surfaces in the terminal-only list only", () => {
+    const tabs = [tab("t-1", { restoreTerminalOnly: true, claudeSessionId: "sess-1" })];
+    expect(terminalOnlyRestoreTabs(tabs).map((t) => t.id)).toEqual(["t-1"]);
+    expect(failedResumeTabs(tabs)).toEqual([]);
+    expect(quarantinedResumeTabs(tabs)).toEqual([]);
+  });
+
+  it("an actionable failed state on the same tab takes precedence over the note", () => {
+    const tabs = [tab("t-1", { restoreTerminalOnly: true, resumeFailed: true })];
+    expect(failedResumeTabs(tabs).map((t) => t.id)).toEqual(["t-1"]);
+    expect(terminalOnlyRestoreTabs(tabs)).toEqual([]);
+  });
+
+  it("an actionable quarantine state on the same tab takes precedence over the note", () => {
+    const tabs = [tab("t-1", { restoreTerminalOnly: true, resumeQuarantined: true })];
+    expect(quarantinedResumeTabs(tabs).map((t) => t.id)).toEqual(["t-1"]);
+    expect(terminalOnlyRestoreTabs(tabs)).toEqual([]);
+  });
+
+  it("dead terminal-only tabs are dropped", () => {
+    const tabs = [tab("t-1", { restoreTerminalOnly: true, isAlive: false })];
+    expect(terminalOnlyRestoreTabs(tabs)).toEqual([]);
   });
 });
