@@ -141,13 +141,18 @@ pub struct SessionOpenRequest {
     /// The per-PTY terminal id the runner injected as `QONTINUI_TERMINAL_ID`.
     pub terminal_id: String,
     /// The provider session id (the runner-pinned `QONTINUI_PINNED_SESSION_ID`,
-    /// echoed back by the hook for confirmation).
+    /// echoed back by the hook for confirmation). ABSENT/empty for a READ-BACK
+    /// provider (codex generates its own id; the runner reads it back from the
+    /// rollout file) — then the route triggers the codex read-back capture for
+    /// this terminal instead of recording synchronously.
+    #[serde(default)]
     pub session_id: String,
     /// `"startup"` | `"resume"` — the hook's source signal (liveness only).
     #[serde(default)]
     pub source: Option<String>,
-    /// Which provider owns the session (`"claude"`, `"gemini"`). Defaults to
-    /// claude when the hook omits it (back-compat / Claude-only deployments).
+    /// Which provider owns the session (`"claude"`, `"gemini"`, `"codex"`).
+    /// Defaults to claude when the hook omits it (back-compat / Claude-only
+    /// deployments).
     #[serde(default)]
     pub provider: Option<String>,
     /// The provider config dir, if the hook reports it.
@@ -176,11 +181,11 @@ async fn post_session_open(
     use crate::session::session_lifecycle_store::{SessionLifecycleStore, DEFAULT_PROVIDER};
     use tauri::Manager;
 
-    if req.terminal_id.trim().is_empty() || req.session_id.trim().is_empty() {
+    if req.terminal_id.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(api_error(
-                "session-open requires non-empty terminal_id and session_id".to_string(),
+                "session-open requires a non-empty terminal_id".to_string(),
             )),
         ));
     }
@@ -191,11 +196,77 @@ async fn post_session_open(
         .filter(|p| !p.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_PROVIDER.to_string());
 
+    let is_codex = provider == crate::session::codex_capture::CODEX_PROVIDER;
+    let has_session_id = !req.session_id.trim().is_empty();
+
     // The session-restore lifecycle store, shared in Tauri state by main.rs.
     let store = state
         .app_handle
         .try_state::<Arc<SessionLifecycleStore>>()
         .map(|s| s.inner().clone());
+
+    // ---- READ-BACK provider branch (codex, no session_id) --------------------
+    // Codex has no `--session-id` flag — it GENERATES its own id and writes it
+    // into a rollout file under CODEX_HOME. The codex wrapper signals here with
+    // NO session_id; we DON'T synchronously record a pinned row (we don't know
+    // the id yet). Instead we spawn the runner-side read-back capture for THIS
+    // terminal: it watches the real CODEX_HOME for the post-spawn rollout whose
+    // line-1 `session_meta.cwd` matches this terminal's cwd, then records+confirms
+    // the real id and supersedes the speculative spawn-time claude pin. Fail-open.
+    if is_codex && !has_session_id {
+        match store {
+            Some(store) => {
+                let cwd = req.cwd.clone().unwrap_or_default();
+                let title = req
+                    .cwd
+                    .as_deref()
+                    .and_then(|c| c.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(crate::session::codex_capture::CODEX_PROVIDER)
+                    .to_string();
+                let spawn_ms = chrono::Utc::now().timestamp_millis();
+                tokio::spawn(crate::session::codex_capture::capture_and_record_by_cwd(
+                    store,
+                    req.terminal_id.clone(),
+                    req.config_dir.clone(),
+                    cwd,
+                    title,
+                    "default".to_string(),
+                    0,
+                    spawn_ms,
+                    "session_meta".to_string(),
+                    "session_id".to_string(),
+                    crate::session::codex_capture::CODEX_CAPTURE_POLL_INTERVAL,
+                    crate::session::codex_capture::CODEX_CAPTURE_TIMEOUT,
+                ));
+                info!(
+                    terminal_id = %req.terminal_id,
+                    source = %req.source.as_deref().unwrap_or("?"),
+                    "control/session-open: codex signal — read-back capture spawned for terminal"
+                );
+            }
+            None => {
+                warn!(
+                    terminal_id = %req.terminal_id,
+                    "control/session-open: codex signal but lifecycle store not in Tauri state — \
+                     read-back capture skipped (best-effort); reconcile backstop owns recovery"
+                );
+            }
+        }
+        // 200: best-effort signal; never wedge codex startup.
+        return Ok(Json(ApiResponse::success(())));
+    }
+
+    // ---- PINNED provider branch (claude/gemini hooks — session_id present) ---
+    // Unchanged synchronous record behavior.
+    if !has_session_id {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(
+                "session-open requires a non-empty session_id for a pinned provider".to_string(),
+            )),
+        ));
+    }
 
     match store {
         Some(store) => {
