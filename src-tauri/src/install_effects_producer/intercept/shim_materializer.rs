@@ -41,11 +41,29 @@ const IDENTITY_SHIM_BASH: &str = include_str!("../../../resources/intercept/iden
 #[cfg(target_os = "windows")]
 const IDENTITY_SHIM_CMD: &str = include_str!("../../../resources/intercept/identity_shim.cmd");
 
+/// Always-on CODEX identity shim template (bash / Git-Bash / Unix). DISTINCT
+/// from [`IDENTITY_SHIM_BASH`]: codex has NO `--session-id` flag, so this
+/// wrapper NEVER mutates the user's argv — it only SIGNALS the runner (POST
+/// `/control/session-open` with NO `session_id`) to start the read-back capture,
+/// then execs the real codex with the args unchanged.
+const CODEX_IDENTITY_SHIM_BASH: &str =
+    include_str!("../../../resources/intercept/codex_identity_shim.bash");
+/// Always-on CODEX identity shim template (`.cmd` Windows cmd/PowerShell shadow).
+#[cfg(target_os = "windows")]
+const CODEX_IDENTITY_SHIM_CMD: &str =
+    include_str!("../../../resources/intercept/codex_identity_shim.cmd");
+
+/// The provider id whose identity rides a READ-BACK channel (no `--session-id`
+/// pin). The materializer selects the codex-specific wrapper template for this
+/// tool; every other [`IDENTITY_TOOLS`] entry gets the pinning template.
+pub const CODEX_TOOL: &str = "codex";
+
 /// The always-on identity tool family (plan §3b). These shims are ALWAYS
 /// materialized for every terminal regardless of the install-intercept master
 /// flag, so the out-of-box session-restore guarantee never rides a default-dark
-/// flag. `claude` is provider #1, `gemini` #2.
-pub const IDENTITY_TOOLS: &[&str] = &["claude", "gemini"];
+/// flag. `claude` is provider #1, `gemini` #2, `codex` #3 (read-back — its
+/// wrapper never appends `--session-id`).
+pub const IDENTITY_TOOLS: &[&str] = &["claude", "gemini", CODEX_TOOL];
 
 /// Filename prefix for a per-terminal IDENTITY shim dir
 /// (`qontinui-identity-<terminal_id>`). Distinct from [`SHIM_DIR_PREFIX`] so the
@@ -263,26 +281,55 @@ fn render_identity(body: &str, tool: &str, shim_dir: &Path) -> String {
         .replace("@@SHIM_DIR@@", &shim_dir.to_string_lossy())
 }
 
-/// Test-only accessor for [`render_identity`].
+/// Test-only accessor for [`render_identity`] over a tool's selected bash
+/// template (the pinning template for claude/gemini, the codex template for
+/// codex — see [`identity_bash_template`]).
 #[cfg(test)]
 pub fn render_identity_for_test(tool: &str, shim_dir: &Path) -> String {
-    render_identity(IDENTITY_SHIM_BASH, tool, shim_dir)
+    render_identity(identity_bash_template(tool), tool, shim_dir)
+}
+
+/// Select the bash identity-shim TEMPLATE for `tool`. `codex` rides the
+/// read-back channel (no `--session-id` flag exists), so it gets the distinct
+/// [`CODEX_IDENTITY_SHIM_BASH`] which only signals the runner and execs codex
+/// with the args UNCHANGED; every other identity tool (claude/gemini) gets the
+/// pinning [`IDENTITY_SHIM_BASH`] that appends `--session-id`.
+fn identity_bash_template(tool: &str) -> &'static str {
+    if tool == CODEX_TOOL {
+        CODEX_IDENTITY_SHIM_BASH
+    } else {
+        IDENTITY_SHIM_BASH
+    }
+}
+
+/// Select the `.cmd` identity-shim TEMPLATE for `tool` (codex → read-back
+/// wrapper; everything else → pinning wrapper). See [`identity_bash_template`].
+#[cfg(target_os = "windows")]
+fn identity_cmd_template(tool: &str) -> &'static str {
+    if tool == CODEX_TOOL {
+        CODEX_IDENTITY_SHIM_CMD
+    } else {
+        IDENTITY_SHIM_CMD
+    }
 }
 
 /// Write the platform-appropriate identity shim file(s) for `tool`
-/// (`claude`/`gemini`) into `dir`. Mirrors [`write_shims_for`]: always an
-/// extensionless script (Git Bash + Unix), plus a `.cmd` on Windows. No `.exe`
-/// stub is needed — `claude`/`gemini` ship as `.cmd`/scripts (not `.exe`), so a
-/// `.cmd`/extensionless shim wins under both shells.
+/// (`claude`/`gemini`/`codex`) into `dir`. Mirrors [`write_shims_for`]: always
+/// an extensionless script (Git Bash + Unix), plus a `.cmd` on Windows. No
+/// `.exe` stub is needed — these providers ship as `.cmd`/scripts (not `.exe`),
+/// so a `.cmd`/extensionless shim wins under both shells. The TEMPLATE is
+/// selected per tool ([`identity_bash_template`] / [`identity_cmd_template`]):
+/// claude/gemini get the pinning `--session-id` wrapper; codex gets the
+/// read-back signal-only wrapper (no flag injection).
 fn write_identity_shims_for(dir: &Path, tool: &str) -> std::io::Result<()> {
-    let bash = render_identity(IDENTITY_SHIM_BASH, tool, dir);
+    let bash = render_identity(identity_bash_template(tool), tool, dir);
     let extensionless = dir.join(tool);
     std::fs::write(&extensionless, bash.as_bytes())?;
     set_executable(&extensionless)?;
 
     #[cfg(target_os = "windows")]
     {
-        let cmd_body = render_identity(IDENTITY_SHIM_CMD, tool, dir);
+        let cmd_body = render_identity(identity_cmd_template(tool), tool, dir);
         std::fs::write(dir.join(format!("{tool}.cmd")), cmd_body.as_bytes())?;
     }
 
@@ -619,9 +666,10 @@ mod tests {
     }
 
     #[test]
-    fn materialize_identity_writes_claude_and_gemini_always() {
+    fn materialize_identity_writes_claude_gemini_and_codex_always() {
         // The identity family is materialized with NO master-flag gate — it is
-        // the out-of-box session-restore guarantee.
+        // the out-of-box session-restore guarantee. Includes the read-back
+        // provider `codex` (provider #3).
         let tmp = tempfile::tempdir().unwrap();
         let dir = materialize_identity(tmp.path(), "term-id").expect("identity materialize ok");
         assert!(
@@ -631,23 +679,60 @@ mod tests {
                 .starts_with(IDENTITY_DIR_PREFIX),
             "identity dir uses its own prefix"
         );
+        // codex MUST be in the always-on family.
+        assert!(
+            IDENTITY_TOOLS.contains(&CODEX_TOOL),
+            "codex is an always-on identity tool"
+        );
         for tool in IDENTITY_TOOLS {
             let f = dir.join(tool);
             assert!(f.exists(), "extensionless {tool} identity shim must exist");
             let body = std::fs::read_to_string(&f).unwrap();
             assert!(body.contains(&format!("TOOL=\"{tool}\"")));
-            // The shim pins the runner-injected session id and respects the
-            // recursion guard.
-            assert!(body.contains("QONTINUI_PINNED_SESSION_ID"));
-            assert!(body.contains("--session-id"));
+            // Every identity shim respects the recursion guard and signals via
+            // the control route.
             assert!(body.contains("QONTINUI_INSTALL_INTERCEPT_GUARD"));
-            // It confirms via the new control route.
             assert!(body.contains("/control/session-open"));
+
+            if *tool == CODEX_TOOL {
+                // The codex wrapper is the READ-BACK signal-only wrapper: it
+                // must NOT pin/append a `--session-id` (codex has no such flag —
+                // appending one would break it), and must NOT read the pinned-id
+                // env. Identity is read back from the rollout file instead.
+                assert!(
+                    !body.contains("--session-id"),
+                    "codex wrapper must NOT append --session-id (no such flag)"
+                );
+                assert!(
+                    !body.contains("QONTINUI_PINNED_SESSION_ID"),
+                    "codex wrapper does not pin an id"
+                );
+            } else {
+                // claude/gemini get the pinning wrapper: it reads the
+                // runner-injected pinned id and appends `--session-id`.
+                assert!(body.contains("QONTINUI_PINNED_SESSION_ID"));
+                assert!(body.contains("--session-id"));
+            }
             #[cfg(target_os = "windows")]
-            assert!(
-                dir.join(format!("{tool}.cmd")).exists(),
-                "{tool}.cmd identity shim must exist on Windows"
-            );
+            {
+                let cmd_path = dir.join(format!("{tool}.cmd"));
+                assert!(
+                    cmd_path.exists(),
+                    "{tool}.cmd identity shim must exist on Windows"
+                );
+                let cmd_body = std::fs::read_to_string(&cmd_path).unwrap();
+                if *tool == CODEX_TOOL {
+                    assert!(
+                        !cmd_body.contains("--session-id"),
+                        "codex .cmd wrapper must NOT append --session-id"
+                    );
+                } else {
+                    assert!(
+                        cmd_body.contains("--session-id"),
+                        "{tool} .cmd wrapper appends --session-id"
+                    );
+                }
+            }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
