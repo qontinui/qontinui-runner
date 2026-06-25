@@ -63,6 +63,7 @@ pub mod intent;
 pub mod local_store;
 pub mod output_pipe;
 pub mod pane_store;
+pub mod provider_adapter;
 pub mod session_lifecycle_store;
 pub mod shutdown_marker;
 pub mod transport;

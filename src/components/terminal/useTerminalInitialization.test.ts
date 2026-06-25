@@ -329,29 +329,30 @@ describe("runVerifiedResume", () => {
   });
 });
 
-// Item 5 (boot-restore remediation): restore must consult `bindOrigin`. Only
-// pinned bindings auto-resume; guessed/absent rows are quarantined behind a
-// one-click operator confirm (no resume typed).
-describe("classifyRestoreAction (bindOrigin quarantine gate)", () => {
-  it("pinned binding with a valid id auto-resumes", () => {
-    expect(classifyRestoreAction({ claudeSessionId: "sess-1", bindOrigin: "pinned" })).toBe(
+// Item 5 (boot-restore remediation): restore must consult `origin`. Only
+// authoritative bindings auto-resume; reconciled/absent rows are quarantined
+// behind a one-click operator confirm (no resume typed). (Migrated from the
+// previous `bindOrigin` pinned/guessed vocabulary.)
+describe("classifyRestoreAction (origin quarantine gate)", () => {
+  it("authoritative binding with a valid id auto-resumes", () => {
+    expect(classifyRestoreAction({ claudeSessionId: "sess-1", origin: "authoritative" })).toBe(
       "auto-resume",
     );
   });
 
-  it("guessed binding is quarantined (mtime guess can name a foreign VS Code session)", () => {
-    expect(classifyRestoreAction({ claudeSessionId: "sess-1", bindOrigin: "guessed" })).toBe(
+  it("reconciled binding is quarantined (backstop guess can name a foreign session)", () => {
+    expect(classifyRestoreAction({ claudeSessionId: "sess-1", origin: "reconciled" })).toBe(
       "quarantine",
     );
   });
 
-  it("absent bindOrigin (pre-field record) reads as guessed ⇒ quarantined", () => {
+  it("absent origin (pre-field record) reads as reconciled ⇒ quarantined", () => {
     expect(classifyRestoreAction({ claudeSessionId: "sess-1" })).toBe("quarantine");
   });
 
   it("shell-unsafe session ids are skipped outright, never typed or quarantined", () => {
     expect(
-      classifyRestoreAction({ claudeSessionId: "bad; rm -rf /", bindOrigin: "pinned" }),
+      classifyRestoreAction({ claudeSessionId: "bad; rm -rf /", origin: "authoritative" }),
     ).toBe("skip-invalid");
   });
 });

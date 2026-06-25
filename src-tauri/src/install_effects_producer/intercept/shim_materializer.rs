@@ -34,6 +34,33 @@ const SHIM_BASH: &str = include_str!("../../../resources/intercept/shim.bash");
 #[cfg(target_os = "windows")]
 const SHIM_CMD: &str = include_str!("../../../resources/intercept/shim.cmd");
 
+/// Always-on session-restore IDENTITY shim template (bash / Git-Bash / Unix).
+/// Wraps `claude`/`gemini` to append `--session-id $QONTINUI_PINNED_SESSION_ID`.
+const IDENTITY_SHIM_BASH: &str =
+    include_str!("../../../resources/intercept/identity_shim.bash");
+/// Always-on identity shim template (`.cmd` Windows cmd/PowerShell shadow).
+#[cfg(target_os = "windows")]
+const IDENTITY_SHIM_CMD: &str = include_str!("../../../resources/intercept/identity_shim.cmd");
+
+/// The always-on identity tool family (plan §3b). These shims are ALWAYS
+/// materialized for every terminal regardless of the install-intercept master
+/// flag, so the out-of-box session-restore guarantee never rides a default-dark
+/// flag. `claude` is provider #1, `gemini` #2.
+pub const IDENTITY_TOOLS: &[&str] = &["claude", "gemini"];
+
+/// Filename prefix for a per-terminal IDENTITY shim dir
+/// (`qontinui-identity-<terminal_id>`). Distinct from [`SHIM_DIR_PREFIX`] so the
+/// always-on identity family has its own lifecycle (it is materialized even when
+/// install interception is off), while [`sweep_stale`]/[`cleanup`] reap BOTH.
+pub const IDENTITY_DIR_PREFIX: &str = "qontinui-identity-";
+
+/// Env var carrying the per-PTY terminal id the identity shim echoes back when
+/// it confirms a session (plan §3b). Always injected at spawn.
+pub const TERMINAL_ID_ENV: &str = "QONTINUI_TERMINAL_ID";
+/// Env var carrying the runner-pre-generated session UUID the identity shim
+/// pins via `--session-id` (plan §3b "Determinism mechanism"). Always injected.
+pub const PINNED_SESSION_ID_ENV: &str = "QONTINUI_PINNED_SESSION_ID";
+
 /// The shim tools materialized per terminal. Phase 2 ships all seven
 /// (`npm`, `pnpm`, `yarn`, `npx`, `cargo`, `pip`, `pip3`) — the single source of
 /// truth is [`classify::SHIM_TOOLS`].
@@ -195,6 +222,74 @@ pub fn materialize(
     })
 }
 
+/// Materialize the ALWAYS-ON session-restore identity shims for `terminal_id`
+/// into a fresh per-terminal identity bin dir and return its absolute path to
+/// PREPEND to the child `PATH` (plan §3b). Unlike [`materialize`], this is NOT
+/// gated by the install-intercept master flag — the out-of-box session-restore
+/// guarantee applies to every user with zero setup.
+///
+/// The identity shims (`claude`, `gemini`) append
+/// `--session-id $QONTINUI_PINNED_SESSION_ID` to the real provider argv (the
+/// runner pre-generates that id per terminal and injects it as env). On any IO
+/// failure returns `None` (fail-open: a shim we couldn't write must never break
+/// the terminal — the seam just doesn't prepend the identity dir).
+pub fn materialize_identity(base_dir: &Path, terminal_id: &str) -> Option<PathBuf> {
+    let dir = base_dir.join(format!("{IDENTITY_DIR_PREFIX}{terminal_id}"));
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(
+            error = %e,
+            dir = %dir.display(),
+            "session-restore: identity shim dir create failed — identity capture off for this terminal"
+        );
+        return None;
+    }
+    for &tool in IDENTITY_TOOLS {
+        if let Err(e) = write_identity_shims_for(&dir, tool) {
+            tracing::warn!(
+                error = %e,
+                tool,
+                "session-restore: identity shim write failed — identity capture off for this terminal"
+            );
+            return None;
+        }
+    }
+    Some(dir)
+}
+
+/// Render an identity shim template by substituting its `@@…@@` placeholders.
+/// Pure. Keys: `@@TOOL@@` (provider program), `@@SHIM_DIR@@` (own dir, skipped
+/// in the real-tool scan).
+fn render_identity(body: &str, tool: &str, shim_dir: &Path) -> String {
+    body.replace("@@TOOL@@", tool)
+        .replace("@@SHIM_DIR@@", &shim_dir.to_string_lossy())
+}
+
+/// Test-only accessor for [`render_identity`].
+#[cfg(test)]
+pub fn render_identity_for_test(tool: &str, shim_dir: &Path) -> String {
+    render_identity(IDENTITY_SHIM_BASH, tool, shim_dir)
+}
+
+/// Write the platform-appropriate identity shim file(s) for `tool`
+/// (`claude`/`gemini`) into `dir`. Mirrors [`write_shims_for`]: always an
+/// extensionless script (Git Bash + Unix), plus a `.cmd` on Windows. No `.exe`
+/// stub is needed — `claude`/`gemini` ship as `.cmd`/scripts (not `.exe`), so a
+/// `.cmd`/extensionless shim wins under both shells.
+fn write_identity_shims_for(dir: &Path, tool: &str) -> std::io::Result<()> {
+    let bash = render_identity(IDENTITY_SHIM_BASH, tool, dir);
+    let extensionless = dir.join(tool);
+    std::fs::write(&extensionless, bash.as_bytes())?;
+    set_executable(&extensionless)?;
+
+    #[cfg(target_os = "windows")]
+    {
+        let cmd_body = render_identity(IDENTITY_SHIM_CMD, tool, dir);
+        std::fs::write(dir.join(format!("{tool}.cmd")), cmd_body.as_bytes())?;
+    }
+
+    Ok(())
+}
+
 /// Write the platform-appropriate shim file(s) for `tool` into `shim_dir`.
 fn write_shims_for(shim_dir: &Path, tool: ShimTool) -> std::io::Result<()> {
     let name = tool.program();
@@ -306,16 +401,20 @@ fn set_executable(_path: &Path) -> std::io::Result<()> {
 /// never interfere with teardown, and the stale-sweep ([`sweep_stale`]) reaps
 /// any leftover on the next materialize.
 pub fn cleanup(base_dir: &Path, terminal_id: &str) {
-    let dir = base_dir.join(format!("{SHIM_DIR_PREFIX}{terminal_id}"));
-    if !dir.exists() {
-        return;
-    }
-    if let Err(e) = std::fs::remove_dir_all(&dir) {
-        tracing::debug!(
-            error = %e,
-            dir = %dir.display(),
-            "install-intercept: per-terminal shim dir cleanup failed (will be swept later)"
-        );
+    // Reap BOTH the install-intercept shim dir and the always-on identity shim
+    // dir for this terminal.
+    for prefix in [SHIM_DIR_PREFIX, IDENTITY_DIR_PREFIX] {
+        let dir = base_dir.join(format!("{prefix}{terminal_id}"));
+        if !dir.exists() {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            tracing::debug!(
+                error = %e,
+                dir = %dir.display(),
+                "session/install shim dir cleanup failed (will be swept later)"
+            );
+        }
     }
 }
 
@@ -335,11 +434,12 @@ pub fn sweep_stale(base_dir: &Path, max_age: std::time::Duration) {
             break;
         }
         let path = entry.path();
-        // Only our own per-terminal dirs.
+        // Only our own per-terminal dirs (install-intercept OR always-on
+        // identity).
         let is_ours = path
             .file_name()
             .and_then(|n| n.to_str())
-            .map(|n| n.starts_with(SHIM_DIR_PREFIX))
+            .map(|n| n.starts_with(SHIM_DIR_PREFIX) || n.starts_with(IDENTITY_DIR_PREFIX))
             .unwrap_or(false);
         if !is_ours || !path.is_dir() {
             continue;
@@ -517,6 +617,73 @@ mod tests {
                 assert_eq!(mode & 0o111, 0o111, "{tool} shim must be executable");
             }
         }
+    }
+
+    #[test]
+    fn materialize_identity_writes_claude_and_gemini_always() {
+        // The identity family is materialized with NO master-flag gate — it is
+        // the out-of-box session-restore guarantee.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = materialize_identity(tmp.path(), "term-id").expect("identity materialize ok");
+        assert!(
+            dir.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(IDENTITY_DIR_PREFIX),
+            "identity dir uses its own prefix"
+        );
+        for tool in IDENTITY_TOOLS {
+            let f = dir.join(tool);
+            assert!(f.exists(), "extensionless {tool} identity shim must exist");
+            let body = std::fs::read_to_string(&f).unwrap();
+            assert!(body.contains(&format!("TOOL=\"{tool}\"")));
+            // The shim pins the runner-injected session id and respects the
+            // recursion guard.
+            assert!(body.contains("QONTINUI_PINNED_SESSION_ID"));
+            assert!(body.contains("--session-id"));
+            assert!(body.contains("QONTINUI_INSTALL_INTERCEPT_GUARD"));
+            // It confirms via the new control route.
+            assert!(body.contains("/control/session-open"));
+            #[cfg(target_os = "windows")]
+            assert!(
+                dir.join(format!("{tool}.cmd")).exists(),
+                "{tool}.cmd identity shim must exist on Windows"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&f).unwrap().permissions().mode();
+                assert_eq!(mode & 0o111, 0o111, "{tool} identity shim must be executable");
+            }
+        }
+    }
+
+    #[test]
+    fn render_identity_substitutes_placeholders() {
+        let dir = Path::new("/tmp/qontinui-identity-x");
+        let out = render_identity_for_test("claude", dir);
+        assert!(!out.contains("@@TOOL@@"));
+        assert!(!out.contains("@@SHIM_DIR@@"));
+        assert!(out.contains("TOOL=\"claude\""));
+        assert!(out.contains("/tmp/qontinui-identity-x"));
+    }
+
+    #[test]
+    fn cleanup_and_sweep_cover_identity_dirs() {
+        use std::time::Duration;
+        let tmp = tempfile::tempdir().unwrap();
+        // Materialize BOTH families for one terminal; cleanup must reap both.
+        let install = materialize(tmp.path(), "term-x", 1, InterceptMode::Observe).unwrap();
+        let identity = materialize_identity(tmp.path(), "term-x").unwrap();
+        assert!(install.shim_dir.exists() && identity.exists());
+        cleanup(tmp.path(), "term-x");
+        assert!(!install.shim_dir.exists(), "install dir reaped");
+        assert!(!identity.exists(), "identity dir reaped");
+
+        // sweep_stale also reaps an orphaned identity dir at zero max-age.
+        let orphan = materialize_identity(tmp.path(), "orphan").unwrap();
+        sweep_stale(tmp.path(), Duration::from_secs(0));
+        assert!(!orphan.exists(), "stale identity dir swept");
     }
 
     #[test]

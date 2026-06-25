@@ -843,7 +843,8 @@ pub fn terminal_session_record_open(
     zone_index: i32,
     title: Option<String>,
     terminal_id: String,
-    bind_origin: Option<String>,
+    origin: Option<String>,
+    provider: Option<String>,
 ) -> Result<CommandResponse, String> {
     let record = TerminalSessionRecord {
         claude_session_id,
@@ -859,8 +860,15 @@ pub fn terminal_session_record_open(
         state: "open".to_string(),
         closed_at: None,
         close_reason: None,
-        // `None` (origin-unaware callers) preserves any existing origin.
-        bind_origin,
+        // Origin-unaware callers omit `provider`; default to claude (the only
+        // provider today). record_open never downgrades an existing provider
+        // via a re-record because it always refreshes it from the incoming
+        // record — callers that re-assert must pass the right provider.
+        provider: provider
+            .unwrap_or_else(|| crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string()),
+        // `None` (origin-unaware callers) preserves any existing origin;
+        // record_open normalizes any legacy value passed in.
+        origin,
         restore_pending_at: None,
     };
     store.record_open(record);
@@ -1250,6 +1258,7 @@ pub(crate) fn create_terminal_session_backend(
                     title,
                     record_page_id,
                     record_zone_index,
+                    crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
                 );
                 let verify_dirs: Vec<std::path::PathBuf> = config_dir
                     .iter()
@@ -1372,8 +1381,11 @@ async fn poll_and_record_session<F>(
                 state: "open".to_string(),
                 closed_at: None,
                 close_reason: None,
+                provider: crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
                 // Freshest-transcript mtime guess — may be a foreign session.
-                bind_origin: Some("guessed".to_string()),
+                origin: Some(
+                    crate::session::session_lifecycle_store::ORIGIN_RECONCILED.to_string(),
+                ),
                 restore_pending_at: None,
             };
             store.record_open(record);
@@ -1410,6 +1422,7 @@ pub(crate) fn record_pinned_session_open(
     title: String,
     page_id: String,
     zone_index: i32,
+    provider: String,
 ) {
     store.record_open(TerminalSessionRecord {
         claude_session_id: claude_session_id.clone(),
@@ -1425,7 +1438,12 @@ pub(crate) fn record_pinned_session_open(
         state: "open".to_string(),
         closed_at: None,
         close_reason: None,
-        bind_origin: Some("pinned".to_string()),
+        provider,
+        // The runner KNOWS this id — it pre-pinned `--session-id` (or lifted a
+        // typed flag / a hook POSTed it). Authoritative ⇒ auto-resume safe.
+        origin: Some(
+            crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string(),
+        ),
         restore_pending_at: None,
     });
     info!(
@@ -1671,6 +1689,7 @@ mod tests {
             "Pinned".to_string(),
             "default".to_string(),
             0,
+            crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
         );
         let verify_cfg = cfg.path().to_path_buf();
         poll_and_verify_pinned_session(
@@ -1685,6 +1704,13 @@ mod tests {
         let open = store.open_records();
         assert_eq!(open.len(), 1, "exactly one record — nothing guessed in");
         assert_eq!(open[0].claude_session_id, pinned_id);
-        assert_eq!(open[0].bind_origin.as_deref(), Some("pinned"));
+        assert_eq!(
+            open[0].origin.as_deref(),
+            Some(crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE)
+        );
+        assert_eq!(
+            open[0].provider,
+            crate::session::session_lifecycle_store::DEFAULT_PROVIDER
+        );
     }
 }

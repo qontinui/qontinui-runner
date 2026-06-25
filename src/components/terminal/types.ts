@@ -41,13 +41,19 @@ export interface TerminalSessionRecord {
   closedAt?: number;
   /** Why the session closed. */
   closeReason?: string;
+  /** Which AI-CLI provider owns this session (`"claude"`, `"gemini"`). Absent
+   * on records predating the field — read as `"claude"`. */
+  provider?: string;
   /**
-   * How `claudeSessionId` was bound: `"pinned"` (`--session-id` / `--resume`
-   * — exact) or `"guessed"` (freshest-transcript mtime guess). Absent on
-   * records predating the field — read as guessed. Restore quarantines
-   * non-pinned rows behind an operator confirm instead of auto-resuming.
+   * How `claudeSessionId` was bound: `"authoritative"` (the runner KNOWS the
+   * id — `--session-id`/`--resume`/a provider hook) or `"reconciled"`
+   * (recovered by a transcript/process-anchored backstop, may be foreign).
+   * Absent on records predating the field — read as reconciled. Restore
+   * auto-resumes authoritative rows; reconciled rows are treated
+   * conservatively. (Migrated from the previous `bindOrigin`
+   * `pinned`/`guessed` vocabulary.)
    */
-  bindOrigin?: string;
+  origin?: string;
   /**
    * Epoch ms a boot-restore began re-typing this session's resume command
    * (backend-owned; while set the liveness poll never flips the record

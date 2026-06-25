@@ -32,10 +32,10 @@ export interface TerminalTab {
   resumeFailed?: boolean;
   /**
    * True when a boot-restore re-created this tab for a registry record whose
-   * `bindOrigin` is NOT `"pinned"` (mtime-guessed or pre-bindOrigin row). The
-   * resume command is deliberately NOT auto-typed — a guessed binding can be
-   * a foreign (e.g. VS Code) session, and auto-resuming it resurrects the
-   * mis-bind. Surfaced as a one-click operator confirm (`ResumeFailedBanner`);
+   * `origin` is NOT `"authoritative"` (backstop-reconciled or pre-origin row).
+   * The resume command is deliberately NOT auto-typed — a reconciled binding
+   * can be a foreign (e.g. VS Code) session, and auto-resuming it resurrects
+   * the mis-bind. Surfaced as a one-click operator confirm (`ResumeFailedBanner`);
    * cleared when the operator confirms (which runs the normal verified
    * resume). The durable record keeps its restore-pending marker meanwhile.
    */

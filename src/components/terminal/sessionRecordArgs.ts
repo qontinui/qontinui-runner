@@ -19,11 +19,15 @@ export interface OpenRecordTab {
 }
 
 /**
- * How a tab learned its `claudeSessionId`: `"pinned"` (`--session-id` /
- * `--resume` — exact) vs `"guessed"` (freshest-transcript mtime guess).
- * Omitted = unknown; the backend then preserves any existing origin.
+ * How a tab learned its `claudeSessionId`: `"authoritative"` (the runner KNOWS
+ * the id exactly — `--session-id`/`--resume`/a provider hook) vs `"reconciled"`
+ * (recovered by a freshest-transcript/process-anchored backstop, may be
+ * foreign). Omitted = unknown; the backend then preserves any existing origin.
+ *
+ * (Migrated from the previous `pinned`/`guessed` vocabulary in the
+ * session-restore-redesign Phase 1.)
  */
-export type SessionBindOrigin = "pinned" | "guessed";
+export type SessionOrigin = "authoritative" | "reconciled";
 
 /** Args for the `terminal_session_record_open` Tauri command. */
 export interface SessionOpenArgs {
@@ -34,7 +38,9 @@ export interface SessionOpenArgs {
   zoneIndex: number;
   title?: string;
   terminalId: string;
-  bindOrigin?: SessionBindOrigin;
+  origin?: SessionOrigin;
+  /** Which provider owns the session. Defaults to `"claude"` backend-side. */
+  provider?: string;
 }
 
 /**
@@ -58,9 +64,9 @@ export function buildSessionOpenArgs(params: {
   claudeSessionId: string;
   configDir: string | undefined;
   pageId: string;
-  bindOrigin?: SessionBindOrigin;
+  origin?: SessionOrigin;
 }): SessionOpenArgs {
-  const { assignments, tabs, tabId, claudeSessionId, configDir, pageId, bindOrigin } = params;
+  const { assignments, tabs, tabId, claudeSessionId, configDir, pageId, origin } = params;
   const tab = tabs.find((t) => t.id === tabId);
   return {
     claudeSessionId,
@@ -70,6 +76,6 @@ export function buildSessionOpenArgs(params: {
     zoneIndex: resolveZoneIndex(assignments, tabId),
     title: tab?.title,
     terminalId: tabId,
-    ...(bindOrigin ? { bindOrigin } : {}),
+    ...(origin ? { origin } : {}),
   };
 }
