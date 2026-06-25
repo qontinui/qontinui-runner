@@ -62,8 +62,8 @@ describe("buildSessionOpenArgs — onSessionIdBound zone resolution", () => {
     });
   });
 
-  // Omitted bindOrigin → key ABSENT so the backend preserves any existing origin.
-  it("includes bindOrigin only when the caller asserts one", () => {
+  // Omitted origin → key ABSENT so the backend preserves any existing origin.
+  it("includes origin only when the caller asserts one", () => {
     const base = {
       assignments: {},
       tabs: [],
@@ -72,8 +72,10 @@ describe("buildSessionOpenArgs — onSessionIdBound zone resolution", () => {
       configDir: undefined,
       pageId: "default",
     };
-    expect("bindOrigin" in buildSessionOpenArgs(base)).toBe(false);
-    expect(buildSessionOpenArgs({ ...base, bindOrigin: "pinned" }).bindOrigin).toBe("pinned");
+    expect("origin" in buildSessionOpenArgs(base)).toBe(false);
+    expect(buildSessionOpenArgs({ ...base, origin: "authoritative" }).origin).toBe(
+      "authoritative",
+    );
   });
 
   it("records zoneIndex -1 when the bound tab is unassigned", () => {

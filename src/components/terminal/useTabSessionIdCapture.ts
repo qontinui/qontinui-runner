@@ -2,9 +2,19 @@
  * Post-spawn polling hook that fills in `tab.claudeSessionId` for
  * PTY-launched AI tabs (the `onLaunchAiSession` path in TerminalPage).
  *
- * FALLBACK ONLY since #548 Phase 1: runner launches pre-pin the id via
- * `--session-id` and never start a capture; this poll covers only un-pinned
- * tabs (custom launch commands, hand-typed `claude`), binds origin "guessed".
+ * LAST-RESORT BACKSTOP since the session-restore redesign (#548 Phase 1 → the
+ * 2026-06-25 provider-agnostic redesign). The PRIMARY identity path is now the
+ * always-on PATH shim + the spawn-time authoritative `--session-id` pin
+ * (recorded synchronously) + the provider SessionStart hook, with the
+ * process-start-anchored reconcile as the on-disk backstop. This mtime-capture
+ * poll is NO LONGER the primary path — it survives as the single fallback for
+ * the ONE case the spawn-time pin can't cover from the frontend: a CUSTOM
+ * launch command (`sessionManager.launchCommands`, possibly an alias that drops
+ * the runner's `--session-id`), where the frontend doesn't know the id up
+ * front. Its single live caller is `TerminalPage.handleLaunchAiSession`'s
+ * custom-command branch; it binds origin `"reconciled"` (a freshest-mtime guess
+ * that can name a foreign session — hence quarantined on restore, not
+ * auto-resumed). Do NOT add new callers — pin the id at spawn instead.
  *
  * Today, `useShellIntegration.ts:135` only sets `claudeSessionId` on
  * the resume path (`handleResumeSession`). For initial spawns, the

@@ -329,29 +329,55 @@ describe("runVerifiedResume", () => {
   });
 });
 
-// Item 5 (boot-restore remediation): restore must consult `bindOrigin`. Only
-// pinned bindings auto-resume; guessed/absent rows are quarantined behind a
-// one-click operator confirm (no resume typed).
-describe("classifyRestoreAction (bindOrigin quarantine gate)", () => {
-  it("pinned binding with a valid id auto-resumes", () => {
-    expect(classifyRestoreAction({ claudeSessionId: "sess-1", bindOrigin: "pinned" })).toBe(
-      "auto-resume",
+// Phase 4 (autonomous restore): the auto-resume GATE is
+// `origin === "authoritative" && confirmed`. A CONFIRMED authoritative record
+// auto-resumes with NO operator click; an authoritative-but-PROVISIONAL record
+// is a phantom shell → terminal-only restore (no resume, no banner);
+// reconciled/absent origins stay quarantined behind the one-click confirm.
+describe("classifyRestoreAction (Phase 4 confirmed-authoritative auto-resume gate)", () => {
+  it("CONFIRMED authoritative binding auto-resumes with no operator click", () => {
+    expect(
+      classifyRestoreAction({
+        claudeSessionId: "sess-1",
+        origin: "authoritative",
+        confirmedAt: 1_700_000_000_000,
+      }),
+    ).toBe("auto-resume");
+  });
+
+  it("authoritative-but-PROVISIONAL (no confirmedAt) is a phantom shell ⇒ terminal-only (no resume, no banner)", () => {
+    expect(classifyRestoreAction({ claudeSessionId: "sess-1", origin: "authoritative" })).toBe(
+      "terminal-only",
     );
   });
 
-  it("guessed binding is quarantined (mtime guess can name a foreign VS Code session)", () => {
-    expect(classifyRestoreAction({ claudeSessionId: "sess-1", bindOrigin: "guessed" })).toBe(
+  it("reconciled binding is quarantined (backstop guess can name a foreign session)", () => {
+    expect(classifyRestoreAction({ claudeSessionId: "sess-1", origin: "reconciled" })).toBe(
       "quarantine",
     );
   });
 
-  it("absent bindOrigin (pre-field record) reads as guessed ⇒ quarantined", () => {
+  it("a confirmed RECONCILED row is still quarantined (confirmation upgrades only authoritative rows)", () => {
+    expect(
+      classifyRestoreAction({
+        claudeSessionId: "sess-1",
+        origin: "reconciled",
+        confirmedAt: 1_700_000_000_000,
+      }),
+    ).toBe("quarantine");
+  });
+
+  it("absent origin (pre-field record) reads as reconciled ⇒ quarantined", () => {
     expect(classifyRestoreAction({ claudeSessionId: "sess-1" })).toBe("quarantine");
   });
 
   it("shell-unsafe session ids are skipped outright, never typed or quarantined", () => {
     expect(
-      classifyRestoreAction({ claudeSessionId: "bad; rm -rf /", bindOrigin: "pinned" }),
+      classifyRestoreAction({
+        claudeSessionId: "bad; rm -rf /",
+        origin: "authoritative",
+        confirmedAt: 1,
+      }),
     ).toBe("skip-invalid");
   });
 });
