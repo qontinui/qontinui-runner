@@ -29,7 +29,7 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "resources/qontinui-setup-mcp/src/qontinui_setup_mcp": "qontinui-setup-mcp/src/qontinui_setup_mcp"
+      "resources/qontinui-setup-mcp/src/qontinui_setup_mcp/**/*": "qontinui-setup-mcp/src/qontinui_setup_mcp"
     },
     "createUpdaterArtifacts": true
   },
