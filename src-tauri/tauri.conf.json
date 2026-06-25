@@ -31,7 +31,7 @@
     "resources": {
       "resources/qontinui-setup-mcp/src/qontinui_setup_mcp/**/*": "qontinui-setup-mcp/src/qontinui_setup_mcp"
     },
-    "createUpdaterArtifacts": true
+    "createUpdaterArtifacts": false
   },
   "plugins": {
     "updater": {
