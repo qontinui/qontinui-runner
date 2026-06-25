@@ -50,14 +50,34 @@ export interface SessionProviderDescriptor {
 }
 
 /**
- * The Phase-1 PLACEHOLDER Claude descriptor. The resume command shape is stable
- * enough to ship now; Phase 2 fills the handshake patterns from
- * `resumeVerification.ts`. No method throws.
+ * The Claude descriptor (Phase 2). Resume is the deterministic, non-interactive
+ * `claude --resume <id>`; the handshake patterns mirror `resumeVerification.ts`
+ * (the `CLAUDE_HANDSHAKE_PATTERNS` success set + the `RESUME_FAILURE_PATTERNS`
+ * "did NOT resume" set — failure checked first, since a failure dialog is itself
+ * Claude UI). `restoreTier` is `"full"` — Claude resumes the FULL conversation
+ * by id. The patterns are plain substrings (the descriptor contract is
+ * substring-based); the regex-based matchers in `resumeVerification.ts` remain
+ * the live boot-restore implementation this descriptor describes.
  */
 export const claudeDescriptor: SessionProviderDescriptor = {
   provider: "claude",
   resumeCommand: (sessionId: string) => ["claude", "--resume", sessionId],
-  handshakePatterns: () => ({ success: [], failure: [] }),
+  handshakePatterns: () => ({
+    success: [
+      "? for shortcuts", // status-line hint under the input box
+      "esc to interrupt", // shown while Claude is working
+      "bypass permissions", // permission-mode indicator
+      "Welcome to Claude", // launch banner
+      "Welcome back to Claude", // resumed-banner variant
+    ],
+    failure: [
+      "No conversation found", // `--resume <unknown-id>` error
+      "No conversations found", // empty-history variant
+      "No conversations to resume",
+      "Select a session to resume", // interactive session-picker frame
+      "Select a conversation to resume",
+    ],
+  }),
   restoreTier: () => "full",
 };
 

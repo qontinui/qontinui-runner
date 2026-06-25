@@ -864,12 +864,14 @@ pub fn terminal_session_record_open(
         // provider today). record_open never downgrades an existing provider
         // via a re-record because it always refreshes it from the incoming
         // record — callers that re-assert must pass the right provider.
-        provider: provider
-            .unwrap_or_else(|| crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string()),
+        provider: provider.unwrap_or_else(|| {
+            crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string()
+        }),
         // `None` (origin-unaware callers) preserves any existing origin;
         // record_open normalizes any legacy value passed in.
         origin,
         restore_pending_at: None,
+        confirmed_at: None,
     };
     store.record_open(record);
     Ok(CommandResponse {
@@ -1387,6 +1389,7 @@ async fn poll_and_record_session<F>(
                     crate::session::session_lifecycle_store::ORIGIN_RECONCILED.to_string(),
                 ),
                 restore_pending_at: None,
+                confirmed_at: None,
             };
             store.record_open(record);
             info!(
@@ -1441,10 +1444,9 @@ pub(crate) fn record_pinned_session_open(
         provider,
         // The runner KNOWS this id — it pre-pinned `--session-id` (or lifted a
         // typed flag / a hook POSTed it). Authoritative ⇒ auto-resume safe.
-        origin: Some(
-            crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string(),
-        ),
+        origin: Some(crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string()),
         restore_pending_at: None,
+        confirmed_at: None,
     });
     info!(
         terminal_id = %terminal_id,

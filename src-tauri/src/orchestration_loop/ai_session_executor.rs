@@ -355,6 +355,7 @@ pub async fn dispatch_subtask(
                     crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string(),
                 ),
                 restore_pending_at: None,
+                confirmed_at: None,
             },
         );
         info!(

@@ -477,14 +477,7 @@ impl TerminalSession {
         // spawn (zero transcript race — the §3b determinism mechanism). Runs
         // AFTER caller `extra_env` so the identity dir wins on PATH. Fail-open:
         // any failure injects nothing and the terminal still spawns.
-        Self::apply_identity_seam(
-            &mut cmd,
-            &id,
-            &app_handle,
-            &cwd,
-            &title,
-            &page_id,
-        );
+        Self::apply_identity_seam(&mut cmd, &id, &app_handle, &cwd, &title, &page_id);
 
         // ---- Install-interception PATH-shim seam (plan §4 Phase 1) ----------
         // Behind the master flag `QONTINUI_INSTALL_INTERCEPT_ENABLED` (default
@@ -1097,6 +1090,30 @@ impl TerminalSession {
         // install interception is dark — no install shims are on PATH then).
         let port = crate::install_effects_producer::intercept::bound_port();
         cmd.env(shim_materializer::PORT_ENV, port.to_string());
+
+        // ---- Claude SessionStart hook delivery (plan §4, Phase 2) -----------
+        // Materialize the bundled `--settings` hook into the runner's OWN
+        // app-data dir (~/.qontinui/runner/session-restore/) — NEVER ~/.claude —
+        // and inject its absolute path. The identity shim's `claude` wrapper
+        // appends `--settings $that` (additive: Claude merges the hook on top of
+        // any ~/.claude config WITHOUT writing to it). The SessionStart hook then
+        // POSTs a confirmation/liveness signal to /control/session-open on
+        // startup AND --resume. Fail-open: a materialize failure injects nothing
+        // (identity still rides the spawn-time --session-id pin; only the
+        // confirmation hook is absent).
+        let hook_dir = crate::session::claude_hook::session_restore_dir();
+        match crate::session::claude_hook::materialize(&hook_dir) {
+            Some(settings_path) => {
+                cmd.env(
+                    crate::session::claude_hook::CLAUDE_SETTINGS_ENV,
+                    settings_path.to_string_lossy().as_ref(),
+                );
+            }
+            None => {
+                // Hook delivery off for this terminal — identity is still pinned
+                // + recorded at spawn below; only the confirmation hook is absent.
+            }
+        }
 
         // 3. Materialize the always-on identity shims + prepend their dir.
         let base_dir = std::env::temp_dir();

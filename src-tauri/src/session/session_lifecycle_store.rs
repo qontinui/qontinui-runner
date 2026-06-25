@@ -185,6 +185,30 @@ pub struct TerminalSessionRecord {
     /// observes the session confidently alive (KeepAlive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_pending_at: Option<i64>,
+    /// Unix millis when a provider's SessionStart hook CONFIRMED that a real
+    /// session actually started in this terminal (session-restore-redesign
+    /// Phase 2 coordinator refinement). `None`/unset = PROVISIONAL.
+    ///
+    /// ## Why a provisional→confirmed distinction
+    ///
+    /// The spawn-time authoritative record ([`apply_identity_seam`]) is written
+    /// for EVERY terminal — including a plain shell that never runs a provider
+    /// (the runner can't know at spawn whether the user will type `claude`, run
+    /// `ls`, or just sit at a prompt). Restoring those phantom shell "sessions"
+    /// as `claude --resume <unused-uuid>` would manufacture failed resumes. The
+    /// provider's SessionStart hook firing — POSTed to `/control/session-open`
+    /// with `source:"startup"|"resume"` — is the observable proof that a REAL
+    /// provider started here. The hook write sets this; the spawn-time write
+    /// leaves it unset. Phase 4's restore classifier uses `confirmed_at`
+    /// (OR a real transcript on disk) to gate auto-resume vs treat-as-plain-shell
+    /// — this phase only PROVIDES the signal; it does NOT change the classifier.
+    ///
+    /// `#[serde(default)]`: every pre-Phase-2 on-disk record deserializes as
+    /// `None` (provisional) — a confirming hook (or Phase 4's transcript check)
+    /// re-establishes confirmation; nothing is lost, the field is purely
+    /// additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_at: Option<i64>,
 }
 
 /// Durable map of `claude_session_id -> TerminalSessionRecord`. Cheap to
@@ -247,6 +271,14 @@ impl SessionLifecycleStore {
             // passing "pinned"/"guessed" lands as authoritative/reconciled.
             if let Some(origin) = normalize_origin(rec.origin) {
                 entry.origin = Some(origin);
+            }
+            // Confirmation is monotonic: a provisional re-record (the spawn-time
+            // writer, a zone-move backstop) must NEVER clear a confirmation a
+            // provider hook already set. An incoming `Some` (a hook-sourced write
+            // carrying confirmation) DOES set it. So: take the incoming value when
+            // present, else preserve the existing one.
+            if rec.confirmed_at.is_some() {
+                entry.confirmed_at = rec.confirmed_at;
             }
             entry.state = "open".to_string();
             entry.closed_at = None;
@@ -341,6 +373,33 @@ impl SessionLifecycleStore {
             match m.get_mut(claude_session_id) {
                 Some(rec) if rec.restore_pending_at.is_some() => rec.restore_pending_at = None,
                 _ => return, // absent or already clear — nothing to flush
+            }
+            m.clone()
+        };
+        self.persist(&snapshot);
+    }
+
+    /// Flip a present session from PROVISIONAL to CONFIRMED (a provider's
+    /// SessionStart hook fired for this session id — session-restore-redesign
+    /// Phase 2). Stamps `confirmed_at` with now iff it is not already set
+    /// (confirmation is monotonic — the first hook wins; a later resume hook is
+    /// a no-op). No-op (no write) if the session is absent or already confirmed.
+    ///
+    /// Phase 4 reads `confirmed_at` (OR a real transcript on disk) to decide
+    /// auto-resume vs treat-as-plain-shell; this method just records the signal.
+    pub fn confirm_session(&self, claude_session_id: &str) {
+        let now = Utc::now().timestamp_millis();
+        let snapshot = {
+            let mut m = match self.map.lock() {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = %e, "session_lifecycle_store: lock poisoned on confirm_session");
+                    return;
+                }
+            };
+            match m.get_mut(claude_session_id) {
+                Some(rec) if rec.confirmed_at.is_none() => rec.confirmed_at = Some(now),
+                _ => return, // absent or already confirmed — nothing to flush
             }
             m.clone()
         };
@@ -794,7 +853,67 @@ mod tests {
             provider: DEFAULT_PROVIDER.to_string(),
             origin: None,
             restore_pending_at: None,
+            confirmed_at: None,
         }
+    }
+
+    /// `confirm_session` flips provisional→confirmed monotonically, a
+    /// provisional re-record never clears it, and pre-Phase-2 rows load
+    /// provisional (session-restore-redesign Phase 2 coordinator refinement).
+    #[test]
+    fn confirm_session_flips_provisional_and_record_open_never_clears_it() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        // Spawn-time write is PROVISIONAL (confirmed_at unset).
+        store.record_open(rec("sess-1"));
+        assert!(
+            store.get("sess-1").unwrap().confirmed_at.is_none(),
+            "spawn-time record is provisional"
+        );
+
+        // The provider's SessionStart hook fires → confirm.
+        store.confirm_session("sess-1");
+        let confirmed_at = store.get("sess-1").unwrap().confirmed_at;
+        assert!(confirmed_at.is_some(), "hook flips it to confirmed");
+
+        // Confirmation is monotonic: a second confirm (a later resume hook) is a
+        // no-op (does NOT bump the timestamp).
+        store.confirm_session("sess-1");
+        assert_eq!(
+            store.get("sess-1").unwrap().confirmed_at,
+            confirmed_at,
+            "second confirm is a no-op (first hook wins)"
+        );
+
+        // A PROVISIONAL re-record (spawn-time writer / zone-move backstop) must
+        // NOT clear an existing confirmation.
+        store.record_open(rec("sess-1"));
+        assert_eq!(
+            store.get("sess-1").unwrap().confirmed_at,
+            confirmed_at,
+            "provisional re-record preserves confirmation"
+        );
+
+        // Durable across reload + confirming an absent id is a no-op.
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        assert!(store.get("sess-1").unwrap().confirmed_at.is_some());
+        store.confirm_session("ghost"); // no panic
+
+        // A pre-Phase-2 on-disk record (no confirmedAt key) loads provisional.
+        let json = r#"{"old": {
+            "claudeSessionId":"old","configDir":null,"workingDir":"C:/repo",
+            "pageId":"default","zoneIndex":1,"title":"Old","terminalId":"t",
+            "openedAt":1,"lastSeenAt":2,"state":"open","closedAt":null,"closeReason":null
+        }}"#;
+        let p2 = dir.path().join("legacy.json");
+        std::fs::write(&p2, json).unwrap();
+        let s2 = SessionLifecycleStore::open(&p2).unwrap();
+        assert!(
+            s2.get("old").unwrap().confirmed_at.is_none(),
+            "pre-Phase-2 record loads provisional"
+        );
     }
 
     /// Records predating the origin field must deserialize and read as
@@ -1526,6 +1645,7 @@ mod tests {
             provider: DEFAULT_PROVIDER.to_string(),
             origin: None,
             restore_pending_at: None,
+            confirmed_at: None,
         }
     }
 
