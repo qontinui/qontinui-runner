@@ -10,14 +10,17 @@
 //! ref-update storms) and runs:
 //!
 //! ```text
-//! git -C <worktree_path> push <coord-origin>/git/<repo>.git <branch>
+//! git -C <worktree_path> -c http.extraHeader="Authorization: Bearer <jwt>" \
+//!     push <coord-origin>/git/<repo-basename>.git refs/heads/<branch>:refs/agent/<m>-<a>
 //! ```
 //!
 //! against the coord-hosted git origin (Row 9 Phase 2, §3.4). The push
-//! is authenticated by the agent's coord-issued JWT injected into the
-//! URL as the `x-access-token` basic-auth user (same scheme coord uses
-//! when async-mirroring out to GitHub — see
-//! `qontinui-coord/src/outbound_mirror.rs::inject_token`).
+//! is authenticated by the agent's coord-issued JWT handed to git as an
+//! `Authorization: Bearer` header via `-c http.extraHeader` — coord's
+//! git-http gate is Bearer-only and rejects GitHub-style
+//! `x-access-token:<jwt>@host` basic-auth in the URL
+//! (`qontinui-coord/src/git_replication.rs`), so the origin URL stays
+//! credential-free. See [`build_origin_url`] / [`push_one`].
 //!
 //! ## Why it exists
 //!
