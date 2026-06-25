@@ -329,14 +329,25 @@ describe("runVerifiedResume", () => {
   });
 });
 
-// Item 5 (boot-restore remediation): restore must consult `origin`. Only
-// authoritative bindings auto-resume; reconciled/absent rows are quarantined
-// behind a one-click operator confirm (no resume typed). (Migrated from the
-// previous `bindOrigin` pinned/guessed vocabulary.)
-describe("classifyRestoreAction (origin quarantine gate)", () => {
-  it("authoritative binding with a valid id auto-resumes", () => {
+// Phase 4 (autonomous restore): the auto-resume GATE is
+// `origin === "authoritative" && confirmed`. A CONFIRMED authoritative record
+// auto-resumes with NO operator click; an authoritative-but-PROVISIONAL record
+// is a phantom shell → terminal-only restore (no resume, no banner);
+// reconciled/absent origins stay quarantined behind the one-click confirm.
+describe("classifyRestoreAction (Phase 4 confirmed-authoritative auto-resume gate)", () => {
+  it("CONFIRMED authoritative binding auto-resumes with no operator click", () => {
+    expect(
+      classifyRestoreAction({
+        claudeSessionId: "sess-1",
+        origin: "authoritative",
+        confirmedAt: 1_700_000_000_000,
+      }),
+    ).toBe("auto-resume");
+  });
+
+  it("authoritative-but-PROVISIONAL (no confirmedAt) is a phantom shell ⇒ terminal-only (no resume, no banner)", () => {
     expect(classifyRestoreAction({ claudeSessionId: "sess-1", origin: "authoritative" })).toBe(
-      "auto-resume",
+      "terminal-only",
     );
   });
 
@@ -346,13 +357,27 @@ describe("classifyRestoreAction (origin quarantine gate)", () => {
     );
   });
 
+  it("a confirmed RECONCILED row is still quarantined (confirmation upgrades only authoritative rows)", () => {
+    expect(
+      classifyRestoreAction({
+        claudeSessionId: "sess-1",
+        origin: "reconciled",
+        confirmedAt: 1_700_000_000_000,
+      }),
+    ).toBe("quarantine");
+  });
+
   it("absent origin (pre-field record) reads as reconciled ⇒ quarantined", () => {
     expect(classifyRestoreAction({ claudeSessionId: "sess-1" })).toBe("quarantine");
   });
 
   it("shell-unsafe session ids are skipped outright, never typed or quarantined", () => {
     expect(
-      classifyRestoreAction({ claudeSessionId: "bad; rm -rf /", origin: "authoritative" }),
+      classifyRestoreAction({
+        claudeSessionId: "bad; rm -rf /",
+        origin: "authoritative",
+        confirmedAt: 1,
+      }),
     ).toBe("skip-invalid");
   });
 });

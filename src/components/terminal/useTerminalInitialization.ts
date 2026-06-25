@@ -10,6 +10,7 @@ import {
   type ResumeSummaryPolicy,
   type TypeAndVerifyOptions,
 } from "./resumeVerification";
+import { providerDescriptorFor } from "./providerAdapter";
 import type { TerminalTab } from "./useTerminalManager";
 import type { TerminalInstanceHandle } from "./TerminalInstance";
 import type { CommandResponse, TerminalSessionRecord } from "./types";
@@ -75,16 +76,32 @@ export async function fetchOpenRecords(pageId: string): Promise<TerminalSessionR
  * is unattended, so a bare `claude --resume` would stall forever on its first
  * permission prompt. Aligned with PR #547 — whichever lands second resolves
  * the textual conflict by keeping this union form.
+ *
+ * Phase 4 (provider-agnostic resume): the program + resume-flag SHAPE is
+ * sourced from the provider descriptor's `resumeCommand` (so a future Gemini
+ * record resumes via `gemini --resume <id>`, not a hardcoded `claude`); the
+ * Claude-specific autonomous flag (`--permission-mode bypassPermissions`) and
+ * the resume-summary env thresholds are applied ONLY when the resolved program
+ * is Claude — they are CLI-specific and harmless to omit for other providers.
  */
 export function buildResumeCmd(
   sessionId: string,
   configDir: string | undefined,
   policy: ResumeSummaryPolicy = getResumeSummaryPolicy(),
+  provider?: string,
 ): string {
-  const base = `claude --permission-mode bypassPermissions --resume ${sessionId}`;
+  // Adapter-supplied resume shape, e.g. ["claude","--resume",id] /
+  // ["gemini","--resume",id]. The descriptor owns the program + flags so the
+  // boot restore is not Claude-hardcoded.
+  const argv = providerDescriptorFor(provider).resumeCommand(sessionId);
+  const program = argv[0];
+  const isClaude = program === "claude";
+  const base = isClaude
+    ? `claude --permission-mode bypassPermissions --resume ${sessionId}`
+    : argv.join(" ");
   const env: Array<[string, string]> = [];
-  if (configDir) env.push(["CLAUDE_CONFIG_DIR", configDir]);
-  if (policy === "full") {
+  if (configDir && isClaude) env.push(["CLAUDE_CONFIG_DIR", configDir]);
+  if (isClaude && policy === "full") {
     env.push(["CLAUDE_CODE_RESUME_TOKEN_THRESHOLD", "999999999"]);
     env.push(["CLAUDE_CODE_RESUME_THRESHOLD_MINUTES", "999999999"]);
   }
@@ -114,6 +131,8 @@ export async function runVerifiedResume(params: {
   tabId: string;
   claudeSessionId: string;
   configDir?: string;
+  /** Provider owning the session — selects the adapter resume + handshake. */
+  provider?: string;
   updateTab: (
     id: string,
     updates: Partial<{ isReconnecting?: boolean; resumeFailed?: boolean }>,
@@ -131,15 +150,29 @@ export async function runVerifiedResume(params: {
   recordOpen?: SessionOpenArgs;
   verifyOptions?: TypeAndVerifyOptions;
 }): Promise<"verified" | "failed"> {
-  const { terminalRefs, tabId, claudeSessionId, configDir, updateTab, recordOpen, verifyOptions } =
-    params;
+  const {
+    terminalRefs,
+    tabId,
+    claudeSessionId,
+    configDir,
+    provider,
+    updateTab,
+    recordOpen,
+    verifyOptions,
+  } = params;
   const policy = getResumeSummaryPolicy();
-  const resumeCmd = buildResumeCmd(claudeSessionId, configDir, policy);
+  const resumeCmd = buildResumeCmd(claudeSessionId, configDir, policy, provider);
+  // Per-adapter handshake patterns (Phase 4): the verification loop matches the
+  // resume success/failure against the descriptor's patterns instead of the
+  // Claude-hardcoded sets, so a future Gemini resume verifies against Gemini's
+  // banners. Claude's descriptor mirrors the live `resumeVerification.ts` sets.
+  const handshakePatterns = providerDescriptorFor(provider).handshakePatterns();
   const outcome = await typeResumeAndVerify(terminalRefs, tabId, resumeCmd, {
     // Fallback picker answerer (#548 item 3): under the default "full" policy
     // the env thresholds in `buildResumeCmd` already suppress the picker;
     // this catches CLI version drift and the opt-in "summary" policy.
     pickerAnswer: buildPickerAnswer(policy),
+    handshakePatterns,
     ...verifyOptions,
   });
   if (outcome === "verified") {
@@ -198,30 +231,56 @@ function isValidSessionId(id: string): boolean {
 }
 
 /**
- * What the cold-restore path does with a registry record (boot-restore
- * remediation item 5):
+ * What the cold-restore path does with a registry record (Phase 4 —
+ * autonomous restore).
  *
- * - `"auto-resume"`: `origin === "authoritative"` — the runner KNOWS the id
- *   (`--session-id` / `--resume` / a provider hook), safe to type
- *   `claude --resume` unattended.
- * - `"quarantine"`: any other origin (`"reconciled"`, or absent on rows
- *   predating the field — both mean a backstop-recovered id that can name a
- *   foreign session). The tab is still created so the screen layout is
- *   preserved, but no resume is typed; the operator confirms via a one-click
- *   `ResumeFailedBanner` affordance. (Phase 4 reworks this so authoritative
- *   rows auto-resume without an operator click.)
+ * - `"auto-resume"`: the record is `origin === "authoritative"` AND
+ *   CONFIRMED (`confirmedAt` set). The runner KNOWS the id (it pre-pinned
+ *   `--session-id`) AND a provider's SessionStart hook (or the process-start-
+ *   anchored reconcile backstop) observed a REAL provider session start here —
+ *   so the resume command is typed unattended, with NO operator click. This
+ *   removes the old `guessed→quarantine` gate for authoritative records.
+ * - `"terminal-only"`: an authoritative-but-PROVISIONAL record — the spawn-time
+ *   pin wrote a provisional record for EVERY terminal, including plain shells
+ *   that never ran a provider (a "phantom shell"). Auto-`--resume`-ing it would
+ *   manufacture a failed resume against an unused uuid. The tab + cwd are
+ *   restored (layout preserved) but NO resume is typed and NO operator-confirm
+ *   banner is shown — there is no conversation to resume. The backend reconcile
+ *   normally PRUNES these phantoms before the frontend ever classifies (it
+ *   confirms the ones that have a real transcript, drops the rest); this branch
+ *   is the frontend's defense-in-depth for a cold-boot phantom the reconcile
+ *   couldn't reach (no live PTY).
+ * - `"quarantine"`: a `"reconciled"` (or pre-field) origin — a backstop-
+ *   recovered id that can name a FOREIGN session. The tab is created so layout
+ *   is preserved, but no resume is typed; the operator confirms via a one-click
+ *   `ResumeFailedBanner`. (Reserved for genuinely uncertain identity, NOT for
+ *   never-confirmed authoritative rows — those are `terminal-only`.)
  * - `"skip-invalid"`: the recorded id fails shell-safety validation — never
  *   typed, never quarantined (nothing actionable).
  *
- * Pure + exported so the quarantine gate is unit-testable without React.
+ * The auto-resume GATE lives here on the frontend as
+ * `origin === "authoritative" && confirmed` (a record is "confirmed" when its
+ * `confirmedAt` is set). The backend reconcile is the PRIMARY phantom defense
+ * (it prunes/flags provisional records for live PTYs before this runs), but the
+ * classifier keeps the `confirmed` check so a phantom the reconcile didn't see
+ * (cold boot, no live process) still can't be auto-resumed. Pure + exported so
+ * the gate is unit-testable without React.
  */
-export type RestoreAction = "auto-resume" | "quarantine" | "skip-invalid";
+export type RestoreAction = "auto-resume" | "terminal-only" | "quarantine" | "skip-invalid";
 
 export function classifyRestoreAction(
-  rec: Pick<TerminalSessionRecord, "claudeSessionId" | "origin">,
+  rec: Pick<TerminalSessionRecord, "claudeSessionId" | "origin" | "confirmedAt">,
 ): RestoreAction {
   if (!isValidSessionId(rec.claudeSessionId)) return "skip-invalid";
-  return rec.origin === "authoritative" ? "auto-resume" : "quarantine";
+  if (rec.origin === "authoritative") {
+    // Confirmed authoritative ⇒ auto-resume (no operator click). An
+    // authoritative-but-unconfirmed record is a phantom shell — restore the
+    // terminal only, never auto-resume a session that may never have existed.
+    return rec.confirmedAt != null ? "auto-resume" : "terminal-only";
+  }
+  // Reconciled / pre-field origin: a backstop guess that can name a foreign
+  // session — quarantine behind the one-click confirm.
+  return "quarantine";
 }
 
 /** Validate config dir paths — reject shell metacharacters. */
@@ -367,6 +426,8 @@ export function useTerminalInitialization({
       isClaudeSession?: boolean;
       claudeSessionId?: string;
       claudeConfigDir?: string;
+      /** Which provider owns this session — drives the adapter resume. */
+      provider?: string;
       /** Deferred registry re-assert — applied only on VERIFIED resume. */
       recordOpen?: SessionOpenArgs;
     }> = [];
@@ -469,17 +530,23 @@ export function useTerminalInitialization({
           updateTab(tabId, {
             claudeSessionId: rec.claudeSessionId,
             claudeConfigDir: safeConfigDir,
-            // Show a "resuming" affordance until `claude --resume` lands;
-            // cleared in the drain loop after the resume command is written.
-            // Quarantined rows are NOT auto-resumed (item 5): a non-authoritative
-            // origin is a backstop guess that can name a foreign VS Code
-            // session — surface a one-click confirm instead.
+            // Show a "resuming" affordance until the resume lands; cleared in
+            // the drain loop after the resume command is written. Phase 4:
+            // CONFIRMED authoritative rows auto-resume with NO operator click.
+            // A `terminal-only` row (authoritative but PROVISIONAL — a phantom
+            // shell that never ran a provider) restores terminal+cwd only: no
+            // resume, no quarantine banner. Quarantined (reconciled) rows can
+            // name a foreign session — surface a one-click confirm instead.
             isReconnecting: restoreAction === "auto-resume",
             resumeQuarantined: restoreAction === "quarantine",
           });
           rememberSessionId(tabId, rec.claudeSessionId, safeConfigDir);
 
-          if (restoreAction !== "skip-invalid") {
+          // Restore-pending marker only protects rows whose resume the drain
+          // will actually attempt (auto-resume) or that await an operator retry
+          // (quarantine). A `terminal-only` phantom has no resume to verify, so
+          // marking it would leave the marker permanently SET — skip it.
+          if (restoreAction === "auto-resume" || restoreAction === "quarantine") {
             // Durable, backend-owned restore-pending marker (Phase 3, #548):
             // from here until the resume handshake is VERIFIED the liveness
             // poll must never flip this record `poll-dead` — a failed (or
@@ -498,9 +565,9 @@ export function useTerminalInitialization({
           }
 
           if (restoreAction !== "skip-invalid") {
-            // Both auto-resume and quarantined tabs get their saved scrollback
-            // replayed by the drain; ONLY auto-resume entries type a resume
-            // (`isClaudeSession` gates the typing in the drain loop).
+            // auto-resume, quarantined AND terminal-only tabs get their saved
+            // scrollback replayed by the drain; ONLY auto-resume entries type a
+            // resume (`isClaudeSession` gates the typing in the drain loop).
             pendingRestores.push({
               tabId,
               scrollbackPath:
@@ -508,6 +575,9 @@ export function useTerminalInitialization({
               isClaudeSession: restoreAction === "auto-resume",
               claudeSessionId: rec.claudeSessionId,
               claudeConfigDir: safeConfigDir,
+              // Provider drives the adapter-supplied resume command + handshake
+              // patterns (Phase 4) — defaults to "claude" on pre-provider rows.
+              provider: rec.provider,
               // Deferred re-assert payload: applied by `runVerifiedResume`
               // on VERIFIED handshake only. No `origin` — the backend
               // preserves the existing (authoritative) origin on unasserted writes.
@@ -598,6 +668,7 @@ export function useTerminalInitialization({
                     tabId: restore.tabId,
                     claudeSessionId: restore.claudeSessionId,
                     configDir: restore.claudeConfigDir,
+                    provider: restore.provider,
                     updateTab,
                     recordOpen: restore.recordOpen,
                   });
