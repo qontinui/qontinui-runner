@@ -32,14 +32,28 @@ export interface TerminalTab {
   resumeFailed?: boolean;
   /**
    * True when a boot-restore re-created this tab for a registry record whose
-   * `bindOrigin` is NOT `"pinned"` (mtime-guessed or pre-bindOrigin row). The
-   * resume command is deliberately NOT auto-typed — a guessed binding can be
-   * a foreign (e.g. VS Code) session, and auto-resuming it resurrects the
-   * mis-bind. Surfaced as a one-click operator confirm (`ResumeFailedBanner`);
+   * `origin` is NOT `"authoritative"` (backstop-reconciled or pre-origin row).
+   * The resume command is deliberately NOT auto-typed — a reconciled binding
+   * can be a foreign (e.g. VS Code) session, and auto-resuming it resurrects
+   * the mis-bind. Surfaced as a one-click operator confirm (`ResumeFailedBanner`);
    * cleared when the operator confirms (which runs the normal verified
    * resume). The durable record keeps its restore-pending marker meanwhile.
    */
   resumeQuarantined?: boolean;
+  /**
+   * True when a boot-restore re-created this tab for a record that restores
+   * TERMINAL-ONLY (Phase 5 honest tiers): the terminal + cwd are back but the
+   * conversation was NOT resumed. Two sources land here — an authoritative
+   * phantom shell (a spawn-time provisional record with no confirmed provider
+   * session), or a CONFIRMED authoritative record whose provider's
+   * `restoreTier()` is `"terminal-only"` (it can re-open the terminal but
+   * cannot deterministically `--resume` the chat by id). No resume is typed and
+   * NO confirm banner is shown; instead the `ResumeFailedBanner`'s informational
+   * "fresh conversation" note surfaces it so the user is never misled into
+   * thinking the conversation came back. Cleared once the user dismisses the
+   * note or the tab is otherwise used.
+   */
+  restoreTerminalOnly?: boolean;
   /** Claude Code session ID running in this tab (set on resume). */
   claudeSessionId?: string;
   /** Claude config dir for the session (set on resume). */
@@ -563,6 +577,7 @@ export function useTerminalManager(pageId: string = "default", windowLabel: stri
           | "isReconnecting"
           | "resumeFailed"
           | "resumeQuarantined"
+          | "restoreTerminalOnly"
         >
       >,
     ) => {
