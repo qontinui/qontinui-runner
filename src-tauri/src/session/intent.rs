@@ -74,6 +74,14 @@ pub struct Intent {
     /// [`Intent::share_output`] (see [`Intent::effective_redact_secrets`]).
     #[serde(default)]
     pub redact_secrets: Option<bool>,
+    /// Phase 6 (session-restore redesign) — the AI-CLI provider hosting this
+    /// session (`"claude"`, `"codex"`, …). Threaded into the `started` outbox
+    /// payload as a top-level `provider` key so the drain loop forwards it to
+    /// coord's `CreateSessionRequest.provider`, populating
+    /// `coord.sessions.provider`. `None` for a plain shell with no AI CLI or a
+    /// caller that hasn't resolved a provider — coord tolerates its absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 
 impl Intent {
@@ -144,6 +152,7 @@ mod tests {
             declared_paths: vec![],
             share_output: false,
             redact_secrets: None,
+            provider: None,
         }
     }
 
@@ -223,6 +232,7 @@ mod tests {
             declared_paths: vec![PathBuf::from("/repo/path")],
             share_output: true,
             redact_secrets: Some(false),
+            provider: Some("claude".into()),
         };
         let serialized = serde_json::to_string(&i).unwrap();
         let back: Intent = serde_json::from_str(&serialized).unwrap();

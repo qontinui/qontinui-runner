@@ -434,6 +434,10 @@ impl SessionRegistry {
         // `parent_session_id` is threaded into the payload so the drain
         // loop's `rebuild_create_body` forwards it to coord's
         // `CreateSessionRequest.parent_session_id`.
+        // `provider` is threaded as a TOP-LEVEL payload key (like
+        // `parent_session_id`) so the drain loop's `rebuild_create_body`
+        // forwards it to coord's `CreateSessionRequest.provider`, populating
+        // `coord.sessions.provider`. Source of truth is the intent's provider.
         let payload = json!({
             "id": id,
             "kind": intent.kind.as_str(),
@@ -442,6 +446,7 @@ impl SessionRegistry {
             "started_at": now,
             "parent_session_id": parent_session_id,
             "claude_code_session_id": claude_code_session_id,
+            "provider": intent.provider,
         });
         self.coord_sync
             .outbox()
@@ -518,6 +523,8 @@ impl SessionRegistry {
             output_pipe: None,
         };
 
+        // `provider` threaded as a top-level key (see `start_inner`) so the
+        // mirror's create body carries it to `coord.sessions.provider`.
         let payload = json!({
             "id": id,
             "kind": intent.kind.as_str(),
@@ -525,6 +532,7 @@ impl SessionRegistry {
             "state": SessionState::Active.as_str(),
             "started_at": now,
             "claude_code_session_id": claude_code_session_id,
+            "provider": intent.provider,
         });
         self.coord_sync
             .outbox()
@@ -1064,6 +1072,7 @@ mod tests {
             declared_paths: vec![],
             share_output: false,
             redact_secrets: None,
+            provider: None,
         }
     }
 
