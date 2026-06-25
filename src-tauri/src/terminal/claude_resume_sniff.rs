@@ -132,10 +132,14 @@ pub(crate) fn apply_typed_resume_effects(
                 state: "open".to_string(),
                 closed_at: None,
                 close_reason: None,
+                provider: crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
                 // Exact id lifted from the typed `--resume`/`--session-id`
-                // flag — a pinned bind, same as the spawn-argv pre-pin path.
-                bind_origin: Some("pinned".to_string()),
+                // flag — authoritative, same as the spawn-argv pre-pin path.
+                origin: Some(
+                    crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string(),
+                ),
                 restore_pending_at: None,
+                confirmed_at: None,
             });
             info!(
                 terminal_id = %terminal_id,

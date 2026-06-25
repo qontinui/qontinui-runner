@@ -44,7 +44,7 @@ import { setTerminalSessions, type TerminalSessionEntry } from "@/lib/terminal-s
 import { UIBridgeComponentScope } from "@qontinui/ui-bridge";
 import { useCommitState } from "./useCommitState";
 import { useTabSessionIdCapture } from "./useTabSessionIdCapture";
-import { buildSessionOpenArgs, type SessionBindOrigin } from "./sessionRecordArgs";
+import { buildSessionOpenArgs, type SessionOrigin } from "./sessionRecordArgs";
 import { buildAiLaunchCommand } from "./aiLaunchCommand";
 import { rememberSessionId } from "./lastKnownSessionIds";
 import { useRegistryAwareness } from "./useRegistryAwareness";
@@ -545,13 +545,13 @@ function TerminalPageInner({
    * restore hint, the live session is unaffected.
    */
   const recordSessionOpen = useCallback(
-    // Default origin "guessed": the only caller that omits it is the
-    // transcript-capture hook, whose id IS a freshest-mtime guess.
+    // Default origin "reconciled": the only caller that omits it is the
+    // transcript-capture hook, whose id IS a freshest-mtime backstop guess.
     (
       tabId: string,
       claudeSessionId: string,
       configDir?: string,
-      bindOrigin: SessionBindOrigin = "guessed",
+      origin: SessionOrigin = "reconciled",
     ) => {
       const args = buildSessionOpenArgs({
         assignments: assignmentsRef.current,
@@ -560,7 +560,7 @@ function TerminalPageInner({
         claudeSessionId,
         configDir,
         pageId,
-        bindOrigin,
+        origin,
       });
       invoke("terminal_session_record_open", { ...args }).catch((err) => {
         logger.warn(`terminal_session_record_open failed for ${claudeSessionId}: ${err}`);
@@ -765,7 +765,7 @@ function TerminalPageInner({
         claudeSessionId: tab.claudeSessionId,
         configDir: tab.claudeConfigDir,
         updateTab,
-        // Re-assert payload for the verified branch — no bindOrigin, so the
+        // Re-assert payload for the verified branch — no origin, so the
         // backend preserves the record's existing origin.
         recordOpen: buildSessionOpenArgs({
           assignments: assignmentsRef.current,
@@ -779,6 +779,18 @@ function TerminalPageInner({
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [updateTab, pageId],
+  );
+
+  // Dismiss the informational "fresh conversation" (terminal-only) restore note
+  // for a tab (Phase 5 honest tiers). There is nothing to resume — the terminal
+  // was restored but the provider can't bring the conversation back by id — so
+  // the only affordance is acknowledging the note; clearing the flag drops the
+  // tab from the banner's terminal-only list.
+  const handleDismissTerminalOnly = useCallback(
+    (tabId: string) => {
+      updateTab(tabId, { restoreTerminalOnly: false });
+    },
+    [updateTab],
   );
 
   const handleExit = useCallback(
@@ -914,9 +926,14 @@ function TerminalPageInner({
         if (pinnedSessionId) {
           updateTab(tabId, { claudeSessionId: pinnedSessionId, claudeConfigDir: configDir });
           rememberSessionId(tabId, pinnedSessionId, configDir);
-          recordSessionOpen(tabId, pinnedSessionId, configDir, "pinned");
+          recordSessionOpen(tabId, pinnedSessionId, configDir, "authoritative");
         } else {
-          // Custom launch command — id unknown; capture poll is the fallback.
+          // Custom launch command (an alias that may drop the runner's
+          // `--session-id` pin) — the id is unknown up front, so fall back to
+          // the mtime-capture poll. This is the ONE remaining last-resort caller
+          // of `startSessionIdCapture`; it binds origin "reconciled" (a
+          // freshest-mtime guess), so restore quarantines it rather than
+          // auto-resuming. Every pinned path above records authoritatively.
           const tab = tabs.find((t) => t.id === tabId);
           startSessionIdCapture(tabId, tab?.workingDir ?? "", spawnAt, configDir);
         }
@@ -1208,11 +1225,17 @@ function TerminalPageInner({
                 blocks input. */}
             <CoordWarningBanner activeTerminalId={activeId ?? undefined} />
 
-            {/* Phase 3 (#548) — restored tabs whose `claude --resume` never
-                produced the Claude UI handshake (after one auto-retry) park
-                here with an explicit operator retry instead of silently
-                posing as resumed. Same top-right advisory column. */}
-            <ResumeFailedBanner tabs={tabs} onRetryResume={handleRetryResume} />
+            {/* Honest restore-status banner (Phase 5 + #548): restored tabs
+                whose `--resume` failed (operator retry), reconciled best-effort
+                matches (one-click confirm), and terminal-only / fresh-
+                conversation restores (informational, dismissible) — instead of
+                any of these silently posing as a fully resumed conversation.
+                Same top-right advisory column. */}
+            <ResumeFailedBanner
+              tabs={tabs}
+              onRetryResume={handleRetryResume}
+              onDismissTerminalOnly={handleDismissTerminalOnly}
+            />
           </div>
 
           {/* Phase 2 — `isMultiZone` gate dropped so the Unassigned (N) list

@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '@@HOOK_SCRIPT@@'"
+          }
+        ]
+      }
+    ]
+  }
+}

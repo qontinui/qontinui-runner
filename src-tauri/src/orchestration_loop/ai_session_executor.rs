@@ -347,10 +347,15 @@ pub async fn dispatch_subtask(
                 state: "open".to_string(),
                 closed_at: None,
                 close_reason: None,
-                // Pinned: the CLI session id was pre-pinned to task_run_id via
-                // `CliSessionContext { is_resume: false }` above (`--session-id`).
-                bind_origin: Some("pinned".to_string()),
+                provider: crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
+                // Authoritative: the CLI session id was pre-pinned to
+                // task_run_id via `CliSessionContext { is_resume: false }` above
+                // (`--session-id`).
+                origin: Some(
+                    crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string(),
+                ),
                 restore_pending_at: None,
+                confirmed_at: None,
             },
         );
         info!(
