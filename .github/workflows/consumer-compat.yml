@@ -1,0 +1,77 @@
+name: Consumer Compatibility Check
+
+on:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "src-tauri/Cargo.toml"
+      - "crates/**/Cargo.toml"
+      - "package.json"
+      - ".github/workflows/consumer-compat.yml"
+
+jobs:
+  check-version-bump:
+    name: Check Version Bump & Consumer Compat
+    runs-on: ubuntu-latest
+    outputs:
+      version_bumped: ${{ steps.detect.outputs.version_bumped }}
+      new_version: ${{ steps.detect.outputs.new_version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - id: detect
+        run: |
+          set -e
+          git fetch origin main:main
+          BASE_VERSION=$(git show main:src-tauri/Cargo.toml | grep '^version = ' | head -1 | sed 's/version = "\(.*\)"/\1/')
+          HEAD_VERSION=$(grep '^version = ' src-tauri/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          if [ "$BASE_VERSION" != "$HEAD_VERSION" ]; then
+            echo "version_bumped=true" >> $GITHUB_OUTPUT
+            echo "new_version=$HEAD_VERSION" >> $GITHUB_OUTPUT
+          else
+            echo "version_bumped=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check upstream-of label requirement
+        if: steps.detect.outputs.version_bumped == 'true'
+        run: |
+          PR_DATA='${{ github.event.pull_request.labels }}'
+          HAS_UPSTREAM=$(echo "$PR_DATA" | jq -r '.[] | select(.name | startswith("coord:upstream-of")) | .name' | wc -l)
+          if [ $HAS_UPSTREAM -eq 0 ]; then
+            echo "❌ Version bump detected but no coord:upstream-of label found"
+            exit 1
+          fi
+
+  test-consumer:
+    name: "Test Consumer: qontinui-web"
+    needs: check-version-bump
+    if: needs.check-version-bump.outputs.version_bumped == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract consumer from label
+        id: extract
+        run: |
+          PR_DATA='${{ github.event.pull_request.labels }}'
+          CONSUMER_MATCH=$(echo "$PR_DATA" | jq -r '.[] | select(.name == "coord:upstream-of=qontinui-web") | .name')
+          [ -z "$CONSUMER_MATCH" ] && echo "skip=true" >> $GITHUB_OUTPUT || echo "skip=false" >> $GITHUB_OUTPUT
+
+      - uses: actions/checkout@v5
+        if: steps.extract.outputs.skip == 'false'
+        with:
+          repository: qontinui/qontinui-web
+          path: consumer
+
+      - uses: actions/setup-node@v4
+        if: steps.extract.outputs.skip == 'false'
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: consumer/package-lock.json
+
+      - name: Test qontinui-web
+        if: steps.extract.outputs.skip == 'false'
+        run: |
+          cd consumer
+          npm run type-check || exit 1
