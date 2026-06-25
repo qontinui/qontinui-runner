@@ -19,6 +19,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { instanceStorage } from "@/lib/instance-storage";
 import type { CommandResponse } from "./types";
+import type { HandshakePatterns } from "./providerAdapter";
 import { writeWhenReady, type TerminalRefsMap } from "./writeWhenReady";
 
 // ---------------------------------------------------------------------------
@@ -125,17 +126,35 @@ const RESUME_FAILURE_PATTERNS: RegExp[] = [
 /**
  * True when the pane's recent output shows a definitive resume FAILURE
  * (unknown session id / fell through to the session picker). Checked before
- * {@link detectClaudeHandshake} — failure frames are themselves Claude UI.
+ * {@link detectClaudeHandshake} — failure frames are themselves provider UI.
+ *
+ * Phase 4 (provider-agnostic): when `patterns` is supplied (the per-adapter
+ * `HandshakePatterns` from the provider descriptor), its `failure` substrings
+ * are matched (case-insensitive) on the ANSI-stripped text. Omitting it falls
+ * back to the built-in Claude regex set — the live default for Claude restores.
  */
-export function detectResumeFailure(text: string): boolean {
+export function detectResumeFailure(text: string, patterns?: HandshakePatterns): boolean {
   const stripped = stripAnsi(text);
+  if (patterns) return matchSubstrings(stripped, patterns.failure);
   return RESUME_FAILURE_PATTERNS.some((p) => p.test(stripped));
 }
 
-/** True when the pane's recent output shows the Claude Code UI. */
-export function detectClaudeHandshake(text: string): boolean {
+/**
+ * True when the pane's recent output shows the provider's resume handshake.
+ * With `patterns` supplied, matches its `success` substrings (case-insensitive)
+ * on ANSI-stripped text; otherwise falls back to the built-in Claude regex set.
+ */
+export function detectClaudeHandshake(text: string, patterns?: HandshakePatterns): boolean {
   const stripped = stripAnsi(text);
+  if (patterns) return matchSubstrings(stripped, patterns.success);
   return CLAUDE_HANDSHAKE_PATTERNS.some((p) => p.test(stripped));
+}
+
+/** Case-insensitive substring match of any pattern in `text`. */
+function matchSubstrings(text: string, substrings: string[]): boolean {
+  if (substrings.length === 0) return false;
+  const lower = text.toLowerCase();
+  return substrings.some((s) => s.length > 0 && lower.includes(s.toLowerCase()));
 }
 
 /** How many trailing characters of the (decoded) ring to scan per probe. */
@@ -173,6 +192,13 @@ export interface HandshakeWaitOptions {
    * (the "Resume from summary?" answerer) without coupling it in here.
    */
   onProbe?: (tail: string) => void;
+  /**
+   * Per-adapter resume success/failure substrings (Phase 4). When set, the
+   * detection uses the provider descriptor's patterns instead of the built-in
+   * Claude regex sets — so a Gemini resume verifies against Gemini's banners.
+   * Omit to use the Claude default.
+   */
+  handshakePatterns?: HandshakePatterns;
 }
 
 /**
@@ -185,7 +211,13 @@ export async function waitForClaudeHandshake(
   tabId: string,
   options: HandshakeWaitOptions = {},
 ): Promise<"verified" | "failed" | "timeout"> {
-  const { timeoutMs = 15_000, intervalMs = 1_000, readTail = readScrollbackTail, onProbe } = options;
+  const {
+    timeoutMs = 15_000,
+    intervalMs = 1_000,
+    readTail = readScrollbackTail,
+    onProbe,
+    handshakePatterns,
+  } = options;
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const tail = await readTail(tabId);
@@ -194,8 +226,8 @@ export async function waitForClaudeHandshake(
       // Negative evidence wins over positive: an error dialog / session
       // picker renders TUI frames too, so the handshake check alone would
       // false-positive exactly the wrong-content case being fixed.
-      if (detectResumeFailure(tail)) return "failed";
-      if (detectClaudeHandshake(tail)) return "verified";
+      if (detectResumeFailure(tail, handshakePatterns)) return "failed";
+      if (detectClaudeHandshake(tail, handshakePatterns)) return "verified";
     }
     if (Date.now() >= deadline) return "timeout";
     await new Promise((r) => setTimeout(r, intervalMs));

@@ -2304,6 +2304,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     },
                 );
                 let poll_lifecycle_store = lifecycle_store.clone();
+                let reconcile_lifecycle_store = lifecycle_store.clone();
                 app.manage(lifecycle_store);
 
                 // VT output sanitizer: terminal output is UNTRUSTED (whatever a
@@ -2530,6 +2531,34 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                         poll_lifecycle_store.prune(chrono::Utc::now().timestamp_millis());
                     }
+                });
+
+                // Process-start-anchored reconcile backstop (session-restore-
+                // redesign Phase 4). Runs ONCE near boot, BEFORE the frontend
+                // classifies the restorable set: for every live PTY lacking a
+                // CONFIRMED record it correlates the child AI process's start
+                // time + cwd to the freshest post-start transcript (covering the
+                // shim-bypass / absolute-path edge the deterministic path
+                // misses), and prunes phantom provisional records (a spawn-time
+                // pin for a plain shell that never ran a provider, now with no
+                // live process + no transcript) so they never auto-resume.
+                // Fail-open: any snapshot/scan failure degrades to a no-op. A
+                // short delay lets the restored PTYs register first.
+                let reconcile_tm = term_for_session.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    let live: Vec<session::reconcile::LivePty> = reconcile_tm
+                        .list()
+                        .into_iter()
+                        .map(|i| session::reconcile::LivePty {
+                            terminal_id: i.id,
+                            pid: i.pid,
+                            working_dir: i.working_dir,
+                            page_id: i.page_id,
+                            title: i.title,
+                        })
+                        .collect();
+                    session::reconcile::run_at_boot(&reconcile_lifecycle_store, live).await;
                 });
 
                 // Plan §Phase 3/7/10 — start the coord-sync background loops

@@ -455,6 +455,29 @@ impl SessionLifecycleStore {
         self.persist(&snapshot);
     }
 
+    /// Remove a record outright (session-restore-redesign Phase 4 reconcile
+    /// phantom-prune). Unlike [`record_close`], which leaves a `closed` row that
+    /// the restore-grace logic might still resurrect, this DELETES the entry so a
+    /// phantom provisional record (authoritative-but-unconfirmed, no live process
+    /// and no transcript) can never auto-resume on any future boot. No-op (no
+    /// write) if the id is absent.
+    pub fn remove_session(&self, claude_session_id: &str) {
+        let snapshot = {
+            let mut m = match self.map.lock() {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = %e, "session_lifecycle_store: lock poisoned on remove_session");
+                    return;
+                }
+            };
+            if m.remove(claude_session_id).is_none() {
+                return; // absent — nothing to flush
+            }
+            m.clone()
+        };
+        self.persist(&snapshot);
+    }
+
     /// Clone of the open record currently hosted by `terminal_id`, if any.
     /// Terminal ids are fresh per PTY spawn, so at most one OPEN record can
     /// reference a given terminal at a time.
@@ -1046,6 +1069,29 @@ mod tests {
             "new",
             "target untouched on refusal"
         );
+    }
+
+    /// `remove_session` deletes a row outright (phantom-prune) so it never
+    /// resurrects on a future boot, and is a no-op when the id is absent.
+    #[test]
+    fn remove_session_deletes_row_and_is_noop_when_absent() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.record_open(rec("phantom"));
+        assert!(store.get("phantom").is_some());
+
+        store.remove_session("phantom");
+        assert!(store.get("phantom").is_none(), "row deleted");
+        // Durable across reload — the row stays gone (not just closed-in-grace).
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        assert!(store.get("phantom").is_none(), "stays removed after reload");
+        assert!(
+            store.restorable_records(Utc::now().timestamp_millis(), None).is_empty(),
+            "a removed phantom is never restorable"
+        );
+        // Absent id — no panic, no write.
+        store.remove_session("ghost");
     }
 
     #[test]
