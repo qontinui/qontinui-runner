@@ -36,8 +36,7 @@ const SHIM_CMD: &str = include_str!("../../../resources/intercept/shim.cmd");
 
 /// Always-on session-restore IDENTITY shim template (bash / Git-Bash / Unix).
 /// Wraps `claude`/`gemini` to append `--session-id $QONTINUI_PINNED_SESSION_ID`.
-const IDENTITY_SHIM_BASH: &str =
-    include_str!("../../../resources/intercept/identity_shim.bash");
+const IDENTITY_SHIM_BASH: &str = include_str!("../../../resources/intercept/identity_shim.bash");
 /// Always-on identity shim template (`.cmd` Windows cmd/PowerShell shadow).
 #[cfg(target_os = "windows")]
 const IDENTITY_SHIM_CMD: &str = include_str!("../../../resources/intercept/identity_shim.cmd");
@@ -653,7 +652,11 @@ mod tests {
             {
                 use std::os::unix::fs::PermissionsExt;
                 let mode = std::fs::metadata(&f).unwrap().permissions().mode();
-                assert_eq!(mode & 0o111, 0o111, "{tool} identity shim must be executable");
+                assert_eq!(
+                    mode & 0o111,
+                    0o111,
+                    "{tool} identity shim must be executable"
+                );
             }
         }
     }

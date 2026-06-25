@@ -143,32 +143,57 @@ impl SessionProviderAdapter for ClaudeAdapter {
         DEFAULT_PROVIDER // "claude"
     }
 
-    fn launch_with_identity(&self, _cwd: &str, account: Option<&str>) -> LaunchSpec {
-        // Phase 2 fills the full argv/env. The deterministic skeleton —
-        // runner-generated uuid pinned via `--session-id` — is correct now so
-        // the registry seam + a Phase-1 caller see a usable shape.
+    fn launch_with_identity(&self, cwd: &str, account: Option<&str>) -> LaunchSpec {
+        // The Rust home for what `aiLaunchCommand.ts` does: a runner-generated
+        // uuid pinned via `--session-id` so identity is KNOWN at spawn (recorded
+        // synchronously, zero transcript race — plan §3b/§4). Autonomous mode
+        // (`--permission-mode bypassPermissions`) matches the operator's
+        // clg/clh/clp wrappers so a runner-spawned session never stalls on a
+        // permission prompt (mirrors `aiLaunchCommand.ts`).
         let pinned = uuid::Uuid::new_v4().to_string();
+        let mut argv = vec![
+            "claude".to_string(),
+            "--permission-mode".to_string(),
+            "bypassPermissions".to_string(),
+            "--session-id".to_string(),
+            pinned.clone(),
+        ];
+        // Attach the SessionStart capture hook ADDITIVELY via `--settings`
+        // (never touches `~/.claude`). When the delivery resolves to a settings
+        // file, it rides on the argv; otherwise identity still rides the pin.
+        if let DeliverySpec::SettingsFlag { settings_path } = self.capture_hook_delivery(cwd) {
+            argv.push("--settings".to_string());
+            argv.push(settings_path);
+        }
         LaunchSpec {
-            argv: vec![
-                "claude".to_string(),
-                "--session-id".to_string(),
-                pinned.clone(),
-            ],
+            argv,
             env: self.account_isolation(account),
             pinned_session_id: pinned,
         }
     }
 
     fn capture_hook_delivery(&self, _cwd: &str) -> DeliverySpec {
-        // Phase 2 ships the bundled hook settings file + path. Until then the
-        // hook is absent (identity still rides the pinned `--session-id`).
-        DeliverySpec::None
+        // Materialize the bundled SessionStart hook (script + `--settings` file)
+        // into the runner's OWN app-data dir (`~/.qontinui/runner/session-
+        // restore/`) — NEVER `~/.claude` — and report its path. The hook POSTs
+        // `{terminal_id, session_id, source, provider, cwd}` to
+        // `/control/session-open` on startup AND `--resume` (Phase-0-proven
+        // additive `--settings` delivery). Fail-open: a materialize failure
+        // degrades to `None` (identity still rides the pinned `--session-id`).
+        let dir = crate::session::claude_hook::session_restore_dir();
+        match crate::session::claude_hook::materialize(&dir) {
+            Some(settings_path) => DeliverySpec::SettingsFlag {
+                settings_path: settings_path.to_string_lossy().into_owned(),
+            },
+            None => DeliverySpec::None,
+        }
     }
 
     fn resume_command(&self, session_id: &str, _account: Option<&str>) -> Vec<String> {
-        // Claude resume is `claude --resume <id>` (plan §4 / Phase 2). Stable
-        // enough to ship now; Phase 2 layers account isolation onto the env,
-        // not the argv.
+        // Claude resume is the deterministic, non-interactive `claude --resume
+        // <id>` (plan §4). Account isolation rides the ENV
+        // (`account_isolation`), not the argv — the resume must look identical
+        // across accounts so the typed-resume sniff + handshake stay stable.
         vec![
             "claude".to_string(),
             "--resume".to_string(),
@@ -179,16 +204,42 @@ impl SessionProviderAdapter for ClaudeAdapter {
     fn account_isolation(&self, account: Option<&str>) -> BTreeMap<String, String> {
         let mut env = BTreeMap::new();
         if let Some(dir) = account {
-            // Claude config/home isolation is `CLAUDE_CONFIG_DIR` (plan §4).
+            // Claude config/home isolation is `CLAUDE_CONFIG_DIR` (plan §4) —
+            // the SAME var `terminal/session.rs` sets around line 501 from
+            // `ai_provider::get_effective_config_dir`. `account` here is the
+            // already-resolved per-account config dir; the adapter just names
+            // the env var. An absent account ⇒ empty (the runner's
+            // process-global resolved dir applies, set by the spawn path).
             env.insert("CLAUDE_CONFIG_DIR".to_string(), dir.to_string());
         }
         env
     }
 
     fn resume_handshake_patterns(&self) -> HandshakePatterns {
-        // Phase 2 ports the real patterns from `resumeVerification.ts`. Empty
-        // sets are a safe default (no false confirm / no false failure).
-        HandshakePatterns::default()
+        // Mirror of `resumeVerification.ts` — the SUCCESS set is the Claude TUI
+        // handshake markers (the CLI took over the terminal); the FAILURE set is
+        // definitive "the requested session did NOT resume" evidence (unknown id
+        // / fell through to the session picker), checked BEFORE success since a
+        // failure dialog is itself Claude UI. Plain substrings matched against
+        // ANSI-stripped output (the TS uses regexes; these are the literal
+        // substrings those regexes key on, since the trait contract is
+        // substring-based).
+        HandshakePatterns {
+            success: vec![
+                "? for shortcuts".to_string(),  // status-line hint under the input box
+                "esc to interrupt".to_string(), // shown while Claude is working
+                "bypass permissions".to_string(), // permission-mode indicator
+                "Welcome to Claude".to_string(), // launch banner
+                "Welcome back to Claude".to_string(), // resumed-banner variant
+            ],
+            failure: vec![
+                "No conversation found".to_string(), // `--resume <unknown-id>` error
+                "No conversations found".to_string(), // empty-history variant
+                "No conversations to resume".to_string(),
+                "Select a session to resume".to_string(), // interactive picker frame
+                "Select a conversation to resume".to_string(),
+            ],
+        }
     }
 
     fn restore_tier(&self) -> RestoreTier {
@@ -226,9 +277,12 @@ mod tests {
         let a = ClaudeAdapter;
         assert_eq!(a.restore_tier(), RestoreTier::Full);
 
-        // launch_with_identity pins a uuid into the argv + reports it.
+        // launch_with_identity pins a uuid into the argv + reports it, in
+        // autonomous (bypassPermissions) mode (mirrors aiLaunchCommand.ts).
         let spec = a.launch_with_identity("C:/repo", Some("C:/cfg"));
         assert_eq!(spec.argv.first().map(String::as_str), Some("claude"));
+        assert!(spec.argv.contains(&"--permission-mode".to_string()));
+        assert!(spec.argv.contains(&"bypassPermissions".to_string()));
         assert!(spec.argv.contains(&"--session-id".to_string()));
         assert!(spec.argv.contains(&spec.pinned_session_id));
         assert_eq!(
@@ -236,7 +290,7 @@ mod tests {
             Some("C:/cfg")
         );
 
-        // resume_command is the deterministic --resume form.
+        // resume_command is the deterministic --resume form (account rides env).
         assert_eq!(
             a.resume_command("sess-1", None),
             vec![
@@ -253,8 +307,46 @@ mod tests {
             Some(&"C:/cfg".to_string())
         );
 
-        // hook delivery + handshake default to the honest "none/empty" shapes.
-        assert_eq!(a.capture_hook_delivery("C:/repo"), DeliverySpec::None);
-        assert_eq!(a.resume_handshake_patterns(), HandshakePatterns::default());
+        // resume_handshake_patterns ports the real sets from resumeVerification.ts
+        // (non-empty success + failure; failure is checked first by consumers).
+        let hp = a.resume_handshake_patterns();
+        assert!(hp.success.iter().any(|s| s.contains("for shortcuts")));
+        assert!(hp
+            .failure
+            .iter()
+            .any(|s| s.contains("No conversation found")));
+    }
+
+    #[test]
+    fn capture_hook_delivery_is_settings_flag_never_dot_claude() {
+        // The Claude hook delivery is an additive `--settings <file>` pointing
+        // at a runner-app-data settings file — NEVER `~/.claude`. (This
+        // materializes into the real ~/.qontinui/runner/session-restore/ dir on
+        // the test host; that dir is the runner's own app data, not the user's
+        // claude config, which is exactly the out-of-box guarantee.)
+        let a = ClaudeAdapter;
+        match a.capture_hook_delivery("C:/repo") {
+            DeliverySpec::SettingsFlag { settings_path } => {
+                assert!(
+                    settings_path.contains("session-restore"),
+                    "delivery is the runner-app-data hook settings file"
+                );
+                assert!(
+                    !settings_path.replace('\\', "/").contains("/.claude/"),
+                    "delivery NEVER points into the user's ~/.claude"
+                );
+                // The pinned-launch argv carries the same `--settings` flag.
+                let spec = a.launch_with_identity("C:/repo", None);
+                assert!(spec.argv.contains(&"--settings".to_string()));
+            }
+            // Fail-open: if the runner app-data dir couldn't be written on this
+            // host, the delivery degrades to None and the launch omits
+            // `--settings` (identity still rides the pin) — also acceptable.
+            DeliverySpec::None => {
+                let spec = a.launch_with_identity("C:/repo", None);
+                assert!(!spec.argv.contains(&"--settings".to_string()));
+            }
+            other => panic!("unexpected Claude delivery: {other:?}"),
+        }
     }
 }

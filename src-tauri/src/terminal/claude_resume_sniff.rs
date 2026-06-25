@@ -139,6 +139,7 @@ pub(crate) fn apply_typed_resume_effects(
                     crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string(),
                 ),
                 restore_pending_at: None,
+                confirmed_at: None,
             });
             info!(
                 terminal_id = %terminal_id,
