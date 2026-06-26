@@ -120,13 +120,19 @@ jobs:
             bundles: nsis
 
     runs-on: ${{ matrix.platform }}
-    # v1.0.0 ships WINDOWS-ONLY. macOS (x86_64 cross-compile) and Linux release
-    # bundles are currently broken; tolerate their failure so the Windows
-    # installers still publish. Windows is the only platform v0.1.0 ever shipped,
-    # and the download page shows build-from-source for the rest. Only
-    # windows-latest is a hard gate, so publish-update-json runs iff the Windows
-    # installers build (never an empty/assetless release). Tracked as a follow-up
-    # to repair macOS + Linux and drop continue-on-error.
+    # macOS + Linux installer legs are being restored (issue #656). Each platform
+    # that DOES build now uploads its real installer (dmg / deb+AppImage / nsis)
+    # via the per-platform upload steps below — so a green macOS or Linux leg
+    # publishes its installer to the draft release. They remain non-blocking
+    # (continue-on-error) until a tagged release run confirms they build clean:
+    # this keeps a still-flaky non-Windows leg from taking down the proven Windows
+    # build (the only platform shipped historically). Windows stays the sole hard
+    # gate, so publish-update-json runs iff the Windows installers build (never an
+    # empty/assetless release).
+    #
+    # GOAL: once a tagged release run shows macOS (x86_64 + aarch64) and Linux
+    # build and bundle cleanly, DROP continue-on-error entirely (set it to false /
+    # remove this expression) so every platform becomes a hard gate again.
     continue-on-error: ${{ matrix.platform != 'windows-latest' }}
 
     steps:
@@ -155,10 +161,30 @@ jobs:
           cache: "pnpm"
           cache-dependency-path: pnpm-lock.yaml
 
+      # The repo pins the toolchain via `rust-toolchain.toml` (channel = "1.95.0").
+      # dtolnay/rust-toolchain@stable installs *stable* and adds `targets:` to
+      # stable — but `cargo build` (run inside the repo by `tauri build`) honors
+      # the rust-toolchain.toml override and uses 1.95.0 instead, which does NOT
+      # have the cross-target std. That mismatch is the real cause of the macOS
+      # `error[E0463]: can't find crate for 'core'` (libc) failure on the Intel
+      # leg: the target was added to the wrong toolchain. Install the toolchain
+      # that the override actually selects, and add the matrix target to IT.
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.95.0"
           targets: ${{ matrix.target }}
+
+      # GitHub's `macos-latest` image is Apple Silicon (arm64), so the Intel leg
+      # (`x86_64-apple-darwin`) needs its std added explicitly. `rustup target add`
+      # is run from the repo dir, so it respects the rust-toolchain.toml override
+      # and adds the target to the 1.95.0 toolchain that the build will use.
+      # Idempotent (no-op if already present, e.g. the native aarch64 leg) and
+      # gated to macOS so the Linux/Windows legs are untouched.
+      - name: Add Rust target (macOS)
+        if: runner.os == 'macOS'
+        run: rustup target add ${{ matrix.target }}
+        shell: bash
 
       - name: Install dependencies (Ubuntu)
         if: matrix.platform == 'ubuntu-22.04'
