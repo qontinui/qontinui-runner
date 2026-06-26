@@ -65,8 +65,8 @@ impl EnvAgentConfig {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
         }
-        let pretty =
-            serde_json::to_vec_pretty(self).map_err(|e| format!("serialize env-agent.json: {e}"))?;
+        let pretty = serde_json::to_vec_pretty(self)
+            .map_err(|e| format!("serialize env-agent.json: {e}"))?;
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, &pretty).map_err(|e| format!("write {}: {e}", tmp.display()))?;
         std::fs::rename(&tmp, &path).map_err(|e| format!("rename {}: {e}", path.display()))?;

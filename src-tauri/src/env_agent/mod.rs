@@ -52,8 +52,8 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use tracing::{debug, info, warn};
 
-use self::config::EnvAgentConfig;
 use self::collectors::Section;
+use self::config::EnvAgentConfig;
 
 /// Current envelope schema version. Must match the backend's expectation.
 const SCHEMA_VERSION: u32 = 1;
@@ -113,8 +113,7 @@ pub fn publish_pg_pool_from_url(database_url: &str) -> Result<(), String> {
     let mgr_config = deadpool_postgres::ManagerConfig {
         recycling_method: deadpool_postgres::RecyclingMethod::Fast,
     };
-    let mgr =
-        deadpool_postgres::Manager::from_config(pg_config, tokio_postgres::NoTls, mgr_config);
+    let mgr = deadpool_postgres::Manager::from_config(pg_config, tokio_postgres::NoTls, mgr_config);
     let pool = deadpool_postgres::Pool::builder(mgr)
         .max_size(2)
         .build()
@@ -192,7 +191,11 @@ fn add_section(sections: &mut Map<String, Value>, name: &str, section: Option<Se
 pub async fn build_envelope() -> ConfigEnvelope {
     let mut sections = Map::new();
 
-    add_section(&mut sections, "services", collectors::collect_services().await);
+    add_section(
+        &mut sections,
+        "services",
+        collectors::collect_services().await,
+    );
     add_section(
         &mut sections,
         "db_schema",
@@ -331,8 +334,13 @@ pub async fn capture_and_push() -> Result<(), String> {
     // Cache BEFORE the POST.
     write_last_capture_cache(&envelope, &cfg.environment_id);
 
-    match put_envelope_with_retry(&cfg.backend_url, &cfg.environment_id, &machine_key, &envelope)
-        .await
+    match put_envelope_with_retry(
+        &cfg.backend_url,
+        &cfg.environment_id,
+        &machine_key,
+        &envelope,
+    )
+    .await
     {
         Ok(()) => {
             info!(
@@ -411,7 +419,9 @@ pub fn spawn_env_capture() {
 
             // Gate INSIDE the loop so mid-session enroll works. An unenrolled
             // machine simply skips this tick (no log spam — debug only).
-            let enrolled = EnvAgentConfig::load().map(|c| c.is_enrolled()).unwrap_or(false);
+            let enrolled = EnvAgentConfig::load()
+                .map(|c| c.is_enrolled())
+                .unwrap_or(false);
             if !enrolled {
                 debug!("env_agent::capture: not enrolled — skipping tick");
                 continue;
@@ -420,9 +430,7 @@ pub fn spawn_env_capture() {
             match capture_and_push().await {
                 Err(e) => {
                     consecutive_failures += 1;
-                    warn!(
-                        "env_agent::capture: {e} (consecutive_failures={consecutive_failures})"
-                    );
+                    warn!("env_agent::capture: {e} (consecutive_failures={consecutive_failures})");
                 }
                 Ok(()) if consecutive_failures > 0 => {
                     info!(
@@ -478,8 +486,7 @@ mod tests {
         );
         // The var NAME must be present with value "present".
         assert!(
-            json.contains("QONTINUI_SECRET_TOKEN_ENVELOPE_TEST")
-                && json.contains("present"),
+            json.contains("QONTINUI_SECRET_TOKEN_ENVELOPE_TEST") && json.contains("present"),
             "expected var name + 'present' marker in envelope: {json}"
         );
     }
