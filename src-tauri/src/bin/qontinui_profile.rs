@@ -1305,6 +1305,20 @@ fn cmd_env_enroll(code: &str, backend_arg: Option<&str>, environment_arg: Option
 }
 
 fn cmd_env_capture(dry_run: bool) -> ExitCode {
+    // Publish a lazy PG pool from the active profile so the high-value
+    // `db_schema` collector (alembic_head + schema/table census) can run. The
+    // full runner does this at boot (main.rs fleet-publishers block); the
+    // standalone CLI has no pre-built pool, so without this the section is
+    // always omitted and schema drift is invisible from the CLI. Best-effort:
+    // a build failure here (or a connect failure later inside the collector)
+    // just omits the `db_schema` section — capture still succeeds.
+    let profile = qontinui_runner_lib::profiles::load();
+    if let Err(e) =
+        qontinui_runner_lib::env_agent::publish_pg_pool_from_url(&profile.database_url)
+    {
+        eprintln!("note: db_schema collector unavailable — {e}");
+    }
+
     if dry_run {
         match qontinui_runner_lib::env_agent::build_envelope_blocking() {
             Ok(envelope) => match serde_json::to_string_pretty(&envelope) {

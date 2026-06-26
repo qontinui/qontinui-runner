@@ -89,6 +89,40 @@ pub fn publish_pg_pool(pool: deadpool_postgres::Pool) {
     let _ = PG_POOL.set(pool);
 }
 
+/// Build a LAZY deadpool PG pool from a connection string and publish it for
+/// the `db_schema` collector.
+///
+/// The full runner hands `publish_pg_pool` a clone of its already-built boot
+/// pool (`main.rs`), but the standalone `qontinui_profile env capture` CLI has
+/// no such pool — without this it can never populate the high-value `db_schema`
+/// section (alembic_head + schema/table census), so cross-machine schema drift
+/// is invisible from the CLI. This builds a small pool (mirroring
+/// `database::pg::build_pool`, minus the search_path hook — `alembic_version`
+/// lives in `public`, already covered by the default search_path — and minus
+/// the timeout setters, which would panic without an active tokio runtime).
+///
+/// Lazy by design: the pool is built but NOT connected here, so it is safe to
+/// call from a synchronous CLI context with no runtime entered. The collector
+/// connects on first `get().await` inside the capture runtime; any connect
+/// failure there simply omits the section. Idempotent: a second call no-ops
+/// because the underlying `OnceLock` is already set.
+pub fn publish_pg_pool_from_url(database_url: &str) -> Result<(), String> {
+    let pg_config: tokio_postgres::Config = database_url
+        .parse()
+        .map_err(|e| format!("invalid PG connection string: {e}"))?;
+    let mgr_config = deadpool_postgres::ManagerConfig {
+        recycling_method: deadpool_postgres::RecyclingMethod::Fast,
+    };
+    let mgr =
+        deadpool_postgres::Manager::from_config(pg_config, tokio_postgres::NoTls, mgr_config);
+    let pool = deadpool_postgres::Pool::builder(mgr)
+        .max_size(2)
+        .build()
+        .map_err(|e| format!("failed to build PG pool: {e}"))?;
+    publish_pg_pool(pool);
+    Ok(())
+}
+
 /// Get a clone of the published PG pool, if any. `deadpool_postgres::Pool` is an
 /// `Arc` internally, so cloning is cheap and shares the live pool.
 pub(crate) fn pg_pool() -> Option<deadpool_postgres::Pool> {
