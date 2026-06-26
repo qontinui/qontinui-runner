@@ -229,6 +229,34 @@ jobs:
       #     certutil -decode certificate/tempCert.txt certificate/cert.pfx
       #     Remove-Item certificate/tempCert.txt
 
+      # Tauri's NSIS bundler auto-downloads its toolset (makensis + plugins) and
+      # the WebView2 bootstrapper into %LOCALAPPDATA%\tauri on first use. On a
+      # fresh windows-latest runner that download has to happen every run, and
+      # when it is missing/incomplete the bundler aborts immediately after
+      # "Built application" with a bare "cannot find the file specified
+      # (os error 2)" (issue #654). Caching that dir makes the toolset present
+      # on cache-hit and persists a successful download across runs on miss.
+      # Keyed on the OS so each platform gets its own cache slot.
+      - name: Cache Tauri bundler toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/AppData/Local/tauri
+          key: tauri-toolchain-${{ runner.os }}-v1
+
+      # Belt-and-braces for the os-error-2 failure: pre-install a system NSIS so
+      # `makensis` is guaranteed on PATH even if Tauri's own download of its NSIS
+      # toolset fails or is rate-limited. Chocolatey is preinstalled on the
+      # GitHub windows-latest image. This is fast and idempotent (cache-friendly).
+      - name: Ensure NSIS is installed (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
+            choco install nsis -y --no-progress
+          } else {
+            Write-Host "makensis already available: $((Get-Command makensis).Source)"
+          }
+
       - name: Build Tauri app
         # Tauri signing disabled for alpha - will be enabled when certificates arrive
         # env:
