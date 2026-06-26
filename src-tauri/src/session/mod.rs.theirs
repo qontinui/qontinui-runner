@@ -65,10 +65,7 @@ pub mod local_store;
 pub mod output_pipe;
 pub mod pane_store;
 pub mod provider_adapter;
-<<<<<<< HEAD
 pub mod reconcile;
-=======
->>>>>>> 21acbfae (feat(session-restore): Phase 1 — provider-agnostic core, origin migration, /control/session-open, always-on identity seam, SessionProviderAdapter trait)
 pub mod session_lifecycle_store;
 pub mod shutdown_marker;
 pub mod transport;
