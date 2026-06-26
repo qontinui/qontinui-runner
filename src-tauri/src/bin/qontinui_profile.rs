@@ -1177,7 +1177,11 @@ fn resolve_env_backend_base(backend_arg: Option<&str>) -> Result<String, String>
     Ok(derive_web_base_from_coord(&coord_base))
 }
 
-fn cmd_env_enroll(code: &str, backend_arg: Option<&str>, environment_arg: Option<&str>) -> ExitCode {
+fn cmd_env_enroll(
+    code: &str,
+    backend_arg: Option<&str>,
+    environment_arg: Option<&str>,
+) -> ExitCode {
     if code.trim().is_empty() {
         eprintln!("error: --code requires a non-empty enrollment code");
         return ExitCode::from(2);
@@ -1313,8 +1317,7 @@ fn cmd_env_capture(dry_run: bool) -> ExitCode {
     // a build failure here (or a connect failure later inside the collector)
     // just omits the `db_schema` section — capture still succeeds.
     let profile = qontinui_runner_lib::profiles::load();
-    if let Err(e) =
-        qontinui_runner_lib::env_agent::publish_pg_pool_from_url(&profile.database_url)
+    if let Err(e) = qontinui_runner_lib::env_agent::publish_pg_pool_from_url(&profile.database_url)
     {
         eprintln!("note: db_schema collector unavailable — {e}");
     }
@@ -1717,8 +1720,8 @@ mod tests {
 
     #[test]
     fn env_enroll_requires_code() {
-        let err =
-            Cli::try_parse_from(["qontinui_profile", "env", "enroll"]).expect_err("requires --code");
+        let err = Cli::try_parse_from(["qontinui_profile", "env", "enroll"])
+            .expect_err("requires --code");
         assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
     }
 

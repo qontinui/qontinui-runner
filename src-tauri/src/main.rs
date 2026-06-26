@@ -647,9 +647,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // picked up), and logs+swallows push failures. NEVER awaited
                 // synchronously — kept off the boot critical path like the
                 // sibling publishers above.
-                qontinui_runner_lib::env_agent::publish_pg_pool(
-                    fleet_publish_pg.pool().clone(),
-                );
+                qontinui_runner_lib::env_agent::publish_pg_pool(fleet_publish_pg.pool().clone());
                 qontinui_runner_lib::env_agent::spawn_env_capture();
                 // Session Bus Phase 3b directed-message delivery executor is
                 // RETIRED in favor of `mcp::session_message_poller` (in-session
