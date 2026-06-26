@@ -44,6 +44,7 @@ if "%QONTINUI_INSTALL_INTERCEPT_GUARD%"=="1" goto :passthrough
 
 set "PINNED=%QONTINUI_PINNED_SESSION_ID%"
 
+<<<<<<< HEAD
 rem ---- Claude SessionStart hook delivery (plan SECTION 4, Phase 2) ----------
 rem For TOOL=claude ONLY, append --settings <runner-app-data hook file> so the
 rem confirmation hook is delivered ADDITIVELY (Claude merges it on top of any
@@ -53,6 +54,8 @@ if /I "%TOOL%"=="claude" if defined QONTINUI_CLAUDE_HOOK_SETTINGS (
   if exist "%QONTINUI_CLAUDE_HOOK_SETTINGS%" set "SETTINGS_ARGS=--settings "%QONTINUI_CLAUDE_HOOK_SETTINGS%""
 )
 
+=======
+>>>>>>> 21acbfae (feat(session-restore): Phase 1 — provider-agnostic core, origin migration, /control/session-open, always-on identity seam, SessionProviderAdapter trait)
 rem ---- did the user already choose a session? then don't double-pin --------
 set "USER_CHOSE=0"
 for %%A in (%*) do (
@@ -78,15 +81,24 @@ set "QONTINUI_INSTALL_INTERCEPT_GUARD=1"
 if "%USER_CHOSE%"=="1" goto :passthrough
 if not defined PINNED goto :passthrough
 
+<<<<<<< HEAD
 rem ---- append the runner-pinned session id (+ claude --settings hook) -------
 if defined REAL (
   call "%REAL%" %* %SETTINGS_ARGS% --session-id %PINNED%
 ) else (
   call %TOOL% %* %SETTINGS_ARGS% --session-id %PINNED%
+=======
+rem ---- append the runner-pinned session id and run the real provider --------
+if defined REAL (
+  call "%REAL%" %* --session-id %PINNED%
+) else (
+  call %TOOL% %* --session-id %PINNED%
+>>>>>>> 21acbfae (feat(session-restore): Phase 1 — provider-agnostic core, origin migration, /control/session-open, always-on identity seam, SessionProviderAdapter trait)
 )
 endlocal & exit /b %ERRORLEVEL%
 
 :passthrough
+<<<<<<< HEAD
 rem User chose their own session (or no pin) — still deliver the claude
 rem --settings hook so a --resume/--continue confirms via SessionStart.
 set "QONTINUI_INSTALL_INTERCEPT_GUARD=1"
@@ -94,5 +106,12 @@ if defined REAL (
   call "%REAL%" %* %SETTINGS_ARGS%
 ) else (
   call %TOOL% %* %SETTINGS_ARGS%
+=======
+set "QONTINUI_INSTALL_INTERCEPT_GUARD=1"
+if defined REAL (
+  call "%REAL%" %*
+) else (
+  call %TOOL% %*
+>>>>>>> 21acbfae (feat(session-restore): Phase 1 — provider-agnostic core, origin migration, /control/session-open, always-on identity seam, SessionProviderAdapter trait)
 )
 endlocal & exit /b %ERRORLEVEL%

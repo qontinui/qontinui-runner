@@ -81,7 +81,6 @@ fi
 
 PINNED="${QONTINUI_PINNED_SESSION_ID:-}"
 
-<<<<<<< HEAD
 # ---------------------------------------------------------------------------
 # Claude SessionStart hook delivery (plan §4, Phase 2).
 # For TOOL=claude ONLY, append `--settings <runner-app-data hook file>` so the
@@ -97,8 +96,6 @@ if [ "$TOOL" = "claude" ] && [ -n "${QONTINUI_CLAUDE_HOOK_SETTINGS:-}" ] \
   SETTINGS_ARGS=(--settings "${QONTINUI_CLAUDE_HOOK_SETTINGS}")
 fi
 
-=======
->>>>>>> 21acbfae (feat(session-restore): Phase 1 — provider-agnostic core, origin migration, /control/session-open, always-on identity seam, SessionProviderAdapter trait)
 # Does the user's argv already choose a session? Then don't double-pin.
 user_chose_session=0
 for a in "$@"; do
@@ -129,7 +126,6 @@ notify_session_open() {
 }
 
 if [ "$user_chose_session" -eq 1 ] || [ -z "$PINNED" ]; then
-<<<<<<< HEAD
   # User chose their own session (or we have no pinned id) — don't append our
   # `--session-id`, but STILL deliver the `--settings` hook (claude) so a
   # `--resume`/`--continue` confirms via the SessionStart hook. Also send a
@@ -146,18 +142,3 @@ fi
 # transparent.
 notify_session_open "$PINNED" "startup"
 exec_real "$@" "${SETTINGS_ARGS[@]}" --session-id "$PINNED"
-=======
-  # User chose their own session (or we have no pinned id) — passthrough.
-  # Still send a best-effort confirmation when WE know the pinned id and the
-  # user did not override it (so a bare `claude` with our pin still confirms).
-  if [ "$user_chose_session" -eq 0 ] && [ -n "$PINNED" ]; then
-    notify_session_open "$PINNED" "startup"
-  fi
-  exec_real "$@"
-fi
-
-# Append our pinned id and run the real provider. Confirmation POST first
-# (fire-and-forget); then exec so stdio/exit are transparent.
-notify_session_open "$PINNED" "startup"
-exec_real "$@" --session-id "$PINNED"
->>>>>>> 21acbfae (feat(session-restore): Phase 1 — provider-agnostic core, origin migration, /control/session-open, always-on identity seam, SessionProviderAdapter trait)

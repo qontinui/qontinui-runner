@@ -36,12 +36,8 @@ const SHIM_CMD: &str = include_str!("../../../resources/intercept/shim.cmd");
 
 /// Always-on session-restore IDENTITY shim template (bash / Git-Bash / Unix).
 /// Wraps `claude`/`gemini` to append `--session-id $QONTINUI_PINNED_SESSION_ID`.
-<<<<<<< HEAD
-const IDENTITY_SHIM_BASH: &str = include_str!("../../../resources/intercept/identity_shim.bash");
-=======
 const IDENTITY_SHIM_BASH: &str =
     include_str!("../../../resources/intercept/identity_shim.bash");
->>>>>>> 21acbfae (feat(session-restore): Phase 1 — provider-agnostic core, origin migration, /control/session-open, always-on identity seam, SessionProviderAdapter trait)
 /// Always-on identity shim template (`.cmd` Windows cmd/PowerShell shadow).
 #[cfg(target_os = "windows")]
 const IDENTITY_SHIM_CMD: &str = include_str!("../../../resources/intercept/identity_shim.cmd");
@@ -657,15 +653,7 @@ mod tests {
             {
                 use std::os::unix::fs::PermissionsExt;
                 let mode = std::fs::metadata(&f).unwrap().permissions().mode();
-<<<<<<< HEAD
-                assert_eq!(
-                    mode & 0o111,
-                    0o111,
-                    "{tool} identity shim must be executable"
-                );
-=======
                 assert_eq!(mode & 0o111, 0o111, "{tool} identity shim must be executable");
->>>>>>> 21acbfae (feat(session-restore): Phase 1 — provider-agnostic core, origin migration, /control/session-open, always-on identity seam, SessionProviderAdapter trait)
             }
         }
     }

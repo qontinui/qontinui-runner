@@ -1,3 +1,0 @@
-# TriggersTab
-
-_(notes)_

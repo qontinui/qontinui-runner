@@ -50,7 +50,6 @@ export interface SessionProviderDescriptor {
 }
 
 /**
-<<<<<<< HEAD
  * The Claude descriptor (Phase 2). Resume is the deterministic, non-interactive
  * `claude --resume <id>`; the handshake patterns mirror `resumeVerification.ts`
  * (the `CLAUDE_HANDSHAKE_PATTERNS` success set + the `RESUME_FAILURE_PATTERNS`
@@ -59,16 +58,10 @@ export interface SessionProviderDescriptor {
  * by id. The patterns are plain substrings (the descriptor contract is
  * substring-based); the regex-based matchers in `resumeVerification.ts` remain
  * the live boot-restore implementation this descriptor describes.
-=======
- * The Phase-1 PLACEHOLDER Claude descriptor. The resume command shape is stable
- * enough to ship now; Phase 2 fills the handshake patterns from
- * `resumeVerification.ts`. No method throws.
->>>>>>> 21acbfae (feat(session-restore): Phase 1 — provider-agnostic core, origin migration, /control/session-open, always-on identity seam, SessionProviderAdapter trait)
  */
 export const claudeDescriptor: SessionProviderDescriptor = {
   provider: "claude",
   resumeCommand: (sessionId: string) => ["claude", "--resume", sessionId],
-<<<<<<< HEAD
   handshakePatterns: () => ({
     success: [
       "? for shortcuts", // status-line hint under the input box
@@ -85,9 +78,6 @@ export const claudeDescriptor: SessionProviderDescriptor = {
       "Select a conversation to resume",
     ],
   }),
-=======
-  handshakePatterns: () => ({ success: [], failure: [] }),
->>>>>>> 21acbfae (feat(session-restore): Phase 1 — provider-agnostic core, origin migration, /control/session-open, always-on identity seam, SessionProviderAdapter trait)
   restoreTier: () => "full",
 };
 

@@ -477,18 +477,7 @@ impl TerminalSession {
         // spawn (zero transcript race — the §3b determinism mechanism). Runs
         // AFTER caller `extra_env` so the identity dir wins on PATH. Fail-open:
         // any failure injects nothing and the terminal still spawns.
-<<<<<<< HEAD
         Self::apply_identity_seam(&mut cmd, &id, &app_handle, &cwd, &title, &page_id);
-=======
-        Self::apply_identity_seam(
-            &mut cmd,
-            &id,
-            &app_handle,
-            &cwd,
-            &title,
-            &page_id,
-        );
->>>>>>> 21acbfae (feat(session-restore): Phase 1 — provider-agnostic core, origin migration, /control/session-open, always-on identity seam, SessionProviderAdapter trait)
 
         // ---- Install-interception PATH-shim seam (plan §4 Phase 1) ----------
         // Behind the master flag `QONTINUI_INSTALL_INTERCEPT_ENABLED` (default
@@ -1102,7 +1091,6 @@ impl TerminalSession {
         let port = crate::install_effects_producer::intercept::bound_port();
         cmd.env(shim_materializer::PORT_ENV, port.to_string());
 
-<<<<<<< HEAD
         // ---- Claude SessionStart hook delivery (plan §4, Phase 2) -----------
         // Materialize the bundled `--settings` hook into the runner's OWN
         // app-data dir (~/.qontinui/runner/session-restore/) — NEVER ~/.claude —
@@ -1127,8 +1115,6 @@ impl TerminalSession {
             }
         }
 
-=======
->>>>>>> 21acbfae (feat(session-restore): Phase 1 — provider-agnostic core, origin migration, /control/session-open, always-on identity seam, SessionProviderAdapter trait)
         // 3. Materialize the always-on identity shims + prepend their dir.
         let base_dir = std::env::temp_dir();
         match shim_materializer::materialize_identity(&base_dir, terminal_id) {
