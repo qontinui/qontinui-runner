@@ -89,36 +89,6 @@ const LIVE_SHELL_DEAD_TICKS: u32 = 3;
 /// only covers `"pty-exit"` / `"poll-dead"`.
 const NO_TERMINAL_ORPHAN_TICKS: u32 = 3;
 
-/// The provider every pre-provider-aware record is assumed to belong to. Used
-/// as the `#[serde(default)]` for [`TerminalSessionRecord::provider`]: existing
-/// on-disk records have no `provider` field and are all Claude today.
-pub const DEFAULT_PROVIDER: &str = "claude";
-
-/// `#[serde(default)]` source for [`TerminalSessionRecord::provider`].
-fn default_provider() -> String {
-    DEFAULT_PROVIDER.to_string()
-}
-
-/// Authoritative origin: the runner KNOWS the session id exactly (pre-pinned
-/// `--session-id`, lifted from a typed flag, or a provider hook POSTed it).
-pub const ORIGIN_AUTHORITATIVE: &str = "authoritative";
-/// Reconciled origin: the id was recovered by a backstop and may name a foreign
-/// session — restore treats it conservatively.
-pub const ORIGIN_RECONCILED: &str = "reconciled";
-
-/// Normalize a possibly-legacy `origin` value to the current vocabulary. Maps
-/// the pre-migration `bind_origin` values (`"pinned"`→`"authoritative"`,
-/// `"guessed"`→`"reconciled"`) and passes the new values through unchanged. Any
-/// other string is left verbatim (forward-compat: a value this build doesn't
-/// know is not silently rewritten). Returns `None` for `None`.
-fn normalize_origin(origin: Option<String>) -> Option<String> {
-    origin.map(|o| match o.as_str() {
-        "pinned" => ORIGIN_AUTHORITATIVE.to_string(),
-        "guessed" => ORIGIN_RECONCILED.to_string(),
-        _ => o,
-    })
-}
-
 /// One persisted terminal-session lifecycle record, keyed by
 /// `claude_session_id`. Timestamps are unix epoch millis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,29 +120,11 @@ pub struct TerminalSessionRecord {
     pub closed_at: Option<i64>,
     /// Why the session was closed (e.g. `"poll-dead"`, an explicit reason).
     pub close_reason: Option<String>,
-    /// Which AI-CLI provider owns this session (`"claude"`, `"gemini"`, …).
-    /// `#[serde(default)]` makes every existing record — written before the
-    /// runner was provider-aware — deserialize as `"claude"` (see
-    /// [`default_provider`]); they are all Claude today.
-    #[serde(default = "default_provider")]
-    pub provider: String,
-    /// How `claude_session_id` was bound:
-    ///
-    /// - `"authoritative"` — the runner KNOWS the id exactly (it pre-pinned
-    ///   `--session-id`, lifted it from a typed `--resume`/`--session-id`, or
-    ///   a provider hook POSTed it). Safe to auto-resume unattended.
-    /// - `"reconciled"` — the id was recovered by a backstop (freshest-
-    ///   transcript mtime / process-start-anchored reconcile) and may name a
-    ///   foreign session. Restore treats it conservatively.
-    ///
-    /// Migration: on-disk records written by the previous schema carried this
-    /// field as `bindOrigin` with the values `"pinned"`/`"guessed"`. The
-    /// `alias = "bindOrigin"` reads the old JSON key, and [`load_map`]
-    /// normalizes the legacy values (`pinned`→`authoritative`,
-    /// `guessed`→`reconciled`) at load. Records predating the field entirely
-    /// deserialize as `None`, which consumers read as `"reconciled"`.
-    #[serde(default, alias = "bindOrigin", skip_serializing_if = "Option::is_none")]
-    pub origin: Option<String>,
+    /// How `claude_session_id` was bound: `"pinned"` (`--session-id` /
+    /// `--resume` — exact) or `"guessed"` (freshest-transcript mtime guess).
+    /// Records predating the field deserialize as `None` = guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_origin: Option<String>,
     /// Unix millis when a boot-restore began re-typing this session's
     /// `claude --resume` (set via [`SessionLifecycleStore::mark_restore_pending`],
     /// cleared via [`SessionLifecycleStore::clear_restore_pending`] once the
@@ -185,30 +137,6 @@ pub struct TerminalSessionRecord {
     /// observes the session confidently alive (KeepAlive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_pending_at: Option<i64>,
-    /// Unix millis when a provider's SessionStart hook CONFIRMED that a real
-    /// session actually started in this terminal (session-restore-redesign
-    /// Phase 2 coordinator refinement). `None`/unset = PROVISIONAL.
-    ///
-    /// ## Why a provisional→confirmed distinction
-    ///
-    /// The spawn-time authoritative record ([`apply_identity_seam`]) is written
-    /// for EVERY terminal — including a plain shell that never runs a provider
-    /// (the runner can't know at spawn whether the user will type `claude`, run
-    /// `ls`, or just sit at a prompt). Restoring those phantom shell "sessions"
-    /// as `claude --resume <unused-uuid>` would manufacture failed resumes. The
-    /// provider's SessionStart hook firing — POSTed to `/control/session-open`
-    /// with `source:"startup"|"resume"` — is the observable proof that a REAL
-    /// provider started here. The hook write sets this; the spawn-time write
-    /// leaves it unset. Phase 4's restore classifier uses `confirmed_at`
-    /// (OR a real transcript on disk) to gate auto-resume vs treat-as-plain-shell
-    /// — this phase only PROVIDES the signal; it does NOT change the classifier.
-    ///
-    /// `#[serde(default)]`: every pre-Phase-2 on-disk record deserializes as
-    /// `None` (provisional) — a confirming hook (or Phase 4's transcript check)
-    /// re-establishes confirmation; nothing is lost, the field is purely
-    /// additive.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub confirmed_at: Option<i64>,
 }
 
 /// Durable map of `claude_session_id -> TerminalSessionRecord`. Cheap to
@@ -264,24 +192,10 @@ impl SessionLifecycleStore {
             entry.zone_index = rec.zone_index;
             entry.title = rec.title;
             entry.terminal_id = rec.terminal_id;
-            entry.provider = rec.provider;
-            // Unasserted origin (zone-move backstop / boot re-assert) must not
-            // degrade an authoritative binding to reconciled — preserve on
-            // None. The incoming value is normalized so a legacy caller still
-            // passing "pinned"/"guessed" lands as authoritative/reconciled.
-            if let Some(origin) = normalize_origin(rec.origin) {
-                entry.origin = Some(origin);
-<<<<<<< HEAD
-            }
-            // Confirmation is monotonic: a provisional re-record (the spawn-time
-            // writer, a zone-move backstop) must NEVER clear a confirmation a
-            // provider hook already set. An incoming `Some` (a hook-sourced write
-            // carrying confirmation) DOES set it. So: take the incoming value when
-            // present, else preserve the existing one.
-            if rec.confirmed_at.is_some() {
-                entry.confirmed_at = rec.confirmed_at;
-=======
->>>>>>> 21acbfae (feat(session-restore): Phase 1 — provider-agnostic core, origin migration, /control/session-open, always-on identity seam, SessionProviderAdapter trait)
+            // Unasserted origin (zone-move backstop / boot re-assert) must
+            // not degrade a pinned binding to guessed — preserve on None.
+            if rec.bind_origin.is_some() {
+                entry.bind_origin = rec.bind_origin;
             }
             entry.state = "open".to_string();
             entry.closed_at = None;
@@ -382,111 +296,6 @@ impl SessionLifecycleStore {
         self.persist(&snapshot);
     }
 
-<<<<<<< HEAD
-    /// Flip a present session from PROVISIONAL to CONFIRMED (a provider's
-    /// SessionStart hook fired for this session id — session-restore-redesign
-    /// Phase 2). Stamps `confirmed_at` with now iff it is not already set
-    /// (confirmation is monotonic — the first hook wins; a later resume hook is
-    /// a no-op). No-op (no write) if the session is absent or already confirmed.
-    ///
-    /// Phase 4 reads `confirmed_at` (OR a real transcript on disk) to decide
-    /// auto-resume vs treat-as-plain-shell; this method just records the signal.
-    pub fn confirm_session(&self, claude_session_id: &str) {
-        let now = Utc::now().timestamp_millis();
-        let snapshot = {
-            let mut m = match self.map.lock() {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!(error = %e, "session_lifecycle_store: lock poisoned on confirm_session");
-                    return;
-                }
-            };
-            match m.get_mut(claude_session_id) {
-                Some(rec) if rec.confirmed_at.is_none() => rec.confirmed_at = Some(now),
-                _ => return, // absent or already confirmed — nothing to flush
-            }
-            m.clone()
-        };
-        self.persist(&snapshot);
-    }
-
-=======
->>>>>>> 21acbfae (feat(session-restore): Phase 1 — provider-agnostic core, origin migration, /control/session-open, always-on identity seam, SessionProviderAdapter trait)
-    /// Re-key a record from `old_id` to `new_id`: remove the entry stored under
-    /// `old_id` and re-insert it under `new_id`, updating the record's own
-    /// `claude_session_id` to match. Atomic under the same lock + persisted via
-    /// the existing temp-file write.
-    ///
-    /// ## Why a re-key, not a field edit
-    ///
-    /// `claude_session_id` is the MAP KEY ([`record_open`] does
-    /// `m.entry(rec.claude_session_id.clone())`, and the in-place refresh block
-    /// only touches non-key fields). An adapter that reports a CORRECTED id can
-    /// therefore not change the key by re-recording — it must re-key. This helper
-    /// is the defensive primitive for that.
-    ///
-    /// No-op (no write) when: `old_id == new_id`; `old_id` is absent; or `new_id`
-    /// is ALREADY present (re-keying onto a live row would clobber it — refuse
-    /// rather than lose data). NOTE: no shipped adapter triggers this today (the
-    /// audit refuted Claude id-rotation); it exists so a future adapter that does
-    /// report a corrected id has a correct primitive and never leaves a
-    /// permanently-stale row.
-    pub fn rekey_session(&self, old_id: &str, new_id: &str) {
-        if old_id == new_id {
-            return;
-        }
-        let snapshot = {
-            let mut m = match self.map.lock() {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!(error = %e, "session_lifecycle_store: lock poisoned on rekey_session");
-                    return;
-                }
-            };
-            if m.contains_key(new_id) {
-                warn!(
-                    old_id,
-                    new_id,
-                    "session_lifecycle_store: rekey target already present — refusing to clobber"
-                );
-                return;
-            }
-            let Some(mut rec) = m.remove(old_id) else {
-                return; // old id absent — nothing to re-key
-            };
-            rec.claude_session_id = new_id.to_string();
-            m.insert(new_id.to_string(), rec);
-            m.clone()
-        };
-        self.persist(&snapshot);
-    }
-
-<<<<<<< HEAD
-    /// Remove a record outright (session-restore-redesign Phase 4 reconcile
-    /// phantom-prune). Unlike [`record_close`], which leaves a `closed` row that
-    /// the restore-grace logic might still resurrect, this DELETES the entry so a
-    /// phantom provisional record (authoritative-but-unconfirmed, no live process
-    /// and no transcript) can never auto-resume on any future boot. No-op (no
-    /// write) if the id is absent.
-    pub fn remove_session(&self, claude_session_id: &str) {
-        let snapshot = {
-            let mut m = match self.map.lock() {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!(error = %e, "session_lifecycle_store: lock poisoned on remove_session");
-                    return;
-                }
-            };
-            if m.remove(claude_session_id).is_none() {
-                return; // absent — nothing to flush
-            }
-            m.clone()
-        };
-        self.persist(&snapshot);
-    }
-
-=======
->>>>>>> 21acbfae (feat(session-restore): Phase 1 — provider-agnostic core, origin migration, /control/session-open, always-on identity seam, SessionProviderAdapter trait)
     /// Clone of the open record currently hosted by `terminal_id`, if any.
     /// Terminal ids are fresh per PTY spawn, so at most one OPEN record can
     /// reference a given terminal at a time.
@@ -693,12 +502,7 @@ fn load_map(path: &Path) -> HashMap<String, TerminalSessionRecord> {
     let mut dropped: Vec<(String, serde_json::Value)> = Vec::new();
     for (key, value) in raw {
         match serde_json::from_value::<TerminalSessionRecord>(value.clone()) {
-            Ok(mut rec) => {
-                // Migrate legacy `bind_origin` values to the current vocabulary
-                // at load (`pinned`→`authoritative`, `guessed`→`reconciled`).
-                // The field-name read is handled by `alias = "bindOrigin"`; this
-                // maps the VALUES, which also changed.
-                rec.origin = normalize_origin(rec.origin);
+            Ok(rec) => {
                 map.insert(key, rec);
             }
             Err(e) => {
@@ -882,291 +686,42 @@ mod tests {
             state: "open".to_string(),
             closed_at: None,
             close_reason: None,
-            provider: DEFAULT_PROVIDER.to_string(),
-            origin: None,
+            bind_origin: None,
             restore_pending_at: None,
-            confirmed_at: None,
         }
     }
 
-<<<<<<< HEAD
-    /// `confirm_session` flips provisional→confirmed monotonically, a
-    /// provisional re-record never clears it, and pre-Phase-2 rows load
-    /// provisional (session-restore-redesign Phase 2 coordinator refinement).
+    /// Records predating `bindOrigin` must deserialize and read as guessed.
     #[test]
-    fn confirm_session_flips_provisional_and_record_open_never_clears_it() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("terminal-sessions.json");
-        let store = SessionLifecycleStore::open(&path).unwrap();
-
-        // Spawn-time write is PROVISIONAL (confirmed_at unset).
-        store.record_open(rec("sess-1"));
-        assert!(
-            store.get("sess-1").unwrap().confirmed_at.is_none(),
-            "spawn-time record is provisional"
-        );
-
-        // The provider's SessionStart hook fires → confirm.
-        store.confirm_session("sess-1");
-        let confirmed_at = store.get("sess-1").unwrap().confirmed_at;
-        assert!(confirmed_at.is_some(), "hook flips it to confirmed");
-
-        // Confirmation is monotonic: a second confirm (a later resume hook) is a
-        // no-op (does NOT bump the timestamp).
-        store.confirm_session("sess-1");
-        assert_eq!(
-            store.get("sess-1").unwrap().confirmed_at,
-            confirmed_at,
-            "second confirm is a no-op (first hook wins)"
-        );
-
-        // A PROVISIONAL re-record (spawn-time writer / zone-move backstop) must
-        // NOT clear an existing confirmation.
-        store.record_open(rec("sess-1"));
-        assert_eq!(
-            store.get("sess-1").unwrap().confirmed_at,
-            confirmed_at,
-            "provisional re-record preserves confirmation"
-        );
-
-        // Durable across reload + confirming an absent id is a no-op.
-        let store = SessionLifecycleStore::open(&path).unwrap();
-        assert!(store.get("sess-1").unwrap().confirmed_at.is_some());
-        store.confirm_session("ghost"); // no panic
-
-        // A pre-Phase-2 on-disk record (no confirmedAt key) loads provisional.
-        let json = r#"{"old": {
-            "claudeSessionId":"old","configDir":null,"workingDir":"C:/repo",
-            "pageId":"default","zoneIndex":1,"title":"Old","terminalId":"t",
-            "openedAt":1,"lastSeenAt":2,"state":"open","closedAt":null,"closeReason":null
-        }}"#;
-        let p2 = dir.path().join("legacy.json");
-        std::fs::write(&p2, json).unwrap();
-        let s2 = SessionLifecycleStore::open(&p2).unwrap();
-        assert!(
-            s2.get("old").unwrap().confirmed_at.is_none(),
-            "pre-Phase-2 record loads provisional"
-        );
-    }
-
-    /// Records predating the origin field must deserialize and read as
-    /// reconciled (the conservative default).
-    #[test]
-=======
-    /// Records predating the origin field must deserialize and read as
-    /// reconciled (the conservative default).
-    #[test]
->>>>>>> 21acbfae (feat(session-restore): Phase 1 — provider-agnostic core, origin migration, /control/session-open, always-on identity seam, SessionProviderAdapter trait)
-    fn pre_origin_record_deserializes_as_reconciled() {
+    fn pre_bind_origin_record_deserializes_as_guessed() {
         let json = r#"{"claudeSessionId":"old-sess","configDir":null,"workingDir":"C:/repo",
             "pageId":"default","zoneIndex":1,"title":"Old","terminalId":"term-old",
             "openedAt":1,"lastSeenAt":2,"state":"open","closedAt":null,"closeReason":null}"#;
         let rec: TerminalSessionRecord = serde_json::from_str(json).unwrap();
-        // `None` IS the reconciled reading — consumers default absent to
-        // "reconciled". Provider defaults to claude for pre-provider rows.
-        assert_eq!(
-            rec.origin.as_deref().unwrap_or(ORIGIN_RECONCILED),
-            ORIGIN_RECONCILED
-        );
-        assert_eq!(rec.provider, DEFAULT_PROVIDER);
+        // `None` IS the guessed reading — consumers default absent to "guessed".
+        assert_eq!(rec.bind_origin.as_deref().unwrap_or("guessed"), "guessed");
     }
 
-    /// A legacy on-disk record carrying `bindOrigin:"pinned"` must load as
-    /// `origin:"authoritative"`, and `bindOrigin:"guessed"` as
-    /// `origin:"reconciled"` (the value migration, exercised through the real
-    /// load path so the `alias` + `load_map` normalization both fire).
+    /// Pinned origin survives an unasserted re-record; asserted updates.
     #[test]
-    fn legacy_bind_origin_values_migrate_on_load() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("terminal-sessions.json");
-        let file = r#"{
-            "pin": {
-                "claudeSessionId":"pin","configDir":null,"workingDir":"C:/repo",
-                "pageId":"default","zoneIndex":1,"title":"P","terminalId":"t1",
-                "openedAt":1,"lastSeenAt":2,"state":"open","closedAt":null,
-                "closeReason":null,"bindOrigin":"pinned"
-            },
-            "guess": {
-                "claudeSessionId":"guess","configDir":null,"workingDir":"C:/repo",
-                "pageId":"default","zoneIndex":2,"title":"G","terminalId":"t2",
-                "openedAt":1,"lastSeenAt":2,"state":"open","closedAt":null,
-                "closeReason":null,"bindOrigin":"guessed"
-            }
-        }"#;
-        std::fs::write(&path, file).unwrap();
-        let store = SessionLifecycleStore::open(&path).unwrap();
-        assert_eq!(
-            store.get("pin").unwrap().origin.as_deref(),
-            Some(ORIGIN_AUTHORITATIVE),
-            "legacy pinned migrates to authoritative"
-        );
-        assert_eq!(
-            store.get("guess").unwrap().origin.as_deref(),
-            Some(ORIGIN_RECONCILED),
-            "legacy guessed migrates to reconciled"
-        );
-        // Pre-provider rows default to claude.
-        assert_eq!(store.get("pin").unwrap().provider, DEFAULT_PROVIDER);
-    }
-
-    /// Authoritative origin survives an unasserted re-record; asserted updates.
-    #[test]
-    fn record_open_preserves_origin_when_unasserted() {
+    fn record_open_preserves_bind_origin_when_unasserted() {
         let dir = tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
-        let mut auth = rec("sess-1");
-        auth.origin = Some(ORIGIN_AUTHORITATIVE.to_string());
-        store.record_open(auth);
+        let mut pinned = rec("sess-1");
+        pinned.bind_origin = Some("pinned".to_string());
+        store.record_open(pinned);
         store.record_open(rec("sess-1")); // unasserted (None)
         assert_eq!(
-            store.open_records()[0].origin.as_deref(),
-            Some(ORIGIN_AUTHORITATIVE)
+            store.open_records()[0].bind_origin.as_deref(),
+            Some("pinned")
         );
-        let mut reconciled = rec("sess-1");
-        reconciled.origin = Some(ORIGIN_RECONCILED.to_string());
-        store.record_open(reconciled);
+        let mut guessed = rec("sess-1");
+        guessed.bind_origin = Some("guessed".to_string());
+        store.record_open(guessed);
         assert_eq!(
-            store.open_records()[0].origin.as_deref(),
-            Some(ORIGIN_RECONCILED)
-<<<<<<< HEAD
-=======
+            store.open_records()[0].bind_origin.as_deref(),
+            Some("guessed")
         );
-    }
-
-    /// `record_open` normalizes a legacy origin value handed in by an
-    /// un-migrated caller (`pinned` → `authoritative`).
-    #[test]
-    fn record_open_normalizes_legacy_origin_value() {
-        let dir = tempdir().unwrap();
-        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
-        let mut legacy = rec("sess-1");
-        legacy.origin = Some("pinned".to_string());
-        store.record_open(legacy);
-        assert_eq!(
-            store.open_records()[0].origin.as_deref(),
-            Some(ORIGIN_AUTHORITATIVE)
-        );
-    }
-
-    /// `rekey_session` moves a row from the old id to the new id, updating the
-    /// record's own `claude_session_id`, and is a safe no-op on the edge cases.
-    #[test]
-    fn rekey_session_moves_row_and_guards_edges() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("terminal-sessions.json");
-        let store = SessionLifecycleStore::open(&path).unwrap();
-        let mut r = rec("old");
-        r.origin = Some(ORIGIN_AUTHORITATIVE.to_string());
-        store.record_open(r);
-
-        store.rekey_session("old", "new");
-        assert!(store.get("old").is_none(), "old key removed");
-        let moved = store.get("new").expect("row present under new id");
-        assert_eq!(moved.claude_session_id, "new", "record id updated to match");
-        assert_eq!(moved.origin.as_deref(), Some(ORIGIN_AUTHORITATIVE));
-
-        // Durable across a reload.
-        let store = SessionLifecycleStore::open(&path).unwrap();
-        assert!(store.get("new").is_some());
-
-        // Edge: absent old id — no-op, no panic.
-        store.rekey_session("ghost", "whatever");
-        assert!(store.get("whatever").is_none());
-
-        // Edge: old == new — no-op.
-        store.rekey_session("new", "new");
-        assert!(store.get("new").is_some());
-
-        // Edge: target already present — refuse to clobber.
-        store.record_open(rec("other"));
-        store.rekey_session("other", "new");
-        assert!(store.get("other").is_some(), "source kept on refusal");
-        assert_eq!(
-            store.get("new").unwrap().claude_session_id,
-            "new",
-            "target untouched on refusal"
->>>>>>> 21acbfae (feat(session-restore): Phase 1 — provider-agnostic core, origin migration, /control/session-open, always-on identity seam, SessionProviderAdapter trait)
-        );
-    }
-
-    /// `record_open` normalizes a legacy origin value handed in by an
-    /// un-migrated caller (`pinned` → `authoritative`).
-    #[test]
-    fn record_open_normalizes_legacy_origin_value() {
-        let dir = tempdir().unwrap();
-        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
-        let mut legacy = rec("sess-1");
-        legacy.origin = Some("pinned".to_string());
-        store.record_open(legacy);
-        assert_eq!(
-            store.open_records()[0].origin.as_deref(),
-            Some(ORIGIN_AUTHORITATIVE)
-        );
-    }
-
-    /// `rekey_session` moves a row from the old id to the new id, updating the
-    /// record's own `claude_session_id`, and is a safe no-op on the edge cases.
-    #[test]
-    fn rekey_session_moves_row_and_guards_edges() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("terminal-sessions.json");
-        let store = SessionLifecycleStore::open(&path).unwrap();
-        let mut r = rec("old");
-        r.origin = Some(ORIGIN_AUTHORITATIVE.to_string());
-        store.record_open(r);
-
-        store.rekey_session("old", "new");
-        assert!(store.get("old").is_none(), "old key removed");
-        let moved = store.get("new").expect("row present under new id");
-        assert_eq!(moved.claude_session_id, "new", "record id updated to match");
-        assert_eq!(moved.origin.as_deref(), Some(ORIGIN_AUTHORITATIVE));
-
-        // Durable across a reload.
-        let store = SessionLifecycleStore::open(&path).unwrap();
-        assert!(store.get("new").is_some());
-
-        // Edge: absent old id — no-op, no panic.
-        store.rekey_session("ghost", "whatever");
-        assert!(store.get("whatever").is_none());
-
-        // Edge: old == new — no-op.
-        store.rekey_session("new", "new");
-        assert!(store.get("new").is_some());
-
-        // Edge: target already present — refuse to clobber.
-        store.record_open(rec("other"));
-        store.rekey_session("other", "new");
-        assert!(store.get("other").is_some(), "source kept on refusal");
-        assert_eq!(
-            store.get("new").unwrap().claude_session_id,
-            "new",
-            "target untouched on refusal"
-        );
-    }
-
-    /// `remove_session` deletes a row outright (phantom-prune) so it never
-    /// resurrects on a future boot, and is a no-op when the id is absent.
-    #[test]
-    fn remove_session_deletes_row_and_is_noop_when_absent() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("terminal-sessions.json");
-        let store = SessionLifecycleStore::open(&path).unwrap();
-        store.record_open(rec("phantom"));
-        assert!(store.get("phantom").is_some());
-
-        store.remove_session("phantom");
-        assert!(store.get("phantom").is_none(), "row deleted");
-        // Durable across reload — the row stays gone (not just closed-in-grace).
-        let store = SessionLifecycleStore::open(&path).unwrap();
-        assert!(store.get("phantom").is_none(), "stays removed after reload");
-        assert!(
-            store
-                .restorable_records(Utc::now().timestamp_millis(), None)
-                .is_empty(),
-            "a removed phantom is never restorable"
-        );
-        // Absent id — no panic, no write.
-        store.remove_session("ghost");
     }
 
     #[test]
@@ -1763,10 +1318,8 @@ mod tests {
             state: state.to_string(),
             closed_at,
             close_reason: close_reason.map(str::to_string),
-            provider: DEFAULT_PROVIDER.to_string(),
-            origin: None,
+            bind_origin: None,
             restore_pending_at: None,
-            confirmed_at: None,
         }
     }
 

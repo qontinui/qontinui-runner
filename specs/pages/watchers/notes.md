@@ -1,3 +1,0 @@
-# WatcherManagementPanel
-
-_(notes)_

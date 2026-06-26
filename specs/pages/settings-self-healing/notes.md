@@ -1,3 +1,0 @@
-# SelfHealingSettings
-
-_(notes)_

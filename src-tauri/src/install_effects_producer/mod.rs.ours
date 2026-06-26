@@ -256,18 +256,6 @@ fn record_session_open_into(
         0,
         provider.to_string(),
     );
-<<<<<<< HEAD
-    // CONFIRM the record (session-restore-redesign Phase 2 coordinator
-    // refinement). This route is hit ONLY by a provider's SessionStart hook,
-    // which fires only when a REAL provider session actually started in this
-    // terminal — so a POST here is the observable proof that flips the
-    // (provisional, spawn-time) record to confirmed. The spawn-time writer in
-    // `apply_identity_seam` leaves it provisional; a plain shell that never runs
-    // a provider therefore never gets a hook and stays provisional, so Phase 4's
-    // restore classifier won't try to `--resume` a phantom shell "session".
-    store.confirm_session(&req.session_id);
-=======
->>>>>>> 21acbfae (feat(session-restore): Phase 1 — provider-agnostic core, origin migration, /control/session-open, always-on identity seam, SessionProviderAdapter trait)
 }
 
 /// `POST /install-effects/run`.
@@ -1256,15 +1244,6 @@ mod tests {
         assert_eq!(rec.working_dir.as_deref(), Some("C:/repos/widget"));
         // Title derives from the cwd basename.
         assert_eq!(rec.title.as_deref(), Some("widget"));
-<<<<<<< HEAD
-        // The hook POST CONFIRMS the record (Phase 2): a real provider started
-        // here, so the (provisional) spawn-time row is flipped to confirmed.
-        assert!(
-            rec.confirmed_at.is_some(),
-            "a SessionStart-hook-sourced write confirms the record"
-        );
-=======
->>>>>>> 21acbfae (feat(session-restore): Phase 1 — provider-agnostic core, origin migration, /control/session-open, always-on identity seam, SessionProviderAdapter trait)
 
         // A confirming hook on the SAME id (e.g. a later --resume) dedups by key
         // and refreshes the row rather than duplicating it.

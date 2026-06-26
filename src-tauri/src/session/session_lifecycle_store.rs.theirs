@@ -271,7 +271,6 @@ impl SessionLifecycleStore {
             // passing "pinned"/"guessed" lands as authoritative/reconciled.
             if let Some(origin) = normalize_origin(rec.origin) {
                 entry.origin = Some(origin);
-<<<<<<< HEAD
             }
             // Confirmation is monotonic: a provisional re-record (the spawn-time
             // writer, a zone-move backstop) must NEVER clear a confirmation a
@@ -280,8 +279,6 @@ impl SessionLifecycleStore {
             // present, else preserve the existing one.
             if rec.confirmed_at.is_some() {
                 entry.confirmed_at = rec.confirmed_at;
-=======
->>>>>>> 21acbfae (feat(session-restore): Phase 1 — provider-agnostic core, origin migration, /control/session-open, always-on identity seam, SessionProviderAdapter trait)
             }
             entry.state = "open".to_string();
             entry.closed_at = None;
@@ -382,7 +379,6 @@ impl SessionLifecycleStore {
         self.persist(&snapshot);
     }
 
-<<<<<<< HEAD
     /// Flip a present session from PROVISIONAL to CONFIRMED (a provider's
     /// SessionStart hook fired for this session id — session-restore-redesign
     /// Phase 2). Stamps `confirmed_at` with now iff it is not already set
@@ -410,8 +406,6 @@ impl SessionLifecycleStore {
         self.persist(&snapshot);
     }
 
-=======
->>>>>>> 21acbfae (feat(session-restore): Phase 1 — provider-agnostic core, origin migration, /control/session-open, always-on identity seam, SessionProviderAdapter trait)
     /// Re-key a record from `old_id` to `new_id`: remove the entry stored under
     /// `old_id` and re-insert it under `new_id`, updating the record's own
     /// `claude_session_id` to match. Atomic under the same lock + persisted via
@@ -461,7 +455,6 @@ impl SessionLifecycleStore {
         self.persist(&snapshot);
     }
 
-<<<<<<< HEAD
     /// Remove a record outright (session-restore-redesign Phase 4 reconcile
     /// phantom-prune). Unlike [`record_close`], which leaves a `closed` row that
     /// the restore-grace logic might still resurrect, this DELETES the entry so a
@@ -485,8 +478,6 @@ impl SessionLifecycleStore {
         self.persist(&snapshot);
     }
 
-=======
->>>>>>> 21acbfae (feat(session-restore): Phase 1 — provider-agnostic core, origin migration, /control/session-open, always-on identity seam, SessionProviderAdapter trait)
     /// Clone of the open record currently hosted by `terminal_id`, if any.
     /// Terminal ids are fresh per PTY spawn, so at most one OPEN record can
     /// reference a given terminal at a time.
@@ -889,7 +880,6 @@ mod tests {
         }
     }
 
-<<<<<<< HEAD
     /// `confirm_session` flips provisional→confirmed monotonically, a
     /// provisional re-record never clears it, and pre-Phase-2 rows load
     /// provisional (session-restore-redesign Phase 2 coordinator refinement).
@@ -952,11 +942,6 @@ mod tests {
     /// Records predating the origin field must deserialize and read as
     /// reconciled (the conservative default).
     #[test]
-=======
-    /// Records predating the origin field must deserialize and read as
-    /// reconciled (the conservative default).
-    #[test]
->>>>>>> 21acbfae (feat(session-restore): Phase 1 — provider-agnostic core, origin migration, /control/session-open, always-on identity seam, SessionProviderAdapter trait)
     fn pre_origin_record_deserializes_as_reconciled() {
         let json = r#"{"claudeSessionId":"old-sess","configDir":null,"workingDir":"C:/repo",
             "pageId":"default","zoneIndex":1,"title":"Old","terminalId":"term-old",
@@ -1028,64 +1013,6 @@ mod tests {
         assert_eq!(
             store.open_records()[0].origin.as_deref(),
             Some(ORIGIN_RECONCILED)
-<<<<<<< HEAD
-=======
-        );
-    }
-
-    /// `record_open` normalizes a legacy origin value handed in by an
-    /// un-migrated caller (`pinned` → `authoritative`).
-    #[test]
-    fn record_open_normalizes_legacy_origin_value() {
-        let dir = tempdir().unwrap();
-        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
-        let mut legacy = rec("sess-1");
-        legacy.origin = Some("pinned".to_string());
-        store.record_open(legacy);
-        assert_eq!(
-            store.open_records()[0].origin.as_deref(),
-            Some(ORIGIN_AUTHORITATIVE)
-        );
-    }
-
-    /// `rekey_session` moves a row from the old id to the new id, updating the
-    /// record's own `claude_session_id`, and is a safe no-op on the edge cases.
-    #[test]
-    fn rekey_session_moves_row_and_guards_edges() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("terminal-sessions.json");
-        let store = SessionLifecycleStore::open(&path).unwrap();
-        let mut r = rec("old");
-        r.origin = Some(ORIGIN_AUTHORITATIVE.to_string());
-        store.record_open(r);
-
-        store.rekey_session("old", "new");
-        assert!(store.get("old").is_none(), "old key removed");
-        let moved = store.get("new").expect("row present under new id");
-        assert_eq!(moved.claude_session_id, "new", "record id updated to match");
-        assert_eq!(moved.origin.as_deref(), Some(ORIGIN_AUTHORITATIVE));
-
-        // Durable across a reload.
-        let store = SessionLifecycleStore::open(&path).unwrap();
-        assert!(store.get("new").is_some());
-
-        // Edge: absent old id — no-op, no panic.
-        store.rekey_session("ghost", "whatever");
-        assert!(store.get("whatever").is_none());
-
-        // Edge: old == new — no-op.
-        store.rekey_session("new", "new");
-        assert!(store.get("new").is_some());
-
-        // Edge: target already present — refuse to clobber.
-        store.record_open(rec("other"));
-        store.rekey_session("other", "new");
-        assert!(store.get("other").is_some(), "source kept on refusal");
-        assert_eq!(
-            store.get("new").unwrap().claude_session_id,
-            "new",
-            "target untouched on refusal"
->>>>>>> 21acbfae (feat(session-restore): Phase 1 — provider-agnostic core, origin migration, /control/session-open, always-on identity seam, SessionProviderAdapter trait)
         );
     }
 
