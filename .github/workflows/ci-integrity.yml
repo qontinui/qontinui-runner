@@ -1,110 +1,88 @@
+# CI Integrity — self-gating guard for an autonomous, auto-merging fleet.
+#
+# THREAT: coord auto-merges green PRs with zero human review, so the integrity
+# of the gating workflows IS the security boundary. An agent PR that edits or
+# deletes a gate (e.g. neuters a job in ci.yml, removes a drift check) could
+# then auto-land using the weakened gate. This guard makes any change to a
+# gating workflow surface as RED CI, so coord will NOT auto-land it and an
+# operator reviews the diff. "Red CI" is the project's sanctioned merge-stopper
+# — this is deliberately NOT a GitHub *required* status context and NOT a coord
+# escalate-path:
+#   * Required contexts desync GitHub's mergeStateStatus from coord (the real
+#     merge authority) and — when path-filtered or producer-less — BLOCK every
+#     PR forever (the 2026-06-26 fleet wedge: phantom `secret-scan`/`ci-integrity`
+#     required contexts). Enforce gate integrity as red CI instead, never as
+#     branch protection. Keep `required_status_checks.contexts: []` (matches web).
+#
+# WHY pull_request_target: GitHub runs the workflow file from the BASE branch
+# (trusted main), not the PR's copy — so a PR cannot neuter THIS check by editing
+# its own ci-integrity.yml. We never check out or execute PR code; we only read
+# the PR's changed-file LIST via the API. Permissions are read-only.
+#
+# Maintaining GATING_WORKFLOWS: list only files that exist and that actually
+# gate merges (the original guarded a non-existent `secret-scan.yml` — useless).
+# ci-integrity.yml guards itself, so removing a gate from this list is itself a
+# guarded edit (goes red -> operator review).
 name: CI Integrity
 
 on:
   pull_request_target:
     branches: [main]
     paths:
-      - '.github/workflows/*.yml'
+      - '.github/workflows/**'
 
 permissions:
   contents: read
-  statuses: write
+  pull-requests: read
 
 jobs:
-  check-self-gating:
-    name: Prevent Self-Gating Workflow Edits
+  guard-gating-workflows:
+    name: Guard gating workflows from self-edits
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout base ref (main - trusted)
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.base_ref }}
-          path: base
-
-      - name: Checkout PR head
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.head_ref }}
-          repository: ${{ github.head_repo.full_name }}
-          path: head
-
-      - name: Install yq for YAML parsing
+      - name: Flag edits/deletes to gating workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
         run: |
-          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
-          sudo chmod +x /usr/local/bin/yq
+          set -euo pipefail
 
-      - name: Check for self-gating edits
-        id: check
-        run: |
-          set +e
-          GATING_WORKFLOWS="secret-scan"
+          # Integrity-critical workflows. Editing or DELETING any of these is a
+          # high-trust change that must not auto-merge. Only list files that
+          # exist (verify with: ls .github/workflows). ci-integrity.yml guards
+          # itself.
+          read -r -d '' GATING <<'EOF' || true
+          .github/workflows/ci.yml
+          .github/workflows/ci-integrity.yml
+          .github/workflows/reproducibility-gate.yml
+          .github/workflows/forbid-runner-schema.yml
+          .github/workflows/clorinde-bindings-fresh.yml
+          .github/workflows/schema-pg-sql-fresh.yml
+          .github/workflows/qontinui-types-drift.yml
+          EOF
 
-          # Get list of modified workflow files
-          MODIFIED_WORKFLOWS=$(find base/.github/workflows -name "*.yml" -type f | while read base_file; do
-            head_file="${base_file/base\//head\/}"
-            if [ ! -f "$head_file" ]; then
-              continue
+          # Changed files in this PR (paths only). No checkout of untrusted
+          # code; `removed` files are included so deletions are caught too.
+          CHANGED="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" \
+            --jq '.[].filename')"
+
+          HITS=""
+          while IFS= read -r gate; do
+            [ -z "${gate}" ] && continue
+            if printf '%s\n' "${CHANGED}" | grep -qxF "${gate}"; then
+              HITS="${HITS}  - ${gate}"$'\n'
             fi
-            if ! diff -q "$base_file" "$head_file" >/dev/null 2>&1; then
-              basename "$base_file"
-            fi
-          done)
+          done <<< "${GATING}"
 
-          if [ -z "$MODIFIED_WORKFLOWS" ]; then
-            echo "No workflow files modified"
-            exit 0
-          fi
-
-          echo "Modified workflows:"
-          echo "$MODIFIED_WORKFLOWS"
-          echo ""
-
-          SELF_GATING_DETECTED=0
-
-          # Check each modified workflow
-          while IFS= read -r workflow; do
-            if [ -z "$workflow" ]; then
-              continue
-            fi
-
-            # Check if this workflow is a gating workflow
-            for gating_wf in $GATING_WORKFLOWS; do
-              if [ "$workflow" = "${gating_wf}.yml" ]; then
-                echo "FAILURE: Modified workflow '$workflow' is a gating workflow"
-                SELF_GATING_DETECTED=1
-              fi
-            done
-
-            # Check if the workflow runs on pull_request
-            workflow_path="base/.github/workflows/$workflow"
-            if yq eval '.on.pull_request' "$workflow_path" >/dev/null 2>&1; then
-              pr_trigger=$(yq eval '.on.pull_request' "$workflow_path")
-              if [ "$pr_trigger" != "null" ] && [ -n "$pr_trigger" ]; then
-                # This workflow runs on pull_request
-                # Check if it's in the list of gating workflows
-                for gating_wf in $GATING_WORKFLOWS; do
-                  if [ "$workflow" = "${gating_wf}.yml" ]; then
-                    echo "FAILURE: Self-gating detected: '$workflow' is a gating workflow and was modified by this PR"
-                    SELF_GATING_DETECTED=1
-                  fi
-                done
-              fi
-            fi
-          done <<< "$MODIFIED_WORKFLOWS"
-
-          if [ $SELF_GATING_DETECTED -eq 1 ]; then
-            echo "self_gating_detected=true" >> $GITHUB_OUTPUT
+          if [ -n "${HITS}" ]; then
+            echo "::error::This PR changes gating workflow(s) that protect merge integrity:"
+            printf '%s' "${HITS}"
+            echo ""
+            echo "Gate-workflow changes do NOT auto-merge — they surface as red CI so an"
+            echo "operator can review the diff before it lands. If the change is intended"
+            echo "and safe, an operator merges it after review."
             exit 1
           fi
 
-          echo "self_gating_detected=false" >> $GITHUB_OUTPUT
-          exit 0
-
-      - name: Report status
-        if: always()
-        run: |
-          if [ "${{ steps.check.outputs.self_gating_detected }}" = "true" ]; then
-            echo "::error::A PR cannot modify its own gating workflows. This PR edits one or more workflows that are required for CI gating."
-            exit 1
-          fi
-          echo "✓ CI integrity check passed: No self-gating edits detected"
+          echo "No gating workflow modified — CI integrity intact."
