@@ -18,7 +18,15 @@ on:
       - 'merge-candidate-spec/**'
       - 'merge-candidate-batch/**'
   pull_request:
-    branches: [main, develop]
+    # `session-restore-**`: stacked PRs that target a long-lived integration
+    # branch (e.g. `session-restore-redesign`) instead of `main` matched no
+    # `pull_request` trigger, so runner CI never ran on them → coord's
+    # awaiting-ci poll of `coord.pr_check_runs` stayed empty → the PRs sat at
+    # `ci-pending` forever and never auto-landed (runner #651/#652, 2026-06-26).
+    # The base-branch filter is matched against the PR's *base*, so the
+    # integration branch must be listed here for stacked-PR CI to fire. CI has
+    # no `paths:` filter, so adding the branch suffices. (Mirrors #660 on main.)
+    branches: [main, develop, 'session-restore-**']
 
 env:
   CARGO_TERM_COLOR: always
