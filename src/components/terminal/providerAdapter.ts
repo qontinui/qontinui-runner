@@ -82,14 +82,50 @@ export const claudeDescriptor: SessionProviderDescriptor = {
 };
 
 /**
- * Registry lookup (plan §4 registry seam). Phase 1 knows only the Claude
- * descriptor; Phase 3 adds the Gemini arm. An unknown provider degrades to the
- * Claude descriptor (the only shipped provider today) rather than failing — a
- * record with an unexpected provider should still restore via the default path.
+ * The Codex descriptor (Phase 3 — provider #2, OpenAI Codex CLI). Resume is the
+ * interactive typed-into-PTV form `codex resume <id>` (codex accepts the UUID
+ * directly; the `claude --resume` analogue). The handshake patterns mirror the
+ * Rust `CodexAdapter::resume_handshake_patterns` — best-effort Codex-TUI success
+ * markers + definitive failure markers ("No previous sessions" / "not found"),
+ * failure checked first since a failure dialog is itself Codex UI. `restoreTier`
+ * is `"full"` — codex resumes the FULL conversation by id.
+ *
+ * BEST-EFFORT / PIN-YOUR-VERSION: these substrings are derived from codex-cli
+ * 0.142.2 and may need refinement against a live AUTHENTICATED codex. The
+ * identity model differs from Claude (read-back, not `--session-id` pinning), but
+ * that is a backend concern; the frontend descriptor only mirrors the resume +
+ * handshake + tier surface, which IS substring-symmetric with Claude.
+ */
+export const codexDescriptor: SessionProviderDescriptor = {
+  provider: "codex",
+  resumeCommand: (sessionId: string) => ["codex", "resume", sessionId],
+  handshakePatterns: () => ({
+    success: [
+      "Codex", // TUI banner / header
+      "send a message", // input-box hint
+      "/help", // status-line shortcut hint
+    ],
+    failure: [
+      "No previous sessions", // resume with no history
+      "not found", // unknown id
+      "No such session",
+      "error: ", // generic codex CLI error prefix
+    ],
+  }),
+  restoreTier: () => "full",
+};
+
+/**
+ * Registry lookup (plan §4 registry seam). Phase 1 knew only the Claude
+ * descriptor; Phase 2 filled it in; Phase 3 adds the Codex arm. An unknown
+ * provider degrades to the Claude descriptor (the reference provider) rather than
+ * failing — a record with an unexpected provider should still restore via the
+ * default path.
  */
 export function providerDescriptorFor(provider: string | undefined): SessionProviderDescriptor {
   switch (provider) {
-    // Phase 3 adds: case "gemini": return geminiDescriptor;
+    case "codex":
+      return codexDescriptor;
     case "claude":
     default:
       return claudeDescriptor;

@@ -1142,28 +1142,142 @@ impl TerminalSession {
             }
         }
 
-        // 4. Record AUTHORITATIVELY at spawn (zero transcript race). The
-        // lifecycle store is shared in Tauri state by main.rs; absent in test
-        // fixtures / a boot window — then the confirming hook records instead.
+        // 4. Resolve identity per the provider adapter's IdentitySource and
+        // record. The interactive hand-start is the Claude reference path, whose
+        // identity is `Pinned` (the runner generated `pinned` above and injects
+        // it via env for the shim to apply) — so this records AUTHORITATIVELY at
+        // spawn, zero transcript race, exactly as before. The dispatcher
+        // (`consume_identity_source`) ALSO handles the `ReadBack` arm a read-back
+        // provider (codex) returns — recording provisionally + spawning the
+        // capture task — so the seam is genuinely general, not a Claude special
+        // case. The lifecycle store is shared in Tauri state by main.rs; absent
+        // in test fixtures / a boot window — then the confirming hook records.
         if let Some(store) = app_handle
             .try_state::<std::sync::Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
         {
-            crate::commands::terminal::record_pinned_session_open(
-                store.inner(),
-                pinned.clone(),
+            let adapter = crate::session::provider_adapter::adapter_for(
+                crate::session::session_lifecycle_store::DEFAULT_PROVIDER,
+            );
+            // The Claude adapter returns `Pinned`; we substitute the env-injected
+            // `pinned` so the recorded id matches the one the shim applies (the
+            // adapter would otherwise mint a fresh uuid). For a read-back provider
+            // the spec's `ReadBack` capture is used as-is.
+            let identity = match adapter.launch_with_identity(cwd, None).identity {
+                crate::session::provider_adapter::IdentitySource::Pinned(_) => {
+                    crate::session::provider_adapter::IdentitySource::Pinned(pinned.clone())
+                }
+                read_back => read_back,
+            };
+            Self::consume_identity_source(
+                store.inner().clone(),
+                identity,
+                adapter.provider().to_string(),
                 terminal_id.to_string(),
-                None, // config dir resolved by the hook / reconcile if needed
+                None, // config dir resolved by the hook / capture / reconcile
                 cwd.to_string(),
                 title.to_string(),
                 page_id.to_string(),
                 0,
-                crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
             );
-            info!(
-                terminal_id = %terminal_id,
-                session_id = %pinned,
-                "session-restore: session recorded authoritatively at spawn"
-            );
+        }
+    }
+
+    /// Consume a provider adapter's [`crate::session::provider_adapter::IdentitySource`]
+    /// at spawn — the generalized (pin-OR-read-back) identity recorder.
+    ///
+    /// - [`IdentitySource::Pinned`](crate::session::provider_adapter::IdentitySource::Pinned)
+    ///   → the runner KNOWS the id synchronously (Claude `--session-id`): record
+    ///   it AUTHORITATIVELY at spawn, zero transcript race (today's behavior).
+    /// - [`IdentitySource::ReadBack`](crate::session::provider_adapter::IdentitySource::ReadBack)
+    ///   with [`IdentityCapture::SessionFile`](crate::session::provider_adapter::IdentityCapture::SessionFile)
+    ///   → the provider GENERATES the id (codex): the real id isn't known at
+    ///   spawn, so DON'T write a phantom row here — spawn the read-back capture
+    ///   task ([`crate::session::codex_capture::capture_and_record`]), which finds
+    ///   the newest post-spawn rollout under the runner-isolated provider home,
+    ///   parses its line-1 `session_meta`, and records+confirms the real id. A
+    ///   miss degrades to the reconcile backstop (fail-open, never panics). The
+    ///   `StreamEvent` capture (codex `exec --json`) is not reachable from the
+    ///   interactive PTY hand-start (the runner doesn't own the child's stdout
+    ///   here) and is left to the headless `codex exec` path; it degrades to the
+    ///   reconcile backstop here.
+    #[allow(clippy::too_many_arguments)]
+    fn consume_identity_source(
+        store: std::sync::Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>,
+        identity: crate::session::provider_adapter::IdentitySource,
+        provider: String,
+        terminal_id: String,
+        config_dir: Option<String>,
+        cwd: String,
+        title: String,
+        page_id: String,
+        zone_index: i32,
+    ) {
+        use crate::session::provider_adapter::{IdentityCapture, IdentitySource};
+        match identity {
+            IdentitySource::Pinned(pinned) => {
+                crate::commands::terminal::record_pinned_session_open(
+                    &store,
+                    pinned.clone(),
+                    terminal_id.clone(),
+                    config_dir,
+                    cwd,
+                    title,
+                    page_id,
+                    zone_index,
+                    provider,
+                );
+                info!(
+                    terminal_id = %terminal_id,
+                    session_id = %pinned,
+                    "session-restore: pinned session recorded authoritatively at spawn"
+                );
+            }
+            IdentitySource::ReadBack(capture) => match capture {
+                IdentityCapture::SessionFile {
+                    dir_env,
+                    meta_line_type,
+                    id_field,
+                    ..
+                } => {
+                    // The provider home to read back from. Without it (no account
+                    // isolation env), the read-back has nowhere to look — degrade
+                    // to the reconcile backstop.
+                    let Some(home) = std::env::var(&dir_env).ok().filter(|v| !v.is_empty()) else {
+                        info!(
+                            terminal_id = %terminal_id,
+                            dir_env = %dir_env,
+                            "session-restore: read-back provider home env unset — deferring to reconcile backstop"
+                        );
+                        return;
+                    };
+                    let spawn_ms = chrono::Utc::now().timestamp_millis();
+                    tokio::spawn(crate::session::codex_capture::capture_and_record(
+                        store,
+                        std::path::PathBuf::from(home),
+                        terminal_id,
+                        config_dir,
+                        cwd,
+                        title,
+                        page_id,
+                        zone_index,
+                        spawn_ms,
+                        meta_line_type,
+                        id_field,
+                        crate::session::codex_capture::CODEX_CAPTURE_POLL_INTERVAL,
+                        crate::session::codex_capture::CODEX_CAPTURE_TIMEOUT,
+                    ));
+                }
+                IdentityCapture::StreamEvent { .. } => {
+                    // Not reachable from the interactive PTY hand-start (the runner
+                    // doesn't own the child's stdout here). The headless
+                    // `codex exec --json` path owns this channel; here it degrades
+                    // to the reconcile backstop.
+                    info!(
+                        terminal_id = %terminal_id,
+                        "session-restore: StreamEvent read-back not applicable to interactive PTY — deferring to reconcile backstop"
+                    );
+                }
+            },
         }
     }
 

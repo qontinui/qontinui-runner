@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { providerDescriptorFor, claudeDescriptor } from "./providerAdapter";
+import { providerDescriptorFor, claudeDescriptor, codexDescriptor } from "./providerAdapter";
 
 describe("providerDescriptorFor", () => {
   it("resolves the Claude descriptor for 'claude'", () => {
@@ -14,10 +14,37 @@ describe("providerDescriptorFor", () => {
     expect(providerDescriptorFor("claude").provider).toBe("claude");
   });
 
+  it("resolves the Codex descriptor for 'codex'", () => {
+    expect(providerDescriptorFor("codex")).toBe(codexDescriptor);
+    expect(providerDescriptorFor("codex").provider).toBe("codex");
+  });
+
   it("degrades unknown/undefined providers to the Claude descriptor (never drops)", () => {
     expect(providerDescriptorFor("gemini")).toBe(claudeDescriptor);
     expect(providerDescriptorFor("totally-new")).toBe(claudeDescriptor);
     expect(providerDescriptorFor(undefined)).toBe(claudeDescriptor);
+  });
+});
+
+describe("codexDescriptor", () => {
+  it("builds the interactive `codex resume <id>` command (no --session-id; read-back identity)", () => {
+    expect(codexDescriptor.resumeCommand("11111111-2222-7333-8444-555555555555")).toEqual([
+      "codex",
+      "resume",
+      "11111111-2222-7333-8444-555555555555",
+    ]);
+  });
+
+  it("declares the Full restore tier (codex resumes the full conversation by id)", () => {
+    expect(codexDescriptor.restoreTier()).toBe("full");
+  });
+
+  it("exposes non-empty success + failure handshake patterns (best-effort / pin-your-version)", () => {
+    const hp = codexDescriptor.handshakePatterns();
+    expect(hp.success.length).toBeGreaterThan(0);
+    expect(hp.failure.length).toBeGreaterThan(0);
+    expect(hp.failure).toContain("No previous sessions");
+    expect(hp.failure).toContain("not found");
   });
 });
 
