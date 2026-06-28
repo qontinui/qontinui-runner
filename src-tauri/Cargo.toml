@@ -223,7 +223,7 @@ zbus = "4"
 libc = "0.2"  # SIGTERM/SIGKILL via libc::kill in cfg(not(windows)) blocks
 
 [features]
-default = ["restate"]
+default = ["restate", "spec-authoring"]
 restate = ["restate-sdk"]
 # Tells Tauri to embed the frontend from dist/ instead of loading from devUrl.
 # Without this, debug builds load from localhost:1420 (Vite dev server).

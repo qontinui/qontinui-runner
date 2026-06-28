@@ -28,8 +28,8 @@ use crate::fetch::{compute_content_sha256, millis_to_iso8601};
 use crate::snapshot::{ElementIdx, IndexedSnapshot};
 use crate::{
     AssertionMiss, AssertionOutcome, AssertionResult, AssertionSeverityCounts, BridgeFingerprint,
-    MatchOutcome, MatchedElement, SpecCheckResult, SpecCheckSummary, SpecValidation,
-    StateMatchResult, UIBridgeSnapshot,
+    ClassificationStatus, MatchOutcome, MatchedElement, SpecCheckResult, SpecCheckSummary,
+    SpecValidation, StateMatchResult, ThresholdConfig, UIBridgeSnapshot,
 };
 
 /// `recommendation_reason` value set when the matcher refuses to recommend
@@ -216,6 +216,12 @@ fn evaluate_with_indexed(
     let evaluated_at = now_iso8601();
     let spec_content_hash = hash_spec(spec);
 
+    // Default threshold configuration (0.5/0.8). HTTP handlers will override
+    // with app-specific thresholds after fetching from the database.
+    let default_thresholds = ThresholdConfig::default();
+    let overall_match_rate = summary.overall_match_rate as f64;
+    let classification = default_thresholds.classify_match_rate(overall_match_rate as f32);
+
     SpecCheckResult {
         result_schema_version: RESULT_SCHEMA_VERSION,
         snapshot_id: SENTINEL_SNAPSHOT_ID.to_string(),
@@ -228,6 +234,8 @@ fn evaluate_with_indexed(
         bridge_fingerprint,
         evaluated_at,
         warnings: Vec::new(),
+        classification,
+        thresholds_used: default_thresholds,
     }
 }
 
@@ -257,10 +265,16 @@ fn evaluate_state(indexed: &IndexedSnapshot, state: &IrState) -> StateMatchResul
         passed as f32 / total as f32
     };
 
+    // Classify per-state match rate using default thresholds. HTTP handlers
+    // will override with app-specific thresholds after fetching from database.
+    let default_thresholds = ThresholdConfig::default();
+    let classification = default_thresholds.classify_match_rate(match_rate);
+
     StateMatchResult {
         state_id: state.id.clone(),
         state_name: state.name.clone(),
         match_rate,
+        classification,
         assertions,
     }
 }
