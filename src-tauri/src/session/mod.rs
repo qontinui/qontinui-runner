@@ -180,6 +180,13 @@ pub enum SessionEventKind {
     /// payload carries `{repo, branch, shas}` and NO session id (coord resolves
     /// the session server-side from `(repo, branch)`).
     CommitReport,
+    /// Work-progress report (plan
+    /// `2026-06-25-session-progress-reporting-and-agent-session-linkage.md`).
+    /// Drained to `PATCH /sessions/:id {progress:{…}}`, advancing
+    /// `coord.sessions.last_progress_at` on a *work-activity* boundary —
+    /// orthogonal to the liveness `Heartbeat`. Emitted on operator interaction
+    /// by [`crate::claude_session::coord_register::AiCoordRegistrar::progress_on_interaction`].
+    Progress,
 }
 
 impl SessionEventKind {
@@ -193,6 +200,7 @@ impl SessionEventKind {
             SessionEventKind::OutputChunk => "output_chunk",
             SessionEventKind::HandoffRequest => "handoff_request",
             SessionEventKind::CommitReport => "commit_report",
+            SessionEventKind::Progress => "progress",
         }
     }
 }

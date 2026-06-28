@@ -233,6 +233,10 @@ pub fn drain(app_handle: &tauri::AppHandle, timeout: Duration) -> DrainSummary {
             // bumps the freshness so the stale sweep doesn't reap it in the
             // restart window. No-op for unregistered sessions.
             reg.heartbeat_on_interaction(task_run_id);
+            // Advance the work-progress clock alongside the liveness heartbeat:
+            // a session preserved across a planned restart was active up to the
+            // drain, so it must not be mistaken for stalled when it resumes.
+            reg.progress_on_interaction(task_run_id);
             summary.claims_persisted += 1;
         }
     } else {

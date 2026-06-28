@@ -252,6 +252,11 @@ pub async fn send_user_message(
     // loop) is what lets an idle session age to `stale` so the inject trigger
     // can fire (P0.2). Best-effort + no-op when the session isn't registered.
     ai_coord_registrar.heartbeat_on_interaction(&task_run_id);
+    // Session-progress reporting — the same operator-interaction boundary is the
+    // work-activity signal that advances `coord.sessions.last_progress_at` (the
+    // producer the session-stall watcher was starved of). Orthogonal to the
+    // liveness heartbeat above; same best-effort/no-op-when-unregistered posture.
+    ai_coord_registrar.progress_on_interaction(&task_run_id);
 
     let session = session_manager
         .get(&task_run_id)
