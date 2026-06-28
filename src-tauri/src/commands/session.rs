@@ -38,6 +38,11 @@ pub struct StartSessionArgs {
     pub share_output: bool,
     #[serde(default)]
     pub redact_secrets: Option<bool>,
+    /// Phase 6 — AI-CLI provider hosting the session (`"claude"`, `"codex"`).
+    /// Forwarded to `coord.sessions.provider`. Optional; absent for plain
+    /// shells.
+    #[serde(default)]
+    pub provider: Option<String>,
 }
 
 impl From<StartSessionArgs> for Intent {
@@ -55,6 +60,7 @@ impl From<StartSessionArgs> for Intent {
             declared_paths: a.declared_paths,
             share_output: a.share_output,
             redact_secrets: a.redact_secrets,
+            provider: a.provider,
         }
     }
 }

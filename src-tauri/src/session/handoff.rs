@@ -635,6 +635,12 @@ fn build_child_intent(state: &HandoffState) -> Result<Intent, HandoffError> {
         .get("correlation_topic")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    // Carry the source session's provider across the handoff so the child's
+    // coord.sessions row keeps the same AI-CLI attribution.
+    let provider = src
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
 
     Ok(Intent {
         kind,
@@ -647,6 +653,7 @@ fn build_child_intent(state: &HandoffState) -> Result<Intent, HandoffError> {
         declared_paths,
         share_output,
         redact_secrets,
+        provider,
     })
 }
 
