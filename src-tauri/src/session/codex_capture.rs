@@ -352,16 +352,24 @@ pub fn record_captured_session(
     // analogue of the Claude SessionStart hook firing).
     store.confirm_session(&session_id);
 
-    // ---- supersede the speculative spawn-time pin -----------------------------
+    // ---- supersede the speculative spawn-time pin(s) --------------------------
     // The always-on identity seam pre-records a PROVISIONAL claude row for EVERY
     // terminal (keyed on the runner-pinned uuid). When codex turned out to host
     // this terminal, that claude row is a phantom (no real claude session). Close
     // it so the terminal has exactly ONE live row (the captured codex one).
     // Records are keyed by session_id, so the claude pin is a DIFFERENT open row
-    // for the same terminal — find it and close it, skipping the codex row we
-    // just wrote.
-    if let Some(other) = store.find_open_by_terminal(&terminal_id) {
-        if other.claude_session_id != session_id {
+    // for the same terminal — close every open row for the terminal EXCEPT the
+    // codex row we just wrote.
+    //
+    // We must iterate ALL matching open rows, not `find_open_by_terminal` (a
+    // single arbitrary match): at this point the terminal has two open rows (the
+    // claude pin AND the codex row), and that helper scans `HashMap::values()`
+    // in nondeterministic order — it can return the codex row itself, so a
+    // single-find + skip-self silently skips the supersede (flaky: green on
+    // Linux, red on Windows). A loop is order-independent and also closes any
+    // additional stale pins for the terminal.
+    for other in store.open_records() {
+        if other.terminal_id == terminal_id && other.claude_session_id != session_id {
             store.record_close(&other.claude_session_id, "superseded-by-codex");
             tracing::info!(
                 terminal_id = %terminal_id,
