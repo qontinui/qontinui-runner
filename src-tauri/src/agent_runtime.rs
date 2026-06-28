@@ -154,6 +154,21 @@ pub struct GateContinuationPayload {
     /// currently-deployed coord. The poll surface ALWAYS supplies it.
     #[serde(default)]
     pub gate_id: Option<uuid::Uuid>,
+    /// The work-unit DAG dispatch id (added by the coord work-unit scheduler).
+    /// A *unit* dispatch reuses this same `source:"gate_continuation"` frame shape
+    /// but carries NO `gate_id` — it is keyed on `dispatch_id` instead. Used to (1)
+    /// dedupe a unit continuation delivered by BOTH the live WS frame and the
+    /// `pending-unit-dispatches` poll backstop against the process-wide
+    /// [`dispatched_dispatch_ids`] set, and (2) POST the
+    /// `unit-dispatches/{dispatch_id}/consumed` ack so coord stops re-listing it.
+    ///
+    /// **Optional on purpose**: a gate continuation never carries this; a unit
+    /// dispatch always does. When BOTH `gate_id` and `dispatch_id` are absent the
+    /// frame falls into the legacy no-dedupe/no-ack branch (a coord on
+    /// `origin/main` today). The unit pull surface ALWAYS supplies it; coord also
+    /// stamps it on the live unit WS frame.
+    #[serde(default)]
+    pub dispatch_id: Option<uuid::Uuid>,
     /// Explicit instance target (E2E carve-out). When set, ONLY the runner
     /// instance whose `QONTINUI_INSTANCE_NAME` equals this value spawns the
     /// continuation. When ABSENT (the normal case, and every coord on
@@ -577,6 +592,10 @@ async fn connect_and_pump(ws_url: &str, device_id: uuid::Uuid) -> anyhow::Result
     // coord persisted while we were disconnected. Best-effort — a poll failure
     // must never abort the pump (the live WS subscription proceeds regardless).
     poll_pending_continuations(device_id).await;
+    // Work-unit DAG replay backstop: same reconnect tick, back-to-back. Replays
+    // any unit dispatches coord persisted while we were disconnected (keyed on
+    // dispatch_id). Best-effort, same warn-and-continue posture.
+    poll_pending_unit_dispatches(device_id).await;
 
     let mut keepalive = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
     keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -972,6 +991,29 @@ fn claim_gate_dispatch(gate_id: uuid::Uuid) -> bool {
     dispatched_gate_ids().lock().unwrap().insert(gate_id)
 }
 
+/// Process-wide set of work-unit `dispatch_id`s whose continuation we have
+/// ALREADY dispatched. The sibling of [`dispatched_gate_ids`] for the work-unit
+/// DAG dispatch path: a unit dispatch reuses the `gate_continuation` spawn frame
+/// but is keyed on `dispatch_id` (it has no `gate_id`), so it needs its own
+/// dedupe set. At-least-once delivery means a single unit dispatch can arrive via
+/// BOTH the live WS frame and the `pending-unit-dispatches` poll backstop (or via
+/// two successive polls before the consume ack lands); the FIRST dispatch inserts
+/// the id and subsequent attempts short-circuit.
+fn dispatched_dispatch_ids() -> &'static std::sync::Mutex<std::collections::HashSet<uuid::Uuid>> {
+    static DISPATCHED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>,
+    > = std::sync::OnceLock::new();
+    DISPATCHED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Atomically claim a `dispatch_id` for dispatch. Returns `true` if THIS call was
+/// the first to claim it (caller should dispatch); `false` if it was already
+/// claimed (a duplicate delivery — caller must skip). Insert-and-test under one
+/// lock, exactly like [`claim_gate_dispatch`].
+fn claim_dispatch_dispatch(dispatch_id: uuid::Uuid) -> bool {
+    dispatched_dispatch_ids().lock().unwrap().insert(dispatch_id)
+}
+
 // =============================================================================
 // Continuation-session registry (P3 anchor_key dedup + P4 concurrency cap)
 // =============================================================================
@@ -1199,6 +1241,7 @@ pub(crate) fn notify_continuation_terminal_exit(
     );
     handle.spawn(async move {
         poll_pending_continuations(device_id).await;
+        poll_pending_unit_dispatches(device_id).await;
     });
 }
 
@@ -1249,6 +1292,7 @@ fn spawn_continuation_backstop_poll(device_id: uuid::Uuid) {
                      for device_id={device_id}"
                 );
                 poll_pending_continuations(device_id).await;
+                poll_pending_unit_dispatches(device_id).await;
             }
         }
     });
@@ -1333,6 +1377,28 @@ fn focus_existing_continuation(terminal_id: &str) {
     }
 }
 
+/// The coord ack surface a continuation must drive after it is handled. Threaded
+/// through [`run_gate_continuation_inner`] so the SHARED spawn machinery is
+/// reused while the ack differs per kind:
+///
+/// - [`ConsumeTarget::Gate`] — the gate continuation contract: a consume CLAIM is
+///   POSTed BEFORE spawning (a `409 cancelled` skips the spawn) and a typed
+///   OUTCOME (`spawned`/`spawn_failed`) is POSTed after, both on
+///   `/coord/gates/{gate_id}/continuation-consumed`.
+/// - [`ConsumeTarget::Dispatch`] — the work-unit dispatch contract: NO
+///   claim-before-spawn (the CAS already made dispatch at-most-once-create); a
+///   single idempotent consume ack is POSTed AFTER a successful handle on
+///   `/coord/agents/unit-dispatches/{dispatch_id}/consumed`. A failed spawn is
+///   deliberately NOT acked so coord re-lists it on the next reconnect
+///   (at-least-once).
+/// - [`ConsumeTarget::None`] — legacy coord (neither id): spawn once, no ack.
+#[derive(Debug, Clone, Copy)]
+enum ConsumeTarget {
+    Gate(uuid::Uuid),
+    Dispatch(uuid::Uuid),
+    None,
+}
+
 /// Shared dispatch seam for BOTH the WS fast-path and the poll backstop.
 ///
 /// **Claim-then-spawn-then-outcome** (the coord continuation contract). For a
@@ -1391,13 +1457,45 @@ fn dispatch_gate_continuation(payload: GateContinuationPayload, device_id: uuid:
         // consume-CLAIM is awaited (contract item 4: claim only after the local
         // cap passes), then spawn-or-skip, then the outcome POST.
         tokio::spawn(async move {
-            if let Err(e) = run_gate_continuation_inner(payload, device_id, Some(gate_id)).await {
+            if let Err(e) =
+                run_gate_continuation_inner(payload, device_id, ConsumeTarget::Gate(gate_id)).await
+            {
                 error!("agent_runtime: run_gate_continuation (gate_id={gate_id}) failed: {e:#}");
             }
         });
+    } else if let Some(dispatch_id) = payload.dispatch_id {
+        // Work-unit DAG dispatch: reuses the `gate_continuation` spawn frame but
+        // is keyed on `dispatch_id` (no gate_id). Applies on BOTH the live WS
+        // frame AND the `pending-unit-dispatches` replay-poll path (both route
+        // through here), so dedupe + ack happen regardless of arrival path.
+        //
+        // Synchronous fast-path: drop an in-process duplicate before any I/O.
+        if !claim_dispatch_dispatch(dispatch_id) {
+            debug!(
+                "agent_runtime: unit-dispatch dispatch_id={dispatch_id} already dispatched; \
+                 skipping duplicate"
+            );
+            return;
+        }
+        // One task owns spawn → consume-ack. Unlike the gate path there is NO
+        // claim-before-spawn: the scheduler's `metadata.dispatched_at` CAS is the
+        // single dispatch authority (at-most-once-create); this record is only the
+        // replay payload, so the runner just spawns and acks the consume on a
+        // successful handle (a failed spawn stays un-consumed → re-listed next
+        // reconnect = at-least-once).
+        tokio::spawn(async move {
+            if let Err(e) =
+                run_gate_continuation_inner(payload, device_id, ConsumeTarget::Dispatch(dispatch_id))
+                    .await
+            {
+                error!(
+                    "agent_runtime: run_gate_continuation (dispatch_id={dispatch_id}) failed: {e:#}"
+                );
+            }
+        });
     } else {
-        // Legacy coord: no gate_id → no dedupe-by-id and no claim/outcome.
-        // Dispatch once with no coord handshake (unchanged behavior).
+        // Legacy coord: neither gate_id nor dispatch_id → no dedupe-by-id and no
+        // claim/outcome. Dispatch once with no coord handshake (unchanged).
         spawn_gate_continuation_task(payload, device_id);
     }
 }
@@ -1464,6 +1562,115 @@ async fn poll_pending_continuations(device_id: uuid::Uuid) {
         // shared seam dedupes + acks even if coord omitted it inside `payload`.
         let mut payload = row.payload;
         payload.gate_id = Some(row.gate_id);
+        dispatch_gate_continuation(payload, device_id);
+    }
+}
+
+/// One row of coord's `GET /coord/agents/pending-unit-dispatches` response.
+///
+/// LOCKED wire contract (coded against exactly):
+/// `{"pending": [{"dispatch_id", "payload": {…}, "dispatched_at"}], "total": N}`,
+/// where `payload` is the EXACT work-unit spawn frame coord publishes on the WS
+/// channel (the same `source:"gate_continuation"` shape [`GateContinuationPayload`]
+/// parses). The sibling of [`PendingContinuation`] keyed on `dispatch_id` instead
+/// of `gate_id`. Rows are dispatched-but-unconsumed.
+#[derive(Debug, Clone, Deserialize)]
+struct PendingUnitDispatch {
+    dispatch_id: uuid::Uuid,
+    payload: GateContinuationPayload,
+    #[serde(default)]
+    #[allow(dead_code)]
+    dispatched_at: Option<String>,
+}
+
+/// The envelope of coord's `GET /coord/agents/pending-unit-dispatches` response.
+#[derive(Debug, Clone, Deserialize)]
+struct PendingUnitDispatchesResponse {
+    #[serde(default)]
+    pending: Vec<PendingUnitDispatch>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    total: i64,
+}
+
+/// Poll coord for work-unit DAG dispatches that landed while this runner was
+/// disconnected, and replay any we haven't already dispatched. The sibling of
+/// [`poll_pending_continuations`] for the work-unit path — fired back-to-back with
+/// it on the SAME reconnect ticks.
+///
+/// `GET <coord_http_base>/coord/agents/pending-unit-dispatches?device_id=<uuid>`
+/// returns the dispatched-but-unconsumed rows for this device. For each row we
+/// stamp the row's `dispatch_id` onto the parsed payload (so the shared dispatch
+/// seam dedupes by `dispatch_id` + acks via the unit consume route) and route it
+/// through [`dispatch_gate_continuation`] — exactly as the gate pull stamps
+/// `gate_id`.
+///
+/// **Best-effort, warn-and-continue**: coord unreachable, a non-2xx status (incl.
+/// a 404 if coord's new endpoint is not deployed yet), or a parse error all
+/// `warn!`/`debug!` once and return — the live WS subscription proceeds regardless
+/// (a missed poll is retried on the next connect; at-least-once is preserved).
+async fn poll_pending_unit_dispatches(device_id: uuid::Uuid) {
+    let Some(base) = coord_http_base() else {
+        return;
+    };
+    let url = format!("{base}/coord/agents/pending-unit-dispatches?device_id={device_id}");
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("agent_runtime: pending-unit-dispatches client build failed: {e:#}");
+            return;
+        }
+    };
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("agent_runtime: pending-unit-dispatches GET failed (continuing): {e:#}");
+            return;
+        }
+    };
+    if !resp.status().is_success() {
+        // A 404 is expected until coord's Phase 2 endpoint is deployed — log at
+        // debug for that, warn for anything else.
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            debug!(
+                "agent_runtime: pending-unit-dispatches GET 404 (endpoint not deployed yet; \
+                 continuing)"
+            );
+        } else {
+            warn!(
+                "agent_runtime: pending-unit-dispatches GET returned {} (continuing)",
+                resp.status()
+            );
+        }
+        return;
+    }
+    let body: PendingUnitDispatchesResponse = match resp.json().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("agent_runtime: pending-unit-dispatches parse failed (continuing): {e:#}");
+            return;
+        }
+    };
+    if body.pending.is_empty() {
+        debug!(
+            "agent_runtime: pending-unit-dispatches poll: none pending for device_id={device_id}"
+        );
+        return;
+    }
+    info!(
+        "agent_runtime: pending-unit-dispatches poll: {} pending for device_id={device_id} — \
+         replaying",
+        body.pending.len()
+    );
+    for row in body.pending {
+        // The row's dispatch_id is authoritative; stamp it onto the payload so the
+        // shared seam dedupes by dispatch_id + acks the unit consume route even if
+        // coord omitted it inside `payload`.
+        let mut payload = row.payload;
+        payload.dispatch_id = Some(row.dispatch_id);
         dispatch_gate_continuation(payload, device_id);
     }
 }
@@ -1559,6 +1766,65 @@ async fn post_continuation_outcome(
     }
 }
 
+/// Body for `POST /coord/agents/unit-dispatches/{dispatch_id}/consumed`.
+///
+/// The work-unit consume contract is simpler than the gate's claim-then-outcome:
+/// a single idempotent ack carrying only the runner's `device_id` (the read was
+/// narrowed by `device_id` on the pull, so the consume re-asserts ownership).
+/// Coord responds `{dispatch_id, consumed:true}` and a second consume is a no-op
+/// success (`consumed_at` set once).
+#[derive(Debug, Clone, Serialize)]
+struct UnitDispatchConsumedBody {
+    device_id: uuid::Uuid,
+}
+
+/// POST the work-unit dispatch consume ack
+/// (`POST /coord/agents/unit-dispatches/{dispatch_id}/consumed` body
+/// `{device_id}`) AFTER a unit continuation has been handled (spawned). The
+/// sibling of [`post_continuation_outcome`] for the unit path: best-effort, 5s
+/// timeout, a failure `warn!`s once and is swallowed (coord keeps the row
+/// un-consumed and re-lists it on the next reconnect — at-least-once, never
+/// crashes the caller). Idempotent on coord's side.
+///
+/// No `coord_http_base` (legacy / coord not configured) → no-op: there is no
+/// consume surface to ack against (the unit pull also can't have happened).
+async fn post_unit_dispatch_consumed(dispatch_id: uuid::Uuid, device_id: uuid::Uuid) {
+    let Some(base) = coord_http_base() else {
+        return;
+    };
+    let url = format!("{base}/coord/agents/unit-dispatches/{dispatch_id}/consumed");
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                "agent_runtime: unit-dispatch consume client build failed \
+                 dispatch_id={dispatch_id}: {e:#}"
+            );
+            return;
+        }
+    };
+    let body = UnitDispatchConsumedBody { device_id };
+    match client.post(&url).json(&body).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            debug!("agent_runtime: unit-dispatch consume posted dispatch_id={dispatch_id}");
+        }
+        Ok(resp) => {
+            warn!(
+                "agent_runtime: unit-dispatch consume POST dispatch_id={dispatch_id} returned {} \
+                 (continuing)",
+                resp.status()
+            );
+        }
+        Err(e) => warn!(
+            "agent_runtime: unit-dispatch consume POST dispatch_id={dispatch_id} failed \
+             (continuing): {e:#}"
+        ),
+    }
+}
+
 /// First line of an error message (for the `spawn_failed` outcome `detail`).
 fn first_line(msg: &str) -> String {
     msg.lines().next().unwrap_or("").trim().to_string()
@@ -1582,41 +1848,42 @@ fn spawn_gate_continuation_task(payload: GateContinuationPayload, device_id: uui
         payload.anchor_key,
     );
     tokio::spawn(async move {
-        if let Err(e) = run_gate_continuation_inner(payload, device_id, None).await {
+        if let Err(e) = run_gate_continuation_inner(payload, device_id, ConsumeTarget::None).await {
             error!("agent_runtime: run_gate_continuation (legacy) failed: {e:#}");
         }
     });
 }
 
-/// End-to-end run of one gate continuation, with the claim→spawn→outcome
-/// handshake gated on `claim_gate_id`:
+/// End-to-end run of one continuation (gate OR work-unit dispatch), with the
+/// coord ack handshake selected by `consume_target`:
 ///
 /// 0. `target_device_id` sanity check.
 /// 1. #469 local guards (anchor_key dedup, concurrency cap) — run FIRST so a
 ///    locally-rejected dispatch never burns a coord-side claim (contract item 4).
-/// 2. **CLAIM** (only when `claim_gate_id` is `Some`): POST the consume CLAIM
-///    and AWAIT it. `409 cancelled` → log INFO + SKIP the spawn entirely;
-///    network/other error → WARN + PROCEED (availability over consistency).
+/// 2. **CLAIM** ([`ConsumeTarget::Gate`] only): POST the consume CLAIM and AWAIT
+///    it. `409 cancelled` → log INFO + SKIP the spawn entirely; network/other
+///    error → WARN + PROCEED. The work-unit path has no claim-before-spawn (the
+///    scheduler CAS is the dispatch authority), so this is skipped for it.
 /// 3. Acquire a device-local worktree (+ claim heartbeat) and dispatch on
 ///    `presentation` (terminal / headless) to produce the REAL spawn result.
-/// 4. **OUTCOME** (only when `claim_gate_id` is `Some`): POST `spawned` /
-///    `spawn_failed` (first-line detail) sourced from step 3's result —
-///    best-effort, 5s timeout.
+/// 4. **ACK** — [`ConsumeTarget::Gate`]: POST the typed `spawned`/`spawn_failed`
+///    OUTCOME. [`ConsumeTarget::Dispatch`]: POST the idempotent unit consume only
+///    on a SUCCESSFUL handle (a failed spawn stays un-consumed → re-listed next
+///    reconnect). Both best-effort, 5s timeout.
 ///
-/// `claim_gate_id == None` is the legacy path: steps 2 and 4 are skipped.
+/// [`ConsumeTarget::None`] is the legacy path: steps 2 and 4 are skipped.
 async fn run_gate_continuation_inner(
     payload: GateContinuationPayload,
     device_id: uuid::Uuid,
-    claim_gate_id: Option<uuid::Uuid>,
+    consume_target: ConsumeTarget,
 ) -> anyhow::Result<()> {
     info!(
-        "agent_runtime: gate-continuation dispatch target_device_id={} presentation={:?} \
-         repos={} anchor_key={:?} gate_id={:?}",
+        "agent_runtime: continuation dispatch target_device_id={} presentation={:?} \
+         repos={} anchor_key={:?} consume_target={consume_target:?}",
         payload.target_device_id,
         payload.presentation,
         payload.repos.len(),
         payload.anchor_key,
-        claim_gate_id,
     );
 
     // Defensive: coord's WS pattern filter is device-scoped, but a frame that
@@ -1702,7 +1969,7 @@ async fn run_gate_continuation_inner(
     // AFTER the #469 guards pass and AWAITED — its result decides whether to
     // spawn. This closes the poll→cancel→spawn race: if a cancel landed between
     // the poll and now, coord returns 409 cancelled and we skip the spawn.
-    if let Some(gate_id) = claim_gate_id {
+    if let ConsumeTarget::Gate(gate_id) = consume_target {
         match post_continuation_claim(gate_id, device_id).await {
             SpawnDecision::Spawn => {}
             SpawnDecision::SkipCancelled { reason } => {
@@ -1757,10 +2024,12 @@ async fn run_gate_continuation_inner(
     {
         Ok(triple) => triple,
         Err(e) => {
-            warn!("agent_runtime: gate-continuation worktree acquisition failed: {e:#}");
-            // The claim was already posted (step 2): record the honest outcome so
-            // coord doesn't show a perpetually-pending continuation.
-            if let Some(gate_id) = claim_gate_id {
+            warn!("agent_runtime: continuation worktree acquisition failed: {e:#}");
+            // The gate claim was already posted (step 2): record the honest
+            // outcome so coord doesn't show a perpetually-pending continuation.
+            // The work-unit path does NOT ack on failure — leaving the dispatch
+            // un-consumed re-lists it on the next reconnect (at-least-once).
+            if let ConsumeTarget::Gate(gate_id) = consume_target {
                 post_continuation_outcome(
                     gate_id,
                     device_id,
@@ -1792,9 +2061,9 @@ async fn run_gate_continuation_inner(
         }
     };
 
-    // Step 4: outcome ack (best-effort) from the actual result.
-    if let Some(gate_id) = claim_gate_id {
-        match &result {
+    // Step 4: ack (best-effort) from the actual result, per consume target.
+    match consume_target {
+        ConsumeTarget::Gate(gate_id) => match &result {
             Ok(()) => post_continuation_outcome(gate_id, device_id, true, None).await,
             Err(e) => {
                 post_continuation_outcome(
@@ -1805,7 +2074,21 @@ async fn run_gate_continuation_inner(
                 )
                 .await
             }
+        },
+        // Work-unit dispatch: a single idempotent consume ack, ONLY on success.
+        // A failed spawn is deliberately left un-consumed so coord re-lists the
+        // dispatch on the next reconnect (at-least-once).
+        ConsumeTarget::Dispatch(dispatch_id) => {
+            if result.is_ok() {
+                post_unit_dispatch_consumed(dispatch_id, device_id).await;
+            } else {
+                warn!(
+                    "agent_runtime: unit-dispatch dispatch_id={dispatch_id} spawn failed — \
+                     NOT acking consume (will be re-listed on next reconnect)"
+                );
+            }
         }
+        ConsumeTarget::None => {}
     }
     result
 }
@@ -4099,6 +4382,7 @@ mod tests {
             source: GATE_CONTINUATION_SOURCE.to_string(),
             anchor_key: anchor.map(|s| s.to_string()),
             gate_id: None,
+            dispatch_id: None,
             target_instance_name: None,
         };
 
@@ -4141,6 +4425,7 @@ mod tests {
             source: GATE_CONTINUATION_SOURCE.to_string(),
             anchor_key: Some("anchor-z".to_string()),
             gate_id: None,
+            dispatch_id: None,
             target_instance_name: None,
         };
         let workdir = std::env::temp_dir().to_string_lossy().to_string();
@@ -4332,6 +4617,110 @@ mod tests {
         assert!(
             claim_gate_dispatch(other),
             "a different gate_id is unaffected"
+        );
+    }
+
+    /// The work-unit dispatch dedupe set ([`claim_dispatch_dispatch`]) is the
+    /// sibling of the gate set: it claims a `dispatch_id` exactly once so a unit
+    /// dispatch delivered by BOTH the live WS frame and the
+    /// `pending-unit-dispatches` poll backstop spawns exactly once. Distinct ids
+    /// never collide. This is the load-bearing guard for the dispatch_id arm.
+    #[test]
+    fn claim_dispatch_dispatch_is_once_per_dispatch_id() {
+        let d = uuid::Uuid::now_v7();
+        let other = uuid::Uuid::now_v7();
+        assert!(claim_dispatch_dispatch(d), "first claim of a dispatch_id wins");
+        assert!(
+            !claim_dispatch_dispatch(d),
+            "second claim of the same dispatch_id loses (deduped)"
+        );
+        assert!(
+            !claim_dispatch_dispatch(d),
+            "third claim still loses (idempotent skip)"
+        );
+        assert!(
+            claim_dispatch_dispatch(other),
+            "a different dispatch_id is unaffected"
+        );
+    }
+
+    /// The gate dedupe set and the dispatch dedupe set are INDEPENDENT: a
+    /// `gate_id` and a `dispatch_id` that happen to be the same Uuid value do not
+    /// collide (they live in separate sets). Proves the dispatch_id arm did not
+    /// fold into the gate set.
+    #[test]
+    fn gate_and_dispatch_dedupe_sets_are_independent() {
+        let id = uuid::Uuid::now_v7();
+        assert!(claim_gate_dispatch(id), "gate claim of id wins");
+        assert!(
+            claim_dispatch_dispatch(id),
+            "the SAME uuid as a dispatch_id still wins — separate set"
+        );
+    }
+
+    /// Coord's `GET /coord/agents/pending-unit-dispatches` response parses into
+    /// [`PendingUnitDispatchesResponse`]: each row's `payload` is the spawn-frame
+    /// object (the same shape the WS path parses) and each row's `dispatch_id` is
+    /// the authoritative id the poll loop stamps onto the payload before dispatch.
+    /// A `payload` that OMITS `dispatch_id` still parses (coord need not duplicate
+    /// it inside the payload — the poll loop stamps `row.dispatch_id` on).
+    #[test]
+    fn pending_unit_dispatches_response_parses() {
+        let d_a = uuid::Uuid::now_v7();
+        let d_b = uuid::Uuid::now_v7();
+        let dev = uuid::Uuid::now_v7();
+        let json = serde_json::json!({
+            "pending": [
+                {
+                    "dispatch_id": d_a,
+                    "payload": {
+                        "target_device_id": dev,
+                        "initial_prompt": "do unit A",
+                        "source": "gate_continuation",
+                        // payload carries dispatch_id too here (coord may stamp it)
+                        "dispatch_id": d_a,
+                    },
+                    "dispatched_at": "2026-06-28T00:00:00Z",
+                },
+                {
+                    "dispatch_id": d_b,
+                    "payload": {
+                        "target_device_id": dev,
+                        "initial_prompt": "do unit B",
+                        "source": "gate_continuation",
+                        // payload OMITS dispatch_id — the poll loop stamps it on.
+                    },
+                },
+            ],
+            "total": 2,
+        });
+        let body: PendingUnitDispatchesResponse =
+            serde_json::from_value(json).expect("pending-unit-dispatches response must parse");
+        assert_eq!(body.pending.len(), 2);
+        assert_eq!(body.total, 2);
+
+        let r0 = &body.pending[0];
+        assert_eq!(r0.dispatch_id, d_a);
+        assert_eq!(r0.payload.dispatch_id, Some(d_a));
+        assert_eq!(r0.payload.gate_id, None, "unit dispatch carries no gate_id");
+
+        let r1 = &body.pending[1];
+        assert_eq!(r1.dispatch_id, d_b);
+        // payload had no dispatch_id → None; the poll loop stamps row.dispatch_id.
+        assert_eq!(r1.payload.dispatch_id, None);
+    }
+
+    /// The unit consume body serializes to exactly `{"device_id": ...}` — the
+    /// LOCKED wire contract for `POST .../unit-dispatches/{dispatch_id}/consumed`.
+    #[test]
+    fn unit_dispatch_consumed_body_serializes_device_id_only() {
+        let dev = uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let body = UnitDispatchConsumedBody { device_id: dev };
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({ "device_id": "11111111-1111-1111-1111-111111111111" }),
+            "consume body must be exactly {{device_id}}"
         );
     }
 
@@ -4596,6 +4985,33 @@ mod tests {
         let p2 = parse_gate_continuation_payload(&no_gate)
             .expect("payload without gate_id must still parse (back-compat)");
         assert_eq!(p2.gate_id, None, "absent gate_id must be optional → None");
+    }
+
+    /// A LIVE work-unit dispatch WS frame reuses `source:"gate_continuation"` but
+    /// carries `dispatch_id` and NO `gate_id`. It must parse, surface the
+    /// `dispatch_id`, and leave `gate_id == None` — so `dispatch_gate_continuation`
+    /// routes it into the dispatch_id arm (dedupe + unit consume ack) on the live
+    /// path, exactly as the replay-pull path does.
+    #[test]
+    fn unit_dispatch_ws_frame_parses_with_dispatch_id_and_no_gate_id() {
+        let device = uuid::Uuid::now_v7();
+        let dispatch = uuid::Uuid::now_v7();
+        let inner = serde_json::json!({
+            "target_device_id": device,
+            "initial_prompt": "run unit",
+            "repos": ["qontinui-runner"],
+            "source": "gate_continuation",
+            "dispatch_id": dispatch,
+        });
+        let env = serde_json::json!({
+            "channel": format!("events.agent.spawn_requested.{device}"),
+            "payload": serde_json::to_string(&inner).unwrap(),
+        });
+        let p = parse_gate_continuation_payload(&env)
+            .expect("live unit dispatch frame must parse");
+        assert_eq!(p.dispatch_id, Some(dispatch), "dispatch_id must round-trip");
+        assert_eq!(p.gate_id, None, "a unit dispatch carries no gate_id");
+        assert_eq!(p.target_device_id, device);
     }
 
     /// The CLAIM body serializes to the FIXED wire contract coord accepts as a
