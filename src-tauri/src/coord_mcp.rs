@@ -316,7 +316,7 @@ fn register_proxy_nonce(workdir: &str) -> String {
 /// agent nonce must hard-fail closed across a restart, which is automatic since
 /// [`persist_proxy_nonces`] drops non-device bindings. The per-request bearer
 /// comes from the agent's own [`AGENT_TOKENS`] slot, never the device JWT.
-fn register_agent_proxy_nonce(workdir: &str, agent_id: Uuid) -> String {
+pub(crate) fn register_agent_proxy_nonce(workdir: &str, agent_id: Uuid) -> String {
     let (nonce, snapshot) = mint_and_register_nonce(workdir, ProxyPrincipal::Agent { agent_id });
     // Mirror to the store as a no-op for the agent entry (device entries in the
     // same snapshot, if any, are still persisted) — `persist_proxy_nonces`
