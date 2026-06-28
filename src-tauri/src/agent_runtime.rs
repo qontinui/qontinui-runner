@@ -1011,7 +1011,10 @@ fn dispatched_dispatch_ids() -> &'static std::sync::Mutex<std::collections::Hash
 /// claimed (a duplicate delivery — caller must skip). Insert-and-test under one
 /// lock, exactly like [`claim_gate_dispatch`].
 fn claim_dispatch_dispatch(dispatch_id: uuid::Uuid) -> bool {
-    dispatched_dispatch_ids().lock().unwrap().insert(dispatch_id)
+    dispatched_dispatch_ids()
+        .lock()
+        .unwrap()
+        .insert(dispatch_id)
 }
 
 // =============================================================================
@@ -1484,9 +1487,12 @@ fn dispatch_gate_continuation(payload: GateContinuationPayload, device_id: uuid:
         // successful handle (a failed spawn stays un-consumed → re-listed next
         // reconnect = at-least-once).
         tokio::spawn(async move {
-            if let Err(e) =
-                run_gate_continuation_inner(payload, device_id, ConsumeTarget::Dispatch(dispatch_id))
-                    .await
+            if let Err(e) = run_gate_continuation_inner(
+                payload,
+                device_id,
+                ConsumeTarget::Dispatch(dispatch_id),
+            )
+            .await
             {
                 error!(
                     "agent_runtime: run_gate_continuation (dispatch_id={dispatch_id}) failed: {e:#}"
@@ -4629,7 +4635,10 @@ mod tests {
     fn claim_dispatch_dispatch_is_once_per_dispatch_id() {
         let d = uuid::Uuid::now_v7();
         let other = uuid::Uuid::now_v7();
-        assert!(claim_dispatch_dispatch(d), "first claim of a dispatch_id wins");
+        assert!(
+            claim_dispatch_dispatch(d),
+            "first claim of a dispatch_id wins"
+        );
         assert!(
             !claim_dispatch_dispatch(d),
             "second claim of the same dispatch_id loses (deduped)"
@@ -5007,8 +5016,7 @@ mod tests {
             "channel": format!("events.agent.spawn_requested.{device}"),
             "payload": serde_json::to_string(&inner).unwrap(),
         });
-        let p = parse_gate_continuation_payload(&env)
-            .expect("live unit dispatch frame must parse");
+        let p = parse_gate_continuation_payload(&env).expect("live unit dispatch frame must parse");
         assert_eq!(p.dispatch_id, Some(dispatch), "dispatch_id must round-trip");
         assert_eq!(p.gate_id, None, "a unit dispatch carries no gate_id");
         assert_eq!(p.target_device_id, device);
