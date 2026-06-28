@@ -234,7 +234,6 @@ function isValidSessionId(id: string): boolean {
  * What the cold-restore path does with a registry record (Phase 4 —
  * autonomous restore).
  *
-<<<<<<< HEAD
  * - `"auto-resume"`: the record is `origin === "authoritative"` AND
  *   CONFIRMED (`confirmedAt` set) AND its provider's `restoreTier()` is
  *   `"full"`. The runner KNOWS the id (it pre-pinned `--session-id`) AND a
@@ -264,17 +263,6 @@ function isValidSessionId(id: string): boolean {
  *   is preserved, but no resume is typed; the operator confirms via a one-click
  *   `ResumeFailedBanner`. (Reserved for genuinely uncertain identity, NOT for
  *   never-confirmed authoritative rows — those are `terminal-only`.)
-=======
- * - `"auto-resume"`: `origin === "authoritative"` — the runner KNOWS the id
- *   (`--session-id` / `--resume` / a provider hook), safe to type
- *   `claude --resume` unattended.
- * - `"quarantine"`: any other origin (`"reconciled"`, or absent on rows
- *   predating the field — both mean a backstop-recovered id that can name a
- *   foreign session). The tab is still created so the screen layout is
- *   preserved, but no resume is typed; the operator confirms via a one-click
- *   `ResumeFailedBanner` affordance. (Phase 4 reworks this so authoritative
- *   rows auto-resume without an operator click.)
->>>>>>> 21acbfae (feat(session-restore): Phase 1 — provider-agnostic core, origin migration, /control/session-open, always-on identity seam, SessionProviderAdapter trait)
  * - `"skip-invalid"`: the recorded id fails shell-safety validation — never
  *   typed, never quarantined (nothing actionable).
  *
@@ -289,7 +277,6 @@ function isValidSessionId(id: string): boolean {
 export type RestoreAction = "auto-resume" | "terminal-only" | "quarantine" | "skip-invalid";
 
 export function classifyRestoreAction(
-<<<<<<< HEAD
   rec: Pick<TerminalSessionRecord, "claudeSessionId" | "origin" | "confirmedAt" | "provider">,
 ): RestoreAction {
   if (!isValidSessionId(rec.claudeSessionId)) return "skip-invalid";
@@ -310,12 +297,6 @@ export function classifyRestoreAction(
   // Reconciled / pre-field origin: a backstop guess that can name a foreign
   // session — quarantine behind the one-click confirm.
   return "quarantine";
-=======
-  rec: Pick<TerminalSessionRecord, "claudeSessionId" | "origin">,
-): RestoreAction {
-  if (!isValidSessionId(rec.claudeSessionId)) return "skip-invalid";
-  return rec.origin === "authoritative" ? "auto-resume" : "quarantine";
->>>>>>> 21acbfae (feat(session-restore): Phase 1 — provider-agnostic core, origin migration, /control/session-open, always-on identity seam, SessionProviderAdapter trait)
 }
 
 /** Validate config dir paths — reject shell metacharacters. */
@@ -566,7 +547,6 @@ export function useTerminalInitialization({
           updateTab(tabId, {
             claudeSessionId: rec.claudeSessionId,
             claudeConfigDir: safeConfigDir,
-<<<<<<< HEAD
             // Show a "resuming" affordance until the resume lands; cleared in
             // the drain loop after the resume command is written. Phase 4:
             // CONFIRMED authoritative rows of a FULL-tier provider auto-resume
@@ -576,13 +556,6 @@ export function useTerminalInitialization({
             // the user sees the conversation was NOT restored (phantom shell, or
             // a terminal-only-tier provider). Quarantined (reconciled) rows can
             // name a foreign session — surface a one-click best-effort confirm.
-=======
-            // Show a "resuming" affordance until `claude --resume` lands;
-            // cleared in the drain loop after the resume command is written.
-            // Quarantined rows are NOT auto-resumed (item 5): a non-authoritative
-            // origin is a backstop guess that can name a foreign VS Code
-            // session — surface a one-click confirm instead.
->>>>>>> 21acbfae (feat(session-restore): Phase 1 — provider-agnostic core, origin migration, /control/session-open, always-on identity seam, SessionProviderAdapter trait)
             isReconnecting: restoreAction === "auto-resume",
             resumeQuarantined: restoreAction === "quarantine",
             // Honest "fresh conversation" note (Phase 5) ONLY for a CONFIRMED
