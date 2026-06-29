@@ -149,11 +149,12 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use axum::http::StatusCode;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::info;
+use uuid::Uuid;
 
 use super::types::ApiState;
 
@@ -1194,6 +1195,122 @@ async fn clear_lifecycle_store_handler(
 }
 
 // =============================================================================
+// /ui-bridge/test/coord-mcp/seed-agent-token  (+ agent-token read-back)
+// =============================================================================
+//
+// The agent-proxy refresh path (runner #592) holds each spawned agent's live JWT
+// in a process-global `AGENT_TOKENS` slot (`coord_mcp.rs`), refreshed by
+// `agent_token::maybe_refresh` off the slot's BOOKKEEPING `exp` (not the JWT's
+// own exp claim). These seams let a test drive that path from OUTSIDE the spawn
+// flow:
+//   - seed-agent-token: build a `TokenSlot { token, jti: nil, exp }` from a real
+//     (still-valid) JWT plus a deliberately-short bookkeeping `exp`, register it
+//     under `agent_id`, and register an Agent-bound proxy nonce for `workdir`.
+//     Returns the nonce. A short `exp` makes `maybe_refresh` fire immediately
+//     while the real token still authenticates the refresh POST.
+//   - agent-token (GET): observe the slot's `exp` / `jti` / `ttl_secs` so a test
+//     can prove a refresh rotated the slot. NEVER returns the token string.
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SeedAgentTokenRequest {
+    pub agent_id: Uuid,
+    /// The real (still-valid) agent JWT to install in the slot. Untouched — only
+    /// the bookkeeping `exp` below drives the refresh decision.
+    pub jwt: String,
+    /// Bookkeeping `exp` (unix seconds) to stamp into the slot. Pass a value near
+    /// `now` to make the refresh boundary fire immediately even though `jwt` is
+    /// still valid for hours.
+    pub jwt_exp: i64,
+    /// Session workdir the Agent-bound proxy nonce is provisioned for.
+    pub workdir: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SeedAgentTokenResponse {
+    pub success: bool,
+    pub nonce: String,
+}
+
+async fn seed_agent_token_handler(
+    Json(req): Json<SeedAgentTokenRequest>,
+) -> Result<Json<SeedAgentTokenResponse>, (StatusCode, Json<InjectSessionError>)> {
+    if req.jwt.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(InjectSessionError {
+                success: false,
+                error: "jwt must not be empty".to_string(),
+            }),
+        ));
+    }
+    if req.workdir.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(InjectSessionError {
+                success: false,
+                error: "workdir must not be empty".to_string(),
+            }),
+        ));
+    }
+
+    let slot = Arc::new(tokio::sync::RwLock::new(crate::agent_token::TokenSlot {
+        token: req.jwt.clone(),
+        jti: Uuid::nil(),
+        exp: req.jwt_exp,
+    }));
+    crate::coord_mcp::register_agent_token(req.agent_id, slot);
+    let nonce = crate::coord_mcp::register_agent_proxy_nonce(&req.workdir, req.agent_id);
+
+    info!(
+        "test_fixtures: seeded agent token agent_id={} exp={} workdir={} (agent-bound proxy nonce minted)",
+        req.agent_id, req.jwt_exp, req.workdir,
+    );
+
+    Ok(Json(SeedAgentTokenResponse {
+        success: true,
+        nonce,
+    }))
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentTokenView {
+    pub present: bool,
+    /// Bookkeeping expiry (unix seconds). `None` when the slot is absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exp: Option<i64>,
+    /// Slot `jti` as a string. `None` when the slot is absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jti: Option<String>,
+    /// Seconds until the bookkeeping `exp` from now (may be negative). `None`
+    /// when the slot is absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<i64>,
+}
+
+async fn agent_token_view_handler(
+    axum::extract::Path(agent_id): axum::extract::Path<Uuid>,
+) -> Json<AgentTokenView> {
+    match crate::coord_mcp::lookup_agent_token(agent_id) {
+        Some(slot) => {
+            let guard = slot.read().await;
+            let now = chrono::Utc::now().timestamp();
+            Json(AgentTokenView {
+                present: true,
+                exp: Some(guard.exp),
+                jti: Some(guard.jti.to_string()),
+                ttl_secs: Some(guard.ttl_secs(now)),
+            })
+        }
+        None => Json(AgentTokenView {
+            present: false,
+            exp: None,
+            jti: None,
+            ttl_secs: None,
+        }),
+    }
+}
+
+// =============================================================================
 // Routes
 // =============================================================================
 
@@ -1232,6 +1349,14 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route(
             "/ui-bridge/test/clear-lifecycle-store",
             post(clear_lifecycle_store_handler),
+        )
+        .route(
+            "/ui-bridge/test/coord-mcp/seed-agent-token",
+            post(seed_agent_token_handler),
+        )
+        .route(
+            "/ui-bridge/test/coord-mcp/agent-token/{agent_id}",
+            get(agent_token_view_handler),
         )
 }
 
@@ -1345,12 +1470,26 @@ mod tests {
             "/ui-bridge/test/seed-lifecycle-store",
             "/ui-bridge/test/list-lifecycle-open",
             "/ui-bridge/test/clear-lifecycle-store",
+            "/ui-bridge/test/coord-mcp/seed-agent-token",
+            "/ui-bridge/test/coord-mcp/agent-token/{agent_id}",
         ] {
             assert!(
                 src.contains(&format!("\"{route}\"")),
                 "route {route} must remain wired in test_fixtures::routes()",
             );
         }
+    }
+
+    /// Actually BUILD the router. `routes()` panics at construction on a bad
+    /// path pattern (e.g. axum 0.8 rejects the legacy `:param` capture syntax
+    /// and requires `{param}`) — a failure the source-string canary above and
+    /// the direct handler-call tests both miss, because neither constructs the
+    /// `Router`. Only a full boot does, which is why this regressed past unit
+    /// tests and only surfaced in the runner boot smoke. This test makes the
+    /// construction panic a cheap, local `cargo test` failure instead.
+    #[test]
+    fn routes_construct_without_panic() {
+        let _ = routes();
     }
 
     /// Inject + clear roundtrip exercises every public path in this module
@@ -2189,5 +2328,123 @@ mod tests {
             !path.exists(),
             "a rejected seed must not write the store file"
         );
+    }
+
+    // =========================================================================
+    // Agent-proxy refresh test seam (coord-mcp/seed-agent-token + agent-token).
+    //
+    // These cover ONLY the new seams: seeding the AGENT_TOKENS slot + an
+    // Agent-bound proxy nonce from outside the spawn path, and reading the slot
+    // back. They do NOT re-cover `agent_token`/`coord_mcp` internals (those have
+    // their own suites). The `AGENT_TOKENS` + proxy-nonce maps are process
+    // globals, so each test uses a fresh random `agent_id` to stay isolated.
+    // =========================================================================
+
+    /// seed-agent-token registers a slot observable via `lookup_agent_token`
+    /// with the seeded `exp`, and the returned nonce is AGENT-bound (proves the
+    /// nonce→principal binding via `proxy_principal_for_nonce`).
+    #[tokio::test]
+    async fn seed_agent_token_registers_slot_and_agent_bound_nonce() {
+        let agent_id = Uuid::new_v4();
+        let seeded_exp = chrono::Utc::now().timestamp() + 5;
+        let req = SeedAgentTokenRequest {
+            agent_id,
+            jwt: "header.payload.sig".to_string(),
+            jwt_exp: seeded_exp,
+            workdir: format!("C:/tmp/agent-seam-{agent_id}"),
+        };
+
+        let resp = seed_agent_token_handler(Json(req))
+            .await
+            .expect("seed should succeed");
+        assert!(resp.success);
+        assert!(!resp.nonce.is_empty(), "a nonce must be returned");
+
+        // The slot is observable with the seeded exp.
+        let slot = crate::coord_mcp::lookup_agent_token(agent_id)
+            .expect("slot must be registered after seed");
+        assert_eq!(slot.read().await.exp, seeded_exp);
+
+        // The returned nonce is AGENT-bound to this agent_id.
+        let principal = crate::coord_mcp::proxy_principal_for_nonce(&resp.nonce)
+            .expect("nonce must resolve to a principal");
+        assert_eq!(
+            principal,
+            crate::coord_mcp::ProxyPrincipal::Agent { agent_id },
+            "the seeded nonce must be bound to ProxyPrincipal::Agent for this agent_id"
+        );
+
+        crate::coord_mcp::remove_agent_token(agent_id);
+    }
+
+    /// seed-agent-token rejects an empty jwt / workdir with 400.
+    #[tokio::test]
+    async fn seed_agent_token_rejects_empty_fields() {
+        let agent_id = Uuid::new_v4();
+        let empty_jwt = SeedAgentTokenRequest {
+            agent_id,
+            jwt: "   ".to_string(),
+            jwt_exp: 0,
+            workdir: "C:/tmp/x".to_string(),
+        };
+        let err = seed_agent_token_handler(Json(empty_jwt))
+            .await
+            .expect_err("empty jwt rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        let empty_workdir = SeedAgentTokenRequest {
+            agent_id,
+            jwt: "a.b.c".to_string(),
+            jwt_exp: 0,
+            workdir: " ".to_string(),
+        };
+        let err = seed_agent_token_handler(Json(empty_workdir))
+            .await
+            .expect_err("empty workdir rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    /// agent-token GET returns present:true with the seeded exp/jti for a seeded
+    /// slot, and present:false for an unknown agent_id. NEVER leaks the token.
+    #[tokio::test]
+    async fn agent_token_view_present_and_absent() {
+        // Unknown agent → present:false, no exp/jti/ttl.
+        let unknown = Uuid::new_v4();
+        let view = agent_token_view_handler(axum::extract::Path(unknown))
+            .await
+            .0;
+        assert!(!view.present);
+        assert!(view.exp.is_none());
+        assert!(view.jti.is_none());
+        assert!(view.ttl_secs.is_none());
+
+        // Seed, then read back.
+        let agent_id = Uuid::new_v4();
+        let seeded_exp = chrono::Utc::now().timestamp() + 3;
+        let seeded = seed_agent_token_handler(Json(SeedAgentTokenRequest {
+            agent_id,
+            jwt: "a.b.c".to_string(),
+            jwt_exp: seeded_exp,
+            workdir: format!("C:/tmp/view-{agent_id}"),
+        }))
+        .await
+        .expect("seed should succeed");
+        assert!(
+            !seeded.0.nonce.is_empty(),
+            "seed returns a non-empty agent-bound nonce"
+        );
+
+        let view = agent_token_view_handler(axum::extract::Path(agent_id))
+            .await
+            .0;
+        assert!(view.present);
+        assert_eq!(view.exp, Some(seeded_exp));
+        // jti is Uuid::nil() per the seed path.
+        assert_eq!(view.jti.as_deref(), Some(Uuid::nil().to_string().as_str()));
+        // ttl is roughly the seeded delta (allow a couple seconds of slack).
+        let ttl = view.ttl_secs.expect("ttl present for a seeded slot");
+        assert!((0..=3).contains(&ttl), "ttl_secs ~= now+3, got {ttl}");
+
+        crate::coord_mcp::remove_agent_token(agent_id);
     }
 }

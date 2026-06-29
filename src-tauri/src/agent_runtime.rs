@@ -232,6 +232,47 @@ impl SpawnPrContext {
     }
 }
 
+/// Env var (debug / `test-fixtures` builds only) that compresses the per-agent
+/// TokenSlot's BOOKKEEPING `exp` to `now + n` seconds. Lets a test fire the
+/// proactive-refresh boundary in seconds while the REAL JWT in the slot is still
+/// valid and authenticates the refresh POST. Absent in release builds.
+#[cfg(any(debug_assertions, feature = "test-fixtures"))]
+const AGENT_JWT_EXP_COMPRESS_ENV: &str = "QONTINUI_AGENT_JWT_EXP_COMPRESS_SECS";
+
+/// Resolve the bookkeeping `exp` to stamp into a freshly-seeded per-agent
+/// `TokenSlot`. The real `payload.jwt` is NEVER touched — only this bookkeeping
+/// value, which `agent_token::maybe_refresh` reads to decide whether to refresh.
+///
+/// In debug / `test-fixtures` builds, if `QONTINUI_AGENT_JWT_EXP_COMPRESS_SECS`
+/// parses to an `i64` `n`, the result is clamped to `min(jwt_exp, now + n)` so a
+/// test can compress the ~4h refresh boundary to seconds. In release builds (no
+/// cfg) it is always `jwt_exp`.
+#[cfg(any(debug_assertions, feature = "test-fixtures"))]
+fn compressed_jwt_exp(jwt_exp: i64) -> i64 {
+    match std::env::var(AGENT_JWT_EXP_COMPRESS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+    {
+        Some(n) => {
+            let compressed = std::cmp::min(jwt_exp, chrono::Utc::now().timestamp() + n);
+            tracing::warn!(
+                "agent_runtime: {AGENT_JWT_EXP_COMPRESS_ENV}={n} set — compressing agent \
+                 TokenSlot bookkeeping exp {jwt_exp} -> {compressed} (real JWT untouched; \
+                 debug/test-fixtures only)"
+            );
+            compressed
+        }
+        None => jwt_exp,
+    }
+}
+
+/// Release variant: no env knob exists, so the bookkeeping `exp` is always the
+/// payload's real `exp`.
+#[cfg(not(any(debug_assertions, feature = "test-fixtures")))]
+fn compressed_jwt_exp(jwt_exp: i64) -> i64 {
+    jwt_exp
+}
+
 /// Extract a PR number from a `refs/pull/<n>/head` (or `/merge`) push ref.
 /// Returns `None` for any ref that is not in the GitHub pull-ref shape — the
 /// runner only reports a PR it can read directly off the ref, never one it
@@ -2713,7 +2754,11 @@ async fn run_agent_subprocess(
         let slot = std::sync::Arc::new(tokio::sync::RwLock::new(crate::agent_token::TokenSlot {
             token: payload.jwt.clone(),
             jti: uuid::Uuid::nil(),
-            exp: payload.jwt_exp,
+            // The REAL JWT is untouched (still ~4h valid); only the bookkeeping
+            // `exp` is clamped here. In debug / `test-fixtures` builds a test can
+            // compress it via QONTINUI_AGENT_JWT_EXP_COMPRESS_SECS so the refresh
+            // boundary fires in seconds. In release this is always `payload.jwt_exp`.
+            exp: compressed_jwt_exp(payload.jwt_exp),
         }));
         crate::coord_mcp::register_agent_token(payload.agent_id, slot.clone());
         match crate::coord_mcp::resolve_bound_api_port() {
@@ -5278,5 +5323,59 @@ mod tests {
             reason.contains(&format!("cap ({cap})")),
             "the reason must still name the cap for the operator log"
         );
+    }
+
+    /// `compressed_jwt_exp` (debug / test-fixtures variant): with the env knob
+    /// set it clamps the bookkeeping exp to ~`now + n`; without it the real
+    /// `jwt_exp` passes through untouched. This is the Phase-2 Tier-B override.
+    ///
+    /// Touches the process env var, so it must run serially w.r.t. any other
+    /// test reading the same var. It is the only test that reads it, and it
+    /// restores the prior value, so a `set/remove` here is self-contained.
+    #[test]
+    #[cfg(any(debug_assertions, feature = "test-fixtures"))]
+    fn compressed_jwt_exp_honors_env_override() {
+        let prior = std::env::var(AGENT_JWT_EXP_COMPRESS_ENV).ok();
+
+        // A far-future real expiry (~4h out), like a real agent JWT.
+        let real_exp = chrono::Utc::now().timestamp() + 4 * 3600;
+
+        // Unset → pass-through.
+        std::env::remove_var(AGENT_JWT_EXP_COMPRESS_ENV);
+        assert_eq!(
+            compressed_jwt_exp(real_exp),
+            real_exp,
+            "without the env knob the real exp passes through unchanged"
+        );
+
+        // Set to n=5 → clamp to min(real_exp, now+5) == now+5.
+        std::env::set_var(AGENT_JWT_EXP_COMPRESS_ENV, "5");
+        let before = chrono::Utc::now().timestamp();
+        let got = compressed_jwt_exp(real_exp);
+        let after = chrono::Utc::now().timestamp();
+        assert!(
+            (before + 5..=after + 5).contains(&got),
+            "compressed exp must be ~now+5 (got {got}, window {}..={})",
+            before + 5,
+            after + 5
+        );
+        assert!(
+            got < real_exp,
+            "compressed exp must be earlier than real exp"
+        );
+
+        // A non-numeric value is ignored → pass-through.
+        std::env::set_var(AGENT_JWT_EXP_COMPRESS_ENV, "not-a-number");
+        assert_eq!(
+            compressed_jwt_exp(real_exp),
+            real_exp,
+            "an unparseable env value is ignored and the real exp passes through"
+        );
+
+        // Restore prior env state.
+        match prior {
+            Some(v) => std::env::set_var(AGENT_JWT_EXP_COMPRESS_ENV, v),
+            None => std::env::remove_var(AGENT_JWT_EXP_COMPRESS_ENV),
+        }
     }
 }
