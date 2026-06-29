@@ -1355,7 +1355,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
             post(seed_agent_token_handler),
         )
         .route(
-            "/ui-bridge/test/coord-mcp/agent-token/:agent_id",
+            "/ui-bridge/test/coord-mcp/agent-token/{agent_id}",
             get(agent_token_view_handler),
         )
 }
@@ -1471,13 +1471,25 @@ mod tests {
             "/ui-bridge/test/list-lifecycle-open",
             "/ui-bridge/test/clear-lifecycle-store",
             "/ui-bridge/test/coord-mcp/seed-agent-token",
-            "/ui-bridge/test/coord-mcp/agent-token/:agent_id",
+            "/ui-bridge/test/coord-mcp/agent-token/{agent_id}",
         ] {
             assert!(
                 src.contains(&format!("\"{route}\"")),
                 "route {route} must remain wired in test_fixtures::routes()",
             );
         }
+    }
+
+    /// Actually BUILD the router. `routes()` panics at construction on a bad
+    /// path pattern (e.g. axum 0.8 rejects the legacy `:param` capture syntax
+    /// and requires `{param}`) — a failure the source-string canary above and
+    /// the direct handler-call tests both miss, because neither constructs the
+    /// `Router`. Only a full boot does, which is why this regressed past unit
+    /// tests and only surfaced in the runner boot smoke. This test makes the
+    /// construction panic a cheap, local `cargo test` failure instead.
+    #[test]
+    fn routes_construct_without_panic() {
+        let _ = routes();
     }
 
     /// Inject + clear roundtrip exercises every public path in this module
