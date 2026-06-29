@@ -180,14 +180,6 @@ pub enum SessionEventKind {
     /// payload carries `{repo, branch, shas}` and NO session id (coord resolves
     /// the session server-side from `(repo, branch)`).
     CommitReport,
-<<<<<<< HEAD
-    /// Work-progress report (plan
-    /// `2026-06-25-session-progress-reporting-and-agent-session-linkage.md`).
-    /// Drained to `PATCH /sessions/:id {progress:{…}}`, advancing
-    /// `coord.sessions.last_progress_at` on a *work-activity* boundary —
-    /// orthogonal to the liveness `Heartbeat`. Emitted on operator interaction
-    /// by [`crate::claude_session::coord_register::AiCoordRegistrar::progress_on_interaction`].
-=======
     /// Session work-PROGRESS signal (Plan 2026-06-29 Phase 1). Drained to
     /// `PATCH /sessions/:id {progress:{...}}`, which coord routes through
     /// `advance_session_progress` to bump `coord.sessions.last_progress_at`
@@ -196,7 +188,6 @@ pub enum SessionEventKind {
     /// (liveness). Emitted ONLY at genuine forward-progress boundaries (a new
     /// assistant tool-use turn), NOT on the heartbeat timer, so an idle/stuck
     /// session's `last_progress_at` ages to stale and the watcher can fire.
->>>>>>> 4e6b5b5a (feat(sessions): emit work-progress to coord at forward-progress boundaries)
     Progress,
 }
 
