@@ -1,3 +1,0 @@
-# UpdateSettings
-
-_(notes)_

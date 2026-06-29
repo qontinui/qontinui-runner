@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "base_sha": "f3afcfea471fb5349e2e36ab4478da5e8b8a9c09",
+  "ours_sha": "0882cd2ec6e33aa289724a898e19427edc2febef",
+  "theirs_sha": "79c3d0f3a29d4568c2750f515aa8ef98640b977b",
+  "entries": [
+    {
+      "path": "src-tauri/src/mcp/test_fixtures.rs",
+      "base_oid": "15b1340703c31fbc808205e242edcbed0d923a37",
+      "ours_oid": "46b063d6ebba77c21e1991c85de6b98655edd976",
+      "theirs_oid": "6e3943d1eac1bf26a69f4c2dc8545322bb039253",
+      "base_path": "src-tauri/src/mcp/test_fixtures.rs.base",
+      "ours_path": "src-tauri/src/mcp/test_fixtures.rs.ours",
+      "theirs_path": "src-tauri/src/mcp/test_fixtures.rs.theirs",
+      "hunks": [
+        "<<<<<<< HEAD\n            \"/ui-bridge/test/coord-mcp/agent-token/{agent_id}\",\n=======\n            \"/ui-bridge/test/coord-mcp/agent-token/:agent_id\",\n>>>>>>> eabfead1 (feat(test-fixtures): seam to verify per-agent coord-mcp proxy refresh past JWT expiry)\n",
+        "<<<<<<< HEAD\n            \"/ui-bridge/test/coord-mcp/agent-token/{agent_id}\",\n=======\n            \"/ui-bridge/test/coord-mcp/agent-token/:agent_id\",\n>>>>>>> eabfead1 (feat(test-fixtures): seam to verify per-agent coord-mcp proxy refresh past JWT expiry)\n"
+      ]
+    }
+  ]
+}
