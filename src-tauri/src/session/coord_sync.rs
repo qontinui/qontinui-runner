@@ -631,6 +631,19 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 .send()
                 .await
         }
+        "progress" => {
+            // Work-progress report (plan
+            // 2026-06-25-session-progress-reporting-and-agent-session-linkage.md).
+            // PATCH /sessions/:id {progress:{…}} advances
+            // coord.sessions.last_progress_at on a work-activity boundary —
+            // orthogonal to the {heartbeat:true} liveness PATCH above. Coord
+            // stamps last_progress_at=now() when the body omits it.
+            let url = format!("{base}/sessions/{}", rec.session_id);
+            let body = progress_body(&rec.payload);
+            crate::auth::attach_device_auth(inner.http.patch(&url).json(&body))
+                .send()
+                .await
+        }
         "commit_report" => {
             // Commit ↔ session lineage push-report (plan
             // 2026-06-07-coord-commit-session-lineage.md, Population path 2).
@@ -772,6 +785,26 @@ fn state_change_body(payload: &JsonValue) -> JsonValue {
     // caller only changed metadata.
     body.insert("heartbeat".into(), JsonValue::Bool(true));
     JsonValue::Object(body)
+}
+
+/// Build the `PATCH /sessions/:id {progress:{…}}` body from a `progress`
+/// outbox payload. The registrar records the work-progress fields flat in the
+/// payload (`session_status`, optional `last_progress_at` / `progress_detail`);
+/// coord's `UpdateSessionRequest` nests them under `progress` and stamps
+/// `last_progress_at = now()` when omitted. Advances the work-progress axis
+/// (`coord.sessions.last_progress_at`), independent of the liveness heartbeat.
+fn progress_body(payload: &JsonValue) -> JsonValue {
+    let mut progress = serde_json::Map::new();
+    if let Some(status) = payload.get("session_status") {
+        progress.insert("session_status".into(), status.clone());
+    }
+    if let Some(at) = payload.get("last_progress_at") {
+        progress.insert("last_progress_at".into(), at.clone());
+    }
+    if let Some(detail) = payload.get("progress_detail") {
+        progress.insert("progress_detail".into(), detail.clone());
+    }
+    json!({ "progress": JsonValue::Object(progress) })
 }
 
 /// Build the `POST /sessions/:id/steal` body from the claim_stolen
@@ -1591,6 +1624,32 @@ mod tests {
         assert_eq!(body["branch"], "main");
         assert_eq!(body["heartbeat"], true);
         assert!(body.get("unrelated").is_none());
+    }
+
+    /// `progress` body nests the flat work-progress fields under `progress`
+    /// (coord's `UpdateSessionRequest` shape) and drops unknown keys. A minimal
+    /// payload yields a `{progress:{session_status}}` body — coord stamps
+    /// last_progress_at=now() when the body omits it.
+    #[test]
+    fn progress_body_nests_known_fields_under_progress() {
+        let minimal = json!({ "id": Uuid::new_v4(), "session_status": "working" });
+        let body = progress_body(&minimal);
+        assert_eq!(body["progress"]["session_status"], "working");
+        // `id` is the outbox routing key, not a progress field — not forwarded.
+        assert!(body["progress"].get("id").is_none());
+        assert!(body["progress"].get("last_progress_at").is_none());
+
+        let full = json!({
+            "session_status": "blocked",
+            "last_progress_at": "2026-06-28T10:30:00Z",
+            "progress_detail": { "step": "tests", "pct": 60 },
+            "unrelated": "ignored",
+        });
+        let body = progress_body(&full);
+        assert_eq!(body["progress"]["session_status"], "blocked");
+        assert_eq!(body["progress"]["last_progress_at"], "2026-06-28T10:30:00Z");
+        assert_eq!(body["progress"]["progress_detail"]["pct"], 60);
+        assert!(body["progress"].get("unrelated").is_none());
     }
 
     /// `claim_stolen` body carries `reason` + the runner's machine_id.

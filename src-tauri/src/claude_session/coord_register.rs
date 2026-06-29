@@ -330,6 +330,49 @@ impl AiCoordRegistrar {
         }
     }
 
+    /// Advance this session's **work-progress** clock
+    /// (`coord.sessions.last_progress_at`) on operator interaction — a sibling
+    /// of [`Self::heartbeat_on_interaction`], called from the same
+    /// `send_user_message` work-activity boundary. Plan
+    /// `2026-06-25-session-progress-reporting-and-agent-session-linkage.md`.
+    ///
+    /// This is the missing *producer* the prior plan's session-stall watcher
+    /// was starved of: it advances `last_progress_at` on the **work axis**,
+    /// orthogonal to the liveness `Heartbeat` (a session can hold a claim yet
+    /// stop advancing — the watcher flips such a session to `stalled`). The
+    /// `Progress` outbox row drains to `PATCH /sessions/:id {progress:{…}}`;
+    /// coord stamps `last_progress_at = now()` (we send no explicit timestamp).
+    ///
+    /// No-op (silently) if the session was never registered — which is also how
+    /// the `QONTINUI_SESSION_AUTOMATION_REGISTER` kill switch disables it: a
+    /// disabled session has no R4 index entry, so this resolves to `None`.
+    /// Best-effort throughout — a write failure never disturbs the live session.
+    pub fn progress_on_interaction(&self, task_run_id: &str) {
+        let Some(session_id) = self.session_id_for(task_run_id) else {
+            return;
+        };
+        // Minimal body: `session_status="working"`. Coord stamps
+        // `last_progress_at=now()` on receipt (no explicit `last_progress_at`
+        // or `progress_detail` sent — the interaction itself is the signal).
+        let payload = json!({ "id": session_id, "session_status": "working" });
+        if let Err(e) = self.inner.outbox.record(
+            self.inner.machine_id,
+            session_id,
+            SessionEventKind::Progress,
+            payload,
+        ) {
+            warn!(
+                "ai_coord_register: outbox Progress write failed for {} (best-effort): {}",
+                task_run_id, e
+            );
+        } else {
+            debug!(
+                "ai_coord_register: interaction progress for {} (coord {})",
+                task_run_id, session_id
+            );
+        }
+    }
+
     /// R5 — on AI-session end, emit a `Closed` outbox row (`DELETE
     /// /sessions/:id`) and evict the R4 index entry so coord.sessions doesn't
     /// leak a ghost row and the resolver doesn't keep a dangling mapping.
@@ -808,6 +851,54 @@ mod tests {
             .collect();
         assert_eq!(hb.len(), 1, "exactly one interaction heartbeat");
         assert_eq!(hb[0].session_id, coord_id);
+    }
+
+    #[test]
+    fn progress_only_after_register_and_keyed_by_session() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let trid = Uuid::new_v4().to_string();
+
+        // Progress before registration is a no-op (no row) — this is also how
+        // the kill switch disables it (unregistered → no R4 index entry).
+        reg.progress_on_interaction(&trid);
+        assert!(reg
+            .inner
+            .outbox
+            .pending()
+            .unwrap()
+            .iter()
+            .all(|r| r.event_kind != SessionEventKind::Progress.as_str()));
+
+        let coord_id = reg.register_session(&trid, "purpose", None).unwrap();
+        reg.progress_on_interaction(&trid);
+
+        let prog: Vec<_> = reg
+            .inner
+            .outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event_kind == SessionEventKind::Progress.as_str())
+            .collect();
+        assert_eq!(prog.len(), 1, "exactly one interaction progress row");
+        assert_eq!(prog[0].session_id, coord_id);
+        // Minimal body advances the work axis; coord stamps last_progress_at.
+        assert_eq!(prog[0].payload["session_status"], json!("working"));
+    }
+
+    #[test]
+    fn progress_disabled_gate_is_noop() {
+        let _env = env_lock();
+        std::env::set_var("QONTINUI_SESSION_AUTOMATION_REGISTER", "0");
+        let (reg, _dir) = registrar();
+        let trid = Uuid::new_v4().to_string();
+        // Disabled → register is a no-op → no index entry → progress no-ops.
+        assert!(reg.register_session(&trid, "purpose", None).is_none());
+        reg.progress_on_interaction(&trid);
+        assert!(reg.inner.outbox.pending().unwrap().is_empty());
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
     }
 
     #[test]
