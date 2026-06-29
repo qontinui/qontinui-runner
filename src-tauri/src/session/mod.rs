@@ -180,6 +180,15 @@ pub enum SessionEventKind {
     /// payload carries `{repo, branch, shas}` and NO session id (coord resolves
     /// the session server-side from `(repo, branch)`).
     CommitReport,
+    /// Session work-PROGRESS signal (Plan 2026-06-29 Phase 1). Drained to
+    /// `PATCH /sessions/:id {progress:{...}}`, which coord routes through
+    /// `advance_session_progress` to bump `coord.sessions.last_progress_at`
+    /// (the work-progress axis the `session_stall_watcher` reads) — ORTHOGONAL
+    /// to [`SessionEventKind::Heartbeat`], which bumps `last_heartbeat_at`
+    /// (liveness). Emitted ONLY at genuine forward-progress boundaries (a new
+    /// assistant tool-use turn), NOT on the heartbeat timer, so an idle/stuck
+    /// session's `last_progress_at` ages to stale and the watcher can fire.
+    Progress,
 }
 
 impl SessionEventKind {
@@ -193,6 +202,7 @@ impl SessionEventKind {
             SessionEventKind::OutputChunk => "output_chunk",
             SessionEventKind::HandoffRequest => "handoff_request",
             SessionEventKind::CommitReport => "commit_report",
+            SessionEventKind::Progress => "progress",
         }
     }
 }
@@ -1211,6 +1221,7 @@ mod tests {
             SessionEventKind::OutputChunk,
             SessionEventKind::HandoffRequest,
             SessionEventKind::CommitReport,
+            SessionEventKind::Progress,
         ];
         for k in kinds {
             let json = serde_json::to_string(&k).unwrap();

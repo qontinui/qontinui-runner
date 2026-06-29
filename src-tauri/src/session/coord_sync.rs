@@ -618,6 +618,20 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 .send()
                 .await
         }
+        "progress" => {
+            // Plan 2026-06-29 Phase 1 — work-progress signal. PATCH
+            // `/sessions/:id {progress:{...}}`; coord routes the embedded
+            // `progress` object through `advance_session_progress` to bump
+            // `last_progress_at` (the work-progress axis the stall watcher
+            // reads). Deliberately carries NO `heartbeat:true` — this is the
+            // progress axis, ORTHOGONAL to liveness. Best-effort: a
+            // pre-migration coord swallows the column write and 200s.
+            let url = format!("{base}/sessions/{}", rec.session_id);
+            let body = progress_body(&rec.payload);
+            crate::auth::attach_device_auth(inner.http.patch(&url).json(&body))
+                .send()
+                .await
+        }
         "closed" => {
             let url = format!("{base}/sessions/{}", rec.session_id);
             crate::auth::attach_device_auth(inner.http.delete(&url))
@@ -772,6 +786,28 @@ fn state_change_body(payload: &JsonValue) -> JsonValue {
     // caller only changed metadata.
     body.insert("heartbeat".into(), JsonValue::Bool(true));
     JsonValue::Object(body)
+}
+
+/// Build the `PATCH /sessions/:id {progress:{...}}` body from a `Progress`
+/// outbox payload (Plan 2026-06-29 Phase 1). The runner stamps
+/// `{session_status?, progress_detail?}` into the outbox payload; we wrap it in
+/// coord's `progress` envelope (`UpdateSessionRequest.progress`). `last_progress_at`
+/// is omitted so coord stamps `now()` at receive time — the presence of the
+/// report IS the advance signal. Only fields actually present are forwarded so
+/// a `None` never overwrites an existing column with NULL.
+fn progress_body(payload: &JsonValue) -> JsonValue {
+    let mut progress = serde_json::Map::new();
+    if let Some(status) = payload.get("session_status") {
+        if !status.is_null() {
+            progress.insert("session_status".into(), status.clone());
+        }
+    }
+    if let Some(detail) = payload.get("progress_detail") {
+        if !detail.is_null() {
+            progress.insert("progress_detail".into(), detail.clone());
+        }
+    }
+    json!({ "progress": JsonValue::Object(progress) })
 }
 
 /// Build the `POST /sessions/:id/steal` body from the claim_stolen

@@ -34,6 +34,32 @@ fn emit_state_if_possible(
     }
 }
 
+/// Report a genuine forward-progress boundary (a new assistant tool-use turn)
+/// to coord (Plan 2026-06-29 Phase 1), so `coord.sessions.last_progress_at`
+/// advances and the observe-mode `session_stall_watcher` has rows to evaluate.
+///
+/// Resolves the coord [`AiCoordRegistrar`] from managed Tauri state (the same
+/// handle the heartbeat path uses, `drain.rs`) and the session's `task_run_id`
+/// from `session_ctx`. The registrar rate-caps the actual emit, so calling
+/// this on every tool-use line is cheap. Best-effort + non-blocking: a missing
+/// registrar (registration disabled), a missing context, or a closed session
+/// is a silent no-op — progress reporting must NEVER disturb the session
+/// (exactly like the heartbeat).
+fn report_session_progress(
+    app_handle: &tauri::AppHandle,
+    session_ctx: Option<&AiSessionContext>,
+    tool_name: &str,
+) {
+    let Some(ctx) = session_ctx else { return };
+    let Some(registrar) =
+        app_handle.try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()
+    else {
+        return; // registrar not installed (e.g. registration disabled) — no-op.
+    };
+    let detail = serde_json::json!({ "tool": tool_name });
+    registrar.report_progress(ctx.task_run_id(), Some(detail));
+}
+
 /// Configuration for the dispatcher.
 pub struct DispatcherConfig {
     /// App handle for emitting events.
@@ -105,6 +131,9 @@ pub fn dispatch_line(
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             emit_ai_output(app_handle, &activity, "tool_activity", None, session_ctx);
         }));
+        // Plan 2026-06-29 Phase 1 — a new tool-use turn is genuine forward
+        // progress; report it to coord (rate-capped inside the registrar).
+        report_session_progress(app_handle, session_ctx, tool_name);
         // Auto-register files under active development when Edit/Write tools are used
         auto_register_file(
             app_handle,
@@ -124,6 +153,9 @@ pub fn dispatch_line(
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             emit_ai_output(app_handle, &activity, "tool_activity", None, session_ctx);
         }));
+        // Plan 2026-06-29 Phase 1 — forward-progress boundary (stream-json
+        // path: tool_use arrives as content_block_start).
+        report_session_progress(app_handle, session_ctx, &tool_name);
         // Auto-register files under active development when Edit/Write tools are used
         auto_register_file(
             app_handle,

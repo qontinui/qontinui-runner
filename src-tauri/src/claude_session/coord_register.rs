@@ -116,7 +116,21 @@ struct Inner {
     /// hold (`task_run_id`).
     forward: Mutex<HashMap<Uuid, String>>,
     reverse: Mutex<HashMap<String, Uuid>>,
+    /// R-progress throttle (Plan 2026-06-29 Phase 1): coord `session_id` →
+    /// last instant a progress PATCH was enqueued. A genuine forward-progress
+    /// boundary fires per assistant tool-use turn (potentially many per
+    /// second); we coalesce them to at most one progress emit per
+    /// [`PROGRESS_MIN_INTERVAL`] so the outbox/coord don't see a PATCH per
+    /// line. This is a RATE CAP, not a timer — when the session stops making
+    /// tool-use turns (idle / stuck), NO emit happens and `last_progress_at`
+    /// ages to stale, which is the whole point (false-progress trap, §5).
+    last_progress_emit: Mutex<HashMap<Uuid, std::time::Instant>>,
 }
+
+/// Minimum wall-clock gap between two progress PATCHes for the same session.
+/// Far below the 600s stall threshold (so a working session stays fresh) yet
+/// large enough that a burst of tool-use turns coalesces to a single emit.
+const PROGRESS_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 impl AiCoordRegistrar {
     /// Construct from the shared session outbox + this device's `machine_id`.
@@ -128,6 +142,7 @@ impl AiCoordRegistrar {
                 machine_id,
                 forward: Mutex::new(HashMap::new()),
                 reverse: Mutex::new(HashMap::new()),
+                last_progress_emit: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -330,6 +345,75 @@ impl AiCoordRegistrar {
         }
     }
 
+    /// R-progress (Plan 2026-06-29 Phase 1) — report GENUINE forward progress
+    /// for the AI session backing `task_run_id`, driven by a new assistant
+    /// tool-use turn (called from the stdout dispatcher's `extract_tool_use`
+    /// boundary). Emits a `Progress` outbox row → drained as
+    /// `PATCH /sessions/:id {progress:{...}}` → coord bumps
+    /// `coord.sessions.last_progress_at` (the WORK-PROGRESS axis the
+    /// `session_stall_watcher` reads), distinct from the liveness heartbeat.
+    ///
+    /// **Rate-capped, NOT a timer.** Tool-use turns can arrive many per second;
+    /// we coalesce them to at most one emit per [`PROGRESS_MIN_INTERVAL`] per
+    /// session. Crucially the emit is driven by REAL forward motion: when the
+    /// session stops producing tool-use turns (idle / stuck), nothing fires and
+    /// `last_progress_at` ages to stale so the watcher can flag it (§5
+    /// false-progress trap). A periodic heartbeat would defeat that — this
+    /// deliberately rides the work boundary, not the clock.
+    ///
+    /// `detail` is optional free-form checkpoint JSON (e.g. the active tool
+    /// name) stored in `progress_detail`. Best-effort: no registered session,
+    /// a poisoned lock, or an outbox error is a silent no-op that never
+    /// disturbs the live session.
+    pub fn report_progress(&self, task_run_id: &str, detail: Option<serde_json::Value>) {
+        let Some(session_id) = self.session_id_for(task_run_id) else {
+            return; // never registered — nothing to report against.
+        };
+
+        // Rate cap: skip if we emitted for this session within the window.
+        // Edge case — a poisoned lock recovers via into_inner (the map is pure
+        // throttle bookkeeping; a stale entry only delays the next emit).
+        {
+            let mut guard = self
+                .inner
+                .last_progress_emit
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let now = std::time::Instant::now();
+            if let Some(prev) = guard.get(&session_id) {
+                if now.duration_since(*prev) < PROGRESS_MIN_INTERVAL {
+                    return; // coalesced into the previous emit.
+                }
+            }
+            guard.insert(session_id, now);
+        }
+
+        // `session_status` is left to coord's existing value (omitted) — a
+        // forward-progress emit means "still working" but we don't want to
+        // clobber an operator/agent-set `blocked` status; the presence of the
+        // report alone advances `last_progress_at`.
+        let mut payload = json!({ "id": session_id });
+        if let Some(d) = detail {
+            payload["progress_detail"] = d;
+        }
+        if let Err(e) = self.inner.outbox.record(
+            self.inner.machine_id,
+            session_id,
+            SessionEventKind::Progress,
+            payload,
+        ) {
+            warn!(
+                "ai_coord_register: outbox Progress write failed for {} (best-effort): {}",
+                task_run_id, e
+            );
+        } else {
+            debug!(
+                "ai_coord_register: forward-progress report for {} (coord {})",
+                task_run_id, session_id
+            );
+        }
+    }
+
     /// R5 — on AI-session end, emit a `Closed` outbox row (`DELETE
     /// /sessions/:id`) and evict the R4 index entry so coord.sessions doesn't
     /// leak a ghost row and the resolver doesn't keep a dangling mapping.
@@ -349,6 +433,13 @@ impl AiCoordRegistrar {
             if let Ok(mut fwd) = self.inner.forward.lock() {
                 fwd.remove(&id);
             }
+            // Evict the progress throttle entry so the map doesn't leak across
+            // long-lived runners (best-effort; recover a poisoned lock).
+            self.inner
+                .last_progress_emit
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&id);
             id
         };
 
@@ -808,6 +899,63 @@ mod tests {
             .collect();
         assert_eq!(hb.len(), 1, "exactly one interaction heartbeat");
         assert_eq!(hb[0].session_id, coord_id);
+    }
+
+    #[test]
+    fn report_progress_emits_progress_row_with_detail() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let trid = Uuid::new_v4().to_string();
+
+        // Progress before registration is a no-op (no session to report against).
+        reg.report_progress(&trid, Some(json!({ "tool": "Edit" })));
+        assert!(reg.inner.outbox.pending().unwrap().is_empty());
+
+        let coord_id = reg.register_session(&trid, "purpose", None).unwrap();
+        reg.report_progress(&trid, Some(json!({ "tool": "Bash" })));
+
+        let prog: Vec<_> = reg
+            .inner
+            .outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event_kind == SessionEventKind::Progress.as_str())
+            .collect();
+        assert_eq!(prog.len(), 1, "exactly one progress row");
+        assert_eq!(prog[0].session_id, coord_id);
+        assert_eq!(prog[0].payload["id"], json!(coord_id));
+        assert_eq!(
+            prog[0].payload["progress_detail"],
+            json!({ "tool": "Bash" })
+        );
+        // Carries NO heartbeat field — progress is the work axis, not liveness.
+        assert!(prog[0].payload.get("heartbeat").is_none());
+    }
+
+    #[test]
+    fn report_progress_rate_caps_a_burst_to_one_emit() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let trid = Uuid::new_v4().to_string();
+        reg.register_session(&trid, "purpose", None).unwrap();
+
+        // A burst of tool-use turns within the throttle window coalesces to one
+        // progress emit (genuine-progress, not one-PATCH-per-line).
+        for _ in 0..10 {
+            reg.report_progress(&trid, None);
+        }
+        let n = reg
+            .inner
+            .outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event_kind == SessionEventKind::Progress.as_str())
+            .count();
+        assert_eq!(n, 1, "a burst within PROGRESS_MIN_INTERVAL emits once");
     }
 
     #[test]
