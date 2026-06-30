@@ -47,7 +47,18 @@ export interface AuthContextValue {
    * local-guest auth.
    */
   tier: RunnerTier;
+  /**
+   * Default logout — clears only the interactive device-JWT session and keeps
+   * the Cognito session, so the runner's autonomous terminal sessions keep
+   * running (the device JWT is re-minted in the background).
+   */
   logout: () => Promise<void>;
+  /**
+   * Full sign-out that STOPS autonomous terminal sessions — clears ALL
+   * credentials (device JWT + the Cognito session). The runner cannot
+   * self-recover its device JWT until an interactive re-login.
+   */
+  signOutFull: () => Promise<void>;
   /** Re-validate the current auth status (no token-refresh side effect). */
   refreshAuth: () => Promise<void>;
 }

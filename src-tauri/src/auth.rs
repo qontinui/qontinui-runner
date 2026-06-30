@@ -321,25 +321,68 @@ impl AuthManager {
             .context("Failed to retrieve refresh token from keychain")
     }
 
-    /// Clears all tokens from both storages.
+    /// Clears ALL credentials from both storages — the device-JWT pair AND
+    /// the Cognito (`oauth_*`) session, including the long-lived
+    /// `oauth_refresh_token`.
     ///
-    /// This is typically called during logout.
+    /// This is the explicit full sign-out. It destroys the only credential the
+    /// device-JWT refresher can self-recover from, so it STOPS the runner's
+    /// autonomous terminal sessions (they cannot re-mint a device JWT until an
+    /// interactive re-login). For a default logout that should keep autonomy
+    /// running, use [`Self::clear_interactive_session`].
     ///
     /// # Errors
     ///
     /// Returns an error if clearing fails.
-    pub fn clear_tokens(&self) -> Result<()> {
+    pub fn clear_all_credentials(&self) -> Result<()> {
         // Clear from file storage
         if let Err(e) = self.secure_storage.clear_tokens() {
             warn!("Failed to clear tokens from secure storage: {}", e);
         }
 
-        // Also clear from keychain (best effort)
+        // Also clear from keychain (best effort). The keychain only ever holds
+        // the device-JWT pair (the oauth_* slots are file-only — see the module
+        // comment at the Cognito section), so this deletes the access_token /
+        // refresh_token entries.
         if let Err(e) = self.clear_tokens_from_keychain() {
             debug!("Failed to clear tokens from keychain: {}", e);
         }
 
-        info!("Tokens cleared");
+        info!("All credentials cleared (device JWT + Cognito session)");
+        Ok(())
+    }
+
+    /// Clears ONLY the interactive device-JWT session, PRESERVING the Cognito
+    /// (`oauth_*`) session so the device-JWT refresher can immediately re-mint
+    /// a fresh device JWT and keep autonomous terminal sessions running.
+    ///
+    /// This is the autonomy-preserving clear used by a default logout. Only the
+    /// `access_token` / `refresh_token` slots (file + keychain) are dropped; the
+    /// `oauth_refresh_token` (and the rest of the Cognito session) is left
+    /// intact. Contrast with [`Self::clear_all_credentials`].
+    ///
+    /// The keychain only stores the device-JWT pair (oauth_* are file-only), so
+    /// the keychain clear here is exactly the same `clear_tokens_from_keychain`
+    /// helper and never touches a Cognito entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if clearing fails.
+    pub fn clear_interactive_session(&self) -> Result<()> {
+        // Clear ONLY the device-JWT pair from file storage; preserve oauth_*.
+        if let Err(e) = self.secure_storage.clear_interactive_session() {
+            warn!(
+                "Failed to clear interactive device-JWT session from secure storage: {}",
+                e
+            );
+        }
+
+        // Keychain only holds the device-JWT pair, so this is the same helper.
+        if let Err(e) = self.clear_tokens_from_keychain() {
+            debug!("Failed to clear device-JWT pair from keychain: {}", e);
+        }
+
+        info!("Interactive device-JWT session cleared (Cognito session preserved for autonomous refresh)");
         Ok(())
     }
 
@@ -838,8 +881,8 @@ mod tests {
         // Verify has_tokens
         assert!(auth_manager.has_tokens());
 
-        // Clear and verify
-        auth_manager.clear_tokens().unwrap();
+        // Clear and verify (full wipe).
+        auth_manager.clear_all_credentials().unwrap();
         assert!(!auth_manager.has_tokens());
     }
 

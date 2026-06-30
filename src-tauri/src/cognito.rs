@@ -604,13 +604,87 @@ fn exchange_code(code: &str, code_verifier: &str) -> Result<CognitoTokenResponse
         ("redirect_uri", COGNITO_REDIRECT_URI),
         ("code_verifier", code_verifier),
     ];
-    post_token_form(&form)
+    // The browser PKCE flow surfaces failures straight to the UI, where the
+    // transient/hard distinction is irrelevant — flatten to a message.
+    post_token_form(&form).map_err(|e| e.to_string())
+}
+
+/// Classified failure of a Cognito `/oauth2/token` grant. The refresher needs
+/// to distinguish "retry, connectivity will come back" from "the refresh token
+/// is dead, only an interactive re-login fixes this" — see
+/// [`crate::mcp::device_jwt_refresher`]. `refresh_tokens` returns this; the
+/// browser/code-exchange paths flatten it to a `String` (they surface to the
+/// UI, where the distinction is irrelevant).
+#[derive(Debug, Clone)]
+pub enum CognitoRefreshError {
+    /// Network error, timeout, or a 5xx/429 from the token endpoint. Retryable
+    /// — autonomy should back off and try again, never give up.
+    Transient(String),
+    /// HTTP 400 `invalid_grant`: the refresh token is expired or revoked. There
+    /// is NO headless recovery — the user must sign in again. Retrying is
+    /// pointless and will keep failing identically.
+    InvalidGrant(String),
+    /// Any other failure (a 4xx other than `invalid_grant`, a decode error,
+    /// etc.). Treated conservatively as retryable by the refresher (we never
+    /// falsely tell the user to re-login on an unclassified error), but kept
+    /// distinct so the classifier is unit-testable and future callers can act.
+    Other(String),
+}
+
+impl CognitoRefreshError {
+    /// True for network/5xx/429 failures that warrant a prompt backoff retry.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::Transient(_))
+    }
+
+    /// True iff the refresh token itself is dead (expired/revoked) — the one
+    /// case that cannot self-heal headlessly.
+    pub fn is_invalid_grant(&self) -> bool {
+        matches!(self, Self::InvalidGrant(_))
+    }
+}
+
+impl std::fmt::Display for CognitoRefreshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transient(m) | Self::InvalidGrant(m) | Self::Other(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for CognitoRefreshError {}
+
+/// Pure classifier: map a non-2xx HTTP status + response body from the Cognito
+/// token endpoint to a [`CognitoRefreshError`]. Factored out so the
+/// transient-vs-invalid_grant decision is unit-testable without a live Cognito.
+///
+/// - `400` + an `invalid_grant` error in the body → [`CognitoRefreshError::InvalidGrant`]
+///   (the refresh token is expired/revoked; no headless recovery).
+/// - `5xx` or `429` → [`CognitoRefreshError::Transient`] (server-side / rate
+///   limit; retry with backoff).
+/// - anything else → [`CognitoRefreshError::Other`].
+pub(crate) fn classify_token_error(status: u16, body: &str) -> CognitoRefreshError {
+    let msg = format!(
+        "token endpoint returned HTTP {status}: {}",
+        body.chars().take(300).collect::<String>()
+    );
+    let body_lc = body.to_ascii_lowercase();
+    if status == 400 && body_lc.contains("invalid_grant") {
+        return CognitoRefreshError::InvalidGrant(msg);
+    }
+    if status >= 500 || status == 429 {
+        return CognitoRefreshError::Transient(msg);
+    }
+    CognitoRefreshError::Other(msg)
 }
 
 /// Exchange a refresh token for a fresh access + id token. Cognito does NOT
 /// return a new refresh_token on this grant; the caller keeps the existing
 /// one. Blocking; call via `spawn_blocking`.
-pub fn refresh_tokens(refresh_token: &str) -> Result<CognitoTokenResponse, String> {
+///
+/// Returns a [`CognitoRefreshError`] so the refresher can distinguish a
+/// transient blip (retry) from a dead refresh token (re-login required).
+pub fn refresh_tokens(refresh_token: &str) -> Result<CognitoTokenResponse, CognitoRefreshError> {
     let form = [
         ("grant_type", "refresh_token"),
         ("client_id", COGNITO_CLIENT_ID),
@@ -619,29 +693,31 @@ pub fn refresh_tokens(refresh_token: &str) -> Result<CognitoTokenResponse, Strin
     post_token_form(&form)
 }
 
-/// Shared form POST to the token endpoint with status/error surfacing.
-fn post_token_form(form: &[(&str, &str)]) -> Result<CognitoTokenResponse, String> {
+/// Shared form POST to the token endpoint with status/error surfacing. Errors
+/// are classified ([`CognitoRefreshError`]); the code-exchange path flattens
+/// them to a `String`.
+fn post_token_form(form: &[(&str, &str)]) -> Result<CognitoTokenResponse, CognitoRefreshError> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .map_err(|e| format!("reqwest client build failed: {e}"))?;
+        .map_err(|e| CognitoRefreshError::Transient(format!("reqwest client build failed: {e}")))?;
     let resp = client
         .post(COGNITO_TOKEN_URL)
         .form(form)
         .send()
-        .map_err(|e| format!("POST {COGNITO_TOKEN_URL} failed: {e}"))?;
+        // A send failure is a network error / timeout — always retryable.
+        .map_err(|e| {
+            CognitoRefreshError::Transient(format!("POST {COGNITO_TOKEN_URL} failed: {e}"))
+        })?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp
             .text()
             .unwrap_or_else(|_| "<unreadable body>".to_string());
-        return Err(format!(
-            "token endpoint returned HTTP {status}: {}",
-            body.chars().take(300).collect::<String>()
-        ));
+        return Err(classify_token_error(status.as_u16(), &body));
     }
     resp.json::<CognitoTokenResponse>()
-        .map_err(|e| format!("decode token response failed: {e}"))
+        .map_err(|e| CognitoRefreshError::Other(format!("decode token response failed: {e}")))
 }
 
 #[cfg(test)]
@@ -790,5 +866,48 @@ mod tests {
         );
         // Non-JSON body doesn't panic.
         assert!(humanize_cognito_error("not json", 500).contains("500"));
+    }
+
+    // ---- refresh-error classification (pure, Phase 2) ----
+
+    #[test]
+    fn classify_invalid_grant_is_hard() {
+        // Cognito's canonical expired/revoked refresh-token response.
+        let e = classify_token_error(400, r#"{"error":"invalid_grant"}"#);
+        assert!(
+            e.is_invalid_grant(),
+            "400 invalid_grant must be InvalidGrant"
+        );
+        assert!(!e.is_transient());
+        // Case-insensitive on the body.
+        assert!(classify_token_error(400, r#"{"error":"INVALID_GRANT"}"#).is_invalid_grant());
+    }
+
+    #[test]
+    fn classify_5xx_and_429_are_transient() {
+        assert!(classify_token_error(500, "boom").is_transient());
+        assert!(classify_token_error(503, "overloaded").is_transient());
+        assert!(
+            classify_token_error(429, "slow down").is_transient(),
+            "rate-limit (429) is retryable"
+        );
+    }
+
+    #[test]
+    fn classify_other_4xx_is_other_not_hard() {
+        // A 400 that ISN'T invalid_grant (e.g. a bad client config) must NOT be
+        // mis-flagged as a dead refresh token, and a 401 isn't transient.
+        let bad_req = classify_token_error(400, r#"{"error":"invalid_request"}"#);
+        assert!(!bad_req.is_invalid_grant());
+        assert!(!bad_req.is_transient());
+        assert!(matches!(bad_req, CognitoRefreshError::Other(_)));
+        let unauth = classify_token_error(401, r#"{"error":"invalid_client"}"#);
+        assert!(matches!(unauth, CognitoRefreshError::Other(_)));
+    }
+
+    #[test]
+    fn refresh_error_display_carries_message() {
+        let e = classify_token_error(503, "down");
+        assert!(e.to_string().contains("HTTP 503"));
     }
 }

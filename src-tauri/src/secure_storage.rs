@@ -263,6 +263,13 @@ impl SecureStorage {
     /// Clears all tokens from storage (device-JWT slot AND the Cognito
     /// user-token slots). `device_id` is preserved — it is a stable local
     /// identifier, not a credential.
+    ///
+    /// This is the FULL wipe — it destroys `oauth_refresh_token`, the only
+    /// credential the device-JWT refresher can self-recover from. After this
+    /// call the runner's autonomous terminal sessions can no longer re-mint a
+    /// device JWT and will park until an interactive re-login. Use
+    /// [`Self::clear_interactive_session`] for a default logout that should
+    /// keep autonomy alive.
     pub fn clear_tokens(&self) -> Result<()> {
         let mut tokens = self.load_tokens().unwrap_or_default();
         tokens.access_token = None;
@@ -273,6 +280,28 @@ impl SecureStorage {
         tokens.oauth_expires_at = None;
         self.save_tokens(&tokens)?;
         info!("Tokens cleared from secure file storage");
+        Ok(())
+    }
+
+    /// Clears ONLY the device-JWT pair (`access_token` / `refresh_token`),
+    /// PRESERVING the four Cognito (`oauth_*`) slots and `device_id`.
+    ///
+    /// This is the autonomy-preserving clear used by a default logout: the
+    /// device JWT is dropped, but the long-lived `oauth_refresh_token` (and the
+    /// rest of the Cognito session) is left intact so the supervised device-JWT
+    /// refresher can immediately re-mint a fresh device JWT and keep the
+    /// runner's autonomous terminal sessions running. Contrast with
+    /// [`Self::clear_tokens`], which wipes everything.
+    pub fn clear_interactive_session(&self) -> Result<()> {
+        let mut tokens = self.load_tokens().unwrap_or_default();
+        tokens.access_token = None;
+        tokens.refresh_token = None;
+        // oauth_* slots and device_id are intentionally preserved.
+        self.save_tokens(&tokens)?;
+        info!(
+            "Device-JWT pair cleared from secure file storage (Cognito session preserved for \
+             autonomous refresh)"
+        );
         Ok(())
     }
 
@@ -515,6 +544,53 @@ mod tests {
         storage.clear_oauth_tokens().unwrap();
         assert!(storage.get_oauth_access_token().is_err());
         assert_eq!(storage.get_access_token().unwrap(), "device.jwt.here");
+    }
+
+    /// `clear_interactive_session` drops ONLY the device-JWT pair and PRESERVES
+    /// the Cognito session (`oauth_refresh_token` et al.) so the refresher can
+    /// re-mint autonomously, whereas the full `clear_tokens` wipe destroys the
+    /// `oauth_refresh_token` too. This is the core Phase-1 invariant.
+    #[test]
+    fn test_interactive_clear_preserves_oauth_full_clear_wipes() {
+        let storage = create_test_storage("test_interactive_vs_full_clear");
+
+        // Seed both the device-JWT pair and a Cognito session.
+        storage
+            .store_tokens("device.jwt", "device.refresh")
+            .unwrap();
+        storage
+            .store_oauth_tokens("cog.access", "cog.id", "cog.refresh", 1_700_000_000)
+            .unwrap();
+
+        // Interactive clear: device JWT gone, Cognito session intact.
+        storage.clear_interactive_session().unwrap();
+        assert!(
+            storage.get_access_token().is_err(),
+            "interactive clear must drop the device JWT"
+        );
+        assert!(
+            storage.get_refresh_token().is_err(),
+            "interactive clear must drop the device refresh token"
+        );
+        assert_eq!(
+            storage.get_oauth_refresh_token().unwrap(),
+            "cog.refresh",
+            "interactive clear MUST preserve oauth_refresh_token (the autonomy credential)"
+        );
+        assert_eq!(storage.get_oauth_access_token().unwrap(), "cog.access");
+        assert_eq!(storage.get_oauth_expires_at(), Some(1_700_000_000));
+
+        // Re-seed and prove the full wipe destroys the Cognito session too.
+        storage
+            .store_oauth_tokens("cog.access2", "cog.id2", "cog.refresh2", 1_700_000_001)
+            .unwrap();
+        storage.clear_tokens().unwrap();
+        assert!(
+            storage.get_oauth_refresh_token().is_err(),
+            "full clear_tokens MUST wipe oauth_refresh_token"
+        );
+        assert!(storage.get_oauth_access_token().is_err());
+        assert_eq!(storage.get_oauth_expires_at(), None);
     }
 
     /// A pre-Phase-5 `StoredTokens` JSON (only the original three keys) must

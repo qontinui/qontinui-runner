@@ -33,11 +33,21 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use tauri::Emitter;
 use tokio::sync::{watch, Mutex};
 use tracing::{info, warn};
 
 use crate::mcp::types::ApiState;
 use crate::settings::{self, RunnerTier};
+
+/// Frontend event fired when the runner goes credential-dark on a HARD Cognito
+/// refresh failure (the refresh token is expired/revoked — no headless
+/// recovery). Carries `{ dark: bool, message: String }`: `dark:true` on the
+/// dark transition (the operator must sign in again to resume autonomy),
+/// `dark:false` when a later refresh succeeds and autonomy resumes. The UI can
+/// surface this as a banner/toast; fired once per transition (deduped via
+/// [`RefreshBackoff::dark_notified`]).
+pub const AUTONOMY_CREDENTIAL_DARK_EVENT: &str = "autonomy-credential-dark";
 
 /// Outcome of a single refresh attempt. Tests assert on this variant
 /// directly; the runtime loop in [`refresher_loop`] consumes it via
@@ -72,6 +82,145 @@ pub(crate) enum RefreshOutcome {
 /// How often the loop wakes to check whether the JWT is approaching
 /// expiry. 5 minutes is plenty given the refresh threshold is 80 min.
 const REFRESH_CHECK_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Floor of the transient-failure backoff. When a Cognito refresh fails
+/// transiently (network/5xx/429) we retry far sooner than the 5m steady
+/// cadence so parked autonomy self-recovers within seconds of connectivity
+/// returning — not up to 5 minutes later.
+const TRANSIENT_BACKOFF_MIN: Duration = Duration::from_secs(15);
+
+/// Ceiling of the transient-failure backoff. Kept well under
+/// [`REFRESH_CHECK_INTERVAL`] so even a long outage retries every 2 min (fast
+/// recovery) without hot-looping on a persistent error.
+const TRANSIENT_BACKOFF_MAX: Duration = Duration::from_secs(120);
+
+/// Classification of a Cognito-bearer refresh attempt, used to drive the loop's
+/// backoff + credential-dark notification. Produced by [`refresh_cognito_bearer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefreshClass {
+    /// No refresh was needed, or the refresh succeeded — healthy.
+    Ok,
+    /// Refresh failed transiently (network, timeout, 5xx, 429) OR with an
+    /// unclassified error. Retry promptly with capped-exponential backoff;
+    /// autonomy self-recovers once connectivity returns.
+    Transient,
+    /// Refresh failed because the refresh token is expired/revoked
+    /// (`invalid_grant`). No headless recovery — fire the credential-dark
+    /// notification and fall to the steady cadence (don't hot-retry a grant
+    /// that will keep failing identically).
+    Hard,
+    /// No Cognito session at all (no refresh token stored) — legacy/local-login
+    /// install or a full sign-out. Not a Cognito-refresh episode; the caller
+    /// falls back to the device-JWT slot bearer.
+    NoSession,
+}
+
+/// Carried across loop iterations so the backoff can grow then reset and the
+/// credential-dark notification fires exactly once per dark transition.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct RefreshBackoff {
+    /// Consecutive transient failures so far — drives the exponential growth.
+    consecutive_transient: u32,
+    /// True once we've emitted the credential-dark notification for the current
+    /// dark episode. Reset on recovery so we notify once per transition, not
+    /// every 5m tick.
+    dark_notified: bool,
+}
+
+/// What the loop should do after a Cognito-bearer attempt this tick: how long
+/// to wait, and which (if any) notification to emit. Pure output of
+/// [`plan_refresh_wait`] so the decision is unit-testable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RefreshLoopAction {
+    pub wait: Duration,
+    /// Emit the credential-dark notification this tick (deduped to once per
+    /// dark transition).
+    pub notify_dark: bool,
+    /// Emit the autonomy-resumed notification this tick (fired once, when a
+    /// previously-dark runner recovers).
+    pub notify_recovered: bool,
+}
+
+/// Capped exponential backoff for transient failures: 15s, 30s, 60s, 120s, then
+/// pinned at the 120s ceiling. `consecutive` is the count of prior consecutive
+/// transient failures (0 on the first failure).
+fn transient_backoff(consecutive: u32) -> Duration {
+    let min = TRANSIENT_BACKOFF_MIN.as_secs();
+    let max = TRANSIENT_BACKOFF_MAX.as_secs();
+    // min * 2^consecutive, saturating, clamped to [min, max].
+    let scaled = min.saturating_mul(1u64 << consecutive.min(20));
+    Duration::from_secs(scaled.clamp(min, max))
+}
+
+/// Pure transition: fold this tick's [`RefreshClass`] into the backoff state and
+/// decide the wait duration + which notification to fire. Mutates `state` so the
+/// loop carries the backoff + dark-dedup across iterations.
+///
+/// - `Transient` → shortened [`transient_backoff`] that grows each consecutive
+///   failure; the counter resets on any non-transient outcome.
+/// - `Hard` → steady [`REFRESH_CHECK_INTERVAL`] + the credential-dark
+///   notification (once per dark transition).
+/// - `Ok` → steady cadence; if we were dark, emit the recovered notification.
+/// - `NoSession` → steady cadence; not a Cognito-refresh episode (no dark/
+///   recovered signal — a full sign-out shouldn't claim "resumed").
+pub(crate) fn plan_refresh_wait(
+    state: &mut RefreshBackoff,
+    class: RefreshClass,
+) -> RefreshLoopAction {
+    match class {
+        RefreshClass::Transient => {
+            let wait = transient_backoff(state.consecutive_transient);
+            state.consecutive_transient = state.consecutive_transient.saturating_add(1);
+            RefreshLoopAction {
+                wait,
+                notify_dark: false,
+                notify_recovered: false,
+            }
+        }
+        RefreshClass::Hard => {
+            state.consecutive_transient = 0;
+            let first = !state.dark_notified;
+            state.dark_notified = true;
+            RefreshLoopAction {
+                wait: REFRESH_CHECK_INTERVAL,
+                notify_dark: first,
+                notify_recovered: false,
+            }
+        }
+        RefreshClass::Ok => {
+            let was_dark = state.dark_notified;
+            state.consecutive_transient = 0;
+            state.dark_notified = false;
+            RefreshLoopAction {
+                wait: REFRESH_CHECK_INTERVAL,
+                notify_dark: false,
+                notify_recovered: was_dark,
+            }
+        }
+        RefreshClass::NoSession => {
+            state.consecutive_transient = 0;
+            RefreshLoopAction {
+                wait: REFRESH_CHECK_INTERVAL,
+                notify_dark: false,
+                notify_recovered: false,
+            }
+        }
+    }
+}
+
+/// Emit the credential-dark / recovered notification to the frontend. Best-
+/// effort: an emit failure only `warn!`s — telemetry must never break the loop.
+fn emit_credential_dark(app: &tauri::AppHandle, dark: bool) {
+    let message = if dark {
+        "Autonomous sessions paused — sign in again to resume."
+    } else {
+        "Autonomous sessions resumed — credentials refreshed."
+    };
+    let payload = serde_json::json!({ "dark": dark, "message": message });
+    if let Err(e) = app.emit(AUTONOMY_CREDENTIAL_DARK_EVENT, &payload) {
+        warn!("device_jwt_refresher: failed to emit {AUTONOMY_CREDENTIAL_DARK_EVENT}: {e}");
+    }
+}
 
 /// What action the loop should take this iteration. Factored out of
 /// [`refresher_loop`] so unit tests can exercise the branching without
@@ -579,11 +728,35 @@ pub(crate) async fn try_refresh_once(
 pub(crate) async fn ensure_fresh_cognito_bearer(
     auth_manager: &crate::auth::AuthManager,
 ) -> Option<String> {
+    refresh_cognito_bearer(auth_manager).await.0
+}
+
+/// The classifying core behind [`ensure_fresh_cognito_bearer`]. Returns the
+/// bearer to present (same value the wrapper yields) AND a [`RefreshClass`] the
+/// refresher loop uses to drive backoff + the credential-dark notification.
+///
+/// Phase 2: a failed Cognito refresh is no longer an opaque `warn!`-and-fall-
+/// through. We classify the failure so the loop can:
+///   - retry transient failures (network/5xx/429/unclassified) on a tightened
+///     backoff (autonomy self-recovers fast), and
+///   - treat a dead refresh token (`invalid_grant`) as terminal-headless:
+///     notify the operator instead of silently retrying a grant that will keep
+///     failing.
+///
+/// The bearer-returning contract is identical to the historical
+/// `ensure_fresh_cognito_bearer`: a fresh token on success, the stored
+/// (possibly stale) token on a refresh failure, `None` when there is no Cognito
+/// session — so the REPLACE-not-REVOKE invariant holds (we never clear a stored
+/// token on a transient error; `try_refresh_once` independently preserves the
+/// device JWT).
+pub(crate) async fn refresh_cognito_bearer(
+    auth_manager: &crate::auth::AuthManager,
+) -> (Option<String>, RefreshClass) {
     // No Cognito session → legacy/local-login install; let the caller use its
     // existing bearer source.
     let refresh_token = match auth_manager.get_oauth_refresh_token() {
         Ok(t) if !t.trim().is_empty() => t,
-        _ => return None,
+        _ => return (None, RefreshClass::NoSession),
     };
 
     if auth_manager.cognito_token_needs_refresh() {
@@ -608,30 +781,54 @@ pub(crate) async fn ensure_fresh_cognito_bearer(
                 } else {
                     info!("device_jwt_refresher: Cognito access token refreshed");
                 }
-                return Some(resp.access_token);
+                return (Some(resp.access_token), RefreshClass::Ok);
             }
             Ok(Err(e)) => {
-                warn!(
-                    "device_jwt_refresher: Cognito token refresh failed: {e} — using stored token"
-                );
+                // Classify: a dead refresh token is terminal-headless; anything
+                // else is retryable. We still fall through with the stored
+                // token (REPLACE-not-REVOKE).
+                let class = if e.is_invalid_grant() {
+                    warn!(
+                        "device_jwt_refresher: Cognito refresh token expired/revoked \
+                         (invalid_grant) — autonomy is credential-dark until the operator \
+                         signs in again: {e}"
+                    );
+                    RefreshClass::Hard
+                } else {
+                    warn!(
+                        "device_jwt_refresher: Cognito token refresh failed transiently: {e} \
+                         — using stored token, will retry on backoff"
+                    );
+                    RefreshClass::Transient
+                };
+                return (auth_manager.get_oauth_access_token().ok(), class);
             }
             Err(join_err) => {
+                // A spawn_blocking join failure is an internal/transient fault.
                 warn!("device_jwt_refresher: Cognito refresh task join failed: {join_err}");
+                return (
+                    auth_manager.get_oauth_access_token().ok(),
+                    RefreshClass::Transient,
+                );
             }
         }
     }
 
-    // Fresh enough (or refresh failed) — use whatever access token is stored.
-    auth_manager.get_oauth_access_token().ok()
+    // Fresh enough — use whatever access token is stored.
+    (auth_manager.get_oauth_access_token().ok(), RefreshClass::Ok)
 }
 
 async fn refresher_loop(
-    _api_state: Arc<ApiState>,
+    api_state: Arc<ApiState>,
     mut shutdown_rx: watch::Receiver<bool>,
     mut kick_rx: watch::Receiver<u64>,
 ) {
     let auth_manager = crate::auth::AuthManager::new();
     info!("Device-JWT refresher started (check interval = 5m, threshold = 80m)");
+
+    // Phase 2: carries the transient-failure backoff + the credential-dark
+    // notify-once dedup across iterations.
+    let mut backoff = RefreshBackoff::default();
 
     loop {
         if *shutdown_rx.borrow() {
@@ -699,7 +896,13 @@ async fn refresher_loop(
                 // valid user token). For legacy/local-login installs there's
                 // no Cognito session, so we fall back to the device-JWT slot
                 // bearer (the historical Phase-2 source).
-                let bearer_token = match ensure_fresh_cognito_bearer(&auth_manager).await {
+                // Phase 2: classify the Cognito refresh so we can back off on a
+                // transient blip and fire the credential-dark notification on a
+                // dead refresh token (`invalid_grant`) instead of silently
+                // stalling. `refresh_class` drives the wait + notification at
+                // each exit below.
+                let (cognito_bearer, refresh_class) = refresh_cognito_bearer(&auth_manager).await;
+                let bearer_token = match cognito_bearer {
                     Some(t) if !t.trim().is_empty() => t.trim().to_string(),
                     _ => match auth_manager.get_access_token() {
                         Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
@@ -717,12 +920,16 @@ async fn refresher_loop(
                                 ),
                             )
                             .await;
-                            if wait_with_signals(
-                                REFRESH_CHECK_INTERVAL,
-                                &mut shutdown_rx,
-                                &mut kick_rx,
-                            )
-                            .await
+                            // Phase 2: if the refresh token is dead
+                            // (`invalid_grant`) and we also have no device-JWT
+                            // bearer, fire the credential-dark notification +
+                            // back off per classification; otherwise (no session)
+                            // fall to the steady cadence.
+                            let action = plan_refresh_wait(&mut backoff, refresh_class);
+                            if action.notify_dark {
+                                emit_credential_dark(&api_state.app_handle, true);
+                            }
+                            if wait_with_signals(action.wait, &mut shutdown_rx, &mut kick_rx).await
                             {
                                 return;
                             }
@@ -849,9 +1056,19 @@ async fn refresher_loop(
                 )
                 .await;
 
-                // Brief sleep before next iteration (success or failure)
-                // so we don't hammer coord on persistent errors.
-                if wait_with_signals(REFRESH_CHECK_INTERVAL, &mut shutdown_rx, &mut kick_rx).await {
+                // Phase 2: drive the wait + credential-dark notification off the
+                // Cognito-refresh classification. Transient → shortened backoff
+                // (autonomy self-recovers fast once connectivity returns); Hard
+                // (`invalid_grant`) → steady cadence + notify-once; Ok → steady
+                // cadence, emitting "resumed" if we were previously dark.
+                let action = plan_refresh_wait(&mut backoff, refresh_class);
+                if action.notify_dark {
+                    emit_credential_dark(&api_state.app_handle, true);
+                }
+                if action.notify_recovered {
+                    emit_credential_dark(&api_state.app_handle, false);
+                }
+                if wait_with_signals(action.wait, &mut shutdown_rx, &mut kick_rx).await {
                     return;
                 }
                 continue;
@@ -1120,6 +1337,120 @@ mod tests {
         // Pin the constant so a future refactor that "tunes" it has to
         // update this test (and explain why in review).
         assert_eq!(REFRESH_CHECK_INTERVAL, Duration::from_secs(300));
+    }
+
+    // ---- Phase 2: transient backoff + credential-dark notify decision ----
+
+    #[test]
+    fn transient_backoff_is_capped_exponential() {
+        // 15s, 30s, 60s, 120s, then pinned at the 120s ceiling.
+        assert_eq!(transient_backoff(0), Duration::from_secs(15));
+        assert_eq!(transient_backoff(1), Duration::from_secs(30));
+        assert_eq!(transient_backoff(2), Duration::from_secs(60));
+        assert_eq!(transient_backoff(3), Duration::from_secs(120));
+        assert_eq!(transient_backoff(4), Duration::from_secs(120));
+        // Never panics / overflows for a large failure count, stays at ceiling.
+        assert_eq!(transient_backoff(1000), Duration::from_secs(120));
+        // And the ceiling is well under the steady cadence (fast recovery).
+        assert!(TRANSIENT_BACKOFF_MAX < REFRESH_CHECK_INTERVAL);
+    }
+
+    #[test]
+    fn transient_grows_then_resets_on_success() {
+        let mut s = RefreshBackoff::default();
+        // Each consecutive transient failure grows the wait...
+        let a0 = plan_refresh_wait(&mut s, RefreshClass::Transient);
+        assert_eq!(a0.wait, Duration::from_secs(15));
+        assert!(
+            !a0.notify_dark && !a0.notify_recovered,
+            "transient never notifies"
+        );
+        let a1 = plan_refresh_wait(&mut s, RefreshClass::Transient);
+        assert_eq!(a1.wait, Duration::from_secs(30));
+        let a2 = plan_refresh_wait(&mut s, RefreshClass::Transient);
+        assert_eq!(a2.wait, Duration::from_secs(60));
+        // ...then a success resets to the steady cadence AND the counter.
+        let ok = plan_refresh_wait(&mut s, RefreshClass::Ok);
+        assert_eq!(ok.wait, REFRESH_CHECK_INTERVAL);
+        assert!(
+            !ok.notify_recovered,
+            "Ok with no prior dark episode emits nothing"
+        );
+        // The next transient starts again from the floor (counter reset).
+        let again = plan_refresh_wait(&mut s, RefreshClass::Transient);
+        assert_eq!(again.wait, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn hard_failure_uses_steady_wait_and_notifies_once() {
+        let mut s = RefreshBackoff::default();
+        // First hard failure → steady cadence + the dark notification.
+        let first = plan_refresh_wait(&mut s, RefreshClass::Hard);
+        assert_eq!(
+            first.wait, REFRESH_CHECK_INTERVAL,
+            "hard must NOT hot-retry"
+        );
+        assert!(
+            first.notify_dark,
+            "first dark transition fires the notification"
+        );
+        assert!(!first.notify_recovered);
+        // Subsequent hard ticks must NOT re-notify (deduped per dark episode).
+        let second = plan_refresh_wait(&mut s, RefreshClass::Hard);
+        assert!(
+            !second.notify_dark,
+            "credential-dark notify is once per transition"
+        );
+        assert_eq!(second.wait, REFRESH_CHECK_INTERVAL);
+    }
+
+    #[test]
+    fn recovery_after_dark_emits_recovered_once() {
+        let mut s = RefreshBackoff::default();
+        let _ = plan_refresh_wait(&mut s, RefreshClass::Hard); // go dark
+                                                               // A later success emits the recovered notification exactly once.
+        let recovered = plan_refresh_wait(&mut s, RefreshClass::Ok);
+        assert!(
+            recovered.notify_recovered,
+            "recovery from dark emits resumed"
+        );
+        assert!(!recovered.notify_dark);
+        // A second consecutive Ok no longer re-emits recovered.
+        let steady = plan_refresh_wait(&mut s, RefreshClass::Ok);
+        assert!(
+            !steady.notify_recovered,
+            "recovered fires once per transition"
+        );
+        // And a fresh hard transition can fire dark again (state was cleared).
+        let dark_again = plan_refresh_wait(&mut s, RefreshClass::Hard);
+        assert!(dark_again.notify_dark);
+    }
+
+    #[test]
+    fn no_session_is_steady_and_silent() {
+        // A full sign-out / legacy install must not claim "resumed" and must
+        // not fast-retry — there's no Cognito session to refresh.
+        let mut s = RefreshBackoff::default();
+        let _ = plan_refresh_wait(&mut s, RefreshClass::Hard); // was dark
+        let ns = plan_refresh_wait(&mut s, RefreshClass::NoSession);
+        assert_eq!(ns.wait, REFRESH_CHECK_INTERVAL);
+        assert!(
+            !ns.notify_dark && !ns.notify_recovered,
+            "no-session is silent"
+        );
+    }
+
+    #[test]
+    fn transient_after_dark_does_not_emit_recovered() {
+        // A transient blip while dark must NOT prematurely signal "resumed"
+        // (we only recovered once a refresh actually succeeds → Ok).
+        let mut s = RefreshBackoff::default();
+        let _ = plan_refresh_wait(&mut s, RefreshClass::Hard);
+        let t = plan_refresh_wait(&mut s, RefreshClass::Transient);
+        assert!(!t.notify_recovered && !t.notify_dark);
+        // Still dark → a subsequent success emits recovered.
+        let ok = plan_refresh_wait(&mut s, RefreshClass::Ok);
+        assert!(ok.notify_recovered);
     }
 }
 

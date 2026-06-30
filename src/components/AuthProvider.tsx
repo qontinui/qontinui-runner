@@ -137,6 +137,12 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
   /**
    * Logout and clear local auth state.
+   *
+   * This is the DEFAULT logout: the Rust `logout` command clears only the
+   * interactive device-JWT session and PRESERVES the Cognito session, so the
+   * runner's autonomous terminal AI sessions keep running (the device JWT is
+   * re-minted in the background). Use {@link signOutFull} to fully sign out and
+   * stop autonomous sessions.
    */
   const logout = useCallback(async () => {
     try {
@@ -150,6 +156,38 @@ export function AuthProvider({ children }: AuthProviderProps) {
       });
     } catch (err) {
       log.error("Logout failed:", err);
+      setError(err as string);
+      // Clear local state even if backend call fails
+      setAuthStatus({
+        authenticated: false,
+        user: null,
+        device_info: null,
+      });
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  /**
+   * Full sign-out that STOPS autonomous terminal sessions.
+   *
+   * The Rust `sign_out_full` command clears ALL credentials (device JWT AND the
+   * Cognito session, including the long-lived refresh token), so the
+   * device-JWT refresher can no longer self-recover and the background daemons
+   * stop driving autonomous sessions until an interactive re-login.
+   */
+  const signOutFull = useCallback(async () => {
+    try {
+      setLoading(true);
+      setError(null);
+      await invoke("sign_out_full");
+      setAuthStatus({
+        authenticated: false,
+        user: null,
+        device_info: null,
+      });
+    } catch (err) {
+      log.error("Full sign-out failed:", err);
       setError(err as string);
       // Clear local state even if backend call fails
       setAuthStatus({
@@ -274,6 +312,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     devAutoLoginPending: false,
     tier,
     logout,
+    signOutFull,
     refreshAuth,
   };
 
