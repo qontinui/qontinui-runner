@@ -478,10 +478,47 @@ async fn coord_mcp_proxy_handler(
     //    too. An absent slot (torn-down / restarted agent) is a hard 401.
     let bearer = match &principal {
         crate::coord_mcp::ProxyPrincipal::Device => {
-            tokio::task::spawn_blocking(|| crate::auth::AuthManager::new().get_access_token().ok())
-                .await
-                .ok()
-                .flatten()
+            // Read the live device JWT (filesystem I/O → off the async executor),
+            // the same fresh token `backend_relay` reads.
+            let mut tok = tokio::task::spawn_blocking(|| {
+                crate::auth::AuthManager::new().get_access_token().ok()
+            })
+            .await
+            .ok()
+            .flatten();
+            // Phase 3 (terminal-autonomy-survives-logout): a momentarily-missing
+            // device JWT is almost always the refresher's re-mint window or a
+            // transient-backoff gap (Phases 1-2) — NOT a dead session. Kick the
+            // refresher and wait a tightly-bounded time for a re-mint before
+            // degrading, so an in-flight tool call the AI makes mid-turn rides
+            // through the gap instead of erroring on a bare 401.
+            if tok.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                tok = crate::coord_mcp::await_device_jwt_remint().await;
+            }
+            match tok {
+                Some(t) if !t.trim().is_empty() => Some(t),
+                _ => {
+                    // STILL no JWT after the bounded wait: degrade to an
+                    // actionable, retry-shaped error (NOT the bare 401, NOT a
+                    // hang) so the autonomous caller knows to retry shortly.
+                    let (status, msg) = crate::coord_mcp::device_jwt_refreshing_error();
+                    warn!(
+                        "coord-mcp proxy: device JWT still missing after bounded \
+                         re-mint wait — degrading to retry ({status})"
+                    );
+                    return (
+                        axum::http::StatusCode::from_u16(status)
+                            .unwrap_or(axum::http::StatusCode::SERVICE_UNAVAILABLE),
+                        Json(serde_json::json!({
+                            "success": false,
+                            "error": msg,
+                            "code": "COORD_MCP_PROXY_CREDENTIAL_REFRESHING",
+                            "retryable": true,
+                        })),
+                    )
+                        .into_response();
+                }
+            }
         }
         crate::coord_mcp::ProxyPrincipal::Agent { agent_id } => {
             match crate::coord_mcp::lookup_agent_token(*agent_id) {

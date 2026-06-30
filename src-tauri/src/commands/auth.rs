@@ -140,17 +140,19 @@ fn get_device_name() -> String {
     format!("{} ({})", hostname, platform)
 }
 
-/// Logs out the current user.
+/// Logs out the current user WITHOUT stopping autonomous terminal sessions.
 ///
-/// This command:
-/// 1. Retrieves the device ID
-/// 2. Calls the backend to deactivate the device (optional)
-/// 3. Clears all tokens from the keychain
+/// This is the DEFAULT logout: it clears only the interactive device-JWT
+/// session and PRESERVES the Cognito (`oauth_*`) session, then kicks the
+/// device-JWT refresher so a fresh device JWT is re-minted immediately. The
+/// runner's background daemons keep driving autonomous terminal AI sessions
+/// across the logout — there is no multi-minute autonomy gap.
+///
+/// Use [`sign_out_full`] to fully sign out and STOP autonomous sessions.
 ///
 /// # Errors
 ///
-/// Returns an error string if keychain operations fail.
-/// Network errors during device deactivation are logged but don't fail the operation.
+/// Returns an error string if clearing fails.
 #[tauri::command]
 pub async fn logout() -> Result<(), String> {
     logout_impl().await.map_err(String::from)
@@ -158,7 +160,7 @@ pub async fn logout() -> Result<(), String> {
 
 async fn logout_impl() -> Result<(), AppError> {
     require_tier_2()?;
-    info!("Logout requested");
+    info!("Logout requested (interactive session only — autonomous sessions preserved)");
 
     let auth_manager = AuthManager::new();
 
@@ -167,10 +169,45 @@ async fn logout_impl() -> Result<(), AppError> {
     // the unified WebSocket relay; closing the WS (which happens on token
     // revocation) is the equivalent of "logging the device out".
     //
-    // Clear tokens from the keychain.
-    auth_manager.clear_tokens()?;
+    // Clear ONLY the interactive device-JWT session; preserve the Cognito
+    // session so autonomy survives the logout.
+    auth_manager.clear_interactive_session()?;
 
-    info!("Logout successful");
+    // Re-mint the device JWT right away from the preserved Cognito session so
+    // the autonomous daemons don't see even a transient missing-token window.
+    crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
+
+    info!("Logout successful — autonomous terminal sessions preserved (device JWT re-minting from the kept Cognito session)");
+    Ok(())
+}
+
+/// Fully signs out and STOPS the runner's autonomous terminal sessions.
+///
+/// Unlike [`logout`], this clears ALL credentials — the device-JWT pair AND
+/// the Cognito (`oauth_*`) session, including the long-lived
+/// `oauth_refresh_token`. With the Cognito session gone the device-JWT
+/// refresher can no longer self-recover, so the background daemons stop
+/// driving autonomous sessions until an interactive re-login. This is the
+/// explicit "stop autonomy" sign-out.
+///
+/// # Errors
+///
+/// Returns an error string if clearing fails.
+#[tauri::command]
+pub async fn sign_out_full() -> Result<(), String> {
+    sign_out_full_impl().await.map_err(String::from)
+}
+
+async fn sign_out_full_impl() -> Result<(), AppError> {
+    require_tier_2()?;
+    info!("Full sign-out requested — clearing ALL credentials (autonomous sessions will stop)");
+
+    let auth_manager = AuthManager::new();
+    auth_manager.clear_all_credentials()?;
+
+    info!(
+        "Full sign-out successful — autonomous terminal sessions stopped (Cognito session wiped)"
+    );
     Ok(())
 }
 
@@ -827,9 +864,19 @@ pub async fn qontinui_sign_out() -> Result<(), String> {
 
     // Best-effort: a stale keychain entry is annoying but not fatal —
     // the gating checks all run off the `tier` field + cleared token below.
+    //
+    // This is the explicit "switch accounts → LoginScreen" path, so it must be
+    // the FULL wipe: `has_local_signed_in_session` treats a preserved Cognito
+    // session as still-authenticated, so an interactive-only clear would keep
+    // the App gate out of the LoginScreen. Clearing the Cognito session also
+    // (correctly) stops the old account's autonomous sessions before a new
+    // account signs in.
     let auth_manager = AuthManager::new();
-    if let Err(e) = auth_manager.clear_tokens() {
-        warn!("qontinui_sign_out: clear_tokens failed (continuing): {}", e);
+    if let Err(e) = auth_manager.clear_all_credentials() {
+        warn!(
+            "qontinui_sign_out: clear_all_credentials failed (continuing): {}",
+            e
+        );
     }
 
     let mut s = settings::load_settings();
@@ -924,6 +971,7 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             cognito_sign_in,
             cognito_sign_in_password,
             qontinui_sign_out,
+            sign_out_full,
             device_jwt_present,
             get_coord_device_token,
             kick_device_jwt_refresher_cmd,

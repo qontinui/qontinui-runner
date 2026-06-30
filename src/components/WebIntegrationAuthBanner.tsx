@@ -111,6 +111,17 @@ export function WebIntegrationAuthBanner() {
   const [reKicking, setReKicking] = useState(false);
   const [reKickError, setReKickError] = useState<string | null>(null);
 
+  // Phase 2 (terminal-autonomy-survives-logout): credential-dark signal. The
+  // device-JWT refresher emits `autonomy-credential-dark` with
+  // `{ dark, message }` when a HARD Cognito refresh failure (expired/revoked
+  // refresh token — no headless recovery) parks the coord-dependent autonomy
+  // driver, and again with `dark:false` when a later refresh succeeds. We hold
+  // the latest signal and surface a distinct, top-precedence banner so the
+  // operator knows autonomy needs a re-auth instead of silently stalling.
+  const [credentialDark, setCredentialDark] = useState<{ dark: boolean; message: string } | null>(
+    null,
+  );
+
   const { ref: rootRef } = useUIElement({
     id: "web-integration-banner",
     label: "Web integration authorization banner",
@@ -200,6 +211,28 @@ export function WebIntegrationAuthBanner() {
     };
   }, []);
 
+  // Phase 2 (terminal-autonomy-survives-logout): subscribe to the refresher's
+  // `autonomy-credential-dark` event. `dark:true` reveals the credential-dark
+  // banner; `dark:false` (autonomy resumed) clears it. setState is only called
+  // inside the event callback, satisfying react-hooks/set-state-in-effect.
+  useEffect(() => {
+    let cancelled = false;
+    const unlisten = listen<{ dark: boolean; message: string }>(
+      "autonomy-credential-dark",
+      (event) => {
+        if (!cancelled) setCredentialDark(event.payload);
+      },
+    );
+    return () => {
+      cancelled = true;
+      unlisten
+        .then((fn) => fn())
+        .catch(() => {
+          /* listener cleanup is best-effort */
+        });
+    };
+  }, []);
+
   // Phase 4 — record the first-detected-at timestamp when the migration
   // state first qualifies, and schedule a one-shot re-render at
   // detectedAt + RE_PAIR_CTA_GRACE_MS so the CTA reveal isn't gated on
@@ -275,6 +308,76 @@ export function WebIntegrationAuthBanner() {
   }, [status, deviceJwtPresent]);
 
   if (tier !== "qontinui_account") return null;
+
+  // Phase 2 (terminal-autonomy-survives-logout): credential-dark banner takes
+  // TOP precedence — when the refresher reports a dead Cognito refresh token,
+  // the coord-dependent autonomy driver is parked and only an interactive
+  // re-login fixes it. The "Sign in" CTA reuses the canonical Cognito flow.
+  if (credentialDark?.dark) {
+    return (
+      <div
+        ref={rootRef}
+        role="alert"
+        aria-live="assertive"
+        style={{
+          position: "fixed",
+          top: 16,
+          left: "50%",
+          transform: "translateX(-50%)",
+          zIndex: 9999,
+          display: "flex",
+          alignItems: "center",
+          gap: 12,
+          padding: "10px 14px",
+          background: "var(--bg-tertiary, #242837)",
+          color: "var(--text-primary, #e4e4e7)",
+          border: "1px solid hsl(var(--destructive, 0 84% 60%))",
+          borderRadius: 8,
+          boxShadow: "0 4px 16px rgba(0, 0, 0, 0.35)",
+          fontSize: "0.875rem",
+          maxWidth: "min(640px, calc(100vw - 32px))",
+        }}
+      >
+        <AlertCircle
+          className="w-4 h-4 shrink-0"
+          style={{ color: "hsl(var(--destructive, 0 84% 60%))" }}
+          aria-hidden="true"
+        />
+        <div style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0 }}>
+          <div style={{ fontWeight: 600 }}>Autonomous sessions paused</div>
+          <div style={{ fontSize: "0.8125rem", opacity: 0.85 }}>
+            {credentialDark.message || "Sign in again to resume autonomous sessions."}
+            {authorizeError ? (
+              <>
+                <br />
+                <span style={{ color: "hsl(var(--destructive, 0 84% 60%))" }}>{authorizeError}</span>
+              </>
+            ) : null}
+          </div>
+        </div>
+        <button
+          ref={authorizeButtonRef}
+          type="button"
+          onClick={handleAuthorize}
+          disabled={authorizing}
+          style={{
+            background: "var(--accent, #6366f1)",
+            color: "#fff",
+            border: "none",
+            borderRadius: 4,
+            padding: "4px 10px",
+            fontSize: "0.8125rem",
+            fontWeight: 600,
+            cursor: authorizing ? "wait" : "pointer",
+            opacity: authorizing ? 0.7 : 1,
+            whiteSpace: "nowrap",
+          }}
+        >
+          {authorizing ? "Opening…" : "Sign in"}
+        </button>
+      </div>
+    );
+  }
 
   // Phase 4 (unified-devices migration): re-pair CTA takes precedence over
   // the "needs first pair" banner. When this runner WAS paired pre-upgrade

@@ -61,7 +61,7 @@ interface DoctorReport {
 
 export function AccountSettings({ onLog }: AccountSettingsProps) {
   const { tier, loading: tierLoading, refresh: refreshTier } = useRunnerTier();
-  const { authStatus, logout: clearAuthState } = useAuth();
+  const { authStatus, signOutFull } = useAuth();
   const [flowError, setFlowError] = useState<string | null>(null);
   const [signingOut, setSigningOut] = useState(false);
 
@@ -163,12 +163,16 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
       window.dispatchEvent(new CustomEvent("runner-tier-changed"));
       await refreshTier();
       // Clear the local JWT-flow auth state immediately so the gate flips
-      // to the LoginScreen without waiting for the re-check round-trip.
+      // to the LoginScreen without waiting for the re-check round-trip. Use
+      // `signOutFull` (not the autonomy-preserving `logout`): this is the
+      // STOP-autonomy path, so it must NOT kick the device-JWT refresher.
+      // `sign_out_full` is an idempotent full wipe — the credentials were
+      // already cleared by `qontinui_sign_out` above, so this only flips state.
       try {
-        await clearAuthState();
+        await signOutFull();
       } catch {
-        // clearAuthState invokes the `logout` command, which may error now
-        // that the token is already cleared; that's expected and harmless.
+        // signOutFull re-invokes the full-wipe command, which may error now
+        // that the credentials are already cleared; that's expected and harmless.
       }
       onLog("info", "Signed out — sign in again on the login screen");
     } catch (err) {
@@ -178,7 +182,7 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
     } finally {
       setSigningOut(false);
     }
-  }, [onLog, refreshTier, clearAuthState]);
+  }, [onLog, refreshTier, signOutFull]);
 
   if (tierLoading) {
     return (
@@ -347,11 +351,18 @@ function SignedInPanel({ email, userId, name, signingOut, onSignOut }: SignedInP
         className="inline-flex items-center gap-2 rounded bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
       >
         {signingOut ? <Loader2 className="w-4 h-4 animate-spin" /> : <LogOut className="w-4 h-4" />}
-        Sign out
+        Sign out &amp; stop autonomous sessions
       </button>
       <p className="text-xs text-muted-foreground">
-        Signing out clears the runner token and returns you to the sign-in screen, where you can sign
-        in again or switch accounts.
+        This fully signs out: it clears your account session and returns you to the sign-in screen,
+        where you can sign in again or switch accounts. It also <strong>stops this runner&apos;s
+        autonomous terminal sessions</strong> — they cannot keep running without your account
+        session.
+      </p>
+      <p className="text-xs text-muted-foreground">
+        To stop using the app while keeping autonomous terminal sessions running, just close this
+        window instead of signing out — the runner keeps refreshing its device credential in the
+        background.
       </p>
     </div>
   );

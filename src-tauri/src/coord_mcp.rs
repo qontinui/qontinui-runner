@@ -431,6 +431,102 @@ pub(crate) fn proxy_request_gate(
     }
 }
 
+/// Phase 3 (terminal-autonomy-survives-logout): maximum TOTAL time the
+/// DEVICE-path coord-mcp proxy will wait for the device-JWT refresher to
+/// re-mint a momentarily-missing token before it degrades to an actionable
+/// retry error. Bounded tightly — a proxy request must NEVER block
+/// indefinitely on a credential gap. The device JWT re-mints from the
+/// preserved Cognito session in seconds (Phase 1), so this smooths the common
+/// re-mint-window / transient-backoff gap (Phases 1-2) without hanging.
+pub(crate) const DEVICE_JWT_REMINT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Poll interval while waiting for the [`DEVICE_JWT_REMINT_WAIT`] re-mint.
+pub(crate) const DEVICE_JWT_REMINT_POLL: std::time::Duration =
+    std::time::Duration::from_millis(250);
+
+/// The actionable, retry-shaped error the DEVICE-path proxy returns when the
+/// device JWT is STILL missing after the bounded [`DEVICE_JWT_REMINT_WAIT`].
+///
+/// Distinct from the gate's hard 401s (bad/absent nonce, scope-elevation): this
+/// is a TRANSIENT credential gap, not an auth failure — the autonomous session
+/// is alive and the refresher is re-minting, so the caller should simply retry.
+/// `503` (the canonical "temporarily unavailable, retry" code) keeps it an
+/// error the MCP client will not mistake for success while signalling
+/// retry-ability; the message is human/agent-actionable rather than a bare
+/// "no live JWT available". The nonce/scope FAIL-CLOSED 401s in
+/// [`proxy_request_gate`] are unchanged — only the missing-device-JWT case
+/// degrades to this.
+pub(crate) fn device_jwt_refreshing_error() -> (u16, String) {
+    (
+        503,
+        "coord credential refreshing — autonomous session will resume; \
+         retry shortly"
+            .to_string(),
+    )
+}
+
+/// Bounded poll for a usable token: returns as soon as `read_usable` yields a
+/// non-empty token, or `None` once `total` elapses. Generic over the reader so
+/// the bound/termination behavior is unit-testable without a live AuthManager
+/// or a real 5s wait. NEVER blocks indefinitely — the deadline is checked every
+/// `interval`.
+async fn await_remint_with<F, Fut>(
+    mut read_usable: F,
+    total: std::time::Duration,
+    interval: std::time::Duration,
+) -> Option<String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
+    let deadline = tokio::time::Instant::now() + total;
+    loop {
+        if let Some(t) = read_usable().await {
+            if !t.trim().is_empty() {
+                return Some(t);
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// Read the device JWT ONLY if it is freshly usable (present, non-empty, and
+/// not stale per [`AuthManager::device_jwt_needs_refresh`]). Filesystem I/O, so
+/// it runs on a blocking thread off the async executor — the same discipline
+/// the proxy handler's first read uses. Used by [`await_device_jwt_remint`] to
+/// detect "a usable JWT is now present" after a refresher kick.
+async fn read_usable_device_jwt() -> Option<String> {
+    tokio::task::spawn_blocking(|| {
+        let am = crate::auth::AuthManager::new();
+        match am.device_jwt_needs_refresh() {
+            Ok(false) => am.get_access_token().ok().filter(|t| !t.trim().is_empty()),
+            _ => None,
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Phase 3 graceful-degrade for the DEVICE proxy path: when the device JWT is
+/// momentarily absent, KICK the refresher (so it re-mints immediately from the
+/// preserved Cognito session instead of waiting out its sleep) and wait a
+/// tightly-bounded [`DEVICE_JWT_REMINT_WAIT`] for a usable JWT to appear.
+/// Returns the fresh token if one re-mints within the bound, else `None` (the
+/// caller then degrades to [`device_jwt_refreshing_error`]). Agent-bound proxy
+/// requests do NOT use this — they refresh via their own `AGENT_TOKENS` slot.
+pub(crate) async fn await_device_jwt_remint() -> Option<String> {
+    crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
+    await_remint_with(
+        read_usable_device_jwt,
+        DEVICE_JWT_REMINT_WAIT,
+        DEVICE_JWT_REMINT_POLL,
+    )
+    .await
+}
+
 /// Resolve the runner's ACTUALLY-BOUND local API port for loopback URLs:
 /// the managed `AppState.api_port` (set at bind time) via the process-global
 /// `AppHandle`. Returns `None` — fail-closed, Phase 3a — when no Tauri runtime
@@ -1215,6 +1311,114 @@ mod tests {
                 .0,
             401
         );
+    }
+
+    /// Phase 3 invariant pin (terminal-autonomy-survives-logout): a MISSING
+    /// device JWT degrades the coord-mcp PROXY path to an actionable retry —
+    /// and ONLY that path. Local terminal AI session work (model reasoning, the
+    /// PTY, local tools) is structurally independent of this gate, so a coord
+    /// credential gap can never block local work.
+    ///
+    /// This asserts the gating is scoped to coord-mcp proxy requests:
+    ///  - [`proxy_request_gate`] is the ONLY thing a missing device JWT affects;
+    ///    it governs proxy forwarding exclusively (it takes a proxy nonce +
+    ///    bearer + the bound principal and returns only forward-or-401). It is
+    ///    not on, and has no handle into, any local-execution path.
+    ///  - the missing-device-JWT case degrades to an ACTIONABLE, retry-shaped
+    ///    error ([`device_jwt_refreshing_error`]) — not a panic, not a hang
+    ///    (the wait is bounded, see `await_remint_*` tests), not a bare 401.
+    ///  - the gate's hard nonce/scope 401s stay FAIL-CLOSED and unchanged.
+    ///
+    /// Why local work is independent (documented here as the layer can't call a
+    /// PTY): the terminal AI session's MODEL auth is the operator's own Claude
+    /// subscription via `CLAUDE_CONFIG_DIR`, and the PTY + local tools never
+    /// issue a coord-mcp proxy request — only an explicit coord MCP tool call
+    /// routes through this gate. So a missing device JWT can at most make a
+    /// coord tool call retry; it cannot stall the session's local progress.
+    #[test]
+    fn missing_device_jwt_degrades_proxy_only_not_local_work() {
+        // (a) The degrade is an ACTIONABLE retry, distinct from the hard 401.
+        let (status, msg) = device_jwt_refreshing_error();
+        assert_eq!(status, 503, "transient credential gap → retryable, not 401");
+        assert!(
+            msg.to_lowercase().contains("retry"),
+            "degrade message must tell the caller to retry: {msg:?}"
+        );
+        assert!(
+            !msg.contains("no live JWT available"),
+            "must NOT be the bare missing-JWT 401 message"
+        );
+
+        // (b) The gate is scoped to proxy requests only: its hard nonce/scope
+        // 401s remain fail-closed and unchanged. A valid device nonce with NO
+        // bearer is still a hard 401 backstop (the proxy handler only reaches
+        // the gate AFTER the bounded re-mint produced a usable bearer).
+        let dir = std::env::temp_dir().join(format!("coord-mcp-p3-{}", uuid::Uuid::new_v4()));
+        let nonce = register_proxy_nonce(&dir.to_string_lossy());
+        let dev_p = ProxyPrincipal::Device;
+        assert_eq!(
+            proxy_request_gate(Some(&nonce), None, &dev_p)
+                .unwrap_err()
+                .0,
+            401,
+            "missing bearer at the gate is still a hard 401 backstop"
+        );
+        // Bad nonce stays a hard 401 regardless of the degrade path.
+        assert_eq!(
+            proxy_request_gate(Some("nope"), None, &dev_p)
+                .unwrap_err()
+                .0,
+            401
+        );
+    }
+
+    /// The bounded re-mint wait TERMINATES on the deadline (never hangs) when no
+    /// usable JWT ever appears — pins "NEVER block a request indefinitely".
+    #[tokio::test]
+    async fn await_remint_is_bounded_when_no_jwt_appears() {
+        let calls = std::cell::Cell::new(0u32);
+        let started = std::time::Instant::now();
+        let out = await_remint_with(
+            || {
+                calls.set(calls.get() + 1);
+                async { None }
+            },
+            std::time::Duration::from_millis(120),
+            std::time::Duration::from_millis(20),
+        )
+        .await;
+        assert_eq!(out, None, "no JWT → None after the bound");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "must return promptly at the bound, not hang"
+        );
+        assert!(calls.get() >= 2, "should have polled more than once");
+    }
+
+    /// The bounded re-mint wait RETURNS as soon as a freshly-minted JWT appears
+    /// mid-poll — pins the common case: the refresher re-mints within the bound
+    /// and the in-flight tool call proceeds normally.
+    #[tokio::test]
+    async fn await_remint_returns_jwt_once_it_appears() {
+        let calls = std::cell::Cell::new(0u32);
+        let out = await_remint_with(
+            || {
+                calls.set(calls.get() + 1);
+                let n = calls.get();
+                async move {
+                    if n >= 3 {
+                        Some("h.payload.s".to_string())
+                    } else {
+                        None
+                    }
+                }
+            },
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(out.as_deref(), Some("h.payload.s"));
+        assert_eq!(calls.get(), 3, "returns on the first usable read, no more");
     }
 
     /// `AGENT_TOKENS` register / lookup / remove round-trip.
