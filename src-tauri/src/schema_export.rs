@@ -36,12 +36,12 @@ pub fn export_all_schemas() -> Value {
         accessibility as qa, ai_workflows as qaw, app_events as qae, apps as qap,
         completeness_verdict as qcv, config as qcfg, constraints as qc, discovery as qdc,
         execution as qe, findings as qfn, functional_spec as qfs, geometry as qg, git_ops as qgo,
-        ir as qir, mcp_config as qmc, memory as qmem, orchestration_config as qoc,
-        priorities_profile as qpp, process_management as qpm, rag as qr, runner as qrn,
-        scheduler as qs, spec_api_events as qsae, spec_check as qsc, state_machine as qsm,
-        targets as qt, task_run as qtr, terminal as qtm, ticket_system as qts, tree_events as qte,
-        ui_bridge as qub, verification as qv, worker_output as qwo, workflow as qw,
-        workflow_step as qws,
+        helper_task as qht, ir as qir, mcp_config as qmc, memory as qmem,
+        orchestration_config as qoc, priorities_profile as qpp, process_management as qpm,
+        rag as qr, runner as qrn, scheduler as qs, spec_api_events as qsae, spec_check as qsc,
+        state_machine as qsm, targets as qt, task_run as qtr, terminal as qtm,
+        ticket_system as qts, tree_events as qte, ui_bridge as qub, verification as qv,
+        worker_output as qwo, workflow as qw, workflow_step as qws,
     };
 
     // Built via a plain Map instead of `json!` to avoid the
@@ -804,6 +804,16 @@ pub fn export_all_schemas() -> Value {
     add!("RunnerStatusEvent", re::RunnerStatusEvent);
     add!("RunnerConnectedConnection", re::RunnerConnectedConnection);
 
+    // ── qontinui-types: helper_task (helper-task queue) ──
+    add!("HelperTask", qht::HelperTask);
+    add!("HelperAnswer", qht::HelperAnswer);
+    add!("HelperTaskKind", qht::HelperTaskKind);
+    add!("HelperTaskStatus", qht::HelperTaskStatus);
+    add!("HelperVerdict", qht::HelperVerdict);
+    add!("HelperTaskPayload", qht::HelperTaskPayload);
+    add!("HelperAnswerSchema", qht::HelperAnswerSchema);
+    add!("HelperTaskSource", qht::HelperTaskSource);
+
     Value::Object(m)
 }
 
@@ -839,7 +849,12 @@ mod tests {
             obj.contains_key("SpecApiEvent"),
             "Missing SpecApiEvent schema (Plan 06)"
         );
-        assert_eq!(obj.len(), 523, "Expected 523 schema entries");
+        assert!(obj.contains_key("HelperTask"), "Missing HelperTask schema");
+        assert!(
+            obj.contains_key("HelperAnswer"),
+            "Missing HelperAnswer schema"
+        );
+        assert_eq!(obj.len(), 531, "Expected 531 schema entries");
 
         // Sanity-check that qontinui_types re-exports are present
         assert!(
