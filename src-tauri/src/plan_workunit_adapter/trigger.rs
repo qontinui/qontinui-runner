@@ -288,7 +288,7 @@ pub fn spawn_if_configured() -> Option<tokio::task::JoinHandle<()>> {
 #[cfg(test)]
 mod tests {
     use super::super::parser::ParsedWorkUnit;
-    use super::super::push::{SetDepsOutcome, TransitionBody, UpsertBody};
+    use super::super::push::{SetDepsOutcome, TransitionBody, UpsertBody, ADAPTER_ACTOR};
     use super::*;
     use anyhow::Result;
     use std::sync::Mutex;
@@ -322,6 +322,9 @@ mod tests {
     struct FakeSink {
         statuses: Mutex<HashMap<String, String>>,
         transitions: Mutex<u64>,
+        /// Configured `by_actor` of every unit's latest history row (default
+        /// None ⇒ no history ⇒ no owner to defer to).
+        last_actor: Option<String>,
         deps_behavior: DepsBehavior,
         deps_calls: Mutex<Vec<(String, Vec<String>)>>,
     }
@@ -329,6 +332,9 @@ mod tests {
     impl WorkUnitSink for FakeSink {
         async fn current_status(&self, slug: &str) -> Result<Option<String>> {
             Ok(self.statuses.lock().unwrap().get(slug).cloned())
+        }
+        async fn last_actor(&self, _slug: &str) -> Result<Option<String>> {
+            Ok(self.last_actor.clone())
         }
         async fn upsert(&self, body: &UpsertBody) -> Result<()> {
             if let Some(s) = &body.status {
@@ -392,6 +398,88 @@ mod tests {
 
         reconcile_once(&[unit("a", "vetted")], &mut mem, &mut deps, &sink, &metrics).await;
         // Plan edited: vetted -> shipped.
+        let s = reconcile_once(
+            &[unit("a", "shipped")],
+            &mut mem,
+            &mut deps,
+            &sink,
+            &metrics,
+        )
+        .await;
+        assert_eq!(s.transitions, 1);
+        assert_eq!(*sink.transitions.lock().unwrap(), 1);
+        assert_eq!(metrics.snapshot().transitions_total, 1);
+    }
+
+    // --- Graduation-bootstrap P2a: markdown proxy defers to real agents ------
+
+    #[tokio::test]
+    async fn defers_transition_when_real_agent_owns_unit() {
+        // A real agent last drove the unit (its own agent-scoped actor). The
+        // file's status edge (vetted -> shipped) WOULD transition, but the proxy
+        // must DEFER so it doesn't collapse the agent's transition to the system
+        // actor: ZERO transitions emitted.
+        let sink = FakeSink {
+            last_actor: Some("device:d:agent:a".to_string()),
+            ..Default::default()
+        };
+        let metrics = AdapterMetrics::default();
+        let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
+
+        // Establish last-applied=vetted (create; UpsertWithStatus is never gated).
+        reconcile_once(&[unit("a", "vetted")], &mut mem, &mut deps, &sink, &metrics).await;
+        assert_eq!(*sink.transitions.lock().unwrap(), 0);
+
+        // File edited vetted -> shipped: transition WOULD fire, but defer.
+        let s = reconcile_once(
+            &[unit("a", "shipped")],
+            &mut mem,
+            &mut deps,
+            &sink,
+            &metrics,
+        )
+        .await;
+        assert_eq!(s.transitions, 0);
+        assert_eq!(*sink.transitions.lock().unwrap(), 0);
+        assert_eq!(metrics.snapshot().transitions_total, 0);
+    }
+
+    #[tokio::test]
+    async fn proceeds_when_last_actor_is_adapter() {
+        // The adapter itself last drove the unit ⇒ no real agent owns it ⇒ the
+        // proxy proceeds with its transition as normal.
+        let sink = FakeSink {
+            last_actor: Some(ADAPTER_ACTOR.to_string()),
+            ..Default::default()
+        };
+        let metrics = AdapterMetrics::default();
+        let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
+
+        reconcile_once(&[unit("a", "vetted")], &mut mem, &mut deps, &sink, &metrics).await;
+        let s = reconcile_once(
+            &[unit("a", "shipped")],
+            &mut mem,
+            &mut deps,
+            &sink,
+            &metrics,
+        )
+        .await;
+        assert_eq!(s.transitions, 1);
+        assert_eq!(*sink.transitions.lock().unwrap(), 1);
+        assert_eq!(metrics.snapshot().transitions_total, 1);
+    }
+
+    #[tokio::test]
+    async fn proceeds_when_no_history() {
+        // No history (last_actor = None) ⇒ nobody owns the unit ⇒ proceed.
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
+
+        reconcile_once(&[unit("a", "vetted")], &mut mem, &mut deps, &sink, &metrics).await;
         let s = reconcile_once(
             &[unit("a", "shipped")],
             &mut mem,
