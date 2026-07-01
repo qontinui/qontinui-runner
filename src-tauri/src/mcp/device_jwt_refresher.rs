@@ -706,6 +706,130 @@ pub(crate) async fn try_refresh_once(
     }
 }
 
+/// Coord's `POST /devices/:device_id/refresh-token` response. Only the
+/// re-minted `token` matters to the runner (coord owns jti/exp; the runner
+/// re-derives exp from the JWT claim when it next checks freshness). Extra
+/// fields are ignored, so an evolving coord response stays compatible.
+#[derive(Debug, serde::Deserialize)]
+struct DeviceRefreshResponse {
+    token: String,
+}
+
+/// Phase 4a: attempt a login-INDEPENDENT device self-refresh — re-mint the
+/// device-JWT by presenting the runner's CURRENT (still-valid) device-JWT as the
+/// bearer to coord's `POST /devices/:device_id/refresh-token`. NO Cognito is
+/// touched. This is what lets a continuously-running runner stay autonomous
+/// INDEFINITELY: as long as it holds a currently-valid device-JWT it re-mints
+/// from itself, never hitting the ~30-day Cognito refresh-token ceiling.
+///
+/// Returns `Some(new_jwt)` on success — the new JWT is ALREADY persisted to the
+/// `access_token` slot, so the caller treats it exactly like a successful Cognito
+/// re-mint (wake the relay, publish healthy, steady wait) and SKIPS the Cognito
+/// path for the tick.
+///
+/// Returns `None` — so the caller FALLS BACK to the Cognito pair-cli path — when:
+///   - no device-JWT is held, or it's opaque/undecodable, or already expired
+///     (self-refresh needs a currently-valid bearer; coord would 401 an expired
+///     one, and an absent/expired JWT is precisely the Cognito-recovery case),
+///   - coord returns ANY non-2xx (incl. 404 when the route isn't deployed yet —
+///     ORDERING SAFETY: a runner talking to an old coord without this route
+///     simply falls back to Cognito, so the runner half can ship before/without
+///     the coord half), OR
+///   - the network call fails or the body fails to decode.
+///
+/// REPLACE-not-REVOKE: on ANY failure the existing JWT is left UNTOUCHED. A
+/// self-refresh miss means "try Cognito", NEVER "go credential-dark".
+pub(crate) async fn try_device_self_refresh(
+    auth_manager: &crate::auth::AuthManager,
+    coord_base: &str,
+    device_id: &str,
+) -> Option<String> {
+    // Precondition: a currently-valid (future-exp) device-JWT must be held —
+    // coord authenticates this request with THAT bearer. An absent/opaque/
+    // already-expired JWT cannot self-refresh, so hand off to Cognito.
+    let current = auth_manager
+        .get_access_token()
+        .ok()
+        .filter(|t| !t.trim().is_empty())?;
+    match auth_manager.access_token_exp() {
+        // Future exp → self-refreshable (even if within the refresh threshold).
+        Some(exp) if chrono::Utc::now().timestamp() < exp => {}
+        // Absent/opaque exp, or already expired → Cognito fallback.
+        _ => return None,
+    }
+
+    let url = format!(
+        "{}/devices/{}/refresh-token",
+        coord_base.trim_end_matches('/'),
+        device_id
+    );
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("device_jwt_refresher: device self-refresh client build failed: {e} — falling back to Cognito");
+            return None;
+        }
+    };
+    let resp = match client.post(&url).bearer_auth(current.trim()).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(
+                "device_jwt_refresher: device self-refresh request failed: {e} \
+                 — falling back to Cognito"
+            );
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        // 404 (route undeployed) / 401 / 5xx — all fall through to Cognito.
+        // REPLACE-not-REVOKE: the existing JWT is left untouched.
+        info!(
+            "device_jwt_refresher: device self-refresh got HTTP {} \
+             — falling back to Cognito (existing JWT preserved)",
+            resp.status()
+        );
+        return None;
+    }
+    let body: DeviceRefreshResponse = match resp.json().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(
+                "device_jwt_refresher: device self-refresh body decode failed: {e} \
+                 — falling back to Cognito"
+            );
+            return None;
+        }
+    };
+    if body.token.trim().is_empty() {
+        warn!(
+            "device_jwt_refresher: device self-refresh returned an empty token \
+             — falling back to Cognito"
+        );
+        return None;
+    }
+    // Persist into the access_token slot (refresh-token slot stays empty — the
+    // device-JWT lifecycle is coord-owned, not an OAuth refresh chain).
+    match auth_manager.store_tokens(&body.token, "") {
+        Ok(()) => {
+            info!(
+                "device_jwt_refresher: device-JWT self-refreshed login-independently (len={})",
+                body.token.len()
+            );
+            Some(body.token)
+        }
+        Err(e) => {
+            warn!(
+                "device_jwt_refresher: persist self-refreshed JWT failed: {e} \
+                 — falling back to Cognito (existing JWT preserved)"
+            );
+            None
+        }
+    }
+}
+
 /// Ensure the Cognito (oauth) access token is fresh before it's used as the
 /// pair-cli bearer. If a Cognito refresh token is stored and the access token
 /// is within the refresh threshold (or already expired), POST the
@@ -888,6 +1012,54 @@ async fn refresher_loop(
                 continue;
             }
             Decision::Pair => {
+                // Phase 4a: PREFER a login-independent DEVICE self-refresh. When
+                // the runner still holds a currently-valid device-JWT, re-mint it
+                // by presenting that JWT to coord's
+                // `POST /devices/:id/refresh-token` (NO Cognito touched) — this
+                // keeps a continuously-running runner autonomous past the ~30-day
+                // Cognito refresh-token ceiling. Only when no valid device-JWT is
+                // held (expired/absent), OR coord doesn't support the route yet
+                // (404 → fall through, ordering-safe), do we run the Cognito
+                // pair-cli path below. device_id: env override first (multi-
+                // instance / test), else machine.json — same resolution as the
+                // status publisher.
+                let self_refresh_device_id = std::env::var("QONTINUI_MACHINE_ID")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| s.trim().to_string())
+                    .or_else(|| qontinui_runner_lib::pair::read_device_id_from_disk().ok());
+                if let Some(did) = self_refresh_device_id {
+                    let coord_base = crate::coord_mcp::coord_base_url();
+                    if let Some(new_jwt) =
+                        try_device_self_refresh(&auth_manager, &coord_base, &did).await
+                    {
+                        info!(
+                            "device_jwt_refresher: device-JWT self-refreshed (len={}) \
+                             — Cognito path skipped this tick",
+                            new_jwt.len()
+                        );
+                        // Same downstream handling as a successful Cognito re-mint:
+                        // wake the relay so it reconnects with the new JWT, publish
+                        // healthy, reset backoff, and fall to the steady cadence.
+                        crate::mcp::backend_relay::commands::kick_cloud_relay().await;
+                        publish_coord_credential_status(
+                            &auth_manager,
+                            &coord_credential_health(decision, Some(PairProgress::Healthy)),
+                        )
+                        .await;
+                        // A healthy tick: reset transient backoff + emit "resumed"
+                        // if we were previously credential-dark.
+                        let action = plan_refresh_wait(&mut backoff, RefreshClass::Ok);
+                        if action.notify_recovered {
+                            emit_credential_dark(&api_state.app_handle, false);
+                        }
+                        if wait_with_signals(action.wait, &mut shutdown_rx, &mut kick_rx).await {
+                            return;
+                        }
+                        continue;
+                    }
+                }
+
                 // The web backend's pair-cli endpoint gates on the user
                 // bearer (`Authorization: Bearer <user-token>`). Phase 5
                 // (unified-Cognito-identity): when the runner was signed in
@@ -1918,6 +2090,255 @@ mod try_refresh_once_tests {
             *cap.hits.lock().unwrap(),
             1,
             "pair-cli should be hit exactly once when machine tenant supplies the id"
+        );
+    }
+}
+
+#[cfg(test)]
+mod device_self_refresh_tests {
+    //! Phase 4a tests — `try_device_self_refresh` against an in-process mock
+    //! coord serving `POST /devices/:device_id/refresh-token`. Covers:
+    //!   - preferred path: a valid (future-exp) device-JWT self-refreshes,
+    //!     presenting itself as the bearer, stores the new token, returns
+    //!     `Some(new_jwt)` (so the loop SKIPS the Cognito path),
+    //!   - fallback: an expired/absent device-JWT returns `None` WITHOUT hitting
+    //!     coord (the caller falls back to Cognito),
+    //!   - REPLACE-not-REVOKE + ordering safety: a non-2xx (incl. 404 for an
+    //!     undeployed coord route) returns `None` and leaves the existing JWT
+    //!     untouched.
+
+    use super::*;
+    use axum::{
+        extract::{Path, State},
+        http::{HeaderMap, StatusCode},
+        routing::post,
+        Router,
+    };
+    use std::sync::{Arc, Mutex};
+
+    fn b64url(b: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+    }
+
+    /// Mint a synthetic device-JWT carrying `exp` so `access_token_exp` can
+    /// decode it (signature isn't verified by the runner).
+    fn synth_jwt(exp: i64) -> String {
+        let header = b64url(b"{\"alg\":\"EdDSA\",\"typ\":\"JWT\"}");
+        let payload = b64url(format!("{{\"exp\":{}}}", exp).as_bytes());
+        let sig = b64url(b"fake-sig");
+        format!("{header}.{payload}.{sig}")
+    }
+
+    fn test_auth_manager(name: &str) -> crate::auth::AuthManager {
+        let dir = std::env::temp_dir().join("qontinui_test_self_refresh");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("{name}.enc"));
+        let _ = std::fs::remove_file(&path);
+        let storage = crate::secure_storage::SecureStorage::with_path(path).expect("storage");
+        crate::auth::AuthManager::with_storage(storage)
+    }
+
+    #[derive(Clone)]
+    struct MockState {
+        status: StatusCode,
+        body: String,
+        hits: Arc<Mutex<u32>>,
+        last_auth: Arc<Mutex<Option<String>>>,
+    }
+
+    async fn handler(
+        State(s): State<MockState>,
+        Path(_device_id): Path<String>,
+        h: HeaderMap,
+    ) -> (StatusCode, String) {
+        *s.hits.lock().unwrap() += 1;
+        *s.last_auth.lock().unwrap() = h
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_string());
+        (s.status, s.body.clone())
+    }
+
+    struct MockCapture {
+        hits: Arc<Mutex<u32>>,
+        last_auth: Arc<Mutex<Option<String>>>,
+    }
+
+    fn spawn_mock(
+        status: StatusCode,
+        body: String,
+    ) -> (String, MockCapture, tokio::sync::oneshot::Sender<()>) {
+        let hits = Arc::new(Mutex::new(0u32));
+        let last_auth = Arc::new(Mutex::new(None));
+        let hits_h = hits.clone();
+        let last_auth_h = last_auth.clone();
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = std_listener.local_addr().expect("addr").port();
+        std_listener.set_nonblocking(true).expect("nb");
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("rt");
+            rt.block_on(async move {
+                let state = MockState {
+                    status,
+                    body,
+                    hits: hits_h,
+                    last_auth: last_auth_h,
+                };
+                // axum 0.8 path-param syntax: `{device_id}`.
+                let app: Router = Router::new()
+                    .route("/devices/{device_id}/refresh-token", post(handler))
+                    .with_state(state);
+                let listener =
+                    tokio::net::TcpListener::from_std(std_listener).expect("tokio listener");
+                let _ = axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = rx.await;
+                    })
+                    .await;
+            });
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        (
+            format!("http://127.0.0.1:{port}"),
+            MockCapture { hits, last_auth },
+            tx,
+        )
+    }
+
+    const DID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+    #[tokio::test]
+    async fn self_refresh_preferred_when_valid_device_jwt_held() {
+        // A currently-valid (future-exp) device-JWT is held → self-refresh
+        // re-mints from it (presenting it as the bearer), stores the new token,
+        // and returns Some. The caller uses this to SKIP the Cognito path
+        // (Cognito is never consulted on this tick).
+        let mgr = test_auth_manager("preferred_when_valid");
+        let existing = synth_jwt(chrono::Utc::now().timestamp() + 30 * 60);
+        mgr.store_tokens(&existing, "").expect("store");
+
+        let new_jwt = synth_jwt(chrono::Utc::now().timestamp() + 4 * 60 * 60);
+        let body = serde_json::json!({ "token": new_jwt }).to_string();
+        let (base, cap, _shutdown) = spawn_mock(StatusCode::OK, body);
+
+        let got = try_device_self_refresh(&mgr, &base, DID).await;
+        assert_eq!(
+            got.as_deref(),
+            Some(new_jwt.as_str()),
+            "self-refresh must return the new JWT"
+        );
+        assert_eq!(
+            *cap.hits.lock().unwrap(),
+            1,
+            "coord self-refresh route should be hit exactly once"
+        );
+        // The CURRENT device-JWT was presented as the bearer (login-independent —
+        // no Cognito token involved).
+        assert_eq!(
+            cap.last_auth.lock().unwrap().clone(),
+            Some(format!("Bearer {existing}")),
+            "self-refresh must present the CURRENT device-JWT as the bearer"
+        );
+        // Slot now holds the NEW token.
+        assert_eq!(mgr.get_access_token().unwrap(), new_jwt);
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_cognito_when_device_jwt_expired() {
+        // An already-expired device-JWT cannot self-refresh (coord would 401 the
+        // bearer, and this IS the Cognito-recovery case). Return None WITHOUT
+        // touching coord so the caller falls back to the Cognito path.
+        let mgr = test_auth_manager("fallback_when_expired");
+        let expired = synth_jwt(chrono::Utc::now().timestamp() - 60);
+        mgr.store_tokens(&expired, "").expect("store");
+
+        let (base, cap, _shutdown) = spawn_mock(
+            StatusCode::OK,
+            serde_json::json!({ "token": "x" }).to_string(),
+        );
+
+        let got = try_device_self_refresh(&mgr, &base, DID).await;
+        assert!(got.is_none(), "expired JWT → None (Cognito fallback)");
+        assert_eq!(
+            *cap.hits.lock().unwrap(),
+            0,
+            "coord must NOT be hit for an expired JWT"
+        );
+        // Existing (expired) JWT untouched — REPLACE-not-REVOKE.
+        assert_eq!(mgr.get_access_token().unwrap(), expired);
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_cognito_when_device_jwt_absent() {
+        // No device-JWT held at all → None without hitting coord.
+        let mgr = test_auth_manager("fallback_when_absent");
+        let (base, cap, _shutdown) = spawn_mock(
+            StatusCode::OK,
+            serde_json::json!({ "token": "x" }).to_string(),
+        );
+        let got = try_device_self_refresh(&mgr, &base, DID).await;
+        assert!(got.is_none(), "absent JWT → None (Cognito fallback)");
+        assert_eq!(
+            *cap.hits.lock().unwrap(),
+            0,
+            "coord must NOT be hit when no device-JWT is held"
+        );
+    }
+
+    #[tokio::test]
+    async fn self_refresh_404_returns_none_and_preserves_jwt() {
+        // ORDERING SAFETY + REPLACE-not-REVOKE: a coord that hasn't deployed the
+        // route yet 404s → None (fall back to Cognito) and the existing JWT is
+        // left UNTOUCHED. This is what lets the runner half ship before the coord
+        // half.
+        let mgr = test_auth_manager("route_404_preserves");
+        let existing = synth_jwt(chrono::Utc::now().timestamp() + 30 * 60);
+        mgr.store_tokens(&existing, "").expect("store");
+
+        let (base, cap, _shutdown) = spawn_mock(
+            StatusCode::NOT_FOUND,
+            r#"{"error":"not found"}"#.to_string(),
+        );
+
+        let got = try_device_self_refresh(&mgr, &base, DID).await;
+        assert!(got.is_none(), "404 → None (Cognito fallback)");
+        assert_eq!(
+            *cap.hits.lock().unwrap(),
+            1,
+            "the route was attempted exactly once"
+        );
+        assert_eq!(
+            mgr.get_access_token().unwrap(),
+            existing,
+            "REPLACE-not-REVOKE: existing JWT must be UNCHANGED after a 404"
+        );
+    }
+
+    #[tokio::test]
+    async fn self_refresh_401_returns_none_and_preserves_jwt() {
+        // A 401 (stale/rejected bearer) → None + existing JWT preserved. The
+        // caller falls back to Cognito; the runner is never punished by a cleared
+        // slot for a single non-2xx.
+        let mgr = test_auth_manager("resp_401_preserves");
+        let existing = synth_jwt(chrono::Utc::now().timestamp() + 30 * 60);
+        mgr.store_tokens(&existing, "").expect("store");
+
+        let (base, _cap, _shutdown) = spawn_mock(
+            StatusCode::UNAUTHORIZED,
+            r#"{"error":"expired"}"#.to_string(),
+        );
+
+        let got = try_device_self_refresh(&mgr, &base, DID).await;
+        assert!(got.is_none());
+        assert_eq!(
+            mgr.get_access_token().unwrap(),
+            existing,
+            "existing JWT must be UNCHANGED after a 401"
         );
     }
 }
