@@ -903,6 +903,9 @@ mod handler_tests {
             repo_root: tmp.path().to_string_lossy().to_string(),
             ui_bridge_url: format!("http://localhost:3001/{}", app_id),
             display_name: format!("Test App {}", app_id),
+            auth_required: false,
+            red_threshold: 0.5,
+            yellow_threshold: 0.8,
         };
         pg.insert_app(&req).await.expect("insert app");
 

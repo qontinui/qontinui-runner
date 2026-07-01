@@ -30,13 +30,14 @@ pub use snapshot::IndexedSnapshot;
 // Re-export wire types so downstream crates don't need two deps. Names match
 // the qontinui-schemas registrations at qontinui-runner/src-tauri/src/
 // schema_export.rs:642-673.
-pub use qontinui_types::ir::{IrAssertion, IrAssertionTarget, IrElementCriteria, IrPageSpec, IrState};
+pub use qontinui_types::ir::{
+    IrAssertion, IrAssertionTarget, IrElementCriteria, IrPageSpec, IrState,
+};
 pub use qontinui_types::spec_check::{
-    AssertionMiss, AssertionOutcome, AssertionResult, AssertionScope,
-    AssertionSeverityCounts, BridgeFingerprint, CandidateMiss, Confidence,
-    ConjunctEvaluation, ConjunctRule, FieldDiff, MatchOutcome, MatchedElement,
-    MissReason, PolicyConjunct, PolicyEvaluation, PolicyStatus, RecommendedState,
-    SpecCheckPolicy, SpecCheckResult, SpecCheckStepConfig, SpecCheckSummary,
-    SpecValidation, StateMatchResult,
+    AssertionMiss, AssertionOutcome, AssertionResult, AssertionScope, AssertionSeverityCounts,
+    BridgeFingerprint, CandidateMiss, ClassificationStatus, Confidence, ConjunctEvaluation,
+    ConjunctRule, FieldDiff, MatchOutcome, MatchedElement, MissReason, PolicyConjunct,
+    PolicyEvaluation, PolicyStatus, RecommendedState, SpecCheckPolicy, SpecCheckResult,
+    SpecCheckStepConfig, SpecCheckSummary, SpecValidation, StateMatchResult, ThresholdConfig,
 };
 pub use qontinui_types::ui_bridge::{UIBridgeElement, UIBridgeSnapshot};

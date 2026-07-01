@@ -37,6 +37,12 @@ fn row_to_app(r: &tokio_postgres::Row) -> App {
         display_name: r.get(3),
         created_at_ms: r.get(4),
         last_seen_at_ms: r.get(5),
+        // `project.apps` has no auth/threshold columns yet (0.7.0 added these
+        // fields to the type ahead of the DB migration) — map to the schema
+        // `#[serde(default)]` values until the columns + wiring land.
+        auth_required: false,
+        red_threshold: 0.5,
+        yellow_threshold: 0.8,
     }
 }
 
@@ -323,6 +329,9 @@ pub async fn bootstrap_dev_apps(pg: &PgDb) -> Result<(), AppError> {
         repo_root: runner_root.to_string_lossy().into(),
         ui_bridge_url: "http://localhost:9876".into(),
         display_name: "Qontinui Runner (self)".into(),
+        auth_required: false,
+        red_threshold: 0.5,
+        yellow_threshold: 0.8,
     }];
 
     if let Some(root) = web_root {
@@ -331,6 +340,9 @@ pub async fn bootstrap_dev_apps(pg: &PgDb) -> Result<(), AppError> {
             repo_root: root.to_string_lossy().into(),
             ui_bridge_url: "http://localhost:3001".into(),
             display_name: "Qontinui Web (Next.js)".into(),
+            auth_required: false,
+            red_threshold: 0.5,
+            yellow_threshold: 0.8,
         });
     }
 
@@ -340,6 +352,9 @@ pub async fn bootstrap_dev_apps(pg: &PgDb) -> Result<(), AppError> {
             repo_root: root.to_string_lossy().into(),
             ui_bridge_url: "http://localhost:9875".into(),
             display_name: "Qontinui Supervisor (dashboard)".into(),
+            auth_required: false,
+            red_threshold: 0.5,
+            yellow_threshold: 0.8,
         });
     }
 
@@ -413,6 +428,9 @@ mod tests {
             repo_root: tmp.path().to_string_lossy().to_string(),
             ui_bridge_url: format!("http://localhost:3001/{}", app_id),
             display_name: format!("Test App {}", app_id),
+            auth_required: false,
+            red_threshold: 0.5,
+            yellow_threshold: 0.8,
         }
     }
 
@@ -463,6 +481,9 @@ mod tests {
             repo_root: bogus_root,
             ui_bridge_url: "http://localhost:3001".into(),
             display_name: "Test".into(),
+            auth_required: false,
+            red_threshold: 0.5,
+            yellow_threshold: 0.8,
         };
         let err = pg
             .insert_app(&req)
@@ -541,6 +562,9 @@ mod tests {
         let patch = UpdateAppRequest {
             ui_bridge_url: Some(new_url.clone()),
             display_name: None,
+            auth_required: None,
+            red_threshold: None,
+            yellow_threshold: None,
         };
         let updated = pg.update_app(&app_id, &patch).await.expect("update_app");
         assert_eq!(updated.ui_bridge_url, new_url);

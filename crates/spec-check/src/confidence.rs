@@ -139,11 +139,7 @@ pub fn recommend_state(
     // Either zero or multiple initials — narrow the pool then fall through
     // to the lexical tiebreak. If multiple states are flagged initial, we
     // tiebreak among them; otherwise we tiebreak among all ties.
-    let pool: Vec<&StateMatchResult> = if initials.len() > 1 {
-        initials
-    } else {
-        tied
-    };
+    let pool: Vec<&StateMatchResult> = if initials.len() > 1 { initials } else { tied };
 
     // Tiebreak 2: lexically smallest state_id.
     let winner = pool
@@ -181,6 +177,7 @@ mod tests {
             state_id: id.to_string(),
             state_name: id.to_string(),
             match_rate: rate,
+            classification: crate::ThresholdConfig::default().classify_match_rate(rate),
             assertions: vec![],
         }
     }
@@ -256,7 +253,11 @@ mod tests {
         // Repeat to guard against accidental nondeterminism (the plan
         // calls out 100 runs).
         for _ in 0..100 {
-            let states = vec![state("zebra", 0.60), state("alpha", 0.60), state("mango", 0.60)];
+            let states = vec![
+                state("zebra", 0.60),
+                state("alpha", 0.60),
+                state("mango", 0.60),
+            ];
             let rec = recommend_state(&states, |_| false).expect("a winner");
             assert_eq!(rec.state_id, "alpha");
             assert!(rec.reason.contains("state_id ordering"));
@@ -271,8 +272,7 @@ mod tests {
             state("alpha", 0.80),
             state("mango", 0.80),
         ];
-        let rec = recommend_state(&states, |id| id == "zebra" || id == "mango")
-            .expect("a winner");
+        let rec = recommend_state(&states, |id| id == "zebra" || id == "mango").expect("a winner");
         // Both zebra and mango are initial; lex-smallest is mango.
         assert_eq!(rec.state_id, "mango");
     }
