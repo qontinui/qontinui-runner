@@ -35,12 +35,16 @@ impl PgDb {
 
         conn.execute(
             "INSERT INTO project.app_deploy_state \
-             (device_id, app_id, deployed_sha, freshness, last_error, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
+             (device_id, app_id, deployed_sha, freshness, deployed_at, last_error, updated_at) \
+             VALUES ($1, $2, $3, $4, now(), $5, $6) \
              ON CONFLICT (device_id, app_id) \
              DO UPDATE SET \
                  deployed_sha = EXCLUDED.deployed_sha, \
                  freshness = EXCLUDED.freshness, \
+                 deployed_at = CASE \
+                     WHEN EXCLUDED.deployed_sha IS NOT NULL THEN now() \
+                     ELSE project.app_deploy_state.deployed_at \
+                 END, \
                  last_error = EXCLUDED.last_error, \
                  updated_at = EXCLUDED.updated_at",
             &[

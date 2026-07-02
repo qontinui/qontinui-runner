@@ -442,18 +442,34 @@ impl PgDb {
         // dispatcher on the web side. Same self-heal posture as project.apps
         // above (project.* is runner-authored; the coord.* alembic-sole-authority
         // rule does not apply here).
+        //
+        // MIRROR DDL: the web alembic revision `app_deploy_state_tracking`
+        // carries an equivalent CREATE for migrator-first fresh DBs — keep
+        // the two in lockstep (columns, CHECK, indexes) or whichever side
+        // creates the table first strands the other's expectations
+        // (review blocker 2 of the fleet-fresh pre-PR pass).
         conn.batch_execute(
             "CREATE TABLE IF NOT EXISTS project.app_deploy_state ( \
                  device_id    UUID NOT NULL, \
                  app_id       TEXT NOT NULL, \
                  deployed_sha TEXT, \
                  freshness    TEXT NOT NULL DEFAULT 'failed', \
+                 deployed_at  TIMESTAMPTZ NOT NULL DEFAULT now(), \
                  last_error   TEXT, \
                  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(), \
                  PRIMARY KEY (device_id, app_id) \
              ); \
-             CREATE INDEX IF NOT EXISTS idx_app_deploy_state_app_id \
-                 ON project.app_deploy_state (app_id);",
+             ALTER TABLE project.app_deploy_state \
+                 ADD COLUMN IF NOT EXISTS deployed_at TIMESTAMPTZ NOT NULL DEFAULT now(); \
+             ALTER TABLE project.app_deploy_state \
+                 DROP CONSTRAINT IF EXISTS app_deploy_state_freshness_check; \
+             ALTER TABLE project.app_deploy_state \
+                 ADD CONSTRAINT app_deploy_state_freshness_check \
+                 CHECK (freshness IN ('fresh', 'building', 'failed')); \
+             CREATE INDEX IF NOT EXISTS ix_app_deploy_state_app_id \
+                 ON project.app_deploy_state (app_id); \
+             CREATE INDEX IF NOT EXISTS ix_app_deploy_state_fresh_hosts \
+                 ON project.app_deploy_state (device_id) WHERE freshness = 'fresh';",
         )
         .await
         .map_err(|e| format!("fleet-fresh app_deploy_state self-heal failed: {}", e))?;
