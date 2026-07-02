@@ -166,7 +166,9 @@ pub async fn create_auth_setup_step(
 /// Network failures, missing parameters, and AWS SDK errors return `Ok(None)`
 /// and log a warning. The caller should skip auth injection and allow
 /// spec-check to proceed without authentication.
-pub async fn fetch_app_credentials(app_id: &str) -> Result<Option<AppCredentials>, AuthInjectionError> {
+pub async fn fetch_app_credentials(
+    app_id: &str,
+) -> Result<Option<AppCredentials>, AuthInjectionError> {
     // TODO: Implement AWS SDK integration once dependencies are added to Cargo.toml
     // For now, return None to implement fail-open path and allow testing
 
@@ -233,7 +235,10 @@ mod tests {
     #[test]
     fn auth_injection_error_displays() {
         let err = AuthInjectionError::SsmFetchFailed("network error".into());
-        assert_eq!(err.to_string(), "SSM credential fetch failed: network error");
+        assert_eq!(
+            err.to_string(),
+            "SSM credential fetch failed: network error"
+        );
 
         let err = AuthInjectionError::InvalidCredentials("missing email".into());
         assert_eq!(err.to_string(), "Invalid credentials: missing email");

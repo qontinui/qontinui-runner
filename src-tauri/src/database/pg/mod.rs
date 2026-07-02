@@ -420,7 +420,12 @@ impl PgDb {
              END $$;",
         )
         .await
-        .map_err(|e| format!("B v1 Polish project.apps auth/threshold backfill failed: {}", e))?;
+        .map_err(|e| {
+            format!(
+                "B v1 Polish project.apps auth/threshold backfill failed: {}",
+                e
+            )
+        })?;
 
         // spec-multi-app Stream E.1: backfill `app_id` onto
         // project.proposal_events. The table predates the multi-tenant model,

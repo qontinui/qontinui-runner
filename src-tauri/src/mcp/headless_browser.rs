@@ -343,20 +343,20 @@ pub async fn spawn_headless(
             request.app_id, session_id
         );
         // Kill the child process since it failed to connect
-        let _ = child.id().and_then(|_| Some({
-            let _ = std::process::Command::new("taskkill")
-                .args(&["/PID", &pid.to_string(), "/F"])
-                .output();
-        }));
+        let _ = child.id().and_then(|_| {
+            Some({
+                let _ = std::process::Command::new("taskkill")
+                    .args(&["/PID", &pid.to_string(), "/F"])
+                    .output();
+            })
+        });
 
         return Err((
             StatusCode::GATEWAY_TIMEOUT,
-            axum::Json(ApiResponse::error(
-                format!(
-                    "SDK connection not established within 10 seconds for app_id={}",
-                    request.app_id
-                ),
-            )),
+            axum::Json(ApiResponse::error(format!(
+                "SDK connection not established within 10 seconds for app_id={}",
+                request.app_id
+            ))),
         ));
     }
 
@@ -404,7 +404,10 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
     // Phase 3: spawn-headless route for flywheel validator gate 4
     #[cfg(feature = "spec-authoring")]
     {
-        r = r.route("/ui-bridge/control/sdk/spawn-headless", post(spawn_headless));
+        r = r.route(
+            "/ui-bridge/control/sdk/spawn-headless",
+            post(spawn_headless),
+        );
     }
 
     r
