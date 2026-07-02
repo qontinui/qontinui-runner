@@ -506,9 +506,20 @@ jobs:
         # attacker would need physical/local access AND the ability to
         # drive many timing-measured auth attempts. Revisit when rsa
         # ships a fix or adb_client switches RSA implementations.
+        #
+        # --ignore RUSTSEC-2026-0194 / RUSTSEC-2026-0195: quadratic-runtime
+        # and unbounded-namespace-allocation DoS advisories in quick-xml,
+        # published 2026-07-02 and pulled in only transitively (3+ versions:
+        # 0.30/0.37/0.38 via build/telemetry deps), not on any
+        # attacker-controlled parse path in the desktop runner. No single
+        # coordinated upgrade is available across the transitive versions.
+        # Revisit when the dependents bump to a patched quick-xml.
         run: |
           cargo install cargo-audit
-          cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071
+          cargo audit --file Cargo.lock \
+            --ignore RUSTSEC-2023-0071 \
+            --ignore RUSTSEC-2026-0194 \
+            --ignore RUSTSEC-2026-0195
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
