@@ -1893,6 +1893,9 @@ mod tests {
             },
             evaluated_at: String::new(),
             warnings: vec![],
+            classification: qontinui_types::spec_check::ThresholdConfig::default()
+                .classify_match_rate(rate),
+            thresholds_used: qontinui_types::spec_check::ThresholdConfig::default(),
         };
         let a = mk(MatchOutcome::FullMatch, 1.0);
         let b = mk(MatchOutcome::PartialMatch, 0.5);
@@ -2010,6 +2013,9 @@ mod tests {
             repo_root: tmp.path().to_string_lossy().to_string(),
             ui_bridge_url: format!("http://localhost:3001/{}", app_id),
             display_name: format!("Test App {}", app_id),
+            auth_required: false,
+            red_threshold: 0.5,
+            yellow_threshold: 0.8,
         };
         pg.insert_app(&req).await.expect("insert app");
 

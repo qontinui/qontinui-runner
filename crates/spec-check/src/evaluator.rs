@@ -29,7 +29,7 @@ use crate::snapshot::{ElementIdx, IndexedSnapshot};
 use crate::{
     AssertionMiss, AssertionOutcome, AssertionResult, AssertionSeverityCounts, BridgeFingerprint,
     MatchOutcome, MatchedElement, SpecCheckResult, SpecCheckSummary, SpecValidation,
-    StateMatchResult, UIBridgeSnapshot,
+    StateMatchResult, ThresholdConfig, UIBridgeSnapshot,
 };
 
 /// `recommendation_reason` value set when the matcher refuses to recommend
@@ -128,7 +128,14 @@ pub fn evaluate_with_identity(
     snapshot_id: String,
     content_sha256: String,
 ) -> SpecCheckResult {
-    evaluate_with_identity_and_validation(snapshot, spec, fingerprint, snapshot_id, content_sha256, None)
+    evaluate_with_identity_and_validation(
+        snapshot,
+        spec,
+        fingerprint,
+        snapshot_id,
+        content_sha256,
+        None,
+    )
 }
 
 pub fn evaluate_with_identity_and_validation(
@@ -145,8 +152,7 @@ pub fn evaluate_with_identity_and_validation(
     // index computed it from the same snapshot; they must agree. Warn (don't
     // panic) on mismatch in debug builds; release trusts the caller.
     #[cfg(debug_assertions)]
-    if fingerprint.element_count != snapshot.elements.len() as u32
-        && fingerprint.element_count != 0
+    if fingerprint.element_count != snapshot.elements.len() as u32 && fingerprint.element_count != 0
     {
         tracing::warn!(
             "evaluate_with_identity: caller fp.element_count={} disagrees with snapshot.elements.len={}; using caller's value",
@@ -224,6 +230,9 @@ fn evaluate_with_indexed(
         spec_version: spec.version.clone(),
         page_id: spec.id.clone(),
         state_results,
+        // In-process eval: no app context → documented default thresholds. App-specific RYG threshold threading is separate feature work.
+        classification: ThresholdConfig::default().classify_match_rate(summary.overall_match_rate),
+        thresholds_used: ThresholdConfig::default(),
         summary,
         bridge_fingerprint,
         evaluated_at,
@@ -261,6 +270,8 @@ fn evaluate_state(indexed: &IndexedSnapshot, state: &IrState) -> StateMatchResul
         state_id: state.id.clone(),
         state_name: state.name.clone(),
         match_rate,
+        // In-process eval: no app context → documented default thresholds. App-specific RYG threshold threading is separate feature work.
+        classification: ThresholdConfig::default().classify_match_rate(match_rate),
         assertions,
     }
 }
@@ -469,8 +480,7 @@ fn build_internal_fingerprint(indexed: &IndexedSnapshot) -> BridgeFingerprint {
 /// a fixed sentinel hash so callers can still observe the result.
 fn hash_spec(spec: &IrPageSpec) -> String {
     match serde_json::to_value(spec) {
-        Ok(value) => compute_content_sha256(&value)
-            .unwrap_or_else(|_| "sha256-".to_string()),
+        Ok(value) => compute_content_sha256(&value).unwrap_or_else(|_| "sha256-".to_string()),
         Err(_) => "sha256-".to_string(),
     }
 }
@@ -578,12 +588,7 @@ mod tests {
         }
     }
 
-    fn assertion(
-        id: &str,
-        severity: &str,
-        crit: serde_json::Value,
-        enabled: bool,
-    ) -> IrAssertion {
+    fn assertion(id: &str, severity: &str, crit: serde_json::Value, enabled: bool) -> IrAssertion {
         IrAssertion {
             id: id.to_string(),
             description: format!("desc-{id}"),
@@ -602,7 +607,12 @@ mod tests {
         }
     }
 
-    fn state(id: &str, name: &str, is_initial: Option<bool>, assertions: Vec<IrAssertion>) -> IrState {
+    fn state(
+        id: &str,
+        name: &str,
+        is_initial: Option<bool>,
+        assertions: Vec<IrAssertion>,
+    ) -> IrState {
         IrState {
             id: id.to_string(),
             name: name.to_string(),
@@ -687,10 +697,13 @@ mod tests {
 
     #[test]
     fn evaluate_no_match_when_nothing_passes() {
-        let s = snap(vec![elem(
-            "e0", "#e0", Some("link"), Some("Cancel"), true,
-        )]);
-        let a = assertion("a1", "critical", json!({ "role": "button", "text": "Save" }), true);
+        let s = snap(vec![elem("e0", "#e0", Some("link"), Some("Cancel"), true)]);
+        let a = assertion(
+            "a1",
+            "critical",
+            json!({ "role": "button", "text": "Save" }),
+            true,
+        );
         let st = state("s1", "Loaded", Some(true), vec![a]);
         let spec = page_spec("page-1", vec![st]);
 
@@ -709,7 +722,12 @@ mod tests {
             elem("ok", "#ok", Some("button"), Some("Save"), true),
             elem("nope", "#nope", Some("link"), Some("Other"), true),
         ]);
-        let a1 = assertion("a1", "critical", json!({ "role": "button", "text": "Save" }), true);
+        let a1 = assertion(
+            "a1",
+            "critical",
+            json!({ "role": "button", "text": "Save" }),
+            true,
+        );
         let a2 = assertion("a2", "error", json!({ "role": "checkbox" }), true);
         let st = state("s1", "Loaded", Some(true), vec![a1, a2]);
         let spec = page_spec("page-1", vec![st]);
@@ -739,9 +757,7 @@ mod tests {
 
     #[test]
     fn evaluate_skips_disabled_assertions() {
-        let s = snap(vec![elem(
-            "ok", "#ok", Some("button"), Some("Save"), true,
-        )]);
+        let s = snap(vec![elem("ok", "#ok", Some("button"), Some("Save"), true)]);
         let a_pass = assertion("pass", "info", json!({ "role": "button" }), true);
         let a_skip = assertion("skip", "critical", json!({ "role": "nope" }), false);
         let st = state("s1", "Loaded", Some(true), vec![a_skip, a_pass]);
@@ -758,9 +774,7 @@ mod tests {
     fn evaluate_preserves_declaration_order_across_reruns() {
         // Plan §Step 4 determinism rule: per-state assertion order in
         // `state_results[*].assertions` matches the IR's authoring order.
-        let s = snap(vec![elem(
-            "ok", "#ok", Some("button"), Some("Save"), true,
-        )]);
+        let s = snap(vec![elem("ok", "#ok", Some("button"), Some("Save"), true)]);
         let a1 = assertion("a1", "info", json!({ "role": "button" }), true);
         let a2 = assertion("a2", "info", json!({ "role": "button" }), true);
         let a3 = assertion("a3", "info", json!({ "role": "button" }), true);
@@ -781,9 +795,7 @@ mod tests {
 
     #[test]
     fn evaluate_batch_returns_results_for_each_spec_in_order() {
-        let s = snap(vec![elem(
-            "ok", "#ok", Some("button"), Some("Save"), true,
-        )]);
+        let s = snap(vec![elem("ok", "#ok", Some("button"), Some("Save"), true)]);
         let a1 = assertion("a", "info", json!({ "role": "button" }), true);
         let st1 = state("s1", "Loaded", Some(true), vec![a1]);
         let spec1 = page_spec("page-1", vec![st1]);
@@ -804,9 +816,7 @@ mod tests {
 
     #[test]
     fn evaluate_recommended_state_prefers_highest_match_rate() {
-        let s = snap(vec![elem(
-            "ok", "#ok", Some("button"), Some("Save"), true,
-        )]);
+        let s = snap(vec![elem("ok", "#ok", Some("button"), Some("Save"), true)]);
         // s1 will fail; s2 will pass.
         let a1 = assertion("a1", "info", json!({ "role": "nope" }), true);
         let st1 = state("s1", "Idle", None, vec![a1]);
@@ -827,9 +837,7 @@ mod tests {
         // Same shape as the test above — would normally recommend s2 —
         // but s1 is flagged degenerate. Expect: recommended_state: None,
         // recommendation_reason: "spec_validation_failed".
-        let s = snap(vec![elem(
-            "ok", "#ok", Some("button"), Some("Save"), true,
-        )]);
+        let s = snap(vec![elem("ok", "#ok", Some("button"), Some("Save"), true)]);
         let a1 = assertion("a1", "info", json!({ "role": "nope" }), true);
         let st1 = state("s1", "Idle", None, vec![a1]);
         let a2 = assertion("a2", "info", json!({ "role": "button" }), true);
@@ -855,9 +863,7 @@ mod tests {
 
     #[test]
     fn evaluate_with_validation_refuses_recommendation_on_indistinguishable_pair() {
-        let s = snap(vec![elem(
-            "ok", "#ok", Some("button"), Some("Save"), true,
-        )]);
+        let s = snap(vec![elem("ok", "#ok", Some("button"), Some("Save"), true)]);
         let a = assertion("a", "info", json!({ "role": "button" }), true);
         let st = state("s1", "Idle", Some(true), vec![a]);
         let spec = page_spec("page-1", vec![st]);
@@ -878,9 +884,7 @@ mod tests {
     #[test]
     fn evaluate_with_validation_passes_clean_validation_through() {
         // Empty SpecValidation (no violations) should NOT block recommendation.
-        let s = snap(vec![elem(
-            "ok", "#ok", Some("button"), Some("Save"), true,
-        )]);
+        let s = snap(vec![elem("ok", "#ok", Some("button"), Some("Save"), true)]);
         let a = assertion("a", "info", json!({ "role": "button" }), true);
         let st = state("s1", "Idle", Some(true), vec![a]);
         let spec = page_spec("page-1", vec![st]);
@@ -949,13 +953,8 @@ mod tests {
     fn evaluate_with_identity_writes_caller_fingerprint() {
         let (s, spec) = identity_fixture();
         let fp = caller_fingerprint("qontinui-web", s.elements.len() as u32);
-        let result = evaluate_with_identity(
-            &s,
-            &spec,
-            fp,
-            "scs_018f-abc".to_string(),
-            String::new(),
-        );
+        let result =
+            evaluate_with_identity(&s, &spec, fp, "scs_018f-abc".to_string(), String::new());
         // Caller's app_id flows through; NOT the sentinel.
         assert_eq!(result.bridge_fingerprint.app_id, "qontinui-web");
         assert_ne!(result.bridge_fingerprint.app_id, "internal-evaluator");
@@ -975,13 +974,8 @@ mod tests {
     fn evaluate_with_identity_writes_caller_snapshot_id() {
         let (s, spec) = identity_fixture();
         let fp = caller_fingerprint("qontinui-web", s.elements.len() as u32);
-        let result = evaluate_with_identity(
-            &s,
-            &spec,
-            fp,
-            "scs_018f-abc".to_string(),
-            String::new(),
-        );
+        let result =
+            evaluate_with_identity(&s, &spec, fp, "scs_018f-abc".to_string(), String::new());
         assert_eq!(result.snapshot_id, "scs_018f-abc");
         assert_ne!(result.snapshot_id, "scs_internal_eval");
     }
@@ -1003,13 +997,7 @@ mod tests {
 
         // Empty hash => None (serialized as null via skip_serializing_if).
         let fp2 = caller_fingerprint("qontinui-web", s.elements.len() as u32);
-        let result2 = evaluate_with_identity(
-            &s,
-            &spec,
-            fp2,
-            "scs_x".to_string(),
-            String::new(),
-        );
+        let result2 = evaluate_with_identity(&s, &spec, fp2, "scs_x".to_string(), String::new());
         assert!(result2.snapshot_sha256.is_none());
     }
 
@@ -1018,19 +1006,11 @@ mod tests {
         let (s, spec) = identity_fixture();
         let plain = evaluate(&s, &spec);
         let fp = caller_fingerprint("qontinui-web", s.elements.len() as u32);
-        let identity = evaluate_with_identity(
-            &s,
-            &spec,
-            fp,
-            "scs_x".to_string(),
-            "sha256-abc".to_string(),
-        );
+        let identity =
+            evaluate_with_identity(&s, &spec, fp, "scs_x".to_string(), "sha256-abc".to_string());
         // The matching outcome must be identical regardless of entrypoint —
         // only the identity fields differ.
-        assert_eq!(
-            identity.summary.match_outcome,
-            plain.summary.match_outcome
-        );
+        assert_eq!(identity.summary.match_outcome, plain.summary.match_outcome);
         assert_eq!(
             identity.summary.overall_match_rate,
             plain.summary.overall_match_rate
@@ -1101,7 +1081,10 @@ mod tests {
             let mut v: serde_json::Value = serde_json::to_value(r).unwrap();
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("evaluatedAt".to_string(), json!("FIXED"));
-                if let Some(fp) = obj.get_mut("bridgeFingerprint").and_then(|x| x.as_object_mut()) {
+                if let Some(fp) = obj
+                    .get_mut("bridgeFingerprint")
+                    .and_then(|x| x.as_object_mut())
+                {
                     fp.insert("snapshotTimestamp".to_string(), json!("FIXED"));
                 }
             }
@@ -1126,7 +1109,10 @@ mod tests {
         let mut v: serde_json::Value = serde_json::to_value(r).unwrap();
         if let Some(obj) = v.as_object_mut() {
             obj.insert("evaluatedAt".to_string(), json!("FIXED"));
-            if let Some(fp) = obj.get_mut("bridgeFingerprint").and_then(|x| x.as_object_mut()) {
+            if let Some(fp) = obj
+                .get_mut("bridgeFingerprint")
+                .and_then(|x| x.as_object_mut())
+            {
                 fp.insert("snapshotTimestamp".to_string(), json!("FIXED"));
             }
         }

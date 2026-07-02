@@ -43,10 +43,7 @@ const VERSION_KEY: &str = "resultSchemaVersion";
 pub fn deserialize_result_with_migration(
     value: serde_json::Value,
 ) -> Result<SpecCheckResult, MigrationError> {
-    let version = value
-        .get(VERSION_KEY)
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
+    let version = value.get(VERSION_KEY).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
     let migrated = match version {
         0 => migrate_v0_to_v1(value),
@@ -61,10 +58,7 @@ pub fn deserialize_result_with_migration(
 /// stamping the field so downstream consumers see a consistent shape.
 fn migrate_v0_to_v1(mut value: serde_json::Value) -> serde_json::Value {
     if let Some(obj) = value.as_object_mut() {
-        obj.insert(
-            VERSION_KEY.to_string(),
-            serde_json::Value::from(1_u32),
-        );
+        obj.insert(VERSION_KEY.to_string(), serde_json::Value::from(1_u32));
     }
     value
 }
@@ -73,8 +67,7 @@ fn migrate_v0_to_v1(mut value: serde_json::Value) -> serde_json::Value {
 mod tests {
     use super::*;
     use crate::{
-        AssertionSeverityCounts, BridgeFingerprint, MatchOutcome, SpecCheckResult,
-        SpecCheckSummary,
+        AssertionSeverityCounts, BridgeFingerprint, MatchOutcome, SpecCheckResult, SpecCheckSummary,
     };
 
     fn sample_result(version: u32) -> SpecCheckResult {
@@ -103,6 +96,8 @@ mod tests {
             },
             evaluated_at: "2023-11-14T22:13:21.000Z".to_string(),
             warnings: vec![],
+            classification: crate::ThresholdConfig::default().classify_match_rate(1.0),
+            thresholds_used: crate::ThresholdConfig::default(),
         }
     }
 

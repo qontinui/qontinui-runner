@@ -1404,6 +1404,9 @@ mod tests {
                 repo_root: tmp.path().to_string_lossy().to_string(),
                 ui_bridge_url: format!("http://localhost:0/{}", app_id),
                 display_name: format!("Test {}", app_id),
+                auth_required: false,
+                red_threshold: 0.5,
+                yellow_threshold: 0.8,
             })
             .await
             .expect("insert_app");
@@ -1459,6 +1462,9 @@ mod tests {
                 repo_root: tmp.path().to_string_lossy().to_string(),
                 ui_bridge_url: format!("http://localhost:0/{}", app_id),
                 display_name: format!("Test {}", app_id),
+                auth_required: false,
+                red_threshold: 0.5,
+                yellow_threshold: 0.8,
             })
             .await
             .expect("insert_app");

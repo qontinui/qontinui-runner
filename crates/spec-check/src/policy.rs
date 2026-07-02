@@ -117,14 +117,10 @@ fn filter_assertions<'a>(
             if !scope.states.is_empty() && !scope.states.contains(&sa.state.state_id) {
                 return false;
             }
-            if !scope.severities.is_empty()
-                && !scope.severities.contains(&sa.assertion.severity)
-            {
+            if !scope.severities.is_empty() && !scope.severities.contains(&sa.assertion.severity) {
                 return false;
             }
-            if !scope.categories.is_empty()
-                && !scope.categories.contains(&sa.assertion.category)
-            {
+            if !scope.categories.is_empty() && !scope.categories.contains(&sa.assertion.category) {
                 return false;
             }
             // `groups` filter — no group field on AssertionResult yet; the
@@ -182,10 +178,7 @@ fn evaluate_rule(
             let failed = scope.iter().filter(|sa| !is_pass(sa.assertion)).count();
             let total = scope.len();
             if failed == 0 {
-                (
-                    PolicyStatus::Pass,
-                    format!("all {total} in scope passed"),
-                )
+                (PolicyStatus::Pass, format!("all {total} in scope passed"))
             } else {
                 (
                     PolicyStatus::Fail,
@@ -469,6 +462,7 @@ mod tests {
             state_id: id.to_string(),
             state_name: id.to_string(),
             match_rate: rate,
+            classification: crate::ThresholdConfig::default().classify_match_rate(rate),
             assertions,
         }
     }
@@ -499,6 +493,8 @@ mod tests {
             },
             evaluated_at: "2026-05-13T00:00:00Z".to_string(),
             warnings: vec![],
+            classification: crate::ThresholdConfig::default().classify_match_rate(0.5),
+            thresholds_used: crate::ThresholdConfig::default(),
         }
     }
 
@@ -841,8 +837,14 @@ mod tests {
 
     #[test]
     fn match_outcome_rank_ordering() {
-        assert!(match_outcome_rank(MatchOutcome::NoMatch) < match_outcome_rank(MatchOutcome::PartialMatch));
-        assert!(match_outcome_rank(MatchOutcome::PartialMatch) < match_outcome_rank(MatchOutcome::FullMatch));
+        assert!(
+            match_outcome_rank(MatchOutcome::NoMatch)
+                < match_outcome_rank(MatchOutcome::PartialMatch)
+        );
+        assert!(
+            match_outcome_rank(MatchOutcome::PartialMatch)
+                < match_outcome_rank(MatchOutcome::FullMatch)
+        );
     }
 
     // ------------- Scope filter — AND across populated fields -------------
@@ -950,7 +952,10 @@ mod tests {
         let p = factories::criticals_only();
         assert_eq!(p.conjuncts.len(), 1);
         assert_eq!(p.conjuncts[0].name, "criticals-must-pass");
-        assert_eq!(p.conjuncts[0].scope.severities, vec!["critical".to_string()]);
+        assert_eq!(
+            p.conjuncts[0].scope.severities,
+            vec!["critical".to_string()]
+        );
         assert!(matches!(p.conjuncts[0].rule, ConjunctRule::AllPass));
     }
 
