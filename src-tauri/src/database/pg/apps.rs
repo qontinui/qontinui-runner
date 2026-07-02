@@ -19,8 +19,7 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 use qontinui_types::apps::{
-    validate_app_id, validate_update_strategy, App, AppError, RegisterAppRequest,
-    UpdateAppRequest,
+    validate_app_id, validate_update_strategy, App, AppError, RegisterAppRequest, UpdateAppRequest,
 };
 
 use super::PgDb;
@@ -506,12 +505,8 @@ mod tests {
             std::env::temp_dir().display(),
             app_id
         );
-        let req = RegisterAppRequest::new(
-            app_id.clone(),
-            bogus_root,
-            "http://localhost:3001",
-            "Test",
-        );
+        let req =
+            RegisterAppRequest::new(app_id.clone(), bogus_root, "http://localhost:3001", "Test");
         let err = pg
             .insert_app(&req)
             .await

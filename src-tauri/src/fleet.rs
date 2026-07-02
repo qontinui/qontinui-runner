@@ -2478,21 +2478,23 @@ pub async fn publish_tree_state() -> Result<(), String> {
     // a cycle where this lookup fails cannot null an earlier stamp).
     // Best-effort: no DB / no registry -> empty map -> app_id stays None.
     let app_by_root: std::collections::HashMap<PathBuf, String> = match PgDb::try_global() {
-        Some(pg) => match pg.list_apps().await {
-            Ok(apps) => apps
-                .into_iter()
-                .filter_map(|a| {
-                    std::path::Path::new(&a.repo_root)
-                        .canonicalize()
-                        .ok()
-                        .map(|p| (p, a.app_id))
-                })
-                .collect(),
-            Err(e) => {
-                debug!("fleet::tree_publisher: list_apps failed ({e}); app_id unstamped this cycle");
-                Default::default()
+        Some(pg) => {
+            match pg.list_apps().await {
+                Ok(apps) => apps
+                    .into_iter()
+                    .filter_map(|a| {
+                        std::path::Path::new(&a.repo_root)
+                            .canonicalize()
+                            .ok()
+                            .map(|p| (p, a.app_id))
+                    })
+                    .collect(),
+                Err(e) => {
+                    debug!("fleet::tree_publisher: list_apps failed ({e}); app_id unstamped this cycle");
+                    Default::default()
+                }
             }
-        },
+        }
         None => Default::default(),
     };
 
@@ -2700,8 +2702,7 @@ async fn run_auto_fresh_cycle() -> Result<(), String> {
     let device_id = uuid::Uuid::parse_str(&device.device_id)
         .map_err(|e| format!("invalid device_id UUID: {e}"))?;
 
-    let coord_base = coord_http_base()
-        .ok_or_else(|| "no coord endpoint available".to_string())?;
+    let coord_base = coord_http_base().ok_or_else(|| "no coord endpoint available".to_string())?;
 
     // Poll coord for test-targets designated for this device + auto_fresh enabled
     let url = format!(
@@ -2717,11 +2718,7 @@ async fn run_auto_fresh_cycle() -> Result<(), String> {
         .map_err(|e| format!("GET {}: {e}", url))?;
 
     if !response.status().is_success() {
-        return Err(format!(
-            "GET {} returned {}",
-            url,
-            response.status()
-        ));
+        return Err(format!("GET {} returned {}", url, response.status()));
     }
 
     #[derive(serde::Deserialize)]
@@ -3084,7 +3081,14 @@ fn pull_and_update_app(repo_path: &std::path::Path) -> Result<(bool, String), St
     }
 
     let output = Command::new("git")
-        .args(["-C", repo_str, "pull", "--ff-only", "origin", &default_branch])
+        .args([
+            "-C",
+            repo_str,
+            "pull",
+            "--ff-only",
+            "origin",
+            &default_branch,
+        ])
         .output()
         .map_err(|e| format!("git pull failed: {}", e))?;
 
@@ -3119,10 +3123,7 @@ fn run_shell_command(cwd: &str, command: &str) -> std::io::Result<std::process::
 /// Execute build_command and start_command for pull_build strategy.
 /// Blocking — runs a possibly-minutes-long build; call ONLY from the
 /// blocking pool (`process_auto_fresh_app`'s phase-2 closure).
-fn execute_build_and_restart(
-    app: &qontinui_types::apps::App,
-    app_id: &str,
-) -> Result<(), String> {
+fn execute_build_and_restart(app: &qontinui_types::apps::App, app_id: &str) -> Result<(), String> {
     // Execute build_command if present
     if let Some(ref build_cmd) = app.build_command {
         info!(
