@@ -953,7 +953,7 @@ pub async fn post_spec_check_batch(
                 &fingerprint_owned,
                 &content_hash_owned,
                 shared_policy.as_ref(),
-                app_owned.as_deref(),
+                (*app_owned).as_ref(),
             )
             .await
         });
@@ -1220,7 +1220,7 @@ async fn stream_batch_results(
                 &fingerprint,
                 &content_hash,
                 shared_policy.as_ref(),
-                app_option.as_deref(),
+                (*app_option).as_ref(),
             )
             .await;
             match (r.status, r.result.as_ref()) {

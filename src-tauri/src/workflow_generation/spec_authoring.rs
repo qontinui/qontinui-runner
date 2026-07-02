@@ -255,6 +255,7 @@ async fn load_and_project_skeleton(
         transitions: Vec::new(),
         synthesized_groups: None,
         initial_state: None,
+        api_assertions: None,
     })
 }
 

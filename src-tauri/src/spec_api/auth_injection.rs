@@ -15,7 +15,7 @@
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use qontinui_schemas::workflow_step::{BaseStepFields, CommandMode, CommandStep, CommandStepPhase};
+use qontinui_types::workflow_step::{BaseStepFields, CommandMode, CommandStep, CommandStepPhase};
 
 // ============================================================================
 // Types

@@ -445,6 +445,7 @@ mod tests {
                 metadata: None,
                 provenance: None,
                 cross_refs: None,
+                api_assertions: None,
             });
         }
 
@@ -712,6 +713,7 @@ mod tests {
                 metadata: None,
                 provenance: None,
                 cross_refs: None,
+                api_assertions: None,
             }],
             transitions: Vec::new(),
             synthesized_groups: None,
