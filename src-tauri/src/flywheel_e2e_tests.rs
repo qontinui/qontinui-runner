@@ -222,6 +222,7 @@ fn proposed_ir(id: &str) -> IrPageSpec {
         transitions: Vec::new(),
         synthesized_groups: None,
         initial_state: Some("s0".into()),
+        api_assertions: None,
     }
 }
 
@@ -258,6 +259,7 @@ fn disconnected_ir(id: &str) -> IrPageSpec {
         transitions: Vec::new(),
         synthesized_groups: None,
         initial_state: Some("s0".into()),
+        api_assertions: None,
     }
 }
 

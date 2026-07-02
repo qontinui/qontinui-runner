@@ -1398,6 +1398,7 @@ mod tests {
             &fp,
             "",
             None,
+            None,
         )
         .await;
         assert_eq!(r.status, "spec-not-found");
@@ -1424,6 +1425,7 @@ mod tests {
             "scs_test",
             &fp,
             "",
+            None,
             None,
         )
         .await;
@@ -1492,6 +1494,7 @@ mod tests {
             "scs_test",
             &fp,
             "",
+            None,
             None,
         )
         .await;
@@ -1577,6 +1580,7 @@ mod tests {
             &fp,
             "",
             Some(&policy),
+            None,
         )
         .await;
         assert_eq!(r.status, "ok");

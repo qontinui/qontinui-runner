@@ -972,6 +972,7 @@ mod tests {
             transitions: Vec::new(),
             synthesized_groups: None,
             initial_state: None,
+            api_assertions: None,
         }
     }
 
@@ -1085,6 +1086,7 @@ mod tests {
             transitions: vec![],
             synthesized_groups: None,
             initial_state: None,
+            api_assertions: None,
         }
     }
 
@@ -1163,6 +1165,7 @@ mod tests {
             transitions: vec![],
             synthesized_groups: None,
             initial_state: None,
+            api_assertions: None,
         };
         let bare = serde_json::to_value(&ir).unwrap();
         assert!(parse_meta_workflow_output(&bare).is_ok());

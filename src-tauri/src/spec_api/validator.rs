@@ -446,7 +446,6 @@ mod tests {
                 metadata: None,
                 provenance: None,
                 cross_refs: None,
-                api_assertions: None,
             });
         }
 
@@ -484,6 +483,7 @@ mod tests {
             transitions,
             synthesized_groups: None,
             initial_state: Some("s0".into()),
+            api_assertions: None,
         }
     }
 
@@ -714,11 +714,11 @@ mod tests {
                 metadata: None,
                 provenance: None,
                 cross_refs: None,
-                api_assertions: None,
             }],
             transitions: Vec::new(),
             synthesized_groups: None,
             initial_state: Some("s0".into()),
+            api_assertions: None,
         };
         let snapshot = empty_snapshot();
         // strict_all_pass with an empty conjunct scope (no assertions)

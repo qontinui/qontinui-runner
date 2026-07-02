@@ -1285,6 +1285,7 @@ mod tests {
             transitions: Vec::new(),
             synthesized_groups: None,
             initial_state: None,
+            api_assertions: None,
         };
         let path = storage::write_pending_ir(tmp.path(), "qontinui-runner", &candidate).unwrap();
         let path_str = path.display().to_string();
@@ -1563,6 +1564,7 @@ mod tests {
                 transitions: Vec::new(),
                 synthesized_groups: None,
                 initial_state: None,
+                api_assertions: None,
             };
             let staged =
                 storage::write_pending_ir(&root, &app_id, &candidate).expect("write_pending_ir");
