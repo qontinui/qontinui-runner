@@ -72,12 +72,17 @@ fn free_loopback_port() -> Option<u16> {
 /// - `setup()` runs `initdb` (first launch only; a no-op on an existing
 ///   cluster). `start()` launches the server. `temporary=false` persists data.
 pub async fn bootstrap(data_root: PathBuf, db_name: &str) -> Result<ManagedPg, String> {
-    let mut settings = Settings::default();
-    settings.installation_dir = data_root.join("pg-install");
-    settings.data_dir = data_root.join("pg-data");
-    settings.password_file = data_root.join("pg-pass");
-    settings.host = "127.0.0.1".to_string();
-    settings.temporary = false; // persist the cluster across launches
+    // Struct-update form (not `default()` + field reassignment) to satisfy
+    // clippy::field_reassign_with_default.
+    let mut settings = Settings {
+        installation_dir: data_root.join("pg-install"),
+        data_dir: data_root.join("pg-data"),
+        password_file: data_root.join("pg-pass"),
+        host: "127.0.0.1".to_string(),
+        temporary: false, // persist the cluster across launches
+        ..Settings::default()
+    };
+    // Prefer an explicit free loopback port; fall back to whatever Default chose.
     if let Some(port) = free_loopback_port() {
         settings.port = port;
     }
@@ -142,13 +147,25 @@ pub async fn bootstrap(data_root: PathBuf, db_name: &str) -> Result<ManagedPg, S
 /// Applied once, only when the database was just created.
 async fn apply_canonical_schema(url: &str) -> Result<(), String> {
     const SCHEMA: &str = include_str!("../schema.pg.sql.generated");
-    let transformed: String = SCHEMA
+    let body: String = SCHEMA
         .replace("public.vector(384)", "bytea")
         .replace("public.vector(512)", "bytea")
+        // The dump emits `CREATE SCHEMA public;`, which errors on a fresh
+        // database (the `public` schema already exists). Make every schema
+        // creation idempotent so the one-shot apply cannot trip on it.
+        .replace("CREATE SCHEMA ", "CREATE SCHEMA IF NOT EXISTS ")
         .lines()
         .filter(|l| !l.contains("ivfflat") && !l.contains("public.vector_cosine_ops"))
         .collect::<Vec<_>>()
         .join("\n");
+
+    // pgcrypto is a STANDARD contrib extension shipped with Postgres (unlike
+    // pgvector). The schema uses `public.gen_random_bytes()` / `digest()` in
+    // column DEFAULTs, which must exist before the CREATE TABLEs. The dump
+    // doesn't emit the extension (the dev/CI Postgres already has it), so
+    // provision it into `public` for the fresh embedded cluster.
+    let transformed =
+        format!("CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;\n{body}");
 
     let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
         .await
@@ -159,10 +176,21 @@ async fn apply_canonical_schema(url: &str) -> Result<(), String> {
         }
     });
 
-    let result = client
-        .batch_execute(&transformed)
-        .await
-        .map_err(|e| format!("applying canonical schema to embedded PG failed: {e}"));
+    let result = client.batch_execute(&transformed).await.map_err(|e| {
+        let detail = e
+            .as_db_error()
+            .map(|db| {
+                format!(
+                    "{} (SQLSTATE {}){}{}",
+                    db.message(),
+                    db.code().code(),
+                    db.detail().map(|d| format!("; detail: {d}")).unwrap_or_default(),
+                    db.where_().map(|w| format!("; where: {w}")).unwrap_or_default(),
+                )
+            })
+            .unwrap_or_else(|| e.to_string());
+        format!("applying canonical schema to embedded PG failed: {detail}")
+    });
 
     drop(client); // closes the connection so the driver task can finish
     let _ = conn_task.await;
@@ -204,5 +232,64 @@ pub fn stop_on_exit() {
 async fn stop(mut handle: PostgreSQL) {
     if let Err(e) = handle.stop().await {
         tracing::warn!("embedded Postgres stop failed (non-fatal on exit): {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// End-to-end: initdb → start → create db → apply the transformed canonical
+    /// schema → connect → verify. Runs offline (the `bundled` archive is
+    /// embedded at compile time, so `setup()` extracts from bytes, no network).
+    /// Guards the whole pgvector-free schema-apply path against runtime
+    /// restore errors (the reason this fix exists).
+    #[tokio::test]
+    async fn boots_and_applies_transformed_schema() {
+        let root =
+            std::env::temp_dir().join(format!("qr-embedded-pg-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root); // clean any prior run
+
+        let managed = bootstrap(root.clone(), "qontinui_test")
+            .await
+            .expect("embedded PG should boot and apply the schema");
+
+        let (client, connection) = tokio_postgres::connect(&managed.url, tokio_postgres::NoTls)
+            .await
+            .expect("connect to embedded PG");
+        let conn = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        // The pgvector-free transform applied: the former `public.vector`
+        // column is now `bytea`.
+        let dtype: String = client
+            .query_one(
+                "SELECT data_type FROM information_schema.columns \
+                 WHERE table_schema = 'project' AND table_name = 'domain_knowledge' \
+                   AND column_name = 'content_embedding'",
+                &[],
+            )
+            .await
+            .expect("domain_knowledge.content_embedding should exist after schema apply")
+            .get(0);
+        assert_eq!(dtype, "bytea", "vector column should be transformed to bytea");
+
+        // The full schema applied (not just a handful of self-heal tables).
+        let n: i64 = client
+            .query_one(
+                "SELECT count(*)::bigint FROM information_schema.tables \
+                 WHERE table_schema IN ('project','agent','coord','auth','cloud','public')",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(n > 100, "expected the full canonical schema (>100 tables), got {n}");
+
+        drop(client);
+        let _ = conn.await;
+        stop(managed.handle).await;
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
