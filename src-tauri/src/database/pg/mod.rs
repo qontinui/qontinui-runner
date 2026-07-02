@@ -265,12 +265,27 @@ impl PgDb {
         // table shape. The historical alembic migration
         // `f9d3e8a4c1b6_add_regression_tables.py` remains in
         // `qontinui-web/backend/alembic/versions/` as frozen history.
-        conn.batch_execute(
-            "CREATE SCHEMA IF NOT EXISTS runner; \
-             CREATE EXTENSION IF NOT EXISTS vector;",
-        )
-        .await
-        .map_err(|e| format!("Failed to bootstrap runner schema/extension: {}", e))?;
+        conn.batch_execute("CREATE SCHEMA IF NOT EXISTS runner;")
+            .await
+            .map_err(|e| format!("Failed to bootstrap runner schema: {}", e))?;
+
+        // pgvector is OPTIONAL. The runner stores embeddings as `bytea` blobs
+        // and computes cosine similarity in Rust (see `database::embeddings`
+        // and `database::hybrid_search`) — no column uses the `vector` type and
+        // no query uses pgvector distance operators. Creating the extension is
+        // therefore best-effort: a bundled/standalone Postgres (which does not
+        // ship pgvector) must still boot. A missing extension is logged, not
+        // fatal. Kept as a no-op on managed clusters that DO ship pgvector.
+        if let Err(e) = conn
+            .batch_execute("CREATE EXTENSION IF NOT EXISTS vector;")
+            .await
+        {
+            warn!(
+                "pgvector extension unavailable — continuing without it \
+                 (embeddings use bytea + in-Rust cosine similarity): {}",
+                e
+            );
+        }
 
         // CR-5 (Plan 03): convert `project.workflow_verification_phase_results
         // .result_json` from `text` to `jsonb` so design-context §5.16's
