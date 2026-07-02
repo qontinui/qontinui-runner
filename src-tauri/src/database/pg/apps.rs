@@ -30,6 +30,10 @@ fn now_ms() -> i64 {
 }
 
 fn row_to_app(r: &tokio_postgres::Row) -> App {
+    let auth_required: Option<bool> = r.try_get(6).ok();
+    let red_threshold: Option<f64> = r.try_get::<_, Option<f64>>(7).ok().flatten();
+    let yellow_threshold: Option<f64> = r.try_get::<_, Option<f64>>(8).ok().flatten();
+
     App {
         app_id: r.get(0),
         repo_root: r.get(1),
@@ -37,12 +41,9 @@ fn row_to_app(r: &tokio_postgres::Row) -> App {
         display_name: r.get(3),
         created_at_ms: r.get(4),
         last_seen_at_ms: r.get(5),
-        // `project.apps` has no auth/threshold columns yet (0.7.0 added these
-        // fields to the type ahead of the DB migration) — map to the schema
-        // `#[serde(default)]` values until the columns + wiring land.
-        auth_required: false,
-        red_threshold: 0.5,
-        yellow_threshold: 0.8,
+        auth_required: auth_required.unwrap_or(false),
+        red_threshold: red_threshold.unwrap_or(0.5),
+        yellow_threshold: yellow_threshold.unwrap_or(0.8),
     }
 }
 
@@ -61,7 +62,7 @@ impl PgDb {
         let rows = conn
             .query(
                 "SELECT app_id, repo_root, ui_bridge_url, display_name, \
-                        created_at_ms, last_seen_at_ms \
+                        created_at_ms, last_seen_at_ms, auth_required, red_threshold, yellow_threshold \
                  FROM project.apps \
                  ORDER BY last_seen_at_ms DESC, app_id",
                 &[],
@@ -83,7 +84,7 @@ impl PgDb {
         let rows = conn
             .query(
                 "SELECT app_id, repo_root, ui_bridge_url, display_name, \
-                        created_at_ms, last_seen_at_ms \
+                        created_at_ms, last_seen_at_ms, auth_required, red_threshold, yellow_threshold \
                  FROM project.apps \
                  WHERE app_id = $1",
                 &[&app_id],
@@ -158,16 +159,19 @@ impl PgDb {
             .query(
                 "INSERT INTO project.apps \
                      (app_id, repo_root, ui_bridge_url, display_name, \
-                      created_at_ms, last_seen_at_ms) \
-                 VALUES ($1, $2, $3, $4, $5, $5) \
+                      created_at_ms, last_seen_at_ms, auth_required, red_threshold, yellow_threshold) \
+                 VALUES ($1, $2, $3, $4, $5, $5, $6, $7, $8) \
                  RETURNING app_id, repo_root, ui_bridge_url, display_name, \
-                           created_at_ms, last_seen_at_ms",
+                           created_at_ms, last_seen_at_ms, auth_required, red_threshold, yellow_threshold",
                 &[
                     &req.app_id,
                     &req.repo_root,
                     &req.ui_bridge_url,
                     &req.display_name,
                     &now,
+                    &req.auth_required,
+                    &req.red_threshold,
+                    &req.yellow_threshold,
                 ],
             )
             .await
@@ -197,10 +201,9 @@ impl PgDb {
         Ok(row_to_app(row))
     }
 
-    /// Patch mutable fields on an existing app. Both fields on
-    /// `UpdateAppRequest` are optional — `None` means "leave unchanged".
-    /// Returns the updated row. Errors with `AppError::NotRegistered` if no
-    /// row exists for `app_id`.
+    /// Patch mutable fields on an existing app. Fields on `UpdateAppRequest`
+    /// are optional — `None` means "leave unchanged". Returns the updated row.
+    /// Errors with `AppError::NotRegistered` if no row exists for `app_id`.
     pub async fn update_app(&self, app_id: &str, req: &UpdateAppRequest) -> Result<App, AppError> {
         let conn = self
             .pool
@@ -215,12 +218,22 @@ impl PgDb {
         let rows = conn
             .query(
                 "UPDATE project.apps \
-                 SET ui_bridge_url = COALESCE($2, ui_bridge_url), \
-                     display_name  = COALESCE($3, display_name) \
+                 SET ui_bridge_url   = COALESCE($2, ui_bridge_url), \
+                     display_name    = COALESCE($3, display_name), \
+                     auth_required   = COALESCE($4, auth_required), \
+                     red_threshold   = COALESCE($5, red_threshold), \
+                     yellow_threshold = COALESCE($6, yellow_threshold) \
                  WHERE app_id = $1 \
                  RETURNING app_id, repo_root, ui_bridge_url, display_name, \
-                           created_at_ms, last_seen_at_ms",
-                &[&app_id, &req.ui_bridge_url, &req.display_name],
+                           created_at_ms, last_seen_at_ms, auth_required, red_threshold, yellow_threshold",
+                &[
+                    &app_id,
+                    &req.ui_bridge_url,
+                    &req.display_name,
+                    &req.auth_required,
+                    &req.red_threshold,
+                    &req.yellow_threshold,
+                ],
             )
             .await
             .map_err(|e| AppError::InvalidRepoRoot {
@@ -578,6 +591,33 @@ mod tests {
             .expect("get_app")
             .expect("present");
         assert_eq!(read.ui_bridge_url, new_url);
+
+        cleanup_app(&pg, &app_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PG via DATABASE_URL"]
+    async fn update_app_changes_auth_required_and_thresholds() {
+        let pg = test_pg().await;
+        let app_id = unique_app_id("update-auth");
+        let tmp = tempfile::tempdir().unwrap();
+        let req = register_request(&app_id, &tmp);
+        let inserted = pg.insert_app(&req).await.expect("insert");
+        assert!(!inserted.auth_required);
+        assert_eq!(inserted.red_threshold, 0.5);
+        assert_eq!(inserted.yellow_threshold, 0.8);
+
+        let patch = UpdateAppRequest {
+            ui_bridge_url: None,
+            display_name: None,
+            auth_required: Some(true),
+            red_threshold: Some(0.55),
+            yellow_threshold: Some(0.85),
+        };
+        let updated = pg.update_app(&app_id, &patch).await.expect("update_app");
+        assert!(updated.auth_required);
+        assert_eq!(updated.red_threshold, 0.55);
+        assert_eq!(updated.yellow_threshold, 0.85);
 
         cleanup_app(&pg, &app_id).await;
     }

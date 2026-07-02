@@ -795,6 +795,7 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
                 selectedGroup={state.selectedGroup}
                 selectionType={state.selection.type}
                 editMode={state.editMode}
+                appId={state.selectedSpec?.appName === "qontinui-runner" ? "qontinui-runner" : "qontinui-runner"}
                 unspeccedPageInfo={
                   state.selection.type === "unspecced-page"
                     ? {

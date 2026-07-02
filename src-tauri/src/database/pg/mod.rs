@@ -381,18 +381,46 @@ impl PgDb {
         conn.batch_execute(
             "CREATE SCHEMA IF NOT EXISTS project; \
              CREATE TABLE IF NOT EXISTS project.apps ( \
-                 app_id          TEXT PRIMARY KEY, \
-                 repo_root       TEXT NOT NULL, \
-                 ui_bridge_url   TEXT NOT NULL, \
-                 display_name    TEXT NOT NULL, \
-                 created_at_ms   BIGINT NOT NULL, \
-                 last_seen_at_ms BIGINT NOT NULL \
+                 app_id            TEXT PRIMARY KEY, \
+                 repo_root         TEXT NOT NULL, \
+                 ui_bridge_url     TEXT NOT NULL, \
+                 display_name      TEXT NOT NULL, \
+                 created_at_ms     BIGINT NOT NULL, \
+                 last_seen_at_ms   BIGINT NOT NULL, \
+                 auth_required     BOOLEAN DEFAULT false, \
+                 red_threshold     DOUBLE PRECISION DEFAULT 0.5 CHECK (red_threshold >= 0.0 AND red_threshold <= 1.0), \
+                 yellow_threshold  DOUBLE PRECISION DEFAULT 0.8 CHECK (yellow_threshold >= 0.0 AND yellow_threshold <= 1.0) \
              ); \
              CREATE INDEX IF NOT EXISTS idx_apps_last_seen \
                  ON project.apps (last_seen_at_ms DESC);",
         )
         .await
         .map_err(|e| format!("Stream B project.apps self-heal failed: {}", e))?;
+
+        // B v1 Polish Step 1c: backfill threshold columns if apps table already exists.
+        // Idempotent: UPDATE WHERE IS NULL only affects rows missing the columns after ADD COLUMN IF NOT EXISTS.
+        conn.batch_execute(
+            "DO $$
+             BEGIN
+               IF EXISTS (
+                 SELECT 1 FROM information_schema.tables
+                 WHERE table_schema = 'project' AND table_name = 'apps'
+               ) THEN
+                 ALTER TABLE project.apps
+                     ADD COLUMN IF NOT EXISTS auth_required BOOLEAN DEFAULT false;
+                 ALTER TABLE project.apps
+                     ADD COLUMN IF NOT EXISTS red_threshold DOUBLE PRECISION DEFAULT 0.5;
+                 ALTER TABLE project.apps
+                     ADD COLUMN IF NOT EXISTS yellow_threshold DOUBLE PRECISION DEFAULT 0.8;
+                 -- Backfill existing rows with defaults (no-op if columns already populated)
+                 UPDATE project.apps SET auth_required = false WHERE auth_required IS NULL;
+                 UPDATE project.apps SET red_threshold = 0.5 WHERE red_threshold IS NULL;
+                 UPDATE project.apps SET yellow_threshold = 0.8 WHERE yellow_threshold IS NULL;
+               END IF;
+             END $$;",
+        )
+        .await
+        .map_err(|e| format!("B v1 Polish project.apps auth/threshold backfill failed: {}", e))?;
 
         // spec-multi-app Stream E.1: backfill `app_id` onto
         // project.proposal_events. The table predates the multi-tenant model,
