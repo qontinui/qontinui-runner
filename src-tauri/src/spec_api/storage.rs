@@ -748,6 +748,7 @@ mod pending_tests {
             transitions: Vec::new(),
             synthesized_groups: None,
             initial_state: None,
+            api_assertions: None,
         }
     }
 
