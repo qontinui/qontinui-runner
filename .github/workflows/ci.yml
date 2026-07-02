@@ -507,17 +507,18 @@ jobs:
         # drive many timing-measured auth attempts. Revisit when rsa
         # ships a fix or adb_client switches RSA implementations.
         #
-        # --ignore RUSTSEC-2026-0194: quadratic-time attribute-duplicate
-        # check in quick-xml < 0.41 (DoS on untrusted XML with many
-        # attributes in one start tag). The tree carries FOUR quick-xml
-        # versions (0.30/0.37/0.38/0.39), all pinned transitively by the
-        # tauri/gtk stack — none upgradeable to 0.41 from this repo. The
-        # runner does not parse untrusted network XML through these paths
-        # (build-time manifests/plists). Revisit when tauri/gtk bump to
-        # quick-xml >= 0.41.
+        # --ignore RUSTSEC-2026-0194 + RUSTSEC-2026-0195: two quick-xml
+        # < 0.41 DoS advisories published together on 2026-07-02 (quadratic
+        # attribute-duplicate check; unbounded NsReader namespace-declaration
+        # allocation). The tree carries FOUR quick-xml versions
+        # (0.30/0.37/0.38/0.39), all pinned transitively by the tauri/gtk
+        # stack — none upgradeable to 0.41 from this repo. The runner does
+        # not parse untrusted network XML through these paths (build-time
+        # manifests/plists). These are the ONLY two quick-xml advisories in
+        # the DB as of 2026-07-02. Revisit when tauri/gtk bump to >= 0.41.
         run: |
           cargo install cargo-audit
-          cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194
+          cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
