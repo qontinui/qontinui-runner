@@ -716,6 +716,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // each other (unlike the heartbeat above, which feeds
                 // coord's 120s liveness TTL and must never be starved).
                 fleet::spawn_tree_publisher();
+                // Fleet-wide auto-fresh engine (P3 — fleet-fresh test-target routing).
+                // Periodically polls coord for auto_fresh designations and pulls+builds
+                // registered apps to keep deployed versions at upstream HEAD.
+                fleet::spawn_auto_fresh_engine();
                 // Machine-side dev-environment capture agent
                 // (feat/devenv-environments). Publishes the live PG pool so the
                 // lib-side `db_schema` collector can reach it, then spawns the
