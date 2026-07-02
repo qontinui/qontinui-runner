@@ -1929,6 +1929,18 @@ pub fn create_router(
         });
     }
 
+    // Helper Task Queue (plan 2026-06-29, Phase 1.3 Part D) — poll collected
+    // helper answers from coord into the in-memory store that feeds the
+    // reflection-context section and the Helper Tasks Review tab. Owner-gated
+    // (settings.helper_tasks.emit_enabled, default OFF) and device-JWT-gated
+    // inside the tick, so spawning unconditionally adds no always-on traffic.
+    {
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            crate::helper_tasks::poller::run_forever().await;
+        });
+    }
+
     // Restore persisted coord-mcp proxy nonces + reconcile session configs to
     // the current bound port (plan 2026-06-13 Phases 3b + 3c). 3b makes an
     // already-written `.mcp.json` keep validating across a restart (the nonce
