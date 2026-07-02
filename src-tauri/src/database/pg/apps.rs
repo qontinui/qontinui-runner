@@ -44,9 +44,13 @@ fn row_to_app(r: &tokio_postgres::Row) -> App {
         auth_required: auth_required.unwrap_or(false),
         red_threshold: red_threshold.unwrap_or(0.5),
         yellow_threshold: yellow_threshold.unwrap_or(0.8),
-        update_strategy: "pull_only".to_string(),
-        build_command: None,
-        start_command: None,
+        // Columns added by P1a (update_strategy/build_command/start_command).
+        // Option guards keep reads tolerant of a not-yet-healed DB mid-rollout.
+        update_strategy: r
+            .get::<_, Option<String>>(9)
+            .unwrap_or_else(|| "pull_only".to_string()),
+        build_command: r.get(10),
+        start_command: r.get(11),
     }
 }
 
@@ -65,7 +69,8 @@ impl PgDb {
         let rows = conn
             .query(
                 "SELECT app_id, repo_root, ui_bridge_url, display_name, \
-                        created_at_ms, last_seen_at_ms, auth_required, red_threshold, yellow_threshold \
+                        created_at_ms, last_seen_at_ms, auth_required, red_threshold, \
+                        yellow_threshold, update_strategy, build_command, start_command \
                  FROM project.apps \
                  ORDER BY last_seen_at_ms DESC, app_id",
                 &[],
@@ -87,7 +92,8 @@ impl PgDb {
         let rows = conn
             .query(
                 "SELECT app_id, repo_root, ui_bridge_url, display_name, \
-                        created_at_ms, last_seen_at_ms, auth_required, red_threshold, yellow_threshold \
+                        created_at_ms, last_seen_at_ms, auth_required, red_threshold, \
+                        yellow_threshold, update_strategy, build_command, start_command \
                  FROM project.apps \
                  WHERE app_id = $1",
                 &[&app_id],
@@ -162,10 +168,12 @@ impl PgDb {
             .query(
                 "INSERT INTO project.apps \
                      (app_id, repo_root, ui_bridge_url, display_name, \
-                      created_at_ms, last_seen_at_ms, auth_required, red_threshold, yellow_threshold) \
-                 VALUES ($1, $2, $3, $4, $5, $5, $6, $7, $8) \
+                      created_at_ms, last_seen_at_ms, auth_required, red_threshold, \
+                      yellow_threshold, update_strategy, build_command, start_command) \
+                 VALUES ($1, $2, $3, $4, $5, $5, $6, $7, $8, $9, $10, $11) \
                  RETURNING app_id, repo_root, ui_bridge_url, display_name, \
-                           created_at_ms, last_seen_at_ms, auth_required, red_threshold, yellow_threshold",
+                           created_at_ms, last_seen_at_ms, auth_required, red_threshold, \
+                           yellow_threshold, update_strategy, build_command, start_command",
                 &[
                     &req.app_id,
                     &req.repo_root,
@@ -175,6 +183,9 @@ impl PgDb {
                     &req.auth_required,
                     &req.red_threshold,
                     &req.yellow_threshold,
+                    &req.update_strategy,
+                    &req.build_command,
+                    &req.start_command,
                 ],
             )
             .await
@@ -221,14 +232,18 @@ impl PgDb {
         let rows = conn
             .query(
                 "UPDATE project.apps \
-                 SET ui_bridge_url   = COALESCE($2, ui_bridge_url), \
-                     display_name    = COALESCE($3, display_name), \
-                     auth_required   = COALESCE($4, auth_required), \
-                     red_threshold   = COALESCE($5, red_threshold), \
-                     yellow_threshold = COALESCE($6, yellow_threshold) \
+                 SET ui_bridge_url = COALESCE($2, ui_bridge_url), \
+                     display_name  = COALESCE($3, display_name), \
+                     auth_required  = COALESCE($4, auth_required), \
+                     red_threshold  = COALESCE($5, red_threshold), \
+                     yellow_threshold = COALESCE($6, yellow_threshold), \
+                     update_strategy  = COALESCE($7, update_strategy), \
+                     build_command    = COALESCE($8, build_command), \
+                     start_command    = COALESCE($9, start_command) \
                  WHERE app_id = $1 \
                  RETURNING app_id, repo_root, ui_bridge_url, display_name, \
-                           created_at_ms, last_seen_at_ms, auth_required, red_threshold, yellow_threshold",
+                           created_at_ms, last_seen_at_ms, auth_required, red_threshold, \
+                           yellow_threshold, update_strategy, build_command, start_command",
                 &[
                     &app_id,
                     &req.ui_bridge_url,
@@ -236,6 +251,9 @@ impl PgDb {
                     &req.auth_required,
                     &req.red_threshold,
                     &req.yellow_threshold,
+                    &req.update_strategy,
+                    &req.build_command,
+                    &req.start_command,
                 ],
             )
             .await
@@ -340,47 +358,29 @@ pub async fn bootstrap_dev_apps(pg: &PgDb) -> Result<(), AppError> {
         .canonicalize()
         .ok();
 
-    let mut registrations = vec![RegisterAppRequest {
-        app_id: "qontinui-runner".into(),
-        repo_root: runner_root.to_string_lossy().into(),
-        ui_bridge_url: "http://localhost:9876".into(),
-        display_name: "Qontinui Runner (self)".into(),
-        auth_required: false,
-        red_threshold: 0.5,
-        yellow_threshold: 0.8,
-        update_strategy: "pull_only".to_string(),
-        build_command: None,
-        start_command: None,
-    }];
+    let mut registrations = vec![RegisterAppRequest::new(
+        "qontinui-runner",
+        runner_root.to_string_lossy(),
+        "http://localhost:9876",
+        "Qontinui Runner (self)",
+    )];
 
     if let Some(root) = web_root {
-        registrations.push(RegisterAppRequest {
-            app_id: "qontinui-web".into(),
-            repo_root: root.to_string_lossy().into(),
-            ui_bridge_url: "http://localhost:3001".into(),
-            display_name: "Qontinui Web (Next.js)".into(),
-            auth_required: false,
-            red_threshold: 0.5,
-            yellow_threshold: 0.8,
-            update_strategy: "pull_only".to_string(),
-            build_command: None,
-            start_command: None,
-        });
+        registrations.push(RegisterAppRequest::new(
+            "qontinui-web",
+            root.to_string_lossy(),
+            "http://localhost:3001",
+            "Qontinui Web (Next.js)",
+        ));
     }
 
     if let Some(root) = supervisor_root {
-        registrations.push(RegisterAppRequest {
-            app_id: "qontinui-supervisor".into(),
-            repo_root: root.to_string_lossy().into(),
-            ui_bridge_url: "http://localhost:9875".into(),
-            display_name: "Qontinui Supervisor (dashboard)".into(),
-            auth_required: false,
-            red_threshold: 0.5,
-            yellow_threshold: 0.8,
-            update_strategy: "pull_only".to_string(),
-            build_command: None,
-            start_command: None,
-        });
+        registrations.push(RegisterAppRequest::new(
+            "qontinui-supervisor",
+            root.to_string_lossy(),
+            "http://localhost:9875",
+            "Qontinui Supervisor (dashboard)",
+        ));
     }
 
     for req in registrations {
@@ -448,18 +448,12 @@ mod tests {
     }
 
     fn register_request(app_id: &str, tmp: &tempfile::TempDir) -> RegisterAppRequest {
-        RegisterAppRequest {
-            app_id: app_id.into(),
-            repo_root: tmp.path().to_string_lossy().to_string(),
-            ui_bridge_url: format!("http://localhost:3001/{}", app_id),
-            display_name: format!("Test App {}", app_id),
-            auth_required: false,
-            red_threshold: 0.5,
-            yellow_threshold: 0.8,
-            update_strategy: "pull_only".to_string(),
-            build_command: None,
-            start_command: None,
-        }
+        RegisterAppRequest::new(
+            app_id,
+            tmp.path().to_string_lossy(),
+            format!("http://localhost:3001/{}", app_id),
+            format!("Test App {}", app_id),
+        )
     }
 
     async fn cleanup_app(pg: &PgDb, app_id: &str) {
@@ -504,18 +498,12 @@ mod tests {
             std::env::temp_dir().display(),
             app_id
         );
-        let req = RegisterAppRequest {
-            app_id: app_id.clone(),
-            repo_root: bogus_root,
-            ui_bridge_url: "http://localhost:3001".into(),
-            display_name: "Test".into(),
-            auth_required: false,
-            red_threshold: 0.5,
-            yellow_threshold: 0.8,
-            update_strategy: "pull_only".to_string(),
-            build_command: None,
-            start_command: None,
-        };
+        let req = RegisterAppRequest::new(
+            app_id.clone(),
+            bogus_root,
+            "http://localhost:3001",
+            "Test",
+        );
         let err = pg
             .insert_app(&req)
             .await

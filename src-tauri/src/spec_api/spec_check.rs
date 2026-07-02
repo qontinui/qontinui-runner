@@ -2148,18 +2148,12 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let app_id = format!("d9-known-{}", nanos);
-        let req = RegisterAppRequest {
-            app_id: app_id.clone(),
-            repo_root: tmp.path().to_string_lossy().to_string(),
-            ui_bridge_url: format!("http://localhost:3001/{}", app_id),
-            display_name: format!("Test App {}", app_id),
-            auth_required: false,
-            red_threshold: 0.5,
-            yellow_threshold: 0.8,
-            update_strategy: "pull_only".to_string(),
-            build_command: None,
-            start_command: None,
-        };
+        let req = RegisterAppRequest::new(
+            app_id.clone(),
+            tmp.path().to_string_lossy(),
+            format!("http://localhost:3001/{}", app_id),
+            format!("Test App {}", app_id),
+        );
         pg.insert_app(&req).await.expect("insert app");
 
         // Resolve succeeds (app is registered).
