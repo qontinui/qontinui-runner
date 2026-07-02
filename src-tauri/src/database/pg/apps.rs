@@ -18,7 +18,10 @@ use std::path::{Path, PathBuf};
 
 use tracing::{debug, info, warn};
 
-use qontinui_types::apps::{validate_app_id, App, AppError, RegisterAppRequest, UpdateAppRequest};
+use qontinui_types::apps::{
+    validate_app_id, validate_update_strategy, App, AppError, RegisterAppRequest,
+    UpdateAppRequest,
+};
 
 use super::PgDb;
 
@@ -118,6 +121,7 @@ impl PgDb {
     /// - `AppError::AlreadyRegistered` if a row with `req.app_id` exists.
     pub async fn insert_app(&self, req: &RegisterAppRequest) -> Result<App, AppError> {
         validate_app_id(&req.app_id)?;
+        validate_update_strategy(&req.update_strategy)?;
 
         if !Path::new(&req.repo_root).is_dir() {
             return Err(AppError::InvalidRepoRoot {
@@ -219,6 +223,10 @@ impl PgDb {
     /// are optional — `None` means "leave unchanged". Returns the updated row.
     /// Errors with `AppError::NotRegistered` if no row exists for `app_id`.
     pub async fn update_app(&self, app_id: &str, req: &UpdateAppRequest) -> Result<App, AppError> {
+        if let Some(ref strategy) = req.update_strategy {
+            validate_update_strategy(strategy)?;
+        }
+
         let conn = self
             .pool
             .get()

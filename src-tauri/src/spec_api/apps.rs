@@ -45,6 +45,7 @@ use crate::mcp::types::ApiState;
 /// - `InvalidAppId` → 400
 /// - `InvalidRepoRoot` → 500
 /// - `AlreadyRegistered` → 409 (only reachable from `POST /apps`)
+/// - `InvalidUpdateStrategy` → 400
 pub fn app_error_into_response(err: AppError) -> Response {
     let (status, reason, detail) = match &err {
         AppError::NotRegistered { app_id } => (

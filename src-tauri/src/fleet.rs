@@ -2472,6 +2472,30 @@ pub async fn publish_tree_state() -> Result<(), String> {
         .map_err(|e| format!("reqwest builder: {e}"))?;
     let url = format!("{base}/coord/trees/upsert");
 
+    // fleet-fresh P2 producer: canonicalized repo_root -> app_id from the
+    // project.apps registry, loaded once per publish cycle, so each tree
+    // payload carries the app it belongs to (coord COALESCE-preserves, so
+    // a cycle where this lookup fails cannot null an earlier stamp).
+    // Best-effort: no DB / no registry -> empty map -> app_id stays None.
+    let app_by_root: std::collections::HashMap<PathBuf, String> = match PgDb::try_global() {
+        Some(pg) => match pg.list_apps().await {
+            Ok(apps) => apps
+                .into_iter()
+                .filter_map(|a| {
+                    std::path::Path::new(&a.repo_root)
+                        .canonicalize()
+                        .ok()
+                        .map(|p| (p, a.app_id))
+                })
+                .collect(),
+            Err(e) => {
+                debug!("fleet::tree_publisher: list_apps failed ({e}); app_id unstamped this cycle");
+                Default::default()
+            }
+        },
+        None => Default::default(),
+    };
+
     let mut total = 0usize;
     let mut posted = 0usize;
     for entry in entries.flatten() {
@@ -2534,6 +2558,12 @@ pub async fn publish_tree_state() -> Result<(), String> {
         // DEFAULT binding; canonical trees are device-scoped). Identity-side
         // like `device_id`, so stamped here rather than in capture_tree.
         payload.tenant_id = publisher_tenant;
+        // Stamp the registered app for this tree (fleet-fresh P2 producer);
+        // non-registered repos stay None on the wire.
+        payload.app_id = path
+            .canonicalize()
+            .ok()
+            .and_then(|p| app_by_root.get(&p).cloned());
 
         let upsert_ok = match client.post(&url).json(&payload).send().await {
             Ok(resp) if resp.status().is_success() => {
@@ -2759,8 +2789,9 @@ async fn runner_has_active_tasks() -> bool {
     }
 }
 
-/// Get current HEAD SHA via git rev-parse (blocking operation).
-/// Returns Option<String> with last 12 chars of SHA, or None on error.
+/// Get current HEAD SHA via git rev-parse (blocking operation). Full
+/// 40-char SHA — "fresh" means deployed_sha EQUALS upstream HEAD, so the
+/// stored value must be comparable against a full rev, never a prefix.
 fn get_current_head_sha(repo_path: &std::path::Path) -> Option<String> {
     use std::process::Command;
 
@@ -2770,17 +2801,58 @@ fn get_current_head_sha(repo_path: &std::path::Path) -> Option<String> {
         .ok()?;
 
     if output.status.success() {
-        let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Some(sha.chars().take(12).collect())
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
         None
     }
 }
 
-/// Process a single auto_fresh app: check if behind upstream, pull, build if
-/// configured, and restart via start_command. Updates app_deploy_state table.
+/// In-flight auto-fresh apps — at most one refresh per app at a time. A
+/// build can outlast the tick interval, and each tick DETACHES its per-app
+/// task, so without this set a slow build races a second `git pull` +
+/// build + start against the same repo_root. Same process-global pattern
+/// as the fetch-interval map above.
+fn auto_fresh_in_flight() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static IN_FLIGHT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    IN_FLIGHT.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// RAII release for [`auto_fresh_in_flight`] — the removal must survive
+/// every exit path (early return, `?`, panic inside the blocking pool),
+/// or one wedged refresh permanently mutes auto-fresh for that app.
+struct InFlightGuard(String);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = auto_fresh_in_flight().lock() {
+            set.remove(&self.0);
+        }
+    }
+}
+
+/// Process a single auto_fresh app: fetch + behind-check, pull, build if
+/// configured, restart via start_command; record the outcome to
+/// `project.app_deploy_state`. Git/build work runs on the blocking pool —
+/// a multi-minute `build_command` must never pin a tokio worker.
 async fn process_auto_fresh_app(app_id: &str, device_id: uuid::Uuid) -> Result<(), String> {
-    // Phase P3: lookup app from project.apps, check freshness, pull+build
+    // In-flight guard: skip this tick if a previous refresh of this app is
+    // still running (slow build). Insert-or-skip is atomic under the lock.
+    {
+        let mut in_flight = auto_fresh_in_flight()
+            .lock()
+            .map_err(|e| format!("in-flight lock poisoned: {e}"))?;
+        if !in_flight.insert(app_id.to_string()) {
+            debug!(
+                "fleet::auto_fresh_engine::process_app: app_id={} skipping \
+                 (previous refresh still in flight)",
+                app_id
+            );
+            return Ok(());
+        }
+    }
+    let _in_flight = InFlightGuard(app_id.to_string());
+
     let pg = match PgDb::try_global() {
         Some(db) => db,
         None => {
@@ -2792,7 +2864,7 @@ async fn process_auto_fresh_app(app_id: &str, device_id: uuid::Uuid) -> Result<(
         }
     };
 
-    // Get app from registry
+    // App config from the registry (update_strategy, build/start commands).
     let app = match pg.get_app(app_id).await {
         Ok(Some(a)) => a,
         Ok(None) => {
@@ -2807,7 +2879,7 @@ async fn process_auto_fresh_app(app_id: &str, device_id: uuid::Uuid) -> Result<(
         }
     };
 
-    let repo_path = std::path::Path::new(&app.repo_root);
+    let repo_path = std::path::PathBuf::from(&app.repo_root);
     if !repo_path.exists() {
         warn!(
             "fleet::auto_fresh_engine::process_app: app_id={} repo_root does not exist: {}",
@@ -2816,7 +2888,8 @@ async fn process_auto_fresh_app(app_id: &str, device_id: uuid::Uuid) -> Result<(
         return Ok(());
     }
 
-    // Step 1: Idle-aware guard — never interrupt running tests
+    // Idle-aware guard — never disturb a repo while THIS runner instance
+    // has task-runs executing against it.
     if runner_has_active_tasks().await {
         debug!(
             "fleet::auto_fresh_engine::process_app: app_id={} skipping (active task-runs)",
@@ -2825,9 +2898,24 @@ async fn process_auto_fresh_app(app_id: &str, device_id: uuid::Uuid) -> Result<(
         return Ok(());
     }
 
-    // Step 2: Check if tree is behind upstream via git
-    let is_behind = match check_if_behind(repo_path) {
-        Ok(behind) => behind,
+    // Phase 1 (blocking pool): fetch remote refs if due, then behind-check.
+    // The explicit fetch matters for NON-qontinui repo_roots: the tree
+    // publisher's periodic fetch walks only qontinui-root dirs, so an
+    // arbitrary registered app's `origin/*` refs would otherwise go stale
+    // and the app would never read as behind.
+    let is_behind = {
+        let repo = repo_path.clone();
+        tokio::task::spawn_blocking(move || {
+            if fetch_due(&repo, std::time::Instant::now()) {
+                fetch_remote_refs_blocking(&repo);
+            }
+            check_if_behind(&repo)
+        })
+        .await
+        .map_err(|e| format!("behind-check task panicked: {e}"))?
+    };
+    let is_behind = match is_behind {
+        Ok(b) => b,
         Err(e) => {
             warn!(
                 "fleet::auto_fresh_engine::process_app: app_id={} \
@@ -2837,7 +2925,6 @@ async fn process_auto_fresh_app(app_id: &str, device_id: uuid::Uuid) -> Result<(
             return Ok(());
         }
     };
-
     if !is_behind {
         debug!(
             "fleet::auto_fresh_engine::process_app: app_id={} is up to date",
@@ -2852,100 +2939,69 @@ async fn process_auto_fresh_app(app_id: &str, device_id: uuid::Uuid) -> Result<(
         app_id, app.update_strategy
     );
 
-    // Step 3: Pull updated source code
-    match pull_and_update_app(repo_path).await {
-        Ok((success, message)) => {
-            if success {
-                let deployed_sha = get_current_head_sha(repo_path);
-                info!(
-                    "fleet::auto_fresh_engine::process_app: app_id={} \
-                     pull succeeded, update_strategy={}, deployed_sha={}",
-                    app_id, app.update_strategy,
-                    deployed_sha.as_deref().unwrap_or("unknown")
-                );
+    // Visible 'building' marker while the pull(+build) runs. A crash
+    // mid-refresh leaves 'building' with a stale updated_at — which reads
+    // honestly as "wedged" on the dashboard rather than falsely fresh.
+    pg.update_app_deploy_state_best_effort(device_id, app_id, None, "building", None)
+        .await;
 
-                // Step 4: On pull_build strategy, run build and restart
-                if app.update_strategy == "pull_build" {
-                    if let Err(e) = execute_build_and_restart(&app, app_id).await {
-                        warn!(
-                            "fleet::auto_fresh_engine::process_app: app_id={} \
-                             build/restart failed: {}",
-                            app_id, e
-                        );
-                        // Record failure to app_deploy_state (best-effort)
-                        if let Some(pg) = PgDb::try_global() {
-                            pg.update_app_deploy_state_best_effort(
-                                device_id,
-                                app_id,
-                                None,
-                                "failed",
-                                Some(&e),
-                            )
-                            .await;
-                        }
-                        return Ok(());
-                    }
-
-                    // Record success to app_deploy_state (best-effort)
-                    if let Some(pg) = PgDb::try_global() {
-                        pg.update_app_deploy_state_best_effort(
-                            device_id,
-                            app_id,
-                            deployed_sha.as_deref(),
-                            "fresh",
-                            None,
-                        )
-                        .await;
-                    }
-
-                    info!(
-                        "fleet::auto_fresh_engine::process_app: app_id={} \
-                         build and restart complete",
-                        app_id
-                    );
-                } else {
-                    // pull_only: record fresh state (best-effort)
-                    if let Some(pg) = PgDb::try_global() {
-                        pg.update_app_deploy_state_best_effort(
-                            device_id,
-                            app_id,
-                            deployed_sha.as_deref(),
-                            "fresh",
-                            None,
-                        )
-                        .await;
-                    }
-
-                    info!(
-                        "fleet::auto_fresh_engine::process_app: app_id={} \
-                         pull_only strategy complete",
-                        app_id
-                    );
-                }
-            } else {
-                warn!(
-                    "fleet::auto_fresh_engine::process_app: app_id={} \
-                     pull failed: {}",
-                    app_id, message
-                );
-                // Record failure to app_deploy_state (best-effort)
-                if let Some(pg) = PgDb::try_global() {
-                    pg.update_app_deploy_state_best_effort(
-                        device_id,
-                        app_id,
-                        None,
-                        "failed",
-                        Some(&message),
-                    )
-                    .await;
+    // Phase 2 (blocking pool): pull, capture HEAD, then build + start for
+    // the pull_build strategy. Outcome: (succeeded, message, sha_after_pull).
+    let outcome = {
+        let repo = repo_path.clone();
+        let app_cl = app.clone();
+        let app_id_cl = app_id.to_string();
+        tokio::task::spawn_blocking(move || -> (bool, String, Option<String>) {
+            let (pulled, msg) = match pull_and_update_app(&repo) {
+                Ok(r) => r,
+                Err(e) => return (false, e, None),
+            };
+            if !pulled {
+                return (false, msg, None);
+            }
+            let sha = get_current_head_sha(&repo);
+            if app_cl.update_strategy == "pull_build" {
+                if let Err(e) = execute_build_and_restart(&app_cl, &app_id_cl) {
+                    return (false, e, sha);
                 }
             }
+            (true, msg, sha)
+        })
+        .await
+        .map_err(|e| format!("refresh task panicked: {e}"))?
+    };
+
+    match outcome {
+        (true, _, deployed_sha) => {
+            pg.update_app_deploy_state_best_effort(
+                device_id,
+                app_id,
+                deployed_sha.as_deref(),
+                "fresh",
+                None,
+            )
+            .await;
+            info!(
+                "fleet::auto_fresh_engine::process_app: app_id={} refresh complete \
+                 (strategy={}, deployed_sha={})",
+                app_id,
+                app.update_strategy,
+                deployed_sha.as_deref().unwrap_or("unknown")
+            );
         }
-        Err(e) => {
-            return Err(format!(
-                "fleet::auto_fresh_engine::process_app: app_id={} pull error: {}",
-                app_id, e
-            ));
+        (false, message, _) => {
+            warn!(
+                "fleet::auto_fresh_engine::process_app: app_id={} refresh failed: {}",
+                app_id, message
+            );
+            pg.update_app_deploy_state_best_effort(
+                device_id,
+                app_id,
+                None,
+                "failed",
+                Some(&message),
+            )
+            .await;
         }
     }
 
@@ -2990,7 +3046,7 @@ fn check_if_behind(repo_path: &std::path::Path) -> Result<bool, String> {
 /// the tree must be ON the default branch AND clean, or we refuse — an
 /// auto-fresh engine must never disturb operator WIP or a parked feature
 /// branch. `--ff-only` additionally refuses diverged history.
-async fn pull_and_update_app(repo_path: &std::path::Path) -> Result<(bool, String), String> {
+fn pull_and_update_app(repo_path: &std::path::Path) -> Result<(bool, String), String> {
     use std::process::Command;
 
     let repo_str = repo_path.to_str().unwrap_or(".");
@@ -3061,7 +3117,9 @@ fn run_shell_command(cwd: &str, command: &str) -> std::io::Result<std::process::
 }
 
 /// Execute build_command and start_command for pull_build strategy.
-async fn execute_build_and_restart(
+/// Blocking — runs a possibly-minutes-long build; call ONLY from the
+/// blocking pool (`process_auto_fresh_app`'s phase-2 closure).
+fn execute_build_and_restart(
     app: &qontinui_types::apps::App,
     app_id: &str,
 ) -> Result<(), String> {
