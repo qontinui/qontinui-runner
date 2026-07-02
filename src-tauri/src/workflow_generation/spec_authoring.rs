@@ -724,7 +724,7 @@ pub(crate) fn merge_patch_into_ir(
     }
 
     // Validate every targeted state allows additions.
-    for (state_id, _criteria) in &patch.add_required_elements {
+    for state_id in patch.add_required_elements.keys() {
         let target = existing
             .states
             .iter()
