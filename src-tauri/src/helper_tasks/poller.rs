@@ -3,14 +3,17 @@
 //!
 //! Periodically GETs `GET /coord/helper-tasks/answers?since=<cursor>` with
 //! the device JWT (same auth + coord-base resolution posture as
-//! `mcp::session_message_poller`), folds returned answers into the in-memory
+//! `mcp::session_message_poller`), folds returned answers into the persisted
 //! store (`super::record_answers`), and persists the cursor to a small JSON
 //! file next to `settings.json` so a restart resumes where it left off.
 //!
 //! Safety rails (mirroring the sibling pollers):
-//! - **Owner-gated.** `settings.helper_tasks.emit_enabled=false` (default)
-//!   skips the tick — a runner that never emits tasks has no answers to pull,
-//!   so the feature adds zero always-on coord traffic until opted in.
+//! - **Owner-gated, with an outstanding-work carve-out.** The tick runs when
+//!   `settings.helper_tasks.emit_enabled` is on OR the store already knows
+//!   about tasks/answers — pausing emission must not stop collecting answers
+//!   to tasks that are already outstanding. A runner that never emitted
+//!   anything (empty store, emit off) still adds zero always-on coord
+//!   traffic.
 //! - **Device-JWT-gated.** Unpaired ⇒ skip quietly.
 //! - **503-tolerant.** Coord maps un-migrated helper-task tables to 503 —
 //!   treated as "feature not available yet", debug-logged, never an error.
@@ -29,11 +32,19 @@ const POLL_INTERVAL: Duration = Duration::from_secs(60);
 /// cursor).
 const CURSOR_FILE: &str = "helper-answers-cursor.json";
 
+/// Overlap window subtracted from the persisted cursor when polling. Coord
+/// filters strictly `created_at > since` while the cursor is the newest
+/// `created_at` the poller has SEEN — an answer committed concurrently with a
+/// poll and stamped ≤ cursor would otherwise be skipped forever. Re-reading a
+/// 2s boundary window is idempotent: the store dedups by answer id and only
+/// replaces on a strictly newer `created_at` (revision rule).
+const CURSOR_OVERLAP_SECS: i64 = 2;
+
 /// Run the poll loop forever. Spawned once at API boot; every failure mode is
 /// contained inside the tick.
 pub async fn run_forever() {
     info!(
-        "helper_tasks poller started (interval={}s, gated on settings.helper_tasks.emit_enabled)",
+        "helper_tasks poller started (interval={}s, active when settings.helper_tasks.emit_enabled OR the answer store is non-empty)",
         POLL_INTERVAL.as_secs()
     );
     loop {
@@ -45,9 +56,12 @@ pub async fn run_forever() {
 }
 
 async fn tick() -> Result<(), String> {
-    // Owner gate — default OFF. No emit ⇒ no answers ⇒ no traffic.
+    // Owner gate — default OFF — but only for a runner with nothing
+    // outstanding: pausing emission must not stop collecting answers to tasks
+    // already emitted, so a non-empty store keeps the poll alive. Only the
+    // EMIT side keys on the toggle.
     let cfg = crate::settings::get_helper_tasks_settings();
-    if !cfg.emit_enabled {
+    if !cfg.emit_enabled && !super::store_has_content() {
         return Ok(());
     }
 
@@ -74,7 +88,7 @@ async fn tick() -> Result<(), String> {
     let url = match load_cursor() {
         Some(cursor) => format!(
             "{base}/coord/helper-tasks/answers?since={}",
-            percent_encode(&cursor)
+            percent_encode(&overlapped_since(&cursor))
         ),
         None => format!("{base}/coord/helper-tasks/answers"),
     };
@@ -97,7 +111,9 @@ async fn tick() -> Result<(), String> {
     }
 
     // Oldest-first per the coord contract; the LAST element carries the
-    // newest `created_at`, which becomes the next cursor.
+    // newest `created_at`, which becomes the next cursor. NOTE: coord's
+    // filter is strictly EXCLUSIVE (`created_at > since`) — the
+    // CURSOR_OVERLAP_SECS window above is what protects the boundary.
     let answers: Vec<HelperAnswer> = resp
         .json()
         .await
@@ -133,6 +149,16 @@ fn percent_encode(value: &str) -> String {
         }
     }
     out
+}
+
+/// Subtract [`CURSOR_OVERLAP_SECS`] from an RFC 3339 cursor. Falls back to
+/// the raw cursor when it doesn't parse (coord then applies its strict `>`
+/// against the value we stored — same behavior as before the overlap).
+fn overlapped_since(cursor: &str) -> String {
+    match chrono::DateTime::parse_from_rfc3339(cursor) {
+        Ok(dt) => (dt - chrono::Duration::seconds(CURSOR_OVERLAP_SECS)).to_rfc3339(),
+        Err(_) => cursor.to_string(),
+    }
 }
 
 fn cursor_path() -> Option<std::path::PathBuf> {

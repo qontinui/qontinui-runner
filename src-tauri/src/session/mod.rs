@@ -191,8 +191,10 @@ pub enum SessionEventKind {
     /// Helper Task Queue (plan `2026-06-29-helper-task-queue`, Phase 1.3).
     /// Drained to `POST /coord/helper-tasks`; the payload is the full
     /// `CreateHelperTaskRequest` body recorded by
-    /// [`crate::helper_tasks::HelperTaskRegistrar`]. A coord 503 (helper-task
-    /// tables not migrated yet) is dropped with a warn — never a retry loop.
+    /// [`crate::helper_tasks::HelperTaskRegistrar`]. Best-effort: failures
+    /// never block session events queued behind it (bounded per-record retry,
+    /// then Ack-drop); a coord `helper_task_queue_unavailable` 503
+    /// (helper-task tables not migrated yet) is dropped with a warn.
     HelperTaskCreated,
 }
 
