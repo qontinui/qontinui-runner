@@ -9,6 +9,7 @@ pub mod agent_worktrees;
 pub mod agentic_metrics;
 pub mod ai_sessions;
 pub mod approval_gates;
+pub mod app_deploy_state;
 pub mod apps;
 pub mod breakpoints;
 pub mod cached_specs;
@@ -389,8 +390,17 @@ impl PgDb {
                  last_seen_at_ms   BIGINT NOT NULL, \
                  auth_required     BOOLEAN DEFAULT false, \
                  red_threshold     DOUBLE PRECISION DEFAULT 0.5 CHECK (red_threshold >= 0.0 AND red_threshold <= 1.0), \
-                 yellow_threshold  DOUBLE PRECISION DEFAULT 0.8 CHECK (yellow_threshold >= 0.0 AND yellow_threshold <= 1.0) \
+                 yellow_threshold  DOUBLE PRECISION DEFAULT 0.8 CHECK (yellow_threshold >= 0.0 AND yellow_threshold <= 1.0), \
+                 update_strategy   TEXT NOT NULL DEFAULT 'pull_only', \
+                 build_command     TEXT, \
+                 start_command     TEXT \
              ); \
+             ALTER TABLE project.apps ADD COLUMN IF NOT EXISTS auth_required    BOOLEAN NOT NULL DEFAULT false; \
+             ALTER TABLE project.apps ADD COLUMN IF NOT EXISTS red_threshold    DOUBLE PRECISION NOT NULL DEFAULT 0.5; \
+             ALTER TABLE project.apps ADD COLUMN IF NOT EXISTS yellow_threshold DOUBLE PRECISION NOT NULL DEFAULT 0.8; \
+             ALTER TABLE project.apps ADD COLUMN IF NOT EXISTS update_strategy  TEXT NOT NULL DEFAULT 'pull_only'; \
+             ALTER TABLE project.apps ADD COLUMN IF NOT EXISTS build_command    TEXT; \
+             ALTER TABLE project.apps ADD COLUMN IF NOT EXISTS start_command    TEXT; \
              CREATE INDEX IF NOT EXISTS idx_apps_last_seen \
                  ON project.apps (last_seen_at_ms DESC);",
         )
@@ -426,6 +436,27 @@ impl PgDb {
                 e
             )
         })?;
+
+        // fleet-fresh P3: project.app_deploy_state — per-(device, app) deployment
+        // outcome written by the auto-fresh engine (fleet.rs), read by the P4
+        // dispatcher on the web side. Same self-heal posture as project.apps
+        // above (project.* is runner-authored; the coord.* alembic-sole-authority
+        // rule does not apply here).
+        conn.batch_execute(
+            "CREATE TABLE IF NOT EXISTS project.app_deploy_state ( \
+                 device_id    UUID NOT NULL, \
+                 app_id       TEXT NOT NULL, \
+                 deployed_sha TEXT, \
+                 freshness    TEXT NOT NULL DEFAULT 'failed', \
+                 last_error   TEXT, \
+                 updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(), \
+                 PRIMARY KEY (device_id, app_id) \
+             ); \
+             CREATE INDEX IF NOT EXISTS idx_app_deploy_state_app_id \
+                 ON project.app_deploy_state (app_id);",
+        )
+        .await
+        .map_err(|e| format!("fleet-fresh app_deploy_state self-heal failed: {}", e))?;
 
         // spec-multi-app Stream E.1: backfill `app_id` onto
         // project.proposal_events. The table predates the multi-tenant model,

@@ -1479,18 +1479,12 @@ mod tests {
             let app_id = unique_id("e9-app-write");
             let tmp = tempfile::tempdir().unwrap();
             std::fs::create_dir_all(tmp.path().join("specs")).unwrap();
-            pg.insert_app(&RegisterAppRequest {
-                app_id: app_id.clone(),
-                repo_root: tmp.path().to_string_lossy().to_string(),
-                ui_bridge_url: format!("http://localhost:0/{}", app_id),
-                display_name: format!("Test {}", app_id),
-                auth_required: false,
-                red_threshold: 0.5,
-                yellow_threshold: 0.8,
-                update_strategy: "pull_only".to_string(),
-                build_command: None,
-                start_command: None,
-            })
+            pg.insert_app(&RegisterAppRequest::new(
+                app_id.clone(),
+                tmp.path().to_string_lossy(),
+                format!("http://localhost:0/{}", app_id),
+                format!("Test {}", app_id),
+            ))
             .await
             .expect("insert_app");
 
@@ -1540,18 +1534,12 @@ mod tests {
             let app_id = unique_id("e9-app-promote");
             let tmp = tempfile::tempdir().unwrap();
             std::fs::create_dir_all(tmp.path().join("specs")).unwrap();
-            pg.insert_app(&RegisterAppRequest {
-                app_id: app_id.clone(),
-                repo_root: tmp.path().to_string_lossy().to_string(),
-                ui_bridge_url: format!("http://localhost:0/{}", app_id),
-                display_name: format!("Test {}", app_id),
-                auth_required: false,
-                red_threshold: 0.5,
-                yellow_threshold: 0.8,
-                update_strategy: "pull_only".to_string(),
-                build_command: None,
-                start_command: None,
-            })
+            pg.insert_app(&RegisterAppRequest::new(
+                app_id.clone(),
+                tmp.path().to_string_lossy(),
+                format!("http://localhost:0/{}", app_id),
+                format!("Test {}", app_id),
+            ))
             .await
             .expect("insert_app");
 
