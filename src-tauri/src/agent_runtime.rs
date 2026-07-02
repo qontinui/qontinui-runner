@@ -183,6 +183,58 @@ pub struct GateContinuationPayload {
 /// The `source` discriminator coord stamps on a gate-continuation spawn frame.
 const GATE_CONTINUATION_SOURCE: &str = "gate_continuation";
 
+/// The `source` discriminator coord stamps on a condition-check spawn frame.
+///
+/// A condition check is coord dispatching an AI session to this runner to verify
+/// UI "conditions" via the UI Bridge and report the result back with a curl. It
+/// reuses the same `events.agent.spawn_requested.<device>` WS surface as a gate
+/// continuation but carries an even MORE minimal payload (no repos, no gate id,
+/// no worktree) — see [`ConditionCheckPayload`]. Routed by this `source` value
+/// into [`dispatch_condition_check`] BEFORE the gate/`LaunchPayload` parses.
+const CONDITION_CHECK_SOURCE: &str = "condition_check";
+
+/// Minimal condition-check spawn payload published by coord to
+/// `events.agent.spawn_requested.<device>`.
+///
+/// A condition check does NOT edit code — it drives the UI Bridge to verify a set
+/// of UI conditions at `target_url` and curls the outcome back to coord. So,
+/// unlike [`GateContinuationPayload`], it carries no `repos`, no worktree, no
+/// gate id and needs no coord ack handshake: the operator-visible terminal spawn
+/// is the whole contract. `initial_prompt` already contains the full UI Bridge
+/// instructions and the report-back curl (coord composes it).
+///
+/// A `source` of `"condition_check"` is the wire discriminator that routes a
+/// frame into [`dispatch_condition_check`] instead of the gate / `LaunchPayload`
+/// arms.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConditionCheckPayload {
+    /// The coord run id this check belongs to (used for the terminal title and
+    /// correlation logging). A UUID string.
+    pub run_id: String,
+    /// Explicit target device (defensive). Coord's WS pattern filter is already
+    /// device-scoped, so this is usually redundant; when present and it does not
+    /// match this runner's device id the frame is ignored. `Option` because a
+    /// coord that relies solely on the WS filter may omit it.
+    #[serde(default)]
+    pub target_device_id: Option<String>,
+    /// The URL whose UI conditions are being checked. Informational here (the
+    /// prompt already embeds it); surfaced in logs for correlation.
+    pub target_url: String,
+    /// The full prompt to run in the spawned session — already contains the UI
+    /// Bridge instructions and the report-back curl.
+    pub initial_prompt: String,
+    /// How to surface the session. Defaults to [`Presentation::Terminal`] when
+    /// coord omits the field. A condition check is inherently operator-visible,
+    /// so this handler always spawns a visible terminal; the field is carried for
+    /// wire-compat and logged.
+    #[serde(default)]
+    pub presentation: Presentation,
+    /// Wire discriminator. Always `"condition_check"` for this shape; the arm
+    /// only deserializes a frame here after confirming this value.
+    #[serde(default)]
+    pub source: String,
+}
+
 /// Typed spawn lifecycle phase coord keys an outcome to. The runner emits ONLY
 /// phases it can observe from its own subprocess bookkeeping — never
 /// `subagent_resolved`, which lives inside `claude` and the runner cannot see.
@@ -712,7 +764,21 @@ async fn handle_message(txt: &str, device_id: uuid::Uuid) -> anyhow::Result<()> 
             // arm FIRST; only fall back to the `LaunchPayload` parse for the
             // agent-spawn source. This is the fix for the 2026-06-03
             // "dispatched but never consumed" drop.
-            if envelope_is_gate_continuation(&value) {
+            if envelope_is_condition_check(&value) {
+                // Condition check: coord dispatched an AI session to verify UI
+                // conditions via the UI Bridge and report back. Spawn an
+                // operator-visible terminal — parallel to gate_continuation but
+                // with no worktree / gate ack (there is no gate). Routed FIRST by
+                // its `source` discriminator; the three spawn shapes are mutually
+                // exclusive.
+                match parse_condition_check_payload(&value) {
+                    Some(payload) => dispatch_condition_check(payload, device_id),
+                    None => warn!(
+                        "agent_runtime: condition-check envelope on {channel} had no \
+                         parseable payload/body"
+                    ),
+                }
+            } else if envelope_is_gate_continuation(&value) {
                 match parse_gate_continuation_payload(&value) {
                     Some(payload) => dispatch_gate_continuation(payload, device_id),
                     None => warn!(
@@ -815,6 +881,30 @@ fn envelope_is_gate_continuation(envelope: &serde_json::Value) -> bool {
 fn parse_gate_continuation_payload(
     envelope: &serde_json::Value,
 ) -> Option<GateContinuationPayload> {
+    let inner = envelope_inner_value(envelope)?;
+    serde_json::from_value(inner).ok()
+}
+
+/// Does this spawn-request envelope carry the condition-check discriminator
+/// (`source == "condition_check"`)? Routes a frame into the dedicated
+/// condition-check arm BEFORE the gate / full-`LaunchPayload` parses — the three
+/// shapes are mutually exclusive by `source`. Mirrors
+/// [`envelope_is_gate_continuation`].
+fn envelope_is_condition_check(envelope: &serde_json::Value) -> bool {
+    envelope_inner_value(envelope)
+        .and_then(|v| {
+            v.get("source")
+                .and_then(|s| s.as_str())
+                .map(|s| s == CONDITION_CHECK_SOURCE)
+        })
+        .unwrap_or(false)
+}
+
+/// Extract a [`ConditionCheckPayload`] from a coord `/ws` envelope. Mirrors
+/// [`parse_gate_continuation_payload`]'s string-or-object inner handling.
+/// Returns `None` if the inner JSON does not deserialize into the condition-check
+/// shape.
+fn parse_condition_check_payload(envelope: &serde_json::Value) -> Option<ConditionCheckPayload> {
     let inner = envelope_inner_value(envelope)?;
     serde_json::from_value(inner).ok()
 }
@@ -2469,6 +2559,211 @@ async fn run_continuation_terminal(
             .await;
             Err(anyhow::anyhow!(e))
         }
+    }
+}
+
+/// Dispatch a condition-check spawn frame (coord `source: "condition_check"`).
+///
+/// Parallel to [`dispatch_gate_continuation`] but deliberately simpler: a
+/// condition check has NO gate/dispatch id, so there is no in-process dedupe,
+/// no coord consume claim, and no outcome ack — the live WS publish plus the
+/// visible terminal spawn IS the whole contract. Spawns the terminal on a
+/// detached task so a slow spawn never blocks the WS pump.
+fn dispatch_condition_check(payload: ConditionCheckPayload, device_id: uuid::Uuid) {
+    info!(
+        "agent_runtime: condition-check received run_id={} target_url={} presentation={:?} \
+         target_device_id={:?}",
+        payload.run_id, payload.target_url, payload.presentation, payload.target_device_id,
+    );
+    let run_id = payload.run_id.clone();
+    tokio::spawn(async move {
+        if let Err(e) = run_condition_check_terminal(payload, device_id).await {
+            error!("agent_runtime: run_condition_check_terminal (run_id={run_id}) failed: {e:#}");
+        }
+    });
+}
+
+/// Run a condition check as a VISIBLE terminal session.
+///
+/// Mirrors [`run_continuation_terminal`] — opens a docked, operator-visible
+/// terminal whose PTY child IS the `claude` CLI launched with the condition
+/// prompt as a positional argv (interactive, NOT `--print`) — but drops the
+/// gate-specific machinery a condition check does not need:
+///
+/// - **No worktree isolation.** A condition check drives the UI Bridge and curls
+///   a report back; it does not edit code, so it runs from `QONTINUI_ROOT` with
+///   no `IsolatedEditContext` / `--add-dir` and no `.mcp.json`/fleet-command
+///   provisioning (which would write into the shared canonical checkout).
+/// - **No coord ack.** There is no gate/dispatch id, so no consume claim and no
+///   outcome POST — the WS publish + spawn is the contract.
+/// - **Host git identity.** No autonomous-agent git author is injected (no
+///   commits happen), so the PTY keeps the ambient host identity.
+///
+/// The account-selection fail-loud posture IS kept from the gate path: without a
+/// credential-valid account the spawned `claude` would die instantly with a 401,
+/// so we abort with an actionable reason instead of leaving a dead pane.
+async fn run_condition_check_terminal(
+    payload: ConditionCheckPayload,
+    device_id: uuid::Uuid,
+) -> anyhow::Result<()> {
+    use std::sync::Arc;
+
+    // Defensive device targeting. Coord's WS pattern filter is already
+    // device-scoped, so this is usually redundant; honor an explicit mismatch.
+    // An absent or unparseable id proceeds (the WS filter already gated delivery).
+    if let Some(target) = payload.target_device_id.as_deref() {
+        match uuid::Uuid::parse_str(target) {
+            Ok(t) if t != device_id => {
+                debug!(
+                    "agent_runtime: condition-check target_device_id={t} != local {device_id}; \
+                     ignoring"
+                );
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(_) => debug!(
+                "agent_runtime: condition-check target_device_id={target} unparseable; proceeding \
+                 (device-scoped WS filter already gated delivery)"
+            ),
+        }
+    }
+
+    // A condition check is inherently operator-visible; there is no headless
+    // variant. Log if coord ever asks for headless, then spawn a terminal anyway.
+    if payload.presentation != Presentation::Terminal {
+        debug!(
+            "agent_runtime: condition-check requested presentation={:?}; a condition check has no \
+             headless surface — spawning a visible terminal",
+            payload.presentation
+        );
+    }
+
+    // Reach the managed Tauri state via the process-global AppHandle. No webview
+    // runtime (headless/unit-test) → cannot open a visible terminal.
+    let app = match crate::tauri_app_handle::current() {
+        Some(a) => a,
+        None => {
+            let reason = "no Tauri AppHandle (runner has no webview runtime) — \
+                          cannot open a visible condition-check terminal";
+            warn!("agent_runtime: condition-check: {reason}");
+            return Err(anyhow::anyhow!(reason));
+        }
+    };
+
+    use tauri::Manager;
+    let terminal_manager = match app.try_state::<Arc<crate::terminal::TerminalManager>>() {
+        Some(s) => s.inner().clone(),
+        None => {
+            let reason = "TerminalManager state not managed — cannot create terminal session";
+            warn!("agent_runtime: condition-check: {reason}");
+            return Err(anyhow::anyhow!(reason));
+        }
+    };
+    let session_registry = match app.try_state::<Arc<crate::session::SessionRegistry>>() {
+        Some(s) => s.inner().clone(),
+        None => {
+            let reason = "SessionRegistry state not managed — cannot register terminal session";
+            warn!("agent_runtime: condition-check: {reason}");
+            return Err(anyhow::anyhow!(reason));
+        }
+    };
+
+    // Title from a short run-id prefix: "Condition check <8 chars>".
+    let run_id_short: String = payload.run_id.chars().take(8).collect();
+    let title = format!("Condition check {run_id_short}");
+
+    // A condition check does not edit code, so no worktree isolation — run from
+    // QONTINUI_ROOT. We intentionally do NOT provision `.mcp.json`/fleet commands
+    // here (the gate path writes those into its per-continuation worktree; doing
+    // so against the shared canonical root would clobber the operator's files).
+    let workdir = qontinui_root_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .ok_or_else(|| anyhow::anyhow!("condition-check: no QONTINUI_ROOT resolved"))?;
+
+    // Resolve the SAME `claude` binary the gate path uses, pinned session id, and
+    // interactive positional-prompt argv (no `--add-dir`: no sibling worktrees).
+    let claude_bin = claude_bin_path();
+    let pinned_session_id = uuid::Uuid::new_v4().to_string();
+    let command = Some(build_continuation_claude_command(
+        claude_bin,
+        &pinned_session_id,
+        Vec::new(),
+        payload.initial_prompt.clone(),
+    ));
+
+    // Account selection (fail-loud) — identical posture to the gate path so the
+    // spawned `claude` never dies instantly under a quota-exhausted default.
+    let _ = tokio::task::spawn_blocking(crate::ai_provider::pick_best_account).await;
+    let selected_config_dir = {
+        let ai = crate::settings::get_ai_settings();
+        crate::ai_provider::get_effective_config_dir(&ai.claude_cli)
+    };
+    if selected_config_dir.is_none()
+        && !crate::ai_provider::oauth_refresh::default_location_has_valid_credentials()
+    {
+        let instance = crate::instance::instance_name().unwrap_or_else(|| "primary".to_string());
+        let reason = format!(
+            "no authenticated Claude account on this runner — run /login (instance={instance})"
+        );
+        warn!("agent_runtime: condition-check aborted — {reason}");
+        return Err(anyhow::anyhow!(reason));
+    }
+
+    // Spread across non-full pages (same picker + ceiling as the gate path).
+    let counts: Vec<(String, usize)> = {
+        let mut per_page: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for info in terminal_manager.list() {
+            *per_page.entry(info.page_id).or_insert(0) += 1;
+        }
+        per_page.into_iter().collect()
+    };
+    let target_page = pick_continuation_page(&counts, CONTINUATION_PAGE_ZONE_CEILING, || {
+        uuid::Uuid::new_v4().to_string()
+    });
+
+    let capture_hint = Some(crate::commands::terminal::SessionCaptureHint {
+        config_dir: selected_config_dir,
+        working_dir: workdir.clone(),
+        title: title.clone(),
+        page_id: Some(target_page.clone()),
+        // Matches the `--session-id` in the spawn argv → synchronous record.
+        claude_session_id: Some(pinned_session_id),
+        zone_index: None,
+        // A condition check commits nothing → keep the ambient host git identity.
+        inject_agent_git_identity: false,
+    });
+
+    let result = crate::commands::terminal::create_terminal_session_backend(
+        &terminal_manager,
+        &session_registry,
+        app.clone(),
+        title,
+        workdir,
+        None, // plan_slug — a condition check is not plan-scoped
+        None, // correlation_topic
+        None, // intent_repo — no repo edited
+        command,
+        None, // isolated_ctx — no worktree acquired
+        capture_hint,
+        Some(target_page),
+    );
+
+    match result {
+        Ok((terminal_id, coord_session_id)) => {
+            info!(
+                "agent_runtime: condition-check terminal session created terminal_id={terminal_id} \
+                 coord_session={coord_session_id:?} run_id={}",
+                payload.run_id
+            );
+            // Surface it: switch the main view to the Terminal panel + select the
+            // tab (scoped to the MAIN window, same as the gate path).
+            emit_terminal_focus_request(&app, &terminal_id);
+            Ok(())
+        }
+        Err(e) => Err(anyhow::anyhow!(
+            "condition-check terminal session create failed: {e}"
+        )),
     }
 }
 
