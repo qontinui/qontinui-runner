@@ -343,13 +343,11 @@ pub async fn spawn_headless(
             request.app_id, session_id
         );
         // Kill the child process since it failed to connect
-        let _ = child.id().and_then(|_| {
-            Some({
-                let _ = std::process::Command::new("taskkill")
-                    .args(&["/PID", &pid.to_string(), "/F"])
-                    .output();
-            })
-        });
+        if child.id().is_some() {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/F"])
+                .output();
+        }
 
         return Err((
             StatusCode::GATEWAY_TIMEOUT,
