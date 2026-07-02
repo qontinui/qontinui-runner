@@ -391,6 +391,7 @@ const VALID_TAB_IDS: &[&str] = &[
     "wrappers",
     "productivity",
     "regression",
+    "helper-tasks",
 ];
 
 // ============================================================================

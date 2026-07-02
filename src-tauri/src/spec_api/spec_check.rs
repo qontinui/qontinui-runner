@@ -26,7 +26,8 @@ use crate::spec_api::storage::{self, RUNNER_APP_ID};
 use qontinui_spec_check as spec_check; // crate name = "qontinui-spec-check"
 use qontinui_types::spec_api_events::SpecApiEvent;
 use qontinui_types::spec_check::{
-    MatchOutcome, PolicyEvaluation, SpecCheckPolicy, SpecCheckResult, ThresholdConfig,
+    ClassificationStatus, MatchOutcome, PolicyEvaluation, SpecCheckPolicy, SpecCheckResult,
+    ThresholdConfig,
 };
 use qontinui_types::ui_bridge::UIBridgeSnapshot; // capital UI; lives in ui_bridge
 
@@ -717,6 +718,20 @@ pub async fn post_spec_check(
         req.page_id, snapshot_id, result.summary.match_outcome, result.summary.overall_match_rate, result.classification
     );
 
+    // Helper Task Queue (plan 2026-06-29, Phase 1.3 Part B): a Yellow
+    // (partial-match) classification is exactly the ambiguous band a human
+    // spot-check resolves cheaply — Green needs no help and Red is already a
+    // hard failure. Owner-gated (settings.helper_tasks, default OFF) inside
+    // maybe_emit_spot_check; best-effort and never affects the response.
+    if result.classification == ClassificationStatus::Yellow {
+        crate::helper_tasks::maybe_emit_spot_check(
+            &state.app_handle,
+            &req.app_id,
+            &req.page_id,
+            f64::from(result.summary.overall_match_rate),
+        );
+    }
+
     // Plan 06: emit Completed after the evaluator returns. The full result
     // body stays out of the broadcast (subscribers join by snapshot_id).
     // Stream D: emit on the request's `app_id` channel.
@@ -970,6 +985,23 @@ pub async fn post_spec_check_batch(
     }
     // Stable order by input pageId for determinism.
     results.sort_by(|a, b| a.page_id.cmp(&b.page_id));
+
+    // Helper Task Queue (Phase 1.3 Part B) — same Yellow-band hook as the
+    // single-shot handler, applied per evaluated page. Owner-gated + best-effort
+    // inside maybe_emit_spot_check. (The NDJSON streaming path is not hooked —
+    // its unfold closure has no handle to Tauri state.)
+    for r in results.iter().filter(|r| r.status == "ok") {
+        if let Some(res) = r.result.as_ref() {
+            if res.classification == ClassificationStatus::Yellow {
+                crate::helper_tasks::maybe_emit_spot_check(
+                    &state.app_handle,
+                    &req.app_id,
+                    &r.page_id,
+                    f64::from(res.summary.overall_match_rate),
+                );
+            }
+        }
+    }
 
     // Plan 06: emit Completed once after all per-element evaluations have
     // landed. The `eval_error_count` derives from input vs successfully-evaluated.

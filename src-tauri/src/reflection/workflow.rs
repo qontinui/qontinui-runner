@@ -454,7 +454,16 @@ pub fn build_reflection_config(
 ) -> LoopConfig {
     LoopConfig {
         max_iterations: 3,
-        base_prompt: build_agentic_prompt(source_workflow_name),
+        base_prompt: {
+            // Helper Task Queue (plan 2026-06-29, Phase 1.3 Part D): append
+            // the collected human helper verdicts as a small additive section.
+            // None (the common no-helpers case) leaves the prompt unchanged.
+            let mut prompt = build_agentic_prompt(source_workflow_name);
+            if let Some(section) = crate::helper_tasks::reflection_context_section() {
+                prompt.push_str(&section);
+            }
+            prompt
+        },
         workflow_name: workflow_name.to_string(),
         workflow_id: format!("reflection-{}", execution_id),
         execution_id: execution_id.to_string(),
@@ -1083,7 +1092,15 @@ pub fn build_project_reflection_config(
 ) -> LoopConfig {
     LoopConfig {
         max_iterations: 3, // Increased from 2: AI verification step needs room to retry
-        base_prompt: build_project_agentic_prompt(source_workflow_name),
+        base_prompt: {
+            // Helper Task Queue (Phase 1.3 Part D) — same additive helper-verdict
+            // section as build_reflection_config.
+            let mut prompt = build_project_agentic_prompt(source_workflow_name);
+            if let Some(section) = crate::helper_tasks::reflection_context_section() {
+                prompt.push_str(&section);
+            }
+            prompt
+        },
         workflow_name: workflow_name.to_string(),
         workflow_id: format!("project-reflection-{}", execution_id),
         execution_id: execution_id.to_string(),
@@ -1505,7 +1522,16 @@ pub fn build_ui_bridge_reflection_config(
 ) -> LoopConfig {
     LoopConfig {
         max_iterations: 5,
-        base_prompt: build_ui_bridge_agentic_prompt(source_workflow_name),
+        base_prompt: {
+            // Helper Task Queue (Phase 1.3 Part D) — helper spot-check verdicts
+            // are page-visual judgments, the most relevant signal for the
+            // UI-bridge reflection variant.
+            let mut prompt = build_ui_bridge_agentic_prompt(source_workflow_name);
+            if let Some(section) = crate::helper_tasks::reflection_context_section() {
+                prompt.push_str(&section);
+            }
+            prompt
+        },
         workflow_name: workflow_name.to_string(),
         workflow_id: format!("ui-bridge-reflection-{}", execution_id),
         execution_id: execution_id.to_string(),

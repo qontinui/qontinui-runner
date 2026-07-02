@@ -255,6 +255,20 @@ impl SettingsField for crate::step_output::script_emitter::ScriptedOutputSetting
     }
 }
 
+impl SettingsField for crate::settings::HelperTasksSettings {
+    fn get_from(settings: &Settings) -> &Self {
+        &settings.helper_tasks
+    }
+
+    fn set_in(settings: &mut Settings, value: Self) {
+        settings.helper_tasks = value;
+    }
+
+    fn field_name() -> &'static str {
+        "helper_tasks"
+    }
+}
+
 // ============================================================================
 // Generic Settings Functions
 // ============================================================================

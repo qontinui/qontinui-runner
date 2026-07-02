@@ -192,6 +192,7 @@ pub mod file_browser; // Safe read-only filesystem browsing for mobile
 pub mod findings;
 pub mod flow; // Flow designer commands
 pub mod global_log_sources; // Global log source management
+pub mod helper_tasks; // Helper Task Queue settings + collected answers (plan 2026-06-29)
 pub mod hooks;
 pub mod instances; // Runner instance management (dev feature)
 pub mod interaction;

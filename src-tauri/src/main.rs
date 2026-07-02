@@ -94,6 +94,7 @@ mod blind_spots;
 mod graphql;
 mod health_monitor;
 mod heartbeat;
+mod helper_tasks;
 mod install_effects_producer;
 mod instance;
 mod instance_health;
@@ -1456,6 +1457,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::global_log_sources::set_log_source_ai_selection_mode,
             commands::global_log_sources::update_global_log_source,
             commands::global_log_sources::update_global_log_source_profile,
+            commands::helper_tasks::get_helper_answers,
+            commands::helper_tasks::get_helper_tasks_settings,
+            commands::helper_tasks::save_helper_tasks_settings,
             commands::hooks::create_hook,
             commands::hooks::delete_hook,
             commands::hooks::get_all_hooks,
@@ -2202,6 +2206,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         uuid::Uuid::parse_str(s).ok()
                     })
                     .unwrap_or_else(uuid::Uuid::new_v4);
+                // Helper Task Queue (plan 2026-06-29, Phase 1.3) — the
+                // helper-task registrar shares the SAME outbox (and thus the
+                // same CoordSync drain) as the AI-session registrar. Managed
+                // as Tauri state so the spec-check yellow-band hook
+                // (`helper_tasks::maybe_emit_spot_check`) can reach it.
+                let helper_task_registrar =
+                    helper_tasks::HelperTaskRegistrar::new(registrar_outbox.clone(), machine_id);
+                app.manage(helper_task_registrar);
                 // Session-automation Phase 0 (R1–R6) — register authenticated
                 // AI sessions into coord.sessions with their task_run_id, so
                 // they are visible + addressable + correctly stale to coord.

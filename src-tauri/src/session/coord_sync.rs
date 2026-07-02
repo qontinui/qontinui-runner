@@ -644,6 +644,18 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 .send()
                 .await
         }
+        "helper_task_created" => {
+            // Helper Task Queue (plan 2026-06-29-helper-task-queue, Phase 1.3).
+            // The payload is the full CreateHelperTaskRequest body recorded by
+            // HelperTaskRegistrar — forward it verbatim. Auth is the device
+            // JWT (attach_device_auth), same as every other coord data-plane
+            // call. A 503 (helper-task tables not migrated yet) is handled
+            // below: dropped with a warn, never retried.
+            let url = format!("{base}/coord/helper-tasks");
+            crate::auth::attach_device_auth(inner.http.post(&url).json(&rec.payload))
+                .send()
+                .await
+        }
         "commit_report" => {
             // Commit ↔ session lineage push-report (plan
             // 2026-06-07-coord-commit-session-lineage.md, Population path 2).
@@ -685,6 +697,20 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                     let row = resp.json::<JsonValue>().await.ok();
                     return PushOutcome::Conflict { row };
                 }
+                return PushOutcome::Acked;
+            }
+            // Helper Task Queue: coord maps un-migrated helper-task tables to
+            // 503 ("feature not available yet"). Retrying can't help until the
+            // operator runs migrations, so drop the row with a warn instead of
+            // entering a backoff loop that would also stall every event queued
+            // behind it.
+            if kind == "helper_task_created" && status == StatusCode::SERVICE_UNAVAILABLE {
+                tracing::warn!(
+                    session = %rec.session_id,
+                    seq = rec.seq,
+                    "coord_sync: POST /coord/helper-tasks returned 503 (helper-task \
+                     tables not migrated) — dropping helper task event"
+                );
                 return PushOutcome::Acked;
             }
             let detail = resp.text().await.unwrap_or_default();

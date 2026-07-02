@@ -1417,6 +1417,42 @@ impl From<&MemoryConsolidationSettings> for crate::memory::consolidation::Consol
     }
 }
 
+// ============================================================================
+// Helper Task Queue Settings (plan 2026-06-29-helper-task-queue, Phase 1.3)
+// ============================================================================
+
+/// Owner controls for the Helper Task Queue emit surface.
+///
+/// When `emit_enabled` is true, runner subsystems (currently the yellow-band
+/// spec-check hook in `spec_api::spec_check`) emit human-judgment micro-tasks
+/// to coord's helper-task broker via `helper_tasks::HelperTaskRegistrar`.
+/// `emit_kinds` scopes which task kinds may be emitted — Phase 1 ships only
+/// `"spot_check"`. Default is OFF so no helper tasks leave the runner until
+/// the owner opts in via Settings (Helper Tasks page → Config tab).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HelperTasksSettings {
+    /// Master emit toggle. Default FALSE — opt-in only.
+    #[serde(default)]
+    pub emit_enabled: bool,
+    /// Task kinds the runner may emit (snake_case wire values, e.g.
+    /// `"spot_check"`). Emit sites check membership before emitting.
+    #[serde(default = "default_helper_task_emit_kinds")]
+    pub emit_kinds: Vec<String>,
+}
+
+fn default_helper_task_emit_kinds() -> Vec<String> {
+    vec!["spot_check".to_string()]
+}
+
+impl Default for HelperTasksSettings {
+    fn default() -> Self {
+        Self {
+            emit_enabled: false,
+            emit_kinds: default_helper_task_emit_kinds(),
+        }
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1574,6 +1610,10 @@ pub struct Settings {
     /// Tier-2 sign-in, cleared on sign-out. `local_user_id` stays alongside.
     #[serde(default)]
     pub qontinui_user_id: Option<String>,
+    /// Helper Task Queue owner controls (emit toggle + allowed kinds).
+    /// Default OFF — see `HelperTasksSettings`.
+    #[serde(default)]
+    pub helper_tasks: HelperTasksSettings,
 }
 
 // ============================================================================
@@ -1810,8 +1850,11 @@ fn default_app_mode() -> String {
     "advanced".to_string()
 }
 
-/// Get the settings file path in the app data directory
-fn get_settings_path() -> Result<PathBuf, String> {
+/// Resolve (and create if missing) the app config directory that holds
+/// `settings.json` and small sibling state files (e.g. the helper-answers
+/// poll cursor). Honors the per-instance `QONTINUI_CONFIG_DIR` override the
+/// supervisor sets for spawned runners.
+pub(crate) fn get_config_dir() -> Result<PathBuf, String> {
     let app_data_dir = std::env::var("QONTINUI_CONFIG_DIR")
         .ok()
         .filter(|s| !s.is_empty())
@@ -1825,7 +1868,12 @@ fn get_settings_path() -> Result<PathBuf, String> {
             .map_err(|e| format!("Failed to create app data directory: {}", e))?;
     }
 
-    Ok(app_data_dir.join(SETTINGS_FILE))
+    Ok(app_data_dir)
+}
+
+/// Get the settings file path in the app data directory
+fn get_settings_path() -> Result<PathBuf, String> {
+    Ok(get_config_dir()?.join(SETTINGS_FILE))
 }
 
 /// Load settings from file
@@ -2534,6 +2582,20 @@ pub fn save_saved_projects(projects: Vec<SavedProject>) -> Result<(), String> {
     let mut settings = load_settings();
     settings.saved_projects = projects;
     save_settings(&settings)
+}
+
+// ============================================================================
+// Helper Task Queue accessors
+// ============================================================================
+
+/// Get the current Helper Task Queue settings.
+pub fn get_helper_tasks_settings() -> HelperTasksSettings {
+    crate::config_facade::get_setting::<HelperTasksSettings>()
+}
+
+/// Save Helper Task Queue settings.
+pub fn save_helper_tasks_settings(helper_tasks: HelperTasksSettings) -> Result<(), String> {
+    crate::config_facade::save_setting(helper_tasks)
 }
 
 // ============================================================================
