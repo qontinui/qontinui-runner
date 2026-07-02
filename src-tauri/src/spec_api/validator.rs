@@ -300,7 +300,8 @@ async fn fetch_live_snapshot(
                     app_id_found = Some(conn.app_info.app_id.clone());
                     debug!(
                         "fetch_live_snapshot: SDK connected on retry {} for app_id={}",
-                        retry, app_id_found.as_ref().unwrap()
+                        retry,
+                        app_id_found.as_ref().unwrap()
                     );
                     break;
                 }

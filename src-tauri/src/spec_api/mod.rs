@@ -114,10 +114,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/apps/{app_id}/spec/proposals/sweep-pending",
             post(proposals::post_sweep_pending),
         )
-        .route(
-            "/spec/proposals/metrics",
-            get(proposals::get_metrics),
-        );
+        .route("/spec/proposals/metrics", get(proposals::get_metrics));
 
     r
 }

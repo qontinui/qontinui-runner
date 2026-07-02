@@ -99,7 +99,10 @@ mod tests {
         let cfg = ThresholdConfig::new(0.5, 0.8).unwrap();
         assert_eq!(cfg.classify_match_rate(0.5), ClassificationStatus::Yellow);
         assert_eq!(cfg.classify_match_rate(0.6), ClassificationStatus::Yellow);
-        assert_eq!(cfg.classify_match_rate(0.79999), ClassificationStatus::Yellow);
+        assert_eq!(
+            cfg.classify_match_rate(0.79999),
+            ClassificationStatus::Yellow
+        );
     }
 
     #[test]

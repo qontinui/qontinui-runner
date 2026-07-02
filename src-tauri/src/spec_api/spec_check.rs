@@ -281,10 +281,7 @@ fn apply_thresholds_to_result(
             match ThresholdConfig::new(app.red_threshold, app.yellow_threshold) {
                 Ok(tc) => tc,
                 Err(e) => {
-                    warn!(
-                        "app thresholds validation failed; using defaults: {}",
-                        e
-                    );
+                    warn!("app thresholds validation failed; using defaults: {}", e);
                     ThresholdConfig::default()
                 }
             }
@@ -911,7 +908,10 @@ pub async fn post_spec_check_batch(
     let app_option = match state.app_state.pg_db.get_app(&req.app_id).await {
         Ok(app) => app,
         Err(e) => {
-            warn!("failed to fetch app {} for batch threshold application: {}", req.app_id, e);
+            warn!(
+                "failed to fetch app {} for batch threshold application: {}",
+                req.app_id, e
+            );
             None
         }
     };
