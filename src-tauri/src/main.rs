@@ -63,6 +63,7 @@ mod display;
 mod doctor;
 mod dom_capture;
 mod drain;
+mod embedded_pg;
 mod error;
 mod error_monitor; // Must be declared before error (error re-exports ErrorSeverity from error_monitor)
 mod event_system;
@@ -461,12 +462,76 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 } else {
-                    error!(
-                        "PostgreSQL connection failed: {}. Ensure docker-compose PG is running \
-                         (or set QONTINUI_ALLOW_NO_DB=1 to boot DB-less in degraded mode).",
+                    // No external PostgreSQL reachable. If the DB was never
+                    // explicitly configured (the unconfigured end-user case: the
+                    // resolved URL is the hardcoded localhost default), start a
+                    // private BUNDLED PostgreSQL under the app data dir instead
+                    // of aborting before the window is ever shown — the root fix
+                    // for "installs but doesn't open" on machines with no DB.
+                    //
+                    // An explicitly configured URL (a profile or
+                    // RUNNER_DATABASE_URL) is NOT overridden: the operator meant
+                    // that specific database, and silently using a fresh empty
+                    // one would hide the misconfiguration. `QONTINUI_DISABLE_EMBEDDED_PG`
+                    // forces the legacy behaviour.
+                    let explicitly_configured = profile.source != "legacy-env"
+                        || std::env::var("RUNNER_DATABASE_URL").is_ok();
+                    let embedded_disabled = std::env::var("QONTINUI_DISABLE_EMBEDDED_PG")
+                        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"))
+                        .unwrap_or(false);
+
+                    if explicitly_configured || embedded_disabled {
+                        error!(
+                            "PostgreSQL connection failed: {}. The database is explicitly \
+                             configured but unreachable — start it, or unset the config to use \
+                             the bundled embedded PostgreSQL.",
+                            e
+                        );
+                        panic!("PostgreSQL connection required — {}", e);
+                    }
+
+                    warn!(
+                        "No external PostgreSQL reachable ({}). Starting the bundled embedded \
+                         PostgreSQL (standalone mode).",
                         e
                     );
-                    panic!("PostgreSQL connection required — {}", e);
+                    let data_root = dirs::data_local_dir()
+                        .unwrap_or_else(std::env::temp_dir)
+                        .join("com.qontinui.runner")
+                        .join("embedded-pg");
+
+                    let degrade = |reason: String| {
+                        error!("{reason} Booting degraded — DB-backed routes return 503.");
+                        let pg = Arc::new(
+                            crate::database::pg::PgDb::new_degraded(&pg_url)
+                                .expect("degraded PG pool construction failed"),
+                        );
+                        crate::database::pg::PgDb::set_global(pg.clone());
+                        crate::database::pg::set_pg_available(false);
+                        pg
+                    };
+
+                    match rt.block_on(crate::embedded_pg::bootstrap(data_root, "qontinui_db")) {
+                        Ok(managed) => {
+                            let url = managed.url.clone();
+                            crate::embedded_pg::store_handle(managed.handle);
+                            match rt.block_on(crate::database::pg::PgDb::new(&url)) {
+                                Ok(pg) => {
+                                    info!("Connected to embedded PostgreSQL (standalone mode)");
+                                    let pg = Arc::new(pg);
+                                    crate::database::pg::PgDb::set_global(pg.clone());
+                                    crate::database::pg::set_pg_available(true);
+                                    pg
+                                }
+                                Err(conn_err) => degrade(format!(
+                                    "Embedded PostgreSQL started but connection failed: {conn_err}."
+                                )),
+                            }
+                        }
+                        Err(boot_err) => degrade(format!(
+                            "Failed to start bundled embedded PostgreSQL: {boot_err}."
+                        )),
+                    }
                 }
             }
         }
@@ -4053,6 +4118,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // a programmatic `app.exit(0)` that didn't route through the main
             // window's close handler), so pop-out teardown preserves records.
             commands::terminal_windows::mark_app_quitting();
+            // Stop the bundled embedded PostgreSQL (if we started one) so no
+            // orphaned `postgres` process lingers holding the data dir / port.
+            // No-op when running against an external DB.
+            crate::embedded_pg::stop_on_exit();
         }
     });
 

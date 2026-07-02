@@ -34,6 +34,12 @@
 
 use postgresql_embedded::{PostgreSQL, Settings};
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+
+/// Holds the running managed instance for the process lifetime so it is not
+/// dropped early (which would stop the server); stopped explicitly on exit via
+/// [`stop_on_exit`].
+static MANAGED_PG: OnceLock<Mutex<Option<PostgreSQL>>> = OnceLock::new();
 
 /// A running managed PostgreSQL instance plus the connection URL for the
 /// runner's database. Keep [`Self::handle`] alive for the whole process; call
@@ -97,10 +103,14 @@ pub async fn bootstrap(data_root: PathBuf, db_name: &str) -> Result<ManagedPg, S
         .await
         .map_err(|e| format!("embedded Postgres database_exists({db_name}) failed: {e}"))?;
     if !exists {
+        // Fresh cluster: create the database and apply the canonical schema
+        // once. An existing database is left untouched (the schema was applied
+        // on a prior launch).
         handle
             .create_database(db_name)
             .await
             .map_err(|e| format!("embedded Postgres create_database({db_name}) failed: {e}"))?;
+        apply_canonical_schema(&url).await?;
     }
 
     tracing::info!(
@@ -112,9 +122,86 @@ pub async fn bootstrap(data_root: PathBuf, db_name: &str) -> Result<ManagedPg, S
     Ok(ManagedPg { handle, url })
 }
 
-/// Stop a managed PostgreSQL instance on app exit. Best-effort: logs on
-/// failure rather than propagating (shutdown must not hang the app).
-pub async fn stop(mut handle: PostgreSQL) {
+/// Apply the bundled canonical schema to a freshly-created embedded database.
+///
+/// The schema (`schema.pg.sql.generated`, a `pg_dump`-style dump of the full
+/// 362-table canonical schema) is embedded at compile time. Two transforms make
+/// it apply to a **pgvector-free** Postgres:
+///
+///   1. `public.vector(N)` column types → `bytea`. The runner stores every
+///      embedding as `bytea` and computes cosine similarity in Rust
+///      (`database::embeddings`), and none of the six `vector` columns
+///      (in `project.domain_knowledge` / `execution_issues` /
+///      `project_embeddings`) are ever read or written as a vector by the
+///      runner — so `bytea` is behaviourally identical here and needs no
+///      extension.
+///   2. Drop the three `ivfflat`/`vector_cosine_ops` indexes on those columns
+///      (they require pgvector and only accelerate similarity queries the
+///      runner never issues).
+///
+/// Applied once, only when the database was just created.
+async fn apply_canonical_schema(url: &str) -> Result<(), String> {
+    const SCHEMA: &str = include_str!("../schema.pg.sql.generated");
+    let transformed: String = SCHEMA
+        .replace("public.vector(384)", "bytea")
+        .replace("public.vector(512)", "bytea")
+        .lines()
+        .filter(|l| !l.contains("ivfflat") && !l.contains("public.vector_cosine_ops"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
+        .await
+        .map_err(|e| format!("connect to embedded PG for schema apply failed: {e}"))?;
+    let conn_task = tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            tracing::warn!("embedded PG schema-apply connection closed with error: {e}");
+        }
+    });
+
+    let result = client
+        .batch_execute(&transformed)
+        .await
+        .map_err(|e| format!("applying canonical schema to embedded PG failed: {e}"));
+
+    drop(client); // closes the connection so the driver task can finish
+    let _ = conn_task.await;
+    result
+}
+
+/// Store the managed handle so it is kept alive for the process lifetime and
+/// can be stopped cleanly on exit. Call once, right after [`bootstrap`].
+pub fn store_handle(handle: PostgreSQL) {
+    let slot = MANAGED_PG.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = slot.lock() {
+        *guard = Some(handle);
+    }
+}
+
+/// Stop the managed PostgreSQL (if one was started) so no orphaned `postgres`
+/// process lingers. Call from the Tauri `RunEvent::Exit` hook. Best-effort and
+/// self-contained (uses its own short-lived runtime so it does not depend on
+/// any other runtime still being alive at shutdown).
+pub fn stop_on_exit() {
+    let Some(slot) = MANAGED_PG.get() else {
+        return;
+    };
+    let handle = slot.lock().ok().and_then(|mut g| g.take());
+    let Some(handle) = handle else {
+        return;
+    };
+    match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt.block_on(stop(handle)),
+        Err(e) => tracing::warn!("embedded Postgres stop skipped — runtime build failed: {e}"),
+    }
+}
+
+/// Stop a managed PostgreSQL instance. Best-effort: logs on failure rather than
+/// propagating (shutdown must not hang the app).
+async fn stop(mut handle: PostgreSQL) {
     if let Err(e) = handle.stop().await {
         tracing::warn!("embedded Postgres stop failed (non-fatal on exit): {e}");
     }
