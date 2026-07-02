@@ -490,12 +490,23 @@ const TICK_IDLE: Duration = Duration::from_secs(5);
 /// Max backoff after repeated transport errors.
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
+/// Bounded retry budget for a `helper_task_created` record. Helper tasks are
+/// BEST-EFFORT: they must never head-of-line-block session lifecycle events
+/// queued behind them, so a failing record is skipped (not batch-breaking)
+/// and Ack-dropped once its budget is spent.
+const HELPER_TASK_MAX_ATTEMPTS: u32 = 3;
+
 async fn run_drain_loop(inner: Arc<CoordSyncInner>) {
     tracing::info!(
         coord_url = %inner.coord_url,
         "coord_sync: drain loop starting"
     );
     let mut backoff = TICK_BUSY;
+    // Best-effort retry budget for helper_task_created records, keyed by
+    // (session_id, seq). In-memory by design: a restart resets the budget,
+    // which only re-grants retries — never duplicates (coord POST is the
+    // side effect, and an unacked record retries anyway).
+    let mut helper_task_attempts: HashMap<(Uuid, i64), u32> = HashMap::new();
     loop {
         let pending = match inner.outbox.pending() {
             Ok(p) => p,
@@ -518,12 +529,49 @@ async fn run_drain_loop(inner: Arc<CoordSyncInner>) {
 
         for rec in pending {
             match push_record(&inner, &rec).await {
-                PushOutcome::Acked => succeeded.push((rec.session_id, rec.seq)),
+                PushOutcome::Acked => {
+                    succeeded.push((rec.session_id, rec.seq));
+                    helper_task_attempts.remove(&(rec.session_id, rec.seq));
+                }
                 PushOutcome::Conflict { row } => {
                     succeeded.push((rec.session_id, rec.seq));
                     handle_conflict(&inner, &rec, row).await;
                 }
                 PushOutcome::Transport(e) => {
+                    // helper_task_created is BEST-EFFORT: it must never break
+                    // the batch (session lifecycle events queued behind it
+                    // would stall indefinitely). Skip it WITHOUT acking —
+                    // `OutboxWriter::ack` marks exact (session_id, seq) pairs,
+                    // so acking later records leaves this one pending — and
+                    // keep draining. Retried on subsequent ticks up to
+                    // HELPER_TASK_MAX_ATTEMPTS, then Ack-dropped with a warn.
+                    if rec.event_kind == SessionEventKind::HelperTaskCreated.as_str() {
+                        let key = (rec.session_id, rec.seq);
+                        let attempts = helper_task_attempts.entry(key).or_insert(0);
+                        *attempts += 1;
+                        if *attempts >= HELPER_TASK_MAX_ATTEMPTS {
+                            tracing::warn!(
+                                session = %rec.session_id,
+                                seq = rec.seq,
+                                error = %e,
+                                "coord_sync: helper task push failed {HELPER_TASK_MAX_ATTEMPTS} \
+                                 time(s) — dropping (best-effort)"
+                            );
+                            succeeded.push(key);
+                            helper_task_attempts.remove(&key);
+                        } else {
+                            tracing::warn!(
+                                session = %rec.session_id,
+                                seq = rec.seq,
+                                attempt = *attempts,
+                                error = %e,
+                                "coord_sync: helper task push failed — will retry \
+                                 (best-effort; does not block the batch)"
+                            );
+                            had_transport_error = true;
+                        }
+                        continue;
+                    }
                     tracing::warn!(
                         session = %rec.session_id,
                         seq = rec.seq,
@@ -551,6 +599,7 @@ async fn run_drain_loop(inner: Arc<CoordSyncInner>) {
                         "coord_sync: permanent failure — ACKing locally"
                     );
                     succeeded.push((rec.session_id, rec.seq));
+                    helper_task_attempts.remove(&(rec.session_id, rec.seq));
                 }
             }
         }
@@ -649,8 +698,10 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // The payload is the full CreateHelperTaskRequest body recorded by
             // HelperTaskRegistrar — forward it verbatim. Auth is the device
             // JWT (attach_device_auth), same as every other coord data-plane
-            // call. A 503 (helper-task tables not migrated yet) is handled
-            // below: dropped with a warn, never retried.
+            // call. Responses take the dedicated best-effort path in
+            // `helper_task_outcome` (201 provenance capture, the
+            // `helper_task_queue_unavailable` 503 drop, bounded retry for
+            // everything else).
             let url = format!("{base}/coord/helper-tasks");
             crate::auth::attach_device_auth(inner.http.post(&url).json(&rec.payload))
                 .send()
@@ -684,6 +735,9 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
 
     match result {
         Ok(resp) => {
+            if kind == "helper_task_created" {
+                return helper_task_outcome(rec, resp).await;
+            }
             let status = resp.status();
             if status.is_success() {
                 return PushOutcome::Acked;
@@ -699,20 +753,6 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 }
                 return PushOutcome::Acked;
             }
-            // Helper Task Queue: coord maps un-migrated helper-task tables to
-            // 503 ("feature not available yet"). Retrying can't help until the
-            // operator runs migrations, so drop the row with a warn instead of
-            // entering a backoff loop that would also stall every event queued
-            // behind it.
-            if kind == "helper_task_created" && status == StatusCode::SERVICE_UNAVAILABLE {
-                tracing::warn!(
-                    session = %rec.session_id,
-                    seq = rec.seq,
-                    "coord_sync: POST /coord/helper-tasks returned 503 (helper-task \
-                     tables not migrated) — dropping helper task event"
-                );
-                return PushOutcome::Acked;
-            }
             let detail = resp.text().await.unwrap_or_default();
             if status.is_client_error() {
                 return PushOutcome::PermanentFailure(format!("{status}: {detail}"));
@@ -722,6 +762,71 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
         }
         Err(e) => PushOutcome::Transport(format!("{e}")),
     }
+}
+
+/// Response handling for `helper_task_created` POSTs — best-effort posture.
+///
+/// - **2xx** — the 201 body is the created `HelperTask` (camelCase JSON with
+///   `id` / `appId` / `source.pageId`); its provenance is recorded into the
+///   persisted helper-task store so reflection verdict lines can name the
+///   page/app instead of an unactionable coord task UUID. The store is the
+///   `helper_tasks` module's process-global (`OnceLock`) store, so no state
+///   handle needs plumbing into the drain.
+/// - **503 with body `helper_task_queue_unavailable`** — coord's helper-task
+///   tables aren't migrated; retrying can't help until the operator runs
+///   migrations, so the record is Ack-dropped with a warn.
+/// - **any other 503 (ELB/deploy blip), 5xx** — `Transport`, which the drain
+///   loop maps to a bounded per-record retry that never breaks the batch.
+/// - **4xx** — `PermanentFailure` (Ack-drop), same as other kinds.
+async fn helper_task_outcome(rec: &OutboxRecord, resp: reqwest::Response) -> PushOutcome {
+    let status = resp.status();
+    if status.is_success() {
+        match resp.json::<JsonValue>().await {
+            Ok(body) => {
+                let task_id = body.get("id").and_then(JsonValue::as_str);
+                let app_id = body.get("appId").and_then(JsonValue::as_str);
+                let page_id = body
+                    .pointer("/source/pageId")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_string);
+                if let (Some(task_id), Some(app_id)) = (task_id, app_id) {
+                    crate::helper_tasks::record_task_metadata(task_id, app_id, page_id);
+                } else {
+                    tracing::debug!(
+                        session = %rec.session_id,
+                        seq = rec.seq,
+                        "coord_sync: helper-task 201 body missing id/appId — provenance skipped"
+                    );
+                }
+            }
+            Err(e) => tracing::debug!(
+                session = %rec.session_id,
+                seq = rec.seq,
+                error = %e,
+                "coord_sync: helper-task 201 body not parseable — provenance skipped"
+            ),
+        }
+        return PushOutcome::Acked;
+    }
+    let detail = resp.text().await.unwrap_or_default();
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        if detail.contains("helper_task_queue_unavailable") {
+            tracing::warn!(
+                session = %rec.session_id,
+                seq = rec.seq,
+                "coord_sync: POST /coord/helper-tasks returned 503 \
+                 helper_task_queue_unavailable (tables not migrated) — dropping \
+                 helper task event"
+            );
+            return PushOutcome::Acked;
+        }
+        // Transient 503 (ELB / deploy) — bounded-retry, don't drop the task.
+        return PushOutcome::Transport(format!("{status}: {detail}"));
+    }
+    if status.is_client_error() {
+        return PushOutcome::PermanentFailure(format!("{status}: {detail}"));
+    }
+    PushOutcome::Transport(format!("{status}: {detail}"))
 }
 
 /// Reassemble a `POST /sessions` body from the outbox payload + the row's

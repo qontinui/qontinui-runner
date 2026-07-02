@@ -6,8 +6,10 @@
 //! shared [`OutboxWriter`] the `CoordSync` drain loop reads. Emitting a task
 //! is therefore one durable local write; the drain maps
 //! [`SessionEventKind::HelperTaskCreated`] to `POST /coord/helper-tasks` with
-//! the device JWT and the existing retry posture (a coord 503 — helper-task
-//! tables not migrated — is dropped with a warn, never a retry loop).
+//! the device JWT under a best-effort posture: transient failures get a
+//! bounded per-record retry that never blocks session events queued behind
+//! them, and a coord `helper_task_queue_unavailable` 503 (helper-task tables
+//! not migrated) is dropped with a warn, never a retry loop.
 
 use std::sync::Arc;
 
@@ -54,8 +56,11 @@ impl HelperTaskRegistrar {
 
     /// Emit a `spot_check` helper task for `app_id`. Gated on the owner
     /// setting (`settings.helper_tasks`): emit must be enabled AND
-    /// `"spot_check"` must be in `emit_kinds`. Returns `true` when a task was
-    /// recorded on the outbox. Best-effort throughout — a disabled gate or an
+    /// `"spot_check"` must be in `emit_kinds`. Also gated on the per-
+    /// `(app_id, page_id)` emit cooldown ([`super::EMIT_COOLDOWN`]) so a
+    /// still-yellow page doesn't re-emit a duplicate task on every
+    /// evaluation. Returns `true` when a task was recorded on the outbox.
+    /// Best-effort throughout — a disabled gate, an active cooldown, or an
     /// outbox write error never disturbs the caller.
     pub fn emit_spot_check(
         &self,
@@ -74,7 +79,18 @@ impl HelperTaskRegistrar {
             debug!("helper_tasks: kind spot_check not in emit_kinds — skipping for {app_id}");
             return false;
         }
-        self.record_spot_check(app_id, prompt, screenshot_url, page_id, match_rate)
+        let page_key = page_id.as_deref().unwrap_or("").to_string();
+        if super::emit_cooldown_active(app_id, &page_key) {
+            debug!(
+                "helper_tasks: spot-check for {app_id}/{page_key} within emit cooldown — skipping"
+            );
+            return false;
+        }
+        let recorded = self.record_spot_check(app_id, prompt, screenshot_url, page_id, match_rate);
+        if recorded {
+            super::record_emit_timestamp(app_id, &page_key);
+        }
+        recorded
     }
 
     /// Build the `CreateHelperTaskRequest` body and record it on the outbox.

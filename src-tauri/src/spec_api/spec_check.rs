@@ -718,19 +718,15 @@ pub async fn post_spec_check(
         req.page_id, snapshot_id, result.summary.match_outcome, result.summary.overall_match_rate, result.classification
     );
 
-    // Helper Task Queue (plan 2026-06-29, Phase 1.3 Part B): a Yellow
-    // (partial-match) classification is exactly the ambiguous band a human
-    // spot-check resolves cheaply — Green needs no help and Red is already a
-    // hard failure. Owner-gated (settings.helper_tasks, default OFF) inside
-    // maybe_emit_spot_check; best-effort and never affects the response.
-    if result.classification == ClassificationStatus::Yellow {
-        crate::helper_tasks::maybe_emit_spot_check(
-            &state.app_handle,
-            &req.app_id,
-            &req.page_id,
-            f64::from(result.summary.overall_match_rate),
-        );
-    }
+    // Helper Task Queue (plan 2026-06-29, Phase 1.3 Part B) — see
+    // maybe_emit_yellow_spot_check (shared with both batch paths via
+    // evaluate_one).
+    maybe_emit_yellow_spot_check(
+        crate::helper_tasks::registrar_from_app(&state.app_handle).as_ref(),
+        &req.app_id,
+        &req.page_id,
+        &result,
+    );
 
     // Plan 06: emit Completed after the evaluator returns. The full result
     // body stays out of the broadcast (subscribers join by snapshot_id).
@@ -932,6 +928,12 @@ pub async fn post_spec_check_batch(
     };
     let app_arc = Arc::new(app_option);
 
+    // Helper Task Queue (Phase 1.3 Part B): resolve the registrar handle ONCE,
+    // outside any stream/task closure — an Arc-backed clone is cheap, and
+    // capturing it before construction is what lets the NDJSON unfold closure
+    // (which has no Tauri state handle) participate in the yellow-band emit.
+    let helper_registrar = crate::helper_tasks::registrar_from_app(&state.app_handle);
+
     if req.stream {
         return stream_batch_results(
             req.app_id.clone(),
@@ -943,6 +945,7 @@ pub async fn post_spec_check_batch(
             req.pages,
             req.shared_policy,
             app_arc,
+            helper_registrar,
         )
         .await;
     }
@@ -958,6 +961,7 @@ pub async fn post_spec_check_batch(
         let fingerprint_owned = fingerprint.clone();
         let content_hash_owned = content_hash.clone();
         let app_owned = app_arc.clone();
+        let registrar_owned = helper_registrar.clone();
         set.spawn(async move {
             evaluate_one(
                 &app_id_owned,
@@ -969,6 +973,7 @@ pub async fn post_spec_check_batch(
                 &content_hash_owned,
                 shared_policy.as_ref(),
                 (*app_owned).as_ref(),
+                registrar_owned.as_ref(),
             )
             .await
         });
@@ -985,23 +990,6 @@ pub async fn post_spec_check_batch(
     }
     // Stable order by input pageId for determinism.
     results.sort_by(|a, b| a.page_id.cmp(&b.page_id));
-
-    // Helper Task Queue (Phase 1.3 Part B) — same Yellow-band hook as the
-    // single-shot handler, applied per evaluated page. Owner-gated + best-effort
-    // inside maybe_emit_spot_check. (The NDJSON streaming path is not hooked —
-    // its unfold closure has no handle to Tauri state.)
-    for r in results.iter().filter(|r| r.status == "ok") {
-        if let Some(res) = r.result.as_ref() {
-            if res.classification == ClassificationStatus::Yellow {
-                crate::helper_tasks::maybe_emit_spot_check(
-                    &state.app_handle,
-                    &req.app_id,
-                    &r.page_id,
-                    f64::from(res.summary.overall_match_rate),
-                );
-            }
-        }
-    }
 
     // Plan 06: emit Completed once after all per-element evaluations have
     // landed. The `eval_error_count` derives from input vs successfully-evaluated.
@@ -1103,6 +1091,33 @@ impl BatchElementResult {
     }
 }
 
+/// Helper Task Queue (plan 2026-06-29, Phase 1.3 Part B): the ONE yellow-band
+/// spot-check emit shared by all three handler paths (single-shot, batch
+/// collected, batch NDJSON — the latter two via [`evaluate_one`]). A Yellow
+/// (partial-match) classification is exactly the ambiguous band a human
+/// spot-check resolves cheaply — Green needs no help and Red is already a
+/// hard failure. Owner-gated (settings.helper_tasks, default OFF) and
+/// cooldown-gated inside the registrar; best-effort and never affects the
+/// response. `None` registrar (early boot, tests) is a silent no-op.
+fn maybe_emit_yellow_spot_check(
+    registrar: Option<&crate::helper_tasks::HelperTaskRegistrar>,
+    app_id: &str,
+    page_id: &str,
+    result: &SpecCheckResult,
+) {
+    if result.classification != ClassificationStatus::Yellow {
+        return;
+    }
+    if let Some(reg) = registrar {
+        crate::helper_tasks::maybe_emit_spot_check(
+            reg,
+            app_id,
+            page_id,
+            f64::from(result.summary.overall_match_rate),
+        );
+    }
+}
+
 /// Evaluate one batch entry. Identical to the single-shot handler except
 /// errors become per-element statuses, not HTTP responses (§5.14).
 #[allow(clippy::too_many_arguments)]
@@ -1116,6 +1131,7 @@ async fn evaluate_one(
     content_sha256: &str,
     shared_policy: Option<&SpecCheckPolicy>,
     app_option: Option<&qontinui_types::apps::App>,
+    helper_registrar: Option<&crate::helper_tasks::HelperTaskRegistrar>,
 ) -> BatchElementResult {
     if invalid_page_id(&entry.page_id) {
         return BatchElementResult::invalid_page_id(entry.page_id.clone());
@@ -1141,6 +1157,11 @@ async fn evaluate_one(
 
     // Apply app-specific thresholds to the evaluation result
     apply_thresholds_to_result(&mut result, app_option);
+
+    // Shared classification site for both batch paths (collected + NDJSON).
+    // Runs AFTER threshold application so the Yellow-band check sees the
+    // final (app-adjusted) classification, matching the single-shot path.
+    maybe_emit_yellow_spot_check(helper_registrar, app_id, &entry.page_id, &result);
 
     // Per-entry override wins over the shared policy.
     let policy = entry.policy_override.as_ref().or(shared_policy);
@@ -1177,6 +1198,9 @@ async fn stream_batch_results(
     pages: Vec<BatchPageEntry>,
     shared_policy: Option<SpecCheckPolicy>,
     app_option: Arc<Option<qontinui_types::apps::App>>,
+    // Cloned OUT of Tauri state by the caller so the unfold closure below can
+    // own it — Arc-backed, so per-iteration clones are cheap.
+    helper_registrar: Option<crate::helper_tasks::HelperTaskRegistrar>,
 ) -> Response {
     // Plan 06: stream-path Completed emission. Accumulate counts as we
     // walk each item, then emit on stream end (when the inner iterator is
@@ -1214,6 +1238,7 @@ async fn stream_batch_results(
         let fingerprint = fingerprint.clone();
         let content_hash = content_hash.clone();
         let app_option = app_option.clone();
+        let helper_registrar = helper_registrar.clone();
         async move {
             let entry = match st.iter.next() {
                 Some(e) => e,
@@ -1253,6 +1278,7 @@ async fn stream_batch_results(
                 &content_hash,
                 shared_policy.as_ref(),
                 (*app_option).as_ref(),
+                helper_registrar.as_ref(),
             )
             .await;
             match (r.status, r.result.as_ref()) {
@@ -1431,6 +1457,7 @@ mod tests {
             "",
             None,
             None,
+            None,
         )
         .await;
         assert_eq!(r.status, "spec-not-found");
@@ -1457,6 +1484,7 @@ mod tests {
             "scs_test",
             &fp,
             "",
+            None,
             None,
             None,
         )
@@ -1526,6 +1554,7 @@ mod tests {
             "scs_test",
             &fp,
             "",
+            None,
             None,
             None,
         )
@@ -1612,6 +1641,7 @@ mod tests {
             &fp,
             "",
             Some(&policy),
+            None,
             None,
         )
         .await;

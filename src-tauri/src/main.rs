@@ -2211,6 +2211,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // same CoordSync drain) as the AI-session registrar. Managed
                 // as Tauri state so the spec-check yellow-band hook
                 // (`helper_tasks::maybe_emit_spot_check`) can reach it.
+                // Restore the persisted store (collected answers + task
+                // provenance + emit cooldowns) BEFORE anything can emit or
+                // render — a restart must not discard human verdicts (coord
+                // only serves answers newer than the poll cursor).
+                helper_tasks::load_persisted_store();
                 let helper_task_registrar =
                     helper_tasks::HelperTaskRegistrar::new(registrar_outbox.clone(), machine_id);
                 app.manage(helper_task_registrar);
