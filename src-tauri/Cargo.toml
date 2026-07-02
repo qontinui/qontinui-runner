@@ -104,6 +104,15 @@ regex = "1.10"
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
 deadpool-postgres = "0.14"
 qontinui-db = { path = "./clorinde" }
+# Embedded/managed PostgreSQL so the shipped desktop app is self-contained:
+# it starts a private Postgres under the app's data dir when no external DB is
+# configured/reachable (see src/embedded_pg.rs), instead of panicking on boot.
+# `bundled` embeds the PG archive at COMPILE time — no runtime download, offline
+# first run. Provisioning only; the tokio-postgres/clorinde query layer above is
+# unchanged. Version resolves via the POSTGRESQL_VERSION build env (defaults to
+# the crate's latest); keep it consistent across builds for on-disk cluster
+# compatibility.
+postgresql_embedded = { version = "0.20.2", features = ["bundled"] }
 qontinui-spec-check = { path = "../crates/spec-check" }
 qontinui-types = { path = "../../qontinui-schemas/rust", version = ">=0.1.2, <2.0.0" }
 qontinui-code-graph = { path = "../../qontinui-schemas/code-graph", version = ">=0.1.0, <2.0.0" }
