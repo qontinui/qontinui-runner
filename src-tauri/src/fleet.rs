@@ -1131,6 +1131,12 @@ struct TreeStatePayload {
     /// the publisher alongside `device_id` (identity-side, not per-repo).
     #[serde(skip_serializing_if = "Option::is_none")]
     tenant_id: Option<uuid::Uuid>,
+    /// Application ID associated with this repository (fleet-fresh test-target
+    /// routing). Stamped by the publisher: `Some(app.app_id)` for app-repo
+    /// trees (from `project.apps` registry), `None` for plain `qontinui-*`
+    /// repos. Used by dispatcher to route tests to fresh app instances.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    app_id: Option<String>,
 }
 
 /// Maximum number of dirty paths included per row (the column is unbounded
@@ -1517,6 +1523,7 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
 
     // device_id is filled in by the caller (it's identity-side, not
     // per-repo). Punch in a placeholder; the publisher overwrites it.
+    // app_id is populated by the publisher if the repo is in project.apps.
     Some(TreeStatePayload {
         device_id: uuid::Uuid::nil(),
         repo: repo_name,
@@ -1536,6 +1543,7 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
         behind_default_count,
         dirty_total: Some(dirty_total_count),
         tenant_id: None,
+        app_id: None,
     })
 }
 
@@ -2620,6 +2628,484 @@ pub fn spawn_tree_publisher() {
     });
 }
 
+/// P3 — Fleet-Wide Auto-Fresh Engine (fleet-fresh test-target routing)
+///
+/// Polls coord for designated test-targets and auto-refreshes app repositories
+/// to keep their deployed/built versions at upstream HEAD. Runs on a background
+/// loop similar to `spawn_tree_publisher`.
+pub fn spawn_auto_fresh_engine() {
+    let secs: u64 = std::env::var("AUTO_FRESH_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300)
+        .max(60);
+
+    info!(
+        "fleet::auto_fresh_engine: starting periodic auto-fresh loop, interval={}s",
+        secs
+    );
+
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(secs));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            if let Err(e) = run_auto_fresh_cycle().await {
+                warn!("fleet::auto_fresh_engine: {e}");
+            }
+        }
+    });
+}
+
+/// Single cycle of the auto-fresh engine: poll coord for test-targets,
+/// check freshness, pull+build+restart as needed.
+async fn run_auto_fresh_cycle() -> Result<(), String> {
+    let device = match load_device_file() {
+        Some(d) => d,
+        None => {
+            return Ok(()); // Device not initialized, skip silently
+        }
+    };
+
+    let device_id = uuid::Uuid::parse_str(&device.device_id)
+        .map_err(|e| format!("invalid device_id UUID: {e}"))?;
+
+    let coord_base = coord_http_base()
+        .ok_or_else(|| "no coord endpoint available".to_string())?;
+
+    // Poll coord for test-targets designated for this device + auto_fresh enabled
+    let url = format!(
+        "{}/coord/trees/test-targets/by-device/{}",
+        coord_base, device_id
+    );
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("GET {}: {e}", url))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "GET {} returned {}",
+            url,
+            response.status()
+        ));
+    }
+
+    #[derive(serde::Deserialize)]
+    struct TestTarget {
+        app_id: String,
+        auto_fresh: bool,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct TestTargetsResponse {
+        test_targets: Vec<TestTarget>,
+    }
+
+    let data: TestTargetsResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("parsing test-targets response: {e}"))?;
+
+    // For each auto_fresh app, check if refresh is needed
+    for target in data.test_targets {
+        if !target.auto_fresh {
+            continue;
+        }
+
+        // Spawn async task to process this app (non-blocking iteration)
+        let app_id = target.app_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = process_auto_fresh_app(&app_id, device_id).await {
+                warn!(
+                    "fleet::auto_fresh_engine: failed to process app_id={}: {}",
+                    app_id, e
+                );
+            }
+        });
+    }
+
+    Ok(())
+}
+
+/// Check if THIS runner instance has active task-runs (idle-aware guard).
+///
+/// Asks our own HTTP API (`get_mcp_api_port()`, NOT a hardcoded 9876 — temp
+/// runners bind 9877+) whether `/task-runs/running` has entries. Best-effort
+/// with a 2s ceiling; any failure reads as idle so a wedged API can't
+/// permanently starve auto-fresh.
+async fn runner_has_active_tasks() -> bool {
+    let port = crate::mcp::types::get_mcp_api_port();
+    let probe = async move {
+        let resp = reqwest::Client::new()
+            .get(format!("http://localhost:{port}/task-runs/running"))
+            .send()
+            .await
+            .ok()?;
+        let body: serde_json::Value = resp.json().await.ok()?;
+        // Handler returns a bare array; tolerate an envelope like the
+        // discovery_tools consumer does.
+        body.get("data")
+            .and_then(|d| d.as_array())
+            .or_else(|| body.as_array())
+            .map(|a| !a.is_empty())
+    };
+    match tokio::time::timeout(Duration::from_secs(2), probe).await {
+        Ok(Some(has_tasks)) => has_tasks,
+        _ => false, // timeout, HTTP error, or unexpected shape: assume idle
+    }
+}
+
+/// Get current HEAD SHA via git rev-parse (blocking operation).
+/// Returns Option<String> with last 12 chars of SHA, or None on error.
+fn get_current_head_sha(repo_path: &std::path::Path) -> Option<String> {
+    use std::process::Command;
+
+    let output = Command::new("git")
+        .args(["-C", repo_path.to_str().unwrap_or("."), "rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Some(sha.chars().take(12).collect())
+    } else {
+        None
+    }
+}
+
+/// Process a single auto_fresh app: check if behind upstream, pull, build if
+/// configured, and restart via start_command. Updates app_deploy_state table.
+async fn process_auto_fresh_app(app_id: &str, device_id: uuid::Uuid) -> Result<(), String> {
+    // Phase P3: lookup app from project.apps, check freshness, pull+build
+    let pg = match PgDb::try_global() {
+        Some(db) => db,
+        None => {
+            debug!(
+                "fleet::auto_fresh_engine::process_app: app_id={}: no runner DB available",
+                app_id
+            );
+            return Ok(());
+        }
+    };
+
+    // Get app from registry
+    let app = match pg.get_app(app_id).await {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            warn!(
+                "fleet::auto_fresh_engine::process_app: app_id={} not found in project.apps",
+                app_id
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(format!("get_app({}): {}", app_id, e));
+        }
+    };
+
+    let repo_path = std::path::Path::new(&app.repo_root);
+    if !repo_path.exists() {
+        warn!(
+            "fleet::auto_fresh_engine::process_app: app_id={} repo_root does not exist: {}",
+            app_id, app.repo_root
+        );
+        return Ok(());
+    }
+
+    // Step 1: Idle-aware guard — never interrupt running tests
+    if runner_has_active_tasks().await {
+        debug!(
+            "fleet::auto_fresh_engine::process_app: app_id={} skipping (active task-runs)",
+            app_id
+        );
+        return Ok(());
+    }
+
+    // Step 2: Check if tree is behind upstream via git
+    let is_behind = match check_if_behind(repo_path) {
+        Ok(behind) => behind,
+        Err(e) => {
+            warn!(
+                "fleet::auto_fresh_engine::process_app: app_id={} \
+                 failed to check upstream: {}",
+                app_id, e
+            );
+            return Ok(());
+        }
+    };
+
+    if !is_behind {
+        debug!(
+            "fleet::auto_fresh_engine::process_app: app_id={} is up to date",
+            app_id
+        );
+        return Ok(());
+    }
+
+    info!(
+        "fleet::auto_fresh_engine::process_app: app_id={} is behind upstream, \
+         update_strategy={}",
+        app_id, app.update_strategy
+    );
+
+    // Step 3: Pull updated source code
+    match pull_and_update_app(repo_path).await {
+        Ok((success, message)) => {
+            if success {
+                let deployed_sha = get_current_head_sha(repo_path);
+                info!(
+                    "fleet::auto_fresh_engine::process_app: app_id={} \
+                     pull succeeded, update_strategy={}, deployed_sha={}",
+                    app_id, app.update_strategy,
+                    deployed_sha.as_deref().unwrap_or("unknown")
+                );
+
+                // Step 4: On pull_build strategy, run build and restart
+                if app.update_strategy == "pull_build" {
+                    if let Err(e) = execute_build_and_restart(&app, app_id).await {
+                        warn!(
+                            "fleet::auto_fresh_engine::process_app: app_id={} \
+                             build/restart failed: {}",
+                            app_id, e
+                        );
+                        // Record failure to app_deploy_state (best-effort)
+                        if let Some(pg) = PgDb::try_global() {
+                            pg.update_app_deploy_state_best_effort(
+                                device_id,
+                                app_id,
+                                None,
+                                "failed",
+                                Some(&e),
+                            )
+                            .await;
+                        }
+                        return Ok(());
+                    }
+
+                    // Record success to app_deploy_state (best-effort)
+                    if let Some(pg) = PgDb::try_global() {
+                        pg.update_app_deploy_state_best_effort(
+                            device_id,
+                            app_id,
+                            deployed_sha.as_deref(),
+                            "fresh",
+                            None,
+                        )
+                        .await;
+                    }
+
+                    info!(
+                        "fleet::auto_fresh_engine::process_app: app_id={} \
+                         build and restart complete",
+                        app_id
+                    );
+                } else {
+                    // pull_only: record fresh state (best-effort)
+                    if let Some(pg) = PgDb::try_global() {
+                        pg.update_app_deploy_state_best_effort(
+                            device_id,
+                            app_id,
+                            deployed_sha.as_deref(),
+                            "fresh",
+                            None,
+                        )
+                        .await;
+                    }
+
+                    info!(
+                        "fleet::auto_fresh_engine::process_app: app_id={} \
+                         pull_only strategy complete",
+                        app_id
+                    );
+                }
+            } else {
+                warn!(
+                    "fleet::auto_fresh_engine::process_app: app_id={} \
+                     pull failed: {}",
+                    app_id, message
+                );
+                // Record failure to app_deploy_state (best-effort)
+                if let Some(pg) = PgDb::try_global() {
+                    pg.update_app_deploy_state_best_effort(
+                        device_id,
+                        app_id,
+                        None,
+                        "failed",
+                        Some(&message),
+                    )
+                    .await;
+                }
+            }
+        }
+        Err(e) => {
+            return Err(format!(
+                "fleet::auto_fresh_engine::process_app: app_id={} pull error: {}",
+                app_id, e
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Check if a git repository is behind upstream (origin/<default>).
+fn check_if_behind(repo_path: &std::path::Path) -> Result<bool, String> {
+    use std::process::Command;
+
+    // First resolve the default branch
+    let default_branch = resolve_default_branch(repo_path);
+
+    // Check behind_count via git rev-list
+    let output = Command::new("git")
+        .args([
+            "-C",
+            repo_path.to_str().unwrap_or("."),
+            "rev-list",
+            "--count",
+            &format!("HEAD..origin/{}", default_branch),
+        ])
+        .output()
+        .map_err(|e| format!("git rev-list failed: {}", e))?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+
+    let count_str = String::from_utf8_lossy(&output.stdout);
+    let behind_count: i32 = count_str
+        .trim()
+        .parse()
+        .map_err(|e| format!("parse behind_count: {}", e))?;
+
+    Ok(behind_count > 0)
+}
+
+/// Pull updated source code from origin. Returns (success, message).
+///
+/// Enforces the /pull-scoped hard rules the repo's pull executor lives by:
+/// the tree must be ON the default branch AND clean, or we refuse — an
+/// auto-fresh engine must never disturb operator WIP or a parked feature
+/// branch. `--ff-only` additionally refuses diverged history.
+async fn pull_and_update_app(repo_path: &std::path::Path) -> Result<(bool, String), String> {
+    use std::process::Command;
+
+    let repo_str = repo_path.to_str().unwrap_or(".");
+    let default_branch = resolve_default_branch(repo_path);
+
+    // Guard 1: must be parked on the default branch.
+    let head = Command::new("git")
+        .args(["-C", repo_str, "symbolic-ref", "--short", "-q", "HEAD"])
+        .output()
+        .map_err(|e| format!("git symbolic-ref failed: {}", e))?;
+    let on_branch = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    if on_branch != default_branch {
+        return Ok((
+            false,
+            format!(
+                "refused: tree is on '{}' not default '{}' — auto-fresh never \
+                 switches or pulls a non-default branch",
+                on_branch, default_branch
+            ),
+        ));
+    }
+
+    // Guard 2: tree must be clean (uncommitted WIP is an implicit claim).
+    let porcelain = Command::new("git")
+        .args(["-C", repo_str, "status", "--porcelain"])
+        .output()
+        .map_err(|e| format!("git status failed: {}", e))?;
+    if !porcelain.stdout.is_empty() {
+        return Ok((
+            false,
+            "refused: working tree has uncommitted changes — auto-fresh never \
+             pulls over WIP"
+                .to_string(),
+        ));
+    }
+
+    let output = Command::new("git")
+        .args(["-C", repo_str, "pull", "--ff-only", "origin", &default_branch])
+        .output()
+        .map_err(|e| format!("git pull failed: {}", e))?;
+
+    let success = output.status.success();
+    let message = String::from_utf8_lossy(if success {
+        &output.stdout
+    } else {
+        &output.stderr
+    });
+
+    Ok((success, message.to_string()))
+}
+
+/// Run a configured shell command in `cwd` via the platform shell —
+/// `cmd /C` on Windows, `sh -c` elsewhere (same split as agent_runtime's
+/// spawn path).
+fn run_shell_command(cwd: &str, command: &str) -> std::io::Result<std::process::Output> {
+    use std::process::Command;
+    if cfg!(target_os = "windows") {
+        Command::new("cmd")
+            .args(["/C", command])
+            .current_dir(cwd)
+            .output()
+    } else {
+        Command::new("sh")
+            .args(["-c", command])
+            .current_dir(cwd)
+            .output()
+    }
+}
+
+/// Execute build_command and start_command for pull_build strategy.
+async fn execute_build_and_restart(
+    app: &qontinui_types::apps::App,
+    app_id: &str,
+) -> Result<(), String> {
+    // Execute build_command if present
+    if let Some(ref build_cmd) = app.build_command {
+        info!(
+            "fleet::auto_fresh_engine::execute_build: app_id={} \
+             running build_command: {}",
+            app_id, build_cmd
+        );
+
+        let output = run_shell_command(&app.repo_root, build_cmd)
+            .map_err(|e| format!("build_command failed: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("build_command error: {}", stderr));
+        }
+
+        debug!("fleet::auto_fresh_engine::execute_build: build_command succeeded");
+    }
+
+    // Execute start_command if present
+    if let Some(ref start_cmd) = app.start_command {
+        info!(
+            "fleet::auto_fresh_engine::execute_start: app_id={} \
+             running start_command: {}",
+            app_id, start_cmd
+        );
+
+        let output = run_shell_command(&app.repo_root, start_cmd)
+            .map_err(|e| format!("start_command failed: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("start_command error: {}", stderr));
+        }
+
+        debug!("fleet::auto_fresh_engine::execute_start: start_command succeeded");
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3321,6 +3807,7 @@ mod tests {
             behind_default_count: None,
             dirty_total: None,
             tenant_id: None,
+            app_id: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert!(
@@ -3348,6 +3835,7 @@ mod tests {
             behind_default_count: Some(42),
             dirty_total: None,
             tenant_id: None,
+            app_id: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
