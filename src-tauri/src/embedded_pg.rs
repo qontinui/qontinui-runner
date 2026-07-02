@@ -184,8 +184,12 @@ async fn apply_canonical_schema(url: &str) -> Result<(), String> {
                     "{} (SQLSTATE {}){}{}",
                     db.message(),
                     db.code().code(),
-                    db.detail().map(|d| format!("; detail: {d}")).unwrap_or_default(),
-                    db.where_().map(|w| format!("; where: {w}")).unwrap_or_default(),
+                    db.detail()
+                        .map(|d| format!("; detail: {d}"))
+                        .unwrap_or_default(),
+                    db.where_()
+                        .map(|w| format!("; where: {w}"))
+                        .unwrap_or_default(),
                 )
             })
             .unwrap_or_else(|| e.to_string());
@@ -246,8 +250,7 @@ mod tests {
     /// restore errors (the reason this fix exists).
     #[tokio::test]
     async fn boots_and_applies_transformed_schema() {
-        let root =
-            std::env::temp_dir().join(format!("qr-embedded-pg-test-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("qr-embedded-pg-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root); // clean any prior run
 
         let managed = bootstrap(root.clone(), "qontinui_test")
@@ -273,7 +276,10 @@ mod tests {
             .await
             .expect("domain_knowledge.content_embedding should exist after schema apply")
             .get(0);
-        assert_eq!(dtype, "bytea", "vector column should be transformed to bytea");
+        assert_eq!(
+            dtype, "bytea",
+            "vector column should be transformed to bytea"
+        );
 
         // The full schema applied (not just a handful of self-heal tables).
         let n: i64 = client
@@ -285,7 +291,10 @@ mod tests {
             .await
             .unwrap()
             .get(0);
-        assert!(n > 100, "expected the full canonical schema (>100 tables), got {n}");
+        assert!(
+            n > 100,
+            "expected the full canonical schema (>100 tables), got {n}"
+        );
 
         drop(client);
         let _ = conn.await;
