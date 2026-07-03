@@ -11,6 +11,7 @@ pub mod accessibility;
 // Pure logic only — no async, no coord/keyring deps. See the module doc.
 pub mod intercept_core;
 pub mod observable_bridge;
+pub mod profile_cli;
 pub mod profiles;
 pub mod relay_envelopes;
 pub mod schema_export;
