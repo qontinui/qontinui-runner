@@ -60,7 +60,7 @@
     "tailwind-merge": "^3.3.1",
     "tailwindcss": "^4.0.0",
     "tailwindcss-animate": "^1.0.7",
-    "vite": "^8.0.0"
+    "vite": "^8.1.3"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
@@ -121,7 +121,7 @@
     "test:coverage": "vitest run --coverage",
     "test:watch": "vitest",
     "graphql:codegen": "graphql-codegen",
-    "graphql:check": "graphql-codegen && git diff --exit-code src/generated/graphql.ts || (echo 'GraphQL codegen output is stale \u00e2\u20ac\u201d run npm run graphql:codegen' && exit 1)",
+    "graphql:check": "graphql-codegen && git diff --exit-code src/generated/graphql.ts || (echo 'GraphQL codegen output is stale â€” run npm run graphql:codegen' && exit 1)",
     "graphql:schema": "cd src-tauri && cargo test --bin qontinui-runner schema_exports_valid_sdl -- --nocapture",
     "typecheck": "tsc --noEmit"
   },
@@ -130,7 +130,10 @@
   "pnpm": {
     "overrides": {
       "@qontinui/shared-types": "^0.6.0",
-      "dompurify": ">=3.4.11"
+      "dompurify": ">=3.4.11",
+      "esbuild": ">=0.28.1",
+      "@babel/core": "^7.29.6",
+      "shell-quote": ">=1.8.4"
     }
   }
 }
