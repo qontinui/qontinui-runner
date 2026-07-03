@@ -86,6 +86,21 @@ struct StoredTokens {
     /// deserializing.
     #[serde(default)]
     agent_machine_key: Option<String>,
+    /// Long-lived, device-bound machine key (`dmk_<token>`) minted by the
+    /// qontinui-web backend (mirror of `agent_machine_key`, but for the
+    /// DEVICE rather than the env-capture agent). Sent as the
+    /// `X-Device-Machine-Key` header to web's
+    /// `POST /api/v1/devices/{device_id}/machine-credential/exchange`, which
+    /// exchanges it for a fresh device JWT with NO user session — the final
+    /// cold-start recovery path for a runner offline longer than BOTH the
+    /// device-JWT TTL and the Cognito refresh-token window (plan
+    /// 2026-07-02-runner-device-machine-key-cold-start Phase 4). This is a
+    /// higher-privilege bearer than `agent_machine_key`, so a full sign-out
+    /// (`clear_tokens`) MUST wipe it while the autonomy-preserving
+    /// `clear_interactive_session` PRESERVES it. `#[serde(default)]` keeps a
+    /// pre-dmk `.enc` deserializing.
+    #[serde(default)]
+    device_machine_key: Option<String>,
 }
 
 /// Secure file-based storage manager.
@@ -278,6 +293,12 @@ impl SecureStorage {
         tokens.oauth_id_token = None;
         tokens.oauth_refresh_token = None;
         tokens.oauth_expires_at = None;
+        // Full sign-out & stop-autonomy: drop the long-lived autonomy
+        // credentials too (both the device machine key and the env-agent
+        // machine key). `clear_interactive_session` below deliberately does
+        // NOT touch these, so autonomy survives a default logout.
+        tokens.device_machine_key = None;
+        tokens.agent_machine_key = None;
         self.save_tokens(&tokens)?;
         info!("Tokens cleared from secure file storage");
         Ok(())
@@ -296,7 +317,9 @@ impl SecureStorage {
         let mut tokens = self.load_tokens().unwrap_or_default();
         tokens.access_token = None;
         tokens.refresh_token = None;
-        // oauth_* slots and device_id are intentionally preserved.
+        // oauth_* slots, device_id, and the long-lived autonomy machine keys
+        // (device_machine_key / agent_machine_key) are intentionally preserved
+        // so the refresher can re-mint a device JWT after a default logout.
         self.save_tokens(&tokens)?;
         info!(
             "Device-JWT pair cleared from secure file storage (Cognito session preserved for \
@@ -459,6 +482,38 @@ impl SecureStorage {
         tokens.agent_machine_key = None;
         self.save_tokens(&tokens)?;
         info!("env-agent machine key cleared from secure file storage");
+        Ok(())
+    }
+
+    /// Store the device-bound machine key (`dmk_<token>`). Minted by the
+    /// qontinui-web backend (at pairing or via an explicit mint), overwrites
+    /// any prior key. Leaves all other slots untouched. Mirror of
+    /// [`Self::store_agent_machine_key`].
+    pub fn store_device_machine_key(&self, key: &str) -> Result<()> {
+        let mut tokens = self.load_tokens().unwrap_or_default();
+        tokens.device_machine_key = Some(key.to_string());
+        self.save_tokens(&tokens)?;
+        info!("device machine key stored in secure file storage");
+        Ok(())
+    }
+
+    /// Retrieve the device-bound machine key, if present. `Ok(None)` when the
+    /// device has never been issued a `dmk_` (vs an `Err` only on a
+    /// decrypt/parse failure of an existing store). Mirror of
+    /// [`Self::get_agent_machine_key`].
+    pub fn get_device_machine_key(&self) -> Result<Option<String>> {
+        let tokens = self.load_tokens()?;
+        Ok(tokens.device_machine_key)
+    }
+
+    /// Clear the device-bound machine key, leaving all other slots intact.
+    /// Used on revocation / re-issue. Mirror of
+    /// [`Self::clear_agent_machine_key`].
+    pub fn clear_device_machine_key(&self) -> Result<()> {
+        let mut tokens = self.load_tokens().unwrap_or_default();
+        tokens.device_machine_key = None;
+        self.save_tokens(&tokens)?;
+        info!("device machine key cleared from secure file storage");
         Ok(())
     }
 
@@ -626,6 +681,86 @@ mod tests {
         storage.clear_agent_machine_key().unwrap();
         assert!(storage.get_agent_machine_key().unwrap().is_none());
         assert_eq!(storage.get_access_token().unwrap(), "device.jwt");
+    }
+
+    #[test]
+    fn test_device_machine_key_round_trip_and_isolation() {
+        let storage = create_test_storage("test_device_machine_key");
+
+        // Absent before any store.
+        assert!(storage.get_device_machine_key().unwrap().is_none());
+
+        // A device JWT in the access_token slot must NOT be clobbered by the
+        // device-machine-key write (slot isolation).
+        storage.store_tokens("device.jwt", "").unwrap();
+        storage.store_device_machine_key("dmk_abc123").unwrap();
+
+        assert_eq!(
+            storage.get_device_machine_key().unwrap().as_deref(),
+            Some("dmk_abc123")
+        );
+        assert_eq!(storage.get_access_token().unwrap(), "device.jwt");
+
+        // Clearing only the device machine key leaves the device JWT intact.
+        storage.clear_device_machine_key().unwrap();
+        assert!(storage.get_device_machine_key().unwrap().is_none());
+        assert_eq!(storage.get_access_token().unwrap(), "device.jwt");
+    }
+
+    /// Credential-split invariant (plan 2026-07-02 Phase 4): the FULL wipe
+    /// (`clear_tokens`) MUST drop `device_machine_key` (a "sign out & stop
+    /// autonomy" must drop the autonomy credential), while the
+    /// autonomy-preserving interactive clear (`clear_interactive_session`)
+    /// MUST keep it so the refresher can still cold-start-recover.
+    #[test]
+    fn test_device_machine_key_clear_semantics() {
+        let storage = create_test_storage("test_device_machine_key_clear_semantics");
+
+        // Seed a device JWT + a dmk_ (and prove agent_machine_key is wiped too).
+        storage
+            .store_tokens("device.jwt", "device.refresh")
+            .unwrap();
+        storage.store_device_machine_key("dmk_keepme").unwrap();
+        storage.store_agent_machine_key("mk_keepme").unwrap();
+
+        // Interactive clear: device JWT gone, dmk_ (and mk_) PRESERVED.
+        storage.clear_interactive_session().unwrap();
+        assert!(
+            storage.get_access_token().is_err(),
+            "interactive clear must drop the device JWT"
+        );
+        assert_eq!(
+            storage.get_device_machine_key().unwrap().as_deref(),
+            Some("dmk_keepme"),
+            "interactive clear MUST preserve device_machine_key (the autonomy credential)"
+        );
+        assert_eq!(
+            storage.get_agent_machine_key().unwrap().as_deref(),
+            Some("mk_keepme"),
+            "interactive clear MUST preserve agent_machine_key"
+        );
+
+        // Full wipe: the dmk_ (and mk_) MUST be gone.
+        storage.clear_tokens().unwrap();
+        assert!(
+            storage.get_device_machine_key().unwrap().is_none(),
+            "full clear_tokens MUST wipe device_machine_key"
+        );
+        assert!(
+            storage.get_agent_machine_key().unwrap().is_none(),
+            "full clear_tokens MUST wipe agent_machine_key"
+        );
+    }
+
+    /// A pre-dmk `StoredTokens` JSON must still deserialize — the new
+    /// `device_machine_key` field carries `#[serde(default)]`.
+    #[test]
+    fn test_legacy_stored_tokens_without_device_machine_key_deserializes() {
+        let raw = r#"{"access_token":"a","refresh_token":"r","device_id":"d","agent_machine_key":"mk_x"}"#;
+        let parsed: StoredTokens = serde_json::from_str(raw).expect("legacy shape must decode");
+        assert_eq!(parsed.access_token.as_deref(), Some("a"));
+        assert_eq!(parsed.agent_machine_key.as_deref(), Some("mk_x"));
+        assert!(parsed.device_machine_key.is_none());
     }
 
     #[test]

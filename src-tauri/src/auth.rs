@@ -588,6 +588,15 @@ impl AuthManager {
         self.secure_storage.get_oauth_expires_at()
     }
 
+    /// Retrieve the device-bound machine key (`dmk_<token>`), if present.
+    /// `Ok(None)` when the device was never issued one. Thin pass-through to
+    /// [`SecureStorage::get_device_machine_key`] so the device-JWT refresher's
+    /// Phase-4b cold-start exchange reads it through the same (test-injectable)
+    /// storage as every other credential.
+    pub fn get_device_machine_key(&self) -> Result<Option<String>> {
+        self.secure_storage.get_device_machine_key()
+    }
+
     /// `true` iff the Cognito access token is missing OR within
     /// [`REFRESH_BEFORE_EXPIRY_SECS`] of expiry. Used by the device-JWT
     /// refresher to refresh the Cognito token *first* when it's stale (so the
