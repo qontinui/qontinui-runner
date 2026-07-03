@@ -1136,58 +1136,19 @@ fn active_profile_dsn() -> Result<String, String> {
 // `qontinui_runner_lib::env_agent` so the runner GUI's background task and this
 // CLI share one code path.
 
-/// Wire shape of the enroll request body. Conforms EXACTLY to the backend
-/// contract: `{ enrollment_code, machine_id?, hostname? }`.
-#[derive(Debug, Serialize)]
-struct EnrollRequest {
-    enrollment_code: String,
-    machine_id: Option<String>,
-    hostname: Option<String>,
-}
-
-/// Wire shape of the enroll response. The backend returns the machine key ONCE
-/// — we store it immediately. `environment_id` is sourced from HERE, never
-/// hardcoded.
-#[derive(Debug, Deserialize)]
-struct EnrollResponse {
-    machine_id: String,
-    machine_key: String,
-    #[serde(default)]
-    environment_id: Option<String>,
-}
-
-/// Resolve the web backend base URL for the enroll POST. Order:
-/// `--backend` → `QONTINUI_WEB_BASE` → web base derived from the active
-/// profile's coord_url (`derive_web_base_from_coord(coord_http_base())`).
-fn resolve_env_backend_base(backend_arg: Option<&str>) -> Result<String, String> {
-    if let Some(b) = backend_arg {
-        let t = b.trim();
-        if !t.is_empty() {
-            return Ok(t.trim_end_matches('/').to_string());
-        }
-    }
-    if let Ok(v) = std::env::var("QONTINUI_WEB_BASE") {
-        let t = v.trim();
-        if !t.is_empty() {
-            return Ok(t.trim_end_matches('/').to_string());
-        }
-    }
-    let coord_base = coord_http_base()
-        .map_err(|e| format!("could not resolve a backend URL (no --backend, no QONTINUI_WEB_BASE, and coord_url unavailable: {e})"))?;
-    Ok(derive_web_base_from_coord(&coord_base))
-}
-
 fn cmd_env_enroll(
     code: &str,
     backend_arg: Option<&str>,
     environment_arg: Option<&str>,
 ) -> ExitCode {
+    use qontinui_runner_lib::env_agent::enroll::{self, EnrollParams};
+
     if code.trim().is_empty() {
         eprintln!("error: --code requires a non-empty enrollment code");
         return ExitCode::from(2);
     }
 
-    let backend = match resolve_env_backend_base(backend_arg) {
+    let backend = match enroll::resolve_backend_base(backend_arg) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("error: {e}");
@@ -1195,117 +1156,40 @@ fn cmd_env_enroll(
         }
     };
 
-    // machine_id + hostname come from the existing device-file reader. A
-    // machine.json is expected (run `qontinui_profile device init` first), but
-    // we tolerate its absence by sending nulls — the backend may assign a
+    // machine_id + hostname come from ~/.qontinui/machine.json (run
+    // `qontinui_profile device init` first for a stable identity). Absence is
+    // tolerated — the shared core sends nulls and the backend may assign a
     // machine_id.
-    let path = device_file_path();
-    let (machine_id, hostname): (Option<String>, Option<String>) = match path {
-        Some(p) if p.exists() => match read_device_file(&p) {
-            Ok(f) => (Some(f.device_id), Some(f.hostname)),
-            Err(e) => {
-                eprintln!(
-                    "warning: machine.json unreadable ({e}); enrolling with null machine_id/hostname"
-                );
-                (None, None)
-            }
-        },
-        _ => {
-            eprintln!(
-                "note: no ~/.qontinui/machine.json — enrolling with null machine_id/hostname \
-                 (run `qontinui_profile device init` first for a stable identity)"
-            );
-            (None, None)
-        }
-    };
+    let (machine_id, hostname) = enroll::local_machine_identity();
+    if machine_id.is_none() {
+        eprintln!(
+            "note: no readable ~/.qontinui/machine.json — enrolling with null machine_id/hostname \
+             (run `qontinui_profile device init` first for a stable identity)"
+        );
+    }
 
-    let body = EnrollRequest {
-        enrollment_code: code.trim().to_string(),
+    // The POST + key storage + env-agent.json write live in the shared
+    // `env_agent::enroll` core, so this CLI, the in-app Tauri command, and the
+    // (Phase 3) dispatched directive consumer all enroll through one code path.
+    match enroll::run_enroll(EnrollParams {
+        code: code.to_string(),
+        backend,
         machine_id,
         hostname,
-    };
-    let url = format!("{}/api/v1/devenv/agent/enroll", backend);
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("error: reqwest client build failed: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    let resp = match client.post(&url).json(&body).send() {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("error: POST {url} failed (backend unreachable?): {e}");
-            return ExitCode::from(1);
-        }
-    };
-    let status = resp.status();
-    if !status.is_success() {
-        let body_text = resp
-            .text()
-            .unwrap_or_else(|_| "<unable to read response body>".to_string());
-        eprintln!("error: enroll failed — POST {url} -> HTTP {status}: {body_text}");
-        // Write NOTHING on failure.
-        return ExitCode::from(1);
-    }
-    let parsed: EnrollResponse = match resp.json() {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("error: enroll succeeded but decoding the response failed: {e}");
-            return ExitCode::from(1);
-        }
-    };
-
-    // environment_id ALWAYS comes from the response. The --environment flag is
-    // a diagnostic override only; the response value wins when present.
-    let environment_id = parsed
-        .environment_id
-        .clone()
-        .or_else(|| environment_arg.map(|s| s.to_string()));
-    let environment_id = match environment_id {
-        Some(e) if !e.trim().is_empty() => e,
-        _ => {
-            eprintln!(
-                "error: enroll response did not include an environment_id and none was supplied \
-                 via --environment; refusing to write a half-enrolled config"
+        environment_override: environment_arg.map(|s| s.to_string()),
+    }) {
+        Ok(outcome) => {
+            println!(
+                "enrolled: machine_id={} environment_id={} backend={} (machine key stored)",
+                outcome.machine_id, outcome.environment_id, outcome.backend_url
             );
-            return ExitCode::from(1);
+            ExitCode::SUCCESS
         }
-    };
-
-    // Store the machine key in secure storage FIRST — it is the credential.
-    let storage = match qontinui_runner_lib::secure_storage::SecureStorage::new() {
-        Ok(s) => s,
         Err(e) => {
-            eprintln!("error: could not open secure storage: {e}");
-            return ExitCode::from(2);
+            eprintln!("error: {e}");
+            ExitCode::from(1)
         }
-    };
-    if let Err(e) = storage.store_agent_machine_key(&parsed.machine_key) {
-        eprintln!("error: failed to store machine key: {e}");
-        return ExitCode::from(2);
     }
-
-    // Then write env-agent.json with the RESPONSE environment_id.
-    let cfg = qontinui_runner_lib::env_agent::config::EnvAgentConfig {
-        backend_url: backend.clone(),
-        machine_id: parsed.machine_id.clone(),
-        environment_id: environment_id.clone(),
-        enrolled_at: Some(chrono::Utc::now().to_rfc3339()),
-    };
-    if let Err(e) = cfg.save() {
-        eprintln!("error: enrolled + key stored, but writing env-agent.json failed: {e}");
-        return ExitCode::from(2);
-    }
-
-    println!(
-        "enrolled: machine_id={} environment_id={} backend={} (machine key stored)",
-        parsed.machine_id, environment_id, backend
-    );
-    ExitCode::SUCCESS
 }
 
 fn cmd_env_capture(dry_run: bool) -> ExitCode {
