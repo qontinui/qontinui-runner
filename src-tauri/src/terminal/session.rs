@@ -999,6 +999,68 @@ impl TerminalSession {
         }
     }
 
+    /// The canonical PATH env-var key for the PTY child process. Windows env is
+    /// case-insensitive with undefined duplicate-key resolution, so a shim
+    /// prepended under a different casing than the inherited key can be shadowed
+    /// by the original. We therefore always set the SAME casing the OS itself
+    /// uses (`Path` on Windows, `PATH` elsewhere) and remove every inherited
+    /// case-variant first (see [`Self::set_child_path`]).
+    const PATH_ENV_KEY: &'static str = if cfg!(windows) { "Path" } else { "PATH" };
+
+    /// Set the child's path env var to `value` under the single canonical key,
+    /// removing every case-variant first so the child has EXACTLY ONE path key.
+    ///
+    /// Why this matters on Windows: the runner's own env var is `Path`;
+    /// `portable_pty`'s `CommandBuilder` seeds the child from the parent env and
+    /// a naive `cmd.env("PATH", …)` used to be able to leave the child with both
+    /// an inherited `Path` (no shim) and an added `PATH` (shimmed), letting the
+    /// loader resolve tools via the original `Path` and bypass the identity
+    /// shim. Removing all three variants then setting the OS-preferred casing
+    /// guarantees the shim-prepended value is the one Windows actually reads.
+    ///
+    /// (portable_pty 0.8 folds env keys case-insensitively on Windows, so this
+    /// is belt-and-suspenders there; the removal is a harmless no-op when no
+    /// variant is present, and the fix is correct regardless of the library's
+    /// internal folding.)
+    fn set_child_path(cmd: &mut CommandBuilder, value: &str) {
+        cmd.env_remove("PATH");
+        cmd.env_remove("Path");
+        cmd.env_remove("path");
+        cmd.env(Self::PATH_ENV_KEY, value);
+    }
+
+    /// Extract an explicit `--session-id <id>` (or `--session-id=<id>`) from a
+    /// built PTY child command's argv, if present. Used by the identity seam to
+    /// adopt the id a runner-launched direct-command spawn actually carries as
+    /// its authoritative pin — so the recorded id equals the id the session runs
+    /// under (no phantom). Returns `None` for the interactive-shell path, whose
+    /// argv is the shell program and carries no `--session-id`.
+    fn explicit_session_id_from(cmd: &CommandBuilder) -> Option<String> {
+        let argv = cmd.get_argv();
+        let mut it = argv.iter();
+        while let Some(arg) = it.next() {
+            let s = arg.to_string_lossy();
+            if let Some(rest) = s.strip_prefix("--session-id") {
+                // Attached form: `--session-id=<id>`.
+                if let Some(id) = rest.strip_prefix('=') {
+                    if !id.is_empty() {
+                        return Some(id.to_string());
+                    }
+                }
+                // Space-separated form: `--session-id <id>`.
+                if rest.is_empty() {
+                    if let Some(next) = it.next() {
+                        let id = next.to_string_lossy();
+                        if !id.is_empty() {
+                            return Some(id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Install-interception env-seam (plan §4 Phase 1). Behind the master flag
     /// `QONTINUI_INSTALL_INTERCEPT_ENABLED` (default OFF). When ON, materialize
     /// the per-terminal PATH-shim bin dir and mutate the child `cmd`:
@@ -1010,9 +1072,11 @@ impl TerminalSession {
     /// spawns, un-shimmed). When OFF, this is a pure no-op — the child env is
     /// byte-identical to pre-interception.
     ///
-    /// `cmd`'s PATH is the runner's own inherited `PATH` (CommandBuilder does
-    /// not override it), so we read `std::env::var("PATH")` to compute the
-    /// prepended value and set it explicitly on the child.
+    /// The prepended value is written under the OS-canonical path key via
+    /// [`Self::set_child_path`], which first removes every inherited case-variant
+    /// (`PATH`/`Path`/`path`) — on Windows the runner env var is `Path`, so
+    /// setting a bare `"PATH"` could leave the original `Path` (un-shimmed) to
+    /// win the loader's case-insensitive resolution.
     fn apply_install_intercept_env(cmd: &mut CommandBuilder, terminal_id: &str) {
         use crate::install_effects_producer::intercept::shim_materializer;
 
@@ -1032,7 +1096,7 @@ impl TerminalSession {
 
         let current_path = std::env::var("PATH").ok();
         let new_path = shim_materializer::prepend_path(&seam.shim_dir, current_path.as_deref());
-        cmd.env("PATH", new_path);
+        Self::set_child_path(cmd, &new_path);
         cmd.env(shim_materializer::PORT_ENV, seam.port.to_string());
         cmd.env(shim_materializer::MODE_ENV, &seam.mode);
         // Tell the compiled `.exe` stub its own dir so its real-tool PATH scan
@@ -1078,8 +1142,21 @@ impl TerminalSession {
         use crate::install_effects_producer::intercept::shim_materializer;
         use tauri::Manager;
 
-        // 1. Per-terminal pinned session id (the runner KNOWS it up front).
-        let pinned = uuid::Uuid::new_v4().to_string();
+        // 1. Pinned session id — the runner KNOWS it up front.
+        //
+        // If the caller supplied an explicit `--session-id <id>` in the PTY
+        // child command (the gate-continuation / runner-launched direct-command
+        // path builds `[claude, --session-id, <id>, …]`), ADOPT that id as the
+        // authoritative pin instead of minting a fresh one. Otherwise the seam
+        // would record a fresh uuid the session never runs under (the identity
+        // shim's don't-double-pin passes the explicit id straight through), and
+        // the caller's own capture-hint record would carry the REAL id — a
+        // two-record split where the seam's row is a phantom. Recording the id
+        // the command actually carries makes recorded id == run id == the id
+        // that gets the SessionStart confirmation hook (plan Phase 2). When no
+        // explicit id is present (the interactive-shell path), generate one.
+        let pinned =
+            Self::explicit_session_id_from(cmd).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
         // 2. Identity env — ALWAYS injected (zero-setup capture).
         cmd.env(shim_materializer::TERMINAL_ID_ENV, terminal_id);
@@ -1122,7 +1199,7 @@ impl TerminalSession {
                 let current_path = std::env::var("PATH").ok();
                 let new_path =
                     shim_materializer::prepend_path(&identity_dir, current_path.as_deref());
-                cmd.env("PATH", new_path);
+                Self::set_child_path(cmd, &new_path);
                 // The identity shim reads this to skip its own dir in the
                 // real-tool scan (reusing the install shim's env contract).
                 cmd.env(
@@ -1834,6 +1911,102 @@ mod tests {
         let fallback = TerminalSession::build_command_from(Some(vec![]));
         let shell = TerminalSession::build_shell_command();
         assert_eq!(fallback.get_argv().first(), shell.get_argv().first());
+    }
+
+    #[test]
+    fn path_env_key_is_os_canonical_casing() {
+        // Windows env is case-insensitive with undefined duplicate resolution,
+        // so the child path key MUST be the OS-preferred casing (`Path`), not a
+        // bare `PATH` that the inherited `Path` could shadow.
+        #[cfg(windows)]
+        assert_eq!(TerminalSession::PATH_ENV_KEY, "Path");
+        #[cfg(not(windows))]
+        assert_eq!(TerminalSession::PATH_ENV_KEY, "PATH");
+    }
+
+    #[test]
+    fn set_child_path_leaves_exactly_one_shim_first_path_key() {
+        // The env-injection invariant (plan Phase 1): after set_child_path the
+        // child has EXACTLY ONE path key (any casing) and it carries the shim
+        // dir as its FIRST segment. Seed a pre-existing case-variant to prove
+        // the removal defeats the Windows `Path`-shadows-`PATH` collision.
+        let mut cmd = CommandBuilder::new("dummy");
+        cmd.env("Path", "C:\\real\\bin;C:\\windows");
+        cmd.env("PATH", "/usr/bin:/bin");
+
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        let shim_dir = "SHIM_DIR_MARKER";
+        let existing = if cfg!(windows) {
+            "C:\\real\\bin;C:\\windows"
+        } else {
+            "/usr/bin:/bin"
+        };
+        let new_path = format!("{shim_dir}{sep}{existing}");
+        TerminalSession::set_child_path(&mut cmd, &new_path);
+
+        // Exactly one path key survives (case-folded), and it is shim-first.
+        let path_keys: Vec<(String, String)> = cmd
+            .iter_full_env_as_str()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("path"))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        assert_eq!(
+            path_keys.len(),
+            1,
+            "expected exactly one path key, got {path_keys:?}"
+        );
+        let (key, value) = &path_keys[0];
+        assert_eq!(key, TerminalSession::PATH_ENV_KEY, "canonical casing");
+        assert!(
+            value.starts_with(shim_dir),
+            "shim dir must be the FIRST path segment; got {value:?}"
+        );
+        // The readback via the canonical key must also find the shim-first value
+        // (guards against a stray un-removed variant winning).
+        let read = cmd
+            .get_env(TerminalSession::PATH_ENV_KEY)
+            .map(|v| v.to_string_lossy().to_string());
+        assert_eq!(read.as_deref(), Some(new_path.as_str()));
+    }
+
+    #[test]
+    fn explicit_session_id_from_space_separated() {
+        // The runner-launched direct-command path builds
+        // `[claude, --session-id, <id>, …]`; the seam must adopt <id> as its
+        // authoritative pin so recorded id == the id claude runs under.
+        let cmd = TerminalSession::build_command_from(Some(vec![
+            "claude".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+            "--session-id".to_string(),
+            "abc-123".to_string(),
+            "--".to_string(),
+            "do the thing".to_string(),
+        ]));
+        assert_eq!(
+            TerminalSession::explicit_session_id_from(&cmd),
+            Some("abc-123".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_session_id_from_attached_form() {
+        let cmd = TerminalSession::build_command_from(Some(vec![
+            "claude".to_string(),
+            "--session-id=xyz-789".to_string(),
+        ]));
+        assert_eq!(
+            TerminalSession::explicit_session_id_from(&cmd),
+            Some("xyz-789".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_session_id_from_none_for_interactive_shell() {
+        // The interactive-shell path carries no --session-id → the seam mints a
+        // fresh id (unit-tested here only that it returns None so the caller
+        // falls back to Uuid::new_v4).
+        let cmd = TerminalSession::build_command_from(None);
+        assert_eq!(TerminalSession::explicit_session_id_from(&cmd), None);
     }
 
     #[test]
