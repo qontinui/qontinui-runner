@@ -525,6 +525,12 @@ fn read_runner_tier() -> Option<String> {
 // `device_jwt_refresher::resolve_pair_tenant_id`'s ordered chain without
 // depending on the runner binary: OAuth/runner-bearer claim → outgoing
 // device-JWT claim (same slot) → machine.json::active_tenant_id.
+//
+// Phase 8b semantics: this diagnoses the DEVICE-LEVEL DEFAULT binding
+// (machine.json's active_tenant_id is default-for-new-sessions, not
+// the-only-tenant). A multi-bound device with per-session tenants can be
+// healthy for its default while individual sessions run under other
+// bindings — the doctor's check is scoped to the default surface.
 // ---------------------------------------------------------------------------
 
 fn read_active_tenant_id_from_machine_json() -> Option<uuid::Uuid> {

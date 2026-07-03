@@ -685,7 +685,62 @@ static MISSING_TOKEN_WARNED: std::sync::Once = std::sync::Once::new();
 /// the refresher loop), so a stale long-lived cache would risk presenting an
 /// expired bearer. Reading per-call keeps us always-current.
 pub fn device_bearer() -> Option<String> {
-    match AuthManager::new().get_access_token() {
+    device_bearer_for(None)
+}
+
+/// Tenant-selecting variant of [`device_bearer`] — the Phase 8b credential
+/// seam (plan `2026-07-02-session-scoped-multi-tenant-device-binding` §D4).
+///
+/// - `None` → the DEFAULT binding's JWT from the legacy `access_token` slot
+///   (byte-identical to the pre-8b [`device_bearer`] behavior, so every
+///   unparameterized caller keeps the default slot by construction).
+/// - `Some(t)` → that tenant's `device_jwt:<t>` slot. On a slot MISS:
+///   - when `t` IS the default binding (per `paired_user.json`), fall back
+///     to the legacy `access_token` slot — it holds the same binding's JWT
+///     (and is the only slot on a pre-8a install);
+///   - otherwise return `None` (send unauthenticated) and warn once per
+///     tenant per process. FAIL-SOFT POSTURE (decided here): a slot miss for
+///     a non-default tenant must NEVER silently present another tenant's
+///     credential — a wrong claim would be attributed cross-tenant coord-side
+///     with no observable. Unauthenticated requests instead flow through
+///     coord's server-side resolution (explicit payload tenant / sole-binding
+///     / legacy-pointer window), which is counted and 422s honestly.
+pub fn device_bearer_for(tenant: Option<&Uuid>) -> Option<String> {
+    select_device_bearer(&AuthManager::new(), tenant, default_binding_tenant())
+}
+
+/// Pure-over-injected-parts core of [`device_bearer_for`] so slot selection
+/// is hermetically testable (temp-dir [`SecureStorage::with_path`] +
+/// explicit `default_tenant`, no process-global env mutation).
+pub(crate) fn select_device_bearer(
+    am: &AuthManager,
+    tenant: Option<&Uuid>,
+    default_tenant: Option<Uuid>,
+) -> Option<String> {
+    let Some(t) = tenant else {
+        return legacy_slot_bearer(am);
+    };
+    match am.get_tenant_device_jwt(t) {
+        Ok(Some(jwt)) if !jwt.trim().is_empty() => return Some(jwt),
+        Ok(_) => {}
+        Err(e) => {
+            debug!("coord data-plane: tenant {t} device-JWT slot read failed ({e})");
+        }
+    }
+    // Slot miss. The default binding may legitimately live only in the
+    // legacy slot (pre-8a install, or a pairing that predates per-tenant
+    // slots) — that slot IS this tenant's JWT, so fall back to it.
+    if default_tenant.as_ref() == Some(t) {
+        return legacy_slot_bearer(am);
+    }
+    warn_once_per_tenant_slot_miss(t);
+    None
+}
+
+/// Read the legacy `access_token` slot (the DEFAULT binding's JWT) with the
+/// original never-fatal posture + once-per-process missing-token warning.
+fn legacy_slot_bearer(am: &AuthManager) -> Option<String> {
+    match am.get_access_token() {
         Ok(token) if !token.trim().is_empty() => Some(token),
         Ok(_) => {
             MISSING_TOKEN_WARNED.call_once(|| {
@@ -708,6 +763,43 @@ pub fn device_bearer() -> Option<String> {
     }
 }
 
+/// Warn once per (tenant, process) that a requested non-default tenant has
+/// no device-JWT slot — the heal is pairing this runner for that tenant.
+fn warn_once_per_tenant_slot_miss(tenant: &Uuid) {
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<Uuid>>> =
+        std::sync::OnceLock::new();
+    let set = WARNED.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    let mut guard = set.lock().expect("tenant slot-miss warn set poisoned");
+    if guard.insert(*tenant) {
+        warn!(
+            "coord data-plane: no device-JWT slot for tenant {tenant} — sending that \
+             tenant's coord calls unauthenticated (never another tenant's credential); \
+             pair this runner for that tenant to authenticate"
+        );
+    }
+}
+
+/// The device's DEFAULT binding tenant, read from `paired_user.json`
+/// (v2 `default_tenant_id`, legacy `tenant_id` fallback). Kept as a local
+/// minimal reader because `auth` compiles into BOTH the lib and bin crates
+/// while `pair` (the canonical v2-aware reader) is lib-only — same
+/// documented duplication pattern as the census/backstop `machine.json`
+/// readers. `None` on any failure (unpaired runner).
+fn default_binding_tenant() -> Option<Uuid> {
+    let base = std::env::var("QONTINUI_SECURE_STORAGE_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::data_local_dir().map(|d| d.join("com.qontinui.runner")))?;
+    let bytes = std::fs::read(base.join("paired_user.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let raw = value
+        .get("default_tenant_id")
+        .and_then(|v| v.as_str())
+        .or_else(|| value.get("tenant_id").and_then(|v| v.as_str()))?;
+    Uuid::parse_str(raw.trim()).ok()
+}
+
 /// Attach the device-JWT bearer to a coord data-plane request when one is
 /// available, otherwise return the builder unchanged. Also drives the
 /// auth-coverage metric (the dogfood signal Phase 1 gates on): every call is
@@ -716,8 +808,21 @@ pub fn device_bearer() -> Option<String> {
 /// call so an operator can watch the unpaired→paired transition without a new
 /// dependency.
 pub fn attach_device_auth(rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    attach_device_auth_for(rb, None)
+}
+
+/// Tenant-selecting variant of [`attach_device_auth`] (Phase 8b, plan §D4):
+/// `Some(tenant)` presents that binding's device-JWT slot, `None` the default
+/// binding's. Slot-miss posture is [`device_bearer_for`]'s (never another
+/// tenant's credential — degrade to unauthenticated). Session-scoped callers
+/// pass the owning session's tenant; device-scoped callers use the plain
+/// [`attach_device_auth`] and keep the default slot by construction.
+pub fn attach_device_auth_for(
+    rb: reqwest::RequestBuilder,
+    tenant: Option<&Uuid>,
+) -> reqwest::RequestBuilder {
     let total = DATA_PLANE_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    let rb = match device_bearer() {
+    let rb = match device_bearer_for(tenant) {
         Some(token) => {
             DATA_PLANE_AUTHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             rb.header("Authorization", format!("Bearer {token}"))
@@ -1042,6 +1147,128 @@ mod tenant_device_jwt_tests {
             mgr.get_tenant_device_jwt(&a).unwrap().as_deref(),
             Some("jwt.a.v3")
         );
+    }
+}
+
+/// Tests for the Phase 8b per-session credential SELECTION seam
+/// ([`select_device_bearer`] — the injected core of [`device_bearer_for`] /
+/// [`attach_device_auth_for`]). Hermetic: temp-dir storage + explicit
+/// `default_tenant`, no env mutation, no network.
+#[cfg(test)]
+mod bearer_selection_tests {
+    use super::*;
+    use std::env;
+    use std::fs;
+
+    fn create_test_auth_manager(test_name: &str) -> AuthManager {
+        let temp_dir = env::temp_dir().join("qontinui_test_auth_bearer_select");
+        let storage_path = temp_dir.join(format!("{}.enc", test_name));
+        let _ = fs::remove_file(&storage_path);
+        let storage = SecureStorage::with_path(storage_path).unwrap();
+        AuthManager::with_storage(storage)
+    }
+
+    fn tenant(n: u8) -> Uuid {
+        Uuid::from_bytes([n; 16])
+    }
+
+    /// No tenant in scope → the legacy `access_token` slot (default binding)
+    /// — the by-construction guarantee for every unparameterized caller.
+    #[test]
+    fn no_tenant_selects_legacy_default_slot() {
+        let mgr = create_test_auth_manager("no_tenant_default_slot");
+        mgr.store_tokens("default.jwt", "").unwrap();
+        let a = tenant(0xAA);
+        mgr.store_tenant_device_jwt(&a, "jwt.a").unwrap();
+
+        assert_eq!(
+            select_device_bearer(&mgr, None, Some(a)).as_deref(),
+            Some("default.jwt"),
+            "None tenant must read the legacy slot, never a tenant slot"
+        );
+    }
+
+    /// Session tenant with a populated slot → that slot's JWT, not the
+    /// default.
+    #[test]
+    fn session_tenant_selects_its_own_slot() {
+        let mgr = create_test_auth_manager("session_tenant_own_slot");
+        mgr.store_tokens("default.jwt", "").unwrap();
+        let a = tenant(0xA1);
+        let b = tenant(0xB2);
+        mgr.store_tenant_device_jwt(&a, "jwt.a").unwrap();
+        mgr.store_tenant_device_jwt(&b, "jwt.b").unwrap();
+
+        assert_eq!(
+            select_device_bearer(&mgr, Some(&b), Some(a)).as_deref(),
+            Some("jwt.b"),
+            "a session-scoped call must present the session tenant's slot"
+        );
+        assert_eq!(
+            select_device_bearer(&mgr, Some(&a), Some(a)).as_deref(),
+            Some("jwt.a")
+        );
+    }
+
+    /// DEFAULT-tenant slot miss falls back to the legacy slot — the legacy
+    /// slot holds the same binding's JWT (pre-8a installs have only it).
+    #[test]
+    fn default_tenant_slot_miss_falls_back_to_legacy_slot() {
+        let mgr = create_test_auth_manager("default_miss_legacy_fallback");
+        mgr.store_tokens("default.jwt", "").unwrap();
+        let a = tenant(0xC3);
+        // No per-tenant slot stored for `a`, but `a` IS the default binding.
+        assert_eq!(
+            select_device_bearer(&mgr, Some(&a), Some(a)).as_deref(),
+            Some("default.jwt"),
+            "default-binding slot miss must fall back to access_token (same binding)"
+        );
+    }
+
+    /// FAIL-SOFT posture: an unknown (non-default) tenant slot miss yields
+    /// NO bearer — never another tenant's credential.
+    #[test]
+    fn unknown_tenant_slot_miss_sends_unauthenticated() {
+        let mgr = create_test_auth_manager("unknown_miss_unauthenticated");
+        mgr.store_tokens("default.jwt", "").unwrap();
+        let default = tenant(0xD4);
+        mgr.store_tenant_device_jwt(&default, "jwt.default")
+            .unwrap();
+        let stranger = tenant(0xE5);
+
+        assert_eq!(
+            select_device_bearer(&mgr, Some(&stranger), Some(default)),
+            None,
+            "non-default slot miss must degrade to unauthenticated, not cross-tenant"
+        );
+    }
+
+    /// An empty/whitespace tenant-slot value counts as a miss and follows
+    /// the same posture (default → legacy fallback; stranger → None).
+    #[test]
+    fn empty_slot_value_counts_as_miss() {
+        let mgr = create_test_auth_manager("empty_slot_is_miss");
+        mgr.store_tokens("default.jwt", "").unwrap();
+        let a = tenant(0xF6);
+        mgr.store_tenant_device_jwt(&a, "   ").unwrap();
+
+        assert_eq!(
+            select_device_bearer(&mgr, Some(&a), Some(a)).as_deref(),
+            Some("default.jwt")
+        );
+        let default = tenant(0x11);
+        assert_eq!(select_device_bearer(&mgr, Some(&a), Some(default)), None);
+    }
+
+    /// No default binding known (unpaired) + non-default tenant miss →
+    /// None; None tenant still degrades to the legacy read (which may
+    /// itself be empty → None).
+    #[test]
+    fn unpaired_runner_degrades_to_none() {
+        let mgr = create_test_auth_manager("unpaired_degrades_none");
+        let a = tenant(0x22);
+        assert_eq!(select_device_bearer(&mgr, Some(&a), None), None);
+        assert_eq!(select_device_bearer(&mgr, None, None), None);
     }
 }
 

@@ -171,6 +171,9 @@ pub async fn terminal_create(
             .collect(),
         share_output: true,
         redact_secrets: None,
+        // Operator-opened tab — no explicit spawn tenant; the registry
+        // stamps the device default (default-for-new-sessions).
+        tenant_id: None,
     };
     // R2 — RESUME the pane's prior coord session if one is persisted,
     // otherwise register fresh. Resuming PATCHes the EXISTING coord row
@@ -1172,6 +1175,9 @@ pub(crate) fn create_terminal_session_backend(
         declared_paths: vec![std::path::PathBuf::from(&working_dir)],
         share_output: true,
         redact_secrets: None,
+        // Gate-continuation terminal — device-default binding; the registry
+        // stamps machine.json's default-for-new-sessions.
+        tenant_id: None,
     };
 
     let mut coord_session_id: Option<uuid::Uuid> = None;

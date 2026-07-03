@@ -110,6 +110,11 @@ pub(crate) fn should_relay_idle_with(
 /// slot from `AuthManager` (filesystem I/O on `~/.qontinui`) and delegates
 /// to the pure inner [`should_relay_idle_with`]. Tests must use the inner
 /// directly to avoid touching user data_local_dir.
+///
+/// Phase 8b tenant disposition: the relay is a DEVICE-scoped surface — it
+/// deliberately reads the legacy `access_token` slot (the DEFAULT
+/// binding's JWT) and stays on the unparameterized seam by construction;
+/// per-session tenants never route through the relay's WS identity.
 pub(crate) fn should_relay_idle(settings: &crate::settings::Settings) -> bool {
     let has_device_jwt = match crate::auth::AuthManager::new().get_access_token() {
         Ok(t) => !t.trim().is_empty(),

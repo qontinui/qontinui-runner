@@ -410,10 +410,14 @@ async fn publish_coord_credential_status(
         return;
     };
 
-    // tenant_id: machine.json::active_tenant_id, then the outgoing device-JWT
-    // claim (still parseable when expired). NULL is acceptable on the wire
-    // (coord's StatusUpsert.tenant_id is Option), but we send it when known so
-    // the row is tenant-scoped.
+    // tenant_id: machine.json::active_tenant_id (Phase 8b semantics: the
+    // DEVICE-LEVEL DEFAULT binding — this publish is a device-scoped surface,
+    // so the default is the correct attribution; session-scoped writes get
+    // their tenant from the owning session instead), then the outgoing
+    // device-JWT claim (still parseable when expired). NULL is acceptable on
+    // the wire (coord's StatusUpsert.tenant_id is Option), but we send it
+    // when known so the row is tenant-scoped — the explicit-tenant_id
+    // publisher posture D2 site 16b/Phase 8 item 7 asks for.
     let tenant_id = crate::session::dual_write::resolve_active_tenant_id().or_else(|| {
         auth_manager
             .get_access_token()

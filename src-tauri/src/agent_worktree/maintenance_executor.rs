@@ -343,8 +343,11 @@ fn execute_instruction(instr: &MaintenanceInstruction) -> ExecOutcome {
 // git_ops reporting — reuse the SHIPPED observable-bridge record path.
 // ---------------------------------------------------------------------------
 
-/// Read `active_tenant_id` from `~/.qontinui/machine.json` (advisory — coord
-/// DB-resolves the real tenant). `None` for single-tenant operators, which is
+/// Read `active_tenant_id` from `~/.qontinui/machine.json` — Phase 8b
+/// semantics: the DEVICE-LEVEL DEFAULT binding (default-for-new-sessions),
+/// not the-only-tenant. Correct here because maintenance branch-resets act
+/// on CANONICAL checkouts (a device-scoped surface), never on allocate-
+/// stamped agent worktrees. `None` for single-tenant operators, which is
 /// fine. Mirrors `census::resolve_tenant_id` / `fs_backstop::resolve_tenant_id`
 /// (both private; the read is trivial and attribution is best-effort).
 fn resolve_tenant_id() -> Option<uuid::Uuid> {

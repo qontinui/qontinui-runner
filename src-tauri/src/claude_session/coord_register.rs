@@ -473,6 +473,15 @@ pub struct LogEntry {
     pub agent_session_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_id: Option<Uuid>,
+    /// Phase 8b (plan 2026-07-02-session-scoped-multi-tenant-device-binding,
+    /// Phase 8 item 7 / D2 site 14): EXPLICIT tenant attribution from the
+    /// owning session's binding — these emitters serve runner-managed
+    /// operator sessions, whose binding is the device DEFAULT. Coord's
+    /// ingest fallback chain prefers it once Phase 5 deploys; today's coord
+    /// ignores the extra field. Omitted when unresolvable (coord then
+    /// resolves agent→worktree→device-side, the pre-8b behavior).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub occurred_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -497,6 +506,10 @@ pub struct AgentLogEmitter {
     /// caller re-threading it.
     agent_id: Uuid,
     device_id: Option<Uuid>,
+    /// Phase 8b item 7 — the owning session's tenant binding, resolved once
+    /// at emitter start (device DEFAULT for these runner-managed sessions)
+    /// and stamped on every entry.
+    tenant_id: Option<Uuid>,
 }
 
 impl AgentLogEmitter {
@@ -535,11 +548,16 @@ impl AgentLogEmitter {
             tx,
             agent_id,
             device_id: Some(device_id),
+            // Phase 8b item 7 — resolve the owning session's binding once
+            // (device DEFAULT: these are runner-managed operator sessions;
+            // coord-spawned agent sessions don't stream through this
+            // emitter). Best-effort: `None` omits the field on the wire.
+            tenant_id: crate::fleet::resolve_tenant_id(),
         })
     }
 
     /// Build a `LogEntry` stamped with this emitter's identity (agent session
-    /// id + device id), letting coord stamp `occurred_at`.
+    /// id + device id + owning tenant), letting coord stamp `occurred_at`.
     fn entry(&self, level: &str, event: &str, payload: Option<serde_json::Value>) -> LogEntry {
         LogEntry {
             level: level.to_string(),
@@ -547,6 +565,7 @@ impl AgentLogEmitter {
             payload,
             agent_session_id: Some(self.agent_id),
             device_id: self.device_id,
+            tenant_id: self.tenant_id,
             occurred_at: None,
         }
     }
@@ -1019,12 +1038,14 @@ mod tests {
     fn log_entry_serializes_to_coord_wire_shape() {
         let agent = Uuid::new_v4();
         let device = Uuid::new_v4();
+        let tenant = Uuid::new_v4();
         let entry = LogEntry {
             level: "info".to_string(),
             event: "stdout".to_string(),
             payload: Some(json!({ "text": "hello" })),
             agent_session_id: Some(agent),
             device_id: Some(device),
+            tenant_id: Some(tenant),
             occurred_at: None,
         };
         let v = serde_json::to_value(&entry).unwrap();
@@ -1034,8 +1055,27 @@ mod tests {
         assert_eq!(v["payload"]["text"], json!("hello"));
         assert_eq!(v["agent_session_id"], json!(agent));
         assert_eq!(v["device_id"], json!(device));
+        // Phase 8b item 7 — explicit tenant attribution on the wire.
+        assert_eq!(v["tenant_id"], json!(tenant));
         // `occurred_at` omitted (skip_serializing_if None) so coord stamps now().
         assert!(v.get("occurred_at").is_none());
+    }
+
+    /// Phase 8b — a None tenant_id is omitted (pre-8b wire shape preserved
+    /// for unpaired runners; coord's fallback chain still resolves).
+    #[test]
+    fn log_entry_omits_none_tenant_id() {
+        let entry = LogEntry {
+            level: "info".to_string(),
+            event: "stdout".to_string(),
+            payload: None,
+            agent_session_id: None,
+            device_id: None,
+            tenant_id: None,
+            occurred_at: None,
+        };
+        let v = serde_json::to_value(&entry).unwrap();
+        assert!(v.get("tenant_id").is_none());
     }
 
     #[test]
@@ -1046,6 +1086,7 @@ mod tests {
             payload: None,
             agent_session_id: None,
             device_id: None,
+            tenant_id: None,
             occurred_at: None,
         };
         let mut q: std::collections::VecDeque<LogEntry> = std::collections::VecDeque::new();

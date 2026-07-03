@@ -1307,6 +1307,9 @@ pub async fn spawn_worker_session(
                 declared_paths: vec![],
                 share_output: true,
                 redact_secrets: None,
+                // Worker session — no explicit spawn tenant; the registry
+                // stamps the device default (default-for-new-sessions).
+                tenant_id: None,
             };
             match registry.register_external(intent) {
                 Ok(coord_id) => {

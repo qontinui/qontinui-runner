@@ -89,11 +89,20 @@ impl MemoryBridge {
         }
     }
 
-    /// Read the device-token JWT used as `Authorization: Bearer`.
-    /// Returns `None` if the runner is not paired — every call site
-    /// short-circuits in that case (best-effort posture).
-    fn device_token(&self) -> Option<String> {
-        crate::auth::AuthManager::new().get_access_token().ok()
+    /// Read the device-token JWT used as `Authorization: Bearer` — the
+    /// OWNING SESSION's tenant slot (Phase 8b per-session credential
+    /// selection, plan 2026-07-02-session-scoped-multi-tenant-device-binding
+    /// §D4): memories are hard tenant-scoped, so a session federating
+    /// tenant B's pool must present B's device JWT, not the machine
+    /// default's. `ctx.tenant_id` is the session's binding (resolved by
+    /// `federation::build_federation_ctx`: spawn input, else the device
+    /// default) — when it IS the default, `device_bearer_for` falls back to
+    /// the legacy slot, preserving today's behavior byte-for-byte. Returns
+    /// `None` if no credential exists for that tenant (slot-miss fail-soft:
+    /// never another tenant's token) — every call site short-circuits in
+    /// that case (best-effort posture).
+    fn device_token(&self, ctx: &SessionContext) -> Option<String> {
+        crate::auth::device_bearer_for(Some(&ctx.tenant_id))
     }
 
     /// Push one local change to coord. Inherent (NOT a trait method):
@@ -101,7 +110,7 @@ impl MemoryBridge {
     /// site through the trait object. Best-effort — failures are logged,
     /// never propagated.
     async fn push(&self, change: ObservableChange, session_ctx: &SessionContext) -> Result<()> {
-        let token = match self.device_token() {
+        let token = match self.device_token(session_ctx) {
             Some(t) if !t.is_empty() => t,
             _ => {
                 debug!("observable_bridge::memory::push: no device token; dropping change");
@@ -339,7 +348,7 @@ impl RunnerObservableBridge for MemoryBridge {
 
         let local_pre = snapshot_dir(&session_ctx.memory_dir)?;
 
-        let token = match self.device_token() {
+        let token = match self.device_token(session_ctx) {
             Some(t) if !t.is_empty() => t,
             _ => {
                 warn!(
@@ -552,7 +561,7 @@ impl RunnerObservableBridge for MemoryBridge {
         };
         let post_session = snapshot_dir(&session_ctx.memory_dir)?;
 
-        let token = match self.device_token() {
+        let token = match self.device_token(session_ctx) {
             Some(t) if !t.is_empty() => t,
             _ => {
                 warn!(

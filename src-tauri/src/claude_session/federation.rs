@@ -195,26 +195,36 @@ pub fn session_uuid(session_id: &str) -> Uuid {
 ///
 /// Resolution sources:
 ///
-/// - `tenant_id` → `fleet::resolve_tenant_id`-equivalent: prefer
-///   `paired_user.json::tenant_id`, fall back to the cached
-///   device-token JWT claim.
+/// - `tenant_id` → **the spawned session's own binding first** (Phase 8b,
+///   plan 2026-07-02-session-scoped-multi-tenant-device-binding §D4:
+///   `session_tenant`, threaded from the spawn input when the caller
+///   recorded one), else the device DEFAULT binding:
+///   `paired_user.json::default_tenant_id`, falling back to the cached
+///   device-token JWT claim. Memories are hard tenant-scoped, so a
+///   session spawned for tenant B must federate B's pool even when the
+///   machine default is A.
 /// - `device_id` → `~/.qontinui/machine.json::device_id`.
 /// - `account_name` → derived from `effective_config_dir` (trailing
 ///   `.claude-<name>` component). Falls back to `"default"` for a
 ///   single-account install where `config_dir` is `~/.claude`.
 /// - `memory_dir` → `<effective_config_dir>/projects/<encoded
 ///   working_dir>/memory/` per Claude Code's on-disk convention.
+///
+/// The home-dir identity PIN (`federation.rs` device identity) is
+/// deliberately untouched (plan §6).
 pub fn build_federation_ctx(
     session_id: &str,
     working_dir: &str,
     cli_settings: &ClaudeCliSettings,
+    session_tenant: Option<Uuid>,
 ) -> Result<SessionContext, FederationSkipReason> {
-    let tenant_id = match resolve_tenant_id() {
+    let tenant_id = match session_tenant.or_else(resolve_tenant_id) {
         Some(t) => t,
         None => {
             warn!(
                 "claude_session::federation: tenant_id unresolvable \
-                 (no paired_user.json::tenant_id, no claim in cached device-token JWT); \
+                 (no session tenant, no paired_user.json::tenant_id, no claim in \
+                 cached device-token JWT); \
                  skipping memory federation for session {session_id}"
             );
             return Err(FederationSkipReason::TenantUnresolved);
@@ -474,9 +484,10 @@ pub fn log_bridge_report(category: &str, ctx: &SessionContext, report: Result<Re
     }
 }
 
-/// Resolve the tenant UUID. Mirrors `fleet.rs::resolve_tenant_id` but
-/// that's private to `fleet`; the duplication here keeps the federation
-/// module self-contained.
+/// Resolve the device DEFAULT binding's tenant UUID (Phase 8b semantics —
+/// the fallback for sessions with no recorded tenant of their own).
+/// Mirrors `fleet.rs::resolve_tenant_id` but that's private to `fleet`;
+/// the duplication here keeps the federation module self-contained.
 fn resolve_tenant_id() -> Option<Uuid> {
     if let Some(s) = qontinui_runner_lib::pair::read_paired_tenant_id_from_disk() {
         if let Ok(t) = Uuid::parse_str(s.trim()) {

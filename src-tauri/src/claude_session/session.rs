@@ -311,6 +311,10 @@ impl ClaudeSession {
                 session_id,
                 working_dir,
                 &ai_settings.claude_cli,
+                // Phase 8b: interactive sessions have no explicit spawn
+                // tenant yet — device default. A spawn input recording a
+                // session tenant threads it here.
+                None,
             ) {
                 Ok(ctx) => Some(ctx),
                 Err(reason) => {

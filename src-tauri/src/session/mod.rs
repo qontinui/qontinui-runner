@@ -345,6 +345,22 @@ fn ambient_claude_code_session_id() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Phase 8b (plan `2026-07-02-session-scoped-multi-tenant-device-binding`
+/// §D4/§D7) — record the session's tenant AT CREATION: the spawn input
+/// (`intent.tenant_id`) wins; otherwise the device's default binding
+/// (`machine.json::active_tenant_id`, whose semantics are now
+/// default-for-NEW-sessions). Immutable afterwards — the recorded value
+/// drives both the coord `POST /sessions` body and which device-JWT slot the
+/// coord-sync loop presents for this session's writes. Stays `None` on
+/// single-tenant installs with no configured default (coord resolves
+/// sole-binding server-side, exactly the pre-8b behavior).
+fn stamp_session_tenant(mut intent: Intent) -> Intent {
+    if intent.tenant_id.is_none() {
+        intent.tenant_id = dual_write::resolve_active_tenant_id();
+    }
+    intent
+}
+
 impl SessionRegistry {
     pub fn new(
         machine_id: Uuid,
@@ -387,6 +403,7 @@ impl SessionRegistry {
         parent_session_id: Option<Uuid>,
     ) -> Result<SessionHandle, SessionError> {
         intent.validate()?;
+        let intent = stamp_session_tenant(intent);
 
         let transport = self.transports.pick(intent.kind);
         let transport_handle = transport.start(&intent)?;
@@ -501,6 +518,7 @@ impl SessionRegistry {
     /// off this is never reached.
     pub fn register_external(self: &Arc<Self>, intent: Intent) -> Result<Uuid, SessionError> {
         intent.validate()?;
+        let intent = stamp_session_tenant(intent);
 
         let id = uuid_v7();
         let now = chrono::Utc::now();
@@ -1072,6 +1090,7 @@ mod tests {
             declared_paths: vec![],
             share_output: false,
             redact_secrets: None,
+            tenant_id: None,
         }
     }
 

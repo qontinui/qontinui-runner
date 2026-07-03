@@ -219,9 +219,10 @@ fn resolve_binding_set() -> Option<LocalBindingSet> {
 
 /// Single-tenant convenience over [`resolve_binding_set`]: the DEFAULT
 /// binding, for callers that stamp one tenant on a device-scoped write
-/// (e.g. the git-ops fleet feed). Session-scoped callers get their
-/// tenant from the owning session instead (Phase 8b).
-fn resolve_tenant_id() -> Option<uuid::Uuid> {
+/// (e.g. the git-ops fleet feed, the tree publisher's explicit
+/// `tenant_id`, the WIP-attribution walker). Session-scoped callers get
+/// their tenant from the owning session instead (Phase 8b).
+pub(crate) fn resolve_tenant_id() -> Option<uuid::Uuid> {
     resolve_binding_set().map(|b| b.default_tenant)
 }
 
@@ -1120,6 +1121,16 @@ struct TreeStatePayload {
     /// the truncated sample. `None` only if status couldn't be determined.
     #[serde(skip_serializing_if = "Option::is_none")]
     dirty_total: Option<i32>,
+    /// Phase 8b (plan 2026-07-02-session-scoped-multi-tenant-device-binding,
+    /// Phase 8 item 7 / D2 site 13): EXPLICIT tenant attribution — the
+    /// device DEFAULT binding, since primary trees are canonical
+    /// device-scoped checkouts (agent worktrees are coord-stamped at
+    /// allocate and never published here). Explicit-wins coord-side once
+    /// Phase 5's resolver deploys; today's coord ignores the extra field.
+    /// Omitted when the runner has no resolvable default binding. Filled by
+    /// the publisher alongside `device_id` (identity-side, not per-repo).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tenant_id: Option<uuid::Uuid>,
 }
 
 /// Maximum number of dirty paths included per row (the column is unbounded
@@ -1524,6 +1535,7 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
         local_ahead,
         behind_default_count,
         dirty_total: Some(dirty_total_count),
+        tenant_id: None,
     })
 }
 
@@ -2101,9 +2113,13 @@ async fn request_and_apply_pull(
     repo_path: std::path::PathBuf,
     payload: &TreeStatePayload,
 ) {
-    // 1. Request the decision (device-scoped — coord resolves tenant from
-    //    device_id; the executor's fresh git state rides in `context` so the
-    //    verdict can fall back to it if coord's row lags).
+    // 1. Request the decision (device-scoped; the executor's fresh git state
+    //    rides in `context` so the verdict can fall back to it if coord's
+    //    row lags). Phase 8b item 7: `tenant_id` goes EXPLICIT (device
+    //    DEFAULT binding, mirrored from the tree upsert) — coord's D2
+    //    resolver prefers it once Phase 5 deploys and stamps it into the
+    //    policy_rule_resolutions row that `pull-decision/record` later
+    //    resolves through; today's coord ignores the extra field.
     let context = serde_json::json!({
         "repo": payload.repo,
         "branch": payload.branch,
@@ -2113,12 +2129,15 @@ async fn request_and_apply_pull(
         "detached": payload.head_detached,
         "local_ahead": payload.local_ahead,
     });
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "device_id": device_id,
         "repo": payload.repo,
         "surface": "infra",
         "context": context,
     });
+    if let Some(t) = payload.tenant_id {
+        body["tenant_id"] = serde_json::json!(t);
+    }
     let url = format!("{base}/coord/trees/pull-decision");
     let resp = match client.post(&url).json(&body).send().await {
         Ok(r) if r.status().is_success() => r,
@@ -2404,6 +2423,11 @@ pub async fn publish_tree_state() -> Result<(), String> {
         }
     };
 
+    // Phase 8b item 7 — resolve the explicit publisher tenant (device
+    // DEFAULT binding) once per pass. `None` (unpaired) omits the field and
+    // coord resolves device-side, exactly the pre-8b behavior.
+    let publisher_tenant = resolve_tenant_id();
+
     let base = match coord_http_base() {
         Some(b) => b,
         None => {
@@ -2498,6 +2522,10 @@ pub async fn publish_tree_state() -> Result<(), String> {
         };
         total += 1;
         payload.device_id = device_id;
+        // Phase 8b item 7 — explicit tenant on the upsert wire (device
+        // DEFAULT binding; canonical trees are device-scoped). Identity-side
+        // like `device_id`, so stamped here rather than in capture_tree.
+        payload.tenant_id = publisher_tenant;
 
         let upsert_ok = match client.post(&url).json(&payload).send().await {
             Ok(resp) if resp.status().is_success() => {
@@ -3292,6 +3320,7 @@ mod tests {
             local_ahead: Some(0),
             behind_default_count: None,
             dirty_total: None,
+            tenant_id: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert!(
@@ -3318,12 +3347,48 @@ mod tests {
             local_ahead: Some(0),
             behind_default_count: Some(42),
             dirty_total: None,
+            tenant_id: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
             body.get("behind_default_count").and_then(|v| v.as_i64()),
             Some(42),
             "a set behind_default_count must appear on the upsert wire"
+        );
+        // Phase 8b item 7 — a None tenant_id is omitted (pre-8b wire shape
+        // preserved for unpaired runners)…
+        assert!(
+            body.get("tenant_id").is_none(),
+            "None tenant_id must be omitted from the upsert wire"
+        );
+    }
+
+    /// Phase 8b item 7 — the tree upsert goes EXPLICIT: a resolved default
+    /// binding appears as `tenant_id` on the wire.
+    #[test]
+    fn tree_payload_serializes_explicit_tenant_id() {
+        let t = uuid::Uuid::from_bytes([0x5A; 16]);
+        let p = TreeStatePayload {
+            device_id: uuid::Uuid::nil(),
+            repo: "qontinui-runner".into(),
+            branch: "main".into(),
+            head_sha: "deadbeef".into(),
+            dirty: false,
+            dirty_files: None,
+            last_edit_at: None,
+            behind_count: Some(0),
+            head_detached: Some(false),
+            untracked_count: Some(0),
+            local_ahead: Some(0),
+            behind_default_count: None,
+            dirty_total: None,
+            tenant_id: Some(t),
+        };
+        let body = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            body.get("tenant_id").and_then(|v| v.as_str()),
+            Some(t.to_string().as_str()),
+            "an explicit tenant_id must appear on the upsert wire"
         );
     }
 }

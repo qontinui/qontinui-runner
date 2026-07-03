@@ -2653,6 +2653,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 //   Phase 10 flag-poll only spawns when an `active_tenant_id`
                 //   resolved from machine.json (None → dormant); dual-write
                 //   stays off until `session_coordination_enabled` flips.
+                //   Multi-tenant (Phase 8b) disposition: the flag-poll is a
+                //   DEVICE-scoped surface — it polls the DEFAULT binding's
+                //   tenant policy and presents the default device-JWT slot
+                //   (unparameterized `coord_get`) by construction.
                 let loop_registry = registry.clone();
                 tauri::async_runtime::spawn(async move {
                     let _drain = loop_registry.coord_sync().start_drain_task();

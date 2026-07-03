@@ -636,6 +636,15 @@ fn build_child_intent(state: &HandoffState) -> Result<Intent, HandoffError> {
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
+    // Phase 8b — carry the SOURCE session's tenant binding across the
+    // handoff (session tenancy is immutable; the child continues the same
+    // tenant's work). Absent on legacy source intents → None, and the
+    // registry stamps this machine's default at materialization.
+    let tenant_id = src
+        .get("tenant_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok());
+
     Ok(Intent {
         kind,
         purpose,
@@ -647,6 +656,7 @@ fn build_child_intent(state: &HandoffState) -> Result<Intent, HandoffError> {
         declared_paths,
         share_output,
         redact_secrets,
+        tenant_id,
     })
 }
 

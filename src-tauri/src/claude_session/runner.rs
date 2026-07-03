@@ -484,6 +484,10 @@ fn run_claude_session_inline(
             session_id,
             working_dir,
             &ai_settings.claude_cli,
+            // Phase 8b: no explicit spawn tenant on this path yet — the
+            // non-interactive runner spawns under the device default. A
+            // spawn input that records a session tenant threads it here.
+            None,
         ) {
             Ok(ctx) => Some(ctx),
             Err(reason) => {
