@@ -58,6 +58,12 @@
 //!   against a double-inject within a tick or before the ack lands. A
 //!   per-`to_session` cooldown debounces a flapping source so it cannot spam a
 //!   session.
+//! - **Blocked-delivery surfacing.** A `priority="blocking"` message that
+//!   stays undeliverable (target not live, or PTY never idle) past
+//!   `RUNNER_BLOCKING_MSG_SURFACE_SECS` is reported to coord via a fail-open
+//!   `delivery-blocked` POST — evidence for the stall-watchdog supervisor,
+//!   never a change to delivery behavior. Gated (default ON) by
+//!   `RUNNER_DELIVERY_SURFACING_ENABLED`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -173,6 +179,247 @@ impl DeliveryGuard {
     fn mark_injected(&mut self, to_session: &str, message_id: &str, now: Instant) {
         self.last_injected.insert(to_session.to_string(), now);
         self.delivered.insert(message_id.to_string(), now);
+    }
+}
+
+// ===========================================================================
+// Delivery-blocked surfacing (lost-wakeup fixes 2-3,
+// plan 2026-07-03-subagent-stall-watchdog)
+// ===========================================================================
+//
+// A `priority="blocking"` message that cannot be delivered used to fail
+// SILENTLY forever: an unresolvable `to_session` just logged-and-waited (until
+// the 14d TTL), and a PTY that never passes the idle gate deferred injection
+// on every tick with no aging signal. Both are exactly the invisible-stall
+// class the stall-watchdog plan exists to kill, so once a blocking message has
+// been blocked past `RUNNER_BLOCKING_MSG_SURFACE_SECS` we POST a typed
+// delivery-failure to coord (`.../delivery-blocked`) as EVIDENCE for coord's
+// expectation supervisor. Delivery behavior itself is UNCHANGED — the POST is
+// reporting-only, fail-open, and fired at most once per threshold window per
+// message.
+
+/// Flag gating the surfacing POSTs (fixes 2-3). **Default ON** — they are
+/// reporting-only (no mutation, no injection change; plan vet decision).
+/// `0`/`false`/`no`/`off` disables the POSTs (blocked-time tracking still
+/// runs; it is cheap and keeps `blocked_since` honest if re-enabled).
+const SURFACING_ENABLED_ENV: &str = "RUNNER_DELIVERY_SURFACING_ENABLED";
+
+/// How long a blocking message must be continuously undeliverable before the
+/// first surfacing POST, and the minimum spacing between POSTs for the same
+/// message thereafter (once per window). Seconds; env-tunable.
+const SURFACE_SECS_ENV: &str = "RUNNER_BLOCKING_MSG_SURFACE_SECS";
+
+/// Default surfacing threshold: 30 minutes.
+const SURFACE_SECS_DEFAULT: u64 = 1800;
+
+/// Resolve the surfacing flag from a raw env value. Pure for unit tests.
+/// Absent ⇒ ON (default); only an explicit falsy value disables.
+fn resolve_surfacing_enabled(raw: Option<&str>) -> bool {
+    match raw {
+        Some(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        None => true,
+    }
+}
+
+/// Is delivery-blocked surfacing enabled? (env, default ON)
+fn surfacing_enabled() -> bool {
+    resolve_surfacing_enabled(std::env::var(SURFACING_ENABLED_ENV).ok().as_deref())
+}
+
+/// Resolve the surfacing threshold from a raw env value. Pure for unit tests.
+/// Unset / non-numeric ⇒ the 1800s default.
+fn resolve_surface_threshold(raw: Option<&str>) -> Duration {
+    Duration::from_secs(
+        raw.and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(SURFACE_SECS_DEFAULT),
+    )
+}
+
+/// The configured surfacing threshold (env override, else 1800s).
+fn surface_threshold() -> Duration {
+    resolve_surface_threshold(std::env::var(SURFACE_SECS_ENV).ok().as_deref())
+}
+
+/// Why a blocking message could not be delivered — the typed `reason` the
+/// surfacing POST carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum BlockReason {
+    /// Fix 2: `to_session` does not resolve to a live local session.
+    TargetNotLive,
+    /// Fix 3: the target PTY keeps failing the idle gate, deferring injection.
+    PtyNeverIdle,
+}
+
+impl BlockReason {
+    /// The wire value for the POST body's `reason` field.
+    fn as_str(self) -> &'static str {
+        match self {
+            BlockReason::TargetNotLive => "target_not_live",
+            BlockReason::PtyNeverIdle => "pty_never_idle",
+        }
+    }
+}
+
+/// Pure surfacing decision: should a POST fire NOW for a message first seen
+/// blocked at `first_seen`, last surfaced at `last_posted`?
+///
+/// - Disabled flag ⇒ never.
+/// - Blocked for less than `threshold` ⇒ not yet.
+/// - Never posted ⇒ fire.
+/// - Already posted ⇒ fire again only after a full `threshold` cooldown window
+///   since the last POST (at most one POST per message per window).
+fn should_surface(
+    first_seen: Instant,
+    last_posted: Option<Instant>,
+    now: Instant,
+    threshold: Duration,
+    enabled: bool,
+) -> bool {
+    if !enabled {
+        return false;
+    }
+    if now.duration_since(first_seen) < threshold {
+        return false;
+    }
+    match last_posted {
+        None => true,
+        Some(at) => now.duration_since(at) >= threshold,
+    }
+}
+
+/// Per-(message, reason) blocked-delivery bookkeeping.
+struct BlockEntry {
+    /// Monotonic first-seen, for threshold/cooldown math.
+    first_seen: Instant,
+    /// Wall-clock first-seen, for the POST's `blocked_since` (RFC 3339).
+    first_seen_wall: chrono::DateTime<chrono::Utc>,
+    /// Monotonic time of the last surfacing POST attempt (None = never).
+    last_posted: Option<Instant>,
+}
+
+/// Tracks how long each blocking message has been undeliverable, per reason.
+///
+/// IN-PROCESS ONLY (restart caveat): a runner restart resets the clock, which
+/// only DELAYS surfacing by up to one threshold window — it can never spam,
+/// because a fresh map means no entry is past the threshold yet.
+#[derive(Default)]
+struct SurfacingTracker {
+    entries: HashMap<(String, BlockReason), BlockEntry>,
+}
+
+impl SurfacingTracker {
+    /// Record that `message_id` is blocked for `reason` as of `now`. Returns
+    /// `Some(blocked_since)` when a surfacing POST should fire (and stamps the
+    /// cooldown so the same window never fires twice), else `None`.
+    fn note_blocked(
+        &mut self,
+        message_id: &str,
+        reason: BlockReason,
+        now: Instant,
+        threshold: Duration,
+        enabled: bool,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        let entry = self
+            .entries
+            .entry((message_id.to_string(), reason))
+            .or_insert_with(|| BlockEntry {
+                first_seen: now,
+                first_seen_wall: chrono::Utc::now(),
+                last_posted: None,
+            });
+        if should_surface(entry.first_seen, entry.last_posted, now, threshold, enabled) {
+            // Stamp BEFORE the (fail-open) POST attempt: at most one attempt
+            // per window even if the POST errors — never a retry storm.
+            entry.last_posted = Some(now);
+            Some(entry.first_seen_wall)
+        } else {
+            None
+        }
+    }
+
+    /// A successful delivery clears every tracking entry for the message.
+    fn clear_message(&mut self, message_id: &str) {
+        self.entries.retain(|(mid, _), _| mid != message_id);
+    }
+
+    /// Drop entries whose message is no longer in coord's pending set (it was
+    /// delivered elsewhere, cancelled, or expired) so the map stays bounded.
+    fn retain_pending(&mut self, pending_ids: &std::collections::HashSet<&str>) {
+        self.entries
+            .retain(|(mid, _), _| pending_ids.contains(mid.as_str()));
+    }
+}
+
+/// Fire the delivery-blocked surfacing POST for `message_id` if it has been
+/// blocked past the threshold (once per window). **Fail-open by contract**:
+/// any error / non-2xx — including 404 while the coord route (shipped in the
+/// plan's PR 3) hasn't landed — is a debug log; delivery behavior is never
+/// affected.
+///
+/// Auth: the same device-JWT bearer the poller's `pending` / `mark-delivered`
+/// calls use (the `token` threaded from `deliver_once`).
+async fn surface_blocked_delivery(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    tracker: &mut SurfacingTracker,
+    message_id: &str,
+    reason: BlockReason,
+    now: Instant,
+) {
+    let Some(blocked_since) = tracker.note_blocked(
+        message_id,
+        reason,
+        now,
+        surface_threshold(),
+        surfacing_enabled(),
+    ) else {
+        return;
+    };
+    let Some(device_id) = crate::agent_runtime::load_local_device_id() else {
+        debug!(
+            "session_message_poller: delivery-blocked surfacing for msg {message_id} \
+             skipped — no local device id"
+        );
+        return;
+    };
+    let url = format!("{base}/coord/session-messages/{message_id}/delivery-blocked");
+    let body = serde_json::json!({
+        "device_id": device_id.to_string(),
+        "reason": reason.as_str(),
+        "blocked_since": blocked_since.to_rfc3339(),
+    });
+    match client
+        .post(&url)
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            info!(
+                "session_message_poller: surfaced delivery-blocked msg {message_id} \
+                 (reason={}) to coord",
+                reason.as_str()
+            );
+        }
+        Ok(resp) => {
+            // 404 expected until coord's delivery-blocked route ships (PR 3).
+            debug!(
+                "session_message_poller: delivery-blocked POST for msg {message_id} \
+                 -> HTTP {} (fail-open, continuing)",
+                resp.status()
+            );
+        }
+        Err(e) => {
+            debug!(
+                "session_message_poller: delivery-blocked POST for msg {message_id} \
+                 failed: {e} (fail-open, continuing)"
+            );
+        }
     }
 }
 
@@ -449,6 +696,7 @@ async fn poller_loop(api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver<
     );
 
     let mut guard = DeliveryGuard::default();
+    let mut tracker = SurfacingTracker::default();
     // Edge-trigger the "killed" / "unpaired" steady-state logs.
     let mut last_killed_logged = false;
 
@@ -471,7 +719,7 @@ async fn poller_loop(api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver<
                 last_killed_logged = false;
             }
             // Fail-open: a tick error NEVER panics the loop.
-            if let Err(e) = deliver_once(&api_state, &mut guard).await {
+            if let Err(e) = deliver_once(&api_state, &mut guard, &mut tracker).await {
                 warn!("session_message_poller: delivery tick failed: {e}");
             }
             guard.prune(Instant::now());
@@ -490,8 +738,14 @@ async fn poller_loop(api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver<
 /// One delivery pass: pull pending → resolve → (idle-gate for PTY) → inject via
 /// the in-process primitive → mark delivered. Returns `Err` only for a
 /// tick-level failure (no JWT, coord unreachable, decode) — a per-message
-/// resolution miss or idle-skip is normal and silent.
-async fn deliver_once(api_state: &Arc<ApiState>, guard: &mut DeliveryGuard) -> anyhow::Result<()> {
+/// resolution miss or idle-skip is normal and silent, except that a BLOCKING
+/// message blocked past the surfacing threshold fires a (fail-open, once per
+/// window) delivery-blocked POST via `tracker`.
+async fn deliver_once(
+    api_state: &Arc<ApiState>,
+    guard: &mut DeliveryGuard,
+    tracker: &mut SurfacingTracker,
+) -> anyhow::Result<()> {
     // Device JWT — unpaired ⇒ skip the tick quietly (no spam).
     let token = match crate::auth::AuthManager::new().get_access_token() {
         Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
@@ -521,6 +775,14 @@ async fn deliver_once(api_state: &Arc<ApiState>, guard: &mut DeliveryGuard) -> a
         anyhow::bail!("pull {pending_url} -> HTTP {}", resp.status());
     }
     let pending: PendingResponse = resp.json().await?;
+    // Drop surfacing entries for messages no longer pending (delivered
+    // elsewhere / cancelled / expired) so the tracker stays bounded.
+    let pending_ids: std::collections::HashSet<&str> = pending
+        .messages
+        .iter()
+        .map(|m| m.message_id.as_str())
+        .collect();
+    tracker.retain_pending(&pending_ids);
     if pending.messages.is_empty() {
         return Ok(());
     }
@@ -585,6 +847,18 @@ async fn deliver_once(api_state: &Arc<ApiState>, guard: &mut DeliveryGuard) -> a
                      here — pending until it next opens",
                     msg.message_id
                 );
+                // Fix 2: a blocking message unresolvable past the threshold is
+                // surfaced to coord (once per window, fail-open).
+                surface_blocked_delivery(
+                    &client,
+                    &base,
+                    &token,
+                    tracker,
+                    &msg.message_id,
+                    BlockReason::TargetNotLive,
+                    now,
+                )
+                .await;
             } else {
                 debug!(
                     "session_message_poller: msg {} target {to_session} not live — pending",
@@ -617,6 +891,22 @@ async fn deliver_once(api_state: &Arc<ApiState>, guard: &mut DeliveryGuard) -> a
                         "session_message_poller: terminal {terminal_id} not idle — deferring msg {}",
                         msg.message_id
                     );
+                    // Fix 3: a blocking message whose PTY never quiesces past
+                    // the threshold is surfaced to coord as evidence for the
+                    // stuck-not-dead classifier (once per window, fail-open).
+                    // Injection behavior is unchanged — we still just defer.
+                    if msg.priority == "blocking" {
+                        surface_blocked_delivery(
+                            &client,
+                            &base,
+                            &token,
+                            tracker,
+                            &msg.message_id,
+                            BlockReason::PtyNeverIdle,
+                            now,
+                        )
+                        .await;
+                    }
                     continue;
                 }
                 task_run_id.clone()
@@ -631,6 +921,8 @@ async fn deliver_once(api_state: &Arc<ApiState>, guard: &mut DeliveryGuard) -> a
         // 4. Mark delivered. Record locally FIRST (cooldown + delivered-set)
         // so even if the ack POST fails we won't re-inject within the TTL.
         guard.mark_injected(to_session, &msg.message_id, now);
+        // A successful delivery clears the message's blocked-surfacing state.
+        tracker.clear_message(&msg.message_id);
 
         let mark_url = format!("{base}/coord/session-messages/mark-delivered");
         if let Err(e) = client
@@ -889,5 +1181,169 @@ mod tests {
         assert!(framed.contains("directed message"));
         assert!(framed.contains("normal priority"));
         assert!(!framed.contains("from session"));
+    }
+
+    // ---- delivery-blocked surfacing (fixes 2-3) ---------------------------
+
+    const THRESH: Duration = Duration::from_secs(1800);
+
+    // NOTE: all instants below are built ADDITIVELY from a fresh `Instant::now()`
+    // base (`base + offset`), never `Instant::now() - big_offset` — `Instant`
+    // subtraction panics on underflow, and on a freshly booted CI VM the
+    // monotonic clock's zero point can be closer than the offsets used here.
+
+    #[test]
+    fn surfacing_disabled_flag_never_fires() {
+        let first_seen = Instant::now();
+        let now = first_seen + THRESH * 3;
+        assert!(!should_surface(first_seen, None, now, THRESH, false));
+    }
+
+    #[test]
+    fn surfacing_waits_for_threshold() {
+        let first_seen = Instant::now();
+        // Just became blocked — not yet.
+        assert!(!should_surface(first_seen, None, first_seen, THRESH, true));
+        // Blocked one second short of the threshold — still not yet.
+        let now = first_seen + THRESH - Duration::from_secs(1);
+        assert!(!should_surface(first_seen, None, now, THRESH, true));
+        // Past the threshold, never posted — fire.
+        let now = first_seen + THRESH + Duration::from_secs(1);
+        assert!(should_surface(first_seen, None, now, THRESH, true));
+    }
+
+    #[test]
+    fn surfacing_cooldown_is_once_per_window() {
+        let first_seen = Instant::now();
+        let now = first_seen + THRESH * 3;
+        // Posted moments ago — the same window must NOT fire again.
+        let just_posted = now - Duration::from_secs(5);
+        assert!(!should_surface(
+            first_seen,
+            Some(just_posted),
+            now,
+            THRESH,
+            true
+        ));
+        // A full window since the last POST — fires again (next window).
+        let window_ago = now - THRESH;
+        assert!(should_surface(
+            first_seen,
+            Some(window_ago),
+            now,
+            THRESH,
+            true
+        ));
+    }
+
+    #[test]
+    fn tracker_fires_once_then_cools_down_then_fires_next_window() {
+        let mut t = SurfacingTracker::default();
+        let t0 = Instant::now();
+        // First sighting: entry created, nothing fires (below threshold).
+        assert!(t
+            .note_blocked("m1", BlockReason::TargetNotLive, t0, THRESH, true)
+            .is_none());
+        // Past the threshold: fires exactly once...
+        let t1 = t0 + THRESH + Duration::from_secs(1);
+        let since = t.note_blocked("m1", BlockReason::TargetNotLive, t1, THRESH, true);
+        assert!(since.is_some(), "first over-threshold sighting must fire");
+        // ...and the immediate next tick is in cooldown.
+        let t2 = t1 + Duration::from_secs(10);
+        assert!(t
+            .note_blocked("m1", BlockReason::TargetNotLive, t2, THRESH, true)
+            .is_none());
+        // A full window later it fires again, carrying the SAME blocked_since
+        // (first-seen is never reset by a POST).
+        let t3 = t1 + THRESH;
+        let again = t.note_blocked("m1", BlockReason::TargetNotLive, t3, THRESH, true);
+        assert_eq!(
+            again, since,
+            "blocked_since must remain the first-seen time"
+        );
+    }
+
+    #[test]
+    fn tracker_reasons_are_tracked_independently() {
+        let mut t = SurfacingTracker::default();
+        let t0 = Instant::now();
+        let t1 = t0 + THRESH + Duration::from_secs(1);
+        // target_not_live aged past the threshold...
+        t.note_blocked("m1", BlockReason::TargetNotLive, t0, THRESH, true);
+        assert!(t
+            .note_blocked("m1", BlockReason::TargetNotLive, t1, THRESH, true)
+            .is_some());
+        // ...but a FRESH pty_never_idle sighting of the same message starts
+        // its own clock and does not fire yet.
+        assert!(t
+            .note_blocked("m1", BlockReason::PtyNeverIdle, t1, THRESH, true)
+            .is_none());
+    }
+
+    #[test]
+    fn successful_delivery_clears_tracking() {
+        let mut t = SurfacingTracker::default();
+        let t0 = Instant::now();
+        t.note_blocked("m1", BlockReason::TargetNotLive, t0, THRESH, true);
+        t.note_blocked("m1", BlockReason::PtyNeverIdle, t0, THRESH, true);
+        t.note_blocked("m2", BlockReason::TargetNotLive, t0, THRESH, true);
+        t.clear_message("m1");
+        // m1's clocks restart from scratch; m2 is untouched.
+        let t1 = t0 + THRESH + Duration::from_secs(1);
+        assert!(
+            t.note_blocked("m1", BlockReason::TargetNotLive, t1, THRESH, true)
+                .is_none(),
+            "delivery must reset m1's first-seen clock"
+        );
+        assert!(
+            t.note_blocked("m2", BlockReason::TargetNotLive, t1, THRESH, true)
+                .is_some(),
+            "m2's clock must be unaffected by m1's delivery"
+        );
+    }
+
+    #[test]
+    fn retain_pending_drops_vanished_messages() {
+        let mut t = SurfacingTracker::default();
+        let t0 = Instant::now();
+        t.note_blocked("gone", BlockReason::TargetNotLive, t0, THRESH, true);
+        t.note_blocked("kept", BlockReason::PtyNeverIdle, t0, THRESH, true);
+        let pending: std::collections::HashSet<&str> = ["kept"].into_iter().collect();
+        t.retain_pending(&pending);
+        assert!(!t
+            .entries
+            .contains_key(&("gone".to_string(), BlockReason::TargetNotLive)));
+        assert!(t
+            .entries
+            .contains_key(&("kept".to_string(), BlockReason::PtyNeverIdle)));
+    }
+
+    #[test]
+    fn surfacing_env_parsing_defaults() {
+        // Flag: absent ⇒ ON; only explicit falsy values disable.
+        assert!(resolve_surfacing_enabled(None));
+        assert!(resolve_surfacing_enabled(Some("1")));
+        assert!(resolve_surfacing_enabled(Some("weird")));
+        assert!(!resolve_surfacing_enabled(Some("0")));
+        assert!(!resolve_surfacing_enabled(Some("false")));
+        assert!(!resolve_surfacing_enabled(Some("No")));
+        assert!(!resolve_surfacing_enabled(Some(" off ")));
+        // Threshold: default 1800s, numeric override, garbage ⇒ default.
+        assert_eq!(resolve_surface_threshold(None), Duration::from_secs(1800));
+        assert_eq!(
+            resolve_surface_threshold(Some("60")),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            resolve_surface_threshold(Some("nope")),
+            Duration::from_secs(1800)
+        );
+    }
+
+    #[test]
+    fn block_reason_wire_values() {
+        // Pins the coord route contract (`POST .../delivery-blocked` body).
+        assert_eq!(BlockReason::TargetNotLive.as_str(), "target_not_live");
+        assert_eq!(BlockReason::PtyNeverIdle.as_str(), "pty_never_idle");
     }
 }

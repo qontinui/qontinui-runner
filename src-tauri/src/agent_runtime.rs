@@ -484,7 +484,9 @@ fn build_coord_ws_url(coord_url: &str, device_id: uuid::Uuid) -> String {
 }
 
 /// Read `~/.qontinui/machine.json` → device_id. Falls back to None.
-fn load_local_device_id() -> Option<uuid::Uuid> {
+/// `pub(crate)` so `mcp::session_message_poller` can stamp its
+/// delivery-blocked surfacing POSTs with the device identity.
+pub(crate) fn load_local_device_id() -> Option<uuid::Uuid> {
     #[derive(Deserialize)]
     struct DeviceFile {
         #[serde(alias = "machine_id")]
@@ -533,10 +535,11 @@ pub fn spawn_runtime() {
     }
 
     info!("agent_runtime: starting for device_id={}", device_id);
-    // Periodic backstop for the capacity-freed re-poll: drains a deferred
-    // (AtCap) continuation even if its terminal's exit-hook trigger is missed.
-    // Spawned independently of the WS pump so it survives subscription flaps;
-    // it is an idle no-op until the first AtCap deferral arms it.
+    // Periodic backstop poll (always armed): drains a pending continuation /
+    // unit dispatch even when every push-shaped trigger is missed — a lost WS
+    // frame while connected, a deferred (AtCap) continuation whose terminal
+    // exit-hook trigger never fired, a slot freed between WS connects.
+    // Spawned independently of the WS pump so it survives subscription flaps.
     spawn_continuation_backstop_poll(device_id);
     tokio::spawn(async move {
         if let Err(e) = subscribe_to_spawn_requests(device_id).await {
@@ -1297,34 +1300,6 @@ fn register_continuation_session(terminal_id: String, anchor_key: Option<String>
 // Capacity-freed re-poll (Defect A item 3, layered on #484)
 // =============================================================================
 
-/// Has at least one `AtCap` deferral happened this process lifetime?
-///
-/// #484 leaves an `AtCap` continuation pending (uncancelled, unconsumed) on
-/// coord so it is re-deliverable once a cap slot frees — but it adds NO trigger
-/// to re-fetch it. Without one, a deferred continuation only drains on the next
-/// WS reconnect (`poll_pending_continuations` is called exactly once, on
-/// connect). This flag arms the periodic backstop poll
-/// ([`spawn_continuation_backstop_poll`]) so the queue still drains even if the
-/// capacity-freed exit-hook trigger ([`notify_continuation_terminal_exit`]) is
-/// missed (e.g. coord registration failed so no exit hook was installed, or the
-/// process restarted between the deferral and the slot freeing). Cheap, set-once,
-/// never reset: a single deferral is enough to want the backstop for the rest of
-/// the process's life.
-fn at_cap_ever() -> &'static std::sync::atomic::AtomicBool {
-    static AT_CAP_EVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    &AT_CAP_EVER
-}
-
-/// Record that an `AtCap` deferral occurred (arms the periodic backstop poll).
-fn mark_at_cap_deferral() {
-    at_cap_ever().store(true, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Whether any `AtCap` deferral has happened this process lifetime.
-fn at_cap_deferral_happened() -> bool {
-    at_cap_ever().load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// Capacity-freed re-poll trigger: called from the continuation terminal's
 /// on-exit hook (`create_terminal_session_backend`, `commands/terminal.rs`) the
 /// instant a continuation-spawned PTY exits.
@@ -1393,41 +1368,75 @@ fn deregister_exited_continuation(terminal_id: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// How often the periodic backstop poll fires once armed (5 min).
-const CONTINUATION_BACKSTOP_POLL_SECS: u64 = 300;
+/// Default backstop-poll cadence (5 min). Env-tunable via
+/// [`CONTINUATION_BACKSTOP_POLL_SECS_ENV`].
+const CONTINUATION_BACKSTOP_POLL_SECS_DEFAULT: u64 = 300;
 
-/// Spawn the periodic backstop poll task (Defect A item 3, backstop half).
+/// Floor for the backstop-poll cadence — a misconfigured tiny value must not
+/// turn the safety net into a coord hammer.
+const CONTINUATION_BACKSTOP_POLL_SECS_FLOOR: u64 = 30;
+
+/// Env var overriding the backstop-poll cadence (seconds). Default
+/// [`CONTINUATION_BACKSTOP_POLL_SECS_DEFAULT`], floored at
+/// [`CONTINUATION_BACKSTOP_POLL_SECS_FLOOR`].
+const CONTINUATION_BACKSTOP_POLL_SECS_ENV: &str = "RUNNER_CONTINUATION_BACKSTOP_POLL_SECS";
+
+/// Resolve the backstop-poll cadence from a raw env value. Pure over the input
+/// so the default / floor / garbage-fallback policy is unit-testable without
+/// env mutation: unset or non-numeric → default; numeric → floored.
+fn resolve_backstop_poll_secs(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|v| v.max(CONTINUATION_BACKSTOP_POLL_SECS_FLOOR))
+        .unwrap_or(CONTINUATION_BACKSTOP_POLL_SECS_DEFAULT)
+}
+
+/// The configured backstop-poll cadence (env override, else the default).
+fn continuation_backstop_poll_secs() -> u64 {
+    resolve_backstop_poll_secs(
+        std::env::var(CONTINUATION_BACKSTOP_POLL_SECS_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Spawn the periodic backstop poll task (Defect A item 3, backstop half;
+/// always-on since the `2026-07-03-subagent-stall-watchdog` plan).
 ///
-/// A best-effort safety net for the capacity-freed exit-hook trigger
-/// ([`notify_continuation_terminal_exit`]): a missed exit signal — a continuation
-/// terminal whose coord registration failed (so no on-exit hook was installed),
-/// or a slot that frees while the runner is between WS connects — must not strand
-/// a deferred continuation on coord's pending queue until an unrelated WS
-/// reconnect happens to re-poll. Every [`CONTINUATION_BACKSTOP_POLL_SECS`] this
-/// task polls coord for pending continuations, but ONLY after at least one
-/// `AtCap` deferral has happened this process lifetime
-/// ([`at_cap_deferral_happened`]) — until then there is nothing to drain and the
-/// task is a cheap idle tick (no network I/O).
+/// A best-effort safety net for EVERY lost-wakeup path, not just the
+/// capacity-freed exit-hook trigger ([`notify_continuation_terminal_exit`]):
+/// a WS frame lost while connected, a continuation terminal whose coord
+/// registration failed (so no on-exit hook was installed), or a slot that
+/// frees while the runner is between WS connects — none of these may strand a
+/// pending continuation on coord's queue until an unrelated WS reconnect
+/// happens to re-poll. Every [`continuation_backstop_poll_secs`] this task
+/// polls coord for pending continuations and unit dispatches
+/// **unconditionally**.
+///
+/// It used to poll only after at least one `AtCap` deferral this process
+/// lifetime (the deleted `at_cap_deferral_happened` arming flag) — but that
+/// gate meant a WS frame lost while connected, with no AtCap deferral and no
+/// terminal exit, stranded a continuation until the next reconnect. The tick
+/// is two cheap authenticated GETs against coord; paying them every interval
+/// buys at-least-once delivery for the whole class.
 ///
 /// Spawned once per process from [`spawn_runtime`]. Independent of the WS pump
 /// so it keeps draining even while the subscription is flapping.
 fn spawn_continuation_backstop_poll(device_id: uuid::Uuid) {
     tokio::spawn(async move {
-        let mut interval =
-            tokio::time::interval(Duration::from_secs(CONTINUATION_BACKSTOP_POLL_SECS));
+        let secs = continuation_backstop_poll_secs();
+        let mut interval = tokio::time::interval(Duration::from_secs(secs));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Skip the immediate first tick — nothing can be deferred at startup.
+        // Skip the immediate first tick — the WS-connect catch-up poll
+        // (`poll_pending_continuations` on connect) covers startup.
         interval.tick().await;
         loop {
             interval.tick().await;
-            if at_cap_deferral_happened() {
-                debug!(
-                    "agent_runtime: backstop poll firing (a prior AtCap deferral armed it) \
-                     for device_id={device_id}"
-                );
-                poll_pending_continuations(device_id).await;
-                poll_pending_unit_dispatches(device_id).await;
-            }
+            debug!(
+                "agent_runtime: backstop poll firing (every {secs}s, always armed) \
+                 for device_id={device_id}"
+            );
+            poll_pending_continuations(device_id).await;
+            poll_pending_unit_dispatches(device_id).await;
         }
     });
 }
@@ -2065,12 +2074,11 @@ async fn run_gate_continuation_inner(
             return Ok(());
         }
         ContinuationGuard::AtCap(cap) => {
-            // Mark that a deferral happened this process lifetime so the periodic
-            // backstop poll arms (`spawn_continuation_backstop_poll`): even if the
-            // capacity-freed exit-hook trigger is missed, the deferred queue still
-            // drains within the backstop interval instead of stranding until an
-            // unrelated WS reconnect.
-            mark_at_cap_deferral();
+            // The deferred continuation stays pending on coord; the periodic
+            // backstop poll (`spawn_continuation_backstop_poll`, always armed)
+            // re-fetches it within one interval even if the capacity-freed
+            // exit-hook trigger is missed — no per-process arming flag needed.
+            //
             // The `deferred:` prefix (Resolved Q3) distinguishes a capacity DEFER
             // (the continuation is intact + pending on coord, re-deliverable once a
             // slot frees) from a hard spawn failure, so a coord-side consumer can
@@ -5597,29 +5605,45 @@ mod tests {
         clear_continuation_registry();
     }
 
-    /// The periodic-backstop arming flag flips from `false` to `true` the first
-    /// time an `AtCap` deferral is recorded, and stays `true` (set-once, never
-    /// reset) — so the backstop poll stays armed for the rest of the process's
-    /// life once any deferral has happened.
+    /// The periodic backstop poll is ALWAYS armed — its cadence resolution is
+    /// the only remaining policy knob. Unset / garbage env values fall back to
+    /// the 300s default; explicit values are honored but floored at 30s so a
+    /// misconfiguration can't turn the safety net into a coord hammer.
     ///
-    /// NOTE: the flag is a process-global `static AtomicBool` shared across the
-    /// whole test binary; this test only asserts the post-mark state (`true`) and
-    /// the idempotence of a second mark, never the pre-mark `false` (another test
-    /// could have armed it first). It runs under `CONT_GUARD_LOCK` for ordering
-    /// hygiene with the other continuation tests.
+    /// (Replaces `at_cap_deferral_arms_backstop_flag`: the AtCap arming
+    /// predicate was deleted with the gate — a WS frame lost while connected,
+    /// with no AtCap deferral this process lifetime and no terminal exit,
+    /// stranded a continuation until the next reconnect. The loop body now
+    /// polls unconditionally on every tick; there is no arming state left to
+    /// test.)
     #[test]
-    fn at_cap_deferral_arms_backstop_flag() {
-        let _g = CONT_GUARD_LOCK.lock().unwrap();
-        mark_at_cap_deferral();
-        assert!(
-            at_cap_deferral_happened(),
-            "an AtCap deferral must arm the periodic-backstop flag"
+    fn backstop_poll_secs_default_floor_and_override() {
+        // Unset → default.
+        assert_eq!(
+            resolve_backstop_poll_secs(None),
+            CONTINUATION_BACKSTOP_POLL_SECS_DEFAULT,
+            "unset env must fall back to the 300s default"
         );
-        // Set-once / idempotent: marking again keeps it armed.
-        mark_at_cap_deferral();
-        assert!(
-            at_cap_deferral_happened(),
-            "the backstop flag stays armed (set-once, never reset)"
+        // Garbage → default (never panics, never zero).
+        assert_eq!(
+            resolve_backstop_poll_secs(Some("not-a-number")),
+            CONTINUATION_BACKSTOP_POLL_SECS_DEFAULT
+        );
+        assert_eq!(
+            resolve_backstop_poll_secs(Some("")),
+            CONTINUATION_BACKSTOP_POLL_SECS_DEFAULT
+        );
+        // Explicit override honored (whitespace-tolerant).
+        assert_eq!(resolve_backstop_poll_secs(Some(" 600 ")), 600);
+        // Below-floor values are clamped up; zero can never disable the poll.
+        assert_eq!(
+            resolve_backstop_poll_secs(Some("5")),
+            CONTINUATION_BACKSTOP_POLL_SECS_FLOOR
+        );
+        assert_eq!(
+            resolve_backstop_poll_secs(Some("0")),
+            CONTINUATION_BACKSTOP_POLL_SECS_FLOOR,
+            "the backstop is always-on; 0 must clamp to the floor, not park the loop"
         );
     }
 
