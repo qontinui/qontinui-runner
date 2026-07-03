@@ -125,6 +125,28 @@ notify_session_open() {
       -d "$body" >/dev/null 2>&1 || true
 }
 
+# Fire-and-forget DIAGNOSTIC beacon on EVERY real shim invocation (even the
+# don't-double-pin passthrough that sends no session-open). Log-only on the
+# runner side — makes "did the shim run for this terminal, and will it deliver
+# --session-id/--settings?" observable in the logs. Never blocks the exec.
+notify_shim_beacon() {
+  local port="${QONTINUI_INSTALL_INTERCEPT_PORT:-}"
+  [ -z "$port" ] && return 0
+  command -v curl >/dev/null 2>&1 || return 0
+  local settings="false"
+  [ "${#SETTINGS_ARGS[@]}" -gt 0 ] && settings="true"
+  local pinned="false"; [ -n "$PINNED" ] && pinned="true"
+  local user_chose="false"; [ "$user_chose_session" -eq 1 ] && user_chose="true"
+  local detail="user_session_id=$user_chose settings=$settings pinned=$pinned"
+  local body
+  body="{\"terminal_id\":\"${QONTINUI_TERMINAL_ID:-}\",\"tool\":\"$TOOL\",\"event\":\"invoked\",\"detail\":\"$detail\"}"
+  curl -fsS --connect-timeout 3 --max-time 10 \
+      -X POST "http://127.0.0.1:$port/control/shim-beacon" \
+      -H 'Content-Type: application/json' \
+      -d "$body" >/dev/null 2>&1 || true
+}
+notify_shim_beacon
+
 if [ "$user_chose_session" -eq 1 ] || [ -z "$PINNED" ]; then
   # User chose their own session (or we have no pinned id) — don't append our
   # `--session-id`, but STILL deliver the `--settings` hook (claude) so a

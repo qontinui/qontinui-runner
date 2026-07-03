@@ -74,6 +74,23 @@ if not "%USER_CHOSE%"=="1" if defined PINNED if defined QONTINUI_INSTALL_INTERCE
   )
 )
 
+rem ---- diagnostic beacon: fires on EVERY real invocation (log-only runner) ---
+rem Makes "did the shim run for this terminal, will it deliver --session-id /
+rem --settings?" observable in the runner logs — including the passthrough path
+rem that sends no session-open. Never blocks.
+if defined QONTINUI_INSTALL_INTERCEPT_PORT (
+  where curl >nul 2>nul
+  if not errorlevel 1 (
+    set "BSET=false"
+    if defined SETTINGS_ARGS set "BSET=true"
+    set "BPIN=false"
+    if defined PINNED set "BPIN=true"
+    set "BUSR=false"
+    if "%USER_CHOSE%"=="1" set "BUSR=true"
+    curl -fsS --connect-timeout 3 --max-time 10 -X POST "http://127.0.0.1:%QONTINUI_INSTALL_INTERCEPT_PORT%/control/shim-beacon" -H "Content-Type: application/json" -d "{\"terminal_id\":\"%QONTINUI_TERMINAL_ID%\",\"tool\":\"%TOOL%\",\"event\":\"invoked\",\"detail\":\"user_session_id=!BUSR! settings=!BSET! pinned=!BPIN!\"}" >nul 2>nul
+  )
+)
+
 set "QONTINUI_INSTALL_INTERCEPT_GUARD=1"
 if "%USER_CHOSE%"=="1" goto :passthrough
 if not defined PINNED goto :passthrough
