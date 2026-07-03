@@ -283,6 +283,41 @@ jobs:
             Write-Host "makensis already available: $((Get-Command makensis).Source)"
           }
 
+      # Pre-seed Tauri's OWN NSIS toolset so `tauri build` never has to download
+      # it. Issue #654: Tauri 2.x's NSIS bundler IGNORES the system NSIS above
+      # and requires its own toolset at %LOCALAPPDATA%\tauri\NSIS; its in-bundler
+      # download is flaky on the hosted Windows image and, when it misses, aborts
+      # bundling with a bare "cannot find the file specified (os error 2)" right
+      # after "Built application" (cargo build itself succeeds). The toolchain
+      # cache above never self-heals because its post-save runs only on success.
+      # We fetch the EXACT NSIS build + nsis_tauri_utils plugin that tauri-bundler
+      # (tauri-cli 2.11) pins, into the EXACT layout it install-checks — makensis
+      # at NSIS\makensis.exe (+ NSIS\Bin\makensis.exe) and the plugin at
+      # NSIS\Plugins\x86-unicode\additional\nsis_tauri_utils.dll with the pinned
+      # SHA1 — so the bundler skips its own (failing) download. `curl --retry`
+      # hardens the fetch we control. Bump the versions here if tauri-cli is
+      # upgraded (they live in tauri-bundler `src/bundle/windows/nsis/mod.rs`).
+      - name: Pre-seed Tauri NSIS toolset (Windows, issue #654)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tauri = "$env:LOCALAPPDATA\tauri"
+          New-Item -ItemType Directory -Force -Path $tauri | Out-Null
+          if (-not (Test-Path "$tauri\NSIS\makensis.exe")) {
+            $zip = "$env:RUNNER_TEMP\nsis-3.11.zip"
+            curl.exe -L --retry 5 --retry-all-errors --fail -o $zip `
+              "https://github.com/tauri-apps/binary-releases/releases/download/nsis-3.11/nsis-3.11.zip"
+            Remove-Item "$tauri\NSIS" -Recurse -Force -ErrorAction SilentlyContinue
+            Expand-Archive -Path $zip -DestinationPath $tauri -Force
+            Rename-Item "$tauri\nsis-3.11" "NSIS" -Force
+          }
+          $add = "$tauri\NSIS\Plugins\x86-unicode\additional"
+          New-Item -ItemType Directory -Force -Path $add | Out-Null
+          curl.exe -L --retry 5 --retry-all-errors --fail -o "$add\nsis_tauri_utils.dll" `
+            "https://github.com/tauri-apps/nsis-tauri-utils/releases/download/nsis_tauri_utils-v0.5.3/nsis_tauri_utils.dll"
+          Write-Host ("Seeded NSIS toolset -> makensis:{0} bin_makensis:{1} plugin:{2}" -f `
+            (Test-Path "$tauri\NSIS\makensis.exe"), (Test-Path "$tauri\NSIS\Bin\makensis.exe"), (Test-Path "$add\nsis_tauri_utils.dll"))
+
       - name: Build Tauri app
         # Tauri signing disabled for alpha - will be enabled when certificates arrive
         # env:
