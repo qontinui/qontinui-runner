@@ -335,20 +335,21 @@ pub fn migrate_session(
         // or autonomous); don't force the agent identity onto an unknown session.
         inject_agent_git_identity: false,
     };
-    let (new_terminal_id, _coord_id) = crate::commands::terminal::create_terminal_session_backend(
-        &terminal_manager,
-        &session_registry,
-        app.clone(),
-        title.clone(),
-        working_dir.clone(),
-        None,
-        None,
-        None,
-        Some(command),
-        None,
-        Some(capture_hint),
-        Some(record.page_id.clone()),
-    )?;
+    let (new_terminal_id, _coord_id) =
+        crate::commands::terminal::create_tracked_terminal_session_backend(
+            &terminal_manager,
+            &session_registry,
+            app.clone(),
+            title.clone(),
+            working_dir.clone(),
+            None,
+            None,
+            None,
+            Some(command),
+            None,
+            capture_hint,
+            Some(record.page_id.clone()),
+        )?;
 
     // The lifecycle row was re-opened synchronously by the pinned-id capture
     // hint inside `create_terminal_session_backend` (`--resume <id>` keys the

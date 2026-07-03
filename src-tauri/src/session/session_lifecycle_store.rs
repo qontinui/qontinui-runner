@@ -334,6 +334,41 @@ impl SessionLifecycleStore {
         self.persist(&snapshot);
     }
 
+    /// Update the persisted `title` of the OPEN record hosted by
+    /// `terminal_id` (plan
+    /// `2026-07-03-runner-session-tracking-drift-and-guardrails` Phase 3
+    /// item 4). Title renames (`terminal_set_title` → OSC 0 echo, the `/name`
+    /// skill, an operator rename) previously mutated only the in-memory
+    /// `TerminalSession` title, so the durable registry stayed frozen at the
+    /// spawn-time title and a restart restored the pane under a stale name.
+    /// Keyed by terminal id because the rename call sites hold only that —
+    /// same resolution [`Self::find_open_by_terminal`] performs. No-op (no
+    /// write) if no open record references the terminal, or the title is
+    /// already current.
+    pub fn update_title_by_terminal(&self, terminal_id: &str, title: &str) {
+        let snapshot = {
+            let mut m = match self.map.lock() {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = %e, "session_lifecycle_store: lock poisoned on update_title_by_terminal");
+                    return;
+                }
+            };
+            let Some(rec) = m
+                .values_mut()
+                .find(|r| r.state == "open" && r.terminal_id == terminal_id)
+            else {
+                return; // no open record hosts this terminal — nothing to flush
+            };
+            if rec.title.as_deref() == Some(title) {
+                return; // already current — nothing to flush
+            }
+            rec.title = Some(title.to_string());
+            m.clone()
+        };
+        self.persist(&snapshot);
+    }
+
     /// Mark a present session as restore-pending (a boot-restore is about to
     /// type / has typed `claude --resume` and the handshake is not yet
     /// verified). While the marker is set the liveness poll skips the record
@@ -1068,6 +1103,51 @@ mod tests {
             store.get("new").unwrap().claude_session_id,
             "new",
             "target untouched on refusal"
+        );
+    }
+
+    /// `update_title_by_terminal` durably persists a rename keyed by
+    /// terminal id (Phase 3 item 4: the rename call sites hold only a
+    /// terminal id), survives a reload, and no-ops cleanly on the edges
+    /// (unknown terminal, closed record, already-current title).
+    #[test]
+    fn update_title_by_terminal_persists_rename_and_guards_edges() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.record_open(rec("sess-1")); // terminal "term-abc", title "Claude 1"
+
+        store.update_title_by_terminal("term-abc", "634 agent_pusher fix");
+        assert_eq!(
+            store.get("sess-1").unwrap().title.as_deref(),
+            Some("634 agent_pusher fix")
+        );
+
+        // Durable: a fresh open from the same path (simulated restart) sees
+        // the renamed title, not the spawn-time one.
+        let reloaded = SessionLifecycleStore::open(&path).unwrap();
+        assert_eq!(
+            reloaded.get("sess-1").unwrap().title.as_deref(),
+            Some("634 agent_pusher fix"),
+            "rename must survive restart"
+        );
+
+        // Edge: unknown terminal — no-op, no panic, nothing changed.
+        store.update_title_by_terminal("no-such-terminal", "whatever");
+        assert_eq!(
+            store.get("sess-1").unwrap().title.as_deref(),
+            Some("634 agent_pusher fix")
+        );
+
+        // Edge: closed record no longer matches (only OPEN rows are keyed by
+        // terminal — a fresh PTY may reuse nothing, but a stale closed row
+        // must not swallow the rename).
+        store.record_close("sess-1", "pty-exit");
+        store.update_title_by_terminal("term-abc", "should-not-land");
+        assert_eq!(
+            store.get("sess-1").unwrap().title.as_deref(),
+            Some("634 agent_pusher fix"),
+            "a closed record is not renamed"
         );
     }
 

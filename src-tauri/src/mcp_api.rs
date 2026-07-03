@@ -303,6 +303,14 @@ async fn health(
     // mounted past App.tsx's loading screen and is processing UI Bridge IPC".
     let frontend_ready = state.app_state.frontend_ready.load(Ordering::Relaxed);
 
+    // Build/deploy drift vs origin/main (plan 2026-07-03-runner-session-
+    // tracking-drift-and-guardrails Phase 3 item 3). `mainSha` is
+    // origin/main's current SHA (null when unresolvable — production install
+    // without a repo, no network); `buildDrift.behind` compares it against
+    // the embedded `gitSha` prefix. Populated by the background checker in
+    // `crate::build_drift`.
+    let (main_sha_json, build_drift_json) = crate::build_drift::health_fields();
+
     let mut data = serde_json::json!({
         "status": status,
         "ready": last_pong > 0,
@@ -334,6 +342,15 @@ async fn health(
         // the running binary's value — the only divergence vector is a
         // mid-session binary swap behind the live webview.
         "buildId": env!("RUNNER_BUILD_ID"),
+        // origin/main's current SHA + drift verdict vs the embedded gitSha
+        // (see `crate::build_drift`). All-null until the first background
+        // check completes, and permanently null on a repo-less install.
+        "mainSha": main_sha_json,
+        "buildDrift": build_drift_json,
+        // Session-tracking health (see `crate::session::tracking_health`):
+        // last cross-reference timestamp, live-but-untracked / tracked-but-
+        // dead counts + detail, and the untracked-backend-spawn counter.
+        "sessionTracking": crate::session::tracking_health::health_json(),
         "storage": {
             "apiPort": api_port,
             "namespaceSuffix": storage_namespace_suffix,

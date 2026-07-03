@@ -150,6 +150,19 @@ impl TerminalManager {
             .get(id)
             .ok_or_else(|| format!("Terminal session not found: {}", id))?;
         session.set_title(title.clone());
+        // Durable-title sync (plan 2026-07-03-runner-session-tracking-drift-
+        // and-guardrails Phase 3 item 4): mirror the rename into the lifecycle
+        // registry so a restart restores the pane under its CURRENT name, not
+        // the spawn-time one. No-ops cleanly when the terminal has no open
+        // record (plain shell never recorded) or the store isn't managed.
+        {
+            use tauri::Manager;
+            if let Some(store) = app_handle
+                .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+            {
+                store.update_title_by_terminal(id, &title);
+            }
+        }
         let payload = serde_json::json!({ "id": id, "title": title });
         if let Err(e) = app_handle.emit("terminal-title-changed", &payload) {
             error!("Failed to emit terminal-title-changed: {}", e);

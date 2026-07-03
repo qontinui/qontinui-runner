@@ -2476,7 +2476,7 @@ async fn run_continuation_terminal(
         uuid::Uuid::new_v4().to_string()
     });
 
-    let capture_hint = Some(crate::commands::terminal::SessionCaptureHint {
+    let capture_hint = crate::commands::terminal::SessionCaptureHint {
         config_dir: selected_config_dir,
         working_dir: workdir.to_string(),
         title: title.clone(),
@@ -2486,7 +2486,7 @@ async fn run_continuation_terminal(
         zone_index: None,
         // Autonomous gate continuation → pin the agent git identity on the PTY.
         inject_agent_git_identity: true,
-    });
+    };
 
     // Provision `.mcp.json` so this continuation can reach coord coordination
     // tools (`coord_register_gate` over /mcp) and `coord-acting-bearer.sh` for
@@ -2509,7 +2509,7 @@ async fn run_continuation_terminal(
     // as project slash commands regardless of the device's ~/.claude.
     crate::fleet_commands::provision_fleet_commands_for_session(workdir);
 
-    let result = crate::commands::terminal::create_terminal_session_backend(
+    let result = crate::commands::terminal::create_tracked_terminal_session_backend(
         &terminal_manager,
         &session_registry,
         app.clone(),
@@ -2722,7 +2722,7 @@ async fn run_condition_check_terminal(
         uuid::Uuid::new_v4().to_string()
     });
 
-    let capture_hint = Some(crate::commands::terminal::SessionCaptureHint {
+    let capture_hint = crate::commands::terminal::SessionCaptureHint {
         config_dir: selected_config_dir,
         working_dir: workdir.clone(),
         title: title.clone(),
@@ -2732,9 +2732,9 @@ async fn run_condition_check_terminal(
         zone_index: None,
         // A condition check commits nothing → keep the ambient host git identity.
         inject_agent_git_identity: false,
-    });
+    };
 
-    let result = crate::commands::terminal::create_terminal_session_backend(
+    let result = crate::commands::terminal::create_tracked_terminal_session_backend(
         &terminal_manager,
         &session_registry,
         app.clone(),
@@ -2897,8 +2897,18 @@ async fn run_continuation_headless(
     match spawn_claude_child(workdir, initial_prompt).await {
         Ok(mut child) => {
             let pid = child.id().map(|p| p as i64);
+            // Exempt this headless child from the session-tracking health
+            // check for its lifetime — it legitimately has no lifecycle
+            // record (no PTY, no capture_hint).
+            let health_pid = child.id();
+            if let Some(p) = health_pid {
+                crate::session::tracking_health::register_headless_claude_pid(p);
+            }
             report_spawn_complete(agent_id, pid, Some("gate continuation"), None).await;
             let exit = pump_subprocess(agent_id, &mut child, log_path.as_deref()).await;
+            if let Some(p) = health_pid {
+                crate::session::tracking_health::unregister_headless_claude_pid(p);
+            }
             match exit {
                 Ok(0) => {
                     info!(
@@ -3139,6 +3149,13 @@ async fn run_agent_subprocess(
         match spawn_claude_child(&primary_wt, &payload.initial_prompt).await {
             Ok(mut child) => {
                 let pid = child.id().map(|p| p as i64);
+                // Exempt this headless child from the session-tracking health
+                // check for its lifetime — WS agent spawns legitimately have
+                // no lifecycle record (no PTY, no capture_hint BY DESIGN).
+                let health_pid = child.id();
+                if let Some(p) = health_pid {
+                    crate::session::tracking_health::register_headless_claude_pid(p);
+                }
                 // First successful spawn = post spawn-complete with pid.
                 if restarts == 0 {
                     report_spawn_complete(payload.agent_id, pid, None, primary_push_ref.as_deref())
@@ -3169,11 +3186,17 @@ async fn run_agent_subprocess(
                             payload.agent_id
                         );
                         let _ = child.kill().await;
+                        if let Some(p) = health_pid {
+                            crate::session::tracking_health::unregister_headless_claude_pid(p);
+                        }
                         final_reason =
                             Some("stopped by operator (events.agent.stop_requested)".to_string());
                         break;
                     }
                 };
+                if let Some(p) = health_pid {
+                    crate::session::tracking_health::unregister_headless_claude_pid(p);
+                }
                 match exit {
                     Ok(0) => {
                         info!(
