@@ -1192,9 +1192,10 @@ mod tests {
     }
 
     fn make_criteria(id: &str) -> IrElementCriteria {
-        let mut c = IrElementCriteria::default();
-        c.id = Some(id.into());
-        c
+        IrElementCriteria {
+            id: Some(id.into()),
+            ..Default::default()
+        }
     }
 
     fn make_transition(id: &str, from: &str, to: &str) -> IrTransition {
