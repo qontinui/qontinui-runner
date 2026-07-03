@@ -356,41 +356,44 @@ this vet session as in-flight.
 *(canonical spec: `_gate-registration` — keep copies in sync)*
 
 A VETTED plan is **ready, dispatchable work** — not a human decision. When you
-stamp VETTED, register (or **refresh** an existing) `unit_ready` gate so coord
-turns the ready plan into a queued continuation that dispatches into a session
-the operator can **see**, instead of leaving the plan to rot until someone
-clicks. This **replaces** the old `operator_approval`-bootstrap gate that used
-to queue ready work: a work queue is `unit_ready`, NOT `operator_approval`
-(`operator_approval` is for genuine human decisions only — see the predicate
-guidance in `_gate-registration`).
+stamp VETTED, register (or **refresh** an existing) `unit_ready` gate (coord
+tracks the plan as a generic **work unit**) so coord turns the ready plan into a
+queued continuation that dispatches into a session the operator can **see**,
+instead of leaving the plan to rot until someone clicks. This **replaces** the old
+`operator_approval`-bootstrap gate that used to queue ready work: a work queue is
+`unit_ready`, NOT `operator_approval` (`operator_approval` is for genuine human
+decisions only — see the predicate guidance in `_gate-registration`).
 
 Register exactly once per VETTED stamp (refresh, don't duplicate):
 
 > **Agent sessions: use the device-authed work-unit door.** A vetting agent holds
 > a coord **device JWT** (carrying `tenant_id`) but **no `OperatorContext`**. The
-> work-unit DML routes are on the same `require_jwt` sub-router as the gate
-> register, so a device/agent JWT reaches all of them — the operator-only
-> `/coord/gates/register` is not used here. Registration is now a **TWO-call
-> flow**: first `POST /coord/work-units/upsert` to create the row (capture its
-> `work_unit_id` UUID), then `POST /coord/work-units/<slug>/register-gate` — the
-> register route does **NOT** upsert (unlike the old `register_plan_gate`) and
-> **404s `work_unit_not_found`** if the slug isn't present. Prefer the transports
-> in order: (1) MCP `coord_register_gate` over the `/coord-mcp` proxy (now
-> device-usable, since `/coord/work-units/upsert` is device-authed); (2) the
-> **direct device-authed HTTP route** `POST $COORD_HTTP_URL/coord/work-units/<plan
-> stem>/register-gate` with a raw device JWT, after the upsert; (3) the
-> acting-user-service-token on the same routes only if no device identity is
-> available at all. (`2026-06-18-coord-generic-work-unit-primitive`.)
+> `/coord/work-units/*` routes live on coord's `require_jwt` sub-router, so a
+> device JWT resolves `tenant_id` server-side and CAN upsert + register — the old
+> operator-only `/coord/plans/*` wall (which 403'd a vetting agent and silently
+> broke §5.4 auto-dispatch) is gone. Registration is now **TWO calls** — upsert
+> then register-gate — because `register-gate` does NOT upsert (it 404s
+> `work_unit_not_found` if the slug is absent). Prefer, in order: (1) MCP
+> `coord_register_gate` (now usable from a device session — it can upsert the work
+> unit then register, both over the `/coord-mcp` proxy); (2) the **direct
+> device-authed HTTP** routes when a raw device JWT is held:
+> `POST $COORD_HTTP_URL/coord/work-units/upsert {slug,title?}` → capture
+> `work_unit_id`, then
+> `POST $COORD_HTTP_URL/coord/work-units/<plan stem>/register-gate`; (3) the
+> acting-user-service token (`coord-acting-bearer.sh`) on the same two routes if no
+> device identity is available. The legacy operator-only `/coord/plans/upsert` +
+> `/coord/gates/register` are removed (coord P4) — do not use them.
+> (`2026-06-15-coord-device-authed-plan-ready-gate-registration`, generalized to
+> work units.)
 
-1. **Upsert the work unit, capture `work_unit_id`.**
+1. **Upsert the work unit and capture `work_unit_id`.**
    `POST $COORD_HTTP_URL/coord/work-units/upsert` with
-   `{ "slug": "<plan stem>", "title": "<plan H1>" }` (idempotent on slug; the
-   stem is the filename without `.md`/path, the same `<plan-stem>` Step 0 used).
-   This route is **device-authed** (`require_jwt`), so it works from a vetting
-   agent's device JWT. Capture `work_unit_id` (a UUID) from the response — it
-   anchors the gate AND is carried inside the `unit_ready` predicate. Optionally
-   set `"status"` if you want the row stamped (statuses are opaque caller strings,
-   not a vocabulary); the gate's `ready_status` decides clearing, not this.
+   `{ "slug": "<plan stem>", "title": "<plan H1>" }` (idempotent on slug; the stem
+   is the filename without `.md`/path, the same `<plan-stem>` Step 0 used) →
+   returns `{ "work_unit_id": "<uuid>", … }`. This is the **mandatory FIRST call**:
+   the device-authed `register-gate` endpoint in step 4 does NOT upsert (it 404s if
+   the slug is absent). The captured `work_unit_id` UUID anchors the gate AND is
+   what the `unit_ready` predicate carries.
 2. **Resolve the operator's `device_id` DYNAMICALLY** (never hardcode a UUID):
    env `QONTINUI_MACHINE_ID` first, else read `~/.qontinui/machine.json` and parse
    `"device_id"` (fall back to `"machine_id"` if present). If neither yields a
@@ -398,7 +401,7 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    note it in the report.
 3. **Check for an existing gate** anchored to this work unit
    (`GET $COORD_HTTP_URL/coord/gates?work_unit_id=<id>` — find an OPEN `unit_ready`
-   gate for this work unit). If one exists, **refresh** it (re-register / update the
+   gate for this plan). If one exists, **refresh** it (re-register / update the
    continuation) rather than creating a duplicate. **Before refreshing, cancel
    the prior gate's PENDING continuation** so the old queued runner-terminal spawn
    does not fire alongside the new one: for any row in that GET with
@@ -406,29 +409,31 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    continuation_cancelled_at == null`, fire
    `POST $COORD_HTTP_URL/coord/gates/:gate_id/continuation-cancel`
    `{cancelled_by:"<this session>", reason:"refreshed — superseded by re-registration"}`
-   (`TenantId` auth, tenant derives server-side). Best-effort: a 404 = nothing
-   pending; a 409 `already_consumed` = a spawn already happened (report it, don't
-   pretend the cancel landed). (canonical spec: `_gate-registration` →
-   "Continuation cancel + refresh".)
-4. **Register** via the transport cascade in the blockquote above, AFTER step 1's
-   upsert (the register route never creates the work unit and 404s
-   `work_unit_not_found` if you skip the upsert): the direct device-authed
+   (`TenantId` auth, tenant derives server-side — an operator/`TenantId`-only
+   route). Best-effort: a 404 = nothing pending; a 409 `already_consumed` = a spawn
+   already happened (report it, don't pretend the cancel landed). (canonical spec:
+   `_gate-registration` → "Continuation cancel + refresh".)
+4. **Register** via the transport cascade in the blockquote above (the work unit
+   was already upserted in step 1, so `register-gate` will find it): prefer MCP
+   `coord_register_gate`; when a raw device JWT is held, the direct device-authed
    `POST $COORD_HTTP_URL/coord/work-units/<plan stem>/register-gate` (resolves
-   tenant from the device JWT; body omits `slug`/`work_unit_id`, which come from
-   the path + the predicate), or MCP `coord_register_gate` over the `/coord-mcp`
-   proxy. The legacy operator-only `POST /coord/gates/register` is not used here.
-   - **Predicate:** `{"kind": "unit_ready", "work_unit_id": "<uuid from step 1>",
-     "ready_status": "vetted"}` — coord auto-clears it when
-     `coord.work_units.status == <ready_status>` AND every other gate anchored to
-     this work unit is cleared. (The device-authed endpoint accepts any
-     **predicate-cleared** kind; only `operator_approval` — a human decision — is
-     rejected 403, so it can never become a work-queue-as-decision fallback.)
-   - **Anchor:** the work unit. The `work_unit_id` comes from step 1's upsert
-     (and must match the `work_unit_id` inside the predicate — coord enforces this
-     cross-anchor guard). Pass `phase_name` (the plan title, or a synthetic label
-     like `"vet→implement handoff"` for a whole-unit gate — `phase_name` is
-     **required**, since coord's work-unit anchor is `work_unit_id` + `phase_name`
-     together).
+   tenant from the device JWT; body `{predicate, phase_name (required),
+   continuation_spawn?, clearance_audience?}` — `slug` comes from the path, the
+   predicate carries the `work_unit_id` UUID from step 1). `register-gate` does NOT
+   upsert — if step 1 was skipped it 404s `work_unit_not_found`. The acting-user
+   token works on the same route when no device identity is held. The legacy
+   operator-only `/coord/plans/upsert` + `/coord/gates/register` are removed (coord
+   P4) — do not fall back to them.
+   - **Predicate:** `{"kind": "unit_ready", "work_unit_id": "<uuid from step 1>", "ready_status": "vetted"}`
+     — coord auto-clears it when the work unit reaches `ready_status` (`vetted`) AND
+     every other gate anchored to this unit is cleared. (The `register-gate` endpoint
+     accepts any **predicate-cleared** kind; only `operator_approval` — a human
+     decision — is rejected 403, so it can never become a work-queue-as-decision
+     fallback.)
+   - **Anchor:** the plan (work unit). The `work_unit_id` comes from the step-1
+     upsert; pass `phase_name` (the plan title, or a synthetic label like
+     `"vet→implement handoff"` for a whole-plan gate — `phase_name` is **required**,
+     since coord's anchor is `work_unit_id` + `phase_name` together).
    - **`continuation_spawn`:** target the operator's device with a **visible**
      session —
      ```json
@@ -458,24 +463,23 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
      is moot for *clearing*; register consistently with the model (default
      `operator`) — the typed predicate, not a human, is what clears it.
 5. **Masked-tool honesty + verification:** if `coord_register_gate` reads as
-   unknown/method-not-found (per-agent allow-set masking) fall back to HTTP, and
-   NEVER report a gate registered/refreshed without a returned `gate_id`.
+   unknown/method-not-found (per-agent allow-set masking) fall back to the
+   device-authed HTTP routes (upsert → register-gate), and NEVER report a gate
+   registered/refreshed without a returned `gate_id`.
 
 (If coord doesn't yet accept `unit_ready` — e.g. the deploy that ships the
-work-unit primitive hasn't landed — report the gate as NOT registered with the
-reason, rather than silently registering an `operator_approval` fallback that
-would re-create the work-queue-as-decision antipattern.)
+work-unit surface hasn't landed — report the gate as NOT registered with the
+reason, rather than silently registering an `operator_approval` fallback that would
+re-create the work-queue-as-decision antipattern.)
 
-**Set the work-unit status directly + push the stamped file.** Transition the
-work unit's status in coord by calling
-`POST $COORD_HTTP_URL/coord/work-units/<plan stem>/transition`
-`{to_status:"vetted", by_actor:"<this session>"}` (the device-authed registry
-route — there is no plan-ingest worker mirroring file edits any more). Separately,
-the plan .md's VETTED stamp + its archive still apply: if the plan lives under
-`qontinui-dev-notes/plans/`, commit + push the stamped file (the markdown artifact,
-its stamps, and the archive step all STAY — only the coord-registry transition
-moved from "push a file edge" to "call the transition route"). (claude-config is
-NOT a coord sole-authority repo — its PRs land via normal GitHub flow.)
+**Set the work unit's VETTED status directly.** When you stamp VETTED, transition
+the coord work-unit registry so the `unit_ready` predicate can see it:
+`POST $COORD_HTTP_URL/coord/work-units/<plan stem>/transition {to_status:"vetted", by_actor:"<this session>"}`
+(or the step-1 upsert carrying `status:"vetted"`). The registry is directly
+writable — there is no longer a plan-ingest worker mirroring `qontinui-dev-notes/plans/`,
+so this explicit transition is what marks the unit vetted (the plan `.md` VETTED
+stamp + its commit/push remain the operator-private artifact record). (claude-config
+is NOT a coord sole-authority repo — its PRs land via normal GitHub flow.)
 
 ### 5.5. Offer to register a coord gate for a flagged-but-not-fixed item
 
@@ -493,24 +497,27 @@ leave it in the report.
   options Register / Skip), showing the derived anchor + predicate + condition.
   Under opt-in auto mode (env `QONTINUI_AUTO_GATE=1`) register without asking and
   note the gate_id in the report.
-- **Anchor (zero user input):** `work_unit_id` from
+- **Anchor (zero user input):** `work_unit_id` (a UUID) from
   `POST $COORD_HTTP_URL/coord/work-units/upsert` with the plan stem as `slug`
-  (or `GET /coord/work-units/<slug>`); `phase_name` from the relevant
-  phase/section heading. Anchor = (work_unit_id, phase_name).
+  (capture the returned `work_unit_id`; or `GET /coord/work-units/<slug>`);
+  `phase_name` from the relevant phase/section heading. Anchor = (work_unit_id,
+  phase_name).
 - **Register:** prefer MCP `coord_register_gate` (kinds: `pr_merged`,
   `deploy_healthy`, `claim_terminal`, `operator_approval`, `ci_green`,
   `ref_exists`, `metric_threshold`, `time_elapsed`, `unit_ready`,
   `migration_at_head`, `infra_drift_clear`, `file_exists`, `sql_count`,
   `unit_status`, `gate_cleared`; optional
   `continuation_prompt`). **HTTP fallback** when MCP is unavailable — for a
-  work-unit-anchored gate it is a **TWO-call flow** (the register route never
-  upserts, and 404s `work_unit_not_found` if the slug isn't present): (1) first
-  `POST $COORD_HTTP_URL/coord/work-units/upsert {slug, title?, status?}` and
-  capture `work_unit_id`; (2) then `POST $COORD_HTTP_URL/coord/work-units/<slug>/register-gate`
-  with a raw device JWT (resolves tenant from the JWT; body omits
-  `slug`/`work_unit_id`). All work-unit routes are device-authed (`require_jwt`),
-  so a device session reaches them directly. For a claim-anchored gate (no work
-  unit) or with no device identity, fall back to
+  plan-anchored gate it is now TWO device-authed calls on coord's `require_jwt`
+  sub-router (device/agent/service JWT all work): (1)
+  `POST $COORD_HTTP_URL/coord/work-units/upsert {slug, title?, status?}` →
+  **capture `work_unit_id`**; (2)
+  `POST $COORD_HTTP_URL/coord/work-units/<slug>/register-gate`
+  `{predicate, phase_name (required), continuation_spawn?, clearance_audience?}` —
+  `register-gate` does NOT upsert (404s `work_unit_not_found` if you skip step 1).
+  Reach the two routes over a held device JWT, the `/coord-mcp` proxy (injects a
+  device JWT), or the acting-user-service token; MCP `coord_register_gate` now works
+  from a device session too. A claim-anchored gate (no slug) uses MCP or
   `POST $COORD_HTTP_URL/coord/gates/register` (default `https://coord.qontinui.io`).
   Tenant derives server-side — never pass it.
 - **`clearance_audience`:** set `agent` for agent-verifiable facts ("/vet-plan
@@ -525,11 +532,11 @@ leave it in the report.
   `{work_unit_id, ready_status}` (**NOT** `operator_approval` — `operator_approval`
   is for genuine human decisions, not a work queue); schema/alembic-at-head →
   `migration_at_head` `{schema}`; infra drift cleared → `infra_drift_clear`; a repo
-  file/workflow existing → `file_exists` `{repo,path,on_ref?}` (contents, not
-  refs); a coord data count crossing a bound → `sql_count` `{query_id,op,n}`
-  (whitelisted `query_id`, never raw SQL); an umbrella work unit reaching a status
-  → `unit_status` `{work_unit_id, status}`; another cross-anchor gate clearing →
-  `gate_cleared` `{gate_id}`; needs-human → `operator_approval`. Anything
+  file/workflow existing → `file_exists` `{repo,path,on_ref?}` (contents, not refs);
+  a coord data count crossing a bound → `sql_count` `{query_id,op,n}` (whitelisted
+  `query_id`, never raw SQL); an umbrella plan reaching a status → `unit_status`
+  `{work_unit_id,status}`; another cross-anchor gate clearing → `gate_cleared`
+  `{gate_id}`; needs-human → `operator_approval`. Anything
   **security / credential / billing / strategy-sensitive** → `operator_approval` +
   notify, never an auto-resuming gate, never silently auto-registered.
 - **Masked-tool honesty:** if `coord_register_gate` fails as unknown/
@@ -539,7 +546,7 @@ leave it in the report.
   gate registered without a returned `gate_id`.
 - The plan-file `## Gates` block is a **local convenience mirror only** — coord is
   the source of truth; never require it, never read it back as authoritative.
-- **Re-registering for the same work-unit/anchor:** first cancel the prior gate's
+- **Re-registering for the same plan/anchor:** first cancel the prior gate's
   PENDING continuation (the §5.4 refresh-cancel rule applies to any
   continuation-carrying gate too) — `GET .../coord/gates?work_unit_id=<id>` for rows
   with `continuation_dispatched_at != null ∧ continuation_consumed_at == null ∧
@@ -556,9 +563,9 @@ gate rots open until a human clicks it).
 - **Find the gate:** by the `gate_id` recorded at registration, or by lookup
   `GET $COORD_HTTP_URL/coord/gates?work_unit_id=<id>&phase_name=<name>` — the OPEN
   gate whose condition the completed work satisfies.
-- **Attest:** prefer MCP `coord_attest_gate` (pass `gate_id` — works from a device
-  session since attest takes no plan upsert); fall back to the device loopback
-  forwarder `POST http://127.0.0.1:{runner_port}/coord-mcp/gates/{gate_id}/attest`
+- **Attest (unchanged — keyed by `gate_id`):** prefer MCP `coord_attest_gate` (pass
+  `gate_id` — works from a device session since attest takes no upsert); fall back to
+  the device loopback forwarder `POST http://127.0.0.1:{runner_port}/coord-mcp/gates/{gate_id}/attest`
   (header `X-Coord-Mcp-Proxy-Key`, no body bearer — maskless fallback), then the
   direct device-authed `POST $COORD_HTTP_URL/coord/gates/:gate_id/attest`. Tenant
   derives server-side — never pass it. Legal only on an OPEN `operator_approval`
@@ -588,6 +595,6 @@ End-of-turn summary: one or two sentences.
 - **Cite the code.** Every claim added to the plan should reference a file:line. "Almost certainly exists" is not good enough.
 - **Verify memories before quoting them.** `MEMORY.md` entries are point-in-time observations; check the current code before treating a memory as fact.
 - **Don't add new phases or scope.** If you find work the plan missed, note it in the report — adding a new phase is a decision for the user.
-- **Parallelize research.** Use Glob, Grep, and Read in parallel; spawn `Explore` for broad surveys.
+- **Parallelize research.** Use Glob, Grep, and Read in parallel; spawn `Explore` for broad surveys. When you spawn agents, never end a turn purely "awaiting notification" on their results — completion notifications are an optimization, never a guarantee (the wake-up channel is at-most-once); re-check for finished results on a bounded timer and proceed on evidence. On any nudge / system-reminder wake, FIRST re-check whether the awaited research already finished (evidence over memory), collect it, and continue — never re-spawn completed research.
 - **No new files.** The plan file is the only thing you should be writing to.
 - **Decide; don't escalate.** Engineering trade-offs surfaced during vetting must be resolved in the plan using the Decision policy. Effort and backward compatibility are not factors. Only kick a question up to the user when it's genuinely a product/scope/stakeholder call.
