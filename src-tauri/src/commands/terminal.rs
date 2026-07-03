@@ -1060,6 +1060,73 @@ pub(crate) struct SessionCaptureHint {
     pub inject_agent_git_identity: bool,
 }
 
+/// Untracked-backend-spawn guardrail (plan
+/// `2026-07-03-runner-session-tracking-drift-and-guardrails` Phase 3 item 1):
+/// every backend/headless caller generates its own pinned session id before
+/// calling in, so there is NEVER a legitimate reason for a backend spawn to
+/// omit `capture_hint` — an omission means the session will not be durably
+/// recorded and a restart silently drops it (the exact bug class three prior
+/// fixes each patched at one call site). WARN + count
+/// (`session_lifecycle_untracked_backend_spawn_total`, surfaced on `/health`
+/// under `sessionTracking`) so the NEXT gap is loud instead of silent.
+fn warn_untracked_backend_spawn(
+    capture_hint: &Option<SessionCaptureHint>,
+    title: &str,
+    working_dir: &str,
+) {
+    if capture_hint.is_some() {
+        return;
+    }
+    let total = crate::session::tracking_health::note_untracked_backend_spawn();
+    warn!(
+        counter = "session_lifecycle_untracked_backend_spawn_total",
+        total,
+        title = %title,
+        working_dir = %working_dir,
+        "backend terminal spawn without capture_hint — session will NOT be durably \
+         recorded and a restart will silently drop it; use \
+         create_tracked_terminal_session_backend"
+    );
+}
+
+/// Tracked variant of [`create_terminal_session_backend`] where the capture
+/// hint is NON-OPTIONAL — the compiler, not a log line, guarantees a backend
+/// spawn is durably recorded. All backend/headless callers (gate
+/// continuation, condition check, account migration) go through this; only a
+/// genuinely-interactive path that cannot know the session id at spawn time
+/// may use the optional-shape function directly (and eats the WARN + counter
+/// if it passes `None`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_tracked_terminal_session_backend(
+    terminal_manager: &Arc<TerminalManager>,
+    session_registry: &Arc<SessionRegistry>,
+    app_handle: tauri::AppHandle,
+    title: String,
+    working_dir: String,
+    plan_slug: Option<String>,
+    correlation_topic: Option<String>,
+    intent_repo: Option<String>,
+    command: Option<Vec<String>>,
+    isolated_ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    capture_hint: SessionCaptureHint,
+    page_id: Option<String>,
+) -> Result<(String, Option<uuid::Uuid>), String> {
+    create_terminal_session_backend(
+        terminal_manager,
+        session_registry,
+        app_handle,
+        title,
+        working_dir,
+        plan_slug,
+        correlation_topic,
+        intent_repo,
+        command,
+        isolated_ctx,
+        Some(capture_hint),
+        page_id,
+    )
+}
+
 /// Backend-task entry point for creating a terminal session + coord row from a
 /// non-Tauri context (e.g. the gate-continuation runtime task, which has no
 /// `tauri::State` extractors — it reaches the managed `Arc`s via the global
@@ -1074,6 +1141,11 @@ pub(crate) struct SessionCaptureHint {
 /// hands the resulting `IsolatedEditContext` in via `isolated_ctx` so ownership
 /// (and the heartbeat) transfers to the terminal session. Returns the new
 /// terminal id and the coord session id (when registration succeeded).
+///
+/// Prefer [`create_tracked_terminal_session_backend`] — the `capture_hint:
+/// Option<_>` shape here exists only for a path that genuinely cannot know
+/// the session id at spawn time; a `None` trips the untracked-backend-spawn
+/// guardrail (WARN + counter, see [`warn_untracked_backend_spawn`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_terminal_session_backend(
     terminal_manager: &Arc<TerminalManager>,
@@ -1089,6 +1161,7 @@ pub(crate) fn create_terminal_session_backend(
     capture_hint: Option<SessionCaptureHint>,
     page_id: Option<String>,
 ) -> Result<(String, Option<uuid::Uuid>), String> {
+    warn_untracked_backend_spawn(&capture_hint, &title, &working_dir);
     // Phase 2c — derive the `QONTINUI_SESSION_WORKTREES` env from the
     // pre-acquired context (all materialized sibling worktrees) before it is
     // parked on the session. `None` (no ctx / single-or-zero worktree) → no
@@ -1540,6 +1613,44 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    /// Phase 3 item 1 guardrail: a backend call arriving with
+    /// `capture_hint: None` (through the optional-shape compatibility
+    /// surface — [`warn_untracked_backend_spawn`] is its first statement)
+    /// trips the `session_lifecycle_untracked_backend_spawn_total` counter;
+    /// a hinted call does not. The tracked variant
+    /// (`create_tracked_terminal_session_backend`) makes the hint
+    /// non-optional, so its callers compile the guarantee away — no runtime
+    /// assertion is possible or needed there.
+    #[test]
+    fn untracked_backend_spawn_guard_trips_counter_on_none_hint_only() {
+        let before = crate::session::tracking_health::untracked_backend_spawn_total();
+
+        // Hinted call → no increment.
+        let hint = Some(SessionCaptureHint {
+            config_dir: None,
+            working_dir: "/work/dir".to_string(),
+            title: "Hinted".to_string(),
+            page_id: None,
+            claude_session_id: Some("pinned-1".to_string()),
+            zone_index: None,
+            inject_agent_git_identity: false,
+        });
+        warn_untracked_backend_spawn(&hint, "Hinted", "/work/dir");
+        assert_eq!(
+            crate::session::tracking_health::untracked_backend_spawn_total(),
+            before,
+            "a hinted backend spawn must not count as untracked"
+        );
+
+        // Hint-less call → warn + increment. (Other tests share the global
+        // counter, so assert a strict increase rather than an exact value.)
+        warn_untracked_backend_spawn(&None, "Untracked", "/work/dir");
+        assert!(
+            crate::session::tracking_health::untracked_backend_spawn_total() > before,
+            "a backend spawn with capture_hint: None must trip the counter"
+        );
+    }
 
     /// When the injected resolver yields an id, exactly one open record lands
     /// in the store, keyed by the resolved id, restored into zone 0 / default

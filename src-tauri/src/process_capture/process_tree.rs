@@ -92,6 +92,28 @@ pub fn claude_present_in_inclusive_subtree(
         .any(|d| is_claude_image(snapshot.names.get(&d.pid)))
 }
 
+/// Every claude-image PID in the **inclusive** subtree rooted at `root_pid`
+/// (the root itself is included when its image is `claude*`). Same walk as
+/// [`claude_present_in_inclusive_subtree`] but returning the PIDs instead of
+/// a bool — the session-tracking health check
+/// ([`crate::session::tracking_health`]) uses it to cross-reference live
+/// Claude processes against the durable lifecycle records. No PID-reuse
+/// guard here: this is an enumeration, not a liveness verdict — callers that
+/// need the guard pair it with `claude_present_in_inclusive_subtree`.
+pub fn claude_pids_in_inclusive_subtree(root_pid: u32, snapshot: &ProcessSnapshot) -> Vec<u32> {
+    let mut out = Vec::new();
+    if is_claude_image(snapshot.names.get(&root_pid)) {
+        out.push(root_pid);
+    }
+    out.extend(
+        bfs_descendants_from(root_pid, &snapshot.parent_map, &snapshot.creation_times)
+            .iter()
+            .filter(|d| is_claude_image(snapshot.names.get(&d.pid)))
+            .map(|d| d.pid),
+    );
+    out
+}
+
 /// Case-insensitive basename match on `claude` / `claude.exe`. Tolerates a
 /// path-qualified name (takes the basename) and a trailing `.exe`.
 fn is_claude_image(name: Option<&String>) -> bool {

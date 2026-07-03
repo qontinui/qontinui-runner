@@ -31,6 +31,7 @@ mod asset_headers;
 mod auth;
 mod auto_commit;
 mod backup;
+mod build_drift;
 mod check_executor;
 mod check_generation;
 mod claude_accounts;
@@ -2383,6 +2384,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 let poll_lifecycle_store = lifecycle_store.clone();
                 let reconcile_lifecycle_store = lifecycle_store.clone();
+                let health_lifecycle_store = lifecycle_store.clone();
                 app.manage(lifecycle_store);
 
                 // VT output sanitizer: terminal output is UNTRUSTED (whatever a
@@ -2637,6 +2639,36 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         })
                         .collect();
                     session::reconcile::run_at_boot(&reconcile_lifecycle_store, live).await;
+                });
+
+                // Session-tracking health check (plan 2026-07-03-runner-
+                // session-tracking-drift-and-guardrails Phase 3 item 2): every
+                // 10 min cross-reference the live claude descendants of this
+                // process against the durable open records — WARN + /health
+                // `sessionTracking` on any live-but-untracked or tracked-but-
+                // dead drift, so this bug class surfaces in minutes instead of
+                // a manual process-tree audit.
+                let health_tm = term_for_session.clone();
+                let health_sm = app
+                    .state::<std::sync::Arc<claude_session::SessionManager>>()
+                    .inner()
+                    .clone();
+                tauri::async_runtime::spawn(async move {
+                    session::tracking_health::run_periodic(
+                        health_tm,
+                        health_lifecycle_store,
+                        health_sm,
+                    )
+                    .await;
+                });
+
+                // Build/deploy drift (item 3): once at startup + every 15 min,
+                // resolve origin/main and diff against the embedded gitSha —
+                // surfaced on /health (`mainSha` + `buildDrift`) and a WARN
+                // when the running binary is behind, so "shipped but never
+                // deployed to the live primary" is visible at a glance.
+                tauri::async_runtime::spawn(async move {
+                    build_drift::run_periodic().await;
                 });
 
                 // Plan §Phase 3/7/10 — start the coord-sync background loops
