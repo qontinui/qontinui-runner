@@ -1,7 +1,7 @@
 export { CompactZoneCard } from "./CompactZoneCard";
 export { ZoneContextMenu } from "./ZoneContextMenu";
 export { ZoneQuickActions } from "./ZoneQuickActions";
-export { ZoneLabel } from "./ZoneLabel";
+export { ZoneLabel, SessionPrDropdown } from "./ZoneLabel";
 export { HiddenTerminal } from "./HiddenTerminal";
 export { ActivitySparkline } from "./ActivitySparkline";
 export { HighlightedText } from "./HighlightedText";

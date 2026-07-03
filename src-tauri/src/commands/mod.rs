@@ -224,6 +224,7 @@ pub mod scripted_output_settings; // get/save the ScriptedOutputSettings (provid
 pub mod security_settings;
 pub mod self_healing_settings;
 pub mod session; // Plan 2026-05-22-coord-native-session-coordination Phase 2 — unified Session primitive Tauri commands
+pub mod session_prs; // Per-session PR merged/unmerged status for the Terminal zone-header dropdown (coord proxy)
 pub mod setup_wizard; // First-launch setup wizard commands
 pub mod shell_commands; // Shell command management and execution
 pub mod spec_drift; // Spec drift detection (useUIElement vs spec assertions)
