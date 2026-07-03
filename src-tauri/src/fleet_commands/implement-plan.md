@@ -258,17 +258,17 @@ Rules:
 - If the existing block is already `IN PROGRESS`, refresh the date and append your session marker — multiple agents may pick up the same plan; keep the trail.
 - If the existing block is `SHIPPED` / `SUPERSEDED` / `OBSOLETE`, STOP — implementing a shipped plan is almost certainly a mistake. Confirm with the user before proceeding.
 
-**Set the work-unit status directly.** IN PROGRESS / SHIPPED transitions drive
-`unit_status` gates via coord's work-unit registry — there is no longer a
-plan-ingest worker mirroring `qontinui-dev-notes/plans/` file edges into
-`coord.plans`. Transition the work unit explicitly:
-`POST $COORD_HTTP_URL/coord/work-units/<plan stem>/transition`
-`{to_status:"in_progress", by_actor:"<session>"}` (the device-authed registry
-route). The plan .md stamp + archive still apply (commit + push the stamped file
-when archiving — the markdown artifact, its stamps, and the archive step all STAY);
-only the coord-registry transition moved from "push a file edge" to "call the
-transition route". (claude-config is NOT a coord sole-authority repo — its PRs
-land via normal GitHub flow.)
+**Transition the work-unit registry directly when you stamp.** IN PROGRESS /
+SHIPPED stamps drive `unit_status` gates, which watch the work unit's `status` in
+coord's directly-writable work-unit registry. There is no longer a plan-ingest
+worker mirroring `qontinui-dev-notes/plans/` into the registry, so set the status
+with an explicit `POST $COORD_HTTP_URL/coord/work-units/<plan-stem>/transition`
+`{to_status, by_actor}` (or an upsert carrying a new `status`) — a direct
+transition is durable, not reverted by an ingest tick. The plan `.md` stamp +
+commit/push + archive STAY (the operator-private artifact workflow), but the coord
+status transition is now this explicit call, not a side effect of the file push.
+(claude-config is NOT a coord sole-authority repo — its PRs land via normal GitHub
+flow.)
 
 #### Single-stamp invariant — applies to Step 0.5 and Step 6
 
@@ -724,29 +724,34 @@ Before launching phase agents, scan the plan and the touched-files list for any 
 ### Step 0.7.5: Semantic-resource reserve handshake (predict-then-reserve)
 
 Before a phase agent **authors** a change to a known **shared semantic
-resource**, it must reserve that resource through coord first — so two
-concurrent sessions don't hand-pick the same `down_revision` / registry
-slot and fork `main`. This is the read-side of the auto-reconcile +
-handshake layer (plan
+resource** that cannot be mechanically re-pointed at land, it must reserve
+that resource through coord first — so two concurrent sessions don't
+hand-pick the same registry slot and fork `main`. This is the read-side of
+the auto-reconcile + handshake layer (plan
 `2026-06-02-coord-conflict-autoreconcile-and-agent-handshake`); it pairs
-with the auto-rebase that re-points a loser when a fork *does* slip
-through, and with Plan A's CI gate that enforces the reservation existed.
+with the auto-rebase that re-points a loser when a fork *does* slip through.
+
+**Migrations are NO LONGER mandatory-reserve** (plan
+`2026-06-25-migration-ordering-land-time-repoint`). An alembic migration's
+`down_revision` is a mechanical, conflict-free link that coord re-points to
+the live merged head **at land time** (the land-time re-point engine), and
+the `alembic-graph-pr.yml` CI check fails any PR that would fork the chain.
+So a phase that authors a migration just chains off its **local head** and
+pushes — no reserve-before-author handshake, no `down_revision` assignment,
+no bind. `coord_migration_reserve` still exists as an **optional advisory**
+call (returns a suggested `down_revision` + a "you're stacked behind #N"
+heads-up); use it for the early signal if convenient, but it gates nothing.
 
 **Mandatory-reserve scope.** A resource is mandatory-reserve iff coord has
-a **registered `SemanticResource` grammar** for it. Today that is exactly:
+a **registered `SemanticResource` grammar** for it AND it is NOT land-time
+re-pointable. Today that is exactly:
 
-- **Alembic migration heads** — any phase that authors a new migration
-  (a `down_revision` pick). coord owns chain succession now: ask for a
-  **slot** and coord ASSIGNS your `down_revision`. Reserve it with
-  **`coord_migration_reserve`** (HTTP: `POST $COORD_HTTP_URL/coord/migrations/reserve`),
-  NOT `coord_claim_acquire` / `coord_reserve_resource`. The old
-  `kind=alembic_revision` claim is retired and returns **410**; the CI gate
-  matches your PR against your reservation and auto-binds it (no
-  `coord.claims_audit` claim to keep alive).
 - **The MCP tool registry** — any phase that adds/renumbers a tool
   registration or a grammar-tracked count assertion. Resource:
   `mcp-tool-registry:<mount>` (the registry mount, e.g. `phase11` — not
-  the repo), reserved via `coord_reserve_resource`.
+  the repo), reserved via `coord_reserve_resource`. (A colliding tool slot
+  cannot be re-pointed at merge, so pre-authoring reservation is the only
+  fork-prevention available — unlike migrations.)
 
 Other tracked-but-not-yet-grammared resources (enums, lockfiles) are
 **advisory** — reserve if convenient, but the CI gate is not (yet) keyed
@@ -756,24 +761,32 @@ automatically — do not maintain a separate hand-edited list here.
 
 **Scan + inject.** Before launching each phase agent (alongside the
 Step 0.7 UI-Bridge scan), check whether the phase's touched-files /
-description authors a mandatory-reserve resource. If so, include this
-block in the agent prompt:
+description authors a mandatory-reserve resource (the MCP tool registry /
+enum / lockfile classes — NOT migrations). If so, include this block in the
+agent prompt:
 
 > **Reserve-before-author handshake.** Before you author this change,
 > reserve the resource over MCP — the call differs by resource class:
 >
-> **Migration (alembic):** ask coord for a slot —
-> `POST $COORD_HTTP_URL/coord/migrations/reserve {"repo":"<repo>","revision":"<your-new-rev-id>","machine_id":...,"agent_session_id":...}`
-> (MCP: `coord_migration_reserve` when available). The response ASSIGNS your
-> `down_revision` — use it verbatim; never compute the head from a local
-> checkout. `position > 1` means you're stacked behind in-flight migrations
-> (fine — author against the assigned head). No heartbeat, no claim juggling:
-> push your PR and the CI gate auto-binds it; merge releases the slot. If a
-> predecessor expires/withdraws, coord re-points you — the gate (and a PR
-> comment) tells you the corrected `down_revision`; update the file and
-> re-push. Withdraw an abandoned slot:
-> `POST /coord/migrations/:id/withdraw {"reason":...}`. The old
-> `kind=alembic_revision` claim returns 410.
+> **Migration (alembic): NO reserve needed.** Just author your migration
+> with `down_revision` = your **local** alembic head and push. coord
+> re-points the `down_revision` to the live merged head at LAND time (the
+> land-time re-point engine), and `alembic-graph-pr.yml` CI fails any PR
+> that would fork the chain — those are the fork-prevention authority, not a
+> reservation. OPTIONAL early signal only: `coord_migration_reserve(repo, revision)`
+> (HTTP: `POST $COORD_HTTP_URL/coord/migrations/reserve`) returns an advisory
+> suggested `down_revision` + queue position ("stacked behind #N") — handy to
+> know if a sibling is in flight, but it binds nothing, expires nothing, and
+> you never need to act on it. (The old `kind=alembic_revision` claim returns
+> 410; the bind/withdraw flow is gone.)
+> **Do NOT add a `coord:stacked-on` / `coord:upstream-of` label to order a
+> migration stack.** coord derives the serialization edge
+> (`EdgeKind::StackedOn`, `dep_graph.rs` `predict_migration_stacks`) from the
+> `down_revision` chain automatically — the `down_revision` link IS the
+> ordering. A hand-added label is redundant noise (and was a historical
+> stale-block source); reserve `coord:stacked-on` / `coord:upstream-of` for
+> genuine *code* stacks — one PR's source depends on another's, with no shared
+> migration.
 >
 > **Tool registry / enum / lockfile:** call
 > **`coord_reserve_resource(kind, name)`** — `kind` is the lowercase-kebab
@@ -795,16 +808,17 @@ block in the agent prompt:
 >
 > For the tool-registry path, heartbeat (`coord_claim_heartbeat`) if
 > authoring takes a while; release (`coord_claim_release`) once your commit
-> that claims the slot lands. (Migrations need none of this — the
-> reservation binds to your PR and is released by merge.)
+> that claims the slot lands. (Migrations need none of this — there is no
+> reservation lifecycle; land-time re-point handles chain order.)
 
 The semantic-resource tools live on coord's `phase11` MCP mount
 (`coord_claim_acquire/heartbeat/release/check`, `coord_reserve_resource`);
-migration reservations use `coord_migration_reserve` / `_bind_pr` /
-`_withdraw` / `_queue`. If a phase agent has no MCP access to coord, fall
-back to the HTTP API: migrations use
-`POST $COORD_HTTP_URL/coord/migrations/reserve` (coord assigns the
-`down_revision`); other semantic resources use
+the advisory migration tools are `coord_migration_reserve` (optional early
+signal) and `coord_migration_queue` (read the advisory queue) — the
+`_bind_pr` / `_withdraw` tools were retired with the bind gate. If a phase
+agent has no MCP access to coord, fall back to the HTTP API: the optional
+migration advisory is `POST $COORD_HTTP_URL/coord/migrations/reserve`
+(returns a suggested `down_revision`); other semantic resources use
 `POST $COORD_HTTP_URL/claims/acquire` with
 `kind: "semantic_resource", resource_key: "<class>:<name>"`.
 
@@ -856,6 +870,40 @@ blocks a phase, it informs the coordinator's decision.
 > report. A `Contradiction`/`Failure` composed outcome is a phase-report
 > **red flag**, NOT an automatic revert.
 
+### Step 0.7.7: Subagent stall contract
+
+Include this block in EVERY phase agent's prompt — it is the prompt-side
+half of the subagent stall watchdog (plan
+`2026-07-03-subagent-stall-watchdog`). The observed failure class it kills:
+an agent backgrounds a long build, ends its turn "awaiting notification,"
+the wake-up never fires, and the finished work sits uncollected.
+
+> **Stall contract — never wait passively, always resume idempotently,
+> check in when you can.**
+>
+> **1. Never end a turn purely "awaiting notification."** Any
+> backgrounded or long-running step (builds, test runs, CI waits) gets a
+> work-type-appropriate fallback: re-check completion evidence (build
+> artifacts, process state, output files) on a bounded timer and proceed
+> on evidence. Completion notifications are an optimization, never a
+> guarantee — the wake-up channel is at-most-once.
+>
+> **2. Idempotent resume.** On any nudge / system-reminder wake, FIRST
+> re-check whether the awaited work already finished (evidence over
+> memory), collect the result, and continue — never restart completed
+> work.
+>
+> **3. Check in.** When a `coord_expectation_checkin` MCP tool is
+> available in the session AND your prompt carries an `expectation_id`,
+> call `coord_expectation_checkin(expectation_id, progress_seq=<bumped>)`
+> at each phase boundary. `progress_seq` is any monotonically increasing
+> number of your choosing (phases completed, files edited — anything that
+> only goes up); a higher value resets the supervision ladder and pushes
+> your deadline out. Any `status_ask` message you receive MUST be answered
+> via the same call (bump `progress_seq`, optionally add a one-line
+> `note`). If the tool or the `expectation_id` is absent, skip silently
+> (fail-soft) — never block phase work on it.
+
 ### Step 0.8: Coordinator mode (when the plan scope is too large)
 
 If you complained earlier that the plan scope is too large to implement directly,
@@ -873,7 +921,21 @@ unblock.
    TODOs), run type checks + lints, fix what it finds, and report a structured
    summary (files changed, decisions made, issues hit + how resolved, any
    remaining concerns). Launch independent phases / chunks in parallel via
-   multiple Agent tool calls in a single message.
+   multiple Agent tool calls in a single message. Every spawned agent
+   prompt MUST also contain the Step 0.7.7 stall-contract block (no
+   passive waits, idempotent resume, fail-soft check-in) — the coordinator
+   is the enforcement point for prompts it authors. At spawn time, if a
+   `coord_expectation_register` MCP tool is available, call it once per
+   spawned agent to register what you delegated:
+   `coord_expectation_register(expected_kind='checkin_only',
+   phase='<phase name>', note='<one line: what was delegated>')` — or
+   `expected_kind='commit_on_branch'` with `expected_ref={repo, branch}`
+   when the phase is expected to produce commits on a known branch. Keep
+   the returned `expectation_id` and pass it to the phase agent in its
+   prompt (its Step 0.7.7 check-ins reference it); when you collect that
+   agent's result, call `coord_expectation_close(expectation_id)`
+   (`status='met'` by default, `'cancelled'` if the phase was abandoned).
+   If the tool is absent, skip silently — never block a spawn on it.
 2. **Review.** When each agent returns, read its summary critically. Spot-check
    the actual diff with `git diff` / `Read` — don't trust the summary alone
    (see [[feedback_verify_function_exists_before_trusting_stamp]]). Confirm:
@@ -1011,16 +1073,36 @@ UPSERTs sequentially in launch order, then launch the Agents in
 parallel.
 
 **Reserve handshake (per Step 0.7.5).** If a phase authors a
-mandatory-reserve semantic resource (a new migration / a tool-registry
-change), include the Step 0.7.5 reserve-before-author block in that
-phase's Agent prompt so the agent reserves the resource (and, for
-migrations, uses the `down_revision` coord assigns) before authoring —
-never hand-picking a colliding value.
+mandatory-reserve semantic resource (a tool-registry / enum / lockfile
+change — NOT a migration), include the Step 0.7.5 reserve-before-author
+block in that phase's Agent prompt so the agent reserves the resource
+before authoring — never hand-picking a colliding value. Migrations need
+no reserve: they author against the local head and coord re-points at land.
 
 **Edit-effect loop (per Step 0.7.6).** Include the Step 0.7.6
 predict→gate→verify block in EVERY phase Agent prompt so the agent
 predicts before its first edit, surfaces any `escalate` risk_factors to
 you, and verifies after its commit. Best-effort — never blocks a launch.
+
+**Stall contract (per Step 0.7.7).** Include the Step 0.7.7 stall-contract
+block in EVERY phase Agent prompt so the agent never ends a turn purely
+"awaiting notification" on backgrounded work, resumes idempotently
+(evidence over memory) on any nudge/wake, and checks in via
+`coord_expectation_checkin(expectation_id, progress_seq=<bumped>)` at each
+phase boundary when that tool is available (fail-soft when absent).
+
+**Expectation register (per Step 0.7.7).** At spawn time for each phase
+Agent, if a `coord_expectation_register` MCP tool is available, call it
+once per spawned agent:
+`coord_expectation_register(expected_kind='checkin_only',
+phase='<phase name>', note='<one line: what was delegated>')` — or
+`expected_kind='commit_on_branch'` with `expected_ref={repo, branch}` when
+the phase is expected to produce commits on a known branch. Keep the
+returned `expectation_id` and pass it into that agent's prompt so its
+Step 0.7.7 check-ins reference it. When you collect the agent's result,
+call `coord_expectation_close(expectation_id)` (`status='met'` by default,
+`'cancelled'` if the phase was abandoned). If the tool is absent, skip
+silently — never block a spawn on it.
 
 **Launch independent phases in parallel** using multiple Agent tool calls in a single message. Only serialize phases that have true dependencies on each other.
 
@@ -1093,7 +1175,7 @@ Once Steps 1–5 land cleanly:
 
    Use a plain `mv plans/<name>.md qontinui-dev-notes/plans/<name>.md`. The plan's followup file (if any) stays in whichever location matches its own state — completed plans go to dev-notes, plans with open items stay at the workspace root.
 
-3. **Commit the archived plan in dev-notes.** Single commit with message like `plans: archive <plan-name> as shipped (<commit-sha-summary>)`. Push. The archive commit is the durable record of the markdown artifact; it no longer drives the coord registry (the ingest worker is gone). Transition the work unit's status to SHIPPED explicitly via `POST $COORD_HTTP_URL/coord/work-units/<plan stem>/transition {to_status:"shipped", by_actor:"<session>"}` so any `unit_status` gate clears — don't skip either.
+3. **Commit the archived plan in dev-notes.** Single commit with message like `plans: archive <plan-name> as shipped (<commit-sha-summary>)`. Push — this is the operator-private artifact archive. **Separately, transition the coord work-unit registry** so `unit_status` gates clear: `POST $COORD_HTTP_URL/coord/work-units/<plan-stem>/transition {to_status:"shipped", by_actor:"<this session>"}` (the work-unit registry is directly writable; there is no longer an ingest worker mirroring dev-notes, so the file push no longer transitions the registry for you).
 
 4. **If the plan was already authored inside `qontinui-dev-notes/plans/`** (e.g. it was vetted there from the start), skip the move; just edit the status block in place and commit.
 
@@ -1116,34 +1198,46 @@ window must elapse, an operator must approve), OR Step 6 records a "follow-up
 plan with open items" that waits on such a condition. A deferral with no
 observable trigger (open-ended TODO) is NOT a gate — skip those.
 
+**Prefer a work-unit dependency over a `unit_ready` gate for "phase N+1 waits on
+phase N."** A deferral that is *purely* an in-graph dependency on another
+work-unit reaching a terminal status is NOT a gate case: declare the edge to
+coord (`POST /coord/work-units/:slug/deps {"depends_on":[<upstream-slug>...]}`, or
+`metadata.depends_on` on upsert if it 503s pre-migration) and set the unit's
+`metadata.dispatch` payload — coord's DAG scheduler auto-dispatches it when the
+upstream reaches terminal status. Reserve gates below for *out-of-graph*
+observable conditions (PR merge, deploy/CI, metric, time window, operator
+approval). (canonical spec: `_gate-registration` → "DAG-dependency dispatch
+supersedes unit_ready for the dependency-gated case".)
+
 - **Default = explicit offer.** Ask via `AskUserQuestion` (header `Register
   gate?`, options Register / Skip), showing the derived anchor, predicate kind,
   and human-readable condition. Under opt-in auto mode (env `QONTINUI_AUTO_GATE=1`)
   register WITHOUT asking and report what was registered (gate_id + predicate).
-- **Anchor (zero user input):** `work_unit_id` from
+- **Anchor (zero user input):** `work_unit_id` (a UUID) from
   `POST $COORD_HTTP_URL/coord/work-units/upsert` with the plan stem as `slug`
-  (or `GET /coord/work-units/<slug>`); `phase_name` from the phase heading. Anchor
-  = (work_unit_id, phase_name). Claim-bound deferrals use the claim-anchored shape
-  (`claim_kind`+`resource_key`) instead.
+  (capture the returned `work_unit_id`; or `GET /coord/work-units/<slug>`);
+  `phase_name` from the phase heading. Anchor = (work_unit_id, phase_name). The
+  `unit_ready`/`unit_status` predicates carry this UUID, not the slug. Claim-bound
+  deferrals use the claim-anchored shape (`claim_kind`+`resource_key`) instead.
 - **Register:** prefer MCP `coord_register_gate` (kinds: `pr_merged`,
   `deploy_healthy`, `claim_terminal`, `operator_approval`, `ci_green`,
   `ref_exists`, `metric_threshold`, `time_elapsed`, `unit_ready`,
   `migration_at_head`, `infra_drift_clear`, `file_exists`, `sql_count`,
   `unit_status`, `gate_cleared`; optional
   `continuation_prompt` e.g. `run /implement-phase <stem> "Phase N"` for
-  auto-resume). **HTTP fallback** when MCP is unavailable — for a work-unit-anchored
-  gate it is a **TWO-call flow** (the register route never upserts the work unit,
-  and 404s `work_unit_not_found` if the slug isn't present): (1) first
-  `POST $COORD_HTTP_URL/coord/work-units/upsert {slug, title?, status?}` and
-  capture `work_unit_id` from the response; (2) then
-  `POST $COORD_HTTP_URL/coord/work-units/<slug>/register-gate` with a raw device JWT
-  (resolves tenant from the device JWT; body omits `slug`/`work_unit_id`, which come
-  from the path + the predicate). All work-unit routes are device-authed
-  (`require_jwt`), so a device session reaches them directly; the operator-only
-  `/coord/gates/register` is not used for a work-unit anchor. For a claim-anchored
-  gate (no work unit) or with no device identity, fall back to
-  `POST $COORD_HTTP_URL/coord/gates/register` (default `https://coord.qontinui.io`).
-  Tenant derives server-side — never pass it.
+  auto-resume). **HTTP fallback** when MCP is unavailable — for a plan-anchored gate
+  it is now TWO device-authed calls on coord's `require_jwt` sub-router
+  (device/agent/service JWT all work): (1)
+  `POST $COORD_HTTP_URL/coord/work-units/upsert {slug, title?, status?}` →
+  **capture `work_unit_id`**; (2)
+  `POST $COORD_HTTP_URL/coord/work-units/<slug>/register-gate`
+  `{predicate, phase_name (required), continuation_spawn?, clearance_audience?}` —
+  `register-gate` does NOT upsert (404s `work_unit_not_found` if you skip step 1).
+  Reach the two routes over a held device JWT, the `/coord-mcp` proxy (injects a
+  device JWT), or the acting-user-service token (`coord-acting-bearer.sh`); MCP
+  `coord_register_gate` now works from a device session too. A claim-anchored gate
+  (no slug) uses MCP or `POST $COORD_HTTP_URL/coord/gates/register` (default
+  `https://coord.qontinui.io`). Tenant derives server-side — never pass it.
 - **`clearance_audience`:** set `agent` for agent-verifiable facts ("/vet-plan
   was run", "crate exists + tests green", "a dual run emitted evidence") so the
   session that completes the work can attest the gate itself; set `operator` for
@@ -1159,8 +1253,8 @@ observable trigger (open-ended TODO) is NOT a gate — skip those.
   cleared → `infra_drift_clear`; a repo file/workflow existing → `file_exists`
   `{repo,path,on_ref?}` (contents, not refs); a coord data count crossing a bound
   → `sql_count` `{query_id,op,n}` (whitelisted `query_id`, never raw SQL); an
-  umbrella work unit reaching a status → `unit_status` `{work_unit_id, status}`;
-  another cross-anchor gate clearing → `gate_cleared` `{gate_id}`;
+  umbrella plan reaching a status → `unit_status` `{work_unit_id,status}`; another
+  cross-anchor gate clearing → `gate_cleared` `{gate_id}`;
   needs-human → `operator_approval`. Anything **security / credential / billing /
   strategy-sensitive** registers as `operator_approval` + notify — never an
   auto-resuming gate, never silently auto-registered.
@@ -1181,9 +1275,9 @@ gate rots open until a human clicks it.
 - **Find the gate:** by the `gate_id` recorded at registration, or by lookup
   `GET $COORD_HTTP_URL/coord/gates?work_unit_id=<id>&phase_name=<name>` — the OPEN
   gate whose condition the completed work satisfies.
-- **Attest:** prefer MCP `coord_attest_gate` (pass `gate_id` — works from a device
-  session since attest takes no plan upsert); fall back to the device loopback
-  forwarder `POST http://127.0.0.1:{runner_port}/coord-mcp/gates/{gate_id}/attest`
+- **Attest (unchanged — keyed by `gate_id`):** prefer MCP `coord_attest_gate` (pass
+  `gate_id` — works from a device session since attest takes no upsert); fall back to
+  the device loopback forwarder `POST http://127.0.0.1:{runner_port}/coord-mcp/gates/{gate_id}/attest`
   (header `X-Coord-Mcp-Proxy-Key`, no body bearer — maskless fallback), then the
   direct device-authed `POST $COORD_HTTP_URL/coord/gates/:gate_id/attest`. Tenant
   derives server-side — never pass it. Legal only on an OPEN `operator_approval`
@@ -1197,15 +1291,15 @@ gate rots open until a human clicks it.
 
 **Continuation cancel (refresh + takeover).** A CLEARED `unit_ready` gate may have
 dispatched a pending runner-terminal continuation. If you **re-register** a gate
-for the same work-unit/anchor, or this run **directly takes over** the work a
-pending continuation was queued for (the active takeover wiring lives in Step 0.6),
-first cancel that pending continuation so the runner does not spawn a redundant
+for the same plan/anchor, or this run **directly takes over** the work a pending
+continuation was queued for (the active takeover wiring lives in Step 0.6), first
+cancel that pending continuation so the runner does not spawn a redundant
 terminal: find it via `GET $COORD_HTTP_URL/coord/gates?work_unit_id=<id>` (rows with
 `continuation_dispatched_at != null ∧ continuation_consumed_at == null ∧
 continuation_cancelled_at == null`), then
 `POST $COORD_HTTP_URL/coord/gates/:gate_id/continuation-cancel`
-`{cancelled_by, reason}` (`TenantId` auth, on the operator/`TenantId` path,
-unchanged). Best-effort, never blocking:
+`{cancelled_by, reason}` (`TenantId` auth — an operator/`TenantId`-only route).
+Best-effort, never blocking:
 404 = nothing pending; **409 `already_consumed` = a spawn already happened, report
 it honestly** rather than claiming the cancel landed. Narrate the cancelled
 `gate_id`. (canonical spec: `_gate-registration` → "Continuation cancel + refresh".)
