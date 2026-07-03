@@ -44,11 +44,6 @@
 
 pub mod collectors;
 pub mod config;
-<<<<<<< HEAD
-pub mod directive;
-=======
->>>>>>> 5f1d3b3e (feat(devenv): in-app enrollment — Tauri command + settings panel (Phase 2))
-pub mod enroll;
 
 use std::sync::OnceLock;
 use std::time::Duration;

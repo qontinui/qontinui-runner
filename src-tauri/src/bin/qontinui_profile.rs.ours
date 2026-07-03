@@ -60,7 +60,6 @@ use qontinui_runner_lib::pair::{
     coord_http_base, derive_web_base_from_coord, pair_via_browser, pair_with_auth_token,
     pair_with_pair_code, persist_pairing, tenant_id_from_oauth_claim, PairCompleteResponse,
 };
-use qontinui_runner_lib::profile_cli::EnvCmd;
 use qontinui_runner_lib::profiles::{
     load_strict, profiles_path, AuthConfig, BlobConfig, Profile, ProfilesFile,
 };
@@ -133,9 +132,38 @@ enum Cmd {
     },
 }
 
-// `EnvCmd` (the `env enroll/capture/show` subcommand tree) lives in
-// `qontinui_runner_lib::profile_cli` so this bin AND the main runner binary's
-// pre-GUI CLI mode share one implementation.
+#[derive(Subcommand, Debug)]
+enum EnvCmd {
+    /// Enroll this machine into a web environment via an enrollment code.
+    /// POSTs `{enrollment_code, machine_id, hostname}` to
+    /// `{backend}/api/v1/devenv/agent/enroll`; on success stores the returned
+    /// `mk_<token>` machine key in secure storage and writes
+    /// `~/.qontinui/env-agent.json` with the RESPONSE environment_id.
+    Enroll {
+        /// The enrollment code minted by the web dashboard.
+        #[arg(long)]
+        code: String,
+        /// Override the backend base URL. Falls back to `QONTINUI_WEB_BASE`,
+        /// then a web base derived from the active profile's coord_url.
+        #[arg(long)]
+        backend: Option<String>,
+        /// Reserved override for the target environment id. Normally the
+        /// environment is assigned by the enroll response; this is only used
+        /// for diagnostics / re-enroll against a specific environment.
+        #[arg(long)]
+        environment: Option<String>,
+    },
+    /// Capture the current dev-environment config and push it to the backend.
+    /// `--dry-run` assembles + pretty-prints the envelope WITHOUT pushing.
+    Capture {
+        /// Assemble + print the envelope without POSTing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Print enrollment state (from env-agent.json) + whether a machine key is
+    /// stored.
+    Show,
+}
 
 #[derive(Subcommand, Debug)]
 enum DeviceCmd {
@@ -215,9 +243,15 @@ fn main() -> ExitCode {
                 tenant_id.as_deref(),
             ),
         },
-        // The `env` subcommands share one implementation with the main runner
-        // binary's pre-GUI CLI mode (`qontinui-runner env …`), in the lib.
-        Cmd::Env { sub } => ExitCode::from(qontinui_runner_lib::profile_cli::run_env(sub)),
+        Cmd::Env { sub } => match sub {
+            EnvCmd::Enroll {
+                code,
+                backend,
+                environment,
+            } => cmd_env_enroll(&code, backend.as_deref(), environment.as_deref()),
+            EnvCmd::Capture { dry_run } => cmd_env_capture(dry_run),
+            EnvCmd::Show => cmd_env_show(),
+        },
     }
 }
 
@@ -1090,8 +1124,6 @@ fn active_profile_dsn() -> Result<String, String> {
         .map_err(|e| format!("active profile has no database_url: {}", e))
 }
 
-<<<<<<< HEAD
-=======
 // ============================================================================
 // env subcommand — machine-side dev-environment capture agent
 // ============================================================================
@@ -1236,7 +1268,6 @@ fn cmd_env_show() -> ExitCode {
     ExitCode::SUCCESS
 }
 
->>>>>>> 5f1d3b3e (feat(devenv): in-app enrollment — Tauri command + settings panel (Phase 2))
 #[cfg(test)]
 mod tests {
     use super::*;
