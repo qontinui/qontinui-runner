@@ -21,7 +21,11 @@
 //! chains to whatever hook was previously installed (which is the default
 //! stderr printer during this early window). Later, `logging::setup_panic_handler`
 //! overwrites the hook with the richer crash-dump version; by then early
-//! init has succeeded and the simpler hook has done its job.
+//! init has succeeded and the simpler hook has done its job. The late hook
+//! (`logging::log_panic`) calls back into [`write_panic_log`] so post-init
+//! panics keep producing the supervisor-parseable `runner-panic.log` too —
+//! before 2026-07-03 they didn't, and a crashed primary showed
+//! `recent_panic: null` on the supervisor's `/runners`.
 //!
 //! # File semantics
 //!

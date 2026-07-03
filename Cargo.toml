@@ -11,6 +11,20 @@ resolver = "2"
 debug = 0
 split-debuginfo = "packed"
 
+# 2026-07-03: the primary (debug build) hard-aborted with 0xc0000409 — a Rust
+# std debug-assertion UB check ("Alignment::new_unchecked requires a power of
+# two") fired inside AWS-LC's jitter-entropy path
+# (aws_lc_..._jent_entropy_switch_notime_impl) across an FFI/nounwind boundary,
+# turning a rare, timing-dependent bogus alignment value into a process abort.
+# Release builds never compile this check in; disabling debug-assertions for
+# these two crates ONLY restores release-parity there while keeping assertions
+# everywhere else. Escalation path if the same panic recurs from another dep:
+# widen to [profile.dev.package."*"].
+[profile.dev.package.aws-lc-rs]
+debug-assertions = false
+[profile.dev.package.aws-lc-sys]
+debug-assertions = false
+
 [profile.test]
 debug = 0
 

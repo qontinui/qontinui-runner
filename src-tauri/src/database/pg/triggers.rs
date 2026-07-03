@@ -37,7 +37,7 @@ impl PgDb {
 
         Ok(rows
             .iter()
-            .map(|r| Self::trigger_row_to_workflow_trigger(r))
+            .filter_map(Self::tolerant_trigger_from_row)
             .collect())
     }
 
@@ -65,7 +65,7 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG get_trigger: {}", e))?;
 
-        Ok(row.map(|r| Self::trigger_row_to_workflow_trigger(&r)))
+        Ok(row.and_then(|r| Self::tolerant_trigger_from_row(&r)))
     }
 
     /// Get all enabled triggers.
@@ -94,7 +94,7 @@ impl PgDb {
 
         Ok(rows
             .iter()
-            .map(|r| Self::trigger_row_to_workflow_trigger(r))
+            .filter_map(Self::tolerant_trigger_from_row)
             .collect())
     }
 
@@ -442,10 +442,43 @@ impl PgDb {
 
     // -- helpers --
 
-    fn trigger_row_to_workflow_trigger(row: &tokio_postgres::Row) -> WorkflowTrigger {
-        let config_str: String = row.get::<_, Option<String>>(4).unwrap_or_default();
-        let conditions_str: String = row.get::<_, Option<String>>(7).unwrap_or_default();
-        let overrides_str: Option<String> = row.get(6);
+    /// Decode a trigger row, tolerating malformed rows.
+    ///
+    /// Converts a decode failure from [`Self::trigger_row_to_workflow_trigger`]
+    /// into a logged skip (`None`) so one bad row can never take down a loader
+    /// — or the runner. Live incident 2026-07-03: the primary crash-looped at
+    /// startup because the old panicking `row.get(5)` hit a `workflow_id`
+    /// value that does not decode as TEXT (the canonical column is `uuid`;
+    /// this mapper reads it as `Option<String>`).
+    fn tolerant_trigger_from_row(row: &tokio_postgres::Row) -> Option<WorkflowTrigger> {
+        match Self::trigger_row_to_workflow_trigger(row) {
+            Ok(trigger) => Some(trigger),
+            Err(e) => {
+                let row_id = row
+                    .try_get::<_, String>(0)
+                    .unwrap_or_else(|_| "<unreadable id>".to_string());
+                // tokio-postgres 0.7's `Display` impl prints only a generic
+                // "error deserializing column N" / "db error" — the `{:?}`
+                // debug format carries the failing column and source cause,
+                // so log that.
+                tracing::error!("skipping malformed trigger row id={}: {:?}", row_id, e);
+                None
+            }
+        }
+    }
+
+    /// Decode one `workflow_triggers` row.
+    ///
+    /// Every column goes through `try_get` so a malformed / unexpected-type
+    /// value surfaces as an `Err` for the caller to skip instead of a panic
+    /// that aborts the process. Nullable numeric/bool columns fall back to
+    /// the same defaults `WorkflowTrigger`'s serde derives use.
+    fn trigger_row_to_workflow_trigger(
+        row: &tokio_postgres::Row,
+    ) -> Result<WorkflowTrigger, tokio_postgres::Error> {
+        let config_str: String = row.try_get::<_, Option<String>>(4)?.unwrap_or_default();
+        let conditions_str: String = row.try_get::<_, Option<String>>(7)?.unwrap_or_default();
+        let overrides_str: Option<String> = row.try_get(6)?;
 
         let trigger_config: TriggerConfig = serde_json::from_str(&config_str).unwrap_or_else(|e| {
             tracing::error!(
@@ -465,27 +498,27 @@ impl PgDb {
         let workflow_overrides: Option<serde_json::Value> =
             overrides_str.and_then(|s| serde_json::from_str(&s).ok());
 
-        WorkflowTrigger {
-            id: row.get(0),
-            name: row.get(1),
-            description: row.get(2),
-            trigger_type: row.get(3),
+        Ok(WorkflowTrigger {
+            id: row.try_get(0)?,
+            name: row.try_get(1)?,
+            description: row.try_get(2)?,
+            trigger_type: row.try_get(3)?,
             trigger_config,
-            workflow_id: row.get(5),
+            workflow_id: row.try_get(5)?,
             workflow_overrides,
             conditions,
-            debounce_ms: row.get::<_, i64>(8) as u64,
-            cooldown_seconds: row.get::<_, i64>(9) as u64,
-            max_concurrent: row.get::<_, i32>(10) as u32,
-            retry_count: row.get::<_, i32>(11) as u32,
-            retry_delay_seconds: row.get::<_, i64>(12) as u64,
-            enabled: row.get(13),
-            last_triggered_at: row.get(14),
-            last_execution_id: row.get(15),
-            trigger_count: row.get::<_, i64>(16) as u64,
-            created_at: row.get(17),
-            updated_at: row.get(18),
-        }
+            debounce_ms: row.try_get::<_, Option<i64>>(8)?.unwrap_or(1000) as u64,
+            cooldown_seconds: row.try_get::<_, Option<i64>>(9)?.unwrap_or(60) as u64,
+            max_concurrent: row.try_get::<_, Option<i32>>(10)?.unwrap_or(1) as u32,
+            retry_count: row.try_get::<_, Option<i32>>(11)?.unwrap_or(0) as u32,
+            retry_delay_seconds: row.try_get::<_, Option<i64>>(12)?.unwrap_or(30) as u64,
+            enabled: row.try_get::<_, Option<bool>>(13)?.unwrap_or(false),
+            last_triggered_at: row.try_get(14)?,
+            last_execution_id: row.try_get(15)?,
+            trigger_count: row.try_get::<_, Option<i64>>(16)?.unwrap_or(0) as u64,
+            created_at: row.try_get(17)?,
+            updated_at: row.try_get(18)?,
+        })
     }
 }
 
