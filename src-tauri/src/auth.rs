@@ -95,6 +95,25 @@ fn keychain_enabled() -> bool {
     std::env::var_os("QONTINUI_DISABLE_KEYCHAIN").is_none()
 }
 
+/// Feature flag for the session-scoped multi-tenant device-JWT model
+/// (plan 2026-07-02-session-scoped-multi-tenant-device-binding, Phase 1).
+///
+/// `QONTINUI_MULTI_TENANT_JWT=1` turns on the flag-gated dark paths (the
+/// refresher's per-tenant slot pass). DEFAULT OFF: unset, empty, or any
+/// value other than `1` leaves every behavior byte-identical to today.
+/// Read from the environment on each call so a long-lived process picks up
+/// nothing stale — the check is a trivial env read.
+pub fn multi_tenant_jwt_enabled() -> bool {
+    multi_tenant_jwt_flag_from(std::env::var("QONTINUI_MULTI_TENANT_JWT").ok().as_deref())
+}
+
+/// Pure core of [`multi_tenant_jwt_enabled`]: only the exact value `1`
+/// (after trimming) enables the flag. Factored out so the gate is testable
+/// without mutating process-global env vars (racy across parallel tests).
+pub(crate) fn multi_tenant_jwt_flag_from(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1"))
+}
+
 /// Manages authentication tokens and device ID storage.
 ///
 /// The AuthManager provides secure storage for:
@@ -601,6 +620,49 @@ impl AuthManager {
             None => self.secure_storage.get_oauth_refresh_token().is_ok(),
         }
     }
+
+    // ========================================================================
+    // Per-tenant device-JWT slots — session-scoped multi-tenant Phase 1
+    // (plan 2026-07-02-session-scoped-multi-tenant-device-binding, D4).
+    //
+    // One secure-storage slot per tenant binding, keyed
+    // `device_jwt:<tenant_id>`. The legacy `access_token` slot is NEVER
+    // read or written by these methods — it keeps holding the DEFAULT
+    // binding's JWT, so every unmodified consumer (relay, data-plane bearer,
+    // legacy refresher path) keeps working during the compat window. Like
+    // the oauth_* slots, the keychain backup is intentionally not mirrored
+    // (file store is the source of truth; see module docs).
+    // ========================================================================
+
+    /// Store (or overwrite) the device JWT for one tenant binding
+    /// (slot `device_jwt:<tenant_id>`). Never touches the legacy
+    /// `access_token` slot.
+    pub fn store_tenant_device_jwt(&self, tenant_id: &Uuid, jwt: &str) -> Result<()> {
+        self.secure_storage
+            .store_tenant_device_jwt(tenant_id, jwt)
+            .context("Failed to store per-tenant device JWT in secure storage")
+    }
+
+    /// Retrieve the device JWT for one tenant binding. `Ok(None)` when no
+    /// slot exists for that tenant.
+    pub fn get_tenant_device_jwt(&self, tenant_id: &Uuid) -> Result<Option<String>> {
+        self.secure_storage.get_tenant_device_jwt(tenant_id)
+    }
+
+    /// Remove one tenant's device-JWT slot. Idempotent; never touches the
+    /// legacy `access_token` slot or any other tenant's slot.
+    pub fn clear_tenant_device_jwt(&self, tenant_id: &Uuid) -> Result<()> {
+        self.secure_storage
+            .clear_tenant_device_jwt(tenant_id)
+            .context("Failed to clear per-tenant device JWT from secure storage")
+    }
+
+    /// Enumerate the tenant ids that currently have a device-JWT slot, in
+    /// deterministic order. Never fatal — an unreadable store yields an
+    /// empty list.
+    pub fn list_tenant_device_jwt_tenants(&self) -> Vec<Uuid> {
+        self.secure_storage.list_tenant_device_jwt_tenants()
+    }
 }
 
 impl Default for AuthManager {
@@ -920,6 +982,98 @@ mod tests {
         );
 
         let _ = fs::remove_file(&storage_path);
+    }
+}
+
+/// Tests for the per-tenant device-JWT slots + the multi-tenant feature flag
+/// (session-scoped multi-tenant Phase 1).
+#[cfg(test)]
+mod tenant_device_jwt_tests {
+    use super::*;
+    use std::env;
+    use std::fs;
+
+    fn create_test_auth_manager(test_name: &str) -> AuthManager {
+        let temp_dir = env::temp_dir().join("qontinui_test_auth_tenant_jwt");
+        let storage_path = temp_dir.join(format!("{}.enc", test_name));
+        let _ = fs::remove_file(&storage_path);
+        let storage = SecureStorage::with_path(storage_path).unwrap();
+        AuthManager::with_storage(storage)
+    }
+
+    #[test]
+    fn flag_is_default_off_and_only_exactly_1_enables() {
+        // Default off: unset / empty / junk / "true" / "0" all stay dark.
+        assert!(!multi_tenant_jwt_flag_from(None));
+        assert!(!multi_tenant_jwt_flag_from(Some("")));
+        assert!(!multi_tenant_jwt_flag_from(Some("0")));
+        assert!(!multi_tenant_jwt_flag_from(Some("true")));
+        assert!(!multi_tenant_jwt_flag_from(Some("yes")));
+        // Only the documented value (trimmed) enables.
+        assert!(multi_tenant_jwt_flag_from(Some("1")));
+        assert!(multi_tenant_jwt_flag_from(Some(" 1 ")));
+    }
+
+    #[test]
+    fn tenant_slot_round_trip_and_enumeration() {
+        let mgr = create_test_auth_manager("tenant_slot_round_trip");
+        let a = Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+        let b = Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap();
+
+        assert!(mgr.get_tenant_device_jwt(&a).unwrap().is_none());
+        assert!(mgr.list_tenant_device_jwt_tenants().is_empty());
+
+        mgr.store_tenant_device_jwt(&a, "jwt.a").unwrap();
+        mgr.store_tenant_device_jwt(&b, "jwt.b").unwrap();
+
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&a).unwrap().as_deref(),
+            Some("jwt.a")
+        );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&b).unwrap().as_deref(),
+            Some("jwt.b")
+        );
+        let mut listed = mgr.list_tenant_device_jwt_tenants();
+        listed.sort();
+        assert_eq!(listed, vec![a, b]);
+
+        mgr.clear_tenant_device_jwt(&a).unwrap();
+        assert!(mgr.get_tenant_device_jwt(&a).unwrap().is_none());
+        assert_eq!(mgr.list_tenant_device_jwt_tenants(), vec![b]);
+    }
+
+    /// THE Phase-1 invariant: writing per-tenant slots never mutates the
+    /// legacy `access_token` slot (which keeps the DEFAULT binding's JWT for
+    /// every unmodified consumer), and clearing tenant slots doesn't either.
+    #[test]
+    fn tenant_slot_writes_never_mutate_legacy_access_token() {
+        let mgr = create_test_auth_manager("tenant_slot_legacy_preserved");
+        let a = Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+
+        mgr.store_tokens("default.binding.jwt", "").unwrap();
+        mgr.store_tenant_device_jwt(&a, "jwt.a").unwrap();
+        assert_eq!(
+            mgr.get_access_token().unwrap(),
+            "default.binding.jwt",
+            "storing a tenant slot must not mutate access_token"
+        );
+
+        mgr.store_tenant_device_jwt(&a, "jwt.a.v2").unwrap();
+        mgr.clear_tenant_device_jwt(&a).unwrap();
+        assert_eq!(
+            mgr.get_access_token().unwrap(),
+            "default.binding.jwt",
+            "overwriting/clearing a tenant slot must not mutate access_token"
+        );
+
+        // Reverse direction: a legacy write leaves tenant slots alone.
+        mgr.store_tenant_device_jwt(&a, "jwt.a.v3").unwrap();
+        mgr.store_tokens("default.binding.jwt.v2", "").unwrap();
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&a).unwrap().as_deref(),
+            Some("jwt.a.v3")
+        );
     }
 }
 

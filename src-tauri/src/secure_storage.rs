@@ -34,6 +34,11 @@ use tracing::{debug, info};
 /// Service identifier for the storage
 const SERVICE_NAME: &str = "com.qontinui.runner";
 
+/// Key prefix for the per-tenant device-JWT slots (session-scoped
+/// multi-tenant Phase 1, plan 2026-07-02). A slot for tenant
+/// `aaaa…` is stored under the map key `device_jwt:aaaa…`.
+const TENANT_DEVICE_JWT_PREFIX: &str = "device_jwt:";
+
 /// Storage file name
 const STORAGE_FILE: &str = "auth_tokens.enc";
 
@@ -86,6 +91,17 @@ struct StoredTokens {
     /// deserializing.
     #[serde(default)]
     agent_machine_key: Option<String>,
+    /// Per-tenant coord device-JWT slots (session-scoped multi-tenant
+    /// Phase 1, plan 2026-07-02). Keys are `device_jwt:<tenant_id>`; values
+    /// are the coord-minted device JWTs for that tenant binding. The legacy
+    /// `access_token` slot is COMPLETELY UNTOUCHED by these — it keeps
+    /// holding the DEFAULT binding's JWT so every unmodified consumer keeps
+    /// working during the compat window. Only populated when the
+    /// `QONTINUI_MULTI_TENANT_JWT=1` flag is on; `#[serde(default)]` keeps
+    /// every pre-Phase-1 `.enc` deserializing. BTreeMap so enumeration is
+    /// deterministic.
+    #[serde(default)]
+    tenant_device_jwts: std::collections::BTreeMap<String, String>,
 }
 
 /// Secure file-based storage manager.
@@ -278,13 +294,19 @@ impl SecureStorage {
         tokens.oauth_id_token = None;
         tokens.oauth_refresh_token = None;
         tokens.oauth_expires_at = None;
+        // Full sign-out also destroys every per-tenant device-JWT slot —
+        // they are bearer credentials just like the default-binding JWT.
+        // (`clear_interactive_session` deliberately preserves them, same as
+        // it preserves the other autonomy credentials.)
+        tokens.tenant_device_jwts.clear();
         self.save_tokens(&tokens)?;
         info!("Tokens cleared from secure file storage");
         Ok(())
     }
 
     /// Clears ONLY the device-JWT pair (`access_token` / `refresh_token`),
-    /// PRESERVING the four Cognito (`oauth_*`) slots and `device_id`.
+    /// PRESERVING the four Cognito (`oauth_*`) slots, the per-tenant
+    /// device-JWT slots, and `device_id`.
     ///
     /// This is the autonomy-preserving clear used by a default logout: the
     /// device JWT is dropped, but the long-lived `oauth_refresh_token` (and the
@@ -462,6 +484,73 @@ impl SecureStorage {
         Ok(())
     }
 
+    // ========================================================================
+    // Per-tenant device-JWT slots — session-scoped multi-tenant Phase 1
+    // (plan 2026-07-02-session-scoped-multi-tenant-device-binding, D4).
+    //
+    // One slot per tenant binding, keyed `device_jwt:<tenant_id>`. The legacy
+    // `access_token` slot is never read or written by these helpers — it keeps
+    // holding the DEFAULT binding's JWT. Like the oauth_* slots, the keychain
+    // backup is intentionally NOT mirrored here: the encrypted file is the
+    // source of truth (the keychain proved unreliable on Windows; see module
+    // docs).
+    // ========================================================================
+
+    /// Map key for a tenant's device-JWT slot: `device_jwt:<tenant_id>`.
+    fn tenant_device_jwt_key(tenant_id: &uuid::Uuid) -> String {
+        format!("{TENANT_DEVICE_JWT_PREFIX}{tenant_id}")
+    }
+
+    /// Store (or overwrite) the device JWT for one tenant binding. Leaves the
+    /// legacy `access_token` slot and every other slot untouched.
+    pub fn store_tenant_device_jwt(&self, tenant_id: &uuid::Uuid, jwt: &str) -> Result<()> {
+        let mut tokens = self.load_tokens().unwrap_or_default();
+        tokens
+            .tenant_device_jwts
+            .insert(Self::tenant_device_jwt_key(tenant_id), jwt.to_string());
+        self.save_tokens(&tokens)?;
+        info!("Per-tenant device JWT stored for tenant {tenant_id}");
+        Ok(())
+    }
+
+    /// Retrieve the device JWT for one tenant binding. `Ok(None)` when no
+    /// slot exists for that tenant (vs an `Err` only on a decrypt/parse
+    /// failure of an existing store).
+    pub fn get_tenant_device_jwt(&self, tenant_id: &uuid::Uuid) -> Result<Option<String>> {
+        let tokens = self.load_tokens()?;
+        Ok(tokens
+            .tenant_device_jwts
+            .get(&Self::tenant_device_jwt_key(tenant_id))
+            .cloned())
+    }
+
+    /// Remove one tenant's device-JWT slot, leaving all other slots (incl.
+    /// the legacy `access_token`) intact. Idempotent.
+    pub fn clear_tenant_device_jwt(&self, tenant_id: &uuid::Uuid) -> Result<()> {
+        let mut tokens = self.load_tokens().unwrap_or_default();
+        tokens
+            .tenant_device_jwts
+            .remove(&Self::tenant_device_jwt_key(tenant_id));
+        self.save_tokens(&tokens)?;
+        info!("Per-tenant device JWT cleared for tenant {tenant_id}");
+        Ok(())
+    }
+
+    /// Enumerate the tenant ids that currently have a device-JWT slot, in
+    /// deterministic (BTreeMap key) order. Unreadable stores and malformed
+    /// keys yield an empty / filtered list — enumeration is never fatal.
+    pub fn list_tenant_device_jwt_tenants(&self) -> Vec<uuid::Uuid> {
+        self.load_tokens()
+            .map(|t| {
+                t.tenant_device_jwts
+                    .keys()
+                    .filter_map(|k| k.strip_prefix(TENANT_DEVICE_JWT_PREFIX))
+                    .filter_map(|s| uuid::Uuid::parse_str(s).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Deletes the storage file entirely.
     #[allow(dead_code)]
     pub fn delete_storage(&self) -> Result<()> {
@@ -626,6 +715,111 @@ mod tests {
         storage.clear_agent_machine_key().unwrap();
         assert!(storage.get_agent_machine_key().unwrap().is_none());
         assert_eq!(storage.get_access_token().unwrap(), "device.jwt");
+    }
+
+    /// Per-tenant device-JWT slots: round-trip + enumeration + legacy-slot
+    /// isolation (session-scoped multi-tenant Phase 1). Writing/clearing a
+    /// tenant slot must NEVER mutate the legacy `access_token` slot, and
+    /// vice versa.
+    #[test]
+    fn test_tenant_device_jwt_slots_round_trip_and_isolation() {
+        let storage = create_test_storage("test_tenant_device_jwt_slots");
+        let tenant_a = uuid::Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+        let tenant_b = uuid::Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap();
+
+        // Legacy slot seeded first — it must survive everything below.
+        storage.store_tokens("legacy.default.jwt", "").unwrap();
+
+        // Absent before any store.
+        assert!(storage.get_tenant_device_jwt(&tenant_a).unwrap().is_none());
+        assert!(storage.list_tenant_device_jwt_tenants().is_empty());
+
+        // Round-trip both tenants.
+        storage
+            .store_tenant_device_jwt(&tenant_a, "jwt.for.a")
+            .unwrap();
+        storage
+            .store_tenant_device_jwt(&tenant_b, "jwt.for.b")
+            .unwrap();
+        assert_eq!(
+            storage.get_tenant_device_jwt(&tenant_a).unwrap().as_deref(),
+            Some("jwt.for.a")
+        );
+        assert_eq!(
+            storage.get_tenant_device_jwt(&tenant_b).unwrap().as_deref(),
+            Some("jwt.for.b")
+        );
+        let mut listed = storage.list_tenant_device_jwt_tenants();
+        listed.sort();
+        assert_eq!(listed, vec![tenant_a, tenant_b]);
+
+        // Overwrite is in-place (no duplicate slots).
+        storage
+            .store_tenant_device_jwt(&tenant_a, "jwt.for.a.v2")
+            .unwrap();
+        assert_eq!(
+            storage.get_tenant_device_jwt(&tenant_a).unwrap().as_deref(),
+            Some("jwt.for.a.v2")
+        );
+        assert_eq!(storage.list_tenant_device_jwt_tenants().len(), 2);
+
+        // LEGACY-SLOT PRESERVATION: none of the tenant-slot writes touched it.
+        assert_eq!(storage.get_access_token().unwrap(), "legacy.default.jwt");
+
+        // Clearing one tenant leaves the other + the legacy slot intact.
+        storage.clear_tenant_device_jwt(&tenant_a).unwrap();
+        assert!(storage.get_tenant_device_jwt(&tenant_a).unwrap().is_none());
+        assert_eq!(
+            storage.get_tenant_device_jwt(&tenant_b).unwrap().as_deref(),
+            Some("jwt.for.b")
+        );
+        assert_eq!(storage.get_access_token().unwrap(), "legacy.default.jwt");
+        // Idempotent clear.
+        storage.clear_tenant_device_jwt(&tenant_a).unwrap();
+
+        // And the reverse direction: a legacy-slot write leaves tenant slots
+        // untouched.
+        storage.store_tokens("legacy.default.jwt.v2", "").unwrap();
+        assert_eq!(
+            storage.get_tenant_device_jwt(&tenant_b).unwrap().as_deref(),
+            Some("jwt.for.b")
+        );
+    }
+
+    /// The FULL wipe (`clear_tokens`) destroys the per-tenant slots (they are
+    /// bearer credentials); the autonomy-preserving interactive clear keeps
+    /// them, exactly like it keeps the oauth_* credentials.
+    #[test]
+    fn test_tenant_device_jwt_slots_clear_semantics() {
+        let storage = create_test_storage("test_tenant_device_jwt_clear");
+        let tenant = uuid::Uuid::parse_str("cccccccc-cccc-4ccc-8ccc-cccccccccccc").unwrap();
+
+        storage.store_tokens("legacy.jwt", "").unwrap();
+        storage
+            .store_tenant_device_jwt(&tenant, "jwt.tenant")
+            .unwrap();
+
+        // Interactive clear: legacy pair dropped, tenant slots preserved.
+        storage.clear_interactive_session().unwrap();
+        assert!(storage.get_access_token().is_err());
+        assert_eq!(
+            storage.get_tenant_device_jwt(&tenant).unwrap().as_deref(),
+            Some("jwt.tenant")
+        );
+
+        // Full wipe: tenant slots destroyed too.
+        storage.clear_tokens().unwrap();
+        assert!(storage.get_tenant_device_jwt(&tenant).unwrap().is_none());
+        assert!(storage.list_tenant_device_jwt_tenants().is_empty());
+    }
+
+    /// A pre-Phase-1 `StoredTokens` JSON (no `tenant_device_jwts` key) must
+    /// still deserialize, with an empty slot map.
+    #[test]
+    fn test_legacy_stored_tokens_without_tenant_slots_deserializes() {
+        let raw = r#"{"access_token":"a","refresh_token":"r","device_id":"d"}"#;
+        let parsed: StoredTokens = serde_json::from_str(raw).expect("legacy shape must decode");
+        assert!(parsed.tenant_device_jwts.is_empty());
     }
 
     #[test]
