@@ -831,10 +831,22 @@ pub(crate) async fn try_device_self_refresh(
 }
 
 // ===========================================================================
-// Session-scoped multi-tenant Phase 1 (plan 2026-07-02, D4) — flag-gated DARK
-// multi-slot refresh. With `QONTINUI_MULTI_TENANT_JWT` unset (the default)
-// none of this runs and the refresher behaves byte-identically to today.
+// Session-scoped multi-tenant per-tenant slot refresh (plan 2026-07-02, D4).
+// Shipped behavior as of Phase 8a (the Phase-1 `QONTINUI_MULTI_TENANT_JWT`
+// flag gate is retired): every `device_jwt:<tenant_id>` slot self-refreshes
+// with its own claim each refresher iteration, independent of the legacy
+// `access_token` slot (which the pre-existing paths above keep owning).
 // ===========================================================================
+
+/// How the `IdleWrongTier` arm should wait (Phase 8a). With per-tenant
+/// slots held, the arm must wake on the steady cadence so the slot pass —
+/// which runs once per loop iteration — can't be starved by an unbounded
+/// block-until-kick (a wrong-tier runner may never receive a kick). With
+/// no slots, `None` preserves the historical block-until-kick. Pure, so
+/// the starvation fix is pinned by a unit test.
+pub(crate) fn idle_wrong_tier_wait(has_tenant_slots: bool) -> Option<Duration> {
+    has_tenant_slots.then_some(REFRESH_CHECK_INTERVAL)
+}
 
 /// What to do with one per-tenant device-JWT slot this pass. Pure output of
 /// [`plan_tenant_slot`] so the staleness branching is unit-testable without
@@ -1141,16 +1153,18 @@ async fn refresher_loop(
 
         let decision = next_action(settings_snapshot.tier, needs_refresh);
 
-        // Session-scoped multi-tenant Phase 1 (flag-gated DARK, default OFF):
-        // when `QONTINUI_MULTI_TENANT_JWT=1`, refresh every per-tenant
-        // device-JWT slot independently of the legacy `access_token` slot's
-        // own staleness/decision below. With the flag unset this whole block
-        // is a single false env check — behavior byte-identical to today.
-        // Placed before the decision match so the Idle arm (legacy JWT fresh)
-        // still ticks the tenant slots each cadence/kick. Note the
-        // IdleWrongTier arm blocks on kick — acceptable for the dark spike
-        // (the flag is only meaningful on Tier-2 runners).
-        if crate::auth::multi_tenant_jwt_enabled() {
+        // Session-scoped multi-tenant Phase 8a (plan 2026-07-02, D4): the
+        // per-tenant device-JWT slot pass is the SHIPPED behavior (the
+        // Phase-1 `QONTINUI_MULTI_TENANT_JWT` flag is retired). Every slot
+        // self-refreshes with ITS OWN claim, independently of the legacy
+        // `access_token` slot's own staleness/decision below; the
+        // machine.json tenant-precedence chain (`resolve_pair_tenant_id`)
+        // only ever feeds the DEFAULT slot's Cognito pair path. Placed
+        // before the decision match so the Idle arm (legacy JWT fresh)
+        // still ticks the tenant slots each cadence/kick. Runners with no
+        // tenant slots (never paired post-8a) skip in one storage read.
+        let has_tenant_slots = !auth_manager.list_tenant_device_jwt_tenants().is_empty();
+        if has_tenant_slots {
             let mt_device_id = std::env::var("QONTINUI_MACHINE_ID")
                 .ok()
                 .filter(|s| !s.trim().is_empty())
@@ -1173,7 +1187,7 @@ async fn refresher_loop(
                     }
                 }
                 None => warn!(
-                    "device_jwt_refresher: QONTINUI_MULTI_TENANT_JWT=1 but no device_id \
+                    "device_jwt_refresher: tenant device-JWT slots present but no device_id \
                      (QONTINUI_MACHINE_ID unset, machine.json unreadable) — skipping \
                      tenant-slot pass"
                 ),
@@ -1190,6 +1204,19 @@ async fn refresher_loop(
                     &coord_credential_health(decision, None),
                 )
                 .await;
+                // Phase 8a: with tenant slots held, a wrong-tier idle must
+                // NOT park indefinitely — the slot pass above only runs per
+                // loop iteration, so an unbounded block would starve slot
+                // refreshes until a kick that may never come. Bounded wait
+                // instead (kick/shutdown still wake early). Slot-less
+                // runners keep the historical block-until-kick behavior.
+                if let Some(wait) = idle_wrong_tier_wait(has_tenant_slots) {
+                    if wait_with_signals(wait, &mut shutdown_rx, &mut kick_rx).await {
+                        info!("Device-JWT refresher shutting down (was idle on non-Tier2)");
+                        return;
+                    }
+                    continue;
+                }
                 // Nothing to do until tier changes. Block on shutdown or
                 // kick (set_runner_tier kicks us on every transition).
                 tokio::select! {
@@ -2548,12 +2575,13 @@ mod device_self_refresh_tests {
 
 #[cfg(test)]
 mod tenant_slot_refresh_tests {
-    //! Session-scoped multi-tenant Phase 1 — hermetic tests for the
-    //! flag-gated per-tenant slot pass (`refresh_tenant_slots`) against an
-    //! in-process mock coord, plus the pure `plan_tenant_slot` staleness
-    //! decision and the `QONTINUI_MULTI_TENANT_JWT` gate. Injected tokens
-    //! only (the established refresher test pattern) — no live coord, no
-    //! `~/.qontinui`, no env-var mutation.
+    //! Session-scoped multi-tenant — hermetic tests for the per-tenant
+    //! slot pass (`refresh_tenant_slots`, shipped un-gated as of Phase
+    //! 8a) against an in-process mock coord, plus the pure
+    //! `plan_tenant_slot` staleness decision and the `IdleWrongTier`
+    //! bounded-wait rule. Injected tokens only (the established
+    //! refresher test pattern) — no live coord, no `~/.qontinui`, no
+    //! env-var mutation.
 
     use super::*;
     use axum::{
@@ -2835,5 +2863,15 @@ mod tenant_slot_refresh_tests {
         let outcomes = refresh_tenant_slots(&mgr, &base, DID).await;
         assert!(outcomes.is_empty());
         assert!(cap.bearers_seen.lock().unwrap().is_empty());
+    }
+
+    /// Phase 8a starvation fix: with tenant slots held, the wrong-tier
+    /// idle arm must wake on the steady cadence (so the per-slot pass at
+    /// the top of the loop keeps running); with no slots it keeps the
+    /// historical block-until-kick (`None`).
+    #[test]
+    fn idle_wrong_tier_waits_bounded_only_when_slots_exist() {
+        assert_eq!(idle_wrong_tier_wait(true), Some(REFRESH_CHECK_INTERVAL));
+        assert_eq!(idle_wrong_tier_wait(false), None);
     }
 }

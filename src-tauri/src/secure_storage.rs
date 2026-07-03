@@ -92,12 +92,13 @@ struct StoredTokens {
     #[serde(default)]
     agent_machine_key: Option<String>,
     /// Per-tenant coord device-JWT slots (session-scoped multi-tenant
-    /// Phase 1, plan 2026-07-02). Keys are `device_jwt:<tenant_id>`; values
-    /// are the coord-minted device JWTs for that tenant binding. The legacy
+    /// plan 2026-07-02; shipped un-gated as of Phase 8a). Keys are
+    /// `device_jwt:<tenant_id>`; values are the coord-minted device JWTs
+    /// for that tenant binding, written by `pair::persist_pairing` and
+    /// kept fresh by the refresher's per-slot pass. The legacy
     /// `access_token` slot is COMPLETELY UNTOUCHED by these — it keeps
     /// holding the DEFAULT binding's JWT so every unmodified consumer keeps
-    /// working during the compat window. Only populated when the
-    /// `QONTINUI_MULTI_TENANT_JWT=1` flag is on; `#[serde(default)]` keeps
+    /// working during the compat window. `#[serde(default)]` keeps
     /// every pre-Phase-1 `.enc` deserializing. BTreeMap so enumeration is
     /// deterministic.
     #[serde(default)]

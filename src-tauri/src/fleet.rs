@@ -157,28 +157,51 @@ pub fn canonical_hostname() -> Option<String> {
     })
 }
 
-/// Resolve the device's `tenant_id` for coord-side requests
+/// The device's locally-held tenant bindings, as resolved for coord-side
+/// requests. Phase 8a (plan 2026-07-02, D3/D4): the register heartbeat
+/// sends the WHOLE set (`tenant_ids`) while the legacy single `tenant_id`
+/// field keeps carrying the DEFAULT binding for older coords.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalBindingSet {
+    /// The default binding — what the legacy `access_token` slot holds a
+    /// JWT for, and what device-level single-tenant surfaces use.
+    pub(crate) default_tenant: uuid::Uuid,
+    /// Every locally-held binding (deduped; always contains
+    /// `default_tenant`).
+    pub(crate) tenant_ids: Vec<uuid::Uuid>,
+}
+
+/// Resolve the device's binding set for coord-side requests
 /// (`POST /coord/devices/register`). Returns the first hit:
 ///
-/// 1. `paired_user.json::tenant_id` — present on newly-paired devices
-///    (written by `pair::persist_pairing` since 2026-05-22).
+/// 1. `paired_user.json` — the v2-migrated binding set (legacy files
+///    yield their one synthesized entry); the default is
+///    `default_tenant_id`/`tenant_id`.
 /// 2. JWT-claim fallback — decode `tenant_id` from the cached
 ///    device-token JWT via
-///    [`qontinui_runner_lib::pair::tenant_id_from_oauth_claim`].
-///    On success, opportunistically rewrites `paired_user.json` with
-///    the resolved value so subsequent heartbeats hit branch 1.
-///    Best-effort: rewrite IO errors are swallowed.
-/// 3. `None` — neither source has a usable tenant_id. Callers must
-///    skip the request (coord rejects with `400 tenant_id_required`).
-fn resolve_tenant_id() -> Option<uuid::Uuid> {
-    // Branch 1 — paired_user.json
+///    [`qontinui_runner_lib::pair::tenant_id_from_oauth_claim`]; the set
+///    is that single tenant. (The pre-8a opportunistic disk backfill is
+///    gone — the register response's `tenant_ids` reconciliation is the
+///    file's healer now, and per-tick resolution works without the
+///    write-back.)
+/// 3. `None` — no source has a usable tenant. Callers must skip the
+///    request (coord rejects with `400 tenant_id_required`).
+fn resolve_binding_set() -> Option<LocalBindingSet> {
+    // Branch 1 — paired_user.json (v2-migrated view)
     if let Some(s) = qontinui_runner_lib::pair::read_paired_tenant_id_from_disk() {
-        if let Ok(t) = uuid::Uuid::parse_str(s.trim()) {
-            return Some(t);
+        if let Ok(default_tenant) = uuid::Uuid::parse_str(s.trim()) {
+            let mut tenant_ids = qontinui_runner_lib::pair::read_paired_binding_tenant_ids();
+            if !tenant_ids.contains(&default_tenant) {
+                tenant_ids.insert(0, default_tenant);
+            }
+            return Some(LocalBindingSet {
+                default_tenant,
+                tenant_ids,
+            });
         }
     }
 
-    // Branch 2 — cached device-token JWT
+    // Branch 2 — cached device-token JWT (the legacy/default slot)
     let token = crate::auth::AuthManager::new()
         .get_access_token()
         .ok()
@@ -188,13 +211,18 @@ fn resolve_tenant_id() -> Option<uuid::Uuid> {
     }
     let claim = qontinui_runner_lib::pair::tenant_id_from_oauth_claim(&token)?;
     let parsed = uuid::Uuid::parse_str(claim.trim()).ok()?;
+    Some(LocalBindingSet {
+        default_tenant: parsed,
+        tenant_ids: vec![parsed],
+    })
+}
 
-    // Opportunistic backfill — best-effort, ignore IO errors.
-    if let Err(e) = qontinui_runner_lib::pair::backfill_paired_tenant_id(&parsed) {
-        tracing::debug!("fleet::resolve_tenant_id: backfill non-fatal: {e}");
-    }
-
-    Some(parsed)
+/// Single-tenant convenience over [`resolve_binding_set`]: the DEFAULT
+/// binding, for callers that stamp one tenant on a device-scoped write
+/// (e.g. the git-ops fleet feed). Session-scoped callers get their
+/// tenant from the owning session instead (Phase 8b).
+fn resolve_tenant_id() -> Option<uuid::Uuid> {
+    resolve_binding_set().map(|b| b.default_tenant)
 }
 
 /// Parse the authoritative `tenant_id` out of a successful
@@ -210,6 +238,46 @@ fn response_tenant_id(body: &str) -> Option<uuid::Uuid> {
         .and_then(|j| j.get("tenant_id"))
         .and_then(|v| v.as_str())
         .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
+}
+
+/// Parse the authoritative binding set (`tenant_ids: ["<uuid>", …]`) out
+/// of a register response, if coord sent one (Phase 3 coord — D3).
+///
+/// FAIL-SOFT is the contract: `None` (→ the caller must NOT reconcile)
+/// when the body isn't JSON, the field is ABSENT (today's production
+/// coord), it isn't an array, or ANY element fails to parse as a UUID
+/// string — a partially-parseable set must never drive binding drops.
+/// `Some(vec![])` (present-but-empty) IS meaningful: coord says the
+/// device has zero bindings. Pure (no IO) for unit-testability.
+fn response_tenant_ids(body: &str) -> Option<Vec<uuid::Uuid>> {
+    let json: serde_json::Value = serde_json::from_str(body).ok()?;
+    let arr = json.get("tenant_ids")?.as_array()?;
+    let mut out = Vec::with_capacity(arr.len());
+    for v in arr {
+        let s = v.as_str()?;
+        out.push(uuid::Uuid::parse_str(s.trim()).ok()?);
+    }
+    Some(out)
+}
+
+/// Dedupe the "coord reports a binding this runner holds no JWT for"
+/// warning per tenant per process — the heartbeat ticks every 30s and
+/// the heal (pair for that tenant) is operator-paced.
+static COORD_ONLY_BINDINGS_WARNED: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::BTreeSet<uuid::Uuid>>,
+> = std::sync::OnceLock::new();
+
+fn warn_coord_only_binding_once(tenant: uuid::Uuid) {
+    let set = COORD_ONLY_BINDINGS_WARNED
+        .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    let fresh = set.lock().map(|mut g| g.insert(tenant)).unwrap_or(false);
+    if fresh {
+        warn!(
+            "fleet::heartbeat: coord reports this device bound to tenant {tenant} but the \
+             runner holds no device-JWT for it — pair for that tenant to enable its \
+             sessions. Logging once per tenant per process."
+        );
+    }
 }
 
 /// Dedupe the "tenant_id unresolvable" startup warning — the heartbeat
@@ -616,11 +684,17 @@ struct HeartbeatPayload {
     claude_code_available: bool,
     /// REQUIRED by coord's `post_device_register` handler — absence
     /// produces `400 tenant_id_required` (see qontinui-coord
-    /// `routes_phase3.rs:257-269`). Resolved via [`resolve_tenant_id`]
-    /// before the payload is constructed; if `None` there, the
-    /// heartbeat is skipped rather than 400-spamming coord.
-    /// Phase 2 of the default-tenant-propagation plan.
+    /// `routes_phase3.rs:257-269`). Resolved via [`resolve_binding_set`]
+    /// (the DEFAULT binding) before the payload is constructed; if
+    /// `None` there, the heartbeat is skipped rather than 400-spamming
+    /// coord. Phase 2 of the default-tenant-propagation plan.
     tenant_id: uuid::Uuid,
+    /// Phase 8a (plan 2026-07-02, D3): the runner's WHOLE locally-held
+    /// binding set (always includes `tenant_id`). Phase-3 coord touches
+    /// `tenant_devices.last_active_at` for the intersection with real
+    /// bindings (never inserts); today's production coord simply ignores
+    /// the field (`DeviceRegisterRequest` has no `deny_unknown_fields`).
+    tenant_ids: Vec<uuid::Uuid>,
     /// Capture-backend telemetry (plan 2026-06-07-fleet-capture-backend-
     /// telemetry.md D1) — cumulative WebView2 CapturePreview frames served
     /// since this process started. Straight-write coord-side into
@@ -693,8 +767,8 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
         }
     };
 
-    let tenant_id = match resolve_tenant_id() {
-        Some(t) => t,
+    let bindings = match resolve_binding_set() {
+        Some(b) => b,
         None => {
             warn_tenant_id_unresolvable_once();
             return Ok(());
@@ -710,7 +784,8 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
         device_id,
         hostname: device.hostname.clone(),
         claude_code_available,
-        tenant_id,
+        tenant_id: bindings.default_tenant,
+        tenant_ids: bindings.tenant_ids,
         capture_preview_count,
         monitor_crop_count,
         last_capture_fallback_at,
@@ -737,17 +812,39 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
             "fleet::heartbeat: ok device_id={device_id} hostname={} status={}",
             device.hostname, status
         );
-        // Soft-heal write-back. Coord's response carries the authoritative
-        // (possibly soft-healed) `tenant_id` for this device — if our cached
-        // value was a stale orphan, coord rescued the call using its stored
-        // tenant and returned THAT here. Persist it to paired_user.json so
-        // the next tick's `resolve_tenant_id` branch 1 sends the corrected
-        // value and the loop converges (coord stops soft-healing). The
-        // helper is idempotent (`pair::backfill_paired_tenant_id` no-ops
-        // when unchanged), so steady state is one write then silence.
-        // Best-effort: a parse/IO miss just retries the heal next tick.
+        // Binding reconciliation (Phase 8a, D3). When coord's response
+        // carries the authoritative `tenant_ids` set (Phase 3 coord), the
+        // runner reconciles its local binding state against it: drop
+        // entries (+ their JWT slots) coord no longer has, warn-once for
+        // bindings coord has that this runner holds no JWT for. When the
+        // field is ABSENT — today's production coord — this is a strict
+        // no-op on binding state, and only the LEGACY single-value
+        // echo-heal runs (itself a no-op on v2 multi-entry files: see
+        // `pair::backfill_paired_tenant_id`), preserving the pre-8a
+        // stale-single-tenant convergence for legacy-shape installs.
+        // Best-effort throughout: a parse/IO miss just retries next tick.
         let body = resp.text().await.unwrap_or_default();
-        if let Some(resp_tenant) = response_tenant_id(&body) {
+        if let Some(coord_set) = response_tenant_ids(&body) {
+            match qontinui_runner_lib::pair::reconcile_paired_bindings(&coord_set) {
+                Ok(report) => {
+                    if report.changed() {
+                        info!(
+                            "fleet::heartbeat: reconciled bindings against coord \
+                             (dropped={:?} dropped_slots={:?} default_repointed={:?})",
+                            report.dropped, report.dropped_slots, report.default_repointed
+                        );
+                    }
+                    for t in report.coord_only {
+                        warn_coord_only_binding_once(t);
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("fleet::heartbeat: binding reconcile non-fatal: {e}");
+                }
+            }
+        } else if let Some(resp_tenant) = response_tenant_id(&body) {
+            // Legacy echo-heal (single-value; v2-file-aware no-op).
+            // Scheduled for deletion in Phase 10 item 4.
             if let Err(e) = qontinui_runner_lib::pair::backfill_paired_tenant_id(&resp_tenant) {
                 tracing::debug!("fleet::heartbeat: tenant_id write-back non-fatal: {e}");
             }
@@ -2869,6 +2966,7 @@ mod tests {
             hostname: "test".into(),
             claude_code_available: false,
             tenant_id: uuid::Uuid::nil(),
+            tenant_ids: vec![uuid::Uuid::nil()],
             capture_preview_count: 0,
             monitor_crop_count: 0,
             last_capture_fallback_at: None,
@@ -2887,6 +2985,7 @@ mod tests {
             hostname: "test".into(),
             claude_code_available: true,
             tenant_id: uuid::Uuid::nil(),
+            tenant_ids: vec![uuid::Uuid::nil()],
             capture_preview_count: 0,
             monitor_crop_count: 0,
             last_capture_fallback_at: None,
@@ -2911,6 +3010,7 @@ mod tests {
             hostname: "test".into(),
             claude_code_available: true,
             tenant_id: tenant,
+            tenant_ids: vec![tenant],
             capture_preview_count: 0,
             monitor_crop_count: 0,
             last_capture_fallback_at: None,
@@ -2933,6 +3033,7 @@ mod tests {
             hostname: "test".into(),
             claude_code_available: true,
             tenant_id: uuid::Uuid::nil(),
+            tenant_ids: vec![uuid::Uuid::nil()],
             capture_preview_count: 0,
             monitor_crop_count: 0,
             last_capture_fallback_at: None,
@@ -2961,6 +3062,7 @@ mod tests {
             hostname: "test".into(),
             claude_code_available: false,
             tenant_id: uuid::Uuid::nil(),
+            tenant_ids: vec![uuid::Uuid::nil()],
             capture_preview_count: 7,
             monitor_crop_count: 3,
             last_capture_fallback_at: Some(at),
@@ -2990,6 +3092,7 @@ mod tests {
             hostname: "test".into(),
             claude_code_available: false,
             tenant_id: uuid::Uuid::nil(),
+            tenant_ids: vec![uuid::Uuid::nil()],
             capture_preview_count: 0,
             monitor_crop_count: 0,
             last_capture_fallback_at: None,
@@ -3043,6 +3146,91 @@ mod tests {
             None,
             "non-UUID tenant_id → None"
         );
+    }
+
+    /// Phase 8a reconciliation gate: `response_tenant_ids` must be
+    /// strictly fail-soft. `None` (→ NO reconciliation, the no-op path
+    /// against today's production coord) for: absent field, non-JSON
+    /// body, non-array field, or ANY malformed element. Present-but-empty
+    /// is `Some(vec![])` — a meaningful "zero bindings" statement.
+    #[test]
+    fn response_tenant_ids_is_fail_soft() {
+        let a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+        // Phase-3 coord shape: full set parses.
+        let body = format!(r#"{{"tenant_id":"{a}","tenant_ids":["{a}","{b}"]}}"#);
+        assert_eq!(
+            response_tenant_ids(&body),
+            Some(vec![
+                uuid::Uuid::parse_str(a).unwrap(),
+                uuid::Uuid::parse_str(b).unwrap()
+            ])
+        );
+
+        // Today's production coord: field ABSENT → None → caller no-ops.
+        assert_eq!(
+            response_tenant_ids(&format!(r#"{{"tenant_id":"{a}"}}"#)),
+            None,
+            "absent tenant_ids (today's coord) must be None — reconciliation no-op"
+        );
+        assert_eq!(response_tenant_ids("not json"), None);
+        assert_eq!(
+            response_tenant_ids(r#"{"tenant_ids":"not-an-array"}"#),
+            None,
+            "non-array tenant_ids → None"
+        );
+        assert_eq!(
+            response_tenant_ids(&format!(r#"{{"tenant_ids":["{a}","junk"]}}"#)),
+            None,
+            "ANY malformed element poisons the set — a partial set must never drive drops"
+        );
+        assert_eq!(
+            response_tenant_ids(&format!(r#"{{"tenant_ids":["{a}",42]}}"#)),
+            None,
+            "non-string element → None"
+        );
+
+        // Present-but-empty IS meaningful (zero server-side bindings).
+        assert_eq!(
+            response_tenant_ids(r#"{"tenant_ids":[]}"#),
+            Some(vec![]),
+            "empty array → Some(empty): coord says zero bindings"
+        );
+    }
+
+    /// Phase 8a wire shape: the register heartbeat carries the whole
+    /// binding set as `tenant_ids` alongside the legacy single
+    /// `tenant_id` (today's coord ignores the new field — its
+    /// `DeviceRegisterRequest` has no `deny_unknown_fields`).
+    #[test]
+    fn heartbeat_payload_serializes_binding_set() {
+        let a = uuid::Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+        let b = uuid::Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap();
+        let p = HeartbeatPayload {
+            device_id: uuid::Uuid::nil(),
+            hostname: "test".into(),
+            claude_code_available: false,
+            tenant_id: a,
+            tenant_ids: vec![a, b],
+            capture_preview_count: 0,
+            monitor_crop_count: 0,
+            last_capture_fallback_at: None,
+        };
+        let body = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            body.get("tenant_id").and_then(|v| v.as_str()),
+            Some(a.to_string().as_str()),
+            "legacy single tenant_id (the DEFAULT binding) must stay on the wire"
+        );
+        let ids: Vec<String> = body
+            .get("tenant_ids")
+            .and_then(|v| v.as_array())
+            .expect("tenant_ids array on the wire")
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        assert_eq!(ids, vec![a.to_string(), b.to_string()]);
     }
 
     // ---- behind_default_count (stale-primary-checkout guard, Phase 1c) ----

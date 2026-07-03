@@ -17,9 +17,11 @@
 //!   up a localhost callback server, and captures the device-token JWT
 //!   from the browser redirect (coord's `pair-complete` is called by the
 //!   web frontend, not the runner).
-//! - [`persist_pairing`] — writes the device-token JWT into
-//!   `AuthManager`'s access-token slot + the paired user_id to
-//!   `paired_user.json`.
+//! - [`persist_pairing`] — writes the device-token JWT into the paired
+//!   tenant's `device_jwt:<tenant_id>` slot (+ the legacy access-token
+//!   slot when that tenant is the device default) and appends/updates
+//!   the binding entry in `paired_user.json` (v2 multi-entry shape,
+//!   Phase 8a).
 //! - [`coord_http_base`] / [`coord_http_base_from_url`] — resolve the
 //!   coord HTTP base from the active profile's `coord_url`
 //!   (`ws[s]://host:port/ws` → `http[s]://host:port`).
@@ -247,17 +249,118 @@ pub(crate) fn paired_user_path() -> Option<PathBuf> {
     Some(base.join("paired_user.json"))
 }
 
+/// One tenant binding entry in the v2 `paired_user.json` shape
+/// (session-scoped multi-tenant plan 2026-07-02, Phase 8a / D4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairedBinding {
+    /// Stringified tenant UUID.
+    pub tenant_id: String,
+    /// The user who paired this binding (stringified UUID).
+    pub user_id: String,
+    /// RFC3339 timestamp of the (most recent) pair for this tenant.
+    /// Optional on read so a hand-edited / partially-written entry still
+    /// parses; always written by [`persist_pairing`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paired_at: Option<String>,
+}
+
+/// `paired_user.json` — BOTH wire shapes in one struct.
+///
+/// - **Legacy (v1)**: `{user_id, tenant_id?}` — single-entry, written
+///   before Phase 8a. Parses with `bindings == []`,
+///   `default_tenant_id == None`.
+/// - **v2 (Phase 8a, plan 2026-07-02 D4)**: adds
+///   `bindings: [{tenant_id, user_id, paired_at}]` +
+///   `default_tenant_id`. The legacy `user_id` / `tenant_id` fields are
+///   kept as **mirrors of the DEFAULT binding** so every legacy reader
+///   (this crate's pre-8a consumers, `bin/qontinui_profile.rs`'s local
+///   mirror struct, and any older installed binary during an upgrade
+///   window) keeps working unmodified.
+///
+/// Read-side migration is [`PairedUserFile::effective_bindings`] /
+/// [`PairedUserFile::effective_default_tenant_id`]: a legacy file's
+/// single entry is synthesized into a one-element binding set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PairedUserFile {
+    /// v2: mirror of the DEFAULT binding's `user_id`. Legacy: the paired
+    /// user.
     pub user_id: String,
     /// Stringified UUID. `#[serde(default)]` keeps legacy files
     /// (written before the 2026-05-22 schema bump) deserializing
     /// — they carry only `user_id`. A heartbeat/register caller
     /// that finds `None` here falls back to decoding the cached
     /// device-token JWT via [`tenant_id_from_oauth_claim`]
-    /// (see `fleet::resolve_tenant_id`).
+    /// (see `fleet::resolve_tenant_id`). v2: mirror of
+    /// `default_tenant_id`.
     #[serde(default)]
     pub tenant_id: Option<String>,
+    /// v2 multi-entry binding set. Empty on legacy files (serde default);
+    /// omitted from serialization when empty so a legacy-heal write keeps
+    /// the legacy shape byte-compatible.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bindings: Vec<PairedBinding>,
+    /// v2: which binding's JWT the legacy `access_token` slot holds (the
+    /// device-level default — D4). Set at first pair, changed only by
+    /// reconciliation dropping the default binding (never stolen by a
+    /// later additive pair).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_tenant_id: Option<String>,
+}
+
+impl PairedUserFile {
+    /// v2-migrated view of the binding set: the `bindings` array when
+    /// non-empty, else a single entry synthesized from the legacy
+    /// `user_id`/`tenant_id` fields (or empty when the legacy file has
+    /// no `tenant_id`).
+    pub(crate) fn effective_bindings(&self) -> Vec<PairedBinding> {
+        if !self.bindings.is_empty() {
+            return self.bindings.clone();
+        }
+        match &self.tenant_id {
+            Some(t) => vec![PairedBinding {
+                tenant_id: t.clone(),
+                user_id: self.user_id.clone(),
+                paired_at: None,
+            }],
+            None => Vec::new(),
+        }
+    }
+
+    /// v2-migrated view of the default tenant: `default_tenant_id` when
+    /// present, else the legacy single `tenant_id`.
+    pub(crate) fn effective_default_tenant_id(&self) -> Option<String> {
+        self.default_tenant_id
+            .clone()
+            .or_else(|| self.tenant_id.clone())
+    }
+
+    /// Is this file in the v2 multi-entry shape (vs pure legacy)?
+    fn is_v2(&self) -> bool {
+        !self.bindings.is_empty() || self.default_tenant_id.is_some()
+    }
+}
+
+/// Read + parse `paired_user.json` at an explicit path. `None` when the
+/// file is missing or unparseable (callers that must distinguish the two
+/// read the file themselves — see `reconcile_paired_bindings_with`).
+fn read_paired_user_file_at(path: &std::path::Path) -> Option<PairedUserFile> {
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Atomic write of `paired_user.json` (tmp + rename), pretty-printed —
+/// the shared writer for [`persist_pairing`], [`backfill_paired_tenant_id`]
+/// and [`reconcile_paired_bindings`].
+fn write_paired_user_file(path: &std::path::Path, pf: &PairedUserFile) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    let pretty =
+        serde_json::to_vec_pretty(pf).map_err(|e| format!("serialize paired_user.json: {e}"))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &pretty).map_err(|e| format!("write tmp: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))?;
+    Ok(())
 }
 
 /// Read the cached `user_id` written by a prior browser-pair. Returns
@@ -276,27 +379,60 @@ fn read_paired_user_id() -> Option<String> {
     Some(parsed.user_id)
 }
 
-/// Read the cached `tenant_id` from `paired_user.json`. Returns `None`
-/// if the file is missing OR the field is absent (legacy file written
-/// before the 2026-05-22 schema bump). Used by
-/// `fleet::resolve_tenant_id` as the primary resolution branch.
+/// Read the cached DEFAULT tenant_id from `paired_user.json`. Returns
+/// `None` if the file is missing OR no tenant is recorded (legacy file
+/// written before the 2026-05-22 schema bump). Used by
+/// `fleet::resolve_binding_set` as the primary resolution branch, and by
+/// every "which tenant is this device's default" consumer
+/// (`commands/tenant.rs`, `claude_session/federation.rs`).
+///
+/// v2-aware: prefers `default_tenant_id`, falling back to the legacy
+/// single `tenant_id` field (which v2 writers keep mirrored anyway).
 pub fn read_paired_tenant_id_from_disk() -> Option<String> {
     let path = paired_user_path()?;
-    let bytes = std::fs::read(&path).ok()?;
-    let parsed: PairedUserFile = serde_json::from_slice(&bytes).ok()?;
-    parsed.tenant_id
+    read_paired_user_file_at(&path)?.effective_default_tenant_id()
 }
 
-/// Opportunistically rewrite `paired_user.json` with the supplied
-/// `tenant_id`, preserving the existing `user_id`. Used by
-/// `fleet::resolve_tenant_id`'s JWT-claim fallback so a legacy file
-/// gets backfilled on the first heartbeat after a runner upgrade.
+/// Read the locally-held binding set from `paired_user.json` as parsed
+/// tenant UUIDs (deduped, file order preserved; entries with malformed
+/// `tenant_id` silently skipped). Legacy single-entry files yield their
+/// one synthesized binding. Empty when the file is missing/unparseable
+/// or carries no tenant. Phase 8a: this is what the register heartbeat
+/// sends as `tenant_ids` (D3).
+pub fn read_paired_binding_tenant_ids() -> Vec<uuid::Uuid> {
+    let Some(path) = paired_user_path() else {
+        return Vec::new();
+    };
+    let Some(pf) = read_paired_user_file_at(&path) else {
+        return Vec::new();
+    };
+    let mut out: Vec<uuid::Uuid> = Vec::new();
+    for b in pf.effective_bindings() {
+        if let Ok(t) = uuid::Uuid::parse_str(b.tenant_id.trim()) {
+            if !out.contains(&t) {
+                out.push(t);
+            }
+        }
+    }
+    out
+}
+
+/// LEGACY single-value heal: opportunistically rewrite `paired_user.json`
+/// with the supplied `tenant_id`, preserving the existing `user_id`.
+/// Phase 8a posture: this heal applies ONLY to pure-legacy (v1) files —
+/// a v2 multi-entry file's tenant state is owned by
+/// [`reconcile_paired_bindings`], and a single-value overwrite would
+/// clobber the binding set / flip the default (coord's single
+/// `tenant_id` echo means "most recently paired", NOT "your default").
+/// On a v2 file this is a quiet no-op success.
 ///
 /// No-op if the file doesn't exist (the JWT-claim path only fires
 /// when SOMETHING was paired previously, but we tolerate the race
 /// where pair-state was wiped between read and write). Returns
 /// `Err(String)` on filesystem failures so the caller can log them
 /// at `debug!` — the outer flow proceeds either way.
+///
+/// Scheduled for deletion in Phase 10 item 4 (with the echo-heal).
 pub fn backfill_paired_tenant_id(tenant_id: &uuid::Uuid) -> Result<(), String> {
     let path = paired_user_path().ok_or_else(|| "could not resolve data_local_dir".to_string())?;
     let bytes = match std::fs::read(&path) {
@@ -309,17 +445,230 @@ pub fn backfill_paired_tenant_id(tenant_id: &uuid::Uuid) -> Result<(), String> {
     };
     let mut parsed: PairedUserFile =
         serde_json::from_slice(&bytes).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    if parsed.is_v2() {
+        // v2 file: the binding set is reconciled against coord's
+        // `tenant_ids` (Phase 8a); the single-value heal must not touch it.
+        return Ok(());
+    }
     if parsed.tenant_id.as_deref() == Some(tenant_id.to_string().as_str()) {
         // Already up-to-date; avoid an unnecessary disk write.
         return Ok(());
     }
     parsed.tenant_id = Some(tenant_id.to_string());
-    let pretty = serde_json::to_vec_pretty(&parsed)
-        .map_err(|e| format!("serialize paired_user.json: {e}"))?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &pretty).map_err(|e| format!("write tmp: {e}"))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))?;
-    Ok(())
+    write_paired_user_file(&path, &parsed)
+}
+
+// ============================================================================
+// Binding reconciliation against coord's register echo (Phase 8a, D3)
+// ============================================================================
+
+/// What one [`reconcile_paired_bindings`] pass changed / observed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BindingReconcileReport {
+    /// Local binding entries removed because coord's authoritative set no
+    /// longer contains them. Their per-tenant JWT slots were cleared too
+    /// (the designed home of slot deletion — REPLACE-not-REVOKE applies
+    /// everywhere else).
+    pub dropped: Vec<uuid::Uuid>,
+    /// Orphan per-tenant JWT slots (no binding entry) cleared because
+    /// coord's set doesn't contain them either.
+    pub dropped_slots: Vec<uuid::Uuid>,
+    /// Tenants coord reports bound to this device for which the runner
+    /// holds NO usable credential (no binding entry, or entry without a
+    /// JWT slot). Flag-only: the runner never fabricates a binding — the
+    /// operator must pair for that tenant to mint its JWT.
+    pub coord_only: Vec<uuid::Uuid>,
+    /// `Some` when the default binding was dropped and the default was
+    /// re-pointed (`Some(tenant)`) or cleared entirely (`None` — no
+    /// bindings remain).
+    pub default_repointed: Option<Option<uuid::Uuid>>,
+}
+
+impl BindingReconcileReport {
+    /// Did this pass mutate any local state (file or slots)?
+    pub fn changed(&self) -> bool {
+        !self.dropped.is_empty()
+            || !self.dropped_slots.is_empty()
+            || self.default_repointed.is_some()
+    }
+}
+
+/// Reconcile the local binding state (`paired_user.json` v2 entries +
+/// per-tenant JWT slots) against coord's authoritative server-side
+/// binding set, as echoed in the register response's `tenant_ids` field
+/// (D3 — replaces the single-value echo-heal for v2 state).
+///
+/// Semantics:
+/// - **Drop**: local binding entries whose tenant is NOT in `coord_set`
+///   are removed, and their `device_jwt:<tenant>` slots cleared (coord
+///   Phase 3's refresh gate would 403 them anyway). Orphan slots with no
+///   binding entry are cleared by the same rule.
+/// - **Flag**: tenants in `coord_set` the runner lacks a JWT for are
+///   reported (`coord_only`) — never fabricated locally; pair to heal.
+/// - **Default re-point**: if the default binding was dropped, the most
+///   recently paired surviving binding becomes the default and its slot
+///   JWT is copied into the legacy `access_token` slot (D4: the legacy
+///   slot always holds the DEFAULT binding's JWT). If no binding
+///   survives, the default is cleared but the legacy slot is left as-is
+///   (matching coord Phase 3's unpair posture — the stale JWT simply
+///   ages out, and the refresh gate stops it self-perpetuating).
+/// - **No silent churn**: the file is rewritten only when something
+///   actually changed, so the 30s heartbeat cadence costs no disk writes
+///   at steady state.
+///
+/// This function is only ever called when coord's response CARRIES a
+/// `tenant_ids` field (Phase 3 coord). The caller (`fleet::heartbeat`)
+/// must no-op when the field is absent — today's production coord.
+///
+/// Missing file → `Ok` empty report (nothing local to reconcile).
+/// Unparseable file → `Err` (caller logs at debug; never fatal).
+pub fn reconcile_paired_bindings(
+    coord_set: &[uuid::Uuid],
+) -> Result<BindingReconcileReport, String> {
+    let mgr = crate::auth::AuthManager::new();
+    let path = paired_user_path().ok_or_else(|| "could not resolve data_local_dir".to_string())?;
+    reconcile_paired_bindings_with(&mgr, &path, coord_set)
+}
+
+/// Parameterized core of [`reconcile_paired_bindings`] — explicit
+/// `AuthManager` + file path so the unit tests run hermetically against
+/// a temp store, never the operator's real credentials.
+pub(crate) fn reconcile_paired_bindings_with(
+    mgr: &crate::auth::AuthManager,
+    path: &std::path::Path,
+    coord_set: &[uuid::Uuid],
+) -> Result<BindingReconcileReport, String> {
+    let mut report = BindingReconcileReport::default();
+
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Never paired locally — nothing to reconcile. Coord-side
+            // bindings without ANY local file are still worth flagging.
+            for t in coord_set {
+                report.coord_only.push(*t);
+            }
+            return Ok(report);
+        }
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    let pf: PairedUserFile =
+        serde_json::from_slice(&bytes).map_err(|e| format!("parse {}: {e}", path.display()))?;
+
+    // Partition the (migrated) binding set by coord membership. Entries
+    // with malformed tenant_id can never match coord and carry no slot —
+    // dropped as junk (logged, not reported).
+    let mut kept: Vec<PairedBinding> = Vec::new();
+    let mut dropped_malformed = false;
+    for b in pf.effective_bindings() {
+        match uuid::Uuid::parse_str(b.tenant_id.trim()) {
+            Ok(t) if coord_set.contains(&t) => kept.push(b),
+            Ok(t) => {
+                report.dropped.push(t);
+                // Designed home of slot deletion: coord no longer has the
+                // binding, so its credential is dead weight. Best-effort.
+                if let Err(e) = mgr.clear_tenant_device_jwt(&t) {
+                    tracing::debug!("reconcile: clear slot for dropped tenant {t} failed: {e}");
+                }
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "reconcile: dropping paired_user.json binding with malformed tenant_id {:?}",
+                    b.tenant_id
+                );
+                dropped_malformed = true;
+            }
+        }
+    }
+
+    // Orphan slots (credential without a binding entry) that coord's set
+    // doesn't contain either — same authority statement, same fate.
+    let kept_tenants: Vec<uuid::Uuid> = kept
+        .iter()
+        .filter_map(|b| uuid::Uuid::parse_str(b.tenant_id.trim()).ok())
+        .collect();
+    for t in mgr.list_tenant_device_jwt_tenants() {
+        if !coord_set.contains(&t) && !report.dropped.contains(&t) {
+            if let Err(e) = mgr.clear_tenant_device_jwt(&t) {
+                tracing::debug!("reconcile: clear orphan slot {t} failed: {e}");
+            } else {
+                report.dropped_slots.push(t);
+            }
+        }
+    }
+
+    // Flag coord-side bindings the runner cannot act for: no entry, or an
+    // entry without a JWT slot.
+    for t in coord_set {
+        let has_entry = kept_tenants.contains(t);
+        let has_jwt =
+            matches!(mgr.get_tenant_device_jwt(t), Ok(Some(ref j)) if !j.trim().is_empty());
+        if !has_entry || !has_jwt {
+            report.coord_only.push(*t);
+        }
+    }
+
+    // Default re-point when the default binding was dropped.
+    let old_default = pf
+        .effective_default_tenant_id()
+        .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok());
+    let new_default: Option<uuid::Uuid> = match old_default {
+        Some(d) if kept_tenants.contains(&d) => Some(d),
+        _ => {
+            // Most recently paired survivor (RFC3339 strings order
+            // lexicographically; entries without paired_at sort oldest).
+            kept.iter()
+                .max_by(|a, b| a.paired_at.cmp(&b.paired_at))
+                .and_then(|b| uuid::Uuid::parse_str(b.tenant_id.trim()).ok())
+        }
+    };
+    if new_default != old_default {
+        report.default_repointed = Some(new_default);
+        if let Some(nd) = new_default {
+            // D4: the legacy access_token slot holds the DEFAULT
+            // binding's JWT — re-point it alongside the default.
+            match mgr.get_tenant_device_jwt(&nd) {
+                Ok(Some(jwt)) if !jwt.trim().is_empty() => {
+                    if let Err(e) = mgr.store_tokens(&jwt, "") {
+                        tracing::warn!(
+                            "reconcile: default re-pointed to {nd} but legacy-slot write \
+                             failed: {e} (legacy slot left as-is)"
+                        );
+                    }
+                }
+                _ => tracing::warn!(
+                    "reconcile: default re-pointed to {nd} but no JWT slot for it — \
+                     legacy access_token slot left as-is until the next pair/refresh"
+                ),
+            }
+        }
+        // No surviving binding → legacy slot deliberately left as-is
+        // (coord Phase 3 unpair posture; the refresh gate stops the stale
+        // JWT self-perpetuating).
+    }
+
+    let changed =
+        !report.dropped.is_empty() || report.default_repointed.is_some() || dropped_malformed;
+    if changed {
+        let default_binding = new_default.and_then(|d| {
+            kept.iter()
+                .find(|b| uuid::Uuid::parse_str(b.tenant_id.trim()).ok() == Some(d))
+                .cloned()
+        });
+        let out = PairedUserFile {
+            // Mirrors track the DEFAULT binding; with no survivor keep
+            // the old user_id (the field is required by legacy readers).
+            user_id: default_binding
+                .as_ref()
+                .map(|b| b.user_id.clone())
+                .unwrap_or_else(|| pf.user_id.clone()),
+            tenant_id: new_default.map(|d| d.to_string()),
+            bindings: kept,
+            default_tenant_id: new_default.map(|d| d.to_string()),
+        };
+        write_paired_user_file(path, &out)?;
+    }
+    Ok(report)
 }
 
 // ============================================================================
@@ -869,36 +1218,30 @@ pub fn pair_via_browser(
 // Persist: store device-token JWT + cache user_id
 // ============================================================================
 
-/// Persist the device-token JWT (via
-/// `qontinui_runner_lib::auth::AuthManager`) and write the paired
-/// user_id to `paired_user.json` so the next `device init` attaches it
-/// to the register payload.
+/// Persist a completed pairing: the device-token JWT into the paired
+/// tenant's `device_jwt:<tenant_id>` slot (and, when that tenant is the
+/// device's DEFAULT binding, also the legacy `access_token` slot), plus
+/// an appended/updated binding entry in `paired_user.json` (v2 shape).
 ///
-/// Storing the JWT in the `access_token` slot is intentional: the
-/// existing `AuthManager` already calls that slot the "primary
-/// credential," and the runner's outer code reads `get_access_token()`
-/// when authenticating to the web backend. The refresh-token slot is
-/// unused for the device-token flow (the device JWT has its own
-/// lifecycle managed by coord); we pass an empty string. See the
-/// format-change comment in `secure_storage.rs`.
+/// Phase 8a semantics (plan 2026-07-02, D4):
+/// - Pairing is ADDITIVE: an existing binding for another tenant is
+///   never removed or overwritten; re-pairing the same tenant updates
+///   its entry (user_id + paired_at) in place.
+/// - The paired tenant becomes the default ONLY when no default exists
+///   yet (first pair / legacy no-tenant file). An established default is
+///   never stolen by a later additive pair.
+/// - The legacy `access_token` slot keeps holding the DEFAULT binding's
+///   JWT, so every unmodified consumer (`backend_relay`,
+///   `commands/auth.rs` signed-in check, `attach_device_auth`, …) keeps
+///   working. Pairing a NON-default tenant therefore does NOT touch it.
+/// - The legacy `user_id`/`tenant_id` file fields are written as mirrors
+///   of the default binding so pre-8a readers (incl. the
+///   `qontinui_profile` bin's local struct) stay compatible.
 pub fn persist_pairing(resp: &PairCompleteResponse, tenant_id: uuid::Uuid) -> Result<(), String> {
     use crate::auth::AuthManager;
     let mgr = AuthManager::new();
-    mgr.store_tokens(&resp.token, "")
-        .map_err(|e| format!("AuthManager::store_tokens failed: {e}"))?;
     let path = paired_user_path().ok_or_else(|| "could not resolve data_local_dir".to_string())?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
-    }
-    let pf = PairedUserFile {
-        user_id: resp.user_id.clone(),
-        tenant_id: Some(tenant_id.to_string()),
-    };
-    let pretty =
-        serde_json::to_vec_pretty(&pf).map_err(|e| format!("serialize paired_user.json: {e}"))?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &pretty).map_err(|e| format!("write tmp: {e}"))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))?;
+    persist_pairing_with(&mgr, &path, resp, tenant_id)?;
     if let Some(did) = &resp.device_id {
         // Best-effort: record device_id alongside the auth tokens so the
         // runner GUI can identify itself without reading machine.json.
@@ -909,6 +1252,90 @@ pub fn persist_pairing(resp: &PairCompleteResponse, tenant_id: uuid::Uuid) -> Re
         }
     }
     Ok(())
+}
+
+/// Parameterized core of [`persist_pairing`] — explicit `AuthManager` +
+/// file path so unit tests run hermetically against a temp store.
+pub(crate) fn persist_pairing_with(
+    mgr: &crate::auth::AuthManager,
+    path: &std::path::Path,
+    resp: &PairCompleteResponse,
+    tenant_id: uuid::Uuid,
+) -> Result<(), String> {
+    // 1. The paired tenant's slot ALWAYS gets the fresh JWT.
+    mgr.store_tenant_device_jwt(&tenant_id, &resp.token)
+        .map_err(|e| format!("store_tenant_device_jwt failed: {e}"))?;
+
+    // 2. Load + migrate the existing file (missing → fresh; unparseable
+    //    → start over, same clobber posture the pre-8a writer had).
+    let existing = match std::fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice::<PairedUserFile>(&bytes) {
+            Ok(pf) => Some(pf),
+            Err(e) => {
+                tracing::warn!(
+                    "persist_pairing: existing {} unparseable ({e}) — rewriting fresh",
+                    path.display()
+                );
+                None
+            }
+        },
+        Err(_) => None,
+    };
+    let mut bindings = existing
+        .as_ref()
+        .map(|pf| pf.effective_bindings())
+        .unwrap_or_default();
+
+    // 3. Append/update this tenant's binding entry.
+    let tenant_str = tenant_id.to_string();
+    let paired_at = Some(chrono::Utc::now().to_rfc3339());
+    match bindings
+        .iter_mut()
+        .find(|b| uuid::Uuid::parse_str(b.tenant_id.trim()).ok() == Some(tenant_id))
+    {
+        Some(b) => {
+            b.user_id = resp.user_id.clone();
+            b.paired_at = paired_at;
+        }
+        None => bindings.push(PairedBinding {
+            tenant_id: tenant_str.clone(),
+            user_id: resp.user_id.clone(),
+            paired_at,
+        }),
+    }
+
+    // 4. Default: keep the established one (if it still names a binding);
+    //    otherwise this pair sets it.
+    let default_tenant = existing
+        .as_ref()
+        .and_then(|pf| pf.effective_default_tenant_id())
+        .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
+        .filter(|d| {
+            bindings
+                .iter()
+                .any(|b| uuid::Uuid::parse_str(b.tenant_id.trim()).ok() == Some(*d))
+        })
+        .unwrap_or(tenant_id);
+
+    // 5. Legacy access_token slot = the DEFAULT binding's JWT (D4).
+    if default_tenant == tenant_id {
+        mgr.store_tokens(&resp.token, "")
+            .map_err(|e| format!("AuthManager::store_tokens failed: {e}"))?;
+    }
+
+    // 6. Write the v2 file with legacy mirrors tracking the default.
+    let default_user_id = bindings
+        .iter()
+        .find(|b| uuid::Uuid::parse_str(b.tenant_id.trim()).ok() == Some(default_tenant))
+        .map(|b| b.user_id.clone())
+        .unwrap_or_else(|| resp.user_id.clone());
+    let pf = PairedUserFile {
+        user_id: default_user_id,
+        tenant_id: Some(default_tenant.to_string()),
+        bindings,
+        default_tenant_id: Some(default_tenant.to_string()),
+    };
+    write_paired_user_file(path, &pf)
 }
 
 // ============================================================================
@@ -1184,17 +1611,443 @@ mod tests {
 
     /// Forward shape — a newly-written `paired_user.json` round-trips
     /// both fields. Pins the serde representation against accidental
-    /// `#[serde(rename)]` / `#[serde(skip)]` regressions.
+    /// `#[serde(rename)]` / `#[serde(skip)]` regressions. Also pins the
+    /// Phase 8a legacy-shape preservation: a v1 struct (no bindings, no
+    /// default) serializes WITHOUT the v2 keys, so a legacy-heal write
+    /// keeps the legacy shape.
     #[test]
     fn paired_user_file_with_tenant_id_round_trips() {
         let original = PairedUserFile {
             user_id: "22222222-2222-4222-8222-222222222222".to_string(),
             tenant_id: Some("11111111-2222-3333-4444-555555555555".to_string()),
+            bindings: Vec::new(),
+            default_tenant_id: None,
         };
         let json = serde_json::to_string(&original).expect("serialize");
+        assert!(
+            !json.contains("bindings") && !json.contains("default_tenant_id"),
+            "empty v2 fields must not serialize (legacy shape preserved): {json}"
+        );
         let parsed: PairedUserFile = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.user_id, original.user_id);
         assert_eq!(parsed.tenant_id, original.tenant_id);
+        assert!(parsed.bindings.is_empty());
+        assert!(parsed.default_tenant_id.is_none());
+    }
+
+    // ------------------------------------------------------------------------
+    // Phase 8a — paired_user.json v2 multi-entry + migration + persist +
+    // reconciliation (plan 2026-07-02, D3/D4). All hermetic: temp file paths
+    // + AuthManager::with_storage — never the operator's real state.
+    // ------------------------------------------------------------------------
+
+    const T_A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const T_B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const T_C: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const USER: &str = "22222222-2222-4222-8222-222222222222";
+
+    fn ta() -> uuid::Uuid {
+        uuid::Uuid::parse_str(T_A).unwrap()
+    }
+    fn tb() -> uuid::Uuid {
+        uuid::Uuid::parse_str(T_B).unwrap()
+    }
+    fn tc() -> uuid::Uuid {
+        uuid::Uuid::parse_str(T_C).unwrap()
+    }
+
+    fn temp_dir_for(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join("qontinui_test_paired_v2")
+            .join(format!("{test}_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("mkdir tempdir");
+        dir
+    }
+
+    fn test_mgr(dir: &std::path::Path) -> crate::auth::AuthManager {
+        let storage = crate::secure_storage::SecureStorage::with_path(dir.join("tokens.enc"))
+            .expect("test storage");
+        crate::auth::AuthManager::with_storage(storage)
+    }
+
+    fn pair_resp(token: &str) -> PairCompleteResponse {
+        PairCompleteResponse {
+            token: token.to_string(),
+            user_id: USER.to_string(),
+            device_id: None,
+            jti: None,
+            exp: None,
+            tenant_id: None,
+        }
+    }
+
+    fn read_file(path: &std::path::Path) -> PairedUserFile {
+        serde_json::from_slice(&std::fs::read(path).expect("read paired file"))
+            .expect("parse paired file")
+    }
+
+    /// Legacy (v1) shapes migrate through the effective-view accessors:
+    /// `{user_id, tenant_id}` yields one synthesized binding + that
+    /// default; `{user_id}` yields an empty set and no default.
+    #[test]
+    fn legacy_file_migrates_via_effective_view() {
+        let with_tenant: PairedUserFile =
+            serde_json::from_str(&format!(r#"{{"user_id":"{USER}","tenant_id":"{T_A}"}}"#))
+                .unwrap();
+        assert_eq!(
+            with_tenant.effective_bindings(),
+            vec![PairedBinding {
+                tenant_id: T_A.to_string(),
+                user_id: USER.to_string(),
+                paired_at: None,
+            }]
+        );
+        assert_eq!(
+            with_tenant.effective_default_tenant_id().as_deref(),
+            Some(T_A)
+        );
+
+        let no_tenant: PairedUserFile =
+            serde_json::from_str(&format!(r#"{{"user_id":"{USER}"}}"#)).unwrap();
+        assert!(no_tenant.effective_bindings().is_empty());
+        assert!(no_tenant.effective_default_tenant_id().is_none());
+    }
+
+    /// v2 files round-trip and the explicit `bindings`/`default_tenant_id`
+    /// win over the legacy mirror fields in the effective view.
+    #[test]
+    fn v2_file_round_trips_and_bindings_win_over_mirrors() {
+        let v2 = PairedUserFile {
+            user_id: USER.to_string(),
+            tenant_id: Some(T_A.to_string()),
+            bindings: vec![
+                PairedBinding {
+                    tenant_id: T_A.to_string(),
+                    user_id: USER.to_string(),
+                    paired_at: Some("2026-07-01T00:00:00Z".to_string()),
+                },
+                PairedBinding {
+                    tenant_id: T_B.to_string(),
+                    user_id: USER.to_string(),
+                    paired_at: Some("2026-07-02T00:00:00Z".to_string()),
+                },
+            ],
+            default_tenant_id: Some(T_A.to_string()),
+        };
+        let json = serde_json::to_string_pretty(&v2).unwrap();
+        let parsed: PairedUserFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.effective_bindings().len(), 2);
+        assert_eq!(parsed.effective_default_tenant_id().as_deref(), Some(T_A));
+        // Legacy mirrors present on the wire for pre-8a readers.
+        assert!(json.contains("\"user_id\""));
+        assert!(json.contains("\"tenant_id\""));
+    }
+
+    /// First pair: binding appended, becomes default, JWT written to BOTH
+    /// the tenant slot and the legacy access_token slot, mirrors set.
+    #[test]
+    fn persist_first_pair_sets_default_and_both_slots() {
+        let dir = temp_dir_for("persist_first");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+
+        persist_pairing_with(&mgr, &path, &pair_resp("jwt.a.1"), ta()).expect("persist");
+
+        let pf = read_file(&path);
+        assert_eq!(pf.bindings.len(), 1);
+        assert_eq!(pf.bindings[0].tenant_id, T_A);
+        assert_eq!(pf.bindings[0].user_id, USER);
+        assert!(pf.bindings[0].paired_at.is_some());
+        assert_eq!(pf.default_tenant_id.as_deref(), Some(T_A));
+        // Legacy mirrors track the default.
+        assert_eq!(pf.user_id, USER);
+        assert_eq!(pf.tenant_id.as_deref(), Some(T_A));
+        // Both credential slots hold the fresh JWT.
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&ta()).unwrap().as_deref(),
+            Some("jwt.a.1")
+        );
+        assert_eq!(mgr.get_access_token().unwrap(), "jwt.a.1");
+    }
+
+    /// Additive pair for a SECOND tenant: appended, default NOT stolen,
+    /// legacy access_token slot untouched (it holds the DEFAULT binding's
+    /// JWT — D4).
+    #[test]
+    fn persist_second_tenant_appends_without_stealing_default() {
+        let dir = temp_dir_for("persist_second");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+
+        persist_pairing_with(&mgr, &path, &pair_resp("jwt.a.1"), ta()).expect("persist A");
+        persist_pairing_with(&mgr, &path, &pair_resp("jwt.b.1"), tb()).expect("persist B");
+
+        let pf = read_file(&path);
+        assert_eq!(pf.bindings.len(), 2, "pairing is additive");
+        assert_eq!(
+            pf.default_tenant_id.as_deref(),
+            Some(T_A),
+            "an established default is never stolen by a later pair"
+        );
+        assert_eq!(
+            pf.tenant_id.as_deref(),
+            Some(T_A),
+            "mirror stays on default"
+        );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&tb()).unwrap().as_deref(),
+            Some("jwt.b.1")
+        );
+        assert_eq!(
+            mgr.get_access_token().unwrap(),
+            "jwt.a.1",
+            "legacy slot keeps the DEFAULT binding's JWT"
+        );
+    }
+
+    /// Re-pairing the DEFAULT tenant updates its entry in place (no
+    /// duplicate) and refreshes BOTH slots.
+    #[test]
+    fn persist_repair_default_updates_entry_and_both_slots() {
+        let dir = temp_dir_for("persist_repair");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+
+        persist_pairing_with(&mgr, &path, &pair_resp("jwt.a.1"), ta()).expect("persist A1");
+        persist_pairing_with(&mgr, &path, &pair_resp("jwt.b.1"), tb()).expect("persist B");
+        persist_pairing_with(&mgr, &path, &pair_resp("jwt.a.2"), ta()).expect("persist A2");
+
+        let pf = read_file(&path);
+        assert_eq!(pf.bindings.len(), 2, "re-pair must not duplicate the entry");
+        assert_eq!(pf.default_tenant_id.as_deref(), Some(T_A));
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&ta()).unwrap().as_deref(),
+            Some("jwt.a.2")
+        );
+        assert_eq!(
+            mgr.get_access_token().unwrap(),
+            "jwt.a.2",
+            "re-pairing the default refreshes the legacy slot too"
+        );
+    }
+
+    /// Pairing on top of a LEGACY (v1) file migrates it: the legacy
+    /// tenant becomes a binding AND stays the default; the new tenant is
+    /// appended; the legacy slot (still holding the legacy default's JWT)
+    /// is untouched.
+    #[test]
+    fn persist_migrates_legacy_file_preserving_its_default() {
+        let dir = temp_dir_for("persist_migrate");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+        std::fs::write(
+            &path,
+            format!(r#"{{"user_id":"{USER}","tenant_id":"{T_A}"}}"#),
+        )
+        .unwrap();
+        mgr.store_tokens("jwt.a.legacy", "").unwrap();
+
+        persist_pairing_with(&mgr, &path, &pair_resp("jwt.b.1"), tb()).expect("persist B");
+
+        let pf = read_file(&path);
+        assert_eq!(
+            pf.bindings.len(),
+            2,
+            "legacy entry synthesized + B appended"
+        );
+        assert_eq!(
+            pf.default_tenant_id.as_deref(),
+            Some(T_A),
+            "legacy tenant stays the default"
+        );
+        assert_eq!(
+            mgr.get_access_token().unwrap(),
+            "jwt.a.legacy",
+            "legacy slot untouched when pairing a non-default tenant"
+        );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&tb()).unwrap().as_deref(),
+            Some("jwt.b.1")
+        );
+    }
+
+    /// The legacy single-value echo-heal must be a quiet no-op on v2
+    /// files (a single-value overwrite would clobber the binding set /
+    /// flip the default), while keeping its pre-8a behavior on v1 files.
+    #[test]
+    fn backfill_heal_noops_on_v2_shape_only() {
+        // v1 shape: is_v2() false → heal applies (behavior unchanged).
+        let v1: PairedUserFile =
+            serde_json::from_str(&format!(r#"{{"user_id":"{USER}","tenant_id":"{T_A}"}}"#))
+                .unwrap();
+        assert!(!v1.is_v2());
+        // v2 shape (either marker) → heal must no-op.
+        let v2_bindings: PairedUserFile = serde_json::from_str(&format!(
+            r#"{{"user_id":"{USER}","bindings":[{{"tenant_id":"{T_A}","user_id":"{USER}"}}]}}"#
+        ))
+        .unwrap();
+        assert!(v2_bindings.is_v2());
+        let v2_default: PairedUserFile = serde_json::from_str(&format!(
+            r#"{{"user_id":"{USER}","default_tenant_id":"{T_A}"}}"#
+        ))
+        .unwrap();
+        assert!(v2_default.is_v2());
+    }
+
+    /// Reconcile: entries coord no longer returns are dropped and their
+    /// slots cleared; the surviving default is kept; the file is
+    /// rewritten. Coord-side tenants the runner lacks a JWT for are
+    /// flagged (never fabricated).
+    #[test]
+    fn reconcile_drops_missing_and_flags_coord_only() {
+        let dir = temp_dir_for("reconcile_drop_flag");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+        persist_pairing_with(&mgr, &path, &pair_resp("jwt.a.1"), ta()).unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp("jwt.b.1"), tb()).unwrap();
+
+        // Coord says: A still bound, B gone, C newly bound elsewhere.
+        let report = reconcile_paired_bindings_with(&mgr, &path, &[ta(), tc()]).expect("reconcile");
+
+        assert_eq!(report.dropped, vec![tb()]);
+        assert_eq!(
+            report.coord_only,
+            vec![tc()],
+            "no local JWT for C → flagged"
+        );
+        assert_eq!(report.default_repointed, None, "default A survived");
+        assert!(
+            mgr.get_tenant_device_jwt(&tb()).unwrap().is_none(),
+            "dropped binding's slot is cleared (the designed slot-deletion home)"
+        );
+        let pf = read_file(&path);
+        assert_eq!(pf.bindings.len(), 1);
+        assert_eq!(pf.bindings[0].tenant_id, T_A);
+        assert_eq!(pf.default_tenant_id.as_deref(), Some(T_A));
+        assert_eq!(
+            mgr.get_access_token().unwrap(),
+            "jwt.a.1",
+            "legacy slot untouched when the default survives"
+        );
+    }
+
+    /// Reconcile: when the DEFAULT binding is dropped, the most recently
+    /// paired survivor becomes the default and its slot JWT is copied
+    /// into the legacy access_token slot (D4 invariant).
+    #[test]
+    fn reconcile_repoints_default_and_legacy_slot() {
+        let dir = temp_dir_for("reconcile_repoint");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+        persist_pairing_with(&mgr, &path, &pair_resp("jwt.a.1"), ta()).unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp("jwt.b.1"), tb()).unwrap();
+        assert_eq!(mgr.get_access_token().unwrap(), "jwt.a.1");
+
+        // Coord dropped A (the default); B survives.
+        let report = reconcile_paired_bindings_with(&mgr, &path, &[tb()]).expect("reconcile");
+
+        assert_eq!(report.dropped, vec![ta()]);
+        assert_eq!(report.default_repointed, Some(Some(tb())));
+        let pf = read_file(&path);
+        assert_eq!(pf.default_tenant_id.as_deref(), Some(T_B));
+        assert_eq!(
+            pf.tenant_id.as_deref(),
+            Some(T_B),
+            "mirror follows the default"
+        );
+        assert_eq!(
+            mgr.get_access_token().unwrap(),
+            "jwt.b.1",
+            "legacy slot re-pointed to the new default binding's JWT"
+        );
+        assert!(mgr.get_tenant_device_jwt(&ta()).unwrap().is_none());
+    }
+
+    /// Reconcile: present-but-EMPTY set = coord says zero bindings → all
+    /// entries + slots dropped, default cleared, but the legacy
+    /// access_token slot is deliberately left as-is (Phase 3 unpair
+    /// posture — the refresh gate stops it self-perpetuating).
+    #[test]
+    fn reconcile_empty_set_drops_all_but_preserves_legacy_slot() {
+        let dir = temp_dir_for("reconcile_empty");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+        persist_pairing_with(&mgr, &path, &pair_resp("jwt.a.1"), ta()).unwrap();
+
+        let report = reconcile_paired_bindings_with(&mgr, &path, &[]).expect("reconcile");
+
+        assert_eq!(report.dropped, vec![ta()]);
+        assert_eq!(report.default_repointed, Some(None), "default cleared");
+        let pf = read_file(&path);
+        assert!(pf.bindings.is_empty());
+        assert!(pf.default_tenant_id.is_none());
+        assert!(pf.tenant_id.is_none());
+        assert_eq!(pf.user_id, USER, "user_id kept for legacy readers");
+        assert!(mgr.get_tenant_device_jwt(&ta()).unwrap().is_none());
+        assert_eq!(
+            mgr.get_access_token().unwrap(),
+            "jwt.a.1",
+            "legacy slot left as-is when no binding survives"
+        );
+    }
+
+    /// Reconcile: a matching set is a pure no-op — no report changes and
+    /// NO disk write (the heartbeat calls this every 30s; steady state
+    /// must not churn the file).
+    #[test]
+    fn reconcile_matching_set_writes_nothing() {
+        let dir = temp_dir_for("reconcile_noop");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+        persist_pairing_with(&mgr, &path, &pair_resp("jwt.a.1"), ta()).unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp("jwt.b.1"), tb()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let report = reconcile_paired_bindings_with(&mgr, &path, &[ta(), tb()]).expect("reconcile");
+
+        assert!(!report.changed(), "nothing changed: {report:?}");
+        assert!(report.coord_only.is_empty(), "both tenants hold JWTs");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "steady state must not rewrite the file"
+        );
+    }
+
+    /// Reconcile with NO local file: nothing to drop, coord-side
+    /// bindings flagged, quiet success (never an error).
+    #[test]
+    fn reconcile_missing_file_flags_only() {
+        let dir = temp_dir_for("reconcile_missing");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+
+        let report = reconcile_paired_bindings_with(&mgr, &path, &[ta()]).expect("reconcile");
+        assert!(report.dropped.is_empty());
+        assert_eq!(report.coord_only, vec![ta()]);
+        assert!(!path.exists(), "no file must be created");
+    }
+
+    /// Reconcile clears ORPHAN slots (credential without a binding
+    /// entry) that coord's set doesn't contain either.
+    #[test]
+    fn reconcile_clears_orphan_slots_outside_coord_set() {
+        let dir = temp_dir_for("reconcile_orphan");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+        persist_pairing_with(&mgr, &path, &pair_resp("jwt.a.1"), ta()).unwrap();
+        // Orphan slot for C: no binding entry, and coord doesn't have C.
+        mgr.store_tenant_device_jwt(&tc(), "jwt.c.orphan").unwrap();
+
+        let report = reconcile_paired_bindings_with(&mgr, &path, &[ta()]).expect("reconcile");
+
+        assert_eq!(report.dropped_slots, vec![tc()]);
+        assert!(mgr.get_tenant_device_jwt(&tc()).unwrap().is_none());
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&ta()).unwrap().as_deref(),
+            Some("jwt.a.1"),
+            "coord-confirmed slot untouched"
+        );
     }
 
     // ------------------------------------------------------------------------

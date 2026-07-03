@@ -95,25 +95,6 @@ fn keychain_enabled() -> bool {
     std::env::var_os("QONTINUI_DISABLE_KEYCHAIN").is_none()
 }
 
-/// Feature flag for the session-scoped multi-tenant device-JWT model
-/// (plan 2026-07-02-session-scoped-multi-tenant-device-binding, Phase 1).
-///
-/// `QONTINUI_MULTI_TENANT_JWT=1` turns on the flag-gated dark paths (the
-/// refresher's per-tenant slot pass). DEFAULT OFF: unset, empty, or any
-/// value other than `1` leaves every behavior byte-identical to today.
-/// Read from the environment on each call so a long-lived process picks up
-/// nothing stale — the check is a trivial env read.
-pub fn multi_tenant_jwt_enabled() -> bool {
-    multi_tenant_jwt_flag_from(std::env::var("QONTINUI_MULTI_TENANT_JWT").ok().as_deref())
-}
-
-/// Pure core of [`multi_tenant_jwt_enabled`]: only the exact value `1`
-/// (after trimming) enables the flag. Factored out so the gate is testable
-/// without mutating process-global env vars (racy across parallel tests).
-pub(crate) fn multi_tenant_jwt_flag_from(raw: Option<&str>) -> bool {
-    matches!(raw.map(str::trim), Some("1"))
-}
-
 /// Manages authentication tokens and device ID storage.
 ///
 /// The AuthManager provides secure storage for:
@@ -999,19 +980,6 @@ mod tenant_device_jwt_tests {
         let _ = fs::remove_file(&storage_path);
         let storage = SecureStorage::with_path(storage_path).unwrap();
         AuthManager::with_storage(storage)
-    }
-
-    #[test]
-    fn flag_is_default_off_and_only_exactly_1_enables() {
-        // Default off: unset / empty / junk / "true" / "0" all stay dark.
-        assert!(!multi_tenant_jwt_flag_from(None));
-        assert!(!multi_tenant_jwt_flag_from(Some("")));
-        assert!(!multi_tenant_jwt_flag_from(Some("0")));
-        assert!(!multi_tenant_jwt_flag_from(Some("true")));
-        assert!(!multi_tenant_jwt_flag_from(Some("yes")));
-        // Only the documented value (trimmed) enables.
-        assert!(multi_tenant_jwt_flag_from(Some("1")));
-        assert!(multi_tenant_jwt_flag_from(Some(" 1 ")));
     }
 
     #[test]
