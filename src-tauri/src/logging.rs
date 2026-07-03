@@ -16,6 +16,12 @@ use crate::tracing_layers::{JsonlSpanLayer, SpanLayerConfig};
 /// Flag to track if we're already handling a crash (prevent recursive crashes)
 static CRASH_HANDLING: AtomicBool = AtomicBool::new(false);
 
+/// Re-entrancy guard for the `runner-panic.log` write inside `log_panic`.
+/// A panic raised while writing the panic log re-enters the hook; without
+/// this latch that recursion would be unbounded (each nested panic runs the
+/// hook synchronously before unwinding).
+static PANIC_LOG_WRITING: AtomicBool = AtomicBool::new(false);
+
 /// Safely write to stderr, ignoring errors if the pipe is closed.
 /// This prevents panics when stderr is unavailable
 /// (e.g., when the parent terminal/process has closed the pipe - Windows error 232).
@@ -201,32 +207,45 @@ macro_rules! log_debug {
     };
 }
 
+/// Walk up from `exe_path` looking for an ancestor directory that already
+/// contains a `.dev-logs` child, and return that child.
+///
+/// This replaces a fixed five-`.parent()` walk written for the
+/// pre-workspace `src-tauri\target\debug\` exe layout. The workspace root
+/// moved `target/` one level up (`qontinui-runner\target\debug\`), so the
+/// fixed count overshot to the drive root — the 2026-07-03 primary crash
+/// dumps landed at `D:\.dev-logs` instead of `D:\qontinui-root\.dev-logs`.
+/// A marker-based search survives any future layout move (slot pools,
+/// deeper target dirs, worktrees) as long as a `.dev-logs` dir exists
+/// somewhere above the exe.
+fn find_dev_logs_ancestor(exe_path: &std::path::Path) -> Option<PathBuf> {
+    // `ancestors()` yields the path itself first — skip it (it's the exe
+    // file, not a directory).
+    exe_path.ancestors().skip(1).find_map(|dir| {
+        let candidate = dir.join(".dev-logs");
+        if candidate.is_dir() {
+            Some(candidate)
+        } else {
+            None
+        }
+    })
+}
+
 /// Get the crash dump directory.
 ///
 /// Scoped per-runner for secondary instances so the `latest_crash.txt` file
 /// from one runner doesn't overwrite another's.
 pub fn get_crash_dump_dir() -> PathBuf {
-    // Try to use the .dev-logs directory in the parent directory
-    let base = if let Ok(exe_path) = std::env::current_exe() {
-        // Navigate from exe to qontinui-root/.dev-logs
-        exe_path
-            .parent()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-            .map(|parent_dir| parent_dir.join(".dev-logs"))
-            .filter(|dev_logs| dev_logs.exists() || std::fs::create_dir_all(dev_logs).is_ok())
-    } else {
-        None
-    }
-    .unwrap_or_else(|| {
-        // Fallback to local app data
-        dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("qontinui-runner")
-            .join("crash-dumps")
-    });
+    let base = std::env::current_exe()
+        .ok()
+        .and_then(|exe_path| find_dev_logs_ancestor(&exe_path))
+        .unwrap_or_else(|| {
+            // Fallback to local app data
+            dirs::data_local_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("qontinui-runner")
+                .join("crash-dumps")
+        });
 
     crate::instance::scope_path(&base)
 }
@@ -329,6 +348,32 @@ pub fn log_panic(info: &std::panic::PanicHookInfo) {
 
         let backtrace = format!("{:?}", std::backtrace::Backtrace::capture());
 
+        // ALSO write the supervisor-visible `runner-panic.log`. This hook
+        // REPLACES the early `startup_panic` hook at init, and the
+        // supervisor's postmortem path (`check_and_record_panic_log` /
+        // `parse_panic_file`) reads ONLY that file — before this call,
+        // any post-init crash left `recent_panic: null` on `GET /runners`
+        // (observed live 3x on 2026-07-03). `startup_panic::write_panic_log`
+        // is deliberately self-contained: dir resolution via
+        // `QONTINUI_RUNNER_LOG_DIR` (set by the supervisor) with a
+        // data_local_dir fallback, and no settings reads that could panic
+        // or poison a OnceLock mid-panic.
+        if !PANIC_LOG_WRITING.swap(true, Ordering::SeqCst) {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let thread_name = std::thread::current()
+                    .name()
+                    .unwrap_or("<unnamed>")
+                    .to_string();
+                crate::startup_panic::write_panic_log(
+                    &message,
+                    &location,
+                    &thread_name,
+                    &backtrace,
+                );
+            }));
+            PANIC_LOG_WRITING.store(false, Ordering::SeqCst);
+        }
+
         // Write crash dump to file
         write_crash_dump(&location, &message, &backtrace);
 
@@ -353,4 +398,107 @@ pub fn setup_panic_handler() {
     std::panic::set_hook(Box::new(|info| {
         log_panic(info);
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// Create `dir` and every missing parent, panicking on failure (tests only).
+    fn mk(dir: &Path) {
+        std::fs::create_dir_all(dir).expect("create test dir");
+    }
+
+    /// All three deployed exe layouts must resolve to `<root>/.dev-logs`
+    /// when it exists. The old fixed five-`.parent()` walk only handled the
+    /// pre-workspace `src-tauri\target\debug\` layout and overshot to the
+    /// drive root for the others (live evidence 2026-07-03: dumps at
+    /// `D:\.dev-logs` instead of `D:\qontinui-root\.dev-logs`).
+    #[test]
+    fn find_dev_logs_ancestor_resolves_all_known_exe_layouts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let dev_logs = root.join(".dev-logs");
+        mk(&dev_logs);
+
+        let layouts = [
+            // Workspace-root target (current deployed layout).
+            root.join("qontinui-runner")
+                .join("target")
+                .join("debug")
+                .join("qontinui-runner-primary.exe"),
+            // Pre-workspace layout (the one the old fixed walk assumed).
+            root.join("qontinui-runner")
+                .join("src-tauri")
+                .join("target")
+                .join("debug")
+                .join("qontinui-runner.exe"),
+            // Supervisor build-pool slot layout.
+            root.join("qontinui-runner")
+                .join("target-pool")
+                .join("slot-0")
+                .join("debug")
+                .join("qontinui-runner.exe"),
+        ];
+
+        for exe in &layouts {
+            mk(exe.parent().unwrap());
+            assert_eq!(
+                find_dev_logs_ancestor(exe).as_deref(),
+                Some(dev_logs.as_path()),
+                "layout {:?} must resolve to the fixture .dev-logs",
+                exe
+            );
+        }
+    }
+
+    /// The NEAREST ancestor with a `.dev-logs` child wins — a repo-local
+    /// `.dev-logs` must shadow one further up the tree.
+    #[test]
+    fn find_dev_logs_ancestor_prefers_nearest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        mk(&root.join(".dev-logs"));
+        let near = root.join("qontinui-runner").join(".dev-logs");
+        mk(&near);
+
+        let exe = root
+            .join("qontinui-runner")
+            .join("target")
+            .join("debug")
+            .join("qontinui-runner.exe");
+        mk(exe.parent().unwrap());
+
+        assert_eq!(
+            find_dev_logs_ancestor(&exe).as_deref(),
+            Some(near.as_path())
+        );
+    }
+
+    /// A `.dev-logs` FILE (not dir) must not be picked up.
+    #[test]
+    fn find_dev_logs_ancestor_ignores_plain_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(root.join(".dev-logs"), b"not a dir").unwrap();
+
+        let exe = root
+            .join("qontinui-runner")
+            .join("target")
+            .join("debug")
+            .join("qontinui-runner.exe");
+        mk(exe.parent().unwrap());
+
+        // Either nothing is found, or (on a dev box that genuinely has a
+        // `.dev-logs` dir above the temp dir) the hit must lie OUTSIDE the
+        // fixture — never the plain file inside it.
+        if let Some(found) = find_dev_logs_ancestor(&exe) {
+            assert!(
+                !found.starts_with(root),
+                "must not resolve to the .dev-logs FILE inside the fixture: {:?}",
+                found
+            );
+        }
+    }
 }
