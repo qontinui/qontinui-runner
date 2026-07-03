@@ -380,9 +380,31 @@ jobs:
   publish-update-json:
     needs: [create-release, build]
     runs-on: ubuntu-latest
+    # Run even when the non-blocking (continue-on-error) macOS/Linux legs fail.
+    # A failed leg makes `needs.build` non-success, which was SILENTLY SKIPPING
+    # this whole job — so releases never actually auto-published (v1.0.0 and
+    # v1.0.1 both had to be un-drafted by hand). `always()` lets it run; the
+    # asset-verify step below still guarantees we never publish an assetless
+    # release, keeping Windows the sole hard gate.
+    if: ${{ always() && needs.create-release.result == 'success' }}
 
     steps:
       - uses: actions/checkout@v5
+
+      # Hard gate: only proceed if the Windows installer actually built and
+      # uploaded. Fails the job (leaving the release a draft) otherwise, so a
+      # broken Windows leg never yields a published-but-empty "latest" release.
+      - name: Verify Windows installer uploaded
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          names=$(gh release view "v${{ needs.create-release.outputs.release_version }}" \
+            --repo "${{ github.repository }}" --json assets --jq '.assets[].name')
+          echo "Release assets:"; echo "$names"
+          echo "$names" | grep -qi 'setup\.exe' || {
+            echo "::error::No Windows -setup.exe asset on the release — refusing to publish an empty release.";
+            exit 1;
+          }
 
       - name: Generate update manifest
         run: |
@@ -406,7 +428,7 @@ jobs:
               },
               "windows-x86_64": {
                 "signature": "",
-                "url": "https://github.com/${{ github.repository }}/releases/download/v${{ needs.create-release.outputs.release_version }}/qontinui-runner_${{ needs.create-release.outputs.release_version }}_x64.msi"
+                "url": "https://github.com/${{ github.repository }}/releases/download/v${{ needs.create-release.outputs.release_version }}/Qontinui.Runner_${{ needs.create-release.outputs.release_version }}_x64-setup.exe"
               }
             }
           }
