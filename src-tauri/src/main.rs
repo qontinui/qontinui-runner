@@ -2431,6 +2431,18 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                     use session::session_lifecycle_store::{classify, PollAction};
 
+                    // Reference instant for `claude_present_in_inclusive_subtree`'s
+                    // PID-reuse guard: this primary's own boot time (captured once,
+                    // at task spawn — effectively boot time), NOT a per-record
+                    // `opened_at`. A per-record timestamp misfires whenever a later
+                    // session record reuses an already-running terminal's
+                    // `terminal_id` (e.g. a reconnect into an existing pane) — the
+                    // tracked PID's real creation legitimately predates that later
+                    // record's `opened_at` by design, not because of PID recycling.
+                    // See the doc comment on `claude_present_in_inclusive_subtree`
+                    // for the full incident writeup (2026-07-03).
+                    let primary_boot_unix_millis = chrono::Utc::now().timestamp_millis();
+
                     // claudeSessionId -> consecutive claude-absent ticks,
                     // carried across ticks to debounce `NeedsConfirm`.
                     let mut consecutive_dead: StdHashMap<String, u32> = StdHashMap::new();
@@ -2507,7 +2519,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     let claude_present = crate::process_capture::process_tree::claude_present_in_inclusive_subtree(
                                         pid,
                                         &snap,
-                                        rec.opened_at,
+                                        primary_boot_unix_millis,
                                     );
                                     (Some(alive), claude_present, tick_snapshot_ok)
                                 }
