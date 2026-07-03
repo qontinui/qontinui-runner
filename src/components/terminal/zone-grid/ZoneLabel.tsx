@@ -1,11 +1,119 @@
 import { useState, useRef, useEffect } from "react";
-import { ChevronDown, Pin, Filter, ArrowDownToLine, Zap } from "lucide-react";
+import { ChevronDown, GitPullRequest, Pin, Filter, ArrowDownToLine, Zap } from "lucide-react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { useUIElement } from "@qontinui/ui-bridge";
 import type { TerminalTab } from "../useTerminalManager";
 import type { ZoneAssignments, SessionState } from "../useZoneLayout";
 import { STATE_BORDER_COLORS } from "./constants";
 import { isNonDurablePty, NON_DURABLE_TOOLTIP, NON_DURABLE_LABEL } from "../sessionDurability";
 import { useTerminalWindowActions } from "../useTerminalWindowActions";
+import { useSessionPrs, summarizePrs, prGithubUrl, prLabel } from "../useSessionPrs";
+
+/** Tokyo-Night verdict colors shared by the summary symbol and per-PR dots
+ * (same green/red the state dots use — `constants.ts`). */
+const PR_MERGED_COLOR = "#9ece6a";
+const PR_UNMERGED_COLOR = "#f7768e";
+
+/**
+ * Per-session PR status dropdown for the zone header: the trigger shows a
+ * pull-request symbol that is green when EVERY PR the session authored has
+ * merged and red otherwise; the panel lists each PR (unmerged first) with
+ * its own red/green mark. Data comes from coord via `useSessionPrs`
+ * (fail-soft: unpaired/unreachable/pre-endpoint coord ⇒ renders nothing).
+ * Hidden for tabs with no Claude session id and sessions with no PRs.
+ */
+export function SessionPrDropdown({ claudeSessionId }: { claudeSessionId?: string }) {
+  const [open, setOpen] = useState(false);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const { available, prs, allMerged, refresh } = useSessionPrs(claudeSessionId);
+
+  useEffect(() => {
+    if (!open) return;
+    const handleClick = (e: MouseEvent) => {
+      if (panelRef.current && !panelRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [open]);
+
+  if (!claudeSessionId || !available || prs.length === 0) return null;
+
+  const { total, unmerged } = summarizePrs(prs);
+  const summaryColor = allMerged ? PR_MERGED_COLOR : PR_UNMERGED_COLOR;
+  const summaryText = allMerged ? `all ${total} merged` : `${unmerged} of ${total} unmerged`;
+
+  return (
+    <div className="relative shrink-0" ref={panelRef}>
+      <button
+        onClick={(e) => {
+          e.stopPropagation();
+          if (!open) refresh();
+          setOpen(!open);
+        }}
+        className="flex items-center gap-0.5 p-0.5 rounded hover:bg-[#2a2d3d] transition-colors"
+        style={{ color: summaryColor }}
+        title={`Session PRs: ${summaryText}`}
+        aria-label={`Session PRs: ${summaryText}`}
+        data-pr-summary={allMerged ? "all-merged" : "unmerged"}
+      >
+        <GitPullRequest className="w-2.5 h-2.5" />
+        <span className="text-[9px] font-mono leading-none">{allMerged ? total : unmerged}</span>
+        <ChevronDown className="w-2 h-2" />
+      </button>
+
+      {open && (
+        <div className="absolute left-0 top-full mt-0.5 w-56 bg-[#1a1b26] border border-[#2a2d3d] rounded-lg shadow-xl z-50 overflow-hidden">
+          <div className="flex items-center gap-1.5 px-2 py-1 border-b border-[#2a2d3d]">
+            <div
+              className="w-2 h-2 rounded-full shrink-0"
+              style={{ backgroundColor: summaryColor }}
+            />
+            <span className="text-[9px] text-[#a9b1d6]">{summaryText}</span>
+          </div>
+          <div className="max-h-48 overflow-y-auto scrollbar-dark">
+            {prs.map((pr) => {
+              const url = prGithubUrl(pr);
+              return (
+                <button
+                  key={`${pr.repo}#${pr.pr_number}`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (url) {
+                      void openUrl(url).catch((err) =>
+                        console.error("Failed to open PR url:", err),
+                      );
+                      setOpen(false);
+                    }
+                  }}
+                  className={`w-full flex items-center gap-1.5 px-2 py-1 text-left transition-colors text-[#a9b1d6] ${
+                    url ? "hover:bg-[#2a2d3d]/50 cursor-pointer" : "cursor-default"
+                  }`}
+                  title={url ?? `${pr.repo}#${pr.pr_number} (no GitHub link — bare repo name)`}
+                >
+                  <div
+                    className="w-1.5 h-1.5 rounded-full shrink-0"
+                    style={{
+                      backgroundColor: pr.merged ? PR_MERGED_COLOR : PR_UNMERGED_COLOR,
+                    }}
+                  />
+                  <span className="text-[10px] font-mono truncate flex-1">{prLabel(pr)}</span>
+                  <span
+                    className="text-[8px] shrink-0"
+                    style={{ color: pr.merged ? PR_MERGED_COLOR : PR_UNMERGED_COLOR }}
+                  >
+                    {pr.merged ? "merged" : (pr.pr_state ?? "open")}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 /**
  * UI Bridge registration spec for a zone header (boot-restore remediation
@@ -143,6 +251,11 @@ export function ZoneLabel({
           {NON_DURABLE_LABEL}
         </span>
       )}
+
+      {/* Per-session PR status: green = every authored PR merged, red = at
+          least one unmerged; the panel lists PR numbers unmerged-first so a
+          stuck/red-CI PR is visible without asking the session. */}
+      <SessionPrDropdown claudeSessionId={tab.claudeSessionId} />
 
       {outputLineCount !== undefined && outputLineCount > 0 && (
         <span className="text-[9px] text-[#565f89] font-mono ml-1 shrink-0">

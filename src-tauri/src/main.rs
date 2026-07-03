@@ -1752,6 +1752,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Plan 2026-05-23-coord-native-sessions-phase-7-10 §Phase 7 —
             // "Continue elsewhere" cross-machine handoff trigger.
             commands::session::session_handoff,
+            // Terminal zone-header PR dropdown — per-session PR merged/unmerged
+            // status proxied from coord's GET /pr-merge/session/:id/prs.
+            commands::session_prs::session_prs_get,
             // Plan 2026-05-22-coord-native-session-coordination §D12 / Phase 4 —
             // active tenant resolver for the frontend TenantContext.
             commands::tenant::get_active_tenant,
