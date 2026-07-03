@@ -259,6 +259,32 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
     let user_chose = user_chose_session(args);
     let settings = identity_settings_args(tool, env::var(CLAUDE_HOOK_SETTINGS_ENV).ok().as_deref());
 
+    // Fire-and-forget DIAGNOSTIC beacon on EVERY (non-nested) invocation —
+    // INCLUDING the don't-double-pin passthrough that sends no session-open —
+    // mirroring the `.bash`/`.cmd` shim beacons, with `"surface":"exe"` so the
+    // runner logs reveal WHICH shim surface actually ran (post-#696 this exe is
+    // the primary Windows surface; the `.cmd` is fail-open fallback only).
+    // Log-only on the runner side; strictly fail-open here: absent port /
+    // connect refused / timeout (hard-capped at BEACON_TIMEOUT per phase) are
+    // all swallowed and never block or delay the real tool exec.
+    if let Some(port) = env::var(PORT_ENV)
+        .ok()
+        .and_then(|p| p.trim().parse::<u16>().ok())
+    {
+        let _ = http_post_with_timeouts(
+            port,
+            "/control/shim-beacon",
+            &shim_beacon_body(
+                tool.program(),
+                user_chose,
+                !settings.is_empty(),
+                pinned.is_some(),
+            ),
+            BEACON_TIMEOUT,
+            BEACON_TIMEOUT,
+        );
+    }
+
     // Best-effort confirmation/liveness POST (never load-bearing; the runner
     // already recorded the session authoritatively at spawn). All failures —
     // absent port, connect refused, non-2xx — are ignored.
@@ -279,6 +305,29 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
 
     let final_args = identity_argv(args, &settings, pinned.as_deref(), user_chose);
     exec_real(&real, tool.program(), &final_args)
+}
+
+/// JSON body for the `/control/shim-beacon` diagnostic POST. Same fields the
+/// `.bash`/`.cmd` shim beacons report (`terminal_id`, `tool`, `event`, and the
+/// `user_session_id=… settings=… pinned=…` detail line), plus
+/// `"surface":"exe"` — the discriminator that tells the runner logs the NATIVE
+/// exe stub fired (the script shims omit the field). Pure aside from the env
+/// read, so the shape is unit-testable.
+fn shim_beacon_body(
+    provider: &str,
+    user_chose: bool,
+    settings_delivered: bool,
+    pinned_present: bool,
+) -> String {
+    let terminal_id = env::var(TERMINAL_ID_ENV).unwrap_or_default();
+    format!(
+        "{{\"terminal_id\":\"{}\",\"tool\":\"{}\",\"event\":\"invoked\",\"surface\":\"exe\",\"detail\":\"user_session_id={} settings={} pinned={}\"}}",
+        json_escape(&terminal_id),
+        json_escape(provider),
+        user_chose,
+        settings_delivered,
+        pinned_present
+    )
 }
 
 /// JSON body for the identity confirmation POST. Every value is
@@ -657,8 +706,22 @@ fn exec_real_child(real: &Option<PathBuf>, name: &str, args: &[String]) -> Optio
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const RW_TIMEOUT: Duration = Duration::from_secs(20);
+/// Hard cap per phase (connect / read / write) for the diagnostic shim beacon —
+/// deliberately tiny so a wedged loopback can never delay the real tool exec
+/// noticeably. The beacon is log-only; any timeout is silently swallowed.
+const BEACON_TIMEOUT: Duration = Duration::from_millis(500);
 
 fn http_post(port: u16, path: &str, body: &str) -> Result<String, String> {
+    http_post_with_timeouts(port, path, body, CONNECT_TIMEOUT, RW_TIMEOUT)
+}
+
+fn http_post_with_timeouts(
+    port: u16,
+    path: &str,
+    body: &str,
+    connect_timeout: Duration,
+    rw_timeout: Duration,
+) -> Result<String, String> {
     let addr = format!("127.0.0.1:{port}");
     let sockaddr = addr
         .to_socket_addrs()
@@ -666,12 +729,12 @@ fn http_post(port: u16, path: &str, body: &str) -> Result<String, String> {
         .next()
         .ok_or_else(|| "no addr".to_string())?;
     let mut stream =
-        TcpStream::connect_timeout(&sockaddr, CONNECT_TIMEOUT).map_err(|e| e.to_string())?;
+        TcpStream::connect_timeout(&sockaddr, connect_timeout).map_err(|e| e.to_string())?;
     stream
-        .set_read_timeout(Some(RW_TIMEOUT))
+        .set_read_timeout(Some(rw_timeout))
         .map_err(|e| e.to_string())?;
     stream
-        .set_write_timeout(Some(RW_TIMEOUT))
+        .set_write_timeout(Some(rw_timeout))
         .map_err(|e| e.to_string())?;
 
     let req = format!(
@@ -1047,6 +1110,26 @@ mod tests {
             identity_argv(&orig, &[], Some("p"), false),
             [orig.clone(), strs(&["--session-id", "p"])].concat()
         );
+    }
+
+    #[test]
+    fn shim_beacon_body_reports_surface_and_decision_flags() {
+        let body = shim_beacon_body("claude", false, true, true);
+        assert!(body.starts_with('{') && body.ends_with('}'));
+        // The exe surface discriminator — the script shims omit this field, so
+        // its presence is what tells the runner logs the NATIVE stub fired.
+        assert!(body.contains("\"surface\":\"exe\""));
+        assert!(body.contains("\"tool\":\"claude\""));
+        assert!(body.contains("\"event\":\"invoked\""));
+        // Detail line mirrors the .cmd/.bash beacons' key=value format.
+        assert!(body.contains("\"detail\":\"user_session_id=false settings=true pinned=true\""));
+        assert!(body.contains("\"terminal_id\":"));
+        assert!(!body.contains('\n'));
+
+        // Flag permutations land verbatim in the detail line.
+        let body2 = shim_beacon_body("gemini", true, false, false);
+        assert!(body2.contains("\"tool\":\"gemini\""));
+        assert!(body2.contains("\"detail\":\"user_session_id=true settings=false pinned=false\""));
     }
 
     #[test]

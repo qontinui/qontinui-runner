@@ -240,6 +240,11 @@ pub struct ShimBeaconRequest {
     pub tool: Option<String>,
     #[serde(default)]
     pub event: Option<String>,
+    /// Which shim surface fired: `"exe"` (the native `qontinui-shim` stub — the
+    /// primary Windows surface post-#696). The `.bash`/`.cmd` script shims
+    /// predate the field and omit it, so absent ⇒ a script surface.
+    #[serde(default)]
+    pub surface: Option<String>,
     #[serde(default)]
     pub detail: Option<String>,
 }
@@ -253,6 +258,9 @@ async fn post_shim_beacon(Json(req): Json<ShimBeaconRequest>) -> Json<ApiRespons
         terminal_id = %req.terminal_id.as_deref().unwrap_or("?"),
         tool = %req.tool.as_deref().unwrap_or("?"),
         event = %req.event.as_deref().unwrap_or("invoked"),
+        // Only the pre-`surface` script shims omit the field, so absent means
+        // a `.bash`/`.cmd` surface (the exe stub always sends "exe").
+        surface = %req.surface.as_deref().unwrap_or("script"),
         detail = %req.detail.as_deref().unwrap_or(""),
         "control/shim-beacon: identity shim invoked"
     );
@@ -1333,21 +1341,30 @@ mod tests {
 
     #[test]
     fn shim_beacon_request_parses_full_and_defaults_missing() {
-        // Full payload (what the shim POSTs).
+        // Full payload (what the native exe stub POSTs, incl. `surface`).
         let full: ShimBeaconRequest = serde_json::from_str(
-            r#"{"terminal_id":"t1","tool":"claude","event":"invoked","detail":"user_session_id=true settings=true pinned=true"}"#,
+            r#"{"terminal_id":"t1","tool":"claude","event":"invoked","surface":"exe","detail":"user_session_id=true settings=true pinned=true"}"#,
         )
         .expect("full beacon body must parse");
         assert_eq!(full.terminal_id.as_deref(), Some("t1"));
         assert_eq!(full.tool.as_deref(), Some("claude"));
         assert_eq!(full.event.as_deref(), Some("invoked"));
+        assert_eq!(full.surface.as_deref(), Some("exe"));
         assert!(full.detail.as_deref().unwrap().contains("settings=true"));
+
+        // The `.bash`/`.cmd` script shims predate `surface` and omit it — the
+        // field must default (the handler logs it as "script").
+        let script: ShimBeaconRequest = serde_json::from_str(
+            r#"{"terminal_id":"t1","tool":"claude","event":"invoked","detail":"user_session_id=false settings=true pinned=true"}"#,
+        )
+        .expect("script beacon body (no surface) must parse");
+        assert!(script.surface.is_none());
 
         // Every field is optional — an empty object must still parse (the
         // handler is log-only and never rejects a malformed-but-JSON beacon).
         let empty: ShimBeaconRequest =
             serde_json::from_str("{}").expect("empty beacon body must parse");
-        assert!(empty.terminal_id.is_none() && empty.tool.is_none());
+        assert!(empty.terminal_id.is_none() && empty.tool.is_none() && empty.surface.is_none());
     }
 
     // -------------------------------------------------------------------
