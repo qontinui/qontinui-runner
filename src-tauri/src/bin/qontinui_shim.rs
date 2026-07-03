@@ -31,6 +31,20 @@
 //!
 //! Registry creds: like the rest of interception, the stub injects NO registry
 //! secrets — the agent's shell already carries the operator's registry config.
+//!
+//! ## IDENTITY mode (claude / gemini)
+//! When `argv[0]`'s stem is `claude` or `gemini` this binary runs the always-on
+//! session-restore IDENTITY straddle instead of the install straddle, mirroring
+//! `resources/intercept/identity_shim.cmd`: resolve the REAL provider outside
+//! our own dir(s), honor the recursion guard, deliver the claude `--settings`
+//! hook, best-effort POST `/control/session-open`, and append
+//! `--session-id $QONTINUI_PINNED_SESSION_ID` unless the user already chose a
+//! session. It exists as a NATIVE exe because a `.cmd` batch shim is launched
+//! via cmd.exe, which CANNOT accept multi-line (or cmd-metachar) arguments —
+//! the runner's shell integration passes a multi-line `--append-system-prompt`,
+//! so the `.cmd`-only identity shim broke EVERY pane `claude` launch on
+//! 2026-07-03 ("The syntax of the command is incorrect."). Native argv has no
+//! such re-quoting layer; arguments pass through byte-exact.
 
 use std::env;
 use std::io::{Read, Write};
@@ -48,14 +62,40 @@ const PORT_ENV: &str = "QONTINUI_INSTALL_INTERCEPT_PORT";
 const MODE_ENV: &str = "QONTINUI_INSTALL_INTERCEPT_MODE";
 const OVERRIDE_ENV: &str = "QONTINUI_INSTALL_OVERRIDE";
 /// Own-dir hint the materializer sets so the real-tool PATH scan can skip this
-/// stub's directory even if `current_exe` is unavailable.
+/// stub's directory even if `current_exe` is unavailable. NOTE: the seam may
+/// point this at EITHER the install shim dir or the identity shim dir (they are
+/// injected independently), so [`own_shim_dirs`] excludes BOTH this env dir AND
+/// `current_exe().parent()` — the copied identity exe physically lives in the
+/// identity dir, and failing to exclude it would let the stub resolve ITSELF as
+/// the "real" tool (self-spawn loop).
 const SHIM_DIR_ENV: &str = "QONTINUI_INSTALL_INTERCEPT_SHIM_DIR";
+
+/// Env var carrying the runner-pre-generated session UUID the identity shim
+/// pins via `--session-id` (identity mode only).
+const PINNED_SESSION_ENV: &str = "QONTINUI_PINNED_SESSION_ID";
+/// Env var carrying the per-PTY terminal id echoed back in the identity
+/// confirmation POST.
+const TERMINAL_ID_ENV: &str = "QONTINUI_TERMINAL_ID";
+/// Env var carrying the absolute path of the runner-materialized claude
+/// `--settings` hook file (identity mode, tool==claude only).
+const CLAUDE_HOOK_SETTINGS_ENV: &str = "QONTINUI_CLAUDE_HOOK_SETTINGS";
 
 fn main() -> std::process::ExitCode {
     // argv[0] → which tool we are impersonating. Fail-open to passthrough on
     // anything we don't recognize.
     let raw_args: Vec<String> = env::args().collect();
-    let tool = match detect_tool(raw_args.first().map(String::as_str)) {
+    let argv0 = raw_args.first().cloned();
+    // Args after argv[0] — exactly what the bash shim sees in "$@".
+    let args: Vec<String> = raw_args.into_iter().skip(1).collect();
+
+    // IDENTITY mode (claude/gemini) is checked FIRST — the identity family is
+    // disjoint from the install family, and its detection stays local to this
+    // bin (install classification via `ShimTool` is a separate concern).
+    if let Some(tool) = detect_identity_tool(argv0.as_deref()) {
+        return std::process::ExitCode::from(code_to_u8(run_identity(tool, &args)));
+    }
+
+    let tool = match detect_tool(argv0.as_deref()) {
         Some(t) => t,
         None => {
             // Unknown invocation name: nothing sensible to do. Exit 0 rather
@@ -63,8 +103,6 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(0);
         }
     };
-    // Args after argv[0] — exactly what the bash shim sees in "$@".
-    let args: Vec<String> = raw_args.into_iter().skip(1).collect();
 
     let code = run(tool, &args);
     // Clamp to the u8 ExitCode space; preserve 0 vs non-zero faithfully.
@@ -89,12 +127,10 @@ fn code_to_u8(code: Option<i32>) -> u8 {
     }
 }
 
-/// Detect the impersonated [`ShimTool`] from `argv[0]` (the file stem, lower-
-/// cased, extension stripped). `cargo.exe` → `Cargo`, `pip3` → `Pip3`, etc.
-/// Pure + total (returns `None` for an unknown stem) so it is unit-testable
-/// without running the exe.
-pub fn detect_tool(argv0: Option<&str>) -> Option<ShimTool> {
-    let argv0 = argv0?;
+/// Lower-cased file stem of an argv[0] string: path components split on BOTH
+/// separators, trailing extension stripped. Shared by [`detect_tool`] and
+/// [`detect_identity_tool`].
+fn argv0_stem(argv0: &str) -> String {
     // Hand-split on BOTH separators — `Path::file_stem` does not treat `\` as a
     // separator on unix, so a Windows-style argv0 (`C:\…\Cargo.EXE`) would be
     // read as one filename and the stem would carry the whole path. Cross-OS CI
@@ -103,14 +139,169 @@ pub fn detect_tool(argv0: Option<&str>) -> Option<ShimTool> {
     // Strip a trailing extension (`.exe`/`.cmd`/…) — everything before the last
     // `.`, or the whole base if there is no `.`.
     let stem = base.rsplit_once('.').map(|(s, _)| s).unwrap_or(base);
-    ShimTool::from_program(&stem.to_ascii_lowercase())
+    stem.to_ascii_lowercase()
+}
+
+/// Detect the impersonated [`ShimTool`] from `argv[0]` (the file stem, lower-
+/// cased, extension stripped). `cargo.exe` → `Cargo`, `pip3` → `Pip3`, etc.
+/// Pure + total (returns `None` for an unknown stem) so it is unit-testable
+/// without running the exe.
+pub fn detect_tool(argv0: Option<&str>) -> Option<ShimTool> {
+    ShimTool::from_program(&argv0_stem(argv0?))
+}
+
+// ===========================================================================
+// IDENTITY mode (claude / gemini) — the always-on session-restore straddle.
+// Kept LOCAL to this bin (not `intercept_core::classify::ShimTool`): install
+// classification is a separate concern. Mirrors
+// `resources/intercept/identity_shim.cmd` semantics exactly, with the same
+// fail-open invariants as the install straddle.
+// ===========================================================================
+
+/// The identity provider this exe impersonates (from `argv[0]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityTool {
+    Claude,
+    Gemini,
+}
+
+impl IdentityTool {
+    /// The provider program name (also the wire `provider` string).
+    pub fn program(self) -> &'static str {
+        match self {
+            IdentityTool::Claude => "claude",
+            IdentityTool::Gemini => "gemini",
+        }
+    }
+}
+
+/// Detect an identity provider from `argv[0]` (stem, case-insensitive).
+/// `None` ⇒ not an identity invocation (fall through to the install path).
+pub fn detect_identity_tool(argv0: Option<&str>) -> Option<IdentityTool> {
+    match argv0_stem(argv0?).as_str() {
+        "claude" => Some(IdentityTool::Claude),
+        "gemini" => Some(IdentityTool::Gemini),
+        _ => None,
+    }
+}
+
+/// Did the user's argv already choose a session? Then the shim must NOT
+/// double-pin. Exact token match, case-insensitive, mirroring
+/// `identity_shim.cmd`; plus the `--session-id=…`/`--resume=…` inline forms the
+/// bash identity shim also honors. A merely-prefixed token
+/// (`--session-id-ish`) does NOT match.
+pub fn user_chose_session(args: &[String]) -> bool {
+    args.iter().any(|a| {
+        let t = a.to_ascii_lowercase();
+        matches!(
+            t.as_str(),
+            "--session-id" | "--resume" | "-r" | "resume" | "--continue" | "-c"
+        ) || t.starts_with("--session-id=")
+            || t.starts_with("--resume=")
+    })
+}
+
+/// The claude SessionStart-hook `--settings` args: tool==claude AND the env
+/// path is non-empty AND that file exists ⇒ `["--settings", <path>]` (two argv
+/// entries — native args, no quoting games). Otherwise empty (fail-open).
+pub fn identity_settings_args(tool: IdentityTool, settings_path: Option<&str>) -> Vec<String> {
+    if tool != IdentityTool::Claude {
+        return Vec::new();
+    }
+    match settings_path {
+        Some(p) if !p.trim().is_empty() && Path::new(p).is_file() => {
+            vec!["--settings".to_string(), p.to_string()]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Compose the final identity argv (everything after the program): the
+/// ORIGINAL args byte-exact, then the `--settings` pair (claude hook), then
+/// `--session-id <pinned>` ONLY when the user did not choose a session and a
+/// pinned id exists. Pure, so passthrough purity (incl. multi-line args) is
+/// unit-testable.
+pub fn identity_argv(
+    original: &[String],
+    settings_args: &[String],
+    pinned: Option<&str>,
+    user_chose: bool,
+) -> Vec<String> {
+    let mut out: Vec<String> = original.to_vec();
+    out.extend(settings_args.iter().cloned());
+    if !user_chose {
+        if let Some(p) = pinned {
+            if !p.is_empty() {
+                out.push("--session-id".to_string());
+                out.push(p.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The identity straddle, fail-open at every step. Returns the exit code to
+/// propagate. Mirrors `identity_shim.cmd`:
+/// resolve real → guard passthrough → settings/user-chose scan → best-effort
+/// confirmation POST → exec real with the composed argv.
+fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
+    let own_dirs = own_shim_dirs();
+    let real = resolve_real(tool.program(), &own_dirs);
+
+    // Recursion guard: a nested invocation never re-pins — pure passthrough.
+    if env::var(GUARD_ENV).ok().as_deref() == Some("1") {
+        return exec_real(&real, tool.program(), args);
+    }
+
+    let pinned = env::var(PINNED_SESSION_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let user_chose = user_chose_session(args);
+    let settings = identity_settings_args(tool, env::var(CLAUDE_HOOK_SETTINGS_ENV).ok().as_deref());
+
+    // Best-effort confirmation/liveness POST (never load-bearing; the runner
+    // already recorded the session authoritatively at spawn). All failures —
+    // absent port, connect refused, non-2xx — are ignored.
+    if !user_chose {
+        if let (Some(pin), Some(port)) = (
+            pinned.as_deref(),
+            env::var(PORT_ENV)
+                .ok()
+                .and_then(|p| p.trim().parse::<u16>().ok()),
+        ) {
+            let _ = http_post(
+                port,
+                "/control/session-open",
+                &session_open_body(pin, tool.program()),
+            );
+        }
+    }
+
+    let final_args = identity_argv(args, &settings, pinned.as_deref(), user_chose);
+    exec_real(&real, tool.program(), &final_args)
+}
+
+/// JSON body for the identity confirmation POST. Every value is
+/// [`json_escape`]d.
+fn session_open_body(session_id: &str, provider: &str) -> String {
+    let terminal_id = env::var(TERMINAL_ID_ENV).unwrap_or_default();
+    let cwd = env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!(
+        "{{\"terminal_id\":\"{}\",\"session_id\":\"{}\",\"source\":\"startup\",\"provider\":\"{}\",\"cwd\":\"{}\"}}",
+        json_escape(&terminal_id),
+        json_escape(session_id),
+        json_escape(provider),
+        json_escape(&cwd)
+    )
 }
 
 /// The full straddle, fail-open at every step. Returns the exit code the stub
 /// should propagate (the real tool's, or the spawn-failure surrogate).
 fn run(tool: ShimTool, args: &[String]) -> Option<i32> {
-    let shim_dir = own_shim_dir();
-    let real = resolve_real(tool.program(), shim_dir.as_deref());
+    let own_dirs = own_shim_dirs();
+    let real = resolve_real(tool.program(), &own_dirs);
 
     // Recursion guard: a nested invocation is a pure passthrough — no runner
     // contact, just run the real tool with the guard still set.
@@ -351,33 +542,44 @@ fn log_unavailable_once() {
     );
 }
 
-/// This stub's own directory (so the real-tool scan can skip it). Prefer the
-/// env hint the materializer sets; fall back to `current_exe().parent()`.
-fn own_shim_dir() -> Option<PathBuf> {
-    if let Ok(d) = env::var(SHIM_DIR_ENV) {
-        if !d.is_empty() {
-            return Some(PathBuf::from(d));
-        }
-    }
-    env::current_exe()
+/// This stub's own directory candidates (so the real-tool scan can skip them):
+/// `current_exe().parent()` PLUS the env hint the materializer sets. BOTH are
+/// excluded because the seams inject two shim dirs (install + identity) and
+/// `SHIM_DIR_ENV` only names one of them — but the exe physically lives in the
+/// dir it was copied to, so `current_exe().parent()` always covers the copy the
+/// OS actually resolved. Missing either exclusion could let the stub resolve
+/// ITSELF as the "real" tool.
+fn own_shim_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::with_capacity(2);
+    if let Some(p) = env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf))
+    {
+        dirs.push(p);
+    }
+    if let Ok(d) = env::var(SHIM_DIR_ENV) {
+        if !d.is_empty() {
+            let p = PathBuf::from(d);
+            if !dirs.contains(&p) {
+                dirs.push(p);
+            }
+        }
+    }
+    dirs
 }
 
-/// Resolve the REAL tool: the first PATH entry (excluding `shim_dir`) that holds
+/// Resolve the REAL tool: the first PATH entry (excluding `own_dirs`) that holds
 /// `<name>.exe`, then `<name>.cmd`, then bare `<name>`. `None` ⇒ let the OS PATH
 /// resolution handle it at exec time (last-resort fail-open).
-fn resolve_real(name: &str, shim_dir: Option<&Path>) -> Option<PathBuf> {
+fn resolve_real(name: &str, own_dirs: &[PathBuf]) -> Option<PathBuf> {
     let path_var = env::var_os("PATH")?;
-    let own = shim_dir.map(normalize_dir);
+    let own: Vec<PathBuf> = own_dirs.iter().map(|d| normalize_dir(d)).collect();
     for dir in env::split_paths(&path_var) {
         if dir.as_os_str().is_empty() {
             continue;
         }
-        if let Some(own) = &own {
-            if normalize_dir(&dir) == *own {
-                continue; // skip our own dir — never recurse
-            }
+        if own.contains(&normalize_dir(&dir)) {
+            continue; // skip our own dir(s) — never recurse
         }
         // Windows real tools: cargo/pip = .exe; npm-family = .cmd. Prefer .exe.
         for cand_name in candidate_names(name) {
@@ -641,7 +843,7 @@ mod tests {
             "PATH",
             format!("{}{sep}{}", shim.display(), realbin.display()),
         );
-        let got = resolve_real("cargo", Some(shim.as_path()));
+        let got = resolve_real("cargo", std::slice::from_ref(&shim));
         if let Some(p) = saved {
             env::set_var("PATH", p);
         }
@@ -650,6 +852,313 @@ mod tests {
             normalize_dir(got.parent().unwrap()),
             normalize_dir(&realbin),
             "must resolve the real tool OUTSIDE the shim dir"
+        );
+    }
+
+    #[test]
+    fn resolve_real_skips_all_own_dirs() {
+        // The identity seam can put TWO of our dirs on PATH (identity + install)
+        // while SHIM_DIR_ENV names only one — resolution must skip every own
+        // dir, or the stub resolves itself.
+        let tmp = tempfile::tempdir().unwrap();
+        let identity = tmp.path().join("identity");
+        let install = tmp.path().join("install");
+        let realbin = tmp.path().join("realbin");
+        for d in [&identity, &install, &realbin] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let exe = if cfg!(windows) {
+            "claude.exe"
+        } else {
+            "claude"
+        };
+        std::fs::write(identity.join(exe), b"x").unwrap();
+        std::fs::write(install.join(exe), b"x").unwrap();
+        std::fs::write(realbin.join(exe), b"x").unwrap();
+
+        let saved = env::var_os("PATH");
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        env::set_var(
+            "PATH",
+            format!(
+                "{}{sep}{}{sep}{}",
+                identity.display(),
+                install.display(),
+                realbin.display()
+            ),
+        );
+        let got = resolve_real("claude", &[identity.clone(), install.clone()]);
+        if let Some(p) = saved {
+            env::set_var("PATH", p);
+        }
+        let got = got.expect("resolve real claude");
+        assert_eq!(
+            normalize_dir(got.parent().unwrap()),
+            normalize_dir(&realbin),
+            "must skip BOTH own dirs"
+        );
+    }
+
+    // ---- IDENTITY mode -----------------------------------------------------
+
+    #[test]
+    fn detect_identity_tool_from_argv0_variants() {
+        // Plain names.
+        assert_eq!(
+            detect_identity_tool(Some("claude")),
+            Some(IdentityTool::Claude)
+        );
+        assert_eq!(
+            detect_identity_tool(Some("gemini")),
+            Some(IdentityTool::Gemini)
+        );
+        // Extension + case variants (Windows materialized names).
+        assert_eq!(
+            detect_identity_tool(Some("claude.exe")),
+            Some(IdentityTool::Claude)
+        );
+        assert_eq!(
+            detect_identity_tool(Some("CLAUDE.EXE")),
+            Some(IdentityTool::Claude)
+        );
+        // Full paths, both separators.
+        assert_eq!(
+            detect_identity_tool(Some("C:\\Temp\\qontinui-identity-x\\Claude.EXE")),
+            Some(IdentityTool::Claude)
+        );
+        assert_eq!(
+            detect_identity_tool(Some("/tmp/qontinui-identity-x/gemini")),
+            Some(IdentityTool::Gemini)
+        );
+        // Unknown stems fall through to the install path (or exit-0).
+        assert_eq!(detect_identity_tool(Some("cargo.exe")), None);
+        assert_eq!(detect_identity_tool(Some("claudette")), None);
+        assert_eq!(detect_identity_tool(Some("")), None);
+        assert_eq!(detect_identity_tool(None), None);
+        // And identity names are NOT install tools.
+        assert_eq!(detect_tool(Some("claude")), None);
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn user_chose_session_token_scan() {
+        // Positive: every token, incl. case variants and any position.
+        for tok in [
+            "--session-id",
+            "--SESSION-ID",
+            "--resume",
+            "--Resume",
+            "-r",
+            "-R",
+            "resume",
+            "RESUME",
+            "--continue",
+            "-c",
+            "-C",
+        ] {
+            assert!(
+                user_chose_session(&strs(&["-p", "hi", tok])),
+                "{tok} must mark user-chose"
+            );
+        }
+        // Inline `=` forms (bash-shim parity).
+        assert!(user_chose_session(&strs(&["--session-id=abc"])));
+        assert!(user_chose_session(&strs(&["--resume=abc"])));
+        // Negative: token-exact — prefixes/lookalikes must NOT match.
+        assert!(!user_chose_session(&strs(&["--session-id-ish"])));
+        assert!(!user_chose_session(&strs(&["--session-identifier"])));
+        assert!(!user_chose_session(&strs(&["--continued"])));
+        assert!(!user_chose_session(&strs(&["-cc"])));
+        assert!(!user_chose_session(&strs(&["--print", "resume the work"])));
+        assert!(!user_chose_session(&strs(&[])));
+        // A VALUE that merely contains a token string is a separate argv entry
+        // in native-args land and DOES match only if it IS the token.
+        assert!(!user_chose_session(&strs(&[
+            "--append-system-prompt",
+            "use --resume-like flows"
+        ])));
+    }
+
+    #[test]
+    fn identity_settings_args_only_for_claude_with_existing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("settings.json");
+        std::fs::write(&file, b"{}").unwrap();
+        let path = file.to_string_lossy().into_owned();
+
+        // claude + existing file ⇒ the two-entry pair.
+        assert_eq!(
+            identity_settings_args(IdentityTool::Claude, Some(&path)),
+            vec!["--settings".to_string(), path.clone()]
+        );
+        // gemini never gets --settings.
+        assert!(identity_settings_args(IdentityTool::Gemini, Some(&path)).is_empty());
+        // Missing file / empty / unset ⇒ nothing (fail-open).
+        let missing = tmp.path().join("nope.json").to_string_lossy().into_owned();
+        assert!(identity_settings_args(IdentityTool::Claude, Some(&missing)).is_empty());
+        assert!(identity_settings_args(IdentityTool::Claude, Some("")).is_empty());
+        assert!(identity_settings_args(IdentityTool::Claude, Some("  ")).is_empty());
+        assert!(identity_settings_args(IdentityTool::Claude, None).is_empty());
+    }
+
+    #[test]
+    fn identity_argv_composition() {
+        let multiline = "You are in a runner pane.\nSecond line \"quoted\" & <cmd|metachars>";
+        let orig = strs(&["--append-system-prompt", multiline, "--version"]);
+        let settings = strs(&["--settings", "C:\\hooks\\s.json"]);
+
+        // Pinned + not user-chose ⇒ original (byte-exact) + settings + pin.
+        let got = identity_argv(&orig, &settings, Some("pin-123"), false);
+        assert_eq!(
+            got,
+            strs(&[
+                "--append-system-prompt",
+                multiline,
+                "--version",
+                "--settings",
+                "C:\\hooks\\s.json",
+                "--session-id",
+                "pin-123",
+            ])
+        );
+        // The multi-line arg passes through BYTE-EXACT (the 2026-07-03 P0: the
+        // .cmd shim mangled/refused exactly this argument class).
+        assert_eq!(got[1], multiline);
+
+        // User chose ⇒ no pin appended, settings still delivered.
+        assert_eq!(
+            identity_argv(&orig, &settings, Some("pin-123"), true),
+            [orig.clone(), settings.clone()].concat()
+        );
+        // No pinned id ⇒ no pin appended.
+        assert_eq!(
+            identity_argv(&orig, &settings, None, false),
+            [orig.clone(), settings.clone()].concat()
+        );
+        assert_eq!(
+            identity_argv(&orig, &settings, Some(""), false),
+            [orig.clone(), settings.clone()].concat()
+        );
+        // No settings ⇒ original + pin only.
+        assert_eq!(
+            identity_argv(&orig, &[], Some("p"), false),
+            [orig.clone(), strs(&["--session-id", "p"])].concat()
+        );
+    }
+
+    #[test]
+    fn session_open_body_is_valid_json_shape() {
+        let body = session_open_body("sid-1", "claude");
+        assert!(body.starts_with('{') && body.ends_with('}'));
+        assert!(body.contains("\"session_id\":\"sid-1\""));
+        assert!(body.contains("\"source\":\"startup\""));
+        assert!(body.contains("\"provider\":\"claude\""));
+        assert!(body.contains("\"terminal_id\":"));
+        // cwd is escaped (Windows backslashes must not produce bare `\`).
+        assert!(body.contains("\"cwd\":\""));
+        assert!(!body.contains('\n'));
+    }
+
+    /// END-TO-END regression for the 2026-07-03 P0: invoking the identity shim
+    /// EXE as `claude.exe` with an argument containing an EMBEDDED NEWLINE must
+    /// launch the real tool and pass every argument byte-exact (plus append the
+    /// pinned `--session-id`). The `.cmd` shim died here with "The syntax of
+    /// the command is incorrect."
+    ///
+    /// Ignored by default: it needs the built `qontinui-shim.exe`
+    /// (`cargo build --bin qontinui-shim` first; override the location with
+    /// `QONTINUI_SHIM_E2E_EXE`) and a working `rustc` to compile a tiny
+    /// arg-recording fake provider.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs a built qontinui-shim.exe + rustc; run explicitly"]
+    fn e2e_identity_exe_passes_multiline_arg_byte_exact() {
+        // Locate the built shim exe (target/debug/qontinui-shim.exe relative to
+        // this test binary in target/debug/deps/).
+        let shim_exe = env::var("QONTINUI_SHIM_E2E_EXE")
+            .map(PathBuf::from)
+            .ok()
+            .filter(|p| p.is_file())
+            .or_else(|| {
+                let me = env::current_exe().ok()?;
+                let debug = me.parent()?.parent()?;
+                let p = debug.join("qontinui-shim.exe");
+                p.is_file().then_some(p)
+            })
+            .expect("qontinui-shim.exe not found — build it or set QONTINUI_SHIM_E2E_EXE");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shim_dir = tmp.path().join("identity");
+        let realbin = tmp.path().join("realbin");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&realbin).unwrap();
+        std::fs::copy(&shim_exe, shim_dir.join("claude.exe")).unwrap();
+
+        // Compile a tiny NATIVE fake provider that records its argv (0x1F-
+        // separated, so embedded newlines survive) to the file named by
+        // QONTINUI_E2E_ARGS_OUT. It must be a real exe: the whole point is that
+        // no cmd.exe re-quoting layer sits between the shim and the provider.
+        let helper_src = tmp.path().join("fake_claude.rs");
+        std::fs::write(
+            &helper_src,
+            r#"fn main() {
+                let out = std::env::var("QONTINUI_E2E_ARGS_OUT").unwrap();
+                let args: Vec<String> = std::env::args().skip(1).collect();
+                std::fs::write(out, args.join("\x1f")).unwrap();
+            }"#,
+        )
+        .unwrap();
+        let rustc = Command::new("rustc")
+            .args([
+                helper_src.to_str().unwrap(),
+                "-o",
+                realbin.join("claude.exe").to_str().unwrap(),
+            ])
+            .output()
+            .expect("rustc must be runnable for this e2e test");
+        assert!(
+            rustc.status.success(),
+            "helper compile failed: {}",
+            String::from_utf8_lossy(&rustc.stderr)
+        );
+
+        let args_out = tmp.path().join("argv.txt");
+        let multiline = "You are running inside a qontinui-runner terminal.\nline two\nline three";
+        let sep = ";";
+        let path = format!(
+            "{}{sep}{}{sep}{}",
+            shim_dir.display(),
+            realbin.display(),
+            env::var("PATH").unwrap_or_default()
+        );
+        let status = Command::new(shim_dir.join("claude.exe"))
+            .args(["--append-system-prompt", multiline, "--version"])
+            .env("PATH", &path)
+            .env("QONTINUI_E2E_ARGS_OUT", &args_out)
+            .env("QONTINUI_PINNED_SESSION_ID", "e2e-pin-1")
+            .env_remove("QONTINUI_INSTALL_INTERCEPT_GUARD")
+            .env_remove("QONTINUI_INSTALL_INTERCEPT_PORT")
+            .env_remove("QONTINUI_INSTALL_INTERCEPT_SHIM_DIR")
+            .env_remove("QONTINUI_CLAUDE_HOOK_SETTINGS")
+            .status()
+            .expect("shim exe must spawn");
+        assert!(status.success(), "shim must propagate the fake's exit 0");
+
+        let recorded = std::fs::read_to_string(&args_out).expect("fake provider must have run");
+        let got: Vec<&str> = recorded.split('\x1f').collect();
+        assert_eq!(
+            got,
+            vec![
+                "--append-system-prompt",
+                multiline,
+                "--version",
+                "--session-id",
+                "e2e-pin-1",
+            ],
+            "argv must arrive byte-exact (multi-line arg intact) + pinned id"
         );
     }
 }
