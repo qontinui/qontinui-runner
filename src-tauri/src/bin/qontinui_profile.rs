@@ -60,6 +60,7 @@ use qontinui_runner_lib::pair::{
     coord_http_base, derive_web_base_from_coord, pair_via_browser, pair_with_auth_token,
     pair_with_pair_code, persist_pairing, tenant_id_from_oauth_claim, PairCompleteResponse,
 };
+use qontinui_runner_lib::profile_cli::EnvCmd;
 use qontinui_runner_lib::profiles::{
     load_strict, profiles_path, AuthConfig, BlobConfig, Profile, ProfilesFile,
 };
@@ -132,38 +133,9 @@ enum Cmd {
     },
 }
 
-#[derive(Subcommand, Debug)]
-enum EnvCmd {
-    /// Enroll this machine into a web environment via an enrollment code.
-    /// POSTs `{enrollment_code, machine_id, hostname}` to
-    /// `{backend}/api/v1/devenv/agent/enroll`; on success stores the returned
-    /// `mk_<token>` machine key in secure storage and writes
-    /// `~/.qontinui/env-agent.json` with the RESPONSE environment_id.
-    Enroll {
-        /// The enrollment code minted by the web dashboard.
-        #[arg(long)]
-        code: String,
-        /// Override the backend base URL. Falls back to `QONTINUI_WEB_BASE`,
-        /// then a web base derived from the active profile's coord_url.
-        #[arg(long)]
-        backend: Option<String>,
-        /// Reserved override for the target environment id. Normally the
-        /// environment is assigned by the enroll response; this is only used
-        /// for diagnostics / re-enroll against a specific environment.
-        #[arg(long)]
-        environment: Option<String>,
-    },
-    /// Capture the current dev-environment config and push it to the backend.
-    /// `--dry-run` assembles + pretty-prints the envelope WITHOUT pushing.
-    Capture {
-        /// Assemble + print the envelope without POSTing.
-        #[arg(long)]
-        dry_run: bool,
-    },
-    /// Print enrollment state (from env-agent.json) + whether a machine key is
-    /// stored.
-    Show,
-}
+// `EnvCmd` (the `env enroll/capture/show` subcommand tree) lives in
+// `qontinui_runner_lib::profile_cli` so this bin AND the main runner binary's
+// pre-GUI CLI mode share one implementation.
 
 #[derive(Subcommand, Debug)]
 enum DeviceCmd {
@@ -243,15 +215,9 @@ fn main() -> ExitCode {
                 tenant_id.as_deref(),
             ),
         },
-        Cmd::Env { sub } => match sub {
-            EnvCmd::Enroll {
-                code,
-                backend,
-                environment,
-            } => cmd_env_enroll(&code, backend.as_deref(), environment.as_deref()),
-            EnvCmd::Capture { dry_run } => cmd_env_capture(dry_run),
-            EnvCmd::Show => cmd_env_show(),
-        },
+        // The `env` subcommands share one implementation with the main runner
+        // binary's pre-GUI CLI mode (`qontinui-runner env …`), in the lib.
+        Cmd::Env { sub } => ExitCode::from(qontinui_runner_lib::profile_cli::run_env(sub)),
     }
 }
 
@@ -1122,150 +1088,6 @@ fn active_profile_dsn() -> Result<String, String> {
     load_strict()
         .map(|p| p.database_url)
         .map_err(|e| format!("active profile has no database_url: {}", e))
-}
-
-// ============================================================================
-// env subcommand — machine-side dev-environment capture agent
-// ============================================================================
-//
-// `env enroll` binds this machine to a web environment via a per-machine API
-// key (`mk_<token>`), stored in the encrypted secure storage. `env capture`
-// pushes a SECRET-FREE config envelope. `env show` prints enrollment state.
-//
-// The capture/push logic + envelope assembly live in
-// `qontinui_runner_lib::env_agent` so the runner GUI's background task and this
-// CLI share one code path.
-
-fn cmd_env_enroll(
-    code: &str,
-    backend_arg: Option<&str>,
-    environment_arg: Option<&str>,
-) -> ExitCode {
-    use qontinui_runner_lib::env_agent::enroll::{self, EnrollParams};
-
-    if code.trim().is_empty() {
-        eprintln!("error: --code requires a non-empty enrollment code");
-        return ExitCode::from(2);
-    }
-
-    let backend = match enroll::resolve_backend_base(backend_arg) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::from(2);
-        }
-    };
-
-    // machine_id + hostname come from ~/.qontinui/machine.json (run
-    // `qontinui_profile device init` first for a stable identity). Absence is
-    // tolerated — the shared core sends nulls and the backend may assign a
-    // machine_id.
-    let (machine_id, hostname) = enroll::local_machine_identity();
-    if machine_id.is_none() {
-        eprintln!(
-            "note: no readable ~/.qontinui/machine.json — enrolling with null machine_id/hostname \
-             (run `qontinui_profile device init` first for a stable identity)"
-        );
-    }
-
-    // The POST + key storage + env-agent.json write live in the shared
-    // `env_agent::enroll` core, so this CLI, the in-app Tauri command, and the
-    // (Phase 3) dispatched directive consumer all enroll through one code path.
-    match enroll::run_enroll(EnrollParams {
-        code: code.to_string(),
-        backend,
-        machine_id,
-        hostname,
-        environment_override: environment_arg.map(|s| s.to_string()),
-    }) {
-        Ok(outcome) => {
-            println!(
-                "enrolled: machine_id={} environment_id={} backend={} (machine key stored)",
-                outcome.machine_id, outcome.environment_id, outcome.backend_url
-            );
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("error: {e}");
-            ExitCode::from(1)
-        }
-    }
-}
-
-fn cmd_env_capture(dry_run: bool) -> ExitCode {
-    // Publish a lazy PG pool from the active profile so the high-value
-    // `db_schema` collector (alembic_head + schema/table census) can run. The
-    // full runner does this at boot (main.rs fleet-publishers block); the
-    // standalone CLI has no pre-built pool, so without this the section is
-    // always omitted and schema drift is invisible from the CLI. Best-effort:
-    // a build failure here (or a connect failure later inside the collector)
-    // just omits the `db_schema` section — capture still succeeds.
-    let profile = qontinui_runner_lib::profiles::load();
-    if let Err(e) = qontinui_runner_lib::env_agent::publish_pg_pool_from_url(&profile.database_url)
-    {
-        eprintln!("note: db_schema collector unavailable — {e}");
-    }
-
-    if dry_run {
-        match qontinui_runner_lib::env_agent::build_envelope_blocking() {
-            Ok(envelope) => match serde_json::to_string_pretty(&envelope) {
-                Ok(s) => {
-                    println!("{s}");
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("error: serialize envelope failed: {e}");
-                    ExitCode::from(2)
-                }
-            },
-            Err(e) => {
-                eprintln!("error: building envelope failed: {e}");
-                ExitCode::from(2)
-            }
-        }
-    } else {
-        match qontinui_runner_lib::env_agent::capture_and_push_blocking() {
-            Ok(()) => {
-                println!("capture pushed (or skipped — machine not enrolled)");
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("error: capture/push failed: {e}");
-                ExitCode::from(1)
-            }
-        }
-    }
-}
-
-fn cmd_env_show() -> ExitCode {
-    let cfg = qontinui_runner_lib::env_agent::config::EnvAgentConfig::load();
-    let key_stored = qontinui_runner_lib::secure_storage::SecureStorage::new()
-        .ok()
-        .and_then(|s| s.get_agent_machine_key().ok().flatten())
-        .map(|k| !k.is_empty())
-        .unwrap_or(false);
-
-    let out = match cfg {
-        Some(c) => json!({
-            "enrolled": c.is_enrolled() && key_stored,
-            "backend_url": c.backend_url,
-            "machine_id": c.machine_id,
-            "environment_id": c.environment_id,
-            "enrolled_at": c.enrolled_at,
-            "machine_key_stored": key_stored,
-            "config_path": qontinui_runner_lib::env_agent::config::EnvAgentConfig::path()
-                .map(|p| p.display().to_string()),
-        }),
-        None => json!({
-            "enrolled": false,
-            "machine_key_stored": key_stored,
-            "config_path": qontinui_runner_lib::env_agent::config::EnvAgentConfig::path()
-                .map(|p| p.display().to_string()),
-            "note": "no env-agent.json — run `qontinui_profile env enroll --code <code>`",
-        }),
-    };
-    println!("{}", serde_json::to_string_pretty(&out).unwrap());
-    ExitCode::SUCCESS
 }
 
 #[cfg(test)]

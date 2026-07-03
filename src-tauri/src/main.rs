@@ -253,6 +253,17 @@ use tracing::{error, info, warn};
 use video_recorder::VideoRecordingService;
 
 fn main() {
+    // Pre-GUI CLI mode (Phase 1a — devenv enrollment). `qontinui-runner env
+    // <sub> …` runs the enrollment CLI (enroll / capture / show) and exits
+    // BEFORE any Tauri/GUI init, so the installed runner binary doubles as the
+    // on-box enroll tool with no separately-bundled sidecar. Runs before the
+    // single-instance plugin registers, so a CLI invocation never gets forwarded
+    // to a running GUI instance. Only allow-listed subcommands divert; a bare
+    // launch / `qontinui://` deep-link falls through to the GUI below.
+    if let Some(code) = qontinui_runner_lib::profile_cli::try_run_cli() {
+        std::process::exit(code as i32);
+    }
+
     // Enable backtraces in crash dumps for better diagnostics
     std::env::set_var("RUST_BACKTRACE", "1");
 
