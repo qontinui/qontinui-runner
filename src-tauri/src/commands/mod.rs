@@ -180,6 +180,7 @@ pub mod database; // Database maintenance and optimization
 pub mod dataset;
 pub mod debug;
 pub mod dev_findings; // Dev-only: seed synthetic findings into the frontend tracker
+pub mod devenv_enroll; // Phase 2 — in-app devenv enrollment (no terminal); wraps env_agent::enroll
 pub mod discoveries;
 pub mod durable_execution; // Conductor-inspired replay, rollback, iteration diffs
 pub mod event_search; // Unified full-text search across activity_timeline, observations, deferred_questions, error_events

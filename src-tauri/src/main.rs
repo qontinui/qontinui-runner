@@ -1319,6 +1319,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::debug::set_debug_settings,
             commands::dev_findings::dev_seed_finding,
             commands::dev_findings::is_dev_endpoints_enabled,
+            commands::devenv_enroll::devenv_enroll,
+            commands::devenv_enroll::devenv_enroll_status,
             commands::discoveries::clear_discovery,
             commands::discoveries::clear_failed_discoveries,
             commands::discoveries::get_discovery_summary,
