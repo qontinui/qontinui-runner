@@ -714,6 +714,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // sibling publishers above.
                 qontinui_runner_lib::env_agent::publish_pg_pool(fleet_publish_pg.pool().clone());
                 qontinui_runner_lib::env_agent::spawn_env_capture();
+                // Phase 3 — dispatched self-enroll: subscribe to coord's
+                // `events.devenv.enroll_requested.<device_id>` directive on its
+                // own WS connection (isolated from the agent-spawn subscriber) and
+                // enroll THIS machine via the shared env_agent::enroll core.
+                qontinui_runner_lib::env_agent::directive::spawn_enroll_directive_subscriber();
                 // Session Bus Phase 3b directed-message delivery executor is
                 // RETIRED in favor of `mcp::session_message_poller` (in-session
                 // continuation delivery, plan 2026-06-21 Phase 2), which adds
