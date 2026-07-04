@@ -2495,6 +2495,255 @@ pub fn spawn_tree_publisher() {
     });
 }
 
+// =============================================================================
+// P3 Auto-Fresh Cycle
+// (plan 2026-06-XX-auto-fresh-follow-on.md)
+//
+// Periodically pulls the latest code for registered apps on the fleet. For each
+// app, records the deployment outcome (successful SHA, error, freshness status)
+// to project.app_deploy_state. Includes an idle-aware guard to avoid pulling
+// while workflows are running.
+//
+// Best-effort semantics: errors log at warn!/debug! and never break the cycle;
+// the next tick retries.
+// =============================================================================
+
+/// Check if the runner has active task-runs. Returns `true` if any tasks are
+/// running, `false` if idle or if the health check fails (best-effort).
+async fn runner_has_active_tasks() -> bool {
+    let Ok(resp) = reqwest::Client::new()
+        .get("http://localhost:9876/task-runs/running")
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+    else {
+        // Best-effort: on error, assume idle (don't block auto-fresh).
+        debug!("fleet::auto_fresh: task-runs health check failed; assuming idle");
+        return false;
+    };
+
+    let Ok(json) = resp.json::<serde_json::Value>().await else {
+        debug!("fleet::auto_fresh: task-runs response parse failed; assuming idle");
+        return false;
+    };
+
+    // Check if there's a non-empty array of running tasks.
+    json.as_array()
+        .map(|arr| !arr.is_empty())
+        .unwrap_or(false)
+}
+
+/// Process auto-fresh for a single app on this device. Pulls the app's repo,
+/// records the outcome (deployed SHA or error) to project.app_deploy_state.
+///
+/// `device_id` is the UUID from ~/.qontinui/machine.json.
+/// `app_id` is the app identifier (e.g. "qontinui-runner").
+/// `repo_path` is the filesystem path to the repo to pull.
+///
+/// Returns `Ok` on successful pull, `Err(msg)` if the pull fails (but the
+/// outcome is still recorded). Errors are best-effort — failures log but never
+/// break the cycle. Must run on a blocking task (git spawn is synchronous).
+fn process_auto_fresh_app_blocking(
+    repo_path: &std::path::Path,
+    repo_path_str: &str,
+) -> (Option<String>, Option<String>) {
+    // Get the new HEAD SHA after pull (on success).
+    use std::process::Command;
+
+    let default_branch = "main"; // Assumes default is main; could resolve from origin/HEAD
+
+    // Re-check at apply time that the tree is still clean and on default.
+    let cur_branch = Command::new("git")
+        .args(["-C", repo_path_str, "symbolic-ref", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
+    if cur_branch.as_deref() != Some(default_branch) {
+        return (
+            None,
+            Some(format!(
+                "not on default branch (on {:?}); skipping pull",
+                cur_branch
+            )),
+        );
+    }
+
+    let clean = Command::new("git")
+        .args(["-C", repo_path_str, "status", "--porcelain=v1"])
+        .output()
+        .ok()
+        .map(|o| o.status.success() && o.stdout.is_empty())
+        .unwrap_or(false);
+
+    if !clean {
+        return (
+            None,
+            Some("tree is dirty; skipping pull".to_string()),
+        );
+    }
+
+    // ff-only pull of the default branch.
+    let pull_out = Command::new("git")
+        .args([
+            "-C",
+            repo_path_str,
+            "pull",
+            "--ff-only",
+            "origin",
+            default_branch,
+        ])
+        .output();
+
+    match pull_out {
+        Ok(o) if o.status.success() => {
+            // Get the new HEAD SHA.
+            let new_sha = Command::new("git")
+                .args(["-C", repo_path_str, "rev-parse", "HEAD"])
+                .output()
+                .ok()
+                .filter(|x| x.status.success())
+                .map(|x| String::from_utf8_lossy(&x.stdout).trim().to_string());
+            (new_sha, None)
+        }
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            let excerpt: String = err.trim().chars().take(200).collect();
+            (
+                None,
+                Some(format!("git pull --ff-only failed: {excerpt}")),
+            )
+        }
+        Err(e) => (
+            None,
+            Some(format!("git pull spawn failed: {e}")),
+        ),
+    }
+}
+
+/// Process auto-fresh for one app. Checks idle status, pulls if safe, and
+/// records the outcome. Called from the orchestrating `run_auto_fresh_cycle`.
+async fn process_auto_fresh_app(
+    pg: &Arc<PgDb>,
+    device_id: uuid::Uuid,
+    app_id: &str,
+    repo_path: std::path::PathBuf,
+) {
+    // Idle-aware guard: skip if runner has active tasks.
+    if runner_has_active_tasks().await {
+        debug!(
+            "fleet::auto_fresh: runner has active tasks; skipping pull of {app_id}"
+        );
+        return;
+    }
+
+    let repo_path_str = match repo_path.to_str() {
+        Some(s) => s.to_string(),
+        None => {
+            warn!(
+                "fleet::auto_fresh: {app_id} repo path is not UTF-8; skipping"
+            );
+            return;
+        }
+    };
+
+    // Run git operations on blocking pool.
+    let rp = repo_path.clone();
+    let rps = repo_path_str.clone();
+    let (new_sha, error) = match tokio::task::spawn_blocking(move || {
+        process_auto_fresh_app_blocking(&rp, &rps)
+    })
+    .await
+    {
+        Ok((sha, err)) => (sha, err),
+        Err(e) => {
+            warn!(
+                "fleet::auto_fresh: {app_id} spawn_blocking panicked: {e}"
+            );
+            (None, Some(format!("task panic: {e}")))
+        }
+    };
+
+    // Record outcome to database (best-effort).
+    let freshness = if error.is_none() { "fresh" } else { "failed" };
+    crate::database::pg::app_deploy_state::update_app_deploy_state_best_effort(
+        pg,
+        device_id,
+        app_id,
+        new_sha.as_deref(),
+        freshness,
+        error.as_deref(),
+    )
+    .await;
+
+    if let Some(e) = error {
+        debug!(
+            "fleet::auto_fresh: {app_id} failed: {e}"
+        );
+    } else if let Some(sha) = new_sha {
+        info!(
+            "fleet::auto_fresh: {app_id} pulled successfully (HEAD={})",
+            &sha[..sha.len().min(12)]
+        );
+    }
+}
+
+/// Run one auto-fresh cycle: pull configured apps (if idle), record outcomes
+/// to project.app_deploy_state.
+///
+/// Orchestrates per-app pulls. Device identity comes from ~/.qontinui/machine.json.
+/// App registry comes from the given `apps` list (typically fetched from
+/// project.apps). Best-effort: errors log but never break the cycle.
+pub async fn run_auto_fresh_cycle(
+    pg: &Arc<PgDb>,
+    apps: Vec<(String, String)>, // Vec<(app_id, repo_root)>
+) -> Result<(), String> {
+    // Load device identity.
+    let device = match load_device_file() {
+        Some(d) => d,
+        None => {
+            info!(
+                "fleet::auto_fresh: ~/.qontinui/machine.json missing — \
+                 run `qontinui_profile device init` to enable auto-fresh. Skipping."
+            );
+            return Ok(());
+        }
+    };
+
+    let device_id = match uuid::Uuid::parse_str(&device.device_id) {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(
+                "fleet::auto_fresh: machine.json device_id is not a valid UUID ({e}). Skipping."
+            );
+            return Ok(());
+        }
+    };
+
+    // Process each app in parallel.
+    let mut tasks = Vec::new();
+    for (app_id, repo_root) in apps {
+        let pg_clone = pg.clone();
+        let repo_path = std::path::PathBuf::from(repo_root);
+        let app_id_clone = app_id.clone();
+
+        let task = tokio::spawn(async move {
+            process_auto_fresh_app(&pg_clone, device_id, &app_id_clone, repo_path).await;
+        });
+        tasks.push(task);
+    }
+
+    // Wait for all tasks to complete. Any panics are logged per-task.
+    for task in tasks {
+        if let Err(e) = task.await {
+            warn!("fleet::auto_fresh: app task panicked: {e}");
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

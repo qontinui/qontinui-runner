@@ -8,6 +8,7 @@ pub mod adaptive_learning;
 pub mod agent_worktrees;
 pub mod agentic_metrics;
 pub mod ai_sessions;
+pub mod app_deploy_state;
 pub mod approval_gates;
 pub mod apps;
 pub mod breakpoints;
@@ -380,6 +381,33 @@ impl PgDb {
         )
         .await
         .map_err(|e| format!("Stream B project.apps self-heal failed: {}", e))?;
+
+        // P3 auto-fresh: project.app_deploy_state — tracks deployment outcomes
+        // per app per device (deployed_sha, freshness status, last error).
+        //
+        // Authored declaratively in `atlas/schema.hcl`; mirrored here as a
+        // CREATE TABLE IF NOT EXISTS self-heal so a fresh PG without Atlas
+        // applied still boots cleanly. The fleet auto-fresh cycle writes to this
+        // table after each pull attempt.
+        conn.batch_execute(
+            "CREATE TABLE IF NOT EXISTS project.app_deploy_state ( \
+                 device_id       UUID NOT NULL, \
+                 app_id          TEXT NOT NULL, \
+                 deployed_sha    TEXT, \
+                 freshness       TEXT NOT NULL, \
+                 last_error      TEXT, \
+                 updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(), \
+                 PRIMARY KEY (device_id, app_id) \
+             ); \
+             CREATE INDEX IF NOT EXISTS idx_app_deploy_state_app_id \
+                 ON project.app_deploy_state (app_id); \
+             CREATE INDEX IF NOT EXISTS idx_app_deploy_state_freshness \
+                 ON project.app_deploy_state (freshness); \
+             CREATE INDEX IF NOT EXISTS idx_app_deploy_state_updated_at \
+                 ON project.app_deploy_state (updated_at DESC);",
+        )
+        .await
+        .map_err(|e| format!("P3 project.app_deploy_state self-heal failed: {}", e))?;
 
         // B v1 Polish Step 1c: backfill threshold columns if apps table already exists.
         // Idempotent: UPDATE WHERE IS NULL only affects rows missing the columns after ADD COLUMN IF NOT EXISTS.
