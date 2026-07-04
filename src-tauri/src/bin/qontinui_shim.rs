@@ -98,9 +98,16 @@ fn main() -> std::process::ExitCode {
     let tool = match detect_tool(argv0.as_deref()) {
         Some(t) => t,
         None => {
-            // Unknown invocation name: nothing sensible to do. Exit 0 rather
-            // than panic (the materializer only ever names us a known tool).
-            return std::process::ExitCode::from(0);
+            // Unknown invocation name: LOUD fail-open passthrough. This must
+            // never be a silent exit 0 — on 2026-07-03 a stale stub (predating
+            // identity mode) deployed as `claude.exe` silently no-opped every
+            // pane claude launch, an invisible breakage. One stderr line, then
+            // a TRUE passthrough to the real tool (resolved OUTSIDE our own
+            // shim dirs); only when nothing resolves, exit 127 (not 0).
+            return std::process::ExitCode::from(code_to_u8(run_unknown_passthrough(
+                argv0.as_deref(),
+                &args,
+            )));
         }
     };
 
@@ -124,6 +131,39 @@ fn code_to_u8(code: Option<i32>) -> u8 {
             }
         }
         None => 1,
+    }
+}
+
+/// Loud fail-open passthrough for an argv[0] this stub does not recognize
+/// (neither an install [`ShimTool`] nor an [`IdentityTool`]). The stale-deploy
+/// failure mode: a materializer copies THIS binary under tool names the
+/// running stub build predates, so an old stub can find itself invoked under a
+/// name it has never heard of. Behavior:
+///
+/// 1. ONE stderr line naming the unknown argv[0] — the breakage must be
+///    visible, never a silent no-op.
+/// 2. TRUE passthrough: resolve the real tool by the argv[0] stem via
+///    [`resolve_real`] excluding [`own_shim_dirs`] (so the stub can never
+///    resolve ITSELF — no self-spawn loop) and run it with the original args,
+///    propagating the exit code.
+/// 3. Only when nothing resolves, exit 127 (command-not-found surrogate) —
+///    NOT 0: an unknown-name invocation that did nothing must not look like
+///    success. There is deliberately NO blind `Command::new(name)` fallback
+///    here (unlike the known-tool path): with an unknown name, PATH dispatch
+///    could resolve straight back to this stub's own copy.
+fn run_unknown_passthrough(argv0: Option<&str>, args: &[String]) -> Option<i32> {
+    let _ = writeln!(
+        std::io::stderr(),
+        "qontinui-shim: unknown invocation name '{}' — this stub does not impersonate that tool (stale sidecar deploy?); attempting passthrough",
+        argv0.unwrap_or("")
+    );
+    let name = match argv0.map(argv0_stem) {
+        Some(n) if !n.is_empty() => n,
+        _ => return Some(127), // no name to resolve — loud failure, not exit 0
+    };
+    match resolve_real(&name, &own_shim_dirs()) {
+        Some(real) => exec_real(&Some(real), &name, args),
+        None => Some(127),
     }
 }
 
@@ -747,6 +787,28 @@ mod tests {
         assert_eq!(code_to_u8(Some(256)), 1);
         // Signal-killed (None) → 1.
         assert_eq!(code_to_u8(None), 1);
+    }
+
+    /// The unknown-argv0 path must NEVER report success without doing anything
+    /// (the 2026-07-03 stale-`claude.exe` silent no-op): when the real tool
+    /// cannot be resolved at all, the stub exits 127 — not 0. (The resolvable
+    /// branch execs a child, so it is exercised by the ignored e2e test, not
+    /// here; this covers every spawn-free branch.)
+    #[test]
+    fn unknown_passthrough_exits_127_never_0_when_unresolvable() {
+        // No argv0 / empty stem → nothing to resolve → 127.
+        assert_eq!(run_unknown_passthrough(None, &[]), Some(127));
+        assert_eq!(run_unknown_passthrough(Some(""), &[]), Some(127));
+        // An unknown name that resolves to nothing on PATH → 127.
+        assert_eq!(
+            run_unknown_passthrough(
+                Some("C:\\stale\\shim\\definitely-not-a-real-tool-qzx.exe"),
+                &strs(&["--version"]),
+            ),
+            Some(127)
+        );
+        // And 127 survives the ExitCode clamp (never collapses to exit 0).
+        assert_eq!(code_to_u8(Some(127)), 127);
     }
 
     #[test]
