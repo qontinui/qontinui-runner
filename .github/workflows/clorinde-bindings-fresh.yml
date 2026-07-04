@@ -46,6 +46,16 @@ permissions:
   contents: write
   pull-requests: write
 
+env:
+  # The `cargo check` re-run against fresh bindings compiles the whole
+  # workspace, including the `postgresql_embedded` (bundled) build script — a
+  # compile-time GitHub API release enumeration that 403s on the unauthenticated
+  # 60/hr shared-IP budget. The existing GITHUB_TOKEN/CLORINDE_AUTOCOMMIT_TOKEN
+  # refs are only on the checkout/push steps, not the build env; this
+  # workflow-level export reaches the cargo step.
+  # Plan: 2026-07-04-runner-ci-postgresql-embedded-403-fix.
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
 jobs:
   # ---------------------------------------------------------------------
   # detect: short-circuit when the PR doesn't touch Clorinde-relevant

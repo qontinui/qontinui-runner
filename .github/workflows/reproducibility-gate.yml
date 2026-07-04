@@ -33,6 +33,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Authenticate the `postgresql_embedded` (bundled) build script's compile-time
+  # GitHub API release enumeration — else the unauthenticated 60/hr shared-IP
+  # budget 403s intermittently. Plan: 2026-07-04-runner-ci-postgresql-embedded-403-fix.
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
   repro-build:

@@ -36,6 +36,13 @@ on:
       - "src-tauri/src/relay_envelopes.rs"
       - "src-tauri/scripts/generate_types.sh"
 
+env:
+  # generate_types.sh runs `cargo build --bin export_schemas`, which compiles
+  # the `postgresql_embedded` (bundled) build script → a compile-time GitHub API
+  # release enumeration that 403s on the unauthenticated 60/hr shared-IP budget.
+  # Authenticate it. Plan: 2026-07-04-runner-ci-postgresql-embedded-403-fix.
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
 jobs:
   check-drift:
     runs-on: ubuntu-latest

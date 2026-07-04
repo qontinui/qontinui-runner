@@ -30,6 +30,13 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Authenticate the `postgresql_embedded` (bundled) build script's GitHub
+  # API calls (it enumerates theseus-rs/postgresql-binaries releases at
+  # compile time). Unauthenticated api.github.com is 60 req/hr keyed on the
+  # shared GitHub-hosted-runner IP, which the multi-page enumeration blows
+  # through → intermittent 403 build failures. The Actions token moves it to
+  # the ~1000/hr per-token budget. Plan: 2026-07-04-runner-ci-postgresql-embedded-403-fix.
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
   test:
