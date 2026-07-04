@@ -1464,6 +1464,15 @@ impl TerminalSession {
         self.coord_session_id.lock().ok().and_then(|g| *g)
     }
 
+    /// Read the session's current display title (see [`Self::set_title`]).
+    /// Poison-tolerant: title is pure text with no invariants to preserve.
+    pub fn title(&self) -> String {
+        self.title
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|e| e.into_inner().clone())
+    }
+
     /// R1 — install the on-exit hook the waiter thread fires the instant
     /// the PTY process exits. `terminal_create` wires this (alongside
     /// [`Self::set_coord_session_id`]) to close the coord session mirror
