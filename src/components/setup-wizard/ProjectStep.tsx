@@ -1,8 +1,9 @@
 import { useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { FolderOpen, Search, Loader2, Package, CheckSquare, Square } from "lucide-react";
+import { FolderOpen, Search, Loader2, Package, CheckSquare, Square, HardDrive, GitBranch } from "lucide-react";
 import type { SavedProject } from "../../hooks/useSavedProjects";
+import { GithubRepoPicker } from "./GithubRepoPicker";
 
 interface Project {
   path: string;
@@ -66,11 +67,33 @@ export function ProjectStep({
   onNext,
   onBack,
 }: ProjectStepProps) {
+  const [mode, setMode] = useState<"local" | "github">("local");
   const [scanPath, setScanPath] = useState("");
   const [discoveredProjects, setDiscoveredProjects] = useState<Project[]>([]);
   const [scanning, setScanning] = useState(false);
   const [scanned, setScanned] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  /**
+   * Merge freshly-cloned projects into the discovered + selected lists.
+   * De-duplicates by path so re-cloning the same repo doesn't create doubles,
+   * and marks the step as "scanned" so the Continue button enables.
+   */
+  const handleClonedProjects = useCallback(
+    (cloned: Project[]) => {
+      setDiscoveredProjects((prev) => {
+        const byPath = new Map(prev.map((p) => [p.path, p]));
+        for (const p of cloned) byPath.set(p.path, p);
+        return Array.from(byPath.values());
+      });
+      onProjectsChange([
+        ...selectedProjects.filter((p) => !cloned.some((c) => c.path === p.path)),
+        ...cloned,
+      ]);
+      setScanned(true);
+    },
+    [selectedProjects, onProjectsChange],
+  );
 
   const pickFolder = useCallback(async () => {
     try {
@@ -149,11 +172,36 @@ export function ProjectStep({
       <div className="text-center">
         <h2 className="text-h2 mb-2">Discover Projects</h2>
         <p className="text-body text-muted-foreground">
-          Select a folder to scan for software projects
+          Scan a local folder or clone a repository from GitHub
         </p>
       </div>
 
+      {/* Source mode toggle */}
+      <div className="flex gap-2 justify-center">
+        <button
+          className={`btn-secondary flex items-center gap-2 ${
+            mode === "local" ? "border-primary/50 text-primary" : ""
+          }`}
+          onClick={() => setMode("local")}
+        >
+          <HardDrive className="w-4 h-4" />
+          Local folder
+        </button>
+        <button
+          className={`btn-secondary flex items-center gap-2 ${
+            mode === "github" ? "border-primary/50 text-primary" : ""
+          }`}
+          onClick={() => setMode("github")}
+        >
+          <GitBranch className="w-4 h-4" />
+          Clone from GitHub
+        </button>
+      </div>
+
+      {mode === "github" && <GithubRepoPicker onProjectsCloned={handleClonedProjects} />}
+
       {/* Folder picker */}
+      {mode === "local" && (
       <div className="flex gap-2 items-center max-w-xl mx-auto w-full">
         <button className="btn-secondary flex items-center gap-2 shrink-0" onClick={pickFolder}>
           <FolderOpen className="w-4 h-4" />
@@ -171,6 +219,7 @@ export function ProjectStep({
           Scan
         </button>
       </div>
+      )}
 
       {error && (
         <div className="panel border-red-500/30 bg-red-500/10 p-3 text-sm text-red-300 max-w-xl mx-auto w-full">

@@ -278,6 +278,233 @@ pub async fn suggest_workspace_sources_for_setup(workspace_path: String) -> Resu
 }
 
 // ============================================================================
+// GitHub Repository Cloning (via the qontinui GitHub App)
+// ============================================================================
+//
+// The setup wizard lets users pick a GitHub repository and clone it into a
+// local folder. Instead of depending on a locally-authorized `gh` CLI (which an
+// AI-driven runner usually won't have), we REUSE the GitHub App connection the
+// user already made during qontinui onboarding.
+//
+// Flow: the runner calls the qontinui-web backend with its Cognito bearer; web
+// resolves the operator's tenant and proxies to coord, which owns the GitHub
+// App private key. coord lists the tenant's installation repos and mints a
+// repo-scoped, `contents:read`, short-TTL token for a single clone. The runner
+// never stores a long-lived GitHub credential — the clone token is used once and
+// scrubbed from the cloned repo's `.git/config`.
+
+/// Resolve the runner's Cognito bearer for authenticated web-backend calls.
+/// `None` when the user isn't signed in (Tier 0/1 or no Cognito session).
+async fn cognito_bearer() -> Option<String> {
+    let auth_manager = crate::auth::AuthManager::new();
+    crate::mcp::device_jwt_refresher::ensure_fresh_cognito_bearer(&auth_manager)
+        .await
+        .filter(|t| !t.trim().is_empty())
+}
+
+/// List the GitHub repositories the signed-in user's connected GitHub App
+/// installation(s) can access, for the setup-wizard clone picker.
+///
+/// Returns `{ signed_in, connected, repos }`:
+/// - `signed_in: false` — no Qontinui account session; the wizard shows a
+///   sign-in hint (this is a normal state, not an error).
+/// - `connected: false` — signed in, but the GitHub App isn't installed on any
+///   of the user's orgs yet; the wizard shows a "connect your GitHub" CTA.
+/// - otherwise `repos` is the list to render.
+#[tauri::command]
+pub async fn github_list_repos() -> Result<Value, String> {
+    let Some(bearer) = cognito_bearer().await else {
+        return Ok(serde_json::json!({
+            "signed_in": false,
+            "connected": false,
+            "repos": [],
+        }));
+    };
+
+    let url = format!(
+        "{}/api/v1/operations/github/repos",
+        crate::api_config::get_api_base_url()
+    );
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&url)
+        .bearer_auth(&bearer)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to reach Qontinui backend: {}", e))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        warn!("github_list_repos: backend returned {}: {}", status, body);
+        return Err(format!("Backend returned {}: {}", status, body.trim()));
+    }
+
+    let mut body: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse repo list: {}", e))?;
+    // The backend returns `{connected, repos}`; stamp `signed_in: true` so the
+    // frontend has one uniform shape to branch on.
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("signed_in".to_string(), Value::Bool(true));
+    }
+    Ok(body)
+}
+
+/// Clone a GitHub repository into a local destination folder, reusing the user's
+/// GitHub App connection for credentials.
+///
+/// `repo` is `owner/name`. Fetches a repo-scoped clone token from the backend,
+/// clones into `dest_parent/<name>`, then scrubs the remote URL back to the
+/// tokenless form so the short-TTL token never persists on disk. Refuses to
+/// clone into an existing non-empty directory.
+#[tauri::command]
+pub async fn github_clone_repo(repo: String, dest_parent: String) -> Result<Value, String> {
+    let repo = repo.trim().to_string();
+    let dest_parent = dest_parent.trim().to_string();
+
+    let Some((owner, name_raw)) = repo.split_once('/') else {
+        return Err(format!(
+            "Invalid repository '{}': expected 'owner/name'",
+            repo
+        ));
+    };
+    let owner = owner.to_string();
+    let name = name_raw.trim_end_matches(".git").to_string();
+    if owner.is_empty() || name.is_empty() || name.contains('/') {
+        return Err(format!(
+            "Invalid repository '{}': expected 'owner/name'",
+            repo
+        ));
+    }
+    if dest_parent.is_empty() {
+        return Err("No destination folder selected".to_string());
+    }
+
+    let parent = std::path::PathBuf::from(&dest_parent);
+    if !parent.is_dir() {
+        return Err(format!(
+            "Destination folder does not exist: {}",
+            parent.display()
+        ));
+    }
+    let dest = parent.join(&name);
+    if dest.exists() {
+        let non_empty = std::fs::read_dir(&dest)
+            .map(|mut e| e.next().is_some())
+            .unwrap_or(true);
+        if non_empty {
+            return Err(format!(
+                "A non-empty folder already exists at {}. Remove it or choose a different \
+                 destination.",
+                dest.display()
+            ));
+        }
+    }
+
+    // 1. Obtain a repo-scoped clone token from the backend.
+    let Some(bearer) = cognito_bearer().await else {
+        return Err("Sign in to your Qontinui account to clone from GitHub.".to_string());
+    };
+    let cred_url = format!(
+        "{}/api/v1/operations/github/clone-credential",
+        crate::api_config::get_api_base_url()
+    );
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&cred_url)
+        .bearer_auth(&bearer)
+        .json(&serde_json::json!({ "repo": format!("{}/{}", owner, name) }))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to reach Qontinui backend: {}", e))?;
+    let status = resp.status();
+    let cred: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse clone credential: {}", e))?;
+    if !status.is_success() {
+        let msg = cred
+            .get("message")
+            .or_else(|| cred.get("error"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("clone credential request failed");
+        return Err(msg.to_string());
+    }
+    let token = cred
+        .get("token")
+        .and_then(|v| v.as_str())
+        .ok_or("Backend did not return a clone token")?
+        .to_string();
+
+    info!(
+        "Setup wizard: cloning {}/{} into {}",
+        owner,
+        name,
+        dest.display()
+    );
+
+    // 2. Clone with the token embedded in the URL, then scrub the remote so the
+    //    token never persists in `.git/config`. The token is repo-scoped +
+    //    short-TTL, so brief in-URL use is acceptable.
+    let clean_url = format!("https://github.com/{}/{}.git", owner, name);
+    let auth_url = format!(
+        "https://x-access-token:{}@github.com/{}/{}.git",
+        token, owner, name
+    );
+    let dest_str = dest.to_string_lossy().to_string();
+
+    let clone_out = tokio::task::spawn_blocking(move || {
+        crate::process_helpers::no_window("git")
+            .args(["clone", &auth_url, &dest_str])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+    })
+    .await
+    .map_err(|e| String::from(AppError::ProcessError(format!("Task join error: {}", e))))?
+    .map_err(|e| {
+        String::from(AppError::ProcessError(format!(
+            "Failed to run git: {}. Is git installed?",
+            e
+        )))
+    })?;
+
+    if !clone_out.status.success() {
+        let stderr = String::from_utf8_lossy(&clone_out.stderr);
+        // Redact the token if git ever echoes the URL into an error message.
+        let redacted = stderr.replace(&token, "***");
+        warn!("git clone failed: {}", redacted);
+        return Err(format!("Clone failed: {}", redacted.trim()));
+    }
+
+    // Scrub: repoint origin at the tokenless URL (best-effort — a failure here
+    // leaves a working clone, just with the short-TTL token in the remote URL
+    // until it expires).
+    let dest_scrub = dest.to_string_lossy().to_string();
+    let _ = tokio::task::spawn_blocking(move || {
+        crate::process_helpers::no_window("git")
+            .args(["-C", &dest_scrub, "remote", "set-url", "origin", &clean_url])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+    })
+    .await;
+
+    info!(
+        "Setup wizard: cloned {}/{} -> {}",
+        owner,
+        name,
+        dest.display()
+    );
+    Ok(serde_json::json!({
+        "path": dest.to_string_lossy().to_string(),
+        "name": name,
+    }))
+}
+
+// ============================================================================
 // Claude Config Directory Discovery (pure Rust, no Python CLI)
 // ============================================================================
 
@@ -1092,6 +1319,8 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             suggest_dev_services_for_setup,
             save_dev_services_from_setup,
             discover_claude_config_dirs,
+            github_list_repos,
+            github_clone_repo,
         ])
         .build()
 }
