@@ -258,6 +258,39 @@ pub fn spawn_grid_scan_loop() {
     });
 }
 
+/// The coord identity of a live terminal session, captured for the unified
+/// prompt-injection audit log. `terminal_id` is always set; `coord_session_id`
+/// / `title` are `None` when the session has gone away or has no coord mirror
+/// wired yet.
+#[derive(Clone, Debug, Default)]
+pub(super) struct SessionIdentity {
+    pub terminal_id: Option<String>,
+    pub coord_session_id: Option<uuid::Uuid>,
+    pub title: Option<String>,
+}
+
+/// Resolve the live session identity for `tid` (same TerminalManager lookup the
+/// scheduler uses to submit). Best-effort: always records the `terminal_id`;
+/// leaves the coord id / title `None` if the app handle, the manager, or the
+/// session is unavailable.
+fn resolve_session_identity(tid: &str) -> SessionIdentity {
+    use tauri::Manager;
+
+    let mut ident = SessionIdentity {
+        terminal_id: Some(tid.to_string()),
+        ..Default::default()
+    };
+    if let Some(app) = crate::tauri_app_handle::current() {
+        if let Some(tm) = app.try_state::<Arc<crate::terminal::TerminalManager>>() {
+            if let Some(session) = tm.get(tid) {
+                ident.coord_session_id = session.coord_session_id();
+                ident.title = Some(session.title());
+            }
+        }
+    }
+    ident
+}
+
 // ── Scheduler ────────────────────────────────────────────────────────────────
 
 mod scheduler {
@@ -380,16 +413,37 @@ mod scheduler {
             tokio::time::sleep(delay).await;
             match action {
                 CompiledAction::Fixed(text) => {
-                    submit_to_session(&tid, &text).await;
+                    // Report the regex `submit_prompt` injection to coord's
+                    // unified audit log ONLY when the submission actually
+                    // landed. Best-effort + fire-and-forget (never blocks/fails
+                    // the scheduler).
+                    if submit_to_session(&tid, &text).await {
+                        super::report::report_submit_prompt_injection(
+                            &tid, &rid, &context, &context, &text,
+                        )
+                        .await;
+                    }
                 }
                 CompiledAction::Resolve {
                     policy_id,
                     options,
                     dimensions,
                 } => {
-                    match resolve_scored_response(&policy_id, &context, &options, &dimensions).await
+                    // Resolve the session identity so coord's scoring-injection
+                    // audit row is attributed to the same session.
+                    let identity = super::resolve_session_identity(&tid);
+                    match resolve_scored_response(
+                        &policy_id,
+                        &context,
+                        &options,
+                        &dimensions,
+                        identity,
+                    )
+                    .await
                     {
-                        Some(text) => submit_to_session(&tid, &text).await,
+                        Some(text) => {
+                            submit_to_session(&tid, &text).await;
+                        }
                         None => info!(
                             terminal_id = %tid,
                             rule_id = %rid,
@@ -408,21 +462,24 @@ mod scheduler {
     /// Resolve the live session for `tid` and submit `prompt` into it. If the
     /// session is gone (closed during the backoff), log and return — the
     /// scheduler state is reaped lazily by the next reload / process anyway.
-    async fn submit_to_session(tid: &str, prompt: &str) {
+    ///
+    /// Returns `true` only when the prompt was actually submitted into a live
+    /// session (so the caller can gate audit reporting on a real injection).
+    async fn submit_to_session(tid: &str, prompt: &str) -> bool {
         use tauri::Manager;
 
         let Some(app) = crate::tauri_app_handle::current() else {
-            return;
+            return false;
         };
         let Some(tm) = app.try_state::<Arc<crate::terminal::TerminalManager>>() else {
-            return;
+            return false;
         };
         let Some(session) = tm.get(tid) else {
             info!(
                 terminal_id = %tid,
                 "auto_response: session gone before scheduled submission — skipping"
             );
-            return;
+            return false;
         };
         if let Err(e) = session.submit_prompt(prompt) {
             warn!(
@@ -430,7 +487,9 @@ mod scheduler {
                 error = %e,
                 "auto_response: failed to submit scheduled prompt"
             );
+            return false;
         }
+        true
     }
 
     /// Score the policy's options via the local Claude CLI, then resolve the
@@ -444,6 +503,7 @@ mod scheduler {
         context: &str,
         options: &[ScoringOption],
         dimensions: &[String],
+        identity: super::SessionIdentity,
     ) -> Option<String> {
         decide_resolution_with(
             policy_id,
@@ -455,11 +515,22 @@ mod scheduler {
                 let prompt = super::scoring::build_scoring_prompt(ctx, opts, dims);
                 async move { super::scoring::run_cli_scorer(prompt).await }
             },
-            // Coord resolve seam.
-            |pid, ctx, scores| {
+            // Coord resolve seam — carries the session identity so coord can
+            // attribute the scoring-injection audit row.
+            move |pid, ctx, scores| {
                 let pid = pid.to_string();
                 let ctx = ctx.to_string();
-                async move { super::resolve::resolve_via_coord(&pid, &ctx, scores).await }
+                async move {
+                    super::resolve::resolve_via_coord(
+                        &pid,
+                        &ctx,
+                        scores,
+                        identity.terminal_id,
+                        identity.coord_session_id,
+                        identity.title,
+                    )
+                    .await
+                }
             },
         )
         .await
@@ -653,6 +724,15 @@ mod resolve {
         policy_id: &'a str,
         context: &'a str,
         scores: serde_json::Value,
+        // Optional session identity, so coord's scoring-injection audit row is
+        // attributed to the same terminal session (coord Phase 2 adds these same
+        // optional fields — keep the serde names identical).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        terminal_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        coord_session_id: Option<uuid::Uuid>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
     }
 
     /// Response from `{coord_base}/coord/policies/resolve` (always HTTP 200).
@@ -698,6 +778,9 @@ mod resolve {
         policy_id: &str,
         context: &str,
         scores: serde_json::Value,
+        terminal_id: Option<String>,
+        coord_session_id: Option<uuid::Uuid>,
+        title: Option<String>,
     ) -> Option<String> {
         let url = resolve_endpoint_url()?;
         let client = reqwest::Client::builder()
@@ -708,6 +791,9 @@ mod resolve {
             policy_id,
             context,
             scores,
+            terminal_id,
+            coord_session_id,
+            title,
         };
         // Device-JWT bearer on a POST — the same write-path attach the coord
         // producers use (collapses to anonymous when unpaired).
@@ -735,6 +821,105 @@ mod resolve {
             "auto_response: coord resolve result"
         );
         response_text_to_inject(&parsed)
+    }
+}
+
+/// Reports a regex `submit_prompt` injection to coord's unified prompt-injection
+/// audit log. Best-effort and strictly fire-and-forget: gated off by an env
+/// kill-switch, bounded by a short timeout, and NEVER retries, blocks, or
+/// propagates — any failure is a `warn!` and a return. Coord returns
+/// `200 {"recorded":true}` on success; the body is not parsed.
+mod report {
+    use std::time::Duration;
+
+    use serde::Serialize;
+    use tracing::warn;
+
+    /// POST body for `{coord_base}/coord/prompt-injections/report`.
+    ///
+    /// SHARED CONTRACT with coord Phase 2 — field names and shape must match
+    /// exactly. `coord_session_id` / `title` serialize to `null` when the
+    /// session is gone; `policy_id` is always `null` for the regex source.
+    #[derive(Serialize)]
+    struct ReportBody<'a> {
+        terminal_id: String,
+        coord_session_id: Option<uuid::Uuid>,
+        title: Option<String>,
+        rule_id: &'a str,
+        policy_id: Option<&'a str>,
+        trigger_kind: &'a str,
+        trigger_text: &'a str,
+        injected_prompt: &'a str,
+        source: &'a str,
+        metadata: serde_json::Value,
+    }
+
+    /// Coord audit-report endpoint URL, or `None` when no coord base is
+    /// configured (then the report is silently skipped).
+    fn report_endpoint_url() -> Option<String> {
+        match qontinui_runner_lib::profiles::resolve_coord_base() {
+            qontinui_runner_lib::profiles::CoordBase::Configured(base) => Some(format!(
+                "{}/coord/prompt-injections/report",
+                base.trim_end_matches('/')
+            )),
+            _ => None,
+        }
+    }
+
+    /// Fire-and-forget report of a `submit_prompt` regex injection. `raw_trigger`
+    /// carries the un-normalized matched screen text when available (the caller
+    /// currently passes the normalized text for both, as the raw grid text is
+    /// not plumbed into the scheduler).
+    pub(super) async fn report_submit_prompt_injection(
+        tid: &str,
+        rule_id: &str,
+        trigger_text_normalized: &str,
+        raw_trigger: &str,
+        injected_prompt: &str,
+    ) {
+        if std::env::var_os("QONTINUI_PROMPT_AUDIT_REPORT_DISABLED").is_some() {
+            return;
+        }
+        let Some(url) = report_endpoint_url() else {
+            return;
+        };
+        // Resolve the terminal identity the same way the scheduler submits;
+        // still report (with nulls) if the session has since gone away.
+        let ident = super::resolve_session_identity(tid);
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "auto_response: prompt-audit client build failed — skipping report");
+                return;
+            }
+        };
+        let body = ReportBody {
+            terminal_id: tid.to_string(),
+            coord_session_id: ident.coord_session_id,
+            title: ident.title,
+            rule_id,
+            policy_id: None,
+            trigger_kind: "terminal_regex",
+            trigger_text: trigger_text_normalized,
+            injected_prompt,
+            source: "regex_submit_prompt",
+            metadata: serde_json::json!({ "raw_trigger": raw_trigger }),
+        };
+        // Device-JWT bearer on the write path (collapses to anonymous when
+        // unpaired), mirroring `mod resolve`.
+        let req = qontinui_runner_lib::auth::attach_device_auth(client.post(&url));
+        match req.json(&body).send().await {
+            Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) => {
+                warn!(status = %resp.status(), "auto_response: prompt-audit report non-2xx — dropping");
+            }
+            Err(e) => {
+                warn!(error = %e, "auto_response: prompt-audit report failed — dropping");
+            }
+        }
     }
 }
 
