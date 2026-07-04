@@ -82,16 +82,19 @@ fn registration_enabled() -> bool {
     }
 }
 
-/// Default-OFF env gate for streaming interactive-session activity to coord's
-/// `agent_logs` ingest (Phase 1c). ONLY a truthy value — `1` / `true` / `on` /
-/// `yes` (case-insensitive) — turns it ON; anything else (including unset)
-/// leaves it OFF, so the emitter is a strict no-op by default and never adds
-/// always-on coord traffic.
+/// Default-ON gate for streaming interactive-session activity to coord's
+/// `agent_logs` ingest (Phase 1c). The feature is enabled by default — the
+/// rollout burn-in passed and the Phase-2 `session_started` flood fix
+/// (runner#637) landed — so deployed AND dev runners emit with no
+/// per-environment config (no dev-start.ps1 flag, no machine env var). Set
+/// `QONTINUI_AGENT_LOGS_FROM_SESSIONS` to an explicit falsy value — `0` /
+/// `false` / `off` / `no` (case-insensitive) — as an ops kill-switch to turn
+/// it off; unset (the production default) and any other value leave it ON.
 pub fn agent_logs_from_sessions_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("QONTINUI_AGENT_LOGS_FROM_SESSIONS")
             .map(|v| v.trim().to_ascii_lowercase()),
-        Ok(ref v) if matches!(v.as_str(), "1" | "true" | "on" | "yes")
+        Ok(ref v) if matches!(v.as_str(), "0" | "false" | "off" | "no")
     )
 }
 
@@ -984,24 +987,27 @@ mod tests {
     }
 
     #[test]
-    fn agent_logs_gate_defaults_off_and_only_truthy_enables() {
+    fn agent_logs_gate_defaults_on_and_only_falsy_disables() {
         let _env = env_lock();
         std::env::remove_var("QONTINUI_AGENT_LOGS_FROM_SESSIONS");
-        // Default (unset) is OFF — strict no-op posture.
-        assert!(!agent_logs_from_sessions_enabled());
+        // Default (unset) is ON — the feature is standard after the rollout
+        // burn-in; deployed runners need no per-environment config.
+        assert!(agent_logs_from_sessions_enabled());
 
-        for off in ["0", "false", "off", "", "no", "garbage"] {
+        // Only an explicit falsy value disables it (the ops kill-switch).
+        for off in ["0", "false", "off", "no", "FALSE", "Off", "No"] {
             std::env::set_var("QONTINUI_AGENT_LOGS_FROM_SESSIONS", off);
             assert!(
                 !agent_logs_from_sessions_enabled(),
-                "value {off:?} must NOT enable the gate"
+                "value {off:?} must disable the gate (kill-switch)"
             );
         }
-        for on in ["1", "true", "on", "yes", "TRUE", "On", "Yes"] {
+        // Unset, truthy, empty, or unrecognized all leave it ON.
+        for on in ["1", "true", "on", "yes", "", "garbage"] {
             std::env::set_var("QONTINUI_AGENT_LOGS_FROM_SESSIONS", on);
             assert!(
                 agent_logs_from_sessions_enabled(),
-                "value {on:?} must enable the gate"
+                "value {on:?} must leave the gate ON (only explicit falsy disables)"
             );
         }
         std::env::remove_var("QONTINUI_AGENT_LOGS_FROM_SESSIONS");

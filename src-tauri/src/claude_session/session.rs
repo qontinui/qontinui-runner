@@ -145,8 +145,9 @@ pub struct ClaudeSession {
     /// Interactive-agent log emitter (Phase 1b/1c). When `Some`, the stdout
     /// reader streams each line to coord's `agent_logs` ingest and the waiter
     /// thread emits the terminal `session_closed` line + final flush. `None`
-    /// when the `QONTINUI_AGENT_LOGS_FROM_SESSIONS` gate is OFF (default) or
-    /// the coord session id / device id couldn't be resolved — a strict no-op.
+    /// when the `QONTINUI_AGENT_LOGS_FROM_SESSIONS` gate is disabled (the
+    /// default is ON) or the coord session id / device id couldn't be
+    /// resolved — a strict no-op.
     agent_log_emitter: Option<super::coord_register::AgentLogEmitter>,
 }
 

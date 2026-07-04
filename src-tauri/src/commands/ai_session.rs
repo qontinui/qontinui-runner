@@ -476,8 +476,9 @@ pub async fn create_ai_session(
     let coord_session_id = ai_coord_registrar.register_session(&task_run_id, &name, None);
 
     // Phase 1b/1c — build the interactive-agent log emitter when the
-    // `QONTINUI_AGENT_LOGS_FROM_SESSIONS` gate is ON and the coord session id
-    // resolved. `None` (the default) is a strict no-op threaded through spawn.
+    // `QONTINUI_AGENT_LOGS_FROM_SESSIONS` gate is ON (the default) and the
+    // coord session id resolved. `None` (gate disabled, or id unresolved) is a
+    // strict no-op threaded through spawn.
     let agent_log_emitter =
         coord_session_id.and_then(crate::claude_session::coord_register::AgentLogEmitter::start);
 
