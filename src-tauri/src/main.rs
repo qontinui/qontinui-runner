@@ -2970,7 +2970,36 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // hashed asset filenames the new bundle no longer
                         // contains. Hashed `/assets/*` responses pass
                         // through with their default headers.
-                        .on_web_resource_request(asset_headers::stamp_no_store_on_index);
+                        .on_web_resource_request(asset_headers::stamp_no_store_on_index)
+                        // Keep the WebView2 renderer live when the window is
+                        // backgrounded / occluded / on another virtual desktop.
+                        // Without these flags Chromium throttles the page's
+                        // timers to ~1/min and, after ~5 min hidden, freezes it
+                        // entirely: the terminal panes then keep showing the
+                        // last-painted frame (a mid-turn spinner) while the
+                        // frontend's session-advancing loops (state polling,
+                        // auto-approve, auto-restart) stall — so an operator
+                        // returning to a backgrounded runner sees stale "busy"
+                        // frames and no overnight progress. The Rust backend is
+                        // never throttled; this only realigns the webview with
+                        // it. `CalculateNativeWinOcclusion` off is the key flag
+                        // for the frozen frame (Windows native-occlusion
+                        // detection otherwise marks an occluded window hidden
+                        // and stops compositing). NOTE: setting
+                        // additional_browser_args REPLACES wry's default
+                        // `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection`,
+                        // so those are re-listed here. Windows-only (no-op
+                        // elsewhere). A truly *minimized* window still can't
+                        // composite, but with these flags its JS keeps running
+                        // so state stays current and it repaints instantly on
+                        // restore.
+                        .additional_browser_args(
+                            "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,\
+                             CalculateNativeWinOcclusion,IntensiveWakeUpThrottling \
+                             --disable-background-timer-throttling \
+                             --disable-renderer-backgrounding \
+                             --disable-backgrounding-occluded-windows",
+                        );
 
                     if let Some(ref dir) = data_dir {
                         builder = builder.data_directory(dir.clone());
