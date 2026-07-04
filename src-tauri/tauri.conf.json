@@ -4,7 +4,7 @@
   "version": "1.0.1",
   "identifier": "com.qontinui.runner",
   "build": {
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run build && npm run bundle:profile-sidecar",
     "frontendDist": "../dist"
   },
   "app": {
@@ -31,6 +31,7 @@
     "resources": {
       "resources/qontinui-setup-mcp/src/qontinui_setup_mcp": "qontinui-setup-mcp/src/qontinui_setup_mcp"
     },
+    "externalBin": ["binaries/qontinui_profile"],
     "createUpdaterArtifacts": false
   },
   "plugins": {

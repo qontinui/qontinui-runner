@@ -96,6 +96,7 @@ python-bridge/dist/
 # Bundled Python executors (large, platform-specific)
 # Keep .gitkeep but ignore actual executables
 src-tauri/binaries/qontinui-executor-*
+src-tauri/binaries/qontinui_profile-*
 !src-tauri/binaries/.gitkeep
 
 .claude/
