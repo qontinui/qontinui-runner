@@ -101,6 +101,7 @@ pub mod plans;
 pub mod playwright;
 pub mod playwright_collection;
 pub mod prm_export;
+pub mod probe_executor;
 pub mod processes;
 pub mod prompt_home;
 pub mod prompt_snippets;
