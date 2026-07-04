@@ -803,6 +803,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // (QONTINUI_FS_BACKSTOP_ENABLED); best-effort, never blocking.
                 // Default 300s cadence (QONTINUI_FS_BACKSTOP_INTERVAL_SECS).
                 agent_worktree::fs_backstop::spawn_backstop();
+                // Subagent-stall-watchdog PR 5 — the typed evidence-probe
+                // executor. A device-JWT pull-loop that answers coord's rung-2
+                // supervisor probes with READ-ONLY, worktree-scoped evidence
+                // (process liveness / newest mtime / git branch state /
+                // artifact presence) so a lost-wakeup stall is distinguishable
+                // from live-but-slow work. Same anonymous device-keyed identity
+                // as the reclaim/maintenance pollers. Gated OFF by default
+                // (RUNNER_PROBES_ENABLED); no-op + never spawns while dark.
+                crate::mcp::probe_executor::spawn_probe_executor();
                 // Phase 4 — coord-driven Claude Code subprocess runtime.
                 // Subscribes to `events.agent.spawn_requested.<device_id>`
                 // on coord WS and supervises the resulting `claude` CLI
