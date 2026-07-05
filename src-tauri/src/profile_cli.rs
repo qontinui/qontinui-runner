@@ -12,8 +12,11 @@
 //!
 //! Exit codes: 0 success, 1 runtime failure, 2 usage/serialize error.
 
+use std::path::PathBuf;
+
 use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
+use serde::Serialize;
 use serde_json::json;
 
 use crate::env_agent::config::EnvAgentConfig;
@@ -215,9 +218,211 @@ fn run_env_from_args(args: &[String]) -> u8 {
     }
 }
 
+// ===========================================================================
+// Terminal-command PATH provisioning (Phase 1a follow-up)
+// ===========================================================================
+//
+// After install the runner binary IS `qontinui-runner(.exe)` (Cargo name =
+// Tauri's default `mainBinaryName`), but its install dir is not on PATH, so the
+// dashboard's `qontinui-runner env enroll …` copy-paste command doesn't resolve
+// in a fresh terminal. This adds the install dir to the USER PATH (opt-in, from
+// the Settings panel) so the bare command works.
+//
+// Windows uses `[Environment]::SetEnvironmentVariable(...,'User')` via PowerShell
+// — the correct API (no `setx` 1024-char truncation; it persists AND broadcasts
+// `WM_SETTINGCHANGE` so new shells pick it up). No registry crate, no admin.
+
+/// Outcome of a PATH-provisioning attempt (returned to the Settings UI).
+#[derive(Debug, Clone, Serialize)]
+pub struct CliPathOutcome {
+    /// True when this call modified the user PATH.
+    pub added: bool,
+    /// True when the install dir was already on the user PATH (no-op).
+    pub already_present: bool,
+    /// The runner install dir that is / was added.
+    pub dir: String,
+    /// Human-readable note for the UI.
+    pub message: String,
+}
+
+/// The runner's install directory — the folder containing the running
+/// `qontinui-runner` executable.
+fn runner_install_dir() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("resolve current exe: {e}"))?;
+    exe.parent()
+        .map(|p| p.to_path_buf())
+        .ok_or_else(|| "executable has no parent directory".to_string())
+}
+
+/// Compute the PATH value with `dir` appended, or `None` when `dir` is already
+/// present. Entries are compared after trimming whitespace + a trailing
+/// separator, case-insensitively (Windows PATH is case-insensitive). Pure —
+/// unit-tested.
+fn compute_path_addition(current: &str, dir: &str, sep: char) -> Option<String> {
+    let norm = |s: &str| s.trim().trim_end_matches(['/', '\\']).to_ascii_lowercase();
+    let target = norm(dir);
+    if target.is_empty() {
+        return None;
+    }
+    let present = current
+        .split(sep)
+        .any(|e| !e.trim().is_empty() && norm(e) == target);
+    if present {
+        return None;
+    }
+    if current.trim().is_empty() {
+        Some(dir.to_string())
+    } else {
+        // Preserve the existing value verbatim; append with one separator.
+        let trimmed = current.trim_end_matches(sep);
+        Some(format!("{trimmed}{sep}{dir}"))
+    }
+}
+
+/// Read the current USER-scope `Path` (Windows). Returns "" when unset.
+#[cfg(windows)]
+fn read_user_path() -> Result<String, String> {
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[Environment]::GetEnvironmentVariable('Path','User')",
+        ])
+        .output()
+        .map_err(|e| format!("read user PATH (powershell): {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "read user PATH failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .trim_end_matches(['\r', '\n'])
+        .to_string())
+}
+
+/// Persist a new USER-scope `Path` (Windows). The value is passed via an env var
+/// so a long PATH with special characters survives argument parsing intact.
+#[cfg(windows)]
+fn write_user_path(new_value: &str) -> Result<(), String> {
+    let out = std::process::Command::new("powershell")
+        .env("QONTINUI_NEW_USER_PATH", new_value)
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[Environment]::SetEnvironmentVariable('Path', $env:QONTINUI_NEW_USER_PATH, 'User')",
+        ])
+        .output()
+        .map_err(|e| format!("write user PATH (powershell): {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "write user PATH failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Whether the runner's install dir is already on the user PATH.
+pub fn cli_dir_on_user_path() -> Result<bool, String> {
+    let dir = runner_install_dir()?;
+    let dir_str = dir.to_string_lossy();
+    #[cfg(windows)]
+    {
+        let current = read_user_path()?;
+        Ok(compute_path_addition(&current, &dir_str, ';').is_none())
+    }
+    #[cfg(not(windows))]
+    {
+        // Best-effort: consult the process PATH. We don't edit shell profiles on
+        // Unix (the target boxes are Windows).
+        let current = std::env::var("PATH").unwrap_or_default();
+        Ok(compute_path_addition(&current, &dir_str, ':').is_none())
+    }
+}
+
+/// Add the runner's install dir to the user PATH so `qontinui-runner …` resolves
+/// in a terminal. Idempotent. Windows persists to the USER `Path` via PowerShell;
+/// other platforms are unsupported and return the dir to add manually.
+pub fn install_cli_on_user_path() -> Result<CliPathOutcome, String> {
+    let dir = runner_install_dir()?;
+    let dir_str = dir.to_string_lossy().to_string();
+
+    #[cfg(windows)]
+    {
+        let current = read_user_path()?;
+        match compute_path_addition(&current, &dir_str, ';') {
+            None => Ok(CliPathOutcome {
+                added: false,
+                already_present: true,
+                dir: dir_str,
+                message: "Already on your PATH — `qontinui-runner env enroll …` works in a new \
+                          terminal."
+                    .to_string(),
+            }),
+            Some(new_value) => {
+                write_user_path(&new_value)?;
+                Ok(CliPathOutcome {
+                    added: true,
+                    already_present: false,
+                    dir: dir_str,
+                    message: "Added to your PATH. Open a NEW terminal, then `qontinui-runner env \
+                              enroll …` will work."
+                        .to_string(),
+                })
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Err(format!(
+            "Automatic PATH setup is Windows-only for now. Add this directory to your PATH \
+             manually: {dir_str}"
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_addition_appends_when_absent() {
+        assert_eq!(
+            compute_path_addition("C:\\a;C:\\b", "C:\\qontinui", ';').as_deref(),
+            Some("C:\\a;C:\\b;C:\\qontinui")
+        );
+        // Empty current → just the dir (no leading separator).
+        assert_eq!(
+            compute_path_addition("", "C:\\qontinui", ';').as_deref(),
+            Some("C:\\qontinui")
+        );
+        // A trailing separator is collapsed (no double `;;`).
+        assert_eq!(
+            compute_path_addition("C:\\a;", "C:\\qontinui", ';').as_deref(),
+            Some("C:\\a;C:\\qontinui")
+        );
+    }
+
+    #[test]
+    fn path_addition_is_idempotent_and_case_trailing_insensitive() {
+        // Exact match → None.
+        assert!(compute_path_addition("C:\\a;C:\\qontinui", "C:\\qontinui", ';').is_none());
+        // Case-insensitive + trailing-slash-insensitive → still present → None.
+        assert!(
+            compute_path_addition("C:\\A;C:\\QONTINUI\\", "c:\\qontinui", ';').is_none(),
+            "windows PATH is case-insensitive; trailing slash ignored"
+        );
+        // A substring that isn't a full entry does NOT count as present.
+        assert_eq!(
+            compute_path_addition("C:\\qontinui-runner-old", "C:\\qontinui", ';').as_deref(),
+            Some("C:\\qontinui-runner-old;C:\\qontinui"),
+        );
+        // Empty target dir → never adds.
+        assert!(compute_path_addition("C:\\a", "", ';').is_none());
+    }
 
     fn v(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()

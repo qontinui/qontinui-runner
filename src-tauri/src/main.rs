@@ -1339,6 +1339,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::dev_findings::is_dev_endpoints_enabled,
             commands::devenv_enroll::devenv_enroll,
             commands::devenv_enroll::devenv_enroll_status,
+            commands::devenv_enroll::devenv_install_cli_path,
             commands::discoveries::clear_discovery,
             commands::discoveries::clear_failed_discoveries,
             commands::discoveries::get_discovery_summary,
