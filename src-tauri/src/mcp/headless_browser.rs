@@ -19,10 +19,24 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use super::types::{ApiResponse, ApiState};
+use crate::spec_api::auth_injection::AppCredentials;
 
 // =============================================================================
 // Types
 // =============================================================================
+
+/// Map fetched app credentials to the launcher's login env-var contract.
+///
+/// `headless-launcher.js` reads `QONTINUI_TEST_AUTO_LOGIN_EMAIL` /
+/// `QONTINUI_TEST_AUTO_LOGIN_PASSWORD`, mints a Cognito id token, and seeds the
+/// session before navigating. Pure + testable so the env-var names can't
+/// silently drift out of sync with the launcher.
+fn auth_launcher_env(creds: &AppCredentials) -> [(&'static str, String); 2] {
+    [
+        ("QONTINUI_TEST_AUTO_LOGIN_EMAIL", creds.email.clone()),
+        ("QONTINUI_TEST_AUTO_LOGIN_PASSWORD", creds.password.clone()),
+    ]
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -284,6 +298,33 @@ pub async fn spawn_headless(
         cmd.arg("--headless=false");
     }
 
+    // Authenticated spec CI: if the target app requires auth, fetch its login
+    // credentials and hand them to the launcher via the env vars it already
+    // reads (`headless-launcher.js` mints a Cognito id token from these and
+    // seeds the session before navigating). Env, not argv — the password must
+    // not appear in process listings. Fail-open: a missing/malformed SSM param
+    // logs a warning and spawns UNAUTHENTICATED rather than wedging CI.
+    if let Ok(Some(app)) = state.app_state.pg_db.get_app(&request.app_id).await {
+        if app.auth_required {
+            match crate::spec_api::auth_injection::fetch_app_credentials(&request.app_id).await {
+                Ok(Some(creds)) => {
+                    for (k, v) in auth_launcher_env(&creds) {
+                        cmd.env(k, v);
+                    }
+                    info!(app_id = %request.app_id, "spawn_headless: injected login credentials for auth-required app");
+                }
+                Ok(None) => warn!(
+                    app_id = %request.app_id,
+                    "spawn_headless: auth_required app has no SSM login credentials — spawning UNAUTHENTICATED (fail-open)"
+                ),
+                Err(e) => warn!(
+                    app_id = %request.app_id,
+                    "spawn_headless: auth_required app credential fetch failed ({e}) — spawning UNAUTHENTICATED (fail-open)"
+                ),
+            }
+        }
+    }
+
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     // Prevent child from blocking on stdin
@@ -409,4 +450,24 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
     }
 
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_launcher_env_maps_to_the_launchers_contract() {
+        let creds = AppCredentials {
+            email: "spec-ci@example.com".into(),
+            password: "s3cr3t".into(),
+        };
+        let env = auth_launcher_env(&creds);
+        // Names MUST match what headless-launcher.js reads, or login silently
+        // never happens.
+        assert_eq!(env[0].0, "QONTINUI_TEST_AUTO_LOGIN_EMAIL");
+        assert_eq!(env[0].1, "spec-ci@example.com");
+        assert_eq!(env[1].0, "QONTINUI_TEST_AUTO_LOGIN_PASSWORD");
+        assert_eq!(env[1].1, "s3cr3t");
+    }
 }
