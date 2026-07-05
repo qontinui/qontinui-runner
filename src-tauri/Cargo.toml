@@ -316,6 +316,17 @@ complexity = { level = "warn", priority = 0 }
 style = { level = "warn", priority = 0 }
 pedantic = { level = "allow", priority = 0 }
 nursery = { level = "allow", priority = 0 }
+# Grandfathered pre-existing exceptions. These three were in the prior
+# hand-curated allow-list, so the runner code trips them today — they belong to
+# the now-`deny` correctness/suspicious groups, and re-denying them would newly
+# block EVERY runner push (the opposite of this plan's goal). Keep them `allow`
+# with higher priority so the specific level wins over the group `deny`; drive
+# the sites to zero and re-deny as a follow-up (plan Phase 3). NEW correctness/
+# suspicious lints not listed here still deny — this is a strict no-new-blocks
+# retier, not a blanket relaxation.
+read_zero_byte_vec = { level = "allow", priority = 2 }
+await_holding_lock = { level = "allow", priority = 2 }
+mut_range_bound = { level = "allow", priority = 2 }
 
 [dev-dependencies]
 tempfile = "3"
