@@ -303,49 +303,19 @@ unused_assignments = "allow"
 unused_mut = "allow"
 
 [lints.clippy]
-too_many_arguments = "allow"
-type_complexity = "allow"
-ptr_arg = "allow"
-enum_variant_names = "allow"
-module_inception = "allow"
-unnecessary_cast = "allow"
-redundant_closure = "allow"
-useless_format = "allow"
-manual_strip = "allow"
-collapsible_if = "allow"
-collapsible_match = "allow"
-clone_on_copy = "allow"
-manual_clamp = "allow"
-iter_cloned_collect = "allow"
-unwrap_or_default = "allow"
-format_in_format_args = "allow"
-needless_return = "allow"
-large_enum_variant = "allow"
-while_let_loop = "allow"
-manual_let_else = "allow"
-needless_range_loop = "allow"
-unused_self = "allow"
-wrong_self_convention = "allow"
-struct_field_names = "allow"
-doc_lazy_continuation = "allow"
-redundant_clone = "allow"
-unnecessary_to_owned = "allow"
-unnecessary_unwrap = "allow"
-filter_map_bool_then = "allow"
-struct_excessive_bools = "allow"
-match_single_binding = "allow"
-single_match = "allow"
-needless_pass_by_value = "allow"
-explicit_deref_methods = "allow"
-deref_addrof = "allow"
-await_holding_lock = "allow"
-read_zero_byte_vec = "allow"
-mut_range_bound = "allow"
-if_same_then_else = "allow"
-same_item_push = "allow"
-result_large_err = "allow"
-unnecessary_literal_unwrap = "allow"
-regex_creation_in_loops = "allow"
+# Tiered lint policy (plan 2026-07-05-lint-tiers-and-diff-scoped-gates).
+# T1 correctness = deny (blocks); T3 style/pedantic = warn (emitted, non-blocking).
+# Levels live here as the SINGLE source of truth — the gate runs plain
+# `cargo clippy` (no `-D warnings`), so a warn never hard-blocks a push while
+# a deny still does. Style lints stay `warn` (NOT allow) so Phase 2 reviewdog
+# diff-scoping and the nightly unscoped job still see them in clippy's JSON.
+correctness = { level = "deny", priority = 1 }
+suspicious = { level = "deny", priority = 1 }
+perf = { level = "warn", priority = 1 }
+complexity = { level = "warn", priority = 0 }
+style = { level = "warn", priority = 0 }
+pedantic = { level = "allow", priority = 0 }
+nursery = { level = "allow", priority = 0 }
 
 [dev-dependencies]
 tempfile = "3"
