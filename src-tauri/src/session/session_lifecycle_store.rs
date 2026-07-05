@@ -30,11 +30,13 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
+
+use crate::session::snapshot_history::{SnapshotHistory, SnapshotSession};
 
 /// Closed records older than this are pruned (24h in millis).
 const CLOSED_RETENTION_MS: i64 = 86_400_000;
@@ -218,6 +220,14 @@ pub struct TerminalSessionRecord {
 pub struct SessionLifecycleStore {
     path: PathBuf,
     map: Mutex<HashMap<String, TerminalSessionRecord>>,
+    /// Optional write-only sink for the append-only snapshot HISTORY
+    /// ([`crate::session::snapshot_history`], Phase 4 of the session-restore
+    /// shim-fix plan). When attached, every layout-meaningful mutation
+    /// (open/close/rename/rekey/remove/confirm) appends one complete
+    /// snapshot of the registry to the durable JSONL audit trail. The
+    /// history is DERIVED from this store — never read back by it or by the
+    /// restore path.
+    snapshot_history: OnceLock<Arc<SnapshotHistory>>,
 }
 
 impl SessionLifecycleStore {
@@ -231,7 +241,45 @@ impl SessionLifecycleStore {
         Ok(Self {
             path,
             map: Mutex::new(map),
+            snapshot_history: OnceLock::new(),
         })
+    }
+
+    /// Attach the append-only snapshot-history sink (once, at startup).
+    /// Without an attached sink every history hook is a no-op — the store
+    /// works standalone (tests, ephemeral fallbacks).
+    pub fn attach_snapshot_history(&self, history: Arc<SnapshotHistory>) {
+        if self.snapshot_history.set(history).is_err() {
+            warn!("session_lifecycle_store: snapshot history already attached — ignoring");
+        }
+    }
+
+    /// Append a CHANGE snapshot of the full registry to the history sink,
+    /// if attached. Called by every layout-meaningful mutation AFTER the
+    /// registry write; best-effort by construction (the sink never fails the
+    /// registry path).
+    fn snapshot_change(&self, snapshot: &HashMap<String, TerminalSessionRecord>) {
+        if let Some(history) = self.snapshot_history.get() {
+            history.record_change(snapshot.values().map(SnapshotSession::from).collect());
+        }
+    }
+
+    /// Append a HEARTBEAT snapshot of the full registry to the history sink,
+    /// if attached. Called periodically by the liveness poll; the sink
+    /// itself enforces the minimum heartbeat spacing, so calling this every
+    /// poll tick is cheap.
+    pub fn snapshot_heartbeat(&self) {
+        let Some(history) = self.snapshot_history.get() else {
+            return;
+        };
+        let sessions = match self.map.lock() {
+            Ok(m) => m.values().map(SnapshotSession::from).collect(),
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on snapshot_heartbeat");
+                return;
+            }
+        };
+        history.record_heartbeat(sessions);
     }
 
     /// Insert or refresh a session by `claude_session_id`. If a record
@@ -287,6 +335,7 @@ impl SessionLifecycleStore {
             m.clone()
         };
         self.persist(&snapshot);
+        self.snapshot_change(&snapshot);
     }
 
     /// Mark an open session closed. No-op (no error) if the session is
@@ -312,6 +361,7 @@ impl SessionLifecycleStore {
             m.clone()
         };
         self.persist(&snapshot);
+        self.snapshot_change(&snapshot);
     }
 
     /// Bump `last_seen_at` on a present session. No-op (no write) if absent.
@@ -367,6 +417,7 @@ impl SessionLifecycleStore {
             m.clone()
         };
         self.persist(&snapshot);
+        self.snapshot_change(&snapshot);
     }
 
     /// Mark a present session as restore-pending (a boot-restore is about to
@@ -439,6 +490,7 @@ impl SessionLifecycleStore {
             m.clone()
         };
         self.persist(&snapshot);
+        self.snapshot_change(&snapshot);
     }
 
     /// Re-key a record from `old_id` to `new_id`: remove the entry stored under
@@ -488,6 +540,7 @@ impl SessionLifecycleStore {
             m.clone()
         };
         self.persist(&snapshot);
+        self.snapshot_change(&snapshot);
     }
 
     /// Remove a record outright (session-restore-redesign Phase 4 reconcile
@@ -511,6 +564,7 @@ impl SessionLifecycleStore {
             m.clone()
         };
         self.persist(&snapshot);
+        self.snapshot_change(&snapshot);
     }
 
     /// Clone of the open record currently hosted by `terminal_id`, if any.
@@ -1311,6 +1365,73 @@ mod tests {
             .map(|r| r.claude_session_id)
             .collect();
         assert_eq!(open_ids, vec!["open-sess".to_string()]);
+    }
+
+    /// Phase 4 (session-snapshot history): layout-meaningful mutations
+    /// append CHANGE snapshots to the attached history; liveness churn
+    /// (`touch`, restore-pending markers) and `prune` do NOT — and pruning
+    /// the registry never removes already-appended history lines (the
+    /// history outlives the registry's retention).
+    #[test]
+    fn snapshot_history_captures_changes_but_not_liveness_churn_or_prune() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let history_path = dir.path().join("session-snapshots.jsonl");
+        store.attach_snapshot_history(Arc::new(
+            crate::session::snapshot_history::SnapshotHistory::open(&history_path).unwrap(),
+        ));
+
+        let lines = |path: &Path| -> Vec<serde_json::Value> {
+            std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect()
+        };
+
+        // Open → one change snapshot carrying the full recovery tuple.
+        store.record_open(rec("sess-1"));
+        let recs = lines(&history_path);
+        assert_eq!(recs.len(), 1, "record_open appends a change snapshot");
+        assert_eq!(recs[0]["reason"], "change");
+        let s = &recs[0]["sessions"][0];
+        assert_eq!(s["claudeSessionId"], "sess-1");
+        assert_eq!(s["configDir"], "C:/cfg");
+        assert_eq!(s["workingDir"], "C:/repo");
+        assert_eq!(s["provider"], "claude");
+        assert_eq!(s["pageId"], "default");
+        assert_eq!(s["zoneIndex"], 2);
+        assert_eq!(s["title"], "Claude 1");
+        assert_eq!(s["state"], "open");
+
+        // Liveness churn must stay silent: touch, restore-pending markers,
+        // an identical re-record (boot re-assert), and a snapshot-gated
+        // heartbeat right after a change.
+        store.touch("sess-1");
+        store.mark_restore_pending("sess-1");
+        store.clear_restore_pending("sess-1");
+        store.record_open(rec("sess-1"));
+        store.snapshot_heartbeat();
+        assert_eq!(
+            recs.len(),
+            lines(&history_path).len(),
+            "churn appends nothing"
+        );
+
+        // Close → a change snapshot with the alive-state fields.
+        store.record_close("sess-1", "poll-dead");
+        let recs = lines(&history_path);
+        assert_eq!(recs.len(), 2, "record_close appends a change snapshot");
+        let s = &recs[1]["sessions"][0];
+        assert_eq!(s["state"], "closed");
+        assert_eq!(s["closeReason"], "poll-dead");
+
+        // Prune destroys the registry row (far-future now) but the history
+        // keeps every appended line: the audit outlives `prune`.
+        store.prune(Utc::now().timestamp_millis() + CLOSED_RETENTION_MS + 1_000);
+        assert!(store.get("sess-1").is_none(), "registry row pruned");
+        assert_eq!(lines(&history_path).len(), 2, "history retained past prune");
     }
 
     #[test]

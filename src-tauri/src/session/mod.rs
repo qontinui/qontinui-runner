@@ -68,6 +68,7 @@ pub mod provider_adapter;
 pub mod reconcile;
 pub mod session_lifecycle_store;
 pub mod shutdown_marker;
+pub mod snapshot_history;
 pub mod tracking_health;
 pub mod transport;
 
