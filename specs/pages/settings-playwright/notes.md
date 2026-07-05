@@ -1,3 +1,0 @@
-# PlaywrightSettings
-
-_(notes)_
