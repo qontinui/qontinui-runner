@@ -2418,6 +2418,37 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     },
                 );
+                // Append-only session-snapshot HISTORY (session-restore
+                // shim-fix plan, Phase 4): a durable JSONL audit of the full
+                // session set, written on every layout-meaningful registry
+                // change plus a periodic heartbeat (driven from the liveness
+                // poll below). Lives in the runner's own app-data
+                // (`~/.qontinui/runner/session-restore/`), port-scoped like
+                // the lifecycle file so temp runners never pollute the
+                // primary's history. NEVER read by the restore path — it is
+                // the manual/assistant fallback when auto-restore restores
+                // nothing. Fail-open: an open failure just leaves the sink
+                // unattached (registry keeps working, history is skipped).
+                let snapshot_history_file = if lifecycle_api_port == 9876 {
+                    "session-snapshots.jsonl".to_string()
+                } else {
+                    format!("session-snapshots-{}.jsonl", lifecycle_api_port)
+                };
+                let snapshot_history_path = session::claude_hook::session_restore_dir()
+                    .join(&snapshot_history_file);
+                match session::snapshot_history::SnapshotHistory::open(&snapshot_history_path) {
+                    Ok(history) => {
+                        lifecycle_store.attach_snapshot_history(std::sync::Arc::new(history));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            path = %snapshot_history_path.display(),
+                            "session: snapshot history open failed — layout audit disabled"
+                        );
+                    }
+                }
+
                 let poll_lifecycle_store = lifecycle_store.clone();
                 let reconcile_lifecycle_store = lifecycle_store.clone();
                 let health_lifecycle_store = lifecycle_store.clone();
@@ -2489,6 +2520,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                     loop {
                         tokio::time::sleep(Duration::from_secs(45)).await;
+
+                        // Periodic snapshot-history heartbeat (Phase 4): the
+                        // sink itself enforces the ~5-minute spacing, so
+                        // calling it every tick is cheap. Runs even when the
+                        // registry is empty — an empty snapshot is an honest
+                        // freshness proof.
+                        poll_lifecycle_store.snapshot_heartbeat();
 
                         let open = poll_lifecycle_store.open_records();
                         if open.is_empty() {
