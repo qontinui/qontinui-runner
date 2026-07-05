@@ -32,6 +32,7 @@ import { LockYieldPolicySettings } from "./LockYieldPolicySettings";
 import { SecuritySettings } from "./SecuritySettings";
 import { AccountSettings } from "./AccountSettings";
 import { CiRunnerSettings } from "./CiRunnerSettings";
+import { DevenvEnrollSettings } from "./DevenvEnrollSettings";
 import { DevLoopSettings } from "./DevLoopSettings";
 
 interface SettingsProps {
@@ -52,6 +53,7 @@ type SettingsTab =
   | "mobile"
   | "discovery"
   | "backend-connection"
+  | "devenv-enroll"
   | "mcp"
   | "log-sources"
   | "execution-variables"
@@ -82,6 +84,7 @@ const SETTINGS_TABS = [
   { id: "account", label: "Account" },
   { id: "dev-loop", label: "Test My Change" },
   { id: "backend-connection", label: "Backend Connection" },
+  { id: "devenv-enroll", label: "Devenv Enrollment" },
   { id: "ai", label: "AI Providers" },
   { id: "agentic", label: "Advanced AI" },
   { id: "self-healing", label: "Self-Healing" },
@@ -127,6 +130,7 @@ const SUB_TAB_TO_MAIN_TAB: Record<SettingsTab, string> = {
   account: "settings-account",
   "dev-loop": "settings-dev-loop",
   "backend-connection": "settings-backend-connection",
+  "devenv-enroll": "settings-backend-connection",
   ai: "settings-ai",
   agentic: "settings-agentic",
   "self-healing": "settings-self-healing",
@@ -286,6 +290,8 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
         return <MobileSettings onLog={onLog} />;
       case "discovery":
         return <DiscoverySettings onLog={onLog} />;
+      case "devenv-enroll":
+        return <DevenvEnrollSettings onLog={onLog} />;
       case "mcp":
         return <McpSettings onLog={onLog} />;
       case "log-sources":

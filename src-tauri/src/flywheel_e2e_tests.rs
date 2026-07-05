@@ -17,22 +17,22 @@
 //!
 //!   1. flywheel_full_walk_synthetic_page_through_promotion
 //!      — write_pending_ir → simulate green → promote → assert canonical IR
-//!        exists with provenance.status = Promoted.
+//!     exists with provenance.status = Promoted.
 //!   2. flywheel_demotes_on_single_red
 //!      — write_pending_ir → simulate red → demote → assert _pending/ gone
-//!        and no canonical IR was written.
+//!     and no canonical IR was written.
 //!   3. flywheel_skips_existing_specs_in_scan
 //!      — pre-create canonical IR for spec_id → list_pages exposes it →
-//!        scan filter would skip it.
+//!     scan filter would skip it.
 //!   4. flywheel_dedupes_concurrent_scans
 //!      — insert_proposal twice with same kind+pathname → second returns
-//!        Ok(false) per the UNIQUE constraint.
+//!     Ok(false) per the UNIQUE constraint.
 //!   5. flywheel_patch_preserves_hand_authored
 //!      — merge_patch_into_ir on hand-authored state → rejects with the
-//!        "pinned state" sentinel.
+//!     "pinned state" sentinel.
 //!   6. flywheel_validator_rejects_low_coverage
 //!      — synthetic IR with no transitions → gate_coverage returns
-//!        CoverageBelowFloor.
+//!     CoverageBelowFloor.
 //!
 //! Pretty much all of these rely on integration-time visibility of
 //! `spec_api`, `workflow_generation`, and (for the validator inner helper +
@@ -222,6 +222,7 @@ fn proposed_ir(id: &str) -> IrPageSpec {
         transitions: Vec::new(),
         synthesized_groups: None,
         initial_state: Some("s0".into()),
+        api_assertions: None,
     }
 }
 
@@ -258,6 +259,7 @@ fn disconnected_ir(id: &str) -> IrPageSpec {
         transitions: Vec::new(),
         synthesized_groups: None,
         initial_state: Some("s0".into()),
+        api_assertions: None,
     }
 }
 
@@ -594,8 +596,10 @@ async fn flywheel_patch_preserves_hand_authored() {
     // `add_transitions: Vec<IrTransition>`. We populate just the required-
     // elements bucket — the merge helper validates BEFORE applying so it
     // never half-mutates.
-    let mut crit = IrElementCriteria::default();
-    crit.id = Some("new-elem".into());
+    let crit = IrElementCriteria {
+        id: Some("new-elem".into()),
+        ..Default::default()
+    };
 
     let mut patch = IrPatch::default();
     patch

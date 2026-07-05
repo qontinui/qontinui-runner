@@ -68,6 +68,7 @@ pub mod provider_adapter;
 pub mod reconcile;
 pub mod session_lifecycle_store;
 pub mod shutdown_marker;
+pub mod tracking_health;
 pub mod transport;
 
 use std::collections::HashMap;
@@ -187,6 +188,14 @@ pub enum SessionEventKind {
     /// orthogonal to the liveness `Heartbeat`. Emitted on operator interaction
     /// by [`crate::claude_session::coord_register::AiCoordRegistrar::progress_on_interaction`].
     Progress,
+    /// Helper Task Queue (plan `2026-06-29-helper-task-queue`, Phase 1.3).
+    /// Drained to `POST /coord/helper-tasks`; the payload is the full
+    /// `CreateHelperTaskRequest` body recorded by
+    /// [`crate::helper_tasks::HelperTaskRegistrar`]. Best-effort: failures
+    /// never block session events queued behind it (bounded per-record retry,
+    /// then Ack-drop); a coord `helper_task_queue_unavailable` 503
+    /// (helper-task tables not migrated yet) is dropped with a warn.
+    HelperTaskCreated,
 }
 
 impl SessionEventKind {
@@ -201,6 +210,7 @@ impl SessionEventKind {
             SessionEventKind::HandoffRequest => "handoff_request",
             SessionEventKind::CommitReport => "commit_report",
             SessionEventKind::Progress => "progress",
+            SessionEventKind::HelperTaskCreated => "helper_task_created",
         }
     }
 }
@@ -1238,6 +1248,7 @@ mod tests {
             SessionEventKind::OutputChunk,
             SessionEventKind::HandoffRequest,
             SessionEventKind::CommitReport,
+            SessionEventKind::HelperTaskCreated,
         ];
         for k in kinds {
             let json = serde_json::to_string(&k).unwrap();

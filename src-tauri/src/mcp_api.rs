@@ -303,6 +303,14 @@ async fn health(
     // mounted past App.tsx's loading screen and is processing UI Bridge IPC".
     let frontend_ready = state.app_state.frontend_ready.load(Ordering::Relaxed);
 
+    // Build/deploy drift vs origin/main (plan 2026-07-03-runner-session-
+    // tracking-drift-and-guardrails Phase 3 item 3). `mainSha` is
+    // origin/main's current SHA (null when unresolvable — production install
+    // without a repo, no network); `buildDrift.behind` compares it against
+    // the embedded `gitSha` prefix. Populated by the background checker in
+    // `crate::build_drift`.
+    let (main_sha_json, build_drift_json) = crate::build_drift::health_fields();
+
     let mut data = serde_json::json!({
         "status": status,
         "ready": last_pong > 0,
@@ -334,6 +342,15 @@ async fn health(
         // the running binary's value — the only divergence vector is a
         // mid-session binary swap behind the live webview.
         "buildId": env!("RUNNER_BUILD_ID"),
+        // origin/main's current SHA + drift verdict vs the embedded gitSha
+        // (see `crate::build_drift`). All-null until the first background
+        // check completes, and permanently null on a repo-less install.
+        "mainSha": main_sha_json,
+        "buildDrift": build_drift_json,
+        // Session-tracking health (see `crate::session::tracking_health`):
+        // last cross-reference timestamp, live-but-untracked / tracked-but-
+        // dead counts + detail, and the untracked-backend-spawn counter.
+        "sessionTracking": crate::session::tracking_health::health_json(),
         "storage": {
             "apiPort": api_port,
             "namespaceSuffix": storage_namespace_suffix,
@@ -651,28 +668,65 @@ async fn coord_mcp_proxy_handler(
         })
 }
 
-/// The two — and ONLY two — coord routes the nonce-gated claims read
-/// passthrough may reach (plan 2026-06-11-claims-read-auth-hardening, Phase 2).
+/// The ONLY coord READ routes the nonce-gated read passthrough may reach:
+/// the two claims reads (plan 2026-06-11-claims-read-auth-hardening, Phase 2)
+/// plus the work-unit dependency-edge read (device-session coord surface
+/// hardening follow-up) — coord serves `GET /coord/work-units/{slug}/deps`
+/// on its device-JWT `work_units_agent_authed` sub-router (`require_jwt`),
+/// so a device bearer is accepted there.
 ///
 /// Deliberately a closed enum rather than a path parameter: the per-session
 /// proxy nonce authenticates a *session*, not an operator, so its authority
-/// must stay scoped to these two read-only claims endpoints. A generic
+/// must stay scoped to these enumerated read-only endpoints. A generic
 /// `/coord-mcp/proxy/{path}` passthrough would let a leaked nonce reach any
 /// coord route with the runner's device identity — arbitrary paths must be
-/// structurally impossible, not merely unrouted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// structurally impossible, not merely unrouted. The `WorkUnitDeps` slug is
+/// validated to a safe charset ([`slug_is_valid`]) before any URL is built,
+/// exactly like [`CoordWriteTarget`]'s dynamic segments.
+///
+/// NOTE the deliberate EXCLUSION: `GET /coord/work-units/{slug}` (the bare
+/// work-unit read) moved to coord's operator read sub-router — its `TenantId`
+/// extractor resolves SOLELY from an `OperatorContext` (Cognito bearer), so a
+/// device JWT gets 403 `tenant_not_resolved`. Do not forward it.
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ClaimsReadTarget {
     /// `GET {coord}/coord/claims/list`
     List,
     /// `GET {coord}/coord/claims/by-resource`
     ByResource,
+    /// `GET {coord}/coord/work-units/{slug}/deps`
+    WorkUnitDeps { slug: String },
 }
 
 impl ClaimsReadTarget {
-    fn coord_path(self) -> &'static str {
+    fn coord_path(&self) -> String {
         match self {
-            ClaimsReadTarget::List => "/coord/claims/list",
-            ClaimsReadTarget::ByResource => "/coord/claims/by-resource",
+            ClaimsReadTarget::List => "/coord/claims/list".to_string(),
+            ClaimsReadTarget::ByResource => "/coord/claims/by-resource".to_string(),
+            ClaimsReadTarget::WorkUnitDeps { slug } => {
+                format!("/coord/work-units/{slug}/deps")
+            }
+        }
+    }
+
+    /// Validate the dynamic segment (if any). Returns `Err((status, code, msg))`
+    /// on a bad shape so the caller can emit a runner-originated 400 — the
+    /// segment is rejected BEFORE any coord URL is built, mirroring
+    /// [`CoordWriteTarget::validate`].
+    fn validate(&self) -> Result<(), (u16, &'static str, String)> {
+        match self {
+            ClaimsReadTarget::List | ClaimsReadTarget::ByResource => Ok(()),
+            ClaimsReadTarget::WorkUnitDeps { slug } => {
+                if slug_is_valid(slug) {
+                    Ok(())
+                } else {
+                    Err((
+                        400,
+                        "COORD_CLAIMS_PROXY_BAD_TARGET",
+                        format!("invalid work-unit slug: {slug:?}"),
+                    ))
+                }
+            }
         }
     }
 }
@@ -774,6 +828,21 @@ async fn coord_claims_read_proxy_handler(
     }
     let bearer = bearer.unwrap_or_default(); // gate guarantees Some(non-empty)
 
+    // Validate the dynamic segment (if any) BEFORE building any coord URL — a
+    // bad shape is a runner-originated 400, never forwarded.
+    if let Err((status, code, msg)) = target.validate() {
+        warn!("coord-mcp claims proxy: {msg}");
+        return (
+            axum::http::StatusCode::from_u16(status).unwrap_or(axum::http::StatusCode::BAD_REQUEST),
+            Json(serde_json::json!({
+                "success": false,
+                "error": msg,
+                "code": code,
+            })),
+        )
+            .into_response();
+    }
+
     let url = claims_upstream_url(
         &crate::coord_mcp::coord_base_url(),
         target,
@@ -870,15 +939,26 @@ async fn coord_claims_by_resource_handler(
     coord_claims_read_proxy_handler(ClaimsReadTarget::ByResource, headers, raw_query).await
 }
 
-/// The two — and ONLY two — coord WRITE routes the nonce-gated device-JWT
-/// forwarder may reach (plan 2026-06-15-coord-mcp-live-token-write-forwarder,
-/// Phase 1). The write sibling of [`ClaimsReadTarget`].
+/// The ONLY coord WRITE routes the nonce-gated device-JWT forwarder may reach:
+/// the two gate writes (plan 2026-06-15-coord-mcp-live-token-write-forwarder,
+/// Phase 1) plus the work-unit registry writes (device-session coord surface
+/// hardening follow-up). The write sibling of [`ClaimsReadTarget`].
+///
+/// Every work-unit variant maps to coord's device-JWT `work_units_agent_authed`
+/// sub-router (layered with `require_jwt`, which accepts the device bearer):
+/// `POST /coord/work-units/upsert`, `POST /coord/work-units/{slug}/transition`,
+/// `POST /coord/work-units/{slug}/register-gate`, and
+/// `POST /coord/work-units/{slug}/deps`. Deliberately EXCLUDED (operator-only
+/// on coord — a device JWT gets 403 `tenant_not_resolved` or 401):
+/// `GET /coord/work-units/{slug}` / `/history` / the list read (operator
+/// `TenantId` sub-router) and `POST /coord/work-units/{slug}/operator-transition`
+/// (admin-gated operator lever).
 ///
 /// Deliberately a closed enum carrying a *validated* dynamic segment rather
 /// than a free path parameter, for exactly the security boundary documented on
 /// [`ClaimsReadTarget`] at mcp_api.rs:559-567: the per-session proxy nonce
 /// authenticates a *session*, not an operator, so its authority must stay
-/// scoped to these two device-authed write endpoints. A generic
+/// scoped to these enumerated device-authed write endpoints. A generic
 /// `/coord-mcp/proxy/{path}` POST passthrough would let a leaked nonce reach
 /// any coord write route with the runner's device identity — arbitrary paths
 /// must be structurally impossible, not merely unrouted. The dynamic segment
@@ -895,6 +975,16 @@ enum CoordWriteTarget {
     RegisterPlanGate { slug: String },
     /// `POST {coord}/coord/gates/{gate_id}/attest`
     AttestGate { gate_id: String },
+    /// `POST {coord}/coord/work-units/upsert` (slug travels in the JSON body;
+    /// no dynamic path segment)
+    WorkUnitUpsert,
+    /// `POST {coord}/coord/work-units/{slug}/transition`
+    WorkUnitTransition { slug: String },
+    /// `POST {coord}/coord/work-units/{slug}/register-gate`
+    WorkUnitRegisterGate { slug: String },
+    /// `POST {coord}/coord/work-units/{slug}/deps` (replace-set dependency
+    /// edge write)
+    WorkUnitSetDeps { slug: String },
 }
 
 /// A coord plan slug stem: lowercase alphanumeric + hyphens, must start with an
@@ -923,14 +1013,18 @@ impl CoordWriteTarget {
     /// rejected before any coord URL is built — a bad path can never be smuggled).
     fn validate(&self) -> Result<(), (u16, &'static str, String)> {
         match self {
-            CoordWriteTarget::RegisterPlanGate { slug } => {
+            CoordWriteTarget::WorkUnitUpsert => Ok(()),
+            CoordWriteTarget::RegisterPlanGate { slug }
+            | CoordWriteTarget::WorkUnitTransition { slug }
+            | CoordWriteTarget::WorkUnitRegisterGate { slug }
+            | CoordWriteTarget::WorkUnitSetDeps { slug } => {
                 if slug_is_valid(slug) {
                     Ok(())
                 } else {
                     Err((
                         400,
                         "COORD_WRITE_PROXY_BAD_TARGET",
-                        format!("invalid plan slug: {slug:?}"),
+                        format!("invalid slug: {slug:?}"),
                     ))
                 }
             }
@@ -965,21 +1059,36 @@ fn write_upstream_url(base: &str, target: &CoordWriteTarget) -> String {
         CoordWriteTarget::AttestGate { gate_id } => {
             format!("{base}/coord/gates/{gate_id}/attest")
         }
+        CoordWriteTarget::WorkUnitUpsert => {
+            format!("{base}/coord/work-units/upsert")
+        }
+        CoordWriteTarget::WorkUnitTransition { slug } => {
+            format!("{base}/coord/work-units/{slug}/transition")
+        }
+        CoordWriteTarget::WorkUnitRegisterGate { slug } => {
+            format!("{base}/coord/work-units/{slug}/register-gate")
+        }
+        CoordWriteTarget::WorkUnitSetDeps { slug } => {
+            format!("{base}/coord/work-units/{slug}/deps")
+        }
     }
 }
 
 /// `POST /coord-mcp/gates/register-plan/{slug}` +
-/// `POST /coord-mcp/gates/{gate_id}/attest` — the nonce-gated device-JWT WRITE
+/// `POST /coord-mcp/gates/{gate_id}/attest` +
+/// `POST /coord-mcp/work-units/{upsert | {slug}/transition |
+/// {slug}/register-gate | {slug}/deps}` — the nonce-gated device-JWT WRITE
 /// forwarder for device-provisioned sessions (plan
-/// 2026-06-15-coord-mcp-live-token-write-forwarder, Phase 1).
+/// 2026-06-15-coord-mcp-live-token-write-forwarder, Phase 1; work-unit surface
+/// added by the device-session coord surface hardening follow-up).
 ///
 /// Why: a device session's `.mcp.json` carries no bearer anymore (live-token
-/// proxy, runner #546) — only the per-session loopback nonce. The plan-ready
-/// and gate-attest flows need to POST against coord's two device-authed write
-/// routes, so this lets those callers reuse the nonce: same gate, same live
-/// `AuthManager` device-JWT injection, same coord-base resolution as
-/// `coord_mcp_proxy_handler`, but restricted to the two write routes in
-/// [`CoordWriteTarget`] with a validated dynamic segment.
+/// proxy, runner #546) — only the per-session loopback nonce. The plan-ready,
+/// gate-attest, and work-unit registry flows need to POST against coord's
+/// device-authed write routes, so this lets those callers reuse the nonce:
+/// same gate, same live `AuthManager` device-JWT injection, same coord-base
+/// resolution as `coord_mcp_proxy_handler`, but restricted to the enumerated
+/// write routes in [`CoordWriteTarget`] with a validated dynamic segment.
 ///
 /// Gate (`coord_mcp::proxy_request_gate`, 401 before any network I/O):
 /// registered `X-Coord-Mcp-Proxy-Key` nonce AND the live bearer decodes
@@ -1169,6 +1278,61 @@ async fn coord_attest_gate_handler(
     body: axum::body::Bytes,
 ) -> axum::response::Response {
     coord_write_proxy_handler(CoordWriteTarget::AttestGate { gate_id }, headers, body).await
+}
+
+/// `POST /coord-mcp/work-units/upsert` — see [`coord_write_proxy_handler`].
+async fn coord_work_unit_upsert_handler(
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    coord_write_proxy_handler(CoordWriteTarget::WorkUnitUpsert, headers, body).await
+}
+
+/// `POST /coord-mcp/work-units/{slug}/transition` — see
+/// [`coord_write_proxy_handler`].
+async fn coord_work_unit_transition_handler(
+    axum::extract::Path(slug): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    coord_write_proxy_handler(CoordWriteTarget::WorkUnitTransition { slug }, headers, body).await
+}
+
+/// `POST /coord-mcp/work-units/{slug}/register-gate` — see
+/// [`coord_write_proxy_handler`].
+async fn coord_work_unit_register_gate_handler(
+    axum::extract::Path(slug): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    coord_write_proxy_handler(
+        CoordWriteTarget::WorkUnitRegisterGate { slug },
+        headers,
+        body,
+    )
+    .await
+}
+
+/// `POST /coord-mcp/work-units/{slug}/deps` — see [`coord_write_proxy_handler`].
+async fn coord_work_unit_set_deps_handler(
+    axum::extract::Path(slug): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    coord_write_proxy_handler(CoordWriteTarget::WorkUnitSetDeps { slug }, headers, body).await
+}
+
+/// `GET /coord-mcp/work-units/{slug}/deps` — see
+/// [`coord_claims_read_proxy_handler`] (the nonce-gated device-JWT READ
+/// passthrough; this route rides the same gate + forward leg as the claims
+/// reads, with the slug validated before any URL is built).
+async fn coord_work_unit_deps_get_handler(
+    axum::extract::Path(slug): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+) -> axum::response::Response {
+    coord_claims_read_proxy_handler(ClaimsReadTarget::WorkUnitDeps { slug }, headers, raw_query)
+        .await
 }
 
 /// Create the API router
@@ -1912,6 +2076,20 @@ pub fn create_router(
         });
     }
 
+    // Helper Task Queue (plan 2026-06-29, Phase 1.3 Part D) — poll collected
+    // helper answers from coord into the persisted store that feeds the
+    // reflection-context section and the Helper Tasks Review tab. The tick
+    // runs when settings.helper_tasks.emit_enabled is on OR the store already
+    // has tasks/answers (pausing emission must not pause collection), and is
+    // device-JWT-gated — spawning unconditionally adds no always-on traffic
+    // for an opted-out runner with an empty store.
+    {
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            crate::helper_tasks::poller::run_forever().await;
+        });
+    }
+
     // Restore persisted coord-mcp proxy nonces + reconcile session configs to
     // the current bound port (plan 2026-06-13 Phases 3b + 3c). 3b makes an
     // already-written `.mcp.json` keep validating across a restart (the nonce
@@ -2544,8 +2722,10 @@ pub fn create_router(
         // Nonce-gated claims READ passthrough for device sessions' hook
         // helper + skill wait-poll (plan 2026-06-11-claims-read-auth-hardening
         // Phase 2). Same gate + live device-JWT injection as /coord-mcp, but
-        // allowlisted to EXACTLY these two read-only coord routes — never a
-        // generic path passthrough (see `ClaimsReadTarget`).
+        // allowlisted to EXACTLY the read-only coord routes enumerated in
+        // `ClaimsReadTarget` — never a generic path passthrough. (The
+        // work-unit deps read rides the same passthrough; it is registered
+        // below with the work-unit forward-list.)
         .route("/coord-mcp/claims/list", get(coord_claims_list_handler))
         .route(
             "/coord-mcp/claims/by-resource",
@@ -2554,8 +2734,8 @@ pub fn create_router(
         // Nonce-gated device-JWT WRITE forwarder for device sessions
         // (plan 2026-06-15-coord-mcp-live-token-write-forwarder Phase 1).
         // Same gate + live device-JWT injection as /coord-mcp, but allowlisted
-        // to EXACTLY these two device-authed coord write routes with a validated
-        // dynamic segment — never a generic path passthrough (see
+        // to EXACTLY these enumerated device-authed coord write routes with a
+        // validated dynamic segment — never a generic path passthrough (see
         // `CoordWriteTarget`).
         .route(
             "/coord-mcp/gates/register-plan/{slug}",
@@ -2564,6 +2744,28 @@ pub fn create_router(
         .route(
             "/coord-mcp/gates/{gate_id}/attest",
             post(coord_attest_gate_handler),
+        )
+        // Work-unit registry forward-list (device-session coord surface
+        // hardening follow-up): coord serves all four under its device-JWT
+        // `work_units_agent_authed` sub-router (`require_jwt`), so a device
+        // bearer authenticates. The bare work-unit read
+        // (`GET /coord/work-units/{slug}`) is deliberately NOT forwarded —
+        // it is operator/`TenantId`-only on coord (403 under a device JWT).
+        .route(
+            "/coord-mcp/work-units/upsert",
+            post(coord_work_unit_upsert_handler),
+        )
+        .route(
+            "/coord-mcp/work-units/{slug}/transition",
+            post(coord_work_unit_transition_handler),
+        )
+        .route(
+            "/coord-mcp/work-units/{slug}/register-gate",
+            post(coord_work_unit_register_gate_handler),
+        )
+        .route(
+            "/coord-mcp/work-units/{slug}/deps",
+            get(coord_work_unit_deps_get_handler).post(coord_work_unit_set_deps_handler),
         )
         // Relay web-integration diagnostic — exposes the idle-gating state
         // (tier, enabled, device-JWT presence, WS connection, last error) so
@@ -3035,12 +3237,18 @@ pub async fn start_server(
 mod coord_claims_proxy_tests {
     use super::{
         claims_upstream_url, coord_claims_by_resource_handler, coord_claims_list_handler,
-        forward_claims_get, ClaimsReadTarget,
+        coord_work_unit_deps_get_handler, forward_claims_get, ClaimsReadTarget,
     };
     use axum::{body::Body, http::Request, routing::get, Router};
     use tower::ServiceExt;
 
-    const CLAIMS_ROUTES: &[&str] = &["/coord-mcp/claims/list", "/coord-mcp/claims/by-resource"];
+    // Concrete request paths used to hit the read routes in tests (the deps
+    // read is registered under the `{slug}` template below).
+    const CLAIMS_ROUTES: &[&str] = &[
+        "/coord-mcp/claims/list",
+        "/coord-mcp/claims/by-resource",
+        "/coord-mcp/work-units/2026-07-03-some-unit/deps",
+    ];
 
     fn claims_router() -> Router {
         Router::new()
@@ -3048,6 +3256,10 @@ mod coord_claims_proxy_tests {
             .route(
                 "/coord-mcp/claims/by-resource",
                 get(coord_claims_by_resource_handler),
+            )
+            .route(
+                "/coord-mcp/work-units/{slug}/deps",
+                get(coord_work_unit_deps_get_handler),
             )
     }
 
@@ -3081,11 +3293,47 @@ mod coord_claims_proxy_tests {
             claims_upstream_url("http://127.0.0.1:9870", ClaimsReadTarget::List, Some("")),
             "http://127.0.0.1:9870/coord/claims/list"
         );
+        // Work-unit deps read: the FIXED coord route template with the
+        // (already-validated) slug interpolated.
+        assert_eq!(
+            claims_upstream_url(
+                "https://coord.example.test",
+                ClaimsReadTarget::WorkUnitDeps {
+                    slug: "2026-07-03-some-unit".to_string()
+                },
+                None,
+            ),
+            "https://coord.example.test/coord/work-units/2026-07-03-some-unit/deps"
+        );
+    }
+
+    /// `validate()` on the read targets: the claims paths carry no dynamic
+    /// segment (always Ok); the work-unit deps slug is charset-validated with
+    /// the runner-originated 400 code on a bad shape — a path can never be
+    /// smuggled into the fixed coord route template.
+    #[test]
+    fn read_target_validate_rejects_bad_slugs() {
+        assert!(ClaimsReadTarget::List.validate().is_ok());
+        assert!(ClaimsReadTarget::ByResource.validate().is_ok());
+        assert!(ClaimsReadTarget::WorkUnitDeps {
+            slug: "2026-07-03-some-unit".to_string()
+        }
+        .validate()
+        .is_ok());
+        for bad in ["../etc", "a/b", "A", "a%2f", "a.b", "a b", "", "-leading"] {
+            let err = ClaimsReadTarget::WorkUnitDeps {
+                slug: bad.to_string(),
+            }
+            .validate()
+            .unwrap_err();
+            assert_eq!(err.0, 400, "{bad:?} must be rejected");
+            assert_eq!(err.1, "COORD_CLAIMS_PROXY_BAD_TARGET");
+        }
     }
 
     /// Absent `X-Coord-Mcp-Proxy-Key` → 401 from the runner with the claims
-    /// proxy's own error code, on BOTH routes. The gate runs before any
-    /// upstream I/O, so the request is never forwarded to coord.
+    /// proxy's own error code, on EVERY forwarded read route. The gate runs
+    /// before any upstream I/O, so the request is never forwarded to coord.
     #[tokio::test]
     async fn claims_routes_missing_nonce_is_401_never_forwarded() {
         for path in CLAIMS_ROUTES {
@@ -3100,8 +3348,8 @@ mod coord_claims_proxy_tests {
         }
     }
 
-    /// A wrong (unregistered) nonce → 401, same code, on BOTH routes —
-    /// query string present to prove the gate fires regardless.
+    /// A wrong (unregistered) nonce → 401, same code, on EVERY forwarded read
+    /// route — query string present to prove the gate fires regardless.
     #[tokio::test]
     async fn claims_routes_wrong_nonce_is_401() {
         for path in CLAIMS_ROUTES {
@@ -3228,8 +3476,11 @@ mod coord_claims_proxy_tests {
 #[cfg(test)]
 mod coord_write_proxy_tests {
     use super::{
-        coord_attest_gate_handler, coord_register_plan_gate_handler, forward_coord_write_post,
-        gate_id_is_valid, slug_is_valid, write_upstream_url, CoordWriteTarget,
+        coord_attest_gate_handler, coord_register_plan_gate_handler,
+        coord_work_unit_register_gate_handler, coord_work_unit_set_deps_handler,
+        coord_work_unit_transition_handler, coord_work_unit_upsert_handler,
+        forward_coord_write_post, gate_id_is_valid, slug_is_valid, write_upstream_url,
+        CoordWriteTarget,
     };
     use axum::{body::Body, http::Request, routing::post, Router};
     use tower::ServiceExt;
@@ -3238,17 +3489,29 @@ mod coord_write_proxy_tests {
     const WRITE_ROUTES: &[&str] = &[
         "/coord-mcp/gates/register-plan/{slug}",
         "/coord-mcp/gates/{gate_id}/attest",
+        "/coord-mcp/work-units/upsert",
+        "/coord-mcp/work-units/{slug}/transition",
+        "/coord-mcp/work-units/{slug}/register-gate",
+        "/coord-mcp/work-units/{slug}/deps",
     ];
     // Concrete request paths used to hit those routes in tests.
     const WRITE_REQUEST_PATHS: &[&str] = &[
         "/coord-mcp/gates/register-plan/2026-06-15-some-plan",
         "/coord-mcp/gates/123e4567-e89b-12d3-a456-426614174000/attest",
+        "/coord-mcp/work-units/upsert",
+        "/coord-mcp/work-units/2026-07-03-some-unit/transition",
+        "/coord-mcp/work-units/2026-07-03-some-unit/register-gate",
+        "/coord-mcp/work-units/2026-07-03-some-unit/deps",
     ];
 
     fn write_router() -> Router {
         Router::new()
             .route(WRITE_ROUTES[0], post(coord_register_plan_gate_handler))
             .route(WRITE_ROUTES[1], post(coord_attest_gate_handler))
+            .route(WRITE_ROUTES[2], post(coord_work_unit_upsert_handler))
+            .route(WRITE_ROUTES[3], post(coord_work_unit_transition_handler))
+            .route(WRITE_ROUTES[4], post(coord_work_unit_register_gate_handler))
+            .route(WRITE_ROUTES[5], post(coord_work_unit_set_deps_handler))
     }
 
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {
@@ -3310,6 +3573,42 @@ mod coord_write_proxy_tests {
             ),
             "https://coord.example.test/coord/gates/123e4567-e89b-12d3-a456-426614174000/attest"
         );
+        // Work-unit registry forward-list (device-session coord surface
+        // hardening follow-up).
+        assert_eq!(
+            write_upstream_url(
+                "https://coord.example.test",
+                &CoordWriteTarget::WorkUnitUpsert
+            ),
+            "https://coord.example.test/coord/work-units/upsert"
+        );
+        assert_eq!(
+            write_upstream_url(
+                "https://coord.example.test",
+                &CoordWriteTarget::WorkUnitTransition {
+                    slug: "2026-07-03-some-unit".to_string()
+                },
+            ),
+            "https://coord.example.test/coord/work-units/2026-07-03-some-unit/transition"
+        );
+        assert_eq!(
+            write_upstream_url(
+                "https://coord.example.test",
+                &CoordWriteTarget::WorkUnitRegisterGate {
+                    slug: "2026-07-03-some-unit".to_string()
+                },
+            ),
+            "https://coord.example.test/coord/work-units/2026-07-03-some-unit/register-gate"
+        );
+        assert_eq!(
+            write_upstream_url(
+                "https://coord.example.test/",
+                &CoordWriteTarget::WorkUnitSetDeps {
+                    slug: "2026-07-03-some-unit".to_string()
+                },
+            ),
+            "https://coord.example.test/coord/work-units/2026-07-03-some-unit/deps"
+        );
     }
 
     /// `validate()` returns the runner-originated 400 code for a bad segment and
@@ -3341,11 +3640,44 @@ mod coord_write_proxy_tests {
         .unwrap_err();
         assert_eq!(err.0, 400);
         assert_eq!(err.1, "COORD_WRITE_PROXY_BAD_TARGET");
+
+        // Work-unit targets: upsert carries no segment (always valid); every
+        // slug-carrying variant runs the same charset validation.
+        assert!(CoordWriteTarget::WorkUnitUpsert.validate().is_ok());
+        for target in [
+            CoordWriteTarget::WorkUnitTransition {
+                slug: "2026-07-03-some-unit".to_string(),
+            },
+            CoordWriteTarget::WorkUnitRegisterGate {
+                slug: "2026-07-03-some-unit".to_string(),
+            },
+            CoordWriteTarget::WorkUnitSetDeps {
+                slug: "2026-07-03-some-unit".to_string(),
+            },
+        ] {
+            assert!(target.validate().is_ok(), "{target:?} must validate");
+        }
+        for target in [
+            CoordWriteTarget::WorkUnitTransition {
+                slug: "../etc".to_string(),
+            },
+            CoordWriteTarget::WorkUnitRegisterGate {
+                slug: "a/b".to_string(),
+            },
+            CoordWriteTarget::WorkUnitSetDeps {
+                slug: "a%2f".to_string(),
+            },
+        ] {
+            let err = target.validate().unwrap_err();
+            assert_eq!(err.0, 400);
+            assert_eq!(err.1, "COORD_WRITE_PROXY_BAD_TARGET");
+        }
     }
 
     /// Absent `X-Coord-Mcp-Proxy-Key` → 401 from the runner with the write
-    /// proxy's own error code, on BOTH routes. The gate runs before any upstream
-    /// I/O (and before segment validation), so nothing is forwarded.
+    /// proxy's own error code, on EVERY forwarded write route. The gate runs
+    /// before any upstream I/O (and before segment validation), so nothing is
+    /// forwarded.
     #[tokio::test]
     async fn write_routes_missing_nonce_is_401_never_forwarded() {
         for path in WRITE_REQUEST_PATHS {
@@ -3366,7 +3698,8 @@ mod coord_write_proxy_tests {
         }
     }
 
-    /// A wrong (unregistered) nonce → 401, same code, on BOTH routes.
+    /// A wrong (unregistered) nonce → 401, same code, on EVERY forwarded write
+    /// route.
     #[tokio::test]
     async fn write_routes_wrong_nonce_is_401() {
         for path in WRITE_REQUEST_PATHS {

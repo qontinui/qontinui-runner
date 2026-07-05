@@ -44,6 +44,8 @@
 
 pub mod collectors;
 pub mod config;
+pub mod directive;
+pub mod enroll;
 
 use std::sync::OnceLock;
 use std::time::Duration;

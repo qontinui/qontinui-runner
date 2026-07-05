@@ -73,6 +73,7 @@ import { OrchestrationLoopPanel } from "@/components/orchestration-loop/Orchestr
 import { MetaOptimizerPage } from "@/pages/MetaOptimizerPage";
 import { OnlineLearningDashboard } from "@/components/online-learning/OnlineLearningDashboard";
 import { SpecsPage } from "@/pages/specs/SpecsPage";
+import { HelperTasksPage } from "@/pages/helper-tasks/HelperTasksPage";
 import { UIBridgeIntegrationPage } from "@/pages/ui-bridge-integration/UIBridgeIntegrationPage";
 import { WrappersLibraryPage } from "@/pages/wrappers/WrappersLibraryPage";
 import { UIBridgeStateMachinePage } from "@/pages/state-machine";
@@ -800,6 +801,18 @@ export function TabContent({
               setActiveTab("unified-workflow-builder");
             }}
           />
+        </div>
+      );
+
+    case "helper-tasks":
+      return (
+        <div data-page-id="helper-tasks" className="h-full overflow-hidden">
+          <PageRegistration
+            id="helper-tasks"
+            name="Helper Tasks"
+            description="Helper Task Queue — emit settings, collected helper answers, and helper invites"
+          />
+          <HelperTasksPage />
         </div>
       );
 

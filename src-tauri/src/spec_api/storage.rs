@@ -450,8 +450,10 @@ pub fn write_pending_ir(root: &Path, app_id: &str, ir: &IrPageSpec) -> Result<Pa
         status: None,
     });
     // Backfill `app_id` if the caller supplied a provenance block that left
-    // it blank or hardcoded the legacy `qontinui-runner` placeholder.
-    if prov.app_id.is_empty() {
+    // it blank or hardcoded the legacy `qontinui-runner` placeholder. The
+    // `app_id` parameter is authoritative — it names the app whose root this
+    // IR is being staged under.
+    if prov.app_id.is_empty() || prov.app_id == RUNNER_APP_ID {
         prov.app_id = app_id.to_string();
     }
     prov.status = Some(ProposalStatus::Pending);
@@ -748,6 +750,7 @@ mod pending_tests {
             transitions: Vec::new(),
             synthesized_groups: None,
             initial_state: None,
+            api_assertions: None,
         }
     }
 

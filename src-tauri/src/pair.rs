@@ -81,6 +81,14 @@ pub struct PairCompleteResponse {
     /// wire. `#[serde(default)]` tolerates pre-tenant coord builds.
     #[serde(default)]
     pub tenant_id: Option<String>,
+    /// Optional device-bound machine key (`dmk_<token>`) auto-minted by the
+    /// web `pair_cli` endpoint at pairing time (plan 2026-07-02 Phase 3).
+    /// When present, [`persist_pairing`] stores it so the refresher can later
+    /// exchange it for a device JWT with no user session — the >30-day-offline
+    /// cold-start recovery path (Phase 4b). `#[serde(default)]` tolerates
+    /// pre-dmk web builds that don't return it.
+    #[serde(default)]
+    pub device_machine_key: Option<String>,
 }
 
 /// Wire shape for `POST /coord/devices/pair-start` response. Coord returns
@@ -910,6 +918,8 @@ impl PairCodeRedeemResponse {
             jti: None,
             exp: None,
             tenant_id: Some(self.tenant_id),
+            // The pair-code redeem path does not carry a dmk_ in this phase.
+            device_machine_key: None,
         }
     }
 }
@@ -1211,6 +1221,9 @@ pub fn pair_via_browser(
         jti: None,
         exp: None,
         tenant_id: Some(tenant_id.to_string()),
+        // The browser callback delivers only the device JWT; a dmk_ (if any)
+        // is minted server-side and arrives via the pair-cli response path.
+        device_machine_key: None,
     })
 }
 
@@ -1248,6 +1261,21 @@ pub fn persist_pairing(resp: &PairCompleteResponse, tenant_id: uuid::Uuid) -> Re
         if let Ok(storage) = crate::secure_storage::SecureStorage::new() {
             if let Err(e) = storage.store_device_id(did) {
                 tracing::debug!("store_device_id non-fatal: {e}");
+            }
+        }
+    }
+    // Best-effort: if the web pair response auto-minted a device machine key
+    // (`dmk_`), persist it so the refresher's Phase-4b cold-start exchange can
+    // recover a device JWT after a >30-day outage with no user session. A
+    // missing dmk_ (pre-Phase-3 web / non-cli pairing) is a no-op.
+    if let Some(dmk) = resp
+        .device_machine_key
+        .as_deref()
+        .filter(|k| !k.trim().is_empty())
+    {
+        if let Ok(storage) = crate::secure_storage::SecureStorage::new() {
+            if let Err(e) = storage.store_device_machine_key(dmk) {
+                tracing::debug!("store_device_machine_key non-fatal: {e}");
             }
         }
     }
@@ -1423,6 +1451,35 @@ mod tests {
             Some("33333333-3333-4333-8333-333333333333")
         );
         assert_eq!(parsed.exp, Some(1_234_567_890));
+    }
+
+    /// Phase 4b: the pair-cli response may now carry an optional
+    /// `device_machine_key` (`dmk_`). It must decode when present and default
+    /// to `None` when absent (pre-Phase-3 web) — additive, back-compatible.
+    #[test]
+    fn pair_complete_response_decodes_optional_device_machine_key() {
+        // Present:
+        let with_dmk = serde_json::json!({
+            "token":     "abc.def.ghi",
+            "device_id": "11111111-1111-4111-8111-111111111111",
+            "user_id":   "22222222-2222-4222-8222-222222222222",
+            "device_machine_key": "dmk_unit_fixture_placeholder",
+        });
+        let parsed: PairCompleteResponse =
+            serde_json::from_value(with_dmk).expect("decode with dmk");
+        assert_eq!(
+            parsed.device_machine_key.as_deref(),
+            Some("dmk_unit_fixture_placeholder")
+        );
+
+        // Absent → None (a pre-dmk web build).
+        let without_dmk = serde_json::json!({
+            "token":   "abc.def.ghi",
+            "user_id": "22222222-2222-4222-8222-222222222222",
+        });
+        let parsed2: PairCompleteResponse =
+            serde_json::from_value(without_dmk).expect("decode without dmk");
+        assert!(parsed2.device_machine_key.is_none());
     }
 
     /// Defect 5 shape assertion (body-level): the `pair_with_auth_token`
@@ -1678,6 +1735,7 @@ mod tests {
             jti: None,
             exp: None,
             tenant_id: None,
+            device_machine_key: None,
         }
     }
 

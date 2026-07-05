@@ -253,6 +253,7 @@ mod tests {
             transitions,
             synthesized_groups: None,
             initial_state: initial.map(|s| s.to_string()),
+            api_assertions: None,
         }
     }
 

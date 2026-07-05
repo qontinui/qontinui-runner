@@ -271,9 +271,22 @@ pub fn render_identity_for_test(tool: &str, shim_dir: &Path) -> String {
 
 /// Write the platform-appropriate identity shim file(s) for `tool`
 /// (`claude`/`gemini`) into `dir`. Mirrors [`write_shims_for`]: always an
-/// extensionless script (Git Bash + Unix), plus a `.cmd` on Windows. No `.exe`
-/// stub is needed — `claude`/`gemini` ship as `.cmd`/scripts (not `.exe`), so a
-/// `.cmd`/extensionless shim wins under both shells.
+/// extensionless script (Git Bash + Unix); on Windows ALSO a `.cmd` AND a copy
+/// of the compiled `qontinui-shim` stub as `<tool>.exe` ([`copy_exe_stub`]).
+///
+/// The native `.exe` is the PRIMARY PowerShell/cmd surface (`.EXE` precedes
+/// `.CMD` in `PATHEXT`, so when both exist the exe wins). The earlier
+/// `.cmd`-only policy here was wrong twice over: (a) its premise —
+/// "claude/gemini ship as `.cmd`/scripts, not `.exe`" — does not hold (claude
+/// ships as a native `claude.exe` on some installs, which a `.cmd` cannot
+/// shadow at all), and (b) batch shims are fundamentally unsafe for argument
+/// passing: they are launched via cmd.exe, which cannot accept multi-line or
+/// cmd-metachar arguments, so the `.cmd` shim broke EVERY runner pane `claude`
+/// launch on 2026-07-03 (the shell-integration function passes a multi-line
+/// `--append-system-prompt`; live failure: "The syntax of the command is
+/// incorrect."). The `.cmd` is kept ONLY as a fail-open fallback: if the stub
+/// copy fails (builds without the sidecar, dev setups) behavior degrades to
+/// exactly today's `.cmd` path, logged at debug.
 fn write_identity_shims_for(dir: &Path, tool: &str) -> std::io::Result<()> {
     let bash = render_identity(IDENTITY_SHIM_BASH, tool, dir);
     let extensionless = dir.join(tool);
@@ -284,6 +297,9 @@ fn write_identity_shims_for(dir: &Path, tool: &str) -> std::io::Result<()> {
     {
         let cmd_body = render_identity(IDENTITY_SHIM_CMD, tool, dir);
         std::fs::write(dir.join(format!("{tool}.cmd")), cmd_body.as_bytes())?;
+        // The native exe stub (best-effort, fail-open): the stub detects the
+        // identity tool from argv[0], so the one binary serves claude + gemini.
+        copy_exe_stub(dir, tool);
     }
 
     Ok(())
@@ -340,7 +356,10 @@ pub fn exe_shadow_needed(tool: ShimTool) -> bool {
 /// `<name>.exe`. Best-effort: any failure (or an absent stub in a dev build) is
 /// logged at debug and the materializer falls back to the scripts only —
 /// fail-open, never breaks the terminal. The stub detects which tool it is from
-/// `argv[0]`, so a single binary serves all three names.
+/// `argv[0]`, so a single binary serves every materialized name (the
+/// `.exe`-shipped install tools AND the always-on identity family
+/// `claude`/`gemini`, where the native exe avoids cmd.exe's multi-line-argument
+/// limitation).
 #[cfg(target_os = "windows")]
 fn copy_exe_stub(shim_dir: &Path, name: &str) {
     let stub = match locate_stub_exe() {
@@ -766,6 +785,44 @@ mod tests {
         let missing = std::env::temp_dir().join("qontinui-nonexistent-sweep-base-zzz");
         // Must not panic when the base dir doesn't exist.
         sweep_stale(&missing, STALE_SHIM_MAX_AGE);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn materialize_identity_copies_native_exe_when_stub_present() {
+        // P0 2026-07-03: the identity dir must carry a NATIVE `<tool>.exe`
+        // (PATHEXT: .EXE beats .CMD) so PowerShell/cmd never launch the batch
+        // shim, which cannot accept multi-line args. Arrange the stub the way
+        // `locate_stub_exe` finds it: a `qontinui-shim.exe` next to
+        // `current_exe()` (the test binary's own dir). Create-if-absent and
+        // clean up only what we created, so a dev target dir that already has
+        // the real stub still passes.
+        let exe_dir = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let stub = exe_dir.join("qontinui-shim.exe");
+        let created = if stub.exists() {
+            false
+        } else {
+            std::fs::write(&stub, b"fake stub payload").unwrap();
+            true
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = materialize_identity(tmp.path(), "term-exe").expect("identity materialize ok");
+        for tool in IDENTITY_TOOLS {
+            let exe = dir.join(format!("{tool}.exe"));
+            assert!(exe.is_file(), "{tool}.exe must be materialized");
+            // The .cmd fallback is STILL written alongside (fail-open ladder).
+            assert!(dir.join(format!("{tool}.cmd")).is_file());
+            assert!(dir.join(tool).is_file());
+        }
+
+        if created {
+            let _ = std::fs::remove_file(&stub);
+        }
     }
 
     #[cfg(target_os = "windows")]

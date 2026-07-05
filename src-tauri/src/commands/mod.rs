@@ -180,6 +180,7 @@ pub mod database; // Database maintenance and optimization
 pub mod dataset;
 pub mod debug;
 pub mod dev_findings; // Dev-only: seed synthetic findings into the frontend tracker
+pub mod devenv_enroll; // Phase 2 — in-app devenv enrollment (no terminal); wraps env_agent::enroll
 pub mod discoveries;
 pub mod durable_execution; // Conductor-inspired replay, rollback, iteration diffs
 pub mod event_search; // Unified full-text search across activity_timeline, observations, deferred_questions, error_events
@@ -192,6 +193,7 @@ pub mod file_browser; // Safe read-only filesystem browsing for mobile
 pub mod findings;
 pub mod flow; // Flow designer commands
 pub mod global_log_sources; // Global log source management
+pub mod helper_tasks; // Helper Task Queue settings + collected answers (plan 2026-06-29)
 pub mod hooks;
 pub mod instances; // Runner instance management (dev feature)
 pub mod interaction;
@@ -224,6 +226,7 @@ pub mod scripted_output_settings; // get/save the ScriptedOutputSettings (provid
 pub mod security_settings;
 pub mod self_healing_settings;
 pub mod session; // Plan 2026-05-22-coord-native-session-coordination Phase 2 — unified Session primitive Tauri commands
+pub mod session_prs; // Per-session PR merged/unmerged status for the Terminal zone-header dropdown (coord proxy)
 pub mod setup_wizard; // First-launch setup wizard commands
 pub mod shell_commands; // Shell command management and execution
 pub mod spec_drift; // Spec drift detection (useUIElement vs spec assertions)

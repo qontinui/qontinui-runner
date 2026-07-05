@@ -255,6 +255,7 @@ async fn load_and_project_skeleton(
         transitions: Vec::new(),
         synthesized_groups: None,
         initial_state: None,
+        api_assertions: None,
     })
 }
 
@@ -723,7 +724,7 @@ pub(crate) fn merge_patch_into_ir(
     }
 
     // Validate every targeted state allows additions.
-    for (state_id, _criteria) in &patch.add_required_elements {
+    for state_id in patch.add_required_elements.keys() {
         let target = existing
             .states
             .iter()
@@ -971,6 +972,7 @@ mod tests {
             transitions: Vec::new(),
             synthesized_groups: None,
             initial_state: None,
+            api_assertions: None,
         }
     }
 
@@ -1084,6 +1086,7 @@ mod tests {
             transitions: vec![],
             synthesized_groups: None,
             initial_state: None,
+            api_assertions: None,
         }
     }
 
@@ -1162,6 +1165,7 @@ mod tests {
             transitions: vec![],
             synthesized_groups: None,
             initial_state: None,
+            api_assertions: None,
         };
         let bare = serde_json::to_value(&ir).unwrap();
         assert!(parse_meta_workflow_output(&bare).is_ok());
@@ -1188,9 +1192,10 @@ mod tests {
     }
 
     fn make_criteria(id: &str) -> IrElementCriteria {
-        let mut c = IrElementCriteria::default();
-        c.id = Some(id.into());
-        c
+        IrElementCriteria {
+            id: Some(id.into()),
+            ..Default::default()
+        }
     }
 
     fn make_transition(id: &str, from: &str, to: &str) -> IrTransition {

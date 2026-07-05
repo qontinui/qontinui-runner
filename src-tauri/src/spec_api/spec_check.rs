@@ -26,7 +26,8 @@ use crate::spec_api::storage::{self, RUNNER_APP_ID};
 use qontinui_spec_check as spec_check; // crate name = "qontinui-spec-check"
 use qontinui_types::spec_api_events::SpecApiEvent;
 use qontinui_types::spec_check::{
-    MatchOutcome, PolicyEvaluation, SpecCheckPolicy, SpecCheckResult, ThresholdConfig,
+    ClassificationStatus, MatchOutcome, PolicyEvaluation, SpecCheckPolicy, SpecCheckResult,
+    ThresholdConfig,
 };
 use qontinui_types::ui_bridge::UIBridgeSnapshot; // capital UI; lives in ui_bridge
 
@@ -261,6 +262,45 @@ fn completion_counts(
         rate_sum / results.len() as f32
     };
     (perfect, partial, no_match, eval_error, overall)
+}
+
+/// Apply app-specific threshold configuration to a spec-check result.
+///
+/// Updates the result's `classification` and `thresholds_used` fields based on
+/// the app's configured thresholds. Also updates per-state classifications in
+/// `state_results`.
+///
+/// If the app is not found or thresholds fail validation, logs a warning and
+/// leaves the result unchanged (defaults remain: 0.5/0.8).
+fn apply_thresholds_to_result(
+    result: &mut SpecCheckResult,
+    app_option: Option<&qontinui_types::apps::App>,
+) {
+    let thresholds = match app_option {
+        Some(app) => {
+            // Extract thresholds from app; validate they're sensible
+            match ThresholdConfig::new(app.red_threshold, app.yellow_threshold) {
+                Ok(tc) => tc,
+                Err(e) => {
+                    warn!("app thresholds validation failed; using defaults: {}", e);
+                    ThresholdConfig::default()
+                }
+            }
+        }
+        None => {
+            // App not found; use defaults (evaluator already set them)
+            ThresholdConfig::default()
+        }
+    };
+
+    // Update overall result classification
+    result.classification = thresholds.classify_match_rate(result.summary.overall_match_rate);
+    result.thresholds_used = thresholds;
+
+    // Update per-state classifications
+    for state in &mut result.state_results {
+        state.classification = thresholds.classify_match_rate(state.match_rate);
+    }
 }
 
 // ===========================================================================
@@ -652,7 +692,7 @@ pub async fn post_spec_check(
     // Evaluate — pure crate call, no logic here. Thread the real fingerprint
     // + snapshot identity (minted by fetch_fresh_snapshot or synthesized on
     // the supplied path) into the result instead of the in-process sentinels.
-    let result = spec_check::evaluate_with_identity(
+    let mut result = spec_check::evaluate_with_identity(
         &snapshot,
         &ir,
         fingerprint,
@@ -660,9 +700,32 @@ pub async fn post_spec_check(
         content_hash,
     );
 
+    // Apply app-specific thresholds: fetch app config and update classification
+    let app_option = match state.app_state.pg_db.get_app(&req.app_id).await {
+        Ok(app) => app,
+        Err(e) => {
+            warn!(
+                "failed to fetch app {} for threshold application: {}",
+                req.app_id, e
+            );
+            None
+        }
+    };
+    apply_thresholds_to_result(&mut result, app_option.as_ref());
+
     info!(
-        "spec_check page_id={} snapshot_id={} match_outcome={:?} match_rate={:.3}",
-        req.page_id, snapshot_id, result.summary.match_outcome, result.summary.overall_match_rate
+        "spec_check page_id={} snapshot_id={} match_outcome={:?} match_rate={:.3} classification={}",
+        req.page_id, snapshot_id, result.summary.match_outcome, result.summary.overall_match_rate, result.classification
+    );
+
+    // Helper Task Queue (plan 2026-06-29, Phase 1.3 Part B) — see
+    // maybe_emit_yellow_spot_check (shared with both batch paths via
+    // evaluate_one).
+    maybe_emit_yellow_spot_check(
+        crate::helper_tasks::registrar_from_app(&state.app_handle).as_ref(),
+        &req.app_id,
+        &req.page_id,
+        &result,
     );
 
     // Plan 06: emit Completed after the evaluator returns. The full result
@@ -852,6 +915,25 @@ pub async fn post_spec_check_batch(
     invoke_emit(&req.app_id, &snapshot_id, page_ids, "http");
     let batch_started_ms = events::now_ms();
 
+    // Fetch app once for threshold application across all batch elements
+    let app_option = match state.app_state.pg_db.get_app(&req.app_id).await {
+        Ok(app) => app,
+        Err(e) => {
+            warn!(
+                "failed to fetch app {} for batch threshold application: {}",
+                req.app_id, e
+            );
+            None
+        }
+    };
+    let app_arc = Arc::new(app_option);
+
+    // Helper Task Queue (Phase 1.3 Part B): resolve the registrar handle ONCE,
+    // outside any stream/task closure — an Arc-backed clone is cheap, and
+    // capturing it before construction is what lets the NDJSON unfold closure
+    // (which has no Tauri state handle) participate in the yellow-band emit.
+    let helper_registrar = crate::helper_tasks::registrar_from_app(&state.app_handle);
+
     if req.stream {
         return stream_batch_results(
             req.app_id.clone(),
@@ -862,6 +944,8 @@ pub async fn post_spec_check_batch(
             root,
             req.pages,
             req.shared_policy,
+            app_arc,
+            helper_registrar,
         )
         .await;
     }
@@ -876,6 +960,8 @@ pub async fn post_spec_check_batch(
         let app_id_owned = req.app_id.clone();
         let fingerprint_owned = fingerprint.clone();
         let content_hash_owned = content_hash.clone();
+        let app_owned = app_arc.clone();
+        let registrar_owned = helper_registrar.clone();
         set.spawn(async move {
             evaluate_one(
                 &app_id_owned,
@@ -886,6 +972,8 @@ pub async fn post_spec_check_batch(
                 &fingerprint_owned,
                 &content_hash_owned,
                 shared_policy.as_ref(),
+                (*app_owned).as_ref(),
+                registrar_owned.as_ref(),
             )
             .await
         });
@@ -1003,6 +1091,33 @@ impl BatchElementResult {
     }
 }
 
+/// Helper Task Queue (plan 2026-06-29, Phase 1.3 Part B): the ONE yellow-band
+/// spot-check emit shared by all three handler paths (single-shot, batch
+/// collected, batch NDJSON — the latter two via [`evaluate_one`]). A Yellow
+/// (partial-match) classification is exactly the ambiguous band a human
+/// spot-check resolves cheaply — Green needs no help and Red is already a
+/// hard failure. Owner-gated (settings.helper_tasks, default OFF) and
+/// cooldown-gated inside the registrar; best-effort and never affects the
+/// response. `None` registrar (early boot, tests) is a silent no-op.
+fn maybe_emit_yellow_spot_check(
+    registrar: Option<&crate::helper_tasks::HelperTaskRegistrar>,
+    app_id: &str,
+    page_id: &str,
+    result: &SpecCheckResult,
+) {
+    if result.classification != ClassificationStatus::Yellow {
+        return;
+    }
+    if let Some(reg) = registrar {
+        crate::helper_tasks::maybe_emit_spot_check(
+            reg,
+            app_id,
+            page_id,
+            f64::from(result.summary.overall_match_rate),
+        );
+    }
+}
+
 /// Evaluate one batch entry. Identical to the single-shot handler except
 /// errors become per-element statuses, not HTTP responses (§5.14).
 #[allow(clippy::too_many_arguments)]
@@ -1015,6 +1130,8 @@ async fn evaluate_one(
     fingerprint: &qontinui_types::spec_check::BridgeFingerprint,
     content_sha256: &str,
     shared_policy: Option<&SpecCheckPolicy>,
+    app_option: Option<&qontinui_types::apps::App>,
+    helper_registrar: Option<&crate::helper_tasks::HelperTaskRegistrar>,
 ) -> BatchElementResult {
     if invalid_page_id(&entry.page_id) {
         return BatchElementResult::invalid_page_id(entry.page_id.clone());
@@ -1030,13 +1147,21 @@ async fn evaluate_one(
     // we run it inline on the spawned task (see Risks §"contention").
     // Thread the batch's shared fingerprint + snapshot identity through so
     // the per-element result carries real telemetry, not the sentinel.
-    let result = spec_check::evaluate_with_identity(
+    let mut result = spec_check::evaluate_with_identity(
         snapshot,
         &ir,
         fingerprint.clone(),
         snapshot_id.to_string(),
         content_sha256.to_string(),
     );
+
+    // Apply app-specific thresholds to the evaluation result
+    apply_thresholds_to_result(&mut result, app_option);
+
+    // Shared classification site for both batch paths (collected + NDJSON).
+    // Runs AFTER threshold application so the Yellow-band check sees the
+    // final (app-adjusted) classification, matching the single-shot path.
+    maybe_emit_yellow_spot_check(helper_registrar, app_id, &entry.page_id, &result);
 
     // Per-entry override wins over the shared policy.
     let policy = entry.policy_override.as_ref().or(shared_policy);
@@ -1072,6 +1197,10 @@ async fn stream_batch_results(
     root: Arc<std::path::PathBuf>,
     pages: Vec<BatchPageEntry>,
     shared_policy: Option<SpecCheckPolicy>,
+    app_option: Arc<Option<qontinui_types::apps::App>>,
+    // Cloned OUT of Tauri state by the caller so the unfold closure below can
+    // own it — Arc-backed, so per-iteration clones are cheap.
+    helper_registrar: Option<crate::helper_tasks::HelperTaskRegistrar>,
 ) -> Response {
     // Plan 06: stream-path Completed emission. Accumulate counts as we
     // walk each item, then emit on stream end (when the inner iterator is
@@ -1108,6 +1237,8 @@ async fn stream_batch_results(
         let app_id = app_id.clone();
         let fingerprint = fingerprint.clone();
         let content_hash = content_hash.clone();
+        let app_option = app_option.clone();
+        let helper_registrar = helper_registrar.clone();
         async move {
             let entry = match st.iter.next() {
                 Some(e) => e,
@@ -1146,6 +1277,8 @@ async fn stream_batch_results(
                 &fingerprint,
                 &content_hash,
                 shared_policy.as_ref(),
+                (*app_option).as_ref(),
+                helper_registrar.as_ref(),
             )
             .await;
             match (r.status, r.result.as_ref()) {
@@ -1323,6 +1456,8 @@ mod tests {
             &fp,
             "",
             None,
+            None,
+            None,
         )
         .await;
         assert_eq!(r.status, "spec-not-found");
@@ -1349,6 +1484,8 @@ mod tests {
             "scs_test",
             &fp,
             "",
+            None,
+            None,
             None,
         )
         .await;
@@ -1417,6 +1554,8 @@ mod tests {
             "scs_test",
             &fp,
             "",
+            None,
+            None,
             None,
         )
         .await;
@@ -1502,6 +1641,8 @@ mod tests {
             &fp,
             "",
             Some(&policy),
+            None,
+            None,
         )
         .await;
         assert_eq!(r.status, "ok");

@@ -10,7 +10,9 @@
 //! All authed with the runner's device-JWT via [`crate::auth::attach_device_auth`]
 //! (the same bearer the rest of the runner's coord calls present) — the runner
 //! step is server-side, so it holds the device JWT directly and does NOT need
-//! the loopback write-forwarder (which only serves `register-plan` + `attest`).
+//! the loopback write-forwarder (which serves `register-plan`/`attest` and —
+//! since the device-session coord-surface-hardening follow-up — the work-unit
+//! registry routes, for nonce-only in-terminal sessions).
 //!
 //! ## Edge-triggered + idempotent
 //!
@@ -33,6 +35,14 @@ use serde::Serialize;
 
 /// Actor stamped on adapter-driven upserts/transitions.
 pub const ADAPTER_ACTOR: &str = "harness-markdown-adapter";
+
+/// True when `by_actor` denotes a real (non-proxy) actor that owns the unit —
+/// i.e. anything other than this adapter's own actor (and not empty). Used to
+/// decide whether the markdown proxy should DEFER its transition so it does not
+/// collapse an agent-initiated transition back to the system actor.
+fn is_real_agent_actor(by_actor: &str) -> bool {
+    by_actor != ADAPTER_ACTOR && !by_actor.is_empty()
+}
 
 /// `POST /coord/work-units/upsert` body. Mirrors coord's `UpsertRequest`;
 /// `None` fields are omitted so an upsert that only refreshes title/metadata
@@ -141,6 +151,10 @@ pub enum SetDepsOutcome {
 pub trait WorkUnitSink: Send + Sync {
     /// Current opaque status of the unit, or `None` if it doesn't exist yet.
     async fn current_status(&self, slug: &str) -> Result<Option<String>>;
+    /// The `by_actor` of the unit's most-recent status-history row, or None if
+    /// the unit has no history. Used to defer when a real (non-proxy) actor owns
+    /// the unit. Reads GET /coord/work-units/<slug>/history (newest-first).
+    async fn last_actor(&self, slug: &str) -> Result<Option<String>>;
     async fn upsert(&self, body: &UpsertBody) -> Result<()>;
     async fn transition(&self, slug: &str, body: &TransitionBody) -> Result<()>;
     /// Replace the complete upstream dependency set of `slug` in coord's
@@ -160,6 +174,33 @@ pub async fn push_work_unit<S: WorkUnitSink + ?Sized>(
     u: &ParsedWorkUnit,
     last_applied: Option<&str>,
 ) -> Result<PushOutcome> {
+    let metadata = build_metadata(u);
+    let action = decide_push(&u.status, last_applied);
+
+    // Deferral (graduation-bootstrap P2a): only a `Transition` would OVERWRITE
+    // an existing unit's status. Before emitting it, read the unit's latest
+    // status-history `by_actor`; if a real (non-adapter) actor last drove the
+    // unit, a real agent owns its lifecycle now — DEFER (skip this cycle's
+    // transition, emit nothing) so we don't collapse the agent's transition back
+    // to the system actor. A brand-new unit (`UpsertWithStatus`) or an idempotent
+    // `RefreshOnly` has no agent owner to defer to, so those are never gated.
+    if let PushAction::Transition { .. } = &action {
+        if let Some(actor) = sink.last_actor(&u.slug).await? {
+            if is_real_agent_actor(&actor) {
+                tracing::info!(
+                    slug = %u.slug,
+                    last_actor = %actor,
+                    "markdown proxy defers: real agent owns this unit"
+                );
+                return Ok(PushOutcome {
+                    slug: u.slug.clone(),
+                    kind: PushOutcomeKind::Refreshed,
+                    conflict: false,
+                });
+            }
+        }
+    }
+
     // Conflict detection: did the remote status diverge from what we last
     // applied? (A direct transition by someone else.) File wins, but loudly.
     let mut conflict = false;
@@ -179,8 +220,6 @@ pub async fn push_work_unit<S: WorkUnitSink + ?Sized>(
         }
     }
 
-    let metadata = build_metadata(u);
-    let action = decide_push(&u.status, last_applied);
     let kind = match &action {
         PushAction::UpsertWithStatus => {
             sink.upsert(&UpsertBody {
@@ -307,6 +346,40 @@ impl WorkUnitSink for HttpWorkUnitSink {
         Ok(None)
     }
 
+    async fn last_actor(&self, slug: &str) -> Result<Option<String>> {
+        // GET /coord/work-units/<slug>/history returns
+        // {"work_unit_id":..,"slug":..,"history":[{..,"by_actor":..,"to_status":..,
+        //  "transitioned_at":..}, ...]} ordered newest-first (coord's SQL
+        // `ORDER BY transitioned_at DESC`). We want the newest row's `by_actor`.
+        let url = format!("{}/coord/work-units/{}/history", self.base, slug);
+        let resp = crate::auth::attach_device_auth(self.client.get(&url))
+            .send()
+            .await
+            .context("GET /coord/work-units/:slug/history")?;
+        // No such unit yet ⇒ no history ⇒ no owner to defer to.
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            anyhow::bail!(
+                "GET /coord/work-units/:slug/history returned {}",
+                resp.status()
+            );
+        }
+        let body: serde_json::Value = resp.json().await.context("parse work-unit history")?;
+        // Newest-first: the first `history` element is the most-recent transition.
+        // `by_actor` is nullable (serialized as JSON null) — `as_str` yields None,
+        // and an empty history array yields None, both meaning "no owner".
+        let by_actor = body
+            .get("history")
+            .and_then(|h| h.as_array())
+            .and_then(|rows| rows.first())
+            .and_then(|row| row.get("by_actor"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        Ok(by_actor)
+    }
+
     async fn upsert(&self, body: &UpsertBody) -> Result<()> {
         let url = format!("{}/coord/work-units/upsert", self.base);
         let resp = crate::auth::attach_device_auth(self.client.post(&url).json(body))
@@ -422,6 +495,8 @@ mod tests {
     #[derive(Default)]
     struct FakeSink {
         remote: Option<String>,
+        /// Configured `by_actor` of the unit's latest history row (default None).
+        last_actor: Option<String>,
         upserts: Mutex<Vec<UpsertBody>>,
         transitions: Mutex<Vec<(String, TransitionBody)>>,
         deps_calls: Mutex<Vec<(String, Vec<String>)>>,
@@ -431,6 +506,9 @@ mod tests {
     impl WorkUnitSink for FakeSink {
         async fn current_status(&self, _slug: &str) -> Result<Option<String>> {
             Ok(self.remote.clone())
+        }
+        async fn last_actor(&self, _slug: &str) -> Result<Option<String>> {
+            Ok(self.last_actor.clone())
         }
         async fn upsert(&self, body: &UpsertBody) -> Result<()> {
             self.upserts.lock().unwrap().push(body.clone());

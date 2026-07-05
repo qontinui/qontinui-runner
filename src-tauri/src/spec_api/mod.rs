@@ -20,6 +20,7 @@
 //! Entry point: [`routes`]. Merge into the main router from `mcp_api.rs`.
 
 pub mod apps;
+pub mod auth_injection;
 pub mod distinctness;
 pub mod events;
 pub mod handlers;
@@ -28,6 +29,7 @@ pub mod projection;
 pub mod responses;
 pub mod spec_check;
 pub mod storage;
+pub mod thresholds;
 pub mod types;
 pub mod util;
 
@@ -111,7 +113,8 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route(
             "/apps/{app_id}/spec/proposals/sweep-pending",
             post(proposals::post_sweep_pending),
-        );
+        )
+        .route("/spec/proposals/metrics", get(proposals::get_metrics));
 
     r
 }

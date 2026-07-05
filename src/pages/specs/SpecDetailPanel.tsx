@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Shield, AlertTriangle, Plus, Bug } from "lucide-react";
+import { Shield, AlertTriangle, Plus, Bug, FileJson } from "lucide-react";
 import type { LoadedSpec } from "./types";
 import type { SpecGroup, SpecAssertion, SetupAction } from "@qontinui/ui-bridge";
 import { SpecIssuesPanel } from "./SpecIssuesPanel";
@@ -11,6 +11,7 @@ import { ApiOverview } from "./ApiOverview";
 import { DataOverview } from "./DataOverview";
 import { DependencyOverview } from "./DependencyOverview";
 import { ConstraintOverview } from "./ConstraintOverview";
+import { SpecEditorModal } from "./SpecEditorModal";
 
 function UnspeccedPageView({
   label,
@@ -58,6 +59,7 @@ interface SpecDetailPanelProps {
   selectedGroup: SpecGroup | null;
   selectionType: "none" | "spec" | "group" | "assertion" | "unspecced-page";
   editMode?: boolean;
+  appId?: string;
   unspeccedPageInfo?: { label: string; description: string; expectedSpecId: string } | null;
   onToggleAssertion?: (specId: string, groupId: string, assertionId: string) => void;
   onRemoveAssertion?: (specId: string, groupId: string, assertionId: string) => void;
@@ -76,6 +78,7 @@ export function SpecDetailPanel({
   selectedGroup,
   selectionType,
   editMode,
+  appId = "qontinui-runner",
   unspeccedPageInfo,
   onToggleAssertion,
   onRemoveAssertion,
@@ -89,6 +92,7 @@ export function SpecDetailPanel({
   onFixCode,
 }: SpecDetailPanelProps) {
   const [activeTab, setActiveTab] = useState<"assertions" | "issues" | "triage">("assertions");
+  const [isEditorModalOpen, setIsEditorModalOpen] = useState(false);
 
   if (selectionType === "unspecced-page" && unspeccedPageInfo) {
     return (
@@ -145,39 +149,48 @@ export function SpecDetailPanel({
 
     return (
       <div className="h-full flex flex-col">
-        <div className="flex border-b border-border px-4 pt-2 gap-1 shrink-0">
+        <div className="flex items-center justify-between border-b border-border px-4 pt-2 gap-1 shrink-0">
+          <div className="flex gap-1">
+            <button
+              onClick={() => setActiveTab("assertions")}
+              className={`px-3 py-1.5 text-xs font-medium rounded-t border border-b-0 transition-colors ${
+                activeTab === "assertions"
+                  ? "bg-background text-foreground border-border"
+                  : "text-muted-foreground border-transparent hover:text-foreground"
+              }`}
+            >
+              <Shield className="w-3 h-3 inline-block mr-1 -mt-0.5" />
+              Assertions
+            </button>
+            <button
+              onClick={() => setActiveTab("issues")}
+              className={`px-3 py-1.5 text-xs font-medium rounded-t border border-b-0 transition-colors ${
+                activeTab === "issues"
+                  ? "bg-background text-foreground border-border"
+                  : "text-muted-foreground border-transparent hover:text-foreground"
+              }`}
+            >
+              <Bug className="w-3 h-3 inline-block mr-1 -mt-0.5" />
+              Issues
+            </button>
+            <button
+              onClick={() => setActiveTab("triage")}
+              className={`px-3 py-1.5 text-xs font-medium rounded-t border border-b-0 transition-colors ${
+                activeTab === "triage"
+                  ? "bg-background text-foreground border-border"
+                  : "text-muted-foreground border-transparent hover:text-foreground"
+              }`}
+            >
+              <AlertTriangle className="w-3 h-3 inline-block mr-1 -mt-0.5" />
+              Triage
+            </button>
+          </div>
           <button
-            onClick={() => setActiveTab("assertions")}
-            className={`px-3 py-1.5 text-xs font-medium rounded-t border border-b-0 transition-colors ${
-              activeTab === "assertions"
-                ? "bg-background text-foreground border-border"
-                : "text-muted-foreground border-transparent hover:text-foreground"
-            }`}
+            onClick={() => setIsEditorModalOpen(true)}
+            className="px-2 py-1.5 text-xs font-medium rounded border border-border text-muted-foreground hover:text-foreground hover:bg-white/5 transition-colors ml-auto"
+            title="Edit spec JSON"
           >
-            <Shield className="w-3 h-3 inline-block mr-1 -mt-0.5" />
-            Assertions
-          </button>
-          <button
-            onClick={() => setActiveTab("issues")}
-            className={`px-3 py-1.5 text-xs font-medium rounded-t border border-b-0 transition-colors ${
-              activeTab === "issues"
-                ? "bg-background text-foreground border-border"
-                : "text-muted-foreground border-transparent hover:text-foreground"
-            }`}
-          >
-            <Bug className="w-3 h-3 inline-block mr-1 -mt-0.5" />
-            Issues
-          </button>
-          <button
-            onClick={() => setActiveTab("triage")}
-            className={`px-3 py-1.5 text-xs font-medium rounded-t border border-b-0 transition-colors ${
-              activeTab === "triage"
-                ? "bg-background text-foreground border-border"
-                : "text-muted-foreground border-transparent hover:text-foreground"
-            }`}
-          >
-            <AlertTriangle className="w-3 h-3 inline-block mr-1 -mt-0.5" />
-            Triage
+            <FileJson className="w-3 h-3 inline-block" />
           </button>
         </div>
 
@@ -227,6 +240,15 @@ export function SpecDetailPanel({
             />
           )}
         </div>
+        <SpecEditorModal
+          open={isEditorModalOpen}
+          spec={selectedSpec}
+          appId={appId}
+          onClose={() => setIsEditorModalOpen(false)}
+          onSaveSuccess={() => {
+            setIsEditorModalOpen(false);
+          }}
+        />
       </div>
     );
   }

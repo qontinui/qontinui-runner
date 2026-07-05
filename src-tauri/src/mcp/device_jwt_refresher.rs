@@ -1010,6 +1010,111 @@ pub(crate) async fn refresh_tenant_slots(
     outcomes
 }
 
+/// Phase 4b: the FINAL cold-start fallback — exchange the stored device
+/// machine key (`dmk_`) for a fresh device JWT via web's
+/// `POST {web_base}/api/v1/devices/{device_id}/machine-credential/exchange`
+/// (header `X-Device-Machine-Key: <dmk_>`, no body). This is what lets a
+/// runner offline longer than BOTH the device-JWT TTL (so 4a self-refresh is
+/// impossible) AND the Cognito refresh-token window (so the pair-cli path is
+/// dead) recover a device JWT with NO user session.
+///
+/// `web_base` is the web-backend URL — the SAME base the Cognito pair path
+/// forwards to (`settings.web_integration.backend_url`, i.e. the caller's
+/// `pair_base`); it is NOT the coord URL. `device_id` is resolved by the caller
+/// exactly like 4a's self-refresh (`QONTINUI_MACHINE_ID` env →
+/// `read_device_id_from_disk`).
+///
+/// Returns `Some(new_jwt)` on success — the new JWT is ALREADY persisted to the
+/// `access_token` slot, so the caller treats it like any other successful
+/// re-mint (kick the relay, publish healthy, reset backoff, continue).
+///
+/// Returns `None` — so the caller falls through to the existing credential-dark
+/// bail — when:
+///   - no `dmk_` is stored (this device was never issued one),
+///   - web returns ANY non-2xx (401/403 revoked/expired/mismatch, 503 when
+///     web's `COORD_ADMIN_SECRET` is unset, anything else), OR
+///   - the network call fails, the body fails to decode, or the token is empty.
+///
+/// REPLACE-not-REVOKE: on ANY failure the existing JWT is left UNTOUCHED — a
+/// missed exchange means "stay credential-dark", NEVER "clear the slot".
+pub(crate) async fn try_device_machine_key_exchange(
+    auth_manager: &crate::auth::AuthManager,
+    web_base: &str,
+    device_id: &str,
+) -> Option<String> {
+    // No dmk_ stored → this recovery path is unavailable for this device.
+    let dmk = match auth_manager.get_device_machine_key() {
+        Ok(Some(k)) if !k.trim().is_empty() => k,
+        _ => return None,
+    };
+
+    let url = format!(
+        "{}/api/v1/devices/{}/machine-credential/exchange",
+        web_base.trim_end_matches('/'),
+        device_id
+    );
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("device_jwt_refresher: dmk exchange client build failed: {e}");
+            return None;
+        }
+    };
+    let resp = match client
+        .post(&url)
+        .header("X-Device-Machine-Key", dmk.trim())
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("device_jwt_refresher: dmk exchange request failed: {e}");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        // 401/403 (revoked/expired/mismatch), 503 (web COORD_ADMIN_SECRET
+        // unset), anything else → no recovery this path. REPLACE-not-REVOKE:
+        // the existing JWT is left untouched.
+        info!(
+            "device_jwt_refresher: dmk exchange got HTTP {} — no recovery this path \
+             (existing JWT preserved)",
+            resp.status()
+        );
+        return None;
+    }
+    let body: DeviceRefreshResponse = match resp.json().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("device_jwt_refresher: dmk exchange body decode failed: {e}");
+            return None;
+        }
+    };
+    if body.token.trim().is_empty() {
+        warn!("device_jwt_refresher: dmk exchange returned an empty token");
+        return None;
+    }
+    // Persist into the access_token slot (refresh-token slot stays empty — the
+    // device-JWT lifecycle is coord-owned).
+    match auth_manager.store_tokens(&body.token, "") {
+        Ok(()) => {
+            info!(
+                "device_jwt_refresher: device JWT re-minted via device-machine-key \
+                 exchange (len={})",
+                body.token.len()
+            );
+            Some(body.token)
+        }
+        Err(e) => {
+            warn!("device_jwt_refresher: persist dmk-exchanged JWT failed: {e}");
+            None
+        }
+    }
+}
+
 /// Ensure the Cognito (oauth) access token is fresh before it's used as the
 /// pair-cli bearer. If a Cognito refresh token is stored and the access token
 /// is within the refresh threshold (or already expired), POST the
@@ -1456,6 +1561,52 @@ async fn refresher_loop(
                         }
                     }
                 };
+
+                // Phase 4b: FINAL cold-start fallback. Self-refresh (4a) AND the
+                // Cognito pair-cli path have BOTH failed to advance the slot this
+                // tick (progress != Healthy). If a device machine key (`dmk_`) is
+                // stored, exchange it with web for a fresh device JWT — this
+                // recovers a runner offline past both the device-JWT TTL and the
+                // Cognito refresh-token window (>30d) with no user session. On
+                // success: same healthy-tick handling as the other re-mints (kick
+                // relay, publish healthy, reset backoff, emit "resumed" if we were
+                // dark, continue). On None: fall through to the existing bail.
+                // REPLACE-not-REVOKE: a miss never clears the existing JWT.
+                if !matches!(progress, PairProgress::Healthy) {
+                    let dmk_device_id = std::env::var("QONTINUI_MACHINE_ID")
+                        .ok()
+                        .filter(|s| !s.trim().is_empty())
+                        .map(|s| s.trim().to_string())
+                        .or_else(|| qontinui_runner_lib::pair::read_device_id_from_disk().ok());
+                    if let Some(did) = dmk_device_id {
+                        if let Some(new_jwt) =
+                            try_device_machine_key_exchange(&auth_manager, &pair_base, &did).await
+                        {
+                            info!(
+                                "device_jwt_refresher: device JWT recovered via \
+                                 device-machine-key exchange (len={}) — self-refresh + \
+                                 Cognito both failed this tick",
+                                new_jwt.len()
+                            );
+                            crate::mcp::backend_relay::commands::kick_cloud_relay().await;
+                            publish_coord_credential_status(
+                                &auth_manager,
+                                &coord_credential_health(decision, Some(PairProgress::Healthy)),
+                            )
+                            .await;
+                            let action = plan_refresh_wait(&mut backoff, RefreshClass::Ok);
+                            if action.notify_recovered {
+                                emit_credential_dark(&api_state.app_handle, false);
+                            }
+                            if wait_with_signals(action.wait, &mut shutdown_rx, &mut kick_rx).await
+                            {
+                                return;
+                            }
+                            continue;
+                        }
+                    }
+                }
+
                 publish_coord_credential_status(
                     &auth_manager,
                     &coord_credential_health(decision, Some(progress)),
@@ -2877,5 +3028,250 @@ mod tenant_slot_refresh_tests {
     fn idle_wrong_tier_waits_bounded_only_when_slots_exist() {
         assert_eq!(idle_wrong_tier_wait(true), Some(REFRESH_CHECK_INTERVAL));
         assert_eq!(idle_wrong_tier_wait(false), None);
+    }
+}
+
+#[cfg(test)]
+mod device_machine_key_exchange_tests {
+    //! Phase 4b tests — `try_device_machine_key_exchange` against an in-process
+    //! mock web backend serving
+    //! `POST /api/v1/devices/{device_id}/machine-credential/exchange`. Covers:
+    //!   - the last-resort recovery: a stored `dmk_` is exchanged for a fresh
+    //!     device JWT (returned + stored), and the `X-Device-Machine-Key` header
+    //!     carries the dmk_,
+    //!   - no `dmk_` stored → `None` WITHOUT any HTTP call (so the loop falls
+    //!     through to the credential-dark bail),
+    //!   - REPLACE-not-REVOKE: a non-2xx (403 revoked/expired, 503 web
+    //!     COORD_ADMIN_SECRET unset) → `None` and the existing JWT untouched.
+    //!
+    //! ORDERING NOTE: that the exchange is only ATTEMPTED after 4a self-refresh
+    //! and the Cognito pair-cli path both fail is enforced structurally by its
+    //! placement in `refresher_loop`'s `Pair` arm (guarded by
+    //! `progress != Healthy`, after `try_device_self_refresh` and
+    //! `try_refresh_once`). These unit tests exercise the leaf function in the
+    //! same style as `device_self_refresh_tests`.
+
+    use super::*;
+    use axum::{
+        extract::{Path, State},
+        http::{HeaderMap, StatusCode},
+        routing::post,
+        Router,
+    };
+    use std::sync::{Arc, Mutex};
+
+    fn b64url(b: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+    }
+
+    /// Mint a synthetic device-JWT carrying `exp` (signature unverified).
+    fn synth_jwt(exp: i64) -> String {
+        let header = b64url(b"{\"alg\":\"EdDSA\",\"typ\":\"JWT\"}");
+        let payload = b64url(format!("{{\"exp\":{}}}", exp).as_bytes());
+        let sig = b64url(b"fake-sig");
+        format!("{header}.{payload}.{sig}")
+    }
+
+    /// Build an isolated AuthManager over a temp `.enc`, optionally pre-seeding
+    /// a stored `dmk_` and/or a device JWT. The seed writes go through a sibling
+    /// `SecureStorage` at the SAME path (AuthManager exposes only a `dmk_`
+    /// getter), so the manager reads them back from the encrypted file.
+    fn setup(
+        name: &str,
+        dmk: Option<&str>,
+        existing_jwt: Option<&str>,
+    ) -> crate::auth::AuthManager {
+        let dir = std::env::temp_dir().join("qontinui_test_dmk_exchange");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("{name}.enc"));
+        let _ = std::fs::remove_file(&path);
+        let seed =
+            crate::secure_storage::SecureStorage::with_path(path.clone()).expect("seed storage");
+        if let Some(jwt) = existing_jwt {
+            seed.store_tokens(jwt, "").expect("seed jwt");
+        }
+        if let Some(k) = dmk {
+            seed.store_device_machine_key(k).expect("seed dmk");
+        }
+        let storage = crate::secure_storage::SecureStorage::with_path(path).expect("storage");
+        crate::auth::AuthManager::with_storage(storage)
+    }
+
+    #[derive(Clone)]
+    struct MockState {
+        status: StatusCode,
+        body: String,
+        hits: Arc<Mutex<u32>>,
+        last_dmk: Arc<Mutex<Option<String>>>,
+    }
+
+    async fn handler(
+        State(s): State<MockState>,
+        Path(_device_id): Path<String>,
+        h: HeaderMap,
+    ) -> (StatusCode, String) {
+        *s.hits.lock().unwrap() += 1;
+        *s.last_dmk.lock().unwrap() = h
+            .get("x-device-machine-key")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_string());
+        (s.status, s.body.clone())
+    }
+
+    struct MockCapture {
+        hits: Arc<Mutex<u32>>,
+        last_dmk: Arc<Mutex<Option<String>>>,
+    }
+
+    fn spawn_mock(
+        status: StatusCode,
+        body: String,
+    ) -> (String, MockCapture, tokio::sync::oneshot::Sender<()>) {
+        let hits = Arc::new(Mutex::new(0u32));
+        let last_dmk = Arc::new(Mutex::new(None));
+        let hits_h = hits.clone();
+        let last_dmk_h = last_dmk.clone();
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = std_listener.local_addr().expect("addr").port();
+        std_listener.set_nonblocking(true).expect("nb");
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("rt");
+            rt.block_on(async move {
+                let state = MockState {
+                    status,
+                    body,
+                    hits: hits_h,
+                    last_dmk: last_dmk_h,
+                };
+                let app: Router = Router::new()
+                    .route(
+                        "/api/v1/devices/{device_id}/machine-credential/exchange",
+                        post(handler),
+                    )
+                    .with_state(state);
+                let listener =
+                    tokio::net::TcpListener::from_std(std_listener).expect("tokio listener");
+                let _ = axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = rx.await;
+                    })
+                    .await;
+            });
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        (
+            format!("http://127.0.0.1:{port}"),
+            MockCapture { hits, last_dmk },
+            tx,
+        )
+    }
+
+    const DID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+    #[tokio::test]
+    async fn exchange_recovers_device_jwt_from_stored_dmk() {
+        // The >30-day cold-start: the slot holds an EXPIRED device JWT (4a +
+        // Cognito already failed), but a dmk_ is stored → the exchange mints a
+        // fresh device JWT, stores it, and returns it. The dmk_ must ride the
+        // `X-Device-Machine-Key` header.
+        let expired = synth_jwt(chrono::Utc::now().timestamp() - 60);
+        let mgr = setup(
+            "recovers_from_dmk",
+            Some("dmk_unit_fixture_placeholder"),
+            Some(&expired),
+        );
+
+        let new_jwt = synth_jwt(chrono::Utc::now().timestamp() + 4 * 60 * 60);
+        let body = serde_json::json!({ "token": new_jwt }).to_string();
+        let (base, cap, _shutdown) = spawn_mock(StatusCode::OK, body);
+
+        let got = try_device_machine_key_exchange(&mgr, &base, DID).await;
+        assert_eq!(
+            got.as_deref(),
+            Some(new_jwt.as_str()),
+            "a stored dmk_ must be exchanged for the fresh device JWT"
+        );
+        assert_eq!(
+            *cap.hits.lock().unwrap(),
+            1,
+            "the exchange endpoint should be hit exactly once"
+        );
+        assert_eq!(
+            cap.last_dmk.lock().unwrap().clone(),
+            Some("dmk_unit_fixture_placeholder".to_string()),
+            "the dmk_ must be presented in the X-Device-Machine-Key header"
+        );
+        // Slot now holds the NEW device JWT (the expired one was replaced).
+        assert_eq!(mgr.get_access_token().unwrap(), new_jwt);
+    }
+
+    #[tokio::test]
+    async fn exchange_returns_none_when_no_dmk_stored() {
+        // No dmk_ → the recovery path is unavailable: return None WITHOUT any
+        // HTTP call, so the loop falls through to the credential-dark bail.
+        let expired = synth_jwt(chrono::Utc::now().timestamp() - 60);
+        let mgr = setup("no_dmk_stored", None, Some(&expired));
+
+        // A 200-with-token mock that must NEVER be consulted.
+        let new_jwt = synth_jwt(chrono::Utc::now().timestamp() + 4 * 60 * 60);
+        let body = serde_json::json!({ "token": new_jwt }).to_string();
+        let (base, cap, _shutdown) = spawn_mock(StatusCode::OK, body);
+
+        let got = try_device_machine_key_exchange(&mgr, &base, DID).await;
+        assert!(got.is_none(), "no dmk_ stored → None");
+        assert_eq!(
+            *cap.hits.lock().unwrap(),
+            0,
+            "the exchange endpoint must NOT be hit when no dmk_ is stored"
+        );
+        // Existing (expired) JWT untouched.
+        assert_eq!(mgr.get_access_token().unwrap(), expired);
+    }
+
+    #[tokio::test]
+    async fn exchange_403_returns_none_and_preserves_jwt() {
+        // REPLACE-not-REVOKE: a revoked/expired/mismatched dmk_ → web 403 →
+        // None and the existing JWT is left UNTOUCHED (never cleared).
+        let existing = synth_jwt(chrono::Utc::now().timestamp() + 30 * 60);
+        let mgr = setup("dmk_403_preserves", Some("dmk_revoked"), Some(&existing));
+
+        let (base, cap, _shutdown) =
+            spawn_mock(StatusCode::FORBIDDEN, r#"{"error":"revoked"}"#.to_string());
+
+        let got = try_device_machine_key_exchange(&mgr, &base, DID).await;
+        assert!(got.is_none(), "403 → None");
+        assert_eq!(*cap.hits.lock().unwrap(), 1, "attempted exactly once");
+        assert_eq!(
+            mgr.get_access_token().unwrap(),
+            existing,
+            "REPLACE-not-REVOKE: existing JWT must be UNCHANGED after a 403"
+        );
+    }
+
+    #[tokio::test]
+    async fn exchange_503_returns_none_and_preserves_jwt() {
+        // Web's COORD_ADMIN_SECRET unset (the deployment prerequisite) surfaces
+        // as 503 → None, JWT preserved. A transient/config error never punishes
+        // the runner by clearing its slot.
+        let existing = synth_jwt(chrono::Utc::now().timestamp() + 30 * 60);
+        let mgr = setup("dmk_503_preserves", Some("dmk_ok"), Some(&existing));
+
+        let (base, _cap, _shutdown) = spawn_mock(
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":"coord admin secret unset"}"#.to_string(),
+        );
+
+        let got = try_device_machine_key_exchange(&mgr, &base, DID).await;
+        assert!(got.is_none(), "503 → None");
+        assert_eq!(
+            mgr.get_access_token().unwrap(),
+            existing,
+            "existing JWT must be UNCHANGED after a 503"
+        );
     }
 }

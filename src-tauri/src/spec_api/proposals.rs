@@ -47,6 +47,50 @@ use crate::spec_api::storage;
 use qontinui_types::spec_api_events::SpecApiEvent;
 
 // =============================================================================
+// Flywheel Metrics — observability for the spec proposal lifecycle
+// =============================================================================
+
+/// Global counters for flywheel metrics. Uses atomic increments for thread-safe
+/// observation across the runtime lifecycle.
+use std::sync::atomic::{AtomicU64, Ordering};
+
+pub static FLYWHEEL_PROPOSALS_SCANNED_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static FLYWHEEL_PROPOSALS_EXECUTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static FLYWHEEL_CONSECUTIVE_GREENS_MAX: AtomicU64 = AtomicU64::new(0);
+
+/// Increment the total proposals scanned.
+#[inline]
+fn metric_scanned_inc() {
+    FLYWHEEL_PROPOSALS_SCANNED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment the total proposals executed with the given outcome.
+#[inline]
+fn metric_executed_inc(_outcome: &str) {
+    FLYWHEEL_PROPOSALS_EXECUTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Update the max consecutive greens if the new value is higher.
+#[inline]
+fn metric_consecutive_greens_max(value: i32) {
+    if value > 0 {
+        let val_u64 = value as u64;
+        let mut current = FLYWHEEL_CONSECUTIVE_GREENS_MAX.load(Ordering::Relaxed);
+        while val_u64 > current {
+            match FLYWHEEL_CONSECUTIVE_GREENS_MAX.compare_exchange(
+                current,
+                val_u64,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+// =============================================================================
 // Scan endpoint — POST /spec/proposals/scan
 // =============================================================================
 
@@ -226,6 +270,11 @@ pub async fn post_scan(
     } else {
         format!("queued-{}-proposals", queued.len())
     };
+
+    // Increment metrics for scanned proposals
+    for _ in &queued {
+        metric_scanned_inc();
+    }
 
     info!(
         "post_scan: scanned_pathnames={} scanned_drift_reports={} queued={}",
@@ -442,6 +491,7 @@ pub async fn post_execute(
             let _ = pg_db
                 .update_proposal_status_with_error(&row.id, "failed", &detail)
                 .await;
+            metric_executed_inc("authoring-failed");
             return (
                 StatusCode::OK,
                 Json(json!({
@@ -478,6 +528,7 @@ pub async fn post_execute(
         let _ = pg_db
             .update_proposal_status_with_error(&row.id, "failed", &detail)
             .await;
+        metric_executed_inc("validator-rejected");
         warn!(
             "post_execute: validator rejected proposal {}: {} — {}",
             row.id, reason, detail
@@ -561,6 +612,8 @@ pub async fn post_execute(
     {
         warn!("post_execute: update_proposal_candidate_ir failed: {}", e);
     }
+
+    metric_executed_inc("promoted");
 
     (
         StatusCode::OK,
@@ -742,6 +795,7 @@ pub async fn post_sweep_pending(
         match gate_result {
             Ok(green_result) => {
                 let new_greens = prop.consecutive_greens.saturating_add(1);
+                metric_consecutive_greens_max(new_greens);
                 if new_greens >= 2 {
                     // Promote.
                     match storage::promote_pending(&root, &app_id, &spec_id) {
@@ -946,6 +1000,31 @@ pub async fn get_list(
                 .into_response()
         }
     }
+}
+
+// =============================================================================
+// Metrics endpoint — GET /spec/proposals/metrics
+// =============================================================================
+
+/// Returns a JSON object with current flywheel metrics. Useful for observability
+/// and testing.
+pub async fn get_metrics() -> Response {
+    let scanned = FLYWHEEL_PROPOSALS_SCANNED_TOTAL.load(Ordering::Relaxed);
+    let executed = FLYWHEEL_PROPOSALS_EXECUTED_TOTAL.load(Ordering::Relaxed);
+    let max_greens = FLYWHEEL_CONSECUTIVE_GREENS_MAX.load(Ordering::Relaxed);
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "metrics": {
+                "flywheel_proposals_scanned_total": scanned,
+                "flywheel_proposals_executed_total": executed,
+                "flywheel_consecutive_greens_max": max_greens,
+            }
+        })),
+    )
+        .into_response()
 }
 
 // =============================================================================
@@ -1206,6 +1285,7 @@ mod tests {
             transitions: Vec::new(),
             synthesized_groups: None,
             initial_state: None,
+            api_assertions: None,
         };
         let path = storage::write_pending_ir(tmp.path(), "qontinui-runner", &candidate).unwrap();
         let path_str = path.display().to_string();
@@ -1484,6 +1564,7 @@ mod tests {
                 transitions: Vec::new(),
                 synthesized_groups: None,
                 initial_state: None,
+                api_assertions: None,
             };
             let staged =
                 storage::write_pending_ir(&root, &app_id, &candidate).expect("write_pending_ir");

@@ -266,6 +266,11 @@ fn first_failing_assertion(result: &SpecCheckResult) -> Option<(String, String)>
 /// (a) trusts the user has the app on the right page, or (b) extends this
 /// helper later to pre-dispatch a `/ui-bridge/sdk/navigate` call. v1.0 ships
 /// (a) per the plan's "optional" framing in § Step 8 step 2.
+///
+/// Phase 3: Adds a 3-second grace period retry loop for headless browser
+/// launches. If no SDK connection is active, polls up to 30 times (100ms
+/// backoff) before failing with `NotConnected`. This allows the spawn-headless
+/// flow to complete registration while validator gate 4 is running.
 async fn fetch_live_snapshot(
     app_state: Arc<crate::commands::AppState>,
     pathname: &str,
@@ -273,13 +278,42 @@ async fn fetch_live_snapshot(
     use axum::http::Method;
 
     // 1. Resolve the active app id from the SDK connection.
+    // Phase 3: If no connection initially, wait up to 3s in case headless is launching.
     let active_app_id = {
         let guard = app_state.sdk_connection.lock().await;
         guard.active_connection().map(|c| c.app_info.app_id.clone())
     };
+
     let app_id = match active_app_id {
-        Some(id) => id,
-        None => return Err(SnapshotFetchError::NotConnected),
+        Some(id) => {
+            debug!("fetch_live_snapshot: found active app_id={}", id);
+            id
+        }
+        None => {
+            // Phase 3: Headless launch grace period — wait for SDK to register
+            debug!("fetch_live_snapshot: no active connection, waiting for headless launch grace period");
+            let mut app_id_found: Option<String> = None;
+            for retry in 0..30 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let guard = app_state.sdk_connection.lock().await;
+                if let Some(conn) = guard.active_connection() {
+                    app_id_found = Some(conn.app_info.app_id.clone());
+                    debug!(
+                        "fetch_live_snapshot: SDK connected on retry {} for app_id={}",
+                        retry,
+                        app_id_found.as_ref().unwrap()
+                    );
+                    break;
+                }
+            }
+            match app_id_found {
+                Some(id) => id,
+                None => {
+                    debug!("fetch_live_snapshot: timeout after headless grace period (no active connection)");
+                    return Err(SnapshotFetchError::NotConnected);
+                }
+            }
+        }
     };
 
     // 2. Look up the registry entry (also confirms the app is registered).
@@ -449,6 +483,7 @@ mod tests {
             transitions,
             synthesized_groups: None,
             initial_state: Some("s0".into()),
+            api_assertions: None,
         }
     }
 
@@ -683,6 +718,7 @@ mod tests {
             transitions: Vec::new(),
             synthesized_groups: None,
             initial_state: Some("s0".into()),
+            api_assertions: None,
         };
         let snapshot = empty_snapshot();
         // strict_all_pass with an empty conjunct scope (no assertions)
