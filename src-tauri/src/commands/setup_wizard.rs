@@ -1,8 +1,8 @@
 //! Setup Wizard Commands
 //!
 //! Provides Tauri commands for the first-launch setup wizard.
-//! Discovery operations call the qontinui-setup-mcp CLI via subprocess
-//! (works offline, no AI connection required).
+//! Discovery operations run natively in Rust via `commands::setup_discovery`
+//! (works offline, no AI connection and no Python interpreter required).
 
 use crate::error::AppError;
 use crate::settings::{self, AiProvider, CliExecutionMode, GlobalLogSource};
@@ -53,182 +53,14 @@ pub fn complete_setup() -> Result<(), String> {
 }
 
 // ============================================================================
-// Python CLI Subprocess Helpers
+// Discovery Commands (native Rust — no Python interpreter required)
 // ============================================================================
-
-/// Find the qontinui-setup-mcp source directory by searching parent directories.
-///
-/// Looks for a `qontinui-setup-mcp/src` directory containing the Python package.
-/// Searches from the executable's location upward, then from the current working
-/// directory upward. This handles both dev builds (where the exe is in
-/// `src-tauri/target/debug`) and the standard workspace layout.
-fn find_setup_mcp_src_dir() -> Option<std::path::PathBuf> {
-    // Collect candidate root directories to search from
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-
-    // Start from the executable's directory and walk up
-    if let Ok(exe_path) = std::env::current_exe() {
-        let mut dir = exe_path.parent().map(|p| p.to_path_buf());
-        while let Some(d) = dir {
-            candidates.push(d.clone());
-            dir = d.parent().map(|p| p.to_path_buf());
-        }
-    }
-
-    // Also try from the current working directory upward
-    if let Ok(cwd) = std::env::current_dir() {
-        let mut dir = Some(cwd);
-        while let Some(d) = dir {
-            candidates.push(d.clone());
-            dir = d.parent().map(|p| p.to_path_buf());
-        }
-    }
-
-    // Check each candidate (and its bundled-resource subdir) for the package.
-    // Dev/workspace layout: `<root>/qontinui-setup-mcp/src`. Packaged apps place
-    // bundled resources under a platform dir (macOS `<App>.app/Contents/Resources`,
-    // Windows next to the exe), so also probe `Resources/` at each level so an
-    // out-of-the-box install finds the source without a pip install.
-    for candidate in &candidates {
-        for base in [
-            candidate.clone(),
-            // Vendored in-repo copy (dev builds, no sibling checkout needed):
-            // `<runner>/src-tauri/resources/qontinui-setup-mcp/src`.
-            candidate.join("src-tauri").join("resources"),
-            candidate.join("resources"),
-            // Packaged-app resource dirs (macOS `.app/Contents/Resources`,
-            // Linux/Windows `resources/`).
-            candidate.join("Resources"),
-        ] {
-            let src_dir = base.join("qontinui-setup-mcp").join("src");
-            let module_init = src_dir.join("qontinui_setup_mcp").join("__init__.py");
-            if module_init.exists() {
-                info!("Found qontinui-setup-mcp source at: {}", src_dir.display());
-                return Some(src_dir);
-            }
-        }
-    }
-
-    // Also check QONTINUI_PARENT_DIR env var if set
-    if let Ok(parent_dir) = std::env::var("QONTINUI_PARENT_DIR") {
-        let src_dir = std::path::PathBuf::from(&parent_dir)
-            .join("qontinui-setup-mcp")
-            .join("src");
-        let module_init = src_dir.join("qontinui_setup_mcp").join("__init__.py");
-        if module_init.exists() {
-            info!(
-                "Found qontinui-setup-mcp source via QONTINUI_PARENT_DIR: {}",
-                src_dir.display()
-            );
-            return Some(src_dir);
-        }
-    }
-
-    None
-}
-
-/// Resolve a Python 3.12+ interpreter for the setup CLI.
-///
-/// End-user machines vary: some have `python`, some only `python3`, some a
-/// versioned `python3.12`, and macOS ships an old `/usr/bin/python3` (3.9) that
-/// must be skipped. Probe a preference-ordered candidate list and return the
-/// first that reports >= 3.12. `QONTINUI_PYTHON` overrides the search so an
-/// operator can pin a specific interpreter (or a bundled one).
-fn resolve_python() -> Option<String> {
-    let mut candidates: Vec<String> = Vec::new();
-    if let Ok(p) = std::env::var("QONTINUI_PYTHON") {
-        if !p.is_empty() {
-            candidates.push(p);
-        }
-    }
-    for c in ["python3.13", "python3.12", "python3", "python"] {
-        candidates.push(c.to_string());
-    }
-    candidates.into_iter().find(|cand| {
-        crate::process_helpers::no_window(cand)
-            .args([
-                "-c",
-                "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    })
-}
-
-/// Run a qontinui-setup-mcp CLI command and return parsed JSON output.
-///
-/// Automatically sets PYTHONPATH to include the qontinui-setup-mcp source
-/// directory so the module can be found without requiring pip installation.
-fn run_setup_cli(args: &[&str]) -> Result<Value, String> {
-    let python = resolve_python().ok_or_else(|| {
-        String::from(AppError::ProcessError(
-            "No Python 3.12+ interpreter found (tried $QONTINUI_PYTHON, \
-             python3.13, python3.12, python3, python). Install Python 3.12+ \
-             or set QONTINUI_PYTHON to its path."
-                .to_string(),
-        ))
-    })?;
-    let mut cmd = crate::process_helpers::no_window(&python);
-    cmd.args(
-        std::iter::once("-m")
-            .chain(std::iter::once("qontinui_setup_mcp.cli"))
-            .chain(args.iter().copied()),
-    )
-    .stdout(std::process::Stdio::piped())
-    .stderr(std::process::Stdio::piped());
-
-    // Set PYTHONPATH so the module can be found from source
-    if let Some(src_dir) = find_setup_mcp_src_dir() {
-        let src_dir_str = src_dir.to_string_lossy().to_string();
-        // Prepend to existing PYTHONPATH if set, otherwise just use the src dir.
-        // Use the platform PYTHONPATH separator (':' on Unix, ';' on Windows) —
-        // a hardcoded ';' silently broke source resolution on macOS/Linux
-        // whenever PYTHONPATH was already set (e.g. under Anaconda), forcing a
-        // fallback to a pip-installed copy that out-of-the-box users don't have.
-        let python_path = match std::env::var("PYTHONPATH") {
-            Ok(existing) if !existing.is_empty() => {
-                let sep = if cfg!(windows) { ';' } else { ':' };
-                format!("{}{}{}", src_dir_str, sep, existing)
-            }
-            _ => src_dir_str,
-        };
-        info!("Setting PYTHONPATH for setup CLI: {}", python_path);
-        cmd.env("PYTHONPATH", python_path);
-    } else {
-        warn!(
-            "Could not find qontinui-setup-mcp source directory; \
-             assuming module is installed via pip"
-        );
-    }
-
-    let output = cmd.output().map_err(|e| {
-        String::from(AppError::ProcessError(format!(
-            "Failed to run setup CLI: {}",
-            e
-        )))
-    })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!("Setup CLI failed: {}", stderr);
-        return Err(format!("Setup CLI error: {}", stderr.trim()));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str(&stdout).map_err(|e| {
-        String::from(AppError::ParseError(format!(
-            "Failed to parse setup CLI output: {}",
-            e
-        )))
-    })
-}
-
-// ============================================================================
-// Discovery Commands (via Python subprocess)
-// ============================================================================
+//
+// These were previously implemented by shelling out to the bundled
+// `qontinui_setup_mcp` Python CLI, which required an end-user Python 3.12+
+// interpreter and failed the first-launch scan on machines without one. The
+// discovery logic now lives in `crate::commands::setup_discovery` as a faithful
+// pure-Rust port, so the production wizard works out of the box.
 
 /// Scan a workspace directory for software projects
 #[tauri::command]
@@ -237,30 +69,35 @@ pub async fn scan_workspace_for_setup(
     max_depth: Option<u32>,
 ) -> Result<Value, String> {
     info!("Setup wizard: scanning workspace at {}", path);
-    let depth = max_depth.unwrap_or(3).to_string();
-    tokio::task::spawn_blocking(move || {
-        run_setup_cli(&["scan_workspace", &path, "--max-depth", &depth])
+    let depth = max_depth.unwrap_or(3);
+    let projects = tokio::task::spawn_blocking(move || {
+        crate::commands::setup_discovery::scan_workspace(&path, depth)
     })
     .await
-    .map_err(|e| String::from(AppError::ProcessError(format!("Task join error: {}", e))))?
+    .map_err(|e| String::from(AppError::ProcessError(format!("Task join error: {}", e))))?;
+    Ok(Value::Array(projects))
 }
 
 /// Detect the framework used by a project
 #[tauri::command]
 pub async fn detect_project_framework_for_setup(project_path: String) -> Result<Value, String> {
     info!("Setup wizard: detecting framework at {}", project_path);
-    tokio::task::spawn_blocking(move || run_setup_cli(&["detect_framework", &project_path]))
-        .await
-        .map_err(|e| String::from(AppError::ProcessError(format!("Task join error: {}", e))))?
+    tokio::task::spawn_blocking(move || {
+        crate::commands::setup_discovery::detect_framework(&project_path)
+    })
+    .await
+    .map_err(|e| String::from(AppError::ProcessError(format!("Task join error: {}", e))))
 }
 
 /// Suggest log sources for a project
 #[tauri::command]
 pub async fn suggest_log_sources_for_setup(project_path: String) -> Result<Value, String> {
     info!("Setup wizard: suggesting log sources for {}", project_path);
-    tokio::task::spawn_blocking(move || run_setup_cli(&["suggest_log_sources", &project_path]))
-        .await
-        .map_err(|e| String::from(AppError::ProcessError(format!("Task join error: {}", e))))?
+    tokio::task::spawn_blocking(move || {
+        crate::commands::setup_discovery::suggest_log_sources(&project_path)
+    })
+    .await
+    .map_err(|e| String::from(AppError::ProcessError(format!("Task join error: {}", e))))
 }
 
 /// Suggest workspace-level dev-log sources (.dev-logs/ directory)
@@ -271,10 +108,10 @@ pub async fn suggest_workspace_sources_for_setup(workspace_path: String) -> Resu
         workspace_path
     );
     tokio::task::spawn_blocking(move || {
-        run_setup_cli(&["suggest_workspace_sources", &workspace_path])
+        crate::commands::setup_discovery::suggest_workspace_sources(&workspace_path)
     })
     .await
-    .map_err(|e| String::from(AppError::ProcessError(format!("Task join error: {}", e))))?
+    .map_err(|e| String::from(AppError::ProcessError(format!("Task join error: {}", e))))
 }
 
 // ============================================================================
