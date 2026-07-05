@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Pre-push guard: mirrors CI's Rust gate (cargo fmt --check + clippy -D
-# warnings) so the failure is surfaced in 60-90s of local cycle time
-# instead of 8-15 min of CI roundtrip per push.
+# Pre-push guard: mirrors CI's Rust gate so a correctness failure is surfaced
+# in 60-90s of local cycle time instead of 8-15 min of CI roundtrip per push.
+# Tiered per plan 2026-07-05-lint-tiers-and-diff-scoped-gates: formatting
+# auto-applies (never blocks), and clippy runs plain (no `-D warnings`) so only
+# deny-tier (correctness/suspicious) lints from Cargo.toml [lints.clippy] block.
 #
 # Skip with `git push --no-verify` if you genuinely want CI to be the
 # source of truth (e.g. you're pushing a WIP branch you don't expect to
@@ -56,19 +58,30 @@ restore_lock() {
 }
 trap restore_lock EXIT
 
-echo "[pre-push] cargo fmt -- --check"
-if ! cargo fmt -- --check; then
-  echo
-  echo "[pre-push] FAIL — cargo fmt found unformatted code."
-  echo "          Run 'cd src-tauri && cargo fmt' to fix, then re-push."
-  exit 1
-fi
+# T2 (formatting) — auto-apply, never block. Run `cargo fmt` (writes) instead
+# of `cargo fmt -- --check` (fails). Re-stage anything it rewrote so the
+# formatted result rides in this push rather than failing it. Formatting is
+# mechanical; there is no value in bouncing a push over whitespace.
+echo "[pre-push] cargo fmt (auto-apply)"
+cargo fmt
+# Re-stage any src-tauri files fmt rewrote. `git add -u` on the src-tauri tree
+# picks up tracked-file modifications only (no new/untracked files). Best-effort:
+# if nothing changed this is a no-op.
+git -C "$ROOT" add -u -- src-tauri || true
 
-echo "[pre-push] cargo clippy --all-targets -- -D warnings"
-if ! cargo clippy --all-targets -- -D warnings; then
+# T1 (correctness) — block. Plain `cargo clippy`: NO `--all-targets` (that
+# compiles #[cfg(test)] modules this PR didn't touch — stricter than CI and a
+# frequent source of unrelated-lint push blocks) and NO `-D warnings` (that
+# would promote every warning to an error and neuter the Cargo.toml tiering).
+# Lint levels come solely from `[lints.clippy]` in src-tauri/Cargo.toml: a
+# `deny`-tier (correctness/suspicious) lint still exits non-zero and blocks,
+# while `warn`-tier (style/complexity/perf) lints are emitted but do not fail
+# the push. See plan 2026-07-05-lint-tiers-and-diff-scoped-gates.
+echo "[pre-push] cargo clippy (levels from Cargo.toml [lints.clippy]; deny-tier blocks)"
+if ! cargo clippy; then
   echo
-  echo "[pre-push] FAIL — clippy lints. Either fix the lints or"
-  echo "          QONTINUI_PREPUSH_SKIP=1 git push   if you want CI to gate."
+  echo "[pre-push] FAIL — a deny-tier (correctness/suspicious) clippy lint fired."
+  echo "          Fix the lint, or QONTINUI_PREPUSH_SKIP=1 git push to let CI gate."
   exit 1
 fi
 

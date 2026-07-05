@@ -27,6 +27,14 @@ on:
     # integration branch must be listed here for stacked-PR CI to fire. CI has
     # no `paths:` filter, so adding the branch suffices.
     branches: [main, develop, 'session-restore-**']
+  # Nightly cron drives `clippy-nightly-unscoped` (whole-tree, all-targets) so
+  # test-module / untouched-file lint rot is surfaced loudly on a schedule
+  # rather than ambushing an unrelated PR at push time. Added by plan
+  # 2026-07-05-lint-tiers-and-diff-scoped-gates; does not replace push/PR.
+  schedule:
+    - cron: '23 7 * * *'
+  # Manual trigger for the nightly unscoped clippy sweep (on-demand rot check).
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -232,9 +240,14 @@ jobs:
           cargo fmt -- --check
 
       - name: Clippy check
+        # Plain `cargo clippy` (no `-D warnings`): lint levels come solely from
+        # src-tauri/Cargo.toml [lints.clippy]. T1 correctness/suspicious groups
+        # are `deny` there, so a correctness lint still exits non-zero and fails
+        # this required check; T3 style/complexity/perf stay `warn` (emitted,
+        # non-blocking). See plan 2026-07-05-lint-tiers-and-diff-scoped-gates.
         run: |
           cd src-tauri
-          cargo clippy -- -D warnings
+          cargo clippy
 
       - name: Run Rust tests
         # Accessibility integration tests that require a real desktop session are
@@ -534,3 +547,253 @@ jobs:
 
       - name: Run pnpm audit
         run: pnpm audit --audit-level=moderate || true
+
+  # ---------------------------------------------------------------------------
+  # T3 lint tiering jobs — plan 2026-07-05-lint-tiers-and-diff-scoped-gates.
+  # ---------------------------------------------------------------------------
+
+  # Nightly UNSCOPED clippy sweep. The per-PR `Clippy check` step runs plain
+  # `cargo clippy` (default target only, levels from Cargo.toml) so it never
+  # ambushes an unrelated PR with test-module / whole-tree lint rot. This job
+  # restores that whole-tree coverage on a schedule instead: `--all-targets`
+  # compiles #[cfg(test)] modules too, surfacing warn-tier rot loudly once a
+  # day (and on-demand via workflow_dispatch) without gating any PR. It is
+  # allowed to fail on its own to make rot visible; it is NOT a required check
+  # and blocks nothing. Runs on schedule/manual only.
+  clippy-nightly-unscoped:
+    name: Clippy nightly (unscoped, all-targets)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # Same sibling checkouts the matrix `test` job needs: qontinui-schemas
+      # for the `qontinui-types` path dep, and (for --all-targets test compile)
+      # ui-bridge for the SDK↔runner manifest diff test source.
+      - name: Checkout sibling repos
+        run: |
+          cd "$GITHUB_WORKSPACE/.."
+          git clone --depth 1 https://github.com/qontinui/qontinui-schemas.git
+          git clone --depth 1 https://github.com/qontinui/qontinui-web.git
+          git clone --depth 1 https://github.com/qontinui/ui-bridge.git
+        shell: bash
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+          cache: "pnpm"
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt, clippy
+
+      - name: Install dependencies (Ubuntu)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            libatspi2.0-dev \
+            at-spi2-core
+
+      - name: Free disk space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: Add swapfile (Ubuntu — guard against link-time OOM)
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            src-tauri/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      # tauri::generate_context!() reads ../dist at compile time; clippy compiles
+      # the crate, so the frontend must be built first (same as the matrix job).
+      - name: Build frontend
+        run: pnpm run build
+
+      - name: Clippy (unscoped, all-targets)
+        # No `-D warnings`: report rot, don't deny-block the world. Levels come
+        # from Cargo.toml; --all-targets adds the test-module coverage the PR
+        # gate intentionally drops. A deny-tier lint anywhere in the tree still
+        # fails this job (by design — that's the loud signal), but this job
+        # gates no PR.
+        env:
+          CARGO_BUILD_JOBS: 1
+        run: |
+          cd src-tauri
+          cargo clippy --all-targets
+
+  # DIFF-SCOPED T3 style gate (reviewdog). Runs plain `cargo clippy` with JSON
+  # output and pipes it through reviewdog with -filter-mode=diff_context so it
+  # comments/fails ONLY on findings introduced on the lines this PR changed —
+  # style rot elsewhere in the tree is ignored. This is the T3 mechanism: warn-
+  # tier lints (style/complexity/perf) stay non-blocking globally but a NEW one
+  # you introduce is surfaced on your diff.
+  #
+  # ADVISORY / NOT A REQUIRED CHECK — do NOT add to required-status-checks or
+  # branch protection. Promote to required only after burn-in (plan Phase 2).
+  # Being non-required guarantees it cannot wedge the coord merge train even if
+  # reviewdog misbehaves.
+  #
+  # NOT LIVE-VERIFIED: reviewdog's clippy errorformat + diff_context behavior on
+  # this Tauri crate has not been exercised in real CI (a full clippy compile is
+  # 40-70 min and was not run locally). Treat the first live PR run as the
+  # verification; keep it non-required until confirmed green-and-useful.
+  clippy-diff:
+    name: Clippy diff-scoped (advisory)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: write
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Checkout sibling repos
+        run: |
+          cd "$GITHUB_WORKSPACE/.."
+          git clone --depth 1 https://github.com/qontinui/qontinui-schemas.git
+          git clone --depth 1 https://github.com/qontinui/qontinui-web.git
+          git clone --depth 1 https://github.com/qontinui/ui-bridge.git
+        shell: bash
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+          cache: "pnpm"
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt, clippy
+
+      - name: Setup reviewdog
+        uses: reviewdog/action-setup@v1
+        with:
+          reviewdog_version: latest
+
+      - name: Install dependencies (Ubuntu)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            libatspi2.0-dev \
+            at-spi2-core
+
+      - name: Free disk space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: Add swapfile (Ubuntu — guard against link-time OOM)
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            src-tauri/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend
+        run: pnpm run build
+
+      - name: Clippy diff-scoped via reviewdog
+        # Capture clippy JSON to a file first so cargo's non-zero exit (a deny
+        # lint) does NOT abort the step under `set -eo pipefail` before
+        # reviewdog runs — reviewdog owns the pass/fail decision here, scoped to
+        # the diff. `-filter-mode=diff_context` = fail only on findings on
+        # changed lines; `-fail-on-error=true` makes those diff findings fail
+        # THIS (advisory, non-required) check only.
+        env:
+          CARGO_BUILD_JOBS: 1
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd src-tauri
+          cargo clippy --message-format=json > clippy-report.json 2>/dev/null || true
+          reviewdog \
+            -f=clippy \
+            -name="clippy-diff" \
+            -filter-mode=diff_context \
+            -reporter=github-pr-check \
+            -fail-on-error=true \
+            < clippy-report.json
+        shell: bash
