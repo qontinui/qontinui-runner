@@ -33,6 +33,27 @@
 //! structurally binds nonce→principal→`sub_type`: a device nonce can only ever
 //! forward a `sub_type == "device"` bearer, and an agent nonce a
 //! `sub_type == "agent"` bearer — neither can elevate into the other.
+//!
+//! # Multi-tenant disposition (Phase 8b, plan
+//! `2026-07-02-session-scoped-multi-tenant-device-binding` §D4)
+//!
+//! The proxy is SESSION-SCOPED where it matters and default-scoped where
+//! that is the honest binding:
+//!
+//! - **Agent principal — session-scoped by construction.** A coord-spawned
+//!   agent session's bearer is its own coord-minted agent JWT, whose
+//!   `tenant_id` claim is the SESSION's binding frozen at mint (coord
+//!   Phase 4 validates membership at spawn). Two concurrent agent sessions
+//!   for two tenants each present their own tenant's claim with zero
+//!   runner-side selection logic.
+//! - **Device principal — DEFAULT binding by construction.** Device-path
+//!   nonces serve operator terminals and gate-continuation shells, which
+//!   run under the device's default binding (`machine.json::
+//!   active_tenant_id`, default-for-new-sessions); the injected live device
+//!   JWT is the legacy slot = the default binding's credential. A future
+//!   spawn path that provisions a device-proxied session under a
+//!   NON-default binding must select via `auth::device_bearer_for` rather
+//!   than widen this path silently.
 
 use std::collections::HashMap;
 use std::path::Path;

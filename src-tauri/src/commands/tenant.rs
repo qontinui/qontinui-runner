@@ -1,15 +1,27 @@
 //! Tenant resolution Tauri commands — plan
 //! [`2026-05-22-coord-native-session-coordination`] §D12 + §Phase 4.
 //!
+//! ## `active_tenant_id` semantics (Phase 8b, plan
+//! `2026-07-02-session-scoped-multi-tenant-device-binding` §D4)
+//!
+//! `machine.json::active_tenant_id` is the **default for NEW sessions and
+//! for device-level surfaces** (heartbeat, census, backstop, maintenance,
+//! doctor, flag-poll) — NOT "the only tenant this device serves". A device
+//! holds N concurrent tenant bindings (`paired_user.json` v2 +
+//! `coord.tenant_devices`); each session records its own tenant at
+//! creation (spawn input, else this default) and keeps it for life, so
+//! switching the active tenant re-points FUTURE sessions only.
+//!
 //! The frontend [`TenantContext`] reads the active tenant id (per machine)
 //! and offers a switcher when the operator belongs to >1 tenant. The
-//! source of truth for the active tenant is `~/.qontinui/machine.json`'s
+//! source of truth for the default is `~/.qontinui/machine.json`'s
 //! `active_tenant_id` field (D12 explicitly nominates this file as the
 //! per-machine pin). At first launch on a multi-tenant operator account
 //! the file may not yet hold the field; in that case we fall back to the
-//! single tenant available via the existing
+//! DEFAULT binding available via the existing
 //! [`qontinui_runner_lib::pair::read_paired_tenant_id_from_disk`] reader
-//! so the runner UI can render before the operator has explicitly chosen.
+//! (v2-aware: `default_tenant_id`) so the runner UI can render before the
+//! operator has explicitly chosen.
 //!
 //! Note: a richer "list of tenants the operator belongs to" requires a
 //! coord round-trip (Phase 5 dashboard). Phase 4 only needs the active
@@ -74,7 +86,9 @@ fn write_active_tenant_id(path: &Path, tenant_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Return the active tenant id for this machine. Resolution order:
+/// Return the active tenant id for this machine — the DEFAULT binding for
+/// new sessions and device-level surfaces (Phase 8b semantics; existing
+/// sessions keep their own recorded tenant). Resolution order:
 ///
 /// 1. `~/.qontinui/machine.json` → `active_tenant_id` field (D12 pin)
 /// 2. Cached pair file (`paired_user.json`) → `tenant_id` (fallback so
@@ -111,9 +125,11 @@ pub fn get_active_tenant() -> Result<CommandResponse, String> {
 
 /// Persist the operator's tenant choice to
 /// `~/.qontinui/machine.json::active_tenant_id`. Plan §D12 — stored
-/// per-machine; switching active tenant does NOT migrate already-running
-/// sessions (each session is stamped with its tenant at start and keeps
-/// it for life).
+/// per-machine; Phase 8b semantics: this sets the DEFAULT for NEW sessions
+/// and device-level surfaces on a device that may hold N concurrent
+/// bindings. It does NOT migrate already-running sessions (each session is
+/// stamped with its tenant at start and keeps it for life) and does NOT
+/// unpair any other binding.
 #[tauri::command]
 pub fn set_active_tenant(tenant_id: String) -> Result<CommandResponse, String> {
     let trimmed = tenant_id.trim();

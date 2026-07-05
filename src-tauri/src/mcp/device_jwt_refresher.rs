@@ -410,10 +410,14 @@ async fn publish_coord_credential_status(
         return;
     };
 
-    // tenant_id: machine.json::active_tenant_id, then the outgoing device-JWT
-    // claim (still parseable when expired). NULL is acceptable on the wire
-    // (coord's StatusUpsert.tenant_id is Option), but we send it when known so
-    // the row is tenant-scoped.
+    // tenant_id: machine.json::active_tenant_id (Phase 8b semantics: the
+    // DEVICE-LEVEL DEFAULT binding — this publish is a device-scoped surface,
+    // so the default is the correct attribution; session-scoped writes get
+    // their tenant from the owning session instead), then the outgoing
+    // device-JWT claim (still parseable when expired). NULL is acceptable on
+    // the wire (coord's StatusUpsert.tenant_id is Option), but we send it
+    // when known so the row is tenant-scoped — the explicit-tenant_id
+    // publisher posture D2 site 16b/Phase 8 item 7 asks for.
     let tenant_id = crate::session::dual_write::resolve_active_tenant_id().or_else(|| {
         auth_manager
             .get_access_token()
@@ -830,6 +834,182 @@ pub(crate) async fn try_device_self_refresh(
     }
 }
 
+// ===========================================================================
+// Session-scoped multi-tenant per-tenant slot refresh (plan 2026-07-02, D4).
+// Shipped behavior as of Phase 8a (the Phase-1 `QONTINUI_MULTI_TENANT_JWT`
+// flag gate is retired): every `device_jwt:<tenant_id>` slot self-refreshes
+// with its own claim each refresher iteration, independent of the legacy
+// `access_token` slot (which the pre-existing paths above keep owning).
+// ===========================================================================
+
+/// How the `IdleWrongTier` arm should wait (Phase 8a). With per-tenant
+/// slots held, the arm must wake on the steady cadence so the slot pass —
+/// which runs once per loop iteration — can't be starved by an unbounded
+/// block-until-kick (a wrong-tier runner may never receive a kick). With
+/// no slots, `None` preserves the historical block-until-kick. Pure, so
+/// the starvation fix is pinned by a unit test.
+pub(crate) fn idle_wrong_tier_wait(has_tenant_slots: bool) -> Option<Duration> {
+    has_tenant_slots.then_some(REFRESH_CHECK_INTERVAL)
+}
+
+/// What to do with one per-tenant device-JWT slot this pass. Pure output of
+/// [`plan_tenant_slot`] so the staleness branching is unit-testable without
+/// storage or a tokio runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TenantSlotPlan {
+    /// Future-exp JWT within [`crate::auth::REFRESH_BEFORE_EXPIRY_SECS`] of
+    /// expiry — self-refresh it now (presenting THAT slot's token).
+    Refresh,
+    /// Future-exp JWT with plenty of TTL left — leave it alone this pass.
+    SkipFresh,
+    /// Absent/opaque exp or already expired — NOT self-refreshable (coord
+    /// would 401 the bearer). Skipped; the slot heals at the next pair for
+    /// that tenant. REPLACE-not-REVOKE: never cleared here.
+    SkipNotRefreshable,
+}
+
+/// Pure per-slot staleness decision. `exp` is the slot JWT's decoded
+/// (unverified) `exp` claim; `now` is unix seconds.
+pub(crate) fn plan_tenant_slot(exp: Option<i64>, now: i64) -> TenantSlotPlan {
+    match exp {
+        // Opaque/undecodable — cannot judge or present it for self-refresh.
+        None => TenantSlotPlan::SkipNotRefreshable,
+        // Already expired — coord would 401 the presented bearer.
+        Some(e) if now >= e => TenantSlotPlan::SkipNotRefreshable,
+        // Within TTL/3 of expiry — refresh now.
+        Some(e) if now + crate::auth::REFRESH_BEFORE_EXPIRY_SECS >= e => TenantSlotPlan::Refresh,
+        // Comfortably fresh.
+        Some(_) => TenantSlotPlan::SkipFresh,
+    }
+}
+
+/// Outcome of one per-tenant slot in a [`refresh_tenant_slots`] pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TenantSlotOutcome {
+    /// Coord 2xx'd and the new JWT was persisted into that tenant's slot.
+    Refreshed,
+    /// Slot JWT still comfortably fresh — nothing to do.
+    SkippedFresh,
+    /// Slot empty/opaque/expired — not self-refreshable this pass.
+    SkippedNotRefreshable,
+    /// Refresh was attempted but failed (coord non-2xx, network error,
+    /// decode failure, empty token, or persist error). The existing slot
+    /// value is left UNTOUCHED (REPLACE-not-REVOKE), and the pass CONTINUES
+    /// with the remaining slots.
+    KeptExisting,
+}
+
+/// Flag-gated multi-tenant slot pass: walk every per-tenant device-JWT slot
+/// and self-refresh each stale one via coord's
+/// `POST /devices/{device_id}/refresh-token`, presenting THAT slot's token as
+/// the bearer (coord re-mints from the presented claim's tenant — verified
+/// plan premise, `tokens.rs:341-348`). Each slot succeeds or fails
+/// independently: a failure on one slot never aborts the others, and the
+/// legacy `access_token` slot is never read or written here.
+///
+/// Returns the per-tenant outcomes (deterministic slot order) for logging and
+/// hermetic tests.
+pub(crate) async fn refresh_tenant_slots(
+    auth_manager: &crate::auth::AuthManager,
+    coord_base: &str,
+    device_id: &str,
+) -> Vec<(uuid::Uuid, TenantSlotOutcome)> {
+    let tenants = auth_manager.list_tenant_device_jwt_tenants();
+    let mut outcomes = Vec::with_capacity(tenants.len());
+    if tenants.is_empty() {
+        return outcomes;
+    }
+    let url = format!(
+        "{}/devices/{}/refresh-token",
+        coord_base.trim_end_matches('/'),
+        device_id
+    );
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => Some(c),
+        Err(e) => {
+            warn!("device_jwt_refresher: tenant-slot refresh client build failed: {e}");
+            None
+        }
+    };
+    let now = chrono::Utc::now().timestamp();
+    for tenant in tenants {
+        let token = match auth_manager.get_tenant_device_jwt(&tenant) {
+            Ok(Some(t)) if !t.trim().is_empty() => t.trim().to_string(),
+            _ => {
+                outcomes.push((tenant, TenantSlotOutcome::SkippedNotRefreshable));
+                continue;
+            }
+        };
+        match plan_tenant_slot(crate::auth::decode_jwt_exp(&token), now) {
+            TenantSlotPlan::SkipFresh => {
+                outcomes.push((tenant, TenantSlotOutcome::SkippedFresh));
+                continue;
+            }
+            TenantSlotPlan::SkipNotRefreshable => {
+                warn!(
+                    "device_jwt_refresher: tenant {tenant} slot JWT is expired/opaque — \
+                     cannot self-refresh; re-pair for that tenant to heal the slot"
+                );
+                outcomes.push((tenant, TenantSlotOutcome::SkippedNotRefreshable));
+                continue;
+            }
+            TenantSlotPlan::Refresh => {}
+        }
+        let Some(client) = client.as_ref() else {
+            outcomes.push((tenant, TenantSlotOutcome::KeptExisting));
+            continue;
+        };
+        // Present THIS slot's token — coord re-mints for the claim's tenant.
+        let resp = match client.post(&url).bearer_auth(&token).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("device_jwt_refresher: tenant {tenant} slot refresh request failed: {e}");
+                outcomes.push((tenant, TenantSlotOutcome::KeptExisting));
+                continue;
+            }
+        };
+        if !resp.status().is_success() {
+            warn!(
+                "device_jwt_refresher: tenant {tenant} slot refresh got HTTP {} \
+                 (existing slot JWT preserved)",
+                resp.status()
+            );
+            outcomes.push((tenant, TenantSlotOutcome::KeptExisting));
+            continue;
+        }
+        let body: DeviceRefreshResponse = match resp.json().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("device_jwt_refresher: tenant {tenant} slot refresh body decode failed: {e}");
+                outcomes.push((tenant, TenantSlotOutcome::KeptExisting));
+                continue;
+            }
+        };
+        if body.token.trim().is_empty() {
+            warn!("device_jwt_refresher: tenant {tenant} slot refresh returned an empty token");
+            outcomes.push((tenant, TenantSlotOutcome::KeptExisting));
+            continue;
+        }
+        match auth_manager.store_tenant_device_jwt(&tenant, &body.token) {
+            Ok(()) => {
+                info!(
+                    "device_jwt_refresher: tenant {tenant} device-JWT slot refreshed (len={})",
+                    body.token.len()
+                );
+                outcomes.push((tenant, TenantSlotOutcome::Refreshed));
+            }
+            Err(e) => {
+                warn!("device_jwt_refresher: tenant {tenant} slot persist failed: {e}");
+                outcomes.push((tenant, TenantSlotOutcome::KeptExisting));
+            }
+        }
+    }
+    outcomes
+}
+
 /// Phase 4b: the FINAL cold-start fallback — exchange the stored device
 /// machine key (`dmk_`) for a fresh device JWT via web's
 /// `POST {web_base}/api/v1/devices/{device_id}/machine-credential/exchange`
@@ -1082,6 +1262,47 @@ async fn refresher_loop(
 
         let decision = next_action(settings_snapshot.tier, needs_refresh);
 
+        // Session-scoped multi-tenant Phase 8a (plan 2026-07-02, D4): the
+        // per-tenant device-JWT slot pass is the SHIPPED behavior (the
+        // Phase-1 `QONTINUI_MULTI_TENANT_JWT` flag is retired). Every slot
+        // self-refreshes with ITS OWN claim, independently of the legacy
+        // `access_token` slot's own staleness/decision below; the
+        // machine.json tenant-precedence chain (`resolve_pair_tenant_id`)
+        // only ever feeds the DEFAULT slot's Cognito pair path. Placed
+        // before the decision match so the Idle arm (legacy JWT fresh)
+        // still ticks the tenant slots each cadence/kick. Runners with no
+        // tenant slots (never paired post-8a) skip in one storage read.
+        let has_tenant_slots = !auth_manager.list_tenant_device_jwt_tenants().is_empty();
+        if has_tenant_slots {
+            let mt_device_id = std::env::var("QONTINUI_MACHINE_ID")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().to_string())
+                .or_else(|| qontinui_runner_lib::pair::read_device_id_from_disk().ok());
+            match mt_device_id {
+                Some(did) => {
+                    let coord_base = crate::coord_mcp::coord_base_url();
+                    let outcomes = refresh_tenant_slots(&auth_manager, &coord_base, &did).await;
+                    if !outcomes.is_empty() {
+                        let refreshed = outcomes
+                            .iter()
+                            .filter(|(_, o)| *o == TenantSlotOutcome::Refreshed)
+                            .count();
+                        info!(
+                            "device_jwt_refresher: multi-tenant slot pass — {refreshed}/{} \
+                             refreshed ({outcomes:?})",
+                            outcomes.len()
+                        );
+                    }
+                }
+                None => warn!(
+                    "device_jwt_refresher: tenant device-JWT slots present but no device_id \
+                     (QONTINUI_MACHINE_ID unset, machine.json unreadable) — skipping \
+                     tenant-slot pass"
+                ),
+            }
+        }
+
         match decision {
             Decision::IdleWrongTier => {
                 // Phase 1b: publish the credential-dark signal so coord's
@@ -1092,6 +1313,19 @@ async fn refresher_loop(
                     &coord_credential_health(decision, None),
                 )
                 .await;
+                // Phase 8a: with tenant slots held, a wrong-tier idle must
+                // NOT park indefinitely — the slot pass above only runs per
+                // loop iteration, so an unbounded block would starve slot
+                // refreshes until a kick that may never come. Bounded wait
+                // instead (kick/shutdown still wake early). Slot-less
+                // runners keep the historical block-until-kick behavior.
+                if let Some(wait) = idle_wrong_tier_wait(has_tenant_slots) {
+                    if wait_with_signals(wait, &mut shutdown_rx, &mut kick_rx).await {
+                        info!("Device-JWT refresher shutting down (was idle on non-Tier2)");
+                        return;
+                    }
+                    continue;
+                }
                 // Nothing to do until tier changes. Block on shutdown or
                 // kick (set_runner_tier kicks us on every transition).
                 tokio::select! {
@@ -2491,6 +2725,309 @@ mod device_self_refresh_tests {
             existing,
             "existing JWT must be UNCHANGED after a 401"
         );
+    }
+}
+
+#[cfg(test)]
+mod tenant_slot_refresh_tests {
+    //! Session-scoped multi-tenant — hermetic tests for the per-tenant
+    //! slot pass (`refresh_tenant_slots`, shipped un-gated as of Phase
+    //! 8a) against an in-process mock coord, plus the pure
+    //! `plan_tenant_slot` staleness decision and the `IdleWrongTier`
+    //! bounded-wait rule. Injected tokens only (the established
+    //! refresher test pattern) — no live coord, no `~/.qontinui`, no
+    //! env-var mutation.
+
+    use super::*;
+    use axum::{
+        extract::{Path, State},
+        http::{HeaderMap, StatusCode},
+        routing::post,
+        Router,
+    };
+    use std::sync::{Arc, Mutex};
+
+    fn b64url(b: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+    }
+
+    /// Synthetic device-JWT with an `exp` claim and a distinguishing `sub`
+    /// so each tenant's token is unique on the wire.
+    fn synth_jwt(exp: i64, sub: &str) -> String {
+        let header = b64url(b"{\"alg\":\"EdDSA\",\"typ\":\"JWT\"}");
+        let payload = b64url(format!("{{\"exp\":{exp},\"sub\":\"{sub}\"}}").as_bytes());
+        let sig = b64url(b"fake-sig");
+        format!("{header}.{payload}.{sig}")
+    }
+
+    fn test_auth_manager(name: &str) -> crate::auth::AuthManager {
+        let dir = std::env::temp_dir().join("qontinui_test_tenant_slots");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("{name}.enc"));
+        let _ = std::fs::remove_file(&path);
+        let storage = crate::secure_storage::SecureStorage::with_path(path).expect("storage");
+        crate::auth::AuthManager::with_storage(storage)
+    }
+
+    /// Mock coord: echoes each presented bearer back as `<bearer>.refreshed`
+    /// (so per-slot assertions can prove EACH slot was refreshed with ITS OWN
+    /// token), and 500s any bearer in `fail_bearers` (so failure-isolation is
+    /// testable). Captures every presented bearer in order.
+    #[derive(Clone)]
+    struct MockState {
+        fail_bearers: Arc<Mutex<Vec<String>>>,
+        bearers_seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    async fn handler(
+        State(s): State<MockState>,
+        Path(_device_id): Path<String>,
+        h: HeaderMap,
+    ) -> (StatusCode, String) {
+        let bearer = h
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .unwrap_or("")
+            .to_string();
+        s.bearers_seen.lock().unwrap().push(bearer.clone());
+        if s.fail_bearers.lock().unwrap().contains(&bearer) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":"boom"}"#.to_string(),
+            );
+        }
+        (
+            StatusCode::OK,
+            serde_json::json!({ "token": format!("{bearer}.refreshed") }).to_string(),
+        )
+    }
+
+    struct MockCapture {
+        bearers_seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    fn spawn_mock(
+        fail_bearers: Vec<String>,
+    ) -> (String, MockCapture, tokio::sync::oneshot::Sender<()>) {
+        let bearers_seen = Arc::new(Mutex::new(Vec::new()));
+        let bearers_h = bearers_seen.clone();
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = std_listener.local_addr().expect("addr").port();
+        std_listener.set_nonblocking(true).expect("nb");
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("rt");
+            rt.block_on(async move {
+                let state = MockState {
+                    fail_bearers: Arc::new(Mutex::new(fail_bearers)),
+                    bearers_seen: bearers_h,
+                };
+                // axum 0.8 path-param syntax: `{device_id}`.
+                let app: Router = Router::new()
+                    .route("/devices/{device_id}/refresh-token", post(handler))
+                    .with_state(state);
+                let listener =
+                    tokio::net::TcpListener::from_std(std_listener).expect("tokio listener");
+                let _ = axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = rx.await;
+                    })
+                    .await;
+            });
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        (
+            format!("http://127.0.0.1:{port}"),
+            MockCapture { bearers_seen },
+            tx,
+        )
+    }
+
+    const DID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+    fn tenant(n: u8) -> uuid::Uuid {
+        uuid::Uuid::parse_str(&format!(
+            "{c}{c}{c}{c}{c}{c}{c}{c}-{c}{c}{c}{c}-4{c}{c}{c}-8{c}{c}{c}-{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}",
+            c = (b'a' + n) as char
+        ))
+        .expect("valid uuid")
+    }
+
+    // ---- plan_tenant_slot: pure staleness decision ----
+
+    #[test]
+    fn plan_refreshes_stale_but_valid_and_skips_fresh_or_dead() {
+        let now = 1_000_000_000i64;
+        // Opaque/undecodable → not self-refreshable.
+        assert_eq!(
+            plan_tenant_slot(None, now),
+            TenantSlotPlan::SkipNotRefreshable
+        );
+        // Already expired (or exactly at exp) → not self-refreshable.
+        assert_eq!(
+            plan_tenant_slot(Some(now - 1), now),
+            TenantSlotPlan::SkipNotRefreshable
+        );
+        assert_eq!(
+            plan_tenant_slot(Some(now), now),
+            TenantSlotPlan::SkipNotRefreshable
+        );
+        // Future exp within TTL/3 → refresh.
+        assert_eq!(
+            plan_tenant_slot(Some(now + 30 * 60), now),
+            TenantSlotPlan::Refresh
+        );
+        assert_eq!(
+            plan_tenant_slot(Some(now + crate::auth::REFRESH_BEFORE_EXPIRY_SECS), now),
+            TenantSlotPlan::Refresh
+        );
+        // Comfortably fresh → skip.
+        assert_eq!(
+            plan_tenant_slot(Some(now + 3 * 60 * 60), now),
+            TenantSlotPlan::SkipFresh
+        );
+    }
+
+    // ---- refresh_tenant_slots: hermetic multi-slot iteration ----
+
+    #[tokio::test]
+    async fn multi_slot_pass_refreshes_each_slot_with_its_own_token() {
+        // Two tenant slots, both stale-but-valid, plus a legacy access_token.
+        // Each slot must be refreshed by presenting ITS OWN token, persisted
+        // into ITS OWN slot — and the legacy slot must be byte-identical after.
+        let mgr = test_auth_manager("multi_slot_own_tokens");
+        let (ta, tb) = (tenant(0), tenant(1));
+        let now = chrono::Utc::now().timestamp();
+        let jwt_a = synth_jwt(now + 30 * 60, "tenant-a");
+        let jwt_b = synth_jwt(now + 30 * 60, "tenant-b");
+        mgr.store_tokens("legacy.default.jwt", "")
+            .expect("store legacy");
+        mgr.store_tenant_device_jwt(&ta, &jwt_a).expect("slot a");
+        mgr.store_tenant_device_jwt(&tb, &jwt_b).expect("slot b");
+
+        let (base, cap, _shutdown) = spawn_mock(vec![]);
+        let outcomes = refresh_tenant_slots(&mgr, &base, DID).await;
+
+        assert_eq!(
+            outcomes,
+            vec![
+                (ta, TenantSlotOutcome::Refreshed),
+                (tb, TenantSlotOutcome::Refreshed)
+            ],
+            "both slots must refresh"
+        );
+        // Each slot presented ITS OWN token as the bearer.
+        let seen = cap.bearers_seen.lock().unwrap().clone();
+        assert_eq!(seen, vec![jwt_a.clone(), jwt_b.clone()]);
+        // Each slot now holds ITS OWN re-minted token (echo-mint = bearer +
+        // ".refreshed"), proving no cross-slot mixing.
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&ta).unwrap().as_deref(),
+            Some(format!("{jwt_a}.refreshed").as_str())
+        );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&tb).unwrap().as_deref(),
+            Some(format!("{jwt_b}.refreshed").as_str())
+        );
+        // LEGACY-SLOT PRESERVATION: the pass never touches access_token.
+        assert_eq!(mgr.get_access_token().unwrap(), "legacy.default.jwt");
+    }
+
+    #[tokio::test]
+    async fn failure_on_one_slot_does_not_abort_the_others() {
+        // Coord 500s tenant A's bearer; tenant B must still refresh. A keeps
+        // its existing token (REPLACE-not-REVOKE).
+        let mgr = test_auth_manager("multi_slot_failure_isolation");
+        let (ta, tb) = (tenant(0), tenant(1));
+        let now = chrono::Utc::now().timestamp();
+        let jwt_a = synth_jwt(now + 30 * 60, "tenant-a");
+        let jwt_b = synth_jwt(now + 30 * 60, "tenant-b");
+        mgr.store_tenant_device_jwt(&ta, &jwt_a).expect("slot a");
+        mgr.store_tenant_device_jwt(&tb, &jwt_b).expect("slot b");
+
+        let (base, cap, _shutdown) = spawn_mock(vec![jwt_a.clone()]);
+        let outcomes = refresh_tenant_slots(&mgr, &base, DID).await;
+
+        assert_eq!(
+            outcomes,
+            vec![
+                (ta, TenantSlotOutcome::KeptExisting),
+                (tb, TenantSlotOutcome::Refreshed)
+            ],
+            "A fails, B still refreshes — no abort"
+        );
+        // Both were attempted (B was not skipped because of A's failure).
+        assert_eq!(cap.bearers_seen.lock().unwrap().len(), 2);
+        // A's slot is UNCHANGED; B's slot advanced.
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&ta).unwrap().as_deref(),
+            Some(jwt_a.as_str())
+        );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&tb).unwrap().as_deref(),
+            Some(format!("{jwt_b}.refreshed").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_and_dead_slots_are_skipped_without_http() {
+        // A comfortably-fresh slot and an already-expired slot: neither hits
+        // coord, neither slot value changes.
+        let mgr = test_auth_manager("multi_slot_skip_fresh_dead");
+        let (ta, tb) = (tenant(0), tenant(1));
+        let now = chrono::Utc::now().timestamp();
+        let fresh = synth_jwt(now + 3 * 60 * 60, "fresh");
+        let expired = synth_jwt(now - 60, "expired");
+        mgr.store_tenant_device_jwt(&ta, &fresh).expect("slot a");
+        mgr.store_tenant_device_jwt(&tb, &expired).expect("slot b");
+
+        let (base, cap, _shutdown) = spawn_mock(vec![]);
+        let outcomes = refresh_tenant_slots(&mgr, &base, DID).await;
+
+        assert_eq!(
+            outcomes,
+            vec![
+                (ta, TenantSlotOutcome::SkippedFresh),
+                (tb, TenantSlotOutcome::SkippedNotRefreshable)
+            ]
+        );
+        assert!(
+            cap.bearers_seen.lock().unwrap().is_empty(),
+            "no HTTP call for fresh/expired slots"
+        );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&ta).unwrap().as_deref(),
+            Some(fresh.as_str())
+        );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&tb).unwrap().as_deref(),
+            Some(expired.as_str()),
+            "REPLACE-not-REVOKE: an expired slot is preserved, never cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_slot_set_is_a_no_op() {
+        let mgr = test_auth_manager("multi_slot_empty_noop");
+        let (base, cap, _shutdown) = spawn_mock(vec![]);
+        let outcomes = refresh_tenant_slots(&mgr, &base, DID).await;
+        assert!(outcomes.is_empty());
+        assert!(cap.bearers_seen.lock().unwrap().is_empty());
+    }
+
+    /// Phase 8a starvation fix: with tenant slots held, the wrong-tier
+    /// idle arm must wake on the steady cadence (so the per-slot pass at
+    /// the top of the loop keeps running); with no slots it keeps the
+    /// historical block-until-kick (`None`).
+    #[test]
+    fn idle_wrong_tier_waits_bounded_only_when_slots_exist() {
+        assert_eq!(idle_wrong_tier_wait(true), Some(REFRESH_CHECK_INTERVAL));
+        assert_eq!(idle_wrong_tier_wait(false), None);
     }
 }
 

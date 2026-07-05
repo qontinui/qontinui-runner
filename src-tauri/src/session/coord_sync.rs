@@ -640,6 +640,14 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
     let base = inner.coord_url.trim_end_matches('/');
     let kind = rec.event_kind.as_str();
 
+    // Phase 8b (plan 2026-07-02-session-scoped-multi-tenant-device-binding
+    // §D4) — per-session credential selection: every push presents the
+    // OWNING SESSION's device-JWT slot. `None` (session tenant unknown —
+    // pre-8b outbox rows, registry gone after restart, single-tenant
+    // installs) keeps the default slot, byte-identical to the old behavior.
+    let tenant = record_session_tenant(inner, rec);
+    let tenant_ref = tenant.as_ref();
+
     let result = match kind {
         "started" => {
             // POST /sessions with the full create body. The runner
@@ -647,14 +655,14 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // session start; we just forward it.
             let body = rebuild_create_body(rec);
             let url = format!("{base}/sessions");
-            crate::auth::attach_device_auth(inner.http.post(&url).json(&body))
+            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), tenant_ref)
                 .send()
                 .await
         }
         "heartbeat" => {
             let url = format!("{base}/sessions/{}", rec.session_id);
             let body = json!({ "heartbeat": true });
-            crate::auth::attach_device_auth(inner.http.patch(&url).json(&body))
+            crate::auth::attach_device_auth_for(inner.http.patch(&url).json(&body), tenant_ref)
                 .send()
                 .await
         }
@@ -663,20 +671,20 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // The payload carries whatever fields the runner changed —
             // forward the subset coord understands.
             let body = state_change_body(&rec.payload);
-            crate::auth::attach_device_auth(inner.http.patch(&url).json(&body))
+            crate::auth::attach_device_auth_for(inner.http.patch(&url).json(&body), tenant_ref)
                 .send()
                 .await
         }
         "closed" => {
             let url = format!("{base}/sessions/{}", rec.session_id);
-            crate::auth::attach_device_auth(inner.http.delete(&url))
+            crate::auth::attach_device_auth_for(inner.http.delete(&url), tenant_ref)
                 .send()
                 .await
         }
         "claim_stolen" => {
             let url = format!("{base}/sessions/{}/steal", rec.session_id);
             let body = steal_body(rec);
-            crate::auth::attach_device_auth(inner.http.post(&url).json(&body))
+            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), tenant_ref)
                 .send()
                 .await
         }
@@ -689,23 +697,30 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // stamps last_progress_at=now() when the body omits it.
             let url = format!("{base}/sessions/{}", rec.session_id);
             let body = progress_body(&rec.payload);
-            crate::auth::attach_device_auth(inner.http.patch(&url).json(&body))
+            crate::auth::attach_device_auth_for(inner.http.patch(&url).json(&body), tenant_ref)
                 .send()
                 .await
         }
         "helper_task_created" => {
             // Helper Task Queue (plan 2026-06-29-helper-task-queue, Phase 1.3).
             // The payload is the full CreateHelperTaskRequest body recorded by
-            // HelperTaskRegistrar — forward it verbatim. Auth is the device
-            // JWT (attach_device_auth), same as every other coord data-plane
-            // call. Responses take the dedicated best-effort path in
+            // HelperTaskRegistrar — forward it verbatim. Phase 8b: this is a
+            // SESSION-scoped data-plane push (the helper task is created by an
+            // owning session), so it presents that session's device-JWT slot
+            // via `attach_device_auth_for(tenant_ref)` like every other
+            // per-session arm above — `None` keeps the default slot,
+            // byte-identical to the pre-8b bare `attach_device_auth`.
+            // Responses take the dedicated best-effort path in
             // `helper_task_outcome` (201 provenance capture, the
             // `helper_task_queue_unavailable` 503 drop, bounded retry for
             // everything else).
             let url = format!("{base}/coord/helper-tasks");
-            crate::auth::attach_device_auth(inner.http.post(&url).json(&rec.payload))
-                .send()
-                .await
+            crate::auth::attach_device_auth_for(
+                inner.http.post(&url).json(&rec.payload),
+                tenant_ref,
+            )
+            .send()
+            .await
         }
         "commit_report" => {
             // Commit ↔ session lineage push-report (plan
@@ -713,10 +728,15 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // Body is the payload verbatim ({repo, branch, shas}); coord
             // resolves the session server-side from (repo, branch). Tenant
             // comes from the X-Qontinui-Tenant-Id header (post_device_register
-            // posture) — mirror `rebuild_create_body`'s machine.json resolve.
+            // posture) — Phase 8b: the OWNING SESSION's binding wins; the
+            // machine.json default only backfills tenant-less legacy rows.
             let url = format!("{base}/coord/commits/report");
-            let mut rb = crate::auth::attach_device_auth(inner.http.post(&url).json(&rec.payload));
-            if let Some(tid) = crate::session::dual_write::resolve_active_tenant_id() {
+            let mut rb = crate::auth::attach_device_auth_for(
+                inner.http.post(&url).json(&rec.payload),
+                tenant_ref,
+            );
+            if let Some(tid) = tenant.or_else(crate::session::dual_write::resolve_active_tenant_id)
+            {
                 rb = rb.header("X-Qontinui-Tenant-Id", tid.to_string());
             }
             rb.send().await
@@ -762,6 +782,40 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
         }
         Err(e) => PushOutcome::Transport(format!("{e}")),
     }
+}
+
+/// Resolve which tenant binding OWNS an outbox record's session — the slot
+/// selector for the per-session credential seam (Phase 8b, plan §D4).
+///
+/// Resolution order:
+/// 1. The record payload — the `started` create body carries the full
+///    intent (whose `tenant_id` the registry stamped at creation), and a
+///    top-level `tenant_id` is honored for future event kinds.
+/// 2. The live [`SessionRegistry`] record for `rec.session_id` — thin
+///    payloads (heartbeat / state_change / closed) carry no intent, but the
+///    registry still holds the session's stamped tenant while it's alive.
+/// 3. `None` — replayed rows for sessions the registry no longer holds
+///    (post-restart) and pre-8b rows. Callers treat `None` as "default
+///    slot", the pre-8b behavior, so nothing regresses.
+fn record_session_tenant(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> Option<Uuid> {
+    let from_payload = rec
+        .payload
+        .get("intent")
+        .and_then(|i| i.get("tenant_id"))
+        .or_else(|| rec.payload.get("tenant_id"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s.trim()).ok());
+    if from_payload.is_some() {
+        return from_payload;
+    }
+    inner
+        .registry
+        .lock()
+        .expect("coord_sync registry slot poisoned")
+        .as_ref()
+        .and_then(Weak::upgrade)
+        .and_then(|reg| reg.describe_by_id(rec.session_id).ok())
+        .and_then(|d| d.intent.tenant_id)
 }
 
 /// Response handling for `helper_task_created` POSTs — best-effort posture.
@@ -834,14 +888,16 @@ async fn helper_task_outcome(rec: &OutboxRecord, resp: reqwest::Response) -> Pus
 /// `payload` directly (`{id, kind, intent, state, started_at}`), so
 /// rebuilding for the wire is mostly relabeling.
 fn rebuild_create_body(rec: &OutboxRecord) -> JsonValue {
-    // tenant_id resolution order: the intent/payload body (if the operator
-    // or a future resolver supplied it) → the device's `active_tenant_id`
-    // from `~/.qontinui/machine.json` → nil. The machine.json fallback is
-    // what makes a single-tenant operator's sessions visible on their
-    // tenant-scoped dashboard: without it, every session registers under
-    // the nil tenant `00000000-…` and the operator's `/sessions` view (which
-    // scopes to their resolved tenant) shows nothing despite a healthy
-    // pipeline.
+    // tenant_id resolution order: the intent/payload body (Phase 8b: the
+    // registry stamps the session's tenant into the intent at creation —
+    // spawn input or the machine.json default-for-new-sessions, so this arm
+    // is the common case now) → the device's `active_tenant_id` from
+    // `~/.qontinui/machine.json` (pre-8b outbox rows) → nil. The
+    // machine.json fallback is what makes a single-tenant operator's
+    // sessions visible on their tenant-scoped dashboard: without it, every
+    // session registers under the nil tenant `00000000-…` and the
+    // operator's `/sessions` view (which scopes to their resolved tenant)
+    // shows nothing despite a healthy pipeline.
     let intent = rec
         .payload
         .get("intent")
@@ -1223,6 +1279,7 @@ mod tests {
             declared_paths: vec![],
             share_output: false,
             redact_secrets: None,
+            tenant_id: None,
         }
     }
 
@@ -1457,6 +1514,112 @@ mod tests {
             outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
         })
         .await;
+    }
+
+    /// Phase 8b — an explicit spawn-input tenant survives to the coord
+    /// `POST /sessions` body verbatim (session-create goes explicit).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_forwards_explicit_session_tenant_in_create_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let registry = build_registry(coord.clone());
+        let tenant = Uuid::from_bytes([0x42; 16]);
+        let mut intent = make_test_intent();
+        intent.tenant_id = Some(tenant);
+        let _handle = registry.start(intent).unwrap();
+        let _drain = coord.start_drain_task();
+
+        wait_until(Duration::from_secs(5), || {
+            let r = rec.try_lock();
+            r.map(|g| !g.posts.is_empty()).unwrap_or(false)
+        })
+        .await;
+
+        let g = rec.lock().await;
+        assert_eq!(
+            g.posts[0]["tenant_id"],
+            JsonValue::String(tenant.to_string()),
+            "explicit spawn tenant must land in the create body"
+        );
+        assert_eq!(
+            g.posts[0]["intent"]["tenant_id"],
+            JsonValue::String(tenant.to_string()),
+            "the stamped intent carries the session tenant too"
+        );
+    }
+
+    /// Phase 8b slot-selector resolution: payload intent wins, then the
+    /// top-level payload field, then the live registry record, else None
+    /// (→ default slot, the pre-8b behavior).
+    #[test]
+    fn record_session_tenant_prefers_payload_then_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let coord = CoordSync::new_for_test(
+            outbox,
+            "http://127.0.0.1:1".to_string(),
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let registry = build_registry(coord.clone());
+        let intent_tenant = Uuid::from_bytes([0xA1; 16]);
+        let payload_tenant = Uuid::from_bytes([0xB2; 16]);
+        let registry_tenant = Uuid::from_bytes([0xC3; 16]);
+
+        let mk = |session_id: Uuid, payload: JsonValue| OutboxRecord {
+            machine_id: Uuid::new_v4(),
+            session_id,
+            seq: 1,
+            event_kind: "heartbeat".to_string(),
+            payload,
+            recorded_at: chrono::Utc::now(),
+            acked_at: None,
+        };
+
+        // 1. intent.tenant_id wins over the top-level field.
+        let rec1 = mk(
+            Uuid::new_v4(),
+            json!({
+                "intent": { "tenant_id": intent_tenant.to_string() },
+                "tenant_id": payload_tenant.to_string(),
+            }),
+        );
+        assert_eq!(
+            record_session_tenant(&coord.inner, &rec1),
+            Some(intent_tenant)
+        );
+
+        // 2. top-level payload tenant_id when the intent has none.
+        let rec2 = mk(
+            Uuid::new_v4(),
+            json!({ "tenant_id": payload_tenant.to_string() }),
+        );
+        assert_eq!(
+            record_session_tenant(&coord.inner, &rec2),
+            Some(payload_tenant)
+        );
+
+        // 3. thin payload (heartbeat shape) → the live registry record's
+        //    stamped tenant.
+        let mut intent = make_test_intent();
+        intent.tenant_id = Some(registry_tenant);
+        let handle = registry.start(intent).unwrap();
+        let rec3 = mk(handle.id(), json!({ "at": chrono::Utc::now() }));
+        assert_eq!(
+            record_session_tenant(&coord.inner, &rec3),
+            Some(registry_tenant)
+        );
+
+        // 4. unknown session + thin payload → None (default slot).
+        let rec4 = mk(Uuid::new_v4(), json!({}));
+        assert_eq!(record_session_tenant(&coord.inner, &rec4), None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

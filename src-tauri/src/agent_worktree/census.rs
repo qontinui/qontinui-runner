@@ -284,11 +284,17 @@ pub(crate) fn coord_http_base_pub() -> Option<String> {
     coord_http_base()
 }
 
-/// Read `active_tenant_id` from `~/.qontinui/machine.json` (advisory —
-/// coord DB-resolves the real tenant, per memory
-/// `reference_oauth_tenant_claim_advisory_db_resolved`). `None` for
-/// single-tenant operators, which is fine: coord attributes the census
-/// to the device's resolved tenant regardless.
+/// Read `active_tenant_id` from `~/.qontinui/machine.json` — Phase 8b
+/// semantics (plan 2026-07-02-session-scoped-multi-tenant-device-binding
+/// §D4): the DEVICE-LEVEL DEFAULT binding, not the-only-tenant. The census
+/// is a device-scoped surface (it walks the whole machine), so the default
+/// is the correct request-level attribution. Note the census deliberately
+/// stamps NO per-worktree tenant: a worktree's tenant is its allocate-time
+/// coord stamp (`coord.agent_worktrees.tenant_id`), which coord already
+/// holds — stamping the machine default per row here would misattribute
+/// another tenant's worktrees (plan Phase 8 item 6). `None` for
+/// single-tenant operators, which is fine: coord attributes the census to
+/// the device's resolved tenant regardless.
 fn resolve_tenant_id() -> Option<Uuid> {
     let path = dirs::home_dir()?.join(".qontinui").join("machine.json");
     let bytes = std::fs::read(path).ok()?;

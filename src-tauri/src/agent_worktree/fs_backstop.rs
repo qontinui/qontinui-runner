@@ -224,10 +224,14 @@ fn governed_canonical_checkouts(root: &Path) -> Vec<(String, PathBuf)> {
     out
 }
 
-/// Read `active_tenant_id` from `~/.qontinui/machine.json` (advisory — coord
-/// DB-resolves the real tenant). `None` for single-tenant operators, which is
-/// fine. Mirrors `census::resolve_tenant_id` (which is private; the read is
-/// trivial and tenant attribution is best-effort).
+/// Read `active_tenant_id` from `~/.qontinui/machine.json` — Phase 8b
+/// semantics: the DEVICE-LEVEL DEFAULT binding (default-for-new-sessions),
+/// not the-only-tenant. Correct here because the backstop is a
+/// device-scoped surface: it scans CANONICAL checkouts (never allocate-
+/// stamped agent worktrees, whose tenant lives on their coord row). `None`
+/// for single-tenant operators, which is fine. Mirrors
+/// `census::resolve_tenant_id` (which is private; the read is trivial and
+/// tenant attribution is best-effort).
 fn resolve_tenant_id() -> Option<uuid::Uuid> {
     let path = dirs::home_dir()?.join(".qontinui").join("machine.json");
     let bytes = std::fs::read(path).ok()?;

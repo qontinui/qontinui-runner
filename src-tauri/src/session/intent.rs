@@ -74,6 +74,18 @@ pub struct Intent {
     /// [`Intent::share_output`] (see [`Intent::effective_redact_secrets`]).
     #[serde(default)]
     pub redact_secrets: Option<bool>,
+    /// Phase 8b (plan `2026-07-02-session-scoped-multi-tenant-device-binding`
+    /// §D4/§D7) — the tenant binding this session runs under, recorded at
+    /// creation: the SPAWN INPUT when the caller supplied one, else the
+    /// device's default (`machine.json::active_tenant_id`,
+    /// default-for-new-sessions), stamped by `SessionRegistry::start`/
+    /// `register_external`. Immutable for the session's life. Drives BOTH
+    /// the `POST /sessions` body's `tenant_id` and which device-JWT slot the
+    /// coord-sync loop presents for this session's writes. `None` only on
+    /// single-tenant installs with no configured default (coord then
+    /// resolves sole-binding server-side).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<uuid::Uuid>,
 }
 
 impl Intent {
@@ -144,6 +156,7 @@ mod tests {
             declared_paths: vec![],
             share_output: false,
             redact_secrets: None,
+            tenant_id: None,
         }
     }
 
@@ -223,10 +236,28 @@ mod tests {
             declared_paths: vec![PathBuf::from("/repo/path")],
             share_output: true,
             redact_secrets: Some(false),
+            tenant_id: Some(uuid::Uuid::from_bytes([7; 16])),
         };
         let serialized = serde_json::to_string(&i).unwrap();
         let back: Intent = serde_json::from_str(&serialized).unwrap();
         assert_eq!(back, i);
+    }
+
+    #[test]
+    fn tenant_id_none_omits_key_and_some_round_trips() {
+        // `None` serializes WITHOUT the key (skip_serializing_if) so
+        // existing coord rows / consumers see no shape change; a legacy
+        // intent JSON with no tenant_id deserializes to None.
+        let serialized = serde_json::to_string(&good_intent()).unwrap();
+        assert!(!serialized.contains("tenant_id"));
+
+        let t = uuid::Uuid::from_bytes([9; 16]);
+        let mut with_tenant = good_intent();
+        with_tenant.tenant_id = Some(t);
+        let json = serde_json::to_string(&with_tenant).unwrap();
+        assert!(json.contains(&format!("\"tenant_id\":\"{t}\"")));
+        let back: Intent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, with_tenant);
     }
 
     #[test]

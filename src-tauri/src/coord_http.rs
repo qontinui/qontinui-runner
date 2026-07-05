@@ -33,6 +33,23 @@ pub fn coord_get(client: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwes
     qontinui_runner_lib::auth::attach_device_auth(client.get(url))
 }
 
+/// Tenant-selecting variant of [`coord_get`] (Phase 8b, plan
+/// `2026-07-02-session-scoped-multi-tenant-device-binding` §D4):
+/// `Some(tenant)` attaches that binding's device-JWT slot, `None` the
+/// default binding's (identical to [`coord_get`]). Slot-miss posture is
+/// `auth::device_bearer_for`'s: a non-default tenant with no slot sends the
+/// request UNAUTHENTICATED (never another tenant's credential). Session-
+/// scoped readers pass the owning session's tenant; everything else keeps
+/// using [`coord_get`] and gets the default slot by construction.
+#[allow(dead_code)] // seam: session-scoped GET readers adopt as they gain tenants
+pub fn coord_get_for(
+    client: &reqwest::Client,
+    url: impl reqwest::IntoUrl,
+    tenant: Option<&uuid::Uuid>,
+) -> reqwest::RequestBuilder {
+    qontinui_runner_lib::auth::attach_device_auth_for(client.get(url), tenant)
+}
+
 /// True iff a non-empty device-JWT is currently stored.
 ///
 /// Callers that must distinguish "unpaired" (no token locally) from

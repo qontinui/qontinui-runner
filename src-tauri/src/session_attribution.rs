@@ -88,6 +88,16 @@ struct WipAttributionPayload {
     repo: String,
     /// Repo-relative path (joins `coord.primary_trees.dirty_files`).
     file: String,
+    /// Phase 8b (plan 2026-07-02-session-scoped-multi-tenant-device-binding,
+    /// Phase 8 item 7 / D2 site 12): EXPLICIT tenant attribution from the
+    /// owning session's binding — the lifecycle-hosted sessions this
+    /// publisher walks are operator terminal sessions, whose binding is the
+    /// device DEFAULT. Explicit-wins coord-side once Phase 5's resolver
+    /// deploys; today's coord ignores the extra field (serde tolerant).
+    /// Omitted when the runner has no resolvable default (coord then
+    /// resolves device-side, exactly the pre-8b behavior).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tenant_id: Option<uuid::Uuid>,
 }
 
 /// Map an absolute (or backslash) file path to `(repo, file)` IFF it lives
@@ -271,6 +281,12 @@ pub async fn run_attribution_cycle() -> Result<(), String> {
         .map_err(|e| format!("reqwest builder: {e}"))?;
     let url = format!("{base}/coord/wip-attribution");
 
+    // Phase 8b item 7 — explicit tenant attribution. Resolved once per
+    // cycle: every lifecycle-hosted session is an operator terminal session
+    // running under the device's DEFAULT binding (coord-spawned agent
+    // sessions publish through their own agent identity, not this walker).
+    let tenant_id = crate::fleet::resolve_tenant_id();
+
     let mut posted = 0usize;
     for rec in open {
         let session_id = rec.claude_session_id;
@@ -379,6 +395,7 @@ pub async fn run_attribution_cycle() -> Result<(), String> {
                 session_id: session_uuid,
                 repo,
                 file,
+                tenant_id,
             };
             match client.post(&url).json(&payload).send().await {
                 Ok(resp) if resp.status().is_success() => {
@@ -486,6 +503,39 @@ pub fn spawn_session_attribution() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- WipAttributionPayload wire shape (Phase 8b item 7) -------------------
+
+    #[test]
+    fn wip_payload_serializes_explicit_tenant_and_omits_none() {
+        let t = uuid::Uuid::from_bytes([0x77; 16]);
+        let with_tenant = WipAttributionPayload {
+            device_id: uuid::Uuid::nil(),
+            session_id: None,
+            repo: "qontinui-runner".into(),
+            file: "src/main.rs".into(),
+            tenant_id: Some(t),
+        };
+        let v = serde_json::to_value(&with_tenant).unwrap();
+        assert_eq!(
+            v.get("tenant_id").and_then(|x| x.as_str()),
+            Some(t.to_string().as_str()),
+            "explicit tenant must appear on the WIP wire"
+        );
+
+        let without = WipAttributionPayload {
+            device_id: uuid::Uuid::nil(),
+            session_id: None,
+            repo: "qontinui-runner".into(),
+            file: "src/main.rs".into(),
+            tenant_id: None,
+        };
+        let v = serde_json::to_value(&without).unwrap();
+        assert!(
+            v.get("tenant_id").is_none(),
+            "None tenant must be omitted (pre-8b wire shape preserved)"
+        );
+    }
 
     // ---- map_path_to_repo_file ------------------------------------------------
 

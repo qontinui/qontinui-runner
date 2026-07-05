@@ -38,6 +38,11 @@ pub struct StartSessionArgs {
     pub share_output: bool,
     #[serde(default)]
     pub redact_secrets: Option<bool>,
+    /// Phase 8b — explicit tenant binding for this session (the spawn
+    /// input). Omitted → the registry stamps the device default
+    /// (`machine.json::active_tenant_id`, default-for-new-sessions).
+    #[serde(default)]
+    pub tenant_id: Option<Uuid>,
 }
 
 impl From<StartSessionArgs> for Intent {
@@ -55,6 +60,7 @@ impl From<StartSessionArgs> for Intent {
             declared_paths: a.declared_paths,
             share_output: a.share_output,
             redact_secrets: a.redact_secrets,
+            tenant_id: a.tenant_id,
         }
     }
 }
