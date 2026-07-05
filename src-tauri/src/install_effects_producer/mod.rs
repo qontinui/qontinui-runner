@@ -127,6 +127,12 @@ pub fn routes() -> Router<Arc<ApiState>> {
         // confirmation/liveness signal). Reuses the existing loopback server —
         // the shim already reaches it on the seam-injected port.
         .route("/control/session-open", post(post_session_open))
+        // Diagnostic beacon (session-restore observability): the identity shim
+        // POSTs one line here on EVERY invocation — INCLUDING the don't-double-pin
+        // passthrough branch where it sends no session-open — so a rebuild's logs
+        // reveal whether the shim actually ran for a given terminal and whether it
+        // will deliver `--session-id` / `--settings`. Log-only; no store write.
+        .route("/control/shim-beacon", post(post_shim_beacon))
         // Phase 4: private-registry credential CRUD. Mounted alongside the
         // Phase-1 run route so a single `install_effects_producer::routes()`
         // merge in `mcp_api.rs` covers the whole producer surface.
@@ -220,6 +226,45 @@ async fn post_session_open(
             Ok(Json(ApiResponse::success(())))
         }
     }
+}
+
+/// Body of `POST /control/shim-beacon` — a fire-and-forget diagnostic the
+/// identity shim POSTs on every invocation so shim execution is observable in
+/// the runner logs (does the shim run for organic sessions? does it deliver
+/// `--settings`?). Every field is optional/loose — this is a log line, not data.
+#[derive(Debug, serde::Deserialize)]
+pub struct ShimBeaconRequest {
+    #[serde(default)]
+    pub terminal_id: Option<String>,
+    #[serde(default)]
+    pub tool: Option<String>,
+    #[serde(default)]
+    pub event: Option<String>,
+    /// Which shim surface fired: `"exe"` (the native `qontinui-shim` stub — the
+    /// primary Windows surface post-#696). The `.bash`/`.cmd` script shims
+    /// predate the field and omit it, so absent ⇒ a script surface.
+    #[serde(default)]
+    pub surface: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+/// `POST /control/shim-beacon`. Log-only: emits one INFO line so a rebuild's
+/// logs reveal exactly which terminals invoked the identity shim and with what
+/// pin/settings decision. Never touches the store; always 200 (never wedges the
+/// provider's startup).
+async fn post_shim_beacon(Json(req): Json<ShimBeaconRequest>) -> Json<ApiResponse<()>> {
+    info!(
+        terminal_id = %req.terminal_id.as_deref().unwrap_or("?"),
+        tool = %req.tool.as_deref().unwrap_or("?"),
+        event = %req.event.as_deref().unwrap_or("invoked"),
+        // Only the pre-`surface` script shims omit the field, so absent means
+        // a `.bash`/`.cmd` surface (the exe stub always sends "exe").
+        surface = %req.surface.as_deref().unwrap_or("script"),
+        detail = %req.detail.as_deref().unwrap_or(""),
+        "control/shim-beacon: identity shim invoked"
+    );
+    Json(ApiResponse::success(()))
 }
 
 /// Store-write half of [`post_session_open`], factored out so the route logic is
@@ -1292,6 +1337,34 @@ mod tests {
         // No cwd ⇒ title falls back to the provider name.
         assert_eq!(rec.title.as_deref(), Some("claude"));
         assert_eq!(rec.working_dir.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn shim_beacon_request_parses_full_and_defaults_missing() {
+        // Full payload (what the native exe stub POSTs, incl. `surface`).
+        let full: ShimBeaconRequest = serde_json::from_str(
+            r#"{"terminal_id":"t1","tool":"claude","event":"invoked","surface":"exe","detail":"user_session_id=true settings=true pinned=true"}"#,
+        )
+        .expect("full beacon body must parse");
+        assert_eq!(full.terminal_id.as_deref(), Some("t1"));
+        assert_eq!(full.tool.as_deref(), Some("claude"));
+        assert_eq!(full.event.as_deref(), Some("invoked"));
+        assert_eq!(full.surface.as_deref(), Some("exe"));
+        assert!(full.detail.as_deref().unwrap().contains("settings=true"));
+
+        // The `.bash`/`.cmd` script shims predate `surface` and omit it — the
+        // field must default (the handler logs it as "script").
+        let script: ShimBeaconRequest = serde_json::from_str(
+            r#"{"terminal_id":"t1","tool":"claude","event":"invoked","detail":"user_session_id=false settings=true pinned=true"}"#,
+        )
+        .expect("script beacon body (no surface) must parse");
+        assert!(script.surface.is_none());
+
+        // Every field is optional — an empty object must still parse (the
+        // handler is log-only and never rejects a malformed-but-JSON beacon).
+        let empty: ShimBeaconRequest =
+            serde_json::from_str("{}").expect("empty beacon body must parse");
+        assert!(empty.terminal_id.is_none() && empty.tool.is_none() && empty.surface.is_none());
     }
 
     // -------------------------------------------------------------------
