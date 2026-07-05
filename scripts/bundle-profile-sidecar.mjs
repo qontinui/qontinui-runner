@@ -54,22 +54,60 @@ const triple = resolveTriple();
 const isWindows = triple.includes("windows");
 const exeExt = isWindows ? ".exe" : "";
 
-// 2. Build the sidecar bin in release. Uses src-tauri's own target dir so the
-//    artifact and Tauri's own build share the dep cache.
+// 2. Build the sidecar bin in release, capturing cargo's JSON artifact stream so
+//    we learn the EXACT output path. Do NOT assume `src-tauri/target/` — this
+//    repo's cargo target dir is the workspace root `target/` (and CI/CARGO_TARGET_DIR
+//    or a `--target` subdir can move it further), so guessing the path is what
+//    broke CI. `json-render-diagnostics` keeps machine JSON on stdout while
+//    rendering warnings/errors to stderr (which we inherit for visibility).
 console.log(`[bundle-profile-sidecar] cargo build --release --bin qontinui_profile (target=${triple})`);
+let stdout;
 try {
-  execFileSync("cargo", ["build", "--release", "--bin", "qontinui_profile"], {
-    cwd: srcTauri,
-    stdio: "inherit",
-  });
+  stdout = execFileSync(
+    "cargo",
+    [
+      "build",
+      "--release",
+      "--bin",
+      "qontinui_profile",
+      "--message-format=json-render-diagnostics",
+    ],
+    {
+      cwd: srcTauri,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "inherit"],
+      maxBuffer: 512 * 1024 * 1024,
+    },
+  );
 } catch (e) {
   fail(`cargo build of qontinui_profile failed: ${e.message}`);
 }
 
-// 3. Locate the freshly built artifact.
-const builtExe = join(srcTauri, "target", "release", `qontinui_profile${exeExt}`);
-if (!existsSync(builtExe)) {
-  fail(`expected build artifact not found at ${builtExe}`);
+// 3. Extract the executable path from the last matching compiler-artifact
+//    message — the authoritative location cargo actually wrote it to.
+let builtExe = null;
+for (const line of stdout.split("\n")) {
+  const s = line.trim();
+  if (!s.startsWith("{")) continue;
+  let msg;
+  try {
+    msg = JSON.parse(s);
+  } catch {
+    continue;
+  }
+  if (
+    msg.reason === "compiler-artifact" &&
+    msg.target &&
+    msg.target.name === "qontinui_profile" &&
+    msg.executable
+  ) {
+    builtExe = msg.executable;
+  }
+}
+if (!builtExe || !existsSync(builtExe)) {
+  fail(
+    `could not locate the built qontinui_profile executable from cargo's JSON output (parsed: ${builtExe})`,
+  );
 }
 
 // 4. Copy to the triple-suffixed path Tauri's externalBin resolver expects.
