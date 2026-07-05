@@ -21,12 +21,17 @@ use serde::{Deserialize, Serialize};
 use super::config::EnvAgentConfig;
 
 /// Wire shape of the enroll request body. Conforms EXACTLY to the backend
-/// contract: `{ enrollment_code, machine_id?, hostname? }`.
+/// contract: `{ enrollment_code, machine_id?, hostname?, coord_device_id? }`.
 #[derive(Debug, Serialize)]
 struct EnrollRequest {
     enrollment_code: String,
     machine_id: Option<String>,
     hostname: Option<String>,
+    /// This machine's coord device identity (UUID). Omitted from the wire
+    /// entirely when absent so the request stays compatible with backends that
+    /// predate the contract extension (qontinui-web#697).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coord_device_id: Option<uuid::Uuid>,
 }
 
 /// Wire shape of the enroll response. The backend returns the machine key ONCE
@@ -54,6 +59,12 @@ pub struct EnrollParams {
     pub machine_id: Option<String>,
     /// This machine's hostname, or `None`.
     pub hostname: Option<String>,
+    /// This machine's coord device identity (UUID) from
+    /// `~/.qontinui/machine.json::device_id`. Sent to the backend so it can
+    /// persist the devenv↔coord twin bridge linkage. `None` when the local
+    /// identity is absent/unparseable — enroll still works, the field is just
+    /// omitted from the wire.
+    pub coord_device_id: Option<uuid::Uuid>,
     /// Diagnostic override for `environment_id`; the response value wins when
     /// present. Normally `None`.
     pub environment_override: Option<String>,
@@ -85,6 +96,7 @@ pub fn run_enroll(params: EnrollParams) -> Result<EnrollOutcome, String> {
         enrollment_code: code.to_string(),
         machine_id: params.machine_id.clone(),
         hostname: params.hostname.clone(),
+        coord_device_id: params.coord_device_id,
     };
     let url = format!("{backend}/api/v1/devenv/agent/enroll");
 
@@ -175,11 +187,13 @@ pub fn resolve_backend_base(explicit: Option<&str>) -> Result<String, String> {
     Ok(crate::pair::derive_web_base_from_coord(&coord_base))
 }
 
-/// Read `~/.qontinui/machine.json` → `(machine_id, hostname)`, both optional.
-/// A missing/unreadable/unparseable file yields `(None, None)` — enroll tolerates
-/// null identity (the backend may assign a machine_id). Accepts the legacy
-/// `machine_id` key as an alias for `device_id`, matching the CLI reader.
-pub fn local_machine_identity() -> (Option<String>, Option<String>) {
+/// Read `~/.qontinui/machine.json` → `(machine_id, hostname, coord_device_id)`,
+/// all optional. A missing/unreadable/unparseable file yields `(None, None, None)`
+/// — enroll tolerates null identity (the backend may assign a machine_id).
+/// Accepts the legacy `machine_id` key as an alias for `device_id`, matching the
+/// CLI reader. The third element is the same `device_id` value parsed as a UUID
+/// (coord's device identity), or `None` when it is absent/unparseable.
+pub fn local_machine_identity() -> (Option<String>, Option<String>, Option<uuid::Uuid>) {
     #[derive(Deserialize)]
     struct DeviceFile {
         #[serde(alias = "machine_id")]
@@ -188,11 +202,11 @@ pub fn local_machine_identity() -> (Option<String>, Option<String>) {
         hostname: String,
     }
     let Some(home) = dirs::home_dir() else {
-        return (None, None);
+        return (None, None, None);
     };
     let path = home.join(".qontinui").join("machine.json");
     let Ok(bytes) = std::fs::read(&path) else {
-        return (None, None);
+        return (None, None, None);
     };
     match serde_json::from_slice::<DeviceFile>(&bytes) {
         Ok(f) => {
@@ -201,9 +215,10 @@ pub fn local_machine_identity() -> (Option<String>, Option<String>) {
             } else {
                 Some(f.hostname)
             };
-            (Some(f.device_id), hostname)
+            let coord_device_id = uuid::Uuid::parse_str(f.device_id.trim()).ok();
+            (Some(f.device_id), hostname, coord_device_id)
         }
-        Err(_) => (None, None),
+        Err(_) => (None, None, None),
     }
 }
 
@@ -226,6 +241,7 @@ mod tests {
             backend: "https://qontinui.io".to_string(),
             machine_id: None,
             hostname: None,
+            coord_device_id: None,
             environment_override: None,
         })
         .unwrap_err();
@@ -239,9 +255,42 @@ mod tests {
             backend: "  ".to_string(),
             machine_id: None,
             hostname: None,
+            coord_device_id: None,
             environment_override: None,
         })
         .unwrap_err();
         assert!(err.contains("backend base URL is empty"), "got: {err}");
+    }
+
+    #[test]
+    fn enroll_request_serializes_coord_device_id_only_when_present() {
+        // Present → the `coord_device_id` key appears with the UUID string.
+        let id = uuid::Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let with = EnrollRequest {
+            enrollment_code: "ENR-ABC".to_string(),
+            machine_id: Some("dev-1".to_string()),
+            hostname: Some("host-1".to_string()),
+            coord_device_id: Some(id),
+        };
+        let v = serde_json::to_value(&with).unwrap();
+        assert_eq!(
+            v.get("coord_device_id").and_then(|c| c.as_str()),
+            Some("11111111-2222-3333-4444-555555555555"),
+            "coord_device_id should serialize as the UUID string when Some"
+        );
+
+        // Absent → the key is OMITTED entirely (skip_serializing_if), keeping the
+        // request compatible with pre-#697 backends.
+        let without = EnrollRequest {
+            enrollment_code: "ENR-ABC".to_string(),
+            machine_id: None,
+            hostname: None,
+            coord_device_id: None,
+        };
+        let v = serde_json::to_value(&without).unwrap();
+        assert!(
+            v.get("coord_device_id").is_none(),
+            "coord_device_id key must be absent when None, got: {v}"
+        );
     }
 }

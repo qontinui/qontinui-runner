@@ -91,14 +91,16 @@ pub async fn handle_enroll_directive(directive: EnrollDirective) {
     let outcome = tokio::task::spawn_blocking(move || {
         let backend = enroll::resolve_backend_base(backend_override.as_deref())?;
         // Prefer the server-minted machine_id from the directive; fall back to
-        // the local machine.json identity (which also supplies the hostname).
-        let (local_machine_id, hostname) = enroll::local_machine_identity();
+        // the local machine.json identity (which also supplies the hostname and
+        // the coord device_id for the twin bridge).
+        let (local_machine_id, hostname, coord_device_id) = enroll::local_machine_identity();
         let machine_id = machine_id_override.or(local_machine_id);
         enroll::run_enroll(EnrollParams {
             code,
             backend,
             machine_id,
             hostname,
+            coord_device_id,
             environment_override,
         })
     })
@@ -152,8 +154,8 @@ fn enroll_ws_url(device_id: uuid::Uuid) -> Option<String> {
 /// This machine's coord device_id (uuid) from `~/.qontinui/machine.json`, reusing
 /// the shared identity reader. `None` when absent/unparseable.
 fn load_local_device_id() -> Option<uuid::Uuid> {
-    let (machine_id, _hostname) = enroll::local_machine_identity();
-    machine_id.and_then(|s| uuid::Uuid::parse_str(&s).ok())
+    let (_machine_id, _hostname, coord_device_id) = enroll::local_machine_identity();
+    coord_device_id
 }
 
 /// Spawn the enroll-directive subscriber on the ambient tokio runtime. A no-op
