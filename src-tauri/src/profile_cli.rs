@@ -82,7 +82,7 @@ fn cmd_env_enroll(code: &str, backend_arg: Option<&str>, environment_arg: Option
             return 2;
         }
     };
-    let (machine_id, hostname) = enroll::local_machine_identity();
+    let (machine_id, hostname, coord_device_id) = enroll::local_machine_identity();
     if machine_id.is_none() {
         eprintln!(
             "note: no readable ~/.qontinui/machine.json — enrolling with null \
@@ -95,6 +95,7 @@ fn cmd_env_enroll(code: &str, backend_arg: Option<&str>, environment_arg: Option
         backend,
         machine_id,
         hostname,
+        coord_device_id,
         environment_override: environment_arg.map(|s| s.to_string()),
     }) {
         Ok(outcome) => {
