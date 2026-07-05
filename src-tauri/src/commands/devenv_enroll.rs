@@ -24,6 +24,9 @@ struct EnrollStatus {
     enrolled_at: Option<String>,
     /// Whether a machine key is present in secure storage (capture can push).
     has_key: bool,
+    /// Whether the runner's install dir is on the user PATH, i.e. whether the
+    /// `qontinui-runner env …` terminal command resolves (Phase 1a follow-up).
+    cli_on_path: bool,
 }
 
 /// Enroll this machine into a devenv environment via a one-time code.
@@ -79,6 +82,9 @@ pub fn devenv_enroll_status() -> Result<CommandResponse, String> {
         .and_then(|s| s.get_agent_machine_key().ok().flatten())
         .map(|k| !k.is_empty())
         .unwrap_or(false);
+    // Best-effort: a lookup failure just reports "not on PATH" (the button is a
+    // no-op-safe re-run anyway).
+    let cli_on_path = qontinui_runner_lib::profile_cli::cli_dir_on_user_path().unwrap_or(false);
 
     let status = match cfg {
         Some(c) => EnrollStatus {
@@ -88,6 +94,7 @@ pub fn devenv_enroll_status() -> Result<CommandResponse, String> {
             backend_url: Some(c.backend_url),
             enrolled_at: c.enrolled_at,
             has_key,
+            cli_on_path,
         },
         None => EnrollStatus {
             enrolled: false,
@@ -96,6 +103,7 @@ pub fn devenv_enroll_status() -> Result<CommandResponse, String> {
             backend_url: None,
             enrolled_at: None,
             has_key,
+            cli_on_path,
         },
     };
 
@@ -104,6 +112,30 @@ pub fn devenv_enroll_status() -> Result<CommandResponse, String> {
         message: None,
         data: Some(
             serde_json::to_value(status).map_err(|e| format!("serialize enroll status: {e}"))?,
+        ),
+    })
+}
+
+/// Add the runner's install dir to the user PATH so the dashboard's
+/// `qontinui-runner env enroll …` copy-paste command resolves in a terminal
+/// (Phase 1a follow-up). Idempotent; Windows-only (returns an error with the dir
+/// to add manually on other platforms).
+#[tauri::command]
+pub async fn devenv_install_cli_path() -> Result<CommandResponse, String> {
+    let outcome =
+        tokio::task::spawn_blocking(qontinui_runner_lib::profile_cli::install_cli_on_user_path)
+            .await
+            .map_err(|e| format!("PATH install task panicked: {e}"))??;
+    info!(
+        "devenv_install_cli_path: added={} already_present={} dir={}",
+        outcome.added, outcome.already_present, outcome.dir
+    );
+    Ok(CommandResponse {
+        success: true,
+        message: Some(outcome.message.clone()),
+        data: Some(
+            serde_json::to_value(outcome)
+                .map_err(|e| format!("serialize cli-path outcome: {e}"))?,
         ),
     })
 }

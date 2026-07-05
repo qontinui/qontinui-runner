@@ -11,7 +11,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { KeyRound, Check, Loader2, Server } from "lucide-react";
+import { KeyRound, Check, Loader2, Server, Terminal } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import type { LogFunction } from "./types";
 
@@ -28,6 +28,8 @@ interface EnrollStatus {
   backend_url: string | null;
   enrolled_at: string | null;
   has_key: boolean;
+  /** Whether `qontinui-runner env …` resolves in a terminal (install dir on PATH). */
+  cli_on_path: boolean;
 }
 
 interface EnrollOutcome {
@@ -45,6 +47,7 @@ export function DevenvEnrollSettings({ onLog }: DevenvEnrollSettingsProps) {
   const [backend, setBackend] = useState("");
   const [status, setStatus] = useState<EnrollStatus | null>(null);
   const [enrolling, setEnrolling] = useState(false);
+  const [installingPath, setInstallingPath] = useState(false);
 
   const refreshStatus = useCallback(async () => {
     try {
@@ -85,6 +88,25 @@ export function DevenvEnrollSettings({ onLog }: DevenvEnrollSettingsProps) {
       setEnrolling(false);
     }
   }, [code, backend, onLog, refreshStatus]);
+
+  const handleInstallPath = useCallback(async () => {
+    setInstallingPath(true);
+    try {
+      const res = await invoke<TauriResult<{ message: string }>>(
+        "devenv_install_cli_path",
+      );
+      if (res.success) {
+        onLog("success", res.message ?? "Added to PATH.");
+        await refreshStatus();
+      } else {
+        onLog("error", res.message ?? "Could not update PATH.");
+      }
+    } catch (e) {
+      onLog("error", `PATH setup failed: ${e}`);
+    } finally {
+      setInstallingPath(false);
+    }
+  }, [onLog, refreshStatus]);
 
   return (
     <div className="space-y-6">
@@ -169,6 +191,43 @@ export function DevenvEnrollSettings({ onLog }: DevenvEnrollSettingsProps) {
               ? "Re-enroll"
               : "Enroll this machine"}
         </button>
+      </div>
+
+      {/* Terminal command (PATH) — makes the dashboard's copy-paste
+          `qontinui-runner env enroll …` command resolve in a terminal. */}
+      <div className="space-y-2 border-t border-border pt-4">
+        <div className="flex items-center gap-2 text-xs font-medium">
+          <Terminal className="size-4" />
+          Terminal command
+        </div>
+        {status?.cli_on_path ? (
+          <p className="flex items-center gap-2 text-xs text-muted-foreground">
+            <Check className="size-4 text-green-600 dark:text-green-500" />
+            <code className="font-mono">qontinui-runner</code> is on your PATH —
+            the dashboard&apos;s copy-paste command works in a new terminal.
+          </p>
+        ) : (
+          <>
+            <p className="text-xs text-muted-foreground">
+              Add the runner to your PATH so the dashboard&apos;s{" "}
+              <code className="font-mono">qontinui-runner env enroll …</code>{" "}
+              command resolves in a terminal (Windows).
+            </p>
+            <button
+              type="button"
+              onClick={handleInstallPath}
+              disabled={installingPath}
+              className="inline-flex items-center gap-2 rounded-md border border-border bg-muted px-4 py-2 text-sm font-medium hover:bg-muted/70 disabled:opacity-50"
+            >
+              {installingPath ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : (
+                <Terminal className="size-4" />
+              )}
+              {installingPath ? "Adding…" : "Add to PATH"}
+            </button>
+          </>
+        )}
       </div>
     </div>
   );
