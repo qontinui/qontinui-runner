@@ -144,8 +144,8 @@ impl AiCoordRegistrar {
     }
 
     /// R4 — resolve a runner `task_run_id` to its coord `session_id` (the
-    /// durable handle). Useful for the inject-audit / observability path.
-    #[allow(dead_code)]
+    /// durable handle). Consumed by the coord-mcp proxy's caller
+    /// self-identification (session-fabric Phase 0) and the inject-audit path.
     pub fn session_id_for(&self, task_run_id: &str) -> Option<Uuid> {
         self.inner
             .reverse

@@ -356,6 +356,35 @@ fn mint_and_register_nonce(
     (nonce, snapshot)
 }
 
+/// Request header the runner proxy injects on forwarded `coord_*` calls: the
+/// calling terminal's coord `agent_session_id`, so coord self-identifies the
+/// caller deterministically instead of guessing the device's most-recent
+/// session (session-fabric Phase 0). MUST match coord's `CALLER_SESSION_HEADER`.
+pub(crate) const CALLER_SESSION_HEADER: &str = "x-coord-caller-session";
+
+/// `true` when deterministic caller self-identification is enabled
+/// (`COORD_SESSION_SELF_ID=observe`). Off/unset/any-other value ⇒ the proxy
+/// injects nothing and coord keeps its fuzzy fallback — byte-for-byte today's
+/// behavior. Mirrors coord's own gate so both halves arm from one env var.
+pub(crate) fn session_self_id_enabled() -> bool {
+    std::env::var("COORD_SESSION_SELF_ID").as_deref() == Ok("observe")
+}
+
+/// The session WORKDIR a registered proxy nonce was provisioned into (the
+/// terminal's cwd / isolated worktree path). `None` for an empty or
+/// unregistered nonce. Backs session-fabric Phase 0 caller self-identification:
+/// the proxy maps nonce → workdir → task_run_id → coord `agent_session_id`.
+pub(crate) fn workdir_for_nonce(nonce: &str) -> Option<String> {
+    if nonce.is_empty() {
+        return None;
+    }
+    proxy_nonces()
+        .lock()
+        .expect("proxy nonce map poisoned")
+        .get(nonce)
+        .map(|b| b.workdir.clone())
+}
+
 /// True iff `nonce` is a currently-registered per-session proxy key.
 pub(crate) fn proxy_nonce_is_valid(nonce: &str) -> bool {
     !nonce.is_empty()
