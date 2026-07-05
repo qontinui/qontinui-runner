@@ -13,6 +13,14 @@ fn main() {
     // ever ships by accident.
     ensure_dist_placeholder();
 
+    // Self-provision a zero-byte `binaries/qontinui_profile-<triple>` so
+    // `tauri_build::build()` — which validates `bundle.externalBin` existence
+    // during THIS build script on every `cargo build`/`check`/`test` — does not
+    // fail before the real sidecar has been produced. The real binary is built by
+    // `npm run bundle:profile-sidecar` (wired into `beforeBuildCommand`) at
+    // `tauri build` time and overwrites this stub before bundling.
+    ensure_sidecar_placeholder();
+
     // Tell Cargo to re-run this build script (and re-embed the frontend) when
     // the dist directory changes.  Without this, incremental builds silently
     // serve a stale frontend bundle from the compile-time cache.
@@ -147,6 +155,53 @@ fn ensure_dist_placeholder() {
     if let Err(e) = std::fs::write(dist_index, PLACEHOLDER) {
         println!(
             "cargo:warning=qontinui-runner: failed to write the ../dist/index.html dev placeholder: {e}"
+        );
+    }
+}
+
+/// Self-provision a zero-byte `binaries/qontinui_profile-<target-triple>`
+/// placeholder if absent, so `tauri_build::build()` (which validates
+/// `bundle.externalBin` existence during this build script — hence on every
+/// `cargo build`/`check`/`test`, not just `tauri build`) does not fail when the
+/// real sidecar has not been produced yet.
+///
+/// The REAL binary is produced by `npm run bundle:profile-sidecar` (wired into
+/// `beforeBuildCommand`) at `tauri build` time, which overwrites this placeholder
+/// before the bundle is assembled. So a zero-byte stub only ever exists on
+/// cargo-only paths (CI `cargo test`, the supervisor's `cargo build`, local
+/// `cargo check`) where nothing is bundled — never in a shipped installer (the
+/// sidecar script fails loud if it can't build the real binary). Mirrors
+/// `ensure_dist_placeholder()`.
+fn ensure_sidecar_placeholder() {
+    use std::path::Path;
+
+    // Cargo sets TARGET for build scripts to the triple being compiled; the
+    // externalBin path is `binaries/qontinui_profile-<triple>[.exe]` relative to
+    // src-tauri (this build script's CWD).
+    let Ok(target) = std::env::var("TARGET") else {
+        return;
+    };
+    let ext = if target.contains("windows") {
+        ".exe"
+    } else {
+        ""
+    };
+    let rel = format!("binaries/qontinui_profile-{target}{ext}");
+    let path = Path::new(&rel);
+    if path.exists() {
+        // A real binary (from bundle:profile-sidecar) or a prior placeholder is
+        // already present — never clobber a real one.
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all("binaries") {
+        println!(
+            "cargo:warning=qontinui-runner: failed to create binaries/ for the qontinui_profile sidecar placeholder: {e}"
+        );
+        return;
+    }
+    if let Err(e) = std::fs::write(path, b"") {
+        println!(
+            "cargo:warning=qontinui-runner: failed to write the qontinui_profile sidecar placeholder: {e}"
         );
     }
 }
