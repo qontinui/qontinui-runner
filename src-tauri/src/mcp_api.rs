@@ -454,7 +454,28 @@ async fn drain_handler(
 /// the body + non-hop-by-hop request headers, return coord's status + headers
 /// + body bytes verbatim. Generic header passthrough keeps us correct if coord
 /// ever adds SSE negotiation headers, but no streaming machinery is built.
+/// Resolve the calling terminal's coord `agent_session_id` for the caller-self
+/// header (session-fabric Phase 0). Bridges the only thing the proxy knows —
+/// the per-session nonce — back to a coord session id:
+/// `nonce → workdir → task_run_id → coord agent_session_id`. Every link is
+/// best-effort; a break anywhere returns `None` (the caller then omits the
+/// header and coord keeps its fuzzy fallback — today's behavior). Pure lookups,
+/// no I/O beyond the in-memory maps + a `canonicalize` in the workdir match.
+fn resolve_caller_session_id(state: &Arc<ApiState>, nonce: Option<&str>) -> Option<uuid::Uuid> {
+    let nonce = nonce?;
+    let workdir = crate::coord_mcp::workdir_for_nonce(nonce)?;
+    let session_manager = state
+        .app_handle
+        .try_state::<Arc<crate::claude_session::SessionManager>>()?;
+    let task_run_id = session_manager.task_run_id_for_workdir(&workdir)?;
+    let registrar = state
+        .app_handle
+        .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()?;
+    registrar.session_id_for(&task_run_id)
+}
+
 async fn coord_mcp_proxy_handler(
+    axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
@@ -585,6 +606,22 @@ async fn coord_mcp_proxy_handler(
     }
     let bearer = bearer.unwrap_or_default(); // gate guarantees Some(non-empty)
 
+    // Session-fabric Phase 0: resolve the calling terminal's OWN coord
+    // agent_session_id so coord self-identifies the caller deterministically
+    // instead of guessing the device's most-recent session. Flag-gated
+    // (COORD_SESSION_SELF_ID=observe); DEVICE principal only — agent-spawn
+    // sessions carry their own scoped identity and are out of scope here.
+    // Best-effort: any missing link (unknown workdir / un-promoted session /
+    // unregistered coord session) yields None ⇒ the header is omitted and coord
+    // falls back to its fuzzy pick (today's behavior).
+    let caller_session_id: Option<uuid::Uuid> = if crate::coord_mcp::session_self_id_enabled()
+        && matches!(&principal, crate::coord_mcp::ProxyPrincipal::Device)
+    {
+        resolve_caller_session_id(&state, nonce.as_deref())
+    } else {
+        None
+    };
+
     // Shared client: connect fast-fail, generous overall timeout (coord MCP
     // tool calls can legitimately run long).
     static COORD_PROXY_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
@@ -600,8 +637,11 @@ async fn coord_mcp_proxy_handler(
     let mut req = client.post(&url).bearer_auth(&bearer).body(body.to_vec());
     for (name, value) in headers.iter() {
         let n = name.as_str();
-        // Hop-by-hop / recomputed headers, plus the two we own: the nonce must
-        // not leak upstream and the Authorization slot is the live bearer.
+        // Hop-by-hop / recomputed headers, plus the ones we own: the nonce must
+        // not leak upstream, the Authorization slot is the live bearer, and the
+        // caller-session header is authoritative ONLY when the RUNNER sets it —
+        // a client-supplied one must never pass through (it could otherwise name
+        // a sibling session on the same device to spoof its identity).
         if matches!(
             n,
             "host"
@@ -611,10 +651,18 @@ async fn coord_mcp_proxy_handler(
                 | "accept-encoding"
                 | "authorization"
         ) || n == crate::coord_mcp::COORD_MCP_PROXY_KEY_HEADER
+            || n == crate::coord_mcp::CALLER_SESSION_HEADER
         {
             continue;
         }
         req = req.header(n, value.as_bytes());
+    }
+    // Inject the runner-resolved caller-session id (Phase 0). Coord still
+    // validates it fail-closed as bound to the caller's device before trusting
+    // it, so this is advisory — but stripping any client copy above means coord
+    // only ever sees the runner's own attribution.
+    if let Some(sid) = caller_session_id {
+        req = req.header(crate::coord_mcp::CALLER_SESSION_HEADER, sid.to_string());
     }
 
     let upstream = match req.send().await {

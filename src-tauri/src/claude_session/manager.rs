@@ -157,6 +157,37 @@ impl SessionManager {
         removed
     }
 
+    /// Resolve the `task_run_id` of the active `ClaudeSession` whose isolated
+    /// worktree checkout is `workdir` (session-fabric Phase 0 self-identification).
+    ///
+    /// The coord-mcp loopback proxy knows only the session WORKDIR its
+    /// per-session nonce was provisioned into; this bridges that back to the
+    /// `task_run_id` the `AiCoordRegistrar` keys the coord `agent_session_id`
+    /// on. Matches on the promoted worktree path — the terminal chokepoint
+    /// (`acquire_for_terminal`) provisions the nonce into exactly that dir.
+    ///
+    /// Sessions NOT promoted into a worktree carry no stored cwd to match, so
+    /// they resolve `None`: a documented Phase-0 residual (the proxy then omits
+    /// the caller-session header and coord keeps its fuzzy fallback). O(N) over
+    /// active sessions (bounded by the operator's live terminal count).
+    pub fn task_run_id_for_workdir(&self, workdir: &str) -> Option<String> {
+        let target_canon = std::fs::canonicalize(workdir).ok();
+        let guard = self.sessions.lock().ok()?;
+        for (task_run_id, session) in guard.iter() {
+            let Some(wt) = session.worktree() else {
+                continue;
+            };
+            let matches = wt.path.to_string_lossy() == workdir
+                || target_canon.as_deref().is_some_and(|tc| {
+                    std::fs::canonicalize(&wt.path).ok().as_deref() == Some(tc)
+                });
+            if matches {
+                return Some(task_run_id.clone());
+            }
+        }
+        None
+    }
+
     /// Register an inline (non-interactive) session's PID for stale task sweep visibility.
     /// Unlike `register`, this doesn't require a full ClaudeSession — just the PID.
     pub fn register_inline_pid(&self, task_run_id: &str, pid: u32) {
