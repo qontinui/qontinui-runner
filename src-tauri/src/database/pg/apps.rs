@@ -44,6 +44,9 @@ fn row_to_app(r: &tokio_postgres::Row) -> App {
         auth_required: auth_required.unwrap_or(false),
         red_threshold: red_threshold.unwrap_or(0.5),
         yellow_threshold: yellow_threshold.unwrap_or(0.8),
+        update_strategy: "pull_only".to_string(),
+        build_command: None,
+        start_command: None,
     }
 }
 
@@ -345,6 +348,9 @@ pub async fn bootstrap_dev_apps(pg: &PgDb) -> Result<(), AppError> {
         auth_required: false,
         red_threshold: 0.5,
         yellow_threshold: 0.8,
+        update_strategy: "pull_only".to_string(),
+        build_command: None,
+        start_command: None,
     }];
 
     if let Some(root) = web_root {
@@ -356,6 +362,9 @@ pub async fn bootstrap_dev_apps(pg: &PgDb) -> Result<(), AppError> {
             auth_required: false,
             red_threshold: 0.5,
             yellow_threshold: 0.8,
+            update_strategy: "pull_only".to_string(),
+            build_command: None,
+            start_command: None,
         });
     }
 
@@ -368,6 +377,9 @@ pub async fn bootstrap_dev_apps(pg: &PgDb) -> Result<(), AppError> {
             auth_required: false,
             red_threshold: 0.5,
             yellow_threshold: 0.8,
+            update_strategy: "pull_only".to_string(),
+            build_command: None,
+            start_command: None,
         });
     }
 
@@ -444,6 +456,9 @@ mod tests {
             auth_required: false,
             red_threshold: 0.5,
             yellow_threshold: 0.8,
+            update_strategy: "pull_only".to_string(),
+            build_command: None,
+            start_command: None,
         }
     }
 
@@ -497,6 +512,9 @@ mod tests {
             auth_required: false,
             red_threshold: 0.5,
             yellow_threshold: 0.8,
+            update_strategy: "pull_only".to_string(),
+            build_command: None,
+            start_command: None,
         };
         let err = pg
             .insert_app(&req)
@@ -578,6 +596,9 @@ mod tests {
             auth_required: None,
             red_threshold: None,
             yellow_threshold: None,
+            update_strategy: None,
+            build_command: None,
+            start_command: None,
         };
         let updated = pg.update_app(&app_id, &patch).await.expect("update_app");
         assert_eq!(updated.ui_bridge_url, new_url);
@@ -613,6 +634,9 @@ mod tests {
             auth_required: Some(true),
             red_threshold: Some(0.55),
             yellow_threshold: Some(0.85),
+            update_strategy: None,
+            build_command: None,
+            start_command: None,
         };
         let updated = pg.update_app(&app_id, &patch).await.expect("update_app");
         assert!(updated.auth_required);

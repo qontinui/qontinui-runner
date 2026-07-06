@@ -2156,6 +2156,9 @@ mod tests {
             auth_required: false,
             red_threshold: 0.5,
             yellow_threshold: 0.8,
+            update_strategy: "pull_only".to_string(),
+            build_command: None,
+            start_command: None,
         };
         pg.insert_app(&req).await.expect("insert app");
 

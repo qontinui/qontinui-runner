@@ -67,6 +67,11 @@ pub fn app_error_into_response(err: AppError) -> Response {
             "already-registered",
             json!({ "appId": app_id }),
         ),
+        AppError::InvalidUpdateStrategy { update_strategy } => (
+            StatusCode::BAD_REQUEST,
+            "invalid-update-strategy",
+            json!({ "updateStrategy": update_strategy }),
+        ),
     };
     (status, Json(SpecError::with_detail(reason, detail))).into_response()
 }
