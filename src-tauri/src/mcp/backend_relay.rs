@@ -2004,17 +2004,20 @@ pub(crate) fn existing_relay_session_workdir(task_run_id: &str) -> Option<String
 
 async fn handle_chat_create(api_state: &Arc<ApiState>, data: &Value) -> Option<Value> {
     info!("Handling chat_create command");
-    let task_name = data
-        .get("task_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Remote Chat");
-    let initial_prompt = data
-        .get("prompt")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    // The WS relay (`runner_chat_ws.py`) nests the frontend's fields under
+    // `params`, while the REST path sends them top-level — read either.
+    let params = data.get("params");
+    let field = |name: &str| -> Option<String> {
+        data.get(name)
+            .or_else(|| params.and_then(|p| p.get(name)))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
+    let task_name = field("task_name").unwrap_or_else(|| "Remote Chat".to_string());
+    let initial_prompt = field("prompt");
     let task_run_id = uuid::Uuid::new_v4().to_string();
 
-    let create_input = crate::database::CreateTaskRunInput::new(&task_run_id, task_name)
+    let create_input = crate::database::CreateTaskRunInput::new(&task_run_id, &task_name)
         .with_prompt("Remote AI session")
         .with_workflow_type("chat");
     let create_result = api_state
@@ -2032,7 +2035,7 @@ async fn handle_chat_create(api_state: &Arc<ApiState>, data: &Value) -> Option<V
 
     let bg_state = api_state.clone();
     let bg_task_run_id = task_run_id.clone();
-    let bg_task_name = task_name.to_string();
+    let bg_task_name = task_name.clone();
     tokio::spawn(async move {
         let session_manager: Option<Arc<crate::claude_session::SessionManager>> = bg_state
             .app_handle
