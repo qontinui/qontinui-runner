@@ -149,7 +149,7 @@ impl WrapperManager {
             .map_err(|e| format!("failed to allocate port for '{}': {}", wrapper_id, e))?;
         let env = build_env(wrapper_id, &wrapper.manifest);
 
-        let mut cmd = Command::new("node");
+        let mut cmd = crate::process_helpers::tokio_no_window("node");
         cmd.current_dir(&install_path)
             .arg(&entry)
             .env("WRAPPER_PORT", port.to_string())
@@ -503,7 +503,7 @@ fn instant_to_epoch_ms(then: Instant) -> i64 {
 /// pipeline at startup so we can fail fast with a useful error rather
 /// than letting every spawn explode mysteriously.
 pub fn node_available() -> bool {
-    std::process::Command::new("node")
+    crate::process_helpers::no_window("node")
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())

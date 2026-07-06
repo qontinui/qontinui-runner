@@ -4160,7 +4160,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             pids_to_kill
                         );
                         for pid in &pids_to_kill {
-                            let result = std::process::Command::new("taskkill")
+                            let result = crate::process_helpers::no_window("taskkill")
                                 .args(["/F", "/T", "/PID", &pid.to_string()])
                                 .output();
                             match result {

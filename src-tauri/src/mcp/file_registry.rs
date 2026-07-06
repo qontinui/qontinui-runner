@@ -1077,7 +1077,7 @@ async fn build_recent_git_log(cwd: &str) -> String {
         return String::new();
     }
 
-    let mut cmd = tokio::process::Command::new("git");
+    let mut cmd = crate::process_helpers::tokio_no_window("git");
     cmd.args(["log", "-5", "--oneline"]);
     cmd.current_dir(cwd);
 

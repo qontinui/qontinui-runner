@@ -130,7 +130,7 @@ pub async fn launch_headless(
         })?;
 
     // Spawn the Node.js process
-    let mut cmd = tokio::process::Command::new("node");
+    let mut cmd = crate::process_helpers::tokio_no_window("node");
     cmd.arg(script)
         .arg(format!("--url={}", request.url))
         .arg(format!("--timeout={}", timeout));
@@ -273,7 +273,7 @@ pub async fn spawn_headless(
         })?;
 
     // Spawn the Node.js process
-    let mut cmd = tokio::process::Command::new("node");
+    let mut cmd = crate::process_helpers::tokio_no_window("node");
     cmd.arg(script)
         .arg(format!("--url={}", request.url))
         .arg(format!("--timeout={}", timeout));
@@ -344,7 +344,7 @@ pub async fn spawn_headless(
         );
         // Kill the child process since it failed to connect
         if child.id().is_some() {
-            let _ = std::process::Command::new("taskkill")
+            let _ = crate::process_helpers::no_window("taskkill")
                 .args(["/PID", &pid.to_string(), "/F"])
                 .output();
         }

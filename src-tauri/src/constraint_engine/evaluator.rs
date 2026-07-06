@@ -448,7 +448,7 @@ impl ConstraintEngine {
             }];
         }
 
-        let mut child = match std::process::Command::new(parts[0])
+        let mut child = match crate::process_helpers::no_window(parts[0])
             .args(&parts[1..])
             .current_dir(&working_dir)
             .stdout(std::process::Stdio::piped())

@@ -14,7 +14,7 @@ static REGISTERED_REPOS_CACHE: once_cell::sync::Lazy<RwLock<(Instant, HashSet<St
 const CACHE_TTL: Duration = Duration::from_secs(60);
 
 pub fn detect_repo_slug(working_dir: &str) -> Option<String> {
-    let output = std::process::Command::new("git")
+    let output = crate::process_helpers::no_window("git")
         .args(["-C", working_dir, "remote", "get-url", "origin"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())

@@ -1597,7 +1597,7 @@ impl TerminalSession {
         if let Some(pid) = self.child_pid {
             #[cfg(target_os = "windows")]
             {
-                let _ = std::process::Command::new("taskkill")
+                let _ = crate::process_helpers::no_window("taskkill")
                     .args(["/F", "/T", "/PID", &pid.to_string()])
                     .output();
             }

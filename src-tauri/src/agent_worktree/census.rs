@@ -533,7 +533,7 @@ fn git_registered_worktrees(canonical: &Path) -> Vec<PathBuf> {
         Some(s) => s,
         None => return Vec::new(),
     };
-    let out = match Command::new("git")
+    let out = match crate::process_helpers::no_window("git")
         .args(["-C", canonical_str, "worktree", "list", "--porcelain"])
         .output()
     {
@@ -589,7 +589,7 @@ fn git_capture(worktree: &Path, args: &[&str]) -> Option<String> {
     let wt = worktree.to_str()?;
     let mut full: Vec<&str> = vec!["-C", wt];
     full.extend_from_slice(args);
-    let out = Command::new("git").args(&full).output().ok()?;
+    let out = crate::process_helpers::no_window("git").args(&full).output().ok()?;
     if out.status.success() {
         Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
     } else {
@@ -620,7 +620,7 @@ fn compute_landed_in_main(worktree: &Path) -> Option<bool> {
     let wt = worktree.to_str()?;
 
     // (1) Ancestry test — exit 0 means HEAD is an ancestor of origin/main.
-    if let Ok(status) = Command::new("git")
+    if let Ok(status) = crate::process_helpers::no_window("git")
         .args([
             "-C",
             wt,

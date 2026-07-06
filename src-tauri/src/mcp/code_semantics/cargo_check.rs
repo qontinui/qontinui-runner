@@ -38,7 +38,7 @@ pub fn is_available() -> bool {
 }
 
 fn probe_cargo() -> Result<(), String> {
-    match std::process::Command::new("cargo")
+    match crate::process_helpers::no_window("cargo")
         .arg("--version")
         .output()
     {
@@ -240,7 +240,7 @@ async fn observe(file: &Path, manifest: &Path) -> Envelope {
     let crate_dir = manifest.parent().unwrap_or(Path::new("."));
     let target_dir = isolated_target_dir(manifest);
 
-    let mut cmd = Command::new("cargo");
+    let mut cmd = crate::process_helpers::tokio_no_window("cargo");
     cmd.arg("check")
         .arg("--message-format=json")
         .arg("--manifest-path")

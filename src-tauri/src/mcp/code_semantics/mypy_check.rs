@@ -45,17 +45,15 @@ pub fn is_available() -> bool {
 
 /// Probe `mypy --version`, then `python -m mypy --version` / `python3 -m mypy`.
 fn probe_mypy() -> MypyInvocation {
-    use std::process::Command as StdCommand;
-
     // 1. direct `mypy`
-    if let Ok(out) = StdCommand::new("mypy").arg("--version").output() {
+    if let Ok(out) = crate::process_helpers::no_window("mypy").arg("--version").output() {
         if out.status.success() {
             return MypyInvocation::Direct;
         }
     }
     // 2. `<python> -m mypy`
     for py in ["python", "python3"] {
-        if let Ok(out) = StdCommand::new(py)
+        if let Ok(out) = crate::process_helpers::no_window(py)
             .args(["-m", "mypy", "--version"])
             .output()
         {
@@ -71,12 +69,12 @@ fn probe_mypy() -> MypyInvocation {
 fn mypy_command(inv: &MypyInvocation, args: &[String]) -> Option<Command> {
     match inv {
         MypyInvocation::Direct => {
-            let mut c = Command::new("mypy");
+            let mut c = crate::process_helpers::tokio_no_window("mypy");
             c.args(args);
             Some(c)
         }
         MypyInvocation::Module(py) => {
-            let mut c = Command::new(py);
+            let mut c = crate::process_helpers::tokio_no_window(py);
             c.arg("-m").arg("mypy").args(args);
             Some(c)
         }

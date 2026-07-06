@@ -237,7 +237,7 @@ fn resolve_repo(working_dir: &str) -> Option<(String, String)> {
 /// `git -C <dir> rev-parse --show-toplevel`, or `None` if `dir` isn't in a
 /// git repo / git is unavailable.
 fn git_toplevel(dir: &Path) -> Option<PathBuf> {
-    let output = std::process::Command::new("git")
+    let output = crate::process_helpers::no_window("git")
         .arg("-C")
         .arg(dir)
         .args(["rev-parse", "--show-toplevel"])

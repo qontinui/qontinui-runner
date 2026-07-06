@@ -196,7 +196,7 @@ pub async fn stop_task_run(
     let mut killed_count = 0;
     for pid in &pids_to_kill {
         info!("Killing AI process PID {} for task {}", pid, id);
-        let result = std::process::Command::new("taskkill")
+        let result = crate::process_helpers::no_window("taskkill")
             .args(["/F", "/T", "/PID", &pid.to_string()])
             .output();
 

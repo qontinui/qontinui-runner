@@ -327,7 +327,7 @@ process.stdout.write(emitPersistedStateMachineJSON(result.states, result.transit
         .parent()
         .unwrap_or(std::path::Path::new(&project_root));
 
-    let output = tokio::process::Command::new("node")
+    let output = crate::process_helpers::tokio_no_window("node")
         .arg("-e")
         .arg(&script)
         .current_dir(working_dir)

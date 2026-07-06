@@ -915,7 +915,7 @@ fn claude_probe_ttl() -> Duration {
 /// iff `claude` is invokable AND exits 0 within a 3s budget.
 ///
 /// Cached per [`CLAUDE_PROBE_CACHE`] for [`claude_probe_ttl`]. The
-/// probe is `Command::new("claude").arg("--version")` with stdout +
+/// probe is `no_window("claude").arg("--version")` with stdout +
 /// stderr captured (so a Claude Code that prints to stderr still counts
 /// as available). A child that times out, panics, or never spawns
 /// counts as unavailable.
@@ -941,11 +941,10 @@ pub fn claude_code_probe() -> bool {
 /// Uncached one-shot probe. Pure side-effect (spawns + waits on a
 /// subprocess); should never be called from a hot path directly.
 fn detect_claude_code_now() -> bool {
-    use std::process::Command;
     use std::time::Instant;
 
     let started = Instant::now();
-    let child = Command::new("claude")
+    let child = crate::process_helpers::no_window("claude")
         .arg("--version")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -1265,10 +1264,9 @@ fn behind_default_compare_branch<'a>(branch: &str, default_branch: &'a str) -> O
 
 /// Capture the state of a single primary git tree at `repo_path`. Returns
 /// `None` when the directory isn't a git repo (no `.git/` dir). All
-/// `git` calls use `Command::new("git")` so they go through the operator's
+/// `git` calls use `process_helpers::no_window("git")` so they go through the operator's
 /// PATH-resolved git — same as the rest of the runner.
 fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
-    use std::process::Command;
 
     let dot_git = repo_path.join(".git");
     if !dot_git.exists() {
@@ -1278,7 +1276,7 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     let repo_name = repo_path.file_name()?.to_string_lossy().to_string();
 
     // HEAD SHA
-    let head_sha = Command::new("git")
+    let head_sha = crate::process_helpers::no_window("git")
         .args(["-C", repo_path.to_str()?, "rev-parse", "HEAD"])
         .output()
         .ok()
@@ -1291,7 +1289,7 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
         })?;
 
     // Current branch (best-effort — detached HEAD returns empty)
-    let symbolic_ref = Command::new("git")
+    let symbolic_ref = crate::process_helpers::no_window("git")
         .args(["-C", repo_path.to_str()?, "symbolic-ref", "--short", "HEAD"])
         .output()
         .ok();
@@ -1310,7 +1308,7 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
         .unwrap_or_else(|| "(detached)".to_string());
 
     // Dirty status — `git status --porcelain=v1` is one line per change.
-    let status_out = Command::new("git")
+    let status_out = crate::process_helpers::no_window("git")
         .args(["-C", repo_path.to_str()?, "status", "--porcelain=v1"])
         .output()
         .ok()?;
@@ -1359,7 +1357,7 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
             .max()
     } else {
         // git -C <path> log -1 --format=%cI  — committer-date ISO-8601.
-        Command::new("git")
+        crate::process_helpers::no_window("git")
             .args(["-C", repo_path.to_str()?, "log", "-1", "--format=%cI"])
             .output()
             .ok()
@@ -1389,7 +1387,7 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     } else {
         format!("origin/{branch}")
     };
-    let behind_count: Option<i32> = Command::new("git")
+    let behind_count: Option<i32> = crate::process_helpers::no_window("git")
         .args([
             "-C",
             repo_path.to_str()?,
@@ -1414,7 +1412,7 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     // line per untracked file. The orphan-untracked-file signal that
     // catches sub-agent worktree builds spilling scratch into the
     // primary tree.
-    let untracked_count: Option<i32> = Command::new("git")
+    let untracked_count: Option<i32> = crate::process_helpers::no_window("git")
         .args([
             "-C",
             repo_path.to_str()?,
@@ -1442,7 +1440,7 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     // default branch from `origin/HEAD` (e.g. `origin/main` -> `main`),
     // falling back to `main`. No network fetch — uses last-fetched refs,
     // same posture as `behind_count` above.
-    let default_branch = Command::new("git")
+    let default_branch = crate::process_helpers::no_window("git")
         .args([
             "-C",
             repo_path.to_str()?,
@@ -1462,7 +1460,7 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
             }
         })
         .unwrap_or_else(|| "main".to_string());
-    let local_ahead: Option<i32> = Command::new("git")
+    let local_ahead: Option<i32> = crate::process_helpers::no_window("git")
         .args([
             "-C",
             repo_path.to_str()?,
@@ -1498,7 +1496,7 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     // an error.
     let behind_default_count: Option<i32> =
         match behind_default_compare_branch(&branch, &default_branch) {
-            Some(cmp) => Command::new("git")
+            Some(cmp) => crate::process_helpers::no_window("git")
                 .args([
                     "-C",
                     repo_path.to_str()?,
@@ -1648,12 +1646,11 @@ fn fetch_due(repo_path: &std::path::Path, now: std::time::Instant) -> bool {
 /// call from a blocking context. Non-zero/spawn errors `warn!` and return — a
 /// stale ref is no worse than skipping the fetch entirely.
 fn fetch_remote_refs_blocking(repo_path: &std::path::Path) {
-    use std::process::Command;
     let path_str = match repo_path.to_str() {
         Some(s) => s,
         None => return,
     };
-    match Command::new("git")
+    match crate::process_helpers::no_window("git")
         .args(["-C", path_str, "fetch", "origin", "--prune"])
         .output()
     {
@@ -1679,8 +1676,7 @@ fn fetch_remote_refs_blocking(repo_path: &std::path::Path) {
 /// Resolve a repo's default branch from `origin/HEAD` (`origin/main` -> `main`),
 /// falling back to `main`. No network — uses the last-fetched symbolic ref.
 fn resolve_default_branch(repo_path: &std::path::Path) -> String {
-    use std::process::Command;
-    Command::new("git")
+    crate::process_helpers::no_window("git")
         .args([
             "-C",
             repo_path.to_str().unwrap_or("."),
@@ -1730,7 +1726,6 @@ fn apply_pull_verdict_blocking(
     hold_reason: Option<&str>,
     restore: Option<RestoreParams>,
 ) -> PullOutcome {
-    use std::process::Command;
     let default_branch = resolve_default_branch(repo_path);
     let repo_str = repo_path.to_str().unwrap_or(".");
 
@@ -1752,7 +1747,7 @@ fn apply_pull_verdict_blocking(
             // Pure local-default ref fast-forward; never touches the checked-out
             // tree. git refuses a non-ff ref update, so an unpushed local
             // default is safe.
-            let out = Command::new("git")
+            let out = crate::process_helpers::no_window("git")
                 .args([
                     "-C",
                     repo_str,
@@ -1801,14 +1796,14 @@ fn apply_pull_verdict_blocking(
             // §5 apply-time safety re-check: branch + clean-tree can change
             // between the decision and now. Re-verify we are STILL on the
             // default branch and the tree is STILL clean before pulling.
-            let cur_branch = Command::new("git")
+            let cur_branch = crate::process_helpers::no_window("git")
                 .args(["-C", repo_str, "symbolic-ref", "--short", "HEAD"])
                 .output()
                 .ok()
                 .filter(|o| o.status.success())
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
             let on_default = cur_branch.as_deref() == Some(default_branch.as_str());
-            let clean = Command::new("git")
+            let clean = crate::process_helpers::no_window("git")
                 .args(["-C", repo_str, "status", "--porcelain=v1"])
                 .output()
                 .ok()
@@ -1825,7 +1820,7 @@ fn apply_pull_verdict_blocking(
                 };
             }
             // ff-only pull — the ONLY tree-mutating op the executor performs.
-            let out = Command::new("git")
+            let out = crate::process_helpers::no_window("git")
                 .args([
                     "-C",
                     repo_str,
@@ -1837,7 +1832,7 @@ fn apply_pull_verdict_blocking(
                 .output();
             match out {
                 Ok(o) if o.status.success() => {
-                    let new_sha = Command::new("git")
+                    let new_sha = crate::process_helpers::no_window("git")
                         .args(["-C", repo_str, "rev-parse", "HEAD"])
                         .output()
                         .ok()
@@ -1923,7 +1918,6 @@ fn apply_restore_default_blocking(
     default_branch: &str,
     p: &RestoreParams,
 ) -> PullOutcome {
-    use std::process::Command;
     let pr = p
         .pr_number
         .map(|n| format!("#{n}"))
@@ -1940,7 +1934,7 @@ fn apply_restore_default_blocking(
         };
     }
     // (2) Still on the parked branch coord decided about.
-    let cur_branch = Command::new("git")
+    let cur_branch = crate::process_helpers::no_window("git")
         .args(["-C", repo_str, "symbolic-ref", "--short", "HEAD"])
         .output()
         .ok()
@@ -1957,7 +1951,7 @@ fn apply_restore_default_blocking(
         };
     }
     // (3) Still porcelain-clean (includes untracked).
-    let clean = Command::new("git")
+    let clean = crate::process_helpers::no_window("git")
         .args(["-C", repo_str, "status", "--porcelain=v1"])
         .output()
         .ok()
@@ -1972,7 +1966,7 @@ fn apply_restore_default_blocking(
     }
     // (4) Local HEAD still equals the merged PR's head SHA — the zero-work-loss
     //     proof. A new local commit since the verdict fails this and aborts.
-    let head = Command::new("git")
+    let head = crate::process_helpers::no_window("git")
         .args(["-C", repo_str, "rev-parse", "HEAD"])
         .output()
         .ok()
@@ -1991,7 +1985,7 @@ fn apply_restore_default_blocking(
 
     // Fetch the default ref first so the ff-only merge lands on CURRENT main
     // (the parked tree's origin/<default> may be arbitrarily stale).
-    let fetch = Command::new("git")
+    let fetch = crate::process_helpers::no_window("git")
         .args(["-C", repo_str, "fetch", "origin", default_branch])
         .output();
     if !fetch.as_ref().map(|o| o.status.success()).unwrap_or(false) {
@@ -2010,7 +2004,7 @@ fn apply_restore_default_blocking(
             git_op: None,
         };
     }
-    let switch = Command::new("git")
+    let switch = crate::process_helpers::no_window("git")
         .args(["-C", repo_str, "switch", default_branch])
         .output();
     if !switch.as_ref().map(|o| o.status.success()).unwrap_or(false) {
@@ -2029,7 +2023,7 @@ fn apply_restore_default_blocking(
             git_op: None,
         };
     }
-    let merge = Command::new("git")
+    let merge = crate::process_helpers::no_window("git")
         .args([
             "-C",
             repo_str,
@@ -2069,7 +2063,7 @@ fn apply_restore_default_blocking(
     // an ancestor of the default branch, so -d always refuses it — and the
     // (re-verified) HEAD == merged-PR-head equality above is the actual
     // safety proof (the content is on GitHub as the PR head regardless).
-    let del = Command::new("git")
+    let del = crate::process_helpers::no_window("git")
         .args(["-C", repo_str, "branch", "-D", &p.parked_branch])
         .output();
     let del_note = if del.as_ref().map(|o| o.status.success()).unwrap_or(false) {
@@ -2086,7 +2080,7 @@ fn apply_restore_default_blocking(
                 .unwrap_or_else(|e| format!("spawn failed: {e}"))
         )
     };
-    let new_head = Command::new("git")
+    let new_head = crate::process_helpers::no_window("git")
         .args(["-C", repo_str, "rev-parse", "HEAD"])
         .output()
         .ok()

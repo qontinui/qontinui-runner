@@ -110,7 +110,7 @@ fn download_target() -> Result<&'static str, String> {
 
 /// Validate the installed Restate binary version.
 async fn validate_binary_version(binary_path: &Path, expected_version: &str) -> bool {
-    match tokio::process::Command::new(binary_path)
+    match crate::process_helpers::tokio_no_window(binary_path)
         .arg("--version")
         .output()
         .await

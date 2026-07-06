@@ -118,7 +118,7 @@ async fn fetch_registered_repos(coord_base: &str) -> Result<Vec<String>, String>
 }
 
 fn is_git_repo(working_dir: &Path) -> bool {
-    std::process::Command::new("git")
+    crate::process_helpers::no_window("git")
         .args([
             "-C",
             &working_dir.to_string_lossy(),
@@ -141,7 +141,7 @@ fn set_git_credential_helper(
     let config_str = config_path.to_string_lossy().replace('\\', "/");
     let helper_value = format!("{binary_str} --config {config_str}");
 
-    let output = std::process::Command::new("git")
+    let output = crate::process_helpers::no_window("git")
         .args([
             "-C",
             &working_dir.to_string_lossy(),

@@ -178,7 +178,7 @@ impl NodeBridge {
             self.node,
             self.script.display()
         );
-        let mut cmd = Command::new(&self.node);
+        let mut cmd = crate::process_helpers::tokio_no_window(&self.node);
         cmd.arg(&self.script)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

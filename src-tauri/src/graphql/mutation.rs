@@ -284,7 +284,7 @@ impl MutationRoot {
             info!("GraphQL: Killing AI process PID {} for task {}", pid, id);
             #[cfg(target_os = "windows")]
             {
-                let _ = std::process::Command::new("taskkill")
+                let _ = crate::process_helpers::no_window("taskkill")
                     .args(["/F", "/T", "/PID", &pid.to_string()])
                     .output();
             }

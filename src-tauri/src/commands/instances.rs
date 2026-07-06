@@ -298,7 +298,7 @@ pub async fn list_repo_worktrees(repo_root: String) -> Result<Vec<DevLoopWorktre
         _ => root_path,
     };
 
-    let output = std::process::Command::new("git")
+    let output = crate::process_helpers::no_window("git")
         .arg("-C")
         .arg(git_root)
         .args(["worktree", "list", "--porcelain"])

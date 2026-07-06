@@ -473,7 +473,7 @@ pub async fn open_error_in_editor(
 
     // Try VS Code first (most common for developers)
     let vscode_arg = format!("{}:{}:{}", file_path, line, col);
-    let vscode_result = std::process::Command::new("code")
+    let vscode_result = crate::process_helpers::no_window("code")
         .args(["--goto", &vscode_arg])
         .spawn();
 

@@ -359,7 +359,7 @@ fn remove_worktree(path: &Path) -> Result<(), String> {
     }
     let path_str = path.to_string_lossy().to_string();
     // `git -C <wt> worktree remove --force <wt>` prunes the registration.
-    let git_ok = std::process::Command::new("git")
+    let git_ok = crate::process_helpers::no_window("git")
         .args(["-C", &path_str, "worktree", "remove", "--force", &path_str])
         .output()
         .map(|o| o.status.success())
@@ -422,7 +422,7 @@ fn create_junction(link: &Path, target: &Path) -> Result<(), String> {
         }
     }
     // `cmd /C mklink /J <link> <target>` — /J = directory junction.
-    let out = std::process::Command::new("cmd")
+    let out = crate::process_helpers::no_window("cmd")
         .args([
             "/C",
             "mklink",
@@ -468,7 +468,7 @@ fn worktree_is_dirty(path: &Path) -> bool {
         Some(s) => s,
         None => return false,
     };
-    std::process::Command::new("git")
+    crate::process_helpers::no_window("git")
         .args(["-C", path_str, "status", "--porcelain"])
         .output()
         .map(|o| o.status.success() && !o.stdout.is_empty())

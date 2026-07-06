@@ -174,7 +174,7 @@ pub async fn execute_htn_attempt(
         }
     }
 
-    let mut child = tokio::process::Command::new(python)
+    let mut child = crate::process_helpers::tokio_no_window(python)
         .args(["-m", "qontinui.planning_integration"])
         .env("PYTHONPATH", pythonpath)
         .stdin(std::process::Stdio::piped())

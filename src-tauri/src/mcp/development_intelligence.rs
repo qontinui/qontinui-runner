@@ -333,7 +333,7 @@ fn extract_keywords(name: &str) -> Vec<String> {
 // ============================================================================
 
 fn git_last_change(project_path: &Path, file_path: &str) -> Option<String> {
-    let output = std::process::Command::new("git")
+    let output = crate::process_helpers::no_window("git")
         .args(["log", "-1", "--format=%aI", "--", file_path])
         .current_dir(project_path)
         .output()
@@ -349,7 +349,7 @@ fn git_last_change(project_path: &Path, file_path: &str) -> Option<String> {
 
 fn git_commit_count_since(project_path: &Path, file_path: &str, days: u32) -> usize {
     let since = format!("--since={} days ago", days);
-    let output = std::process::Command::new("git")
+    let output = crate::process_helpers::no_window("git")
         .args(["log", "--oneline", &since, "--", file_path])
         .current_dir(project_path)
         .output();

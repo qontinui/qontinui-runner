@@ -519,7 +519,7 @@ async fn run_manifest_only(cwd: &Path, entry: &Path) -> Result<String, RegistryE
     let cwd = cwd.to_path_buf();
     let entry = entry.to_path_buf();
     let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
-        let mut cmd = Command::new("node");
+        let mut cmd = crate::process_helpers::no_window("node");
         cmd.current_dir(&cwd)
             .arg(&entry)
             .arg("--manifest-only")
