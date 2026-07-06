@@ -3930,6 +3930,7 @@ mod tests {
             behind_default_count: None,
             dirty_total: None,
             tenant_id: Some(t),
+            app_id: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
