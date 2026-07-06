@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "base_sha": "9eb190bc883b38db197e7a84e533459bd04ef469",
+  "ours_sha": "02790d8c3dec9f359d101eb89f2ab860ebc9cd9a",
+  "theirs_sha": "330e2710bb7599bec3e21df64ff98e10061c6ce6",
+  "entries": [
+    {
+      "path": "src-tauri/src/flywheel_e2e_tests.rs",
+      "base_oid": "0ef9c31c987a6f5116609b1f9ed5abbcc825cb71",
+      "ours_oid": "58d46e101a3dcf6f4472ba62e11e1eca7a5ca448",
+      "theirs_oid": "fc1d09251e67f65fa2562194df32956f17f9f9e8",
+      "base_path": "src-tauri/src/flywheel_e2e_tests.rs.base",
+      "ours_path": "src-tauri/src/flywheel_e2e_tests.rs.ours",
+      "theirs_path": "src-tauri/src/flywheel_e2e_tests.rs.theirs",
+      "hunks": [
+        "<<<<<<< HEAD\n//!     exists with provenance.status = Promoted.\n//!   2. flywheel_demotes_on_single_red\n//!      — write_pending_ir → simulate red → demote → assert _pending/ gone\n//!     and no canonical IR was written.\n//!   3. flywheel_skips_existing_specs_in_scan\n//!      — pre-create canonical IR for spec_id → list_pages exposes it →\n//!     scan filter would skip it.\n//!   4. flywheel_dedupes_concurrent_scans\n//!      — insert_proposal twice with same kind+pathname → second returns\n//!     Ok(false) per the UNIQUE constraint.\n//!   5. flywheel_patch_preserves_hand_authored\n//!      — merge_patch_into_ir on hand-authored state → rejects with the\n//!     \"pinned state\" sentinel.\n//!   6. flywheel_validator_rejects_low_coverage\n//!      — synthetic IR with no transitions → gate_coverage returns\n//!     CoverageBelowFloor.\n=======\n//!      exists with provenance.status = Promoted.\n//!   2. flywheel_demotes_on_single_red\n//!      — write_pending_ir → simulate red → demote → assert _pending/ gone\n//!      and no canonical IR was written.\n//!   3. flywheel_skips_existing_specs_in_scan\n//!      — pre-create canonical IR for spec_id → list_pages exposes it →\n//!      scan filter would skip it.\n//!   4. flywheel_dedupes_concurrent_scans\n//!      — insert_proposal twice with same kind+pathname → second returns\n//!      Ok(false) per the UNIQUE constraint.\n//!   5. flywheel_patch_preserves_hand_authored\n//!      — merge_patch_into_ir on hand-authored state → rejects with the\n//!      \"pinned state\" sentinel.\n//!   6. flywheel_validator_rejects_low_coverage\n//!      — synthetic IR with no transitions → gate_coverage returns\n//!      CoverageBelowFloor.\n>>>>>>> 02790d8c (chore(runner): fix pre-existing clippy lints blocking pre-push)\n"
+      ]
+    }
+  ]
+}

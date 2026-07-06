@@ -1,3 +1,0 @@
-# StatisticsTab
-
-_(notes)_
