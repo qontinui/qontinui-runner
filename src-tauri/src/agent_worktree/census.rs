@@ -589,7 +589,10 @@ fn git_capture(worktree: &Path, args: &[&str]) -> Option<String> {
     let wt = worktree.to_str()?;
     let mut full: Vec<&str> = vec!["-C", wt];
     full.extend_from_slice(args);
-    let out = crate::process_helpers::no_window("git").args(&full).output().ok()?;
+    let out = crate::process_helpers::no_window("git")
+        .args(&full)
+        .output()
+        .ok()?;
     if out.status.success() {
         Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
     } else {
