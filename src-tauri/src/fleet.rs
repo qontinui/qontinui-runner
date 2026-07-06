@@ -1261,7 +1261,6 @@ fn behind_default_compare_branch<'a>(branch: &str, default_branch: &'a str) -> O
 /// `git` calls use `process_helpers::no_window("git")` so they go through the operator's
 /// PATH-resolved git — same as the rest of the runner.
 fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
-
     let dot_git = repo_path.join(".git");
     if !dot_git.exists() {
         return None;

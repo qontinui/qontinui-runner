@@ -46,7 +46,10 @@ pub fn is_available() -> bool {
 /// Probe `mypy --version`, then `python -m mypy --version` / `python3 -m mypy`.
 fn probe_mypy() -> MypyInvocation {
     // 1. direct `mypy`
-    if let Ok(out) = crate::process_helpers::no_window("mypy").arg("--version").output() {
+    if let Ok(out) = crate::process_helpers::no_window("mypy")
+        .arg("--version")
+        .output()
+    {
         if out.status.success() {
             return MypyInvocation::Direct;
         }
