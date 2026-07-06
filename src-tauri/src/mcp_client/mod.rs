@@ -615,7 +615,7 @@ impl McpClientManager {
         );
 
         // Build the subprocess command
-        let mut cmd = tokio::process::Command::new(&stdio_config.command);
+        let mut cmd = crate::process_helpers::tokio_no_window(&stdio_config.command);
         cmd.args(&stdio_config.args);
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());

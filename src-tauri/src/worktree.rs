@@ -1084,7 +1084,7 @@ fn get_head_commit(repo_path: &Path) -> Result<String, String> {
 }
 
 pub(crate) fn run_git_command(repo_path: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = crate::process_helpers::no_window("git")
         .args(args)
         .current_dir(repo_path)
         .output()
@@ -1102,7 +1102,7 @@ pub(crate) fn run_git_command(repo_path: &Path, args: &[&str]) -> Result<String,
 }
 
 fn run_git_command_with_status(repo_path: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = crate::process_helpers::no_window("git")
         .args(args)
         .current_dir(repo_path)
         .output()

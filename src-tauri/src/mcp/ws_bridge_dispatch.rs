@@ -125,14 +125,14 @@ pub async fn dispatch_command(command_name: &str, payload: &Value) -> Value {
     let pyproject = bridge_dir.join("pyproject.toml");
     let mut cmd = if pyproject.exists() {
         debug!("ws_bridge_dispatch: using poetry from {:?}", bridge_dir);
-        let mut c = Command::new("poetry");
+        let mut c = crate::process_helpers::tokio_no_window("poetry");
         c.current_dir(&bridge_dir);
         c.arg("run").arg("python").arg("-u");
         c.arg("-m").arg("handlers.dispatch").arg(command_name);
         c
     } else {
         debug!("ws_bridge_dispatch: falling back to system python");
-        let mut c = Command::new("python");
+        let mut c = crate::process_helpers::tokio_no_window("python");
         c.current_dir(&bridge_dir);
         c.arg("-u")
             .arg("-m")

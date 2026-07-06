@@ -2459,7 +2459,7 @@ impl PipelineShared {
 /// L0 file tree: directory structure only (unique directory paths).
 /// Much smaller than the full file listing — typically 10-50x fewer lines.
 pub(super) fn get_file_tree_l0(project_path: &str) -> String {
-    let output = std::process::Command::new("git")
+    let output = crate::process_helpers::no_window("git")
         .args(["ls-files", "--others", "--cached", "--exclude-standard"])
         .current_dir(project_path)
         .output();

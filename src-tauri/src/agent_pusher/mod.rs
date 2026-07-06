@@ -332,7 +332,7 @@ async fn push_one(
     // coord's git-http gate is Bearer-only and rejects basic-auth, so the
     // agent JWT goes in an `Authorization: Bearer` header (not the URL).
     // `-c http.extraHeader=...` scopes the header to this one push.
-    let out = Command::new("git")
+    let out = crate::process_helpers::tokio_no_window("git")
         .arg("-C")
         .arg(&target.worktree_path)
         .arg("-c")

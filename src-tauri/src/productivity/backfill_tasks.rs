@@ -369,7 +369,7 @@ async fn run_git_log(repo: &str, since: &str) -> Result<String, String> {
     // by a blank line, followed by `--name-only` paths, followed by a
     // blank line before the next commit header.
     let format_arg = "--format=%H%x09%cI%x09%s";
-    let mut cmd = tokio::process::Command::new("git");
+    let mut cmd = crate::process_helpers::tokio_no_window("git");
     cmd.args([
         "log",
         &format!("--since={}", since),

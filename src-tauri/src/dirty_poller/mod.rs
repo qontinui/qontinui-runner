@@ -334,7 +334,7 @@ pub async fn tick_once(state: &Arc<DirtyPollerState>) -> Result<bool> {
 /// `git status --porcelain` + `git diff --shortstat HEAD` for one
 /// worktree.
 async fn read_worktree_dirty(t: &DirtyTarget) -> Result<WorktreeDirty> {
-    let status_out = Command::new("git")
+    let status_out = crate::process_helpers::tokio_no_window("git")
         .arg("-C")
         .arg(&t.worktree_path)
         .arg("status")
@@ -351,7 +351,7 @@ async fn read_worktree_dirty(t: &DirtyTarget) -> Result<WorktreeDirty> {
     }
     let files = parse_porcelain(&String::from_utf8_lossy(&status_out.stdout));
 
-    let shortstat_out = Command::new("git")
+    let shortstat_out = crate::process_helpers::tokio_no_window("git")
         .arg("-C")
         .arg(&t.worktree_path)
         .arg("diff")

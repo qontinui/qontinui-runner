@@ -425,7 +425,7 @@ pub fn restore_wip_ref(
 /// Run a `git -C <repo_dir> <args...>` command, returning trimmed stdout on
 /// success or a descriptive error on non-zero exit / spawn failure.
 fn run_git(repo_dir: &std::path::Path, args: &[&str]) -> Result<String, String> {
-    let mut cmd = std::process::Command::new("git");
+    let mut cmd = crate::process_helpers::no_window("git");
     cmd.arg("-C").arg(repo_dir);
     cmd.args(args);
     let output = cmd

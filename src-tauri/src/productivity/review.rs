@@ -612,7 +612,7 @@ fn parse_diff_stat(text: &str) -> (u32, u32, u32) {
 }
 
 async fn run_git(repo_path: &str, args: &[&str]) -> Result<String, String> {
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::process_helpers::tokio_no_window("git");
     cmd.arg("-C")
         .arg(repo_path)
         .args(args)
@@ -793,7 +793,7 @@ async fn run_command_with_timeout(
     cwd: &str,
     timeout_secs: u64,
 ) -> CommandOutcome {
-    let mut cmd = Command::new(program);
+    let mut cmd = crate::process_helpers::tokio_no_window(program);
     cmd.args(args)
         .current_dir(cwd)
         .stdout(Stdio::piped())

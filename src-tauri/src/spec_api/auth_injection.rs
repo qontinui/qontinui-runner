@@ -185,7 +185,7 @@ pub async fn fetch_app_credentials(
     let region =
         std::env::var("QONTINUI_SSM_REGION").unwrap_or_else(|_| "eu-central-1".to_string());
 
-    let output = tokio::process::Command::new("aws")
+    let output = crate::process_helpers::tokio_no_window("aws")
         .args([
             "ssm",
             "get-parameter",

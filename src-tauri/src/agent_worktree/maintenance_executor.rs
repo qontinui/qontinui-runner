@@ -137,7 +137,7 @@ pub enum MaintenanceAction {
 /// Run `git -C <dir> <args>` capturing output. `Ok((success, stdout, stderr))`
 /// — `success` is the process exit status. `Err` only on spawn failure.
 fn git_capture(dir: &str, args: &[&str]) -> Result<(bool, String, String), String> {
-    let out = std::process::Command::new("git")
+    let out = crate::process_helpers::no_window("git")
         .arg("-C")
         .arg(dir)
         .args(args)

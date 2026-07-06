@@ -133,7 +133,7 @@ pub async fn command_interpret(
         tools_json, text
     );
 
-    let output = Command::new("claude")
+    let output = crate::process_helpers::tokio_no_window("claude")
         .arg("-p")
         .arg("--output-format")
         .arg("json")

@@ -213,11 +213,11 @@ pub async fn collect_db_schema() -> Option<Section> {
 /// subprocess pattern.
 fn version_of(cmd: &str, args: &[&str]) -> Option<String> {
     use std::io::Read;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use std::time::Instant;
 
     let started = Instant::now();
-    let mut child = Command::new(cmd)
+    let mut child = crate::process_helpers::no_window(cmd)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

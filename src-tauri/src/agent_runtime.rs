@@ -3284,7 +3284,7 @@ async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
             );
             continue;
         }
-        let out = Command::new("git")
+        let out = crate::process_helpers::tokio_no_window("git")
             .args([
                 "-C",
                 repo_root
@@ -3497,7 +3497,7 @@ pub(crate) fn agent_git_identity_env() -> Vec<(String, String)> {
 /// box still attributes autonomous commits to its owner with zero config.
 fn host_git_identity() -> (Option<String>, Option<String>) {
     fn get(args: &[&str]) -> Option<String> {
-        std::process::Command::new("git")
+        crate::process_helpers::no_window("git")
             .args(args)
             .output()
             .ok()
@@ -3545,7 +3545,7 @@ fn pick_autonomous_git_identity(
 /// them.
 async fn spawn_claude_child(workdir: &str, initial_prompt: &str) -> anyhow::Result<Child> {
     let bin = claude_bin_path();
-    let mut cmd = Command::new(&bin);
+    let mut cmd = crate::process_helpers::tokio_no_window(&bin);
     cmd.current_dir(workdir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

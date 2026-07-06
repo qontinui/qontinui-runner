@@ -950,7 +950,7 @@ fn normalize_import_path(path: &str) -> String {
 }
 
 fn run_git(repo_path: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = crate::process_helpers::no_window("git")
         .args(args)
         .current_dir(repo_path)
         .output()

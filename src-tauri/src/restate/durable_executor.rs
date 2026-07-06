@@ -497,7 +497,7 @@ async fn is_stop_requested(app_state: &AppState, execution_id: &str) -> bool {
 /// Get the current git HEAD commit hash for compensation tracking.
 /// Uses the current working directory unless `repo_path` is specified.
 async fn get_current_commit_hash_in(repo_path: Option<&str>) -> Option<String> {
-    let mut cmd = tokio::process::Command::new("git");
+    let mut cmd = crate::process_helpers::tokio_no_window("git");
     cmd.args(["rev-parse", "HEAD"]);
     if let Some(path) = repo_path {
         cmd.current_dir(path);
@@ -523,7 +523,7 @@ async fn get_current_commit_hash() -> Option<String> {
 /// Get the list of files modified since the last commit (unstaged + staged).
 /// Used to populate `WorkflowOutput.files_modified`.
 pub async fn get_modified_files() -> Vec<String> {
-    let output = tokio::process::Command::new("git")
+    let output = crate::process_helpers::tokio_no_window("git")
         .args(["diff", "--name-only", "HEAD"])
         .output()
         .await;

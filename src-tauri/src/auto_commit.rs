@@ -182,7 +182,7 @@ fn has_staged_diff_for(cwd: &Path, paths: &[&str]) -> Result<bool, String> {
     let mut args: Vec<&str> = vec!["diff", "--cached", "--quiet", "--"];
     args.extend(paths.iter().copied());
 
-    let output = std::process::Command::new("git")
+    let output = crate::process_helpers::no_window("git")
         .args(&args)
         .current_dir(cwd)
         .output()

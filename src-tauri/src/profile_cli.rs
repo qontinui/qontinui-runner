@@ -282,7 +282,7 @@ fn compute_path_addition(current: &str, dir: &str, sep: char) -> Option<String> 
 /// Read the current USER-scope `Path` (Windows). Returns "" when unset.
 #[cfg(windows)]
 fn read_user_path() -> Result<String, String> {
-    let out = std::process::Command::new("powershell")
+    let out = crate::process_helpers::no_window("powershell")
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -306,7 +306,7 @@ fn read_user_path() -> Result<String, String> {
 /// so a long PATH with special characters survives argument parsing intact.
 #[cfg(windows)]
 fn write_user_path(new_value: &str) -> Result<(), String> {
-    let out = std::process::Command::new("powershell")
+    let out = crate::process_helpers::no_window("powershell")
         .env("QONTINUI_NEW_USER_PATH", new_value)
         .args([
             "-NoProfile",

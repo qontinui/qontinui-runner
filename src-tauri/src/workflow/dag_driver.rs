@@ -647,7 +647,7 @@ async fn execute_loop_node(
                     .unwrap_or(1)
             };
             #[cfg(not(target_os = "windows"))]
-            let exit_code = tokio::process::Command::new("bash")
+            let exit_code = crate::process_helpers::tokio_no_window("bash")
                 .arg("-c")
                 .arg(bash_cmd)
                 .status()

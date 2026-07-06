@@ -265,7 +265,7 @@ pub fn parse_repo_full_name(remote_url: &str) -> Option<String> {
 
 /// Run a git subcommand in `dir`, returning trimmed stdout on success.
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
+    let output = crate::process_helpers::no_window("git")
         .current_dir(dir)
         .args(args)
         .output()
