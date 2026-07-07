@@ -162,6 +162,25 @@ pub fn execute_review_subtask(
     prompt: String,
     model_override: Option<String>,
 ) {
+    execute_prompt_subtask(deps, review_id, review_name, prompt, model_override);
+}
+
+/// Execute an arbitrary single-iteration agentic prompt subtask.
+///
+/// The generic core of [`execute_review_subtask`], extracted so non-review
+/// callers — the PR shepherd's Phase 5 remediation spawn
+/// (`trigger_system::pr_shepherd_remediation`), which runs a `/vet-imp <plan>`
+/// or bounded fix prompt — reuse the exact LoopConfig shape without inheriting
+/// review-specific semantics. Builds a minimal LoopConfig (one iteration,
+/// prompt-only, no verification) and fire-and-forgets via
+/// `spawn_workflow_with_panic_guard`.
+pub fn execute_prompt_subtask(
+    deps: ReviewDeps,
+    review_id: String,
+    review_name: String,
+    prompt: String,
+    model_override: Option<String>,
+) {
     use std::collections::HashMap;
 
     let loop_config = super::types::LoopConfig {

@@ -40,7 +40,7 @@
 //! so a seed without a running watcher is inert anyway, and the upsert is
 //! idempotent when the same PR is observed again.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -48,6 +48,10 @@ use once_cell::sync::Lazy;
 
 /// Default green-but-unmerged dwell before `PrAction::GreenButUnmerged` fires.
 pub const DEFAULT_GREEN_THRESHOLD: Duration = Duration::from_secs(45 * 60);
+
+/// Default remediation dedup cooldown (Phase 5): a fresh remediation for the
+/// same defect class within this window is a dedup hit. 24h.
+pub const DEFAULT_REMEDIATION_COOLDOWN: Duration = Duration::from_secs(24 * 3600);
 
 /// Upper bound on buffered seeds. Oldest drop first — the queue only ever
 /// holds seeds between transcript observation and the next PR-watcher poll
@@ -96,6 +100,82 @@ pub fn diagnose_enabled() -> bool {
         ),
         Err(_) => true,
     }
+}
+
+/// Phase-4 notification gate. Requires the master flag; then default **ON**
+/// unless `QONTINUI_PR_SHEPHERD_NOTIFY` is `0`/`false`/`off` (case-insensitive).
+/// Gates the device-local author-notify injection (Phase 4) so notify can be
+/// disabled independently while diagnosis (Phase 3) keeps running — same
+/// default-on shape as [`autoseed_enabled`] / [`diagnose_enabled`].
+pub fn notify_enabled() -> bool {
+    if !shepherd_enabled() {
+        return false;
+    }
+    match std::env::var("QONTINUI_PR_SHEPHERD_NOTIFY") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
+/// Phase-5 spawn gate. Requires the master flag; then default **OFF** — only
+/// `1`/`true`/`on`/`yes` enables the vet-imp / fix-session spawn. The rollout
+/// (plan §Rollout) keeps spawn disabled even when the rest of the shepherd is
+/// on: with this OFF, Phase 5 still WRITES the remediation plan + records the
+/// marker row, it just does not spawn a session. Strict-truthy like the master
+/// flag, because spawning a session is the one irreversible action.
+pub fn spawn_enabled() -> bool {
+    if !shepherd_enabled() {
+        return false;
+    }
+    matches!(
+        std::env::var("QONTINUI_PR_SHEPHERD_SPAWN").map(|v| v.trim().to_ascii_lowercase()),
+        Ok(ref v) if matches!(v.as_str(), "1" | "true" | "on" | "yes")
+    )
+}
+
+/// Phase-5 remediation dedup cooldown. Reads
+/// `QONTINUI_PR_SHEPHERD_REMEDIATION_COOLDOWN` — a bare integer is HOURS (a
+/// cooldown reads naturally in hours), or an `s`/`m`/`h` suffix. Unset /
+/// unparseable falls back to [`DEFAULT_REMEDIATION_COOLDOWN`] (24h).
+pub fn remediation_cooldown() -> Duration {
+    std::env::var("QONTINUI_PR_SHEPHERD_REMEDIATION_COOLDOWN")
+        .ok()
+        .and_then(|v| parse_cooldown(&v))
+        .unwrap_or(DEFAULT_REMEDIATION_COOLDOWN)
+}
+
+/// Parse a cooldown string like [`parse_threshold`] but with a bare integer
+/// meaning HOURS instead of minutes (`"24"` → 24h, `"90m"` → 90 minutes,
+/// `"3600s"` → 1h). Returns `None` for zero / unparseable.
+pub fn parse_cooldown(raw: &str) -> Option<Duration> {
+    let s = raw.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+    let (num, unit_secs): (&str, u64) = match s.as_bytes()[s.len() - 1] {
+        b's' => (&s[..s.len() - 1], 1),
+        b'm' => (&s[..s.len() - 1], 60),
+        b'h' => (&s[..s.len() - 1], 3600),
+        _ => (s.as_str(), 3600), // bare integer = hours
+    };
+    let n: u64 = num.trim().parse().ok()?;
+    if n == 0 {
+        return None;
+    }
+    Some(Duration::from_secs(n * unit_secs))
+}
+
+/// The model override for the spawned vet-imp / fix session (Phase 5). Reads
+/// `QONTINUI_PR_SHEPHERD_VETIMP_MODEL`; unset or blank → `None` (the spawned
+/// session's default model).
+pub fn vetimp_model() -> Option<String> {
+    std::env::var("QONTINUI_PR_SHEPHERD_VETIMP_MODEL")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// Green-but-unmerged dwell threshold. Reads
@@ -218,6 +298,41 @@ pub fn reset_seeds_for_test() {
         .clear();
 }
 
+// ---------------------------------------------------------------------------
+// Phase 4/5 process-global dedup guards — mirror `coord_pr_merge_client`'s
+// `claim_reevaluate_once`. All keyed to include the HEAD SHA so a push (which
+// resets `first_fully_green_at` and clears the block class) makes the PR
+// eligible for a fresh nudge / escalation on the new head — never a storm on
+// the same head.
+// ---------------------------------------------------------------------------
+
+/// `(pr_number, head_sha, kind)` tuples already device-locally notified this
+/// process (Phase 4). Prevents a second injection of the same kind for the same
+/// green head across polls.
+static NOTIFY_ONCE: Lazy<Mutex<HashSet<(u64, String, String)>>> =
+    Lazy::new(|| Mutex::new(HashSet::new()));
+
+/// Claim the single device-local notification for `(pr, head, kind)`. Returns
+/// `true` exactly once per tuple (the first caller), `false` thereafter.
+///
+/// Phase 5 remediation deliberately has NO analogous escalate once-guard — it is
+/// deduped by the plans-dir scan + the durable `pr_shepherd_remediations`
+/// cooldown marker, which (unlike a process-global set) do not suppress a
+/// legitimate re-escalation if coord's own attempt later dies.
+pub fn claim_notify_once(pr: u64, head_sha: &str, kind: &str) -> bool {
+    let mut g = NOTIFY_ONCE.lock().unwrap_or_else(|e| e.into_inner());
+    g.insert((pr, head_sha.to_string(), kind.to_string()))
+}
+
+/// Test-only: clear the Phase 4 notify dedup guard.
+#[cfg(test)]
+pub fn reset_action_guards_for_test() {
+    NOTIFY_ONCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,6 +415,97 @@ mod tests {
 
         std::env::remove_var("QONTINUI_PR_SHEPHERD");
         std::env::remove_var("QONTINUI_PR_SHEPHERD_DIAGNOSE");
+    }
+
+    #[test]
+    fn notify_requires_master_and_defaults_on_under_it() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_PR_SHEPHERD");
+        std::env::set_var("QONTINUI_PR_SHEPHERD_NOTIFY", "1");
+        assert!(!notify_enabled(), "notify must be gated on the master flag");
+
+        std::env::set_var("QONTINUI_PR_SHEPHERD", "1");
+        std::env::remove_var("QONTINUI_PR_SHEPHERD_NOTIFY");
+        assert!(notify_enabled(), "notify defaults ON under the master flag");
+
+        std::env::set_var("QONTINUI_PR_SHEPHERD_NOTIFY", "off");
+        assert!(!notify_enabled());
+
+        std::env::remove_var("QONTINUI_PR_SHEPHERD");
+        std::env::remove_var("QONTINUI_PR_SHEPHERD_NOTIFY");
+    }
+
+    #[test]
+    fn spawn_requires_master_and_defaults_off_under_it() {
+        let _env = env_lock();
+        // Master off → spawn off regardless.
+        std::env::remove_var("QONTINUI_PR_SHEPHERD");
+        std::env::set_var("QONTINUI_PR_SHEPHERD_SPAWN", "1");
+        assert!(!spawn_enabled(), "spawn must be gated on the master flag");
+
+        // Master on, spawn unset → OFF (default; rollout keeps spawn dark).
+        std::env::set_var("QONTINUI_PR_SHEPHERD", "1");
+        std::env::remove_var("QONTINUI_PR_SHEPHERD_SPAWN");
+        assert!(!spawn_enabled(), "spawn defaults OFF under the master flag");
+
+        // Only strict-truthy enables.
+        for off in ["0", "false", "off", "no", "garbage", ""] {
+            std::env::set_var("QONTINUI_PR_SHEPHERD_SPAWN", off);
+            assert!(!spawn_enabled(), "value {off:?} must NOT enable spawn");
+        }
+        for on in ["1", "true", "on", "yes", "TRUE"] {
+            std::env::set_var("QONTINUI_PR_SHEPHERD_SPAWN", on);
+            assert!(spawn_enabled(), "value {on:?} must enable spawn");
+        }
+
+        std::env::remove_var("QONTINUI_PR_SHEPHERD");
+        std::env::remove_var("QONTINUI_PR_SHEPHERD_SPAWN");
+    }
+
+    #[test]
+    fn cooldown_parses_bare_hours_and_suffixes() {
+        assert_eq!(parse_cooldown("24"), Some(Duration::from_secs(24 * 3600)));
+        assert_eq!(parse_cooldown("24h"), Some(Duration::from_secs(24 * 3600)));
+        assert_eq!(parse_cooldown("90m"), Some(Duration::from_secs(90 * 60)));
+        assert_eq!(parse_cooldown("3600s"), Some(Duration::from_secs(3600)));
+        assert_eq!(parse_cooldown("0"), None);
+        assert_eq!(parse_cooldown("nope"), None);
+    }
+
+    #[test]
+    fn remediation_cooldown_falls_back_to_default() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_PR_SHEPHERD_REMEDIATION_COOLDOWN");
+        assert_eq!(remediation_cooldown(), DEFAULT_REMEDIATION_COOLDOWN);
+        std::env::set_var("QONTINUI_PR_SHEPHERD_REMEDIATION_COOLDOWN", "6h");
+        assert_eq!(remediation_cooldown(), Duration::from_secs(6 * 3600));
+        std::env::remove_var("QONTINUI_PR_SHEPHERD_REMEDIATION_COOLDOWN");
+    }
+
+    #[test]
+    fn vetimp_model_reads_env_and_blank_is_none() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_PR_SHEPHERD_VETIMP_MODEL");
+        assert_eq!(vetimp_model(), None);
+        std::env::set_var("QONTINUI_PR_SHEPHERD_VETIMP_MODEL", "  ");
+        assert_eq!(vetimp_model(), None, "blank → None");
+        std::env::set_var("QONTINUI_PR_SHEPHERD_VETIMP_MODEL", "opus");
+        assert_eq!(vetimp_model(), Some("opus".to_string()));
+        std::env::remove_var("QONTINUI_PR_SHEPHERD_VETIMP_MODEL");
+    }
+
+    #[test]
+    fn notify_guard_fires_once_per_head_and_kind() {
+        reset_action_guards_for_test();
+        // Notify: once per (pr, head, kind).
+        assert!(claim_notify_once(708, "headA", "pr_hold_triage"));
+        assert!(!claim_notify_once(708, "headA", "pr_hold_triage"));
+        // A different kind on the same head is independent.
+        assert!(claim_notify_once(708, "headA", "ci_red_triage"));
+        // A new head is a fresh nudge.
+        assert!(claim_notify_once(708, "headB", "pr_hold_triage"));
+        // A different PR is independent.
+        assert!(claim_notify_once(912, "headA", "pr_hold_triage"));
     }
 
     #[test]
