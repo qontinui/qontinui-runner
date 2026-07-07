@@ -2161,12 +2161,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // the existing setup body rely on non-`move` semantics; see
             // the comment block above this closure).
             {
-                // Phase 0 multi-user readiness — normalize the operator's
-                // legacy `machine.json` so the canonical `device_id` key is
-                // present before any consumer reads it (the session machinery
-                // below + the coord data-plane bearer). No-op when the file is
-                // already canonical / missing.
-                qontinui_runner_lib::pair::ensure_device_id_persisted();
+                // Ensure the per-device identity file exists before any
+                // consumer reads it (the session machinery below, the coord
+                // data-plane bearer, and the sign-in device-binding step).
+                // On a fresh production install there is no machine.json and
+                // no end user runs `qontinui_profile device init`, so mint the
+                // identity here on first launch; on an existing file this just
+                // backfills the canonical `device_id` key. Fail-open + no-op
+                // when already canonical.
+                qontinui_runner_lib::pair::ensure_device_initialized();
 
                 let app_handle = app.handle().clone();
                 let term_state: tauri::State<'_, std::sync::Arc<terminal::TerminalManager>> =

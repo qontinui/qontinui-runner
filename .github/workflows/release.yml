@@ -289,10 +289,13 @@ jobs:
           }
 
       - name: Build Tauri app
-        # Tauri signing disabled for alpha - will be enabled when certificates arrive
-        # env:
-        #   TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-        #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        # Updater signing: with createUpdaterArtifacts=true, `tauri build`
+        # signs each bundle and emits a `<installer>.sig` next to it. The
+        # runner's updater plugin verifies that signature against the pubkey in
+        # tauri.conf.json. Both secrets must be set in the repo.
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         # --target must be tauri's OWN flag, not behind `--`. Under npm the
         # first `--` was eaten by npm itself, so tauri saw `--target`; pnpm
         # passes `--` through verbatim, which made tauri forward --target to
@@ -371,6 +374,40 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Generate updater manifest (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        # createUpdaterArtifacts=true makes `tauri build` sign each bundle and
+        # emit <installer>.sig next to it. Assemble the Tauri v2 updater
+        # manifest (latest.json) carrying the REAL signature, so an installed
+        # runner can verify + apply the update against the pubkey embedded in
+        # tauri.conf.json. Windows is the sole shipped platform, so a
+        # Windows-only manifest is correct. Fails loudly if the .sig is absent
+        # (signing key not set) — never ship an unverifiable "auto-update".
+        run: |
+          cd target/${{ matrix.target }}/release/bundle/nsis
+          sig_file=$(ls *-setup.exe.sig 2>/dev/null | head -1)
+          if [[ -z "$sig_file" ]]; then
+            echo "::error::No .sig produced — is TAURI_SIGNING_PRIVATE_KEY set and createUpdaterArtifacts=true?";
+            exit 1;
+          fi
+          sig=$(cat "$sig_file")
+          ver="${{ needs.create-release.outputs.release_version }}"
+          cat > latest.json << EOF
+          {
+            "version": "v${ver}",
+            "notes": "See https://github.com/${{ github.repository }}/releases/tag/v${ver} for release notes.",
+            "pub_date": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "platforms": {
+              "windows-x86_64": {
+                "signature": "${sig}",
+                "url": "https://github.com/${{ github.repository }}/releases/download/v${ver}/Qontinui.Runner_${ver}_x64-setup.exe"
+              }
+            }
+          }
+          EOF
+          echo "Generated latest.json:"; cat latest.json
+
       - name: Upload release assets (Windows)
         if: runner.os == 'Windows'
         uses: softprops/action-gh-release@v1
@@ -379,6 +416,8 @@ jobs:
           prerelease: true
           files: |
             target/${{ matrix.target }}/release/bundle/nsis/*.exe
+            target/${{ matrix.target }}/release/bundle/nsis/*.exe.sig
+            target/${{ matrix.target }}/release/bundle/nsis/latest.json
             target/${{ matrix.target }}/release/bundle/checksums-${{ matrix.name }}.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -412,42 +451,13 @@ jobs:
             exit 1;
           }
 
-      - name: Generate update manifest
-        run: |
-          cat > update.json << EOF
-          {
-            "version": "v${{ needs.create-release.outputs.release_version }}",
-            "notes": "Beta release with stability improvements and auto-update support",
-            "pub_date": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-            "platforms": {
-              "darwin-x86_64": {
-                "signature": "",
-                "url": "https://github.com/${{ github.repository }}/releases/download/v${{ needs.create-release.outputs.release_version }}/qontinui-runner_${{ needs.create-release.outputs.release_version }}_x64.dmg"
-              },
-              "darwin-aarch64": {
-                "signature": "",
-                "url": "https://github.com/${{ github.repository }}/releases/download/v${{ needs.create-release.outputs.release_version }}/qontinui-runner_${{ needs.create-release.outputs.release_version }}_aarch64.dmg"
-              },
-              "linux-x86_64": {
-                "signature": "",
-                "url": "https://github.com/${{ github.repository }}/releases/download/v${{ needs.create-release.outputs.release_version }}/qontinui-runner_${{ needs.create-release.outputs.release_version }}_amd64.AppImage"
-              },
-              "windows-x86_64": {
-                "signature": "",
-                "url": "https://github.com/${{ github.repository }}/releases/download/v${{ needs.create-release.outputs.release_version }}/Qontinui.Runner_${{ needs.create-release.outputs.release_version }}_x64-setup.exe"
-              }
-            }
-          }
-          EOF
-
-      - name: Upload update manifest
-        uses: softprops/action-gh-release@v1
-        with:
-          draft: true
-          prerelease: true
-          files: update.json
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # The updater manifest (latest.json) is now produced by the Windows
+      # build leg ("Generate updater manifest (Windows)") with the REAL
+      # signature read from the bundler's .sig, and uploaded to the draft
+      # release there. The old hand-rolled update.json here carried empty
+      # signatures + a wrong (.msi) URL, so the updater could never verify —
+      # it has been removed. This job now only gates on the Windows installer
+      # and flips the release to published + latest.
 
       # All platform installers, checksums, and the update manifest are now
       # uploaded to the draft release. Flip it to published + non-prerelease as
@@ -462,4 +472,5 @@ jobs:
           gh release edit "v${{ needs.create-release.outputs.release_version }}" \
             --repo "${{ github.repository }}" \
             --draft=false \
-            --prerelease=false
+            --prerelease=false \
+            --latest

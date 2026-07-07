@@ -57,6 +57,7 @@ import { useStateMachineRegistration } from "./hooks/useStateMachineRegistration
 
 import { ToastContainer } from "./components/ToastContainer";
 import { BuildRefreshBanner } from "./components/BuildRefreshBanner";
+import { AutoUpdateChecker } from "./components/AutoUpdateChecker";
 import { ConflictModal } from "./components/ConflictModal";
 import { StolenBanner } from "./components/StolenBanner";
 import { MemoryFederationBanner } from "./components/MemoryFederationBanner";
@@ -969,6 +970,9 @@ export default function App() {
         the runner exe was swapped while this webview stayed open.
       */}
       <BuildRefreshBanner />
+      {/* Launch-time auto-update check: prompts + installs a newer signed
+          release on startup. Renders nothing; fail-open. */}
+      <AutoUpdateChecker />
       <UIBridgeProvider
         features={{ renderLog: true, control: true, debug: true }}
         browserCaptureConfig={{
