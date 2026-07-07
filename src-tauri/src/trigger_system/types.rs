@@ -104,6 +104,13 @@ pub enum TriggerConfig {
         /// Maximum auto-resumes before requiring manual intervention (default: 10).
         #[serde(default = "default_max_auto_resumes")]
         max_auto_resumes: u32,
+        /// Per-repo allowlist for PR-shepherd-seeded watches (plan
+        /// 2026-07-04-runner-pr-shepherd, Phase 1). Tokens match either the
+        /// `owner/repo` full name or the bare repo name, case-insensitively.
+        /// Empty (default) allows all repos. Only consulted when the
+        /// `QONTINUI_PR_SHEPHERD` (+`_AUTOSEED`) gates are on.
+        #[serde(default)]
+        shepherd_repos: Vec<String>,
     },
 }
 

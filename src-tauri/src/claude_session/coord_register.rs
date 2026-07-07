@@ -148,7 +148,9 @@ impl AiCoordRegistrar {
 
     /// R4 — resolve a runner `task_run_id` to its coord `session_id` (the
     /// durable handle). Consumed by the coord-mcp proxy's caller
-    /// self-identification (session-fabric Phase 0) and the inject-audit path.
+    /// self-identification (session-fabric Phase 0), the inject-audit /
+    /// observability path, and the PR-shepherd seed-identity resolver
+    /// (`terminal::pr_open_report::seed_identity`).
     pub fn session_id_for(&self, task_run_id: &str) -> Option<Uuid> {
         self.inner
             .reverse

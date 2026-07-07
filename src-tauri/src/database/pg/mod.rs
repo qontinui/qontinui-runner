@@ -513,6 +513,50 @@ impl PgDb {
         .await
         .map_err(|e| format!("Stream E.1 proposal_events.app_id self-heal failed: {}", e))?;
 
+        // PR-shepherd Phases 1+2 (plan 2026-07-04-runner-pr-shepherd): extend
+        // `project.pr_watch_state` with the seeding + green-but-unmerged
+        // columns. The table is alembic-owned (qontinui-web
+        // `consolidation_phase1_20_tail_specialty.py`) and Atlas-excluded, so
+        // — like the CR-5 jsonb conversion above — the runner self-heals the
+        // shape on its next startup; a companion alembic revision in
+        // qontinui-web should carry the same columns so the regenerated
+        // `schema.pg.sql.generated` eventually reflects them (no Clorinde
+        // `queries/*.sql` references these columns, so the snapshot needs no
+        // hand-edit meanwhile). Gated on table existence so a bare PG where
+        // the migrator hasn't run boots cleanly. Idempotent throughout.
+        //
+        // - `authoring_session_id` (nullable): the coord session id for
+        //   watches seeded from INTERACTIVE sessions, which have no task run
+        //   to attribute. `task_run_id` drops its NOT NULL for the same
+        //   reason; because the existing `(task_run_id, pr_number)` unique
+        //   constraint can never conflict on NULL `task_run_id`, session-keyed
+        //   rows dedup via the partial unique index below instead.
+        // - `first_fully_green_at` (nullable): when all non-skipped checks
+        //   first passed on the current head — the green-but-unmerged
+        //   detector's clock. Reset on head change or any red/pending flip.
+        conn.batch_execute(
+            "DO $prshep$
+             BEGIN
+               IF EXISTS (
+                 SELECT 1 FROM information_schema.tables
+                 WHERE table_schema = 'project' AND table_name = 'pr_watch_state'
+               ) THEN
+                 ALTER TABLE project.pr_watch_state
+                     ADD COLUMN IF NOT EXISTS authoring_session_id TEXT;
+                 ALTER TABLE project.pr_watch_state
+                     ADD COLUMN IF NOT EXISTS first_fully_green_at TIMESTAMPTZ;
+                 ALTER TABLE project.pr_watch_state
+                     ALTER COLUMN task_run_id DROP NOT NULL;
+                 CREATE UNIQUE INDEX IF NOT EXISTS idx_prw_session_pr
+                     ON project.pr_watch_state (authoring_session_id, pr_number)
+                     WHERE task_run_id IS NULL;
+               END IF;
+             END
+             $prshep$;",
+        )
+        .await
+        .map_err(|e| format!("PR-shepherd pr_watch_state self-heal failed: {}", e))?;
+
         // Approach-D Conductor/Engine Phase 1 — runner-owned `orchestration`
         // schema (durable run + subtask DAG ledger).
         //

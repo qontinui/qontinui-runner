@@ -400,6 +400,11 @@ async fn tail_session(
     let mut workflow_check_buf = String::new();
     let mut did_workflow_recheck = false;
 
+    // PR-shepherd Phase 1 (plan 2026-07-04-runner-pr-shepherd): per-session
+    // `gh pr create` tool_use ↔ tool_result correlator. Cheap to hold even
+    // when the shepherd gate is off — the per-line feed below is gated.
+    let mut pr_create_tracker = super::pr_open_report::PrCreateTracker::new();
+
     // ── Interactive-agent log emitter (Phase 2) ───────────────────────────────
     //
     // Stream this PTY CLI session's assistant text + tool_use activity to
@@ -544,6 +549,28 @@ async fn tail_session(
                     let reg = reg.clone();
                     tauri::async_runtime::spawn_blocking(move || {
                         super::commit_report::handle_push_observation(&obs, &reg);
+                    });
+                }
+            }
+
+            // ── PR-shepherd Phase 1: seed PR watches on `gh pr create` ────
+            //
+            // Detect `gh pr create` tool_use blocks + their tool_result URLs
+            // on this line and enqueue pending watch seeds the PR watcher
+            // drains on its next poll (plan 2026-07-04-runner-pr-shepherd).
+            // Gated on QONTINUI_PR_SHEPHERD(+_AUTOSEED), so the common
+            // (off) case costs one env read per line. The branch-lookup
+            // fallback runs git, so — like the push path above — the
+            // handler goes to the blocking pool and never stalls the tail.
+            if crate::trigger_system::pr_shepherd::autoseed_enabled() {
+                for event in pr_create_tracker.observe_line(&line) {
+                    let coord_session_id = registrar
+                        .as_ref()
+                        .and_then(|r| r.session_id_for(&session_id));
+                    let identity =
+                        super::pr_open_report::seed_identity(&session_id, coord_session_id);
+                    tauri::async_runtime::spawn_blocking(move || {
+                        super::pr_open_report::handle_pr_open_event(event, identity);
                     });
                 }
             }
