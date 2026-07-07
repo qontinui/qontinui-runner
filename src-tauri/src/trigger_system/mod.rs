@@ -33,6 +33,7 @@ pub mod evaluator;
 pub mod executor;
 pub mod github_api;
 pub mod pr_shepherd;
+pub mod pr_shepherd_remediation;
 pub mod service;
 pub mod types;
 pub mod watchers;

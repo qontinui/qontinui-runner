@@ -56,6 +56,7 @@ pub mod orchestration_loop;
 pub mod phase_results;
 pub mod pipeline_traces;
 pub mod plans;
+pub mod pr_shepherd_ops;
 pub mod pr_watch_ops;
 pub mod process_sessions;
 pub mod productivity_knowledge;
@@ -612,6 +613,38 @@ impl PgDb {
         )
         .await
         .map_err(|e| format!("Phase 1 orchestration schema self-heal failed: {}", e))?;
+
+        // PR-shepherd Phase 5 (plan 2026-07-04-runner-pr-shepherd): the
+        // remediation dedup marker. One row per remediation the device-local
+        // shepherd authored for a coord defect (or an orphaned-red fix) — it is
+        // BOTH the cooldown arbiter (skip a fresh remediation for the same
+        // defect class within `QONTINUI_PR_SHEPHERD_REMEDIATION_COOLDOWN`) AND
+        // the steward-coexistence record. Runner-owned `project.*` namespace, so
+        // — like `project.apps` / `orchestration.*` above — the runner self-heals
+        // the shape with a plain CREATE TABLE IF NOT EXISTS; there is no coord.*
+        // table here and thus no `require_table`. Idempotent.
+        //
+        // - `defect_class`: the CoordDefectClass kebab id (or `orphaned-red`).
+        // - `pr`: the PR number the remediation targets.
+        // - `plan_path`: the generated remediation plan file (empty for the
+        //   inline-prompt orphaned-red fix spawn).
+        // - `spawned_session`: the child TaskRun id when a session was spawned;
+        //   NULL when spawn was disabled (plan written, no session).
+        conn.batch_execute(
+            "CREATE SCHEMA IF NOT EXISTS project; \
+             CREATE TABLE IF NOT EXISTS project.pr_shepherd_remediations ( \
+                 id              TEXT PRIMARY KEY, \
+                 defect_class    TEXT NOT NULL, \
+                 pr              BIGINT NOT NULL, \
+                 plan_path       TEXT NOT NULL DEFAULT '', \
+                 spawned_session TEXT, \
+                 created_at      TIMESTAMPTZ NOT NULL DEFAULT now() \
+             ); \
+             CREATE INDEX IF NOT EXISTS idx_pr_shepherd_remediations_class_created \
+                 ON project.pr_shepherd_remediations (defect_class, created_at DESC);",
+        )
+        .await
+        .map_err(|e| format!("PR-shepherd remediations self-heal failed: {}", e))?;
 
         info!("PostgreSQL connected (deadpool, max_size=8, schema=runner)");
 

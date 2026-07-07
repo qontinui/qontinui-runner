@@ -41,13 +41,17 @@
 //! labeled PR); no variant models it. Its 2026-07-04 deadlock payloads survive
 //! only as classification fixtures for the *cycle-spin* class (see the tests).
 //!
-//! ## Phase 3 is LOG-ONLY
+//! ## This module classifies; `watchers::pr_watcher` acts
 //!
 //! [`decide_action`] returns an *intent*; the `GreenButUnmerged` handler in
-//! `watchers::pr_watcher` logs it. The one live side effect is the
+//! `watchers::pr_watcher` logs it and then EXECUTES it (Phases 4/5): the
 //! reevaluate-once `POST` on a suspected [`ShepherdDisposition::CoordDefect`]
-//! (a cheap idempotent nudge, guarded per `(pr, head)`); the notify-author
-//! (Phase 4) and spawn-vet-imp (Phase 5) seams stay as logged intents.
+//! (a cheap idempotent nudge, guarded per `(pr, head)`), the device-local
+//! author notify ([`ShepherdIntent::NotifyAuthor`] /
+//! [`ShepherdIntent::CoordDownLocalAlert`], Phase 4), and the remediation-plan
+//! + last-resort vet-imp spawn ([`ShepherdIntent::Escalate`], Phase 5). This
+//! module itself performs only the read + reevaluate calls; it never notifies
+//! or spawns.
 
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -183,6 +187,11 @@ struct PrEventWire {
     event_kind: String,
     #[serde(default)]
     payload: Option<Value>,
+    /// When coord recorded the event (`coord.pr_events.created_at`). Used by the
+    /// Phase 5.4 coexistence check to tell a LIVE coord shepherd attempt (recent
+    /// event on the current head) from a stale one.
+    #[serde(default)]
+    created_at: Option<DateTime<Utc>>,
 }
 
 // ---- merge queue response (deserialize-only projection) --------------------
@@ -703,6 +712,28 @@ impl CoordPrMergeClient {
             .unwrap_or(false))
     }
 
+    /// **Phase 5.4 coexistence rung (i).** Is coord's Unlandable Shepherd
+    /// *currently* attempting this exact `(pr, head)`? Coord writes an
+    /// `unlandable_cycle` (and a `diagnosis`) `pr_events` row on every shepherd
+    /// sweep tick, so a RECENT such event on the current head is the strongest
+    /// signal available over the read surface that coord's shepherd is alive and
+    /// engaged. When coord is the broken component (leaderless / wedged) no
+    /// fresh events appear → returns `false` → the runner proceeds as the
+    /// last-resort rung. Best-effort: any transport failure → `Ok(false)` (we do
+    /// not want an events blip to suppress the last-resort remediation).
+    pub async fn unlandable_attempt_live(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr: u64,
+        head_sha: &str,
+        within: Duration,
+    ) -> Result<bool, String> {
+        let url = format!("{}/pr-merge/events/{owner}/{repo}/{pr}", self.base);
+        let wire: EventsResponseWire = self.get_json(&url).await?;
+        Ok(coord_attempt_live(&wire.events, head_sha, within, Utc::now()))
+    }
+
     /// `POST /pr-merge/prs/:owner/:name/:pr/reevaluate` — the cheap idempotent
     /// nudge tried once before escalating a suspected defect. Returns `Ok` on
     /// any 2xx.
@@ -788,6 +819,42 @@ fn graph_from_wire(wire: &GraphResponseWire) -> GraphDiagnosis {
         cycle_member_count: wire.cycle_members.len(),
         cycle_members_all_green: all_green,
     }
+}
+
+/// PURE core of [`CoordPrMergeClient::unlandable_attempt_live`]: is there a
+/// `unlandable_cycle` or `diagnosis` event on `head_sha` newer than `now -
+/// within`? An event with no `created_at` is treated as NOT recent (we can't
+/// prove liveness), and one with no `head_sha` in its payload matches only if
+/// the current head is empty (never, in the shepherd path). Unit-tested from
+/// recorded event JSON.
+fn coord_attempt_live(
+    events: &[PrEventWire],
+    head_sha: &str,
+    within: Duration,
+    now: DateTime<Utc>,
+) -> bool {
+    if head_sha.is_empty() {
+        return false;
+    }
+    let cutoff = now - chrono::Duration::from_std(within).unwrap_or_else(|_| chrono::Duration::zero());
+    events.iter().any(|ev| {
+        if !matches!(ev.event_kind.as_str(), "unlandable_cycle" | "diagnosis") {
+            return false;
+        }
+        let Some(created) = ev.created_at else {
+            return false;
+        };
+        if created < cutoff {
+            return false;
+        }
+        // Match the event's head to the current head when the payload carries
+        // one; a shepherd sweep records the head it evaluated.
+        ev.payload
+            .as_ref()
+            .and_then(|p| p.get("head_sha").and_then(Value::as_str))
+            .map(|h| h == head_sha)
+            .unwrap_or(false)
+    })
 }
 
 /// Does any enqueued proposal carry a repo head matching `head_sha`?
@@ -1133,6 +1200,7 @@ mod tests {
             PrEventWire {
                 event_kind: "state_change".to_string(),
                 payload: Some(json!({ "state": "BLOCKED" })),
+                created_at: None,
             },
             PrEventWire {
                 event_kind: "predicate_eval".to_string(),
@@ -1141,10 +1209,12 @@ mod tests {
                     "head_sha": "abc123",
                     "detail": { "label": "coord:upstream-of=qontinui-coord#912" }
                 })),
+                created_at: None,
             },
             PrEventWire {
                 event_kind: "unlandable_cycle".to_string(),
                 payload: Some(json!({ "head_sha": "abc123", "cycles": 37 })),
+                created_at: None,
             },
         ];
         let block = block_from_events(&events);
@@ -1189,6 +1259,49 @@ mod tests {
         }))
         .unwrap();
         assert!(!graph_from_wire(&wire2).cycle_members_all_green);
+    }
+
+    #[test]
+    fn coord_attempt_live_detects_recent_cycle_on_current_head() {
+        let now = Utc::now();
+        let within = Duration::from_secs(24 * 3600);
+        // A recent unlandable_cycle on the current head → coord shepherd alive.
+        let events = vec![PrEventWire {
+            event_kind: "unlandable_cycle".to_string(),
+            payload: Some(json!({ "head_sha": "abc123", "cycles": 4 })),
+            created_at: Some(now - chrono::Duration::minutes(10)),
+        }];
+        assert!(coord_attempt_live(&events, "abc123", within, now));
+
+        // Same event but on a DIFFERENT head → not our head → not live for us.
+        assert!(!coord_attempt_live(&events, "NEWHEAD", within, now));
+
+        // A stale event (older than the window) → not live.
+        let stale = vec![PrEventWire {
+            event_kind: "diagnosis".to_string(),
+            payload: Some(json!({ "head_sha": "abc123" })),
+            created_at: Some(now - chrono::Duration::hours(48)),
+        }];
+        assert!(!coord_attempt_live(&stale, "abc123", within, now));
+
+        // An event with no created_at can't prove liveness → not live.
+        let undated = vec![PrEventWire {
+            event_kind: "unlandable_cycle".to_string(),
+            payload: Some(json!({ "head_sha": "abc123" })),
+            created_at: None,
+        }];
+        assert!(!coord_attempt_live(&undated, "abc123", within, now));
+
+        // A recent but irrelevant event kind (predicate_eval) → not an attempt.
+        let other = vec![PrEventWire {
+            event_kind: "predicate_eval".to_string(),
+            payload: Some(json!({ "head_sha": "abc123" })),
+            created_at: Some(now),
+        }];
+        assert!(!coord_attempt_live(&other, "abc123", within, now));
+
+        // Empty current head never matches.
+        assert!(!coord_attempt_live(&events, "", within, now));
     }
 
     #[test]

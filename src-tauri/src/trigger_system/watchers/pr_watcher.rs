@@ -17,6 +17,7 @@ use crate::trigger_system::coord_pr_merge_client::{
 };
 use crate::trigger_system::github_api::{CiStatus, GitHubClient, PrStatus, ReviewStatus};
 use crate::trigger_system::pr_shepherd::{self, PendingPrSeed, SeedIdentity, SeedTarget};
+use crate::trigger_system::pr_shepherd_remediation;
 use crate::unified_workflow_executor::CiFailureContext;
 use crate::AppState;
 
@@ -755,25 +756,29 @@ async fn poll_single_pr(
                 .await?;
         }
         PrAction::GreenButUnmerged { green_for } => {
-            handle_green_but_unmerged(watch, green_for).await;
+            handle_green_but_unmerged(pg_db, watch, green_for, execution_deps).await;
         }
     }
 
     Ok(())
 }
 
-/// PR-shepherd Phase 2/3 seam: the PR has been fully green on an unchanged head
-/// past `QONTINUI_PR_SHEPHERD_GREEN_THRESHOLD` and is still open.
+/// PR-shepherd Phase 2/3/4/5 seam: the PR has been fully green on an unchanged
+/// head past `QONTINUI_PR_SHEPHERD_GREEN_THRESHOLD` and is still open.
 ///
 /// Always emits one structured, coord-independent observability event (Phase 2)
 /// so the condition is visible device-locally even when coord is down. When
 /// Phase-3 diagnosis is enabled (`QONTINUI_PR_SHEPHERD_DIAGNOSE`, default ON
 /// under the master flag), it then asks coord for a verdict, classifies the
-/// disposition, and logs the intended action — **log-only**: the one live side
-/// effect is a single idempotent `reevaluate` nudge per `(pr, head)` on a
-/// suspected coord defect. Notify (Phase 4) and spawn (Phase 5) stay as logged
-/// intents.
-async fn handle_green_but_unmerged(watch: &PrWatchState, green_for: Duration) {
+/// disposition, and EXECUTES the resulting intent: a `reevaluate` nudge, a
+/// device-local author notification (Phase 4), a coord-down local alert
+/// (Phase 4), or a remediation-plan + last-resort vet-imp spawn (Phase 5).
+async fn handle_green_but_unmerged(
+    pg_db: &PgDb,
+    watch: &PrWatchState,
+    green_for: Duration,
+    deps: Option<&PrWatcherDeps>,
+) {
     // Phase-2 event — always emitted, coord-independent (tighter than coord's
     // own 2h `pr_merge_green_unlanded` alert and computed from GitHub data).
     tracing::info!(
@@ -790,14 +795,19 @@ async fn handle_green_but_unmerged(watch: &PrWatchState, green_for: Duration) {
     if !pr_shepherd::diagnose_enabled() {
         return;
     }
-    diagnose_green_but_unmerged(watch, green_for).await;
+    diagnose_green_but_unmerged(pg_db, watch, green_for, deps).await;
 }
 
-/// Phase 3: fetch coord's verdict + evidence, classify the disposition, and log
-/// the intended action. All coord reads are best-effort — an unreachable
-/// verdict/health IS the `CoordDown` signal (the runner's own green witness is
-/// independent of coord).
-async fn diagnose_green_but_unmerged(watch: &PrWatchState, green_for: Duration) {
+/// Phase 3: fetch coord's verdict + evidence, classify the disposition, then
+/// (Phases 4/5) act on the intent. All coord reads are best-effort — an
+/// unreachable verdict/health IS the `CoordDown` signal (the runner's own green
+/// witness is independent of coord).
+async fn diagnose_green_but_unmerged(
+    pg_db: &PgDb,
+    watch: &PrWatchState,
+    green_for: Duration,
+    deps: Option<&PrWatcherDeps>,
+) {
     let parts: Vec<&str> = watch.repo_full_name.splitn(2, '/').collect();
     if parts.len() != 2 {
         tracing::debug!(
@@ -855,9 +865,8 @@ async fn diagnose_green_but_unmerged(watch: &PrWatchState, green_for: Duration) 
     let disposition = coord_pr_merge_client::classify(&input);
     let mut intent = coord_pr_merge_client::decide_action(disposition);
 
-    // CoordDefect: one idempotent reevaluate nudge per (pr, head) before the
-    // escalate intent takes over on the next poll. The escalate-to-Phase-5 path
-    // stays a logged intent in Phase 3.
+    // CoordDefect: one idempotent reevaluate nudge per (pr, head) BEFORE the
+    // escalate intent takes over on the next poll — the cheap fix tried first.
     if let ShepherdDisposition::CoordDefect { class } = disposition {
         if coord_pr_merge_client::claim_reevaluate_once(pr, &watch.head_sha) {
             match client.reevaluate(owner, repo, pr).await {
@@ -883,10 +892,310 @@ async fn diagnose_green_but_unmerged(watch: &PrWatchState, green_for: Duration) 
     }
 
     log_shepherd_intent(watch, disposition, &intent);
+
+    // ---- Phases 4/5: execute the intent -----------------------------------
+    match &intent {
+        ShepherdIntent::Nothing | ShepherdIntent::Reevaluate => {
+            // Transient / just-nudged — nothing to do this poll.
+        }
+        ShepherdIntent::NotifyAuthor { reason } => {
+            // Legitimate hold: notify the author device-locally. Coord may
+            // still own the nudge (it is reachable), so no dead-author fallback
+            // here — a gone author just logs.
+            let body = notify_body(watch, reason, verdict.as_ref());
+            let outcome = notify_author_device_local(watch, reason, &body, deps).await;
+            log_notify_outcome(watch, reason, &outcome);
+        }
+        ShepherdIntent::CoordDownLocalAlert => {
+            // The coord.alert-equivalent the wedged coord cannot emit itself.
+            tracing::warn!(
+                target: "pr_shepherd",
+                repo = %watch.repo_full_name,
+                pr_number = pr,
+                head_sha = %watch.head_sha,
+                green_for_secs = green_for.as_secs(),
+                "pr_shepherd: COORD-DOWN local alert — green PR unlandable while coord is unreachable/leaderless (coord cannot self-report this)"
+            );
+            let kind = "pr_hold_triage";
+            let body = notify_body(watch, kind, verdict.as_ref());
+            let outcome = notify_author_device_local(watch, kind, &body, deps).await;
+            log_notify_outcome(watch, kind, &outcome);
+
+            // Dead-author fallback: coord is down AND the author is gone AND the
+            // task is terminal → orphaned-red bounded fix spawn (Phase 5).
+            if matches!(outcome, NotifyOutcome::AuthorGone) {
+                let author_live = deps
+                    .map(|d| resolve_live_authoring_session(&d.app_handle, watch).is_some())
+                    .unwrap_or(false);
+                let task_terminal = task_is_terminal(pg_db, watch).await;
+                if pr_shepherd_remediation::should_route_orphaned_red(
+                    /* coord_down */ true,
+                    author_live,
+                    task_terminal,
+                ) {
+                    tracing::warn!(
+                        target: "pr_shepherd",
+                        repo = %watch.repo_full_name,
+                        pr_number = pr,
+                        "pr_shepherd: dead author on coord-down green-unlanded PR — routing to orphaned-red fix"
+                    );
+                    let outcome = pr_shepherd_remediation::escalate_orphaned_red(
+                        pg_db,
+                        deps,
+                        &watch.repo_full_name,
+                        pr,
+                    )
+                    .await;
+                    tracing::info!(
+                        target: "pr_shepherd",
+                        pr_number = pr,
+                        outcome = ?outcome,
+                        "pr_shepherd: orphaned-red remediation outcome"
+                    );
+                }
+            }
+        }
+        ShepherdIntent::Escalate { class } => {
+            escalate_coord_defect(
+                pg_db, deps, &client, watch, *class, green_for, verdict.as_ref(),
+                block.as_ref(), graph.as_ref(),
+            )
+            .await;
+        }
+    }
 }
 
-/// Emit the Phase-3 log-only diagnosis: the disposition, defect class (if any),
-/// and the intent Phases 4/5 will act on.
+/// Phase 5 call-site wrapper: run the coexistence rung (i) coord-live-attempt
+/// check, then hand off to `pr_shepherd_remediation::escalate_coord_defect`
+/// (which does the plans-dir + cooldown dedup, plan write, and spawn gate).
+#[allow(clippy::too_many_arguments)]
+async fn escalate_coord_defect(
+    pg_db: &PgDb,
+    deps: Option<&PrWatcherDeps>,
+    client: &CoordPrMergeClient,
+    watch: &PrWatchState,
+    class: coord_pr_merge_client::CoordDefectClass,
+    green_for: Duration,
+    verdict: Option<&coord_pr_merge_client::PrMergeVerdict>,
+    block: Option<&coord_pr_merge_client::BlockDiagnosis>,
+    graph: Option<&coord_pr_merge_client::GraphDiagnosis>,
+) {
+    let pr = watch.pr_number;
+    // NOTE: no process-global escalate once-guard here on purpose — Phase 5 is
+    // deduped by the plans-dir scan + the durable `pr_shepherd_remediations`
+    // cooldown marker (both in `pr_shepherd_remediation`). A once-guard would
+    // wrongly suppress a legitimate re-escalation if coord's own attempt (the
+    // coexistence check below) later dies without landing the PR.
+    let (owner, repo) = match watch.repo_full_name.split_once('/') {
+        Some(pair) => pair,
+        None => return,
+    };
+
+    // Phase 5.4 coexistence rung (i): if coord's own Unlandable Shepherd has a
+    // live attempt for this (PR, head), defer — do NOT double-spawn. The runner
+    // is the last-resort rung; it only fires when NO fleet remediator shows
+    // life. Best-effort: an events blip → not-live → we proceed (a coord-down
+    // outage is exactly when we must act).
+    match client
+        .unlandable_attempt_live(owner, repo, pr, &watch.head_sha, pr_shepherd::remediation_cooldown())
+        .await
+    {
+        Ok(true) => {
+            tracing::info!(
+                target: "pr_shepherd",
+                repo = %watch.repo_full_name,
+                pr_number = pr,
+                defect_class = class.as_str(),
+                "pr_shepherd: coord shepherd has a LIVE attempt for this (PR, head) — deferring last-resort remediation"
+            );
+            return;
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::debug!(
+                target: "pr_shepherd",
+                "pr_shepherd: coexistence attempt-live check failed ({e}) — proceeding as last resort"
+            );
+        }
+    }
+
+    let ctx = pr_shepherd_remediation::RemediationPlanContext {
+        date: Utc::now().format("%Y-%m-%d").to_string(),
+        defect_class: class.as_str().to_string(),
+        suspected_coord_path: class.suspected_coord_path().to_string(),
+        repo_full_name: watch.repo_full_name.clone(),
+        pr_number: pr,
+        head_sha: watch.head_sha.clone(),
+        green_for_secs: green_for.as_secs(),
+        outer_state: verdict.and_then(|v| v.outer_state.clone()),
+        block_reason: verdict.and_then(|v| v.block_reason.clone()),
+        next_action: verdict.map(|v| v.next_action.clone()).unwrap_or_default(),
+        block_detail: block.map(|b| b.detail.clone()).unwrap_or(serde_json::Value::Null),
+        unlandable_cycles: block.and_then(|b| b.unlandable_cycles),
+        cycle_detected: graph.map(|g| g.cycle_detected).unwrap_or(false),
+        cycle_member_count: graph.map(|g| g.cycle_member_count).unwrap_or(0),
+        coord_reachable: verdict.is_some(),
+        leader_healthy: client.health_leader().await.unwrap_or(false),
+    };
+    let outcome = pr_shepherd_remediation::escalate_coord_defect(pg_db, deps, &ctx).await;
+    tracing::info!(
+        target: "pr_shepherd",
+        repo = %watch.repo_full_name,
+        pr_number = pr,
+        defect_class = class.as_str(),
+        outcome = ?outcome,
+        "pr_shepherd: coord-defect remediation outcome"
+    );
+}
+
+/// Compose the device-local author-notify body: repo#PR + the hold reason /
+/// coord's next-action prose. Failing checks + logs are moot in this
+/// green-but-unmerged path (all checks pass), so the body carries the hold
+/// context; the `ci_red_triage` kind + failing-check bodies are reserved for
+/// the red-CI producers (untouched auto-resume path / orphaned-red).
+fn notify_body(
+    watch: &PrWatchState,
+    kind: &str,
+    verdict: Option<&coord_pr_merge_client::PrMergeVerdict>,
+) -> String {
+    let next = verdict
+        .map(|v| v.next_action.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Coord is holding this PR pending author action.");
+    let block = verdict
+        .and_then(|v| v.block_reason.as_deref())
+        .unwrap_or("(unknown)");
+    format!(
+        "Your PR {repo}#{pr} is fully green but not landing ({kind}). Coord block reason: \
+         `{block}`. Coord's next action: {next} — please check the PR and unblock it \
+         (resolve the hold, or coordinate the land).",
+        repo = watch.repo_full_name,
+        pr = watch.pr_number,
+    )
+}
+
+/// Outcome of a Phase-4 device-local author notification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NotifyOutcome {
+    /// Injected into a live local session.
+    Injected,
+    /// Already notified for this (pr, head, kind) — deduped.
+    Deduped,
+    /// The authoring session is not live on this device (or no deps) — nothing
+    /// injected. The caller decides whether the dead-author fallback applies.
+    AuthorGone,
+    /// `QONTINUI_PR_SHEPHERD_NOTIFY` is off.
+    Disabled,
+}
+
+/// Phase 4: deliver an author nudge DIRECTLY into the live local session via
+/// `coordinator::act::send_message_to_worker_via_handle` — the same in-process
+/// injection primitive `session_message_poller` uses AFTER draining coord, NOT
+/// a second coord-mailbox producer. Dedup: one injection per (pr, head, kind),
+/// claimed only on a resolved-live session so a transiently-gone author can
+/// still be notified when it returns (or routed to the dead-author fallback).
+async fn notify_author_device_local(
+    watch: &PrWatchState,
+    kind: &str,
+    body: &str,
+    deps: Option<&PrWatcherDeps>,
+) -> NotifyOutcome {
+    if !pr_shepherd::notify_enabled() {
+        return NotifyOutcome::Disabled;
+    }
+    let Some(deps) = deps else {
+        return NotifyOutcome::AuthorGone;
+    };
+    let Some(session_id) = resolve_live_authoring_session(&deps.app_handle, watch) else {
+        return NotifyOutcome::AuthorGone;
+    };
+    // Claim only now (author is live) — one injection per (pr, head, kind).
+    if !pr_shepherd::claim_notify_once(watch.pr_number, &watch.head_sha, kind) {
+        return NotifyOutcome::Deduped;
+    }
+    let framed = format!(
+        "<system-reminder>PR shepherd {kind} (device-local, coord-independent). \
+         Act on it, then continue. Message: {body}</system-reminder>"
+    );
+    crate::coordinator::act::send_message_to_worker_via_handle(
+        &deps.app_handle,
+        &session_id,
+        &framed,
+    )
+    .await;
+    NotifyOutcome::Injected
+}
+
+/// Resolve a watch's authoring session to a LIVE local runner session id
+/// (task_run_id) to inject into, or `None` if this device isn't hosting it.
+/// Probes, in order: the watch's `task_run_id` directly; the
+/// `authoring_session_id` directly; and the coord-UUID → task_run_id forward
+/// index (`AiCoordRegistrar`). SDK and PTY/Worker sessions both resolve because
+/// `send_message_to_worker_via_handle` dispatches to whichever is live.
+fn resolve_live_authoring_session(
+    app_handle: &tauri::AppHandle,
+    watch: &PrWatchState,
+) -> Option<String> {
+    use tauri::Manager;
+    let sm = app_handle
+        .try_state::<Arc<crate::claude_session::SessionManager>>()?
+        .inner()
+        .clone();
+    let is_live = |id: &str| sm.get(id).is_some() || sm.get_worker(id).is_some();
+
+    if let Some(tr) = watch.task_run_id.as_deref() {
+        if is_live(tr) {
+            return Some(tr.to_string());
+        }
+    }
+    if let Some(sid) = watch.authoring_session_id.as_deref() {
+        if is_live(sid) {
+            return Some(sid.to_string());
+        }
+        if let Some(reg) =
+            app_handle.try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()
+        {
+            if let Ok(uuid) = sid.parse::<uuid::Uuid>() {
+                if let Some(tr) = reg.task_run_id_for(&uuid) {
+                    if is_live(&tr) {
+                        return Some(tr);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Is the watch's authoring task terminal (complete/failed/stopped)? A
+/// session-only watch (no task run) counts as terminal — nothing owns it. Any
+/// DB error is treated as NOT terminal (fail toward not spawning).
+async fn task_is_terminal(pg_db: &PgDb, watch: &PrWatchState) -> bool {
+    let Some(task_run_id) = watch.task_run_id.as_deref() else {
+        return true;
+    };
+    match pg_db.get_task_run(task_run_id).await {
+        Ok(Some(tr)) => matches!(tr.status.as_str(), "complete" | "failed" | "stopped"),
+        Ok(None) => true, // row gone → nothing owns it
+        Err(_) => false,
+    }
+}
+
+/// Log the outcome of a Phase-4 notification attempt.
+fn log_notify_outcome(watch: &PrWatchState, kind: &str, outcome: &NotifyOutcome) {
+    tracing::info!(
+        target: "pr_shepherd",
+        repo = %watch.repo_full_name,
+        pr_number = watch.pr_number,
+        head_sha = %watch.head_sha,
+        kind = kind,
+        outcome = ?outcome,
+        "pr_shepherd: device-local author-notify (phase 4)"
+    );
+}
+
+/// Emit the Phase-3 diagnosis: the disposition, defect class (if any), and the
+/// intent Phases 4/5 act on.
 fn log_shepherd_intent(
     watch: &PrWatchState,
     disposition: ShepherdDisposition,

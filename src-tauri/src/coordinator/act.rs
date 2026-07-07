@@ -850,10 +850,22 @@ async fn dispatch_assignment_brief(
 /// abort the calling action — the user can re-issue from the dashboard if
 /// the message didn't land.
 pub(crate) async fn send_message_to_worker(state: &Arc<ApiState>, session_id: &str, message: &str) {
-    let session_manager = match state
-        .app_handle
-        .try_state::<Arc<crate::claude_session::SessionManager>>()
-    {
+    send_message_to_worker_via_handle(&state.app_handle, session_id, message).await;
+}
+
+/// The `AppHandle`-only variant of [`send_message_to_worker`]. `send_user_message`
+/// only ever needs the `AppHandle` (to reach the `SessionManager` state), so
+/// callers that hold an `AppHandle` but no `Arc<ApiState>` — e.g. the PR
+/// shepherd's device-local author-notify (plan `2026-07-04-runner-pr-shepherd`
+/// Phase 4), which runs inside the PR watcher with only `PrWatcherDeps` —
+/// inject through here without constructing an `ApiState`. `send_message_to_worker`
+/// delegates to this so there is exactly ONE injection primitive.
+pub(crate) async fn send_message_to_worker_via_handle(
+    app_handle: &tauri::AppHandle,
+    session_id: &str,
+    message: &str,
+) {
+    let session_manager = match app_handle.try_state::<Arc<crate::claude_session::SessionManager>>() {
         Some(sm) => sm.inner().clone(),
         None => {
             warn!("send_message_to_worker: SessionManager not available");
