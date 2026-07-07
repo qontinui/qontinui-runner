@@ -12,6 +12,9 @@ use chrono::{DateTime, Utc};
 
 use crate::config_storage::ConfigStorage;
 use crate::database::pg::PgDb;
+use crate::trigger_system::coord_pr_merge_client::{
+    self, CoordPrMergeClient, ShepherdDisposition, ShepherdIntent,
+};
 use crate::trigger_system::github_api::{CiStatus, GitHubClient, PrStatus, ReviewStatus};
 use crate::trigger_system::pr_shepherd::{self, PendingPrSeed, SeedIdentity, SeedTarget};
 use crate::unified_workflow_executor::CiFailureContext;
@@ -752,20 +755,27 @@ async fn poll_single_pr(
                 .await?;
         }
         PrAction::GreenButUnmerged { green_for } => {
-            handle_green_but_unmerged(watch, green_for);
+            handle_green_but_unmerged(watch, green_for).await;
         }
     }
 
     Ok(())
 }
 
-/// PR-shepherd Phase 2 seam: the PR has been fully green on an unchanged head
-/// past `QONTINUI_PR_SHEPHERD_GREEN_THRESHOLD` and is still open. Phase 3
-/// (coord diagnosis + classification) plugs in here; until then the handler
-/// emits one structured info event per poll so the condition is observable
-/// device-locally — deliberately tighter and coord-independent relative to
-/// coord's own `pr_merge_green_unlanded` alert (2h dwell, coord-side).
-fn handle_green_but_unmerged(watch: &PrWatchState, green_for: Duration) {
+/// PR-shepherd Phase 2/3 seam: the PR has been fully green on an unchanged head
+/// past `QONTINUI_PR_SHEPHERD_GREEN_THRESHOLD` and is still open.
+///
+/// Always emits one structured, coord-independent observability event (Phase 2)
+/// so the condition is visible device-locally even when coord is down. When
+/// Phase-3 diagnosis is enabled (`QONTINUI_PR_SHEPHERD_DIAGNOSE`, default ON
+/// under the master flag), it then asks coord for a verdict, classifies the
+/// disposition, and logs the intended action — **log-only**: the one live side
+/// effect is a single idempotent `reevaluate` nudge per `(pr, head)` on a
+/// suspected coord defect. Notify (Phase 4) and spawn (Phase 5) stay as logged
+/// intents.
+async fn handle_green_but_unmerged(watch: &PrWatchState, green_for: Duration) {
+    // Phase-2 event — always emitted, coord-independent (tighter than coord's
+    // own 2h `pr_merge_green_unlanded` alert and computed from GitHub data).
     tracing::info!(
         target: "pr_shepherd",
         watch_id = %watch.id,
@@ -775,6 +785,136 @@ fn handle_green_but_unmerged(watch: &PrWatchState, green_for: Duration) {
         owner = %watch.owner_label(),
         green_for_secs = green_for.as_secs(),
         "pr_shepherd: PR green-but-unmerged past threshold"
+    );
+
+    if !pr_shepherd::diagnose_enabled() {
+        return;
+    }
+    diagnose_green_but_unmerged(watch, green_for).await;
+}
+
+/// Phase 3: fetch coord's verdict + evidence, classify the disposition, and log
+/// the intended action. All coord reads are best-effort — an unreachable
+/// verdict/health IS the `CoordDown` signal (the runner's own green witness is
+/// independent of coord).
+async fn diagnose_green_but_unmerged(watch: &PrWatchState, green_for: Duration) {
+    let parts: Vec<&str> = watch.repo_full_name.splitn(2, '/').collect();
+    if parts.len() != 2 {
+        tracing::debug!(
+            "pr_shepherd: cannot diagnose — invalid repo_full_name {}",
+            watch.repo_full_name
+        );
+        return;
+    }
+    let (owner, repo) = (parts[0], parts[1]);
+    let pr = watch.pr_number;
+
+    let Some(client) = CoordPrMergeClient::new() else {
+        tracing::info!(
+            target: "pr_shepherd",
+            repo = %watch.repo_full_name,
+            pr_number = pr,
+            "pr_shepherd: coord base unconfigured — cannot diagnose green-but-unmerged PR (skipping)"
+        );
+        return;
+    };
+
+    // Primary read (verdict) + evidence reads. Each is best-effort.
+    let verdict = match client.verdict(owner, repo, pr).await {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!(
+                target: "pr_shepherd",
+                repo = %watch.repo_full_name,
+                pr_number = pr,
+                "pr_shepherd: coord verdict unreachable ({e}) — CoordDown candidate"
+            );
+            None
+        }
+    };
+    // `health_leader` failing (Err) → leader not fresh → CoordDown too.
+    let leader_fresh = client.health_leader().await.ok();
+    let block = client.latest_block(owner, repo, pr).await.ok();
+    let graph = client.graph(&watch.repo_full_name, pr).await.ok();
+    let in_queue = client.queue_has(&watch.head_sha).await.unwrap_or(false);
+
+    let ev = coord_pr_merge_client::Evidence {
+        // We reached this handler ONLY because our own GitHubClient saw the PR
+        // fully green — that is the independent witness `CoordDown` needs.
+        github_green: true,
+        verdict: verdict.as_ref(),
+        leader_fresh,
+        block: block.as_ref(),
+        graph: graph.as_ref(),
+        in_queue,
+        current_head: &watch.head_sha,
+        green_for,
+        green_threshold: pr_shepherd::green_threshold(),
+    };
+    let input = coord_pr_merge_client::build_classification_input(&ev);
+    let disposition = coord_pr_merge_client::classify(&input);
+    let mut intent = coord_pr_merge_client::decide_action(disposition);
+
+    // CoordDefect: one idempotent reevaluate nudge per (pr, head) before the
+    // escalate intent takes over on the next poll. The escalate-to-Phase-5 path
+    // stays a logged intent in Phase 3.
+    if let ShepherdDisposition::CoordDefect { class } = disposition {
+        if coord_pr_merge_client::claim_reevaluate_once(pr, &watch.head_sha) {
+            match client.reevaluate(owner, repo, pr).await {
+                Ok(()) => {
+                    intent = ShepherdIntent::Reevaluate;
+                    tracing::info!(
+                        target: "pr_shepherd",
+                        repo = %watch.repo_full_name,
+                        pr_number = pr,
+                        defect_class = class.as_str(),
+                        "pr_shepherd: suspected coord defect — sent one reevaluate nudge (per head)"
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    target: "pr_shepherd",
+                    repo = %watch.repo_full_name,
+                    pr_number = pr,
+                    defect_class = class.as_str(),
+                    "pr_shepherd: reevaluate nudge failed: {e}"
+                ),
+            }
+        }
+    }
+
+    log_shepherd_intent(watch, disposition, &intent);
+}
+
+/// Emit the Phase-3 log-only diagnosis: the disposition, defect class (if any),
+/// and the intent Phases 4/5 will act on.
+fn log_shepherd_intent(
+    watch: &PrWatchState,
+    disposition: ShepherdDisposition,
+    intent: &ShepherdIntent,
+) {
+    let (disp, defect_class) = match disposition {
+        ShepherdDisposition::Transient => ("transient", "-"),
+        ShepherdDisposition::LegitimateHold => ("legitimate_hold", "-"),
+        ShepherdDisposition::CoordDefect { class } => ("coord_defect", class.as_str()),
+        ShepherdDisposition::CoordDown => ("coord_down", "-"),
+    };
+    let intent_str = match intent {
+        ShepherdIntent::Nothing => "nothing".to_string(),
+        ShepherdIntent::NotifyAuthor { reason } => format!("notify_author({reason})"),
+        ShepherdIntent::Reevaluate => "reevaluate".to_string(),
+        ShepherdIntent::Escalate { class } => format!("escalate({})", class.as_str()),
+        ShepherdIntent::CoordDownLocalAlert => "coord_down_local_alert".to_string(),
+    };
+    tracing::info!(
+        target: "pr_shepherd",
+        repo = %watch.repo_full_name,
+        pr_number = watch.pr_number,
+        head_sha = %watch.head_sha,
+        owner = %watch.owner_label(),
+        disposition = disp,
+        defect_class = defect_class,
+        intent = %intent_str,
+        "pr_shepherd: green-but-unmerged diagnosis (phase 3, log-only)"
     );
 }
 
