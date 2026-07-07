@@ -2310,7 +2310,10 @@ mod tests {
             .unwrap()
             .to_string();
 
-        assert_eq!(id1, id2, "must never re-mint / overwrite an existing identity");
+        assert_eq!(
+            id1, id2,
+            "must never re-mint / overwrite an existing identity"
+        );
     }
 
     #[test]
