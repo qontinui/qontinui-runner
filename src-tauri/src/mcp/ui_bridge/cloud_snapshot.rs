@@ -325,6 +325,46 @@ fn top_level_keys(v: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// `GET /ui-bridge/cloud-auth-status`
+///
+/// Diagnostic for the cloud-relay auth path: surfaces the backend URLs the
+/// consumer targets, the relevant [`crate::settings::CloudRelaySettings`] flags,
+/// and whether an access token is retrievable + its expiry — so an opaque `401`
+/// from `/cloud-devices` becomes actionable (wrong backend/env vs an expired or
+/// absent token). Returns metadata only; the token value is never exposed.
+pub async fn ui_bridge_cloud_auth_status_handler(
+    State(_state): State<Arc<ApiState>>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    info!("UI Bridge API: cloud-auth-status");
+
+    let cloud_settings = crate::config_facade::get_setting::<crate::settings::CloudRelaySettings>();
+
+    let auth = crate::auth::AuthManager::new();
+    let token_res = auth.get_access_token();
+    let has_token = token_res.is_ok();
+    let token_error = token_res.as_ref().err().map(|e| e.to_string());
+    let token_exp = auth.access_token_exp();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let token_expired = token_exp.map(|exp| exp <= now);
+    let expires_in_secs = token_exp.map(|exp| exp - now);
+
+    Json(ApiResponse::success(serde_json::json!({
+        "pollerBackendUrl": poller_backend_url(),
+        "transportBackendUrl": transport_backend_url(),
+        "cloudRelayEnabled": cloud_settings.enabled,
+        "deviceBridgeEnabled": cloud_settings.device_bridge_enabled,
+        "hasAccessToken": has_token,
+        "tokenError": token_error,
+        "tokenExp": token_exp,
+        "tokenExpired": token_expired,
+        "expiresInSecs": expires_in_secs,
+        "now": now,
+    })))
+}
+
 /// Cloud-snapshot consumer routes.
 pub fn routes() -> axum::Router<Arc<ApiState>> {
     use axum::routing::get;
@@ -337,6 +377,10 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             "/ui-bridge/cloud-snapshot",
             get(ui_bridge_cloud_snapshot_handler),
         )
+        .route(
+            "/ui-bridge/cloud-auth-status",
+            get(ui_bridge_cloud_auth_status_handler),
+        )
 }
 
 /// Static (method, path) tuples mirroring `routes()`. Concatenated into
@@ -345,6 +389,7 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
     &[
         ("GET", "/ui-bridge/cloud-devices"),
         ("GET", "/ui-bridge/cloud-snapshot"),
+        ("GET", "/ui-bridge/cloud-auth-status"),
     ]
 }
 
@@ -451,7 +496,7 @@ mod tests {
 
     #[test]
     fn route_entries_match_route_count() {
-        assert_eq!(route_entries().len(), 2);
+        assert_eq!(route_entries().len(), 3);
         for (method, path) in route_entries() {
             assert_eq!(*method, "GET");
             assert!(path.starts_with("/ui-bridge/cloud-"));

@@ -745,6 +745,7 @@ mod manifest_drift_tests {
             // analog — the runner is the relay client that owns the tunnel.
             ("GET", "/ui-bridge/cloud-devices"),
             ("GET", "/ui-bridge/cloud-snapshot"),
+            ("GET", "/ui-bridge/cloud-auth-status"),
             // NOTE: vision/* routes are intentionally NOT in any baseline.
             // ui-bridge@^0.8.0 SDK declares all 13 vision routes AND main's
             // #134/#135/#136 (vision-pipeline Phase 3.3/4/6.3) exposes them
