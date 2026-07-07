@@ -2309,6 +2309,7 @@ fn build_continuation_claude_command(
     pinned_session_id: &str,
     add_dir_args: Vec<String>,
     prompt: String,
+    system_prompt: Option<String>,
 ) -> Vec<String> {
     let mut command_vec = vec![
         claude_bin,
@@ -2316,6 +2317,18 @@ fn build_continuation_claude_command(
         "--session-id".to_string(),
         pinned_session_id.to_string(),
     ];
+    // Autonomous spawns exec `claude` directly (no shell wrapping), so unlike
+    // interactive panes they never pick up the shell-integration wrapper's
+    // `--append-system-prompt`. Inject the canonical runner-context briefing
+    // here so the fleet/gate-continuation sessions — the ones acting
+    // unattended against coord and the twin — carry the same capability +
+    // guardrail context an operator's pane gets. Placed among the flags,
+    // BEFORE the `--` end-of-options terminator, so it never disturbs the
+    // trailing-positional-prompt discipline the regression tests below guard.
+    if let Some(sp) = system_prompt {
+        command_vec.push("--append-system-prompt".to_string());
+        command_vec.push(sp);
+    }
     command_vec.extend(add_dir_args);
     command_vec.push("--".to_string());
     command_vec.push(prompt);
@@ -2422,6 +2435,9 @@ async fn run_continuation_terminal(
         &pinned_session_id,
         add_dir_args,
         payload.initial_prompt.clone(),
+        Some(crate::terminal::runner_context(
+            crate::mcp::types::get_mcp_api_port(),
+        )),
     ));
 
     // First repo (if any) is the session's intent_repo for coord attribution.
@@ -2697,6 +2713,9 @@ async fn run_condition_check_terminal(
         &pinned_session_id,
         Vec::new(),
         payload.initial_prompt.clone(),
+        Some(crate::terminal::runner_context(
+            crate::mcp::types::get_mcp_api_port(),
+        )),
     ));
 
     // Account selection (fail-loud) — identical posture to the gate path so the
@@ -4141,6 +4160,7 @@ mod tests {
             "abc-123",
             vec!["--add-dir=D:/wt/sibling".to_string()],
             "do the thing".to_string(),
+            None,
         );
         assert_eq!(
             cmd.join("|"),
@@ -4164,6 +4184,7 @@ mod tests {
                 "--add-dir=D:/wt/web".to_string(),
             ],
             "run /implement-plan plans/x.md".to_string(),
+            None,
         );
         assert_eq!(
             cmd.last().map(String::as_str),
@@ -4190,12 +4211,53 @@ mod tests {
             "abc-123",
             vec![],
             "-prompt with dash".to_string(),
+            None,
         );
         assert_eq!(
             cmd.join("|"),
             "claude|--dangerously-skip-permissions|--session-id|abc-123|\
              --|-prompt with dash"
         );
+    }
+
+    /// The autonomous (direct-exec) path injects the runner-context briefing as
+    /// `--append-system-prompt <text>` — placed AFTER the pinned `--session-id`
+    /// and BEFORE the `--` terminator, so it never disturbs the trailing
+    /// positional prompt even when sibling `--add-dir=` args are present.
+    #[test]
+    fn continuation_command_injects_system_prompt_before_terminator() {
+        let cmd = build_continuation_claude_command(
+            "claude".to_string(),
+            "abc-123",
+            vec!["--add-dir=D:/wt/coord".to_string()],
+            "do the thing".to_string(),
+            Some("You are inside the Qontinui Runner.".to_string()),
+        );
+        // The prompt stays the trailing positional behind `--`.
+        assert_eq!(cmd.last().map(String::as_str), Some("do the thing"));
+        assert_eq!(
+            cmd.get(cmd.len() - 2).map(String::as_str),
+            Some("--"),
+            "the terminator must still immediately precede the prompt"
+        );
+        // The flag + value pair is present, together, ahead of the terminator.
+        let flag = cmd
+            .iter()
+            .position(|a| a == "--append-system-prompt")
+            .expect("--append-system-prompt must be injected");
+        let term = cmd.iter().position(|a| a == "--").unwrap();
+        assert!(
+            flag < term,
+            "system prompt flag must precede the terminator"
+        );
+        assert_eq!(
+            cmd.get(flag + 1).map(String::as_str),
+            Some("You are inside the Qontinui Runner."),
+            "the briefing text must immediately follow its flag"
+        );
+        // Session id is still pinned before the injected flag.
+        let sid = cmd.iter().position(|a| a == "--session-id").unwrap();
+        assert!(sid < flag, "--session-id must precede the injected flag");
     }
 
     #[test]
