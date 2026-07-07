@@ -648,8 +648,8 @@ async fn finalize_signed_in(
     base: String,
 ) -> Result<CognitoSignInResponse, AppError> {
     use qontinui_runner_lib::pair::{
-        pair_with_auth_token_with_ids, persist_pairing, read_device_id_from_disk,
-        tenant_id_from_oauth_claim,
+        ensure_device_initialized, pair_with_auth_token_with_ids, persist_pairing,
+        read_device_id_from_disk, tenant_id_from_oauth_claim,
     };
 
     // 2. Persist the Cognito user tokens in the distinct oauth slots.
@@ -666,7 +666,10 @@ async fn finalize_signed_in(
             AppError::Raw(format!("persist Cognito tokens: {e}"))
         })?;
 
-    // 3. Device identity from disk.
+    // 3. Device identity from disk. Mint it first if a fresh install never
+    //    ran `device init` (startup already does this, but sign-in self-heals
+    //    the edge case rather than dead-ending the user with a CLI hint).
+    ensure_device_initialized();
     let device_id = read_device_id_from_disk().map_err(|e| {
         error!("finalize_signed_in: step 3 (read_device_id_from_disk) failed: {e}");
         AppError::Raw(format!("could not read device identity: {e}"))

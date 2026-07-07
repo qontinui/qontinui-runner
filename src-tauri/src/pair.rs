@@ -243,6 +243,93 @@ pub fn ensure_device_id_persisted_at(path: &std::path::Path) {
     );
 }
 
+/// Ensure the per-device identity file `~/.qontinui/machine.json` EXISTS,
+/// minting it on first launch.
+///
+/// A fresh production install has no identity file. The sign-in chain
+/// (`crate::commands::auth::finalize_signed_in` step 3) and the pair-cli both
+/// call [`read_device_id_from_disk`], which hard-errors when the file is
+/// absent ("device not initialized — run `qontinui_profile device init`").
+/// No end user runs that CLI, so the runner mints the identity itself: a
+/// client-side UUID v4 + hostname, written atomically — the exact shape and
+/// recipe as `qontinui_profile device init`
+/// (`bin/qontinui_profile.rs::cmd_device_init`). Coord-side registration is
+/// intentionally NOT done here; it happens during sign-in
+/// (`pair_with_auth_token_with_ids`, which binds the device to the
+/// authenticated user + tenant server-side) or via the CLI's own coord UPSERT.
+///
+/// Idempotent + fail-open (never panics; safe to call on every launch):
+/// - Existing file → keep the UUID, delegate to [`ensure_device_id_persisted`]
+///   to backfill the canonical `device_id` key. Never overwrites an identity.
+/// - Missing file → mint `{device_id, hostname}` and write it.
+/// - Any error (no home dir, mkdir / write / rename failure) → logged and
+///   swallowed; the caller proceeds and, if the mint genuinely failed, the
+///   downstream read still surfaces the original clear error.
+pub fn ensure_device_initialized() {
+    let Some(path) = machine_file_path() else {
+        tracing::warn!("ensure_device_initialized: could not resolve home directory — skipping");
+        return;
+    };
+    ensure_device_initialized_at(&path);
+}
+
+/// Path-parameterized core of [`ensure_device_initialized`] (testable without
+/// touching the real home directory).
+pub fn ensure_device_initialized_at(path: &std::path::Path) {
+    if path.exists() {
+        // Existing identity: preserve the UUID, just normalize the key.
+        ensure_device_id_persisted_at(path);
+        return;
+    }
+    let device_id = uuid::Uuid::new_v4().to_string();
+    let hostname = hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .unwrap_or_else(|| "unknown".to_string());
+    // Same on-disk shape as DeviceFile in the sidecar ({device_id, hostname};
+    // `name` is optional and omitted). Sibling readers alias machine_id.
+    let body = serde_json::json!({ "device_id": device_id, "hostname": hostname });
+    let pretty = match serde_json::to_vec_pretty(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("ensure_device_initialized: serialize failed: {e}");
+            return;
+        }
+    };
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!(
+                "ensure_device_initialized: mkdir {} failed: {e}",
+                parent.display()
+            );
+            return;
+        }
+    }
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp, &pretty) {
+        tracing::warn!(
+            "ensure_device_initialized: write {} failed: {e}",
+            tmp.display()
+        );
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        tracing::warn!(
+            "ensure_device_initialized: rename {} → {} failed: {e}",
+            tmp.display(),
+            path.display()
+        );
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    tracing::info!(
+        "machine.json: minted device identity {} (host={}) at {}",
+        device_id,
+        hostname,
+        path.display()
+    );
+}
+
 /// Path to the paired-user JSON written by `device pair` and read by
 /// `device init` to attach a `user_id` to the register payload. Lives
 /// under the Tauri app's local data directory (alongside
@@ -2170,6 +2257,81 @@ mod tests {
         // File does not exist.
         ensure_device_id_persisted_at(&path);
         assert!(!path.exists(), "must not create the file");
+    }
+
+    // ------------------------------------------------------------------------
+    // ensure_device_initialized_at — mint machine.json on a fresh install so a
+    // production user never hits "device not initialized — run
+    // `qontinui_profile device init`". Tempdir-scoped; never touches real home.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn autoinit_mints_identity_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("machine.json");
+        assert!(!path.exists());
+
+        ensure_device_initialized_at(&path);
+
+        assert!(path.exists(), "must mint machine.json on a fresh install");
+        let v = read_json(&path);
+        let id = v
+            .get("device_id")
+            .and_then(|x| x.as_str())
+            .expect("device_id present");
+        // A real UUID v4, not empty / placeholder.
+        uuid::Uuid::parse_str(id).expect("device_id is a valid UUID");
+        assert!(
+            v.get("hostname").and_then(|x| x.as_str()).is_some(),
+            "hostname recorded"
+        );
+        // The minted file must parse under the same MachineFile reader that
+        // errored before the fix (device_id present + deserializable).
+        let parsed: MachineFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(parsed.device_id, id);
+    }
+
+    #[test]
+    fn autoinit_preserves_uuid_on_second_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("machine.json");
+
+        ensure_device_initialized_at(&path);
+        let id1 = read_json(&path)
+            .get("device_id")
+            .and_then(|x| x.as_str())
+            .unwrap()
+            .to_string();
+
+        ensure_device_initialized_at(&path);
+        let id2 = read_json(&path)
+            .get("device_id")
+            .and_then(|x| x.as_str())
+            .unwrap()
+            .to_string();
+
+        assert_eq!(id1, id2, "must never re-mint / overwrite an existing identity");
+    }
+
+    #[test]
+    fn autoinit_keeps_legacy_id_and_backfills() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("machine.json");
+        // Operator's legacy machine_id-only file: keep the id, don't re-mint.
+        std::fs::write(&path, r#"{"machine_id":"legacy-abc","hostname":"laptop"}"#).unwrap();
+
+        ensure_device_initialized_at(&path);
+
+        let v = read_json(&path);
+        assert_eq!(
+            v.get("device_id").and_then(|x| x.as_str()),
+            Some("legacy-abc"),
+            "existing identity preserved (backfill, not re-mint)"
+        );
+        assert_eq!(
+            v.get("machine_id").and_then(|x| x.as_str()),
+            Some("legacy-abc")
+        );
     }
 
     #[test]
