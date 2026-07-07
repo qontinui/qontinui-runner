@@ -21,7 +21,9 @@ import {
   reduceCreatedTerminal,
   shouldIngestCreatedTerminal,
   nextActiveIdAfterIngest,
+  backfillClaudeSessionIds,
   type TerminalTab,
+  type SessionIdsByTerminal,
 } from "./useTerminalManager";
 
 const tab = (id: string, overrides: Partial<TerminalTab> = {}): TerminalTab => ({
@@ -239,5 +241,46 @@ describe("applyBypassMark", () => {
     const tabs = [tab("bypass-tab")];
     applyBypassMark(tabs, "bypass-tab");
     expect(tabs[0].bypassPermissions).toBeUndefined();
+  });
+});
+
+// Rehydrating `claudeSessionId` onto reconnected/other tabs from the
+// durable-store index `terminal_list` returns. This is what makes the
+// per-session PR dropdown (and any session-scoped UI) mount for a
+// reconnected session, whose `TerminalInfo` carries no session id.
+describe("backfillClaudeSessionIds", () => {
+  const map: SessionIdsByTerminal = {
+    "term-1": { claudeSessionId: "sess-1", configDir: "/cfg/1" },
+    "term-2": { claudeSessionId: "sess-2" },
+  };
+
+  it("fills claudeSessionId + configDir for a tab missing them", () => {
+    const out = backfillClaudeSessionIds([tab("term-1")], map);
+    expect(out[0].claudeSessionId).toBe("sess-1");
+    expect(out[0].claudeConfigDir).toBe("/cfg/1");
+  });
+
+  it("never overwrites a session id already captured live", () => {
+    const live = tab("term-1", { claudeSessionId: "live-captured", claudeConfigDir: "/live" });
+    const out = backfillClaudeSessionIds([live], map);
+    expect(out[0].claudeSessionId).toBe("live-captured");
+    expect(out[0].claudeConfigDir).toBe("/live");
+  });
+
+  it("preserves an existing claudeConfigDir when only the id is backfilled", () => {
+    const t = tab("term-2", { claudeConfigDir: "/pre-existing" });
+    const out = backfillClaudeSessionIds([t], map);
+    expect(out[0].claudeSessionId).toBe("sess-2");
+    expect(out[0].claudeConfigDir).toBe("/pre-existing");
+  });
+
+  it("returns the SAME array reference when nothing changed (no-op sweep)", () => {
+    const tabs = [tab("term-1", { claudeSessionId: "sess-1" }), tab("no-record")];
+    expect(backfillClaudeSessionIds(tabs, map)).toBe(tabs);
+  });
+
+  it("leaves tabs with no matching record untouched", () => {
+    const out = backfillClaudeSessionIds([tab("unknown-term")], map);
+    expect(out[0].claudeSessionId).toBeUndefined();
   });
 });

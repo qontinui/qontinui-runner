@@ -240,6 +240,44 @@ export function applyBypassMark(
   return { tabs: next, buffered: false };
 }
 
+/** The `terminal_id -> { claudeSessionId, configDir }` shape `terminal_list`
+ * returns as `sessionIdsByTerminal`, derived from the durable lifecycle
+ * store. */
+export type SessionIdsByTerminal = Record<
+  string,
+  { claudeSessionId?: string; configDir?: string | null }
+>;
+
+/**
+ * Attach `claudeSessionId` (and `claudeConfigDir`) to any tab that is
+ * MISSING one, from the durable-store index. Pure — the reconnect path and
+ * the periodic reconcile both funnel through this.
+ *
+ * Only fills gaps: a tab that already has a `claudeSessionId` (e.g. one
+ * captured live from a fresh spawn) is never overwritten. Returns the SAME
+ * array reference when nothing changed, so callers can pass it straight to a
+ * `setTabs` updater without forcing a re-render on a no-op sweep.
+ */
+export function backfillClaudeSessionIds(
+  tabs: TerminalTab[],
+  map: SessionIdsByTerminal,
+): TerminalTab[] {
+  let changed = false;
+  const next = tabs.map((t) => {
+    const sid = map[t.id];
+    if (!t.claudeSessionId && sid?.claudeSessionId) {
+      changed = true;
+      return {
+        ...t,
+        claudeSessionId: sid.claudeSessionId,
+        claudeConfigDir: t.claudeConfigDir ?? sid.configDir ?? undefined,
+      };
+    }
+    return t;
+  });
+  return changed ? next : tabs;
+}
+
 // `TerminalInfo` is imported from `@qontinui/shared-types/tauri-events` —
 // generated from the canonical Rust struct in
 // `qontinui-schemas/rust/src/terminal.rs`. Field names are camelCase via
@@ -405,6 +443,17 @@ export function useTerminalManager(pageId: string = "default", windowLabel: stri
       const terminals = (result.data as { terminals: TerminalInfo[] }).terminals;
       if (!terminals || terminals.length === 0) return null;
 
+      // `TerminalInfo` carries no Claude session id, so a reconnected tab
+      // would otherwise come back with `claudeSessionId: undefined` and any
+      // session-scoped UI (e.g. the per-session PR dropdown) would never
+      // mount for it. `terminal_list` now returns the durable-store's
+      // `terminal_id -> { claudeSessionId, configDir }` index; attach it at
+      // tab-build time so reconnected sessions light up immediately, without
+      // waiting on the transcript-poll backfill (which only runs for fresh
+      // spawns).
+      const sessionIdsByTerminal =
+        (result.data as { sessionIdsByTerminal?: SessionIdsByTerminal }).sessionIdsByTerminal ?? {};
+
       // Filter to terminals belonging to this page
       const pageTerminals = terminals.filter((t) => (t.pageId || "default") === pageId);
 
@@ -421,16 +470,21 @@ export function useTerminalManager(pageId: string = "default", windowLabel: stri
       logger.info(`Reconnecting to ${alive.length} existing PTY session(s)`);
 
       // Rebuild tabs from Rust session data (already sorted by created_at)
-      const reconnectedTabs: TerminalTab[] = alive.map((info) => ({
-        id: info.id,
-        title: info.title,
-        pid: info.pid ?? null,
-        isAlive: info.isAlive,
-        exitCode: info.exitCode ?? null,
-        workingDir: info.workingDir || undefined,
-        createdAt: info.createdAt,
-        isReconnecting: true,
-      }));
+      const reconnectedTabs: TerminalTab[] = alive.map((info) => {
+        const sid = sessionIdsByTerminal[info.id];
+        return {
+          id: info.id,
+          title: info.title,
+          pid: info.pid ?? null,
+          isAlive: info.isAlive,
+          exitCode: info.exitCode ?? null,
+          workingDir: info.workingDir || undefined,
+          createdAt: info.createdAt,
+          isReconnecting: true,
+          claudeSessionId: sid?.claudeSessionId,
+          claudeConfigDir: sid?.configDir ?? undefined,
+        };
+      });
 
       // Update nextTitleNum to avoid collisions
       for (const tab of reconnectedTabs) {
@@ -473,6 +527,38 @@ export function useTerminalManager(pageId: string = "default", windowLabel: stri
   const markReconnected = useCallback((id: string) => {
     setTabs((prev) => prev.map((t) => (t.id === id ? { ...t, isReconnecting: false } : t)));
   }, []);
+
+  /**
+   * Catch-all backfill of `claudeSessionId` for any tab still missing it,
+   * from the durable-store index `terminal_list` returns
+   * (`sessionIdsByTerminal`).
+   *
+   * The reconnect path attaches ids at tab-build time and fresh spawns get
+   * theirs from the transcript poll / shell-integration; this periodic sweep
+   * guarantees EVERY session with a recorded id ends up with it on its tab —
+   * including one whose durable record was written *after* the initial
+   * reconnect, or a tab created outside the spawn-poll path. It only fills
+   * MISSING ids (never overwrites a live-captured one) and no-ops when
+   * nothing changed, so it can't fight the other writers or churn renders.
+   */
+  const reconcileClaudeSessionIds = useCallback(async () => {
+    try {
+      const result = await invoke<CommandResponse>("terminal_list");
+      if (!result.success || !result.data) return;
+      const map =
+        (result.data as { sessionIdsByTerminal?: SessionIdsByTerminal }).sessionIdsByTerminal ?? {};
+      if (Object.keys(map).length === 0) return;
+      setTabs((prev) => backfillClaudeSessionIds(prev, map));
+    } catch {
+      // Best-effort backfill; the reconnect + transcript-poll writers still
+      // cover the common cases if this sweep transiently fails.
+    }
+  }, []);
+
+  useEffect(() => {
+    const timer = setInterval(() => void reconcileClaudeSessionIds(), 30_000);
+    return () => clearInterval(timer);
+  }, [reconcileClaudeSessionIds]);
 
   const createTerminal = useCallback(
     async (title?: string, workingDir?: string, tenantId?: string): Promise<string | null> => {
