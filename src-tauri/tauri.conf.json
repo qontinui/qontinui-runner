@@ -28,9 +28,6 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": {
-      "resources/qontinui-setup-mcp/src/qontinui_setup_mcp": "qontinui-setup-mcp/src/qontinui_setup_mcp"
-    },
     "externalBin": ["binaries/qontinui_profile"],
     "createUpdaterArtifacts": false
   },
