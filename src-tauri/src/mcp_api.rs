@@ -2139,13 +2139,18 @@ pub fn create_router(
     }
 
     // Restore persisted coord-mcp proxy nonces + reconcile session configs to
-    // the current bound port (plan 2026-06-13 Phases 3b + 3c). 3b makes an
-    // already-written `.mcp.json` keep validating across a restart (the nonce
-    // is a loopback-only key, persisted at rest under COORD_MCP_PERSIST_NONCES);
-    // 3c rewrites any live session whose proxy URL names a stale port back to
-    // the instance's current bound port. Ordered AFTER the restore so a rewrite
-    // reuses the restored map where possible, and guarded by
-    // `coord_mcp_safe_to_write` so it never clobbers an agent-spawn config.
+    // the current bound port (plan 2026-06-13 Phases 3b + 3c, plan 2026-07-07
+    // Change 1). 3b makes an already-written `.mcp.json` keep validating across a
+    // restart (the nonce is a loopback-only key, persisted at rest under
+    // COORD_MCP_PERSIST_NONCES); 3c rewrites any live session whose proxy URL
+    // names a stale port back to the instance's current bound port. Ordered
+    // AFTER the restore so a rewrite reuses the restored map where possible, and
+    // guarded by `coord_mcp_safe_to_write` so it never clobbers an agent-spawn
+    // config. Root self-heal (`reconcile_root_config`) runs UNCONDITIONALLY —
+    // NOT gated on session presence — so a boot with zero open sessions still
+    // repairs a stale-port root config (plan 2026-07-07 Change 1 secondary gap),
+    // and adopts (rather than rewrites) the on-disk nonce on a same-port restart
+    // so a live MCP client's cached nonce keeps validating (Change 1 core fix).
     {
         let reconcile_app_handle = app_handle.clone();
         let reconcile_bound_port = api_state
@@ -2154,8 +2159,11 @@ pub fn create_router(
             .load(std::sync::atomic::Ordering::Relaxed);
         tokio::spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-            // Phase 3b — restore the persisted nonce map FIRST (run-once).
-            crate::coord_mcp::restore_proxy_nonces_from_store();
+            // Phase 3b — restore the persisted nonce map FIRST (run-once). The
+            // restored count is half of the Change-2 observability signal: if it
+            // is 0 and root self-heal then has to Rewrite, a silent nonce
+            // rotation just happened (the exact incident this plan fixes).
+            let restored = crate::coord_mcp::restore_proxy_nonces_from_store();
 
             // Phase 3c — reconcile live session `.mcp.json` ports. Pull the live
             // session workdirs from the managed lifecycle store (open records).
@@ -2171,14 +2179,35 @@ pub fn create_router(
                     .collect(),
                 None => Vec::new(),
             };
-            if !workdirs.is_empty() {
-                let rewritten =
-                    crate::coord_mcp::reconcile_session_configs(workdirs, reconcile_bound_port);
-                if rewritten > 0 {
-                    info!(
-                        "coord_mcp boot reconcile: rewrote {rewritten} session config(s) to bound port :{reconcile_bound_port}"
-                    );
-                }
+            let session_rewritten = if workdirs.is_empty() {
+                0
+            } else {
+                crate::coord_mcp::reconcile_session_configs(workdirs, reconcile_bound_port)
+            };
+
+            // Plan 2026-07-07 Change 1 secondary gap: root self-heal ALWAYS runs,
+            // independent of session presence. Change 1 core fix: on a same-port
+            // restart this ADOPTS the on-disk nonce (no file rewrite) instead of
+            // minting a fresh one that would strand a live client's cached nonce.
+            let root_action = crate::coord_mcp::reconcile_root_config(reconcile_bound_port);
+
+            // Change 2 observability: one structured summary of restore vs
+            // self-heal so a future silent rotation (restored=0 → root Rewrite) is
+            // greppable. A root `Rewrite` after `restored == 0` is the smell.
+            info!(
+                "coord_mcp boot reconcile: restored {restored} persisted nonce(s), \
+                 rewrote {session_rewritten} session config(s), root self-heal = {root_action:?} \
+                 (bound port :{reconcile_bound_port})"
+            );
+            if matches!(root_action, crate::coord_mcp::RootReconcileAction::Rewrite)
+                && restored == 0
+            {
+                warn!(
+                    "coord_mcp: root .mcp.json was REWRITTEN with a fresh nonce after restoring 0 \
+                     persisted nonces — a live MCP client that cached the prior nonce will 401 \
+                     until it reconnects (`/mcp` reconnect). Investigate why the persisted nonce \
+                     did not restore (COORD_MCP_PERSIST_NONCES, secure storage, or snapshot gap)."
+                );
             }
         });
     }
