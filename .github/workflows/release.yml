@@ -462,4 +462,5 @@ jobs:
           gh release edit "v${{ needs.create-release.outputs.release_version }}" \
             --repo "${{ github.repository }}" \
             --draft=false \
-            --prerelease=false
+            --prerelease=false \
+            --latest
