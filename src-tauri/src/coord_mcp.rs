@@ -203,6 +203,65 @@ fn proxy_nonces() -> &'static Mutex<HashMap<String, NonceBinding>> {
     PROXY_NONCES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Grace window (plan 2026-07-07-coord-mcp-nonce-survives-runner-restart,
+/// Change 3, defense in depth): a DEVICE nonce evicted by a same-workdir re-mint
+/// stays valid for this long so an in-flight MCP client that cached it rides
+/// through until it reconnects and re-reads the freshly-written `.mcp.json` (the
+/// client never re-reads the file mid-connection, so a hard eviction 401s it the
+/// instant the file is rewritten). Bounded — the accept-set widening lasts only
+/// this window, and only for a device nonce the runner itself just superseded.
+/// AGENT nonces are NEVER graced: they must hard-fail closed on re-mint/restart
+/// (the scope-elevation non-goal, OQ3).
+const NONCE_GRACE_TTL: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// A device nonce kept transiently valid after eviction, with its expiry.
+struct GracedNonce {
+    expires_at: std::time::Instant,
+}
+
+/// Transient grace registry: an evicted DEVICE nonce → its expiry. Separate from
+/// [`PROXY_NONCES`] so the live map stays the single source of truth for a
+/// currently-provisioned nonce and grace never reaches disk (it is process-local
+/// and intentionally forgotten across a restart — Change 1's adopt-on-disk path
+/// owns cross-restart continuity).
+static GRACED_NONCES: OnceLock<Mutex<HashMap<String, GracedNonce>>> = OnceLock::new();
+
+fn graced_nonces() -> &'static Mutex<HashMap<String, GracedNonce>> {
+    GRACED_NONCES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Move DEVICE nonces just evicted for `_workdir` into the grace registry with a
+/// [`NONCE_GRACE_TTL`] expiry, opportunistically pruning expired entries so the
+/// map stays bounded. Only device nonces are passed here (the caller filters);
+/// agent nonces are dropped outright to fail closed.
+fn grace_evicted_device_nonces(nonces: &[String]) {
+    if nonces.is_empty() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let expires_at = now + NONCE_GRACE_TTL;
+    let mut graced = graced_nonces().lock().expect("graced nonce map poisoned");
+    graced.retain(|_, g| g.expires_at > now);
+    for n in nonces {
+        graced.insert(n.clone(), GracedNonce { expires_at });
+    }
+}
+
+/// True iff `nonce` is a DEVICE nonce still inside its grace TTL (Change 3).
+/// Lazily evicts it once expired so grace fails closed exactly at the deadline.
+fn graced_nonce_is_valid(nonce: &str) -> bool {
+    let now = std::time::Instant::now();
+    let mut graced = graced_nonces().lock().expect("graced nonce map poisoned");
+    match graced.get(nonce) {
+        Some(g) if g.expires_at > now => true,
+        Some(_) => {
+            graced.remove(nonce);
+            false
+        }
+        None => false,
+    }
+}
+
 /// Project the live nonce map down to the DEVICE-only `nonce → workdir` shape
 /// the encrypted store persists (OQ3): agent bindings are dropped so they never
 /// reach disk. The store contract is unchanged (`HashMap<String, String>`), so
@@ -273,21 +332,31 @@ fn persist_proxy_nonces_with_store(
 /// practice — the persisted set predates this process). No-op when persistence
 /// is disabled. Wire this into the same startup path as the other auto-start
 /// tasks so already-written `.mcp.json` nonces keep validating post-restart.
-pub(crate) fn restore_proxy_nonces_from_store() {
+/// Returns the number of nonces in the live registry after the restore merge
+/// (0 when persistence is disabled, storage is unavailable, or nothing was
+/// persisted). The count is surfaced by the boot task (plan 2026-07-07 Change 2
+/// observability) so a future silent rotation — restore brought back 0 then
+/// self-heal had to mint fresh — is visible in the logs.
+pub(crate) fn restore_proxy_nonces_from_store() -> usize {
     if !nonce_persistence_enabled() {
-        return;
+        return 0;
     }
     if PROXY_NONCES_RESTORED.set(()).is_err() {
-        return; // already restored once this process
+        // Already restored once this process — report the current live size so a
+        // duplicate boot-task run still logs a coherent count.
+        return proxy_nonces()
+            .lock()
+            .expect("proxy nonce map poisoned")
+            .len();
     }
     let store = match crate::secure_storage::SecureStorage::new() {
         Ok(s) => s,
         Err(e) => {
             warn!("coord_mcp: secure storage unavailable, cannot restore proxy nonces: {e}");
-            return;
+            return 0;
         }
     };
-    restore_proxy_nonces_from(&store);
+    restore_proxy_nonces_from(&store)
 }
 
 /// Merge the persisted nonce set from the GIVEN store into the live in-memory
@@ -364,6 +433,17 @@ fn mint_and_register_nonce(
     );
     let snapshot = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
+        // Change 3: collect the DEVICE nonces being evicted for this workdir so
+        // they ride a short grace TTL — an in-flight client that cached one keeps
+        // validating until it reconnects. Agent nonces are NOT graced (they must
+        // hard-fail closed on re-mint), so they are simply dropped by `retain`.
+        let evicted_device: Vec<String> = map
+            .iter()
+            .filter(|(n, b)| {
+                b.workdir == workdir && b.principal == ProxyPrincipal::Device && *n != &nonce
+            })
+            .map(|(n, _)| n.clone())
+            .collect();
         map.retain(|_, b| b.workdir != workdir);
         map.insert(
             nonce.clone(),
@@ -372,6 +452,7 @@ fn mint_and_register_nonce(
                 principal,
             },
         );
+        grace_evicted_device_nonces(&evicted_device);
         map.clone()
     };
     (nonce, snapshot)
@@ -406,13 +487,19 @@ pub(crate) fn workdir_for_nonce(nonce: &str) -> Option<String> {
         .map(|b| b.workdir.clone())
 }
 
-/// True iff `nonce` is a currently-registered per-session proxy key.
+/// True iff `nonce` is a currently-registered per-session proxy key OR a DEVICE
+/// nonce still inside its post-eviction grace TTL (Change 3). The live-map lock
+/// is taken and released before the grace check so the two maps are never held
+/// at once.
 pub(crate) fn proxy_nonce_is_valid(nonce: &str) -> bool {
-    !nonce.is_empty()
-        && proxy_nonces()
-            .lock()
-            .expect("proxy nonce map poisoned")
-            .contains_key(nonce)
+    if nonce.is_empty() {
+        return false;
+    }
+    let in_live = proxy_nonces()
+        .lock()
+        .expect("proxy nonce map poisoned")
+        .contains_key(nonce);
+    in_live || graced_nonce_is_valid(nonce)
 }
 
 /// Resolve the [`ProxyPrincipal`] a registered nonce is bound to. `None` for an
@@ -424,11 +511,16 @@ pub(crate) fn proxy_principal_for_nonce(nonce: &str) -> Option<ProxyPrincipal> {
     if nonce.is_empty() {
         return None;
     }
-    proxy_nonces()
+    let live = proxy_nonces()
         .lock()
         .expect("proxy nonce map poisoned")
         .get(nonce)
-        .map(|b| b.principal.clone())
+        .map(|b| b.principal.clone());
+    // Grace fallback (Change 3): only DEVICE nonces are ever graced, so a graced
+    // hit resolves to a Device principal — the handler then injects the live
+    // device JWT and `proxy_request_gate` still enforces device-nonce ⇒
+    // device-bearer (no scope-elevation surface).
+    live.or_else(|| graced_nonce_is_valid(nonce).then_some(ProxyPrincipal::Device))
 }
 
 /// Pre-forward gate for the loopback `/coord-mcp` proxy route. Pure over its
@@ -1036,6 +1128,65 @@ pub(crate) fn reconcile_action(
     }
 }
 
+/// Boot-time self-heal decision for the ROOT `.mcp.json` (plan
+/// 2026-07-07-coord-mcp-nonce-survives-runner-restart, Change 1). Finer-grained
+/// than [`ReconcileAction`] because the root path can heal WITHOUT rewriting the
+/// file — which is the whole point: a live MCP client caches the nonce from
+/// `.mcp.json` at connect and NEVER re-reads it, so any file rewrite (even a
+/// byte-different one on the same port) strands that client on a nonce the new
+/// registry evicted. Adopting the on-disk nonce instead keeps the file
+/// byte-identical, so the client's cached nonce keeps validating across a
+/// restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootReconcileAction {
+    /// Healthy (port matches AND the on-disk nonce is currently registered), or
+    /// not our config to touch (absent / static-bearer shape) — do nothing.
+    Leave,
+    /// Adopt the exact on-disk nonce into the live registry as this workdir's
+    /// Device binding — NO file rewrite. Produced only when the proxy port still
+    /// matches, a non-empty nonce IS readable from disk, but that nonce is not in
+    /// the live registry (evicted on a re-provision, or never restored on boot).
+    AdoptNonce,
+    /// Mint a fresh nonce and rewrite the file to the current bound port.
+    /// Produced when the port moved (a live client must reconnect regardless, so
+    /// preserving the old nonce buys nothing) OR no nonce is readable from disk.
+    Rewrite,
+}
+
+/// Pure resolver for [`RootReconcileAction`] — decoupled from file I/O so the
+/// adopt-vs-rewrite decision is unit-testable against explicit inputs. Inputs:
+/// the proxy port currently written to the root file (`None` = absent /
+/// unparseable / static-bearer shape), the nonce string readable from that file
+/// (`None` = no proxy-key header), whether that nonce is currently in the live
+/// registry, and the instance's bound port.
+pub(crate) fn root_reconcile_action(
+    current_proxy_port: Option<u16>,
+    on_disk_nonce: Option<&str>,
+    nonce_is_registered: bool,
+    bound_port: u16,
+) -> RootReconcileAction {
+    let Some(port) = current_proxy_port else {
+        // Not our proxy shape (absent / unparseable / static-bearer agent
+        // config) — never touched here.
+        return RootReconcileAction::Leave;
+    };
+    if port != bound_port {
+        // Port moved: the client's cached URL is stale too, so it must reconnect
+        // to reach the live port regardless — mint fresh + rewrite.
+        return RootReconcileAction::Rewrite;
+    }
+    // Port matches — the only remaining staleness is the nonce.
+    match on_disk_nonce {
+        // A non-empty nonce is readable but not registered → adopt it so the
+        // live client's cached nonce validates again without a file change.
+        Some(nonce) if !nonce.is_empty() && !nonce_is_registered => RootReconcileAction::AdoptNonce,
+        // A registered nonce → healthy, nothing to do.
+        Some(_) if nonce_is_registered => RootReconcileAction::Leave,
+        // No nonce readable (or an empty one) → nothing to adopt; mint fresh.
+        _ => RootReconcileAction::Rewrite,
+    }
+}
+
 /// Resolve the `qontinui-root` directory the checked-in repo-root `.mcp.json`
 /// lives in. Mirror of `agent_runtime::qontinui_root_dir`, inlined so this leaf
 /// module does NOT depend on `agent_runtime` (which depends back on us — the
@@ -1060,79 +1211,160 @@ fn qontinui_root_dir() -> Option<std::path::PathBuf> {
         .filter(|p| p.is_dir())
 }
 
-/// True iff the root `.mcp.json` at `root_dir` holds a coord-mcp PROXY config
-/// that is STALE for the current `bound_port` — its proxy port differs OR its
-/// nonce is not in the live registry. Either case 401s/misroutes a spawned
-/// agent that inherits the root file, so it must be rewritten. Returns `false`
-/// (leave it) for an absent file, a non-proxy (static-bearer) shape, or a
-/// proxy config whose port matches AND whose nonce is currently registered.
-///
-/// Split out as a pure-over-its-inputs predicate so the self-heal decision is
-/// unit-testable without env or the process-global nonce map mutation order.
-fn root_config_is_stale(root_dir: &Path, bound_port: u16) -> bool {
-    let path = root_dir.join(".mcp.json");
-    let Some(port) = read_proxy_port(&root_dir.to_string_lossy()) else {
-        // Absent, unparseable, or a static-bearer (agent) shape — not ours to
-        // refresh here. (The session reconcile's `coord_mcp_safe_to_write`
-        // guard owns the agent-config-protection contract; we never touch one.)
-        return false;
+/// Re-register an EXISTING on-disk proxy nonce string into the live registry as
+/// a Device binding for `workdir`, WITHOUT minting a new nonce or rewriting the
+/// file (plan 2026-07-07-coord-mcp-nonce-survives-runner-restart, Change 1).
+/// This is the restart-resilient self-heal: when the root `.mcp.json` proxy port
+/// still matches but its nonce was evicted / never restored, adopting the exact
+/// on-disk string keeps a live MCP client's CACHED nonce validating across the
+/// restart (the client never re-reads the file, so a fresh-minted-and-rewritten
+/// nonce would strand it on a 401). Evicts any prior nonce for the same workdir
+/// (there should be none) and mirrors the updated set to the encrypted store so
+/// the adoption itself survives the NEXT restart. DEVICE binding only — this
+/// path is never reached for an agent config (a static-bearer shape has no proxy
+/// URL, so [`read_proxy_port`] returns `None` and the resolver leaves it).
+fn adopt_on_disk_nonce(workdir: &str, nonce: &str) {
+    let snapshot = {
+        let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
+        map.retain(|_, b| b.workdir != workdir);
+        map.insert(
+            nonce.to_string(),
+            NonceBinding {
+                workdir: workdir.to_string(),
+                principal: ProxyPrincipal::Device,
+            },
+        );
+        map.clone()
     };
-    if port != bound_port {
-        return true;
-    }
-    // Port matches: the only remaining staleness is an evicted/unrestored nonce
-    // the live proxy would 401.
-    match read_proxy_nonce(&path) {
-        Some(nonce) => !proxy_nonce_is_valid(&nonce),
-        None => true,
-    }
+    persist_proxy_nonces(&snapshot);
+}
+
+/// Read the root `.mcp.json` ONCE and resolve both the self-heal action and the
+/// nonce string readable from it (the [`RootReconcileAction::AdoptNonce`] arm
+/// needs that string to re-register). Keeps the file read out of the pure
+/// [`root_reconcile_action`] resolver while giving both callers
+/// ([`root_config_is_stale`] and [`reconcile_root_config_at`]) a single,
+/// consistent read.
+fn resolve_root_reconcile(
+    root_dir: &Path,
+    bound_port: u16,
+) -> (RootReconcileAction, Option<String>) {
+    let path = root_dir.join(".mcp.json");
+    let current_port = read_proxy_port(&root_dir.to_string_lossy());
+    let on_disk_nonce = read_proxy_nonce(&path);
+    let registered = on_disk_nonce
+        .as_deref()
+        .map(proxy_nonce_is_valid)
+        .unwrap_or(false);
+    let action = root_reconcile_action(
+        current_port,
+        on_disk_nonce.as_deref(),
+        registered,
+        bound_port,
+    );
+    (action, on_disk_nonce)
+}
+
+/// True iff the root `.mcp.json` at `root_dir` needs SOME self-heal action
+/// (adopt-nonce or rewrite) for the current `bound_port`. Returns `false` (leave
+/// it) for an absent file, a non-proxy (static-bearer) shape, or a proxy config
+/// whose port matches AND whose nonce is currently registered. Delegates to the
+/// single-read [`resolve_root_reconcile`] so the "is anything to do" predicate
+/// and the "what to do" dispatch never diverge. Test-only convenience — the prod
+/// dispatch reads the action directly from [`resolve_root_reconcile`].
+#[cfg(test)]
+fn root_config_is_stale(root_dir: &Path, bound_port: u16) -> bool {
+    resolve_root_reconcile(root_dir, bound_port).0 != RootReconcileAction::Leave
 }
 
 /// Boot-time self-heal of the CHECKED-IN repo-root `.mcp.json` (Phase 5b),
 /// resolving the root dir from the environment. Delegates to
-/// [`reconcile_root_config_at`] — split so the rewrite is unit-testable against
+/// [`reconcile_root_config_at`] — split so the heal is unit-testable against
 /// an explicit temp dir WITHOUT mutating the process-global `QONTINUI_ROOT`
 /// (the module deliberately avoids global-env mutation; see the test helpers).
-fn reconcile_root_config(bound_port: u16) -> bool {
+///
+/// `pub(crate)` so the boot task can call root self-heal UNCONDITIONALLY —
+/// independent of whether any live session workdir is present (plan
+/// 2026-07-07 Change 1 secondary gap: a boot with zero open sessions must still
+/// repair a stale-port root config, which the old session-gated wiring skipped).
+/// Returns the [`RootReconcileAction`] actually taken (`Leave` when there is no
+/// resolvable root dir) so the boot task can log the restore-vs-heal outcome.
+pub(crate) fn reconcile_root_config(bound_port: u16) -> RootReconcileAction {
     match qontinui_root_dir() {
         Some(root_dir) => reconcile_root_config_at(&root_dir, bound_port),
-        None => false,
+        None => RootReconcileAction::Leave,
     }
 }
 
-/// Self-heal the repo-root `.mcp.json` under `root_dir` (Phase 5b). The root
-/// config is the loopback PROXY shape (port + per-session nonce); a spawned
-/// agent that inherits it (cwd up the tree, no per-worktree config) breaks if
-/// the nonce was evicted or the port moved across a restart/instance change.
-/// When [`root_config_is_stale`] flags it, rewrite via the SAME
-/// [`write_coord_mcp_proxy_config`] helper the session path uses (fresh
-/// registered nonce + the current bound port) — guarded by
-/// [`coord_mcp_safe_to_write`] so a hand-rolled static-bearer root file is never
-/// clobbered. Returns `true` iff the root file was rewritten.
-fn reconcile_root_config_at(root_dir: &Path, bound_port: u16) -> bool {
-    if !root_config_is_stale(root_dir, bound_port) {
-        return false;
-    }
+/// Self-heal the repo-root `.mcp.json` under `root_dir` (Phase 5b + plan
+/// 2026-07-07 Change 1). The root config is the loopback PROXY shape (port +
+/// per-session nonce); a spawned agent that inherits it (cwd up the tree, no
+/// per-worktree config) — and a long-running operator session whose MCP client
+/// cached the nonce — break if the nonce was evicted or the port moved across a
+/// restart/instance change. Dispatches on [`resolve_root_reconcile`]:
+///
+/// - `AdoptNonce` — port unchanged, a nonce IS on disk but unregistered:
+///   re-register that EXACT string ([`adopt_on_disk_nonce`]), leaving the file
+///   byte-identical so a live client's cached nonce keeps validating. Returns
+///   `false` (no file rewrite).
+/// - `Rewrite` — port moved (client must reconnect regardless) or no nonce
+///   readable: mint fresh + rewrite via [`write_coord_mcp_proxy_config`].
+///   Returns `true`.
+/// - `Leave` — healthy or not ours. Returns `false`.
+///
+/// Both mutating arms are guarded by [`coord_mcp_safe_to_write`] so a
+/// hand-rolled static-bearer root file is never clobbered. Returns the
+/// [`RootReconcileAction`] actually applied — a guard refusal downgrades to
+/// `Leave` (nothing happened), so the return is an honest record of the effect.
+fn reconcile_root_config_at(root_dir: &Path, bound_port: u16) -> RootReconcileAction {
+    let (action, on_disk_nonce) = resolve_root_reconcile(root_dir, bound_port);
     let root = root_dir.to_string_lossy().to_string();
-    if !coord_mcp_safe_to_write(&root) {
-        return false;
+    match action {
+        RootReconcileAction::Leave => RootReconcileAction::Leave,
+        RootReconcileAction::AdoptNonce => {
+            if !coord_mcp_safe_to_write(&root) {
+                return RootReconcileAction::Leave;
+            }
+            // SAFETY: the resolver only yields AdoptNonce when a non-empty nonce
+            // was read from disk, so this Option is always Some here.
+            let nonce = on_disk_nonce
+                .expect("AdoptNonce implies a readable on-disk nonce (resolver invariant)");
+            adopt_on_disk_nonce(&root, &nonce);
+            info!(
+                "coord_mcp: boot self-heal ADOPTED on-disk root nonce for {root} \
+                 (port :{bound_port} unchanged; .mcp.json byte-identical) — live \
+                 MCP client cache preserved"
+            );
+            RootReconcileAction::AdoptNonce
+        }
+        RootReconcileAction::Rewrite => {
+            if !coord_mcp_safe_to_write(&root) {
+                return RootReconcileAction::Leave;
+            }
+            write_coord_mcp_proxy_config(&root, bound_port);
+            info!(
+                "coord_mcp: boot self-heal rewrote root {root}/.mcp.json to bound \
+                 port :{bound_port} (fresh nonce — port moved or no on-disk nonce)"
+            );
+            RootReconcileAction::Rewrite
+        }
     }
-    write_coord_mcp_proxy_config(&root, bound_port);
-    info!("coord_mcp: boot self-heal rewrote root {root}/.mcp.json to bound port :{bound_port}");
-    true
 }
 
-/// Boot-time session-config reconcile (Phase 3c) + root-config self-heal
-/// (Phase 5b). For each live session workdir, if its `.mcp.json` coord-mcp proxy
-/// port ≠ the instance's CURRENT bound port, rewrite it via
-/// [`write_coord_mcp_proxy_config`] (correct port + a freshly persisted nonce),
-/// guarded by [`coord_mcp_safe_to_write`] so it never clobbers an agent-spawn's
-/// static-bearer config. Combined with Phase 3b (persisted nonces), the common
-/// same-port restart needs no rewrite at all — this covers only the
-/// instance/port-change case. ALSO self-heals the checked-in repo-root
-/// `.mcp.json` (see [`reconcile_root_config`]) so a spawned agent inheriting the
-/// root file is never broken by an evicted nonce / stale port. Returns the
-/// number of configs rewritten (sessions + the root file).
+/// Boot-time session-config reconcile (Phase 3c). For each live session workdir,
+/// if its `.mcp.json` coord-mcp proxy port ≠ the instance's CURRENT bound port,
+/// rewrite it via [`write_coord_mcp_proxy_config`] (correct port + a freshly
+/// persisted nonce), guarded by [`coord_mcp_safe_to_write`] so it never clobbers
+/// an agent-spawn's static-bearer config. Combined with Phase 3b (persisted
+/// nonces), the common same-port restart needs no rewrite at all — this covers
+/// only the instance/port-change case. Returns the number of SESSION configs
+/// rewritten.
+///
+/// Root-config self-heal is NOT done here — the boot task calls
+/// [`reconcile_root_config`] UNCONDITIONALLY (plan 2026-07-07 Change 1 secondary
+/// gap: a boot with zero open sessions must still repair the root config, which
+/// the old session-gated tail-call skipped). Keeping the two concerns separate
+/// lets the caller heal the root even when this fn is not called at all.
 ///
 /// Wired into the same startup path as the other auto-start tasks (see
 /// `mcp_api::start_server`), AFTER [`restore_proxy_nonces_from_store`] so a
@@ -1156,12 +1388,10 @@ where
         rewritten += 1;
         info!("coord_mcp: reconciled {workdir}/.mcp.json to bound port :{bound_port}");
     }
-    // Belt-and-braces: self-heal the checked-in repo-root config too (Phase 5b).
-    if reconcile_root_config(bound_port) {
-        rewritten += 1;
-    }
     if rewritten > 0 {
-        info!("coord_mcp: boot reconcile rewrote {rewritten} config(s) to the current bound port");
+        info!(
+            "coord_mcp: boot reconcile rewrote {rewritten} session config(s) to the current bound port"
+        );
     }
     rewritten
 }
@@ -1222,11 +1452,26 @@ mod tests {
             "proxy shape must NOT bake a static Authorization bearer: {written}"
         );
 
-        // Re-provisioning the same workdir evicts the prior nonce.
+        // Re-provisioning the same workdir mints a FRESH nonce and moves the
+        // prior one onto the grace TTL (plan 2026-07-07 Change 3): the old nonce
+        // is dropped from the LIVE map but stays valid briefly so an in-flight
+        // client that cached it rides through until it reconnects — rather than
+        // hard-401ing the instant `.mcp.json` is rewritten. Both nonces resolve
+        // to the same Device principal, so there is no scope-elevation surface.
         write_coord_mcp_proxy_config(&primary_wt, 23456);
+        let reprovisioned = std::fs::read_to_string(tmp.join(".mcp.json")).unwrap();
+        let v2: serde_json::Value = serde_json::from_str(&reprovisioned).unwrap();
+        let new_nonce = v2["mcpServers"]["coord-mcp"]["headers"]["X-Coord-Mcp-Proxy-Key"]
+            .as_str()
+            .expect("re-provision must carry a nonce header");
+        assert_ne!(new_nonce, nonce, "a re-provision must mint a fresh nonce");
         assert!(
-            !proxy_nonce_is_valid(nonce),
-            "a re-provision must evict the prior nonce for the same workdir"
+            proxy_nonce_is_valid(new_nonce),
+            "the freshly-minted nonce is live in the registry"
+        );
+        assert!(
+            proxy_nonce_is_valid(nonce),
+            "the prior device nonce rides the grace TTL (Change 3) — not hard-evicted"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -2019,19 +2264,18 @@ mod tests {
         }
     }
 
-    /// Phase 5b — the boot self-heal rewrites a stale ROOT `.mcp.json` (the
-    /// checked-in repo-root coord-mcp config) to the current bound port + a
-    /// freshly-registered nonce, so a spawned agent inheriting the root file is
-    /// never broken by an evicted nonce / stale port. Drives the env-free
-    /// `reconcile_root_config_at` so it neither mutates `QONTINUI_ROOT` nor
-    /// touches the operator's real root config. Covers all three staleness
-    /// dimensions: wrong port, dead nonce (right port), and the leave-alone
-    /// cases (matching port + live nonce, absent file, foreign static-bearer).
+    /// Phase 5b + plan 2026-07-07 Change 1 — the boot self-heal of the stale ROOT
+    /// `.mcp.json` (the checked-in repo-root coord-mcp config). Drives the
+    /// env-free `reconcile_root_config_at` so it neither mutates `QONTINUI_ROOT`
+    /// nor touches the operator's real root config. Covers every dimension:
+    /// wrong port (Rewrite), same-port-but-unregistered-nonce (ADOPT — Change 1
+    /// core fix, file stays byte-identical), and the leave-alone cases (matching
+    /// port + live nonce, absent file, foreign static-bearer).
     #[test]
     fn reconcile_root_config_self_heals_stale_root_mcp_json() {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
-        // --- Case 1: stale PORT → rewrite. ---
+        // --- Case 1: stale PORT → Rewrite (client must reconnect anyway). ---
         let root = std::env::temp_dir().join(format!("coord-mcp-root-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(
@@ -2040,8 +2284,9 @@ mod tests {
         )
         .unwrap();
         assert!(root_config_is_stale(&root, 9876), "wrong port is stale");
-        assert!(
+        assert_eq!(
             reconcile_root_config_at(&root, 9876),
+            RootReconcileAction::Rewrite,
             "a stale-port root config must be rewritten"
         );
         // Rewritten to the bound port with a freshly-registered nonce.
@@ -2060,47 +2305,73 @@ mod tests {
             .get("Authorization")
             .is_none());
 
-        // --- Case 2: matching port + LIVE nonce → leave (no rewrite). ---
+        // --- Case 2: matching port + LIVE nonce → Leave (no rewrite). ---
         // The case-1 rewrite left a live nonce on port 9876; a second pass is a
         // no-op and must NOT mint a new nonce.
         assert!(
             !root_config_is_stale(&root, 9876),
             "matching port + live nonce is not stale"
         );
-        assert!(
-            !reconcile_root_config_at(&root, 9876),
-            "a fresh root config must not be rewritten again"
+        assert_eq!(
+            reconcile_root_config_at(&root, 9876),
+            RootReconcileAction::Leave,
+            "a fresh root config must not be touched again"
         );
         assert_eq!(
             read_proxy_nonce(&root.join(".mcp.json")).unwrap(),
             new_nonce
         );
 
-        // --- Case 3: matching port but DEAD nonce → rewrite. ---
+        // --- Case 3: matching port but UNREGISTERED nonce → ADOPT (no rewrite). ---
+        // Plan 2026-07-07 Change 1 CORE FIX: re-register the EXACT on-disk nonce
+        // rather than minting a fresh one, so a live MCP client's cached nonce
+        // keeps validating. The `.mcp.json` MUST stay byte-identical.
         let dead = std::env::temp_dir().join(format!("coord-mcp-root-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dead).unwrap();
-        std::fs::write(
-            dead.join(".mcp.json"),
-            r#"{"mcpServers":{"coord-mcp":{"type":"http","url":"http://127.0.0.1:9876/coord-mcp","headers":{"X-Coord-Mcp-Proxy-Key":"notregistered"}}}}"#,
-        )
-        .unwrap();
+        let dead_body = r#"{"mcpServers":{"coord-mcp":{"type":"http","url":"http://127.0.0.1:9876/coord-mcp","headers":{"X-Coord-Mcp-Proxy-Key":"notregistered-9c3f"}}}}"#;
+        std::fs::write(dead.join(".mcp.json"), dead_body).unwrap();
+        assert!(
+            !proxy_nonce_is_valid("notregistered-9c3f"),
+            "precondition: the on-disk nonce is not yet registered"
+        );
         assert!(
             root_config_is_stale(&dead, 9876),
-            "right port but an unregistered nonce is stale"
+            "right port but an unregistered nonce needs healing"
         );
-        assert!(reconcile_root_config_at(&dead, 9876));
-        assert!(proxy_nonce_is_valid(
-            &read_proxy_nonce(&dead.join(".mcp.json")).unwrap()
-        ));
+        assert_eq!(
+            reconcile_root_config_at(&dead, 9876),
+            RootReconcileAction::AdoptNonce,
+            "an unregistered same-port nonce must be ADOPTED, not rewritten"
+        );
+        // The EXACT on-disk nonce is now valid (adopted verbatim into the registry).
+        assert!(
+            proxy_nonce_is_valid("notregistered-9c3f"),
+            "the on-disk nonce must be adopted verbatim so a cached client validates"
+        );
+        // The file is byte-identical — no rewrite → live client cache preserved.
+        assert_eq!(
+            std::fs::read_to_string(dead.join(".mcp.json")).unwrap(),
+            dead_body,
+            "adopt must NOT rewrite the root .mcp.json"
+        );
+        // A second pass is now a no-op (the nonce is registered) → Leave.
+        assert!(!root_config_is_stale(&dead, 9876));
+        assert_eq!(
+            reconcile_root_config_at(&dead, 9876),
+            RootReconcileAction::Leave
+        );
 
-        // --- Case 4: absent root file → leave. ---
+        // --- Case 4: absent root file → Leave. ---
         let empty = std::env::temp_dir().join(format!("coord-mcp-root-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&empty).unwrap();
         assert!(
             !root_config_is_stale(&empty, 9876),
             "absent file is not stale"
         );
-        assert!(!reconcile_root_config_at(&empty, 9876));
+        assert_eq!(
+            reconcile_root_config_at(&empty, 9876),
+            RootReconcileAction::Leave
+        );
         assert!(!empty.join(".mcp.json").exists());
 
         // --- Case 5: foreign STATIC-BEARER (agent) root → never clobbered. ---
@@ -2115,7 +2386,10 @@ mod tests {
         // A static-bearer shape has no proxy URL → not flagged stale (and even if
         // it were, `coord_mcp_safe_to_write` would refuse the rewrite).
         assert!(!root_config_is_stale(&agent, 9876));
-        assert!(!reconcile_root_config_at(&agent, 9876));
+        assert_eq!(
+            reconcile_root_config_at(&agent, 9876),
+            RootReconcileAction::Leave
+        );
         assert_eq!(
             std::fs::read_to_string(agent.join(".mcp.json")).unwrap(),
             agent_cfg,
@@ -2126,5 +2400,128 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dead);
         let _ = std::fs::remove_dir_all(&empty);
         let _ = std::fs::remove_dir_all(&agent);
+    }
+
+    /// Plan 2026-07-07 Change 1 — the pure `root_reconcile_action` resolver over
+    /// explicit inputs, isolating the adopt-vs-rewrite-vs-leave decision from any
+    /// file I/O or the process-global nonce map.
+    #[test]
+    fn root_reconcile_action_resolves_adopt_vs_rewrite_vs_leave() {
+        // Not our shape (no readable proxy port) → Leave regardless of nonce.
+        assert_eq!(
+            root_reconcile_action(None, Some("x"), false, 9876),
+            RootReconcileAction::Leave
+        );
+        // Port moved → Rewrite (client's cached URL is stale too — reconnect).
+        assert_eq!(
+            root_reconcile_action(Some(9999), Some("x"), true, 9876),
+            RootReconcileAction::Rewrite,
+            "a moved port must rewrite even with a registered nonce"
+        );
+        // Same port, nonce readable but UNregistered → Adopt (the core fix).
+        assert_eq!(
+            root_reconcile_action(Some(9876), Some("abc"), false, 9876),
+            RootReconcileAction::AdoptNonce
+        );
+        // Same port, nonce readable AND registered → Leave (healthy).
+        assert_eq!(
+            root_reconcile_action(Some(9876), Some("abc"), true, 9876),
+            RootReconcileAction::Leave
+        );
+        // Same port, NO nonce readable → Rewrite (nothing to adopt).
+        assert_eq!(
+            root_reconcile_action(Some(9876), None, false, 9876),
+            RootReconcileAction::Rewrite
+        );
+        // Same port, EMPTY nonce string → Rewrite (empty is nothing to adopt).
+        assert_eq!(
+            root_reconcile_action(Some(9876), Some(""), false, 9876),
+            RootReconcileAction::Rewrite
+        );
+    }
+
+    /// Plan 2026-07-07 Change 1 — `adopt_on_disk_nonce` re-registers the EXACT
+    /// string as a live Device binding so a subsequent proxy request with that
+    /// string is accepted (the gate's nonce check passes), WITHOUT minting a new
+    /// nonce. Mirrors the restart-survival contract at the unit level.
+    #[test]
+    fn adopt_on_disk_nonce_reregisters_exact_string_as_device() {
+        let workdir = format!("D:/adopt-wt-{}", uuid::Uuid::now_v7());
+        let nonce = format!("ondisk-{}", uuid::Uuid::new_v4().simple());
+        assert!(
+            !proxy_nonce_is_valid(&nonce),
+            "precondition: not registered"
+        );
+
+        adopt_on_disk_nonce(&workdir, &nonce);
+
+        assert!(
+            proxy_nonce_is_valid(&nonce),
+            "the exact on-disk nonce must validate after adoption"
+        );
+        assert_eq!(
+            proxy_principal_for_nonce(&nonce),
+            Some(ProxyPrincipal::Device),
+            "an adopted nonce is bound to the Device principal"
+        );
+    }
+
+    /// Plan 2026-07-07 Change 3 — a DEVICE nonce evicted by a same-workdir
+    /// re-mint stays valid through its grace TTL (so an in-flight client rides
+    /// through), while the fresh nonce is live. An AGENT nonce is NEVER graced.
+    #[test]
+    fn remint_graces_evicted_device_nonce_but_never_agent() {
+        // Device: mint A, then re-mint B for the SAME workdir → A graced, B live.
+        let wd = format!("D:/grace-wt-{}", uuid::Uuid::now_v7());
+        let a = register_proxy_nonce(&wd);
+        assert!(proxy_nonce_is_valid(&a));
+        let b = register_proxy_nonce(&wd);
+        assert_ne!(a, b);
+        assert!(proxy_nonce_is_valid(&b), "the fresh device nonce is live");
+        assert!(
+            proxy_nonce_is_valid(&a),
+            "the evicted device nonce rides the grace TTL"
+        );
+        assert_eq!(
+            proxy_principal_for_nonce(&a),
+            Some(ProxyPrincipal::Device),
+            "a graced nonce resolves to Device (no scope elevation)"
+        );
+
+        // Agent: mint A, re-mint B for the SAME workdir → A NOT graced (fails closed).
+        let awd = format!("D:/grace-agent-wt-{}", uuid::Uuid::now_v7());
+        let agent_id = uuid::Uuid::new_v4();
+        let a2 = register_agent_proxy_nonce(&awd, agent_id);
+        assert!(proxy_nonce_is_valid(&a2));
+        let b2 = register_agent_proxy_nonce(&awd, agent_id);
+        assert_ne!(a2, b2);
+        assert!(proxy_nonce_is_valid(&b2), "the fresh agent nonce is live");
+        assert!(
+            !proxy_nonce_is_valid(&a2),
+            "an evicted AGENT nonce must hard-fail closed — never graced"
+        );
+    }
+
+    /// Plan 2026-07-07 Change 3 — grace fails closed exactly at the deadline:
+    /// an entry whose `expires_at` is not strictly in the future is treated as
+    /// expired and lazily evicted. Deterministic because monotonic time only
+    /// advances — an entry stamped `now()` is never `> now()` at the later check.
+    #[test]
+    fn graced_nonce_expires_and_is_lazily_evicted() {
+        let nonce = format!("expired-{}", uuid::Uuid::new_v4().simple());
+        graced_nonces().lock().unwrap().insert(
+            nonce.clone(),
+            GracedNonce {
+                expires_at: std::time::Instant::now(),
+            },
+        );
+        assert!(
+            !graced_nonce_is_valid(&nonce),
+            "an already-elapsed grace entry must be invalid"
+        );
+        assert!(
+            !graced_nonces().lock().unwrap().contains_key(&nonce),
+            "an expired grace entry must be lazily evicted on the failing check"
+        );
     }
 }
