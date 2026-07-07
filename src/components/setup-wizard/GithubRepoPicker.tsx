@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useMemo } from "react";
+import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -19,6 +19,42 @@ import {
 /** GitHub App install URL for the "connect your GitHub" CTA. */
 const GITHUB_APP_INSTALL_URL =
   "https://github.com/apps/qontinui-merge-orchestrator/installations/new";
+
+/** Map a raw `github_list_repos` failure message to a specific, actionable headline.
+ *  Order matters: check the most specific signals first. */
+export function classifyLoadError(raw: string): string {
+  if (raw.includes("401")) {
+    return "Your Qontinui sign-in has expired. Re-open Settings → Account and sign in again.";
+  }
+  if (raw.includes("403")) {
+    return "Your account isn't authorized for this workspace's GitHub connection. (Couldn't resolve your tenant.)";
+  }
+  if (raw.includes("Failed to reach")) {
+    return "Couldn't reach Qontinui. Check your connection and retry.";
+  }
+  return "Couldn't load your GitHub repositories.";
+}
+
+/** The mutually-exclusive top-level render states of the picker, in precedence order. */
+export type GithubPickerView = "loading" | "error" | "signed_out" | "not_connected" | "connected";
+
+/** Single source of truth for which top-level view the picker renders.
+ *  Precedence MUST match the component's early-return order: loading → error →
+ *  signed_out → not_connected → connected. In particular a thrown load failure
+ *  (`loadError != null`) wins over `!signedIn`/`!connected` so an auth error never
+ *  collapses to the "Connect GitHub" CTA. */
+export function deriveGithubPickerView(s: {
+  loading: boolean;
+  loadError: string | null;
+  signedIn: boolean;
+  connected: boolean;
+}): GithubPickerView {
+  if (s.loading) return "loading";
+  if (s.loadError != null) return "error";
+  if (!s.signedIn) return "signed_out";
+  if (!s.connected) return "not_connected";
+  return "connected";
+}
 
 /** Wizard-internal project shape (mirrors ProjectStep's `Project`). */
 interface Project {
@@ -72,6 +108,10 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
   const [connected, setConnected] = useState(false);
   const [repos, setRepos] = useState<GhRepo[]>([]);
   const [loading, setLoading] = useState(true);
+  /** Load-time failure surface (thrown `github_list_repos` — auth/coord/network).
+   *  SEPARATE from the clone-failure `error` state below, which belongs only to
+   *  the connected picker view. */
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const [filter, setFilter] = useState("");
   const [selectedRepos, setSelectedRepos] = useState<string[]>([]);
@@ -82,7 +122,7 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
   const [clonedRepos, setClonedRepos] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
 
-  const loadRepos = useCallback(async () => {
+  const loadRepos = useCallback(async (): Promise<RepoListResponse | null> => {
     setLoading(true);
     setError(null);
     try {
@@ -90,8 +130,13 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
       setSignedIn(result.signed_in);
       setConnected(result.connected);
       setRepos(result.repos ?? []);
+      setLoadError(null);
+      return result;
     } catch (err) {
-      setError(`Failed to list repositories: ${err}`);
+      // Do NOT rely on the stale signedIn/connected values to pick a branch —
+      // the explicit loadError branch owns rendering on a thrown failure.
+      setLoadError(`${err}`);
+      return null;
     } finally {
       setLoading(false);
     }
@@ -101,6 +146,56 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- one-shot data load on mount
     void loadRepos();
   }, [loadRepos]);
+
+  // --- §4.3 refresh + auto-detect --------------------------------------------
+  // Bounded poll after the user clicks "I've connected — refresh": re-check a few
+  // times with backoff and stop as soon as the App reports connected. Cancellable.
+  const pollTimers = useRef<ReturnType<typeof setTimeout>[]>([]);
+  const clearPoll = useCallback(() => {
+    for (const t of pollTimers.current) clearTimeout(t);
+    pollTimers.current = [];
+  }, []);
+  const startConnectPoll = useCallback(() => {
+    clearPoll();
+    // Cumulative wall-clock offsets giving 2s / 4s / 8s gaps between attempts.
+    const offsets = [2000, 6000, 14000];
+    for (const offset of offsets) {
+      const timer = setTimeout(() => {
+        void loadRepos().then((result) => {
+          if (result?.connected) clearPoll();
+        });
+      }, offset);
+      pollTimers.current.push(timer);
+    }
+  }, [loadRepos, clearPoll]);
+
+  // Stop polling once connected, and always on unmount.
+  useEffect(() => {
+    if (connected) clearPoll();
+  }, [connected, clearPoll]);
+  useEffect(() => clearPoll, [clearPoll]);
+
+  // While the App isn't connected, auto-re-check whenever the window regains
+  // focus or the tab becomes visible — so a browser-side connect is detected
+  // without the user guessing. Guarded to the not_connected view to avoid
+  // spamming the backend from the picker.
+  const notConnectedView =
+    deriveGithubPickerView({ loading, loadError, signedIn, connected }) === "not_connected";
+  useEffect(() => {
+    if (!notConnectedView) return;
+    const recheck = () => {
+      void loadRepos();
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") recheck();
+    };
+    window.addEventListener("focus", recheck);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("focus", recheck);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [notConnectedView, loadRepos]);
 
   const filteredRepos = useMemo(() => {
     const q = filter.trim().toLowerCase();
@@ -182,8 +277,12 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
   }, [selectedRepos, destParent, clonedRepos, onProjectsCloned]);
 
   // --- Render states ---------------------------------------------------------
+  // `view` is the single source of truth for which top-level block renders; the
+  // early-returns below simply realize each state's markup. See
+  // deriveGithubPickerView for the precedence contract.
+  const view = deriveGithubPickerView({ loading, loadError, signedIn, connected });
 
-  if (loading) {
+  if (view === "loading") {
     return (
       <div className="flex items-center justify-center gap-2 py-8 text-muted-foreground">
         <Loader2 className="w-4 h-4 animate-spin" />
@@ -192,7 +291,37 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
     );
   }
 
-  if (!signedIn) {
+  if (view === "error") {
+    // Classify the raw backend detail into a specific, actionable headline while
+    // always preserving the raw message (muted) for support diagnosis. This is
+    // the failure surface — distinct from the genuine "not connected" CTA below.
+    // `view === "error"` implies loadError is non-null (see deriveGithubPickerView).
+    const headline = classifyLoadError(loadError ?? "");
+    return (
+      <div className="panel border-red-500/30 bg-red-500/10 p-4 max-w-xl mx-auto w-full flex flex-col gap-3">
+        <div className="flex gap-3">
+          <AlertCircle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
+          <div className="text-sm min-w-0">
+            <div className="font-medium mb-1 text-red-300">{headline}</div>
+            <p className="text-xs text-muted-foreground break-words whitespace-pre-wrap">
+              {loadError}
+            </p>
+          </div>
+        </div>
+        <div className="flex gap-2">
+          <button
+            className="btn-secondary flex items-center gap-2"
+            onClick={() => void loadRepos()}
+          >
+            <Loader2 className="w-4 h-4" />
+            Retry
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (view === "signed_out") {
     return (
       <div className="panel border-amber-500/30 bg-amber-500/10 p-4 max-w-xl mx-auto w-full flex gap-3">
         <AlertCircle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
@@ -207,7 +336,7 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
     );
   }
 
-  if (!connected) {
+  if (view === "not_connected") {
     return (
       <div className="panel border-primary/30 bg-primary/5 p-4 max-w-xl mx-auto w-full flex flex-col gap-3">
         <div className="flex gap-3">
@@ -228,7 +357,13 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
             <ExternalLink className="w-4 h-4" />
             Connect GitHub
           </button>
-          <button className="btn-secondary flex items-center gap-2" onClick={loadRepos}>
+          <button
+            className="btn-secondary flex items-center gap-2"
+            onClick={() => {
+              void loadRepos();
+              startConnectPoll();
+            }}
+          >
             <Loader2 className="w-4 h-4" />
             I've connected — refresh
           </button>
@@ -302,7 +437,10 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
 
       {/* Destination folder */}
       <div className="flex gap-2 items-center">
-        <button className="btn-secondary flex items-center gap-2 shrink-0" onClick={pickDestination}>
+        <button
+          className="btn-secondary flex items-center gap-2 shrink-0"
+          onClick={pickDestination}
+        >
           <FolderOpen className="w-4 h-4" />
           Clone to…
         </button>
