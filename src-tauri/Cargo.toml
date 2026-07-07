@@ -1,6 +1,10 @@
 [package]
 name = "qontinui-runner"
+<<<<<<< HEAD
 version = "1.0.5"
+=======
+version = "1.0.4"
+>>>>>>> b1addae2 (chore(release): bump version to 1.0.4)
 description = "Desktop app for AI-assisted development: orchestrated AI coding sessions with visual feedback, self-verification, and real-time UI inspection"
 authors = ["Qontinui <contact@qontinui.org>"]
 edition = "2021"

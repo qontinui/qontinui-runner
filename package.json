@@ -126,7 +126,11 @@
     "typecheck": "tsc --noEmit"
   },
   "type": "module",
+<<<<<<< HEAD
   "version": "1.0.5",
+=======
+  "version": "1.0.4",
+>>>>>>> b1addae2 (chore(release): bump version to 1.0.4)
   "pnpm": {
     "overrides": {
       "@qontinui/shared-types": "^0.6.0",

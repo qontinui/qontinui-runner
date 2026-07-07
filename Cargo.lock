@@ -6547,7 +6547,11 @@ dependencies = [
 
 [[package]]
 name = "qontinui-runner"
+<<<<<<< HEAD
 version = "1.0.5"
+=======
+version = "1.0.4"
+>>>>>>> b1addae2 (chore(release): bump version to 1.0.4)
 dependencies = [
  "adb_client",
  "aes-gcm",

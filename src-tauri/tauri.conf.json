@@ -1,7 +1,11 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Qontinui Runner",
+<<<<<<< HEAD
   "version": "1.0.5",
+=======
+  "version": "1.0.4",
+>>>>>>> b1addae2 (chore(release): bump version to 1.0.4)
   "identifier": "com.qontinui.runner",
   "build": {
     "beforeBuildCommand": "npm run build && npm run bundle:profile-sidecar",
