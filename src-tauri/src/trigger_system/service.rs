@@ -416,6 +416,7 @@ impl TriggerService {
                 poll_interval_seconds,
                 auto_resume_on_ci_failure: _,
                 max_auto_resumes: _,
+                shepherd_repos,
             } => {
                 let pr_deps = watchers::pr_watcher::PrWatcherDeps {
                     app_state: self.deps.app_state.clone(),
@@ -427,6 +428,7 @@ impl TriggerService {
                     self.deps.app_state.pg_db.clone(),
                     github_token.clone(),
                     *poll_interval_seconds,
+                    shepherd_repos.clone(),
                     watcher_stop,
                     Some(pr_deps),
                 );

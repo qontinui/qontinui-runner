@@ -274,6 +274,59 @@ impl GitHubClient {
         })
     }
 
+    /// List open PRs whose head branch is `<owner>:<branch>`.
+    ///
+    /// Phase-1 fallback resolution for PR-shepherd seeds: when a
+    /// `gh pr create` observation couldn't recover the PR URL from its
+    /// tool_result, the branch is resolved to a PR number here on the next
+    /// watcher poll. One page suffices — a single head branch realistically
+    /// backs at most one open PR.
+    pub async fn list_open_prs_by_head(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Vec<PrStatus>, String> {
+        let url = format!(
+            "https://api.github.com/repos/{}/{}/pulls?state=open&head={}:{}&per_page=10",
+            owner, repo, owner, branch
+        );
+        let resp = self
+            .send_with_rate_limit(self.client.get(&url).headers(self.headers()))
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(format!(
+                "GitHub API returned {}: {}",
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            ));
+        }
+
+        let body: Vec<serde_json::Value> = resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse PR list response: {}", e))?;
+
+        Ok(body
+            .iter()
+            .filter_map(|pr| {
+                let number = pr["number"].as_u64()?;
+                Some(PrStatus {
+                    number,
+                    state: pr["state"].as_str().unwrap_or("unknown").to_string(),
+                    // The list endpoint has no `merged` boolean; `merged_at`
+                    // is the equivalent signal (always null for open PRs).
+                    merged: pr["merged_at"].is_string(),
+                    mergeable: pr["mergeable"].as_bool(),
+                    head_sha: pr["head"]["sha"].as_str().unwrap_or("").to_string(),
+                    title: pr["title"].as_str().unwrap_or("").to_string(),
+                    html_url: pr["html_url"].as_str().unwrap_or("").to_string(),
+                })
+            })
+            .collect())
+    }
+
     /// Fetch check runs for a commit SHA (paginated).
     pub async fn get_check_runs(
         &self,

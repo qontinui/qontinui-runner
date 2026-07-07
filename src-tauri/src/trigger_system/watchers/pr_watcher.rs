@@ -8,9 +8,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
+
 use crate::config_storage::ConfigStorage;
 use crate::database::pg::PgDb;
-use crate::trigger_system::github_api::{CiStatus, GitHubClient, ReviewStatus};
+use crate::trigger_system::github_api::{CiStatus, GitHubClient, PrStatus, ReviewStatus};
+use crate::trigger_system::pr_shepherd::{self, PendingPrSeed, SeedIdentity, SeedTarget};
 use crate::unified_workflow_executor::CiFailureContext;
 use crate::AppState;
 
@@ -18,7 +21,11 @@ use crate::AppState;
 #[derive(Debug, Clone)]
 pub struct PrWatchState {
     pub id: String,
-    pub task_run_id: String,
+    /// The authoring task run. `None` for PR-shepherd-seeded watches from
+    /// interactive sessions (plan 2026-07-04-runner-pr-shepherd Phase 1) —
+    /// those rows are keyed on `authoring_session_id` instead and never
+    /// auto-resume (there is no task to re-queue).
+    pub task_run_id: Option<String>,
     pub pr_number: u64,
     pub repo_full_name: String,
     pub head_sha: String,
@@ -29,6 +36,26 @@ pub struct PrWatchState {
     pub workflow_id: String,
     pub github_token: String,
     pub auto_resume_enabled: bool,
+    /// Coord session id of the authoring session (nullable; PR-shepherd
+    /// Phase 1). Set alongside `task_run_id` when the registrar resolved a
+    /// mapping, or alone for interactive-session watches.
+    pub authoring_session_id: Option<String>,
+    /// When all non-skipped checks first passed on the CURRENT head
+    /// (PR-shepherd Phase 2). Carried while the green streak holds; reset on
+    /// head change or any red/pending flip. Feeds the green-but-unmerged
+    /// detection in [`determine_pr_action`].
+    pub first_fully_green_at: Option<DateTime<Utc>>,
+}
+
+impl PrWatchState {
+    /// Owner label for log lines: the task run id when present, else the
+    /// authoring session id.
+    fn owner_label(&self) -> &str {
+        self.task_run_id
+            .as_deref()
+            .or(self.authoring_session_id.as_deref())
+            .unwrap_or("<unattributed>")
+    }
 }
 
 /// Action to take based on PR state change.
@@ -46,10 +73,22 @@ pub enum PrAction {
     Closed,
     /// Auto-resume limit reached -- needs manual intervention.
     AutoResumeLimitReached,
+    /// PR-shepherd Phase 2: the PR has been fully green on an unchanged head
+    /// for longer than the shepherd threshold and is still open — something
+    /// downstream (merge train, operator) is not landing it. `green_for` is
+    /// the elapsed streak duration. Fires on every poll while the condition
+    /// holds; remediation-side dedup is PR-keyed and lands in a later phase.
+    GreenButUnmerged { green_for: Duration },
 }
 
 /// Pure function: determine what action to take given old and new PR state.
 /// This is the core decision logic, easily unit-testable.
+///
+/// `first_fully_green_at` is the (already set/carried/reset — see
+/// [`compute_first_fully_green_at`]) start of the current all-green streak;
+/// `green_threshold` is `Some` only when the PR shepherd is enabled — `None`
+/// disables green-but-unmerged detection entirely.
+#[allow(clippy::too_many_arguments)]
 pub fn determine_pr_action(
     old_checks: &str,
     new_checks: &CiStatus,
@@ -61,6 +100,9 @@ pub fn determine_pr_action(
     auto_resume_count: u32,
     max_auto_resumes: u32,
     head_sha_changed: bool,
+    first_fully_green_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    green_threshold: Option<Duration>,
 ) -> PrAction {
     // PR lifecycle events take priority
     if pr_merged {
@@ -101,11 +143,53 @@ pub fn determine_pr_action(
             if old_checks != "success" {
                 return PrAction::CiPassed;
             }
+
+            // Green-but-unmerged (PR-shepherd Phase 2): the PR is open, the
+            // head is unchanged, and the all-green streak has outlived the
+            // threshold. Checked only in the steady green state (not on the
+            // CiPassed transition — a fresh streak is by definition under
+            // any sane threshold).
+            if let (Some(green_since), Some(threshold)) = (first_fully_green_at, green_threshold)
+            {
+                // Clock skew putting `green_since` in the future yields a
+                // negative signed duration; `to_std()` fails and we treat the
+                // streak as zero-length.
+                if let Ok(green_for) = now.signed_duration_since(green_since).to_std() {
+                    if green_for > threshold {
+                        return PrAction::GreenButUnmerged { green_for };
+                    }
+                }
+            }
         }
         CiStatus::Pending => {}
     }
 
     PrAction::NoAction
+}
+
+/// Pure function (PR-shepherd Phase 2): compute the new `first_fully_green_at`
+/// for a watch from this poll's observations.
+///
+/// - Any red/pending status clears the streak.
+/// - A head change under a green status restarts the streak at `now` (the
+///   stored timestamp belongs to the OLD head — CI truth is per-head;
+///   remediation-side dedup in a later phase is PR-keyed, so resetting here
+///   is correct).
+/// - A continuing green streak on the same head carries the stored value,
+///   starting one at `now` if none was recorded yet.
+pub fn compute_first_fully_green_at(
+    ci_green: bool,
+    head_sha_changed: bool,
+    stored: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    if !ci_green {
+        return None;
+    }
+    if head_sha_changed {
+        return Some(now);
+    }
+    stored.or(Some(now))
 }
 
 /// Dependencies for executing review subtasks from within the PR watcher.
@@ -127,6 +211,7 @@ pub fn start_pr_watcher(
     pg_db: Arc<PgDb>,
     github_token: String,
     poll_interval_seconds: u64,
+    shepherd_repos: Vec<String>,
     stop_signal: Arc<AtomicBool>,
     execution_deps: Option<PrWatcherDeps>,
 ) -> tokio::task::JoinHandle<()> {
@@ -151,7 +236,9 @@ pub fn start_pr_watcher(
                 break;
             }
 
-            if let Err(e) = poll_active_prs(&pg_db, &client, execution_deps.as_ref()).await {
+            if let Err(e) =
+                poll_active_prs(&pg_db, &client, &shepherd_repos, execution_deps.as_ref()).await
+            {
                 tracing::warn!("PR watcher poll error: {}", e);
             }
 
@@ -178,8 +265,16 @@ pub fn start_pr_watcher(
 async fn poll_active_prs(
     pg_db: &PgDb,
     default_client: &GitHubClient,
+    shepherd_repos: &[String],
     execution_deps: Option<&PrWatcherDeps>,
 ) -> Result<(), String> {
+    // PR-shepherd Phase 1: land any transcript-observed `gh pr create` seeds
+    // BEFORE loading active watches so a seed becomes a watch within one
+    // poll. Best-effort — seed failures never break the poll itself.
+    if pr_shepherd::autoseed_enabled() {
+        drain_and_seed_pending(pg_db, default_client, shepherd_repos).await;
+    }
+
     let watches = pg_db.get_active_pr_watches().await?;
     if watches.is_empty() {
         return Ok(());
@@ -226,15 +321,139 @@ async fn poll_active_prs(
         for watch in token_watches {
             if let Err(e) = poll_single_pr(pg_db, client_ref, watch, execution_deps).await {
                 tracing::warn!(
-                    "PR watcher: error polling PR #{} for task {}: {}",
+                    "PR watcher: error polling PR #{} for {}: {}",
                     watch.pr_number,
-                    watch.task_run_id,
+                    watch.owner_label(),
                     e
                 );
             }
         }
     }
 
+    Ok(())
+}
+
+/// PR-shepherd Phase 1: drain the pending-seed queue populated by the
+/// transcript watcher's `gh pr create` detection and upsert `pr_watch_state`
+/// rows. Branch-only seeds resolve to a PR number via
+/// `GET /pulls?head=<owner>:<branch>`; already-closed/merged PRs and repos
+/// outside the trigger's `shepherd_repos` allowlist are skipped. Best-effort
+/// throughout — a failed seed is logged and dropped (the transcript watcher
+/// will re-observe a genuinely open PR only if the operator re-runs
+/// `gh pr create`, but the seed pipeline is idempotent when it does).
+async fn drain_and_seed_pending(
+    pg_db: &PgDb,
+    client: &GitHubClient,
+    shepherd_repos: &[String],
+) {
+    for seed in pr_shepherd::drain_seeds() {
+        if let Err(e) = seed_one_pending(pg_db, client, shepherd_repos, &seed).await {
+            tracing::warn!(
+                "PR shepherd: failed to seed watch for {:?}: {}",
+                seed.target,
+                e
+            );
+        }
+    }
+}
+
+/// Land one pending seed as a `pr_watch_state` row (or skip it, with a debug
+/// log, when the allowlist excludes it / no open PR matches / the PR already
+/// terminated).
+async fn seed_one_pending(
+    pg_db: &PgDb,
+    client: &GitHubClient,
+    shepherd_repos: &[String],
+    seed: &PendingPrSeed,
+) -> Result<(), String> {
+    let repo_full_name = match &seed.target {
+        SeedTarget::Pr { repo_full_name, .. } | SeedTarget::Branch { repo_full_name, .. } => {
+            repo_full_name.clone()
+        }
+    };
+    if !pr_shepherd::repo_allowed(&repo_full_name, shepherd_repos) {
+        tracing::debug!(
+            "PR shepherd: repo {} not in shepherd_repos allowlist — dropping seed",
+            repo_full_name
+        );
+        return Ok(());
+    }
+    let parts: Vec<&str> = repo_full_name.splitn(2, '/').collect();
+    if parts.len() != 2 {
+        return Err(format!("Invalid repo_full_name: {}", repo_full_name));
+    }
+    let (owner, repo) = (parts[0], parts[1]);
+
+    // Resolve to a live PR (number + current head SHA).
+    let pr: PrStatus = match &seed.target {
+        SeedTarget::Pr { pr_number, .. } => client.get_pr(owner, repo, *pr_number).await?,
+        SeedTarget::Branch { branch, .. } => {
+            let prs = client.list_open_prs_by_head(owner, repo, branch).await?;
+            match prs.into_iter().next() {
+                Some(pr) => pr,
+                None => {
+                    tracing::debug!(
+                        "PR shepherd: no open PR for {}:{} — dropping seed",
+                        repo_full_name,
+                        branch
+                    );
+                    return Ok(());
+                }
+            }
+        }
+    };
+    if pr.merged || pr.state == "closed" {
+        tracing::debug!(
+            "PR shepherd: PR #{} in {} already terminated — dropping seed",
+            pr.number,
+            repo_full_name
+        );
+        return Ok(());
+    }
+
+    // Auto-resume re-queues the authoring TASK RUN, so only task-run-keyed
+    // watches enable it; an interactive session has nothing to re-queue
+    // (Phase 4 wires its notification path).
+    let (task_run_id, authoring_session_id, auto_resume_enabled) = match &seed.identity {
+        SeedIdentity::TaskRun {
+            task_run_id,
+            authoring_session_id,
+        } => (
+            Some(task_run_id.as_str()),
+            authoring_session_id.as_deref(),
+            true,
+        ),
+        SeedIdentity::Session {
+            authoring_session_id,
+        } => (None, Some(authoring_session_id.as_str()), false),
+    };
+
+    // No workflow backs a shepherd-seeded watch; empty token means the
+    // trigger's default GitHub client polls it. max_auto_resumes keeps the
+    // trigger-config default (10) for task-run seeds.
+    let watch_id = pg_db
+        .upsert_pr_watch_state(
+            task_run_id,
+            authoring_session_id,
+            pr.number,
+            &repo_full_name,
+            &pr.head_sha,
+            "",
+            10,
+            "",
+            auto_resume_enabled,
+        )
+        .await?;
+
+    tracing::info!(
+        target: "pr_shepherd",
+        watch_id = %watch_id,
+        repo = %repo_full_name,
+        pr_number = pr.number,
+        task_run_id = task_run_id.unwrap_or("<none>"),
+        authoring_session_id = authoring_session_id.unwrap_or("<none>"),
+        "pr_shepherd: seeded PR watch from transcript-observed gh pr create"
+    );
     Ok(())
 }
 
@@ -273,6 +492,27 @@ async fn poll_single_pr(
         );
     }
 
+    // PR-shepherd Phase 2: advance/reset the all-green streak clock. Tracked
+    // (and detected) only while the shepherd master flag is on — the flag
+    // gates ALL new behavior, so with it off the column stays NULL and
+    // `determine_pr_action` receives no threshold.
+    let now: DateTime<Utc> = Utc::now();
+    let green_threshold: Option<Duration> = if pr_shepherd::shepherd_enabled() {
+        Some(pr_shepherd::green_threshold())
+    } else {
+        None
+    };
+    let first_fully_green_at: Option<DateTime<Utc>> = if green_threshold.is_some() {
+        compute_first_fully_green_at(
+            matches!(ci_status, CiStatus::Success),
+            head_sha_changed,
+            watch.first_fully_green_at,
+            now,
+        )
+    } else {
+        None
+    };
+
     // Determine action
     let action = determine_pr_action(
         &watch.last_checks_status,
@@ -285,6 +525,9 @@ async fn poll_single_pr(
         watch.auto_resume_count,
         watch.max_auto_resumes,
         head_sha_changed,
+        first_fully_green_at,
+        now,
+        green_threshold,
     );
 
     // Update stored state
@@ -300,7 +543,13 @@ async fn poll_single_pr(
     };
 
     pg_db
-        .update_pr_watch_state(&watch.id, new_checks_str, new_review_str, &pr.head_sha)
+        .update_pr_watch_state(
+            &watch.id,
+            new_checks_str,
+            new_review_str,
+            &pr.head_sha,
+            first_fully_green_at,
+        )
         .await?;
 
     // Execute action
@@ -308,12 +557,23 @@ async fn poll_single_pr(
         PrAction::NoAction => {}
         PrAction::AutoResume { .. } if !watch.auto_resume_enabled => {
             tracing::info!(
-                "PR watcher: CI failure on PR #{} for task {} but auto_resume is disabled, skipping",
+                "PR watcher: CI failure on PR #{} for {} but auto_resume is disabled, skipping",
                 watch.pr_number,
-                watch.task_run_id,
+                watch.owner_label(),
             );
         }
         PrAction::AutoResume { mut ci_context } => {
+            // Auto-resume re-queues the authoring TASK RUN; a session-seeded
+            // watch has none. Seeds set auto_resume_enabled=false so the arm
+            // above catches them — this guard is the defensive backstop.
+            let Some(task_run_id) = watch.task_run_id.as_deref() else {
+                tracing::info!(
+                    "PR watcher: CI failure on PR #{} for session {} — no task run to auto-resume, skipping",
+                    watch.pr_number,
+                    watch.owner_label(),
+                );
+                return Ok(());
+            };
             ci_context.pr_number = Some(watch.pr_number);
 
             // Fetch logs for failed checks (best effort, truncate each to 4KB)
@@ -339,7 +599,7 @@ async fn poll_single_pr(
             tracing::info!(
                 "PR watcher: CI failure on PR #{} for task {}, auto-resuming (attempt {}/{})",
                 watch.pr_number,
-                watch.task_run_id,
+                task_run_id,
                 watch.auto_resume_count + 1,
                 watch.max_auto_resumes,
             );
@@ -350,30 +610,34 @@ async fn poll_single_pr(
                 Err(e) => {
                     tracing::warn!(
                         "PR watcher: failed to serialize CI context for task {}: {e}",
-                        watch.task_run_id
+                        task_run_id
                     );
                     "{}".to_string()
                 }
             };
             pg_db
-                .set_task_run_ci_failure_context(&watch.task_run_id, &ci_context_json)
+                .set_task_run_ci_failure_context(task_run_id, &ci_context_json)
                 .await?;
 
             // Update task status to trigger re-execution
-            pg_db
-                .update_task_run_status(&watch.task_run_id, "queued")
-                .await?;
+            pg_db.update_task_run_status(task_run_id, "queued").await?;
         }
         PrAction::CiPassed => {
             tracing::info!(
-                "PR watcher: CI passed on PR #{} for task {}",
+                "PR watcher: CI passed on PR #{} for {}",
                 watch.pr_number,
-                watch.task_run_id,
+                watch.owner_label(),
             );
+
+            // The review subtask is a child of the authoring TASK RUN; a
+            // session-seeded watch has none, so its CI-pass is log-only.
+            let Some(task_run_id) = watch.task_run_id.as_deref() else {
+                return Ok(());
+            };
 
             // Spawn review subtask if one doesn't already exist (idempotency)
             let existing_review = pg_db
-                .has_review_subtask_for_pr(&watch.task_run_id, watch.pr_number)
+                .has_review_subtask_for_pr(task_run_id, watch.pr_number)
                 .await
                 .unwrap_or(false);
 
@@ -384,7 +648,7 @@ async fn poll_single_pr(
 
                 let review_model = Some("sonnet".to_string());
                 let config = ReviewSubtaskConfig {
-                    parent_task_run_id: watch.task_run_id.clone(),
+                    parent_task_run_id: task_run_id.to_string(),
                     pr_number: watch.pr_number,
                     repo_full_name: watch.repo_full_name.clone(),
                     review_model: review_model.clone(),
@@ -456,35 +720,305 @@ async fn poll_single_pr(
         }
         PrAction::Merged => {
             tracing::info!(
-                "PR watcher: PR #{} merged for task {}",
+                "PR watcher: PR #{} merged for {}",
                 watch.pr_number,
-                watch.task_run_id,
+                watch.owner_label(),
             );
             pg_db.mark_pr_watch_complete(&watch.id, "merged").await?;
-            pg_db
-                .update_task_run_status(&watch.task_run_id, "complete")
-                .await?;
+            // Only task-run-keyed watches have a task to complete.
+            if let Some(task_run_id) = watch.task_run_id.as_deref() {
+                pg_db
+                    .update_task_run_status(task_run_id, "complete")
+                    .await?;
+            }
         }
         PrAction::Closed => {
             tracing::info!(
-                "PR watcher: PR #{} closed without merge for task {}",
+                "PR watcher: PR #{} closed without merge for {}",
                 watch.pr_number,
-                watch.task_run_id,
+                watch.owner_label(),
             );
             pg_db.mark_pr_watch_complete(&watch.id, "closed").await?;
         }
         PrAction::AutoResumeLimitReached => {
             tracing::warn!(
-                "PR watcher: auto-resume limit ({}) reached for PR #{} task {}",
+                "PR watcher: auto-resume limit ({}) reached for PR #{} ({})",
                 watch.max_auto_resumes,
                 watch.pr_number,
-                watch.task_run_id,
+                watch.owner_label(),
             );
             pg_db
                 .mark_pr_watch_complete(&watch.id, "limit_reached")
                 .await?;
         }
+        PrAction::GreenButUnmerged { green_for } => {
+            handle_green_but_unmerged(watch, green_for);
+        }
     }
 
     Ok(())
+}
+
+/// PR-shepherd Phase 2 seam: the PR has been fully green on an unchanged head
+/// past `QONTINUI_PR_SHEPHERD_GREEN_THRESHOLD` and is still open. Phase 3
+/// (coord diagnosis + classification) plugs in here; until then the handler
+/// emits one structured info event per poll so the condition is observable
+/// device-locally — deliberately tighter and coord-independent relative to
+/// coord's own `pr_merge_green_unlanded` alert (2h dwell, coord-side).
+fn handle_green_but_unmerged(watch: &PrWatchState, green_for: Duration) {
+    tracing::info!(
+        target: "pr_shepherd",
+        watch_id = %watch.id,
+        repo = %watch.repo_full_name,
+        pr_number = watch.pr_number,
+        head_sha = %watch.head_sha,
+        owner = %watch.owner_label(),
+        green_for_secs = green_for.as_secs(),
+        "pr_shepherd: PR green-but-unmerged past threshold"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const THRESHOLD: Duration = Duration::from_secs(45 * 60);
+
+    /// Call [`determine_pr_action`] with the boilerplate defaulted: open PR,
+    /// no merge conflict, counters 0/10, review state pending.
+    #[allow(clippy::too_many_arguments)]
+    fn determine(
+        old_checks: &str,
+        new_checks: &CiStatus,
+        pr_merged: bool,
+        pr_closed: bool,
+        head_sha_changed: bool,
+        first_fully_green_at: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+        green_threshold: Option<Duration>,
+    ) -> PrAction {
+        determine_pr_action(
+            old_checks,
+            new_checks,
+            "pending",
+            &ReviewStatus::Pending,
+            pr_merged,
+            pr_closed,
+            false,
+            0,
+            10,
+            head_sha_changed,
+            first_fully_green_at,
+            now,
+            green_threshold,
+        )
+    }
+
+    fn minutes_ago(now: DateTime<Utc>, minutes: i64) -> DateTime<Utc> {
+        now - chrono::Duration::minutes(minutes)
+    }
+
+    #[test]
+    fn green_past_threshold_fires_green_but_unmerged() {
+        let now = Utc::now();
+        let since = minutes_ago(now, 46);
+        let action = determine(
+            "success",
+            &CiStatus::Success,
+            false,
+            false,
+            false,
+            Some(since),
+            now,
+            Some(THRESHOLD),
+        );
+        match action {
+            PrAction::GreenButUnmerged { green_for } => {
+                assert_eq!(green_for.as_secs(), 46 * 60);
+            }
+            other => panic!("expected GreenButUnmerged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn green_under_threshold_is_no_action() {
+        let now = Utc::now();
+        let action = determine(
+            "success",
+            &CiStatus::Success,
+            false,
+            false,
+            false,
+            Some(minutes_ago(now, 44)),
+            now,
+            Some(THRESHOLD),
+        );
+        assert_eq!(action, PrAction::NoAction);
+    }
+
+    #[test]
+    fn transition_to_green_fires_ci_passed_not_green_but_unmerged() {
+        // Fresh transition: old state pending — CiPassed wins even if the
+        // caller somehow passed an ancient streak start.
+        let now = Utc::now();
+        let action = determine(
+            "pending",
+            &CiStatus::Success,
+            false,
+            false,
+            false,
+            Some(minutes_ago(now, 120)),
+            now,
+            Some(THRESHOLD),
+        );
+        assert_eq!(action, PrAction::CiPassed);
+    }
+
+    #[test]
+    fn head_change_returns_no_action_even_when_green_past_threshold() {
+        let now = Utc::now();
+        let action = determine(
+            "success",
+            &CiStatus::Success,
+            false,
+            false,
+            true, // head changed
+            Some(minutes_ago(now, 120)),
+            now,
+            Some(THRESHOLD),
+        );
+        assert_eq!(action, PrAction::NoAction);
+    }
+
+    #[test]
+    fn merged_and_closed_take_priority_over_green() {
+        let now = Utc::now();
+        let long_green = Some(minutes_ago(now, 120));
+        assert_eq!(
+            determine(
+                "success",
+                &CiStatus::Success,
+                true,
+                false,
+                false,
+                long_green,
+                now,
+                Some(THRESHOLD),
+            ),
+            PrAction::Merged
+        );
+        assert_eq!(
+            determine(
+                "success",
+                &CiStatus::Success,
+                false,
+                true,
+                false,
+                long_green,
+                now,
+                Some(THRESHOLD),
+            ),
+            PrAction::Closed
+        );
+    }
+
+    #[test]
+    fn disabled_threshold_never_fires_green_but_unmerged() {
+        let now = Utc::now();
+        let action = determine(
+            "success",
+            &CiStatus::Success,
+            false,
+            false,
+            false,
+            Some(minutes_ago(now, 600)),
+            now,
+            None, // shepherd off
+        );
+        assert_eq!(action, PrAction::NoAction);
+    }
+
+    #[test]
+    fn no_streak_start_is_no_action() {
+        let now = Utc::now();
+        let action = determine(
+            "success",
+            &CiStatus::Success,
+            false,
+            false,
+            false,
+            None,
+            now,
+            Some(THRESHOLD),
+        );
+        assert_eq!(action, PrAction::NoAction);
+    }
+
+    #[test]
+    fn red_transition_still_auto_resumes() {
+        // The Phase-2 params must not disturb the existing failure path.
+        let now = Utc::now();
+        let action = determine(
+            "success",
+            &CiStatus::Failure {
+                failed_checks: vec!["build".to_string()],
+            },
+            false,
+            false,
+            false,
+            Some(minutes_ago(now, 120)),
+            now,
+            Some(THRESHOLD),
+        );
+        match action {
+            PrAction::AutoResume { ci_context } => {
+                assert_eq!(ci_context.failed_check_names, vec!["build".to_string()]);
+            }
+            other => panic!("expected AutoResume, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn future_streak_start_is_no_action() {
+        // Clock skew: a streak start in the future must not fire (to_std()
+        // on the negative duration fails and is treated as zero-length).
+        let now = Utc::now();
+        let action = determine(
+            "success",
+            &CiStatus::Success,
+            false,
+            false,
+            false,
+            Some(now + chrono::Duration::minutes(5)),
+            now,
+            Some(THRESHOLD),
+        );
+        assert_eq!(action, PrAction::NoAction);
+    }
+
+    #[test]
+    fn compute_streak_sets_carries_and_resets() {
+        let now = Utc::now();
+        let earlier = minutes_ago(now, 30);
+
+        // Fresh green with no stored streak → starts at now.
+        assert_eq!(
+            compute_first_fully_green_at(true, false, None, now),
+            Some(now)
+        );
+        // Continuing green streak on the same head → carries the stored start.
+        assert_eq!(
+            compute_first_fully_green_at(true, false, Some(earlier), now),
+            Some(earlier)
+        );
+        // Red/pending flip → clears the streak.
+        assert_eq!(compute_first_fully_green_at(false, false, Some(earlier), now), None);
+        // Head change while green → restarts at now (CI truth is per-head).
+        assert_eq!(
+            compute_first_fully_green_at(true, true, Some(earlier), now),
+            Some(now)
+        );
+        // Head change while red → still cleared.
+        assert_eq!(compute_first_fully_green_at(false, true, Some(earlier), now), None);
+    }
 }

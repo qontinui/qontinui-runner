@@ -1,5 +1,7 @@
 //! Database operations for PR watch state tracking.
 
+use chrono::{DateTime, Utc};
+
 use super::PgDb;
 use crate::trigger_system::watchers::pr_watcher::PrWatchState;
 
@@ -17,7 +19,8 @@ impl PgDb {
                 r#"SELECT id, task_run_id, pr_number, repo_full_name, head_sha,
                        workflow_id, last_checks_status, last_review_status,
                        auto_resume_count, max_auto_resumes, github_token,
-                       auto_resume_enabled
+                       auto_resume_enabled, authoring_session_id,
+                       first_fully_green_at
                 FROM pr_watch_state
                 WHERE completed_at IS NULL
                 ORDER BY created_at ASC"#,
@@ -41,14 +44,25 @@ impl PgDb {
                 max_auto_resumes: r.get::<_, i32>(9) as u32,
                 github_token: r.get(10),
                 auto_resume_enabled: r.get(11),
+                authoring_session_id: r.get(12),
+                first_fully_green_at: r.get(13),
             })
             .collect())
     }
 
     /// Insert or update a PR watch entry.
+    ///
+    /// Two identity keys (PR-shepherd Phase 1): task-run-authored watches key
+    /// on the existing `(task_run_id, pr_number)` unique constraint;
+    /// interactive-session watches carry a NULL `task_run_id` and key on the
+    /// partial unique index `(authoring_session_id, pr_number) WHERE
+    /// task_run_id IS NULL` instead (a NULL `task_run_id` can never conflict
+    /// on the constraint). At least one identity is required.
+    #[allow(clippy::too_many_arguments)]
     pub async fn upsert_pr_watch_state(
         &self,
-        task_run_id: &str,
+        task_run_id: Option<&str>,
+        authoring_session_id: Option<&str>,
         pr_number: u64,
         repo_full_name: &str,
         head_sha: &str,
@@ -67,33 +81,64 @@ impl PgDb {
         let pr_num = pr_number as i64;
         let max_resumes = max_auto_resumes as i32;
 
-        let row = conn
-            .query_one(
-                r#"INSERT INTO pr_watch_state (id, task_run_id, pr_number, repo_full_name, head_sha, workflow_id, max_auto_resumes, github_token, auto_resume_enabled)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-               ON CONFLICT (task_run_id, pr_number) DO UPDATE SET
-                   head_sha = EXCLUDED.head_sha,
-                   workflow_id = EXCLUDED.workflow_id,
-                   max_auto_resumes = EXCLUDED.max_auto_resumes,
-                   github_token = EXCLUDED.github_token,
-                   auto_resume_enabled = EXCLUDED.auto_resume_enabled,
-                   updated_at = NOW()
-               RETURNING id"#,
-                &[&id, &task_run_id, &pr_num, &repo_full_name, &head_sha, &workflow_id, &max_resumes, &github_token, &auto_resume_enabled],
-            )
-            .await
-            .map_err(|e| format!("PG upsert_pr_watch_state: {}", e))?;
+        let row = match task_run_id {
+            Some(task_run_id) => conn
+                .query_one(
+                    r#"INSERT INTO pr_watch_state (id, task_run_id, authoring_session_id, pr_number, repo_full_name, head_sha, workflow_id, max_auto_resumes, github_token, auto_resume_enabled)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                   ON CONFLICT (task_run_id, pr_number) DO UPDATE SET
+                       authoring_session_id = COALESCE(EXCLUDED.authoring_session_id, pr_watch_state.authoring_session_id),
+                       head_sha = EXCLUDED.head_sha,
+                       workflow_id = EXCLUDED.workflow_id,
+                       max_auto_resumes = EXCLUDED.max_auto_resumes,
+                       github_token = EXCLUDED.github_token,
+                       auto_resume_enabled = EXCLUDED.auto_resume_enabled,
+                       updated_at = NOW()
+                   RETURNING id"#,
+                    &[&id, &task_run_id, &authoring_session_id, &pr_num, &repo_full_name, &head_sha, &workflow_id, &max_resumes, &github_token, &auto_resume_enabled],
+                )
+                .await
+                .map_err(|e| format!("PG upsert_pr_watch_state: {}", e))?,
+            None => {
+                let Some(authoring_session_id) = authoring_session_id else {
+                    return Err(
+                        "upsert_pr_watch_state requires task_run_id or authoring_session_id"
+                            .to_string(),
+                    );
+                };
+                conn.query_one(
+                    r#"INSERT INTO pr_watch_state (id, task_run_id, authoring_session_id, pr_number, repo_full_name, head_sha, workflow_id, max_auto_resumes, github_token, auto_resume_enabled)
+                   VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, $9)
+                   ON CONFLICT (authoring_session_id, pr_number) WHERE task_run_id IS NULL DO UPDATE SET
+                       head_sha = EXCLUDED.head_sha,
+                       workflow_id = EXCLUDED.workflow_id,
+                       max_auto_resumes = EXCLUDED.max_auto_resumes,
+                       github_token = EXCLUDED.github_token,
+                       auto_resume_enabled = EXCLUDED.auto_resume_enabled,
+                       updated_at = NOW()
+                   RETURNING id"#,
+                    &[&id, &authoring_session_id, &pr_num, &repo_full_name, &head_sha, &workflow_id, &max_resumes, &github_token, &auto_resume_enabled],
+                )
+                .await
+                .map_err(|e| format!("PG upsert_pr_watch_state (session-keyed): {}", e))?
+            }
+        };
 
         Ok(row.get(0))
     }
 
-    /// Update check/review status and head SHA after polling.
+    /// Update check/review status, head SHA, and the green-streak clock after
+    /// polling. `first_fully_green_at` is written unconditionally — the
+    /// caller computes set/carry/reset semantics
+    /// (`pr_watcher::compute_first_fully_green_at`), so `None` here clears a
+    /// broken streak.
     pub async fn update_pr_watch_state(
         &self,
         id: &str,
         checks_status: &str,
         review_status: &str,
         head_sha: &str,
+        first_fully_green_at: Option<DateTime<Utc>>,
     ) -> Result<(), String> {
         let conn = self
             .pool
@@ -106,10 +151,17 @@ impl PgDb {
                 last_checks_status = $1,
                 last_review_status = $2,
                 head_sha = $3,
+                first_fully_green_at = $4,
                 last_polled_at = NOW(),
                 updated_at = NOW()
-            WHERE id = $4"#,
-            &[&checks_status, &review_status, &head_sha, &id],
+            WHERE id = $5"#,
+            &[
+                &checks_status,
+                &review_status,
+                &head_sha,
+                &first_fully_green_at,
+                &id,
+            ],
         )
         .await
         .map_err(|e| format!("PG update_pr_watch_state: {}", e))?;
