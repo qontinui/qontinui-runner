@@ -178,9 +178,9 @@ impl SessionManager {
                 continue;
             };
             let matches = wt.path.to_string_lossy() == workdir
-                || target_canon.as_deref().is_some_and(|tc| {
-                    std::fs::canonicalize(&wt.path).ok().as_deref() == Some(tc)
-                });
+                || target_canon
+                    .as_deref()
+                    .is_some_and(|tc| std::fs::canonicalize(&wt.path).ok().as_deref() == Some(tc));
             if matches {
                 return Some(task_run_id.clone());
             }
