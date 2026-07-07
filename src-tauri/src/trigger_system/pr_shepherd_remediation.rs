@@ -25,7 +25,6 @@
 //! before this module is invoked.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use serde_json::Value;
 
@@ -341,7 +340,6 @@ async fn spawn_remediation_session(
 ///
 /// The plans-dir / cooldown dedup runs here; the coord-live-attempt coexistence
 /// check (rung i) runs at the call site before this is invoked.
-#[allow(clippy::too_many_arguments)]
 pub async fn escalate_coord_defect(
     pg: &PgDb,
     deps: Option<&PrWatcherDeps>,
