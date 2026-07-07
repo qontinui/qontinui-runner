@@ -1460,6 +1460,33 @@ mod tests {
         }
     }
 
+    /// The `terminal_id -> claude_session_id` reverse index that the enriched
+    /// `terminal_list` (`sessionIdsByTerminal`) relies on to re-attach
+    /// `claudeSessionId` to reconnected tabs: an OPEN record resolves by its
+    /// terminal id (carrying the session id + config dir), and an unknown
+    /// terminal resolves to `None`.
+    #[test]
+    fn find_open_by_terminal_resolves_session_id_for_reconnect() {
+        let dir = tempdir().unwrap();
+        let store =
+            SessionLifecycleStore::open(&dir.path().join("terminal-sessions.json")).unwrap();
+
+        let mut r = rec("sess-1");
+        r.terminal_id = "term-1".to_string();
+        store.record_open(r);
+
+        let found = store
+            .find_open_by_terminal("term-1")
+            .expect("open record resolvable by its terminal id");
+        assert_eq!(found.claude_session_id, "sess-1");
+        assert_eq!(found.config_dir.as_deref(), Some("C:/cfg"));
+
+        assert!(
+            store.find_open_by_terminal("term-unknown").is_none(),
+            "an unknown terminal id resolves to None"
+        );
+    }
+
     /// `confirm_session` flips provisional→confirmed monotonically, a
     /// provisional re-record never clears it, and pre-Phase-2 rows load
     /// provisional (session-restore-redesign Phase 2 coordinator refinement).

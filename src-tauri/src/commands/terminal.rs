@@ -406,16 +406,49 @@ pub async fn terminal_close(
 }
 
 /// List all terminal sessions.
+///
+/// Alongside the `terminals` array (`TerminalInfo`, which structurally does
+/// NOT carry a Claude session id), returns `sessionIdsByTerminal`: a
+/// `{ terminal_id -> { claudeSessionId, configDir } }` map derived from the
+/// durable [`SessionLifecycleStore`]'s `terminal_id -> claude_session_id`
+/// index ([`SessionLifecycleStore::find_open_by_terminal`]).
+///
+/// This is what lets the frontend attach `claudeSessionId` to a RECONNECTED
+/// tab. The per-session PR dropdown (and anything else session-scoped) gates
+/// on `tab.claudeSessionId`; the reconnect path rebuilds tabs from
+/// `TerminalInfo` alone, so without this map every reconnected session lost
+/// its id and the dropdown never mounted for it. Best-effort + additive: if
+/// the store isn't managed the map is simply empty, and the `TerminalInfo`
+/// schema (`deny_unknown_fields`) is untouched.
 #[tauri::command]
 pub fn terminal_list(
+    app: tauri::AppHandle,
     terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
 ) -> Result<CommandResponse, String> {
     let terminals = terminal_manager.list();
 
+    let mut session_ids_by_terminal = serde_json::Map::new();
+    if let Some(store) = app.try_state::<Arc<SessionLifecycleStore>>() {
+        for info in &terminals {
+            if let Some(rec) = store.find_open_by_terminal(&info.id) {
+                session_ids_by_terminal.insert(
+                    info.id.clone(),
+                    serde_json::json!({
+                        "claudeSessionId": rec.claude_session_id,
+                        "configDir": rec.config_dir,
+                    }),
+                );
+            }
+        }
+    }
+
     Ok(CommandResponse {
         success: true,
         message: None,
-        data: Some(serde_json::json!({ "terminals": terminals })),
+        data: Some(serde_json::json!({
+            "terminals": terminals,
+            "sessionIdsByTerminal": serde_json::Value::Object(session_ids_by_terminal),
+        })),
     })
 }
 
