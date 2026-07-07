@@ -28,6 +28,7 @@
 //! Record in trigger_history
 //! ```
 
+pub mod coord_pr_merge_client;
 pub mod evaluator;
 pub mod executor;
 pub mod github_api;

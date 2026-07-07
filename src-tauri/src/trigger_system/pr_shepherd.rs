@@ -80,6 +80,24 @@ pub fn autoseed_enabled() -> bool {
     }
 }
 
+/// Phase-3 diagnosis gate. Requires the master flag; then default **ON** unless
+/// `QONTINUI_PR_SHEPHERD_DIAGNOSE` is `0`/`false`/`off` (case-insensitive).
+/// Gates the coord verdict/events/graph/queue/health calls specifically, so
+/// Phase 3 can run log-only with diagnosis ON while later action phases stay
+/// OFF — the same default-on shape as [`autoseed_enabled`].
+pub fn diagnose_enabled() -> bool {
+    if !shepherd_enabled() {
+        return false;
+    }
+    match std::env::var("QONTINUI_PR_SHEPHERD_DIAGNOSE") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
 /// Green-but-unmerged dwell threshold. Reads
 /// `QONTINUI_PR_SHEPHERD_GREEN_THRESHOLD` (bare minutes or `s`/`m`/`h`
 /// suffix); an unset or unparseable value falls back to
@@ -261,6 +279,27 @@ mod tests {
 
         std::env::remove_var("QONTINUI_PR_SHEPHERD");
         std::env::remove_var("QONTINUI_PR_SHEPHERD_AUTOSEED");
+    }
+
+    #[test]
+    fn diagnose_requires_master_and_defaults_on_under_it() {
+        let _env = env_lock();
+        // Master off → diagnose off regardless of its own var.
+        std::env::remove_var("QONTINUI_PR_SHEPHERD");
+        std::env::set_var("QONTINUI_PR_SHEPHERD_DIAGNOSE", "1");
+        assert!(!diagnose_enabled(), "diagnose must be gated on the master flag");
+
+        // Master on, diagnose unset → ON (default).
+        std::env::set_var("QONTINUI_PR_SHEPHERD", "1");
+        std::env::remove_var("QONTINUI_PR_SHEPHERD_DIAGNOSE");
+        assert!(diagnose_enabled(), "diagnose defaults ON under the master flag");
+
+        // Master on, diagnose explicitly off.
+        std::env::set_var("QONTINUI_PR_SHEPHERD_DIAGNOSE", "off");
+        assert!(!diagnose_enabled());
+
+        std::env::remove_var("QONTINUI_PR_SHEPHERD");
+        std::env::remove_var("QONTINUI_PR_SHEPHERD_DIAGNOSE");
     }
 
     #[test]
