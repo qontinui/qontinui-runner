@@ -49,30 +49,22 @@ PROMPT="%{$(printf '\033]633;A\007')%}${PROMPT}%{$(printf '\033]633;B\007')%}"
 
 # ── Claude Code runner context ─────────────────────────────────────────────
 # Wrap `claude` so sessions launched from this terminal know they run inside
-# the Qontinui Runner (mirrors shell-integration.bash).
+# the Qontinui Runner (mirrors shell-integration.bash). The briefing text is the
+# SINGLE SOURCE OF TRUTH rendered by the runner (Rust `terminal::runner_context`)
+# and delivered via $QONTINUI_RUNNER_CONTEXT. Fail-open: an empty value launches
+# claude unmodified.
 if [ "${QONTINUI_RUNNER_TERMINAL}" = "1" ]; then
-    __qontinui_api_port="${QONTINUI_RUNNER_API_PORT:-9876}"
-    __qontinui_runner_context="You are running inside the Qontinui Runner desktop application terminal.
-The runner provides AI-driven development automation with structured workflows and verification feedback loops.
-
-Runner HTTP API at http://localhost:${__qontinui_api_port}.
-Key endpoints:
-- GET /task-runs/running - list running task runs
-- GET /task-runs/{id}/output?tail_chars=N - live AI conversation output
-- GET /task-runs/{id}/workflow-state - workflow execution state
-- POST /unified-workflows/execute-inline - execute a workflow inline
-- GET /unified-workflows - list saved workflows
-
-Runner SQLite DB (Windows): ~/AppData/Roaming/com.qontinui.runner/runner.db
-Key tables: task_runs, task_run_events, unified_workflows, workflow_verification_phase_results"
-
     claude() {
         case "${1:-}" in
             mcp|config|update|doctor|api-key)
                 command claude "$@"
                 ;;
             *)
-                command claude --append-system-prompt "$__qontinui_runner_context" "$@"
+                if [ -n "${QONTINUI_RUNNER_CONTEXT}" ]; then
+                    command claude --append-system-prompt "$QONTINUI_RUNNER_CONTEXT" "$@"
+                else
+                    command claude "$@"
+                fi
                 ;;
         esac
     }

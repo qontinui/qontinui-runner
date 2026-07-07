@@ -58,25 +58,12 @@ function global:Prompt {
 
 # ── Claude Code runner context ─────────────────────────────────────────────
 # Wrap the `claude` command so sessions launched from this terminal
-# automatically know they are running inside the Qontinui Runner.
+# automatically know they are running inside the Qontinui Runner. The briefing
+# text is the SINGLE SOURCE OF TRUTH rendered by the runner (Rust
+# `terminal::runner_context`) and delivered via $env:QONTINUI_RUNNER_CONTEXT —
+# this wrapper no longer authors its own copy. Fail-open: if the env var is
+# empty we launch claude unmodified.
 if ($env:QONTINUI_RUNNER_TERMINAL -eq "1") {
-    $__qontinui_api_port = if ($env:QONTINUI_RUNNER_API_PORT) { $env:QONTINUI_RUNNER_API_PORT } else { "9876" }
-    $__qontinui_runner_context = @"
-You are running inside the Qontinui Runner desktop application terminal.
-The runner provides AI-driven development automation with structured workflows and verification feedback loops.
-
-Runner HTTP API at http://localhost:${__qontinui_api_port}. Use PowerShell Invoke-WebRequest on Windows (not curl).
-Key endpoints:
-- GET /task-runs/running - list running task runs
-- GET /task-runs/{id}/output?tail_chars=N - live AI conversation output
-- GET /task-runs/{id}/workflow-state - workflow execution state
-- POST /unified-workflows/execute-inline - execute a workflow inline
-- GET /unified-workflows - list saved workflows
-
-Runner SQLite DB (Windows): ~/AppData/Roaming/com.qontinui.runner/runner.db
-Key tables: task_runs, task_run_events, unified_workflows, workflow_verification_phase_results
-"@
-
     function global:claude {
         # Subcommands that do not accept --append-system-prompt
         $skip = @('mcp', 'config', 'update', 'doctor', 'api-key')
@@ -86,10 +73,11 @@ Key tables: task_runs, task_run_events, unified_workflows, workflow_verification
             Write-Host "claude: command not found" -ForegroundColor Red
             return
         }
-        if ($args.Count -gt 0 -and $skip -contains $args[0]) {
+        $ctx = $env:QONTINUI_RUNNER_CONTEXT
+        if (($args.Count -gt 0 -and $skip -contains $args[0]) -or [string]::IsNullOrEmpty($ctx)) {
             & $exe @args
         } else {
-            & $exe --append-system-prompt $__qontinui_runner_context @args
+            & $exe --append-system-prompt $ctx @args
         }
     }
 }
