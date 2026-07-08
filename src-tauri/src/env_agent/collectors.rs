@@ -551,8 +551,14 @@ fn account_name(config_dir: &str) -> String {
 fn read_shell_profiles() -> Option<String> {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     if let Some(docs) = dirs::document_dir() {
-        candidates.push(docs.join("WindowsPowerShell").join("Microsoft.PowerShell_profile.ps1"));
-        candidates.push(docs.join("PowerShell").join("Microsoft.PowerShell_profile.ps1"));
+        candidates.push(
+            docs.join("WindowsPowerShell")
+                .join("Microsoft.PowerShell_profile.ps1"),
+        );
+        candidates.push(
+            docs.join("PowerShell")
+                .join("Microsoft.PowerShell_profile.ps1"),
+        );
     }
     if let Some(home) = dirs::home_dir() {
         candidates.push(home.join(".bashrc"));
@@ -588,7 +594,10 @@ pub fn collect_claude_accounts() -> Option<Section> {
 /// SECRET-SAFETY INVARIANT (pinned by `secret_safety_claude_accounts_*`): this
 /// function NEVER opens `.credentials.json` (or `.claude.json`) — it emits only
 /// names/topology and `present`/`absent` EXISTENCE flags.
-fn collect_claude_accounts_from(config_root: &Path, profiles_text: Option<&str>) -> Option<Section> {
+fn collect_claude_accounts_from(
+    config_root: &Path,
+    profiles_text: Option<&str>,
+) -> Option<Section> {
     let runner_dir = config_root.join("com.qontinui.runner");
     let accounts_file = runner_dir.join("claude-accounts.json");
     let settings_file = runner_dir.join("settings.json");
@@ -612,7 +621,11 @@ fn collect_claude_accounts_from(config_root: &Path, profiles_text: Option<&str>)
         // Fallback source: settings.json (mode is NESTED under ai.claude_cli).
         if let Ok(p) = serde_json::from_str::<SettingsFileProbe>(&contents) {
             config_dirs = p.claude_config_dirs;
-            if let Some(m) = p.ai.claude_cli.account_selection_mode.filter(|m| !m.is_empty()) {
+            if let Some(m) =
+                p.ai.claude_cli
+                    .account_selection_mode
+                    .filter(|m| !m.is_empty())
+            {
                 selection_mode = m;
             }
             launch_commands = p.claude_account_launch_commands;
