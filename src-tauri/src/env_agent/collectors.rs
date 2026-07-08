@@ -15,9 +15,14 @@
 //! - `versions`: package/tool version strings parsed from manifests — no secrets.
 //! - `env_contract`: env var NAMES only (allowlisted by prefix), value `"present"`.
 //!   The VALUE is structurally dropped — we never read `std::env::var(name)`.
+//! - `claude_accounts`: account NAMES + selection mode + credential/shortcut
+//!   PRESENCE flags. The credential file (`.credentials.json`) is checked for
+//!   EXISTENCE only — it is NEVER opened, so an OAuth token can't leak.
 //!
 //! The `secret_safety_*` unit tests below pin this invariant.
 
+use std::collections::HashMap;
+use std::path::Path;
 use std::time::Duration;
 
 use serde_json::{Map, Value};
@@ -475,6 +480,186 @@ pub fn collect_env_contract() -> Section {
     section
 }
 
+// ============================================================================
+// claude_accounts — SECRET-FREE roster topology
+// ============================================================================
+//
+// Captures the machine's Claude Code account roster (which config dirs exist,
+// the selection mode, and per-account credential/shortcut PRESENCE) so the
+// backend can drift-check a machine's account wiring. This is a pure
+// read + file-EXISTENCE-check collector: it never opens a credential file.
+//
+// CRATE-BOUNDARY NOTE: the roster module (`crate::claude_accounts`) lives in
+// the BIN crate (declared in `main.rs`), so this LIB-crate collector cannot
+// call it. We re-implement the tiny roster read inline against the same
+// on-disk shape.
+
+/// On-disk probe of `claude-accounts.json` — only the fields this collector
+/// needs. Selection mode is read as a raw string (snake_case on disk) to avoid
+/// depending on the bin-crate `AccountSelectionMode` enum.
+#[derive(serde::Deserialize, Default)]
+struct AccountsFileProbe {
+    #[serde(default)]
+    claude_config_dirs: Vec<String>,
+    #[serde(default)]
+    account_selection_mode: Option<String>,
+    #[serde(default)]
+    claude_account_launch_commands: HashMap<String, String>,
+}
+
+/// On-disk probe of the fallback `settings.json`. SHAPE DIFFERS from
+/// `claude-accounts.json`: the selection mode is NESTED at
+/// `ai.claude_cli.account_selection_mode` (mirrors `claude_accounts.rs`'s
+/// migration `SettingsProbe`). A flat lookup here silently yields the default —
+/// a bug the settings-fallback test guards against.
+#[derive(serde::Deserialize, Default)]
+struct SettingsCliProbe {
+    #[serde(default)]
+    account_selection_mode: Option<String>,
+}
+#[derive(serde::Deserialize, Default)]
+struct SettingsAiProbe {
+    #[serde(default)]
+    claude_cli: SettingsCliProbe,
+}
+#[derive(serde::Deserialize, Default)]
+struct SettingsFileProbe {
+    #[serde(default)]
+    claude_config_dirs: Vec<String>,
+    #[serde(default)]
+    claude_account_launch_commands: HashMap<String, String>,
+    #[serde(default)]
+    ai: SettingsAiProbe,
+}
+
+/// Derive an account NAME from a config-dir path: the basename with a leading
+/// `.claude-` prefix stripped (`.../.claude-gmail` → `gmail`). Splits on BOTH
+/// separators so Windows (`\`) and POSIX (`/`) paths behave identically. When
+/// the basename has no `.claude-` prefix, the basename is used as-is.
+fn account_name(config_dir: &str) -> String {
+    let base = config_dir
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(config_dir);
+    base.strip_prefix(".claude-").unwrap_or(base).to_string()
+}
+
+/// Best-effort read of the user's shell profiles (PowerShell + `~/.bashrc`),
+/// concatenated. Returns `None` when NONE are readable — the caller then omits
+/// the `shortcut_*` keys entirely (fail-open: never error, never guess).
+fn read_shell_profiles() -> Option<String> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(docs) = dirs::document_dir() {
+        candidates.push(docs.join("WindowsPowerShell").join("Microsoft.PowerShell_profile.ps1"));
+        candidates.push(docs.join("PowerShell").join("Microsoft.PowerShell_profile.ps1"));
+    }
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".bashrc"));
+        candidates.push(home.join(".zshrc"));
+    }
+    let mut combined = String::new();
+    for path in candidates {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            combined.push_str(&text);
+            combined.push('\n');
+        }
+    }
+    if combined.is_empty() {
+        None
+    } else {
+        Some(combined)
+    }
+}
+
+/// Collect the `claude_accounts` section. Resolves the roster from
+/// `dirs::config_dir()` and the user's shell profiles, then delegates to the
+/// injectable core. Returns `None` when neither the accounts file nor any
+/// config dir is found (so the isolation driver omits the section).
+pub fn collect_claude_accounts() -> Option<Section> {
+    let config_root = dirs::config_dir()?;
+    let profiles = read_shell_profiles();
+    collect_claude_accounts_from(&config_root, profiles.as_deref())
+}
+
+/// Injectable core so tests can drive a temp config root (and control the
+/// shell-profile text) without touching the real environment.
+///
+/// SECRET-SAFETY INVARIANT (pinned by `secret_safety_claude_accounts_*`): this
+/// function NEVER opens `.credentials.json` (or `.claude.json`) — it emits only
+/// names/topology and `present`/`absent` EXISTENCE flags.
+fn collect_claude_accounts_from(config_root: &Path, profiles_text: Option<&str>) -> Option<Section> {
+    let runner_dir = config_root.join("com.qontinui.runner");
+    let accounts_file = runner_dir.join("claude-accounts.json");
+    let settings_file = runner_dir.join("settings.json");
+
+    let mut config_dirs: Vec<String> = Vec::new();
+    let mut selection_mode = String::from("least_usage");
+    let mut launch_commands: HashMap<String, String> = HashMap::new();
+    let mut accounts_file_found = false;
+
+    // Primary source: claude-accounts.json (mode is top-level).
+    if let Ok(contents) = std::fs::read_to_string(&accounts_file) {
+        accounts_file_found = true;
+        if let Ok(p) = serde_json::from_str::<AccountsFileProbe>(&contents) {
+            config_dirs = p.claude_config_dirs;
+            if let Some(m) = p.account_selection_mode.filter(|m| !m.is_empty()) {
+                selection_mode = m;
+            }
+            launch_commands = p.claude_account_launch_commands;
+        }
+    } else if let Ok(contents) = std::fs::read_to_string(&settings_file) {
+        // Fallback source: settings.json (mode is NESTED under ai.claude_cli).
+        if let Ok(p) = serde_json::from_str::<SettingsFileProbe>(&contents) {
+            config_dirs = p.claude_config_dirs;
+            if let Some(m) = p.ai.claude_cli.account_selection_mode.filter(|m| !m.is_empty()) {
+                selection_mode = m;
+            }
+            launch_commands = p.claude_account_launch_commands;
+        }
+    }
+
+    // Omit the section only when there is genuinely nothing to report.
+    if !accounts_file_found && config_dirs.is_empty() {
+        return None;
+    }
+
+    // (name, config_dir) pairs, sorted by name for stable output.
+    let mut pairs: Vec<(String, String)> = config_dirs
+        .iter()
+        .map(|d| (account_name(d), d.clone()))
+        .collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut section = Section::new();
+    put(&mut section, "selection_mode", selection_mode);
+    let names: Vec<&str> = pairs.iter().map(|(n, _)| n.as_str()).collect();
+    put(&mut section, "accounts", names.join(","));
+
+    // auth_<name>: EXISTENCE of <config_dir>/.credentials.json — NEVER opened.
+    for (name, dir) in &pairs {
+        let creds = Path::new(dir).join(".credentials.json");
+        let flag = if creds.exists() { "present" } else { "absent" };
+        put(&mut section, &format!("auth_{name}"), flag);
+    }
+
+    // shortcut_<name>: best-effort profile mention. FAIL-OPEN — when no profile
+    // is readable we omit these keys rather than guessing `absent`.
+    if let Some(text) = profiles_text {
+        for (name, dir) in &pairs {
+            let mentioned = text.contains(dir.as_str())
+                || launch_commands
+                    .get(dir)
+                    .map(|c| !c.is_empty() && text.contains(c.as_str()))
+                    .unwrap_or(false);
+            let flag = if mentioned { "present" } else { "absent" };
+            put(&mut section, &format!("shortcut_{name}"), flag);
+        }
+    }
+
+    Some(section)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,5 +734,196 @@ mod tests {
         let sanitized = sanitize_url("postgres://u:pw@h:5432/db").unwrap();
         assert!(!sanitized.contains("pw"), "password leaked: {sanitized}");
         assert!(!sanitized.contains("u@"), "userinfo leaked: {sanitized}");
+    }
+
+    // ---- claude_accounts collector ----
+
+    /// Write `claude-accounts.json` under `<root>/com.qontinui.runner/`.
+    fn write_roster(runner_dir: &Path, json: &str) {
+        std::fs::create_dir_all(runner_dir).unwrap();
+        std::fs::write(runner_dir.join("claude-accounts.json"), json).unwrap();
+    }
+
+    /// Secret-safety: an OAuth-token-bearing `.credentials.json` must never be
+    /// opened — only its EXISTENCE is reported. The token bytes (and any file
+    /// contents) must appear NOWHERE in the serialized section.
+    #[test]
+    fn secret_safety_claude_accounts_never_leaks_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let runner = root.join("com.qontinui.runner");
+
+        let acct = root.join(".claude-secretacct");
+        std::fs::create_dir_all(&acct).unwrap();
+        let token = "sk-ant-oauth-SUPERSECRET-TOKEN-VALUE";
+        std::fs::write(
+            acct.join(".credentials.json"),
+            format!("{{\"access_token\":\"{token}\"}}"),
+        )
+        .unwrap();
+
+        write_roster(
+            &runner,
+            &format!(
+                "{{\"claude_config_dirs\":[{:?}],\"account_selection_mode\":\"least_usage\"}}",
+                acct.to_string_lossy()
+            ),
+        );
+
+        let section = collect_claude_accounts_from(root, None).expect("section present");
+        let json = serde_json::to_string(&section).unwrap();
+
+        assert_eq!(
+            section.get("auth_secretacct").and_then(|v| v.as_str()),
+            Some("present"),
+            "credential existence must be reported: {json}"
+        );
+        assert!(json.contains("present"), "presence marker missing: {json}");
+        assert!(!json.contains(token), "OAuth token leaked: {json}");
+        assert!(
+            !json.contains("access_token"),
+            "credential file contents leaked: {json}"
+        );
+    }
+
+    /// Behavior: sorted stripped names, correct mode, auth presence reflects the
+    /// credential file, and `None` when neither the file nor any dir exists.
+    #[test]
+    fn claude_accounts_reflects_roster_and_auth_presence() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let runner = root.join("com.qontinui.runner");
+
+        let gmail = root.join(".claude-gmail");
+        let work = root.join(".claude-work");
+        std::fs::create_dir_all(&gmail).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        // Credential present for gmail only.
+        std::fs::write(gmail.join(".credentials.json"), "{}").unwrap();
+
+        write_roster(
+            &runner,
+            &format!(
+                // deliberately unsorted (work before gmail)
+                "{{\"claude_config_dirs\":[{:?},{:?}],\"account_selection_mode\":\"manual\"}}",
+                work.to_string_lossy(),
+                gmail.to_string_lossy()
+            ),
+        );
+
+        let section = collect_claude_accounts_from(root, None).unwrap();
+        assert_eq!(
+            section.get("accounts").and_then(|v| v.as_str()),
+            Some("gmail,work"),
+            "names must be stripped + sorted"
+        );
+        assert_eq!(
+            section.get("selection_mode").and_then(|v| v.as_str()),
+            Some("manual")
+        );
+        assert_eq!(
+            section.get("auth_gmail").and_then(|v| v.as_str()),
+            Some("present")
+        );
+        assert_eq!(
+            section.get("auth_work").and_then(|v| v.as_str()),
+            Some("absent")
+        );
+
+        // None when neither the accounts file nor any config dir is found.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(collect_claude_accounts_from(empty.path(), None).is_none());
+    }
+
+    /// Vet caveat: with no `claude-accounts.json`, the mode must be read from
+    /// the NESTED `ai.claude_cli.account_selection_mode` in `settings.json`. A
+    /// flat lookup would silently return the default — this guards that bug.
+    #[test]
+    fn claude_accounts_settings_fallback_reads_nested_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let runner = root.join("com.qontinui.runner");
+        std::fs::create_dir_all(&runner).unwrap();
+
+        let acct = root.join(".claude-personal");
+        std::fs::create_dir_all(&acct).unwrap();
+
+        // Only settings.json (no claude-accounts.json), mode nested.
+        std::fs::write(
+            runner.join("settings.json"),
+            format!(
+                "{{\"claude_config_dirs\":[{:?}],\
+                  \"ai\":{{\"claude_cli\":{{\"account_selection_mode\":\"manual\"}}}}}}",
+                acct.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let section = collect_claude_accounts_from(root, None).unwrap();
+        assert_eq!(
+            section.get("selection_mode").and_then(|v| v.as_str()),
+            Some("manual"),
+            "mode must come from nested ai.claude_cli, not a flat lookup"
+        );
+        assert_eq!(
+            section.get("accounts").and_then(|v| v.as_str()),
+            Some("personal")
+        );
+    }
+
+    /// Shortcuts: detected via config-dir path OR launch-command mention in the
+    /// profile text; omitted entirely when no profile is readable (fail-open).
+    #[test]
+    fn claude_accounts_shortcuts_from_profile_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let runner = root.join("com.qontinui.runner");
+
+        let gmail = root.join(".claude-gmail");
+        let work = root.join(".claude-work");
+        std::fs::create_dir_all(&gmail).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+
+        write_roster(
+            &runner,
+            &format!(
+                "{{\"claude_config_dirs\":[{:?},{:?}],\
+                  \"claude_account_launch_commands\":{{{:?}:\"clw\"}}}}",
+                gmail.to_string_lossy(),
+                work.to_string_lossy(),
+                work.to_string_lossy()
+            ),
+        );
+
+        // Profile mentions gmail's config-dir path and work's launch command.
+        let profile = format!(
+            "$env:CLAUDE_CONFIG_DIR='{}'\nSet-Alias clw launch-work\nclw\n",
+            gmail.to_string_lossy()
+        );
+
+        let section = collect_claude_accounts_from(root, Some(&profile)).unwrap();
+        assert_eq!(
+            section.get("shortcut_gmail").and_then(|v| v.as_str()),
+            Some("present"),
+            "gmail detected via config-dir path"
+        );
+        assert_eq!(
+            section.get("shortcut_work").and_then(|v| v.as_str()),
+            Some("present"),
+            "work detected via launch command 'clw'"
+        );
+
+        // No profile text → shortcut keys omitted.
+        let no_profile = collect_claude_accounts_from(root, None).unwrap();
+        assert!(no_profile.get("shortcut_gmail").is_none());
+        assert!(no_profile.get("shortcut_work").is_none());
+    }
+
+    #[test]
+    fn account_name_strips_claude_prefix_both_separators() {
+        assert_eq!(account_name("C:\\Users\\x\\.claude-gmail"), "gmail");
+        assert_eq!(account_name("/home/user/.claude-work"), "work");
+        assert_eq!(account_name("/home/user/plain"), "plain");
+        assert_eq!(account_name("C:\\Users\\x\\.claude-hotmail\\"), "hotmail");
     }
 }

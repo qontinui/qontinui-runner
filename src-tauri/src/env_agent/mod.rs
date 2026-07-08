@@ -26,7 +26,8 @@
 //!     "services":     { "<key>": "<string>" },
 //!     "db_schema":    { "<key>": "<string>" },
 //!     "versions":     { "<key>": "<string>" },
-//!     "env_contract": { "<VAR_NAME>": "present" }
+//!     "env_contract": { "<VAR_NAME>": "present" },
+//!     "claude_accounts": { "<key>": "<string>" }
 //!   }
 //! }
 //! ```
@@ -214,6 +215,13 @@ pub async fn build_envelope() -> ConfigEnvelope {
         &mut sections,
         "env_contract",
         Some(collectors::collect_env_contract()),
+    );
+    // Claude account roster — SECRET-FREE (names/topology/presence only). Returns
+    // None (section omitted) when no roster or config dir is present.
+    add_section(
+        &mut sections,
+        "claude_accounts",
+        collectors::collect_claude_accounts(),
     );
 
     ConfigEnvelope {
