@@ -1004,7 +1004,7 @@ impl Default for DebugSettings {
 ///
 /// Defaults are tuned for a fresh install to be visible to the qontinui-web
 /// `/connect` flow without any manual configuration: `enabled = true` and
-/// `backend_url` points at the dev backend in debug builds (`http://localhost:8000`)
+/// `backend_url` points at the dev backend in debug builds (`http://127.0.0.1:8000`)
 /// or the production backend in release builds (`https://api.qontinui.io`).
 /// `runner_token` still defaults to empty — it must be granted by the user
 /// through one of the device-pairing flows (Cognito sign-in or pair-code
@@ -1063,7 +1063,16 @@ fn default_web_integration_enabled() -> bool {
 /// override is persisted to `settings.json` and survives upgrades.
 pub(crate) fn default_web_integration_backend_url() -> String {
     if cfg!(debug_assertions) {
-        "http://localhost:8000".to_string()
+        // IPv4-pinned to match `api_config::get_api_base_url`'s debug default.
+        // The backend binds IPv4 only, and `localhost` can resolve to IPv6
+        // `::1` first — since `get_api_base_url` now folds this persisted value
+        // in as its step-3 fallback (plan 2026-07-08), any divergence here would
+        // flip an un-signed-in debug box off the IPv4 pin. Keeping them
+        // byte-identical makes step 3 == step 4 for a fresh install.
+        format!(
+            "http://127.0.0.1:{}",
+            crate::api_config::DEFAULT_BACKEND_PORT
+        )
     } else {
         crate::api_config::PROD_API_BASE_URL.to_string()
     }
@@ -1107,7 +1116,8 @@ mod web_integration_default_tests {
         assert_eq!(s.web_base_url, None);
 
         if cfg!(debug_assertions) {
-            assert_eq!(s.backend_url, "http://localhost:8000");
+            // IPv4-pinned to match api_config's debug default (plan 2026-07-08).
+            assert_eq!(s.backend_url, "http://127.0.0.1:8000");
         } else {
             assert_eq!(s.backend_url, "https://api.qontinui.io");
         }

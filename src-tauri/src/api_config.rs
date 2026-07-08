@@ -82,6 +82,46 @@ pub fn derive_web_base_url(backend_url: &str) -> String {
     }
 }
 
+/// Pure precedence resolver for [`get_api_base_url`] — no I/O so the ordering
+/// is unit-testable. Splitting the decision out matches the codebase's
+/// `next_action` / `resolve_pair_tenant_id` style.
+///
+/// `persisted` is `Some(url)` only when web-integration is enabled AND the
+/// persisted `backend_url` is present; blank/whitespace values at any level
+/// are skipped (treated as unset).
+///
+/// Resolution order:
+/// 1. `env_web` (`QONTINUI_WEB_BACKEND_URL`) — operator/test explicit override
+/// 2. `env_api` (`QONTINUI_API_URL`) — legacy explicit override
+/// 3. `persisted` — the paired backend the user signed into (the one that can
+///    verify this device's JWT). NEW: closes the prod/local device-JWT split
+///    where a debug relay verified against local while pairing minted against
+///    prod. See `plans/2026-07-08-runner-relay-honor-persisted-backend-url.md`.
+/// 4. build default: debug `http://127.0.0.1:8000` (IPv4 — the backend only
+///    binds IPv4; `localhost` may resolve to IPv6 `::1` first) / release
+///    `PROD_API_BASE_URL`.
+///
+/// A trailing slash is trimmed so callers can safely `format!("{base}/api/...")`.
+pub(crate) fn resolve_api_base_url(
+    env_web: Option<String>,
+    env_api: Option<String>,
+    persisted: Option<String>,
+    is_debug: bool,
+) -> String {
+    let pick = env_web
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| env_api.filter(|v| !v.trim().is_empty()))
+        .or_else(|| persisted.filter(|v| !v.trim().is_empty()))
+        .unwrap_or_else(|| {
+            if is_debug {
+                format!("http://127.0.0.1:{}", DEFAULT_BACKEND_PORT)
+            } else {
+                PROD_API_BASE_URL.to_string()
+            }
+        });
+    pick.trim().trim_end_matches('/').to_string()
+}
+
 /// Get API base URL for qontinui-web backend.
 ///
 /// This is the SINGLE source of truth for the web-backend base across every
@@ -89,27 +129,30 @@ pub fn derive_web_base_url(backend_url: &str) -> String {
 /// `heartbeat.rs` honored `QONTINUI_WEB_BACKEND_URL` while workflow-sync only
 /// honored `QONTINUI_API_URL`, so the two could resolve to different hosts and
 /// silently diverge (one path 401'ing against the wrong backend). Folding both
-/// vars in here guarantees every caller resolves to the same host.
+/// vars in here — plus the persisted paired backend below — guarantees every
+/// caller resolves to the same host the user actually signed into.
 ///
-/// Resolution order:
-/// 1. `QONTINUI_WEB_BACKEND_URL` environment variable (web-integration override)
-/// 2. `QONTINUI_API_URL` environment variable
-/// 3. Debug builds: `http://127.0.0.1:8000` (IPv4 — backend only binds IPv4,
-///    localhost may resolve to IPv6 `::1` first)
-/// 4. Release builds: `PROD_API_BASE_URL`
-///
-/// A trailing slash is trimmed so callers can safely `format!("{base}/api/...")`.
+/// Precedence is documented on [`resolve_api_base_url`]; this wrapper supplies
+/// the I/O (env vars + `load_settings()`). `load_settings()` reads env + the
+/// JSON file directly and does NOT call back into `get_api_base_url()`, so
+/// there is no recursion; an absent/unparseable settings file yields
+/// `Settings::default()`, whose `backend_url` == the build default, collapsing
+/// step 3 into step 4.
 pub fn get_api_base_url() -> String {
-    let raw = std::env::var("QONTINUI_WEB_BACKEND_URL")
-        .or_else(|_| std::env::var("QONTINUI_API_URL"))
-        .unwrap_or_else(|_| {
-            if cfg!(debug_assertions) {
-                format!("http://127.0.0.1:{}", DEFAULT_BACKEND_PORT)
-            } else {
-                PROD_API_BASE_URL.to_string()
-            }
-        });
-    raw.trim().trim_end_matches('/').to_string()
+    let s = crate::settings::load_settings();
+    // Only honor the persisted backend when web-integration is enabled — a
+    // disabled integration means "don't reach web", so its stored URL must not
+    // override the build default.
+    let persisted = s
+        .web_integration
+        .enabled
+        .then(|| s.web_integration.backend_url.clone());
+    resolve_api_base_url(
+        std::env::var("QONTINUI_WEB_BACKEND_URL").ok(),
+        std::env::var("QONTINUI_API_URL").ok(),
+        persisted,
+        cfg!(debug_assertions),
+    )
 }
 
 /// MCP API base URL for the runner's own HTTP server.
@@ -253,6 +296,79 @@ mod tests {
         assert_eq!(
             derive_web_base_url("https://qontinui.io"),
             "https://qontinui.io"
+        );
+    }
+
+    #[test]
+    fn resolve_api_base_url_precedence() {
+        let web = || Some("https://web.example".to_string());
+        let api = || Some("https://api.example".to_string());
+        let persisted = || Some("https://persisted.example".to_string());
+
+        // env_web wins over everything.
+        assert_eq!(
+            resolve_api_base_url(web(), api(), persisted(), true),
+            "https://web.example"
+        );
+        // env_api wins over persisted + default.
+        assert_eq!(
+            resolve_api_base_url(None, api(), persisted(), true),
+            "https://api.example"
+        );
+        // persisted wins over the build default.
+        assert_eq!(
+            resolve_api_base_url(None, None, persisted(), true),
+            "https://persisted.example"
+        );
+    }
+
+    #[test]
+    fn resolve_api_base_url_build_defaults() {
+        // All absent → debug default is the IPv4-pinned localhost.
+        assert_eq!(
+            resolve_api_base_url(None, None, None, true),
+            format!("http://127.0.0.1:{}", DEFAULT_BACKEND_PORT)
+        );
+        // All absent → release default is prod.
+        assert_eq!(
+            resolve_api_base_url(None, None, None, false),
+            PROD_API_BASE_URL
+        );
+    }
+
+    #[test]
+    fn resolve_api_base_url_skips_blank_and_trims() {
+        // Blank / whitespace at any level is treated as unset (not selected).
+        assert_eq!(
+            resolve_api_base_url(
+                Some("   ".to_string()),
+                Some("".to_string()),
+                Some("https://persisted.example".to_string()),
+                true,
+            ),
+            "https://persisted.example"
+        );
+        // A blank persisted with no env falls through to the build default.
+        assert_eq!(
+            resolve_api_base_url(None, None, Some("  ".to_string()), true),
+            format!("http://127.0.0.1:{}", DEFAULT_BACKEND_PORT)
+        );
+        // Trailing slash is trimmed on the chosen value.
+        assert_eq!(
+            resolve_api_base_url(Some("https://web.example/".to_string()), None, None, true),
+            "https://web.example"
+        );
+    }
+
+    /// Regression for the prod/local device-JWT split (plan 2026-07-08): a
+    /// debug build whose user signed into a non-default backend must resolve
+    /// to THAT backend, not the localhost build default — so the relay
+    /// verifies against the same coord that minted the device JWT.
+    #[test]
+    fn resolve_api_base_url_debug_honors_persisted_prod() {
+        assert_eq!(
+            resolve_api_base_url(None, None, Some(PROD_API_BASE_URL.to_string()), true),
+            PROD_API_BASE_URL
         );
     }
 

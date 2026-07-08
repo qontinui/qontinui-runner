@@ -492,6 +492,13 @@ async fn relay_loop(
             }
         }
 
+        // `get_api_base_url()` now honors the persisted paired backend
+        // (`web_integration.backend_url`) as its step-3 fallback, so the relay
+        // targets the SAME backend that pairing minted this device's JWT
+        // against — closing the prod/local device-JWT split. The relay re-reads
+        // settings every iteration (see `load_settings()` at the loop top), so
+        // the resolution takes effect on the next reconnect with no extra
+        // plumbing. See plans/2026-07-08-runner-relay-honor-persisted-backend-url.md.
         let backend_url = crate::api_config::get_api_base_url();
 
         let ws_url = format!(
