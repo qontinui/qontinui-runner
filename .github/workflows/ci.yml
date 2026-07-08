@@ -172,12 +172,20 @@ jobs:
           free -h
           df -h
 
+      # 24 GB (was 16 GB): headroom for CARGO_BUILD_JOBS=2 in the test step.
+      # The May 2026 windows OOMs (runs 25612844640 / 75193978255, PR #65)
+      # happened at JOBS=2 with a 16 GB pagefile — two concurrent large-crate
+      # rustc codegens exhausted the 16 GB RAM + 16 GB pagefile commit limit.
+      # 24 GB raises the commit ceiling by 8 GB specifically to make JOBS=2
+      # safe again. Observed pagefile usage right before cargo test is only
+      # ~330 MB (2026-07-08 run 28948290993), i.e. the commit spike is
+      # transient peak, not steady-state — disk cost on D: is the only cost.
       - name: Configure pagefile (Windows — guard against link-time OOM)
         if: matrix.platform == 'windows-latest'
         uses: al-cheb/configure-pagefile-action@v1.4
         with:
-          minimum-size: 16GB
-          maximum-size: 16GB
+          minimum-size: 24GB
+          maximum-size: 24GB
           disk-root: "D:"
 
       # macOS: The accessibility (AX) adapter links against system CoreFoundation
@@ -185,16 +193,36 @@ jobs:
       # Note: AX integration tests require accessibility permissions at runtime,
       # which CI environments typically do not grant. Compilation is unaffected.
 
+      # Swatinem/rust-cache replaces the previous actions/cache stanza, which
+      # was broken two ways and never cached a single build artifact:
+      #   1. It cached `src-tauri/target/` — but the cargo workspace root is
+      #      the REPO root (./Cargo.toml → ./target; see the [workspace]
+      #      table), so the cached path never existed. Observed restore was
+      #      1-6 s and save ~38 s (registry only) on every 2026-07-08 run.
+      #   2. Exact-match key with no restore-keys: any Cargo.lock change was
+      #      a total miss even for the registry portion.
+      # Measured cost of running cache-less (windows leg, runs 28948290993 /
+      # 28947330992 / 28940758985): the full dependency graph compiles THREE
+      # times per run — Clippy ~755 check-compiles (~17 min), cargo test
+      # ~534 dep compiles (~12 min of the 50-min step), tauri build ~767
+      # compiles (~13 min of the 35-min step; its flag set differs from the
+      # test step's, so even host proc-macros rebuild). rust-cache keys on
+      # toolchain + Cargo.lock + cargo config + job/os, provides prefix
+      # restore-keys, and prunes workspace-member artifacts at save time, so
+      # dependency artifacts for ALL flag-sets are restored while the
+      # workspace's own crates always rebuild from real sources (no stale-
+      # artifact flake). NOTE on scoping: GitHub cache is branch-isolated —
+      # saves from merge-candidate/* refs are invisible to sibling
+      # candidates. The cache that matters is the one saved by `main` runs
+      # (every land), which all candidates and PRs can restore.
       - name: Cache Rust dependencies
-        uses: actions/cache@v3
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            src-tauri/target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          # Workspace root is the repo root: ./Cargo.toml -> ./target
+          workspaces: ". -> target"
+          # Candidate/PR runs often fail on steps after the Rust compiles
+          # succeeded; still save so the next run on the ref stays warm.
+          cache-on-failure: true
 
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
@@ -285,6 +313,20 @@ jobs:
           #     (STATUS_ILLEGAL_INSTRUCTION = the rustc allocator
           #     aborting). Dropped to JOBS=1 for single-threaded compile,
           #     matching Ubuntu's mitigation.
+          #     2026-07-08: back to JOBS=2 on Windows, paired with the
+          #     pagefile bump 16→24 GB above (the failed JOBS=2 runs were at
+          #     16 GB commit headroom; +8 GB targets exactly that failure
+          #     mode). Evidence JOBS=1 is far too conservative today: the
+          #     `Clippy check` and `Build Tauri app` steps in this same job
+          #     compile the SAME full dep graph at cargo's DEFAULT
+          #     parallelism (4 jobs) and have not OOM'd — only this step was
+          #     pinned. JOBS=1 also starves rustc's internal codegen
+          #     parallelism via the jobserver: the post-dep phase
+          #     (workspace-crate codegen + test-binary links) measured
+          #     ~38 min of the 50-min step (run 28948290993: last dep
+          #     compile 14:31, `Finished` 15:09). If 0xc000001d /
+          #     rustc-LLVM OOM recurs here, revert to JOBS=1 AND keep the
+          #     24 GB pagefile.
           #   - Ubuntu OOM-killer is harsher: even with a 12 GB swapfile,
           #     JOBS=2 still trips the runner-agent shutdown. Drop Ubuntu
           #     to JOBS=1 for a single-threaded compile.
@@ -301,7 +343,7 @@ jobs:
           #     min timeout. JOBS=1 matches ubuntu/windows: one rustc
           #     at a time, ~no swap pressure, slower wall-clock but
           #     deterministic.
-          CARGO_BUILD_JOBS: 1
+          CARGO_BUILD_JOBS: ${{ matrix.platform == 'windows-latest' && '2' || '1' }}
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
             echo "=== free / df before cargo test ==="
