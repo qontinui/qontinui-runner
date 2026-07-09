@@ -741,10 +741,42 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             }
             rb.send().await
         }
+        "output_chunk" => {
+            // Transcript/output chunk (plan
+            // 2026-07-09-runner-session-history-cloud-sync §3.2). POST
+            // /sessions/:id/output {chunk_offset, payload_b64, stream}.
+            // Unlike the lossy live PTY pipe (`output_pipe.rs`, direct POST,
+            // drops on 429/5xx), these chunks ride the outbox for
+            // at-least-once delivery — coord's warm tier is idempotent on
+            // (session_id, stream, chunk_offset), so a replay is a no-op.
+            let url = format!("{base}/sessions/{}/output", rec.session_id);
+            let body = output_chunk_body(&rec.payload);
+            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), tenant_ref)
+                .send()
+                .await
+        }
+        "restore-record" => {
+            // Restore-registry mirror (plan
+            // 2026-07-09-runner-session-history-cloud-sync §3.4, Phase 4).
+            // POST /sessions/:id/events {seq, event_kind, payload} — coord's
+            // session-events ingest stores event_kind verbatim in
+            // coord.session_events, idempotent on (session_id, seq), so the
+            // outbox can replay freely. The payload is the binding
+            // {provider, authoritative_session_id, cwd, launch_command,
+            // restore_tier, machine_id} contract the web UI reads.
+            let url = format!("{base}/sessions/{}/events", rec.session_id);
+            let body = json!({
+                "seq": rec.seq,
+                "event_kind": rec.event_kind,
+                "payload": rec.payload,
+            });
+            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), tenant_ref)
+                .send()
+                .await
+        }
         other => {
-            // OutputChunk + HandoffRequest are Phase 7/8 — defined now
-            // for wire shape, not pushed yet. Quietly ACK so the file
-            // doesn't grow.
+            // HandoffRequest is Phase 7 — defined now for wire shape, not
+            // pushed yet. Quietly ACK so the file doesn't grow.
             tracing::debug!(
                 kind = %other,
                 "coord_sync: event kind not yet pushed to coord — ACKing"
@@ -759,7 +791,48 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 return helper_task_outcome(rec, resp).await;
             }
             let status = resp.status();
+            if kind == "output_chunk" && status == StatusCode::TOO_MANY_REQUESTS {
+                let detail = resp.text().await.unwrap_or_default();
+                if detail.contains("warm_quota_exceeded") {
+                    // Tenant warm-quota exceeded (gate 2, enforced
+                    // coord-side). Retrying can't help until quota frees,
+                    // and stalling the batch would head-of-line-block this
+                    // session's lifecycle events — ACK-drop with an info
+                    // line instead of the error-level PermanentFailure path.
+                    tracing::info!(
+                        session = %rec.session_id,
+                        seq = rec.seq,
+                        "coord_sync: output chunk rejected by warm quota (429) — dropping"
+                    );
+                    return PushOutcome::Acked;
+                }
+                // Any other 429 (proxy / edge rate limit) is transient —
+                // keep the row and retry, same as a 5xx.
+                return PushOutcome::Transport(format!("{status}: {detail}"));
+            }
             if status.is_success() {
+                return PushOutcome::Acked;
+            }
+            if kind == "restore-record"
+                && matches!(
+                    status,
+                    StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+                )
+            {
+                // Coord build without the session-events ingest route (the
+                // coord slice of Phase 4 ships it in parallel). The mirror is
+                // best-effort observability — drop quietly instead of
+                // error-spamming the PermanentFailure path. Note the emitter's
+                // debounce map already counted this record as emitted, so an
+                // UNCHANGED record will not re-emit until the runner restarts
+                // or the record materially changes — acceptable for a mirror
+                // whose readers always take the newest event.
+                tracing::info!(
+                    session = %rec.session_id,
+                    seq = rec.seq,
+                    status = %status,
+                    "coord_sync: restore-record ingest unavailable — dropping mirror event"
+                );
                 return PushOutcome::Acked;
             }
             if status == StatusCode::CONFLICT {
@@ -992,6 +1065,24 @@ fn progress_body(payload: &JsonValue) -> JsonValue {
         progress.insert("progress_detail".into(), detail.clone());
     }
     json!({ "progress": JsonValue::Object(progress) })
+}
+
+/// Build the `POST /sessions/:id/output` body from an `output_chunk`
+/// outbox payload. The transcript emitter records `{stream, chunk_offset,
+/// payload_b64}` — forward exactly the subset coord's ingest understands.
+/// `stream` defaults to "transcript" when absent: the ONLY writer of
+/// `output_chunk` outbox rows is the transcript emitter (the PTY stream
+/// bypasses the outbox via `output_pipe.rs`), so a missing field can only
+/// be a transcript row.
+fn output_chunk_body(payload: &JsonValue) -> JsonValue {
+    json!({
+        "chunk_offset": payload.get("chunk_offset").cloned().unwrap_or(json!(0)),
+        "payload_b64": payload.get("payload_b64").cloned().unwrap_or(json!("")),
+        "stream": payload
+            .get("stream")
+            .cloned()
+            .unwrap_or_else(|| json!(crate::session::transcript_emitter::TRANSCRIPT_STREAM)),
+    })
 }
 
 /// Build the `POST /sessions/:id/steal` body from the claim_stolen
@@ -1291,6 +1382,8 @@ mod tests {
         patches: Vec<(Uuid, JsonValue)>,
         deletes: Vec<Uuid>,
         steals: Vec<(Uuid, JsonValue)>,
+        outputs: Vec<(Uuid, JsonValue)>,
+        events: Vec<(Uuid, JsonValue)>,
         /// When true, the next POST returns 409 + a synthetic row.
         next_post_conflict: bool,
         /// When >0, the next N POSTs return 500.
@@ -1378,6 +1471,28 @@ mod tests {
                      Json(body): Json<JsonValue>| async move {
                         state.lock().await.steals.push((id, body.clone()));
                         (AxumStatus::OK, Json(json!({"id": id}))).into_response()
+                    },
+                ),
+            )
+            .route(
+                "/sessions/{id}/output",
+                post(
+                    |AxumState(state): AxumState<Arc<TokMutex<CoordRecorder>>>,
+                     AxumPath(id): AxumPath<Uuid>,
+                     Json(body): Json<JsonValue>| async move {
+                        state.lock().await.outputs.push((id, body.clone()));
+                        (AxumStatus::OK, Json(json!({"id": id}))).into_response()
+                    },
+                ),
+            )
+            .route(
+                "/sessions/{id}/events",
+                post(
+                    |AxumState(state): AxumState<Arc<TokMutex<CoordRecorder>>>,
+                     AxumPath(id): AxumPath<Uuid>,
+                     Json(body): Json<JsonValue>| async move {
+                        state.lock().await.events.push((id, body.clone()));
+                        (AxumStatus::CREATED, Json(json!({"id": id}))).into_response()
                     },
                 ),
             )
@@ -1514,6 +1629,145 @@ mod tests {
             outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
         })
         .await;
+    }
+
+    /// Transcript cloud sync (plan 2026-07-09) — an `output_chunk` outbox
+    /// row drains to `POST /sessions/:id/output` carrying
+    /// `{chunk_offset, payload_b64, stream}` and is ACKed on 2xx.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_pushes_output_chunk_to_output_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let _registry = build_registry(coord.clone());
+
+        let machine_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        outbox
+            .record(
+                machine_id,
+                session_id,
+                SessionEventKind::OutputChunk,
+                json!({
+                    "stream": "transcript",
+                    "chunk_offset": 128,
+                    "payload_b64": "aGVsbG8=",
+                }),
+            )
+            .unwrap();
+        let _drain = coord.start_drain_task();
+
+        wait_until(Duration::from_secs(5), || {
+            let r = rec.try_lock();
+            r.map(|g| !g.outputs.is_empty()).unwrap_or(false)
+        })
+        .await;
+
+        let g = rec.lock().await;
+        assert_eq!(g.outputs.len(), 1, "exactly one POST /sessions/:id/output");
+        let (posted_id, body) = &g.outputs[0];
+        assert_eq!(*posted_id, session_id);
+        assert_eq!(body["chunk_offset"], json!(128));
+        assert_eq!(body["payload_b64"], json!("aGVsbG8="));
+        assert_eq!(body["stream"], json!("transcript"));
+        drop(g);
+
+        // The row is ACKed (at-least-once delivery confirmed).
+        wait_until(Duration::from_secs(3), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+    }
+
+    /// Restore-registry mirror (plan 2026-07-09 §3.4, Phase 4) — a
+    /// `restore-record` outbox row drains to `POST /sessions/:id/events`
+    /// carrying `{seq, event_kind, payload}` with the binding payload
+    /// verbatim, and is ACKed on 2xx.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_pushes_restore_record_to_events_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let _registry = build_registry(coord.clone());
+
+        let machine_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        outbox
+            .record(
+                machine_id,
+                session_id,
+                SessionEventKind::RestoreRecord,
+                json!({
+                    "provider": "claude",
+                    "authoritative_session_id": "abc-123",
+                    "cwd": "C:/repo",
+                    "launch_command": "claude --resume abc-123",
+                    "restore_tier": "full",
+                    "machine_id": machine_id,
+                }),
+            )
+            .unwrap();
+        let _drain = coord.start_drain_task();
+
+        wait_until(Duration::from_secs(5), || {
+            let r = rec.try_lock();
+            r.map(|g| !g.events.is_empty()).unwrap_or(false)
+        })
+        .await;
+
+        let g = rec.lock().await;
+        assert_eq!(g.events.len(), 1, "exactly one POST /sessions/:id/events");
+        let (posted_id, body) = &g.events[0];
+        assert_eq!(*posted_id, session_id);
+        assert_eq!(body["event_kind"], json!("restore-record"));
+        assert!(body["seq"].as_i64().is_some(), "seq forwarded");
+        assert_eq!(body["payload"]["restore_tier"], json!("full"));
+        assert_eq!(
+            body["payload"]["authoritative_session_id"],
+            json!("abc-123")
+        );
+        assert_eq!(
+            body["payload"]["launch_command"],
+            json!("claude --resume abc-123")
+        );
+        drop(g);
+
+        // The row is ACKed (at-least-once delivery confirmed).
+        wait_until(Duration::from_secs(3), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+    }
+
+    /// `output_chunk_body` forwards the recorded subset and defaults the
+    /// stream to "transcript" (the outbox's only output_chunk writer).
+    #[test]
+    fn output_chunk_body_forwards_fields_and_defaults_stream() {
+        let body = output_chunk_body(&json!({
+            "stream": "transcript",
+            "chunk_offset": 42,
+            "payload_b64": "eA==",
+            "extraneous": true,
+        }));
+        assert_eq!(
+            body,
+            json!({"chunk_offset": 42, "payload_b64": "eA==", "stream": "transcript"})
+        );
+
+        let defaulted = output_chunk_body(&json!({"chunk_offset": 0, "payload_b64": "eA=="}));
+        assert_eq!(defaulted["stream"], json!("transcript"));
     }
 
     /// Phase 8b — an explicit spawn-input tenant survives to the coord

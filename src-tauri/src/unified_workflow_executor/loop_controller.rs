@@ -151,6 +151,64 @@ impl LoopController {
     ///    d. Run agentic phase with failure context
     /// 3. COMPLETION (only if verification passed)
     /// 4. Return final result
+    ///
+    /// Before the workflow body runs, the execution is registered with the
+    /// [`crate::claude_session::coord_register::AiCoordRegistrar`] (the
+    /// task_run_id → coord-session binding the transcript cloud-sync
+    /// emitter resolves through — plan
+    /// `2026-07-09-runner-session-history-cloud-sync` §3.2), and closed
+    /// again when the body returns. This is the single choke point every
+    /// unified-workflow run passes through (MCP entry points, triggers,
+    /// resume, workflow-ref steps), so registering here covers them all.
+    /// Best-effort and gate-aware: with
+    /// `QONTINUI_SESSION_AUTOMATION_REGISTER` off (or the registrar
+    /// unmanaged, as in tests) no coord session exists and the transcript
+    /// emitter keeps its silent-skip behavior.
+    pub async fn run(
+        &mut self,
+        config: LoopConfig,
+        setup_automation_steps: Vec<ExecutionStepConfig>,
+        setup_prompt_steps: Vec<ExecutionStepConfig>,
+        verification_steps: Vec<ExecutionStepConfig>,
+        agentic_steps: Vec<ExecutionStepConfig>,
+        completion_automation_steps: Vec<ExecutionStepConfig>,
+        completion_prompt_steps: Vec<ExecutionStepConfig>,
+    ) -> WorkflowResult {
+        let registrar = self
+            .app_handle
+            .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()
+            .map(|s| s.inner().clone());
+        let execution_id = config.execution_id.clone();
+        if let Some(reg) = registrar.as_deref() {
+            reg.register_session(
+                &execution_id,
+                &format!("unified workflow: {}", config.workflow_name),
+                None,
+            );
+        }
+
+        let result = self
+            .run_inner(
+                config,
+                setup_automation_steps,
+                setup_prompt_steps,
+                verification_steps,
+                agentic_steps,
+                completion_automation_steps,
+                completion_prompt_steps,
+            )
+            .await;
+
+        // Evict the binding + emit the Closed row so coord.sessions doesn't
+        // leak a ghost row. A panicked/aborted run skips this; coord's
+        // staleness watcher ages the session out (same posture as every
+        // other registrar consumer).
+        if let Some(reg) = registrar.as_deref() {
+            reg.close_session(&execution_id);
+        }
+        result
+    }
+
     #[instrument(
         name = "qontinui.workflow",
         skip(self, setup_automation_steps, setup_prompt_steps, verification_steps, agentic_steps, completion_automation_steps, completion_prompt_steps),
@@ -164,7 +222,7 @@ impl LoopController {
             completion_steps = completion_automation_steps.len() + completion_prompt_steps.len()
         )
     )]
-    pub async fn run(
+    async fn run_inner(
         &mut self,
         mut config: LoopConfig,
         mut setup_automation_steps: Vec<ExecutionStepConfig>,
@@ -1382,6 +1440,17 @@ impl LoopController {
                             .pg_db
                             .append_task_output_ex(&config.execution_id, &output_text, true, false)
                             .await;
+                        // Cloud session sync (opt-in, plan 2026-07-09):
+                        // mirror the agentic iteration block (header +
+                        // output) into the session outbox as a
+                        // transcript-stream chunk. Gated inside `emit`;
+                        // best-effort — can never fail the run.
+                        if let Some(emitter) = tauri::Manager::try_state::<
+                            Arc<crate::session::transcript_emitter::TranscriptEmitter>,
+                        >(&self.app_handle)
+                        {
+                            emitter.emit(&config.execution_id, &output_text);
+                        }
                     }
 
                     // If budget was exceeded, stop the run gracefully
@@ -3084,6 +3153,15 @@ impl LoopController {
                     .pg_db
                     .append_task_output_ex(&config.execution_id, &output_text, true, false)
                     .await;
+                // Cloud session sync (opt-in, plan 2026-07-09): mirror the
+                // completion-sweep block into the session outbox as a
+                // transcript-stream chunk. Gated inside `emit`; best-effort.
+                if let Some(emitter) = tauri::Manager::try_state::<
+                    Arc<crate::session::transcript_emitter::TranscriptEmitter>,
+                >(&self.app_handle)
+                {
+                    emitter.emit(&config.execution_id, &output_text);
+                }
             }
 
             iterations_run = iteration + 1;

@@ -1139,6 +1139,32 @@ mod web_integration_default_tests {
 }
 
 #[cfg(test)]
+mod cloud_sync_tests {
+    use super::*;
+
+    /// Consent contract (plan 2026-07-09-runner-session-history-cloud-sync
+    /// gate 1): a fresh install AND an upgrading settings.json missing the
+    /// key must both land on `cloud_sync_enabled = false` — nothing leaves
+    /// the machine without an explicit opt-in.
+    #[test]
+    fn cloud_sync_defaults_off() {
+        assert!(!Settings::default().cloud_sync_enabled);
+        let parsed: Settings = serde_json::from_str("{}").expect("empty object must deserialize");
+        assert!(!parsed.cloud_sync_enabled);
+    }
+
+    /// An explicit opt-in round-trips through serialization.
+    #[test]
+    fn cloud_sync_explicit_value_round_trips() {
+        let parsed: Settings =
+            serde_json::from_str(r#"{"cloud_sync_enabled": true}"#).expect("must deserialize");
+        assert!(parsed.cloud_sync_enabled);
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert!(json.contains("\"cloud_sync_enabled\":true"));
+    }
+}
+
+#[cfg(test)]
 mod tier_tests {
     use super::*;
 
@@ -1614,6 +1640,16 @@ pub struct Settings {
     /// Default OFF — see `HelperTasksSettings`.
     #[serde(default)]
     pub helper_tasks: HelperTasksSettings,
+    /// Cloud session sync consent — gate 1 of the session-history cloud-sync
+    /// consent model (plan `2026-07-09-runner-session-history-cloud-sync`
+    /// §3.1). When true, AI conversation transcript chunks and terminal
+    /// session records are mirrored to the operator's coord tenant via the
+    /// session outbox (warm tier ~7 days post-close, cold archive 90 days).
+    /// Default FALSE — with the toggle off the feature is inert: no outbox
+    /// entries, no network egress, nothing leaves this machine. A missing
+    /// key in an existing settings.json loads as false.
+    #[serde(default)]
+    pub cloud_sync_enabled: bool,
 }
 
 // ============================================================================
@@ -2596,6 +2632,22 @@ pub fn get_helper_tasks_settings() -> HelperTasksSettings {
 /// Save Helper Task Queue settings.
 pub fn save_helper_tasks_settings(helper_tasks: HelperTasksSettings) -> Result<(), String> {
     crate::config_facade::save_setting(helper_tasks)
+}
+
+// ============================================================================
+// Cloud Session Sync accessors
+// ============================================================================
+
+/// Get the cloud session sync consent flag (gate 1). Default false.
+pub fn get_cloud_sync_enabled() -> bool {
+    load_settings().cloud_sync_enabled
+}
+
+/// Persist the cloud session sync consent flag.
+pub fn save_cloud_sync_enabled(enabled: bool) -> Result<(), String> {
+    let mut settings = load_settings();
+    settings.cloud_sync_enabled = enabled;
+    save_settings(&settings)
 }
 
 // ============================================================================

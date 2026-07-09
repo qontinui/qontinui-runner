@@ -78,6 +78,17 @@ interface WebIntegrationSettingsProps {
   onLog: LogFunction;
 }
 
+/** Shape of `get_cloud_sync_settings` / `save_cloud_sync_settings` data. */
+interface CloudSyncSettingsData {
+  cloud_sync_enabled: boolean;
+}
+
+interface CloudSyncTauriResult<T> {
+  success: boolean;
+  data?: T;
+  message?: string;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -191,6 +202,13 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
     message?: string;
   }>({ state: "idle" });
 
+  // --- Cloud session sync consent (plan 2026-07-09) --------------------------
+  // Independent of the web-integration form: reads/writes the runner-global
+  // `cloud_sync_enabled` settings.json flag via its own command pair, and
+  // saves immediately on toggle (no shared Save button involvement).
+  const [cloudSyncEnabled, setCloudSyncEnabled] = useState(false);
+  const [cloudSyncSaving, setCloudSyncSaving] = useState(false);
+
   // --- Tick to keep "last heartbeat <relative> ago" alive --------------------
   const [, setTick] = useState(0);
   useEffect(() => {
@@ -241,6 +259,49 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
       cancelled = true;
     };
   }, [refreshStatus]);
+
+  useEffect(() => {
+    // Load the cloud session sync consent flag once on mount.
+    let cancelled = false;
+    const loadCloudSync = async () => {
+      try {
+        const result =
+          await invoke<CloudSyncTauriResult<CloudSyncSettingsData>>("get_cloud_sync_settings");
+        if (!cancelled && result?.success && result.data) {
+          setCloudSyncEnabled(result.data.cloud_sync_enabled);
+        }
+      } catch (err) {
+        console.error("Failed to load cloud sync settings:", err);
+      }
+    };
+    void loadCloudSync();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handleToggleCloudSync = useCallback(async () => {
+    const newValue = !cloudSyncEnabled;
+    setCloudSyncEnabled(newValue);
+    setCloudSyncSaving(true);
+    try {
+      const result = await invoke<CloudSyncTauriResult<null>>("save_cloud_sync_settings", {
+        cloudSyncEnabled: newValue,
+      });
+      if (result?.success) {
+        onLog("success", `Cloud session sync ${newValue ? "enabled" : "disabled"}`);
+      } else {
+        onLog("error", "Failed to save cloud session sync setting");
+        setCloudSyncEnabled(!newValue);
+      }
+    } catch (err) {
+      console.error("Failed to save cloud sync setting:", err);
+      onLog("error", `Failed to save cloud session sync setting: ${err}`);
+      setCloudSyncEnabled(!newValue);
+    } finally {
+      setCloudSyncSaving(false);
+    }
+  }, [cloudSyncEnabled, onLog]);
 
   useEffect(() => {
     // React to save events fired from anywhere (including the web token flow).
@@ -384,8 +445,7 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
       const hasToken =
         (tokenEdited && formToken.trim().length > 0) ||
         Boolean(next?.runnerTokenMasked && next.runnerTokenMasked.length > 0);
-      const configComplete =
-        formEnabled && formBackendUrl.trim().length > 0 && hasToken;
+      const configComplete = formEnabled && formBackendUrl.trim().length > 0 && hasToken;
 
       if (configComplete) {
         try {
@@ -710,9 +770,9 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
             <div>
               <div className="text-sm font-medium">Connect this runner</div>
               <div className="text-xs text-muted-foreground">
-                Sign in to bind this device to your Qontinui account so it becomes dispatchable
-                from the web. The quickest way is to sign in on the runner&rsquo;s sign-in screen;
-                you can also connect in your browser here.
+                Sign in to bind this device to your Qontinui account so it becomes dispatchable from
+                the web. The quickest way is to sign in on the runner&rsquo;s sign-in screen; you
+                can also connect in your browser here.
               </div>
             </div>
             <button
@@ -744,9 +804,9 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
         <div>
           <h4 className="font-medium text-sm">Pair with a code</h4>
           <p className="text-xs text-muted-foreground">
-            For headless or remote runners that can&rsquo;t open a browser. Generate a one-time
-            pair code on qontinui-web (Runners &rarr; Auth Tokens) and paste it here. The code
-            expires after 5 minutes.
+            For headless or remote runners that can&rsquo;t open a browser. Generate a one-time pair
+            code on qontinui-web (Runners &rarr; Auth Tokens) and paste it here. The code expires
+            after 5 minutes.
           </p>
         </div>
         <div className="space-y-1.5">
@@ -775,9 +835,7 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
             <button
               type="button"
               onClick={handleRedeemPairCode}
-              disabled={
-                pairCodeState.state === "redeeming" || pairCodeInput.trim().length === 0
-              }
+              disabled={pairCodeState.state === "redeeming" || pairCodeInput.trim().length === 0}
               className="px-3 py-1.5 text-xs font-medium rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap"
             >
               {pairCodeState.state === "redeeming" ? "Pairing…" : "Pair"}
@@ -794,6 +852,41 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
             </p>
           )}
         </div>
+      </div>
+
+      {/* Cloud session sync — independent consent toggle (gate 1 of the
+          session-history cloud-sync consent model). Saves immediately. */}
+      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+        <label className="flex items-center justify-between cursor-pointer p-3 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
+          <div className="space-y-1 pr-4">
+            <div className="text-sm font-medium">Cloud session sync</div>
+            <div className="text-xs text-muted-foreground">
+              Syncs AI conversation transcripts and terminal session records for this runner to your
+              coord tenant (warm tier ~7 days post-close, cold archive 90 days). Off: nothing leaves
+              this machine.
+            </div>
+            <div className="text-[10px] text-muted-foreground">
+              Secrets matching common credential patterns are redacted before upload —
+              defense-in-depth, not a security boundary.
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={handleToggleCloudSync}
+            disabled={cloudSyncSaving}
+            className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:opacity-50 ${
+              cloudSyncEnabled ? "bg-primary" : "bg-muted"
+            }`}
+            aria-pressed={cloudSyncEnabled}
+            aria-label="Toggle cloud session sync"
+          >
+            <span
+              className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                cloudSyncEnabled ? "translate-x-4" : "translate-x-1"
+              }`}
+            />
+          </button>
+        </label>
       </div>
 
       {/* ADVANCED — overrides + legacy token, tucked away but reachable. */}
@@ -857,9 +950,8 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
               </p>
             ) : (
               <p className="text-[10px] text-muted-foreground">
-                User-facing web frontend origin for sign-in links. Leave empty to derive it from
-                the Backend URL. Set this for split web/coord dev (e.g. web on :3001 vs API on
-                :8000).
+                User-facing web frontend origin for sign-in links. Leave empty to derive it from the
+                Backend URL. Set this for split web/coord dev (e.g. web on :3001 vs API on :8000).
               </p>
             )}
           </div>
@@ -900,8 +992,8 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
             </div>
             <div className="min-h-[1rem]">{renderTestResult()}</div>
             <p className="text-[10px] text-muted-foreground">
-              Legacy long-lived token from qontinui-web. Prefer signing in or a pair code above.
-              The token is never displayed in full;{" "}
+              Legacy long-lived token from qontinui-web. Prefer signing in or a pair code above. The
+              token is never displayed in full;{" "}
               {status?.runnerTokenMasked
                 ? "the placeholder shows its masked prefix."
                 : "no token is currently saved."}

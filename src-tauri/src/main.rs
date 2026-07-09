@@ -1298,6 +1298,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::claims::claims_steal,
             commands::clipboard::share_file_to_mobile,
             commands::clipboard::share_to_mobile,
+            commands::cloud_sync_settings::get_cloud_sync_settings,
+            commands::cloud_sync_settings::save_cloud_sync_settings,
             commands::command_interpreter::command_interpret,
             commands::comparison::get_comparison_status,
             commands::comparison::list_comparisons,
@@ -2265,11 +2267,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // (create/resume/send_user_message/close) can reach it.
                 let ai_coord_registrar = std::sync::Arc::new(
                     claude_session::coord_register::AiCoordRegistrar::new(
-                        registrar_outbox,
+                        registrar_outbox.clone(),
                         machine_id,
                     ),
                 );
-                app.manage(ai_coord_registrar);
+                app.manage(ai_coord_registrar.clone());
                 // Phase 3 — wire the coord-sync drain + heartbeat loops.
                 // `attach_app_handle` enables the conflict-event emit;
                 // `attach_registry` gives the heartbeat loop a way to
@@ -2285,6 +2287,25 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     coord_sync_facade.clone(),
                 );
                 coord_sync_facade.attach_registry(&registry);
+
+                // Outbox handle kept for the restore-record mirror emitter
+                // attached to the lifecycle store below (plan 2026-07-09
+                // §3.4, Phase 4).
+                let restore_record_outbox = registrar_outbox.clone();
+
+                // Transcript cloud sync (plan 2026-07-09-runner-session-
+                // history-cloud-sync, Phase 2) — durable, opt-in mirror of
+                // AI transcript blocks into the SAME session outbox the
+                // drain loop reads. Gated on Settings.cloud_sync_enabled
+                // inside `emit`; the AI-output persist sites reach it via
+                // Tauri state.
+                let transcript_emitter =
+                    std::sync::Arc::new(session::transcript_emitter::TranscriptEmitter::new(
+                        registrar_outbox,
+                        machine_id,
+                        ai_coord_registrar.clone(),
+                    ));
+                app.manage(transcript_emitter);
 
                 // R2 (session-lifecycle-cleanup) — pane → coord-session-id
                 // store, so a restored terminal pane RESUMES its prior coord
@@ -2466,9 +2487,36 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
+                // Restore-registry cloud mirror (plan 2026-07-09-runner-
+                // session-history-cloud-sync §3.4, Phase 4) — every registry
+                // write/refresh mirrors a debounced `restore-record` session
+                // event into the SAME outbox the CoordSync drain reads,
+                // gated on Settings.cloud_sync_enabled (gate 1: off ⇒ no
+                // outbox entry, nothing leaves the machine). The coord
+                // session id for a record resolves through its hosting
+                // terminal's coord mirror (`terminal_create` stores it on
+                // the TerminalSession).
+                {
+                    let tm = term_for_session.clone();
+                    let restore_record_emitter = std::sync::Arc::new(
+                        session::restore_record_emitter::RestoreRecordEmitter::new(
+                            restore_record_outbox,
+                            machine_id,
+                            Box::new(move |terminal_id: &str| {
+                                tm.get(terminal_id).and_then(|s| s.coord_session_id())
+                            }),
+                        ),
+                    );
+                    lifecycle_store.attach_restore_record_emitter(restore_record_emitter);
+                }
+
                 let poll_lifecycle_store = lifecycle_store.clone();
                 let reconcile_lifecycle_store = lifecycle_store.clone();
                 let health_lifecycle_store = lifecycle_store.clone();
+                // Phase 4 (§3.4) — the handoff receiver materializes a local
+                // restore-registry record from a mirrored restore-record
+                // event when this device accepts a handoff.
+                let handoff_lifecycle_store = lifecycle_store.clone();
                 app.manage(lifecycle_store);
 
                 // VT output sanitizer: terminal output is UNTRUSTED (whatever a
@@ -2798,8 +2846,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 tauri::async_runtime::spawn(async move {
                     let _drain = loop_registry.coord_sync().start_drain_task();
                     let _heartbeat = loop_registry.coord_sync().start_heartbeat_task();
-                    let _handoff_rx =
-                        session::handoff::start_receiver_task(loop_registry.clone());
+                    let _handoff_rx = session::handoff::start_receiver_task(
+                        loop_registry.clone(),
+                        handoff_lifecycle_store,
+                    );
                     let _flag_poll = loop_registry.coord_sync().start_flag_poll_task();
                 });
                 app.manage(registry);

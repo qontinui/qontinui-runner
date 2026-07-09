@@ -36,6 +36,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use crate::session::restore_record_emitter::RestoreRecordEmitter;
 use crate::session::snapshot_history::{SnapshotHistory, SnapshotSession};
 
 /// Closed records older than this are pruned (24h in millis).
@@ -228,6 +229,18 @@ pub struct SessionLifecycleStore {
     /// history is DERIVED from this store — never read back by it or by the
     /// restore path.
     snapshot_history: OnceLock<Arc<SnapshotHistory>>,
+    /// Optional restore-registry → coord mirror (plan
+    /// `2026-07-09-runner-session-history-cloud-sync` §3.4, Phase 4). When
+    /// attached, every open-record write/refresh ([`record_open`](Self::record_open))
+    /// and every confirmation flip ([`confirm_session`](Self::confirm_session)
+    /// — confirmation changes the record's honest `restore_tier`) hands the
+    /// merged record to the emitter, which gates (`cloud_sync_enabled`),
+    /// debounces on the material wire fields, and enqueues a
+    /// `restore-record` session event via the outbox. Best-effort by
+    /// construction: the emitter swallows every failure and never blocks the
+    /// registry write on the network (the drain loop does the pushing).
+    /// Unattached (tests, ephemeral fallbacks) → no-op.
+    restore_emitter: OnceLock<Arc<RestoreRecordEmitter>>,
 }
 
 impl SessionLifecycleStore {
@@ -242,6 +255,7 @@ impl SessionLifecycleStore {
             path,
             map: Mutex::new(map),
             snapshot_history: OnceLock::new(),
+            restore_emitter: OnceLock::new(),
         })
     }
 
@@ -251,6 +265,28 @@ impl SessionLifecycleStore {
     pub fn attach_snapshot_history(&self, history: Arc<SnapshotHistory>) {
         if self.snapshot_history.set(history).is_err() {
             warn!("session_lifecycle_store: snapshot history already attached — ignoring");
+        }
+    }
+
+    /// Attach the restore-record cloud-mirror emitter (once, at startup).
+    /// Without an attached emitter the mirror hooks are no-ops — the store
+    /// works standalone (tests, ephemeral fallbacks).
+    pub fn attach_restore_record_emitter(&self, emitter: Arc<RestoreRecordEmitter>) {
+        if self.restore_emitter.set(emitter).is_err() {
+            warn!("session_lifecycle_store: restore-record emitter already attached — ignoring");
+        }
+    }
+
+    /// Mirror one just-written OPEN record to coord via the attached
+    /// emitter, if any. Called AFTER the registry persist; best-effort by
+    /// construction (the emitter gates, debounces, and swallows failures —
+    /// it never fails the registry path).
+    fn mirror_restore_record(&self, rec: &TerminalSessionRecord) {
+        if rec.state != "open" {
+            return;
+        }
+        if let Some(emitter) = self.restore_emitter.get() {
+            emitter.emit(rec);
         }
     }
 
@@ -290,7 +326,7 @@ impl SessionLifecycleStore {
     /// writes after mutating.
     pub fn record_open(&self, rec: TerminalSessionRecord) {
         let now = Utc::now().timestamp_millis();
-        let snapshot = {
+        let (snapshot, merged) = {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
                 Err(e) => {
@@ -332,10 +368,14 @@ impl SessionLifecycleStore {
             entry.closed_at = None;
             entry.close_reason = None;
             entry.last_seen_at = now;
-            m.clone()
+            let merged = entry.clone();
+            (m.clone(), merged)
         };
         self.persist(&snapshot);
         self.snapshot_change(&snapshot);
+        // Phase 4 cloud mirror — emit AFTER the durable local write, from
+        // the MERGED record (origin/confirmation preservation applied).
+        self.mirror_restore_record(&merged);
     }
 
     /// Mark an open session closed. No-op (no error) if the session is
@@ -475,7 +515,7 @@ impl SessionLifecycleStore {
     /// auto-resume vs treat-as-plain-shell; this method just records the signal.
     pub fn confirm_session(&self, claude_session_id: &str) {
         let now = Utc::now().timestamp_millis();
-        let snapshot = {
+        let (snapshot, confirmed) = {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
                 Err(e) => {
@@ -483,14 +523,21 @@ impl SessionLifecycleStore {
                     return;
                 }
             };
-            match m.get_mut(claude_session_id) {
-                Some(rec) if rec.confirmed_at.is_none() => rec.confirmed_at = Some(now),
+            let confirmed = match m.get_mut(claude_session_id) {
+                Some(rec) if rec.confirmed_at.is_none() => {
+                    rec.confirmed_at = Some(now);
+                    rec.clone()
+                }
                 _ => return, // absent or already confirmed — nothing to flush
-            }
-            m.clone()
+            };
+            (m.clone(), confirmed)
         };
         self.persist(&snapshot);
         self.snapshot_change(&snapshot);
+        // Phase 4 cloud mirror — a confirmation flip changes the record's
+        // honest restore tier (terminal_only → full for a Full-tier
+        // provider), which is a material wire-field change.
+        self.mirror_restore_record(&confirmed);
     }
 
     /// Re-key a record from `old_id` to `new_id`: remove the entry stored under

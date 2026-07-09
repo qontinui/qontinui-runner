@@ -957,6 +957,17 @@ impl UnifiedAiSessionExecutor {
                             }
                         });
                     }
+                    // Cloud session sync (opt-in, plan 2026-07-09): mirror
+                    // the same transcript block into the session outbox as a
+                    // transcript-stream chunk. Gated inside `emit` on
+                    // Settings.cloud_sync_enabled; best-effort — can never
+                    // fail the run.
+                    if let Some(emitter) = tauri::Manager::try_state::<
+                        std::sync::Arc<crate::session::transcript_emitter::TranscriptEmitter>,
+                    >(&self.app_handle)
+                    {
+                        emitter.emit(&task_run_id, &formatted);
+                    }
                 }
 
                 AiSessionResult {

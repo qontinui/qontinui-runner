@@ -43,12 +43,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
-use once_cell::sync::Lazy;
-use regex::Regex;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use super::coord_sync::CoordSync;
+use super::redact::redact_secrets;
 
 /// Flush the coalescing buffer at least this often, even if it hasn't hit
 /// the byte threshold. Keeps live-tail latency low (sub-100ms) while still
@@ -66,36 +65,9 @@ const FLUSH_BYTES: usize = 16 * 1024;
 /// buffer.
 const MAX_BUFFER_BYTES: usize = 512 * 1024;
 
-/// Secret-redaction regex (plan §D11). Masks `key = value` / `key: value`
-/// fragments whose key looks like a credential. Case-insensitive. The
-/// value (everything up to the next whitespace) is replaced with a fixed
-/// mask. Compiled once.
-///
-/// This is intentionally narrow + fast — it's a courtesy backstop, not a
-/// DLP engine. Documented as defense-in-depth per the plan.
-static SECRET_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)(api[_-]?key|password|token|secret)(\s*[=:]\s*)(\S+)")
-        .expect("secret redaction regex is a valid literal")
-});
-
-/// Mask substituted for a matched secret value.
-const MASK: &str = "***REDACTED***";
-
-/// Apply the redaction sweep to a byte slice. Operates on the UTF-8 lossy
-/// view (PTY output is overwhelmingly UTF-8; non-UTF-8 bytes become the
-/// replacement char in the masked output, which is acceptable for a
-/// shared-tail courtesy view). Returns the (possibly) masked bytes.
-///
-/// Public so the unit tests + any future caller share the one
-/// implementation.
-pub fn redact_secrets(bytes: &[u8]) -> Vec<u8> {
-    let text = String::from_utf8_lossy(bytes);
-    let masked = SECRET_RE.replace_all(&text, |caps: &regex::Captures| {
-        // Keep the key + separator, mask only the value.
-        format!("{}{}{}", &caps[1], &caps[2], MASK)
-    });
-    masked.into_owned().into_bytes()
-}
+// Secret redaction moved to the shared [`super::redact`] module (plan
+// `2026-07-09-runner-session-history-cloud-sync` Phase 3) so the transcript
+// emitter and this pipe run the exact same sweep. Tests live there too.
 
 /// Spawn the output pipe for a session. Returns the [`JoinHandle`] so the
 /// registry can keep it alive for the session's lifetime (dropping it
@@ -272,50 +244,4 @@ async fn flush(
         }
     }
     buffer.clear();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn redacts_key_value_secrets() {
-        let input = b"export API_KEY=sk-abc123def\nnormal line\npassword: hunter2";
-        let out = String::from_utf8(redact_secrets(input)).unwrap();
-        assert!(out.contains("API_KEY=***REDACTED***"), "got: {out}");
-        assert!(out.contains("password: ***REDACTED***"), "got: {out}");
-        assert!(out.contains("normal line"));
-        // The literal secret values must be gone.
-        assert!(!out.contains("sk-abc123def"));
-        assert!(!out.contains("hunter2"));
-    }
-
-    #[test]
-    fn redacts_token_and_secret_variants() {
-        for (line, secret) in [
-            ("TOKEN=ghp_xxx", "ghp_xxx"),
-            ("client_secret = abcdef", "abcdef"),
-            ("api-key: zzz", "zzz"),
-        ] {
-            let out = String::from_utf8(redact_secrets(line.as_bytes())).unwrap();
-            assert!(out.contains(MASK), "expected mask in: {out}");
-            assert!(!out.contains(secret), "secret leaked in: {out}");
-        }
-    }
-
-    #[test]
-    fn leaves_non_secret_output_untouched() {
-        let input = b"ls -la\ntotal 42\ndrwxr-xr-x  3 user group";
-        let out = redact_secrets(input);
-        assert_eq!(out, input);
-    }
-
-    #[test]
-    fn redaction_is_lossless_for_keys() {
-        // The key + separator survive; only the value is masked. This keeps
-        // the shared tail legible ("there was an API_KEY here") without
-        // leaking the value.
-        let out = String::from_utf8(redact_secrets(b"API_KEY=secret123")).unwrap();
-        assert_eq!(out, "API_KEY=***REDACTED***");
-    }
 }

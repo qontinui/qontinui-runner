@@ -49,6 +49,20 @@
 //! 4. Re-acquire each held claim under this device (`POST /claims/acquire`
 //!    — idempotent by resource_key, so this is the "claim transfer").
 //! 5. Replay warm-tier scrollback into the new PTY.
+//! 5b. Materialize a local restore-registry record from the newest
+//!    `restore-record` session event (plan
+//!    `2026-07-09-runner-session-history-cloud-sync` §3.4, Phase 4).
+//!    Coord's `HandoffState` bundle does NOT carry session events (verified
+//!    against coord `sessions.rs::HandoffState` 2026-07-09), so the
+//!    receiver fetches them from the durable-replay portion of
+//!    `GET /sessions/:id/events` (bounded read; the endpoint replays the
+//!    last rows immediately, then live-tails). Tier honesty carries over:
+//!    a `"full"` record materializes AUTHORITATIVE + CONFIRMED (the
+//!    existing restore classifier auto-resumes it by authoritative id); a
+//!    `"terminal_only"` record materializes AUTHORITATIVE + PROVISIONAL
+//!    (the classifier restores terminal+cwd with a fresh conversation —
+//!    exactly the existing phantom-shell branch, no new restore path).
+//!    Best-effort: any failure here never fails the handoff.
 //! 6. Close the source session (`DELETE /sessions/:id`) so it transitions
 //!    to `closed` (`closed_at = now()`); coord's delete handler releases
 //!    the source claim and publishes `closed`. The child's `started`
@@ -72,6 +86,10 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::intent::Intent;
+use super::restore_record_emitter::{RESTORE_RECORD_EVENT, TIER_FULL};
+use super::session_lifecycle_store::{
+    SessionLifecycleStore, TerminalSessionRecord, DEFAULT_PROVIDER, ORIGIN_AUTHORITATIVE,
+};
 use super::{SessionKind, SessionRegistry};
 
 /// Reconnect backoff floor for the push-subscriber WS loop. Matches the
@@ -213,8 +231,16 @@ pub async fn trigger_handoff(
 /// addressed to this device the instant coord fans it out. On every
 /// (re)connect it also runs a single catch-up GET so anything published
 /// while the runner was offline is replayed. Plan §Phase 7.
-pub fn start_receiver_task(registry: Arc<SessionRegistry>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(run_receiver_loop(registry))
+///
+/// `lifecycle_store` is the durable restore registry: an accepted handoff
+/// for a session with a mirrored `restore-record` event materializes a
+/// local registry record so the EXISTING restore flow can resurrect the
+/// session here (plan `2026-07-09-runner-session-history-cloud-sync` §3.4).
+pub fn start_receiver_task(
+    registry: Arc<SessionRegistry>,
+    lifecycle_store: Arc<SessionLifecycleStore>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_receiver_loop(registry, lifecycle_store))
 }
 
 /// Derive coord's `/ws` URL (with the session pattern) from the resolved
@@ -246,7 +272,10 @@ fn urlencode_pattern(pattern: &str) -> String {
 /// The receiver loop. Reconnects the coord `/ws` push subscription with
 /// capped exponential backoff; on each successful connect it fires the
 /// catch-up GET, then pumps inbound frames until the socket drops.
-async fn run_receiver_loop(registry: Arc<SessionRegistry>) {
+async fn run_receiver_loop(
+    registry: Arc<SessionRegistry>,
+    lifecycle_store: Arc<SessionLifecycleStore>,
+) {
     let http = registry.coord_sync().http_client();
     let coord_url = registry.coord_sync().coord_url().to_string();
     let device_id = registry.machine_id();
@@ -261,7 +290,16 @@ async fn run_receiver_loop(registry: Arc<SessionRegistry>) {
 
     let mut backoff = RECONNECT_BACKOFF_FLOOR;
     loop {
-        match connect_and_pump(&registry, &http, &coord_url, &ws_url, device_id).await {
+        match connect_and_pump(
+            &registry,
+            &lifecycle_store,
+            &http,
+            &coord_url,
+            &ws_url,
+            device_id,
+        )
+        .await
+        {
             Ok(()) => {
                 tracing::debug!("session handoff: push WS closed cleanly; reconnecting");
                 backoff = RECONNECT_BACKOFF_FLOOR;
@@ -285,6 +323,7 @@ async fn run_receiver_loop(registry: Arc<SessionRegistry>) {
 /// disconnect (Ok = clean close, Err = transport error).
 async fn connect_and_pump(
     registry: &Arc<SessionRegistry>,
+    lifecycle_store: &Arc<SessionLifecycleStore>,
     http: &reqwest::Client,
     coord_url: &str,
     ws_url: &str,
@@ -301,17 +340,25 @@ async fn connect_and_pump(
     // source of truth; this GET drains it. Best-effort — a failure here
     // doesn't abort the pump (the push path still works, and the next
     // reconnect retries the catch-up).
-    run_catchup(registry, http, coord_url, device_id).await;
+    run_catchup(registry, lifecycle_store, http, coord_url, device_id).await;
 
     while let Some(msg) = ws.next().await {
         let msg = msg.map_err(|e| HandoffError::Http(format!("coord /ws recv: {e}")))?;
         match msg {
             tokio_tungstenite::tungstenite::Message::Text(t) => {
-                handle_push_frame(registry, http, coord_url, device_id, t.as_str()).await;
+                handle_push_frame(
+                    registry,
+                    lifecycle_store,
+                    http,
+                    coord_url,
+                    device_id,
+                    t.as_str(),
+                )
+                .await;
             }
             tokio_tungstenite::tungstenite::Message::Binary(b) => {
                 let s = String::from_utf8_lossy(&b);
-                handle_push_frame(registry, http, coord_url, device_id, &s).await;
+                handle_push_frame(registry, lifecycle_store, http, coord_url, device_id, &s).await;
             }
             tokio_tungstenite::tungstenite::Message::Ping(p) => {
                 // Keep the socket alive — coord's `/ws` answers our pings,
@@ -334,6 +381,7 @@ async fn connect_and_pump(
 /// each. Used on every (re)connect.
 async fn run_catchup(
     registry: &Arc<SessionRegistry>,
+    lifecycle_store: &Arc<SessionLifecycleStore>,
     http: &reqwest::Client,
     coord_url: &str,
     device_id: Uuid,
@@ -347,7 +395,7 @@ async fn run_catchup(
                 );
             }
             for handoff in pending {
-                materialize_logged(registry, http, coord_url, &handoff).await;
+                materialize_logged(registry, lifecycle_store, http, coord_url, &handoff).await;
             }
         }
         Err(HandoffError::Status(401 | 403, _)) => {
@@ -373,6 +421,7 @@ async fn run_catchup(
 /// materialize. Frames for other devices / other subjects are ignored.
 async fn handle_push_frame(
     registry: &Arc<SessionRegistry>,
+    lifecycle_store: &Arc<SessionLifecycleStore>,
     http: &reqwest::Client,
     coord_url: &str,
     device_id: Uuid,
@@ -385,7 +434,7 @@ async fn handle_push_frame(
         source = %handoff.source_session_id,
         "session handoff: push received; materializing"
     );
-    materialize_logged(registry, http, coord_url, &handoff).await;
+    materialize_logged(registry, lifecycle_store, http, coord_url, &handoff).await;
 }
 
 /// Pure parse+filter of a coord `/ws` envelope into a [`PendingHandoff`]
@@ -455,11 +504,12 @@ fn parse_handoff_push(text: &str, device_id: Uuid) -> Option<PendingHandoff> {
 /// left intact on failure so the next push/catch-up retries.
 async fn materialize_logged(
     registry: &Arc<SessionRegistry>,
+    lifecycle_store: &Arc<SessionLifecycleStore>,
     http: &reqwest::Client,
     coord_url: &str,
     handoff: &PendingHandoff,
 ) {
-    if let Err(e) = materialize(registry, http, coord_url, handoff).await {
+    if let Err(e) = materialize(registry, lifecycle_store, http, coord_url, handoff).await {
         tracing::warn!(
             source = %handoff.source_session_id,
             error = %e,
@@ -533,6 +583,7 @@ async fn fetch_state(
 /// scrollback, then close the source. Plan §Phase 7.
 async fn materialize(
     registry: &Arc<SessionRegistry>,
+    lifecycle_store: &Arc<SessionLifecycleStore>,
     http: &reqwest::Client,
     coord_url: &str,
     handoff: &PendingHandoff,
@@ -587,11 +638,264 @@ async fn materialize(
         }
     }
 
-    // Tear down the source — one-way move. coord's DELETE sets
-    // state='closed', closed_at=now(), and releases the source claim.
-    close_source(http, coord_url, handoff.source_session_id).await?;
+    // Tear down the source FIRST — one-way move. coord's DELETE sets
+    // state='closed', closed_at=now(), and releases the source claim. This
+    // deliberately runs before the restore-registry materialization below
+    // (F6): the materialization's bounded SSE read pays an idle wait (up to
+    // RESTORE_RECORD_FETCH_DEADLINE) even when the source mirrored nothing,
+    // and the load-bearing teardown must not queue behind it. Ordering is
+    // safe: coord's DELETE is a soft close (the row and its
+    // coord.session_events rows survive), so the events replay still serves
+    // the mirror afterwards.
+    let close_result = close_source(http, coord_url, handoff.source_session_id).await;
 
-    Ok(())
+    // Phase 4 (session-history cloud sync §3.4) — materialize a local
+    // restore-registry record from the source's newest mirrored
+    // `restore-record` event, so the EXISTING restore flow can resurrect
+    // the session on THIS machine. Best-effort: a session with no mirror
+    // (cloud sync off at the source, no linked terminal) simply has no
+    // record to materialize, and no failure here aborts the handoff. Runs
+    // regardless of the close outcome so a failed close doesn't also cost
+    // the registry record.
+    materialize_restore_registry(
+        registry,
+        lifecycle_store,
+        http,
+        coord_url,
+        handoff.source_session_id,
+        child_id,
+    )
+    .await;
+
+    close_result
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 — restore-registry materialization (plan
+// `2026-07-09-runner-session-history-cloud-sync` §3.4)
+// ---------------------------------------------------------------------------
+
+/// Overall deadline for the bounded `GET /sessions/:id/events` read.
+const RESTORE_RECORD_FETCH_DEADLINE: Duration = Duration::from_secs(8);
+/// Per-chunk idle timeout: the SSE endpoint replays the durable rows
+/// immediately on connect and then live-tails (silence until the next
+/// published event, keep-alive pings every 15s) — a short idle gap after
+/// the replay burst means the durable window is fully read.
+const RESTORE_RECORD_FETCH_IDLE: Duration = Duration::from_secs(2);
+
+/// Fixed UUIDv5 namespace for provisional (terminal-only) handoff record
+/// keys: the key is `Uuid::new_v5(&NS, source_session_id)`, so retrying a
+/// materialization for the same source upserts the SAME registry record
+/// instead of minting a fresh `Uuid::new_v4` duplicate each attempt.
+/// Randomly generated once for this purpose — never change it, or retries
+/// stop being idempotent across builds.
+const HANDOFF_PROVISIONAL_KEY_NS: Uuid = Uuid::from_u128(0x8f1d_5b0e_43c2_4a7a_9f6e_2d81_c4b3_7a59);
+
+/// Fetch + materialize, logging (but swallowing) every failure.
+async fn materialize_restore_registry(
+    registry: &Arc<SessionRegistry>,
+    lifecycle_store: &Arc<SessionLifecycleStore>,
+    http: &reqwest::Client,
+    coord_url: &str,
+    source_session_id: Uuid,
+    child_id: Uuid,
+) {
+    let Some(payload) = fetch_latest_restore_record(http, coord_url, source_session_id).await
+    else {
+        tracing::debug!(
+            source = %source_session_id,
+            "session handoff: no restore-record event for source — skipping registry materialization"
+        );
+        return;
+    };
+
+    // Attach the record to the child's REAL PTY terminal when it has one,
+    // so the registry's liveness poll matches a live terminal instead of
+    // orphan-closing a synthetic id. Non-PTY child kinds fall back to a
+    // deterministic placeholder.
+    let terminal_id = registry
+        .pty_terminal_id(child_id)
+        .unwrap_or_else(|| format!("handoff-{source_session_id}"));
+
+    let record = registry_record_from_restore_payload(&payload, &terminal_id, source_session_id);
+    let session_key = record.claude_session_id.clone();
+    let tier_full = record.confirmed_at.is_some();
+    lifecycle_store.record_open(record);
+    tracing::info!(
+        source = %source_session_id,
+        child = %child_id,
+        session = %session_key,
+        tier = if tier_full { "full" } else { "terminal_only" },
+        "session handoff: materialized restore-registry record"
+    );
+}
+
+/// Read the durable-replay window of `GET /sessions/:id/events` (SSE) and
+/// return the payload of the NEWEST (highest-seq) `restore-record` event,
+/// if any. Coord's `HandoffState` bundle does not carry session events, so
+/// this is the read path for the mirrored registry record. Bounded: the
+/// stream live-tails after the replay, so reading stops on a short idle
+/// gap, the overall deadline, or stream end — whichever comes first.
+async fn fetch_latest_restore_record(
+    http: &reqwest::Client,
+    coord_url: &str,
+    session_id: Uuid,
+) -> Option<serde_json::Value> {
+    let url = format!(
+        "{}/sessions/{}/events",
+        coord_url.trim_end_matches('/'),
+        session_id
+    );
+    let resp = match crate::coord_http::coord_get(http, &url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(error = %e, "session handoff: restore-record fetch failed (GET events)");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        tracing::debug!(
+            status = %resp.status(),
+            session = %session_id,
+            "session handoff: restore-record fetch rejected — proceeding without registry record"
+        );
+        return None;
+    }
+
+    let mut resp = resp;
+    let mut buf = String::new();
+    let deadline = tokio::time::Instant::now() + RESTORE_RECORD_FETCH_DEADLINE;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(RESTORE_RECORD_FETCH_IDLE.min(remaining), resp.chunk()).await {
+            Ok(Ok(Some(bytes))) => buf.push_str(&String::from_utf8_lossy(&bytes)),
+            Ok(Ok(None)) => break, // stream ended (e.g. no live tail configured)
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "session handoff: restore-record fetch stream error");
+                break;
+            }
+            Err(_) => break, // idle — the replay burst is fully read
+        }
+    }
+    latest_restore_record_from_sse(&buf)
+}
+
+/// Pure parse of an accumulated SSE buffer into the newest `restore-record`
+/// payload. Frames are `\n\n`-separated; each carries `data: <json>` lines
+/// (the replay frames serialize coord's `SessionEventRow`:
+/// `{id, session_id, seq, event_kind, payload, occurred_at}`). "Newest" is
+/// max `seq` with last-wins on ties, so re-emitted (debounce-reset) rows
+/// resolve to the latest state.
+fn latest_restore_record_from_sse(buf: &str) -> Option<serde_json::Value> {
+    let mut best: Option<(i64, serde_json::Value)> = None;
+    for frame in buf.split("\n\n") {
+        let mut data = String::new();
+        for line in frame.lines() {
+            if let Some(rest) = line.strip_prefix("data:") {
+                data.push_str(rest.trim_start());
+            }
+        }
+        if data.is_empty() {
+            continue;
+        }
+        let Ok(row) = serde_json::from_str::<serde_json::Value>(&data) else {
+            continue;
+        };
+        if row.get("event_kind").and_then(|v| v.as_str()) != Some(RESTORE_RECORD_EVENT) {
+            continue;
+        }
+        let Some(payload) = row.get("payload").filter(|p| p.is_object()).cloned() else {
+            continue;
+        };
+        let seq = row.get("seq").and_then(|v| v.as_i64()).unwrap_or(0);
+        if best.as_ref().map(|(s, _)| seq >= *s).unwrap_or(true) {
+            best = Some((seq, payload));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// Pure mapping: a mirrored `restore-record` payload → a local
+/// [`TerminalSessionRecord`] that FEEDS THE EXISTING restore flow (the
+/// frontend `classifyRestoreAction` gate), honoring tiers honestly:
+///
+/// - `restore_tier == "full"` with an authoritative id → the record is
+///   keyed by that id, origin `authoritative`, CONFIRMED (the emitter only
+///   claims `full` for source-confirmed records) — the classifier
+///   auto-resumes the conversation via the provider's `--resume <id>`.
+/// - anything else (`terminal_only`, or a malformed `full` with no id) →
+///   a deterministic per-source key (UUIDv5 of `source_session_id` under
+///   [`HANDOFF_PROVISIONAL_KEY_NS`], so a materialization retry upserts the
+///   SAME record instead of piling up duplicates), origin `authoritative`,
+///   PROVISIONAL (`confirmed_at` unset) — the classifier's phantom-shell
+///   branch restores terminal+cwd with an honest fresh conversation and
+///   never types a resume. (NOT `reconciled`: that origin quarantines
+///   behind a resume-confirm banner, which would be dishonest for a record
+///   that has no conversation to resume.)
+///
+/// `record_open` stamps the timestamps; placeholders here are overwritten.
+fn registry_record_from_restore_payload(
+    payload: &serde_json::Value,
+    terminal_id: &str,
+    source_session_id: Uuid,
+) -> TerminalSessionRecord {
+    let provider = payload
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(DEFAULT_PROVIDER)
+        .to_string();
+    let cwd = payload
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let authoritative_id = payload
+        .get("authoritative_session_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let tier = payload
+        .get("restore_tier")
+        .and_then(|v| v.as_str())
+        .unwrap_or("terminal_only");
+
+    let (claude_session_id, confirmed_at) = match (tier, authoritative_id) {
+        (t, Some(id)) if t == TIER_FULL => {
+            (id.to_string(), Some(chrono::Utc::now().timestamp_millis()))
+        }
+        // Honest degrade: no resumable id ⇒ terminal-only semantics under a
+        // DETERMINISTIC per-source key (a real UUID, so shell-safety
+        // validation and future confirmations behave normally; v5 of the
+        // source session id, so a materialization retry is idempotent —
+        // record_open upserts by this key instead of minting a duplicate).
+        _ => (
+            Uuid::new_v5(&HANDOFF_PROVISIONAL_KEY_NS, source_session_id.as_bytes()).to_string(),
+            None,
+        ),
+    };
+
+    TerminalSessionRecord {
+        claude_session_id,
+        config_dir: None,
+        working_dir: cwd,
+        page_id: "default".to_string(),
+        zone_index: 0,
+        title: Some(format!("{provider} (handed off)")),
+        terminal_id: terminal_id.to_string(),
+        // record_open seeds these from `now`; values here are placeholders.
+        opened_at: 0,
+        last_seen_at: 0,
+        state: "open".to_string(),
+        closed_at: None,
+        close_reason: None,
+        provider,
+        origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
+        restore_pending_at: None,
+        confirmed_at,
+    }
 }
 
 /// Build the child session [`Intent`] from the source state. cwd comes
@@ -948,5 +1252,173 @@ mod tests {
         let device = Uuid::new_v4();
         assert!(parse_handoff_push("not json", device).is_none());
         assert!(parse_handoff_push("{}", device).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 4 — restore-registry materialization (plan
+    // `2026-07-09-runner-session-history-cloud-sync` §3.4)
+    // -----------------------------------------------------------------------
+
+    fn restore_payload(tier: &str, authoritative: Option<&str>) -> serde_json::Value {
+        json!({
+            "provider": "claude",
+            "authoritative_session_id": authoritative,
+            "cwd": "C:/repo",
+            "launch_command": match authoritative {
+                Some(id) => format!("claude --resume {id}"),
+                None => "claude".to_string(),
+            },
+            "restore_tier": tier,
+            "machine_id": Uuid::new_v4(),
+        })
+    }
+
+    /// A `full`-tier payload materializes an AUTHORITATIVE + CONFIRMED
+    /// record keyed by the authoritative id — exactly the shape the
+    /// existing restore classifier auto-resumes.
+    #[test]
+    fn restore_payload_full_tier_materializes_confirmed_authoritative_record() {
+        let rec = registry_record_from_restore_payload(
+            &restore_payload(TIER_FULL, Some("11111111-2222-3333-4444-555555555555")),
+            "term-child",
+            Uuid::new_v4(),
+        );
+        assert_eq!(
+            rec.claude_session_id,
+            "11111111-2222-3333-4444-555555555555"
+        );
+        assert_eq!(rec.origin.as_deref(), Some(ORIGIN_AUTHORITATIVE));
+        assert!(
+            rec.confirmed_at.is_some(),
+            "full tier ⇒ confirmed ⇒ classifyRestoreAction auto-resumes"
+        );
+        assert_eq!(rec.provider, "claude");
+        assert_eq!(rec.working_dir.as_deref(), Some("C:/repo"));
+        assert_eq!(rec.terminal_id, "term-child");
+        assert_eq!(rec.state, "open");
+    }
+
+    /// A `terminal_only` payload materializes a PROVISIONAL authoritative
+    /// record under a deterministic per-source key — the classifier's
+    /// phantom-shell branch restores terminal+cwd with an honest fresh
+    /// conversation, never typing a resume against a null id, and a
+    /// materialization retry upserts the SAME record (F7 idempotency).
+    #[test]
+    fn restore_payload_terminal_only_materializes_provisional_record() {
+        let source = Uuid::new_v4();
+        let rec = registry_record_from_restore_payload(
+            &restore_payload("terminal_only", None),
+            "term-child",
+            source,
+        );
+        assert!(
+            Uuid::parse_str(&rec.claude_session_id).is_ok(),
+            "terminal_only key is a real uuid, got {}",
+            rec.claude_session_id
+        );
+        assert_eq!(rec.origin.as_deref(), Some(ORIGIN_AUTHORITATIVE));
+        assert!(
+            rec.confirmed_at.is_none(),
+            "terminal_only ⇒ provisional ⇒ classifyRestoreAction restores terminal-only"
+        );
+        assert_eq!(rec.working_dir.as_deref(), Some("C:/repo"));
+
+        // Deterministic: same source ⇒ same key (retry idempotency);
+        // different source ⇒ different key (no cross-session collision).
+        let retry = registry_record_from_restore_payload(
+            &restore_payload("terminal_only", None),
+            "term-child",
+            source,
+        );
+        assert_eq!(rec.claude_session_id, retry.claude_session_id);
+        let other = registry_record_from_restore_payload(
+            &restore_payload("terminal_only", None),
+            "term-child",
+            Uuid::new_v4(),
+        );
+        assert_ne!(rec.claude_session_id, other.claude_session_id);
+    }
+
+    /// Honest degrade: a `full` claim WITHOUT an authoritative id cannot
+    /// resume anything — it materializes as terminal-only (provisional,
+    /// minted key), never a confirmed record with a fabricated id.
+    #[test]
+    fn restore_payload_full_without_id_degrades_to_terminal_only() {
+        let rec = registry_record_from_restore_payload(
+            &restore_payload(TIER_FULL, None),
+            "term-child",
+            Uuid::new_v4(),
+        );
+        assert!(Uuid::parse_str(&rec.claude_session_id).is_ok());
+        assert!(rec.confirmed_at.is_none());
+    }
+
+    /// Missing/blank provider defaults to claude (the pre-provider-aware
+    /// registry default), so a sparse mirror still restores.
+    #[test]
+    fn restore_payload_defaults_provider() {
+        let rec = registry_record_from_restore_payload(
+            &json!({"restore_tier": "terminal_only"}),
+            "term-child",
+            Uuid::new_v4(),
+        );
+        assert_eq!(rec.provider, DEFAULT_PROVIDER);
+        assert!(rec.working_dir.is_none());
+    }
+
+    /// End-to-end into the real registry: `record_open` on the mapped
+    /// record lands a RESTORABLE row with the tier-honest fields intact.
+    #[test]
+    fn materialized_record_feeds_the_existing_registry_restorably() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let rec = registry_record_from_restore_payload(
+            &restore_payload(TIER_FULL, Some("sess-full-1")),
+            "term-child",
+            Uuid::new_v4(),
+        );
+        store.record_open(rec);
+
+        let restorable = store.restorable_records(chrono::Utc::now().timestamp_millis(), None);
+        assert_eq!(restorable.len(), 1, "materialized record is restorable");
+        let r = &restorable[0];
+        assert_eq!(r.claude_session_id, "sess-full-1");
+        assert_eq!(r.origin.as_deref(), Some(ORIGIN_AUTHORITATIVE));
+        assert!(r.confirmed_at.is_some());
+        assert!(r.opened_at > 0, "record_open stamped real timestamps");
+    }
+
+    /// The SSE-buffer parser picks the NEWEST (highest-seq) restore-record
+    /// row out of the replay window, ignoring other event kinds, non-JSON
+    /// noise, and payload-less rows.
+    #[test]
+    fn latest_restore_record_from_sse_picks_newest_and_ignores_noise() {
+        let old = json!({
+            "id": 1, "session_id": Uuid::nil(), "seq": 3,
+            "event_kind": "restore-record",
+            "payload": {"restore_tier": "terminal_only", "provider": "claude"},
+        });
+        let newest = json!({
+            "id": 2, "session_id": Uuid::nil(), "seq": 7,
+            "event_kind": "restore-record",
+            "payload": {"restore_tier": "full", "provider": "claude",
+                         "authoritative_session_id": "sess-9"},
+        });
+        let other_kind = json!({
+            "id": 3, "session_id": Uuid::nil(), "seq": 9,
+            "event_kind": "handoff_request",
+            "payload": {"target_device_id": Uuid::nil()},
+        });
+        let buf = format!(
+            "event: replay\ndata: {old}\n\nevent: replay\ndata: {newest}\n\n\
+             event: replay\ndata: {other_kind}\n\nevent: live\ndata: not json\n\n"
+        );
+        let payload = latest_restore_record_from_sse(&buf).expect("newest restore-record");
+        assert_eq!(payload["restore_tier"], "full");
+        assert_eq!(payload["authoritative_session_id"], "sess-9");
+
+        // Empty / noise-only buffers yield nothing.
+        assert!(latest_restore_record_from_sse("").is_none());
+        assert!(latest_restore_record_from_sse("event: replay\ndata: {}\n\n").is_none());
     }
 }

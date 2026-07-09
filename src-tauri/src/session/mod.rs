@@ -66,10 +66,13 @@ pub mod output_pipe;
 pub mod pane_store;
 pub mod provider_adapter;
 pub mod reconcile;
+pub mod redact;
+pub mod restore_record_emitter;
 pub mod session_lifecycle_store;
 pub mod shutdown_marker;
 pub mod snapshot_history;
 pub mod tracking_health;
+pub mod transcript_emitter;
 pub mod transport;
 
 use std::collections::HashMap;
@@ -172,7 +175,11 @@ pub enum SessionEventKind {
     Closed,
     Heartbeat,
     ClaimStolen,
-    /// Phase 8 — defined now, published when PTY streaming lands.
+    /// Durable output chunk (plan `2026-07-09-runner-session-history-cloud-sync`
+    /// §3.2): written by [`transcript_emitter::TranscriptEmitter`] with payload
+    /// `{stream, chunk_offset, payload_b64}`, drained to
+    /// `POST /sessions/:id/output`. (The live PTY stream bypasses the outbox
+    /// via [`output_pipe`] — lossy by design.)
     OutputChunk,
     /// Phase 7 — defined now, published when handoff lands.
     HandoffRequest,
@@ -194,9 +201,19 @@ pub enum SessionEventKind {
     /// `CreateHelperTaskRequest` body recorded by
     /// [`crate::helper_tasks::HelperTaskRegistrar`]. Best-effort: failures
     /// never block session events queued behind it (bounded per-record retry,
-    /// then Ack-drop); a coord `helper_task_queue_unavailable` 503
+    /// then Ack-dropped); a coord `helper_task_queue_unavailable` 503
     /// (helper-task tables not migrated yet) is dropped with a warn.
     HelperTaskCreated,
+    /// Restore-registry mirror (plan
+    /// `2026-07-09-runner-session-history-cloud-sync` §3.4, Phase 4).
+    /// Written by [`restore_record_emitter::RestoreRecordEmitter`] with the
+    /// binding payload `{provider, authoritative_session_id, cwd,
+    /// launch_command, restore_tier, machine_id}`; drained to coord's
+    /// session-events ingest, which stores `event_kind` verbatim in
+    /// `coord.session_events`. The hyphenated wire form ("restore-record")
+    /// is the binding contract the web UI is built against.
+    #[serde(rename = "restore-record")]
+    RestoreRecord,
 }
 
 impl SessionEventKind {
@@ -212,6 +229,7 @@ impl SessionEventKind {
             SessionEventKind::CommitReport => "commit_report",
             SessionEventKind::Progress => "progress",
             SessionEventKind::HelperTaskCreated => "helper_task_created",
+            SessionEventKind::RestoreRecord => "restore-record",
         }
     }
 }
@@ -491,6 +509,25 @@ impl SessionRegistry {
             id,
             registry: Arc::clone(self),
         })
+    }
+
+    /// The PTY terminal id backing session `id`, when its transport handle
+    /// is a Pty. Used by the handoff receiver (plan
+    /// `2026-07-09-runner-session-history-cloud-sync` §3.4, Phase 4) to
+    /// attach the materialized restore-registry record to the child's REAL
+    /// terminal, so the registry's liveness poll matches it instead of
+    /// orphan-closing a synthetic id.
+    pub fn pty_terminal_id(&self, id: Uuid) -> Option<String> {
+        let sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sessions
+            .get(&id)
+            .and_then(|rec| match &rec.transport_handle {
+                TransportHandle::Pty { terminal_id } => Some(terminal_id.clone()),
+                _ => None,
+            })
     }
 
     /// Write input bytes to a live session's transport. Plan §Phase 7
@@ -1250,6 +1287,7 @@ mod tests {
             SessionEventKind::HandoffRequest,
             SessionEventKind::CommitReport,
             SessionEventKind::HelperTaskCreated,
+            SessionEventKind::RestoreRecord,
         ];
         for k in kinds {
             let json = serde_json::to_string(&k).unwrap();
