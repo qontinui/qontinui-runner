@@ -1,13 +1,19 @@
 #!/usr/bin/env node
-// Bundle the `qontinui_profile` CLI as a Tauri sidecar (Phase 1(a) of the devenv
-// machine-enrollment UX plan: kill the build-from-source step so every runner
-// install already carries the enroll/capture helper).
+// Bundle the runner's CLI sidecars as Tauri externalBin binaries:
+//   - `qontinui_profile` (Phase 1(a) of the devenv machine-enrollment UX plan:
+//     kill the build-from-source step so every runner install already carries
+//     the enroll/capture helper).
+//   - `qontinui-pr` (plan qontinui-pr-credential-provisioning, Phase 2b: the
+//     session PR CLI the identity-shim materializer hardlinks onto every
+//     terminal's PATH — without this sidecar, installed/bundled runners have
+//     no binary next to the exe and `qontinui-pr create` never materializes).
 //
-// `tauri.conf.json` declares `bundle.externalBin: ["binaries/qontinui_profile"]`.
-// Tauri resolves that to `src-tauri/binaries/qontinui_profile-<target-triple>[.exe]`
-// at bundle time and copies it next to the app binary. `qontinui_profile` is a
-// `[[bin]]` in the SAME cargo crate, so we just cargo-build it in release and copy
-// the artifact to the triple-suffixed path Tauri expects.
+// `tauri.conf.json` declares `bundle.externalBin: ["binaries/qontinui_profile",
+// "binaries/qontinui-pr"]`. Tauri resolves each to
+// `src-tauri/binaries/<name>-<target-triple>[.exe]` at bundle time and copies it
+// next to the app binary (as plain `<name>[.exe]`). Both are `[[bin]]`s in the
+// SAME cargo crate, so we just cargo-build them in release and copy the
+// artifacts to the triple-suffixed paths Tauri expects.
 //
 // Wired into `beforeBuildCommand` (`tauri.conf.json`), so it runs on every
 // `tauri build` (CI release + local bundle) and NOT on `cargo build`/`cargo check`
@@ -29,6 +35,10 @@ import { fileURLToPath } from "node:url";
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const runnerRoot = resolve(scriptDir, "..");
 const srcTauri = join(runnerRoot, "src-tauri");
+
+// Keep in sync with `tauri.conf.json` `bundle.externalBin` and
+// `src-tauri/build.rs` `ensure_sidecar_placeholders`.
+const SIDECAR_BINS = ["qontinui_profile", "qontinui-pr"];
 
 function fail(msg) {
   console.error(`\n[bundle-profile-sidecar] ERROR: ${msg}\n`);
@@ -54,13 +64,16 @@ const triple = resolveTriple();
 const isWindows = triple.includes("windows");
 const exeExt = isWindows ? ".exe" : "";
 
-// 2. Build the sidecar bin in release, capturing cargo's JSON artifact stream so
-//    we learn the EXACT output path. Do NOT assume `src-tauri/target/` — this
-//    repo's cargo target dir is the workspace root `target/` (and CI/CARGO_TARGET_DIR
-//    or a `--target` subdir can move it further), so guessing the path is what
-//    broke CI. `json-render-diagnostics` keeps machine JSON on stdout while
-//    rendering warnings/errors to stderr (which we inherit for visibility).
-console.log(`[bundle-profile-sidecar] cargo build --release --bin qontinui_profile (target=${triple})`);
+// 2. Build the sidecar bins in release (one cargo invocation), capturing cargo's
+//    JSON artifact stream so we learn the EXACT output paths. Do NOT assume
+//    `src-tauri/target/` — this repo's cargo target dir is the workspace root
+//    `target/` (and CI/CARGO_TARGET_DIR or a `--target` subdir can move it
+//    further), so guessing the path is what broke CI. `json-render-diagnostics`
+//    keeps machine JSON on stdout while rendering warnings/errors to stderr
+//    (which we inherit for visibility).
+console.log(
+  `[bundle-profile-sidecar] cargo build --release ${SIDECAR_BINS.map((b) => `--bin ${b}`).join(" ")} (target=${triple})`,
+);
 let stdout;
 try {
   stdout = execFileSync(
@@ -68,8 +81,7 @@ try {
     [
       "build",
       "--release",
-      "--bin",
-      "qontinui_profile",
+      ...SIDECAR_BINS.flatMap((b) => ["--bin", b]),
       "--message-format=json-render-diagnostics",
     ],
     {
@@ -80,12 +92,12 @@ try {
     },
   );
 } catch (e) {
-  fail(`cargo build of qontinui_profile failed: ${e.message}`);
+  fail(`cargo build of ${SIDECAR_BINS.join(", ")} failed: ${e.message}`);
 }
 
-// 3. Extract the executable path from the last matching compiler-artifact
-//    message — the authoritative location cargo actually wrote it to.
-let builtExe = null;
+// 3. Extract each executable path from the last matching compiler-artifact
+//    message — the authoritative locations cargo actually wrote them to.
+const builtExes = new Map(); // bin name -> executable path
 for (const line of stdout.split("\n")) {
   const s = line.trim();
   if (!s.startsWith("{")) continue;
@@ -98,21 +110,24 @@ for (const line of stdout.split("\n")) {
   if (
     msg.reason === "compiler-artifact" &&
     msg.target &&
-    msg.target.name === "qontinui_profile" &&
+    SIDECAR_BINS.includes(msg.target.name) &&
     msg.executable
   ) {
-    builtExe = msg.executable;
+    builtExes.set(msg.target.name, msg.executable);
   }
 }
-if (!builtExe || !existsSync(builtExe)) {
-  fail(
-    `could not locate the built qontinui_profile executable from cargo's JSON output (parsed: ${builtExe})`,
-  );
-}
 
-// 4. Copy to the triple-suffixed path Tauri's externalBin resolver expects.
+// 4. Copy each to the triple-suffixed path Tauri's externalBin resolver expects.
 const binariesDir = join(srcTauri, "binaries");
 mkdirSync(binariesDir, { recursive: true });
-const dest = join(binariesDir, `qontinui_profile-${triple}${exeExt}`);
-copyFileSync(builtExe, dest);
-console.log(`[bundle-profile-sidecar] wrote sidecar -> ${dest}`);
+for (const bin of SIDECAR_BINS) {
+  const builtExe = builtExes.get(bin);
+  if (!builtExe || !existsSync(builtExe)) {
+    fail(
+      `could not locate the built ${bin} executable from cargo's JSON output (parsed: ${builtExe})`,
+    );
+  }
+  const dest = join(binariesDir, `${bin}-${triple}${exeExt}`);
+  copyFileSync(builtExe, dest);
+  console.log(`[bundle-profile-sidecar] wrote sidecar -> ${dest}`);
+}

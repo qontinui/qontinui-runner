@@ -182,8 +182,18 @@ async fn embedding_service_health() -> serde_json::Value {
 
 /// Probe TTL: re-run `gh auth status` at most once every 5 minutes.
 const PR_CRED_PROBE_TTL_MS: u64 = 5 * 60 * 1000;
+/// Hard cap on how long a single `gh auth status` child may run before it is
+/// killed and the probe resolves to the `unknown` state. Without this a hung
+/// `gh` (network stall, credential-helper prompt) would pin a blocking-pool
+/// thread forever — and the TTL would keep kicking NEW probes on top of it.
+const PR_CRED_PROBE_CHILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 static PR_CRED_LAST_KICK_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// In-flight guard: exactly one probe child at a time. The TTL timestamp alone
+/// is NOT the gate — a kick is taken only when this flag is acquired, so a
+/// probe that has not resolved yet can never be stacked on.
+static PR_CRED_PROBE_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 /// One-shot latch for the Phase-0 "no PR credential" startup warning — the
 /// tracing line fires on the FIRST unauthenticated resolution only.
 static PR_CRED_WARNED_UNAUTHENTICATED: std::sync::atomic::AtomicBool =
@@ -193,9 +203,11 @@ static PR_CRED_WARNED_UNAUTHENTICATED: std::sync::atomic::AtomicBool =
 /// completes). Written only by [`run_pr_credential_probe`].
 #[derive(Clone, Debug)]
 struct PrCredentialProbe {
-    gh_cli_authenticated: bool,
+    /// `Some(true)` authenticated, `Some(false)` no credential, `None` the
+    /// probe could not determine it (child timed out and was killed).
+    gh_cli_authenticated: Option<bool>,
     checked_at_ms: u64,
-    /// Actionable hint, present only when unauthenticated.
+    /// Actionable hint, present when unauthenticated or unknown.
     hint: Option<String>,
 }
 
@@ -205,41 +217,86 @@ fn pr_cred_result_slot() -> &'static std::sync::Mutex<Option<PrCredentialProbe>>
     SLOT.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+/// Wait on `child` for at most `timeout`. Returns `Some(status)` when it
+/// exits in time; on expiry (or a wait error) kills the child, reaps it, and
+/// returns `None`. Blocking (poll + sleep) — call off the async executor.
+fn wait_child_with_timeout(
+    child: &mut std::process::Child,
+    timeout: std::time::Duration,
+) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 /// Run `gh auth status` (blocking — call off the async executor) and resolve a
 /// [`PrCredentialProbe`]. Exit code 0 ⇒ authenticated; non-zero ⇒ no credential;
-/// a missing `gh` binary resolves unauthenticated with a distinct hint.
+/// a missing `gh` binary resolves unauthenticated with a distinct hint. The
+/// child is hard-capped at [`PR_CRED_PROBE_CHILD_TIMEOUT`] — on expiry it is
+/// KILLED and the probe resolves to the `unknown` state (never a leaked
+/// blocking-pool thread).
 fn run_pr_credential_probe() -> PrCredentialProbe {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let outcome = crate::process_helpers::no_window("gh")
+    let spawned = crate::process_helpers::no_window("gh")
         .args(["auth", "status"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status();
-    let (authenticated, hint) = match outcome {
-        Ok(status) if status.success() => (true, None),
-        Ok(_) => (
-            false,
-            Some(
-                "no PR credential — `gh auth login` is the interim unblock; \
-                 `qontinui pr create` (coord-brokered) needs no personal login"
-                    .to_string(),
+        .spawn();
+    let (authenticated, hint) = match spawned {
+        Ok(mut child) => match wait_child_with_timeout(&mut child, PR_CRED_PROBE_CHILD_TIMEOUT) {
+            Some(status) if status.success() => (Some(true), None),
+            Some(_) => (
+                Some(false),
+                Some(
+                    "no PR credential — `gh auth login` is the interim unblock; \
+                     `qontinui-pr create` (coord-brokered) needs no personal login"
+                        .to_string(),
+                ),
             ),
-        ),
+            None => (
+                None,
+                Some(format!(
+                    "gh auth status did not finish within {}s and was killed — \
+                     credential state unknown; `qontinui-pr create` \
+                     (coord-brokered) needs no personal login",
+                    PR_CRED_PROBE_CHILD_TIMEOUT.as_secs()
+                )),
+            ),
+        },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
-            false,
+            Some(false),
             Some(
-                "gh CLI not installed — `qontinui pr create` (coord-brokered) \
+                "gh CLI not installed — `qontinui-pr create` (coord-brokered) \
                  needs no personal login"
                     .to_string(),
             ),
         ),
-        Err(e) => (false, Some(format!("gh auth status probe failed: {e}"))),
+        Err(e) => (
+            Some(false),
+            Some(format!("gh auth status probe failed: {e}")),
+        ),
     };
-    if !authenticated
+    if authenticated == Some(false)
         && PR_CRED_WARNED_UNAUTHENTICATED
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
@@ -256,35 +313,64 @@ fn run_pr_credential_probe() -> PrCredentialProbe {
     }
 }
 
+/// Decide whether THIS call should kick a fresh probe, and if so acquire the
+/// in-flight flag + advance the TTL timestamp. Split from
+/// [`pr_credential_health`] so the guard logic is unit-testable. A kick is
+/// taken only when (a) the TTL has expired AND (b) no probe is currently in
+/// flight — the timestamp alone is never the gate, so an unresolved probe can
+/// not be stacked on. The caller that receives `true` MUST run the probe and
+/// release the flag via [`pr_cred_probe_finished`].
+fn pr_cred_try_begin_probe(now_ms: u64) -> bool {
+    let prev = PR_CRED_LAST_KICK_MS.load(Ordering::Relaxed);
+    let stale = now_ms.saturating_sub(prev) > PR_CRED_PROBE_TTL_MS;
+    if !stale {
+        return false;
+    }
+    if PR_CRED_PROBE_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        // A prior probe is still running (bounded by the child timeout) —
+        // do not stack another on top of it.
+        return false;
+    }
+    PR_CRED_LAST_KICK_MS.store(now_ms, Ordering::Relaxed);
+    true
+}
+
+/// Release the probe in-flight flag (after storing the result).
+fn pr_cred_probe_finished() {
+    PR_CRED_PROBE_IN_FLIGHT.store(false, Ordering::Release);
+}
+
 /// Build the `/health` `prCredential` section from the cached probe, kicking a
-/// fresh DETACHED probe when the cache is stale (single-flight via
-/// compare_exchange on the kick timestamp). NEVER blocks: before the first
-/// probe resolves this returns a `pending` shape.
+/// fresh DETACHED probe when the cache is stale and no probe is already in
+/// flight ([`pr_cred_try_begin_probe`]). NEVER blocks: before the first probe
+/// resolves this returns a `pending` shape.
 fn pr_credential_health() -> serde_json::Value {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let prev = PR_CRED_LAST_KICK_MS.load(Ordering::Relaxed);
-    let stale = now_ms.saturating_sub(prev) > PR_CRED_PROBE_TTL_MS;
-    if stale
-        && PR_CRED_LAST_KICK_MS
-            .compare_exchange(prev, now_ms, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-    {
+    if pr_cred_try_begin_probe(now_ms) {
         // Off the hot path: the process spawn runs on a blocking thread and
-        // stores its result for the NEXT /health read.
+        // stores its result for the NEXT /health read. The child is hard-capped
+        // at PR_CRED_PROBE_CHILD_TIMEOUT, so the in-flight flag always frees.
         tokio::task::spawn_blocking(|| {
             let probe = run_pr_credential_probe();
             if let Ok(mut slot) = pr_cred_result_slot().lock() {
                 *slot = Some(probe);
             }
+            pr_cred_probe_finished();
         });
     }
     let cached = pr_cred_result_slot().lock().ok().and_then(|g| g.clone());
     match cached {
         Some(p) => serde_json::json!({
-            "state": "resolved",
+            // `unknown` = the last child timed out; distinct from `pending`
+            // (no probe has resolved yet) so consumers can tell "gh is
+            // wedged" from "still starting up".
+            "state": if p.gh_cli_authenticated.is_some() { "resolved" } else { "unknown" },
             "ghCliAuthenticated": p.gh_cli_authenticated,
             "checkedAt": p.checked_at_ms,
             "hint": p.hint,
@@ -1588,24 +1674,29 @@ fn vcs_pr_upstream_body(req: &VcsPullRequestBody) -> serde_json::Value {
     body
 }
 
-/// `POST /vcs/pull-requests` — the nonce-gated device-JWT PR-creation
-/// forwarder (plan qontinui-pr-credential-provisioning, Phase 2b).
+/// `POST /vcs/pull-requests` — the nonce-gated PR-creation forwarder (plan
+/// qontinui-pr-credential-provisioning, Phase 2b).
 ///
 /// Why: agents in runner-hosted terminals have no personal GitHub login on the
 /// machine, so `gh pr create` fails. Coord brokers PR creation with its own
 /// installation credential (`POST /coord/repos/{owner}/{repo}/pull-requests`,
-/// device-JWT authed); this loopback route lets any session that holds the
-/// per-session coord-mcp proxy nonce reach it — the `qontinui pr create` CLI
-/// is the intended caller.
+/// JWT-authed — coord accepts BOTH device and agent bearers on that route);
+/// this loopback route lets any session that holds a per-session coord-mcp
+/// proxy nonce reach it — the `qontinui-pr create` CLI is the intended caller.
 ///
-/// Gate: exactly the coord-mcp write-forwarder discipline — a registered
-/// DEVICE-bound `X-Coord-Mcp-Proxy-Key` nonce (agent nonces are rejected: the
-/// route injects the device JWT) and a live device bearer that decodes
-/// `sub_type == "device"` ([`crate::coord_mcp::proxy_request_gate`]). A missing
-/// device JWT is a 503 `runner not paired — no device JWT` (a pairing gap, not
-/// an auth failure). Coord's status + body pass through verbatim so 403/404
-/// (repo not in the caller tenant) and 429 (rate limit) surface honestly;
-/// runner-originated failures use distinct `VCS_PR_PROXY_*` codes.
+/// Gate: exactly the coord-mcp proxy discipline — a registered
+/// `X-Coord-Mcp-Proxy-Key` nonce, Device- OR Agent-bound (coord-spawned agent
+/// sessions get Agent-bound nonces via `write_coord_mcp_agent_proxy_config`
+/// and are this feature's primary population), and a live bearer matched to
+/// the nonce's principal by [`crate::coord_mcp::proxy_request_gate`] (device
+/// JWT for Device nonces, THAT agent's own refreshed JWT for Agent nonces —
+/// the nonce→principal binding prevents scope elevation in either direction).
+/// A device JWT that stays missing after the bounded
+/// [`crate::coord_mcp::DEVICE_JWT_REMINT_WAIT`] re-mint wait is a 503
+/// `runner not paired — no device JWT` (a pairing gap, not an auth failure).
+/// Coord's status + body pass through verbatim so 403/404 (repo not in the
+/// caller tenant) and 429 (rate limit) surface honestly; runner-originated
+/// failures use distinct `VCS_PR_PROXY_*` codes.
 async fn vcs_create_pull_request_handler(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
@@ -1617,27 +1708,28 @@ async fn vcs_create_pull_request_handler(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
 
-    // Device-bound nonces only — an agent nonce must never borrow the device
-    // identity through this route (same scope-elevation trap as the coord-mcp
-    // write forwarder).
-    match nonce
+    // Resolve the principal FROM THE NONCE first — the binding decides which
+    // identity's bearer this route injects (device JWT vs the agent's own
+    // JWT). An absent/unregistered nonce 401s before any body parsing or
+    // credential I/O.
+    let principal = match nonce
         .as_deref()
         .and_then(crate::coord_mcp::proxy_principal_for_nonce)
     {
-        Some(crate::coord_mcp::ProxyPrincipal::Device) => {}
-        _ => {
-            warn!("vcs pr proxy: missing/non-device X-Coord-Mcp-Proxy-Key");
+        Some(p) => p,
+        None => {
+            warn!("vcs pr proxy: missing or unrecognized X-Coord-Mcp-Proxy-Key");
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({
                     "success": false,
-                    "error": "missing or non-device X-Coord-Mcp-Proxy-Key",
+                    "error": "missing or unrecognized X-Coord-Mcp-Proxy-Key",
                     "code": "VCS_PR_PROXY_UNAUTHORIZED",
                 })),
             )
                 .into_response();
         }
-    }
+    };
 
     // Parse + validate the request BEFORE any credential I/O — a bad shape is
     // a runner-originated 400, never forwarded.
@@ -1684,31 +1776,80 @@ async fn vcs_create_pull_request_handler(
             .into_response();
     }
 
-    // Live read — the same fresh device JWT the `/coord-mcp` proxy injects.
-    // AuthManager does filesystem I/O, so keep it off the async executor.
-    let bearer =
-        tokio::task::spawn_blocking(|| crate::auth::AuthManager::new().get_access_token().ok())
+    // Pick the bearer by principal — the same per-principal token discipline
+    // as `coord_mcp_proxy_handler`.
+    let bearer = match &principal {
+        crate::coord_mcp::ProxyPrincipal::Device => {
+            // Live read — the same fresh device JWT the `/coord-mcp` proxy
+            // injects. AuthManager does filesystem I/O, so keep it off the
+            // async executor.
+            let mut tok = tokio::task::spawn_blocking(|| {
+                crate::auth::AuthManager::new().get_access_token().ok()
+            })
             .await
             .ok()
             .flatten();
-    if bearer.as_deref().map(str::trim).unwrap_or("").is_empty() {
-        warn!("vcs pr proxy: no device JWT — runner not paired");
-        return (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "success": false,
-                "error": "runner not paired — no device JWT",
-                "code": "VCS_PR_PROXY_NOT_PAIRED",
-            })),
-        )
-            .into_response();
-    }
+            // A momentarily-missing device JWT is usually the refresher's
+            // re-mint window, not a dead pairing — kick the refresher and wait
+            // the bounded DEVICE_JWT_REMINT_WAIT (~5s) before degrading, the
+            // same idiom as the coord-mcp proxy. Only a JWT that is STILL
+            // missing after the wait reports the hard 503.
+            if tok.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                tok = crate::coord_mcp::await_device_jwt_remint().await;
+            }
+            match tok {
+                Some(t) if !t.trim().is_empty() => Some(t),
+                _ => {
+                    warn!(
+                        "vcs pr proxy: no device JWT after bounded re-mint wait — \
+                         runner not paired"
+                    );
+                    return (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({
+                            "success": false,
+                            "error": "runner not paired — no device JWT",
+                            "code": "VCS_PR_PROXY_NOT_PAIRED",
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        crate::coord_mcp::ProxyPrincipal::Agent { agent_id } => {
+            match crate::coord_mcp::lookup_agent_token(*agent_id) {
+                Some(slot) => {
+                    let _ = crate::agent_token::maybe_refresh(
+                        &slot,
+                        &crate::coord_mcp::coord_base_url(),
+                        *agent_id,
+                        "vcs_pr_proxy",
+                    )
+                    .await;
+                    Some(slot.read().await.token.clone())
+                }
+                None => {
+                    warn!(
+                        "vcs pr proxy: no live token slot for agent_id={agent_id} \
+                         (torn-down or restarted agent) — failing closed"
+                    );
+                    return (
+                        axum::http::StatusCode::UNAUTHORIZED,
+                        Json(serde_json::json!({
+                            "success": false,
+                            "error": "no live agent token for this proxy session",
+                            "code": "VCS_PR_PROXY_AGENT_GONE",
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    };
 
-    if let Err((status, msg)) = crate::coord_mcp::proxy_request_gate(
-        nonce.as_deref(),
-        bearer.as_deref(),
-        &crate::coord_mcp::ProxyPrincipal::Device,
-    ) {
+    if let Err((status, msg)) =
+        crate::coord_mcp::proxy_request_gate(nonce.as_deref(), bearer.as_deref(), &principal)
+    {
         warn!("vcs pr proxy: {msg}");
         return (
             axum::http::StatusCode::from_u16(status)
@@ -3235,12 +3376,13 @@ pub fn create_router(
             "/coord-mcp/work-units/{slug}/deps",
             get(coord_work_unit_deps_get_handler).post(coord_work_unit_set_deps_handler),
         )
-        // Nonce-gated device-JWT PR-creation forwarder (plan
+        // Nonce-gated PR-creation forwarder (plan
         // qontinui-pr-credential-provisioning, Phase 2b). Same gate + live
-        // device-JWT injection as the coord-mcp write forwarder, fixed to
-        // coord's `POST /coord/repos/{owner}/{repo}/pull-requests` route with
-        // a validated owner/name — never a generic passthrough. The
-        // `qontinui pr create` session CLI is the intended caller.
+        // per-principal JWT injection (device OR agent) as the coord-mcp
+        // proxy, fixed to coord's
+        // `POST /coord/repos/{owner}/{repo}/pull-requests` route with a
+        // validated owner/name — never a generic passthrough. The
+        // `qontinui-pr create` session CLI is the intended caller.
         .route("/vcs/pull-requests", post(vcs_create_pull_request_handler))
         // Relay web-integration diagnostic — exposes the idle-gating state
         // (tier, enabled, device-JWT presence, WS connection, last error) so
@@ -4451,6 +4593,57 @@ mod vcs_pr_proxy_tests {
         assert_eq!(v["code"], "VCS_PR_PROXY_UNAUTHORIZED");
     }
 
+    /// An AGENT-bound nonce is ACCEPTED by the principal gate (coord-spawned
+    /// agent sessions are this feature's primary population — coord's upstream
+    /// route takes agent JWTs too). With no live token slot registered for the
+    /// agent (torn-down/restarted), the handler fails closed with the DISTINCT
+    /// agent-gone 401 — proving it got PAST the old device-only rejection.
+    #[tokio::test]
+    async fn agent_nonce_passes_principal_gate_and_fails_closed_without_token_slot() {
+        let agent_id = uuid::Uuid::new_v4();
+        let nonce = crate::coord_mcp::register_agent_proxy_nonce(
+            "/tmp/vcs-pr-proxy-agent-nonce-test",
+            agent_id,
+        );
+
+        // A malformed body with a VALID agent nonce is a 400 — the shape is
+        // validated before any credential lookup.
+        let resp = vcs_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/vcs/pull-requests")
+                    .header("X-Coord-Mcp-Proxy-Key", &nonce)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"not":"a pr body"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "agent nonce must reach body validation");
+        let v = body_json(resp).await;
+        assert_eq!(v["code"], "VCS_PR_PROXY_BAD_REQUEST");
+
+        // A well-formed body proceeds to the agent-token lookup, which has no
+        // slot for this agent → the distinct fail-closed 401 (NOT the generic
+        // unrecognized-nonce 401, and NOT a forward).
+        let resp = vcs_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/vcs/pull-requests")
+                    .header("X-Coord-Mcp-Proxy-Key", &nonce)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"repo":"o/r","head":"h","title":"t"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        let v = body_json(resp).await;
+        assert_eq!(v["code"], "VCS_PR_PROXY_AGENT_GONE");
+    }
+
     /// The forwarding leg against a local mock coord: the bearer is injected as
     /// `Authorization: Bearer <token>`, the JSON body arrives verbatim, and
     /// coord's status + body come back unreshaped — including the honest
@@ -4546,6 +4739,98 @@ mod vcs_pr_proxy_tests {
         let v = body_json(resp).await;
         assert_eq!(v["success"], false);
         assert_eq!(v["code"], "VCS_PR_PROXY_UPSTREAM_UNREACHABLE");
+    }
+}
+
+#[cfg(test)]
+mod pr_credential_probe_tests {
+    use super::*;
+
+    /// The kick decision: TTL-stale alone is NOT enough — the in-flight flag
+    /// must also be free, so an unresolved probe is never stacked on. Runs the
+    /// whole sequence in ONE test (the statics are process-global).
+    #[test]
+    fn probe_kick_requires_ttl_stale_and_no_in_flight_probe() {
+        // Reset the process-global gate state.
+        PR_CRED_LAST_KICK_MS.store(0, Ordering::Relaxed);
+        pr_cred_probe_finished();
+
+        let t1 = PR_CRED_PROBE_TTL_MS + 1;
+        assert!(
+            pr_cred_try_begin_probe(t1),
+            "stale + no in-flight probe → kick"
+        );
+        assert!(
+            !pr_cred_try_begin_probe(t1),
+            "fresh timestamp → no kick regardless of flag"
+        );
+
+        // The TTL expires AGAIN while the probe is still unresolved: the old
+        // timestamp-only gating would kick a second probe here; the in-flight
+        // guard must refuse.
+        let t2 = t1 + PR_CRED_PROBE_TTL_MS + 1;
+        assert!(
+            !pr_cred_try_begin_probe(t2),
+            "in-flight probe blocks a new kick even after the TTL expires"
+        );
+
+        // Once the probe resolves and releases the flag, the stale TTL kicks.
+        pr_cred_probe_finished();
+        assert!(
+            pr_cred_try_begin_probe(t2),
+            "released flag + stale TTL → kick"
+        );
+        pr_cred_probe_finished();
+    }
+
+    /// The child wait helper: a fast child yields its exit status; a child that
+    /// outlives the timeout is KILLED and yields `None` (→ the `unknown` probe
+    /// state) instead of pinning the thread.
+    #[test]
+    fn wait_child_with_timeout_reaps_fast_child_and_kills_slow_child() {
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        #[cfg(windows)]
+        let mut fast = Command::new("cmd");
+        #[cfg(windows)]
+        fast.args(["/C", "exit 0"]);
+        #[cfg(not(windows))]
+        let mut fast = Command::new("sh");
+        #[cfg(not(windows))]
+        fast.args(["-c", "exit 0"]);
+        let mut child = fast
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn fast child");
+        let status = wait_child_with_timeout(&mut child, Duration::from_secs(10))
+            .expect("fast child resolves in time");
+        assert!(status.success());
+
+        // A child that would run ~30s must be killed at the (short) deadline.
+        #[cfg(windows)]
+        let mut slow = Command::new("ping");
+        #[cfg(windows)]
+        slow.args(["-n", "30", "127.0.0.1"]);
+        #[cfg(not(windows))]
+        let mut slow = Command::new("sleep");
+        #[cfg(not(windows))]
+        slow.arg("30");
+        let mut child = slow
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn slow child");
+        let started = std::time::Instant::now();
+        let status = wait_child_with_timeout(&mut child, Duration::from_millis(500));
+        assert!(status.is_none(), "slow child times out → None (unknown)");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the kill happens at the deadline, not after the child's own runtime"
+        );
     }
 }
 

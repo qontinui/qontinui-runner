@@ -278,13 +278,17 @@ path = "src/bin/qontinui_specs.rs"
 name = "qontinui-git-credential"
 path = "src/bin/qontinui_git_credential.rs"
 
-# `qontinui` session CLI (plan qontinui-pr-credential-provisioning, Phase 2b).
-# Delivered onto every terminal's PATH by the identity-shim materializer.
-# `qontinui pr create` POSTs the runner's loopback `/vcs/pull-requests` proxy,
-# which forwards to coord's device-JWT-authed PR-creation route — so agents can
-# open PRs without a personal `gh auth login` on the machine.
+# `qontinui-pr` session CLI (plan qontinui-pr-credential-provisioning, Phase 2b).
+# Delivered onto every terminal's PATH by the identity-shim materializer and
+# bundled into installed runners as a Tauri externalBin sidecar (see
+# `tauri.conf.json` + `scripts/bundle-profile-sidecar.mjs`). Named `qontinui-pr`
+# (NOT `qontinui`) so it never shadows the Python qontinui library's `qontinui`
+# console script on the PATH-prepended shim dir. `qontinui-pr create` POSTs the
+# runner's loopback `/vcs/pull-requests` proxy, which forwards to coord's
+# JWT-authed PR-creation route — so agents can open PRs without a personal
+# `gh auth login` on the machine.
 [[bin]]
-name = "qontinui"
+name = "qontinui-pr"
 path = "src/bin/qontinui_cli.rs"
 
 # `coord doctor` headless self-check (plan 2026-06-13 Phase 4). Reuses the

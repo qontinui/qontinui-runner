@@ -252,7 +252,7 @@ pub fn materialize_identity(base_dir: &Path, terminal_id: &str) -> Option<PathBu
             return None;
         }
     }
-    // Also deliver the `qontinui` session CLI (plan
+    // Also deliver the `qontinui-pr` session CLI (plan
     // qontinui-pr-credential-provisioning, Phase 2b) onto the same always-on
     // PATH dir. Best-effort, fail-open: an absent/uncopyable binary never
     // breaks the terminal — the identity dir still materializes.
@@ -260,30 +260,56 @@ pub fn materialize_identity(base_dir: &Path, terminal_id: &str) -> Option<PathBu
     Some(dir)
 }
 
-/// Hardlink (or copy) the built `qontinui` session CLI binary — it sits next
-/// to the runner exe at runtime, like the `qontinui-shim` stub and the
-/// `qontinui-git-credential` helper — into the per-terminal identity dir so
-/// `qontinui pr create` is on every session's PATH. Best-effort, fail-open:
+/// The session-CLI binary filename [`materialize_session_cli`] delivers.
+/// Named `qontinui-pr` (NOT `qontinui`): this dir is PATH-prepended in every
+/// runner terminal, so a `qontinui` bin would shadow the Python qontinui
+/// library's `qontinui` console script.
+pub const SESSION_CLI_BIN: &str = if cfg!(windows) {
+    "qontinui-pr.exe"
+} else {
+    "qontinui-pr"
+};
+
+/// One-shot latch: warn about the missing session-CLI binary ONCE per process,
+/// not once per terminal spawn.
+static SESSION_CLI_MISSING_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Hardlink (or copy) the built `qontinui-pr` session CLI binary — it sits
+/// next to the runner exe at runtime: bundled installs carry it as a Tauri
+/// `externalBin` sidecar (`tauri.conf.json` + `scripts/bundle-profile-sidecar.mjs`,
+/// same mechanism as `qontinui_profile`), and dev/supervisor builds have it in
+/// the shared cargo target dir — into the per-terminal identity dir so
+/// `qontinui-pr create` is on every session's PATH. Best-effort, fail-open:
 /// every failure (dev build without the binary, cross-volume hardlink refusal,
-/// copy error) is logged at debug and the terminal spawns unaffected. Never
-/// panics.
+/// copy error) only logs and the terminal spawns unaffected. Never panics.
+/// An ABSENT binary warns once per process (not per terminal) so a broken
+/// bundle is diagnosable instead of silently degrading.
 fn materialize_session_cli(dir: &Path) {
-    let name = if cfg!(windows) {
-        "qontinui.exe"
-    } else {
-        "qontinui"
-    };
+    let name = SESSION_CLI_BIN;
     let src = match std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|d| d.join(name)))
     {
         Some(p) if p.is_file() => p,
         _ => {
-            tracing::debug!(
-                tool = name,
-                "session cli: {name} not found next to the runner exe — \
-                 `qontinui pr create` unavailable in this terminal (dev build?)"
-            );
+            if SESSION_CLI_MISSING_WARNED
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                tracing::warn!(
+                    tool = name,
+                    "session cli: {name} not found next to the runner exe — \
+                     `qontinui-pr create` unavailable in every terminal of this \
+                     runner (dev build without the bin, or a bundle missing the \
+                     externalBin sidecar)"
+                );
+            }
             return;
         }
     };
@@ -875,16 +901,19 @@ mod tests {
     #[test]
     fn materialize_identity_delivers_session_cli_when_binary_present() {
         // Phase 2b (qontinui-pr-credential-provisioning): the identity dir must
-        // carry the `qontinui` session CLI so `qontinui pr create` is on every
-        // terminal's PATH. Arrange the binary the way `materialize_session_cli`
-        // finds it: next to `current_exe()` (the test binary's own dir).
-        // Create-if-absent and clean up only what we created, so a dev target
-        // dir that already has the real CLI still passes.
-        let name = if cfg!(windows) {
-            "qontinui.exe"
-        } else {
-            "qontinui"
-        };
+        // carry the `qontinui-pr` session CLI so `qontinui-pr create` is on
+        // every terminal's PATH. Arrange the binary the way
+        // `materialize_session_cli` finds it: next to `current_exe()` (the test
+        // binary's own dir). Create-if-absent and clean up only what we
+        // created, so a dev target dir that already has the real CLI still
+        // passes.
+        let name = SESSION_CLI_BIN;
+        assert!(
+            name.starts_with("qontinui-pr"),
+            "the session CLI must NOT be named plain `qontinui` — it would \
+             shadow the Python qontinui console script on the PATH-prepended \
+             shim dir (got {name})"
+        );
         let exe_dir = std::env::current_exe()
             .unwrap()
             .parent()
@@ -912,7 +941,7 @@ mod tests {
 
     #[test]
     fn materialize_identity_survives_absent_session_cli() {
-        // Fail-open: when no `qontinui` binary sits next to current_exe the
+        // Fail-open: when no `qontinui-pr` binary sits next to current_exe the
         // identity dir still materializes with the claude/gemini shims. (If a
         // real CLI binary happens to be present in the test target dir, the
         // stronger delivery assertion is covered by the test above.)
