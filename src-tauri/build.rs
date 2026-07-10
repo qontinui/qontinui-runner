@@ -105,16 +105,57 @@ fn main() {
     // refactor that narrows the dist watch doesn't silently freeze the id).
     println!("cargo:rerun-if-changed=../dist/build-id.txt");
 
-    // Re-run this script when HEAD moves. qontinui-runner's .git lives at
-    // ../.git relative to src-tauri.
-    //   - .git/HEAD fires on branch switch / detached-head jumps.
-    //   - .git/refs/heads/ (directory) fires on any new commit to any local
-    //     branch, since refs/heads/<branch> is the file git updates when
+    // Re-run this script when HEAD moves.
+    //   - <git-dir>/HEAD fires on branch switch / detached-head jumps.
+    //   - <common-dir>/refs/heads/ (directory) fires on any new commit to any
+    //     local branch, since refs/heads/<branch> is the file git updates when
     //     advancing a branch ref. Without this a fresh commit on the
     //     currently-checked-out branch would keep the old QONTINUI_GIT_SHA
     //     embedded, defeating the purpose of this stamp.
-    println!("cargo:rerun-if-changed=../.git/HEAD");
-    println!("cargo:rerun-if-changed=../.git/refs/heads");
+    //
+    // The paths MUST be resolved worktree-aware: in a linked `git worktree`,
+    // `../.git` is a FILE (`gitdir: <path>`), so the former hardcoded
+    // `../.git/HEAD` / `../.git/refs/heads` watches pointed at nonexistent
+    // paths — and cargo re-runs the build script (recompiling this whole
+    // crate) on EVERY invocation when a watched path does not exist. That made
+    // each check/clippy/test in an agent worktree a full rebuild.
+    let git_entry = std::path::Path::new("../.git");
+    let git_dir = if git_entry.is_dir() {
+        Some(git_entry.to_path_buf())
+    } else {
+        // Linked worktree: `.git` is a file `gitdir: <per-worktree git dir>`.
+        std::fs::read_to_string(git_entry).ok().and_then(|s| {
+            s.strip_prefix("gitdir:").map(|p| {
+                let p = std::path::PathBuf::from(p.trim());
+                if p.is_absolute() {
+                    p
+                } else {
+                    std::path::Path::new("..").join(p)
+                }
+            })
+        })
+    };
+    if let Some(git_dir) = git_dir {
+        println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
+        // refs/heads lives in the COMMON git dir; a linked worktree's git dir
+        // has a `commondir` file pointing there (usually `../..`).
+        let common_dir = std::fs::read_to_string(git_dir.join("commondir"))
+            .map(|s| {
+                let p = std::path::PathBuf::from(s.trim());
+                if p.is_absolute() {
+                    p
+                } else {
+                    git_dir.join(p)
+                }
+            })
+            .unwrap_or_else(|_| git_dir.clone());
+        println!(
+            "cargo:rerun-if-changed={}",
+            common_dir.join("refs/heads").display()
+        );
+    }
+    // No git dir at all (source tarball): emit no watch — a stable fingerprint
+    // beats a nonexistent-path watch that forces a rebuild every run.
 
     // Section 4 (UI Bridge redesign) — refresh the runner's IR baseline if
     // any tsx source is newer. Best-effort only; never fails the build.
