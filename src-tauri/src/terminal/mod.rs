@@ -52,7 +52,9 @@ live merge train. BEFORE you edit files or write a plan, call \
 coord_declare_intent so peers can see your scope and you can sequence around \
 them. Check coord_is_merge_safe / gate status before landing. Verify a change \
 actually landed by its CONTENT on origin/main — never trust a green workflow or \
-a PR \"merged\" state alone.
+a PR \"merged\" state alone. Open PRs with `qontinui pr create` (preferred — \
+works without a personal GitHub login on this machine); `gh pr create` also \
+works where a personal `gh auth login` exists.
 
 Digital twin: inspect and verify UI through the UI Bridge tooling (/ui-bridge, \
 /visual-audit, /page-health). Never use Playwright for the runner, qontinui-web, \

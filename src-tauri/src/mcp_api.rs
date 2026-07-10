@@ -170,6 +170,134 @@ async fn embedding_service_health() -> serde_json::Value {
     })
 }
 
+// ---------------------------------------------------------------------------
+// PR-credential probe (plan qontinui-pr-credential-provisioning, Phase 0)
+// ---------------------------------------------------------------------------
+// Cached `gh auth status` probe surfaced on `/health` as `prCredential`, so
+// fleet consumers can see "this machine has no PR credential" instead of
+// discovering it when an agent's `gh pr create` fails. Same single-flight
+// compare_exchange discipline as the embedding probe, but the process spawn
+// runs on a DETACHED blocking task — /health never waits on it (first call
+// returns a pending shape and kicks the probe).
+
+/// Probe TTL: re-run `gh auth status` at most once every 5 minutes.
+const PR_CRED_PROBE_TTL_MS: u64 = 5 * 60 * 1000;
+
+static PR_CRED_LAST_KICK_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// One-shot latch for the Phase-0 "no PR credential" startup warning — the
+/// tracing line fires on the FIRST unauthenticated resolution only.
+static PR_CRED_WARNED_UNAUTHENTICATED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The most recent resolved probe result (`None` until the first probe
+/// completes). Written only by [`run_pr_credential_probe`].
+#[derive(Clone, Debug)]
+struct PrCredentialProbe {
+    gh_cli_authenticated: bool,
+    checked_at_ms: u64,
+    /// Actionable hint, present only when unauthenticated.
+    hint: Option<String>,
+}
+
+fn pr_cred_result_slot() -> &'static std::sync::Mutex<Option<PrCredentialProbe>> {
+    static SLOT: std::sync::OnceLock<std::sync::Mutex<Option<PrCredentialProbe>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Run `gh auth status` (blocking — call off the async executor) and resolve a
+/// [`PrCredentialProbe`]. Exit code 0 ⇒ authenticated; non-zero ⇒ no credential;
+/// a missing `gh` binary resolves unauthenticated with a distinct hint.
+fn run_pr_credential_probe() -> PrCredentialProbe {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let outcome = crate::process_helpers::no_window("gh")
+        .args(["auth", "status"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let (authenticated, hint) = match outcome {
+        Ok(status) if status.success() => (true, None),
+        Ok(_) => (
+            false,
+            Some(
+                "no PR credential — `gh auth login` is the interim unblock; \
+                 `qontinui pr create` (coord-brokered) needs no personal login"
+                    .to_string(),
+            ),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
+            false,
+            Some(
+                "gh CLI not installed — `qontinui pr create` (coord-brokered) \
+                 needs no personal login"
+                    .to_string(),
+            ),
+        ),
+        Err(e) => (false, Some(format!("gh auth status probe failed: {e}"))),
+    };
+    if !authenticated
+        && PR_CRED_WARNED_UNAUTHENTICATED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    {
+        tracing::warn!(
+            "no PR credential on this machine — `gh auth login` is the interim \
+             unblock; the coord-brokered PR path removes this requirement"
+        );
+    }
+    PrCredentialProbe {
+        gh_cli_authenticated: authenticated,
+        checked_at_ms: now_ms,
+        hint,
+    }
+}
+
+/// Build the `/health` `prCredential` section from the cached probe, kicking a
+/// fresh DETACHED probe when the cache is stale (single-flight via
+/// compare_exchange on the kick timestamp). NEVER blocks: before the first
+/// probe resolves this returns a `pending` shape.
+fn pr_credential_health() -> serde_json::Value {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let prev = PR_CRED_LAST_KICK_MS.load(Ordering::Relaxed);
+    let stale = now_ms.saturating_sub(prev) > PR_CRED_PROBE_TTL_MS;
+    if stale
+        && PR_CRED_LAST_KICK_MS
+            .compare_exchange(prev, now_ms, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    {
+        // Off the hot path: the process spawn runs on a blocking thread and
+        // stores its result for the NEXT /health read.
+        tokio::task::spawn_blocking(|| {
+            let probe = run_pr_credential_probe();
+            if let Ok(mut slot) = pr_cred_result_slot().lock() {
+                *slot = Some(probe);
+            }
+        });
+    }
+    let cached = pr_cred_result_slot().lock().ok().and_then(|g| g.clone());
+    match cached {
+        Some(p) => serde_json::json!({
+            "state": "resolved",
+            "ghCliAuthenticated": p.gh_cli_authenticated,
+            "checkedAt": p.checked_at_ms,
+            "hint": p.hint,
+        }),
+        None => serde_json::json!({
+            "state": "pending",
+            "ghCliAuthenticated": serde_json::Value::Null,
+            "checkedAt": serde_json::Value::Null,
+            "hint": serde_json::Value::Null,
+        }),
+    }
+}
+
 /// Health check endpoint (also served at `/ui-bridge/health` and
 /// `/ui-bridge/status` — all three share this handler).
 /// Includes `uiBridge` metadata so the app discovery scanner can detect the runner.
@@ -324,6 +452,12 @@ async fn health(
         "consoleErrorCount": console_errors,
         "aiProviderCircuitBreakers": ai_provider_states,
         "embeddingService": embedding_health,
+        // PR-credential surface (plan qontinui-pr-credential-provisioning,
+        // Phase 0): cached `gh auth status` verdict. `state: "pending"` +
+        // null fields until the first detached probe resolves; `hint` is
+        // populated only when unauthenticated (incl. the gh-not-installed
+        // case). /health never blocks on the probe.
+        "prCredential": pr_credential_health(),
         "ai": {
             "configured": ai_configured,
             "running": ai_running,
@@ -1381,6 +1515,292 @@ async fn coord_work_unit_deps_get_handler(
 ) -> axum::response::Response {
     coord_claims_read_proxy_handler(ClaimsReadTarget::WorkUnitDeps { slug }, headers, raw_query)
         .await
+}
+
+// ---------------------------------------------------------------------------
+// Loopback PR-creation proxy (plan qontinui-pr-credential-provisioning, 2b)
+// ---------------------------------------------------------------------------
+
+/// Request body for `POST /vcs/pull-requests`. `repo` is `owner/name`; every
+/// other field is forwarded to coord's PR-creation route (the coord body is
+/// this struct MINUS `repo`, which travels in the coord URL path instead).
+#[derive(Debug, Clone, serde::Deserialize)]
+struct VcsPullRequestBody {
+    repo: String,
+    head: String,
+    #[serde(default)]
+    base: Option<String>,
+    title: String,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    draft: Option<bool>,
+}
+
+/// Split + validate an `owner/name` repo slug. Each segment must start with an
+/// ASCII alphanumeric and continue in `[A-Za-z0-9._-]`, with `.`/`..` rejected —
+/// so a segment can never smuggle a path separator or escape sequence into the
+/// fixed coord route template (same boundary as [`slug_is_valid`] /
+/// [`gate_id_is_valid`] on the coord-mcp write forwarder).
+fn parse_owner_repo(repo: &str) -> Option<(&str, &str)> {
+    let (owner, name) = repo.split_once('/')?;
+    let segment_ok = |s: &str| {
+        let mut chars = s.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_alphanumeric() => {}
+            _ => return false,
+        }
+        s != "." && s != ".." && chars.all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+    };
+    if segment_ok(owner) && segment_ok(name) && !name.contains('/') {
+        Some((owner, name))
+    } else {
+        None
+    }
+}
+
+/// Build coord's PR-creation URL for an (already-validated) `owner`/`name`:
+/// `POST {coord}/coord/repos/{owner}/{repo}/pull-requests`.
+fn vcs_pr_upstream_url(base: &str, owner: &str, name: &str) -> String {
+    format!(
+        "{}/coord/repos/{owner}/{name}/pull-requests",
+        base.trim_end_matches('/')
+    )
+}
+
+/// The JSON body forwarded to coord: the inbound body MINUS `repo` (which is
+/// path-encoded), with absent optional fields omitted rather than nulled.
+fn vcs_pr_upstream_body(req: &VcsPullRequestBody) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "head": req.head,
+        "title": req.title,
+    });
+    let obj = body.as_object_mut().expect("literal object");
+    if let Some(base) = &req.base {
+        obj.insert("base".to_string(), serde_json::json!(base));
+    }
+    if let Some(b) = &req.body {
+        obj.insert("body".to_string(), serde_json::json!(b));
+    }
+    if let Some(draft) = req.draft {
+        obj.insert("draft".to_string(), serde_json::json!(draft));
+    }
+    body
+}
+
+/// `POST /vcs/pull-requests` — the nonce-gated device-JWT PR-creation
+/// forwarder (plan qontinui-pr-credential-provisioning, Phase 2b).
+///
+/// Why: agents in runner-hosted terminals have no personal GitHub login on the
+/// machine, so `gh pr create` fails. Coord brokers PR creation with its own
+/// installation credential (`POST /coord/repos/{owner}/{repo}/pull-requests`,
+/// device-JWT authed); this loopback route lets any session that holds the
+/// per-session coord-mcp proxy nonce reach it — the `qontinui pr create` CLI
+/// is the intended caller.
+///
+/// Gate: exactly the coord-mcp write-forwarder discipline — a registered
+/// DEVICE-bound `X-Coord-Mcp-Proxy-Key` nonce (agent nonces are rejected: the
+/// route injects the device JWT) and a live device bearer that decodes
+/// `sub_type == "device"` ([`crate::coord_mcp::proxy_request_gate`]). A missing
+/// device JWT is a 503 `runner not paired — no device JWT` (a pairing gap, not
+/// an auth failure). Coord's status + body pass through verbatim so 403/404
+/// (repo not in the caller tenant) and 429 (rate limit) surface honestly;
+/// runner-originated failures use distinct `VCS_PR_PROXY_*` codes.
+async fn vcs_create_pull_request_handler(
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let nonce = headers
+        .get(crate::coord_mcp::COORD_MCP_PROXY_KEY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
+    // Device-bound nonces only — an agent nonce must never borrow the device
+    // identity through this route (same scope-elevation trap as the coord-mcp
+    // write forwarder).
+    match nonce
+        .as_deref()
+        .and_then(crate::coord_mcp::proxy_principal_for_nonce)
+    {
+        Some(crate::coord_mcp::ProxyPrincipal::Device) => {}
+        _ => {
+            warn!("vcs pr proxy: missing/non-device X-Coord-Mcp-Proxy-Key");
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": "missing or non-device X-Coord-Mcp-Proxy-Key",
+                    "code": "VCS_PR_PROXY_UNAUTHORIZED",
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // Parse + validate the request BEFORE any credential I/O — a bad shape is
+    // a runner-originated 400, never forwarded.
+    let req: VcsPullRequestBody = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("invalid request body: {e}"),
+                    "code": "VCS_PR_PROXY_BAD_REQUEST",
+                })),
+            )
+                .into_response();
+        }
+    };
+    let (owner, name) = match parse_owner_repo(&req.repo) {
+        Some(pair) => pair,
+        None => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!(
+                        "invalid repo (expected owner/name): {:?}",
+                        req.repo
+                    ),
+                    "code": "VCS_PR_PROXY_BAD_REQUEST",
+                })),
+            )
+                .into_response();
+        }
+    };
+    if req.head.trim().is_empty() || req.title.trim().is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "head and title are required",
+                "code": "VCS_PR_PROXY_BAD_REQUEST",
+            })),
+        )
+            .into_response();
+    }
+
+    // Live read — the same fresh device JWT the `/coord-mcp` proxy injects.
+    // AuthManager does filesystem I/O, so keep it off the async executor.
+    let bearer =
+        tokio::task::spawn_blocking(|| crate::auth::AuthManager::new().get_access_token().ok())
+            .await
+            .ok()
+            .flatten();
+    if bearer.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        warn!("vcs pr proxy: no device JWT — runner not paired");
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "runner not paired — no device JWT",
+                "code": "VCS_PR_PROXY_NOT_PAIRED",
+            })),
+        )
+            .into_response();
+    }
+
+    if let Err((status, msg)) = crate::coord_mcp::proxy_request_gate(
+        nonce.as_deref(),
+        bearer.as_deref(),
+        &crate::coord_mcp::ProxyPrincipal::Device,
+    ) {
+        warn!("vcs pr proxy: {msg}");
+        return (
+            axum::http::StatusCode::from_u16(status)
+                .unwrap_or(axum::http::StatusCode::UNAUTHORIZED),
+            Json(serde_json::json!({
+                "success": false,
+                "error": msg,
+                "code": "VCS_PR_PROXY_UNAUTHORIZED",
+            })),
+        )
+            .into_response();
+    }
+    let bearer = bearer.unwrap_or_default(); // gate guarantees Some(non-empty)
+
+    // Same coord-base resolution as every other loopback forwarder
+    // (`COORD_HTTP_URL` override → profiles resolver → dev localhost).
+    let url = vcs_pr_upstream_url(&crate::coord_mcp::coord_base_url(), owner, name);
+    let upstream_body = vcs_pr_upstream_body(&req);
+    forward_vcs_pr_post(&url, &bearer, &upstream_body).await
+}
+
+/// Forward the PR-creation POST to coord and return coord's status + headers +
+/// body verbatim. Split from the handler (URL + bearer + body as plain params,
+/// no `AuthManager`/env reads) so the forwarding leg is unit-testable against a
+/// local mock coord with a synthetic bearer — same seam discipline as
+/// [`forward_coord_write_post`], but with the plan's 10s overall timeout (PR
+/// creation is a single bounded GitHub write behind coord).
+async fn forward_vcs_pr_post(
+    url: &str,
+    bearer: &str,
+    body: &serde_json::Value,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    static VCS_PR_PROXY_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = VCS_PR_PROXY_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("vcs pr proxy reqwest client")
+    });
+
+    let upstream = match client.post(url).bearer_auth(bearer).json(body).send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            warn!("vcs pr proxy: forward to {url} failed: {e}");
+            return (
+                axum::http::StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("coord PR endpoint unreachable: {e}"),
+                    "code": "VCS_PR_PROXY_UPSTREAM_UNREACHABLE",
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let status = upstream.status().as_u16();
+    let mut builder = axum::http::Response::builder()
+        .status(axum::http::StatusCode::from_u16(status).unwrap_or(axum::http::StatusCode::OK));
+    for (name, value) in upstream.headers() {
+        if matches!(
+            name.as_str(),
+            "content-length" | "transfer-encoding" | "connection"
+        ) {
+            continue;
+        }
+        builder = builder.header(name.as_str(), value.as_bytes());
+    }
+    let bytes = match upstream.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("vcs pr proxy: reading coord response body failed: {e}");
+            return (
+                axum::http::StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("coord PR response read failed: {e}"),
+                    "code": "VCS_PR_PROXY_UPSTREAM_READ_FAILED",
+                })),
+            )
+                .into_response();
+        }
+    };
+    builder
+        .body(axum::body::Body::from(bytes))
+        .unwrap_or_else(|e| {
+            warn!("vcs pr proxy: response build failed: {e}");
+            axum::http::StatusCode::BAD_GATEWAY.into_response()
+        })
 }
 
 /// Create the API router
@@ -2815,6 +3235,13 @@ pub fn create_router(
             "/coord-mcp/work-units/{slug}/deps",
             get(coord_work_unit_deps_get_handler).post(coord_work_unit_set_deps_handler),
         )
+        // Nonce-gated device-JWT PR-creation forwarder (plan
+        // qontinui-pr-credential-provisioning, Phase 2b). Same gate + live
+        // device-JWT injection as the coord-mcp write forwarder, fixed to
+        // coord's `POST /coord/repos/{owner}/{repo}/pull-requests` route with
+        // a validated owner/name — never a generic passthrough. The
+        // `qontinui pr create` session CLI is the intended caller.
+        .route("/vcs/pull-requests", post(vcs_create_pull_request_handler))
         // Relay web-integration diagnostic — exposes the idle-gating state
         // (tier, enabled, device-JWT presence, WS connection, last error) so
         // an operator can see WHY a runner never appears to the cloud/mobile.
@@ -3875,6 +4302,250 @@ mod coord_write_proxy_tests {
         let v = body_json(resp).await;
         assert_eq!(v["success"], false);
         assert_eq!(v["code"], "COORD_WRITE_PROXY_UPSTREAM_UNREACHABLE");
+    }
+}
+
+/// Nonce-gated device-JWT PR-creation forwarder (plan
+/// qontinui-pr-credential-provisioning, Phase 2b).
+///
+/// Same shape as `coord_write_proxy_tests`: the gate's 401 paths are asserted
+/// through the real route handler (missing/wrong nonce — never forwarded); the
+/// request-shaping helpers (`parse_owner_repo`, `vcs_pr_upstream_url`,
+/// `vcs_pr_upstream_body`) are pure functions tested directly; the forwarding
+/// leg is tested through the `forward_vcs_pr_post` seam against a local mock
+/// coord with a synthetic bearer.
+#[cfg(test)]
+mod vcs_pr_proxy_tests {
+    use super::{
+        forward_vcs_pr_post, parse_owner_repo, vcs_create_pull_request_handler,
+        vcs_pr_upstream_body, vcs_pr_upstream_url, VcsPullRequestBody,
+    };
+    use axum::{body::Body, http::Request, routing::post, Router};
+    use tower::ServiceExt;
+
+    fn vcs_router() -> Router {
+        Router::new().route("/vcs/pull-requests", post(vcs_create_pull_request_handler))
+    }
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// The owner/name validator: accepts real GitHub slugs, rejects
+    /// path-smuggling and out-of-charset shapes.
+    #[test]
+    fn parse_owner_repo_accepts_real_slugs_rejects_path_smuggling() {
+        assert_eq!(
+            parse_owner_repo("qontinui/qontinui-runner"),
+            Some(("qontinui", "qontinui-runner"))
+        );
+        assert_eq!(parse_owner_repo("a/b.c_d-e"), Some(("a", "b.c_d-e")));
+        // Rejections: no slash, extra path segments, dot-dot, leading
+        // punctuation, empty segments, whitespace, percent-encoding.
+        assert_eq!(parse_owner_repo("no-slash"), None);
+        assert_eq!(parse_owner_repo("a/b/c"), None);
+        assert_eq!(parse_owner_repo("../etc/passwd"), None);
+        assert_eq!(parse_owner_repo("a/.."), None);
+        assert_eq!(parse_owner_repo("a/."), None);
+        assert_eq!(parse_owner_repo("-lead/repo"), None);
+        assert_eq!(parse_owner_repo("owner/.hidden"), None);
+        assert_eq!(parse_owner_repo("/repo"), None);
+        assert_eq!(parse_owner_repo("owner/"), None);
+        assert_eq!(parse_owner_repo("a b/c"), None);
+        assert_eq!(parse_owner_repo("a%2f/c"), None);
+    }
+
+    /// The upstream URL is the FIXED coord route template with the validated
+    /// segments interpolated — no double slash on a trailing-slash base.
+    #[test]
+    fn vcs_pr_upstream_url_builds_fixed_coord_route() {
+        assert_eq!(
+            vcs_pr_upstream_url("https://coord.example.test", "qontinui", "qontinui-runner"),
+            "https://coord.example.test/coord/repos/qontinui/qontinui-runner/pull-requests"
+        );
+        assert_eq!(
+            vcs_pr_upstream_url("http://127.0.0.1:9870/", "a", "b"),
+            "http://127.0.0.1:9870/coord/repos/a/b/pull-requests"
+        );
+    }
+
+    /// The forwarded body is the inbound body MINUS `repo`, with absent
+    /// optional fields omitted (not nulled) and present ones carried through.
+    #[test]
+    fn vcs_pr_upstream_body_strips_repo_and_omits_absent_options() {
+        let minimal = VcsPullRequestBody {
+            repo: "o/r".to_string(),
+            head: "feat/x".to_string(),
+            base: None,
+            title: "feat: x".to_string(),
+            body: None,
+            draft: None,
+        };
+        let v = vcs_pr_upstream_body(&minimal);
+        assert_eq!(v, serde_json::json!({"head": "feat/x", "title": "feat: x"}));
+        let obj = v.as_object().unwrap();
+        assert!(!obj.contains_key("repo"), "repo travels in the URL path");
+        assert!(!obj.contains_key("base") && !obj.contains_key("draft"));
+
+        let full = VcsPullRequestBody {
+            repo: "o/r".to_string(),
+            head: "feat/x".to_string(),
+            base: Some("main".to_string()),
+            title: "feat: x".to_string(),
+            body: Some("body text".to_string()),
+            draft: Some(true),
+        };
+        assert_eq!(
+            vcs_pr_upstream_body(&full),
+            serde_json::json!({
+                "head": "feat/x",
+                "base": "main",
+                "title": "feat: x",
+                "body": "body text",
+                "draft": true,
+            })
+        );
+    }
+
+    /// Absent `X-Coord-Mcp-Proxy-Key` → 401 with the route's own code, before
+    /// any body parsing or upstream I/O.
+    #[tokio::test]
+    async fn missing_nonce_is_401_never_forwarded() {
+        let resp = vcs_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/vcs/pull-requests")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"repo":"o/r","head":"h","title":"t"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        let v = body_json(resp).await;
+        assert_eq!(v["success"], false);
+        assert_eq!(v["code"], "VCS_PR_PROXY_UNAUTHORIZED");
+    }
+
+    /// A wrong (unregistered) nonce → the same 401.
+    #[tokio::test]
+    async fn wrong_nonce_is_401() {
+        let resp = vcs_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/vcs/pull-requests")
+                    .header("X-Coord-Mcp-Proxy-Key", "not-a-registered-nonce")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"repo":"o/r","head":"h","title":"t"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        let v = body_json(resp).await;
+        assert_eq!(v["code"], "VCS_PR_PROXY_UNAUTHORIZED");
+    }
+
+    /// The forwarding leg against a local mock coord: the bearer is injected as
+    /// `Authorization: Bearer <token>`, the JSON body arrives verbatim, and
+    /// coord's status + body come back unreshaped — including the honest
+    /// non-2xx verdicts (403 repo-not-in-tenant, 429 rate limit).
+    #[tokio::test]
+    async fn forward_vcs_pr_post_injects_bearer_and_passes_through_verbatim() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app: Router = Router::new()
+            .route(
+                "/coord/repos/{owner}/{repo}/pull-requests",
+                post(
+                    |axum::extract::Path((owner, repo)): axum::extract::Path<(String, String)>,
+                     headers: axum::http::HeaderMap,
+                     body: axum::body::Bytes| async move {
+                        let auth = headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        let body = String::from_utf8_lossy(&body).to_string();
+                        (
+                            axum::http::StatusCode::CREATED,
+                            axum::Json(serde_json::json!({
+                                "number": 42,
+                                "url": format!("https://github.com/{owner}/{repo}/pull/42"),
+                                "echo_auth": auth,
+                                "echo_body": body,
+                            })),
+                        )
+                    },
+                ),
+            )
+            .route(
+                "/coord/repos/other/denied/pull-requests",
+                post(|| async {
+                    (
+                        axum::http::StatusCode::FORBIDDEN,
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        r#"{"detail":"repo not in caller tenant"}"#,
+                    )
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let base = format!("http://{addr}");
+
+        // Happy path: 201 + coord's body verbatim, bearer injected.
+        let url = vcs_pr_upstream_url(&base, "qontinui", "qontinui-runner");
+        let body = serde_json::json!({"head": "feat/x", "title": "feat: x"});
+        let resp = forward_vcs_pr_post(&url, "test-device-jwt", &body).await;
+        assert_eq!(resp.status(), 201);
+        let v = body_json(resp).await;
+        assert_eq!(v["number"], 42);
+        assert_eq!(
+            v["url"],
+            "https://github.com/qontinui/qontinui-runner/pull/42"
+        );
+        assert_eq!(v["echo_auth"], "Bearer test-device-jwt");
+        assert_eq!(
+            v["echo_body"],
+            serde_json::to_string(&body).unwrap(),
+            "the JSON body must arrive verbatim"
+        );
+
+        // Non-2xx coord verdict: status + body verbatim, not reshaped.
+        // (The specific mock route wins over the {owner}/{repo} template.)
+        let url = vcs_pr_upstream_url(&base, "other", "denied");
+        let resp = forward_vcs_pr_post(&url, "test-device-jwt", &body).await;
+        assert_eq!(resp.status(), 403);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&bytes).unwrap(),
+            r#"{"detail":"repo not in caller tenant"}"#,
+            "coord's error body must come back verbatim"
+        );
+    }
+
+    /// Coord unreachable → 502 from the runner with the distinct upstream code.
+    #[tokio::test]
+    async fn forward_vcs_pr_post_unreachable_coord_is_502() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let url = vcs_pr_upstream_url(&format!("http://127.0.0.1:{port}"), "o", "r");
+        let resp =
+            forward_vcs_pr_post(&url, "test-device-jwt", &serde_json::json!({"head": "h"})).await;
+        assert_eq!(resp.status(), 502);
+        let v = body_json(resp).await;
+        assert_eq!(v["success"], false);
+        assert_eq!(v["code"], "VCS_PR_PROXY_UPSTREAM_UNREACHABLE");
     }
 }
 

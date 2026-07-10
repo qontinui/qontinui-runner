@@ -1154,6 +1154,11 @@ reason to coord before fixing + retrying:
 does this automatically; do the same on a manual commit. Never `--no-verify` to
 bypass the hook — that defeats both the hook and the supervision signal.
 
+**Opening a PR:** open the PR with `qontinui pr create` (preferred — it goes
+through the runner's coord-brokered loopback proxy and works without a personal
+GitHub login on this machine). `gh pr create` also works where a personal
+`gh auth login` exists.
+
 ### Step 5: UI Bridge Improvement Plan (if manual testing was performed)
 
 If manual testing was performed in Step 2, create a plan (using EnterPlanMode) for UI Bridge improvements based on friction encountered during testing. This plan is for a future session — do not implement it now.

@@ -252,7 +252,54 @@ pub fn materialize_identity(base_dir: &Path, terminal_id: &str) -> Option<PathBu
             return None;
         }
     }
+    // Also deliver the `qontinui` session CLI (plan
+    // qontinui-pr-credential-provisioning, Phase 2b) onto the same always-on
+    // PATH dir. Best-effort, fail-open: an absent/uncopyable binary never
+    // breaks the terminal — the identity dir still materializes.
+    materialize_session_cli(&dir);
     Some(dir)
+}
+
+/// Hardlink (or copy) the built `qontinui` session CLI binary — it sits next
+/// to the runner exe at runtime, like the `qontinui-shim` stub and the
+/// `qontinui-git-credential` helper — into the per-terminal identity dir so
+/// `qontinui pr create` is on every session's PATH. Best-effort, fail-open:
+/// every failure (dev build without the binary, cross-volume hardlink refusal,
+/// copy error) is logged at debug and the terminal spawns unaffected. Never
+/// panics.
+fn materialize_session_cli(dir: &Path) {
+    let name = if cfg!(windows) {
+        "qontinui.exe"
+    } else {
+        "qontinui"
+    };
+    let src = match std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.join(name)))
+    {
+        Some(p) if p.is_file() => p,
+        _ => {
+            tracing::debug!(
+                tool = name,
+                "session cli: {name} not found next to the runner exe — \
+                 `qontinui pr create` unavailable in this terminal (dev build?)"
+            );
+            return;
+        }
+    };
+    let dest = dir.join(name);
+    // Hardlink first (zero extra disk when temp shares the exe's volume);
+    // fall back to a plain copy (temp on another volume, FS without links).
+    if std::fs::hard_link(&src, &dest).is_ok() {
+        return;
+    }
+    if let Err(e) = std::fs::copy(&src, &dest) {
+        tracing::debug!(
+            tool = name,
+            error = %e,
+            "session cli: failed to materialize {name} into the identity shim dir"
+        );
+    }
 }
 
 /// Render an identity shim template by substituting its `@@…@@` placeholders.
@@ -822,6 +869,57 @@ mod tests {
 
         if created {
             let _ = std::fs::remove_file(&stub);
+        }
+    }
+
+    #[test]
+    fn materialize_identity_delivers_session_cli_when_binary_present() {
+        // Phase 2b (qontinui-pr-credential-provisioning): the identity dir must
+        // carry the `qontinui` session CLI so `qontinui pr create` is on every
+        // terminal's PATH. Arrange the binary the way `materialize_session_cli`
+        // finds it: next to `current_exe()` (the test binary's own dir).
+        // Create-if-absent and clean up only what we created, so a dev target
+        // dir that already has the real CLI still passes.
+        let name = if cfg!(windows) {
+            "qontinui.exe"
+        } else {
+            "qontinui"
+        };
+        let exe_dir = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let cli = exe_dir.join(name);
+        let created = if cli.exists() {
+            false
+        } else {
+            std::fs::write(&cli, b"fake cli payload").unwrap();
+            true
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = materialize_identity(tmp.path(), "term-cli").expect("identity materialize ok");
+        assert!(
+            dir.join(name).is_file(),
+            "{name} must be materialized into the identity dir"
+        );
+
+        if created {
+            let _ = std::fs::remove_file(&cli);
+        }
+    }
+
+    #[test]
+    fn materialize_identity_survives_absent_session_cli() {
+        // Fail-open: when no `qontinui` binary sits next to current_exe the
+        // identity dir still materializes with the claude/gemini shims. (If a
+        // real CLI binary happens to be present in the test target dir, the
+        // stronger delivery assertion is covered by the test above.)
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = materialize_identity(tmp.path(), "term-no-cli").expect("identity materialize ok");
+        for tool in IDENTITY_TOOLS {
+            assert!(dir.join(tool).is_file());
         }
     }
 
