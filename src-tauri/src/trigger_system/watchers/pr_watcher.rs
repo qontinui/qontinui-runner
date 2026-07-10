@@ -153,8 +153,7 @@ pub fn determine_pr_action(
             // threshold. Checked only in the steady green state (not on the
             // CiPassed transition — a fresh streak is by definition under
             // any sane threshold).
-            if let (Some(green_since), Some(threshold)) = (first_fully_green_at, green_threshold)
-            {
+            if let (Some(green_since), Some(threshold)) = (first_fully_green_at, green_threshold) {
                 // Clock skew putting `green_since` in the future yields a
                 // negative signed duration; `to_std()` fails and we treat the
                 // streak as zero-length.
@@ -345,11 +344,7 @@ async fn poll_active_prs(
 /// throughout — a failed seed is logged and dropped (the transcript watcher
 /// will re-observe a genuinely open PR only if the operator re-runs
 /// `gh pr create`, but the seed pipeline is idempotent when it does).
-async fn drain_and_seed_pending(
-    pg_db: &PgDb,
-    client: &GitHubClient,
-    shepherd_repos: &[String],
-) {
+async fn drain_and_seed_pending(pg_db: &PgDb, client: &GitHubClient, shepherd_repos: &[String]) {
     for seed in pr_shepherd::drain_seeds() {
         if let Err(e) = seed_one_pending(pg_db, client, shepherd_repos, &seed).await {
             tracing::warn!(
@@ -999,8 +994,15 @@ async fn diagnose_green_but_unmerged(
         }
         ShepherdIntent::Escalate { class } => {
             escalate_coord_defect(
-                pg_db, deps, &client, watch, *class, green_for, verdict.as_ref(),
-                block.as_ref(), graph.as_ref(),
+                pg_db,
+                deps,
+                &client,
+                watch,
+                *class,
+                green_for,
+                verdict.as_ref(),
+                block.as_ref(),
+                graph.as_ref(),
             )
             .await;
         }
@@ -1042,7 +1044,13 @@ async fn escalate_coord_defect(
     // dedup cooldown, which would let a stale event from a since-wedged coord
     // defer the last-resort rung for a whole day.
     match client
-        .unlandable_attempt_live(owner, repo, pr, &watch.head_sha, pr_shepherd::attempt_live_window())
+        .unlandable_attempt_live(
+            owner,
+            repo,
+            pr,
+            &watch.head_sha,
+            pr_shepherd::attempt_live_window(),
+        )
         .await
     {
         Ok(true) => {
@@ -1075,7 +1083,9 @@ async fn escalate_coord_defect(
         outer_state: verdict.and_then(|v| v.outer_state.clone()),
         block_reason: verdict.and_then(|v| v.block_reason.clone()),
         next_action: verdict.map(|v| v.next_action.clone()).unwrap_or_default(),
-        block_detail: block.map(|b| b.detail.clone()).unwrap_or(serde_json::Value::Null),
+        block_detail: block
+            .map(|b| b.detail.clone())
+            .unwrap_or(serde_json::Value::Null),
         unlandable_cycles: block.and_then(|b| b.unlandable_cycles),
         cycle_detected: graph.map(|g| g.cycle_detected).unwrap_or(false),
         cycle_member_count: graph.map(|g| g.cycle_member_count).unwrap_or(0),
@@ -1529,13 +1539,19 @@ mod tests {
             Some(earlier)
         );
         // Red/pending flip → clears the streak.
-        assert_eq!(compute_first_fully_green_at(false, false, Some(earlier), now), None);
+        assert_eq!(
+            compute_first_fully_green_at(false, false, Some(earlier), now),
+            None
+        );
         // Head change while green → restarts at now (CI truth is per-head).
         assert_eq!(
             compute_first_fully_green_at(true, true, Some(earlier), now),
             Some(now)
         );
         // Head change while red → still cleared.
-        assert_eq!(compute_first_fully_green_at(false, true, Some(earlier), now), None);
+        assert_eq!(
+            compute_first_fully_green_at(false, true, Some(earlier), now),
+            None
+        );
     }
 }

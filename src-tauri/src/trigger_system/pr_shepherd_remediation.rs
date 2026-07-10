@@ -294,7 +294,11 @@ async fn spawn_remediation_session(
 
     let id = format!(
         "pr-shepherd-remediation-{}",
-        uuid::Uuid::new_v4().to_string().chars().take(12).collect::<String>()
+        uuid::Uuid::new_v4()
+            .to_string()
+            .chars()
+            .take(12)
+            .collect::<String>()
     );
     let input = CreateTaskRunInput::new(&id, task_name)
         .with_prompt(prompt)
@@ -310,7 +314,9 @@ async fn spawn_remediation_session(
 
     match deps {
         Some(d) => {
-            use crate::unified_workflow_executor::review_subtask::{execute_prompt_subtask, ReviewDeps};
+            use crate::unified_workflow_executor::review_subtask::{
+                execute_prompt_subtask, ReviewDeps,
+            };
             let review_deps = ReviewDeps {
                 app_state: d.app_state.clone(),
                 config_storage: d.config_storage.clone(),
@@ -402,7 +408,10 @@ pub async fn escalate_coord_defect(
         ctx.pr_number,
         &plan_path,
         &format!("/vet-imp {plan_path}"),
-        &format!("PR shepherd remediation: {class} on {}#{}", ctx.repo_full_name, ctx.pr_number),
+        &format!(
+            "PR shepherd remediation: {class} on {}#{}",
+            ctx.repo_full_name, ctx.pr_number
+        ),
     )
     .await
 }
@@ -598,9 +607,18 @@ mod tests {
         // The only route-in case: coord down, author gone, task terminal.
         assert!(should_route_orphaned_red(true, false, true));
         // Any single condition off → no route.
-        assert!(!should_route_orphaned_red(false, false, true), "coord up → coord owns it");
-        assert!(!should_route_orphaned_red(true, true, true), "author live → owns it");
-        assert!(!should_route_orphaned_red(true, false, false), "task running → owns it");
+        assert!(
+            !should_route_orphaned_red(false, false, true),
+            "coord up → coord owns it"
+        );
+        assert!(
+            !should_route_orphaned_red(true, true, true),
+            "author live → owns it"
+        );
+        assert!(
+            !should_route_orphaned_red(true, false, false),
+            "task running → owns it"
+        );
     }
 
     #[test]
@@ -626,7 +644,10 @@ mod tests {
             !lower.contains("fix the ci"),
             "must NOT instruct a CI fix on a green PR"
         );
-        assert!(p.contains("do NOT admin-merge"), "no admin-merge, per policy");
+        assert!(
+            p.contains("do NOT admin-merge"),
+            "no admin-merge, per policy"
+        );
         assert!(
             p.contains("Do NOT push commits"),
             "no pushes — a 'fix' commit would reset the green streak"
@@ -647,11 +668,23 @@ mod tests {
         assert!(md.contains("stale-ingest"), "defect class present");
         assert!(md.contains("qontinui/qontinui-web#708"), "repo#pr present");
         assert!(md.contains("abc1234"), "head present");
-        assert!(md.contains("stuck_pr_reconciler.rs hydration"), "suspected path present");
+        assert!(
+            md.contains("stuck_pr_reconciler.rs hydration"),
+            "suspected path present"
+        );
         // Verbatim evidence rendered as pretty JSON.
-        assert!(md.contains("\"coord_head\": \"OLDHEAD\""), "verbatim evidence present");
-        assert!(md.contains("behind-main-or-unstable"), "block reason present");
-        assert!(md.contains("Detection-gap note"), "detection-gap section present");
+        assert!(
+            md.contains("\"coord_head\": \"OLDHEAD\""),
+            "verbatim evidence present"
+        );
+        assert!(
+            md.contains("behind-main-or-unstable"),
+            "block reason present"
+        );
+        assert!(
+            md.contains("Detection-gap note"),
+            "detection-gap section present"
+        );
         assert!(md.contains("Status: DRAFT"), "draft status marker present");
     }
 
@@ -669,7 +702,11 @@ mod tests {
     fn open_plan_exists_matches_class_and_openness() {
         let dir = std::env::temp_dir().join(format!(
             "prshep-plans-{}",
-            uuid::Uuid::new_v4().to_string().chars().take(8).collect::<String>()
+            uuid::Uuid::new_v4()
+                .to_string()
+                .chars()
+                .take(8)
+                .collect::<String>()
         ));
         std::fs::create_dir_all(&dir).unwrap();
 

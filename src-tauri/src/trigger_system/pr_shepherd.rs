@@ -415,12 +415,18 @@ mod tests {
         // Master off → autoseed off regardless of its own var.
         std::env::remove_var("QONTINUI_PR_SHEPHERD");
         std::env::set_var("QONTINUI_PR_SHEPHERD_AUTOSEED", "1");
-        assert!(!autoseed_enabled(), "autoseed must be gated on the master flag");
+        assert!(
+            !autoseed_enabled(),
+            "autoseed must be gated on the master flag"
+        );
 
         // Master on, autoseed unset → ON (default).
         std::env::set_var("QONTINUI_PR_SHEPHERD", "1");
         std::env::remove_var("QONTINUI_PR_SHEPHERD_AUTOSEED");
-        assert!(autoseed_enabled(), "autoseed defaults ON under the master flag");
+        assert!(
+            autoseed_enabled(),
+            "autoseed defaults ON under the master flag"
+        );
 
         // Master on, autoseed explicitly off.
         std::env::set_var("QONTINUI_PR_SHEPHERD_AUTOSEED", "off");
@@ -436,12 +442,18 @@ mod tests {
         // Master off → diagnose off regardless of its own var.
         std::env::remove_var("QONTINUI_PR_SHEPHERD");
         std::env::set_var("QONTINUI_PR_SHEPHERD_DIAGNOSE", "1");
-        assert!(!diagnose_enabled(), "diagnose must be gated on the master flag");
+        assert!(
+            !diagnose_enabled(),
+            "diagnose must be gated on the master flag"
+        );
 
         // Master on, diagnose unset → ON (default).
         std::env::set_var("QONTINUI_PR_SHEPHERD", "1");
         std::env::remove_var("QONTINUI_PR_SHEPHERD_DIAGNOSE");
-        assert!(diagnose_enabled(), "diagnose defaults ON under the master flag");
+        assert!(
+            diagnose_enabled(),
+            "diagnose defaults ON under the master flag"
+        );
 
         // Master on, diagnose explicitly off.
         std::env::set_var("QONTINUI_PR_SHEPHERD_DIAGNOSE", "off");
@@ -597,10 +609,19 @@ mod tests {
     fn repo_allowlist_empty_allows_all_and_matches_full_or_short() {
         assert!(repo_allowed("qontinui/qontinui-runner", &[]));
 
-        let list = vec!["qontinui/qontinui-runner".to_string(), "ui-bridge".to_string()];
+        let list = vec![
+            "qontinui/qontinui-runner".to_string(),
+            "ui-bridge".to_string(),
+        ];
         assert!(repo_allowed("qontinui/qontinui-runner", &list));
-        assert!(repo_allowed("QONTINUI/QONTINUI-RUNNER", &list), "case-insensitive");
-        assert!(repo_allowed("qontinui/ui-bridge", &list), "short-name token matches");
+        assert!(
+            repo_allowed("QONTINUI/QONTINUI-RUNNER", &list),
+            "case-insensitive"
+        );
+        assert!(
+            repo_allowed("qontinui/ui-bridge", &list),
+            "short-name token matches"
+        );
         assert!(!repo_allowed("qontinui/qontinui-web", &list));
     }
 

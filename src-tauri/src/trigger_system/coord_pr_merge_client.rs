@@ -104,7 +104,13 @@ impl CoordCallError {
     /// Is this an auth failure (401/403) — i.e. the RUNNER's credentials are
     /// broken, not coord?
     pub fn is_auth(&self) -> bool {
-        matches!(self, CoordCallError::Http { status: 401 | 403, .. })
+        matches!(
+            self,
+            CoordCallError::Http {
+                status: 401 | 403,
+                ..
+            }
+        )
     }
 
     /// Did coord answer at all? `true` for any HTTP response.
@@ -469,7 +475,9 @@ pub fn classify(input: &ClassificationInput) -> ShepherdDisposition {
 
     // Pass-but-no-land: verdict says pass/READY, green past the floor, yet no
     // proposal is enqueued — the land was never scheduled.
-    if input.aged_past_floor && !input.in_queue && is_pass_state(&input.outer_state, &input.block_reason)
+    if input.aged_past_floor
+        && !input.in_queue
+        && is_pass_state(&input.outer_state, &input.block_reason)
     {
         return ShepherdDisposition::CoordDefect {
             class: CoordDefectClass::PassButNoLand,
@@ -760,10 +768,7 @@ impl CoordPrMergeClient {
     pub async fn health_leader(&self) -> Result<bool, String> {
         let url = format!("{}/pr-merge/health", self.base);
         let wire: HealthResponseWire = self.get_json(&url).await.map_err(|e| e.to_string())?;
-        Ok(wire
-            .leader
-            .and_then(|l| l.lease_fresh)
-            .unwrap_or(false))
+        Ok(wire.leader.and_then(|l| l.lease_fresh).unwrap_or(false))
     }
 
     /// **Phase 5.4 coexistence rung (i).** Is coord's Unlandable Shepherd
@@ -785,17 +790,19 @@ impl CoordPrMergeClient {
     ) -> Result<bool, String> {
         let url = format!("{}/pr-merge/events/{owner}/{repo}/{pr}", self.base);
         let wire: EventsResponseWire = self.get_json(&url).await.map_err(|e| e.to_string())?;
-        Ok(coord_attempt_live(&wire.events, head_sha, within, Utc::now()))
+        Ok(coord_attempt_live(
+            &wire.events,
+            head_sha,
+            within,
+            Utc::now(),
+        ))
     }
 
     /// `POST /pr-merge/prs/:owner/:name/:pr/reevaluate` — the cheap idempotent
     /// nudge tried once before escalating a suspected defect. Returns `Ok` on
     /// any 2xx.
     pub async fn reevaluate(&self, owner: &str, repo: &str, pr: u64) -> Result<(), String> {
-        let url = format!(
-            "{}/pr-merge/prs/{owner}/{repo}/{pr}/reevaluate",
-            self.base
-        );
+        let url = format!("{}/pr-merge/prs/{owner}/{repo}/{pr}/reevaluate", self.base);
         let resp = self
             .auth(self.client.post(&url))
             .send()
@@ -842,10 +849,11 @@ fn block_from_events(events: &[PrEventWire]) -> BlockDiagnosis {
             "unlandable_cycle" if !have_cycle => {
                 have_cycle = true;
                 if let Some(p) = &ev.payload {
-                    out.unlandable_cycles =
-                        p.get("cycles").and_then(Value::as_u64).or_else(|| {
-                            p.get("cycles").and_then(Value::as_i64).map(|n| n.max(0) as u64)
-                        });
+                    out.unlandable_cycles = p.get("cycles").and_then(Value::as_u64).or_else(|| {
+                        p.get("cycles")
+                            .and_then(Value::as_i64)
+                            .map(|n| n.max(0) as u64)
+                    });
                 }
             }
             _ => {}
@@ -890,7 +898,8 @@ fn coord_attempt_live(
     if head_sha.is_empty() {
         return false;
     }
-    let cutoff = now - chrono::Duration::from_std(within).unwrap_or_else(|_| chrono::Duration::zero());
+    let cutoff =
+        now - chrono::Duration::from_std(within).unwrap_or_else(|_| chrono::Duration::zero());
     events.iter().any(|ev| {
         if !matches!(ev.event_kind.as_str(), "unlandable_cycle" | "diagnosis") {
             return false;
@@ -1187,7 +1196,11 @@ mod tests {
                 outer_state: Some(state.to_string()),
                 ..green_defect_base()
             };
-            assert_eq!(classify(&input), ShepherdDisposition::LegitimateHold, "{state}");
+            assert_eq!(
+                classify(&input),
+                ShepherdDisposition::LegitimateHold,
+                "{state}"
+            );
         }
     }
 
@@ -1552,7 +1565,10 @@ mod tests {
             detail: String::new(),
         };
         assert!(!server_err.is_auth());
-        assert!(server_err.coord_reachable(), "any HTTP response = reachable");
+        assert!(
+            server_err.coord_reachable(),
+            "any HTTP response = reachable"
+        );
         let down = CoordCallError::Unreachable("connect refused".to_string());
         assert!(!down.is_auth());
         assert!(!down.coord_reachable());
@@ -1571,9 +1587,15 @@ mod tests {
         mark_reevaluate_sent(708, "headA");
         assert!(reevaluate_already_sent(708, "headA"), "sent once — dedup");
         // A new head (a push) is eligible for a fresh nudge.
-        assert!(!reevaluate_already_sent(708, "headB"), "new head is a fresh nudge");
+        assert!(
+            !reevaluate_already_sent(708, "headB"),
+            "new head is a fresh nudge"
+        );
         // A different PR is independent.
-        assert!(!reevaluate_already_sent(912, "headA"), "different PR independent");
+        assert!(
+            !reevaluate_already_sent(912, "headA"),
+            "different PR independent"
+        );
     }
 
     #[test]
@@ -1606,7 +1628,10 @@ mod tests {
             green_threshold: Duration::from_secs(45 * 60),
         };
         let input = build_classification_input(&ev);
-        assert!(input.stale_ingest, "coord head OLDHEAD ≠ real NEWHEAD, aged > 1h");
+        assert!(
+            input.stale_ingest,
+            "coord head OLDHEAD ≠ real NEWHEAD, aged > 1h"
+        );
         assert_eq!(
             classify(&input),
             ShepherdDisposition::CoordDefect {

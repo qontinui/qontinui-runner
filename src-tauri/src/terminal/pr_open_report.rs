@@ -430,9 +430,7 @@ mod tests {
             Some(("qontinui/qontinui-runner".to_string(), 460))
         );
         assert_eq!(
-            extract_pr_url(
-                "Creating pull request…\nhttps://github.com/o/r/pull/7\nDone."
-            ),
+            extract_pr_url("Creating pull request…\nhttps://github.com/o/r/pull/7\nDone."),
             Some(("o/r".to_string(), 7))
         );
         // Trailing punctuation after the number.
@@ -442,9 +440,7 @@ mod tests {
         );
         // Non-pull URLs first, pull URL later — must find the pull one.
         assert_eq!(
-            extract_pr_url(
-                "repo https://github.com/o/r and https://github.com/o/r/pull/3"
-            ),
+            extract_pr_url("repo https://github.com/o/r and https://github.com/o/r/pull/3"),
             Some(("o/r".to_string(), 3))
         );
         assert_eq!(extract_pr_url("https://github.com/o/r/issues/9"), None);
@@ -477,11 +473,8 @@ mod tests {
     #[test]
     fn tracker_resolves_url_from_string_tool_result() {
         let mut tracker = PrCreateTracker::new();
-        let events = tracker.observe_line(&assistant_line(
-            "toolu_1",
-            "gh pr create --fill",
-            "C:/repo",
-        ));
+        let events =
+            tracker.observe_line(&assistant_line("toolu_1", "gh pr create --fill", "C:/repo"));
         assert!(events.is_empty(), "tool_use alone emits nothing");
 
         let events = tracker.observe_line(&tool_result_line(
@@ -571,8 +564,7 @@ mod tests {
         assert!(events.is_empty());
 
         // Past the TTL — expires to a branch-lookup fallback.
-        let events =
-            tracker.observe_line_at("{}", t0 + PENDING_TTL + Duration::from_secs(1));
+        let events = tracker.observe_line_at("{}", t0 + PENDING_TTL + Duration::from_secs(1));
         assert_eq!(
             events,
             vec![PrOpenEvent::NeedsBranchLookup {
