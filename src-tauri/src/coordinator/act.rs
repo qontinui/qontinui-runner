@@ -850,7 +850,8 @@ async fn dispatch_assignment_brief(
 /// abort the calling action — the user can re-issue from the dashboard if
 /// the message didn't land.
 pub(crate) async fn send_message_to_worker(state: &Arc<ApiState>, session_id: &str, message: &str) {
-    send_message_to_worker_via_handle(&state.app_handle, session_id, message).await;
+    // Best-effort at this call site: the failure is already warn-logged inside.
+    let _ = send_message_to_worker_via_handle(&state.app_handle, session_id, message).await;
 }
 
 /// The `AppHandle`-only variant of [`send_message_to_worker`]. `send_user_message`
@@ -860,46 +861,58 @@ pub(crate) async fn send_message_to_worker(state: &Arc<ApiState>, session_id: &s
 /// Phase 4), which runs inside the PR watcher with only `PrWatcherDeps` —
 /// inject through here without constructing an `ApiState`. `send_message_to_worker`
 /// delegates to this so there is exactly ONE injection primitive.
+///
+/// Returns whether the injection actually landed: failures are warn-logged AND
+/// surfaced as `Err`, because some callers (the PR shepherd's one-per-head
+/// notify claim) must not treat a swallowed failure as a delivered message.
 pub(crate) async fn send_message_to_worker_via_handle(
     app_handle: &tauri::AppHandle,
     session_id: &str,
     message: &str,
-) {
+) -> Result<(), String> {
     let session_manager = match app_handle.try_state::<Arc<crate::claude_session::SessionManager>>() {
         Some(sm) => sm.inner().clone(),
         None => {
             warn!("send_message_to_worker: SessionManager not available");
-            return;
+            return Err("SessionManager not available".to_string());
         }
     };
 
     if let Some(session) = session_manager.get(session_id) {
-        if let Err(e) = session.send_user_message(message) {
-            warn!(
-                "send_message_to_worker: send_user_message failed for {}: {}",
-                session_id, e
-            );
-        }
-        return;
+        // Ok(true) = sent immediately, Ok(false) = queued — both delivered.
+        return match session.send_user_message(message) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                warn!(
+                    "send_message_to_worker: send_user_message failed for {}: {}",
+                    session_id, e
+                );
+                Err(format!("send_user_message failed for {session_id}: {e}"))
+            }
+        };
     }
 
     // Phase 6: pty-backed Workers live in `worker_sessions`, not `sessions`.
     // Fall through and dispatch via WorkerSession::send_user_message, which
     // writes raw stdin keystrokes (CR-LF appended) to the pty.
     if let Some(worker) = session_manager.get_worker(session_id) {
-        if let Err(e) = worker.send_user_message(message) {
-            warn!(
-                "send_message_to_worker: worker send_user_message failed for {}: {}",
-                session_id, e
-            );
-        }
-        return;
+        return match worker.send_user_message(message) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                warn!(
+                    "send_message_to_worker: worker send_user_message failed for {}: {}",
+                    session_id, e
+                );
+                Err(format!("worker send_user_message failed for {session_id}: {e}"))
+            }
+        };
     }
 
     warn!(
         "send_message_to_worker: no active session for task_run_id {}",
         session_id
     );
+    Err(format!("no active session for task_run_id {session_id}"))
 }
 
 #[cfg(test)]

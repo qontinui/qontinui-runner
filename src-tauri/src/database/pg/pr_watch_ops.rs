@@ -5,8 +5,69 @@ use chrono::{DateTime, Utc};
 use super::PgDb;
 use crate::trigger_system::watchers::pr_watcher::PrWatchState;
 
+/// The active-watch poll SELECT. Reads the two runner-self-healed columns
+/// (`authoring_session_id`, `first_fully_green_at`); see
+/// [`PgDb::get_active_pr_watches`] for the shape-recovery path when the
+/// alembic-canonical table was created WITHOUT them after runner boot.
+const SELECT_ACTIVE_PR_WATCHES_SQL: &str = r#"SELECT id, task_run_id, pr_number, repo_full_name, head_sha,
+                       workflow_id, last_checks_status, last_review_status,
+                       auto_resume_count, max_auto_resumes, github_token,
+                       auto_resume_enabled, authoring_session_id,
+                       first_fully_green_at
+                FROM pr_watch_state
+                WHERE completed_at IS NULL
+                ORDER BY created_at ASC"#;
+
+/// Task-run-keyed seed upsert. The `first_fully_green_at` CASE mirrors the
+/// poll path's per-head streak-reset invariant
+/// (`pr_watcher::compute_first_fully_green_at`): a seed that ADVANCES the
+/// stored head (e.g. a failed re-run of `gh pr create` resolving the open PR
+/// after a push) must reset the green streak — otherwise the next poll sees
+/// the head "unchanged", carries the OLD head's streak, and fires
+/// GreenButUnmerged immediately for a head whose CI only just went green.
+const UPSERT_PR_WATCH_TASK_RUN_SQL: &str = r#"INSERT INTO pr_watch_state (id, task_run_id, authoring_session_id, pr_number, repo_full_name, head_sha, workflow_id, max_auto_resumes, github_token, auto_resume_enabled)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                   ON CONFLICT (task_run_id, pr_number) DO UPDATE SET
+                       authoring_session_id = COALESCE(EXCLUDED.authoring_session_id, pr_watch_state.authoring_session_id),
+                       first_fully_green_at = CASE
+                           WHEN pr_watch_state.head_sha IS DISTINCT FROM EXCLUDED.head_sha THEN NULL
+                           ELSE pr_watch_state.first_fully_green_at
+                       END,
+                       head_sha = EXCLUDED.head_sha,
+                       workflow_id = EXCLUDED.workflow_id,
+                       max_auto_resumes = EXCLUDED.max_auto_resumes,
+                       github_token = EXCLUDED.github_token,
+                       auto_resume_enabled = EXCLUDED.auto_resume_enabled,
+                       updated_at = NOW()
+                   RETURNING id"#;
+
+/// Session-keyed seed upsert — same streak-reset invariant as
+/// [`UPSERT_PR_WATCH_TASK_RUN_SQL`].
+const UPSERT_PR_WATCH_SESSION_SQL: &str = r#"INSERT INTO pr_watch_state (id, task_run_id, authoring_session_id, pr_number, repo_full_name, head_sha, workflow_id, max_auto_resumes, github_token, auto_resume_enabled)
+                   VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, $9)
+                   ON CONFLICT (authoring_session_id, pr_number) WHERE task_run_id IS NULL DO UPDATE SET
+                       first_fully_green_at = CASE
+                           WHEN pr_watch_state.head_sha IS DISTINCT FROM EXCLUDED.head_sha THEN NULL
+                           ELSE pr_watch_state.first_fully_green_at
+                       END,
+                       head_sha = EXCLUDED.head_sha,
+                       workflow_id = EXCLUDED.workflow_id,
+                       max_auto_resumes = EXCLUDED.max_auto_resumes,
+                       github_token = EXCLUDED.github_token,
+                       auto_resume_enabled = EXCLUDED.auto_resume_enabled,
+                       updated_at = NOW()
+                   RETURNING id"#;
+
 impl PgDb {
     /// Get all active (non-completed) PR watches.
+    ///
+    /// Shape tolerance: if the SELECT fails with SQLSTATE 42703 (undefined
+    /// column), the table exists in its alembic-canonical shape WITHOUT the
+    /// runner-self-healed columns — the boot-time heal no-oped because the
+    /// table did not exist yet, and alembic created it afterwards. Re-run the
+    /// same idempotent self-heal block and retry once, so watcher polls (and
+    /// the pre-existing CI auto-resume / review-subtask features that ride on
+    /// them) recover without a runner restart.
     pub async fn get_active_pr_watches(&self) -> Result<Vec<PrWatchState>, String> {
         let conn = self
             .pool
@@ -14,20 +75,27 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
-        let rows = conn
-            .query(
-                r#"SELECT id, task_run_id, pr_number, repo_full_name, head_sha,
-                       workflow_id, last_checks_status, last_review_status,
-                       auto_resume_count, max_auto_resumes, github_token,
-                       auto_resume_enabled, authoring_session_id,
-                       first_fully_green_at
-                FROM pr_watch_state
-                WHERE completed_at IS NULL
-                ORDER BY created_at ASC"#,
-                &[],
-            )
-            .await
-            .map_err(|e| format!("PG get_active_pr_watches: {}", e))?;
+        let rows = match conn.query(SELECT_ACTIVE_PR_WATCHES_SQL, &[]).await {
+            Ok(rows) => rows,
+            Err(e)
+                if e.code() == Some(&tokio_postgres::error::SqlState::UNDEFINED_COLUMN) =>
+            {
+                tracing::warn!(
+                    "PG get_active_pr_watches: pr_watch_state is missing the shepherd columns \
+                     ({e}) — table created after runner boot; re-running the idempotent shape \
+                     self-heal and retrying"
+                );
+                conn.batch_execute(super::PR_WATCH_STATE_SELF_HEAL_SQL)
+                    .await
+                    .map_err(|e| {
+                        format!("PG get_active_pr_watches: shape self-heal failed: {}", e)
+                    })?;
+                conn.query(SELECT_ACTIVE_PR_WATCHES_SQL, &[])
+                    .await
+                    .map_err(|e| format!("PG get_active_pr_watches (after self-heal): {}", e))?
+            }
+            Err(e) => return Err(format!("PG get_active_pr_watches: {}", e)),
+        };
 
         Ok(rows
             .iter()
@@ -84,17 +152,7 @@ impl PgDb {
         let row = match task_run_id {
             Some(task_run_id) => conn
                 .query_one(
-                    r#"INSERT INTO pr_watch_state (id, task_run_id, authoring_session_id, pr_number, repo_full_name, head_sha, workflow_id, max_auto_resumes, github_token, auto_resume_enabled)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                   ON CONFLICT (task_run_id, pr_number) DO UPDATE SET
-                       authoring_session_id = COALESCE(EXCLUDED.authoring_session_id, pr_watch_state.authoring_session_id),
-                       head_sha = EXCLUDED.head_sha,
-                       workflow_id = EXCLUDED.workflow_id,
-                       max_auto_resumes = EXCLUDED.max_auto_resumes,
-                       github_token = EXCLUDED.github_token,
-                       auto_resume_enabled = EXCLUDED.auto_resume_enabled,
-                       updated_at = NOW()
-                   RETURNING id"#,
+                    UPSERT_PR_WATCH_TASK_RUN_SQL,
                     &[&id, &task_run_id, &authoring_session_id, &pr_num, &repo_full_name, &head_sha, &workflow_id, &max_resumes, &github_token, &auto_resume_enabled],
                 )
                 .await
@@ -107,16 +165,7 @@ impl PgDb {
                     );
                 };
                 conn.query_one(
-                    r#"INSERT INTO pr_watch_state (id, task_run_id, authoring_session_id, pr_number, repo_full_name, head_sha, workflow_id, max_auto_resumes, github_token, auto_resume_enabled)
-                   VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, $9)
-                   ON CONFLICT (authoring_session_id, pr_number) WHERE task_run_id IS NULL DO UPDATE SET
-                       head_sha = EXCLUDED.head_sha,
-                       workflow_id = EXCLUDED.workflow_id,
-                       max_auto_resumes = EXCLUDED.max_auto_resumes,
-                       github_token = EXCLUDED.github_token,
-                       auto_resume_enabled = EXCLUDED.auto_resume_enabled,
-                       updated_at = NOW()
-                   RETURNING id"#,
+                    UPSERT_PR_WATCH_SESSION_SQL,
                     &[&id, &authoring_session_id, &pr_num, &repo_full_name, &head_sha, &workflow_id, &max_resumes, &github_token, &auto_resume_enabled],
                 )
                 .await
@@ -263,5 +312,58 @@ impl PgDb {
         .map_err(|e| format!("PG set_task_run_ci_failure_context: {}", e))?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The per-head streak-reset invariant: BOTH seed-upsert branches must
+    /// clear `first_fully_green_at` when the stored head differs from the
+    /// seeded head — matching the poll path
+    /// (`pr_watcher::compute_first_fully_green_at`). A seed that silently
+    /// advances `head_sha` without this reset makes the next poll carry the
+    /// OLD head's green streak onto the new head and fire GreenButUnmerged
+    /// for CI that only just went green.
+    #[test]
+    fn seed_upserts_reset_green_streak_on_head_change() {
+        for (name, sql) in [
+            ("task-run", UPSERT_PR_WATCH_TASK_RUN_SQL),
+            ("session", UPSERT_PR_WATCH_SESSION_SQL),
+        ] {
+            assert!(
+                sql.contains("head_sha = EXCLUDED.head_sha"),
+                "{name}: upsert must advance head_sha"
+            );
+            assert!(
+                sql.contains(
+                    "WHEN pr_watch_state.head_sha IS DISTINCT FROM EXCLUDED.head_sha THEN NULL"
+                ),
+                "{name}: upsert must NULL first_fully_green_at on a head change"
+            );
+            assert!(
+                sql.contains("ELSE pr_watch_state.first_fully_green_at"),
+                "{name}: upsert must carry the streak when the head is unchanged"
+            );
+        }
+    }
+
+    /// The active-watch SELECT reads the runner-self-healed columns; the
+    /// 42703 recovery path in `get_active_pr_watches` re-runs this exact heal
+    /// block, which must therefore add every such column the SELECT names.
+    #[test]
+    fn select_columns_are_covered_by_the_self_heal() {
+        for col in ["authoring_session_id", "first_fully_green_at"] {
+            assert!(
+                SELECT_ACTIVE_PR_WATCHES_SQL.contains(col),
+                "SELECT must read {col}"
+            );
+            assert!(
+                crate::database::pg::PR_WATCH_STATE_SELF_HEAL_SQL
+                    .contains(&format!("ADD COLUMN IF NOT EXISTS {col}")),
+                "self-heal must add {col} (the 42703 recovery re-runs it)"
+            );
+        }
     }
 }

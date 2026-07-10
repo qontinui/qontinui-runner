@@ -829,17 +829,45 @@ async fn diagnose_green_but_unmerged(
         return;
     };
 
-    // Primary read (verdict) + evidence reads. Each is best-effort.
-    let verdict = match client.verdict(owner, repo, pr).await {
-        Ok(v) => Some(v),
+    // Primary read (verdict) + evidence reads. Each is best-effort. The error
+    // TYPE is load-bearing: any HTTP response (401/403 from our own expired
+    // device bearer, 404, 5xx) proves coord IS reachable — only a transport
+    // failure is CoordDown evidence. An auth failure must never masquerade as
+    // COORD-DOWN (alerts, coord-down session injections, orphaned-red spawns)
+    // when the broken component is the runner's own credentials.
+    let (verdict, coord_reachable) = match client.verdict(owner, repo, pr).await {
+        Ok(v) => (Some(v), true),
         Err(e) => {
-            tracing::warn!(
-                target: "pr_shepherd",
-                repo = %watch.repo_full_name,
-                pr_number = pr,
-                "pr_shepherd: coord verdict unreachable ({e}) — CoordDown candidate"
-            );
-            None
+            if e.is_auth() {
+                // LOUD: an expired device bearer must never read as COORD-DOWN
+                // (no alert, no coord-down session injection, no orphaned-PR
+                // spawn) — coord answered; OUR credentials are the broken part.
+                tracing::error!(
+                    target: "pr_shepherd",
+                    repo = %watch.repo_full_name,
+                    pr_number = pr,
+                    "pr_shepherd: coord AUTH FAILURE ({e}) — coord IS reachable; the runner's \
+                     device bearer is expired/invalid. NOT a coord-down condition: refresh the \
+                     runner's coord credentials (re-pair / re-auth). Diagnosis degraded to \
+                     transient until auth is fixed."
+                );
+            } else if e.coord_reachable() {
+                tracing::warn!(
+                    target: "pr_shepherd",
+                    repo = %watch.repo_full_name,
+                    pr_number = pr,
+                    "pr_shepherd: coord verdict returned {e} — coord reachable but verdict \
+                     unavailable; treating as transient (not CoordDown)"
+                );
+            } else {
+                tracing::warn!(
+                    target: "pr_shepherd",
+                    repo = %watch.repo_full_name,
+                    pr_number = pr,
+                    "pr_shepherd: coord verdict unreachable ({e}) — CoordDown candidate"
+                );
+            }
+            (None, e.coord_reachable())
         }
     };
     // `health_leader` failing (Err) → leader not fresh → CoordDown too.
@@ -852,6 +880,7 @@ async fn diagnose_green_but_unmerged(
         // We reached this handler ONLY because our own GitHubClient saw the PR
         // fully green — that is the independent witness `CoordDown` needs.
         github_green: true,
+        coord_reachable,
         verdict: verdict.as_ref(),
         leader_fresh,
         block: block.as_ref(),
@@ -867,10 +896,14 @@ async fn diagnose_green_but_unmerged(
 
     // CoordDefect: one idempotent reevaluate nudge per (pr, head) BEFORE the
     // escalate intent takes over on the next poll — the cheap fix tried first.
+    // The guard is claimed only AFTER a confirmed-successful POST: a transient
+    // reevaluate failure keeps the intent on the nudge rung (no Escalate on
+    // this poll) and leaves the claim unburnt so the nudge retries next poll.
     if let ShepherdDisposition::CoordDefect { class } = disposition {
-        if coord_pr_merge_client::claim_reevaluate_once(pr, &watch.head_sha) {
+        if !coord_pr_merge_client::reevaluate_already_sent(pr, &watch.head_sha) {
             match client.reevaluate(owner, repo, pr).await {
                 Ok(()) => {
+                    coord_pr_merge_client::mark_reevaluate_sent(pr, &watch.head_sha);
                     intent = ShepherdIntent::Reevaluate;
                     tracing::info!(
                         target: "pr_shepherd",
@@ -880,13 +913,19 @@ async fn diagnose_green_but_unmerged(
                         "pr_shepherd: suspected coord defect — sent one reevaluate nudge (per head)"
                     );
                 }
-                Err(e) => tracing::warn!(
-                    target: "pr_shepherd",
-                    repo = %watch.repo_full_name,
-                    pr_number = pr,
-                    defect_class = class.as_str(),
-                    "pr_shepherd: reevaluate nudge failed: {e}"
-                ),
+                Err(e) => {
+                    // Do NOT fall through to Escalate on the same poll: the
+                    // nudge rung was never actually tried.
+                    intent = ShepherdIntent::Reevaluate;
+                    tracing::warn!(
+                        target: "pr_shepherd",
+                        repo = %watch.repo_full_name,
+                        pr_number = pr,
+                        defect_class = class.as_str(),
+                        "pr_shepherd: reevaluate nudge failed ({e}) — claim not consumed; \
+                         retrying the nudge next poll (not escalating)"
+                    );
+                }
             }
         }
     }
@@ -922,7 +961,10 @@ async fn diagnose_green_but_unmerged(
             log_notify_outcome(watch, kind, &outcome);
 
             // Dead-author fallback: coord is down AND the author is gone AND the
-            // task is terminal → orphaned-red bounded fix spawn (Phase 5).
+            // task is terminal → bounded orphaned-PR triage spawn (Phase 5).
+            // The PR is GREEN here (this handler is only reachable from
+            // GreenButUnmerged) — the spawned session diagnoses/lands per
+            // policy; it is never told to "fix failing CI".
             if matches!(outcome, NotifyOutcome::AuthorGone) {
                 let author_live = deps
                     .map(|d| resolve_live_authoring_session(&d.app_handle, watch).is_some())
@@ -937,7 +979,7 @@ async fn diagnose_green_but_unmerged(
                         target: "pr_shepherd",
                         repo = %watch.repo_full_name,
                         pr_number = pr,
-                        "pr_shepherd: dead author on coord-down green-unlanded PR — routing to orphaned-red fix"
+                        "pr_shepherd: dead author on coord-down green-unlanded PR — routing to orphaned-PR triage"
                     );
                     let outcome = pr_shepherd_remediation::escalate_orphaned_red(
                         pg_db,
@@ -995,9 +1037,12 @@ async fn escalate_coord_defect(
     // live attempt for this (PR, head), defer — do NOT double-spawn. The runner
     // is the last-resort rung; it only fires when NO fleet remediator shows
     // life. Best-effort: an events blip → not-live → we proceed (a coord-down
-    // outage is exactly when we must act).
+    // outage is exactly when we must act). The window is the SHORT liveness
+    // horizon (`attempt_live_window`, default 30m) — NOT the 24h remediation
+    // dedup cooldown, which would let a stale event from a since-wedged coord
+    // defer the last-resort rung for a whole day.
     match client
-        .unlandable_attempt_live(owner, repo, pr, &watch.head_sha, pr_shepherd::remediation_cooldown())
+        .unlandable_attempt_live(owner, repo, pr, &watch.head_sha, pr_shepherd::attempt_live_window())
         .await
     {
         Ok(true) => {
@@ -1084,6 +1129,11 @@ enum NotifyOutcome {
     /// The authoring session is not live on this device (or no deps) — nothing
     /// injected. The caller decides whether the dead-author fallback applies.
     AuthorGone,
+    /// The session resolved live but the injection FAILED (PTY write race,
+    /// SDK channel error). The claim is NOT burnt — the nudge retries next
+    /// poll. Distinct from `AuthorGone` so the dead-author fallback does not
+    /// fire on a transient send failure of a live session.
+    SendFailed,
     /// `QONTINUI_PR_SHEPHERD_NOTIFY` is off.
     Disabled,
 }
@@ -1092,8 +1142,10 @@ enum NotifyOutcome {
 /// `coordinator::act::send_message_to_worker_via_handle` — the same in-process
 /// injection primitive `session_message_poller` uses AFTER draining coord, NOT
 /// a second coord-mailbox producer. Dedup: one injection per (pr, head, kind),
-/// claimed only on a resolved-live session so a transiently-gone author can
-/// still be notified when it returns (or routed to the dead-author fallback).
+/// marked only AFTER a confirmed-successful injection — a failed send must not
+/// burn the author's single nudge for this head (it retries next poll), and a
+/// transiently-gone author can still be notified when it returns (or routed to
+/// the dead-author fallback).
 async fn notify_author_device_local(
     watch: &PrWatchState,
     kind: &str,
@@ -1109,21 +1161,37 @@ async fn notify_author_device_local(
     let Some(session_id) = resolve_live_authoring_session(&deps.app_handle, watch) else {
         return NotifyOutcome::AuthorGone;
     };
-    // Claim only now (author is live) — one injection per (pr, head, kind).
-    if !pr_shepherd::claim_notify_once(watch.pr_number, &watch.head_sha, kind) {
+    if pr_shepherd::notify_already_sent(watch.pr_number, &watch.head_sha, kind) {
         return NotifyOutcome::Deduped;
     }
     let framed = format!(
         "<system-reminder>PR shepherd {kind} (device-local, coord-independent). \
          Act on it, then continue. Message: {body}</system-reminder>"
     );
-    crate::coordinator::act::send_message_to_worker_via_handle(
+    match crate::coordinator::act::send_message_to_worker_via_handle(
         &deps.app_handle,
         &session_id,
         &framed,
     )
-    .await;
-    NotifyOutcome::Injected
+    .await
+    {
+        Ok(()) => {
+            // Claim only now — the injection is confirmed delivered.
+            pr_shepherd::mark_notified(watch.pr_number, &watch.head_sha, kind);
+            NotifyOutcome::Injected
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "pr_shepherd",
+                repo = %watch.repo_full_name,
+                pr_number = watch.pr_number,
+                session_id = %session_id,
+                kind = kind,
+                "pr_shepherd: device-local notify injection failed ({e}) — claim not consumed; retrying next poll"
+            );
+            NotifyOutcome::SendFailed
+        }
+    }
 }
 
 /// Resolve a watch's authoring session to a LIVE local runner session id

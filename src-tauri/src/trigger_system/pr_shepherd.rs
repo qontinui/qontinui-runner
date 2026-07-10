@@ -53,6 +53,14 @@ pub const DEFAULT_GREEN_THRESHOLD: Duration = Duration::from_secs(45 * 60);
 /// same defect class within this window is a dedup hit. 24h.
 pub const DEFAULT_REMEDIATION_COOLDOWN: Duration = Duration::from_secs(24 * 3600);
 
+/// Default liveness window for the Phase 5.4 coexistence check: a coord
+/// shepherd event on the current head younger than this reads as a "currently
+/// LIVE attempt" and defers the runner's last-resort remediation. Deliberately
+/// SHORT (30m) and distinct from [`DEFAULT_REMEDIATION_COOLDOWN`] — reusing the
+/// 24h dedup cooldown as a liveness window would let a stale event from a
+/// since-wedged coord suppress the last-resort rung for a whole day.
+pub const DEFAULT_ATTEMPT_LIVE_WINDOW: Duration = Duration::from_secs(30 * 60);
+
 /// Upper bound on buffered seeds. Oldest drop first — the queue only ever
 /// holds seeds between transcript observation and the next PR-watcher poll
 /// (≤ ~30s in a healthy runner), so 64 is generous.
@@ -166,6 +174,19 @@ pub fn parse_cooldown(raw: &str) -> Option<Duration> {
         return None;
     }
     Some(Duration::from_secs(n * unit_secs))
+}
+
+/// Phase 5.4 coexistence liveness window. Reads
+/// `QONTINUI_PR_SHEPHERD_ATTEMPT_LIVE_WINDOW` — a bare integer is MINUTES
+/// (liveness reads naturally in minutes), or an `s`/`m`/`h` suffix. Unset /
+/// unparseable falls back to [`DEFAULT_ATTEMPT_LIVE_WINDOW`] (30m). This is
+/// the "is coord's shepherd attempting this (PR, head) RIGHT NOW" horizon —
+/// NOT the remediation dedup cooldown ([`remediation_cooldown`], 24h).
+pub fn attempt_live_window() -> Duration {
+    std::env::var("QONTINUI_PR_SHEPHERD_ATTEMPT_LIVE_WINDOW")
+        .ok()
+        .and_then(|v| parse_threshold(&v))
+        .unwrap_or(DEFAULT_ATTEMPT_LIVE_WINDOW)
 }
 
 /// The model override for the spawned vet-imp / fix session (Phase 5). Reads
@@ -300,7 +321,7 @@ pub fn reset_seeds_for_test() {
 
 // ---------------------------------------------------------------------------
 // Phase 4/5 process-global dedup guards — mirror `coord_pr_merge_client`'s
-// `claim_reevaluate_once`. All keyed to include the HEAD SHA so a push (which
+// reevaluate peek/mark pair. All keyed to include the HEAD SHA so a push (which
 // resets `first_fully_green_at` and clears the block class) makes the PR
 // eligible for a fresh nudge / escalation on the new head — never a storm on
 // the same head.
@@ -312,16 +333,29 @@ pub fn reset_seeds_for_test() {
 static NOTIFY_ONCE: Lazy<Mutex<HashSet<(u64, String, String)>>> =
     Lazy::new(|| Mutex::new(HashSet::new()));
 
-/// Claim the single device-local notification for `(pr, head, kind)`. Returns
-/// `true` exactly once per tuple (the first caller), `false` thereafter.
+/// Has the single device-local notification for `(pr, head, kind)` already been
+/// DELIVERED? Non-consuming peek — pair with [`mark_notified`].
+///
+/// The claim is recorded only AFTER a confirmed-successful injection
+/// (claim-after-success): a failed `send_user_message` must leave the tuple
+/// unclaimed so the author's one nudge for this head retries next poll instead
+/// of being permanently lost to a swallowed send failure.
 ///
 /// Phase 5 remediation deliberately has NO analogous escalate once-guard — it is
 /// deduped by the plans-dir scan + the durable `pr_shepherd_remediations`
 /// cooldown marker, which (unlike a process-global set) do not suppress a
 /// legitimate re-escalation if coord's own attempt later dies.
-pub fn claim_notify_once(pr: u64, head_sha: &str, kind: &str) -> bool {
+pub fn notify_already_sent(pr: u64, head_sha: &str, kind: &str) -> bool {
+    let g = NOTIFY_ONCE.lock().unwrap_or_else(|e| e.into_inner());
+    g.contains(&(pr, head_sha.to_string(), kind.to_string()))
+}
+
+/// Record that the device-local notification for `(pr, head, kind)` was
+/// successfully injected. Call ONLY after a confirmed-successful send (see
+/// [`notify_already_sent`]).
+pub fn mark_notified(pr: u64, head_sha: &str, kind: &str) {
     let mut g = NOTIFY_ONCE.lock().unwrap_or_else(|e| e.into_inner());
-    g.insert((pr, head_sha.to_string(), kind.to_string()))
+    g.insert((pr, head_sha.to_string(), kind.to_string()));
 }
 
 /// Test-only: clear the Phase 4 notify dedup guard.
@@ -495,17 +529,44 @@ mod tests {
     }
 
     #[test]
-    fn notify_guard_fires_once_per_head_and_kind() {
+    fn notify_guard_claims_only_after_success() {
         reset_action_guards_for_test();
-        // Notify: once per (pr, head, kind).
-        assert!(claim_notify_once(708, "headA", "pr_hold_triage"));
-        assert!(!claim_notify_once(708, "headA", "pr_hold_triage"));
+        // Peek is non-consuming: a failed injection must leave the author's one
+        // nudge for this head retryable on the next poll.
+        assert!(!notify_already_sent(708, "headA", "pr_hold_triage"));
+        assert!(
+            !notify_already_sent(708, "headA", "pr_hold_triage"),
+            "peek must not consume — a send failure retries next poll"
+        );
+        // Mark only after a confirmed-successful injection → deduped thereafter.
+        mark_notified(708, "headA", "pr_hold_triage");
+        assert!(notify_already_sent(708, "headA", "pr_hold_triage"));
         // A different kind on the same head is independent.
-        assert!(claim_notify_once(708, "headA", "ci_red_triage"));
+        assert!(!notify_already_sent(708, "headA", "ci_red_triage"));
         // A new head is a fresh nudge.
-        assert!(claim_notify_once(708, "headB", "pr_hold_triage"));
+        assert!(!notify_already_sent(708, "headB", "pr_hold_triage"));
         // A different PR is independent.
-        assert!(claim_notify_once(912, "headA", "pr_hold_triage"));
+        assert!(!notify_already_sent(912, "headA", "pr_hold_triage"));
+    }
+
+    #[test]
+    fn attempt_live_window_is_short_and_distinct_from_cooldown() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_PR_SHEPHERD_ATTEMPT_LIVE_WINDOW");
+        assert_eq!(attempt_live_window(), DEFAULT_ATTEMPT_LIVE_WINDOW);
+        assert_eq!(DEFAULT_ATTEMPT_LIVE_WINDOW, Duration::from_secs(30 * 60));
+        assert!(
+            DEFAULT_ATTEMPT_LIVE_WINDOW < DEFAULT_REMEDIATION_COOLDOWN,
+            "liveness window must be much shorter than the 24h dedup cooldown"
+        );
+        // Bare integer = minutes; suffixes accepted.
+        std::env::set_var("QONTINUI_PR_SHEPHERD_ATTEMPT_LIVE_WINDOW", "10");
+        assert_eq!(attempt_live_window(), Duration::from_secs(10 * 60));
+        std::env::set_var("QONTINUI_PR_SHEPHERD_ATTEMPT_LIVE_WINDOW", "1h");
+        assert_eq!(attempt_live_window(), Duration::from_secs(3600));
+        std::env::set_var("QONTINUI_PR_SHEPHERD_ATTEMPT_LIVE_WINDOW", "garbage");
+        assert_eq!(attempt_live_window(), DEFAULT_ATTEMPT_LIVE_WINDOW);
+        std::env::remove_var("QONTINUI_PR_SHEPHERD_ATTEMPT_LIVE_WINDOW");
     }
 
     #[test]
