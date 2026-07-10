@@ -870,7 +870,8 @@ pub(crate) async fn send_message_to_worker_via_handle(
     session_id: &str,
     message: &str,
 ) -> Result<(), String> {
-    let session_manager = match app_handle.try_state::<Arc<crate::claude_session::SessionManager>>() {
+    let session_manager = match app_handle.try_state::<Arc<crate::claude_session::SessionManager>>()
+    {
         Some(sm) => sm.inner().clone(),
         None => {
             warn!("send_message_to_worker: SessionManager not available");
@@ -903,7 +904,9 @@ pub(crate) async fn send_message_to_worker_via_handle(
                     "send_message_to_worker: worker send_user_message failed for {}: {}",
                     session_id, e
                 );
-                Err(format!("worker send_user_message failed for {session_id}: {e}"))
+                Err(format!(
+                    "worker send_user_message failed for {session_id}: {e}"
+                ))
             }
         };
     }

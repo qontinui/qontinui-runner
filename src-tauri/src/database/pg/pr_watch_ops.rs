@@ -77,9 +77,7 @@ impl PgDb {
 
         let rows = match conn.query(SELECT_ACTIVE_PR_WATCHES_SQL, &[]).await {
             Ok(rows) => rows,
-            Err(e)
-                if e.code() == Some(&tokio_postgres::error::SqlState::UNDEFINED_COLUMN) =>
-            {
+            Err(e) if e.code() == Some(&tokio_postgres::error::SqlState::UNDEFINED_COLUMN) => {
                 tracing::warn!(
                     "PG get_active_pr_watches: pr_watch_state is missing the shepherd columns \
                      ({e}) — table created after runner boot; re-running the idempotent shape \
@@ -153,7 +151,18 @@ impl PgDb {
             Some(task_run_id) => conn
                 .query_one(
                     UPSERT_PR_WATCH_TASK_RUN_SQL,
-                    &[&id, &task_run_id, &authoring_session_id, &pr_num, &repo_full_name, &head_sha, &workflow_id, &max_resumes, &github_token, &auto_resume_enabled],
+                    &[
+                        &id,
+                        &task_run_id,
+                        &authoring_session_id,
+                        &pr_num,
+                        &repo_full_name,
+                        &head_sha,
+                        &workflow_id,
+                        &max_resumes,
+                        &github_token,
+                        &auto_resume_enabled,
+                    ],
                 )
                 .await
                 .map_err(|e| format!("PG upsert_pr_watch_state: {}", e))?,
@@ -166,7 +175,17 @@ impl PgDb {
                 };
                 conn.query_one(
                     UPSERT_PR_WATCH_SESSION_SQL,
-                    &[&id, &authoring_session_id, &pr_num, &repo_full_name, &head_sha, &workflow_id, &max_resumes, &github_token, &auto_resume_enabled],
+                    &[
+                        &id,
+                        &authoring_session_id,
+                        &pr_num,
+                        &repo_full_name,
+                        &head_sha,
+                        &workflow_id,
+                        &max_resumes,
+                        &github_token,
+                        &auto_resume_enabled,
+                    ],
                 )
                 .await
                 .map_err(|e| format!("PG upsert_pr_watch_state (session-keyed): {}", e))?
