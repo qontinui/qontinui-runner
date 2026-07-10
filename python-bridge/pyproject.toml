@@ -26,6 +26,7 @@ aiohttp = "^3.9"
 # qontinui-web/backend to keep a single FastAPI/uvicorn line across the repo.
 fastapi = "^0.136"
 uvicorn = {extras = ["standard"], version = "^0.38"}
+pydantic = "^2"  # embedding_server.py imports BaseModel directly; don't rely on transitive pin
 # Pin opencv-python-headless explicitly.
 #
 # IMPORTANT: Do NOT allow `opencv-python` (non-headless) to be installed

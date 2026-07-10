@@ -56,7 +56,11 @@ test-*.json
 src-tauri/src/test.rs
 
 # Python project files
-python-bridge/poetry.lock
+# NOTE: python-bridge/poetry.lock IS committed (like qontinui-web/backend's):
+# the runner's dev-service build_command and the supervisor build pool run bare
+# `poetry install`, which hard-fails when a local lock goes stale against a
+# changed pyproject. Committing the lock keeps every machine's provisioning
+# deterministic. Regenerate with `poetry lock` on dependency changes.
 python-bridge/tox.ini
 python-bridge/requirements.txt
 
