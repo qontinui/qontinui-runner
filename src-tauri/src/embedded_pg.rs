@@ -71,6 +71,9 @@ fn free_loopback_port() -> Option<u16> {
 ///   launches.
 /// - `setup()` runs `initdb` (first launch only; a no-op on an existing
 ///   cluster). `start()` launches the server. `temporary=false` persists data.
+/// - The superuser password persists in `pg-pass` under `data_root` and is read
+///   back on every boot after the first (see below) — the crate alone would
+///   regenerate it randomly each launch and lock us out of our own cluster.
 pub async fn bootstrap(data_root: PathBuf, db_name: &str) -> Result<ManagedPg, String> {
     // Struct-update form (not `default()` + field reassignment) to satisfy
     // clippy::field_reassign_with_default.
@@ -80,6 +83,10 @@ pub async fn bootstrap(data_root: PathBuf, db_name: &str) -> Result<ManagedPg, S
         password_file: data_root.join("pg-pass"),
         host: "127.0.0.1".to_string(),
         temporary: false, // persist the cluster across launches
+        // The crate's default per-command timeout (initdb / pg_ctl) is 5s,
+        // which flakes under CI contention and on slow end-user disks — first
+        // initdb on a cold machine can legitimately take tens of seconds.
+        timeout: Some(std::time::Duration::from_secs(60)),
         ..Settings::default()
     };
     // Prefer an explicit free loopback port; fall back to whatever Default chose.
@@ -87,9 +94,86 @@ pub async fn bootstrap(data_root: PathBuf, db_name: &str) -> Result<ManagedPg, S
         settings.port = port;
     }
 
+    // Read the stored superuser password back from `password_file`. The
+    // `postgresql_embedded` crate (0.20.x) writes that file once at initdb and
+    // NEVER reads it back — while `Settings::default()` generates a fresh
+    // random password on every construction. Without this read-back, every
+    // boot after the first authenticates with a password the cluster has never
+    // seen (`FATAL: password authentication failed`) and the install bricks.
+    // `pg-pass` holds the cluster's real password — treat it as the source of
+    // truth whenever it exists (first boot: absent, the fresh random password
+    // is used and written by initdb, unchanged behaviour).
+    //
+    // Every degenerate combination of (password file, cluster state) is handled
+    // explicitly below: silently falling back to a fresh random password can
+    // never authenticate against an initialized cluster, and that silent
+    // fallback was exactly the original undiagnosable brick. Errors here
+    // surface through `main.rs`'s existing degrade path with an actionable
+    // message. Same initialized-probe the crate's `is_initialized` uses.
+    let cluster_initialized = settings.data_dir.join("postgresql.conf").exists();
+    match std::fs::read_to_string(&settings.password_file) {
+        Ok(stored) => {
+            let stored = stored.trim();
+            if stored.is_empty() {
+                if cluster_initialized {
+                    return Err(format!(
+                        "embedded Postgres password file {} is empty but the cluster is \
+                         initialized — the superuser password is unrecoverable; delete the \
+                         embedded-pg directory to re-provision",
+                        settings.password_file.display()
+                    ));
+                }
+                // The crate's initialize() writes the password file only when
+                // it does NOT exist, so a 0-byte leftover would poison every
+                // future initdb: remove it so initdb regenerates it.
+                tracing::warn!(
+                    path = %settings.password_file.display(),
+                    "embedded Postgres password file is empty before initdb — removing it so \
+                     initdb regenerates it"
+                );
+                std::fs::remove_file(&settings.password_file).map_err(|e| {
+                    format!(
+                        "embedded Postgres could not remove empty password file {}: {e}",
+                        settings.password_file.display()
+                    )
+                })?;
+            } else {
+                if !stored.chars().all(|c| c.is_ascii_alphanumeric()) {
+                    // The crate only ever generates alphanumeric passwords;
+                    // anything else is hand-tampering, and `Settings::url()`
+                    // does no percent-encoding.
+                    tracing::warn!(
+                        path = %settings.password_file.display(),
+                        "embedded Postgres password contains non-alphanumeric characters — \
+                         the connection URL may be malformed"
+                    );
+                }
+                settings.password = stored.to_string();
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if cluster_initialized {
+                return Err(format!(
+                    "embedded Postgres cluster at {} is initialized but its password file {} \
+                     is missing — the superuser password is unrecoverable; delete the \
+                     embedded-pg directory to re-provision",
+                    settings.data_dir.display(),
+                    settings.password_file.display()
+                ));
+            }
+            // First boot: the crate writes the file at initdb.
+        }
+        Err(e) => {
+            return Err(format!(
+                "embedded Postgres password file {} exists but could not be read: {e}",
+                settings.password_file.display()
+            ));
+        }
+    }
+
     // Build the URL before `settings` is moved into `PostgreSQL::new`. The port
-    // and generated password are fixed on `settings` at this point, so the URL
-    // is stable for the lifetime of the started server.
+    // and password are fixed on `settings` at this point, so the URL is stable
+    // for the lifetime of the started server.
     let url = settings.url(db_name);
     let port = settings.port;
 
@@ -108,13 +192,20 @@ pub async fn bootstrap(data_root: PathBuf, db_name: &str) -> Result<ManagedPg, S
         .await
         .map_err(|e| format!("embedded Postgres database_exists({db_name}) failed: {e}"))?;
     if !exists {
-        // Fresh cluster: create the database and apply the canonical schema
-        // once. An existing database is left untouched (the schema was applied
-        // on a prior launch).
         handle
             .create_database(db_name)
             .await
             .map_err(|e| format!("embedded Postgres create_database({db_name}) failed: {e}"))?;
+    }
+
+    // The schema gate is deliberately decoupled from database creation: gating
+    // the apply on "database was just created" would let a crash between
+    // `create_database` and the schema batch leave an existing-but-empty
+    // database that skips schema apply forever. Instead, probe for the schema
+    // and apply whenever it is missing. `batch_execute` runs the whole dump in
+    // one implicit transaction, so a crashed/failed apply rolls back and this
+    // probe stays false on the next boot — self-healing.
+    if !schema_applied(&url).await? {
         apply_canonical_schema(&url).await?;
     }
 
@@ -144,7 +235,8 @@ pub async fn bootstrap(data_root: PathBuf, db_name: &str) -> Result<ManagedPg, S
 ///      (they require pgvector and only accelerate similarity queries the
 ///      runner never issues).
 ///
-/// Applied once, only when the database was just created.
+/// Applied whenever [`schema_applied`] reports the schema missing (fresh
+/// database, or a prior apply that crashed/rolled back).
 async fn apply_canonical_schema(url: &str) -> Result<(), String> {
     const SCHEMA: &str = include_str!("../schema.pg.sql.generated");
     let body: String = SCHEMA
@@ -201,6 +293,36 @@ async fn apply_canonical_schema(url: &str) -> Result<(), String> {
     result
 }
 
+/// Whether the canonical schema is present in the database at `url`, probed
+/// via a sentinel table (`project.domain_knowledge` — one of the dump's own
+/// tables). Because [`apply_canonical_schema`] runs the whole dump in a single
+/// implicit transaction, this is all-or-nothing: the sentinel existing means
+/// the full schema landed, and a crashed/failed apply leaves it absent.
+async fn schema_applied(url: &str) -> Result<bool, String> {
+    let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
+        .await
+        .map_err(|e| format!("connect to embedded PG for schema probe failed: {e}"))?;
+    let conn_task = tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            tracing::warn!("embedded PG schema-probe connection closed with error: {e}");
+        }
+    });
+
+    let result = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+             WHERE table_schema = 'project' AND table_name = 'domain_knowledge')",
+            &[],
+        )
+        .await
+        .map(|row| row.get::<_, bool>(0))
+        .map_err(|e| format!("embedded PG schema probe failed: {e}"));
+
+    drop(client); // closes the connection so the driver task can finish
+    let _ = conn_task.await;
+    result
+}
+
 /// Store the managed handle so it is kept alive for the process lifetime and
 /// can be stopped cleanly on exit. Call once, right after [`bootstrap`].
 pub fn store_handle(handle: PostgreSQL) {
@@ -243,6 +365,27 @@ async fn stop(mut handle: PostgreSQL) {
 mod tests {
     use super::*;
 
+    /// Serializes the embedded-PG tests: each boots a full PostgreSQL server
+    /// (initdb + start), and two clusters extracting/booting concurrently is
+    /// unnecessary risk (disk, port, and archive-extraction contention).
+    /// Works regardless of `--test-threads`.
+    static PG_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Connect to `url` and spawn the driver task — the shared boilerplate for
+    /// asserting against a booted embedded PG. Callers `drop(client)` then
+    /// await the handle so the driver task can finish.
+    async fn connect_test_client(
+        url: &str,
+    ) -> (tokio_postgres::Client, tokio::task::JoinHandle<()>) {
+        let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
+            .await
+            .expect("connect to embedded PG");
+        let driver = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        (client, driver)
+    }
+
     /// End-to-end: initdb → start → create db → apply the transformed canonical
     /// schema → connect → verify. Runs offline (the `bundled` archive is
     /// embedded at compile time, so `setup()` extracts from bytes, no network).
@@ -250,6 +393,7 @@ mod tests {
     /// restore errors (the reason this fix exists).
     #[tokio::test]
     async fn boots_and_applies_transformed_schema() {
+        let _guard = PG_TEST_LOCK.lock().await;
         let root = std::env::temp_dir().join(format!("qr-embedded-pg-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root); // clean any prior run
 
@@ -257,12 +401,7 @@ mod tests {
             .await
             .expect("embedded PG should boot and apply the schema");
 
-        let (client, connection) = tokio_postgres::connect(&managed.url, tokio_postgres::NoTls)
-            .await
-            .expect("connect to embedded PG");
-        let conn = tokio::spawn(async move {
-            let _ = connection.await;
-        });
+        let (client, conn) = connect_test_client(&managed.url).await;
 
         // The pgvector-free transform applied: the former `public.vector`
         // column is now `bytea`.
@@ -295,6 +434,55 @@ mod tests {
             n > 100,
             "expected the full canonical schema (>100 tables), got {n}"
         );
+
+        drop(client);
+        let _ = conn.await;
+        stop(managed.handle).await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Regression: a SECOND bootstrap over the same `data_root` must
+    /// authenticate. `Settings::default()` regenerates a random password every
+    /// construction and the crate never reads `password_file` back, so without
+    /// the read-back in [`bootstrap`] every boot after the first failed with
+    /// `FATAL: password authentication failed` — bricking each standalone
+    /// install on its second launch. (The single-boot test above can never
+    /// catch this.)
+    #[tokio::test]
+    async fn second_boot_reuses_stored_password() {
+        let _guard = PG_TEST_LOCK.lock().await;
+        let root = std::env::temp_dir().join(format!(
+            "qr-embedded-pg-test-second-boot-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root); // clean any prior run
+
+        // First boot: initdb writes the real password to pg-pass.
+        let managed = bootstrap(root.clone(), "qontinui_test2")
+            .await
+            .expect("first boot should succeed");
+        assert!(
+            root.join("pg-pass").is_file(),
+            "initdb should have written the password file"
+        );
+        stop(managed.handle).await;
+
+        // Second boot, same data_root: must read the stored password back and
+        // authenticate against the existing cluster. (Schema apply is skipped —
+        // the schema probe finds it already present — this test is about
+        // authentication.)
+        let managed = bootstrap(root.clone(), "qontinui_test2")
+            .await
+            .expect("second boot over the same data_root should authenticate");
+
+        // The returned URL must actually authenticate end-to-end.
+        let (client, conn) = connect_test_client(&managed.url).await;
+        let one: i32 = client
+            .query_one("SELECT 1", &[])
+            .await
+            .expect("trivial query on second boot")
+            .get(0);
+        assert_eq!(one, 1);
 
         drop(client);
         let _ = conn.await;
