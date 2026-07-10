@@ -1154,7 +1154,7 @@ reason to coord before fixing + retrying:
 does this automatically; do the same on a manual commit. Never `--no-verify` to
 bypass the hook — that defeats both the hook and the supervision signal.
 
-**Opening a PR:** open the PR with `qontinui pr create` (preferred — it goes
+**Opening a PR:** open the PR with `qontinui-pr create` (preferred — it goes
 through the runner's coord-brokered loopback proxy and works without a personal
 GitHub login on this machine). `gh pr create` also works where a personal
 `gh auth login` exists.

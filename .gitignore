@@ -97,6 +97,7 @@ python-bridge/dist/
 # Keep .gitkeep but ignore actual executables
 src-tauri/binaries/qontinui-executor-*
 src-tauri/binaries/qontinui_profile-*
+src-tauri/binaries/qontinui-pr-*
 !src-tauri/binaries/.gitkeep
 
 .claude/

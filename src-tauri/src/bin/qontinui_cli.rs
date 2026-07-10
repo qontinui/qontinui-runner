@@ -1,33 +1,37 @@
-//! `qontinui` — the session CLI delivered onto every runner-hosted terminal's
-//! PATH by the identity-shim materializer
+//! `qontinui-pr` — the session CLI delivered onto every runner-hosted
+//! terminal's PATH by the identity-shim materializer
 //! (`install_effects_producer::intercept::shim_materializer::materialize_identity`).
 //!
-//! ## `qontinui pr create`
+//! Named `qontinui-pr` (NOT `qontinui`): the identity shim dir is PREPENDED to
+//! PATH in every runner terminal, so a bin named `qontinui` would shadow the
+//! Python qontinui library's `qontinui` console script.
+//!
+//! ## `qontinui-pr create`
 //! Opens a pull request WITHOUT a personal GitHub login on the machine: it
 //! POSTs the runner's loopback `POST /vcs/pull-requests` proxy, which injects
-//! the runner's live device JWT and forwards to coord's brokered PR-creation
+//! the session's live JWT and forwards to coord's brokered PR-creation
 //! route (`POST {coord}/coord/repos/{owner}/{repo}/pull-requests`). Coord's
 //! verdict (201 / 403 / 404 / 429) surfaces verbatim.
 //!
-//! ## Runner discovery chain (port + loopback auth)
+//! ## Runner discovery (port + loopback auth)
 //! The loopback route requires the per-session coord-mcp proxy nonce
-//! (`X-Coord-Mcp-Proxy-Key`). Discovery, strongest first:
+//! (`X-Coord-Mcp-Proxy-Key`), discovered by a **`.mcp.json` walk-up from cwd**.
+//! The runner provisions every session workdir with a `.mcp.json` whose
+//! coord-mcp server entry carries BOTH the nonce header and a loopback URL on
+//! the ACTUALLY-BOUND API port (`coord_mcp::write_coord_mcp_proxy_config` /
+//! `write_coord_mcp_agent_proxy_config`; the reconciler rewrites it on port
+//! drift). The nonce and the port are read from the SAME entry, so the POST
+//! always lands on the runner that issued the nonce — there is deliberately NO
+//! port probing/scanning fallback (a scan can bind the nonce to a DIFFERENT
+//! runner, which then 401s it).
 //!
-//! 1. **`.mcp.json` walk-up from cwd** (authoritative). The runner provisions
-//!    every session workdir with a `.mcp.json` whose `coord-mcp` server entry
-//!    carries BOTH the nonce header and a loopback URL on the ACTUALLY-BOUND
-//!    API port (`coord_mcp::write_coord_mcp_proxy_config`; the reconciler
-//!    rewrites it on port drift). This is the only on-disk copy of the nonce —
-//!    without it the CLI cannot authenticate and fails with a clear error.
-//! 2. **`QONTINUI_RUNNER_API_PORT` env** (port fallback). Injected into every
-//!    runner terminal at PTY spawn (`terminal/session.rs`), but sourced from
-//!    the bootstrap default rather than the bound port, so it ranks below the
-//!    `.mcp.json` URL.
-//! 3. **Loopback probe** (last resort): `GET /health` on 9876, then 9877-9899
-//!    (the temp/secondary-runner range), first responder wins.
+//! Borrowing an ANCESTOR directory's `.mcp.json` is intentional: nested
+//! worktrees/subdirs inside a provisioned session workdir inherit the session's
+//! credential, and because port + nonce travel together the borrowed entry
+//! still pairs the nonce with its issuing runner's port.
 //!
-//! The port candidates are only ever PROBED with the safe `GET /health`; the
-//! PR-creation POST fires exactly once, against the selected port.
+//! `QONTINUI_RUNNER_API_PORT` is honored as an EXPLICIT operator override of
+//! the port only (the nonce still comes from `.mcp.json`).
 //!
 //! Style: matches the sibling standalone bins (`qontinui_git_credential`) —
 //! hand-rolled arg parsing, no CLI crates; `reqwest::blocking` for HTTP (the
@@ -40,41 +44,29 @@ use std::time::Duration;
 
 const PROXY_KEY_HEADER: &str = "X-Coord-Mcp-Proxy-Key";
 const RUNNER_PORT_ENV: &str = "QONTINUI_RUNNER_API_PORT";
-const PRIMARY_PORT: u16 = 9876;
-const SECONDARY_PORT_RANGE: std::ops::RangeInclusive<u16> = 9877..=9899;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        Some("pr") => match args.get(1).map(String::as_str) {
-            Some("create") => pr_create(&args[2..]),
-            other => {
-                eprintln!(
-                    "qontinui: unknown pr subcommand {:?}\n{}",
-                    other.unwrap_or(""),
-                    USAGE
-                );
-                ExitCode::from(2)
-            }
-        },
+        Some("create") => pr_create(&args[1..]),
         Some("--help") | Some("-h") | Some("help") | None => {
             println!("{USAGE}");
             ExitCode::SUCCESS
         }
         Some(other) => {
-            eprintln!("qontinui: unknown command {other:?}\n{USAGE}");
+            eprintln!("qontinui-pr: unknown command {other:?}\n{USAGE}");
             ExitCode::from(2)
         }
     }
 }
 
 const USAGE: &str = "\
-qontinui — Qontinui Runner session CLI
+qontinui-pr — Qontinui Runner session PR CLI
 
 USAGE:
-  qontinui pr create --title <title> [options]
+  qontinui-pr create --title <title> [options]
 
-OPTIONS (pr create):
+OPTIONS (create):
   --repo <owner/name>   Target repo (default: inferred from `git remote get-url origin`)
   --head <branch>       Head branch (default: `git symbolic-ref --short HEAD`)
   --base <branch>       Base branch (default: main)
@@ -82,6 +74,8 @@ OPTIONS (pr create):
   --body <text>         PR body
   --body-file <path>    Read the PR body from a file
   --draft               Open as a draft PR
+
+Values that themselves begin with `--` must use the `--flag=value` form.
 
 Opens the PR through the runner's coord-brokered loopback proxy — no personal
 `gh auth login` required. On success prints the PR URL to stdout.";
@@ -101,47 +95,54 @@ fn parse_pr_create_args(args: &[String]) -> Result<PrCreateArgs, String> {
     let mut out = PrCreateArgs::default();
     let mut i = 0;
     while i < args.len() {
-        let flag = args[i].as_str();
+        let arg = args[i].as_str();
+        // `--flag=value` form: split once on the first `=`.
+        let (flag, inline) = match arg.starts_with("--") {
+            true => match arg.split_once('=') {
+                Some((f, v)) => (f, Some(v)),
+                None => (arg, None),
+            },
+            false => (arg, None),
+        };
+        // Take the flag's value: the inline `=value` if given, else the next
+        // argv element — but a next element that LOOKS like a flag is an error
+        // (`--title --draft` must not yield a PR titled "--draft"); use
+        // `--flag=value` for values that legitimately begin with `--`.
+        let mut consumed = 1usize;
         let mut take_value = |slot: &mut Option<String>| -> Result<(), String> {
+            if let Some(v) = inline {
+                *slot = Some(v.to_string());
+                return Ok(());
+            }
             match args.get(i + 1) {
+                Some(v) if v.starts_with("--") => Err(format!(
+                    "{flag} requires a value but got the flag-like {v:?} — \
+                     use {flag}=<value> if the value really starts with --"
+                )),
                 Some(v) => {
                     *slot = Some(v.clone());
+                    consumed = 2;
                     Ok(())
                 }
                 None => Err(format!("{flag} requires a value")),
             }
         };
         match flag {
-            "--repo" => {
-                take_value(&mut out.repo)?;
-                i += 2;
-            }
-            "--head" => {
-                take_value(&mut out.head)?;
-                i += 2;
-            }
-            "--base" => {
-                take_value(&mut out.base)?;
-                i += 2;
-            }
-            "--title" => {
-                take_value(&mut out.title)?;
-                i += 2;
-            }
-            "--body" => {
-                take_value(&mut out.body)?;
-                i += 2;
-            }
-            "--body-file" => {
-                take_value(&mut out.body_file)?;
-                i += 2;
-            }
+            "--repo" => take_value(&mut out.repo)?,
+            "--head" => take_value(&mut out.head)?,
+            "--base" => take_value(&mut out.base)?,
+            "--title" => take_value(&mut out.title)?,
+            "--body" => take_value(&mut out.body)?,
+            "--body-file" => take_value(&mut out.body_file)?,
             "--draft" => {
+                if inline.is_some() {
+                    return Err("--draft does not take a value".to_string());
+                }
                 out.draft = true;
-                i += 1;
             }
             other => return Err(format!("unknown flag {other:?}")),
         }
+        i += consumed;
     }
     Ok(out)
 }
@@ -150,7 +151,7 @@ fn pr_create(args: &[String]) -> ExitCode {
     let parsed = match parse_pr_create_args(args) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("qontinui: {e}\n{USAGE}");
+            eprintln!("qontinui-pr: {e}\n{USAGE}");
             return ExitCode::from(2);
         }
     };
@@ -160,13 +161,13 @@ fn pr_create(args: &[String]) -> ExitCode {
         Some("-") => match first_stdin_line() {
             Some(t) if !t.trim().is_empty() => t,
             _ => {
-                eprintln!("qontinui: --title - given but stdin had no title line");
+                eprintln!("qontinui-pr: --title - given but stdin had no title line");
                 return ExitCode::from(2);
             }
         },
         Some(t) if !t.trim().is_empty() => t.to_string(),
         _ => {
-            eprintln!("qontinui: --title is required (`--title -` reads it from stdin)");
+            eprintln!("qontinui-pr: --title is required (`--title -` reads it from stdin)");
             return ExitCode::from(2);
         }
     };
@@ -176,7 +177,7 @@ fn pr_create(args: &[String]) -> ExitCode {
         Some(path) => match std::fs::read_to_string(path) {
             Ok(text) => Some(text),
             Err(e) => {
-                eprintln!("qontinui: read --body-file {path}: {e}");
+                eprintln!("qontinui-pr: read --body-file {path}: {e}");
                 return ExitCode::from(2);
             }
         },
@@ -190,7 +191,7 @@ fn pr_create(args: &[String]) -> ExitCode {
         Some(r) => r,
         None => {
             eprintln!(
-                "qontinui: could not infer the repo from `git remote get-url origin` — \
+                "qontinui-pr: could not infer the repo from `git remote get-url origin` — \
                  pass --repo owner/name"
             );
             return ExitCode::from(2);
@@ -206,7 +207,7 @@ fn pr_create(args: &[String]) -> ExitCode {
         Some(h) if !h.trim().is_empty() => h.trim().to_string(),
         _ => {
             eprintln!(
-                "qontinui: could not resolve the current branch (detached HEAD?) — pass --head"
+                "qontinui-pr: could not resolve the current branch (detached HEAD?) — pass --head"
             );
             return ExitCode::from(2);
         }
@@ -214,28 +215,33 @@ fn pr_create(args: &[String]) -> ExitCode {
 
     let base = parsed.base.clone().unwrap_or_else(|| "main".to_string());
 
-    // Runner discovery (see the module comment for the chain).
+    // Session-credential discovery (see the module comment): the nonce AND the
+    // port come from the SAME `.mcp.json` entry, so the POST lands on the
+    // runner that issued the nonce.
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let session = find_session_mcp_config(&cwd);
-    let nonce = match session.as_ref().map(|s| s.nonce.clone()) {
-        Some(n) => n,
+    let session = match find_session_mcp_config(&cwd) {
+        Some(s) => s,
         None => {
             eprintln!(
-                "qontinui: no runner session credential found — no `.mcp.json` with a \
-                 coord-mcp entry between {} and the filesystem root. This session was \
-                 not provisioned by the runner (or provisioning is degraded). \
-                 Fallback: `gh pr create` works where a personal `gh auth login` exists.",
+                "qontinui-pr: no runner session credential found — no `.mcp.json` with a \
+                 loopback coord-mcp nonce entry between {} and the filesystem root. \
+                 This session was not provisioned by the runner, or provisioning is \
+                 degraded (check for a `.coord-mcp-status` breadcrumb in the session \
+                 workdir). Fallback: `gh pr create` works where a personal \
+                 `gh auth login` exists.",
                 cwd.display()
             );
             return ExitCode::from(1);
         }
     };
-    let port = match discover_port(session.and_then(|s| s.port)) {
+    let port = match resolve_port(&session, std::env::var(RUNNER_PORT_ENV).ok().as_deref()) {
         Some(p) => p,
         None => {
             eprintln!(
-                "qontinui: no reachable runner loopback API found (tried the session \
-                 .mcp.json port, ${RUNNER_PORT_ENV}, and 9876-9899) — is the runner up?"
+                "qontinui-pr: the session `.mcp.json` coord-mcp URL carries no loopback \
+                 port and ${RUNNER_PORT_ENV} is not set — cannot pair the nonce with \
+                 its issuing runner. Fallback: `gh pr create` works where a personal \
+                 `gh auth login` exists."
             );
             return ExitCode::from(1);
         }
@@ -260,20 +266,20 @@ fn pr_create(args: &[String]) -> ExitCode {
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("qontinui: build http client: {e}");
+            eprintln!("qontinui-pr: build http client: {e}");
             return ExitCode::from(1);
         }
     };
     let url = format!("http://127.0.0.1:{port}/vcs/pull-requests");
     let resp = match client
         .post(&url)
-        .header(PROXY_KEY_HEADER, &nonce)
+        .header(PROXY_KEY_HEADER, &session.nonce)
         .json(&payload)
         .send()
     {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("qontinui: POST {url}: {e}");
+            eprintln!("qontinui-pr: POST {url}: {e}");
             return ExitCode::from(1);
         }
     };
@@ -292,7 +298,7 @@ fn pr_create(args: &[String]) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         // Coord's (or the runner proxy's) error body, verbatim, to stderr.
-        eprintln!("qontinui: pr create failed ({status}): {}", text.trim());
+        eprintln!("qontinui-pr: create failed ({status}): {}", text.trim());
         ExitCode::from(1)
     }
 }
@@ -367,6 +373,9 @@ struct SessionMcpConfig {
 
 /// Walk up from `start` looking for a `.mcp.json` with a coord-mcp proxy
 /// entry. First hit wins (the session workdir is the nearest ancestor).
+/// Borrowing an ancestor's config is intentional — nested worktrees/subdirs
+/// inherit the enclosing session's credential, and the entry pairs the nonce
+/// with its issuing runner's port (see the module comment).
 fn find_session_mcp_config(start: &Path) -> Option<SessionMcpConfig> {
     let mut dir = Some(start);
     while let Some(d) = dir {
@@ -383,8 +392,9 @@ fn find_session_mcp_config(start: &Path) -> Option<SessionMcpConfig> {
 
 /// Parse a `.mcp.json` payload: find a server entry whose URL points at a
 /// loopback `/coord-mcp` proxy and read its `X-Coord-Mcp-Proxy-Key` header
-/// (case-insensitive) + the port embedded in the URL. Static-bearer (agent)
-/// configs without the nonce header yield `None`.
+/// (case-insensitive) + the port embedded in the URL. Entries without the
+/// nonce header (e.g. a static-bearer config) are SKIPPED per-entry — a
+/// non-nonce `/coord-mcp` entry must not mask a later valid one.
 fn parse_mcp_json(text: &str) -> Option<SessionMcpConfig> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
     let servers = v.get("mcpServers")?.as_object()?;
@@ -393,15 +403,17 @@ fn parse_mcp_json(text: &str) -> Option<SessionMcpConfig> {
         if !url.contains("/coord-mcp") {
             continue;
         }
-        let nonce = server
+        let nonce = match server
             .get("headers")
             .and_then(|h| h.as_object())
             .and_then(|h| {
                 h.iter()
                     .find(|(k, _)| k.eq_ignore_ascii_case(PROXY_KEY_HEADER))
                     .and_then(|(_, val)| val.as_str())
-            })
-            .map(String::from)?;
+            }) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
         return Some(SessionMcpConfig {
             nonce,
             port: port_from_url(url),
@@ -419,43 +431,15 @@ fn port_from_url(url: &str) -> Option<u16> {
     host_port.rsplit_once(':')?.1.parse().ok()
 }
 
-/// Quick loopback liveness probe: `GET /health` with a short timeout (safe —
-/// only the final PR POST is a write, and it fires once).
-fn health_ok(client: &reqwest::blocking::Client, port: u16) -> bool {
-    client
-        .get(format!("http://127.0.0.1:{port}/health"))
-        .send()
-        .map(|r| r.status().is_success())
-        .unwrap_or(false)
-}
-
-/// Resolve the runner port per the module-comment discovery chain, verifying
-/// each candidate with `GET /health` before committing the POST to it.
-fn discover_port(mcp_port: Option<u16>) -> Option<u16> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(1))
-        .build()
-        .ok()?;
-    let env_port: Option<u16> = std::env::var(RUNNER_PORT_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse().ok());
-    let mut candidates: Vec<u16> = Vec::new();
-    let mut push = |p: u16| {
-        if !candidates.contains(&p) {
-            candidates.push(p);
-        }
-    };
-    if let Some(p) = mcp_port {
-        push(p);
+/// Resolve the runner port: the explicit `QONTINUI_RUNNER_API_PORT` override
+/// when set (operator escape hatch), else the port from the SAME `.mcp.json`
+/// entry that carried the nonce. NO probing/scan fallback — a scanned port can
+/// belong to a different runner than the nonce's issuer, which then 401s it.
+fn resolve_port(session: &SessionMcpConfig, env_override: Option<&str>) -> Option<u16> {
+    if let Some(p) = env_override.and_then(|v| v.trim().parse::<u16>().ok()) {
+        return Some(p);
     }
-    if let Some(p) = env_port {
-        push(p);
-    }
-    push(PRIMARY_PORT);
-    for p in SECONDARY_PORT_RANGE {
-        push(p);
-    }
-    candidates.into_iter().find(|&p| health_ok(&client, p))
+    session.port
 }
 
 #[cfg(test)]
@@ -495,6 +479,50 @@ mod tests {
         assert!(parse_pr_create_args(&bad).is_err());
         let dangling: Vec<String> = vec!["--title".to_string()];
         assert!(parse_pr_create_args(&dangling).is_err());
+    }
+
+    #[test]
+    fn parse_args_rejects_flag_like_value() {
+        // `--title --draft` must NOT yield a PR titled "--draft".
+        let args: Vec<String> = ["--title", "--draft"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let err = parse_pr_create_args(&args).unwrap_err();
+        assert!(err.contains("--title"), "{err}");
+        assert!(
+            err.contains("--flag=value")
+                || err.contains("--title=<value>")
+                || err.contains("--title="),
+            "{err}"
+        );
+        // A single-dash value is fine (`--title -` is the stdin sentinel).
+        let ok: Vec<String> = ["--title", "-"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            parse_pr_create_args(&ok).unwrap().title.as_deref(),
+            Some("-")
+        );
+    }
+
+    #[test]
+    fn parse_args_supports_flag_equals_value_form() {
+        // Values that legitimately begin with `--` use the `=` form.
+        let args: Vec<String> = ["--title=--weird title", "--base=main", "--draft"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let parsed = parse_pr_create_args(&args).unwrap();
+        assert_eq!(parsed.title.as_deref(), Some("--weird title"));
+        assert_eq!(parsed.base.as_deref(), Some("main"));
+        assert!(parsed.draft);
+        // Value containing `=` splits only on the FIRST `=`.
+        let args: Vec<String> = vec!["--body=a=b=c".to_string()];
+        assert_eq!(
+            parse_pr_create_args(&args).unwrap().body.as_deref(),
+            Some("a=b=c")
+        );
+        // --draft takes no value.
+        assert!(parse_pr_create_args(&["--draft=true".to_string()]).is_err());
     }
 
     #[test]
@@ -561,10 +589,53 @@ mod tests {
     }
 
     #[test]
+    fn parse_mcp_json_skips_non_nonce_entry_without_masking_later_valid_one() {
+        // A `/coord-mcp` entry WITHOUT the nonce header must be skipped
+        // per-entry (continue), so a later valid entry is still found —
+        // previously a `?` aborted the whole parse.
+        let text = r#"{
+            "mcpServers": {
+                "coord-mcp-static": {
+                    "url": "http://127.0.0.1:9876/coord-mcp",
+                    "headers": { "Authorization": "Bearer xyz" }
+                },
+                "coord-mcp": {
+                    "url": "http://127.0.0.1:9877/coord-mcp",
+                    "headers": { "X-Coord-Mcp-Proxy-Key": "later-valid" }
+                }
+            }
+        }"#;
+        let cfg = parse_mcp_json(text).unwrap();
+        assert_eq!(cfg.nonce, "later-valid");
+        assert_eq!(cfg.port, Some(9877));
+    }
+
+    #[test]
     fn port_from_url_parses_loopback_urls() {
         assert_eq!(port_from_url("http://127.0.0.1:9877/coord-mcp"), Some(9877));
         assert_eq!(port_from_url("http://localhost:9876/x"), Some(9876));
         assert_eq!(port_from_url("https://coord.qontinui.io/mcp"), None);
+    }
+
+    #[test]
+    fn resolve_port_pairs_config_port_with_nonce_env_is_explicit_override() {
+        let session = SessionMcpConfig {
+            nonce: "n".to_string(),
+            port: Some(9878),
+        };
+        // Default: the port from the SAME .mcp.json as the nonce.
+        assert_eq!(resolve_port(&session, None), Some(9878));
+        // Explicit env override wins.
+        assert_eq!(resolve_port(&session, Some("9899")), Some(9899));
+        // Garbled env is ignored — falls back to the config port.
+        assert_eq!(resolve_port(&session, Some("not-a-port")), Some(9878));
+        // No port anywhere → None (caller errors out; NO scanning fallback).
+        let portless = SessionMcpConfig {
+            nonce: "n".to_string(),
+            port: None,
+        };
+        assert_eq!(resolve_port(&portless, None), None);
+        assert_eq!(resolve_port(&portless, Some("9880")), Some(9880));
     }
 
     #[test]
