@@ -148,6 +148,41 @@ impl PgDb {
             id, input.fix_type
         );
 
+        // Tenant-memory mirror (plan 2026-07-10-tenant-agentic-memory,
+        // Phase 2): a freshly learned reflection fix is a tenant-level fact.
+        // Single choke point — covers every save_reflection_fix caller
+        // (claude_session runner, MCP reflection API). The dedup early-return
+        // above means an already-known fix never re-emits. Consent-gated +
+        // redacted inside the emitter; best-effort.
+        {
+            let mut content = input.fix_description.clone();
+            if let Some(reasoning) = input.reasoning.as_deref() {
+                if !reasoning.trim().is_empty() {
+                    content.push_str("\n\nReasoning: ");
+                    content.push_str(reasoning);
+                }
+            }
+            let importance = match input.confidence.as_str() {
+                "high" => 0.8,
+                "low" => 0.4,
+                _ => 0.6,
+            };
+            crate::memory::tenant_sync::enqueue_memory_record(
+                crate::memory::tenant_sync::TenantMemoryRecord::new(
+                    format!("Reflection fix: {}", input.fix_type),
+                    content,
+                    crate::memory::tenant_sync::MemoryRecordKind::Fact,
+                )
+                .with_importance(importance)
+                .with_source(serde_json::json!({
+                    "task_run_id": input.source_task_run_id,
+                    "fix_id": id,
+                    "fix_type": input.fix_type,
+                    "file_changed": input.file_changed,
+                })),
+            );
+        }
+
         self.get_reflection_fix(&id)
             .await?
             .ok_or_else(|| "Fix not found after PG insert".to_string())

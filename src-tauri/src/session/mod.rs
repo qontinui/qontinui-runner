@@ -214,6 +214,14 @@ pub enum SessionEventKind {
     /// is the binding contract the web UI is built against.
     #[serde(rename = "restore-record")]
     RestoreRecord,
+    /// Tenant agentic-memory record (plan
+    /// `2026-07-10-tenant-agentic-memory-web-backend`, Phase 2). Written by
+    /// [`crate::memory::tenant_sync`] into its own dedicated
+    /// `memory-outbox.jsonl` (NOT the session outbox — the coord drain never
+    /// sees it); the tenant-memory drain batches these to the web backend's
+    /// `POST /api/v1/memory/records`. Payload is the wire record
+    /// `{title, content, kind, importance, source}`.
+    MemoryRecord,
 }
 
 impl SessionEventKind {
@@ -230,6 +238,7 @@ impl SessionEventKind {
             SessionEventKind::Progress => "progress",
             SessionEventKind::HelperTaskCreated => "helper_task_created",
             SessionEventKind::RestoreRecord => "restore-record",
+            SessionEventKind::MemoryRecord => "memory_record",
         }
     }
 }
@@ -1288,6 +1297,7 @@ mod tests {
             SessionEventKind::CommitReport,
             SessionEventKind::HelperTaskCreated,
             SessionEventKind::RestoreRecord,
+            SessionEventKind::MemoryRecord,
         ];
         for k in kinds {
             let json = serde_json::to_string(&k).unwrap();

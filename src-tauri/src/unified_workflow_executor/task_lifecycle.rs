@@ -919,6 +919,24 @@ async fn auto_capture_observations(pg: &crate::database::pg::PgDb, execution_id:
         workflow_name.to_lowercase().replace(' ', "-")
     );
 
+    // Tenant-memory mirror (plan 2026-07-10-tenant-agentic-memory, Phase 2):
+    // task-run outcomes are episodes the whole tenant can learn from.
+    // Consent-gated (cloud_sync_enabled) + redacted inside the emitter;
+    // best-effort — never affects the local capture below.
+    crate::memory::tenant_sync::enqueue_memory_record(
+        crate::memory::tenant_sync::TenantMemoryRecord::new(
+            title.clone(),
+            content.clone(),
+            crate::memory::tenant_sync::MemoryRecordKind::Episode,
+        )
+        .with_importance(if status == "completed" { 0.5 } else { 0.7 })
+        .with_source(serde_json::json!({
+            "task_run_id": execution_id,
+            "workflow": workflow_name,
+            "status": status,
+        })),
+    );
+
     let input = crate::database::types::CreateObservationInput {
         title,
         content,

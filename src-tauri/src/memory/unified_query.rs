@@ -51,6 +51,11 @@ pub enum MemorySource {
     GraphNode,
     Workflow,
     UiElement,
+    /// Tenant-shared agentic memory served by the web backend's
+    /// `POST /api/v1/memory/query` (plan
+    /// `2026-07-10-tenant-agentic-memory-web-backend`, Phase 2). Consent- and
+    /// failure-gated: any failure degrades silently to local-only.
+    TenantMemory,
 }
 
 impl MemorySource {
@@ -68,6 +73,7 @@ impl MemorySource {
                 "graph_node" | "graph" => Some(Self::GraphNode),
                 "workflow" => Some(Self::Workflow),
                 "ui_element" => Some(Self::UiElement),
+                "tenant_memory" | "tenant" => Some(Self::TenantMemory),
                 _ => None,
             })
             .collect()
@@ -559,6 +565,147 @@ fn retrieve_graph(graph: &KnowledgeGraph, query: &str, limit: usize) -> Vec<Memo
         .collect()
 }
 
+/// Tenant-shared agentic memory via the web backend's hybrid-RRF endpoint
+/// (`POST /api/v1/memory/query`).
+///
+/// Degrades silently to an empty result set on ANY failure — consent gate
+/// off, no web base configured, unpaired (no device JWT), timeout, non-2xx,
+/// or an unparseable body. The unified query must never fail (or slow past
+/// [`TENANT_QUERY_TIMEOUT`]) because the tenant arm is unavailable.
+async fn retrieve_tenant_memory(query: &str, limit: usize) -> Vec<MemoryResult> {
+    // Consent gate: with cloud sync off, the query text must not egress.
+    if !crate::settings::get_cloud_sync_enabled() {
+        return Vec::new();
+    }
+    let Some(base) = crate::memory::tenant_sync::resolve_web_base() else {
+        tracing::debug!("Unified memory: tenant arm skipped (no web base configured)");
+        return Vec::new();
+    };
+    let Some(bearer) = crate::auth::device_bearer() else {
+        tracing::debug!("Unified memory: tenant arm skipped (no device JWT — unpaired)");
+        return Vec::new();
+    };
+    let client = tenant_query_client();
+    retrieve_tenant_memory_at(client, &base, &bearer, query, limit).await
+}
+
+/// Hard latency ceiling for the tenant-memory arm — the fan-out must not
+/// stall the local query on a slow network.
+const TENANT_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Shared client for the tenant arm (connection-pooled, 2s timeout).
+fn tenant_query_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(TENANT_QUERY_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
+/// Endpoint-parameterized core of [`retrieve_tenant_memory`] so tests can
+/// point it at a fake server without env/profile mutation.
+pub(crate) async fn retrieve_tenant_memory_at(
+    client: &reqwest::Client,
+    base: &str,
+    bearer: &str,
+    query: &str,
+    limit: usize,
+) -> Vec<MemoryResult> {
+    let url = format!("{}/api/v1/memory/query", base.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "query_text": query,
+        "limit": limit.clamp(1, 50),
+    });
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {bearer}"))
+        .json(&body)
+        .timeout(TENANT_QUERY_TIMEOUT)
+        .send()
+        .await;
+    let resp = match resp {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            tracing::debug!(
+                status = %r.status(),
+                "Unified memory: tenant query non-2xx — degrading to local-only"
+            );
+            return Vec::new();
+        }
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "Unified memory: tenant query failed — degrading to local-only"
+            );
+            return Vec::new();
+        }
+    };
+    let body: serde_json::Value = match resp.json().await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "Unified memory: tenant query body unparseable — degrading to local-only"
+            );
+            return Vec::new();
+        }
+    };
+    let hits = match body.get("hits").and_then(|h| h.as_array()) {
+        Some(h) => h,
+        None => return Vec::new(),
+    };
+
+    // Normalize the server's fused rrf_score into 0.0–1.0 like the other
+    // per-source retrievers, so RRF re-fusion treats the arm uniformly.
+    let max_rrf = hits
+        .iter()
+        .filter_map(|h| h.get("rrf_score").and_then(|v| v.as_f64()))
+        .fold(f64::NEG_INFINITY, f64::max)
+        .max(f64::MIN_POSITIVE);
+
+    hits.iter()
+        .filter_map(|h| {
+            let id = h.get("memory_id")?.as_str()?.to_string();
+            let title = h.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            let content = h.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let rrf = h.get("rrf_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            // Preserve the server-side RRF provenance: which per-store ranks
+            // (vector / FTS) produced the hit maps onto found_by.
+            let mut found_by = Vec::new();
+            if h.get("vector_rank").is_some_and(|v| !v.is_null()) {
+                found_by.push(RetrievalStrategy::EmbeddingSimilarity);
+            }
+            if h.get("fts_rank").is_some_and(|v| !v.is_null()) {
+                found_by.push(RetrievalStrategy::FullTextSearch);
+            }
+            if found_by.is_empty() {
+                found_by.push(RetrievalStrategy::FullTextSearch);
+            }
+            Some(MemoryResult {
+                id,
+                source: MemorySource::TenantMemory,
+                title: title.to_string(),
+                snippet: truncate_str(content, 500),
+                source_score: rrf / max_rrf,
+                fused_score: 0.0,
+                timestamp: h
+                    .get("created_at")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&Utc)),
+                memory_type: h
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("tenant_memory")
+                    .to_string(),
+                found_by,
+            })
+        })
+        .collect()
+}
+
 // =============================================================================
 // Reciprocal Rank Fusion
 // =============================================================================
@@ -662,9 +809,17 @@ pub async fn query_memory(
     let want_embeddings = source_enabled(&params.sources, MemorySource::TaskKnowledge)
         || source_enabled(&params.sources, MemorySource::Error);
     let want_graph = source_enabled(&params.sources, MemorySource::GraphNode) && graph.is_some();
+    let want_tenant = source_enabled(&params.sources, MemorySource::TenantMemory);
 
     // Fan out parallel retrievals using tokio::join!
-    let (obs_results, timeline_results, knowledge_results, unified_results, embedding_results) = tokio::join!(
+    let (
+        obs_results,
+        timeline_results,
+        knowledge_results,
+        unified_results,
+        embedding_results,
+        tenant_results,
+    ) = tokio::join!(
         async {
             if want_observations {
                 retrieve_observations(pg, query, pg_limit).await
@@ -696,6 +851,13 @@ pub async fn query_memory(
         async {
             if want_embeddings {
                 retrieve_embeddings(pg, query, limit).await
+            } else {
+                Vec::new()
+            }
+        },
+        async {
+            if want_tenant {
+                retrieve_tenant_memory(query, limit).await
             } else {
                 Vec::new()
             }
@@ -732,6 +894,9 @@ pub async fn query_memory(
     }
     if !graph_results.is_empty() {
         result_sets.push(graph_results);
+    }
+    if !tenant_results.is_empty() {
+        result_sets.push(tenant_results);
     }
 
     // Fuse with RRF (k=60 standard smoothing constant)
@@ -953,6 +1118,9 @@ fn build_node_key(source: &MemorySource, id: &str, memory_type: &str) -> String 
         MemorySource::UiElement => "ui_element",
         MemorySource::ActivityTimeline => "timeline",
         MemorySource::TaskKnowledge => memory_type, // e.g. "pattern", "knowledge"
+        // Tenant-shared memories have no local graph nodes; the key never
+        // resolves, which the graph lookups treat as "no neighborhood".
+        MemorySource::TenantMemory => "tenant_memory",
     };
     format!("{}:{}", kind, id)
 }
@@ -1353,6 +1521,12 @@ mod tests {
     }
 
     #[test]
+    fn test_source_parse_list_tenant_memory() {
+        let sources = MemorySource::parse_list("tenant_memory,tenant");
+        assert_eq!(sources, vec![MemorySource::TenantMemory; 2]);
+    }
+
+    #[test]
     fn test_source_filter_restricts() {
         // Replicate the source_enabled helper from query_memory
         fn source_enabled(sources: &Option<Vec<MemorySource>>, s: MemorySource) -> bool {
@@ -1384,6 +1558,140 @@ mod tests {
         assert!(
             !source_enabled(&filter, MemorySource::Error),
             "unlisted source should be disabled"
+        );
+    }
+}
+
+/// Tests for the TenantMemory retrieval arm (plan
+/// `2026-07-10-tenant-agentic-memory-web-backend`, Phase 2). Hermetic: a
+/// local axum server plays the web memory API; no env/profile mutation.
+#[cfg(test)]
+mod tenant_memory_arm_tests {
+    use super::*;
+    use axum::{
+        http::StatusCode as AxumStatus, response::IntoResponse, routing::post, Json, Router,
+    };
+    use serde_json::json;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+
+    async fn spawn_server(app: Router) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{}", addr)
+    }
+
+    fn client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn maps_hits_into_memory_results_with_provenance() {
+        let app = Router::new().route(
+            "/api/v1/memory/query",
+            post(|| async {
+                (
+                    AxumStatus::OK,
+                    Json(json!({"hits": [
+                        {
+                            "memory_id": "11111111-1111-4111-8111-111111111111",
+                            "title": "Login retries",
+                            "content": "Retry auth after token refresh",
+                            "kind": "fact",
+                            "scope": "tenant",
+                            "importance": 0.8,
+                            "created_at": "2026-07-01T00:00:00Z",
+                            "source": {"repo": "qontinui-runner"},
+                            "rrf_score": 0.032,
+                            "vector_rank": 1,
+                            "fts_rank": 2
+                        },
+                        {
+                            "memory_id": "22222222-2222-4222-8222-222222222222",
+                            "title": "Episode",
+                            "content": "Task X succeeded",
+                            "kind": "episode",
+                            "scope": "tenant",
+                            "importance": 0.5,
+                            "created_at": "2026-07-02T00:00:00Z",
+                            "source": {},
+                            "rrf_score": 0.016,
+                            "vector_rank": null,
+                            "fts_rank": 1
+                        }
+                    ]})),
+                )
+                    .into_response()
+            }),
+        );
+        let base = spawn_server(app).await;
+        let results = retrieve_tenant_memory_at(&client(), &base, "test.jwt", "login", 8).await;
+
+        assert_eq!(results.len(), 2);
+        let top = &results[0];
+        assert_eq!(top.source, MemorySource::TenantMemory);
+        assert_eq!(top.title, "Login retries");
+        assert_eq!(top.memory_type, "fact");
+        assert!((top.source_score - 1.0).abs() < 1e-9, "top hit normalized");
+        assert!(top
+            .found_by
+            .contains(&RetrievalStrategy::EmbeddingSimilarity));
+        assert!(top.found_by.contains(&RetrievalStrategy::FullTextSearch));
+        assert!(top.timestamp.is_some());
+        // Second hit: fts-only provenance.
+        assert_eq!(results[1].found_by, vec![RetrievalStrategy::FullTextSearch]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn degrades_to_empty_on_timeout() {
+        // Server sleeps past the 2s arm timeout — the arm must return empty
+        // instead of failing or stalling the fan-out.
+        let app = Router::new().route(
+            "/api/v1/memory/query",
+            post(|| async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                (AxumStatus::OK, Json(json!({"hits": []}))).into_response()
+            }),
+        );
+        let base = spawn_server(app).await;
+        let started = std::time::Instant::now();
+        let results = retrieve_tenant_memory_at(&client(), &base, "test.jwt", "q", 8).await;
+        assert!(results.is_empty(), "timeout must degrade to local-only");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "arm must respect its 2s ceiling"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn degrades_to_empty_on_non_2xx_and_unreachable() {
+        let app = Router::new().route(
+            "/api/v1/memory/query",
+            post(|| async {
+                (
+                    AxumStatus::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "boom"})),
+                )
+                    .into_response()
+            }),
+        );
+        let base = spawn_server(app).await;
+        assert!(
+            retrieve_tenant_memory_at(&client(), &base, "test.jwt", "q", 8)
+                .await
+                .is_empty()
+        );
+        // Connection refused (nothing listens on port 1).
+        assert!(
+            retrieve_tenant_memory_at(&client(), "http://127.0.0.1:1", "test.jwt", "q", 8)
+                .await
+                .is_empty()
         );
     }
 }

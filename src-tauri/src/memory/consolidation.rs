@@ -645,6 +645,24 @@ async fn run_consolidation_inner(
             Ok(_id) => {
                 stats.models_created += 1;
 
+                // Tenant-memory mirror (plan 2026-07-10-tenant-agentic-memory,
+                // Phase 2): a consolidated mental model is distilled knowledge
+                // worth sharing tenant-wide. Consent-gated + redacted inside
+                // the emitter; best-effort.
+                crate::memory::tenant_sync::enqueue_memory_record(
+                    crate::memory::tenant_sync::TenantMemoryRecord::new(
+                        result.title.clone(),
+                        result.content.clone(),
+                        crate::memory::tenant_sync::MemoryRecordKind::MentalModel,
+                    )
+                    .with_importance(mental_model_importance)
+                    .with_source(serde_json::json!({
+                        "consolidation_group": group.group_key,
+                        "source_observations": source_ids.len(),
+                        "scope": scope,
+                    })),
+                );
+
                 // Reduce importance of superseded source observations by 50%
                 for &obs_id in &result.supersedes {
                     if source_ids.contains(&obs_id) {

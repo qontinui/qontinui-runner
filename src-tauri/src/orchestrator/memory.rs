@@ -857,6 +857,11 @@ impl MemorySystem {
     /// Uses `build_context()` as the base and appends results from the unified
     /// memory query (PG + SQLite + graph) when available. Falls back gracefully
     /// to just the base context if the unified query fails or returns no results.
+    ///
+    /// Tenant-shared memories (the `TenantMemory` RRF arm) are injected under
+    /// their own header with a hard [`TENANT_MEMORY_CONTEXT_BUDGET_BYTES`]
+    /// byte budget, so the context cost of the shared tier is constant no
+    /// matter how large the tenant store grows.
     pub async fn build_context_unified(
         &self,
         max_items: usize,
@@ -877,18 +882,31 @@ impl MemorySystem {
 
         match unified_query::query_memory(&params, pg, None).await {
             Ok(results) if !results.is_empty() => {
-                context.push_str("\n## Unified Memory\n");
-                for r in results.iter().take(10) {
-                    context.push_str(&format!(
-                        "- [{}] {} (score: {:.2})\n  {}\n",
-                        serde_json::to_string(&r.source)
-                            .unwrap_or_default()
-                            .trim_matches('"'),
-                        r.title,
-                        r.fused_score,
-                        r.snippet.chars().take(200).collect::<String>(),
-                    ));
+                // Tenant-shared results get their own budgeted section; the
+                // local stores keep the existing "Unified Memory" section.
+                let (tenant_results, local_results): (Vec<_>, Vec<_>) = results
+                    .into_iter()
+                    .partition(|r| r.source == unified_query::MemorySource::TenantMemory);
+
+                if !local_results.is_empty() {
+                    context.push_str("\n## Unified Memory\n");
+                    for r in local_results.iter().take(10) {
+                        context.push_str(&format!(
+                            "- [{}] {} (score: {:.2})\n  {}\n",
+                            serde_json::to_string(&r.source)
+                                .unwrap_or_default()
+                                .trim_matches('"'),
+                            r.title,
+                            r.fused_score,
+                            r.snippet.chars().take(200).collect::<String>(),
+                        ));
+                    }
                 }
+
+                context.push_str(&build_tenant_memory_section(
+                    &tenant_results,
+                    TENANT_MEMORY_CONTEXT_BUDGET_BYTES,
+                ));
             }
             _ => {} // Graceful fallback — unified memory is optional
         }
@@ -1024,6 +1042,48 @@ impl MemorySystem {
         }
 
         Ok(restored)
+    }
+}
+
+/// Byte budget for tenant-shared memory snippets injected into
+/// [`MemorySystem::build_context_unified`]. Hard cap (header included) so
+/// the shared tier's context cost is constant.
+pub(crate) const TENANT_MEMORY_CONTEXT_BUDGET_BYTES: usize = 2048;
+
+/// Render the tenant-memory context section: top-k tenant snippets (already
+/// RRF-ranked, best first) under a clear header, never exceeding `budget`
+/// bytes in total. Empty input — or a budget too small for even one line —
+/// yields an empty string (no bare header).
+pub(crate) fn build_tenant_memory_section(
+    results: &[crate::memory::unified_query::MemoryResult],
+    budget: usize,
+) -> String {
+    if results.is_empty() {
+        return String::new();
+    }
+    let header = "\n## Tenant Memory (shared)\n";
+    if header.len() >= budget {
+        return String::new();
+    }
+    let mut out = String::from(header);
+    let mut wrote_any = false;
+    for r in results {
+        let line = format!(
+            "- [{}] {}: {}\n",
+            r.memory_type,
+            r.title,
+            r.snippet.chars().take(200).collect::<String>(),
+        );
+        if out.len() + line.len() > budget {
+            break;
+        }
+        out.push_str(&line);
+        wrote_any = true;
+    }
+    if wrote_any {
+        out
+    } else {
+        String::new()
     }
 }
 
@@ -1167,5 +1227,59 @@ mod tests {
         assert_eq!(item.source, "test_worker");
         assert!((item.importance - 0.9).abs() < 0.01);
         assert!(item.tags.contains(&"critical".to_string()));
+    }
+
+    // -- tenant-memory context budget (plan 2026-07-10, Phase 2) -------------
+
+    fn tenant_result(i: usize) -> crate::memory::unified_query::MemoryResult {
+        crate::memory::unified_query::MemoryResult {
+            id: format!("mem-{i}"),
+            source: crate::memory::unified_query::MemorySource::TenantMemory,
+            title: format!("Tenant memory number {i} with a fairly long title"),
+            snippet: format!("Snippet {i}: {}", "x".repeat(400)),
+            source_score: 1.0,
+            fused_score: 1.0,
+            timestamp: None,
+            memory_type: "fact".to_string(),
+            found_by: vec![crate::memory::unified_query::RetrievalStrategy::FullTextSearch],
+        }
+    }
+
+    #[test]
+    fn tenant_memory_section_respects_byte_budget() {
+        // Far more content than the budget can hold: the section must cap at
+        // the budget (header included) and keep the top-ranked entries.
+        let results: Vec<_> = (0..50).map(tenant_result).collect();
+        let section = build_tenant_memory_section(&results, TENANT_MEMORY_CONTEXT_BUDGET_BYTES);
+        assert!(
+            section.len() <= TENANT_MEMORY_CONTEXT_BUDGET_BYTES,
+            "section is {} bytes; budget is {}",
+            section.len(),
+            TENANT_MEMORY_CONTEXT_BUDGET_BYTES
+        );
+        assert!(section.starts_with("\n## Tenant Memory (shared)\n"));
+        assert!(
+            section.contains("Tenant memory number 0"),
+            "top-ranked result must survive the cap"
+        );
+        assert!(
+            !section.contains("Tenant memory number 49"),
+            "tail results past the budget must be dropped"
+        );
+    }
+
+    #[test]
+    fn tenant_memory_section_empty_input_renders_nothing() {
+        assert_eq!(
+            build_tenant_memory_section(&[], TENANT_MEMORY_CONTEXT_BUDGET_BYTES),
+            ""
+        );
+    }
+
+    #[test]
+    fn tenant_memory_section_never_emits_bare_header() {
+        // Budget too small for even one line ⇒ no section at all.
+        let results = vec![tenant_result(0)];
+        assert_eq!(build_tenant_memory_section(&results, 40), "");
     }
 }
