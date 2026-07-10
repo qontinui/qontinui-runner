@@ -12,8 +12,9 @@
 //!    `merge-train-steward`, which authors into the same dir + runs the same
 //!    `/vet-imp`), OR a `pr_shepherd_remediations` marker row younger than the
 //!    cooldown, is a dedup hit → skip.
-//! 3. Spawns a child `TaskRun` running `/vet-imp <plan>` (or a bounded fix
-//!    prompt for `orphaned-red`) — but ONLY when `QONTINUI_PR_SHEPHERD_SPAWN`
+//! 3. Spawns a child `TaskRun` running `/vet-imp <plan>` (or a bounded
+//!    diagnose/shepherd prompt for `orphaned-red` — the PR there is GREEN but
+//!    unowned while coord is down) — but ONLY when `QONTINUI_PR_SHEPHERD_SPAWN`
 //!    is on. With spawn off the plan + marker are still written; no session.
 //!
 //! The runner daemon is the LAST-RESORT rung beneath coord's own Unlandable
@@ -397,6 +398,7 @@ pub async fn escalate_coord_defect(
         pg,
         deps,
         class,
+        &ctx.repo_full_name,
         ctx.pr_number,
         &plan_path,
         &format!("/vet-imp {plan_path}"),
@@ -405,9 +407,21 @@ pub async fn escalate_coord_defect(
     .await
 }
 
-/// Phase 4 dead-author fallback: `orphaned-red` — coord can't own the nudge, the
-/// authoring session is gone, and the task is terminal. Spawn a BOUNDED FIX
-/// session (not vet-imp) with an inline prompt; no coord-defect plan file.
+/// Phase 4 dead-author fallback: `orphaned-red` — the PR is GREEN but unmerged,
+/// coord (the merge authority) is unreachable/leaderless so it can't own the
+/// nudge, the authoring session is gone, and the task is terminal. Spawn a
+/// BOUNDED DIAGNOSIS/SHEPHERD session (not vet-imp) with an inline prompt; no
+/// coord-defect plan file.
+///
+/// The only call path (`pr_watcher`'s `GreenButUnmerged` →
+/// `CoordDownLocalAlert` handler) is reachable exclusively when the runner's
+/// own GitHub witness saw the PR fully green — the prompt must NOT claim
+/// failing CI or instruct a "fix" (a fix commit would reset the green streak
+/// and head for nothing).
+///
+/// Dedup is per `(class, repo, pr)` — unlike coord-defect classes (where one
+/// coord fix covers every PR), an orphaned PR is per-PR work, so a class-only
+/// key would silently drop a second orphaned PR inside the cooldown.
 pub async fn escalate_orphaned_red(
     pg: &PgDb,
     deps: Option<&PrWatcherDeps>,
@@ -418,14 +432,20 @@ pub async fn escalate_orphaned_red(
 
     let cooldown = super::pr_shepherd::remediation_cooldown();
     match pg
-        .recent_pr_shepherd_remediation(class, cooldown.as_secs() as i64)
+        .recent_pr_shepherd_remediation_for_pr(
+            class,
+            repo_full_name,
+            pr_number,
+            cooldown.as_secs() as i64,
+        )
         .await
     {
         Ok(true) => {
             tracing::info!(
                 target: "pr_shepherd",
+                repo = %repo_full_name,
                 pr_number = pr_number,
-                "pr_shepherd: recent orphaned-red remediation within cooldown — skipping"
+                "pr_shepherd: recent orphaned-red remediation for this PR within cooldown — skipping"
             );
             return RemediationOutcome::SkippedCooldown;
         }
@@ -437,33 +457,53 @@ pub async fn escalate_orphaned_red(
         }
     }
 
-    let prompt = format!(
-        "The pull request {repo}#{pr} has failing CI and its authoring session has ended \
-         with no one owning the fix. Fix the CI failures for {repo}#{pr} in a dedicated git \
-         worktree off origin/main, bounded: make the minimal change to turn CI green, push, \
-         and stop. Do NOT admin-merge. If the fix is non-obvious or would exceed a small \
-         bounded change, stop and report rather than guessing.",
-        repo = repo_full_name,
-        pr = pr_number,
-    );
+    let prompt = orphaned_green_pr_prompt(repo_full_name, pr_number);
     finalize_remediation(
         pg,
         deps,
         class,
+        repo_full_name,
         pr_number,
         "",
         &prompt,
-        &format!("PR shepherd orphaned-red fix: {repo_full_name}#{pr_number}"),
+        &format!("PR shepherd orphaned-red triage: {repo_full_name}#{pr_number}"),
     )
     .await
 }
 
+/// The bounded prompt for the orphaned GREEN-but-unmerged PR spawn. PURE —
+/// unit-tested to stay truthful to the only reachable reality (PR fully green,
+/// coord down, author gone): it must never claim failing CI, never instruct a
+/// fix/push (a "fix" commit would reset the green streak and head for
+/// nothing), and never permit an admin-merge.
+pub fn orphaned_green_pr_prompt(repo_full_name: &str, pr_number: u64) -> String {
+    format!(
+        "The pull request {repo}#{pr} is fully GREEN (all non-skipped checks passing) but has \
+         not been merged, coord — the fleet's sole merge authority — is unreachable or \
+         leaderless, and the authoring session has ended, so no one owns landing it. \
+         Diagnose why the PR is not landing and shepherd it per fleet policy, bounded: \
+         verify with `gh` that CI really is green on the current head and the PR is still \
+         open; check for blocking labels (`coord:blocked`, `coord:experimental`), unresolved \
+         review threads, and branch-protection requirements; check coord's health and recent \
+         merge activity. Do NOT push commits to the PR branch (CI is green — a 'fix' commit \
+         would only reset the green streak), do NOT `gh pr merge`, and do NOT admin-merge — \
+         coord's PR Merge Orchestrator is the sole landing authority. If the blocker is \
+         something you can resolve per policy (e.g. a stale label the operator asked to \
+         clear), resolve it; otherwise write a short report of findings (why the PR is \
+         unlanded, coord's status, the recommended operator action) and stop.",
+        repo = repo_full_name,
+        pr = pr_number,
+    )
+}
+
 /// Shared tail: insert the marker, then spawn iff `QONTINUI_PR_SHEPHERD_SPAWN`
 /// is on, recording the spawned session id on the marker.
+#[allow(clippy::too_many_arguments)]
 async fn finalize_remediation(
     pg: &PgDb,
     deps: Option<&PrWatcherDeps>,
     class: &str,
+    repo_full_name: &str,
     pr_number: u64,
     plan_path: &str,
     prompt: &str,
@@ -472,7 +512,7 @@ async fn finalize_remediation(
     // Insert the marker BEFORE spawning so a spawn failure still records that we
     // acted (the cooldown then debounces retries).
     let marker_id = match pg
-        .insert_pr_shepherd_remediation(class, pr_number, plan_path, None)
+        .insert_pr_shepherd_remediation(class, repo_full_name, pr_number, plan_path, None)
         .await
     {
         Ok(id) => id,
@@ -561,6 +601,36 @@ mod tests {
         assert!(!should_route_orphaned_red(false, false, true), "coord up → coord owns it");
         assert!(!should_route_orphaned_red(true, true, true), "author live → owns it");
         assert!(!should_route_orphaned_red(true, false, false), "task running → owns it");
+    }
+
+    #[test]
+    fn orphaned_prompt_matches_the_green_but_unmerged_reality() {
+        // The only call path is the GreenButUnmerged → CoordDown → dead-author
+        // route: the PR is GREEN. The prompt must never assert failing CI or
+        // instruct a CI fix (which would push a pointless commit and reset the
+        // streak), and must uphold the no-admin-merge fleet policy.
+        let p = orphaned_green_pr_prompt("qontinui/qontinui-runner", 708);
+        assert!(p.contains("qontinui/qontinui-runner#708"));
+        assert!(p.contains("fully GREEN"), "must state the green witness");
+        assert!(
+            p.contains("coord — the fleet's sole merge authority — is unreachable"),
+            "must state the coord-down context"
+        );
+        assert!(p.contains("authoring session has ended"), "author gone");
+        let lower = p.to_ascii_lowercase();
+        assert!(
+            !lower.contains("failing ci") && !lower.contains("has failing"),
+            "must NOT claim failing CI: the PR is green"
+        );
+        assert!(
+            !lower.contains("fix the ci"),
+            "must NOT instruct a CI fix on a green PR"
+        );
+        assert!(p.contains("do NOT admin-merge"), "no admin-merge, per policy");
+        assert!(
+            p.contains("Do NOT push commits"),
+            "no pushes — a 'fix' commit would reset the green streak"
+        );
     }
 
     #[test]

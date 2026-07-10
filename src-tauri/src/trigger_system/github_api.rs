@@ -27,6 +27,23 @@ pub fn extract_next_url(link_header: &str) -> Option<String> {
     None
 }
 
+/// Build the `GET /pulls?head=<owner>:<branch>` URL for
+/// [`GitHubClient::list_open_prs_by_head`], percent-encoding each interpolated
+/// segment. The branch is the load-bearing one: git ref names legally contain
+/// URL-reserved characters (`#` most notably), and an unencoded `#` truncates
+/// the query as a fragment — GitHub then ignores the malformed `head` filter
+/// and returns ALL open PRs, so the seeder would attribute someone else's PR
+/// to this session. Pure, unit-tested.
+fn open_prs_by_head_url(owner: &str, repo: &str, branch: &str) -> String {
+    format!(
+        "https://api.github.com/repos/{}/{}/pulls?state=open&head={}:{}&per_page=10",
+        urlencoding::encode(owner),
+        urlencoding::encode(repo),
+        urlencoding::encode(owner),
+        urlencoding::encode(branch)
+    )
+}
+
 /// A minimal GitHub API client.
 pub struct GitHubClient {
     client: reqwest::Client,
@@ -287,10 +304,7 @@ impl GitHubClient {
         repo: &str,
         branch: &str,
     ) -> Result<Vec<PrStatus>, String> {
-        let url = format!(
-            "https://api.github.com/repos/{}/{}/pulls?state=open&head={}:{}&per_page=10",
-            owner, repo, owner, branch
-        );
+        let url = open_prs_by_head_url(owner, repo, branch);
         let resp = self
             .send_with_rate_limit(self.client.get(&url).headers(self.headers()))
             .await?;
@@ -602,5 +616,39 @@ impl GitHubClient {
         } else {
             ReviewStatus::Pending
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pr_shepherd_head_lookup_url_percent_encodes_the_branch() {
+        // A plain branch passes through unchanged (except ':' which separates
+        // owner:branch and must stay literal).
+        assert_eq!(
+            open_prs_by_head_url("qontinui", "qontinui-runner", "feat/pr-shepherd"),
+            "https://api.github.com/repos/qontinui/qontinui-runner/pulls?state=open&head=qontinui:feat%2Fpr-shepherd&per_page=10"
+        );
+
+        // '#' is legal in git ref names but reserved in URLs: unencoded it
+        // truncates the query as a fragment, dropping the head filter — GitHub
+        // would return ALL open PRs and the seeder would attribute someone
+        // else's PR to this session.
+        let url = open_prs_by_head_url("qontinui", "qontinui-runner", "fix/issue#42");
+        assert!(
+            !url.contains('#'),
+            "raw '#' must never survive into the URL: {url}"
+        );
+        assert!(url.contains("head=qontinui:fix%2Fissue%2342"), "{url}");
+        assert!(
+            url.ends_with("&per_page=10"),
+            "query must not be truncated: {url}"
+        );
+
+        // Other reserved characters ('&', '?', spaces) are encoded too.
+        let url = open_prs_by_head_url("o", "r", "a&b?c d");
+        assert!(url.contains("head=o:a%26b%3Fc%20d"), "{url}");
     }
 }

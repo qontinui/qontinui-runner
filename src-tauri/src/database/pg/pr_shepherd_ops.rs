@@ -16,7 +16,9 @@ use super::PgDb;
 impl PgDb {
     /// Is there a `pr_shepherd_remediations` row for `defect_class` younger than
     /// `cooldown_secs`? Used as the Phase 5 cooldown dedup gate BEFORE writing a
-    /// plan / spawning a session.
+    /// plan / spawning a session. Class-wide by design: one coord fix covers
+    /// every PR wedged on the same coord defect. Per-PR work (`orphaned-red`)
+    /// must use [`Self::recent_pr_shepherd_remediation_for_pr`] instead.
     pub async fn recent_pr_shepherd_remediation(
         &self,
         defect_class: &str,
@@ -42,11 +44,52 @@ impl PgDb {
         Ok(row.is_some())
     }
 
+    /// PR-scoped variant of [`Self::recent_pr_shepherd_remediation`]: is there a
+    /// marker for `(defect_class, repo, pr)` younger than `cooldown_secs`? Used
+    /// by per-PR remediation classes (`orphaned-red`), where a class-only key
+    /// would let PR A's marker silently starve unrelated PR B of its
+    /// remediation for the whole cooldown.
+    pub async fn recent_pr_shepherd_remediation_for_pr(
+        &self,
+        defect_class: &str,
+        repo_full_name: &str,
+        pr: u64,
+        cooldown_secs: i64,
+    ) -> Result<bool, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let pr_i = pr as i64;
+        let row = conn
+            .query_opt(
+                "SELECT 1 FROM project.pr_shepherd_remediations \
+                 WHERE defect_class = $1 \
+                   AND repo = $2 \
+                   AND pr = $3 \
+                   AND created_at > now() - make_interval(secs => $4::double precision) \
+                 LIMIT 1",
+                &[
+                    &defect_class,
+                    &repo_full_name,
+                    &pr_i,
+                    &(cooldown_secs as f64),
+                ],
+            )
+            .await
+            .map_err(|e| format!("PG recent_pr_shepherd_remediation_for_pr: {}", e))?;
+
+        Ok(row.is_some())
+    }
+
     /// Insert a remediation marker. `spawned_session` is `None` when spawn was
     /// disabled (plan written, no session). Returns the new row id.
     pub async fn insert_pr_shepherd_remediation(
         &self,
         defect_class: &str,
+        repo_full_name: &str,
         pr: u64,
         plan_path: &str,
         spawned_session: Option<&str>,
@@ -61,9 +104,16 @@ impl PgDb {
         let pr_i = pr as i64;
         conn.execute(
             "INSERT INTO project.pr_shepherd_remediations \
-                 (id, defect_class, pr, plan_path, spawned_session) \
-             VALUES ($1, $2, $3, $4, $5)",
-            &[&id, &defect_class, &pr_i, &plan_path, &spawned_session],
+                 (id, defect_class, repo, pr, plan_path, spawned_session) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+            &[
+                &id,
+                &defect_class,
+                &repo_full_name,
+                &pr_i,
+                &plan_path,
+                &spawned_session,
+            ],
         )
         .await
         .map_err(|e| format!("PG insert_pr_shepherd_remediation: {}", e))?;

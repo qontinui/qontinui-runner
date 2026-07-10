@@ -81,6 +81,48 @@ const PHANTOM_HANG_THRESHOLD_MULT: u32 = 2;
 const DEFECT_AGE_FLOOR: Duration = Duration::from_secs(3600);
 
 // ---------------------------------------------------------------------------
+// Call errors — reachability is load-bearing for CoordDown classification.
+// ---------------------------------------------------------------------------
+
+/// Why a coord diagnosis call failed. The distinction is load-bearing: only
+/// [`CoordCallError::Unreachable`] (connect/timeout/transport) is evidence for
+/// `CoordDown`. An HTTP response — 401/403 from an expired device bearer, a
+/// 404, a 500 — proves coord IS reachable and answering; treating those as
+/// unreachability would turn the runner's own broken credentials into
+/// COORD-DOWN alerts + orphaned-red spawns while coord is perfectly healthy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoordCallError {
+    /// Transport-level failure (connect refused, DNS, timeout) — coord may
+    /// genuinely be down/unreachable.
+    Unreachable(String),
+    /// Coord answered with a non-2xx status (or a 2xx whose body failed to
+    /// decode) — coord IS reachable; the call just didn't yield data.
+    Http { status: u16, detail: String },
+}
+
+impl CoordCallError {
+    /// Is this an auth failure (401/403) — i.e. the RUNNER's credentials are
+    /// broken, not coord?
+    pub fn is_auth(&self) -> bool {
+        matches!(self, CoordCallError::Http { status: 401 | 403, .. })
+    }
+
+    /// Did coord answer at all? `true` for any HTTP response.
+    pub fn coord_reachable(&self) -> bool {
+        matches!(self, CoordCallError::Http { .. })
+    }
+}
+
+impl std::fmt::Display for CoordCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CoordCallError::Unreachable(e) => write!(f, "unreachable: {e}"),
+            CoordCallError::Http { status, detail } => write!(f, "HTTP {status}: {detail}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Wire shapes — mirror the coord structs we consume (deserialize-only).
 // ---------------------------------------------------------------------------
 
@@ -256,10 +298,6 @@ pub enum CoordDefectClass {
     /// never scheduled. Suspected coord path: `merge_scheduler.rs` enqueue /
     /// leader reconcile.
     PassButNoLand,
-    /// A live `has-blocking-label` block on an otherwise-green PR — a
-    /// (possibly stale) `coord:*` label is holding the land. Suspected coord
-    /// path: label ingest / `predicate.rs` blocking-label gate.
-    LiveBlockingLabel,
 }
 
 impl CoordDefectClass {
@@ -270,7 +308,6 @@ impl CoordDefectClass {
             CoordDefectClass::PhantomContextHang => "phantom-context-hang",
             CoordDefectClass::StaleIngest => "stale-ingest",
             CoordDefectClass::PassButNoLand => "pass-but-no-land",
-            CoordDefectClass::LiveBlockingLabel => "live-blocking-label",
         }
     }
 
@@ -287,7 +324,6 @@ impl CoordDefectClass {
             }
             CoordDefectClass::StaleIngest => "stuck_pr_reconciler.rs hydration",
             CoordDefectClass::PassButNoLand => "merge_scheduler.rs enqueue / leader reconcile",
-            CoordDefectClass::LiveBlockingLabel => "predicate.rs blocking-label gate / label ingest",
         }
     }
 }
@@ -400,18 +436,18 @@ pub fn classify(input: &ClassificationInput) -> ShepherdDisposition {
 
     // 2. Coord-defect classes — a green PR coord is wedged on. Keyed on coord's
     //    own block_reason taxonomy + evidence thresholds.
-    match input.block_reason.as_deref() {
-        Some("has-blocking-label") => {
-            return ShepherdDisposition::CoordDefect {
-                class: CoordDefectClass::LiveBlockingLabel,
-            };
-        }
-        Some("merge-state-unsettled") if input.merge_state_unsettled_exceeded => {
-            return ShepherdDisposition::CoordDefect {
-                class: CoordDefectClass::PhantomContextHang,
-            };
-        }
-        _ => {}
+    //
+    //    NOTE: `has-blocking-label` is deliberately NOT a defect class. Per the
+    //    fleet convention (CLAUDE.md: "To hold a PR, set coord:blocked"), a
+    //    blocking label on a green PR is the OPERATOR's intended hold
+    //    mechanism — coord's label gate is functioning correctly. It maps to
+    //    LegitimateHold (author-action nudge) below.
+    if matches!(input.block_reason.as_deref(), Some("merge-state-unsettled"))
+        && input.merge_state_unsettled_exceeded
+    {
+        return ShepherdDisposition::CoordDefect {
+            class: CoordDefectClass::PhantomContextHang,
+        };
     }
 
     // Unlandable-cycle spin: a cycle of green PRs churning past the threshold.
@@ -460,11 +496,15 @@ fn is_pass_state(outer_state: &Option<String>, block_reason: &Option<String>) ->
 
 /// A block reason / outer state that represents a LEGITIMATE hold pending
 /// author or operator action (coord is behaving correctly). Keyed on coord's
-/// `BlockReason::code` wire strings.
+/// `BlockReason::code` wire strings. `has-blocking-label` belongs here — a
+/// `coord:blocked` label is the operator's intended hold (fleet convention),
+/// so the right response is the author-action nudge, never a coord-defect
+/// escalation.
 fn is_legitimate_hold(outer_state: &Option<String>, block_reason: &Option<String>) -> bool {
     if matches!(
         block_reason.as_deref(),
-        Some("escalate-path-matched")
+        Some("has-blocking-label")
+            | Some("escalate-path-matched")
             | Some("self-triggering-ci-gate")
             | Some("ci-not-green")
             | Some("main-red")
@@ -511,7 +551,14 @@ pub fn decide_action(disposition: ShepherdDisposition) -> ShepherdIntent {
 pub struct Evidence<'a> {
     /// The runner's own GitHub-green witness (true in the shepherd path).
     pub github_green: bool,
-    /// `Some` iff the verdict call succeeded (→ coord reachable).
+    /// Coord answered the verdict call with SOME HTTP response — including a
+    /// 401/403 from the runner's own expired bearer, a 404, or a 5xx. Only a
+    /// transport-level failure ([`CoordCallError::Unreachable`]) sets this
+    /// `false`. This is deliberately DECOUPLED from `verdict.is_some()`: an
+    /// auth failure yields `verdict: None` but `coord_reachable: true`, which
+    /// classifies as `Transient` rather than fabricating `CoordDown`.
+    pub coord_reachable: bool,
+    /// `Some` iff the verdict call succeeded with a decodable 2xx body.
     pub verdict: Option<&'a PrMergeVerdict>,
     /// `Some(true/false)` iff the `/pr-merge/health` call succeeded (the leader
     /// lease's `lease_fresh`); `None` → the health call itself failed.
@@ -536,7 +583,7 @@ pub struct Evidence<'a> {
 /// Distill [`Evidence`] into a [`ClassificationInput`]. PURE (no IO) so it is
 /// unit-testable from recorded verdict/events/graph payloads.
 pub fn build_classification_input(ev: &Evidence) -> ClassificationInput {
-    let coord_reachable = ev.verdict.is_some();
+    let coord_reachable = ev.coord_reachable;
     // Unknown health (call failed) defaults to healthy: only an EXPLICIT
     // leaderless report — or an unreachable verdict (above) — should trip
     // CoordDown, so a health blip can't mask the verdict's defect signal.
@@ -629,33 +676,40 @@ impl CoordPrMergeClient {
         }
     }
 
-    /// GET + deserialize JSON, mapping any transport/status/parse failure to a
-    /// short `Err(String)`. Non-2xx is an error (the caller treats it as
-    /// unreachable/defective).
-    async fn get_json<T: for<'de> Deserialize<'de>>(&self, url: &str) -> Result<T, String> {
+    /// GET + deserialize JSON, mapping failures onto [`CoordCallError`]:
+    /// transport failure → `Unreachable` (a CoordDown signal); any HTTP
+    /// response (non-2xx, or a 2xx that fails to decode) → `Http` (coord IS
+    /// reachable — never a CoordDown signal).
+    async fn get_json<T: for<'de> Deserialize<'de>>(&self, url: &str) -> Result<T, CoordCallError> {
         let resp = self
             .auth(self.client.get(url))
             .send()
             .await
-            .map_err(|e| format!("GET {url}: {e}"))?;
+            .map_err(|e| CoordCallError::Unreachable(format!("GET {url}: {e}")))?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(format!("GET {url}: HTTP {status}"));
+            return Err(CoordCallError::Http {
+                status: status.as_u16(),
+                detail: format!("GET {url}"),
+            });
         }
-        resp.json::<T>()
-            .await
-            .map_err(|e| format!("GET {url}: decode: {e}"))
+        resp.json::<T>().await.map_err(|e| CoordCallError::Http {
+            status: status.as_u16(),
+            detail: format!("GET {url}: decode: {e}"),
+        })
     }
 
     /// **Primary read.** `GET /pr-merge/verdict/:owner/:name/:pr` →
     /// `compute_pr_merge_verdict`. The daemon's one-call "what is the train
-    /// doing with this PR and what should I do".
+    /// doing with this PR and what should I do". Returns the typed
+    /// [`CoordCallError`] so the caller can tell an auth/HTTP failure (coord
+    /// reachable) from genuine unreachability — the CoordDown discriminator.
     pub async fn verdict(
         &self,
         owner: &str,
         repo: &str,
         pr: u64,
-    ) -> Result<PrMergeVerdict, String> {
+    ) -> Result<PrMergeVerdict, CoordCallError> {
         let url = format!("{}/pr-merge/verdict/{owner}/{repo}/{pr}", self.base);
         self.get_json(&url).await
     }
@@ -669,7 +723,7 @@ impl CoordPrMergeClient {
         pr: u64,
     ) -> Result<BlockDiagnosis, String> {
         let url = format!("{}/pr-merge/events/{owner}/{repo}/{pr}", self.base);
-        let wire: EventsResponseWire = self.get_json(&url).await?;
+        let wire: EventsResponseWire = self.get_json(&url).await.map_err(|e| e.to_string())?;
         Ok(block_from_events(&wire.events))
     }
 
@@ -697,7 +751,7 @@ impl CoordPrMergeClient {
     /// `GET /merge/queue` → is a proposal enqueued whose head matches `head`?
     pub async fn queue_has(&self, head_sha: &str) -> Result<bool, String> {
         let url = format!("{}/merge/queue", self.base);
-        let wire: QueueResponseWire = self.get_json(&url).await?;
+        let wire: QueueResponseWire = self.get_json(&url).await.map_err(|e| e.to_string())?;
         Ok(queue_has_head(&wire, head_sha))
     }
 
@@ -705,7 +759,7 @@ impl CoordPrMergeClient {
     /// lease is leaderless (a `CoordDown` signal).
     pub async fn health_leader(&self) -> Result<bool, String> {
         let url = format!("{}/pr-merge/health", self.base);
-        let wire: HealthResponseWire = self.get_json(&url).await?;
+        let wire: HealthResponseWire = self.get_json(&url).await.map_err(|e| e.to_string())?;
         Ok(wire
             .leader
             .and_then(|l| l.lease_fresh)
@@ -730,7 +784,7 @@ impl CoordPrMergeClient {
         within: Duration,
     ) -> Result<bool, String> {
         let url = format!("{}/pr-merge/events/{owner}/{repo}/{pr}", self.base);
-        let wire: EventsResponseWire = self.get_json(&url).await?;
+        let wire: EventsResponseWire = self.get_json(&url).await.map_err(|e| e.to_string())?;
         Ok(coord_attempt_live(&wire.events, head_sha, within, Utc::now()))
     }
 
@@ -879,13 +933,23 @@ fn queue_has_head(wire: &QueueResponseWire, head_sha: &str) -> bool {
 static REEVALUATE_ONCE: Lazy<Mutex<HashSet<(u64, String)>>> =
     Lazy::new(|| Mutex::new(HashSet::new()));
 
-/// Claim the single reevaluate nudge for `(pr, head)`. Returns `true` exactly
-/// once per `(pr, head)` (the first caller), `false` thereafter — so the call
-/// site tries the nudge once and escalates on the next poll if the defect
-/// persists on the same head.
-pub fn claim_reevaluate_once(pr: u64, head_sha: &str) -> bool {
+/// Has the single reevaluate nudge for `(pr, head)` already been SENT
+/// (successfully)? Non-consuming peek — pair with [`mark_reevaluate_sent`].
+///
+/// The claim is recorded only AFTER a confirmed-successful POST (claim-after-
+/// success): a transient reevaluate failure must leave the guard unclaimed so
+/// the nudge — the documented cheap first rung — retries on the next poll
+/// instead of being permanently burnt and falling through to Escalate.
+pub fn reevaluate_already_sent(pr: u64, head_sha: &str) -> bool {
+    let g = REEVALUATE_ONCE.lock().unwrap_or_else(|e| e.into_inner());
+    g.contains(&(pr, head_sha.to_string()))
+}
+
+/// Record that the reevaluate nudge for `(pr, head)` was successfully sent.
+/// Call ONLY after the POST returned 2xx (see [`reevaluate_already_sent`]).
+pub fn mark_reevaluate_sent(pr: u64, head_sha: &str) {
     let mut g = REEVALUATE_ONCE.lock().unwrap_or_else(|e| e.into_inner());
-    g.insert((pr, head_sha.to_string()))
+    g.insert((pr, head_sha.to_string()));
 }
 
 /// Test-only: clear the once-guard so tests don't bleed into each other.
@@ -946,7 +1010,7 @@ mod tests {
             block_reason: Some("has-blocking-label".to_string()),
             ..Default::default()
         };
-        // Leaderless dominates the has-blocking-label defect: a leaderless coord
+        // Leaderless dominates the has-blocking-label hold: a leaderless coord
         // can misreport the block, so CoordDown wins.
         assert_eq!(classify(&input), ShepherdDisposition::CoordDown);
     }
@@ -965,15 +1029,20 @@ mod tests {
     }
 
     #[test]
-    fn live_blocking_label_is_defect() {
+    fn has_blocking_label_is_legitimate_hold_not_defect() {
+        // A coord:blocked label is the OPERATOR's intended hold mechanism
+        // (fleet convention: "To hold a PR, set coord:blocked"); coord's label
+        // gate is functioning correctly. The right response is the
+        // author-action nudge — never a coord-defect remediation plan/spawn.
         let input = ClassificationInput {
             block_reason: Some("has-blocking-label".to_string()),
             ..green_defect_base()
         };
+        assert_eq!(classify(&input), ShepherdDisposition::LegitimateHold);
         assert_eq!(
-            classify(&input),
-            ShepherdDisposition::CoordDefect {
-                class: CoordDefectClass::LiveBlockingLabel
+            decide_action(classify(&input)),
+            ShepherdIntent::NotifyAuthor {
+                reason: "pr_hold_triage".to_string()
             }
         );
     }
@@ -1087,6 +1156,7 @@ mod tests {
     #[test]
     fn legitimate_holds_map_to_hold() {
         for reason in [
+            "has-blocking-label",
             "escalate-path-matched",
             "self-triggering-ci-gate",
             "ci-not-green",
@@ -1346,6 +1416,7 @@ mod tests {
         };
         let ev = Evidence {
             github_green: true,
+            coord_reachable: true,
             verdict: Some(&verdict),
             leader_fresh: Some(true),
             block: Some(&block),
@@ -1376,12 +1447,13 @@ mod tests {
     #[test]
     fn health_blip_with_reachable_verdict_does_not_force_coord_down() {
         // Verdict reachable (coord up) but the /pr-merge/health call itself
-        // failed (leader_fresh None). A green PR blocked on a stale label must
-        // still classify as the LiveBlockingLabel defect — NOT CoordDown — so a
-        // health hiccup can't mask the verdict's real signal.
+        // failed (leader_fresh None). A green PR hung on merge-state-unsettled
+        // past 2× the threshold must still classify as the PhantomContextHang
+        // defect — NOT CoordDown — so a health hiccup can't mask the verdict's
+        // real signal.
         let verdict = PrMergeVerdict {
             outer_state: Some("BLOCKED".to_string()),
-            block_reason: Some("has-blocking-label".to_string()),
+            block_reason: Some("merge-state-unsettled".to_string()),
             block_evidence: json!({}),
             rollout_state: Some("live".to_string()),
             escalate: None,
@@ -1390,6 +1462,7 @@ mod tests {
         };
         let ev = Evidence {
             github_green: true,
+            coord_reachable: true,
             verdict: Some(&verdict),
             leader_fresh: None, // health call blipped
             block: None,
@@ -1403,7 +1476,7 @@ mod tests {
         assert_eq!(
             classify(&input),
             ShepherdDisposition::CoordDefect {
-                class: CoordDefectClass::LiveBlockingLabel
+                class: CoordDefectClass::PhantomContextHang
             }
         );
 
@@ -1420,9 +1493,11 @@ mod tests {
 
     #[test]
     fn coord_down_end_to_end_when_verdict_absent() {
-        // Verdict call failed (coord unreachable) but the runner witnesses green.
+        // Verdict call failed at the TRANSPORT level (coord unreachable) but
+        // the runner witnesses green.
         let ev = Evidence {
             github_green: true,
+            coord_reachable: false,
             verdict: None,
             leader_fresh: None,
             block: None,
@@ -1437,14 +1512,68 @@ mod tests {
     }
 
     #[test]
-    fn reevaluate_once_guard_fires_once_per_head() {
+    fn auth_failure_is_not_coord_down() {
+        // The runner's own bearer expired: coord answered 401 — verdict body
+        // absent but coord REACHABLE. Must classify Transient, never CoordDown
+        // (no COORD-DOWN alert, no coord-down injection, no orphaned-red spawn
+        // while coord is healthy and only our credentials are broken).
+        let ev = Evidence {
+            github_green: true,
+            coord_reachable: true, // 401/403 IS an answer from coord
+            verdict: None,         // ...but no verdict body
+            leader_fresh: None,
+            block: None,
+            graph: None,
+            in_queue: false,
+            current_head: "abc123",
+            green_for: Duration::from_secs(3 * 3600),
+            green_threshold: Duration::from_secs(45 * 60),
+        };
+        let input = build_classification_input(&ev);
+        assert!(input.coord_reachable);
+        assert_eq!(classify(&input), ShepherdDisposition::Transient);
+    }
+
+    #[test]
+    fn coord_call_error_distinguishes_auth_and_reachability() {
+        let auth = CoordCallError::Http {
+            status: 401,
+            detail: "GET /pr-merge/verdict".to_string(),
+        };
+        assert!(auth.is_auth());
+        assert!(auth.coord_reachable());
+        let forbidden = CoordCallError::Http {
+            status: 403,
+            detail: String::new(),
+        };
+        assert!(forbidden.is_auth());
+        let server_err = CoordCallError::Http {
+            status: 500,
+            detail: String::new(),
+        };
+        assert!(!server_err.is_auth());
+        assert!(server_err.coord_reachable(), "any HTTP response = reachable");
+        let down = CoordCallError::Unreachable("connect refused".to_string());
+        assert!(!down.is_auth());
+        assert!(!down.coord_reachable());
+    }
+
+    #[test]
+    fn reevaluate_guard_claims_only_after_success() {
         reset_reevaluate_guard_for_test();
-        assert!(claim_reevaluate_once(708, "headA"), "first claim on headA");
-        assert!(!claim_reevaluate_once(708, "headA"), "second claim on headA denied");
+        // Peek is non-consuming: a failed POST leaves the nudge retryable.
+        assert!(!reevaluate_already_sent(708, "headA"));
+        assert!(
+            !reevaluate_already_sent(708, "headA"),
+            "peek must not consume — a POST failure retries next poll"
+        );
+        // Mark only after a confirmed-successful POST.
+        mark_reevaluate_sent(708, "headA");
+        assert!(reevaluate_already_sent(708, "headA"), "sent once — dedup");
         // A new head (a push) is eligible for a fresh nudge.
-        assert!(claim_reevaluate_once(708, "headB"), "new head is a fresh nudge");
+        assert!(!reevaluate_already_sent(708, "headB"), "new head is a fresh nudge");
         // A different PR is independent.
-        assert!(claim_reevaluate_once(912, "headA"), "different PR independent");
+        assert!(!reevaluate_already_sent(912, "headA"), "different PR independent");
     }
 
     #[test]
@@ -1466,6 +1595,7 @@ mod tests {
         };
         let ev = Evidence {
             github_green: true,
+            coord_reachable: true,
             verdict: Some(&verdict),
             leader_fresh: Some(true),
             block: Some(&block),
