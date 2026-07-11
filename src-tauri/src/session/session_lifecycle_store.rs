@@ -241,7 +241,7 @@ pub struct SessionLifecycleStore {
     /// attached, every open-record write/refresh ([`record_open`](Self::record_open))
     /// and every confirmation flip ([`confirm_session`](Self::confirm_session)
     /// — confirmation changes the record's honest `restore_tier`) hands the
-    /// merged record to the emitter, which gates (`cloud_sync_enabled`),
+    /// merged record to the emitter, which gates (`session_metadata_sync_enabled`),
     /// debounces on the material wire fields, and enqueues a
     /// `restore-record` session event via the outbox. Best-effort by
     /// construction: the emitter swallows every failure and never blocks the

@@ -34,9 +34,10 @@
 //!
 //! ## Gates
 //!
-//! 1. **Runner-global** — `Settings.cloud_sync_enabled` (default false).
-//!    Checked before anything else: with the toggle off, no outbox entry is
-//!    created and nothing leaves the machine.
+//! 1. **Runner-global** — `Settings.session_metadata_sync_enabled` (default
+//!    true — this event carries no conversation content). Checked before
+//!    anything else: with the toggle off, no outbox entry is created and
+//!    nothing leaves the machine.
 //! 2. **Linkage** — the record's hosting terminal must have a live coord
 //!    session mirror (`terminal_create` stores the coord session id on the
 //!    `TerminalSession`; the injected resolver reads it back). No coord
@@ -97,8 +98,8 @@ pub const TIER_TERMINAL_ONLY: &str = "terminal_only";
 /// live `TerminalManager`.
 pub type CoordSessionResolver = Box<dyn Fn(&str) -> Option<Uuid> + Send + Sync>;
 
-/// Gate-1 probe (`Settings.cloud_sync_enabled`). Injected so tests never
-/// touch the machine's real `settings.json`.
+/// Gate-1 probe (`Settings.session_metadata_sync_enabled`). Injected so
+/// tests never touch the machine's real `settings.json`.
 pub type ConsentGate = Box<dyn Fn() -> bool + Send + Sync>;
 
 /// Emits debounced `restore-record` events into the session outbox.
@@ -121,8 +122,8 @@ pub struct RestoreRecordEmitter {
 
 impl RestoreRecordEmitter {
     /// Production constructor: gate 1 reads the real
-    /// `Settings.cloud_sync_enabled`. The outbox MUST be the same `Arc` the
-    /// `CoordSync` drain loop reads.
+    /// `Settings.session_metadata_sync_enabled`. The outbox MUST be the same
+    /// `Arc` the `CoordSync` drain loop reads.
     pub fn new(
         outbox: Arc<OutboxWriter>,
         machine_id: Uuid,
@@ -132,7 +133,7 @@ impl RestoreRecordEmitter {
             outbox,
             machine_id,
             resolver,
-            Box::new(crate::settings::get_cloud_sync_enabled),
+            Box::new(crate::settings::get_session_metadata_sync_enabled),
         )
     }
 
@@ -154,10 +155,10 @@ impl RestoreRecordEmitter {
         }
     }
 
-    /// Mirror one registry record. Gate 1 (`cloud_sync_enabled`) is checked
-    /// first — when off, this returns before any allocation or I/O and
-    /// nothing leaves the machine. Never fails the caller: all errors are
-    /// logged and swallowed.
+    /// Mirror one registry record. Gate 1
+    /// (`session_metadata_sync_enabled`) is checked first — when off, this
+    /// returns before any allocation or I/O and nothing leaves the machine.
+    /// Never fails the caller: all errors are logged and swallowed.
     pub fn emit(&self, rec: &TerminalSessionRecord) {
         if !(self.gate)() {
             return;
@@ -380,7 +381,7 @@ mod tests {
         em.emit(&rec("sess-1", "term-linked"));
         assert!(
             outbox.pending().unwrap().is_empty(),
-            "cloud_sync_enabled off ⇒ no outbox entry, nothing leaves the machine"
+            "gate off ⇒ no outbox entry, nothing leaves the machine"
         );
     }
 

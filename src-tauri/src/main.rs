@@ -1321,6 +1321,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::clipboard::share_to_mobile,
             commands::cloud_sync_settings::get_cloud_sync_settings,
             commands::cloud_sync_settings::save_cloud_sync_settings,
+            commands::cloud_sync_settings::get_session_metadata_sync_settings,
+            commands::cloud_sync_settings::save_session_metadata_sync_settings,
             commands::command_interpreter::command_interpret,
             commands::comparison::get_comparison_status,
             commands::comparison::list_comparisons,
@@ -2511,10 +2513,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 // Restore-registry cloud mirror (plan 2026-07-09-runner-
-                // session-history-cloud-sync §3.4, Phase 4) — every registry
+                // session-history-cloud-sync §3.4, Phase 4; gate split off
+                // into its own toggle by plan
+                // 2026-07-10-split-cloud-sync-consent) — every registry
                 // write/refresh mirrors a debounced `restore-record` session
                 // event into the SAME outbox the CoordSync drain reads,
-                // gated on Settings.cloud_sync_enabled (gate 1: off ⇒ no
+                // gated on Settings.session_metadata_sync_enabled (off ⇒ no
                 // outbox entry, nothing leaves the machine). The coord
                 // session id for a record resolves through its hosting
                 // terminal's coord mirror (`terminal_create` stores it on
