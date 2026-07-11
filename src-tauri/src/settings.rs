@@ -1175,6 +1175,87 @@ mod cloud_sync_tests {
 }
 
 #[cfg(test)]
+mod session_metadata_sync_tests {
+    use super::*;
+
+    /// Consent contract (plan `2026-07-10-split-cloud-sync-consent` gate 2):
+    /// this half carries no conversation content, so it defaults ON both for
+    /// a genuinely fresh install (`Settings::default()`) and for an empty
+    /// settings.json (`{}`).
+    #[test]
+    fn session_metadata_sync_defaults_true_on_fresh_settings() {
+        assert!(Settings::default().session_metadata_sync_enabled);
+        let parsed: Settings = serde_json::from_str("{}").expect("empty object must deserialize");
+        assert!(parsed.session_metadata_sync_enabled);
+    }
+
+    /// An explicit value (either direction) round-trips through
+    /// serialization untouched.
+    #[test]
+    fn session_metadata_sync_explicit_value_round_trips() {
+        let parsed: Settings =
+            serde_json::from_str(r#"{"session_metadata_sync_enabled": false}"#)
+                .expect("must deserialize");
+        assert!(!parsed.session_metadata_sync_enabled);
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert!(json.contains("\"session_metadata_sync_enabled\":false"));
+    }
+
+    /// Migration: a pre-split settings.json with `cloud_sync_enabled: true`
+    /// and no new key carries the legacy opt-in forward.
+    #[test]
+    fn migrate_legacy_true_carries_forward() {
+        let raw: serde_json::Value =
+            serde_json::from_str(r#"{"cloud_sync_enabled": true}"#).unwrap();
+        let mut settings = Settings::default();
+        settings.session_metadata_sync_enabled = false; // force the opposite value so the assertion below proves the fn actively wrote it, not that it was already true
+        migrate_metadata_sync_flag(&raw, &mut settings);
+        assert!(settings.session_metadata_sync_enabled);
+    }
+
+    /// Migration: a pre-split settings.json with `cloud_sync_enabled: false`
+    /// and no new key carries the legacy opt-out forward — this is the
+    /// consent-preserving case (must NOT silently flip to the new true
+    /// default).
+    #[test]
+    fn migrate_legacy_false_carries_forward() {
+        let raw: serde_json::Value =
+            serde_json::from_str(r#"{"cloud_sync_enabled": false}"#).unwrap();
+        let mut settings = Settings::default();
+        assert!(settings.session_metadata_sync_enabled); // starts true
+        migrate_metadata_sync_flag(&raw, &mut settings);
+        assert!(!settings.session_metadata_sync_enabled);
+    }
+
+    /// Migration: once the new key is present, it is authoritative — a
+    /// legacy `cloud_sync_enabled: false` alongside an explicit
+    /// `session_metadata_sync_enabled: true` must NOT be overwritten by the
+    /// legacy value.
+    #[test]
+    fn migrate_new_key_present_ignores_legacy() {
+        let raw: serde_json::Value = serde_json::from_str(
+            r#"{"cloud_sync_enabled": false, "session_metadata_sync_enabled": true}"#,
+        )
+        .unwrap();
+        let mut settings = Settings::default();
+        settings.session_metadata_sync_enabled = true;
+        migrate_metadata_sync_flag(&raw, &mut settings);
+        assert!(settings.session_metadata_sync_enabled);
+    }
+
+    /// Migration: neither key present (genuinely fresh JSON content) leaves
+    /// the already-defaulted value untouched.
+    #[test]
+    fn migrate_neither_key_present_leaves_default_untouched() {
+        let raw: serde_json::Value = serde_json::from_str("{}").unwrap();
+        let mut settings = Settings::default();
+        assert!(settings.session_metadata_sync_enabled);
+        migrate_metadata_sync_flag(&raw, &mut settings);
+        assert!(settings.session_metadata_sync_enabled);
+    }
+}
+
+#[cfg(test)]
 mod tier_tests {
     use super::*;
 
@@ -1489,7 +1570,7 @@ impl Default for HelperTasksSettings {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Default)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_config_path: Option<String>,
@@ -1660,6 +1741,43 @@ pub struct Settings {
     /// key in an existing settings.json loads as false.
     #[serde(default)]
     pub cloud_sync_enabled: bool,
+    /// Session-metadata sync consent — gate 2 of the session-history
+    /// cloud-sync consent model (split from `cloud_sync_enabled` per plan
+    /// `2026-07-10-split-cloud-sync-consent`). When true, restore-registry
+    /// metadata (provider, cwd, launch command, restore tier, machine id —
+    /// NO conversation content) is mirrored to the operator's coord tenant
+    /// so a session can be resumed or handed off from another machine.
+    /// Default TRUE — this half carries no conversation content, so it is
+    /// opt-out rather than opt-in. A missing key in a settings.json written
+    /// before this split migrates forward from the legacy
+    /// `cloud_sync_enabled` value (see `migrate_metadata_sync_flag` in
+    /// `load_settings`) rather than silently flipping to the new default.
+    #[serde(default = "default_session_metadata_sync_enabled")]
+    pub session_metadata_sync_enabled: bool,
+}
+
+fn default_session_metadata_sync_enabled() -> bool {
+    true
+}
+
+impl Default for Settings {
+    /// Deliberately NOT `#[derive(Default)]`: a derived impl would build each
+    /// field from that field's own `Default::default()`, which silently
+    /// ignores every `#[serde(default = "fn")]` attribute above (those are
+    /// serde-deserialize-only; the standard `Default` derive doesn't read
+    /// them). Several bool fields here (e.g.
+    /// `session_metadata_sync_enabled`, `auto_load_last_config`) intend a
+    /// `true` default via their serde default fn even on a genuinely fresh
+    /// install with no settings file — the branch that constructs
+    /// `Settings::default()` directly in `load_settings()`. Round-tripping
+    /// through an empty JSON object applies every field's serde default
+    /// uniformly (the same mechanism `serde_json::from_str::<Settings>("{}")`
+    /// already exercises in the tests below), so `Settings::default()` and
+    /// "load a settings.json containing `{}`" agree, as they should.
+    fn default() -> Self {
+        serde_json::from_str("{}")
+            .expect("Settings must deserialize from an empty JSON object — every field needs a serde default")
+    }
 }
 
 // ============================================================================
@@ -1929,7 +2047,20 @@ pub fn load_settings() -> Settings {
             if path.exists() {
                 match fs::read_to_string(&path) {
                     Ok(contents) => match serde_json::from_str::<Settings>(&contents) {
-                        Ok(s) => s,
+                        Ok(mut s) => {
+                            // Gate-2 split migration: carry a pre-split explicit
+                            // `cloud_sync_enabled` decision forward onto the new
+                            // `session_metadata_sync_enabled` flag when the new
+                            // key is absent. Only runs against a real,
+                            // successfully-parsed settings file — a genuinely
+                            // fresh install never reaches this branch and
+                            // already gets the field's own serde default
+                            // (`true`) from the parse above.
+                            if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&contents) {
+                                migrate_metadata_sync_flag(&raw, &mut s);
+                            }
+                            s
+                        }
                         Err(e) => {
                             error!("Failed to parse settings file: {}", e);
                             Settings::default()
@@ -2168,6 +2299,28 @@ pub(crate) fn migrate_tier_in_place(settings: &mut Settings) -> bool {
 /// mutating process env or touching the real settings file.
 pub(crate) fn should_persist_migration(needs_persist: bool, is_secondary: bool) -> bool {
     needs_persist && !is_secondary
+}
+
+/// Gate-2 split migration (plan `2026-07-10-split-cloud-sync-consent`):
+/// carry a pre-split user's explicit `cloud_sync_enabled` decision forward
+/// onto the new, independent `session_metadata_sync_enabled` flag.
+///
+/// - New key already present in the raw JSON → already migrated (or the
+///   user explicitly set it post-split); leave `settings` untouched.
+/// - New key absent AND legacy `cloud_sync_enabled` present as a bool →
+///   carry that value forward. This does not silently grant or revoke
+///   anything beyond what the user already decided when the two gates were
+///   still one toggle.
+/// - Neither key present (genuinely fresh settings content, e.g. `{}`) →
+///   leave `settings` untouched; the field's own serde default (`true`)
+///   already applied during deserialization.
+fn migrate_metadata_sync_flag(raw: &serde_json::Value, settings: &mut Settings) {
+    if raw.get("session_metadata_sync_enabled").is_some() {
+        return;
+    }
+    if let Some(legacy) = raw.get("cloud_sync_enabled").and_then(|v| v.as_bool()) {
+        settings.session_metadata_sync_enabled = legacy;
+    }
 }
 
 /// Save settings to file (atomic write to prevent corruption on crash)
@@ -2657,6 +2810,18 @@ pub fn get_cloud_sync_enabled() -> bool {
 pub fn save_cloud_sync_enabled(enabled: bool) -> Result<(), String> {
     let mut settings = load_settings();
     settings.cloud_sync_enabled = enabled;
+    save_settings(&settings)
+}
+
+/// Get the session metadata sync consent flag (gate 2). Default true.
+pub fn get_session_metadata_sync_enabled() -> bool {
+    load_settings().session_metadata_sync_enabled
+}
+
+/// Persist the session metadata sync consent flag.
+pub fn save_session_metadata_sync_enabled(enabled: bool) -> Result<(), String> {
+    let mut settings = load_settings();
+    settings.session_metadata_sync_enabled = enabled;
     save_settings(&settings)
 }
 

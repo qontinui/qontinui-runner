@@ -83,6 +83,18 @@ interface CloudSyncSettingsData {
   cloud_sync_enabled: boolean;
 }
 
+/**
+ * Shape of `get_session_metadata_sync_settings` /
+ * `save_session_metadata_sync_settings` data — a separate command pair from
+ * `CloudSyncSettingsData` above (gate 2 of the consent model, split off by
+ * plan 2026-07-10-split-cloud-sync-consent). Kept as an independent type
+ * rather than extending `CloudSyncSettingsData`, matching the two systems'
+ * independent commands.
+ */
+interface SessionMetadataSyncSettingsData {
+  session_metadata_sync_enabled: boolean;
+}
+
 interface CloudSyncTauriResult<T> {
   success: boolean;
   data?: T;
@@ -202,12 +214,23 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
     message?: string;
   }>({ state: "idle" });
 
-  // --- Cloud session sync consent (plan 2026-07-09) --------------------------
+  // --- AI content sync consent (plan 2026-07-09) ------------------------------
   // Independent of the web-integration form: reads/writes the runner-global
   // `cloud_sync_enabled` settings.json flag via its own command pair, and
   // saves immediately on toggle (no shared Save button involvement).
   const [cloudSyncEnabled, setCloudSyncEnabled] = useState(false);
   const [cloudSyncSaving, setCloudSyncSaving] = useState(false);
+
+  // --- Session metadata sync consent (plan 2026-07-10-split-cloud-sync-
+  // consent) --------------------------------------------------------------
+  // Gate 2, split off from the toggle above: reads/writes the runner-global
+  // `session_metadata_sync_enabled` settings.json flag via its own
+  // independent command pair, and saves immediately on toggle (no shared
+  // Save button involvement). Starts `false` client-side until the load
+  // effect below resolves the real (default `true`) backing value, matching
+  // the loading convention already used for `cloudSyncEnabled` above.
+  const [sessionMetadataSyncEnabled, setSessionMetadataSyncEnabled] = useState(false);
+  const [sessionMetadataSyncSaving, setSessionMetadataSyncSaving] = useState(false);
 
   // --- Tick to keep "last heartbeat <relative> ago" alive --------------------
   const [, setTick] = useState(0);
@@ -302,6 +325,51 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
       setCloudSyncSaving(false);
     }
   }, [cloudSyncEnabled, onLog]);
+
+  useEffect(() => {
+    // Load the session metadata sync consent flag once on mount.
+    let cancelled = false;
+    const loadSessionMetadataSync = async () => {
+      try {
+        const result = await invoke<CloudSyncTauriResult<SessionMetadataSyncSettingsData>>(
+          "get_session_metadata_sync_settings",
+        );
+        if (!cancelled && result?.success && result.data) {
+          setSessionMetadataSyncEnabled(result.data.session_metadata_sync_enabled);
+        }
+      } catch (err) {
+        console.error("Failed to load session metadata sync settings:", err);
+      }
+    };
+    void loadSessionMetadataSync();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handleToggleSessionMetadataSync = useCallback(async () => {
+    const newValue = !sessionMetadataSyncEnabled;
+    setSessionMetadataSyncEnabled(newValue);
+    setSessionMetadataSyncSaving(true);
+    try {
+      const result = await invoke<CloudSyncTauriResult<null>>(
+        "save_session_metadata_sync_settings",
+        { sessionMetadataSyncEnabled: newValue },
+      );
+      if (result?.success) {
+        onLog("success", `Session metadata sync ${newValue ? "enabled" : "disabled"}`);
+      } else {
+        onLog("error", "Failed to save session metadata sync setting");
+        setSessionMetadataSyncEnabled(!newValue);
+      }
+    } catch (err) {
+      console.error("Failed to save session metadata sync setting:", err);
+      onLog("error", `Failed to save session metadata sync setting: ${err}`);
+      setSessionMetadataSyncEnabled(!newValue);
+    } finally {
+      setSessionMetadataSyncSaving(false);
+    }
+  }, [sessionMetadataSyncEnabled, onLog]);
 
   useEffect(() => {
     // React to save events fired from anywhere (including the web token flow).
@@ -854,16 +922,50 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
         </div>
       </div>
 
-      {/* Cloud session sync — independent consent toggle (gate 1 of the
+      {/* Session metadata sync — independent consent toggle (gate 2 of the
+          session-history cloud-sync consent model, split off by plan
+          2026-07-10-split-cloud-sync-consent). Saves immediately. */}
+      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+        <label className="flex items-center justify-between cursor-pointer p-3 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
+          <div className="space-y-1 pr-4">
+            <div className="text-sm font-medium">Session metadata sync</div>
+            <div className="text-xs text-muted-foreground">
+              Shares session lifecycle info (provider, working directory, last command) with your
+              coord tenant so a session can be resumed or handed off from another machine.
+              Recommended — no conversation content leaves this machine. Off: this session can only
+              be resumed on this machine.
+            </div>
+          </div>
+          <button
+            type="button"
+            id="button-toggle-session-metadata-sync"
+            onClick={handleToggleSessionMetadataSync}
+            disabled={sessionMetadataSyncSaving}
+            className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:opacity-50 ${
+              sessionMetadataSyncEnabled ? "bg-primary" : "bg-muted"
+            }`}
+            aria-pressed={sessionMetadataSyncEnabled}
+            aria-label="Toggle session metadata sync"
+          >
+            <span
+              className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                sessionMetadataSyncEnabled ? "translate-x-4" : "translate-x-1"
+              }`}
+            />
+          </button>
+        </label>
+      </div>
+
+      {/* AI content sync — independent consent toggle (gate 1 of the
           session-history cloud-sync consent model). Saves immediately. */}
       <div className="space-y-4 rounded-lg bg-card/50 p-4">
         <label className="flex items-center justify-between cursor-pointer p-3 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
           <div className="space-y-1 pr-4">
-            <div className="text-sm font-medium">Cloud session sync</div>
+            <div className="text-sm font-medium">AI content sync</div>
             <div className="text-xs text-muted-foreground">
-              Syncs AI conversation transcripts and terminal session records for this runner to your
-              coord tenant (warm tier ~7 days post-close, cold archive 90 days). Off: nothing leaves
-              this machine.
+              Syncs AI conversation transcripts and tenant agentic memory (task outcomes, reflection
+              fixes) to your coord tenant (warm tier ~7 days post-close, cold archive 90 days). Off:
+              no conversation or memory content leaves this machine.
             </div>
             <div className="text-[10px] text-muted-foreground">
               Secrets matching common credential patterns are redacted before upload —
@@ -872,13 +974,14 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
           </div>
           <button
             type="button"
+            id="button-toggle-cloud-session-sync"
             onClick={handleToggleCloudSync}
             disabled={cloudSyncSaving}
             className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:opacity-50 ${
               cloudSyncEnabled ? "bg-primary" : "bg-muted"
             }`}
             aria-pressed={cloudSyncEnabled}
-            aria-label="Toggle cloud session sync"
+            aria-label="Toggle AI content sync"
           >
             <span
               className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
