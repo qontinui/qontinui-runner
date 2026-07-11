@@ -6,6 +6,48 @@
 //! to generate typed bindings and switch back to the generated API.
 
 use super::PgDb;
+use crate::memory::tenant_sync::{
+    enqueue_memory_record, MemoryRecordKind, TenantMemoryRecord,
+};
+
+/// Cap for the derived memory title (chars). The tenant-memory emitter
+/// re-clamps to its own server cap; this is just a readable snippet.
+const FEEDBACK_TITLE_CHARS: usize = 120;
+
+/// Importance for operator-feedback memories — deliberate human verdicts are
+/// high-signal training data, above the 0.5 default.
+const FEEDBACK_IMPORTANCE: f64 = 0.7;
+
+/// Build the tenant-memory record that mirrors an operator's verdict on a
+/// deferred question into the agentic-memory store. Pure (no I/O) so it is
+/// unit-testable without a live database. The returned record still rides the
+/// emitter's consent gate + redactor at [`enqueue_memory_record`].
+pub(crate) fn build_review_feedback_record(
+    id: &str,
+    question: &str,
+    context_json: &str,
+    task_run_id: &str,
+    status: &str,
+    reviewer_comment: Option<&str>,
+) -> TenantMemoryRecord {
+    let title: String = question.chars().take(FEEDBACK_TITLE_CHARS).collect();
+
+    let mut content = format!(
+        "Deferred question: {question}\n\nContext: {context_json}\n\nOperator verdict: {status}"
+    );
+    if let Some(comment) = reviewer_comment.filter(|c| !c.trim().is_empty()) {
+        content.push_str(&format!("\n\nReviewer comment: {comment}"));
+    }
+
+    let mut source = serde_json::json!({ "deferred_question_id": id });
+    if !task_run_id.is_empty() {
+        source["task_run_id"] = serde_json::Value::String(task_run_id.to_string());
+    }
+
+    TenantMemoryRecord::new(title, content, MemoryRecordKind::Feedback)
+        .with_importance(FEEDBACK_IMPORTANCE)
+        .with_source(source)
+}
 
 fn row_to_json(row: &tokio_postgres::Row) -> serde_json::Value {
     let reviewed_at: Option<chrono::DateTime<chrono::FixedOffset>> = row.get("reviewed_at");
@@ -89,6 +131,58 @@ impl PgDb {
         )
         .await
         .map_err(|e| format!("PG review_deferred_question: {}", e))?;
+
+        // Phase 3 (plan 2026-07-11-tenant-memory-v1-1): mirror the operator's
+        // verdict into the tenant agentic-memory store as a `feedback` record
+        // so future runs learn from human review. Best-effort — a lookup or
+        // enqueue failure must NEVER break the verdict path, and the enqueue
+        // is itself a no-op when cloud sync is disabled.
+        if let Err(e) = self.emit_review_feedback(id, status, reviewer_comment).await {
+            tracing::warn!(
+                question_id = %id,
+                error = %e,
+                "review_deferred_question: feedback memory emit skipped (non-fatal)"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Look up the reviewed question and enqueue an operator-feedback memory
+    /// record. Separated so the verdict UPDATE stays the single fallible step
+    /// the caller depends on. Returns `Err` only for the diagnostic warn — the
+    /// caller swallows it.
+    async fn emit_review_feedback(
+        &self,
+        id: &str,
+        status: &str,
+        reviewer_comment: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(q) = self.get_deferred_question_by_id(id).await? else {
+            // Row vanished between UPDATE and SELECT — nothing to mirror.
+            return Ok(());
+        };
+        let question = q.get("question").and_then(|v| v.as_str()).unwrap_or_default();
+        let context_json = q
+            .get("context_json")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let task_run_id = q
+            .get("task_run_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+
+        let record = build_review_feedback_record(
+            id,
+            question,
+            context_json,
+            task_run_id,
+            status,
+            reviewer_comment,
+        );
+        // Consent gate + redaction are applied inside enqueue_memory_record;
+        // a no-op when `cloud_sync_enabled` is off.
+        enqueue_memory_record(record);
         Ok(())
     }
 
@@ -329,5 +423,109 @@ impl PgDb {
             }
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::tenant_sync::TenantMemorySync;
+    use crate::session::local_store::OutboxWriter;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use uuid::Uuid;
+
+    #[test]
+    fn build_review_feedback_record_captures_join_fields() {
+        let record = build_review_feedback_record(
+            "dq-123",
+            "Should I delete the legacy migration file?",
+            "{\"phase\":\"cleanup\",\"files\":[\"old.sql\"]}",
+            "tr-77",
+            "approved",
+            Some("Yes, it's superseded."),
+        );
+
+        assert_eq!(record.kind, MemoryRecordKind::Feedback);
+        assert_eq!(record.kind.as_str(), "feedback");
+        assert!((record.importance - FEEDBACK_IMPORTANCE).abs() < f64::EPSILON);
+        assert!(record.title.starts_with("Should I delete"));
+        assert!(record.content.contains("Operator verdict: approved"));
+        assert!(record.content.contains("Reviewer comment: Yes, it's superseded."));
+        assert!(record.content.contains("phase"));
+        assert_eq!(record.source["deferred_question_id"], "dq-123");
+        assert_eq!(record.source["task_run_id"], "tr-77");
+    }
+
+    #[test]
+    fn build_review_feedback_record_truncates_title_and_omits_empty_comment() {
+        let long_question = "q".repeat(FEEDBACK_TITLE_CHARS + 50);
+        let record = build_review_feedback_record(
+            "dq-1",
+            &long_question,
+            "{}",
+            "",
+            "rejected",
+            Some("   "),
+        );
+        assert_eq!(record.title.chars().count(), FEEDBACK_TITLE_CHARS);
+        assert!(!record.content.contains("Reviewer comment"));
+        // Empty task_run_id must not appear as a null/blank join key.
+        assert!(record.source.get("task_run_id").is_none());
+        assert_eq!(record.source["deferred_question_id"], "dq-1");
+    }
+
+    /// A verdict-derived record, enqueued through a consenting emitter, lands
+    /// in the outbox as a `feedback` record carrying the join fields.
+    #[test]
+    fn feedback_record_enqueues_when_consent_on() {
+        let dir = tempdir().unwrap();
+        let outbox = Arc::new(OutboxWriter::open(dir.path().join("memory-outbox.jsonl")).unwrap());
+        let sync = TenantMemorySync::with_probes(
+            outbox.clone(),
+            Uuid::new_v4(),
+            Box::new(|| true), // consent ON
+            Box::new(|| Some("test.jwt".to_string())),
+        );
+
+        let record = build_review_feedback_record(
+            "dq-9",
+            "Ship the schema change?",
+            "{\"risk\":\"low\"}",
+            "tr-9",
+            "approved",
+            None,
+        );
+        sync.enqueue(record);
+
+        let pending = outbox.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        let p = &pending[0].payload;
+        assert_eq!(p["kind"], "feedback");
+        assert_eq!(p["source"]["deferred_question_id"], "dq-9");
+        assert_eq!(p["source"]["task_run_id"], "tr-9");
+        assert!(p["content"].as_str().unwrap().contains("Operator verdict: approved"));
+    }
+
+    /// Consent OFF ⇒ the same record is a hard no-op (nothing hits the outbox).
+    #[test]
+    fn feedback_record_is_noop_when_consent_off() {
+        let dir = tempdir().unwrap();
+        let outbox = Arc::new(OutboxWriter::open(dir.path().join("memory-outbox.jsonl")).unwrap());
+        let sync = TenantMemorySync::with_probes(
+            outbox.clone(),
+            Uuid::new_v4(),
+            Box::new(|| false), // consent OFF
+            Box::new(|| Some("test.jwt".to_string())),
+        );
+
+        sync.enqueue(build_review_feedback_record(
+            "dq-9", "Ship it?", "{}", "tr-9", "approved", None,
+        ));
+
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "consent off ⇒ operator feedback never leaves the machine"
+        );
     }
 }

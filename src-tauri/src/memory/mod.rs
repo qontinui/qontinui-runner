@@ -17,6 +17,7 @@ pub mod contradiction;
 pub mod decay;
 pub mod entity_profiles;
 pub mod importance;
+pub mod memory_synthesis;
 pub mod scheduler;
 pub mod tenant_sync;
 pub mod unified_query;

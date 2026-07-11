@@ -3786,6 +3786,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 memory::scheduler::MemorySchedulerConfig::default(),
             );
 
+            // Start the tenant memory-synthesis poller (plan
+            // 2026-07-11-tenant-memory-v1-1). Consent-gated on
+            // `cloud_sync_enabled` — idles with zero network calls until the
+            // user opts in. Claims synthesis jobs from the web memory API,
+            // distills them via the warm Claude provider, and posts results.
+            info!("Starting tenant memory-synthesis poller");
+            memory::memory_synthesis::start_memory_synthesis_poller();
+
             // Auto-start MCP servers marked with auto_start in background
             let app_state_for_mcp_auto = app.state::<Arc<AppState>>().inner().clone();
             tauri::async_runtime::spawn(async move {
