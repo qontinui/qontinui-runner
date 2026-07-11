@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::session::restore_record_emitter::RestoreRecordEmitter;
 use crate::session::snapshot_history::{SnapshotHistory, SnapshotSession};
@@ -326,6 +326,13 @@ impl SessionLifecycleStore {
     /// writes after mutating.
     pub fn record_open(&self, rec: TerminalSessionRecord) {
         let now = Utc::now().timestamp_millis();
+        // Captured before `rec`'s fields are moved into the entry below — used
+        // after the entry mutation to evict any phantom sibling on the same
+        // terminal (see the supersede scan further down).
+        let new_id = rec.claude_session_id.clone();
+        let new_terminal_id = rec.terminal_id.clone();
+        let new_is_authoritative =
+            normalize_origin(rec.origin.clone()).as_deref() == Some(ORIGIN_AUTHORITATIVE);
         let (snapshot, merged) = {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
@@ -369,6 +376,40 @@ impl SessionLifecycleStore {
             entry.close_reason = None;
             entry.last_seen_at = now;
             let merged = entry.clone();
+
+            // Single-tenant-terminal invariant: a PTY terminal hosts at most
+            // ONE live provider session. When a new AUTHORITATIVE record binds a
+            // terminal, any OTHER still-open record on the SAME terminal that no
+            // provider hook ever confirmed is a superseded phantom — evict it so
+            // restore never resurrects a session that never ran.
+            //
+            // The split this fixes: the always-on identity seam records a fresh
+            // pinned id at SHELL spawn, but an account/CLI launcher then TYPES
+            // `claude --session-id <its own id>` into that shell, so the seam's
+            // row and the launcher's row bind the same terminal under two ids —
+            // the seam row is the orphan (unconfirmed, no transcript). Only
+            // unconfirmed victims are closed: a confirmed row represents a
+            // session that actually started and is retired by the normal
+            // exit / poll-dead path, never here.
+            if new_is_authoritative && !new_terminal_id.is_empty() {
+                for other in m.values_mut() {
+                    if other.claude_session_id != new_id
+                        && other.terminal_id == new_terminal_id
+                        && other.state == "open"
+                        && other.confirmed_at.is_none()
+                    {
+                        other.state = "closed".to_string();
+                        other.closed_at = Some(now);
+                        other.close_reason = Some("superseded".to_string());
+                        info!(
+                            terminal_id = %new_terminal_id,
+                            superseded = %other.claude_session_id,
+                            by = %new_id,
+                            "session-restore: evicted unconfirmed phantom sibling — new authoritative session bound the terminal"
+                        );
+                    }
+                }
+            }
             (m.clone(), merged)
         };
         self.persist(&snapshot);
@@ -1164,6 +1205,81 @@ mod tests {
         assert_eq!(
             store.open_records()[0].origin.as_deref(),
             Some(ORIGIN_AUTHORITATIVE)
+        );
+    }
+
+    /// An authoritative record on the named terminal, unconfirmed by default.
+    fn auth_on(id: &str, terminal: &str) -> TerminalSessionRecord {
+        let mut r = rec(id);
+        r.terminal_id = terminal.to_string();
+        r.origin = Some(ORIGIN_AUTHORITATIVE.to_string());
+        r
+    }
+
+    /// Single-tenant-terminal invariant: a new AUTHORITATIVE session binding a
+    /// terminal evicts an older UNCONFIRMED phantom sibling on that same
+    /// terminal — the identity-seam-vs-account-launcher dual-id split, where the
+    /// seam pins a fresh id at shell spawn and the launcher then types
+    /// `claude --session-id <its own id>` into that shell.
+    #[test]
+    fn record_open_supersedes_unconfirmed_phantom_on_same_terminal() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+
+        store.record_open(auth_on("seam-phantom", "term-1"));
+        store.record_open(auth_on("real", "term-1"));
+
+        let phantom = store.get("seam-phantom").unwrap();
+        assert_eq!(phantom.state, "closed", "phantom superseded");
+        assert_eq!(phantom.close_reason.as_deref(), Some("superseded"));
+        assert_eq!(store.get("real").unwrap().state, "open", "real stays open");
+        let open: Vec<String> = store
+            .open_records()
+            .into_iter()
+            .map(|r| r.claude_session_id)
+            .collect();
+        assert_eq!(open, vec!["real".to_string()], "only the real session open");
+    }
+
+    /// Supersede guards: a CONFIRMED sibling, a sibling on a DIFFERENT terminal,
+    /// and a non-authoritative insert all leave the sibling untouched.
+    #[test]
+    fn record_open_supersede_guards() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+
+        // (a) A confirmed sibling represents a session that actually started —
+        // never superseded here (the exit / poll-dead path retires it).
+        let mut confirmed = auth_on("confirmed", "term-a");
+        confirmed.confirmed_at = Some(123);
+        store.record_open(confirmed);
+        store.record_open(auth_on("newer", "term-a"));
+        assert_eq!(
+            store.get("confirmed").unwrap().state,
+            "open",
+            "confirmed sibling survives"
+        );
+
+        // (b) A sibling on a different terminal is untouched.
+        store.record_open(auth_on("other-term", "term-b"));
+        store.record_open(auth_on("fresh", "term-c"));
+        assert_eq!(
+            store.get("other-term").unwrap().state,
+            "open",
+            "different-terminal sibling survives"
+        );
+
+        // (c) A non-authoritative (reconciled) insert never supersedes — it is
+        // itself a guess and restore already quarantines it.
+        store.record_open(auth_on("phantom2", "term-d"));
+        let mut reconciled = rec("guess");
+        reconciled.terminal_id = "term-d".to_string();
+        reconciled.origin = Some(ORIGIN_RECONCILED.to_string());
+        store.record_open(reconciled);
+        assert_eq!(
+            store.get("phantom2").unwrap().state,
+            "open",
+            "reconciled insert does not supersede"
         );
     }
 
