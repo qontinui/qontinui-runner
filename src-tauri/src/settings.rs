@@ -1206,8 +1206,10 @@ mod session_metadata_sync_tests {
     fn migrate_legacy_true_carries_forward() {
         let raw: serde_json::Value =
             serde_json::from_str(r#"{"cloud_sync_enabled": true}"#).unwrap();
-        let mut settings = Settings::default();
-        settings.session_metadata_sync_enabled = false; // force the opposite value so the assertion below proves the fn actively wrote it, not that it was already true
+        // Start at the opposite value so the assertion below proves the fn
+        // actively wrote it, not that it was already true.
+        let mut settings: Settings =
+            serde_json::from_str(r#"{"session_metadata_sync_enabled": false}"#).unwrap();
         migrate_metadata_sync_flag(&raw, &mut settings);
         assert!(settings.session_metadata_sync_enabled);
     }
@@ -1236,8 +1238,8 @@ mod session_metadata_sync_tests {
             r#"{"cloud_sync_enabled": false, "session_metadata_sync_enabled": true}"#,
         )
         .unwrap();
-        let mut settings = Settings::default();
-        settings.session_metadata_sync_enabled = true;
+        let mut settings: Settings =
+            serde_json::from_str(r#"{"session_metadata_sync_enabled": true}"#).unwrap();
         migrate_metadata_sync_flag(&raw, &mut settings);
         assert!(settings.session_metadata_sync_enabled);
     }
