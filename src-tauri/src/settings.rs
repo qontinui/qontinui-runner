@@ -1193,9 +1193,8 @@ mod session_metadata_sync_tests {
     /// serialization untouched.
     #[test]
     fn session_metadata_sync_explicit_value_round_trips() {
-        let parsed: Settings =
-            serde_json::from_str(r#"{"session_metadata_sync_enabled": false}"#)
-                .expect("must deserialize");
+        let parsed: Settings = serde_json::from_str(r#"{"session_metadata_sync_enabled": false}"#)
+            .expect("must deserialize");
         assert!(!parsed.session_metadata_sync_enabled);
         let json = serde_json::to_string(&parsed).unwrap();
         assert!(json.contains("\"session_metadata_sync_enabled\":false"));
