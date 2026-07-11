@@ -6,9 +6,7 @@
 //! to generate typed bindings and switch back to the generated API.
 
 use super::PgDb;
-use crate::memory::tenant_sync::{
-    enqueue_memory_record, MemoryRecordKind, TenantMemoryRecord,
-};
+use crate::memory::tenant_sync::{enqueue_memory_record, MemoryRecordKind, TenantMemoryRecord};
 
 /// Cap for the derived memory title (chars). The tenant-memory emitter
 /// re-clamps to its own server cap; this is just a readable snippet.
@@ -137,7 +135,10 @@ impl PgDb {
         // so future runs learn from human review. Best-effort — a lookup or
         // enqueue failure must NEVER break the verdict path, and the enqueue
         // is itself a no-op when cloud sync is disabled.
-        if let Err(e) = self.emit_review_feedback(id, status, reviewer_comment).await {
+        if let Err(e) = self
+            .emit_review_feedback(id, status, reviewer_comment)
+            .await
+        {
             tracing::warn!(
                 question_id = %id,
                 error = %e,
@@ -162,7 +163,10 @@ impl PgDb {
             // Row vanished between UPDATE and SELECT — nothing to mirror.
             return Ok(());
         };
-        let question = q.get("question").and_then(|v| v.as_str()).unwrap_or_default();
+        let question = q
+            .get("question")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         let context_json = q
             .get("context_json")
             .and_then(|v| v.as_str())
@@ -451,7 +455,9 @@ mod tests {
         assert!((record.importance - FEEDBACK_IMPORTANCE).abs() < f64::EPSILON);
         assert!(record.title.starts_with("Should I delete"));
         assert!(record.content.contains("Operator verdict: approved"));
-        assert!(record.content.contains("Reviewer comment: Yes, it's superseded."));
+        assert!(record
+            .content
+            .contains("Reviewer comment: Yes, it's superseded."));
         assert!(record.content.contains("phase"));
         assert_eq!(record.source["deferred_question_id"], "dq-123");
         assert_eq!(record.source["task_run_id"], "tr-77");
@@ -460,14 +466,8 @@ mod tests {
     #[test]
     fn build_review_feedback_record_truncates_title_and_omits_empty_comment() {
         let long_question = "q".repeat(FEEDBACK_TITLE_CHARS + 50);
-        let record = build_review_feedback_record(
-            "dq-1",
-            &long_question,
-            "{}",
-            "",
-            "rejected",
-            Some("   "),
-        );
+        let record =
+            build_review_feedback_record("dq-1", &long_question, "{}", "", "rejected", Some("   "));
         assert_eq!(record.title.chars().count(), FEEDBACK_TITLE_CHARS);
         assert!(!record.content.contains("Reviewer comment"));
         // Empty task_run_id must not appear as a null/blank join key.
@@ -504,7 +504,10 @@ mod tests {
         assert_eq!(p["kind"], "feedback");
         assert_eq!(p["source"]["deferred_question_id"], "dq-9");
         assert_eq!(p["source"]["task_run_id"], "tr-9");
-        assert!(p["content"].as_str().unwrap().contains("Operator verdict: approved"));
+        assert!(p["content"]
+            .as_str()
+            .unwrap()
+            .contains("Operator verdict: approved"));
     }
 
     /// Consent OFF ⇒ the same record is a hard no-op (nothing hits the outbox).
