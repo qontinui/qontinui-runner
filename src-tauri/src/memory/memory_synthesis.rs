@@ -50,7 +50,7 @@ use std::time::Duration;
 use serde_json::{json, Value as JsonValue};
 use tracing::{debug, info, warn};
 
-use super::tenant_sync::{resolve_web_base, ConsentGate, BearerProvider};
+use super::tenant_sync::{resolve_web_base, BearerProvider, ConsentGate};
 
 /// Number of jobs to claim per request (server accepts 1..4).
 const CLAIM_LIMIT: u32 = 4;
@@ -259,8 +259,14 @@ impl MemorySynthesisPoller {
                         cache_creation_tokens,
                         "memory_synthesis: synthesized mental model"
                     );
-                    self.post_result(client, base, &bearer, &job.job_id, ResultBody::Success(text))
-                        .await;
+                    self.post_result(
+                        client,
+                        base,
+                        &bearer,
+                        &job.job_id,
+                        ResultBody::Success(text),
+                    )
+                    .await;
                     processed += 1;
                 }
                 SynthOutcome::Failed(reason) => {
@@ -305,7 +311,11 @@ impl MemorySynthesisPoller {
             .await
         {
             Ok(resp) if resp.status().is_success() => {
-                debug!(job_id, kind = body.kind(), "memory_synthesis: result posted");
+                debug!(
+                    job_id,
+                    kind = body.kind(),
+                    "memory_synthesis: result posted"
+                );
             }
             Ok(resp) => {
                 warn!(
@@ -354,10 +364,7 @@ async fn parse_claim(
         let detail: String = detail.chars().take(256).collect();
         return Err(format!("claim {status}: {detail}"));
     }
-    let parsed: ClaimResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("claim parse: {e}"))?;
+    let parsed: ClaimResponse = resp.json().await.map_err(|e| format!("claim parse: {e}"))?;
     Ok(parsed.jobs)
 }
 
@@ -391,8 +398,8 @@ fn warm_synthesize(member_texts: &[String]) -> SynthOutcome {
         &user_message,
         &claude_api_settings,
         Some(SYNTHESIS_MODEL),
-        None,       // no doctor handle
-        Some(0.2),  // low temperature — durable generalization, not creativity
+        None,      // no doctor handle
+        Some(0.2), // low temperature — durable generalization, not creativity
         Some(MAX_SYNTHESIS_TOKENS),
     );
 
@@ -437,7 +444,10 @@ pub fn start_memory_synthesis_poller() -> tauri::async_runtime::JoinHandle<()> {
 
 async fn run_poll_loop(poller: Arc<MemorySynthesisPoller>) {
     tokio::time::sleep(INITIAL_DELAY).await;
-    info!("memory_synthesis: synthesis poller started (idle cadence {}s)", TICK_IDLE.as_secs());
+    info!(
+        "memory_synthesis: synthesis poller started (idle cadence {}s)",
+        TICK_IDLE.as_secs()
+    );
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -575,7 +585,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn consent_gate_off_makes_no_http_calls() {
         let (base, rec) = spawn_fake_synth_web(vec![job("j1", &["a", "b"])]).await;
-        let p = poller(false, Some("test.jwt"), Arc::new(|_| SynthOutcome::Disabled));
+        let p = poller(
+            false,
+            Some("test.jwt"),
+            Arc::new(|_| SynthOutcome::Disabled),
+        );
         let outcome = p.poll_once(&reqwest::Client::new(), &base).await;
         assert_eq!(outcome, PollOutcome::ConsentOff);
         let g = rec.lock().await;
