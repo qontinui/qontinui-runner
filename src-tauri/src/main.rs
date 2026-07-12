@@ -1821,6 +1821,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::setup_wizard::complete_setup,
             commands::setup_wizard::detect_project_framework_for_setup,
             commands::setup_wizard::discover_claude_config_dirs,
+            commands::setup_wizard::github_clone_repo,
+            commands::setup_wizard::github_list_repos,
             commands::setup_wizard::save_ai_provider_from_setup,
             commands::setup_wizard::save_dev_services_from_setup,
             commands::setup_wizard::save_log_sources_from_setup,

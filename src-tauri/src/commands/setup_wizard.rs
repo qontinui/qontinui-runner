@@ -8,8 +8,6 @@ use crate::error::AppError;
 use crate::settings::{self, AiProvider, CliExecutionMode, GlobalLogSource};
 use serde_json::Value;
 
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -1160,26 +1158,4 @@ pub fn save_dev_services_from_setup(
     }
 
     Ok(())
-}
-
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_setup_wizard")
-        .invoke_handler(tauri::generate_handler![
-            check_setup_completed,
-            complete_setup,
-            scan_workspace_for_setup,
-            detect_project_framework_for_setup,
-            suggest_log_sources_for_setup,
-            suggest_workspace_sources_for_setup,
-            save_log_sources_from_setup,
-            save_ai_provider_from_setup,
-            suggest_process_configs_for_setup,
-            suggest_dev_services_for_setup,
-            save_dev_services_from_setup,
-            discover_claude_config_dirs,
-            github_list_repos,
-            github_clone_repo,
-        ])
-        .build()
 }
