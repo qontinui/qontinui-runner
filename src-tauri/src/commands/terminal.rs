@@ -961,12 +961,39 @@ pub fn terminal_session_list_open(
     // running process and must never be re-read for restore decisions.
     let prior_marker_at =
         crate::session::shutdown_marker::boot_classification().and_then(|c| c.prior_marker_at);
+    let mut sessions = store.restorable_records(now, prior_marker_at);
+
+    // G3 (session-restore-redesign Phase 3): UNION the registry restorable set
+    // with the TRANSCRIPT-DERIVED disk-only recovery net. A session that was
+    // live at crash but that the registry never captured — the spawn-record AND
+    // the provider hook both missed, AND the crash beat the next reconcile poll
+    // (which needs a live PTY it no longer has) — has no restorable row today
+    // and is silently lost. `disk_only_restore_candidates` scans every Claude
+    // config dir (dynamic account enumeration via `find_claude_config_dirs` —
+    // NOT a hardcoded account list) for recently-active transcripts and offers
+    // the registry-ABSENT ones under the account that holds each transcript. We
+    // exclude EVERY id the registry already tracks (`all_ids`, not just the
+    // restorable subset) so a restorable row keeps its real page/zone/layout
+    // and a user-CLOSED / orphan row is never resurrected by a fresh mtime.
+    // These candidates are `origin=reconciled`+unconfirmed, so the frontend
+    // classifier quarantines them behind the one-click verified-resume
+    // handshake — never a blind `--resume`. Fail-open by construction: a scan
+    // failure yields zero extra candidates, degrading to today's registry-only
+    // set.
+    let registry_ids = store.all_ids();
+    let disk_only = crate::session::reconcile::disk_only_restore_candidates(now, &registry_ids);
+    if !disk_only.is_empty() {
+        tracing::info!(
+            count = disk_only.len(),
+            "terminal_session_list_open: added transcript-derived disk-only restore candidates (registry capture-miss recovery)"
+        );
+    }
+    sessions.extend(disk_only);
+
     Ok(CommandResponse {
         success: true,
         message: None,
-        data: Some(
-            serde_json::json!({ "sessions": store.restorable_records(now, prior_marker_at) }),
-        ),
+        data: Some(serde_json::json!({ "sessions": sessions })),
     })
 }
 

@@ -2594,16 +2594,49 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         poll_lifecycle_store.snapshot_heartbeat();
 
                         let open = poll_lifecycle_store.open_records();
-                        if open.is_empty() {
-                            // Forget any stale counters and prune, then idle.
+                        let live = poll_tm.list();
+
+                        // Transcript-anchored reconcile steady-state guard
+                        // (Phase 2 / G1). The reconcile pass disk-scans every
+                        // config dir, so only run it when it can matter: when a
+                        // LIVE PTY lacks a CONFIRMED record (spawn-record AND
+                        // hook both missed — the capture-miss the reconcile
+                        // recovers). Any live terminal that is absent from the
+                        // open set, or present but unconfirmed, is not in
+                        // `confirmed_terminals` below, so `needs_reconcile`
+                        // fires. In the common steady state (every live PTY
+                        // already confirmed) this stays false and we never
+                        // disk-scan. Fail-open — a false negative just defers to
+                        // the next tick / boot.
+                        let confirmed_terminals: std::collections::HashSet<String> = open
+                            .iter()
+                            .filter(|r| r.confirmed_at.is_some())
+                            .map(|r| r.terminal_id.clone())
+                            .collect();
+                        let needs_reconcile =
+                            live.iter().any(|i| !confirmed_terminals.contains(&i.id));
+
+                        if open.is_empty() && !needs_reconcile {
+                            // Nothing to classify AND nothing to reconcile —
+                            // forget any stale counters and prune, then idle
+                            // WITHOUT taking the per-tick process snapshot.
                             consecutive_dead.clear();
                             consecutive_no_match.clear();
                             poll_lifecycle_store
                                 .prune(chrono::Utc::now().timestamp_millis());
                             continue;
                         }
-
-                        let live = poll_tm.list();
+                        if open.is_empty() {
+                            // No open records to classify, but a live PTY lacks
+                            // a confirmed record (the G1 capture-miss: live PTY,
+                            // empty store). Do NOT early-continue — fall through
+                            // to the reconcile pass below so the miss is
+                            // recovered while the PTY is still live. Still clear
+                            // the stale close-detection counters (there is
+                            // nothing for them to track this tick).
+                            consecutive_dead.clear();
+                            consecutive_no_match.clear();
+                        }
 
                         // One system-wide process snapshot per tick, shared by
                         // every open record below. The process table is
@@ -2758,6 +2791,37 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     // Uncertain — do NOT touch the counters.
                                 }
                             }
+                        }
+
+                        // Transcript-anchored reconcile pass (Phase 2 / G1):
+                        // recover a live-but-unrecorded session (spawn-record
+                        // AND hook both missed) within one poll interval —
+                        // while its PTY is still live — instead of only at the
+                        // next boot. Reuses THIS tick's `snap` (no 2nd process
+                        // scan) and the steady-state `needs_reconcile` guard
+                        // above (skips the disk scan when every live PTY is
+                        // already confirmed). Runs even when `open` was empty
+                        // (that IS the capture-miss case). Fail-open. Reconciled
+                        // rows are written as quarantine (origin=reconciled,
+                        // unconfirmed-as-restorable) — Phase 3's classifier owns
+                        // any auto-resume upgrade, not this pass.
+                        if needs_reconcile {
+                            let live_ptys: Vec<session::reconcile::LivePty> = live
+                                .iter()
+                                .map(|i| session::reconcile::LivePty {
+                                    terminal_id: i.id.clone(),
+                                    pid: i.pid,
+                                    working_dir: i.working_dir.clone(),
+                                    page_id: i.page_id.clone(),
+                                    title: i.title.clone(),
+                                })
+                                .collect();
+                            session::reconcile::run_reconcile_pass(
+                                &poll_lifecycle_store,
+                                &live_ptys,
+                                &snap,
+                                "periodic",
+                            );
                         }
 
                         poll_lifecycle_store.prune(chrono::Utc::now().timestamp_millis());

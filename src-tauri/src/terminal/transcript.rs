@@ -371,6 +371,133 @@ pub fn list_sessions(
     Ok(sessions)
 }
 
+// ── Disk-only restore scan (session-restore-redesign Phase 3 / G3) ───────────
+//
+// The boot-restore recovery layer is a projection of the registry, so it
+// inherits every registry gap: a session that was LIVE at crash but that the
+// registry never captured (the spawn-record AND the provider hook both missed,
+// AND the crash beat the next reconcile poll) has no restorable row and is
+// silently lost. This scan closes that gap from the DISK side — it enumerates
+// EVERY project dir under a config dir (so a session whose working dir the
+// registry never recorded is still found) and reports the recently-active ones
+// as crash-recovery candidates. The account is the config dir that holds the
+// transcript — derived DYNAMICALLY (the caller iterates `find_claude_config_dirs`),
+// never a hardcoded account list.
+
+/// A registry-absent, on-disk session candidate for the disk-only restore net.
+/// Discovered by a full projects-tree scan of one config dir (unlike
+/// [`list_sessions`], which needs a KNOWN project path).
+#[derive(Debug, Clone)]
+pub struct RecentTranscript {
+    /// Transcript id (the `.jsonl` file stem).
+    pub session_id: String,
+    /// The config dir that holds it — THE ACCOUNT this session must resume
+    /// under.
+    pub config_dir: String,
+    /// The session's real working dir, recovered from the transcript's OWN
+    /// `cwd` field — NOT the lossy encoded project-dir name (`_`, `/`, `:`,
+    /// `\` all collapse to `-`, so decoding it is ambiguous). Preserved
+    /// verbatim so a `claude --resume` launched in this dir re-encodes to the
+    /// exact same project path Claude wrote the transcript under.
+    pub working_dir: String,
+    /// File mtime as unix epoch millis — the session's last on-disk activity
+    /// (the liveness signal the window filter ranks).
+    pub last_activity_ms: i64,
+}
+
+/// Recover the launching working directory from a transcript's own records.
+/// Claude's `user`/`assistant` records carry a top-level `cwd`; the leading
+/// `queue-operation`/summary records do not. Returns the first non-empty `cwd`
+/// in the first ~20 lines, verbatim. `None` when no record carried one (an
+/// empty or malformed transcript) — such a candidate can't be resumed to the
+/// right cwd and is dropped by the scan.
+fn extract_cwd(content: &str) -> Option<String> {
+    for line in content.lines().take(20) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(record) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(cwd) = record.get("cwd").and_then(|c| c.as_str()) {
+                if !cwd.trim().is_empty() {
+                    return Some(cwd.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Scan EVERY project dir under `<config_dir>/projects/` and return one
+/// [`RecentTranscript`] per transcript whose file was modified within
+/// `window_ms` before `now_ms`.
+///
+/// Pre-filters on the CHEAP mtime (a dir-entry metadata read) BEFORE opening a
+/// file, so only recently-touched transcripts are parsed for their `cwd`. Skips
+/// workflow-spawned sessions (the same first-5-lines marker [`list_sessions`]
+/// uses) and any transcript with no recoverable `cwd`. Fail-soft by
+/// construction: an unreadable projects root / project dir / file is skipped,
+/// never fatal — the worst case is an empty result (the caller degrades to the
+/// registry-only restorable set).
+pub fn list_recent_sessions_all_projects(
+    config_dir: &Path,
+    now_ms: i64,
+    window_ms: i64,
+) -> Vec<RecentTranscript> {
+    let projects_root = config_dir.join("projects");
+    let mut out = Vec::new();
+    let Ok(project_dirs) = fs::read_dir(&projects_root) else {
+        return out; // no projects dir (or unreadable) — nothing to scan
+    };
+    for pd in project_dirs.flatten() {
+        let pdir = pd.path();
+        if !pdir.is_dir() {
+            continue;
+        }
+        let Ok(files) = fs::read_dir(&pdir) else {
+            continue;
+        };
+        for f in files.flatten() {
+            let path = f.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            // Cheap mtime pre-filter — skip files outside the window WITHOUT
+            // reading their content. A future-dated mtime (clock skew) yields a
+            // saturating 0 age and is admitted (treated as fresh).
+            let mtime_ms = match fs::metadata(&path).ok().and_then(|m| m.modified().ok()) {
+                Some(t) => chrono::DateTime::<chrono::Utc>::from(t).timestamp_millis(),
+                None => continue,
+            };
+            if now_ms.saturating_sub(mtime_ms) > window_ms {
+                continue;
+            }
+            let content = fs::read_to_string(&path).unwrap_or_default();
+            if content.is_empty() {
+                continue;
+            }
+            // Runner-spawned one-shot sessions (workflow gen, summarization,
+            // auto-debug) are not user sessions — never offer them for restore.
+            if is_workflow_session(&content) {
+                continue;
+            }
+            let Some(working_dir) = extract_cwd(&content) else {
+                continue; // no recoverable cwd — can't resume to the right dir
+            };
+            out.push(RecentTranscript {
+                session_id: stem.to_string(),
+                config_dir: config_dir.to_string_lossy().to_string(),
+                working_dir,
+                last_activity_ms: mtime_ms,
+            });
+        }
+    }
+    out
+}
+
 // ── Session Reading ──────────────────────────────────────────────────────────
 
 /// Parse a Claude Code JSONL transcript file into structured messages.
@@ -1510,6 +1637,71 @@ mod tests {
             encode_project_path("C:\\Users\\jspin\\Documents\\qontinui_parent"),
             "C--Users-jspin-Documents-qontinui-parent"
         );
+    }
+
+    #[test]
+    fn extract_cwd_reads_first_record_with_cwd() {
+        // Leading queue-operation record has NO cwd; the user record does.
+        let content = "\
+{\"type\":\"queue-operation\",\"timestamp\":\"2026-06-14T06:49:11.888Z\"}
+{\"type\":\"user\",\"cwd\":\"C:\\\\Users\\\\jspin\\\\proj\",\"timestamp\":\"2026-06-14T06:49:11.902Z\",\"message\":{\"content\":\"hi\"}}";
+        assert_eq!(extract_cwd(content).as_deref(), Some("C:\\Users\\jspin\\proj"));
+        // A transcript with no cwd anywhere → None.
+        assert_eq!(
+            extract_cwd("{\"type\":\"summary\",\"summary\":\"x\"}"),
+            None
+        );
+    }
+
+    /// The full projects-tree scan finds a recently-active, real user
+    /// transcript across an UNKNOWN project dir, recovers its real cwd, and
+    /// stamps the config dir as the account — while skipping workflow sessions
+    /// and cwd-less transcripts (session-restore-redesign Phase 3 / G3).
+    #[test]
+    fn list_recent_sessions_all_projects_finds_and_filters() {
+        let cfg = tempfile::tempdir().unwrap();
+        let cfg_dir = cfg.path();
+        let proj = cfg_dir.join("projects").join("C--Users-jspin-proj");
+        fs::create_dir_all(&proj).unwrap();
+
+        // A real interactive session with a recoverable cwd.
+        fs::write(
+            proj.join("real-sess.jsonl"),
+            "{\"type\":\"user\",\"cwd\":\"C:/Users/jspin/proj\",\"timestamp\":\"2026-06-14T06:49:11.902Z\",\"message\":{\"content\":\"do the thing\"}}\n",
+        )
+        .unwrap();
+        // A runner-spawned workflow session — must be skipped.
+        fs::write(
+            proj.join("workflow.jsonl"),
+            "{\"type\":\"queue-operation\",\"cwd\":\"C:/Users/jspin/proj\"}\n",
+        )
+        .unwrap();
+        // A transcript with no recoverable cwd — must be skipped.
+        fs::write(
+            proj.join("no-cwd.jsonl"),
+            "{\"type\":\"user\",\"timestamp\":\"2026-06-14T06:49:11.902Z\",\"message\":{\"content\":\"x\"}}\n",
+        )
+        .unwrap();
+
+        let now = chrono::Utc::now().timestamp_millis();
+        // Wide window so the fresh temp files (mtime≈now) are in-window.
+        let out = list_recent_sessions_all_projects(cfg_dir, now, 24 * 60 * 60 * 1000);
+
+        assert_eq!(out.len(), 1, "only the real user session is offered");
+        let s = &out[0];
+        assert_eq!(s.session_id, "real-sess");
+        assert_eq!(s.working_dir, "C:/Users/jspin/proj", "real cwd recovered");
+        assert_eq!(
+            s.config_dir,
+            cfg_dir.to_string_lossy(),
+            "account = the holding config dir"
+        );
+
+        // A tiny window (0ms) excludes the fresh files entirely.
+        let none = list_recent_sessions_all_projects(cfg_dir, now, 0);
+        // The files' mtime is ~now so age is ~0; 0-window admits only age<=0.
+        // Assert the scan does not PANIC and returns <= the wide-window result.
+        assert!(none.len() <= 1);
     }
 
     #[test]

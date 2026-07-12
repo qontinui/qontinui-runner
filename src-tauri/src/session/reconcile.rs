@@ -368,16 +368,24 @@ fn parse_iso_to_unix_secs(s: &str) -> Option<i64> {
         .map(|dt| dt.timestamp())
 }
 
-/// Boot entrypoint: take a fresh process snapshot, project the live PTY set, and
-/// run the reconcile against the store. Fail-open — any failure to snapshot or
-/// scan degrades to "did nothing", never worse than today's behavior.
-pub async fn run_at_boot(store: &SessionLifecycleStore, live: Vec<LivePty>) {
-    if live.is_empty() && store.open_records().is_empty() {
-        return; // nothing to do
-    }
-    let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
+/// Run ONE reconcile pass against an ALREADY-TAKEN process snapshot. Builds the
+/// disk transcript index, runs the correlation, prunes phantoms, and logs the
+/// counts. Shared by the boot driver ([`run_at_boot`]) and the recurring
+/// session-lifecycle poll loop so a post-boot capture-miss is recovered within
+/// one poll interval — while the PTY is still live — instead of only at the next
+/// boot.
+///
+/// `context` tags the INFO log ("boot" / "periodic") so a reconcile-only
+/// recovery is attributable to the pass that made it (the "no silent cap"
+/// observability requirement). Fail-open: a scan failure degrades to a no-op.
+pub fn run_reconcile_pass(
+    store: &SessionLifecycleStore,
+    live: &[LivePty],
+    snapshot: &ProcessSnapshot,
+    context: &str,
+) {
     let index = DiskTranscriptIndex::discover();
-    let actions = run_reconcile(store, &live, &snapshot, &index);
+    let actions = run_reconcile(store, live, snapshot, &index);
     let reconciled = actions
         .iter()
         .filter(|a| matches!(a, ReconcileAction::Reconcile { .. }))
@@ -391,9 +399,155 @@ pub async fn run_at_boot(store: &SessionLifecycleStore, live: Vec<LivePty>) {
             reconciled,
             pruned,
             live = live.len(),
-            "session reconcile: boot pass complete"
+            context,
+            "session reconcile: pass complete"
         );
     }
+}
+
+/// Boot entrypoint: take a fresh process snapshot, project the live PTY set, and
+/// run the reconcile against the store. Fail-open — any failure to snapshot or
+/// scan degrades to "did nothing", never worse than today's behavior.
+pub async fn run_at_boot(store: &SessionLifecycleStore, live: Vec<LivePty>) {
+    if live.is_empty() && store.open_records().is_empty() {
+        return; // nothing to do
+    }
+    let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
+    run_reconcile_pass(store, &live, &snapshot, "boot");
+}
+
+// ---------------------------------------------------------------------------
+// Disk-only transcript-derived restore net (session-restore-redesign
+// Phase 3 / G3).
+//
+// The boot-restore recovery layer (`terminal_session_list_open` →
+// `restorable_records`) is a projection of the REGISTRY, so it inherits every
+// registry gap. A session that was LIVE at crash but that the registry never
+// captured — the spawn-record AND the provider hook both missed, AND the crash
+// beat the next reconcile poll (which needs a LIVE PTY it no longer has) — has
+// no restorable row and is silently lost. The process-start-anchored reconcile
+// above cannot recover it either: with the runner dead there is no live PTY to
+// correlate. This net recovers it from the DISK side instead: scan every config
+// dir for transcripts recently active, and offer the registry-ABSENT ones as
+// QUARANTINE-tier candidates (weak provenance — the frontend gates them behind
+// the verified-resume handshake, never blind `--resume`). The account is the
+// config dir that holds each transcript — enumerated DYNAMICALLY via
+// `find_claude_config_dirs`, never a hardcoded account list (the defect
+// `snapshot.py` has).
+// ---------------------------------------------------------------------------
+
+/// Liveness window for the disk-only restore net. A transcript whose LAST
+/// ON-DISK ACTIVITY (file mtime) is within this window before `now` is treated
+/// as a crash-recovery candidate — a session that was plausibly live when the
+/// runner died but that the registry never captured. A transcript OLDER than
+/// this is a FINISHED session the operator walked away from; resurrecting it on
+/// every boot would be noise (and could re-offer stale foreign sessions), so it
+/// is excluded — do NOT resurrect ancient sessions.
+///
+/// 6h is a defensible middle ground: comfortably longer than any plausible
+/// crash→reboot gap (a genuine capture-miss during an active work session is
+/// still caught after a lunch-break-length outage), yet short enough that
+/// yesterday's finished sessions do not re-surface. The window only bounds how
+/// much is OFFERED; it never auto-resumes anything. The backstop for a stale
+/// candidate that slips through is the VERIFIED-RESUME handshake: a disk-only
+/// candidate is `origin=reconciled`+unconfirmed, so the frontend quarantines it
+/// behind a one-click operator confirm that TYPES the resume and verifies the
+/// handshake (parking on failure), never a blind `--resume`.
+pub const DISK_ONLY_RESTORE_WINDOW_MS: i64 = 6 * 60 * 60 * 1000;
+
+/// Build the quarantine-tier [`TerminalSessionRecord`] for one disk-only
+/// transcript candidate: `origin = reconciled`, `confirmed_at = None` (weak
+/// provenance — the frontend never blind-`--resume`s it), `config_dir` = the
+/// transcript's account, `working_dir` = the real cwd recovered from the
+/// transcript, and DEFAULT page/zone (`page_id = "default"`, `zone_index = -1`)
+/// since there is no recorded layout for a session the registry never saw —
+/// boot-restore rebuilds it. `terminal_id` is empty (no live PTY hosts it; the
+/// frontend creates a fresh terminal). `last_seen_at`/`opened_at` carry the
+/// transcript's last-activity so the record is honest about its recency.
+fn disk_only_record(t: &crate::terminal::transcript::RecentTranscript) -> TerminalSessionRecord {
+    TerminalSessionRecord {
+        claude_session_id: t.session_id.clone(),
+        config_dir: Some(t.config_dir.clone()),
+        working_dir: Some(t.working_dir.clone()),
+        page_id: "default".to_string(),
+        zone_index: -1,
+        title: None,
+        terminal_id: String::new(),
+        opened_at: t.last_activity_ms,
+        last_seen_at: t.last_activity_ms,
+        state: "open".to_string(),
+        closed_at: None,
+        close_reason: None,
+        provider: DEFAULT_PROVIDER.to_string(),
+        origin: Some(ORIGIN_RECONCILED.to_string()),
+        restore_pending_at: None,
+        confirmed_at: None,
+    }
+}
+
+/// Pure selection core for the disk-only restore net — unit-testable without
+/// disk. Given the recently-active on-disk transcripts (each with its
+/// last-activity ms), the set of session ids the registry ALREADY tracks, and
+/// `now`, return the disk-only candidates to ADD.
+///
+/// Filters, in order:
+/// - WINDOW: keep only transcripts within [`DISK_ONLY_RESTORE_WINDOW_MS`] of
+///   `now` (older = finished session, excluded).
+/// - REGISTRY DEDUP: drop any id in `registry_ids` — a restorable registry row
+///   wins (real page/zone/layout), and a non-restorable registry row already
+///   encodes a "do not restore" decision the net must honor (see
+///   [`SessionLifecycleStore::all_ids`]). Only registry-ABSENT ids survive.
+/// - CROSS-ACCOUNT DEDUP: the same session id under two config dirs is admitted
+///   ONCE (first wins) so a transcript copied between accounts is not offered
+///   twice.
+pub fn select_disk_only_candidates(
+    recent: &[crate::terminal::transcript::RecentTranscript],
+    registry_ids: &HashSet<String>,
+    now_ms: i64,
+) -> Vec<TerminalSessionRecord> {
+    let mut out = Vec::new();
+    let mut emitted: HashSet<&str> = HashSet::new();
+    for t in recent {
+        if now_ms.saturating_sub(t.last_activity_ms) > DISK_ONLY_RESTORE_WINDOW_MS {
+            continue; // older than the liveness window — a finished session
+        }
+        if registry_ids.contains(&t.session_id) {
+            continue; // the registry already tracks it — registry wins
+        }
+        if !emitted.insert(t.session_id.as_str()) {
+            continue; // same id under a second config dir — first wins
+        }
+        out.push(disk_only_record(t));
+    }
+    out
+}
+
+/// Build the disk-only restore candidates by SCANNING every Claude config dir
+/// for transcripts recently active (within [`DISK_ONLY_RESTORE_WINDOW_MS`]) and
+/// registry-ABSENT, returning them as quarantine-tier records to UNION into the
+/// boot-restore set (`terminal_session_list_open`). This is the transcript-
+/// DERIVED recovery net (G3): a session live at crash but never captured by the
+/// registry is still restorable — under the correct account, derived
+/// DYNAMICALLY from the config dir that holds its transcript.
+///
+/// Fail-open: any scan failure yields fewer (or zero) candidates, so the caller
+/// degrades to exactly today's registry-only restorable set — never worse.
+pub fn disk_only_restore_candidates(
+    now_ms: i64,
+    registry_ids: &HashSet<String>,
+) -> Vec<TerminalSessionRecord> {
+    let config_dirs = crate::terminal::transcript::find_claude_config_dirs();
+    let mut recent = Vec::new();
+    for dir in &config_dirs {
+        recent.extend(
+            crate::terminal::transcript::list_recent_sessions_all_projects(
+                dir,
+                now_ms,
+                DISK_ONLY_RESTORE_WINDOW_MS,
+            ),
+        );
+    }
+    select_disk_only_candidates(&recent, registry_ids, now_ms)
 }
 
 #[cfg(test)]
@@ -648,5 +802,85 @@ mod tests {
         );
         // Still exactly one row for the session.
         assert!(store.get("real-sess").is_some());
+    }
+
+    // ── Disk-only restore net (G3) — pure selection ─────────────────────────
+
+    fn recent(id: &str, cfg: &str, wd: &str, last_ms: i64) -> crate::terminal::transcript::RecentTranscript {
+        crate::terminal::transcript::RecentTranscript {
+            session_id: id.to_string(),
+            config_dir: cfg.to_string(),
+            working_dir: wd.to_string(),
+            last_activity_ms: last_ms,
+        }
+    }
+
+    /// A registry-ABSENT, recently-active transcript is offered as a
+    /// quarantine-tier candidate under the ACCOUNT (config dir) that holds it;
+    /// a transcript OLDER than the window is excluded; an id ALREADY in the
+    /// registry is not duplicated.
+    #[test]
+    fn select_disk_only_window_dedup_and_account() {
+        let now = 10 * DISK_ONLY_RESTORE_WINDOW_MS; // large, avoids underflow
+        let registry_ids: HashSet<String> = ["in-registry".to_string()].into_iter().collect();
+        let recents = vec![
+            // Recent + registry-absent under account A → INCLUDED.
+            recent("fresh-a", "C:/cfg-A", "C:/repoA", now - 1_000),
+            // Recent but ALREADY in the registry restorable/known set → excluded.
+            recent("in-registry", "C:/cfg-A", "C:/repoA", now - 1_000),
+            // Older than the window → excluded (finished session).
+            recent(
+                "ancient",
+                "C:/cfg-B",
+                "C:/repoB",
+                now - DISK_ONLY_RESTORE_WINDOW_MS - 1,
+            ),
+            // Exactly at the window boundary is still IN-window → included.
+            recent("edge", "C:/cfg-B", "C:/repoB", now - DISK_ONLY_RESTORE_WINDOW_MS),
+        ];
+
+        let out = select_disk_only_candidates(&recents, &registry_ids, now);
+        let ids: HashSet<&str> = out.iter().map(|r| r.claude_session_id.as_str()).collect();
+        assert!(ids.contains("fresh-a"), "recent registry-absent included");
+        assert!(ids.contains("edge"), "boundary transcript included");
+        assert!(!ids.contains("in-registry"), "registry id not duplicated");
+        assert!(!ids.contains("ancient"), "older-than-window excluded");
+
+        // The included candidate is quarantine-tier under the correct account.
+        let a = out
+            .iter()
+            .find(|r| r.claude_session_id == "fresh-a")
+            .unwrap();
+        assert_eq!(a.origin.as_deref(), Some(ORIGIN_RECONCILED));
+        assert!(a.confirmed_at.is_none(), "disk-only candidate is unconfirmed");
+        assert_eq!(
+            a.config_dir.as_deref(),
+            Some("C:/cfg-A"),
+            "account derived from the transcript's config dir"
+        );
+        assert_eq!(a.working_dir.as_deref(), Some("C:/repoA"));
+        assert_eq!(a.zone_index, -1, "no recorded layout — default zone");
+        assert_eq!(a.page_id, "default");
+        assert!(a.terminal_id.is_empty(), "no live PTY hosts it");
+    }
+
+    /// The same session id under two config dirs is offered ONCE (first wins) —
+    /// a transcript copied between accounts is not duplicated in the restore
+    /// set.
+    #[test]
+    fn select_disk_only_dedups_same_id_across_accounts() {
+        let now = 10 * DISK_ONLY_RESTORE_WINDOW_MS;
+        let registry_ids: HashSet<String> = HashSet::new();
+        let recents = vec![
+            recent("dup", "C:/cfg-A", "C:/repo", now - 1_000),
+            recent("dup", "C:/cfg-B", "C:/repo", now - 2_000),
+        ];
+        let out = select_disk_only_candidates(&recents, &registry_ids, now);
+        assert_eq!(out.len(), 1, "same id across accounts offered once");
+        assert_eq!(
+            out[0].config_dir.as_deref(),
+            Some("C:/cfg-A"),
+            "first-seen account wins"
+        );
     }
 }

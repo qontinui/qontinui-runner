@@ -28,7 +28,7 @@
 //! rename. Missing / corrupt file → empty map (a fresh registry is the safe
 //! default; the poll re-discovers live sessions).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -693,6 +693,25 @@ impl SessionLifecycleStore {
             Err(e) => {
                 warn!(error = %e, "session_lifecycle_store: lock poisoned on get");
                 None
+            }
+        }
+    }
+
+    /// Every session id the registry knows, OPEN or CLOSED. Used by the
+    /// disk-only transcript-derived restore net (session-restore-redesign
+    /// Phase 3 / G3) to exclude ANY id the registry already tracks: a
+    /// restorable row wins on layout (real page/zone), and a NON-restorable row
+    /// (user-closed, `no-terminal` orphan, stale ghost) already encodes a
+    /// deliberate "do not restore" decision that the disk-only net must honor —
+    /// a fresh transcript mtime must never resurrect a session the user closed.
+    /// Only genuinely registry-ABSENT on-disk sessions (the true capture-miss)
+    /// survive this exclusion.
+    pub fn all_ids(&self) -> HashSet<String> {
+        match self.map.lock() {
+            Ok(m) => m.keys().cloned().collect(),
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on all_ids");
+                HashSet::new()
             }
         }
     }
