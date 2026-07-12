@@ -54,8 +54,8 @@ pub struct DoctorReport {
 
 impl DoctorReport {
     /// Render the copy-pasteable, machine-identical text report. The ordering
-    /// + the trailing verdict line are the contract — keep them stable so the
-    /// output diffs cleanly across machines.
+    /// plus the trailing verdict line are the contract — keep them stable so
+    /// the output diffs cleanly across machines.
     pub fn render(&self) -> String {
         let mut out = String::new();
         out.push_str("coord doctor — runner gate-access self-check\n");

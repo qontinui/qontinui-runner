@@ -228,7 +228,7 @@ async fn run_watch_loop(
             .values()
             .map(|(t, _)| *t)
             .min()
-            .map(|t| TokioInstant::from_std(t));
+            .map(TokioInstant::from_std);
 
         tokio::select! {
             _ = cancel.cancelled() => {

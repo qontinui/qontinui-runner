@@ -55,11 +55,44 @@ fn parse_stdin_pairs() -> HashMap<String, String> {
     pairs
 }
 
-fn to_bare_slug(owner_name: &str) -> &str {
-    owner_name
-        .rsplit_once('/')
-        .map(|(_, name)| name)
-        .unwrap_or(owner_name)
+/// Normalize a git-credential request `path` into a repo-slug candidate:
+/// strips a leading `/`, the `git/` smart-HTTP route prefix, and a trailing
+/// `.git`. `git/qontinui/qontinui-coord.git` → `qontinui/qontinui-coord`;
+/// legacy flat `git/qontinui-coord.git` → `qontinui-coord`.
+fn normalize_request_path(path: &str) -> &str {
+    let p = path.trim_start_matches('/');
+    let p = p.strip_prefix("git/").unwrap_or(p);
+    p.strip_suffix(".git").unwrap_or(p)
+}
+
+/// Resolve the FULL registered `owner/name` slug for a request-path
+/// candidate. Coord's registry rows carry owner-qualified slugs
+/// (`qontinui/qontinui-coord`); the emitted credential path must carry the
+/// owner too, so we always answer with the registry's full slug.
+///
+/// Owner-qualified candidates must match exactly — a basename fallback here
+/// would recreate the owner-collapse collision the cutover exists to fix
+/// (`qontinui/tools` vs `fork-org/tools`). Bare single-segment candidates
+/// (legacy flat-path remotes, pre-cutover) match by basename.
+fn resolve_registered_slug<'a>(repos: &'a [String], candidate: &str) -> Option<&'a str> {
+    // Exact match on the full slug.
+    for r in repos {
+        let slug = r.trim_end_matches(".git");
+        if slug == candidate {
+            return Some(slug);
+        }
+    }
+    // Legacy flat remotes send only the basename; never apply this to an
+    // owner-qualified candidate (owner-collapse hazard).
+    if !candidate.contains('/') {
+        for r in repos {
+            let slug = r.trim_end_matches(".git");
+            if slug == candidate || slug.ends_with(&format!("/{candidate}")) {
+                return Some(slug);
+            }
+        }
+    }
+    None
 }
 
 fn extract_coord_host_and_scheme(coord_url: &str) -> Option<(&str, &str)> {
@@ -81,12 +114,10 @@ fn main() -> ExitCode {
     let mut action: Option<&str> = None;
     let mut i = 1;
     while i < args.len() {
-        if args[i] == "--config" {
-            if i + 1 < args.len() {
-                config_path = Some(&args[i + 1]);
-                i += 2;
-                continue;
-            }
+        if args[i] == "--config" && i + 1 < args.len() {
+            config_path = Some(&args[i + 1]);
+            i += 2;
+            continue;
         }
         // The action is the remaining positional arg.
         action = Some(&args[i]);
@@ -125,32 +156,30 @@ fn main() -> ExitCode {
 
     let pairs = parse_stdin_pairs();
 
-    let path = match pairs.get("path") {
-        Some(p) => p.trim_end_matches(".git").to_string(),
+    let candidate = match pairs.get("path") {
+        Some(p) => normalize_request_path(p),
         None => return ExitCode::SUCCESS,
     };
 
-    // Check if this repo is in our registered list.
-    let is_registered = config.repos.iter().any(|r| {
-        let r_slug = r.trim_end_matches(".git");
-        r_slug == path || r_slug.ends_with(&format!("/{}", to_bare_slug(&path)))
-    });
-
-    if !is_registered {
+    // Resolve the request against the registered list; keep the FULL
+    // owner-qualified slug for the emitted path.
+    let repo_slug = match resolve_registered_slug(&config.repos, candidate) {
+        Some(slug) => slug,
         // Not a coord-registered repo; exit with no output so git falls through.
-        return ExitCode::SUCCESS;
-    }
+        None => return ExitCode::SUCCESS,
+    };
 
     let (scheme, host) = match extract_coord_host_and_scheme(&config.coord_url) {
         Some(pair) => pair,
         None => return ExitCode::SUCCESS,
     };
 
-    let repo_slug = to_bare_slug(&path);
     let stdout = io::stdout();
     let mut out = stdout.lock();
     let _ = writeln!(out, "protocol={scheme}");
     let _ = writeln!(out, "host={host}");
+    // Owner-qualified smart-HTTP path (multitenant cutover):
+    // `git/<owner>/<name>.git`.
     let _ = writeln!(out, "path=git/{repo_slug}.git");
     let _ = writeln!(out, "username=x-access-token");
     let _ = writeln!(out, "password={}", config.push_token);
@@ -164,13 +193,72 @@ mod tests {
     use super::*;
 
     #[test]
-    fn to_bare_slug_strips_owner() {
-        assert_eq!(to_bare_slug("acme/widget"), "widget");
+    fn normalize_owner_qualified_request_path() {
+        assert_eq!(
+            normalize_request_path("git/qontinui/qontinui-coord.git"),
+            "qontinui/qontinui-coord"
+        );
+        // Leading slash variant (git may pass the path with or without it).
+        assert_eq!(
+            normalize_request_path("/git/qontinui/qontinui-coord.git"),
+            "qontinui/qontinui-coord"
+        );
     }
 
     #[test]
-    fn to_bare_slug_no_slash() {
-        assert_eq!(to_bare_slug("widget"), "widget");
+    fn normalize_legacy_flat_request_path() {
+        assert_eq!(
+            normalize_request_path("git/qontinui-coord.git"),
+            "qontinui-coord"
+        );
+        assert_eq!(normalize_request_path("qontinui-coord"), "qontinui-coord");
+    }
+
+    #[test]
+    fn resolve_owner_qualified_candidate_exact_match() {
+        let repos = vec!["qontinui/qontinui-coord".to_string()];
+        assert_eq!(
+            resolve_registered_slug(&repos, "qontinui/qontinui-coord"),
+            Some("qontinui/qontinui-coord")
+        );
+    }
+
+    #[test]
+    fn resolve_owner_qualified_candidate_rejects_other_owner() {
+        // Owner-collapse guard: fork-org/tools must NOT match qontinui/tools.
+        let repos = vec!["qontinui/tools".to_string()];
+        assert_eq!(resolve_registered_slug(&repos, "fork-org/tools"), None);
+    }
+
+    #[test]
+    fn resolve_bare_candidate_returns_full_slug() {
+        // Legacy flat remote path resolves to the FULL registry slug so the
+        // emitted credential path is owner-qualified.
+        let repos = vec!["qontinui/qontinui-coord".to_string()];
+        assert_eq!(
+            resolve_registered_slug(&repos, "qontinui-coord"),
+            Some("qontinui/qontinui-coord")
+        );
+    }
+
+    #[test]
+    fn resolve_unregistered_candidate_is_none() {
+        let repos = vec!["qontinui/qontinui-coord".to_string()];
+        assert_eq!(resolve_registered_slug(&repos, "qontinui/other"), None);
+        assert_eq!(resolve_registered_slug(&repos, "other"), None);
+    }
+
+    #[test]
+    fn emitted_path_is_owner_qualified() {
+        // The exact wire format git matches against the remote URL path:
+        // `git/<owner>/<name>.git`.
+        let repos = vec!["qontinui/qontinui-coord".to_string()];
+        let candidate = normalize_request_path("git/qontinui/qontinui-coord.git");
+        let slug = resolve_registered_slug(&repos, candidate).unwrap();
+        assert_eq!(
+            format!("path=git/{slug}.git"),
+            "path=git/qontinui/qontinui-coord.git"
+        );
     }
 
     #[test]

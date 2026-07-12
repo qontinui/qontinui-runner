@@ -499,10 +499,10 @@ fn uninstall_hook(hooks_dir: &Path) {
     let pre_push = hooks_dir.join("pre-push");
     let backup = hooks_dir.join(HOOK_BACKUP_NAME);
     if backup.exists() {
-        if std::fs::rename(&backup, &pre_push).is_err() {
-            if std::fs::copy(&backup, &pre_push).is_ok() {
-                let _ = std::fs::remove_file(&backup);
-            }
+        if std::fs::rename(&backup, &pre_push).is_err()
+            && std::fs::copy(&backup, &pre_push).is_ok()
+        {
+            let _ = std::fs::remove_file(&backup);
         }
     } else if pre_push.exists() && is_our_hook(&pre_push) {
         let _ = std::fs::remove_file(&pre_push);
