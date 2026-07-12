@@ -49,7 +49,18 @@ src="$(extract source)"
 # JSON-escape the cwd (backslashes + quotes) so a Windows path is valid JSON.
 cwd_json=$(printf '%s' "${PWD:-}" | sed 's/\\/\\\\/g; s/"/\\"/g')
 
-body="{\"terminal_id\":\"$term\",\"session_id\":\"$sid\",\"source\":\"$src\",\"provider\":\"claude\",\"cwd\":\"$cwd_json\"}"
+# Include the effective account config dir the runner set on this PTY child
+# (session.rs sets CLAUDE_CONFIG_DIR) so the record binds the CORRECT Claude
+# account for an autonomous boot-resume. An EMPTY/unset value means the default
+# account — send NO config_dir field then (never a bogus "", which would resume
+# under CLAUDE_CONFIG_DIR="").
+cfg_field=""
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+  cfg_json=$(printf '%s' "$CLAUDE_CONFIG_DIR" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  cfg_field=",\"config_dir\":\"$cfg_json\""
+fi
+
+body="{\"terminal_id\":\"$term\",\"session_id\":\"$sid\",\"source\":\"$src\",\"provider\":\"claude\",\"cwd\":\"$cwd_json\"$cfg_field}"
 curl -fsS --connect-timeout 3 --max-time 10 \
   -X POST "http://127.0.0.1:${port}/control/session-open" \
   -H 'Content-Type: application/json' \

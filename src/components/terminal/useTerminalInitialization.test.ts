@@ -414,4 +414,21 @@ describe("buildResumeCmd (resume-size picker policy)", () => {
       );
     }
   });
+
+  // G2 (Phase 1 configDir capture): now that every capture path persists a
+  // non-null configDir, the resume must emit the CLAUDE_CONFIG_DIR prefix
+  // whenever an account is bound, and NONE when it isn't — isolated here from
+  // the threshold vars via the 'summary' policy so the config-dir branch alone
+  // is asserted.
+  it("emits the CLAUDE_CONFIG_DIR prefix iff an account dir is bound (config-dir branch, no thresholds)", () => {
+    const bound = buildResumeCmd("sess-1", "C:/claude/.claude-qontinui", "summary");
+    expect(bound).toContain('CLAUDE_CONFIG_DIR="C:/claude/.claude-qontinui"');
+    expect(bound).not.toContain("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD");
+    expect(bound).toContain("--resume sess-1\r");
+
+    // No account bound ⇒ no prefix at all (bare command).
+    const unbound = buildResumeCmd("sess-1", undefined, "summary");
+    expect(unbound).not.toContain("CLAUDE_CONFIG_DIR");
+    expect(unbound).toBe("claude --permission-mode bypassPermissions --resume sess-1\r");
+  });
 });

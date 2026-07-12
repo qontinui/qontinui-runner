@@ -469,14 +469,33 @@ impl TerminalSession {
         // `QONTINUI_SESSION_WORKTREES`, the agent-agnostic pointer to every
         // materialized sibling worktree of this session). Set after the
         // built-in runner vars so a caller can intentionally override them.
-        let caller_pinned_config_dir = extra_env
-            .as_ref()
-            .is_some_and(|env| env.iter().any(|(k, _)| k == "CLAUDE_CONFIG_DIR"));
+        // Capture any caller-pinned CLAUDE_CONFIG_DIR BEFORE `extra_env` is
+        // consumed by the loop below — a caller pin (backend continuation /
+        // account-migration respawn) is the authoritative account for this
+        // session and is what the spawn-time record must bind.
+        let caller_config_dir_value: Option<String> = extra_env.as_ref().and_then(|env| {
+            env.iter()
+                .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+                .map(|(_, v)| v.clone())
+        });
+        let caller_pinned_config_dir = caller_config_dir_value.is_some();
         if let Some(env) = extra_env {
             for (k, v) in env {
                 cmd.env(k, v);
             }
         }
+
+        // Resolve the EFFECTIVE Claude config dir that is (or is about to be)
+        // placed into the PTY env — the caller pin wins, else the credential-
+        // aware resolved account dir. Computed ONCE here so the same value both
+        // stamps the spawn-time authoritative record (so an autonomous boot-
+        // resume runs under the CORRECT account instead of account-blind) AND is
+        // set on the child env below. `get_effective_config_dir` runs only when
+        // no caller pin — identical to the prior behavior.
+        let effective_claude_config_dir: Option<String> = caller_config_dir_value.or_else(|| {
+            let ai_settings = crate::settings::get_ai_settings();
+            crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli)
+        });
 
         // ---- ALWAYS-ON session-restore identity seam (plan §3b) -------------
         // NOT gated by any flag — the out-of-box session-restore guarantee
@@ -487,7 +506,15 @@ impl TerminalSession {
         // spawn (zero transcript race — the §3b determinism mechanism). Runs
         // AFTER caller `extra_env` so the identity dir wins on PATH. Fail-open:
         // any failure injects nothing and the terminal still spawns.
-        Self::apply_identity_seam(&mut cmd, &id, &app_handle, &cwd, &title, &page_id);
+        Self::apply_identity_seam(
+            &mut cmd,
+            &id,
+            &app_handle,
+            &cwd,
+            &title,
+            &page_id,
+            effective_claude_config_dir.clone(),
+        );
 
         // ---- Install-interception PATH-shim seam (plan §4 Phase 1) ----------
         // Behind the master flag `QONTINUI_INSTALL_INTERCEPT_ENABLED` (default
@@ -509,11 +536,8 @@ impl TerminalSession {
         // process-global resolved dir, which may point at a different (or
         // freshly-exhausted) account.
         if !caller_pinned_config_dir {
-            let ai_settings = crate::settings::get_ai_settings();
-            if let Some(config_dir) =
-                crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli)
-            {
-                cmd.env("CLAUDE_CONFIG_DIR", &config_dir);
+            if let Some(config_dir) = effective_claude_config_dir.as_deref() {
+                cmd.env("CLAUDE_CONFIG_DIR", config_dir);
             }
         }
 
@@ -1141,6 +1165,7 @@ impl TerminalSession {
     /// Fail-open at every step: a materialize failure injects nothing (the
     /// terminal still spawns un-shimmed); a missing lifecycle store skips the
     /// record (the confirming hook still records via `/control/session-open`).
+    #[allow(clippy::too_many_arguments)]
     fn apply_identity_seam(
         cmd: &mut CommandBuilder,
         terminal_id: &str,
@@ -1148,6 +1173,11 @@ impl TerminalSession {
         cwd: &str,
         title: &str,
         page_id: &str,
+        // The EFFECTIVE Claude config dir the caller resolved for this PTY child
+        // (caller pin, else the resolved account). Stamped onto the spawn-time
+        // authoritative record so an autonomous boot-resume runs under the
+        // CORRECT account. `None` = default account (no CLAUDE_CONFIG_DIR).
+        config_dir: Option<String>,
     ) {
         use crate::install_effects_producer::intercept::shim_materializer;
         use tauri::Manager;
@@ -1239,7 +1269,10 @@ impl TerminalSession {
                 store.inner(),
                 pinned.clone(),
                 terminal_id.to_string(),
-                None, // config dir resolved by the hook / reconcile if needed
+                // The effective account dir placed into the PTY env — stamped
+                // authoritatively at spawn so restore is account-correct without
+                // waiting on the hook echo. The store normalizes empty→None.
+                config_dir,
                 cwd.to_string(),
                 title.to_string(),
                 page_id.to_string(),

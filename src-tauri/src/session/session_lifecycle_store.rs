@@ -325,6 +325,14 @@ impl SessionLifecycleStore {
     /// A brand-new record sets `opened_at == last_seen_at == now`. Atomic-
     /// writes after mutating.
     pub fn record_open(&self, rec: TerminalSessionRecord) {
+        // Normalize a stray empty/whitespace-only config_dir to None: it must
+        // never become a bogus `CLAUDE_CONFIG_DIR=""` on resume, and the sticky
+        // guard below must treat "no account reported" uniformly as None (so an
+        // empty incoming does not clobber a known-good binding).
+        let rec = TerminalSessionRecord {
+            config_dir: rec.config_dir.filter(|s| !s.trim().is_empty()),
+            ..rec
+        };
         let now = Utc::now().timestamp_millis();
         // Captured before `rec`'s fields are moved into the entry below — used
         // after the entry mutation to evict any phantom sibling on the same
@@ -349,7 +357,14 @@ impl SessionLifecycleStore {
                     });
             // Preserve opened_at on an existing record; refresh everything
             // else and re-open.
-            entry.config_dir = rec.config_dir;
+            // config_dir is STICKY (like the `confirmed_at` monotonic guard
+            // below): a later write that omits it — a provider that doesn't
+            // report an account, a zone-move backstop, Gemini — must NOT clobber
+            // a known-good account binding. Take the incoming value only when it
+            // is Some (empty already normalized to None at the top of the fn).
+            if rec.config_dir.is_some() {
+                entry.config_dir = rec.config_dir;
+            }
             entry.working_dir = rec.working_dir;
             entry.page_id = rec.page_id;
             entry.zone_index = rec.zone_index;
@@ -1113,6 +1128,67 @@ mod tests {
         assert!(
             s2.get("old").unwrap().confirmed_at.is_none(),
             "pre-Phase-2 record loads provisional"
+        );
+    }
+
+    /// `config_dir` is STICKY and empty-normalized (G2 — account-correct
+    /// restore): a known-good account binding survives a later `record_open`
+    /// that omits the account (a provider that doesn't report it, a zone-move
+    /// backstop, Gemini), a stray empty/whitespace incoming normalizes to
+    /// `None` (never a bogus `CLAUDE_CONFIG_DIR=""` on resume), and a later
+    /// non-empty `Some` still updates (sticky ≠ frozen).
+    #[test]
+    fn record_open_config_dir_is_sticky_and_empty_normalizes_to_none() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        // Bind a known-good account.
+        let mut r = rec("sess-cfg");
+        r.config_dir = Some("C:/cfg".to_string());
+        store.record_open(r);
+        assert_eq!(
+            store.get("sess-cfg").unwrap().config_dir.as_deref(),
+            Some("C:/cfg")
+        );
+
+        // A later write that OMITS config_dir (None) must NOT clobber it.
+        let mut r2 = rec("sess-cfg");
+        r2.config_dir = None;
+        store.record_open(r2);
+        assert_eq!(
+            store.get("sess-cfg").unwrap().config_dir.as_deref(),
+            Some("C:/cfg"),
+            "a None re-record must preserve the known account binding"
+        );
+
+        // An empty/whitespace-only incoming normalizes to None → also preserves.
+        let mut r3 = rec("sess-cfg");
+        r3.config_dir = Some("   ".to_string());
+        store.record_open(r3);
+        assert_eq!(
+            store.get("sess-cfg").unwrap().config_dir.as_deref(),
+            Some("C:/cfg"),
+            "an empty incoming normalizes to None and preserves the binding"
+        );
+
+        // A brand-new record whose only config_dir is empty stores None, never "".
+        let mut r4 = rec("sess-empty");
+        r4.config_dir = Some(String::new());
+        store.record_open(r4);
+        assert!(
+            store.get("sess-empty").unwrap().config_dir.is_none(),
+            "empty config_dir normalizes to None on a fresh record"
+        );
+
+        // A later non-empty Some DOES update (sticky is not frozen).
+        let mut r5 = rec("sess-cfg");
+        r5.config_dir = Some("C:/other".to_string());
+        store.record_open(r5);
+        assert_eq!(
+            store.get("sess-cfg").unwrap().config_dir.as_deref(),
+            Some("C:/other"),
+            "a later non-empty Some updates the binding"
         );
     }
 

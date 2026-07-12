@@ -371,18 +371,51 @@ fn shim_beacon_body(
 }
 
 /// JSON body for the identity confirmation POST. Every value is
-/// [`json_escape`]d.
+/// [`json_escape`]d. Reads the effective account config dir the runner set on
+/// this PTY child (`CLAUDE_CONFIG_DIR`) so the record binds the CORRECT Claude
+/// account for an autonomous boot-resume. Env read only; the shape is built by
+/// the pure [`session_open_body_fields`] so it stays deterministically testable.
 fn session_open_body(session_id: &str, provider: &str) -> String {
     let terminal_id = env::var(TERMINAL_ID_ENV).unwrap_or_default();
     let cwd = env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let config_dir = env::var("CLAUDE_CONFIG_DIR").ok();
+    session_open_body_fields(
+        &terminal_id,
+        session_id,
+        provider,
+        &cwd,
+        config_dir.as_deref(),
+    )
+}
+
+/// Pure builder for the identity confirmation POST body — every value is
+/// [`json_escape`]d. `config_dir` is emitted ONLY when `Some` and non-empty: an
+/// empty/unset `CLAUDE_CONFIG_DIR` means the DEFAULT account, which must send NO
+/// `config_dir` field (never a bogus `""`, which would resume under
+/// `CLAUDE_CONFIG_DIR=""`). Split out from the env read so the shape is unit-
+/// testable without touching the process-global (test-parallel-hostile) env.
+fn session_open_body_fields(
+    terminal_id: &str,
+    session_id: &str,
+    provider: &str,
+    cwd: &str,
+    config_dir: Option<&str>,
+) -> String {
+    let cfg_field = match config_dir {
+        Some(dir) if !dir.trim().is_empty() => {
+            format!(",\"config_dir\":\"{}\"", json_escape(dir))
+        }
+        _ => String::new(),
+    };
     format!(
-        "{{\"terminal_id\":\"{}\",\"session_id\":\"{}\",\"source\":\"startup\",\"provider\":\"{}\",\"cwd\":\"{}\"}}",
-        json_escape(&terminal_id),
+        "{{\"terminal_id\":\"{}\",\"session_id\":\"{}\",\"source\":\"startup\",\"provider\":\"{}\",\"cwd\":\"{}\"{}}}",
+        json_escape(terminal_id),
         json_escape(session_id),
         json_escape(provider),
-        json_escape(&cwd)
+        json_escape(cwd),
+        cfg_field
     )
 }
 
@@ -1205,6 +1238,38 @@ mod tests {
         // cwd is escaped (Windows backslashes must not produce bare `\`).
         assert!(body.contains("\"cwd\":\""));
         assert!(!body.contains('\n'));
+    }
+
+    /// `config_dir` rides the body ONLY when a non-empty account dir is present:
+    /// a set dir is emitted (JSON-escaped) so restore binds the right account;
+    /// an unset or empty `CLAUDE_CONFIG_DIR` (the default account) sends NO
+    /// field — never a bogus `""`. Exercises the pure builder so the assertion
+    /// is deterministic under test parallelism (no process-global env read).
+    #[test]
+    fn session_open_body_config_dir_present_only_when_set() {
+        // A set config dir appears, backslash-escaped (Windows path).
+        let with_cfg = session_open_body_fields(
+            "term-1",
+            "sid-1",
+            "claude",
+            "C:\\repo",
+            Some("C:\\Users\\me\\.claude-qontinui"),
+        );
+        assert!(with_cfg.contains("\"config_dir\":\"C:\\\\Users\\\\me\\\\.claude-qontinui\""));
+        // cwd is still escaped and the object is well-formed.
+        assert!(with_cfg.starts_with('{') && with_cfg.ends_with('}'));
+        assert!(with_cfg.contains("\"cwd\":\"C:\\\\repo\""));
+
+        // Unset ⇒ NO config_dir field at all.
+        let no_cfg = session_open_body_fields("term-1", "sid-1", "claude", "/home/x", None);
+        assert!(!no_cfg.contains("config_dir"));
+
+        // Empty / whitespace-only ⇒ ALSO omitted (default account, not `""`).
+        let empty_cfg =
+            session_open_body_fields("term-1", "sid-1", "claude", "/home/x", Some("   "));
+        assert!(!empty_cfg.contains("config_dir"));
+        let blank_cfg = session_open_body_fields("term-1", "sid-1", "claude", "/home/x", Some(""));
+        assert!(!blank_cfg.contains("config_dir"));
     }
 
     /// END-TO-END regression for the 2026-07-03 P0: invoking the identity shim
