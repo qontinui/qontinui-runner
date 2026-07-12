@@ -1232,6 +1232,44 @@ impl TerminalSession {
             }
         }
 
+        // ---- Universal coord-mcp delivery (mcp-config-universal-provisioning) --
+        // Give EVERY device-scope session coord-mcp with zero setup — a plain
+        // hand-typed `claude` in an arbitrary cwd, a restore-re-spawned session, a
+        // fresh install — by materializing a runner-owned DEVICE `--mcp-config`
+        // file (app-data, never the cwd) and exporting its path as
+        // QONTINUI_MCP_CONFIG. The identity shim appends `--mcp-config $that` for
+        // claude, exactly parallel to the `--settings` hook above.
+        //
+        // SKIP when the cwd already declares a coord-mcp server in its own
+        // `.mcp.json`: the operator's repo-root config, or a gate-continuation
+        // terminal whose device `.mcp.json` was written by
+        // `provision_coord_mcp_for_session` BEFORE this spawn. Re-injecting would
+        // give the session two coord-mcp entries racing the per-workdir nonce, and
+        // the loser 401s / shows FAILED — so let the existing file own it.
+        //
+        // DEVICE scope only + fail-open/fail-closed: this seam runs solely for
+        // interactive + continuation terminals (headless agent subprocesses use a
+        // separate direct-spawn path), so it can never elevate an agent session;
+        // and `provision_coord_mcp_config_file` returns None on an unresolvable
+        // bound port — then we inject nothing (no broken `--mcp-config`, no cwd
+        // breadcrumb pollution), mirroring the `--settings` fail-open.
+        if crate::coord_mcp::workdir_declares_coord_mcp(cwd) {
+            info!(
+                terminal_id = %terminal_id,
+                "coord-mcp: cwd already declares coord-mcp — skipping --mcp-config injection"
+            );
+        } else if let Some(cfg_path) = crate::coord_mcp::provision_coord_mcp_config_file(cwd) {
+            cmd.env(
+                crate::coord_mcp::MCP_CONFIG_ENV,
+                cfg_path.to_string_lossy().as_ref(),
+            );
+            info!(
+                terminal_id = %terminal_id,
+                path = %cfg_path.display(),
+                "coord-mcp: QONTINUI_MCP_CONFIG injected for universal --mcp-config delivery"
+            );
+        }
+
         // 3. Materialize the always-on identity shims + prepend their dir.
         let base_dir = std::env::temp_dir();
         match shim_materializer::materialize_identity(&base_dir, terminal_id) {

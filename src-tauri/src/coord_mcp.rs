@@ -747,6 +747,17 @@ pub(crate) fn write_coord_mcp_agent_proxy_config(
 /// or a failed reachability probe). Referenced by the `/gate` skill + CLAUDE.md.
 pub(crate) const COORD_MCP_STATUS_FILE: &str = ".coord-mcp-status";
 
+/// Env var the runner injects at spawn carrying the absolute path of a
+/// runner-owned coord-mcp `--mcp-config` file (the DEVICE loopback-proxy shape).
+/// The identity shim's `claude` wrapper reads it and appends
+/// `--mcp-config $that` to the real argv — the universal delivery seam that gives
+/// EVERY device-scope session (button-spawned, restore-re-spawned, hand-typed in
+/// an arbitrary cwd, fresh install) coord-mcp with no `.mcp.json` in the cwd and
+/// no user setup. Empty/unset ⇒ the shim appends nothing (fail-open — the session
+/// simply has no coord-mcp, never a broken/FAILED server). Parallel to
+/// [`crate::session::claude_hook::CLAUDE_SETTINGS_ENV`].
+pub(crate) const MCP_CONFIG_ENV: &str = "QONTINUI_MCP_CONFIG";
+
 /// Write a SHORT, single-line degraded breadcrumb into `workdir` (Phase 1a).
 /// Emitted ONLY when coord-mcp is degraded — a healthy session writes nothing
 /// (the file is removed by [`clear_degraded_breadcrumb`] on a successful probe),
@@ -1089,6 +1100,114 @@ fn read_proxy_port(workdir: &str) -> Option<u16> {
     port_str.parse::<u16>().ok()
 }
 
+/// True iff `<workdir>/.mcp.json` already declares a `coord-mcp` server (ANY
+/// shape — proxy, static-bearer, or a hand-authored operator entry). The identity
+/// seam uses this to SKIP injecting its app-data `--mcp-config` when the cwd
+/// already provides coord-mcp, so a session never ends up with two `coord-mcp`
+/// entries competing for the per-workdir nonce (the loser 401s and the client
+/// marks it FAILED). Covers three real cases at once:
+///   * a gate-continuation terminal, whose device `.mcp.json` is written by
+///     [`provision_coord_mcp_for_session`] BEFORE the terminal spawn/seam runs;
+///   * the operator's own repo-root `.mcp.json` (boot self-heal keeps it on the
+///     bound proxy port);
+///   * any session re-spawned into a cwd a prior provision already wrote.
+/// A cwd with NO `.mcp.json`, or one whose `.mcp.json` has only the user's OWN
+/// (non-coord) servers, returns `false` → the seam injects `--mcp-config`, which
+/// merges additively without touching the user's file.
+pub(crate) fn workdir_declares_coord_mcp(workdir: &str) -> bool {
+    let path = Path::new(workdir).join(".mcp.json");
+    let Ok(s) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else {
+        return false;
+    };
+    v.pointer("/mcpServers/coord-mcp").is_some()
+}
+
+/// Stable per-workdir filename for the runner-owned coord-mcp `--mcp-config` file.
+/// A non-cryptographic hash of the absolute workdir keeps the name short (Windows
+/// path limits) and collision-free in practice, and STABLE across re-spawns into
+/// the same cwd so a restart reuses one path (rewritten with the fresh nonce).
+fn mcp_config_file_name(workdir: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    workdir.hash(&mut h);
+    format!("coord-mcp-{:016x}.json", h.finish())
+}
+
+/// Materialize a DEVICE-scope coord-mcp `--mcp-config` file into the runner's OWN
+/// app-data dir (`~/.qontinui/runner/session-restore/coord-mcp/`, NEVER the cwd)
+/// and return its absolute path, so the identity shim can append
+/// `--mcp-config <path>` to a claude launch that would not otherwise get coord-mcp
+/// (a plain/hand-typed terminal in an arbitrary cwd, a restore-re-spawned session,
+/// a fresh install). Mirrors the `--settings` hook delivery
+/// ([`crate::session::claude_hook::materialize`]): a runner-owned file + an env
+/// var, never touching `~/.claude` nor the user's cwd.
+///
+/// DEVICE principal ONLY. The identity seam ([`TerminalSession::apply_identity_seam`])
+/// runs exclusively for interactive + gate-continuation terminals (device scope);
+/// headless agent subprocesses launch through a separate direct-`tokio` spawn
+/// (`agent_runtime::run_agent_subprocess` → `spawn_claude_child`) that never
+/// reaches the seam and provisions its own AGENT proxy config in-worktree. So this
+/// can never elevate an agent session onto the device JWT (the scope-elevation
+/// trap [`write_coord_mcp_agent_proxy_config`] guards against).
+///
+/// Fail-closed (Phase 3a) on an unresolvable bound API port: returns `None` rather
+/// than writing a config pointing at the dead bootstrap-default `:9876` (wrong on
+/// any secondary/temp runner — the F1 root cause). The caller (the seam) then sets
+/// no env var, so the shim appends nothing — fail-open to NO coord-mcp, never a
+/// connection-refused server the client marks FAILED, and NO breadcrumb written
+/// into the user's cwd (the pollution non-goal). The nonce is DEVICE-principal and
+/// persisted ([`register_proxy_nonce`]), so an already-written file keeps
+/// validating across an orphan-outliving-a-restart edge.
+pub(crate) fn provision_coord_mcp_config_file(workdir: &str) -> Option<std::path::PathBuf> {
+    // Phase 3a fail-closed: never point --mcp-config at a bootstrap-default port.
+    let bound_port = resolve_bound_api_port()?;
+    let nonce = register_proxy_nonce(workdir); // DEVICE principal, persisted
+    let mcp_config = serde_json::json!({
+        "mcpServers": {
+            "coord-mcp": {
+                "type": "http",
+                "url": format!("http://127.0.0.1:{bound_port}/coord-mcp"),
+                "headers": {
+                    "X-Coord-Mcp-Proxy-Key": nonce,
+                }
+            }
+        }
+    });
+    let dir = crate::session::claude_hook::session_restore_dir().join("coord-mcp");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        warn!(
+            "coord_mcp: failed to create app-data mcp-config dir {}: {e} — \
+             --mcp-config delivery off for {workdir} (session simply has no coord-mcp)",
+            dir.display()
+        );
+        return None;
+    }
+    let file = dir.join(mcp_config_file_name(workdir));
+    match std::fs::write(
+        &file,
+        serde_json::to_string_pretty(&mcp_config).unwrap_or_default(),
+    ) {
+        Ok(()) => {
+            info!(
+                "coord_mcp: wrote --mcp-config file {} for workdir {workdir} (bound :{bound_port})",
+                file.display()
+            );
+            Some(file)
+        }
+        Err(e) => {
+            warn!(
+                "coord_mcp: failed to write --mcp-config file {}: {e} — \
+                 --mcp-config delivery off for {workdir}",
+                file.display()
+            );
+            None
+        }
+    }
+}
+
 /// Read the per-session proxy NONCE out of an existing coord-mcp `.mcp.json`, if
 /// the file holds the PROXY shape (an `X-Coord-Mcp-Proxy-Key` header). Returns
 /// `None` for an absent/unparseable file or a non-proxy shape. Used by the
@@ -1399,6 +1518,80 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `workdir_declares_coord_mcp` — the identity-seam skip gate — is true iff
+    /// `<workdir>/.mcp.json` declares a `coord-mcp` server (any shape), false for
+    /// absent / unparseable / non-coord `.mcp.json`.
+    #[test]
+    fn workdir_declares_coord_mcp_detects_any_coord_entry() {
+        let dir = std::env::temp_dir().join(format!("coord-mcp-declares-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wd = dir.to_string_lossy().to_string();
+        let mcp = dir.join(".mcp.json");
+
+        // Absent → false (seam injects).
+        assert!(!workdir_declares_coord_mcp(&wd));
+
+        // A user's OWN non-coord servers → false (seam injects --mcp-config,
+        // merging additively without touching their file).
+        std::fs::write(
+            &mcp,
+            r#"{"mcpServers":{"my-server":{"type":"stdio","command":"x"}}}"#,
+        )
+        .unwrap();
+        assert!(!workdir_declares_coord_mcp(&wd));
+
+        // A coord-mcp proxy entry → true (seam skips — continuation terminal /
+        // operator root / previously-provisioned cwd already provides it).
+        std::fs::write(
+            &mcp,
+            r#"{"mcpServers":{"coord-mcp":{"type":"http","url":"http://127.0.0.1:9876/coord-mcp"}}}"#,
+        )
+        .unwrap();
+        assert!(workdir_declares_coord_mcp(&wd));
+
+        // Unparseable → false (never a false-skip on a garbage file).
+        std::fs::write(&mcp, "not json {").unwrap();
+        assert!(!workdir_declares_coord_mcp(&wd));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Phase 3a fail-closed: with no Tauri runtime / managed AppState in a unit
+    /// test, `resolve_bound_api_port` returns `None`, so `provision_coord_mcp_config_file`
+    /// writes NOTHING and returns `None` — the seam then injects no
+    /// QONTINUI_MCP_CONFIG (fail-open to no coord-mcp, never a dead-port config,
+    /// and — critically — no breadcrumb written into the user's cwd).
+    #[test]
+    fn provision_coord_mcp_config_file_fail_closed_without_bound_port() {
+        let dir = std::env::temp_dir().join(format!("coord-mcp-provfile-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wd = dir.to_string_lossy().to_string();
+
+        assert!(
+            provision_coord_mcp_config_file(&wd).is_none(),
+            "no bound port ⇒ no --mcp-config file (fail-closed)"
+        );
+        // And no cwd pollution — the degraded breadcrumb belongs to the workdir
+        // `.mcp.json` path, never the seam's arbitrary-cwd delivery.
+        assert!(
+            !dir.join(COORD_MCP_STATUS_FILE).exists(),
+            "seam fail-closed must not pollute the cwd with a breadcrumb"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The per-workdir `--mcp-config` filename is stable for a given workdir and
+    /// distinct across workdirs (so two cwds never collide on one app-data file).
+    #[test]
+    fn mcp_config_file_name_is_stable_and_workdir_distinct() {
+        let a1 = mcp_config_file_name("D:/repo/one");
+        let a2 = mcp_config_file_name("D:/repo/one");
+        let b = mcp_config_file_name("D:/repo/two");
+        assert_eq!(a1, a2, "stable across calls for one workdir");
+        assert_ne!(a1, b, "distinct across workdirs");
+        assert!(a1.starts_with("coord-mcp-") && a1.ends_with(".json"));
+    }
 
     /// A temp-dir-backed [`SecureStorage`] for the persistence tests — injected
     /// directly into the `_with_store` seam so a test NEVER mutates the

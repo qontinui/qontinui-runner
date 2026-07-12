@@ -156,6 +156,18 @@ mod tests {
             "command runs our hook script"
         );
 
+        // The SAME delivered settings file pre-approves the coord-mcp tools, so a
+        // fresh user's first coord tool call isn't blocked by a per-tool prompt
+        // (mcp-config-universal-provisioning Phase 2). This rides the `--settings`
+        // the shim already appends — one file delivers both hook + pre-approval.
+        let allow = v["permissions"]["allow"]
+            .as_array()
+            .expect("permissions.allow present");
+        assert!(
+            allow.iter().any(|a| a.as_str() == Some("mcp__coord-mcp")),
+            "coord-mcp tools pre-approved in the delivered settings"
+        );
+
         // The hook script POSTs to the control route and reads the seam env.
         let script_text = std::fs::read_to_string(&script_path).unwrap();
         assert!(script_text.contains("/control/session-open"));

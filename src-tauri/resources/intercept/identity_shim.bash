@@ -96,6 +96,23 @@ if [ "$TOOL" = "claude" ] && [ -n "${QONTINUI_CLAUDE_HOOK_SETTINGS:-}" ] \
   SETTINGS_ARGS=(--settings "${QONTINUI_CLAUDE_HOOK_SETTINGS}")
 fi
 
+# ---------------------------------------------------------------------------
+# Universal coord-mcp delivery (mcp-config-universal-provisioning plan).
+# For TOOL=claude ONLY, append `--mcp-config <runner-app-data file>` so a
+# hand-typed `claude` in ANY cwd (or a fresh install whose cwd has no
+# `.mcp.json`) still gets coord-mcp out of the box. The runner injects
+# QONTINUI_MCP_CONFIG with the absolute path (a DEVICE loopback-proxy config);
+# empty/unset => append nothing (fail-open — the session simply has no
+# coord-mcp, never a broken/FAILED server). NOTE: `--mcp-config` is VARIADIC
+# (`<configs...>`), so it MUST be placed so a `--`-flag follows it in the exec
+# lines below (before `--session-id`) — otherwise it would swallow a trailing
+# positional. Same fail-open/recursion-guard/no-clobber contract as --settings.
+MCP_CONFIG_ARGS=()
+if [ "$TOOL" = "claude" ] && [ -n "${QONTINUI_MCP_CONFIG:-}" ] \
+    && [ -f "${QONTINUI_MCP_CONFIG}" ]; then
+  MCP_CONFIG_ARGS=(--mcp-config "${QONTINUI_MCP_CONFIG}")
+fi
+
 # Does the user's argv already choose a session? Then don't double-pin.
 user_chose_session=0
 for a in "$@"; do
@@ -135,9 +152,11 @@ notify_shim_beacon() {
   command -v curl >/dev/null 2>&1 || return 0
   local settings="false"
   [ "${#SETTINGS_ARGS[@]}" -gt 0 ] && settings="true"
+  local mcp_config="false"
+  [ "${#MCP_CONFIG_ARGS[@]}" -gt 0 ] && mcp_config="true"
   local pinned="false"; [ -n "$PINNED" ] && pinned="true"
   local user_chose="false"; [ "$user_chose_session" -eq 1 ] && user_chose="true"
-  local detail="user_session_id=$user_chose settings=$settings pinned=$pinned"
+  local detail="user_session_id=$user_chose settings=$settings mcp_config=$mcp_config pinned=$pinned"
   local body
   body="{\"terminal_id\":\"${QONTINUI_TERMINAL_ID:-}\",\"tool\":\"$TOOL\",\"event\":\"invoked\",\"detail\":\"$detail\"}"
   curl -fsS --connect-timeout 3 --max-time 10 \
@@ -156,11 +175,11 @@ if [ "$user_chose_session" -eq 1 ] || [ -z "$PINNED" ]; then
   if [ "$user_chose_session" -eq 0 ] && [ -n "$PINNED" ]; then
     notify_session_open "$PINNED" "startup"
   fi
-  exec_real "$@" "${SETTINGS_ARGS[@]}"
+  exec_real "$@" "${SETTINGS_ARGS[@]}" "${MCP_CONFIG_ARGS[@]}"
 fi
 
 # Append our pinned id (+ the claude --settings hook) and run the real provider.
 # Confirmation POST first (fire-and-forget); then exec so stdio/exit are
 # transparent.
 notify_session_open "$PINNED" "startup"
-exec_real "$@" "${SETTINGS_ARGS[@]}" --session-id "$PINNED"
+exec_real "$@" "${SETTINGS_ARGS[@]}" "${MCP_CONFIG_ARGS[@]}" --session-id "$PINNED"
