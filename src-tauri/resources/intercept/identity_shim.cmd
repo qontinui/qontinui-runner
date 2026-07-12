@@ -53,6 +53,16 @@ if /I "%TOOL%"=="claude" if defined QONTINUI_CLAUDE_HOOK_SETTINGS (
   if exist "%QONTINUI_CLAUDE_HOOK_SETTINGS%" set "SETTINGS_ARGS=--settings "%QONTINUI_CLAUDE_HOOK_SETTINGS%""
 )
 
+rem ---- Universal coord-mcp delivery (--mcp-config) --------------------------
+rem For TOOL=claude ONLY, append --mcp-config <runner-app-data file> so a
+rem hand-typed claude in ANY cwd (or a fresh install with no .mcp.json) still
+rem gets coord-mcp. Empty/unset or non-claude => none (fail-open). --mcp-config
+rem is VARIADIC, so it MUST precede --session-id in the pin path below.
+set "MCPCFG_ARGS="
+if /I "%TOOL%"=="claude" if defined QONTINUI_MCP_CONFIG (
+  if exist "%QONTINUI_MCP_CONFIG%" set "MCPCFG_ARGS=--mcp-config "%QONTINUI_MCP_CONFIG%""
+)
+
 rem ---- did the user already choose a session? then don't double-pin --------
 set "USER_CHOSE=0"
 for %%A in (%*) do (
@@ -83,11 +93,13 @@ if defined QONTINUI_INSTALL_INTERCEPT_PORT (
   if not errorlevel 1 (
     set "BSET=false"
     if defined SETTINGS_ARGS set "BSET=true"
+    set "BMCP=false"
+    if defined MCPCFG_ARGS set "BMCP=true"
     set "BPIN=false"
     if defined PINNED set "BPIN=true"
     set "BUSR=false"
     if "%USER_CHOSE%"=="1" set "BUSR=true"
-    curl -fsS --connect-timeout 3 --max-time 10 -X POST "http://127.0.0.1:%QONTINUI_INSTALL_INTERCEPT_PORT%/control/shim-beacon" -H "Content-Type: application/json" -d "{\"terminal_id\":\"%QONTINUI_TERMINAL_ID%\",\"tool\":\"%TOOL%\",\"event\":\"invoked\",\"detail\":\"user_session_id=!BUSR! settings=!BSET! pinned=!BPIN!\"}" >nul 2>nul
+    curl -fsS --connect-timeout 3 --max-time 10 -X POST "http://127.0.0.1:%QONTINUI_INSTALL_INTERCEPT_PORT%/control/shim-beacon" -H "Content-Type: application/json" -d "{\"terminal_id\":\"%QONTINUI_TERMINAL_ID%\",\"tool\":\"%TOOL%\",\"event\":\"invoked\",\"detail\":\"user_session_id=!BUSR! settings=!BSET! mcp_config=!BMCP! pinned=!BPIN!\"}" >nul 2>nul
   )
 )
 
@@ -97,9 +109,9 @@ if not defined PINNED goto :passthrough
 
 rem ---- append the runner-pinned session id (+ claude --settings hook) -------
 if defined REAL (
-  call "%REAL%" %* %SETTINGS_ARGS% --session-id %PINNED%
+  call "%REAL%" %* %SETTINGS_ARGS% %MCPCFG_ARGS% --session-id %PINNED%
 ) else (
-  call %TOOL% %* %SETTINGS_ARGS% --session-id %PINNED%
+  call %TOOL% %* %SETTINGS_ARGS% %MCPCFG_ARGS% --session-id %PINNED%
 )
 endlocal & exit /b %ERRORLEVEL%
 
@@ -108,8 +120,8 @@ rem User chose their own session (or no pin) — still deliver the claude
 rem --settings hook so a --resume/--continue confirms via SessionStart.
 set "QONTINUI_INSTALL_INTERCEPT_GUARD=1"
 if defined REAL (
-  call "%REAL%" %* %SETTINGS_ARGS%
+  call "%REAL%" %* %SETTINGS_ARGS% %MCPCFG_ARGS%
 ) else (
-  call %TOOL% %* %SETTINGS_ARGS%
+  call %TOOL% %* %SETTINGS_ARGS% %MCPCFG_ARGS%
 )
 endlocal & exit /b %ERRORLEVEL%

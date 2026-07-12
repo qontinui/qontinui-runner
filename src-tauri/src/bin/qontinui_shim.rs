@@ -80,6 +80,10 @@ const TERMINAL_ID_ENV: &str = "QONTINUI_TERMINAL_ID";
 /// Env var carrying the absolute path of the runner-materialized claude
 /// `--settings` hook file (identity mode, tool==claude only).
 const CLAUDE_HOOK_SETTINGS_ENV: &str = "QONTINUI_CLAUDE_HOOK_SETTINGS";
+/// Env var carrying the absolute path of the runner-materialized coord-mcp
+/// `--mcp-config` file (identity mode, tool==claude only) — the universal
+/// coord-mcp delivery seam. Empty/unset ⇒ append nothing (fail-open).
+const MCP_CONFIG_ENV: &str = "QONTINUI_MCP_CONFIG";
 
 fn main() -> std::process::ExitCode {
     // argv[0] → which tool we are impersonating. Fail-open to passthrough on
@@ -257,19 +261,41 @@ pub fn identity_settings_args(tool: IdentityTool, settings_path: Option<&str>) -
     }
 }
 
+/// The universal coord-mcp `--mcp-config` args: tool==claude AND the env path is
+/// non-empty AND that file exists ⇒ `["--mcp-config", <path>]` (two argv entries).
+/// Otherwise empty (fail-open). Symmetric with [`identity_settings_args`].
+/// `--mcp-config` is VARIADIC in the claude CLI, so [`identity_argv`] places this
+/// pair BEFORE the `--session-id` flag (which terminates the variadic) — never as
+/// the trailing argv token.
+pub fn identity_mcp_config_args(tool: IdentityTool, mcp_config_path: Option<&str>) -> Vec<String> {
+    if tool != IdentityTool::Claude {
+        return Vec::new();
+    }
+    match mcp_config_path {
+        Some(p) if !p.trim().is_empty() && Path::new(p).is_file() => {
+            vec!["--mcp-config".to_string(), p.to_string()]
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Compose the final identity argv (everything after the program): the
-/// ORIGINAL args byte-exact, then the `--settings` pair (claude hook), then
-/// `--session-id <pinned>` ONLY when the user did not choose a session and a
-/// pinned id exists. Pure, so passthrough purity (incl. multi-line args) is
-/// unit-testable.
+/// ORIGINAL args byte-exact, then the `--settings` pair (claude hook), then the
+/// `--mcp-config` pair (coord-mcp delivery), then `--session-id <pinned>` ONLY
+/// when the user did not choose a session and a pinned id exists. `--mcp-config`
+/// sits BEFORE `--session-id` on purpose: it is variadic, so a following
+/// `--`-flag must terminate it. Pure, so passthrough purity (incl. multi-line
+/// args) is unit-testable.
 pub fn identity_argv(
     original: &[String],
     settings_args: &[String],
+    mcp_config_args: &[String],
     pinned: Option<&str>,
     user_chose: bool,
 ) -> Vec<String> {
     let mut out: Vec<String> = original.to_vec();
     out.extend(settings_args.iter().cloned());
+    out.extend(mcp_config_args.iter().cloned());
     if !user_chose {
         if let Some(p) = pinned {
             if !p.is_empty() {
@@ -299,6 +325,7 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
         .filter(|s| !s.trim().is_empty());
     let user_chose = user_chose_session(args);
     let settings = identity_settings_args(tool, env::var(CLAUDE_HOOK_SETTINGS_ENV).ok().as_deref());
+    let mcp_config = identity_mcp_config_args(tool, env::var(MCP_CONFIG_ENV).ok().as_deref());
 
     // Fire-and-forget DIAGNOSTIC beacon on EVERY (non-nested) invocation —
     // INCLUDING the don't-double-pin passthrough that sends no session-open —
@@ -319,6 +346,7 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
                 tool.program(),
                 user_chose,
                 !settings.is_empty(),
+                !mcp_config.is_empty(),
                 pinned.is_some(),
             ),
             BEACON_TIMEOUT,
@@ -344,7 +372,7 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
         }
     }
 
-    let final_args = identity_argv(args, &settings, pinned.as_deref(), user_chose);
+    let final_args = identity_argv(args, &settings, &mcp_config, pinned.as_deref(), user_chose);
     exec_real(&real, tool.program(), &final_args)
 }
 
@@ -358,15 +386,17 @@ fn shim_beacon_body(
     provider: &str,
     user_chose: bool,
     settings_delivered: bool,
+    mcp_config_delivered: bool,
     pinned_present: bool,
 ) -> String {
     let terminal_id = env::var(TERMINAL_ID_ENV).unwrap_or_default();
     format!(
-        "{{\"terminal_id\":\"{}\",\"tool\":\"{}\",\"event\":\"invoked\",\"surface\":\"exe\",\"detail\":\"user_session_id={} settings={} pinned={}\"}}",
+        "{{\"terminal_id\":\"{}\",\"tool\":\"{}\",\"event\":\"invoked\",\"surface\":\"exe\",\"detail\":\"user_session_id={} settings={} mcp_config={} pinned={}\"}}",
         json_escape(&terminal_id),
         json_escape(provider),
         user_chose,
         settings_delivered,
+        mcp_config_delivered,
         pinned_present
     )
 }
@@ -1168,13 +1198,38 @@ mod tests {
     }
 
     #[test]
+    fn identity_mcp_config_args_only_for_claude_with_existing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("coord-mcp.json");
+        std::fs::write(&file, b"{}").unwrap();
+        let path = file.to_string_lossy().into_owned();
+
+        // claude + existing file ⇒ the two-entry pair.
+        assert_eq!(
+            identity_mcp_config_args(IdentityTool::Claude, Some(&path)),
+            vec!["--mcp-config".to_string(), path.clone()]
+        );
+        // gemini never gets --mcp-config (no such flag).
+        assert!(identity_mcp_config_args(IdentityTool::Gemini, Some(&path)).is_empty());
+        // Missing file / empty / unset ⇒ nothing (fail-open — no broken server).
+        let missing = tmp.path().join("nope.json").to_string_lossy().into_owned();
+        assert!(identity_mcp_config_args(IdentityTool::Claude, Some(&missing)).is_empty());
+        assert!(identity_mcp_config_args(IdentityTool::Claude, Some("")).is_empty());
+        assert!(identity_mcp_config_args(IdentityTool::Claude, Some("  ")).is_empty());
+        assert!(identity_mcp_config_args(IdentityTool::Claude, None).is_empty());
+    }
+
+    #[test]
     fn identity_argv_composition() {
         let multiline = "You are in a runner pane.\nSecond line \"quoted\" & <cmd|metachars>";
         let orig = strs(&["--append-system-prompt", multiline, "--version"]);
         let settings = strs(&["--settings", "C:\\hooks\\s.json"]);
+        let mcp = strs(&["--mcp-config", "C:\\cfg\\coord.json"]);
 
-        // Pinned + not user-chose ⇒ original (byte-exact) + settings + pin.
-        let got = identity_argv(&orig, &settings, Some("pin-123"), false);
+        // Pinned + not user-chose ⇒ original (byte-exact) + settings + mcp-config
+        // + pin, with `--mcp-config` BEFORE `--session-id` (the variadic must be
+        // terminated by a following `--`-flag, never trail the argv).
+        let got = identity_argv(&orig, &settings, &mcp, Some("pin-123"), false);
         assert_eq!(
             got,
             strs(&[
@@ -1183,6 +1238,8 @@ mod tests {
                 "--version",
                 "--settings",
                 "C:\\hooks\\s.json",
+                "--mcp-config",
+                "C:\\cfg\\coord.json",
                 "--session-id",
                 "pin-123",
             ])
@@ -1190,31 +1247,40 @@ mod tests {
         // The multi-line arg passes through BYTE-EXACT (the 2026-07-03 P0: the
         // .cmd shim mangled/refused exactly this argument class).
         assert_eq!(got[1], multiline);
+        // Variadic-safety invariant: --mcp-config's pair precedes --session-id.
+        let mcp_pos = got.iter().position(|a| a == "--mcp-config").unwrap();
+        let sid_pos = got.iter().position(|a| a == "--session-id").unwrap();
+        assert!(mcp_pos < sid_pos, "--mcp-config must precede --session-id");
 
-        // User chose ⇒ no pin appended, settings still delivered.
+        // User chose ⇒ no pin appended, settings + mcp-config still delivered.
         assert_eq!(
-            identity_argv(&orig, &settings, Some("pin-123"), true),
-            [orig.clone(), settings.clone()].concat()
+            identity_argv(&orig, &settings, &mcp, Some("pin-123"), true),
+            [orig.clone(), settings.clone(), mcp.clone()].concat()
         );
-        // No pinned id ⇒ no pin appended.
+        // No pinned id ⇒ no pin appended (settings + mcp-config still delivered).
         assert_eq!(
-            identity_argv(&orig, &settings, None, false),
-            [orig.clone(), settings.clone()].concat()
+            identity_argv(&orig, &settings, &mcp, None, false),
+            [orig.clone(), settings.clone(), mcp.clone()].concat()
         );
         assert_eq!(
-            identity_argv(&orig, &settings, Some(""), false),
-            [orig.clone(), settings.clone()].concat()
+            identity_argv(&orig, &settings, &mcp, Some(""), false),
+            [orig.clone(), settings.clone(), mcp.clone()].concat()
         );
-        // No settings ⇒ original + pin only.
+        // No settings, no mcp-config ⇒ original + pin only.
         assert_eq!(
-            identity_argv(&orig, &[], Some("p"), false),
+            identity_argv(&orig, &[], &[], Some("p"), false),
             [orig.clone(), strs(&["--session-id", "p"])].concat()
+        );
+        // mcp-config without settings ⇒ original + mcp-config + pin.
+        assert_eq!(
+            identity_argv(&orig, &[], &mcp, Some("p"), false),
+            [orig.clone(), mcp.clone(), strs(&["--session-id", "p"])].concat()
         );
     }
 
     #[test]
     fn shim_beacon_body_reports_surface_and_decision_flags() {
-        let body = shim_beacon_body("claude", false, true, true);
+        let body = shim_beacon_body("claude", false, true, true, true);
         assert!(body.starts_with('{') && body.ends_with('}'));
         // The exe surface discriminator — the script shims omit this field, so
         // its presence is what tells the runner logs the NATIVE stub fired.
@@ -1222,14 +1288,18 @@ mod tests {
         assert!(body.contains("\"tool\":\"claude\""));
         assert!(body.contains("\"event\":\"invoked\""));
         // Detail line mirrors the .cmd/.bash beacons' key=value format.
-        assert!(body.contains("\"detail\":\"user_session_id=false settings=true pinned=true\""));
+        assert!(body.contains(
+            "\"detail\":\"user_session_id=false settings=true mcp_config=true pinned=true\""
+        ));
         assert!(body.contains("\"terminal_id\":"));
         assert!(!body.contains('\n'));
 
         // Flag permutations land verbatim in the detail line.
-        let body2 = shim_beacon_body("gemini", true, false, false);
+        let body2 = shim_beacon_body("gemini", true, false, false, false);
         assert!(body2.contains("\"tool\":\"gemini\""));
-        assert!(body2.contains("\"detail\":\"user_session_id=true settings=false pinned=false\""));
+        assert!(body2.contains(
+            "\"detail\":\"user_session_id=true settings=false mcp_config=false pinned=false\""
+        ));
     }
 
     #[test]
