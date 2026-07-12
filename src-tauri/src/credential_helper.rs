@@ -132,6 +132,27 @@ fn is_git_repo(working_dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn git_config_local(working_dir: &Path, key: &str, value: &str) -> Result<(), String> {
+    let output = crate::process_helpers::no_window("git")
+        .args([
+            "-C",
+            &working_dir.to_string_lossy(),
+            "config",
+            "--local",
+            key,
+            value,
+        ])
+        .output()
+        .map_err(|e| format!("run git config: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git config --local {key} failed: {stderr}"));
+    }
+
+    Ok(())
+}
+
 fn set_git_credential_helper(
     working_dir: &Path,
     binary_path: &Path,
@@ -141,24 +162,11 @@ fn set_git_credential_helper(
     let config_str = config_path.to_string_lossy().replace('\\', "/");
     let helper_value = format!("{binary_str} --config {config_str}");
 
-    let output = crate::process_helpers::no_window("git")
-        .args([
-            "-C",
-            &working_dir.to_string_lossy(),
-            "config",
-            "--local",
-            "credential.helper",
-            &helper_value,
-        ])
-        .output()
-        .map_err(|e| format!("run git config: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "git config --local credential.helper failed: {stderr}"
-        ));
-    }
+    git_config_local(working_dir, "credential.helper", &helper_value)?;
+    // Without useHttpPath git never sends `path=` to the helper, and the
+    // helper's repo-registry lookup is keyed on the request path — the
+    // install would be a production no-op.
+    git_config_local(working_dir, "credential.useHttpPath", "true")?;
 
     Ok(())
 }
@@ -207,8 +215,10 @@ pub async fn setup_credential_helper(working_dir: &str, session_id: &str) {
     }
 
     let config_path = config_file_path(session_id);
+    // NOTE: the helper binary emits ONLY username/password (no
+    // protocol/host/path rewrite), so it needs just the token and the
+    // registered-repo list for its emit decision — no coord_url.
     let config = json!({
-        "coord_url": coord_base,
         "push_token": push_token,
         "repos": repos,
     });
@@ -244,5 +254,61 @@ pub fn cleanup_credential_helper(session_id: &str) {
         if let Err(e) = std::fs::remove_file(&config_path) {
             debug!("credential_helper: cleanup config file failed: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git_config_get(dir: &Path, key: &str) -> Option<String> {
+        let out = crate::process_helpers::no_window("git")
+            .args(["-C", &dir.to_string_lossy(), "config", "--local", key])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    #[test]
+    fn set_git_credential_helper_writes_helper_and_use_http_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let status = crate::process_helpers::no_window("git")
+            .args(["init", "-q", &tmp.path().to_string_lossy()])
+            .status()
+            .expect("git init");
+        assert!(status.success());
+
+        set_git_credential_helper(
+            tmp.path(),
+            Path::new("C:\\bin\\qontinui-git-credential.exe"),
+            Path::new("C:\\tmp\\cred.json"),
+        )
+        .expect("set_git_credential_helper");
+
+        assert_eq!(
+            git_config_get(tmp.path(), "credential.helper").as_deref(),
+            Some("C:/bin/qontinui-git-credential.exe --config C:/tmp/cred.json")
+        );
+        // Without useHttpPath git never passes `path=` to the helper, which
+        // makes the whole install a production no-op — it must be set.
+        assert_eq!(
+            git_config_get(tmp.path(), "credential.useHttpPath").as_deref(),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn set_git_credential_helper_fails_outside_git_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = set_git_credential_helper(
+            tmp.path(),
+            Path::new("C:\\bin\\qontinui-git-credential.exe"),
+            Path::new("C:\\tmp\\cred.json"),
+        )
+        .unwrap_err();
+        assert!(err.contains("credential.helper"), "unexpected error: {err}");
     }
 }

@@ -386,8 +386,10 @@ async fn push_one(
 /// smart-HTTP routes are owner-qualified (`/git/:owner/:repo/...`) per the
 /// multitenant cutover — collapsing to a basename would map distinct owners
 /// (`qontinui/tools` vs `fork-org/tools`) onto the same bare repo. A bare
-/// single-segment name (no owner in the allocation) passes through unchanged
-/// as the legacy flat form.
+/// single-segment name (coord's allocate response echoes bare repo names) is
+/// mapped under the **default owner** — the same legacy mapping coord's
+/// `git_origin::default_repo_owner` applies server-side — so both sides agree
+/// by construction; the old flat `/git/<name>.git` route is deleted coord-side.
 pub fn build_origin_url(base: &str, repo: &str) -> Result<String> {
     let base = base.trim_end_matches('/');
     let prefix = if let Some(rest) = base.strip_prefix("https://") {
@@ -399,7 +401,34 @@ pub fn build_origin_url(base: &str, repo: &str) -> Result<String> {
     };
     let repo = repo.strip_suffix(".git").unwrap_or(repo);
     let slug = repo.trim_start_matches('/');
-    Ok(format!("{}{}/git/{}.git", prefix.0, prefix.1, slug))
+    if slug.contains('/') {
+        Ok(format!("{}{}/git/{}.git", prefix.0, prefix.1, slug))
+    } else {
+        Ok(format!(
+            "{}{}/git/{}/{}.git",
+            prefix.0,
+            prefix.1,
+            default_repo_owner(),
+            slug
+        ))
+    }
+}
+
+/// The owner coord maps legacy bare repo slugs under. Mirrors coord's
+/// `git_origin::default_repo_owner` exactly — env `GITHUB_REPO_OWNER`
+/// (trimmed, non-empty) else `"qontinui"` — so the runner-built URL and
+/// coord's legacy-slug route agree by construction.
+fn default_repo_owner() -> String {
+    owner_or_default(std::env::var("GITHUB_REPO_OWNER").ok().as_deref())
+}
+
+/// Pure core of [`default_repo_owner`], split out for deterministic tests
+/// (no process-global env mutation in the test suite).
+fn owner_or_default(env_value: Option<&str>) -> String {
+    match env_value.map(str::trim) {
+        Some(owner) if !owner.is_empty() => owner.to_string(),
+        _ => "qontinui".to_string(),
+    }
 }
 
 /// Outcome of one [`push_one`] attempt. `Transient` carries the git
@@ -512,11 +541,24 @@ mod tests {
     }
 
     #[test]
-    fn build_origin_url_bare_name_passes_through() {
-        // A bare single-segment repo (no owner in the allocation) keeps the
-        // legacy flat form — the runner never fabricates an owner.
+    fn build_origin_url_bare_name_maps_under_default_owner() {
+        // coord's allocate response echoes BARE repo names, and the flat
+        // `/git/<name>.git` route is deleted coord-side — a bare slug must be
+        // mapped under the default owner, mirroring coord's
+        // `git_origin::default_repo_owner` legacy mapping.
         let url = build_origin_url("http://h:9870", "qontinui-coord").unwrap();
-        assert_eq!(url, "http://h:9870/git/qontinui-coord.git");
+        assert_eq!(url, "http://h:9870/git/qontinui/qontinui-coord.git");
+    }
+
+    #[test]
+    fn owner_or_default_matches_coord_legacy_mapping() {
+        // Same rule as coord `git_origin::default_repo_owner`: env value
+        // (trimmed, non-empty) wins, else "qontinui".
+        assert_eq!(owner_or_default(None), "qontinui");
+        assert_eq!(owner_or_default(Some("")), "qontinui");
+        assert_eq!(owner_or_default(Some("   ")), "qontinui");
+        assert_eq!(owner_or_default(Some("acme")), "acme");
+        assert_eq!(owner_or_default(Some("  acme ")), "acme");
     }
 
     #[test]
