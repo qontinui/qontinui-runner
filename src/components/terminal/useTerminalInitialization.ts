@@ -234,43 +234,49 @@ function isValidSessionId(id: string): boolean {
  * What the cold-restore path does with a registry record (Phase 4 —
  * autonomous restore).
  *
- * - `"auto-resume"`: the record is `origin === "authoritative"` AND
- *   CONFIRMED (`confirmedAt` set) AND its provider's `restoreTier()` is
- *   `"full"`. The runner KNOWS the id (it pre-pinned `--session-id`) AND a
- *   provider's SessionStart hook (or the process-start-anchored reconcile
- *   backstop) observed a REAL provider session start here — so the resume
- *   command is typed unattended, with NO operator click. This removes the old
- *   `guessed→quarantine` gate for authoritative records.
+ * - `"auto-resume"`: the record is `origin === "authoritative"` OR
+ *   `origin === "observed"`, AND CONFIRMED (`confirmedAt` set) AND its
+ *   provider's `restoreTier()` is `"full"`. For `authoritative` the runner KNOWS
+ *   the id (it pre-pinned `--session-id`) AND a provider's SessionStart hook (or
+ *   the process-start-anchored reconcile backstop) observed a REAL provider
+ *   session start here. `observed` is the same-strength proof arrived at from the
+ *   other direction — a claude-process-start-anchored, uniquely-correlated
+ *   transcript bind — so a CONFIRMED observed record is treated IDENTICALLY to a
+ *   confirmed authoritative one: the resume command is typed unattended, with NO
+ *   operator click. This removes the old `guessed→quarantine` gate for both
+ *   authoritative and observed records.
  * - `"terminal-only"`: restore terminal+cwd+launch-command, but type NO resume
  *   and show NO operator-confirm banner — there is no conversation to bring
  *   back, and the UI is HONEST about it ("fresh conversation"). Two distinct
  *   sources land here:
- *     1. an authoritative-but-PROVISIONAL record — the spawn-time pin wrote a
- *        provisional record for EVERY terminal, including plain shells that
- *        never ran a provider (a "phantom shell"); auto-`--resume`-ing it would
- *        manufacture a failed resume against an unused uuid. The backend
+ *     1. an authoritative/observed-but-PROVISIONAL record — the spawn-time pin
+ *        wrote a provisional record for EVERY terminal, including plain shells
+ *        that never ran a provider (a "phantom shell"); auto-`--resume`-ing it
+ *        would manufacture a failed resume against an unused uuid. The backend
  *        reconcile normally PRUNES these before the frontend ever classifies
  *        (it confirms the ones with a real transcript, drops the rest); this
  *        branch is the frontend's defense-in-depth for a cold-boot phantom the
  *        reconcile couldn't reach (no live PTY).
- *     2. a CONFIRMED authoritative record whose provider declares
+ *     2. a CONFIRMED authoritative/observed record whose provider declares
  *        `restoreTier() === "terminal-only"` (Phase 5 honest tiers) — the
  *        provider can re-open the terminal at the right cwd/launch-command but
  *        CANNOT deterministically resume the conversation by id. The terminal
  *        is restored; the UI notes the conversation is fresh.
- * - `"quarantine"`: a `"reconciled"` (or pre-field) origin — a backstop-
- *   recovered id that can name a FOREIGN session. The tab is created so layout
- *   is preserved, but no resume is typed; the operator confirms via a one-click
- *   `ResumeFailedBanner`. (Reserved for genuinely uncertain identity, NOT for
- *   never-confirmed authoritative rows — those are `terminal-only`.)
+ * - `"quarantine"`: a `"reconciled"` (or pre-field / any other) origin — a
+ *   backstop-recovered id that can name a FOREIGN session. The tab is created so
+ *   layout is preserved, but no resume is typed; the operator confirms via a
+ *   one-click `ResumeFailedBanner`. (Reserved for genuinely uncertain identity,
+ *   NOT for never-confirmed authoritative/observed rows — those are
+ *   `terminal-only`.)
  * - `"skip-invalid"`: the recorded id fails shell-safety validation — never
  *   typed, never quarantined (nothing actionable).
  *
  * The auto-resume GATE lives here on the frontend as
- * `origin === "authoritative" && confirmed` (a record is "confirmed" when its
- * `confirmedAt` is set). The backend reconcile is the PRIMARY phantom defense
- * (it prunes/flags provisional records for live PTYs before this runs), but the
- * classifier keeps the `confirmed` check so a phantom the reconcile didn't see
+ * `(origin === "authoritative" || origin === "observed") && confirmed` (a record
+ * is "confirmed" when its `confirmedAt` is set). The backend reconcile is the
+ * PRIMARY phantom defense (it prunes/flags provisional records for live PTYs
+ * before this runs), but the classifier keeps the `confirmed` check so a phantom
+ * the reconcile didn't see
  * (cold boot, no live process) still can't be auto-resumed. Pure + exported so
  * the gate is unit-testable without React.
  */
@@ -280,16 +286,20 @@ export function classifyRestoreAction(
   rec: Pick<TerminalSessionRecord, "claudeSessionId" | "origin" | "confirmedAt" | "provider">,
 ): RestoreAction {
   if (!isValidSessionId(rec.claudeSessionId)) return "skip-invalid";
-  if (rec.origin === "authoritative") {
-    // Authoritative-but-unconfirmed ⇒ phantom shell — restore the terminal
-    // only, never auto-resume a session that may never have existed.
+  if (rec.origin === "authoritative" || rec.origin === "observed") {
+    // Authoritative/observed-but-unconfirmed ⇒ phantom shell — restore the
+    // terminal only, never auto-resume a session that may never have existed.
+    // (`observed` is the claude-process-start-anchored, uniquely-correlated
+    // transcript bind; a CONFIRMED observed record is as strong a proof that the
+    // session exists as a confirmed authoritative one, so it takes the same
+    // path.)
     if (rec.confirmedAt == null) return "terminal-only";
-    // Confirmed authoritative ⇒ auto-resume (no operator click) — but ONLY when
-    // the provider can deterministically resume the FULL conversation by id
-    // (`restoreTier() === "full"`). A `terminal-only`-tier provider can re-open
-    // the terminal but not the chat, so a CONFIRMED authoritative row of that
-    // provider restores terminal-only (honest "fresh conversation"), never a
-    // resume typed against an id the provider can't resume by `--resume`.
+    // Confirmed authoritative/observed ⇒ auto-resume (no operator click) — but
+    // ONLY when the provider can deterministically resume the FULL conversation
+    // by id (`restoreTier() === "full"`). A `terminal-only`-tier provider can
+    // re-open the terminal but not the chat, so a CONFIRMED row of that provider
+    // restores terminal-only (honest "fresh conversation"), never a resume typed
+    // against an id the provider can't resume by `--resume`.
     return providerDescriptorFor(rec.provider).restoreTier() === "full"
       ? "auto-resume"
       : "terminal-only";

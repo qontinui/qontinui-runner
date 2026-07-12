@@ -108,12 +108,19 @@ pub const ORIGIN_AUTHORITATIVE: &str = "authoritative";
 /// Reconciled origin: the id was recovered by a backstop and may name a foreign
 /// session — restore treats it conservatively.
 pub const ORIGIN_RECONCILED: &str = "reconciled";
+/// Observed origin: a claude-process-start-anchored, uniquely-correlated
+/// transcript bind — the transcript proves the session exists, so restore
+/// treats a CONFIRMED observed row the same as confirmed authoritative
+/// (auto-resume-eligible), unlike the conservative `reconciled`/mtime guess.
+pub const ORIGIN_OBSERVED: &str = "observed";
 
 /// Normalize a possibly-legacy `origin` value to the current vocabulary. Maps
 /// the pre-migration `bind_origin` values (`"pinned"`→`"authoritative"`,
-/// `"guessed"`→`"reconciled"`) and passes the new values through unchanged. Any
-/// other string is left verbatim (forward-compat: a value this build doesn't
-/// know is not silently rewritten). Returns `None` for `None`.
+/// `"guessed"`→`"reconciled"`) and passes the new values through unchanged —
+/// including `"observed"`, which has no legacy alias and falls through the `_`
+/// arm verbatim. Any other string is left verbatim (forward-compat: a value
+/// this build doesn't know is not silently rewritten). Returns `None` for
+/// `None`.
 fn normalize_origin(origin: Option<String>) -> Option<String> {
     origin.map(|o| match o.as_str() {
         "pinned" => ORIGIN_AUTHORITATIVE.to_string(),
@@ -341,6 +348,11 @@ impl SessionLifecycleStore {
         let new_terminal_id = rec.terminal_id.clone();
         let new_is_authoritative =
             normalize_origin(rec.origin.clone()).as_deref() == Some(ORIGIN_AUTHORITATIVE);
+        // A bind that carries confirmation proves a real session owns the
+        // terminal, regardless of origin (authoritative OR the launch-agnostic
+        // `observed` bind). `confirmed_at` is `Option<i64>` (Copy) — safe to
+        // read here before `rec`'s fields are moved into the entry below.
+        let new_is_confirmed = rec.confirmed_at.is_some();
         let (snapshot, merged) = {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
@@ -393,10 +405,20 @@ impl SessionLifecycleStore {
             let merged = entry.clone();
 
             // Single-tenant-terminal invariant: a PTY terminal hosts at most
-            // ONE live provider session. When a new AUTHORITATIVE record binds a
-            // terminal, any OTHER still-open record on the SAME terminal that no
-            // provider hook ever confirmed is a superseded phantom — evict it so
-            // restore never resurrects a session that never ran.
+            // ONE live provider session. When a new record that PROVES a real
+            // session owns the terminal binds it, any OTHER still-open record on
+            // the SAME terminal that no provider hook ever confirmed is a
+            // superseded phantom — evict it so restore never resurrects a
+            // session that never ran.
+            //
+            // "Proves a real session" = either AUTHORITATIVE (the runner knows
+            // the id exactly — a pinned/typed `--session-id`) OR CONFIRMED of
+            // ANY origin. The confirmed arm is what closes the launch-agnostic
+            // `observed`-orphan class: a process-anchored, uniquely-correlated
+            // `observed` bind is confirmed the moment its transcript is found,
+            // and that confirmation proves the terminal's real session — so its
+            // unconfirmed siblings are phantoms, evicted here while the terminal
+            // is still alive.
             //
             // The split this fixes: the always-on identity seam records a fresh
             // pinned id at SHELL spawn, but an account/CLI launcher then TYPES
@@ -406,7 +428,7 @@ impl SessionLifecycleStore {
             // unconfirmed victims are closed: a confirmed row represents a
             // session that actually started and is retired by the normal
             // exit / poll-dead path, never here.
-            if new_is_authoritative && !new_terminal_id.is_empty() {
+            if (new_is_authoritative || new_is_confirmed) && !new_terminal_id.is_empty() {
                 for other in m.values_mut() {
                     if other.claude_session_id != new_id
                         && other.terminal_id == new_terminal_id
@@ -1375,6 +1397,58 @@ mod tests {
             store.get("phantom2").unwrap().state,
             "open",
             "reconciled insert does not supersede"
+        );
+    }
+
+    /// Launch-agnostic supersede: a CONFIRMED `observed` bind (process-anchored
+    /// unique transcript correlation) evicts an unconfirmed same-terminal
+    /// sibling, closing the observed-orphan class while the terminal is alive —
+    /// even though `observed` is not authoritative.
+    #[test]
+    fn record_open_observed_confirmed_supersedes_unconfirmed_sibling() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+
+        // Spawn-time seam pin: authoritative but unconfirmed, on term-1.
+        store.record_open(auth_on("seam-phantom", "term-1"));
+
+        // The live binder observes the real session on the same terminal and
+        // confirms it (a transcript proved it exists).
+        let mut observed = rec("observed-real");
+        observed.terminal_id = "term-1".to_string();
+        observed.origin = Some(ORIGIN_OBSERVED.to_string());
+        observed.confirmed_at = Some(999);
+        store.record_open(observed);
+
+        let phantom = store.get("seam-phantom").unwrap();
+        assert_eq!(phantom.state, "closed", "unconfirmed sibling superseded");
+        assert_eq!(phantom.close_reason.as_deref(), Some("superseded"));
+        assert_eq!(
+            store.get("observed-real").unwrap().state,
+            "open",
+            "the confirmed observed bind stays open"
+        );
+    }
+
+    /// An UNconfirmed `observed` bind is itself only a candidate — it must NOT
+    /// supersede a sibling (no proof yet a real session owns the terminal).
+    #[test]
+    fn record_open_observed_unconfirmed_does_not_supersede() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+
+        store.record_open(auth_on("sibling", "term-2"));
+
+        let mut observed = rec("observed-provisional");
+        observed.terminal_id = "term-2".to_string();
+        observed.origin = Some(ORIGIN_OBSERVED.to_string());
+        // confirmed_at stays None.
+        store.record_open(observed);
+
+        assert_eq!(
+            store.get("sibling").unwrap().state,
+            "open",
+            "an unconfirmed observed bind does not supersede its sibling"
         );
     }
 

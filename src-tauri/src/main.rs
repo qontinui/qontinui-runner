@@ -2793,18 +2793,23 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
 
-                        // Transcript-anchored reconcile pass (Phase 2 / G1):
-                        // recover a live-but-unrecorded session (spawn-record
-                        // AND hook both missed) within one poll interval —
-                        // while its PTY is still live — instead of only at the
-                        // next boot. Reuses THIS tick's `snap` (no 2nd process
-                        // scan) and the steady-state `needs_reconcile` guard
-                        // above (skips the disk scan when every live PTY is
-                        // already confirmed). Runs even when `open` was empty
-                        // (that IS the capture-miss case). Fail-open. Reconciled
-                        // rows are written as quarantine (origin=reconciled,
-                        // unconfirmed-as-restorable) — Phase 3's classifier owns
-                        // any auto-resume upgrade, not this pass.
+                        // Continuous, claude-process-anchored session binder
+                        // (Phase 2 / G1 + launch-agnostic session binding).
+                        // Recovers a live-but-unrecorded session (spawn-record
+                        // AND hook both missed — including an absolute-path
+                        // `claude.exe` that bypasses the PATH shim entirely)
+                        // within one poll interval, while its PTY is still live,
+                        // instead of only at the next boot. REUSES this tick's
+                        // `snap` (no 2nd process scan) and the steady-state
+                        // `needs_reconcile` guard above (skips the disk scan when
+                        // every live PTY is already confirmed). Runs even when
+                        // `open` was empty — that IS the capture-miss case. The
+                        // pass itself resolves each PTY's claude anchor from
+                        // `snap` and issues the targeted `--session-id` cmdline
+                        // query for the unbound anchors only. Fail-open: every
+                        // store / cmdline / snapshot op inside swallows its own
+                        // errors, so a failure degrades to "bound nothing this
+                        // tick", never a panic that would break the liveness loop.
                         if needs_reconcile {
                             let live_ptys: Vec<session::reconcile::LivePty> = live
                                 .iter()
@@ -2814,6 +2819,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     working_dir: i.working_dir.clone(),
                                     page_id: i.page_id.clone(),
                                     title: i.title.clone(),
+                                    // run_reconcile_pass resolves the claude
+                                    // anchor from the snapshot it is handed.
+                                    ai_pid: None,
+                                    ai_start_unix: None,
                                 })
                                 .collect();
                             session::reconcile::run_reconcile_pass(
@@ -2821,7 +2830,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 &live_ptys,
                                 &snap,
                                 "periodic",
-                            );
+                            )
+                            .await;
                         }
 
                         poll_lifecycle_store.prune(chrono::Utc::now().timestamp_millis());
@@ -2851,6 +2861,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             working_dir: i.working_dir,
                             page_id: i.page_id,
                             title: i.title,
+                            // run_at_boot enriches the claude anchor itself from
+                            // its own fresh snapshot.
+                            ai_pid: None,
+                            ai_start_unix: None,
                         })
                         .collect();
                     session::reconcile::run_at_boot(&reconcile_lifecycle_store, live).await;
