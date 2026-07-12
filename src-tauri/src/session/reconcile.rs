@@ -806,7 +806,12 @@ mod tests {
 
     // ── Disk-only restore net (G3) — pure selection ─────────────────────────
 
-    fn recent(id: &str, cfg: &str, wd: &str, last_ms: i64) -> crate::terminal::transcript::RecentTranscript {
+    fn recent(
+        id: &str,
+        cfg: &str,
+        wd: &str,
+        last_ms: i64,
+    ) -> crate::terminal::transcript::RecentTranscript {
         crate::terminal::transcript::RecentTranscript {
             session_id: id.to_string(),
             config_dir: cfg.to_string(),
@@ -836,7 +841,12 @@ mod tests {
                 now - DISK_ONLY_RESTORE_WINDOW_MS - 1,
             ),
             // Exactly at the window boundary is still IN-window → included.
-            recent("edge", "C:/cfg-B", "C:/repoB", now - DISK_ONLY_RESTORE_WINDOW_MS),
+            recent(
+                "edge",
+                "C:/cfg-B",
+                "C:/repoB",
+                now - DISK_ONLY_RESTORE_WINDOW_MS,
+            ),
         ];
 
         let out = select_disk_only_candidates(&recents, &registry_ids, now);
@@ -852,7 +862,10 @@ mod tests {
             .find(|r| r.claude_session_id == "fresh-a")
             .unwrap();
         assert_eq!(a.origin.as_deref(), Some(ORIGIN_RECONCILED));
-        assert!(a.confirmed_at.is_none(), "disk-only candidate is unconfirmed");
+        assert!(
+            a.confirmed_at.is_none(),
+            "disk-only candidate is unconfirmed"
+        );
         assert_eq!(
             a.config_dir.as_deref(),
             Some("C:/cfg-A"),

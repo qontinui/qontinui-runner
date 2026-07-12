@@ -1645,7 +1645,10 @@ mod tests {
         let content = "\
 {\"type\":\"queue-operation\",\"timestamp\":\"2026-06-14T06:49:11.888Z\"}
 {\"type\":\"user\",\"cwd\":\"C:\\\\Users\\\\jspin\\\\proj\",\"timestamp\":\"2026-06-14T06:49:11.902Z\",\"message\":{\"content\":\"hi\"}}";
-        assert_eq!(extract_cwd(content).as_deref(), Some("C:\\Users\\jspin\\proj"));
+        assert_eq!(
+            extract_cwd(content).as_deref(),
+            Some("C:\\Users\\jspin\\proj")
+        );
         // A transcript with no cwd anywhere → None.
         assert_eq!(
             extract_cwd("{\"type\":\"summary\",\"summary\":\"x\"}"),
