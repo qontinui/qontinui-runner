@@ -65,6 +65,38 @@ describe("classifyRestoreAction — restore-tier gate (Phase 5)", () => {
     ).toBe("terminal-only");
   });
 
+  it("CONFIRMED observed + FULL-tier provider ⇒ auto-resume (mirrors authoritative)", () => {
+    expect(
+      classifyRestoreAction({
+        claudeSessionId: "sess-1",
+        origin: "observed",
+        confirmedAt: 1,
+        provider: "full-provider",
+      }),
+    ).toBe("auto-resume");
+  });
+
+  it("CONFIRMED observed + TERMINAL-ONLY-tier provider ⇒ terminal-only (no resume)", () => {
+    expect(
+      classifyRestoreAction({
+        claudeSessionId: "sess-1",
+        origin: "observed",
+        confirmedAt: 1,
+        provider: "terminal-only-provider",
+      }),
+    ).toBe("terminal-only");
+  });
+
+  it("UNCONFIRMED observed is a phantom shell ⇒ terminal-only regardless of tier", () => {
+    expect(
+      classifyRestoreAction({
+        claudeSessionId: "sess-1",
+        origin: "observed",
+        provider: "full-provider",
+      }),
+    ).toBe("terminal-only");
+  });
+
   it("reconciled origin is quarantined regardless of provider tier", () => {
     expect(
       classifyRestoreAction({
