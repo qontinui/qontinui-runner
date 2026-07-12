@@ -47,6 +47,7 @@
 //! such re-quoting layer; arguments pass through byte-exact.
 
 use std::env;
+use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -695,8 +696,18 @@ fn own_shim_dirs() -> Vec<PathBuf> {
 /// resolution handle it at exec time (last-resort fail-open).
 fn resolve_real(name: &str, own_dirs: &[PathBuf]) -> Option<PathBuf> {
     let path_var = env::var_os("PATH")?;
+    resolve_real_in(name, own_dirs, &path_var)
+}
+
+/// Core of [`resolve_real`], parameterized on the `PATH` value. Split out so
+/// tests can drive resolution with an explicit PATH instead of mutating the
+/// process-global `PATH` env var: that mutation raced other tests under the
+/// parallel test runner and intermittently reddened CI (the candidate-CI flake
+/// that blocked merges on 2026-07-11). The binary's callers pass the live env
+/// `PATH` via `resolve_real`.
+fn resolve_real_in(name: &str, own_dirs: &[PathBuf], path_var: &OsStr) -> Option<PathBuf> {
     let own: Vec<PathBuf> = own_dirs.iter().map(|d| normalize_dir(d)).collect();
-    for dir in env::split_paths(&path_var) {
+    for dir in env::split_paths(path_var) {
         if dir.as_os_str().is_empty() {
             continue;
         }
@@ -995,17 +1006,12 @@ mod tests {
         let real_path = realbin.join(exe);
         std::fs::write(&real_path, b"x").unwrap();
 
-        let saved = env::var_os("PATH");
+        // Drive the pure core with an explicit PATH — no process-global env
+        // mutation, so this test can't race other threads' PATH reads/writes.
         let sep = if cfg!(windows) { ";" } else { ":" };
-        env::set_var(
-            "PATH",
-            format!("{}{sep}{}", shim.display(), realbin.display()),
-        );
-        let got = resolve_real("cargo", std::slice::from_ref(&shim));
-        if let Some(p) = saved {
-            env::set_var("PATH", p);
-        }
-        let got = got.expect("resolve real cargo");
+        let path = format!("{}{sep}{}", shim.display(), realbin.display());
+        let got = resolve_real_in("cargo", std::slice::from_ref(&shim), OsStr::new(&path))
+            .expect("resolve real cargo");
         assert_eq!(
             normalize_dir(got.parent().unwrap()),
             normalize_dir(&realbin),
@@ -1034,22 +1040,21 @@ mod tests {
         std::fs::write(install.join(exe), b"x").unwrap();
         std::fs::write(realbin.join(exe), b"x").unwrap();
 
-        let saved = env::var_os("PATH");
+        // Drive the pure core with an explicit PATH — no process-global env
+        // mutation, so this test can't race other threads' PATH reads/writes.
         let sep = if cfg!(windows) { ";" } else { ":" };
-        env::set_var(
-            "PATH",
-            format!(
-                "{}{sep}{}{sep}{}",
-                identity.display(),
-                install.display(),
-                realbin.display()
-            ),
+        let path = format!(
+            "{}{sep}{}{sep}{}",
+            identity.display(),
+            install.display(),
+            realbin.display()
         );
-        let got = resolve_real("claude", &[identity.clone(), install.clone()]);
-        if let Some(p) = saved {
-            env::set_var("PATH", p);
-        }
-        let got = got.expect("resolve real claude");
+        let got = resolve_real_in(
+            "claude",
+            &[identity.clone(), install.clone()],
+            OsStr::new(&path),
+        )
+        .expect("resolve real claude");
         assert_eq!(
             normalize_dir(got.parent().unwrap()),
             normalize_dir(&realbin),
