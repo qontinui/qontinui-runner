@@ -502,12 +502,12 @@ fn newest_tsx_mtime(dir: &std::path::Path) -> Option<std::time::SystemTime> {
                     }
                 }
                 stack.push(path);
-            } else if ft.is_file() {
-                if path.extension().and_then(|e| e.to_str()) == Some("tsx") {
-                    if let Ok(meta) = entry.metadata() {
-                        if let Ok(modified) = meta.modified() {
-                            newest = Some(newest.map_or(modified, |cur| cur.max(modified)));
-                        }
+            } else if ft.is_file()
+                && path.extension().and_then(|e| e.to_str()) == Some("tsx")
+            {
+                if let Ok(meta) = entry.metadata() {
+                    if let Ok(modified) = meta.modified() {
+                        newest = Some(newest.map_or(modified, |cur| cur.max(modified)));
                     }
                 }
             }

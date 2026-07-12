@@ -287,7 +287,6 @@ pub fn pkce_login(identity_provider: Option<&str>) -> Result<CognitoLoginResult,
                     let state_for_route = state_for_route.clone();
                     let received_for_route = received_for_route.clone();
                     let shutdown_tx_route = shutdown_tx_route.clone();
-                    let signal_shutdown = signal_shutdown.clone();
                     async move {
                         // Error path: Cognito reported a problem.
                         if let Some(err) = q.error {

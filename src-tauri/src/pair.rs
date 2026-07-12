@@ -824,7 +824,7 @@ pub fn coord_http_base_from_url(coord_url: &str) -> String {
 }
 
 /// Derive a `https://` web base from the coord HTTP base, assuming web
-/// + coord live on the same host (the dev-default). Production
+/// and coord live on the same host (the dev-default). Production
 /// deployments override via `QONTINUI_WEB_BASE`. Best-effort: strips
 /// the trailing `:port`.
 pub fn derive_web_base_from_coord(coord_base: &str) -> String {
