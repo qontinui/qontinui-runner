@@ -93,12 +93,6 @@ pub fn get_main_window(app: &tauri::AppHandle) -> Option<tauri::WebviewWindow> {
     app.get_webview_window(get_main_window_label())
 }
 
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
-
 /// Read an image file and return it as a base64 data URL
 #[tauri::command]
 fn read_image_as_base64(path: String) -> Result<String, String> {
@@ -134,7 +128,7 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet, read_image_as_base64])
+        .invoke_handler(tauri::generate_handler![read_image_as_base64])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

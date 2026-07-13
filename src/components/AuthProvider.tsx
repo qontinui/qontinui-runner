@@ -189,7 +189,13 @@ export function AuthProvider({ children }: AuthProviderProps) {
     } catch (err) {
       log.error("Full sign-out failed:", err);
       setError(err as string);
-      // Clear local state even if backend call fails
+      // The credentials may still be on disk — surface the error, but still
+      // flip local state so the user is not trapped in a signed-in shell.
+      // NOTE: this catch once masked a real bug. `sign_out_full` was never
+      // registered in main.rs's `generate_handler!`, so every call threw
+      // "Command sign_out_full not found" and the wipe silently never ran,
+      // while this branch still reported a clean sign-out. A registration
+      // guard now prevents that class (src-tauri/tests/tauri_commands_are_registered.rs).
       setAuthStatus({
         authenticated: false,
         user: null,

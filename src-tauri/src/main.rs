@@ -1247,6 +1247,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::auth::kick_device_jwt_refresher_cmd,
             commands::auth::logout,
             commands::auth::qontinui_sign_out,
+            commands::auth::sign_out_full,
             commands::auth::set_runner_tier,
             commands::auth::cognito_sign_in,
             commands::auth::cognito_sign_in_password,
