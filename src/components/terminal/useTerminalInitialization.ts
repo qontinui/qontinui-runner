@@ -17,6 +17,7 @@ import type { CommandResponse, TerminalSessionRecord } from "./types";
 import type { SaveSessionLayoutParams } from "./useSessionPersistence";
 import type { SessionOpenArgs } from "./sessionRecordArgs";
 import { rememberSessionId } from "./lastKnownSessionIds";
+import { loadKnownPageIds } from "./useTerminalPages";
 
 /**
  * Fetch the durable RESTORABLE session records for `pageId` from the backend
@@ -35,7 +36,10 @@ import { rememberSessionId } from "./lastKnownSessionIds";
  *
  * Exported for unit testing the restore-binding logic without booting React.
  */
-export async function fetchOpenRecords(pageId: string): Promise<TerminalSessionRecord[]> {
+export async function fetchOpenRecords(
+  pageId: string,
+  opts?: { knownPageIds?: readonly string[]; adoptOrphans?: boolean },
+): Promise<TerminalSessionRecord[]> {
   let resp: CommandResponse | null;
   try {
     resp = await invoke<CommandResponse>("terminal_session_list_open");
@@ -48,10 +52,51 @@ export async function fetchOpenRecords(pageId: string): Promise<TerminalSessionR
   const byId = new Map<string, TerminalSessionRecord>();
   for (const rec of sessions) {
     if (!rec || typeof rec.claudeSessionId !== "string") continue;
-    if ((rec.pageId ?? "default") !== pageId) continue;
+    if (
+      !recordBelongsToRestore(
+        rec,
+        pageId,
+        opts?.knownPageIds ?? [],
+        opts?.adoptOrphans ?? false,
+      )
+    ) {
+      continue;
+    }
     if (!byId.has(rec.claudeSessionId)) byId.set(rec.claudeSessionId, rec);
   }
   return [...byId.values()];
+}
+
+/**
+ * Does `rec` belong to THIS page's restore run?
+ *
+ * - Its `pageId` matches ⇒ yes (the normal case).
+ * - Its `pageId` names a page that EXISTS in the persisted layout
+ *   (`knownPageIds`) ⇒ no — that page's own restore run owns it.
+ * - Its `pageId` names NO live page (an ORPHAN — e.g. the hook-confirm path
+ *   wrote its hardcoded "default" onto a layout whose default page was
+ *   replaced) ⇒ adopted by the FIRST page to restore (`adoptOrphans`), but
+ *   ONLY when the record classifies `auto-resume` (a confirmed, resumable
+ *   provider session someone would actually miss). Unconfirmed shells and
+ *   quarantine-tier guesses are never adopted — restoring a stale agent
+ *   shell into the operator's page would be noise, not recovery.
+ *
+ * Without adoption, an orphan record is never restored on any page and the
+ * no-terminal sweep closes it ~3 min after boot — permanent, silent session
+ * loss (observed live 2026-07-13: two confirmed gmail sessions stranded on
+ * "default"). Pure + exported for unit tests.
+ */
+export function recordBelongsToRestore(
+  rec: TerminalSessionRecord,
+  pageId: string,
+  knownPageIds: readonly string[],
+  adoptOrphans: boolean,
+): boolean {
+  const recPage = rec.pageId ?? "default";
+  if (recPage === pageId) return true;
+  if (!adoptOrphans) return false;
+  if (knownPageIds.includes(recPage)) return false;
+  return classifyRestoreAction(rec) === "auto-resume";
 }
 
 /**
@@ -425,6 +470,11 @@ export function useTerminalInitialization({
   // becomes active — rather than once per mount.
   const didInitPages = useRef<Set<string>>(new Set());
 
+  // Orphan-record adoption is claimed by the FIRST page to restore after
+  // mount (one adopter per boot — two pages both adopting would double-restore
+  // the same orphan). See `recordBelongsToRestore`.
+  const didClaimOrphanAdoption = useRef(false);
+
   // Gate for the debounced auto-save effect. The restore path recreates
   // plain shells and only *asynchronously* types `claude --resume <id>` /
   // re-attaches `claudeSessionId`. If the debounced auto-save fires while
@@ -476,7 +526,12 @@ export function useTerminalInitialization({
         //    which Claude sessions exist and their zones. The localStorage
         //    snapshot is demoted to cosmetics only (layout / labels / notes /
         //    pins / focusedZone / scrollback) — matched by zoneIndex.
-        const openRecords = await fetchOpenRecords(pageId);
+        const adoptOrphans = !didClaimOrphanAdoption.current;
+        didClaimOrphanAdoption.current = true;
+        const openRecords = await fetchOpenRecords(pageId, {
+          knownPageIds: loadKnownPageIds(),
+          adoptOrphans,
+        });
 
         // Cosmetic snapshot — never the resumable Claude set / zone binding.
         const saved = sessionPersistence.hasSavedLayout()

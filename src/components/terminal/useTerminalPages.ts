@@ -36,6 +36,18 @@ function loadPages(): TerminalPageConfig[] {
   return pages;
 }
 
+/**
+ * The page ids that actually EXIST in this window's persisted layout (same
+ * source + empty-list semantics as `loadPages`, so a fresh install reports
+ * `["default"]`). Restore uses this to detect ORPHAN records — sessions whose
+ * `pageId` references no live page (e.g. the hook-confirm path's hardcoded
+ * "default" on a layout that replaced the default page) — which would
+ * otherwise never restore and be closed `no-terminal` by the orphan sweep.
+ */
+export function loadKnownPageIds(): string[] {
+  return loadPages().map((p) => p.id);
+}
+
 function savePages(pages: TerminalPageConfig[]) {
   instanceStorage.setJSON(STORAGE_KEY, pages);
 }

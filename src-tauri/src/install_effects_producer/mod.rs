@@ -267,38 +267,89 @@ async fn post_shim_beacon(Json(req): Json<ShimBeaconRequest>) -> Json<ApiRespons
     Json(ApiResponse::success(()))
 }
 
+/// Convert an MSYS/Git-Bash drive path (`/d/foo/bar`) to its Windows form
+/// (`D:\foo\bar`). Provider hooks run under bash even on Windows, so the cwd
+/// they report is MSYS-style — recording it verbatim poisons the registry
+/// (a restore would try to spawn a PTY with a cwd Windows can't resolve).
+/// Non-drive-pattern inputs pass through untouched.
+///
+/// Only CALLED on Windows (on unix `/d/foo` is a legitimate absolute path that
+/// must not be rewritten); defined everywhere so the pure logic stays testable
+/// on every CI platform.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn normalize_msys_cwd(cwd: &str) -> String {
+    let bytes = cwd.as_bytes();
+    if bytes.len() >= 2
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && (bytes.len() == 2 || bytes[2] == b'/')
+    {
+        let drive = (bytes[1] as char).to_ascii_uppercase();
+        let rest = cwd.get(3..).unwrap_or("");
+        return format!("{}:\\{}", drive, rest.replace('/', "\\"));
+    }
+    cwd.to_string()
+}
+
 /// Store-write half of [`post_session_open`], factored out so the route logic is
 /// unit-testable against a real [`crate::session::session_lifecycle_store::SessionLifecycleStore`]
 /// without a Tauri `ApiState`. Records the session authoritatively (the same
-/// writer the spawn path uses), with the page/zone defaulted and the title
-/// derived from the cwd basename.
+/// writer the spawn path uses).
+///
+/// The hook is a CONFIRMATION/liveness signal, not a layout authority: when a
+/// record already exists (the spawn-time seam / binder / frontend wrote it),
+/// its `page_id` / `zone_index` / `working_dir` / `title` are PRESERVED — the
+/// hook runs under bash and knows neither the grid page nor a Windows-valid
+/// cwd, and clobbering those fields is exactly what stranded confirmed
+/// sessions on the never-mounted "default" page at the 2026-07-13 restart
+/// (restore filters by page; the no-terminal sweep then closed them,
+/// non-restorable). Only a record the hook creates FIRST (capture-miss: the
+/// hook beat every other writer) uses the hook's own cwd/title — normalized
+/// from MSYS to a Windows path so a later restore can actually spawn there.
 fn record_session_open_into(
     store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
     req: &SessionOpenRequest,
     provider: &str,
 ) {
-    // Resolve title from the cwd basename (best-effort) so the grid tile has a
-    // label; default page/zone — boot-restore rebuilds the layout from the live
-    // PTY set, and an authoritative record beats a precise zone. `record_open`
-    // dedups by session id, so a confirming hook on an already-recorded id just
-    // refreshes the row.
-    let working_dir = req.cwd.clone().unwrap_or_default();
-    let title = req
-        .cwd
-        .as_deref()
-        .and_then(|c| c.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(provider)
-        .to_string();
+    let existing = store.get(&req.session_id);
+    let (page_id, zone_index, working_dir, title) = match &existing {
+        Some(prior) => (
+            prior.page_id.clone(),
+            prior.zone_index,
+            prior.working_dir.clone().unwrap_or_default(),
+            prior.title.clone().unwrap_or_else(|| provider.to_string()),
+        ),
+        None => {
+            let raw_cwd = req.cwd.clone().unwrap_or_default();
+            #[cfg(windows)]
+            let working_dir = normalize_msys_cwd(&raw_cwd);
+            #[cfg(not(windows))]
+            let working_dir = raw_cwd;
+            let title = req
+                .cwd
+                .as_deref()
+                .and_then(|c| c.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(provider)
+                .to_string();
+            ("default".to_string(), 0, working_dir, title)
+        }
+    };
+    // config_dir: the hook DOES know the real account (CLAUDE_CONFIG_DIR) —
+    // take it when present, but never erase a known one with None.
+    let config_dir = req
+        .config_dir
+        .clone()
+        .or_else(|| existing.as_ref().and_then(|r| r.config_dir.clone()));
     crate::commands::terminal::record_pinned_session_open(
         store,
         req.session_id.clone(),
         req.terminal_id.clone(),
-        req.config_dir.clone(),
+        config_dir,
         working_dir,
         title,
-        "default".to_string(),
-        0,
+        page_id,
+        zone_index,
         provider.to_string(),
     );
     // CONFIRM the record (session-restore-redesign Phase 2 coordinator
@@ -1315,6 +1366,90 @@ mod tests {
             1,
             "same session id dedups (no duplicate on the confirming hook)"
         );
+    }
+
+    /// The hook is a confirmation signal, not a layout authority: confirming an
+    /// EXISTING record must preserve its page/zone/cwd/title (the hook runs
+    /// under bash — "default" page + MSYS cwd — and clobbering these stranded
+    /// confirmed sessions on a never-mounted page at the 2026-07-13 restart).
+    #[test]
+    fn session_open_preserves_existing_layout_fields() {
+        use crate::session::session_lifecycle_store::{
+            SessionLifecycleStore, TerminalSessionRecord, ORIGIN_OBSERVED,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+
+        // A binder/frontend-written record with REAL layout fields.
+        store.record_open(TerminalSessionRecord {
+            claude_session_id: "sess-1".to_string(),
+            config_dir: Some("C:\\claude\\.claude-gmail".to_string()),
+            working_dir: Some("D:\\qontinui-root".to_string()),
+            page_id: "bf44dfd5-real-page".to_string(),
+            zone_index: 2,
+            title: Some("fleet-cobalt-parrot".to_string()),
+            terminal_id: "term-1".to_string(),
+            opened_at: 0,
+            last_seen_at: 0,
+            state: "open".to_string(),
+            closed_at: None,
+            close_reason: None,
+            provider: "claude".to_string(),
+            origin: Some(ORIGIN_OBSERVED.to_string()),
+            restore_pending_at: None,
+            confirmed_at: None,
+        });
+
+        // The confirming hook fires with bash-flavored context.
+        let req = SessionOpenRequest {
+            terminal_id: "term-1".to_string(),
+            session_id: "sess-1".to_string(),
+            source: Some("startup".to_string()),
+            provider: Some("claude".to_string()),
+            config_dir: None, // hook may omit — must not erase the known one
+            cwd: Some("/d/qontinui-root".to_string()),
+        };
+        record_session_open_into(&store, &req, "claude");
+
+        let rec = store.get("sess-1").unwrap();
+        assert_eq!(rec.page_id, "bf44dfd5-real-page", "page preserved");
+        assert_eq!(rec.zone_index, 2, "zone preserved");
+        assert_eq!(
+            rec.working_dir.as_deref(),
+            Some("D:\\qontinui-root"),
+            "Windows cwd preserved over the hook's MSYS cwd"
+        );
+        assert_eq!(
+            rec.title.as_deref(),
+            Some("fleet-cobalt-parrot"),
+            "title preserved"
+        );
+        assert_eq!(
+            rec.config_dir.as_deref(),
+            Some("C:\\claude\\.claude-gmail"),
+            "config dir not erased by a None from the hook"
+        );
+        assert!(rec.confirmed_at.is_some(), "hook still confirms");
+    }
+
+    /// MSYS drive-path normalization for hook-created records (Windows).
+    #[test]
+    fn normalize_msys_cwd_converts_drive_paths_only() {
+        assert_eq!(normalize_msys_cwd("/d/qontinui-root"), "D:\\qontinui-root");
+        assert_eq!(
+            normalize_msys_cwd("/c/Users/jspin/repo"),
+            "C:\\Users\\jspin\\repo"
+        );
+        assert_eq!(normalize_msys_cwd("/d"), "D:\\");
+        // Non-drive patterns pass through untouched.
+        assert_eq!(
+            normalize_msys_cwd("D:\\already\\windows"),
+            "D:\\already\\windows"
+        );
+        assert_eq!(normalize_msys_cwd("/home/user/repo"), "/home/user/repo");
+        assert_eq!(normalize_msys_cwd(""), "");
+        assert_eq!(normalize_msys_cwd("relative/path"), "relative/path");
     }
 
     #[test]
