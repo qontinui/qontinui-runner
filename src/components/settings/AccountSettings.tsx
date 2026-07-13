@@ -171,8 +171,11 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
       try {
         await signOutFull();
       } catch {
-        // signOutFull re-invokes the full-wipe command, which may error now
-        // that the credentials are already cleared; that's expected and harmless.
+        // Idempotent re-wipe: the credentials were already cleared by
+        // `qontinui_sign_out` above, so a failure here changes nothing.
+        // This catch previously swallowed a REAL bug — `sign_out_full` was
+        // unregistered, so it always threw "command not found" and no wipe
+        // ever ran on any path. Registration is now CI-guarded.
       }
       onLog("info", "Signed out — sign in again on the login screen");
     } catch (err) {
