@@ -74,6 +74,7 @@ pub mod reviews;
 pub mod scheduler;
 pub mod security_audit;
 pub mod session_file_snapshots;
+pub mod session_pr_ops;
 pub mod session_touched_files;
 pub mod settings;
 pub mod skills;
@@ -506,6 +507,43 @@ impl PgDb {
         )
         .await
         .map_err(|e| format!("fleet-fresh app_deploy_state self-heal failed: {}", e))?;
+
+        // runner-centric session-PR dropdown: project.session_prs — the
+        // per-session PR-status projection the Terminal zone-header dropdown
+        // reads (`commands::session_prs::session_prs_get` →
+        // `session_pr_ops::list_session_prs`). Written by the runner-local
+        // attribution reconciler (`session_pr_reconciler`), which resolves
+        // "which PRs did session S open" from the `Session-Id: <id>` git
+        // trailer every commit carries, then hydrates open/merged status from
+        // the GitHub API.
+        //
+        // DELIBERATE POSTURE — a SINGLE-CONSUMER, RUNNER-LOCAL PROJECTION.
+        // Unlike `project.app_deploy_state` above, this table is BOTH written
+        // AND read only by the local runner: there is NO cross-component
+        // reader (no web/coord side) to keep in lockstep. So — intentionally —
+        // it has NO companion web alembic migration and is intentionally
+        // absent from `atlas/schema.hcl` / `schema.pg.sql.generated`; this
+        // CREATE TABLE IF NOT EXISTS self-heal is its sole authority. Schema
+        // `project` (NOT `runner.` — that namespace is CI-retired via
+        // `forbid-runner-schema.yml`).
+        conn.batch_execute(
+            "CREATE TABLE IF NOT EXISTS project.session_prs ( \
+                 claude_session_id UUID        NOT NULL, \
+                 repo              TEXT        NOT NULL, \
+                 pr_number         BIGINT      NOT NULL, \
+                 head_branch       TEXT, \
+                 pr_state          TEXT, \
+                 merged            BOOLEAN     NOT NULL DEFAULT false, \
+                 merged_at         TIMESTAMPTZ, \
+                 created_at        TIMESTAMPTZ NOT NULL DEFAULT now(), \
+                 updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(), \
+                 PRIMARY KEY (claude_session_id, repo, pr_number) \
+             ); \
+             CREATE INDEX IF NOT EXISTS ix_session_prs_session \
+                 ON project.session_prs (claude_session_id);",
+        )
+        .await
+        .map_err(|e| format!("session_prs projection self-heal failed: {}", e))?;
 
         // spec-multi-app Stream E.1: backfill `app_id` onto
         // project.proposal_events. The table predates the multi-tenant model,

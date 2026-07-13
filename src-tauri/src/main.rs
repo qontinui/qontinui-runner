@@ -153,9 +153,10 @@ mod security;
 mod semantic_conventions;
 mod server_mode;
 mod session; // Plan 2026-05-22-coord-native-session-coordination Phase 2 — unified Session primitive
-             // Hook-free, runner-side WIP-attribution capture (mirrors fleet::tree_publisher).
-             // Reads each hosted session's transcript and POSTs file-edit attribution to
-             // coord. Gated OFF by default (COORD_SESSION_ATTRIBUTION_ENABLED).
+mod session_pr_reconciler; // Runner-local per-session PR attribution → project.session_prs (Terminal dropdown)
+                           // Hook-free, runner-side WIP-attribution capture (mirrors fleet::tree_publisher).
+                           // Reads each hosted session's transcript and POSTs file-edit attribution to
+                           // coord. Gated OFF by default (COORD_SESSION_ATTRIBUTION_ENABLED).
 mod session_attribution;
 mod session_bus; // Session Bus Phase 3b — gated directed-message delivery executor
 mod settings;
@@ -2536,6 +2537,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // restore-registry record from a mirrored restore-record
                 // event when this device accepts a handoff.
                 let handoff_lifecycle_store = lifecycle_store.clone();
+                // Runner-local per-session PR reconciler: attributes each live
+                // session's PRs from the `Session-Id` git trailer its commits
+                // carry, projecting open/merged status into
+                // `project.session_prs` for the Terminal zone-header dropdown.
+                // Detached for the process lifetime (like the liveness poll
+                // below); best-effort at startup then every 30s.
+                session_pr_reconciler::start(lifecycle_store.clone());
                 app.manage(lifecycle_store);
 
                 // VT output sanitizer: terminal output is UNTRUSTED (whatever a

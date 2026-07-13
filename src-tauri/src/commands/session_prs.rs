@@ -1,58 +1,67 @@
 //! Per-session PR status for the Terminal page's zone-header dropdown.
 //!
-//! Proxies coord's `GET /pr-merge/session/:session_id/prs` (the inverse of
-//! the PR→author-session resolver): given a terminal's Claude
-//! `--session-id`, coord returns every PR that session's worktree
-//! allocations produced plus the merged/unmerged verdict, unmerged-first.
-//! The device JWT rides on the request via the shared
-//! [`crate::coord_http::coord_get`] helper.
+//! RUNNER-LOCAL data source. Given a terminal's Claude `--session-id`, returns
+//! every PR that session opened plus the merged/unmerged verdict,
+//! unmerged-first. "Which PRs did session S open" is resolved entirely on this
+//! device: every commit a session makes carries a `Session-Id: <session>` git
+//! trailer, so the attribution reconciler ([`crate::session_pr_reconciler`])
+//! walks each terminal's repo, matches head branches by that trailer, resolves
+//! them to PRs via the GitHub API, and projects the result into
+//! `project.session_prs`. This command just reads that projection — no coord
+//! round-trip (coord's session→PR map is empty for interactive operator
+//! sessions, which is what this feature exists to fix).
 //!
 //! FAIL-SOFT BY DESIGN: this feeds a passive status indicator that polls in
-//! the background, so every degraded condition (unpaired device, coord
-//! unreachable, endpoint not yet deployed, auth rejection) returns
-//! `Ok({ available: false, reason, ... })` rather than `Err` — the dropdown
-//! hides itself instead of surfacing an error toast per zone per poll. Only
-//! a malformed session id (a caller bug) is a hard `Err`.
-
-use std::time::Duration;
+//! the background, so every degraded condition (PG unavailable, a query error,
+//! the projection not yet populated) returns `Ok({ available: false, reason,
+//! ... })` rather than `Err` — the dropdown hides itself instead of surfacing
+//! an error toast per zone per poll. Only a malformed session id (a caller
+//! bug) is a hard `Err`.
 
 use serde_json::{json, Value};
 
-/// Shape the command's fail-soft envelope from coord's HTTP verdict.
-/// Pure — unit-tested below; the Tauri command is transport glue around it.
-fn shape_response(status: u16, body: Value) -> Value {
-    match status {
-        200 => json!({
-            "available": true,
-            "prs": body.get("prs").cloned().unwrap_or_else(|| json!([])),
-            "allMerged": body.get("all_merged").cloned().unwrap_or(json!(true)),
-        }),
-        401 | 403 => json!({
-            "available": false,
-            "reason": "unauthorized",
-            "prs": [],
-            "allMerged": true,
-        }),
-        // coord build predating the endpoint — the runner can land ahead of
-        // coord; hide the dropdown until coord catches up.
-        404 => json!({
-            "available": false,
-            "reason": "endpoint_missing",
-            "prs": [],
-            "allMerged": true,
-        }),
-        other => json!({
-            "available": false,
-            "reason": "coord_error",
-            "status": other,
-            "prs": [],
-            "allMerged": true,
-        }),
-    }
+use crate::database::pg::session_pr_ops::SessionPrRow;
+
+/// Map the projection rows to the command's `available: true` envelope, in the
+/// EXACT wire shape the frontend `useSessionPrs.ts` `SessionPr` interface reads
+/// (`{repo, pr_number, branch, pr_state, merged, merged_at}`). `allMerged` is
+/// true iff every row is merged (vacuously true for an empty set). Pure —
+/// unit-tested below.
+fn shape_available(rows: &[SessionPrRow]) -> Value {
+    let prs: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "repo": r.repo,
+                "pr_number": r.pr_number,
+                "branch": r.head_branch,
+                "pr_state": r.pr_state,
+                "merged": r.merged,
+                "merged_at": r.merged_at.map(|t| t.to_rfc3339()),
+            })
+        })
+        .collect();
+    let all_merged = rows.iter().all(|r| r.merged);
+    json!({
+        "available": true,
+        "prs": prs,
+        "allMerged": all_merged,
+    })
+}
+
+/// The fail-soft envelope: a degraded condition hides the dropdown rather than
+/// erroring. Pure.
+fn fail_soft(reason: &str) -> Value {
+    json!({
+        "available": false,
+        "reason": reason,
+        "prs": [],
+        "allMerged": true,
+    })
 }
 
 /// `session_prs_get` — the session's authored PRs with merged verdicts,
-/// unmerged-first (coord orders; the frontend renders verbatim).
+/// unmerged-first (the query orders; the frontend renders verbatim).
 ///
 /// Returns `{ available, reason?, prs: [{repo, pr_number, branch, pr_state,
 /// merged, merged_at}], allMerged }`.
@@ -61,71 +70,88 @@ pub async fn session_prs_get(claude_session_id: String) -> Result<Value, String>
     let session_id = uuid::Uuid::parse_str(claude_session_id.trim())
         .map_err(|e| format!("invalid claude_session_id {claude_session_id:?}: {e}"))?;
 
-    if !crate::coord_http::have_device_token() {
-        return Ok(json!({
-            "available": false,
-            "reason": "unpaired",
-            "prs": [],
-            "allMerged": true,
-        }));
+    // Degraded boot with PG unreachable — hide the dropdown.
+    if !crate::database::pg::pg_available() {
+        return Ok(fail_soft("db_unavailable"));
     }
-
-    let base = crate::coord_mcp::coord_base_url();
-    let url = format!("{base}/pr-merge/session/{session_id}/prs");
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("build http client: {e}"))?;
-
-    let resp = match crate::coord_http::coord_get(&client, &url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            return Ok(json!({
-                "available": false,
-                "reason": "unreachable",
-                "detail": e.to_string(),
-                "prs": [],
-                "allMerged": true,
-            }));
-        }
+    let Some(pg_db) = crate::database::pg::PgDb::try_global() else {
+        return Ok(fail_soft("db_unavailable"));
     };
 
-    let status = resp.status().as_u16();
-    let body: Value = resp.json().await.unwrap_or(Value::Null);
-    Ok(shape_response(status, body))
+    match pg_db.list_session_prs(session_id).await {
+        Ok(rows) => Ok(shape_available(&rows)),
+        Err(e) => {
+            tracing::debug!("session_prs_get: list_session_prs failed (fail-soft): {e}");
+            Ok(fail_soft("db_error"))
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{TimeZone, Utc};
 
-    #[test]
-    fn ok_body_maps_prs_and_all_merged_through() {
-        let out = shape_response(
-            200,
-            json!({
-                "agent_session_id": "s",
-                "prs": [{"repo": "o/r", "pr_number": 7, "merged": false}],
-                "all_merged": false,
-            }),
-        );
-        assert_eq!(out["available"], json!(true));
-        assert_eq!(out["allMerged"], json!(false));
-        assert_eq!(out["prs"][0]["pr_number"], json!(7));
+    fn row(pr_number: i64, merged: bool) -> SessionPrRow {
+        SessionPrRow {
+            claude_session_id: uuid::Uuid::nil(),
+            repo: "qontinui/qontinui-runner".to_string(),
+            pr_number,
+            head_branch: Some("feat/x".to_string()),
+            pr_state: Some(if merged { "merged" } else { "open" }.to_string()),
+            merged,
+            merged_at: if merged {
+                Some(Utc.with_ymd_and_hms(2026, 7, 13, 1, 2, 3).unwrap())
+            } else {
+                None
+            },
+        }
     }
 
     #[test]
-    fn missing_endpoint_and_auth_rejection_fail_soft() {
-        let out = shape_response(404, Value::Null);
-        assert_eq!(out["available"], json!(false));
-        assert_eq!(out["reason"], json!("endpoint_missing"));
+    fn available_envelope_maps_rows_to_the_frontend_wire_shape() {
+        let out = shape_available(&[row(7, false), row(4, true)]);
+        assert_eq!(out["available"], json!(true));
+        // Mixed merged state ⇒ not all merged.
+        assert_eq!(out["allMerged"], json!(false));
+        // Field names/casing are the exact `SessionPr` interface contract.
+        assert_eq!(out["prs"][0]["pr_number"], json!(7));
+        assert_eq!(out["prs"][0]["repo"], json!("qontinui/qontinui-runner"));
+        assert_eq!(out["prs"][0]["branch"], json!("feat/x"));
+        assert_eq!(out["prs"][0]["pr_state"], json!("open"));
+        assert_eq!(out["prs"][0]["merged"], json!(false));
+        assert_eq!(out["prs"][0]["merged_at"], Value::Null);
+        // Merged row carries an RFC3339 merged_at string.
+        assert_eq!(out["prs"][1]["merged"], json!(true));
+        assert!(out["prs"][1]["merged_at"]
+            .as_str()
+            .unwrap()
+            .starts_with("2026-07-13"));
+    }
+
+    #[test]
+    fn empty_projection_is_available_and_all_merged() {
+        let out = shape_available(&[]);
+        assert_eq!(out["available"], json!(true));
         assert_eq!(out["prs"], json!([]));
+        // Vacuously all-merged (green) when the session has no PRs.
+        assert_eq!(out["allMerged"], json!(true));
+    }
 
-        let out = shape_response(403, Value::Null);
-        assert_eq!(out["reason"], json!("unauthorized"));
+    #[test]
+    fn all_rows_merged_rolls_up_to_all_merged() {
+        let out = shape_available(&[row(9, true), row(2, true)]);
+        assert_eq!(out["allMerged"], json!(true));
+    }
 
-        let out = shape_response(500, Value::Null);
-        assert_eq!(out["reason"], json!("coord_error"));
-        assert_eq!(out["status"], json!(500));
+    #[test]
+    fn fail_soft_hides_the_dropdown_without_erroring() {
+        let out = fail_soft("db_unavailable");
+        assert_eq!(out["available"], json!(false));
+        assert_eq!(out["reason"], json!("db_unavailable"));
+        assert_eq!(out["prs"], json!([]));
+        // Fail-soft must never render red — allMerged stays true so the
+        // trigger symbol is neutral/hidden, not a false "unmerged" alarm.
+        assert_eq!(out["allMerged"], json!(true));
     }
 }
