@@ -736,6 +736,8 @@ mod manifest_drift_tests {
             // UI_BRIDGE_ROUTES analog.
             ("GET", "/ui-bridge/session"),
             ("POST", "/ui-bridge/observe/{}"),
+            ("GET", "/ui-bridge/views"),
+            ("POST", "/ui-bridge/control/view/open"),
             ("POST", "/ui-bridge/pong"),
             ("POST", "/ui-bridge/ipc-response"),
             // Relay-tab protocol (plan 2026-06-12-co-pilot-automation item 6a).
