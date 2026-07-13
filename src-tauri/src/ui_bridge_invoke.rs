@@ -145,6 +145,21 @@ pub struct ProxyableCommand {
     /// [`dismiss_recent_crash`]: crate::crash_dumps::dismiss_recent_crash
     #[serde(default = "default_probe_safe")]
     pub probe_with_empty_args: bool,
+
+    /// Observe-tier projection (P2 — gated flows). When `Some`, the command is
+    /// reachable via `POST /ui-bridge/observe/{command}`: the observe handler
+    /// performs the same Tauri round-trip as invoke, then applies this fn to the
+    /// command's raw result and returns ONLY the projection — never the raw
+    /// payload. This is a SEPARATE allowlist tier from [`is_allowlisted`]: a
+    /// command may be observe-allowed while invoke-denied (see
+    /// [`UI_BRIDGE_OBSERVE_COMMANDS`]). Defaults to `None` (no observe access).
+    ///
+    /// A plain (const-declarable) fn pointer, not a closure, so it can appear in
+    /// the `const` command tables. `#[serde(skip)]` because fn pointers aren't
+    /// `Serialize` and the projection is an internal dispatch detail, not part
+    /// of the `GET /ui-bridge/commands` wire contract.
+    #[serde(skip)]
+    pub observe_projection: Option<fn(&serde_json::Value) -> serde_json::Value>,
 }
 
 /// Default for [`ProxyableCommand::probe_with_empty_args`] — commands
@@ -170,6 +185,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         args_schema: "{}",
         response_schema: "{ \"enabled\": boolean, \"backendUrl\": string, \"runnerTokenMasked\": string, \"runnerId\": string | null, \"lastHeartbeatAt\": string | null, \"registrationError\": string | null }",
         probe_with_empty_args: true,
+        observe_projection: None,
     },
     ProxyableCommand {
         name: "save_web_integration_settings",
@@ -177,6 +193,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         args_schema: "{ \"enabled\": boolean, \"backendUrl\": string, \"runnerToken\": string, \"webBaseUrl\"?: string | null }",
         response_schema: "null",
         probe_with_empty_args: true,
+        observe_projection: None,
     },
     ProxyableCommand {
         name: "test_web_integration_connection",
@@ -184,6 +201,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         args_schema: "{ \"backendUrl\": string, \"runnerToken\": string }",
         response_schema: "{ \"runner_id\": string }",
         probe_with_empty_args: true,
+        observe_projection: None,
     },
     ProxyableCommand {
         name: "redeem_pair_code",
@@ -193,6 +211,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         // Redeeming requires a real code; an empty-args boot probe would do a
         // pointless failed round-trip. Skip the startup probe.
         probe_with_empty_args: false,
+        observe_projection: None,
     },
     ProxyableCommand {
         name: "emit_extraction_script",
@@ -200,6 +219,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         args_schema: "{ \"goal\": string, \"schemaHint\": object, \"outputPreview\": string, \"taskRunId\"?: string | null }",
         response_schema: "{ \"expression\": string, \"modelId\": string, \"tokensIn\": number, \"tokensOut\": number, \"source\": \"cache\" | \"llm\", \"cacheTier\": number | null, \"provider\": string, \"cacheCreationTokens\": number, \"cacheReadTokens\": number }",
         probe_with_empty_args: true,
+        observe_projection: None,
     },
     ProxyableCommand {
         name: "emit_scripted_output_event",
@@ -207,6 +227,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         args_schema: "{ \"name\": string, \"metadata\"?: object, \"taskRunId\"?: string | null }",
         response_schema: "null",
         probe_with_empty_args: true,
+        observe_projection: None,
     },
     ProxyableCommand {
         name: "get_scripted_output_stats",
@@ -214,6 +235,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         args_schema: "{ \"taskRunId\"?: string | null }",
         response_schema: "{ \"attempted\": number, \"cacheHit\": number, \"llmOk\": number, \"workerOk\": number, \"bytesAvoided\": number, \"fallbacks\": { [reason: string]: number }, \"totalTokensIn\": number, \"totalTokensOut\": number, \"cacheCreationTokens\": number, \"cacheReadTokens\": number }",
         probe_with_empty_args: true,
+        observe_projection: None,
     },
     ProxyableCommand {
         name: "get_oneshot_stats",
@@ -221,6 +243,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         args_schema: "{}",
         response_schema: "{ \"callsTotal\": { [provider: string]: number }, \"errorsTotal\": { [kind: string]: number }, \"cacheHitsTotal\": { [provider: string]: number }, \"cacheReadTokens\": number, \"cacheCreationTokens\": number, \"totalTokensIn\": number, \"totalTokensOut\": number }",
         probe_with_empty_args: true,
+        observe_projection: None,
     },
     ProxyableCommand {
         name: "get_scripted_output_settings",
@@ -228,6 +251,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         args_schema: "{}",
         response_schema: "{ \"enabled\": boolean, \"model\": string | null, \"provider\": \"auto\" | \"claude_api_warm\" | \"claude_api\" | \"gemma_local_warm\", \"gemma_local_endpoint\": string, \"gemma_local_model_alias\": string }",
         probe_with_empty_args: true,
+        observe_projection: None,
     },
     ProxyableCommand {
         name: "save_scripted_output_settings",
@@ -237,6 +261,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         // Write command — skip the startup empty-args probe so we never
         // race the settings file during boot.
         probe_with_empty_args: false,
+        observe_projection: None,
     },
     ProxyableCommand {
         name: "report_ui_error",
@@ -244,6 +269,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         args_schema: "{ \"message\": string, \"stack\"?: string | null, \"componentStack\"?: string | null, \"digest\"?: string | null }",
         response_schema: "null",
         probe_with_empty_args: true,
+        observe_projection: None,
     },
     ProxyableCommand {
         name: "clear_ui_error",
@@ -253,6 +279,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         // Destructive + takes empty args → probing it on startup would
         // race the React ErrorBoundary's own first report.
         probe_with_empty_args: false,
+        observe_projection: None,
     },
     ProxyableCommand {
         name: "get_ui_error",
@@ -260,6 +287,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         args_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
         response_schema: r#"{"type":["object","null"],"properties":{"message":{"type":"string"},"stack":{"type":["string","null"]},"component_stack":{"type":["string","null"]},"digest":{"type":["string","null"]},"first_seen":{"type":"string"},"reported_at":{"type":"string"},"count":{"type":"integer"}}}"#,
         probe_with_empty_args: true,
+        observe_projection: None,
     },
     ProxyableCommand {
         name: "dismiss_recent_crash",
@@ -269,6 +297,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         // Destructive + takes empty args → probing it on startup would
         // clear the very crash dump we just surfaced to the user.
         probe_with_empty_args: false,
+        observe_projection: None,
     },
     // Saved-projects registry (user-curated project list populated by the
     // setup wizard and surfaced in the UI Bridge Integration panel).
@@ -278,6 +307,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         args_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
         response_schema: r#"{"type":"array","items":{"type":"object","required":["path","name","projectType","manifest"],"properties":{"path":{"type":"string"},"name":{"type":"string"},"projectType":{"type":"string"},"manifest":{"type":"string"}}}}"#,
         probe_with_empty_args: true,
+        observe_projection: None,
     },
     ProxyableCommand {
         name: "save_saved_projects",
@@ -287,6 +317,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         // Destructive (replaces the entire list). Probing with empty args
         // would wipe the user's saved projects every startup.
         probe_with_empty_args: false,
+        observe_projection: None,
     },
     ProxyableCommand {
         name: "add_saved_project",
@@ -295,6 +326,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         response_schema: r#"{"type":"null"}"#,
         // Required `project` arg; empty-args probe would error.
         probe_with_empty_args: false,
+        observe_projection: None,
     },
     ProxyableCommand {
         name: "remove_saved_project",
@@ -303,6 +335,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         response_schema: r#"{"type":"null"}"#,
         // Required `path` arg; empty-args probe would error.
         probe_with_empty_args: false,
+        observe_projection: None,
     },
     // Productivity Stack — Phase 3 (in-product /decompose-plan replacement).
     ProxyableCommand {
@@ -312,6 +345,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         response_schema: r#"{"type":"object","required":["planId","taskCount","versionHash","idempotentSkip","stamped"],"properties":{"planId":{"type":"string"},"taskCount":{"type":"integer"},"versionHash":{"type":"string"},"idempotentSkip":{"type":"boolean"},"stamped":{"type":"boolean"}}}"#,
         // Required `planPath` arg; empty-args probe would always fail.
         probe_with_empty_args: false,
+        observe_projection: None,
     },
     // Productivity Stack — Phase 5 (in-product /summarize-session and /rewind-session replacements).
     ProxyableCommand {
@@ -321,6 +355,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         response_schema: r#"{"type":"object","required":["taskRunId","verdict","learningCount","byArea","placeholder"],"properties":{"taskRunId":{"type":"string"},"verdict":{"type":"string"},"learningCount":{"type":"integer"},"byArea":{"type":"object","additionalProperties":{"type":"integer"}},"placeholder":{"type":"boolean"}}}"#,
         // Required `taskRunId` arg; empty-args probe would always fail.
         probe_with_empty_args: false,
+        observe_projection: None,
     },
     ProxyableCommand {
         name: "rewind_session",
@@ -331,6 +366,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         // kills sessions). Probe-with-empty-args would always fail
         // anyway, but mark explicit for safety.
         probe_with_empty_args: false,
+        observe_projection: None,
     },
     // Productivity Stack — Phase 6 follow-up (worker observability).
     ProxyableCommand {
@@ -340,6 +376,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         response_schema: r#"{"type":"array","items":{"type":"object","required":["taskRunId","terminalId","state","createdAtMs"],"properties":{"taskRunId":{"type":"string"},"terminalId":{"type":"string"},"terminalTitle":{"type":["string","null"]},"state":{"type":"string","enum":["ready","processing","closed"]},"assignedTaskId":{"type":["string","null"]},"createdAtMs":{"type":"integer"}}}}"#,
         // Read-only — empty args is the canonical call shape.
         probe_with_empty_args: true,
+        observe_projection: None,
     },
     // Coord/terminal smoke commands — bi-directional title sync (Phase 2
     // of runner-dispatch-and-terminal-ux-fixes-plan) + worker spawn.
@@ -351,6 +388,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         // Required `terminalId` + `title`; empty-args probe would always
         // fail, and a real call would mutate session state.
         probe_with_empty_args: false,
+        observe_projection: None,
     },
     ProxyableCommand {
         name: "spawn_worker_session",
@@ -360,6 +398,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         // Spawns a PTY child process — side-effectful even with empty
         // args. Probe must skip.
         probe_with_empty_args: false,
+        observe_projection: None,
     },
 ];
 
@@ -367,8 +406,81 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
 ///
 /// Used by the HTTP handler to gate the dispatch — anything not in the
 /// list should return 400 before the request_id is even allocated.
+///
+/// NOTE: this governs `POST /ui-bridge/invoke/{command}` ONLY. The observe
+/// tier (`POST /ui-bridge/observe/{command}`) is a SEPARATE, orthogonal gate —
+/// see [`observe_projection_for`]. A command in [`UI_BRIDGE_OBSERVE_COMMANDS`]
+/// is intentionally NOT in [`UI_BRIDGE_COMMANDS`], so `is_allowlisted` returns
+/// `false` for it (observe-allowed, invoke-denied).
 pub fn is_allowlisted(name: &str) -> bool {
     UI_BRIDGE_COMMANDS.iter().any(|c| c.name == name)
+}
+
+/// Project the `github_list_repos` result down to the three non-sensitive
+/// facts the observe tier is allowed to surface: `{ signed_in, connected,
+/// repo_count }`. NEVER returns the `repos` payload (repo names/urls) or any
+/// token material.
+///
+/// Defensive defaulting mirrors the command's own shape
+/// (`crate::commands::setup_wizard::github_list_repos`), which returns either
+/// `{signed_in, connected, repos}` or the bare `{signed_in:false}` early-out:
+/// a missing `connected` defaults to `false`, and a missing/empty `repos`
+/// array yields `repo_count: 0`.
+fn project_github_list_repos(result: &serde_json::Value) -> serde_json::Value {
+    let signed_in = result
+        .get("signed_in")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let connected = result
+        .get("connected")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let repo_count = result
+        .get("repos")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    serde_json::json!({
+        "signed_in": signed_in,
+        "connected": connected,
+        "repo_count": repo_count,
+    })
+}
+
+/// The observe-only allowlist: credential-adjacent commands that are
+/// **invoke-denied** (absent from [`UI_BRIDGE_COMMANDS`], so `is_allowlisted`
+/// stays `false`) but **observe-allowed** — callable via
+/// `POST /ui-bridge/observe/{command}`, which returns ONLY the entry's
+/// `observe_projection` of the result, never the raw payload.
+///
+/// Kept SEPARATE from `UI_BRIDGE_COMMANDS` precisely so adding an observe tier
+/// never widens the invoke surface: an agent can learn "is a GitHub App
+/// connected and how many repos are visible" without being able to invoke the
+/// command and receive the repo list itself.
+pub const UI_BRIDGE_OBSERVE_COMMANDS: &[ProxyableCommand] = &[ProxyableCommand {
+    name: "github_list_repos",
+    description: "OBSERVE-ONLY (invoke-denied). Reports whether the signed-in user's GitHub App is connected and how many repos are visible, WITHOUT returning the repo list. Projected to { signed_in, connected, repo_count }.",
+    args_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
+    response_schema: r#"{"type":"object","required":["signed_in","connected","repo_count"],"properties":{"signed_in":{"type":"boolean"},"connected":{"type":"boolean"},"repo_count":{"type":"integer"}}}"#,
+    // Observe round-trip only; there is no startup empty-args probe for the
+    // observe tier.
+    probe_with_empty_args: false,
+    observe_projection: Some(project_github_list_repos),
+}];
+
+/// Look up a command's observe-tier projection by name, across BOTH the invoke
+/// allowlist and the observe-only allowlist (the tiers are orthogonal — an
+/// invoke-allowed command could also carry a projection). Returns `Some(fn)`
+/// iff the named command is observe-allowed.
+///
+/// This is the observe-tier gate: `POST /ui-bridge/observe/{command}` is
+/// allowed iff this returns `Some`.
+pub fn observe_projection_for(name: &str) -> Option<fn(&serde_json::Value) -> serde_json::Value> {
+    UI_BRIDGE_COMMANDS
+        .iter()
+        .chain(UI_BRIDGE_OBSERVE_COMMANDS.iter())
+        .find(|c| c.name == name)
+        .and_then(|c| c.observe_projection)
 }
 
 #[cfg(test)]
@@ -481,6 +593,74 @@ mod tests {
         assert!(!is_allowlisted("rm_rf_my_disk"));
         assert!(!is_allowlisted("execute_sql"));
         assert!(!is_allowlisted(""));
+    }
+
+    #[test]
+    fn github_list_repos_is_observe_allowed_but_invoke_denied() {
+        // Observe-allowed: a projection is registered.
+        assert!(observe_projection_for("github_list_repos").is_some());
+        // Invoke-denied: NOT in the invoke allowlist (do not widen invoke).
+        assert!(!is_allowlisted("github_list_repos"));
+    }
+
+    #[test]
+    fn observe_projection_for_unknown_is_none() {
+        assert!(observe_projection_for("rm_rf_my_disk").is_none());
+        assert!(observe_projection_for("").is_none());
+    }
+
+    #[test]
+    fn github_list_repos_projection_drops_repos_and_counts() {
+        let proj = observe_projection_for("github_list_repos").expect("projection present");
+
+        // Full result: two repos → repo_count 2, repos payload dropped.
+        let full = serde_json::json!({
+            "signed_in": true,
+            "connected": true,
+            "repos": [
+                { "name": "acme/app", "url": "https://github.com/acme/app" },
+                { "name": "acme/lib", "url": "https://github.com/acme/lib" }
+            ]
+        });
+        let out = proj(&full);
+        assert_eq!(
+            out,
+            serde_json::json!({ "signed_in": true, "connected": true, "repo_count": 2 })
+        );
+        // Exactly three keys — no `repos` (or anything else) leaks through.
+        let obj = out.as_object().expect("projection is an object");
+        assert_eq!(obj.len(), 3);
+        assert!(obj.get("repos").is_none());
+
+        // Bare not-signed-in early-out → defensive defaults.
+        let bare = serde_json::json!({ "signed_in": false });
+        let out2 = proj(&bare);
+        assert_eq!(
+            out2,
+            serde_json::json!({ "signed_in": false, "connected": false, "repo_count": 0 })
+        );
+    }
+
+    #[test]
+    fn observe_allowlist_entries_carry_projection_and_schemas() {
+        assert!(!UI_BRIDGE_OBSERVE_COMMANDS.is_empty());
+        for cmd in UI_BRIDGE_OBSERVE_COMMANDS {
+            assert!(
+                !cmd.name.is_empty(),
+                "observe command name must not be empty"
+            );
+            assert!(
+                cmd.observe_projection.is_some(),
+                "observe command {} needs a projection",
+                cmd.name
+            );
+            // Observe-only entries must stay OUT of the invoke allowlist.
+            assert!(
+                !is_allowlisted(cmd.name),
+                "observe-only command {} must not be invoke-allowlisted",
+                cmd.name
+            );
+        }
     }
 
     #[test]

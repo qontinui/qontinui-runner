@@ -28,6 +28,7 @@ pub mod elements;
 pub mod errors;
 pub mod exploration;
 pub mod forms;
+pub mod gated_flow;
 pub mod helpers;
 pub mod history;
 pub mod intents;
@@ -354,6 +355,7 @@ pub(super) fn route_manifest() -> &'static [(&'static str, &'static str)] {
         all.extend_from_slice(errors::route_entries());
         all.extend_from_slice(exploration::route_entries());
         all.extend_from_slice(forms::route_entries());
+        all.extend_from_slice(gated_flow::route_entries());
         all.extend_from_slice(history::route_entries());
         all.extend_from_slice(intents::route_entries());
         all.extend_from_slice(intents_registry::route_entries());
@@ -435,6 +437,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .merge(errors::routes())
         .merge(exploration::routes())
         .merge(forms::routes())
+        .merge(gated_flow::routes())
         .merge(history::routes())
         .merge(intents::routes())
         .merge(intents_registry::routes())
@@ -728,6 +731,11 @@ mod manifest_drift_tests {
             ("GET", "/ui-bridge/_help"),
             ("GET", "/ui-bridge/commands"),
             ("POST", "/ui-bridge/invoke/{}"),
+            // Gated-flow family (mcp/ui_bridge/gated_flow.rs): identity
+            // introspection + the observe-only tier. Runner-only — no SDK
+            // UI_BRIDGE_ROUTES analog.
+            ("GET", "/ui-bridge/session"),
+            ("POST", "/ui-bridge/observe/{}"),
             ("POST", "/ui-bridge/pong"),
             ("POST", "/ui-bridge/ipc-response"),
             // Relay-tab protocol (plan 2026-06-12-co-pilot-automation item 6a).
