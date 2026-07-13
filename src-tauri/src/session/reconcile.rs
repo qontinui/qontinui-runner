@@ -630,12 +630,16 @@ fn anchor_live_ptys(live: &[LivePty], snapshot: &ProcessSnapshot) -> Vec<LivePty
 /// requirement). Fail-open throughout: a snapshot / cmdline / scan failure
 /// degrades to "bound nothing this pass", never worse than today's behavior and
 /// never a panic in the poll loop.
+///
+/// Returns the actions taken so the caller can propagate binds to the frontend
+/// (`session-bound` tab-stamp events — see [`session_bound_payloads`]); the
+/// registry writes have already happened by the time this returns.
 pub async fn run_reconcile_pass(
     store: &SessionLifecycleStore,
     live: &[LivePty],
     snapshot: &ProcessSnapshot,
     context: &str,
-) {
+) -> Vec<ReconcileAction> {
     let live = anchor_live_ptys(live, snapshot);
 
     // Rung 2 — ONE targeted cmdline query, for exactly the anchor pids of the
@@ -703,17 +707,80 @@ pub async fn run_reconcile_pass(
             "session reconcile: pass complete"
         );
     }
+    actions
 }
 
 /// Boot entrypoint: take a fresh process snapshot, project the live PTY set, and
 /// run the reconcile against the store. Fail-open — any failure to snapshot or
 /// scan degrades to "did nothing", never worse than today's behavior.
-pub async fn run_at_boot(store: &SessionLifecycleStore, live: Vec<LivePty>) {
+///
+/// Returns the pass's actions (empty on the nothing-to-do fast path) so the boot
+/// driver can emit `session-bound` tab-stamp events like the periodic poll does.
+pub async fn run_at_boot(
+    store: &SessionLifecycleStore,
+    live: Vec<LivePty>,
+) -> Vec<ReconcileAction> {
     if live.is_empty() && store.open_records().is_empty() {
-        return; // nothing to do
+        return Vec::new(); // nothing to do
     }
     let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
-    run_reconcile_pass(store, &live, &snapshot, "boot").await;
+    run_reconcile_pass(store, &live, &snapshot, "boot").await
+}
+
+/// Wire payload for the `session-bound` Tauri event — the binder→frontend
+/// channel that stamps a bound `claudeSessionId` onto the hosting tab.
+///
+/// Why this exists: the tab durability marker (`sessionDurability.ts` — the
+/// "ephemeral" tag) classifies from the FRONTEND tab object, which only learns
+/// a session id on the launch-menu / resume / mtime-capture paths. A session
+/// bound by this module (a hand-typed or absolute-path launch) was durable in
+/// the REGISTRY but invisible to the tab — so the tag dishonestly read
+/// "ephemeral" for a session that restores fine. Emitting one event per Bind
+/// lets the frontend stamp the tab within the same poll tick.
+///
+/// camelCase field names are the wire contract with
+/// `src/components/terminal/sessionBoundEvent.ts` — keep them in sync.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionBoundPayload {
+    pub terminal_id: String,
+    pub session_id: String,
+    /// Empty string when the bind didn't resolve a config dir (rung-2 cmdline
+    /// bind whose transcript hasn't appeared yet) — the frontend treats empty
+    /// as "unknown", never as a path.
+    pub config_dir: String,
+    /// The evidence grade (`authoritative` / `observed` / `reconciled`) — the
+    /// store normalizes on write; this mirrors what was written.
+    pub origin: String,
+    pub confirmed: bool,
+}
+
+/// Event name for the binder→frontend tab-stamp channel.
+pub const SESSION_BOUND_EVENT: &str = "session-bound";
+
+/// Project the [`ReconcileAction::Bind`]s of a pass into `session-bound` wire
+/// payloads. Pure — the caller (main.rs poll / boot driver) does the actual
+/// Tauri emit, so this is unit-testable without an AppHandle.
+pub fn session_bound_payloads(actions: &[ReconcileAction]) -> Vec<SessionBoundPayload> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            ReconcileAction::Bind {
+                terminal_id,
+                session_id,
+                config_dir,
+                origin,
+                confirmed,
+            } => Some(SessionBoundPayload {
+                terminal_id: terminal_id.clone(),
+                session_id: session_id.clone(),
+                config_dir: config_dir.clone(),
+                origin: origin.as_origin_const().to_string(),
+                confirmed: *confirmed,
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -854,6 +921,49 @@ pub fn disk_only_restore_candidates(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// `session_bound_payloads` projects exactly the Bind actions — camelCase
+    /// wire shape, origin as its registry string, non-Bind actions dropped.
+    #[test]
+    fn session_bound_payloads_projects_binds_only() {
+        let actions = vec![
+            ReconcileAction::Bind {
+                terminal_id: "term-1".to_string(),
+                session_id: "sess-1".to_string(),
+                config_dir: "C:/cfg".to_string(),
+                origin: BindOrigin::Observed,
+                confirmed: true,
+            },
+            ReconcileAction::LeaveAlone {
+                terminal_id: "term-2".to_string(),
+            },
+            ReconcileAction::SkipAmbiguous {
+                terminal_id: "term-3".to_string(),
+            },
+            ReconcileAction::PrunePhantom {
+                session_id: "sess-x".to_string(),
+            },
+            ReconcileAction::Bind {
+                terminal_id: "term-4".to_string(),
+                session_id: "sess-4".to_string(),
+                config_dir: String::new(),
+                origin: BindOrigin::Authoritative,
+                confirmed: false,
+            },
+        ];
+        let payloads = session_bound_payloads(&actions);
+        assert_eq!(payloads.len(), 2, "only Bind actions project");
+        assert_eq!(payloads[0].terminal_id, "term-1");
+        assert_eq!(payloads[0].origin, "observed");
+        assert!(payloads[0].confirmed);
+        assert_eq!(payloads[1].origin, "authoritative");
+        assert!(!payloads[1].confirmed);
+        // The wire contract with sessionBoundEvent.ts is camelCase.
+        let wire = serde_json::to_value(&payloads[0]).unwrap();
+        assert!(wire.get("terminalId").is_some(), "camelCase terminalId");
+        assert!(wire.get("sessionId").is_some(), "camelCase sessionId");
+        assert!(wire.get("configDir").is_some(), "camelCase configDir");
+    }
 
     fn pty(id: &str, pid: Option<u32>, wd: &str) -> LivePty {
         LivePty {

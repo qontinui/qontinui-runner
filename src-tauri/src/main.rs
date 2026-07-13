@@ -252,6 +252,25 @@ use tokio::sync::Mutex as TokioMutex;
 use tracing::{error, info, warn};
 use video_recorder::VideoRecordingService;
 
+/// Emit one `session-bound` frontend event per [`ReconcileAction::Bind`] a
+/// reconcile pass produced, so the hosting tab can stamp its `claudeSessionId`
+/// (flipping the durability marker from "ephemeral" to durable) without waiting
+/// for a restart. Fire-and-forget: an emit failure is logged and never affects
+/// the registry writes, which happened before the pass returned.
+fn emit_session_bound(handle: &tauri::AppHandle, actions: &[session::reconcile::ReconcileAction]) {
+    use tauri::Emitter;
+    for payload in session::reconcile::session_bound_payloads(actions) {
+        if let Err(e) = handle.emit(session::reconcile::SESSION_BOUND_EVENT, payload.clone()) {
+            warn!(
+                terminal = %payload.terminal_id,
+                session = %payload.session_id,
+                error = %e,
+                "session-bound emit failed (tab stamp skipped; registry already durable)"
+            );
+        }
+    }
+}
+
 fn main() {
     // Pre-GUI CLI mode (Phase 1a — devenv enrollment). `qontinui-runner env
     // <sub> …` runs the enrollment CLI (enroll / capture / show) and exits
@@ -2554,6 +2573,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // `closed`. Detached for the process lifetime; wrapped so a
                 // fallible tick never panics the loop.
                 let poll_tm = term_for_session.clone();
+                let poll_app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     use std::collections::HashMap as StdHashMap;
                     use std::time::Duration;
@@ -2825,13 +2845,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     ai_start_unix: None,
                                 })
                                 .collect();
-                            session::reconcile::run_reconcile_pass(
+                            let actions = session::reconcile::run_reconcile_pass(
                                 &poll_lifecycle_store,
                                 &live_ptys,
                                 &snap,
                                 "periodic",
                             )
                             .await;
+                            emit_session_bound(&poll_app_handle, &actions);
                         }
 
                         poll_lifecycle_store.prune(chrono::Utc::now().timestamp_millis());
@@ -2850,6 +2871,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // Fail-open: any snapshot/scan failure degrades to a no-op. A
                 // short delay lets the restored PTYs register first.
                 let reconcile_tm = term_for_session.clone();
+                let reconcile_app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     let live: Vec<session::reconcile::LivePty> = reconcile_tm
@@ -2867,7 +2889,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             ai_start_unix: None,
                         })
                         .collect();
-                    session::reconcile::run_at_boot(&reconcile_lifecycle_store, live).await;
+                    let actions =
+                        session::reconcile::run_at_boot(&reconcile_lifecycle_store, live).await;
+                    emit_session_bound(&reconcile_app_handle, &actions);
                 });
 
                 // Session-tracking health check (plan 2026-07-03-runner-

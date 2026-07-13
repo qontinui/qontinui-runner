@@ -51,8 +51,10 @@
 //! `restore_tier` mirrors the frontend restore classifier
 //! (`classifyRestoreAction` in `useTerminalInitialization.ts`): `"full"` —
 //! the provider can deterministically resume the conversation by id — is
-//! claimed ONLY for a CONFIRMED (`confirmed_at` set), AUTHORITATIVE-origin
-//! record whose provider adapter declares [`RestoreTier::Full`]. Everything
+//! claimed ONLY for a CONFIRMED (`confirmed_at` set) record of AUTHORITATIVE
+//! or OBSERVED origin (observed = the continuous binder's process-anchored
+//! transcript bind — resume-safe, unlike the mtime-guess `reconciled`) whose
+//! provider adapter declares [`RestoreTier::Full`]. Everything
 //! else (provisional phantom shells, reconciled ids, terminal-only
 //! providers) is `"terminal_only"` with a null `authoritative_session_id` —
 //! the remote materialization then restores terminal+cwd+command with a
@@ -72,7 +74,9 @@ use uuid::Uuid;
 
 use super::local_store::OutboxWriter;
 use super::provider_adapter::{adapter_for, RestoreTier};
-use super::session_lifecycle_store::{TerminalSessionRecord, ORIGIN_AUTHORITATIVE};
+use super::session_lifecycle_store::{
+    TerminalSessionRecord, ORIGIN_AUTHORITATIVE, ORIGIN_OBSERVED,
+};
 use super::SessionEventKind;
 
 /// Wire value of the mirrored event's kind. Binding contract with the web
@@ -232,8 +236,14 @@ impl std::fmt::Debug for RestoreRecordEmitter {
 /// for `"terminal_only"` (a fresh conversation needs no id).
 pub fn restore_record_payload(rec: &TerminalSessionRecord, machine_id: Uuid) -> JsonValue {
     let adapter = adapter_for(&rec.provider);
-    let full = rec.origin.as_deref() == Some(ORIGIN_AUTHORITATIVE)
-        && rec.confirmed_at.is_some()
+    // `observed` sits with `authoritative` here, mirroring
+    // `classifyRestoreAction`: a confirmed observed bind is process-anchored to
+    // its transcript (never the mtime guess `reconciled` quarantines), so its
+    // id is resume-safe.
+    let full = matches!(
+        rec.origin.as_deref(),
+        Some(ORIGIN_AUTHORITATIVE) | Some(ORIGIN_OBSERVED)
+    ) && rec.confirmed_at.is_some()
         && adapter.restore_tier() == RestoreTier::Full;
 
     let (tier, authoritative_session_id, launch_command) = if full {
@@ -421,6 +431,21 @@ mod tests {
         assert_eq!(p["restore_tier"], TIER_TERMINAL_ONLY);
         assert!(p["authoritative_session_id"].is_null());
         assert_eq!(p["launch_command"], "claude");
+
+        // Observed origin (continuous binder, process-anchored) + confirmed ⇒
+        // full — mirrors classifyRestoreAction's observed branch.
+        let mut observed = rec("sess-1", "t");
+        observed.origin = Some(ORIGIN_OBSERVED.to_string());
+        let o = restore_record_payload(&observed, machine);
+        assert_eq!(o["restore_tier"], TIER_FULL);
+        assert_eq!(o["authoritative_session_id"], "sess-1");
+
+        // Observed but UNCONFIRMED ⇒ terminal_only.
+        let mut observed_prov = rec("sess-1", "t");
+        observed_prov.origin = Some(ORIGIN_OBSERVED.to_string());
+        observed_prov.confirmed_at = None;
+        let op = restore_record_payload(&observed_prov, machine);
+        assert_eq!(op["restore_tier"], TIER_TERMINAL_ONLY);
 
         // Reconciled origin (backstop guess, may name a foreign session) ⇒
         // never claimed as full.
