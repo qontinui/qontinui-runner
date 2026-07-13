@@ -36,8 +36,13 @@
 //!    claimed-id set removes ids already bound to other live terminals, so two
 //!    same-second launches converge across ticks). The transcript proves the
 //!    session exists ⇒ `origin:"observed"` + confirmed ⇒ auto-resume eligible.
-//! 4. **Reconciled** (existing, elsewhere): the mtime guess / the disk-only
-//!    recovery net below — quarantined, never auto-resumed.
+//! 4. **Reconciled** (rung 4): the mtime guess, the disk-only recovery net below,
+//!    AND the degraded rung-3 case where NO start anchor could be resolved (the
+//!    process table yielded neither a claude nor a shell creation time). Without
+//!    the anchor the post-start filter is a no-op and "unique in this cwd" is the
+//!    only evidence left — which is exactly the guess this rung exists to
+//!    quarantine. Never auto-resumed. The grade follows the anchor, not the
+//!    uniqueness gate.
 //!
 //! The anchor is the **claude descendant**, not the shell: anchoring on shell
 //! start would admit a foreign same-cwd session started after the shell but
@@ -118,6 +123,15 @@ pub enum BindOrigin {
     /// the transcript proves the session exists. A CONFIRMED observed row is
     /// auto-resume-eligible (unlike the conservative `reconciled` mtime guess).
     Observed,
+    /// A uniquely-correlated transcript bind whose START ANCHOR WAS UNAVAILABLE
+    /// (rung 4) — the process table gave us neither the claude nor the shell
+    /// creation time, so the post-start filter could not run and the only
+    /// evidence left is "exactly one transcript lives in this cwd". That is the
+    /// mtime-guess class: it can name a foreign session, so it is graded
+    /// `reconciled` and the frontend quarantines it behind the one-click
+    /// confirm. Auto-resume MUST follow the anchor, not the uniqueness gate
+    /// alone.
+    Reconciled,
 }
 
 impl BindOrigin {
@@ -126,6 +140,7 @@ impl BindOrigin {
         match self {
             BindOrigin::Authoritative => ORIGIN_AUTHORITATIVE,
             BindOrigin::Observed => ORIGIN_OBSERVED,
+            BindOrigin::Reconciled => ORIGIN_RECONCILED,
         }
     }
 }
@@ -175,11 +190,14 @@ const START_ANCHOR_SKEW_SECS: i64 = 5;
 ///   `Authoritative`, `confirmed` iff a transcript for `id` already exists (else
 ///   provisional). No guessing.
 /// - **Rung 3 (observed):** else correlate to `candidates` that are BOTH
-///   post-start (`anchor_start_unix <= 0 || started + skew >= anchor_start_unix`)
-///   AND not already `claimed_ids`. UNIQUENESS gate: exactly one passes ⇒ `Bind`
-///   `Observed` `confirmed`; >1 passes ⇒ `SkipAmbiguous` (retry next tick);
-///   0 pass ⇒ `LeaveAlone`. `anchor_start_unix <= 0` disables the start filter
-///   but the uniqueness gate still applies.
+///   post-start (`started + skew >= anchor_start_unix`) AND not already
+///   `claimed_ids`. UNIQUENESS gate: exactly one passes ⇒ `Bind` `confirmed`;
+///   >1 passes ⇒ `SkipAmbiguous` (retry next tick); 0 pass ⇒ `LeaveAlone`.
+/// - **Rung 4 (degraded):** `anchor_start_unix <= 0` disables the start filter
+///   (the uniqueness gate still applies), so the bind rests on "unique in this
+///   cwd" alone. It is therefore graded `Reconciled` — QUARANTINED, not
+///   auto-resumed. The grade tracks the anchor; only an anchored bind earns
+///   `Observed`.
 ///
 /// `anchor_start_unix` is the claude anchor's creation time (epoch seconds);
 /// `claimed_ids` are session ids already bound to OTHER live terminals — removing
@@ -235,12 +253,23 @@ pub fn decide_bind_for_live_pty(
         })
         .collect();
 
+    // The grade follows the EVIDENCE, not the uniqueness gate. With a live
+    // anchor the bind is start-filtered and earns `observed` (auto-resume). With
+    // no anchor the filter above was a no-op, so "unique in this cwd" is all we
+    // have — the same guess `reconciled` exists to quarantine. Grading it
+    // `observed` would let the weakest evidence take the strongest path.
+    let correlated_origin = if anchor_start_unix > 0 {
+        BindOrigin::Observed
+    } else {
+        BindOrigin::Reconciled
+    };
+
     match passing.as_slice() {
         [cand] => ReconcileAction::Bind {
             terminal_id: pty.terminal_id.clone(),
             session_id: cand.session_id.clone(),
             config_dir: cand.config_dir.clone(),
-            origin: BindOrigin::Observed,
+            origin: correlated_origin,
             confirmed: true,
         },
         [] => ReconcileAction::LeaveAlone {
@@ -449,6 +478,20 @@ pub fn run_reconcile<I: TranscriptIndex>(
                             claude_session = %session_id,
                             confirmed = *confirmed,
                             "session binder: bound authoritative session from typed --session-id cmdline"
+                        );
+                    }
+                    BindOrigin::Reconciled => {
+                        // Degraded rung 4: no start anchor was resolvable, so the
+                        // bind rests on the uniqueness gate alone and is written
+                        // QUARANTINED. Logged at info (not debug) because a
+                        // recurring one means the process table is failing to
+                        // yield creation times — the anchor, not the bind, is the
+                        // thing to fix.
+                        tracing::info!(
+                            terminal_id = %pty.terminal_id,
+                            claude_session = %session_id,
+                            working_dir = %pty.working_dir,
+                            "session binder: no start anchor available — bound the unique cwd transcript as RECONCILED (quarantined, not auto-resumed)"
                         );
                     }
                 }
@@ -1009,9 +1052,13 @@ mod tests {
     /// Unknown anchor start (0) disables the start filter, but the uniqueness
     /// gate still applies: one candidate binds, two are ambiguous.
     #[test]
-    fn decide_anchor_unknown_disables_start_filter_but_uniqueness_applies() {
+    fn decide_anchor_unknown_binds_reconciled_not_observed() {
         let p = pty("term-1", None, "C:/repo");
-        // Single candidate, anchor unknown → unique observed bind.
+        // Single candidate, anchor unknown → the start filter could not run, so
+        // the only evidence is "unique in this cwd" — the mtime-guess class.
+        // It binds, but graded `reconciled` so the frontend QUARANTINES it.
+        // Grading it `observed` here would auto-resume a possibly-foreign
+        // session on the weakest evidence in the ladder.
         let one = vec![cand("a", "C:/cfg", Some(500))];
         let action = decide_bind_for_live_pty(&p, None, 0, None, &one, &no_claims());
         assert_eq!(
@@ -1020,7 +1067,7 @@ mod tests {
                 terminal_id: "term-1".to_string(),
                 session_id: "a".to_string(),
                 config_dir: "C:/cfg".to_string(),
-                origin: BindOrigin::Observed,
+                origin: BindOrigin::Reconciled,
                 confirmed: true,
             }
         );
