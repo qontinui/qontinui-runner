@@ -20,6 +20,7 @@ import {
   buildResumeCmd,
   runVerifiedResume,
   classifyRestoreAction,
+  recordBelongsToRestore,
 } from "./useTerminalInitialization";
 import type { TerminalSessionRecord } from "./types";
 import type { SessionOpenArgs } from "./sessionRecordArgs";
@@ -129,6 +130,66 @@ describe("fetchOpenRecords", () => {
   it("returns [] when the payload has no sessions array", async () => {
     mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: {} });
     expect(await fetchOpenRecords("default")).toEqual([]);
+  });
+});
+
+// Orphan-page adoption (2026-07-13 session-loss incident): a record whose
+// pageId names no live page must be adopted by the first restoring page —
+// but ONLY when it classifies auto-resume. Everything else keeps today's
+// strict page filter.
+describe("recordBelongsToRestore (orphan-page adoption)", () => {
+  const confirmed = (page: string): TerminalSessionRecord =>
+    rec({
+      claudeSessionId: "579f119e-4dad-443c-9c11-e036f391d4dc",
+      pageId: page,
+      origin: "authoritative",
+      confirmedAt: 123,
+    });
+
+  it("matching page always restores (no adoption involved)", () => {
+    expect(recordBelongsToRestore(confirmed("page-a"), "page-a", ["page-a"], false)).toBe(true);
+  });
+
+  it("record on ANOTHER live page is never taken (that page owns it)", () => {
+    expect(
+      recordBelongsToRestore(confirmed("page-b"), "page-a", ["page-a", "page-b"], true),
+    ).toBe(false);
+  });
+
+  it("orphan (page not in layout) + auto-resume class ⇒ adopted when this page is the adopter", () => {
+    expect(recordBelongsToRestore(confirmed("default"), "page-a", ["page-a"], true)).toBe(true);
+    // A deleted page's id is just as orphaned as "default".
+    expect(recordBelongsToRestore(confirmed("gone-page"), "page-a", ["page-a"], true)).toBe(true);
+  });
+
+  it("orphan is NOT adopted by a non-adopter page (one adopter per boot)", () => {
+    expect(recordBelongsToRestore(confirmed("default"), "page-a", ["page-a"], false)).toBe(false);
+  });
+
+  it("orphan on the FRESH-INSTALL default page is not an orphan (default is a live page)", () => {
+    // knownPageIds includes "default" ⇒ default-page records belong to the
+    // default page's own restore run, never adopted elsewhere.
+    expect(recordBelongsToRestore(confirmed("default"), "page-a", ["default", "page-a"], true)).toBe(
+      false,
+    );
+    expect(recordBelongsToRestore(confirmed("default"), "default", ["default"], true)).toBe(true);
+  });
+
+  it("unconfirmed / quarantine-tier orphans are never adopted (agent shells stay dead)", () => {
+    const unconfirmed = rec({
+      claudeSessionId: "1fce6334-0000-4000-8000-000000000000",
+      pageId: "default",
+      origin: "authoritative",
+      confirmedAt: undefined,
+    });
+    expect(recordBelongsToRestore(unconfirmed, "page-a", ["page-a"], true)).toBe(false);
+    const reconciled = rec({
+      claudeSessionId: "2fce6334-0000-4000-8000-000000000000",
+      pageId: "default",
+      origin: "reconciled",
+      confirmedAt: 123,
+    });
+    expect(recordBelongsToRestore(reconciled, "page-a", ["page-a"], true)).toBe(false);
   });
 });
 
