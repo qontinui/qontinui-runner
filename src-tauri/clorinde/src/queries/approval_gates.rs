@@ -79,8 +79,8 @@ impl<'a> From<GetApprovalGatesForTaskRunBorrowed<'a>> for GetApprovalGatesForTas
         }
     }
 }
-use crate::client::async_::GenericClient;
 use futures::{self, StreamExt, TryStreamExt};
+use crate::client::async_::GenericClient;
 pub struct StringQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
     client: &'c C,
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
@@ -104,22 +104,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -128,24 +140,32 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
     }
 }
-pub struct GetApprovalGatesForTaskRunQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
+pub struct GetApprovalGatesForTaskRunQuery<
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+    T,
+    const N: usize,
+> {
     client: &'c C,
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
     query: &'static str,
@@ -155,7 +175,14 @@ pub struct GetApprovalGatesForTaskRunQuery<'c, 'a, 's, C: GenericClient, T, cons
     ) -> Result<GetApprovalGatesForTaskRunBorrowed, tokio_postgres::Error>,
     mapper: fn(GetApprovalGatesForTaskRunBorrowed) -> T,
 }
-impl<'c, 'a, 's, C, T: 'c, const N: usize> GetApprovalGatesForTaskRunQuery<'c, 'a, 's, C, T, N>
+impl<
+    'c,
+    'a,
+    's,
+    C,
+    T: 'c,
+    const N: usize,
+> GetApprovalGatesForTaskRunQuery<'c, 'a, 's, C, T, N>
 where
     C: GenericClient,
 {
@@ -173,22 +200,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -197,18 +236,19 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
@@ -266,16 +306,14 @@ impl<
     T2: crate::StringSql,
     T3: crate::StringSql,
     T4: crate::StringSql,
->
-    crate::client::async_::Params<
-        'c,
-        'a,
-        's,
-        InsertApprovalGateParams<T1, T2, T3, T4>,
-        StringQuery<'c, 'a, 's, C, String, 5>,
-        C,
-    > for InsertApprovalGateStmt
-{
+> crate::client::async_::Params<
+    'c,
+    'a,
+    's,
+    InsertApprovalGateParams<T1, T2, T3, T4>,
+    StringQuery<'c, 'a, 's, C, String, 5>,
+    C,
+> for InsertApprovalGateStmt {
     fn params(
         &'s self,
         client: &'c C,
@@ -342,31 +380,26 @@ impl<
     T2: crate::StringSql,
     T3: crate::StringSql,
     T4: crate::StringSql,
->
-    crate::client::async_::Params<
-        'c,
-        'a,
-        's,
-        ResolveApprovalGateParams<T1, T2, T3, T4>,
-        StringQuery<'c, 'a, 's, C, String, 4>,
-        C,
-    > for ResolveApprovalGateStmt
-{
+> crate::client::async_::Params<
+    'c,
+    'a,
+    's,
+    ResolveApprovalGateParams<T1, T2, T3, T4>,
+    StringQuery<'c, 'a, 's, C, String, 4>,
+    C,
+> for ResolveApprovalGateStmt {
     fn params(
         &'s self,
         client: &'c C,
         params: &'a ResolveApprovalGateParams<T1, T2, T3, T4>,
     ) -> StringQuery<'c, 'a, 's, C, String, 4> {
-        self.bind(
-            client,
-            &params.action,
-            &params.comment,
-            &params.status,
-            &params.id,
-        )
+        self.bind(client, &params.action, &params.comment, &params.status, &params.id)
     }
 }
-pub struct GetApprovalGatesForTaskRunStmt(&'static str, Option<tokio_postgres::Statement>);
+pub struct GetApprovalGatesForTaskRunStmt(
+    &'static str,
+    Option<tokio_postgres::Statement>,
+);
 pub fn get_approval_gates_for_task_run() -> GetApprovalGatesForTaskRunStmt {
     GetApprovalGatesForTaskRunStmt(
         "SELECT id, task_run_id, iteration, prompt, context_json, COALESCE(action, '') as action, COALESCE(comment, '') as comment, status, created_at, COALESCE(resolved_at, NOW()) as resolved_at FROM approval_gates WHERE task_run_id = $1 ORDER BY created_at ASC",

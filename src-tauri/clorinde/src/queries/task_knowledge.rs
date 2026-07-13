@@ -156,8 +156,8 @@ impl<'a> From<ListTaskKnowledgeByCategoryBorrowed<'a>> for ListTaskKnowledgeByCa
         }
     }
 }
-use crate::client::async_::GenericClient;
 use futures::{self, StreamExt, TryStreamExt};
+use crate::client::async_::GenericClient;
 pub struct StringQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
     client: &'c C,
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
@@ -181,22 +181,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -205,18 +217,19 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
@@ -227,7 +240,9 @@ pub struct GetTaskKnowledgeQuery<'c, 'a, 's, C: GenericClient, T, const N: usize
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
     query: &'static str,
     cached: Option<&'s tokio_postgres::Statement>,
-    extractor: fn(&tokio_postgres::Row) -> Result<GetTaskKnowledgeBorrowed, tokio_postgres::Error>,
+    extractor: fn(
+        &tokio_postgres::Row,
+    ) -> Result<GetTaskKnowledgeBorrowed, tokio_postgres::Error>,
     mapper: fn(GetTaskKnowledgeBorrowed) -> T,
 }
 impl<'c, 'a, 's, C, T: 'c, const N: usize> GetTaskKnowledgeQuery<'c, 'a, 's, C, T, N>
@@ -248,22 +263,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -272,24 +299,32 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
     }
 }
-pub struct ListTaskKnowledgeByCategoryQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
+pub struct ListTaskKnowledgeByCategoryQuery<
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+    T,
+    const N: usize,
+> {
     client: &'c C,
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
     query: &'static str,
@@ -299,7 +334,14 @@ pub struct ListTaskKnowledgeByCategoryQuery<'c, 'a, 's, C: GenericClient, T, con
     ) -> Result<ListTaskKnowledgeByCategoryBorrowed, tokio_postgres::Error>,
     mapper: fn(ListTaskKnowledgeByCategoryBorrowed) -> T,
 }
-impl<'c, 'a, 's, C, T: 'c, const N: usize> ListTaskKnowledgeByCategoryQuery<'c, 'a, 's, C, T, N>
+impl<
+    'c,
+    'a,
+    's,
+    C,
+    T: 'c,
+    const N: usize,
+> ListTaskKnowledgeByCategoryQuery<'c, 'a, 's, C, T, N>
 where
     C: GenericClient,
 {
@@ -317,22 +359,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -341,18 +395,19 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
@@ -432,16 +487,14 @@ impl<
     T6: crate::StringSql,
     T7: crate::StringSql,
     T8: crate::StringSql,
->
-    crate::client::async_::Params<
-        'c,
-        'a,
-        's,
-        CreateTaskKnowledgeParams<T1, T2, T3, T4, T5, T6, T7, T8>,
-        StringQuery<'c, 'a, 's, C, String, 9>,
-        C,
-    > for CreateTaskKnowledgeStmt
-{
+> crate::client::async_::Params<
+    'c,
+    'a,
+    's,
+    CreateTaskKnowledgeParams<T1, T2, T3, T4, T5, T6, T7, T8>,
+    StringQuery<'c, 'a, 's, C, String, 9>,
+    C,
+> for CreateTaskKnowledgeStmt {
     fn params(
         &'s self,
         client: &'c C,
@@ -507,7 +560,10 @@ impl GetTaskKnowledgeStmt {
         }
     }
 }
-pub struct ListTaskKnowledgeByCategoryStmt(&'static str, Option<tokio_postgres::Statement>);
+pub struct ListTaskKnowledgeByCategoryStmt(
+    &'static str,
+    Option<tokio_postgres::Statement>,
+);
 pub fn list_task_knowledge_by_category() -> ListTaskKnowledgeByCategoryStmt {
     ListTaskKnowledgeByCategoryStmt(
         "SELECT id, task_run_id, category, agent_type, iteration, content, COALESCE(evidence, '') as evidence, confidence, COALESCE(related_files, '[]') as related_files, is_resolved, content_embedding, created_at FROM task_knowledge WHERE ($1::TEXT IS NULL OR category = $1) AND content_embedding IS NOT NULL ORDER BY created_at DESC LIMIT $2",
@@ -527,7 +583,14 @@ impl ListTaskKnowledgeByCategoryStmt {
         client: &'c C,
         category: &'a Option<T1>,
         max_results: &'a i64,
-    ) -> ListTaskKnowledgeByCategoryQuery<'c, 'a, 's, C, ListTaskKnowledgeByCategory, 2> {
+    ) -> ListTaskKnowledgeByCategoryQuery<
+        'c,
+        'a,
+        's,
+        C,
+        ListTaskKnowledgeByCategory,
+        2,
+    > {
         ListTaskKnowledgeByCategoryQuery {
             client,
             params: [category, max_results],
@@ -555,21 +618,32 @@ impl ListTaskKnowledgeByCategoryStmt {
         }
     }
 }
-impl<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>
-    crate::client::async_::Params<
-        'c,
-        'a,
-        's,
-        ListTaskKnowledgeByCategoryParams<T1>,
-        ListTaskKnowledgeByCategoryQuery<'c, 'a, 's, C, ListTaskKnowledgeByCategory, 2>,
-        C,
-    > for ListTaskKnowledgeByCategoryStmt
-{
+impl<
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+    T1: crate::StringSql,
+> crate::client::async_::Params<
+    'c,
+    'a,
+    's,
+    ListTaskKnowledgeByCategoryParams<T1>,
+    ListTaskKnowledgeByCategoryQuery<'c, 'a, 's, C, ListTaskKnowledgeByCategory, 2>,
+    C,
+> for ListTaskKnowledgeByCategoryStmt {
     fn params(
         &'s self,
         client: &'c C,
         params: &'a ListTaskKnowledgeByCategoryParams<T1>,
-    ) -> ListTaskKnowledgeByCategoryQuery<'c, 'a, 's, C, ListTaskKnowledgeByCategory, 2> {
+    ) -> ListTaskKnowledgeByCategoryQuery<
+        'c,
+        'a,
+        's,
+        C,
+        ListTaskKnowledgeByCategory,
+        2,
+    > {
         self.bind(client, &params.category, &params.max_results)
     }
 }
@@ -588,7 +662,14 @@ impl StoreKnowledgeEmbeddingStmt {
         self.1 = Some(client.prepare(self.0).await?);
         Ok(self)
     }
-    pub async fn bind<'c, 'a, 's, C: GenericClient, T1: crate::BytesSql, T2: crate::StringSql>(
+    pub async fn bind<
+        'c,
+        'a,
+        's,
+        C: GenericClient,
+        T1: crate::BytesSql,
+        T2: crate::StringSql,
+    >(
         &'s self,
         client: &'c C,
         embedding: &'a T1,
@@ -597,18 +678,21 @@ impl StoreKnowledgeEmbeddingStmt {
         client.execute(self.0, &[embedding, id]).await
     }
 }
-impl<'a, C: GenericClient + Send + Sync, T1: crate::BytesSql, T2: crate::StringSql>
-    crate::client::async_::Params<
-        'a,
-        'a,
-        'a,
-        StoreKnowledgeEmbeddingParams<T1, T2>,
-        std::pin::Pin<
-            Box<dyn futures::Future<Output = Result<u64, tokio_postgres::Error>> + Send + 'a>,
-        >,
-        C,
-    > for StoreKnowledgeEmbeddingStmt
-{
+impl<
+    'a,
+    C: GenericClient + Send + Sync,
+    T1: crate::BytesSql,
+    T2: crate::StringSql,
+> crate::client::async_::Params<
+    'a,
+    'a,
+    'a,
+    StoreKnowledgeEmbeddingParams<T1, T2>,
+    std::pin::Pin<
+        Box<dyn futures::Future<Output = Result<u64, tokio_postgres::Error>> + Send + 'a>,
+    >,
+    C,
+> for StoreKnowledgeEmbeddingStmt {
     fn params(
         &'a self,
         client: &'a C,
@@ -634,7 +718,14 @@ impl ResolveTaskKnowledgeStmt {
         self.1 = Some(client.prepare(self.0).await?);
         Ok(self)
     }
-    pub async fn bind<'c, 'a, 's, C: GenericClient, T1: crate::StringSql, T2: crate::StringSql>(
+    pub async fn bind<
+        'c,
+        'a,
+        's,
+        C: GenericClient,
+        T1: crate::StringSql,
+        T2: crate::StringSql,
+    >(
         &'s self,
         client: &'c C,
         resolution_notes: &'a Option<T1>,
@@ -643,18 +734,21 @@ impl ResolveTaskKnowledgeStmt {
         client.execute(self.0, &[resolution_notes, id]).await
     }
 }
-impl<'a, C: GenericClient + Send + Sync, T1: crate::StringSql, T2: crate::StringSql>
-    crate::client::async_::Params<
-        'a,
-        'a,
-        'a,
-        ResolveTaskKnowledgeParams<T1, T2>,
-        std::pin::Pin<
-            Box<dyn futures::Future<Output = Result<u64, tokio_postgres::Error>> + Send + 'a>,
-        >,
-        C,
-    > for ResolveTaskKnowledgeStmt
-{
+impl<
+    'a,
+    C: GenericClient + Send + Sync,
+    T1: crate::StringSql,
+    T2: crate::StringSql,
+> crate::client::async_::Params<
+    'a,
+    'a,
+    'a,
+    ResolveTaskKnowledgeParams<T1, T2>,
+    std::pin::Pin<
+        Box<dyn futures::Future<Output = Result<u64, tokio_postgres::Error>> + Send + 'a>,
+    >,
+    C,
+> for ResolveTaskKnowledgeStmt {
     fn params(
         &'a self,
         client: &'a C,

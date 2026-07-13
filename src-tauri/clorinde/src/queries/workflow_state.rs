@@ -106,8 +106,7 @@ pub struct GetStepCheckpointsPaginatedWithCursorBorrowed<'a> {
     pub error: &'a str,
 }
 impl<'a> From<GetStepCheckpointsPaginatedWithCursorBorrowed<'a>>
-    for GetStepCheckpointsPaginatedWithCursor
-{
+for GetStepCheckpointsPaginatedWithCursor {
     fn from(
         GetStepCheckpointsPaginatedWithCursorBorrowed {
             id,
@@ -186,8 +185,7 @@ pub struct GetStepCheckpointsPaginatedNoCursorBorrowed<'a> {
     pub error: &'a str,
 }
 impl<'a> From<GetStepCheckpointsPaginatedNoCursorBorrowed<'a>>
-    for GetStepCheckpointsPaginatedNoCursor
-{
+for GetStepCheckpointsPaginatedNoCursor {
     fn from(
         GetStepCheckpointsPaginatedNoCursorBorrowed {
             id,
@@ -274,8 +272,8 @@ impl<'a> From<GetLatestStepProgressMarkerBorrowed<'a>> for GetLatestStepProgress
         }
     }
 }
-use crate::client::async_::GenericClient;
 use futures::{self, StreamExt, TryStreamExt};
+use crate::client::async_::GenericClient;
 pub struct StringQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
     client: &'c C,
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
@@ -299,22 +297,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -323,24 +333,32 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
     }
 }
-pub struct GetWorkflowExecutionStateQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
+pub struct GetWorkflowExecutionStateQuery<
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+    T,
+    const N: usize,
+> {
     client: &'c C,
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
     query: &'static str,
@@ -350,7 +368,14 @@ pub struct GetWorkflowExecutionStateQuery<'c, 'a, 's, C: GenericClient, T, const
     ) -> Result<GetWorkflowExecutionStateBorrowed, tokio_postgres::Error>,
     mapper: fn(GetWorkflowExecutionStateBorrowed) -> T,
 }
-impl<'c, 'a, 's, C, T: 'c, const N: usize> GetWorkflowExecutionStateQuery<'c, 'a, 's, C, T, N>
+impl<
+    'c,
+    'a,
+    's,
+    C,
+    T: 'c,
+    const N: usize,
+> GetWorkflowExecutionStateQuery<'c, 'a, 's, C, T, N>
 where
     C: GenericClient,
 {
@@ -368,22 +393,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -392,18 +429,19 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
@@ -423,12 +461,17 @@ pub struct GetStepCheckpointsPaginatedWithCursorQuery<
     cached: Option<&'s tokio_postgres::Statement>,
     extractor: fn(
         &tokio_postgres::Row,
-    )
-        -> Result<GetStepCheckpointsPaginatedWithCursorBorrowed, tokio_postgres::Error>,
+    ) -> Result<GetStepCheckpointsPaginatedWithCursorBorrowed, tokio_postgres::Error>,
     mapper: fn(GetStepCheckpointsPaginatedWithCursorBorrowed) -> T,
 }
-impl<'c, 'a, 's, C, T: 'c, const N: usize>
-    GetStepCheckpointsPaginatedWithCursorQuery<'c, 'a, 's, C, T, N>
+impl<
+    'c,
+    'a,
+    's,
+    C,
+    T: 'c,
+    const N: usize,
+> GetStepCheckpointsPaginatedWithCursorQuery<'c, 'a, 's, C, T, N>
 where
     C: GenericClient,
 {
@@ -446,22 +489,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -470,37 +525,49 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
     }
 }
-pub struct GetStepCheckpointsPaginatedNoCursorQuery<'c, 'a, 's, C: GenericClient, T, const N: usize>
-{
+pub struct GetStepCheckpointsPaginatedNoCursorQuery<
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+    T,
+    const N: usize,
+> {
     client: &'c C,
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
     query: &'static str,
     cached: Option<&'s tokio_postgres::Statement>,
     extractor: fn(
         &tokio_postgres::Row,
-    )
-        -> Result<GetStepCheckpointsPaginatedNoCursorBorrowed, tokio_postgres::Error>,
+    ) -> Result<GetStepCheckpointsPaginatedNoCursorBorrowed, tokio_postgres::Error>,
     mapper: fn(GetStepCheckpointsPaginatedNoCursorBorrowed) -> T,
 }
-impl<'c, 'a, 's, C, T: 'c, const N: usize>
-    GetStepCheckpointsPaginatedNoCursorQuery<'c, 'a, 's, C, T, N>
+impl<
+    'c,
+    'a,
+    's,
+    C,
+    T: 'c,
+    const N: usize,
+> GetStepCheckpointsPaginatedNoCursorQuery<'c, 'a, 's, C, T, N>
 where
     C: GenericClient,
 {
@@ -518,22 +585,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -542,24 +621,32 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
     }
 }
-pub struct GetLatestStepProgressMarkerQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
+pub struct GetLatestStepProgressMarkerQuery<
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+    T,
+    const N: usize,
+> {
     client: &'c C,
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
     query: &'static str,
@@ -569,7 +656,14 @@ pub struct GetLatestStepProgressMarkerQuery<'c, 'a, 's, C: GenericClient, T, con
     ) -> Result<GetLatestStepProgressMarkerBorrowed, tokio_postgres::Error>,
     mapper: fn(GetLatestStepProgressMarkerBorrowed) -> T,
 }
-impl<'c, 'a, 's, C, T: 'c, const N: usize> GetLatestStepProgressMarkerQuery<'c, 'a, 's, C, T, N>
+impl<
+    'c,
+    'a,
+    's,
+    C,
+    T: 'c,
+    const N: usize,
+> GetLatestStepProgressMarkerQuery<'c, 'a, 's, C, T, N>
 where
     C: GenericClient,
 {
@@ -587,22 +681,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -611,24 +717,28 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
     }
 }
-pub struct SaveWorkflowExecutionStateStmt(&'static str, Option<tokio_postgres::Statement>);
+pub struct SaveWorkflowExecutionStateStmt(
+    &'static str,
+    Option<tokio_postgres::Statement>,
+);
 pub fn save_workflow_execution_state() -> SaveWorkflowExecutionStateStmt {
     SaveWorkflowExecutionStateStmt(
         "INSERT INTO workflow_execution_state (execution_id, workflow_type, state_name, state_data, phase, iteration, updated_at) VALUES ($1, $2, $3, $4, $5, $6, NOW()) ON CONFLICT(execution_id) DO UPDATE SET workflow_type = EXCLUDED.workflow_type, state_name = EXCLUDED.state_name, state_data = EXCLUDED.state_data, phase = EXCLUDED.phase, iteration = EXCLUDED.iteration, updated_at = NOW() RETURNING execution_id",
@@ -690,16 +800,14 @@ impl<
     T3: crate::StringSql,
     T4: crate::StringSql,
     T5: crate::StringSql,
->
-    crate::client::async_::Params<
-        'c,
-        'a,
-        's,
-        SaveWorkflowExecutionStateParams<T1, T2, T3, T4, T5>,
-        StringQuery<'c, 'a, 's, C, String, 6>,
-        C,
-    > for SaveWorkflowExecutionStateStmt
-{
+> crate::client::async_::Params<
+    'c,
+    'a,
+    's,
+    SaveWorkflowExecutionStateParams<T1, T2, T3, T4, T5>,
+    StringQuery<'c, 'a, 's, C, String, 6>,
+    C,
+> for SaveWorkflowExecutionStateStmt {
     fn params(
         &'s self,
         client: &'c C,
@@ -716,7 +824,10 @@ impl<
         )
     }
 }
-pub struct GetWorkflowExecutionStateStmt(&'static str, Option<tokio_postgres::Statement>);
+pub struct GetWorkflowExecutionStateStmt(
+    &'static str,
+    Option<tokio_postgres::Statement>,
+);
 pub fn get_workflow_execution_state() -> GetWorkflowExecutionStateStmt {
     GetWorkflowExecutionStateStmt(
         "SELECT execution_id, workflow_type, state_name, COALESCE(state_data, '') as state_data, COALESCE(phase, '') as phase, COALESCE(iteration, 0) as iteration, updated_at FROM workflow_execution_state WHERE execution_id = $1",
@@ -758,7 +869,10 @@ impl GetWorkflowExecutionStateStmt {
         }
     }
 }
-pub struct DeleteWorkflowExecutionStateStmt(&'static str, Option<tokio_postgres::Statement>);
+pub struct DeleteWorkflowExecutionStateStmt(
+    &'static str,
+    Option<tokio_postgres::Statement>,
+);
 pub fn delete_workflow_execution_state() -> DeleteWorkflowExecutionStateStmt {
     DeleteWorkflowExecutionStateStmt(
         "DELETE FROM workflow_execution_state WHERE execution_id = $1",
@@ -818,7 +932,9 @@ impl GetStepCheckpointsPaginatedWithCursorStmt {
             params: [execution_id, cursor, max_results],
             query: self.0,
             cached: self.1.as_ref(),
-            extractor: |row: &tokio_postgres::Row| -> Result<
+            extractor: |
+                row: &tokio_postgres::Row,
+            | -> Result<
                 GetStepCheckpointsPaginatedWithCursorBorrowed,
                 tokio_postgres::Error,
             > {
@@ -845,23 +961,27 @@ impl GetStepCheckpointsPaginatedWithCursorStmt {
         }
     }
 }
-impl<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>
-    crate::client::async_::Params<
+impl<
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+    T1: crate::StringSql,
+> crate::client::async_::Params<
+    'c,
+    'a,
+    's,
+    GetStepCheckpointsPaginatedWithCursorParams<T1>,
+    GetStepCheckpointsPaginatedWithCursorQuery<
         'c,
         'a,
         's,
-        GetStepCheckpointsPaginatedWithCursorParams<T1>,
-        GetStepCheckpointsPaginatedWithCursorQuery<
-            'c,
-            'a,
-            's,
-            C,
-            GetStepCheckpointsPaginatedWithCursor,
-            3,
-        >,
         C,
-    > for GetStepCheckpointsPaginatedWithCursorStmt
-{
+        GetStepCheckpointsPaginatedWithCursor,
+        3,
+    >,
+    C,
+> for GetStepCheckpointsPaginatedWithCursorStmt {
     fn params(
         &'s self,
         client: &'c C,
@@ -874,15 +994,13 @@ impl<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>
         GetStepCheckpointsPaginatedWithCursor,
         3,
     > {
-        self.bind(
-            client,
-            &params.execution_id,
-            &params.cursor,
-            &params.max_results,
-        )
+        self.bind(client, &params.execution_id, &params.cursor, &params.max_results)
     }
 }
-pub struct GetStepCheckpointsPaginatedNoCursorStmt(&'static str, Option<tokio_postgres::Statement>);
+pub struct GetStepCheckpointsPaginatedNoCursorStmt(
+    &'static str,
+    Option<tokio_postgres::Statement>,
+);
 pub fn get_step_checkpoints_paginated_no_cursor() -> GetStepCheckpointsPaginatedNoCursorStmt {
     GetStepCheckpointsPaginatedNoCursorStmt(
         "SELECT id, execution_id, workflow_type, phase, COALESCE(iteration, 0) as iteration, step_index, COALESCE(stage_index, 0) as stage_index, step_type, COALESCE(step_name, '') as step_name, status, COALESCE(result_json, '') as result_json, COALESCE(step_config_json, '') as step_config_json, COALESCE(started_at::TEXT, '') as started_at, COALESCE(completed_at::TEXT, '') as completed_at, COALESCE(duration_ms, 0) as duration_ms, COALESCE(error, '') as error FROM workflow_step_checkpoints WHERE execution_id = $1 ORDER BY step_index ASC LIMIT $2",
@@ -915,7 +1033,9 @@ impl GetStepCheckpointsPaginatedNoCursorStmt {
             params: [execution_id, max_results],
             query: self.0,
             cached: self.1.as_ref(),
-            extractor: |row: &tokio_postgres::Row| -> Result<
+            extractor: |
+                row: &tokio_postgres::Row,
+            | -> Result<
                 GetStepCheckpointsPaginatedNoCursorBorrowed,
                 tokio_postgres::Error,
             > {
@@ -942,23 +1062,27 @@ impl GetStepCheckpointsPaginatedNoCursorStmt {
         }
     }
 }
-impl<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>
-    crate::client::async_::Params<
+impl<
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+    T1: crate::StringSql,
+> crate::client::async_::Params<
+    'c,
+    'a,
+    's,
+    GetStepCheckpointsPaginatedNoCursorParams<T1>,
+    GetStepCheckpointsPaginatedNoCursorQuery<
         'c,
         'a,
         's,
-        GetStepCheckpointsPaginatedNoCursorParams<T1>,
-        GetStepCheckpointsPaginatedNoCursorQuery<
-            'c,
-            'a,
-            's,
-            C,
-            GetStepCheckpointsPaginatedNoCursor,
-            2,
-        >,
         C,
-    > for GetStepCheckpointsPaginatedNoCursorStmt
-{
+        GetStepCheckpointsPaginatedNoCursor,
+        2,
+    >,
+    C,
+> for GetStepCheckpointsPaginatedNoCursorStmt {
     fn params(
         &'s self,
         client: &'c C,
@@ -1004,7 +1128,10 @@ impl GetRunningCheckpointIdStmt {
         }
     }
 }
-pub struct GetLatestStepProgressMarkerStmt(&'static str, Option<tokio_postgres::Statement>);
+pub struct GetLatestStepProgressMarkerStmt(
+    &'static str,
+    Option<tokio_postgres::Statement>,
+);
 pub fn get_latest_step_progress_marker() -> GetLatestStepProgressMarkerStmt {
     GetLatestStepProgressMarkerStmt(
         "SELECT id, COALESCE(checkpoint_id, '') as checkpoint_id, marker_type, COALESCE(current_value, 0) as current_value, COALESCE(total_value, 0) as total_value, COALESCE(description, '') as description, COALESCE(data_json, '') as data_json, created_at FROM step_progress_markers WHERE checkpoint_id = $1 ORDER BY id DESC LIMIT 1",
@@ -1023,7 +1150,14 @@ impl GetLatestStepProgressMarkerStmt {
         &'s self,
         client: &'c C,
         checkpoint_id: &'a Option<T1>,
-    ) -> GetLatestStepProgressMarkerQuery<'c, 'a, 's, C, GetLatestStepProgressMarker, 1> {
+    ) -> GetLatestStepProgressMarkerQuery<
+        'c,
+        'a,
+        's,
+        C,
+        GetLatestStepProgressMarker,
+        1,
+    > {
         GetLatestStepProgressMarkerQuery {
             client,
             params: [checkpoint_id],

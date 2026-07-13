@@ -1,11 +1,11 @@
 // This file was generated with `clorinde`. Do not modify.
 
-use super::fallible_iterator::FallibleIterator;
-use super::utils::escape_domain;
-use postgres_protocol::types::{ArrayValues, array_from_sql};
+use postgres_protocol::types::{array_from_sql, ArrayValues};
 use postgres_types::{FromSql, Kind, Type};
 use std::fmt::Debug;
 use std::marker::PhantomData;
+use super::fallible_iterator::FallibleIterator;
+use super::utils::escape_domain;
 /// Iterator over the items in a PostgreSQL array. You only need this if you are
 /// working with custom zero-cost type mapping of rows containing PostgreSQL arrays.
 pub struct ArrayIterator<'a, T: FromSql<'a>> {
