@@ -849,6 +849,12 @@ fn http_post_with_timeouts(
 mod tests {
     use super::*;
 
+    /// `PATH` is process-global, but the harness runs tests on parallel threads.
+    /// Every test that swaps `PATH` out from under `resolve_real` must hold this
+    /// for the whole save/set/resolve/restore window, or a sibling restores the
+    /// original `PATH` mid-flight and `resolve_real` misses the temp dirs.
+    static PATH_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn detect_tool_from_argv0_variants() {
         // Plain names.
@@ -984,6 +990,7 @@ mod tests {
 
     #[test]
     fn resolve_real_skips_own_dir() {
+        let _guard = PATH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let shim = tmp.path().join("shim");
         let realbin = tmp.path().join("realbin");
@@ -1015,6 +1022,7 @@ mod tests {
 
     #[test]
     fn resolve_real_skips_all_own_dirs() {
+        let _guard = PATH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         // The identity seam can put TWO of our dirs on PATH (identity + install)
         // while SHIM_DIR_ENV names only one — resolution must skip every own
         // dir, or the stub resolves itself.
