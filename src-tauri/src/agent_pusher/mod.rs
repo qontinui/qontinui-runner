@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! git -C <worktree_path> -c http.extraHeader="Authorization: Bearer <jwt>" \
-//!     push <coord-origin>/git/<repo-basename>.git refs/heads/<branch>:refs/agent/<m>-<a>
+//!     push <coord-origin>/git/<owner>/<repo>.git refs/heads/<branch>:refs/agent/<m>-<a>
 //! ```
 //!
 //! against the coord-hosted git origin (Row 9 Phase 2, §3.4). The push
@@ -165,8 +165,8 @@ impl PusherState {
 /// returned `PusherHandle`).
 ///
 /// `repo_to_origin_url` builds the per-repo coord origin URL given
-/// the coord HTTP base + repo alias. Default form for the pilot is
-/// `<base>/git/<repo>.git`.
+/// the coord HTTP base + repo alias. Form is the owner-qualified
+/// `<base>/git/<owner>/<repo>.git` (see [`build_origin_url`]).
 ///
 /// Background: a single coord-side scope token covers all repos in
 /// the agent's worktree set (one branch name = one `git_push` glob
@@ -372,7 +372,12 @@ async fn push_one(
     })
 }
 
-/// The coord git-origin URL for `repo`: `<base>/git/<basename>.git`.
+/// The coord git-origin URL for `repo`: `<base>/git/<owner>/<name>.git`.
+///
+/// Owner-qualified per coord's registry-driven git origin (cutover a+b+c,
+/// coord `d535ee3`): routes are `/git/:owner/:repo/...` and the old
+/// single-segment `/git/<name>.git` routes are GONE with no compat — a
+/// basename-only URL misses the route entirely.
 ///
 /// **Auth is NOT injected here.** coord's git-http gate is Bearer-only and
 /// rejects GitHub-style `x-access-token:<jwt>@host` basic-auth in the URL
@@ -381,11 +386,11 @@ async fn push_one(
 /// instead handed to git as an `Authorization: Bearer` header via
 /// `-c http.extraHeader` in [`push_one`], so the URL stays credential-free.
 ///
-/// The repo path is the **basename** (`qontinui/qontinui-coord` →
-/// `qontinui-coord`): coord's `/git/:repo/...` route captures a single path
-/// segment and its origin hosts repos under their basename, so an
-/// org-prefixed name would split into two segments and miss the route
-/// entirely (falling through to an unrelated operator-gated handler).
+/// `repo` may be canonical (`qontinui/qontinui-coord[.git]`) or a legacy
+/// bare slug (`qontinui-coord[.git]`). Bare slugs map under the same
+/// default owner coord applies server-side to legacy scope entries and
+/// persisted rows (`git_origin::split_repo_slug` / `default_repo_owner`),
+/// so both ends of the wire agree on where a bare slug lives.
 pub fn build_origin_url(base: &str, repo: &str) -> Result<String> {
     let base = base.trim_end_matches('/');
     let prefix = if let Some(rest) = base.strip_prefix("https://") {
@@ -396,8 +401,23 @@ pub fn build_origin_url(base: &str, repo: &str) -> Result<String> {
         anyhow::bail!("coord_http_base must be http[s]://, got {base:?}");
     };
     let repo = repo.strip_suffix(".git").unwrap_or(repo);
-    let basename = repo.rsplit('/').next().unwrap_or(repo);
-    Ok(format!("{}{}/git/{}.git", prefix.0, prefix.1, basename))
+    let (owner, name) = match repo.split_once('/') {
+        Some((owner, name)) if !owner.is_empty() && !name.is_empty() => {
+            (owner.to_string(), name.to_string())
+        }
+        _ => (default_repo_owner(), repo.to_string()),
+    };
+    Ok(format!("{}{}/git/{}/{}.git", prefix.0, prefix.1, owner, name))
+}
+
+/// The owner legacy bare repo slugs map under — mirrors coord's
+/// `git_origin::default_repo_owner` (same env var, same default) so the
+/// client and server resolve a bare `<name>.git` to the same repo.
+fn default_repo_owner() -> String {
+    std::env::var("GITHUB_REPO_OWNER")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "qontinui".to_string())
 }
 
 /// Outcome of one [`push_one`] attempt. `Transient` carries the git
@@ -492,7 +512,7 @@ mod tests {
         // coord's git gate is Bearer-only; the URL must carry NO basic-auth
         // (the JWT goes in an http.extraHeader instead).
         let url = build_origin_url("https://coord.example/", "qontinui-coord").unwrap();
-        assert_eq!(url, "https://coord.example/git/qontinui-coord.git");
+        assert_eq!(url, "https://coord.example/git/qontinui/qontinui-coord.git");
         assert!(
             !url.contains("x-access-token"),
             "url must not embed creds: {url}"
@@ -501,12 +521,24 @@ mod tests {
     }
 
     #[test]
-    fn build_origin_url_uses_basename_strips_dot_git_and_org_prefix() {
-        // org-prefixed canonical name → single-segment basename, so the
-        // `/git/:repo/...` route matches (an org prefix would split into
-        // two path segments and miss the route).
+    fn build_origin_url_is_owner_qualified() {
+        // canonical owner/name passes through owner-qualified — coord's
+        // routes are `/git/:owner/:repo/...` (the single-segment routes
+        // are gone, no compat).
         let url = build_origin_url("http://h:9870", "qontinui/qontinui-coord.git").unwrap();
-        assert_eq!(url, "http://h:9870/git/qontinui-coord.git");
+        assert_eq!(url, "http://h:9870/git/qontinui/qontinui-coord.git");
+        // a non-default owner is preserved verbatim
+        let url = build_origin_url("http://h:9870", "acme/widget").unwrap();
+        assert_eq!(url, "http://h:9870/git/acme/widget.git");
+    }
+
+    #[test]
+    fn build_origin_url_maps_bare_slug_under_default_owner() {
+        // legacy bare slug → default owner, mirroring coord's
+        // `split_repo_slug`/`default_repo_owner` mapping so client and
+        // server resolve the same repo.
+        let url = build_origin_url("http://h:9870", "qontinui-coord.git").unwrap();
+        assert_eq!(url, "http://h:9870/git/qontinui/qontinui-coord.git");
     }
 
     #[test]
