@@ -431,21 +431,6 @@ export interface SpawnAgentResult {
   [k: string]: unknown;
 }
 
-/** Resolve coord's HTTP base from the runner backend (env `COORD_HTTP_URL`
- *  → active profile `coord_url` → localhost), so in-app spawn reaches the
- *  SAME coord the backend session-sync uses — not a hardcoded localhost.
- *  Falls back to localhost only if the command is unavailable (e.g. unit
- *  tests, which pass `coordBase` explicitly and never hit this path). */
-async function resolveCoordHttpBase(): Promise<string> {
-  try {
-    const base = await invoke<string>("get_coord_http_base");
-    if (base && base.trim()) return base.trim();
-  } catch {
-    // command unavailable — fall through to localhost default
-  }
-  return "http://localhost:9870";
-}
-
 /** Spawn an agent from a plan/phase tuple via coord.
  *
  *  Mirrors the web SpawnModal contract verbatim:
@@ -469,24 +454,23 @@ export async function spawnFromPlan(
   declaredOverlapPaths?: string[],
   coordBase?: string,
 ): Promise<SpawnAgentResult> {
-  const base = coordBase ?? (await resolveCoordHttpBase());
-  const url = new URL("/agents/spawn", base);
-  const body = {
-    plan_slug: planSlug,
-    plan_phase: phase,
+  // The spawn runs through an authenticated Rust Tauri command: production
+  // coord gates `POST /agents/spawn` on operator SSO, and the operator's
+  // Cognito bearer lives ONLY in the Rust backend (never the frontend). The
+  // command resolves the coord base itself (same source as
+  // `get_coord_http_base`) and attaches the Cognito access token. Tauri
+  // auto-converts snake_case Rust params to camelCase JS keys.
+  //
+  // `coordBase` is retained on the signature for the unit tests that pass it,
+  // but the backend command owns base resolution now (it is not forwarded).
+  void coordBase;
+  const res = await invoke<SpawnAgentResult>("spawn_from_plan", {
+    planSlug,
+    planPhase: phase,
     repos,
     intent,
-    initial_prompt: initialPrompt,
-    declared_overlap_paths: declaredOverlapPaths ?? [],
-  };
-  const res = await fetch(url.toString(), {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify(body),
+    initialPrompt,
+    declaredOverlapPaths: declaredOverlapPaths ?? [],
   });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`HTTP ${res.status}: ${text || res.statusText}`);
-  }
-  return (await res.json()) as SpawnAgentResult;
+  return res;
 }
