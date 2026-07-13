@@ -397,7 +397,16 @@ async fn health(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let pong_age_ms = if last_pong > 0 { now_ms - last_pong } else { 0 };
+    // `last_pong` is a wall-clock stamp, so a backwards clock step (NTP
+    // correction, sleep/resume) can leave it AHEAD of `now_ms`. A plain
+    // subtraction underflows and panics here — in the one handler the
+    // supervisor polls. Saturate: a pong from the "future" reads as age 0,
+    // i.e. maximally fresh, which is the honest answer.
+    let pong_age_ms = if last_pong > 0 {
+        now_ms.saturating_sub(last_pong)
+    } else {
+        0
+    };
     let responsive = last_pong > 0 && pong_age_ms < 15000;
 
     let pending_count = state
@@ -902,17 +911,18 @@ async fn coord_mcp_proxy_handler(
     };
 
     let status = upstream.status().as_u16();
-    let mut builder = axum::http::Response::builder()
-        .status(axum::http::StatusCode::from_u16(status).unwrap_or(axum::http::StatusCode::OK));
-    for (name, value) in upstream.headers() {
-        if matches!(
-            name.as_str(),
-            "content-length" | "transfer-encoding" | "connection"
-        ) {
-            continue;
-        }
-        builder = builder.header(name.as_str(), value.as_bytes());
-    }
+    let status_code =
+        axum::http::StatusCode::from_u16(status).unwrap_or(axum::http::StatusCode::OK);
+    let upstream_content_type = upstream
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    // `upstream.bytes()` consumes the response, so snapshot the headers we
+    // forward before reading the body.
+    let upstream_headers = upstream.headers().clone();
+
     let bytes = match upstream.bytes().await {
         Ok(b) => b,
         Err(e) => {
@@ -928,6 +938,63 @@ async fn coord_mcp_proxy_handler(
                 .into_response();
         }
     };
+
+    // Envelope non-JSON upstream errors instead of mirroring them.
+    //
+    // A gateway in front of coord (ALB, CloudFront) answers a 502/504 with an
+    // HTML error page. Forwarding that verbatim gave this route a `text/html`
+    // 5xx, which is useless to an MCP client (it can only parse JSON) AND trips
+    // the debug-only `envelope_audit` layer, whose premise — "a non-JSON error
+    // response is a handler bug" — does not hold for a pass-through proxy.
+    // That panic is caught by CatchPanicLayer, but the panic hook still writes a
+    // crash dump, so a transient coord blip made a healthy runner look crashed.
+    //
+    // The upstream STATUS is preserved (a 504 stays a 504); only the unusable
+    // body is replaced with a parseable envelope carrying a snippet for triage.
+    let is_error = status_code.is_client_error() || status_code.is_server_error();
+    if is_error && !upstream_content_type.starts_with("application/json") {
+        let snippet: String = String::from_utf8_lossy(&bytes)
+            .chars()
+            .take(200)
+            .collect::<String>()
+            .trim()
+            .to_owned();
+        warn!(
+            status,
+            content_type = %if upstream_content_type.is_empty() {
+                "(missing)"
+            } else {
+                &upstream_content_type
+            },
+            "coord-mcp proxy: enveloping non-JSON upstream error from coord"
+        );
+        return (
+            status_code,
+            Json(serde_json::json!({
+                "success": false,
+                "error": format!(
+                    "coord /mcp returned {status} with a non-JSON body (likely a gateway \
+                     error page, not coord itself)"
+                ),
+                "code": "COORD_MCP_PROXY_UPSTREAM_NON_JSON_ERROR",
+                "upstreamStatus": status,
+                "upstreamContentType": upstream_content_type,
+                "upstreamBodySnippet": snippet,
+            })),
+        )
+            .into_response();
+    }
+
+    let mut builder = axum::http::Response::builder().status(status_code);
+    for (name, value) in upstream_headers.iter() {
+        if matches!(
+            name.as_str(),
+            "content-length" | "transfer-encoding" | "connection"
+        ) {
+            continue;
+        }
+        builder = builder.header(name.as_str(), value.as_bytes());
+    }
     builder
         .body(axum::body::Body::from(bytes))
         .unwrap_or_else(|e| {
@@ -3709,6 +3776,17 @@ fn runner_panic_handler(err: Box<dyn std::any::Any + Send + 'static>) -> axum::r
     };
 
     tracing::error!(handler_panic = true, message = %msg, "runner HTTP handler panicked");
+
+    // The panic hook already wrote a `crash_*.txt` (it runs before unwinding and
+    // cannot know the panic is about to be caught). We DID catch it — the
+    // process lives and the caller gets a 500 envelope — so downgrade the dump.
+    // Left as-is, the next startup's crash-dump scan would adopt it and report
+    // `derived_status: errored` for a runner that never died.
+    let retracted = crate::logging::retract_last_crash_dump("HTTP handler panic");
+    tracing::debug!(
+        retracted,
+        "caught-panic crash-dump retraction after handler panic"
+    );
 
     let body = crate::mcp::types::api_error(format!("handler panicked: {}", msg));
     (
