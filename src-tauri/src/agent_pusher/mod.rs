@@ -407,7 +407,10 @@ pub fn build_origin_url(base: &str, repo: &str) -> Result<String> {
         }
         _ => (default_repo_owner(), repo.to_string()),
     };
-    Ok(format!("{}{}/git/{}/{}.git", prefix.0, prefix.1, owner, name))
+    Ok(format!(
+        "{}{}/git/{}/{}.git",
+        prefix.0, prefix.1, owner, name
+    ))
 }
 
 /// The owner legacy bare repo slugs map under — mirrors coord's
