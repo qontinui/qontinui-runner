@@ -1974,6 +1974,88 @@ pub fn get_coord_http_base() -> String {
     coord_http_base_for_fleet()
 }
 
+/// `spawn_from_plan` — authenticated POST to coord's `POST /agents/spawn`.
+///
+/// Returns coord's spawn result as a permissive `serde_json::Value` (mirrors
+/// the frontend `SpawnAgentResult`: only `agentId` is load-bearing on the
+/// dashboard toast; extra fields pass through, so coord can add fields
+/// without a runner rebuild).
+///
+/// Production coord gates `/agents/spawn` on operator SSO (401 "operator
+/// context missing; SSO required" without a bearer). The operator's Cognito
+/// user bearer lives ONLY in the Rust backend, so the spawn must run here,
+/// not in the frontend `fetch`. We attach the **Cognito access token**
+/// (NOT the coord device-JWT, which coord's SSO gate 401s) obtained from
+/// [`ensure_fresh_cognito_bearer`] — the single source of truth for the
+/// operator user bearer (`sdk_client` uses the same derivation).
+///
+/// The bearer value is NEVER logged. Non-2xx responses surface as
+/// `Err(String)` including the status + body text so the Spawn modal shows
+/// a real error instead of a silent no-op.
+#[tauri::command]
+pub async fn spawn_from_plan(
+    plan_slug: String,
+    plan_phase: String,
+    repos: Vec<String>,
+    intent: String,
+    initial_prompt: String,
+    declared_overlap_paths: Vec<String>,
+) -> Result<serde_json::Value, String> {
+    // Resolve the coord base the SAME way `get_coord_http_base` does
+    // (env `COORD_HTTP_URL` → active profile `coord_url` → dev-localhost).
+    let base = coord_http_base_for_fleet();
+    let base = base.trim_end_matches('/');
+    let url = format!("{base}/agents/spawn");
+
+    // The operator's Cognito user bearer — refresh-first, then read. `None`
+    // means no Cognito session (legacy/local-login); coord's SSO gate will
+    // then return a clean 401 we surface below.
+    let auth_manager = crate::auth::AuthManager::new();
+    let bearer = crate::mcp::device_jwt_refresher::ensure_fresh_cognito_bearer(&auth_manager)
+        .await
+        .filter(|t| !t.trim().is_empty())
+        .ok_or_else(|| {
+            "Not signed in to Qontinui (no Cognito session). Sign in via Settings → Account to \
+             spawn agents."
+                .to_string()
+        })?;
+
+    let body = serde_json::json!({
+        "plan_slug": plan_slug,
+        "plan_phase": plan_phase,
+        "repos": repos,
+        "intent": intent,
+        "initial_prompt": initial_prompt,
+        "declared_overlap_paths": declared_overlap_paths,
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("build http client: {e}"))?;
+
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .bearer_auth(&bearer)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("POST /agents/spawn: {e}"))?;
+
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        // Surface status + body so the modal shows a real error. The bearer
+        // is never included here.
+        return Err(format!("HTTP {}: {}", status.as_u16(), text));
+    }
+
+    serde_json::from_str::<serde_json::Value>(&text)
+        .map_err(|e| format!("parse /agents/spawn response: {e}"))
+}
+
 /// `get_fleet_health` — fetch coord's fleet-health rollup + active
 /// alerts in one call for the dashboard panel. Returns the merged JSON
 /// `{ health: <coord /fleet/health>, alerts: [...], coordBase, auth }`.

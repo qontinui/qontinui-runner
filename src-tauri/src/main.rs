@@ -1815,6 +1815,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::productivity::get_escalations,
             commands::productivity::get_fleet_health,
             commands::productivity::get_coord_http_base,
+            commands::productivity::spawn_from_plan,
             commands::productivity::get_plan_recommendations,
             commands::productivity::get_plan_tasks,
             commands::productivity::get_recommendations,
