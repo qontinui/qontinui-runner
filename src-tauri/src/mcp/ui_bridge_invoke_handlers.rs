@@ -81,7 +81,7 @@ pub struct InvokeTimeoutQuery {
     pub timeout_ms: Option<u64>,
 }
 
-const DEFAULT_INVOKE_TIMEOUT_MS: u64 = 30_000;
+pub(crate) const DEFAULT_INVOKE_TIMEOUT_MS: u64 = 30_000;
 
 /// `GET /ui-bridge/commands`
 ///
@@ -112,8 +112,10 @@ pub async fn ui_bridge_invoke_handler(
     Query(q): Query<InvokeTimeoutQuery>,
     Json(body): Json<InvokeRequestBody>,
 ) -> Result<Json<ApiResponse<Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // 1. Allowlist gate. Done before any resource allocation so the
-    //    rejection path is cheap.
+    // Allowlist gate. Done before any resource allocation so the rejection
+    // path is cheap. This is the INVOKE tier — unchanged by the observe-tier
+    // work (P2). Observe has its own orthogonal gate; see the observe handler
+    // in `mcp/ui_bridge/gated_flow.rs`.
     if !is_allowlisted(&command) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -125,24 +127,51 @@ pub async fn ui_bridge_invoke_handler(
     }
 
     let timeout_ms = q.timeout_ms.unwrap_or(DEFAULT_INVOKE_TIMEOUT_MS);
+    let value = perform_invoke_round_trip(&state, &command, &body.args, timeout_ms).await?;
+    Ok(Json(ApiResponse::success(value)))
+}
+
+/// Shared HTTP→Tauri invoke round-trip used by both the invoke proxy and the
+/// observe tier (`mcp/ui_bridge/gated_flow.rs`).
+///
+/// Registers a oneshot keyed by a fresh `request_id`, emits
+/// `ui-bridge:invoke-request` to the MAIN window, and awaits the frontend's
+/// `InvokeResponse` with `timeout_ms`. Returns the raw command result `Value`
+/// on success (possibly `Value::Null` for `()` returns), or the same
+/// `(StatusCode, ApiResponse<()>)` error envelope the invoke handler has always
+/// returned:
+/// - 500 — emit failed, frontend threw, or the response channel closed.
+/// - 504 — no frontend response before the timeout (pending entry cancelled so
+///   a late response can't leak).
+///
+/// The caller is responsible for its OWN allow/observe gate BEFORE calling
+/// this — this helper does not consult any allowlist. The observe tier applies
+/// its projection to the returned `Value` so the raw payload never leaves the
+/// process.
+pub(crate) async fn perform_invoke_round_trip(
+    state: &Arc<ApiState>,
+    command: &str,
+    args: &Value,
+    timeout_ms: u64,
+) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
     let request_id = uuid::Uuid::new_v4().to_string();
 
-    // 2. Reserve the pending slot before emitting the event so the React
-    //    side can never deliver faster than we register. (Under heavy
-    //    load Tauri's event delivery is reliably slower than our mutex
-    //    lock, but we structure the code to preserve the invariant.)
+    // Reserve the pending slot before emitting the event so the React side can
+    // never deliver faster than we register. (Under heavy load Tauri's event
+    // delivery is reliably slower than our mutex lock, but we structure the
+    // code to preserve the invariant.)
     let (sender, receiver) = oneshot::channel();
     state
         .ui_bridge_invoke_store
         .register(request_id.clone(), sender)
         .await;
 
-    // 3. Emit the event. If the emit itself fails (no webview, app
-    //    shutting down), release the pending slot and bail with 500.
+    // Emit the event. If the emit itself fails (no webview, app shutting
+    // down), release the pending slot and bail with 500.
     let payload = serde_json::json!({
         "request_id": request_id,
         "command": command,
-        "args": body.args,
+        "args": args,
     });
     info!(
         command = %command,
@@ -170,16 +199,14 @@ pub async fn ui_bridge_invoke_handler(
         ));
     }
 
-    // 4. Block on the response with the configured timeout.
+    // Block on the response with the configured timeout.
     let wait = tokio::time::timeout(Duration::from_millis(timeout_ms), receiver).await;
 
     match wait {
         Ok(Ok(resp)) => {
             // Frontend delivered a response.
             if resp.ok {
-                Ok(Json(ApiResponse::success(
-                    resp.result.unwrap_or(Value::Null),
-                )))
+                Ok(resp.result.unwrap_or(Value::Null))
             } else {
                 let err = resp.error.unwrap_or_else(|| {
                     "frontend reported invoke failure without an error message".to_string()
