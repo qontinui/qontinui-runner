@@ -1808,6 +1808,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::setup_wizard::suggest_log_sources_for_setup,
             commands::setup_wizard::suggest_process_configs_for_setup,
             commands::setup_wizard::suggest_workspace_sources_for_setup,
+            commands::setup_wizard::github_list_repos,
+            commands::setup_wizard::github_clone_repo,
             commands::shell_commands::create_shell_command,
             commands::shell_commands::delete_shell_command,
             commands::shell_commands::execute_shell_command,
