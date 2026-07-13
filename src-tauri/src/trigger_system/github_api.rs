@@ -44,6 +44,38 @@ fn open_prs_by_head_url(owner: &str, repo: &str, branch: &str) -> String {
     )
 }
 
+/// Build the `GET /pulls?state=all&head=<owner>:<branch>` URL for
+/// [`GitHubClient::list_prs_for_head`]. Same percent-encoding rationale as
+/// [`open_prs_by_head_url`] (an unencoded `#` in a ref name truncates the
+/// query as a URL fragment and drops the `head` filter), but `state=all` so a
+/// merged/closed PR — the green case the session dropdown must render — still
+/// resolves. Pure, unit-tested.
+fn prs_by_head_url(owner: &str, repo: &str, branch: &str) -> String {
+    format!(
+        "https://api.github.com/repos/{}/{}/pulls?state=all&head={}:{}&per_page=20",
+        urlencoding::encode(owner),
+        urlencoding::encode(repo),
+        urlencoding::encode(owner),
+        urlencoding::encode(branch)
+    )
+}
+
+/// A PR resolved from a head branch by [`GitHubClient::list_prs_for_head`].
+/// Carries the head ref + sha so the attribution reconciler can verify the
+/// PR's head-commit `Session-Id` trailer before recording it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeadPr {
+    pub number: u64,
+    /// `"open"` | `"closed"`.
+    pub state: String,
+    /// True iff the PR was merged (the list endpoint has no `merged` boolean;
+    /// `merged_at` being present is the equivalent signal).
+    pub merged: bool,
+    pub merged_at: Option<String>,
+    pub head_ref: String,
+    pub head_sha: String,
+}
+
 /// A minimal GitHub API client.
 pub struct GitHubClient {
     client: reqwest::Client,
@@ -336,6 +368,53 @@ impl GitHubClient {
                     head_sha: pr["head"]["sha"].as_str().unwrap_or("").to_string(),
                     title: pr["title"].as_str().unwrap_or("").to_string(),
                     html_url: pr["html_url"].as_str().unwrap_or("").to_string(),
+                })
+            })
+            .collect())
+    }
+
+    /// List ALL PRs (open, closed, or merged) whose head branch is
+    /// `<owner>:<branch>`, for the runner-local session-PR attribution
+    /// reconciler. Unlike [`list_open_prs_by_head`](Self::list_open_prs_by_head)
+    /// (Phase-1 seeder, open-only), this uses `state=all` so a session's
+    /// already-merged/closed PR still resolves — the dropdown's green ("all
+    /// merged") state depends on seeing the merged rows. One page (20) suffices;
+    /// a single head branch realistically backs at most one or two PRs.
+    pub async fn list_prs_for_head(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Vec<HeadPr>, String> {
+        let url = prs_by_head_url(owner, repo, branch);
+        let resp = self
+            .send_with_rate_limit(self.client.get(&url).headers(self.headers()))
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(format!(
+                "GitHub API returned {}: {}",
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            ));
+        }
+
+        let body: Vec<serde_json::Value> = resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse PR list response: {}", e))?;
+
+        Ok(body
+            .iter()
+            .filter_map(|pr| {
+                let number = pr["number"].as_u64()?;
+                Some(HeadPr {
+                    number,
+                    state: pr["state"].as_str().unwrap_or("unknown").to_string(),
+                    merged: pr["merged_at"].is_string(),
+                    merged_at: pr["merged_at"].as_str().map(|s| s.to_string()),
+                    head_ref: pr["head"]["ref"].as_str().unwrap_or("").to_string(),
+                    head_sha: pr["head"]["sha"].as_str().unwrap_or("").to_string(),
                 })
             })
             .collect())
@@ -650,5 +729,19 @@ mod tests {
         // Other reserved characters ('&', '?', spaces) are encoded too.
         let url = open_prs_by_head_url("o", "r", "a&b?c d");
         assert!(url.contains("head=o:a%26b%3Fc%20d"), "{url}");
+    }
+
+    #[test]
+    fn session_pr_head_lookup_url_is_state_all_and_percent_encodes_the_branch() {
+        // state=all so a merged/closed PR still resolves (the dropdown's green
+        // "all merged" state depends on seeing the merged rows).
+        let url = prs_by_head_url("qontinui", "qontinui-runner", "feat/x");
+        assert!(url.contains("state=all"), "must query state=all: {url}");
+        assert!(url.contains("head=qontinui:feat%2Fx"), "{url}");
+
+        // Same '#'-fragment-truncation guard as the open-only builder.
+        let url = prs_by_head_url("qontinui", "qontinui-runner", "fix/issue#42");
+        assert!(!url.contains('#'), "raw '#' must never survive: {url}");
+        assert!(url.contains("head=qontinui:fix%2Fissue%2342"), "{url}");
     }
 }
