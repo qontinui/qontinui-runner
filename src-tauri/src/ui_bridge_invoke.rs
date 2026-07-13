@@ -468,6 +468,21 @@ pub const UI_BRIDGE_OBSERVE_COMMANDS: &[ProxyableCommand] = &[ProxyableCommand {
     observe_projection: Some(project_github_list_repos),
 }];
 
+/// Commands whose redacted outbound-call trace the observe tier is allowed to
+/// surface (P5). Opt-in by name, so a trace can never leak by default.
+///
+/// This is only the *surfacing* half. A trace also has to be *recorded* by an
+/// in-tree call site calling `crate::outbound_trace::record` — both halves must
+/// agree for anything to appear. The trace itself is redacted at construction
+/// (never the bearer, never a body); see `crate::outbound_trace`.
+const TRACE_OUTBOUND_COMMANDS: &[&str] = &["github_list_repos"];
+
+/// Whether `name`'s outbound-call trace may be surfaced on the observe
+/// response. See [`TRACE_OUTBOUND_COMMANDS`].
+pub fn traces_outbound(name: &str) -> bool {
+    TRACE_OUTBOUND_COMMANDS.contains(&name)
+}
+
 /// Look up a command's observe-tier projection by name, across BOTH the invoke
 /// allowlist and the observe-only allowlist (the tiers are orthogonal — an
 /// invoke-allowed command could also carry a projection). Returns `Some(fn)`
@@ -601,6 +616,19 @@ mod tests {
         assert!(observe_projection_for("github_list_repos").is_some());
         // Invoke-denied: NOT in the invoke allowlist (do not widen invoke).
         assert!(!is_allowlisted("github_list_repos"));
+    }
+
+    #[test]
+    fn trace_outbound_is_opt_in_by_name() {
+        // github_list_repos opted in (P5) — it is the command the plan's
+        // acceptance test reads a trace from.
+        assert!(traces_outbound("github_list_repos"));
+        // Everything else is off by default, including invoke-allowlisted
+        // commands: a trace must never leak just because a command exists.
+        assert!(!traces_outbound("get_ui_error"));
+        assert!(!traces_outbound("spawn_worker_session"));
+        assert!(!traces_outbound("definitely_not_a_command"));
+        assert!(!traces_outbound(""));
     }
 
     #[test]
