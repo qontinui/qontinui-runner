@@ -1380,7 +1380,8 @@ impl LoopController {
                         &config.execution_id,
                         agentic_iteration,
                         &self.app_state.pg_db,
-                    );
+                    )
+                    .await;
 
                     let (outcome, injected_steps) = self
                         .agentic_executor

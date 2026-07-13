@@ -1368,7 +1368,9 @@ impl LoopController {
                 ctx.iteration,
                 &verification_result,
                 &self.app_state.pg_db,
-            ) {
+            )
+            .await
+            {
                 Some(warning) => format!("{}\n\n{}", warning, failure_context),
                 None => failure_context,
             }

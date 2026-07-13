@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use futures_util::FutureExt;
 use tracing::info;
 
 use crate::mcp::types::MCP_API_PORT;
@@ -519,7 +520,7 @@ pub async fn detect_health_regression(baseline: &Option<HealthBaseline>) -> Opti
 ///
 /// Returns a warning string if regressions are found (steps that were passing before
 /// but now fail), or None if no regressions detected.
-pub fn detect_regression(
+pub async fn detect_regression(
     execution_id: &str,
     current_iteration: u32,
     current_result: &crate::step_executor::VerificationPhaseResult,
@@ -529,23 +530,18 @@ pub fn detect_regression(
         return None;
     }
 
-    // Retrieve previous iteration result from PostgreSQL
+    // Retrieve previous iteration result from PostgreSQL. catch_unwind
+    // around the lookup (not just `?`/`.ok()`) preserves the original
+    // sync-fn behavior: a panic here degrades to "no regression data",
+    // matching build_resume_agentic_context's identical fix above.
     let prev_result = {
         let prev_iter = current_iteration - 1;
-        let pg_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let pg = pg_db.clone();
-            let id = execution_id.to_string();
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                handle.block_on(
-                    async move { pg_db.get_verification_phase_result(&id, prev_iter).await },
-                )
-            }))
+        std::panic::AssertUnwindSafe(pg_db.get_verification_phase_result(execution_id, prev_iter))
+            .catch_unwind()
+            .await
             .ok()
             .and_then(|r| r.ok())
-        } else {
-            None
-        };
-        pg_result.unwrap_or_default()
+            .flatten()
     };
     let prev_result = prev_result?;
 
@@ -643,26 +639,24 @@ pub fn detect_regression(
 /// 1. Verification phase result from database (full structured result)
 /// 2. Step checkpoints from database (step names + error messages)
 /// 3. Fallback generic message
-pub fn build_resume_agentic_context(
+pub async fn build_resume_agentic_context(
     execution_id: &str,
     iteration: u32,
     pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
 ) -> String {
     // Strategy 1: Try loading the full verification phase result.
     // The result may be stored under the execution_id or a child ID.
-    let phase_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let pg = pg_db.clone();
-        let id = execution_id.to_string();
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            handle
-                .block_on(async move { pg_db.get_verification_phase_result(&id, iteration).await })
-        }))
-        .ok()
-        .and_then(|r| r.ok())
-        .unwrap_or(None)
-    } else {
-        None
-    };
+    // catch_unwind around the lookup (not just `?`/`.ok()`) preserves the
+    // original sync-fn behavior: a panic here degrades to Strategy 2/3
+    // instead of aborting the caller's resume path.
+    let phase_result = std::panic::AssertUnwindSafe(
+        pg_db.get_verification_phase_result(execution_id, iteration),
+    )
+    .catch_unwind()
+    .await
+    .ok()
+    .and_then(|r| r.ok())
+    .flatten();
     if let Some(result_json) = phase_result {
         // Try to deserialize into VerificationPhaseResult and use build_failure_context()
         if let Ok(result) =
