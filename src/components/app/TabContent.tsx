@@ -80,7 +80,7 @@ import { UIBridgeStateMachinePage } from "@/pages/state-machine";
 import { ImageQualityTestsPage } from "@/pages/ImageQualityTestsPage";
 import { EventHistoryPage } from "@/pages/EventHistoryPage";
 import { RegressionTabPage } from "@/pages/regression/RegressionTabPage";
-import { lazy, Suspense } from "react";
+import { lazy, Suspense, useEffect } from "react";
 import { Loader2 } from "lucide-react";
 
 const LlmObservabilityDashboard = lazy(
@@ -1279,6 +1279,45 @@ export function TabContent({
       );
 
     default:
-      return null;
+      return <UnknownTabFallback tabId={activeTab} />;
   }
+}
+
+/**
+ * Rendered when `activeTab` matches no case above.
+ *
+ * Previously this switch's `default` arm was `return null`, which painted an
+ * empty `<main>`: the Memory nav item pointed at a tab id (`"memory"`) that no
+ * case handled, so the page was silently blank with nothing in the console and
+ * nothing on screen. A blank region is indistinguishable from a slow load or a
+ * broken layout, which is exactly what made that bug invisible. Fail LOUDLY
+ * instead — name the offending id on screen and on the console-error channel.
+ */
+function UnknownTabFallback({ tabId }: { tabId: string }) {
+  useEffect(() => {
+    console.error(
+      `[TabContent] No renderer for tab id "${tabId}". The active tab is not handled by ` +
+        `TabContent's switch. Add a case for it, or fix the navigation item that dispatched it.`,
+    );
+  }, [tabId]);
+
+  return (
+    <div
+      data-page-id="unknown-tab"
+      data-unknown-tab-id={tabId}
+      className="h-full w-full flex items-center justify-center p-8"
+    >
+      <div className="max-w-lg text-center space-y-2">
+        <h2 className="text-lg font-semibold text-foreground">This page could not be displayed</h2>
+        <p className="text-sm text-muted-foreground">
+          No content is registered for the tab id{" "}
+          <code className="px-1 py-0.5 rounded bg-muted font-mono text-foreground">{tabId}</code>.
+        </p>
+        <p className="text-xs text-muted-foreground">
+          This is a bug: the navigation item that opened this page points at a tab that TabContent
+          cannot render.
+        </p>
+      </div>
+    </div>
+  );
 }

@@ -110,7 +110,7 @@ import {
   useAppNavigation,
   useRunLastWorkflow,
 } from "./components/app";
-import type { MainTabId, LogSubTab } from "./components/app";
+import type { LogSubTab } from "./components/app";
 
 import "./index.css";
 
@@ -543,7 +543,7 @@ function AppContent() {
           <div className="flex flex-1 overflow-hidden">
             <Sidebar
               activeTab={activeTab}
-              onTabChange={(tab) => setActiveTab(tab as MainTabId)}
+              onTabChange={setActiveTab}
               collapsed={sidebarCollapsed}
               onCollapsedChange={handleSidebarCollapsedChange}
             />
