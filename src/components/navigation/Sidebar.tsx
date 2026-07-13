@@ -24,6 +24,7 @@ import {
   KeyboardEvent,
 } from "react";
 import { instanceStorage } from "@/lib/instance-storage";
+import { isValidTabId, migrateTabId, type MainTabId } from "@/components/app/tab-types";
 import {
   Play,
   Bot,
@@ -207,7 +208,14 @@ function getIconComponent(iconName: IconName): LucideIcon {
 
 export interface SidebarProps {
   activeTab: string;
-  onTabChange: (tab: string) => void;
+  /**
+   * Dispatches a tab change. Typed to `MainTabId` — NOT `string` — on purpose:
+   * this is the nav->tab boundary, and it is the one place a bogus id (like the
+   * old `"memory"`, which was in no `MainTabId` union member) could leak into
+   * `TabContent` and render a blank page. Callers must not cast; Sidebar itself
+   * validates every raw nav-package id through `selectTab` before dispatching.
+   */
+  onTabChange: (tab: MainTabId) => void;
   collapsed: boolean;
   onCollapsedChange: (collapsed: boolean) => void;
 }
@@ -219,6 +227,12 @@ interface ResolvedNavigationItem {
   description?: string;
   hasChildren?: boolean;
   selectsFirstChild?: boolean;
+  /**
+   * Parent item that ALSO has a page of its own (e.g. Runs -> the run browser).
+   * Distinct from `selectsFirstChild`: that activates `children[0].id`
+   * (`"run-recap"`), this activates the parent's OWN id (`"runs"`).
+   */
+  hasOwnPage?: boolean;
   badge?: { type: string; value?: string | number; variant?: string };
   hiddenInProd?: boolean; // For showing "dev" badge on items hidden in production
 }
@@ -242,6 +256,7 @@ function transformItem(item: SharedNavigationItem): ResolvedNavigationItem {
     description: item.description,
     hasChildren: item.hasChildren,
     selectsFirstChild: item.selectsFirstChild,
+    hasOwnPage: item.hasOwnPage,
     hiddenInProd: item.hiddenInProd,
   };
 }
@@ -932,6 +947,42 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
     setOpenFlyout(null);
   }, []);
 
+  /**
+   * The nav -> tab boundary. Navigation item ids arrive from the
+   * `@qontinui/navigation` package as plain `string`s; `MainTabId` is a closed
+   * union. Every id crosses through here so an id the app cannot render is
+   * REJECTED AND LOGGED rather than cast through and silently blanked
+   * (the `"memory"` bug: an id in no union member reached `TabContent`, hit its
+   * `default: return null`, and rendered an empty page with no diagnostic).
+   */
+  const selectTab = useCallback(
+    (rawId: string) => {
+      if (isValidTabId(rawId)) {
+        onTabChange(rawId);
+        return;
+      }
+
+      // Legacy alias? `migrateTabId` maps known-old ids onto current ones and
+      // falls back to "prompt-home" for ids it does not recognise. No real
+      // migration targets "prompt-home", so that fallback == "unknown id".
+      const migrated = migrateTabId(rawId);
+      if (migrated !== "prompt-home") {
+        console.warn(
+          `[Sidebar] navigation item id "${rawId}" is a legacy alias; migrated to "${migrated}".`,
+        );
+        onTabChange(migrated);
+        return;
+      }
+
+      console.error(
+        `[Sidebar] navigation item id "${rawId}" is not a known tab (MainTabId) and has no ` +
+          `migration. Ignoring the click instead of navigating to a page that cannot render. ` +
+          `Fix the id in @qontinui/navigation or add it to MainTabId + TabContent.`,
+      );
+    },
+    [onTabChange],
+  );
+
   const handleItemClick = useCallback(
     (item: ResolvedNavigationItem) => {
       if (item.hasChildren) {
@@ -942,16 +993,25 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
           if (item.selectsFirstChild) {
             const children = getChildItems(item.id);
             if (children.length > 0) {
-              onTabChange(children[0].id);
+              selectTab(children[0].id);
             }
           }
         }
+
+        // A parent that also has a page of its own (Runs) activates its OWN id.
+        // This is a THIRD case, not a variant of `selectsFirstChild`: that one
+        // dispatches `children[0].id` ("run-recap"), which is a different page.
+        // Without this branch Runs fell through both arms and dispatched
+        // nothing — the item opened its flyout but never navigated.
+        if (item.hasOwnPage) {
+          selectTab(item.id);
+        }
       } else {
-        onTabChange(item.id);
+        selectTab(item.id);
         closeFlyout();
       }
     },
-    [openFlyout, closeFlyout, openFlyoutSidebar, onTabChange],
+    [openFlyout, closeFlyout, openFlyoutSidebar, selectTab],
   );
 
   const flattenedItems = useMemo(
@@ -1125,7 +1185,7 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
         parentLabel={openFlyout?.label ?? ""}
         items={openFlyout?.items ?? []}
         activeTab={activeTab}
-        onTabChange={onTabChange}
+        onTabChange={selectTab}
         onClose={closeFlyout}
       />
     </div>

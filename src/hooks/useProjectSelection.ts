@@ -137,8 +137,33 @@ export function useProjectSelection(): UseProjectSelectionReturn {
         setSelectedProject(projectList[0].id);
       }
     } catch (err) {
-      console.error("[PROJECT_SELECTION] Failed to load projects:", err);
-      setError(err instanceof Error ? err.message : String(err));
+      const errorMsg = err instanceof Error ? err.message : String(err);
+
+      // A Tier 0/1 (Local / LocalProvider) runner has no Qontinui account, so
+      // `get_user_projects` is gated off by design: the backend's
+      // `require_tier_2_for` (src-tauri/src/commands/auth.rs) rejects every
+      // account command with the canonical "Qontinui account commands are
+      // unavailable" AuthError. That is the EXPECTED steady state for local
+      // mode, not a fault. Reporting it via console.error poisoned the
+      // console-error channel used as a health signal
+      // (`/ui-bridge/control/console-errors`), so a perfectly healthy Tier 0/1
+      // runner always reported errors. Log it at info; keep console.error for
+      // genuine load failures.
+      //
+      // Matched on the canonical tier-gate sentence (stable across the
+      // Tier 0 / Tier 1 wording) plus the auth-race message the retry loop
+      // above gives up on — both mean "no cloud session", not "broken".
+      const isExpectedLocalMode =
+        errorMsg.includes("Qontinui account commands are unavailable") ||
+        errorMsg.includes("Not authenticated");
+
+      if (isExpectedLocalMode) {
+        log.info("No Qontinui account session (Tier 0/1 local mode) — skipping cloud project load");
+      } else {
+        console.error("[PROJECT_SELECTION] Failed to load projects:", err);
+      }
+
+      setError(errorMsg);
     } finally {
       setLoading(false);
     }

@@ -4,7 +4,7 @@
     "@dagrejs/dagre": "^3.0.0",
     "@monaco-editor/react": "^4.7.0",
     "@qontinui/design-tokens": "^1.0.0",
-    "@qontinui/navigation": "^0.1.5",
+    "@qontinui/navigation": "^0.2.0",
     "@qontinui/shared-types": "^0.6.0",
     "@qontinui/ui-bridge": "^0.17.0",
     "@qontinui/ui-bridge-auto": "^0.1.7",
