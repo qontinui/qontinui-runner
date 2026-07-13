@@ -171,6 +171,11 @@ pub async fn ui_bridge_observe_handler(
         .timeout_ms
         .unwrap_or(crate::mcp::ui_bridge_invoke_handlers::DEFAULT_INVOKE_TIMEOUT_MS);
 
+    // P5 — snapshot the trace sequence BEFORE the round-trip so we only collect
+    // outbound calls this invocation caused (there is no request id threaded
+    // across the IPC boundary to correlate on).
+    let trace_seq = crate::outbound_trace::current_seq();
+
     // Same round-trip as invoke; error envelope is returned verbatim (`?`).
     let raw = crate::mcp::ui_bridge_invoke_handlers::perform_invoke_round_trip(
         &state, &command, &body.args, timeout_ms,
@@ -178,7 +183,21 @@ pub async fn ui_bridge_observe_handler(
     .await?;
 
     // Return ONLY the projection — the raw command payload never leaves here.
-    Ok(Json(ApiResponse::success(projection(&raw))))
+    let mut observed = projection(&raw);
+
+    // P5 — append the redacted outbound trace, opt-in per command. Additive:
+    // the projection's own keys are unchanged, so the P2 contract still holds.
+    if crate::ui_bridge_invoke::traces_outbound(&command) {
+        let traces = crate::outbound_trace::drain_since(&command, trace_seq);
+        if let Some(obj) = observed.as_object_mut() {
+            obj.insert(
+                "outbound_trace".to_string(),
+                serde_json::to_value(&traces).unwrap_or(Value::Null),
+            );
+        }
+    }
+
+    Ok(Json(ApiResponse::success(observed)))
 }
 
 /// Gated-flow routes.

@@ -122,6 +122,7 @@ mod orchestration_loop;
 mod orchestration_loop_configs;
 mod orchestrator;
 mod otel;
+mod outbound_trace; // Plan 2026-07-08-ui-bridge-reach-and-verify-gated-flows P5 — redacted outbound-call trace
 mod paths;
 mod planning_bridge;
 mod playwright;

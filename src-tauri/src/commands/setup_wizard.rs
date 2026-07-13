@@ -171,8 +171,26 @@ pub async fn github_list_repos() -> Result<Value, String> {
         .map_err(|e| format!("Failed to reach Qontinui backend: {}", e))?;
 
     let status = resp.status();
+
+    // P5 — record a REDACTED trace of the call we just made, so an agent can
+    // read what the command actually did instead of reproducing it by hand.
+    // Never the bearer (only its kind), never a body (only a type-shape).
+    // Surfaced only via the observe tier, and only for opt-in commands.
+    let (host, path) = crate::outbound_trace::split_url(&url);
+    let mut trace = crate::outbound_trace::OutboundTrace {
+        method: "GET".to_string(),
+        host,
+        path,
+        status: status.as_u16(),
+        // `cognito_bearer()` resolves the Cognito ACCESS token.
+        bearer_kind: "access".to_string(),
+        response_shape: None,
+    };
+
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
+        // Error bodies can echo request context — record the status only.
+        crate::outbound_trace::record("github_list_repos", trace);
         warn!("github_list_repos: backend returned {}: {}", status, body);
         return Err(format!("Backend returned {}: {}", status, body.trim()));
     }
@@ -181,6 +199,10 @@ pub async fn github_list_repos() -> Result<Value, String> {
         .json()
         .await
         .map_err(|e| format!("Failed to parse repo list: {}", e))?;
+
+    trace.response_shape = Some(crate::outbound_trace::shape_of(&body));
+    crate::outbound_trace::record("github_list_repos", trace);
+
     // The backend returns `{connected, repos}`; stamp `signed_in: true` so the
     // frontend has one uniform shape to branch on.
     if let Some(obj) = body.as_object_mut() {
