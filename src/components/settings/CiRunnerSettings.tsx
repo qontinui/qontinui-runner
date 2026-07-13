@@ -15,13 +15,32 @@ import type { LogFunction } from "./types";
 
 // --- Types ---
 
+type CiRunnerState = "idle" | "busy" | "offline";
+
+/**
+ * Shape actually returned by the supervisor's `GET /ci-runner/status` — FLAT:
+ * `{ runner_status, labels, service_names, installed }`.
+ *
+ * This component previously declared a NESTED shape (`{ installed, status: {
+ * status, labels, service_names } }`) that the supervisor has never sent, and
+ * then read `status?.status.status` — optional only on the outer binding. With
+ * `status.status` always `undefined`, that expression threw
+ * `TypeError: Cannot read properties of undefined (reading 'status')` on the
+ * FIRST render after the fetch resolved, escaping to the app-level
+ * ErrorBoundary and taking the whole window down.
+ *
+ * It went unnoticed because the CI Runner sub-nav item was unreachable in
+ * practice: clicking it dispatched `settings-ci-runner`, which `TabContent` had
+ * no case for, so the fallback replaced the Settings tree before this panel
+ * could settle. Fixing the routing (iter-2 R1) made the page reachable — and
+ * immediately surfaced this crash on the UI Bridge. Fields are optional because
+ * the supervisor may be down or older than this build.
+ */
 interface CiRunnerStatus {
-  installed: boolean;
-  status: {
-    status: "idle" | "busy" | "offline";
-    labels: string[];
-    service_names: string[];
-  };
+  installed?: boolean;
+  runner_status?: CiRunnerState;
+  labels?: string[];
+  service_names?: string[];
 }
 
 interface CiRunnerSettingsProps {
@@ -86,7 +105,7 @@ function ToggleSwitch({
   );
 }
 
-function StatusBadge({ status }: { status: "idle" | "busy" | "offline" }) {
+function StatusBadge({ status }: { status: CiRunnerState }) {
   const colors: Record<string, string> = {
     idle: "text-green-400",
     busy: "text-yellow-400",
@@ -266,9 +285,11 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
     );
   }
 
+  // Every read is defaulted: a supervisor that is down, older, or returns a
+  // partial body must degrade to "offline", never throw during render.
   const installed = status?.installed ?? false;
-  const runnerStatus = status?.status.status ?? "offline";
-  const labels = status?.status.labels ?? [];
+  const runnerStatus: CiRunnerState = status?.runner_status ?? "offline";
+  const labels = status?.labels ?? [];
 
   return (
     <div className="space-y-6">

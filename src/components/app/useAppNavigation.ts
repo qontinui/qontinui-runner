@@ -9,6 +9,7 @@ import type { ProductivityView } from "@/components/productivity/types";
 import {
   ACTIVE_TAB_STORAGE_KEY,
   migrateTabId,
+  resolveExternalTabId,
   setActiveTabAndPersist,
   SIDEBAR_COLLAPSED_KEY,
 } from "./tab-types";
@@ -276,9 +277,20 @@ export function useAppNavigation(): UseAppNavigationReturn {
         dispatchProductivitySubView(page);
       }
     };
-    // Direct tab setter (bypasses PAGE_TO_TAB for navigate_tab endpoint)
-    const directHandler = (e: CustomEvent<{ tab: MainTabId }>) => {
-      setActiveTabAndPersist(setActiveTab, instanceStorage, e.detail.tab);
+    // Direct tab setter (bypasses PAGE_TO_TAB for navigate_tab endpoint).
+    // `detail.tab` is typed but NOT trusted: the event crosses the window
+    // boundary, so anything (a stale UI Bridge caller, a retired tab id) can
+    // arrive here. An unresolvable id is REFUSED — the active tab is left
+    // exactly as it was — rather than cast through to a page that cannot render.
+    const directHandler = (e: CustomEvent<{ tab?: string }>) => {
+      const tabId = resolveExternalTabId(e.detail?.tab);
+      if (!tabId) {
+        console.warn(
+          `[useAppNavigation] ignoring ui-bridge-set-tab for unknown tab id "${e.detail?.tab}"`,
+        );
+        return;
+      }
+      setActiveTabAndPersist(setActiveTab, instanceStorage, tabId);
     };
     window.addEventListener("ui-bridge-navigate", handler);
     window.addEventListener("ui-bridge-set-tab", directHandler as EventListener);
@@ -303,7 +315,17 @@ export function useAppNavigation(): UseAppNavigationReturn {
       unlisten = await listen<{ tab_id: string }>("ui-bridge:activate-tab", (event) => {
         const { tab_id } = event.payload ?? { tab_id: "" };
         if (!tab_id) return;
-        setActiveTabAndPersist(setActiveTab, instanceStorage, tab_id as MainTabId);
+        // Validated, not cast: the Rust `VALID_TAB_IDS` gate is now generated
+        // from this same union (R2), but the payload still crosses a process
+        // boundary — refuse an id we cannot render instead of blanking the page.
+        const tabId = resolveExternalTabId(tab_id);
+        if (!tabId) {
+          console.warn(
+            `[useAppNavigation] ignoring ui-bridge:activate-tab for unknown tab id "${tab_id}"`,
+          );
+          return;
+        }
+        setActiveTabAndPersist(setActiveTab, instanceStorage, tabId);
       });
     };
 
@@ -462,10 +484,18 @@ export function useAppNavigation(): UseAppNavigationReturn {
         if (tabId) {
           setActiveTabAndPersist(setActiveTab, instanceStorage, tabId);
           dispatchProductivitySubView(path);
-        } else {
-          // Fall back: try using the path directly as a tab ID
-          setActiveTabAndPersist(setActiveTab, instanceStorage, path as MainTabId);
+          return;
         }
+        // Fall back: the path may itself be a tab id (or a legacy alias for
+        // one). Resolve it — never cast. An unknown path (e.g. "page-zzz")
+        // leaves the active tab untouched instead of navigating the user to a
+        // page that does not exist.
+        const direct = resolveExternalTabId(path);
+        if (!direct) {
+          console.warn(`[useAppNavigation] navigateHandler: no tab for path "${url}" — ignoring`);
+          return;
+        }
+        setActiveTabAndPersist(setActiveTab, instanceStorage, direct);
       };
     }
     return () => {
