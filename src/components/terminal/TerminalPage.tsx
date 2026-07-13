@@ -44,6 +44,7 @@ import { setTerminalSessions, type TerminalSessionEntry } from "@/lib/terminal-s
 import { UIBridgeComponentScope } from "@qontinui/ui-bridge";
 import { useCommitState } from "./useCommitState";
 import { useTabSessionIdCapture } from "./useTabSessionIdCapture";
+import { useSessionBoundEvents } from "./useSessionBoundEvents";
 import { buildSessionOpenArgs, type SessionOrigin } from "./sessionRecordArgs";
 import { buildAiLaunchCommand } from "./aiLaunchCommand";
 import { rememberSessionId } from "./lastKnownSessionIds";
@@ -579,6 +580,13 @@ function TerminalPageInner({
     tabs,
     onSessionIdBound: recordSessionOpen,
   });
+
+  // Backend-binder tab stamp: when the continuous reconcile binder identifies
+  // a session the frontend never pinned (hand-typed / absolute-path launch),
+  // it emits `session-bound`; stamping `claudeSessionId` here flips the
+  // durability marker ("ephemeral" tag) to durable within the same poll tick.
+  // The registry record was already written backend-side — this is UI-only.
+  useSessionBoundEvents({ tabs, updateTab });
 
   // Zone-move backstop: when a Claude session is dragged between zones the
   // recorded `zoneIndex` must follow. Watch `zoneLayout.assignments` and, after
