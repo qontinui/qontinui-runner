@@ -276,10 +276,7 @@ mod tests {
     fn resolve_ambiguous_bare_candidate_prefers_default_owner() {
         // Two owners share the basename: the default-owner row (coord's own
         // legacy mapping for bare slugs) wins — never first-match order.
-        let repos = vec![
-            "fork-org/tools".to_string(),
-            "qontinui/tools".to_string(),
-        ];
+        let repos = vec!["fork-org/tools".to_string(), "qontinui/tools".to_string()];
         assert_eq!(
             resolve_registered_slug(&repos, "tools"),
             Some("qontinui/tools")
@@ -319,7 +316,10 @@ mod tests {
         // (`qontinui/foo.git` + `.git`), must keep its real name — the old
         // `trim_end_matches` collapsed it to `qontinui/foo`, so it could
         // never match the request-side candidate (which is single-stripped).
-        assert_eq!(normalize_registry_slug("qontinui/repo.git"), "qontinui/repo");
+        assert_eq!(
+            normalize_registry_slug("qontinui/repo.git"),
+            "qontinui/repo"
+        );
         assert_eq!(
             normalize_registry_slug("qontinui/foo.git.git"),
             "qontinui/foo.git"
