@@ -234,7 +234,13 @@ export type UIBridgeRequestType =
   // both back the runner's view of ChangeTracker.changeBuffer via
   // peekBuffer() (SDK 0.3.5).
   | "get_changes_since"
-  | "get_element_history";
+  | "get_element_history"
+  // Openable-view registry (plan 2026-07-08-ui-bridge-reach-and-verify-gated-flows,
+  // P1 + P4). The runner has no router, so state-gated views are unreachable by
+  // page/navigate; the frontend registry is the only source of truth for what
+  // can be opened.
+  | "list_openable_views"
+  | "open_view";
 
 // ============================================================
 // N1 — Compile-time exhaustiveness registry for the chained
@@ -454,6 +460,8 @@ export type AnnotationEventTypes =
  */
 export type TerminalEventTypes = "terminal_sessions_list" | "terminal_session_get";
 
+export type GatedViewEventTypes = "list_openable_views" | "open_view";
+
 /** Union of every variant claimed by a sub-hook. */
 export type AllHandledTypes =
   | ControlEventTypes
@@ -467,7 +475,8 @@ export type AllHandledTypes =
   | WorkflowEventTypes
   | MediaEventTypes
   | AnnotationEventTypes
-  | TerminalEventTypes;
+  | TerminalEventTypes
+  | GatedViewEventTypes;
 
 /**
  * Type-level assertion helper. `AssertEqual<X, Y>` is the literal type

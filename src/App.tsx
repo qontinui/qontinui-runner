@@ -69,6 +69,7 @@ import ActionDetailModal from "./components/ActionDetailModal";
 import ImageDetailModal from "./components/ImageDetailModal";
 import { LoginScreen } from "./components/LoginScreen";
 import { SetupWizard } from "./components/setup-wizard";
+import { registerOpenableView } from "./lib/openable-views";
 import { LogSourcePicker } from "./components/LogSourcePicker";
 import { Sidebar } from "./components/navigation";
 import { TerminalPage } from "./components/terminal";
@@ -137,6 +138,25 @@ function AppContent() {
       .then(setSetupCompleted)
       .catch(() => setSetupCompleted(true));
   }, []);
+
+  // Openable-view registry (plan 2026-07-08-ui-bridge-reach-and-verify-gated-flows,
+  // P1). The wizard mounts only when `setupCompleted === false`, and the runner has
+  // no router, so the UI Bridge cannot otherwise reach it.
+  //
+  // NON-DESTRUCTIVE: this flips the in-memory flag only. It deliberately does NOT
+  // clear the persisted `setup_completed` setting — opening the wizard to look at
+  // it must never reset the operator's install.
+  useEffect(
+    () =>
+      registerOpenableView({
+        name: "setup-wizard",
+        description:
+          "First-launch setup wizard (mounts only while setup is incomplete). Contains the GitHub clone picker.",
+        preconditions: "none — opening flips in-memory view state, persistence is untouched",
+        open: () => setSetupCompleted(false),
+      }),
+    [],
+  );
 
   const { data: recentTaskRuns = [] } = useTaskRuns(1);
   const lastRun = recentTaskRuns.length > 0 ? recentTaskRuns[0] : null;

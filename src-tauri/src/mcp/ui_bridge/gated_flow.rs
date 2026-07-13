@@ -200,6 +200,120 @@ pub async fn ui_bridge_observe_handler(
     Ok(Json(ApiResponse::success(observed)))
 }
 
+/// Capability flag gating [`ui_bridge_view_open_handler`] (P1).
+///
+/// **Off by default.** `POST /ui-bridge/control/view/open` can drive the app
+/// into arbitrary named states, so a released operator build must not expose it
+/// as a live footgun — an agent "just looking at the setup wizard" must not be
+/// able to surprise an operator by re-opening it.
+///
+/// The plan originally specified an auth gate ("the same `UI_BRIDGE_REQUIRE_AUTH`
+/// bearer the authed-web relay already enforces"), but that flag gates the
+/// **qontinui-web relay**, not the runner: the runner's own UI Bridge server
+/// binds `127.0.0.1` and has no auth layer at all. So a capability flag is the
+/// real control here, chosen by the operator (2026-07-13). View *discovery*
+/// (`GET /ui-bridge/views`, P4) is read-only and stays ungated.
+const VIEW_CONTROL_FLAG: &str = "QONTINUI_UI_BRIDGE_VIEW_CONTROL";
+
+/// Whether view control is enabled for this process. Read per-request (not
+/// cached) so an operator can flip it without a restart.
+fn view_control_enabled() -> bool {
+    std::env::var(VIEW_CONTROL_FLAG)
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// `GET /ui-bridge/views`
+///
+/// Enumerate the frontend's registered openable views (P4) — the map of
+/// gated/openable flows an agent would otherwise have to learn by grepping TSX.
+/// Read-only, so it is NOT behind the capability flag: knowing a view *exists*
+/// is inert; opening it is the privileged act.
+///
+/// IPC-bridge route: the registry lives in React (`src/lib/openable-views.ts`),
+/// so this funnels through `ui_bridge_request_sync`.
+pub async fn ui_bridge_views_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: views (openable-view discovery)");
+
+    let result = crate::mcp::ui_bridge::request::ui_bridge_request_sync(
+        &state,
+        "list_openable_views",
+        serde_json::json!({}),
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("failed to list openable views: {}", e))),
+        )
+    })?;
+
+    Ok(Json(ApiResponse::success(result)))
+}
+
+/// `POST /ui-bridge/control/view/open` — body `{ "name": "setup-wizard" }`
+///
+/// Drive the app into a named, state-gated view (P1). The runner has no router,
+/// so views that mount on component state (the setup wizard, and the GitHub
+/// clone picker inside it) are otherwise unreachable by the bridge.
+///
+/// **Gated by [`VIEW_CONTROL_FLAG`], off by default** — returns 403 otherwise.
+/// Registered openers are non-destructive by contract: they flip in-memory view
+/// state and never clear persisted data (opening the setup wizard must not reset
+/// `setup_completed`). See `src/lib/openable-views.ts`.
+///
+/// IPC-bridge route: the opener registry lives in React, so this funnels through
+/// `ui_bridge_request_sync`.
+pub async fn ui_bridge_view_open_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<ViewOpenRequest>,
+) -> Result<Json<ApiResponse<Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    if !view_control_enabled() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(api_error(format!(
+                "view control is disabled. Set {}=1 to enable \
+                 POST /ui-bridge/control/view/open (off by default so released \
+                 builds don't expose it). GET /ui-bridge/views works regardless.",
+                VIEW_CONTROL_FLAG
+            ))),
+        ));
+    }
+
+    if body.name.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error("`name` is required".to_string())),
+        ));
+    }
+
+    info!(view = %body.name, "UI Bridge API: view/open");
+
+    let result = crate::mcp::ui_bridge::request::ui_bridge_request_sync(
+        &state,
+        "open_view",
+        serde_json::json!({ "name": body.name }),
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!("failed to open view: {}", e))),
+        )
+    })?;
+
+    Ok(Json(ApiResponse::success(result)))
+}
+
+/// Body of `POST /ui-bridge/control/view/open`.
+#[derive(Debug, serde::Deserialize)]
+pub struct ViewOpenRequest {
+    /// Registered view name, e.g. `"setup-wizard"`.
+    pub name: String,
+}
+
 /// Gated-flow routes.
 pub fn routes() -> axum::Router<Arc<ApiState>> {
     use axum::routing::{get, post};
@@ -209,6 +323,11 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             "/ui-bridge/observe/{command}",
             post(ui_bridge_observe_handler),
         )
+        .route("/ui-bridge/views", get(ui_bridge_views_handler))
+        .route(
+            "/ui-bridge/control/view/open",
+            post(ui_bridge_view_open_handler),
+        )
 }
 
 /// Static (method, path) tuples mirroring [`routes`]. Concatenated into
@@ -217,6 +336,8 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
     &[
         ("GET", "/ui-bridge/session"),
         ("POST", "/ui-bridge/observe/{command}"),
+        ("GET", "/ui-bridge/views"),
+        ("POST", "/ui-bridge/control/view/open"),
     ]
 }
 
@@ -227,11 +348,32 @@ mod tests {
     #[test]
     fn route_entries_match_route_count() {
         // Keep in lockstep with the `.route(` calls in `routes()`.
-        assert_eq!(route_entries().len(), 2);
+        assert_eq!(route_entries().len(), 4);
         for (method, path) in route_entries() {
             assert!(path.starts_with("/ui-bridge/"));
             assert!(matches!(*method, "GET" | "POST"));
         }
+    }
+
+    #[test]
+    fn view_control_is_disabled_unless_flag_is_exactly_1() {
+        // P1's capability gate. Default (unset) MUST be disabled — a released
+        // operator build must not expose the view-open footgun.
+        std::env::remove_var(VIEW_CONTROL_FLAG);
+        assert!(!view_control_enabled(), "must be off when unset");
+
+        for off in ["", "0", "true", "yes", "2"] {
+            std::env::set_var(VIEW_CONTROL_FLAG, off);
+            assert!(
+                !view_control_enabled(),
+                "must be off for {off:?} — only an exact \"1\" enables it"
+            );
+        }
+
+        std::env::set_var(VIEW_CONTROL_FLAG, "1");
+        assert!(view_control_enabled(), "explicit opt-in enables it");
+
+        std::env::remove_var(VIEW_CONTROL_FLAG);
     }
 
     #[test]
