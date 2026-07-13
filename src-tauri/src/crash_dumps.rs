@@ -365,6 +365,19 @@ mod tests {
         )));
     }
 
+    /// A panic that `CatchPanicLayer` absorbed is downgraded to `caught_*.txt`
+    /// by `logging::retract_last_crash_dump`. The startup scan MUST ignore
+    /// those: the process never died, and adopting one would report
+    /// `derived_status: errored` for a healthy runner (live evidence
+    /// 2026-07-09/10 — 14 dumps from transient coord 502/504 gateway pages,
+    /// every one a caught handler panic).
+    #[test]
+    fn is_crash_dump_filename_rejects_retracted_caught_dumps() {
+        assert!(!is_crash_dump_filename(Path::new(
+            "/tmp/caught_20260421_120000.txt"
+        )));
+    }
+
     #[test]
     fn find_latest_fresh_dump_ignores_stale_files() {
         let tmp = TempDir::new().unwrap();

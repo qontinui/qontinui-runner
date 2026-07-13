@@ -22,6 +22,63 @@ static CRASH_HANDLING: AtomicBool = AtomicBool::new(false);
 /// hook synchronously before unwinding).
 static PANIC_LOG_WRITING: AtomicBool = AtomicBool::new(false);
 
+thread_local! {
+    /// Path of the `crash_*.txt` this thread's panic hook wrote most recently.
+    ///
+    /// The panic HOOK runs before unwinding, so it cannot know whether the
+    /// panic is about to be caught. An HTTP handler panic IS caught (by
+    /// `CatchPanicLayer`, which turns it into a 500 JSON envelope and lets the
+    /// process live) — but the dump is on disk by then, and the next startup's
+    /// [`crate::crash_dumps`] scan adopts any fresh `crash_*.txt` as a
+    /// `recent_crash`, badging a runner that never actually died as `errored`.
+    ///
+    /// `catch_unwind` resumes on the SAME thread that panicked, so the catch
+    /// handler can hand this path to [`retract_last_crash_dump`]. A thread-local
+    /// keeps concurrent panics on other worker threads from retracting each
+    /// other's dumps.
+    static LAST_CRASH_DUMP: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Downgrade the crash dump this thread's panic hook just wrote from
+/// `crash_*.txt` to `caught_*.txt`, because the panic was caught and the
+/// process is still alive.
+///
+/// The forensics survive under the new name (and the `runner-panic.log` entry
+/// is left alone); only the `crash_` prefix that `crash_dumps`'
+/// `is_crash_dump_filename` keys on is dropped, so the startup scan no longer
+/// mistakes a handled 500 for a process death.
+///
+/// Returns `true` if a dump was actually renamed.
+pub fn retract_last_crash_dump(reason: &str) -> bool {
+    LAST_CRASH_DUMP.with(|cell| {
+        let Some(path) = cell.borrow_mut().take() else {
+            return false;
+        };
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        let Some(rest) = name.strip_prefix("crash_") else {
+            return false;
+        };
+        let caught = path.with_file_name(format!("caught_{rest}"));
+        match std::fs::rename(&path, &caught) {
+            Ok(()) => {
+                safe_eprintln(&format!(
+                    "Panic was caught ({reason}) — crash dump downgraded to {caught:?}"
+                ));
+                true
+            }
+            Err(e) => {
+                safe_eprintln(&format!(
+                    "Failed to downgrade caught-panic crash dump {path:?}: {e}"
+                ));
+                false
+            }
+        }
+    })
+}
+
 /// Safely write to stderr, ignoring errors if the pipe is closed.
 /// This prevents panics when stderr is unavailable
 /// (e.g., when the parent terminal/process has closed the pipe - Windows error 232).
@@ -305,6 +362,9 @@ pub fn write_crash_dump(location: &str, message: &str, backtrace: &str) {
         Ok(mut file) => {
             let _ = file.write_all(crash_content.as_bytes());
             safe_eprintln(&format!("Crash dump written to: {:?}", crash_file));
+            // Remember it so a catch handler on THIS thread can downgrade it if
+            // the panic turns out to be caught. See `retract_last_crash_dump`.
+            LAST_CRASH_DUMP.with(|cell| *cell.borrow_mut() = Some(crash_file.clone()));
         }
         Err(e) => {
             safe_eprintln(&format!("Failed to write crash dump: {}", e));
@@ -500,5 +560,50 @@ mod tests {
                 found
             );
         }
+    }
+
+    /// A caught panic must leave NO `crash_*.txt` behind: the hook writes one
+    /// before unwinding, and the catch handler downgrades it. The forensics
+    /// survive under `caught_*`, which the startup scan ignores.
+    #[test]
+    fn retract_last_crash_dump_downgrades_crash_to_caught() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dump = tmp.path().join("crash_20260713_101500.txt");
+        std::fs::write(&dump, "=== QONTINUI RUNNER CRASH DUMP ===").expect("write dump");
+        LAST_CRASH_DUMP.with(|cell| *cell.borrow_mut() = Some(dump.clone()));
+
+        assert!(retract_last_crash_dump("unit test"));
+
+        let caught = tmp.path().join("caught_20260713_101500.txt");
+        assert!(!dump.exists(), "the crash_ dump must be gone");
+        assert!(caught.exists(), "it must survive as caught_");
+        assert_eq!(
+            std::fs::read_to_string(&caught).expect("read caught"),
+            "=== QONTINUI RUNNER CRASH DUMP ===",
+            "forensics must be preserved verbatim"
+        );
+    }
+
+    /// Retraction consumes the record, so a second call cannot reach back and
+    /// downgrade an unrelated later dump. Also covers the "hook never wrote
+    /// one" path (e.g. the recursive-crash guard tripped).
+    #[test]
+    fn retract_last_crash_dump_is_noop_when_nothing_was_written() {
+        LAST_CRASH_DUMP.with(|cell| *cell.borrow_mut() = None);
+        assert!(!retract_last_crash_dump("unit test"));
+    }
+
+    /// A panic that killed the process leaves its dump alone — only the catch
+    /// handler retracts, and it never runs on that path. Guards against a
+    /// future refactor pointing the thread-local at a real crash.
+    #[test]
+    fn retract_last_crash_dump_ignores_a_non_crash_filename() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let other = tmp.path().join("latest_crash.txt");
+        std::fs::write(&other, "x").expect("write");
+        LAST_CRASH_DUMP.with(|cell| *cell.borrow_mut() = Some(other.clone()));
+
+        assert!(!retract_last_crash_dump("unit test"));
+        assert!(other.exists(), "a non-`crash_` file must not be renamed");
     }
 }
