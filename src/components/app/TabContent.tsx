@@ -29,6 +29,7 @@ import { LogSourcesConfigTab } from "./LogSourcesConfigTab";
 import { LogsTab } from "@/components/LogsTab";
 import { CaptureTab } from "@/components/CaptureTab";
 import { Settings } from "@/components/Settings";
+import { isSettingsTabId, settingsSubTabFor } from "@/components/settings/settings-tabs";
 import { AiTab } from "@/components/AiTab";
 import { LibraryDashboard } from "@/components/LibraryDashboard";
 import {
@@ -280,6 +281,40 @@ export function TabContent({
   clearErrorMonitorScope,
 }: TabContentProps) {
   const execution = useExecution();
+
+  // The WHOLE `settings*` family routes through one arm, derived from the
+  // single settings registry (`settings/settings-tabs.ts`) rather than a
+  // hand-listed `case` block. Before iter-2 R1 this switch enumerated 21 of the
+  // 26 settings ids; the five it missed (`settings-notifications`,
+  // `-otel`, `-containers`, `-ci-runner`, `-lock-yield`) were reachable in two
+  // clicks from the Settings sub-nav and fell through to `UnknownTabFallback`,
+  // which REPLACED the Settings shell (sub-nav included) and stranded the user.
+  // Routing by `isSettingsTabId` makes that whole drift class impossible: a new
+  // settings sub-tab is routable the moment it exists in the registry, and the
+  // registry's compile-time completeness guard fails the build otherwise.
+  if (isSettingsTabId(activeTab)) {
+    return (
+      <div data-page-id="settings" className="h-full overflow-hidden">
+        <Settings
+          defaultTab={settingsSubTabFor(activeTab)}
+          onLog={addLog}
+          onDebugModeChange={async (enabled) => {
+            try {
+              await invoke("set_debug_settings", {
+                settings: {
+                  enable_image_debug: enabled,
+                  top_matches_count: 5,
+                },
+              });
+              addLog("info", `Image debug mode ${enabled ? "enabled" : "disabled"}`);
+            } catch (error) {
+              addLog("error", `Failed to set debug mode: ${error}`);
+            }
+          }}
+        />
+      </div>
+    );
+  }
 
   switch (activeTab) {
     case "prompt-home":
@@ -978,75 +1013,6 @@ export function TabContent({
         </div>
       );
 
-    case "settings":
-    case "settings-account":
-    case "settings-dev-loop":
-    case "settings-ai":
-    case "settings-agentic":
-    case "settings-self-healing":
-    case "settings-world-state-verifier":
-    case "settings-playwright":
-    case "settings-mobile":
-    case "settings-discovery":
-    case "settings-backend-connection":
-    case "settings-mcp":
-    case "settings-log-sources":
-    case "settings-execution-variables":
-    case "settings-general":
-    case "settings-storage":
-    case "settings-backup":
-    case "settings-instances":
-    case "settings-debug":
-    case "settings-security":
-    case "settings-updates": {
-      const settingsTabMap: Record<string, string> = {
-        settings: "backend-connection",
-        "settings-account": "account",
-        "settings-dev-loop": "dev-loop",
-        "settings-ai": "ai",
-        "settings-agentic": "agentic",
-        "settings-self-healing": "self-healing",
-        "settings-world-state-verifier": "world-state-verifier",
-        "settings-playwright": "playwright",
-        "settings-mobile": "mobile",
-        "settings-discovery": "discovery",
-        "settings-backend-connection": "backend-connection",
-        "settings-mcp": "mcp",
-        "settings-log-sources": "log-sources",
-        "settings-execution-variables": "execution-variables",
-        "settings-general": "general",
-        "settings-storage": "storage",
-        "settings-backup": "backup",
-        "settings-instances": "instances",
-        "settings-debug": "advanced",
-        "settings-security": "security",
-        "settings-updates": "updates",
-      };
-      const defaultSettingsTab = settingsTabMap[activeTab] || "backend-connection";
-
-      return (
-        <div data-page-id="settings" className="h-full overflow-hidden">
-          <Settings
-            defaultTab={defaultSettingsTab}
-            onLog={addLog}
-            onDebugModeChange={async (enabled) => {
-              try {
-                await invoke("set_debug_settings", {
-                  settings: {
-                    enable_image_debug: enabled,
-                    top_matches_count: 5,
-                  },
-                });
-                addLog("info", `Image debug mode ${enabled ? "enabled" : "disabled"}`);
-              } catch (error) {
-                addLog("error", `Failed to set debug mode: ${error}`);
-              }
-            }}
-          />
-        </div>
-      );
-    }
-
     case "llm-analytics":
       return (
         <div data-page-id="llm-analytics" className="h-full overflow-hidden">
@@ -1279,8 +1245,24 @@ export function TabContent({
       );
 
     default:
-      return <UnknownTabFallback tabId={activeTab} />;
+      // `activeTab` is `never` here IF every non-settings `MainTabId` has a
+      // case above (settings ids returned earlier). `assertNeverTab` therefore
+      // turns "a MainTabId with no renderer" into a `tsc` FAILURE naming the
+      // id, instead of a runtime page that only a human clicking through the
+      // nav would ever discover. It still returns the loud runtime fallback for
+      // ids that reach us from outside the type system (stale persisted
+      // storage, a malformed UI Bridge payload).
+      return <UnknownTabFallback tabId={assertNeverTab(activeTab)} />;
   }
+}
+
+/**
+ * Compile-time exhaustiveness guard for `TabContent`'s switch — see the
+ * `default` arm. Passing anything other than `never` is a type error that names
+ * the unhandled `MainTabId`.
+ */
+function assertNeverTab(tab: never): string {
+  return String(tab);
 }
 
 /**

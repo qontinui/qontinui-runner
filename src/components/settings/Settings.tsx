@@ -34,6 +34,14 @@ import { AccountSettings } from "./AccountSettings";
 import { CiRunnerSettings } from "./CiRunnerSettings";
 import { DevenvEnrollSettings } from "./DevenvEnrollSettings";
 import { DevLoopSettings } from "./DevLoopSettings";
+import {
+  DEFAULT_SETTINGS_SUB_TAB,
+  migrateSettingsSubTab,
+  SETTINGS_SUB_TAB_TO_MAIN_TAB,
+  SETTINGS_TABS,
+  VALID_SETTINGS_TABS,
+  type SettingsTab,
+} from "./settings-tabs";
 
 interface SettingsProps {
   /** Default tab to open. If provided, overrides instanceStorage persistence. */
@@ -42,134 +50,16 @@ interface SettingsProps {
   onDebugModeChange: (enabled: boolean) => void;
 }
 
-type SettingsTab =
-  | "account"
-  | "dev-loop"
-  | "ai"
-  | "agentic"
-  | "self-healing"
-  | "world-state-verifier"
-  | "playwright"
-  | "mobile"
-  | "discovery"
-  | "backend-connection"
-  | "devenv-enroll"
-  | "mcp"
-  | "log-sources"
-  | "execution-variables"
-  | "notifications"
-  | "general"
-  | "storage"
-  | "backup"
-  | "instances"
-  | "otel"
-  | "containers"
-  | "security"
-  | "ci-runner"
-  | "lock-yield"
-  | "advanced"
-  | "updates";
-
 const STORAGE_KEY = "qontinui-settings-active-tab";
 
-/**
- * Canonical list of settings sub-tabs.
- *
- * The runner ↔ web channel is a single outbound WebSocket driven by
- * `WebIntegrationSettings`. The panel id is `backend-connection` to
- * reflect the unified scope, but we still mount `WebIntegrationSettings`
- * underneath until the next UX pass.
- */
-const SETTINGS_TABS = [
-  { id: "account", label: "Account" },
-  { id: "dev-loop", label: "Test My Change" },
-  { id: "backend-connection", label: "Backend Connection" },
-  { id: "devenv-enroll", label: "Devenv Enrollment" },
-  { id: "ai", label: "AI Providers" },
-  { id: "agentic", label: "Advanced AI" },
-  { id: "self-healing", label: "Self-Healing" },
-  { id: "world-state-verifier", label: "World State Verifier" },
-  { id: "playwright", label: "Playwright" },
-  { id: "mobile", label: "Mobile" },
-  { id: "discovery", label: "Discovery" },
-  { id: "mcp", label: "MCP Servers" },
-  { id: "log-sources", label: "Log Sources" },
-  { id: "execution-variables", label: "Execution Variables" },
-  { id: "notifications", label: "Notifications" },
-  { id: "general", label: "General" },
-  { id: "storage", label: "Storage" },
-  { id: "backup", label: "Backup" },
-  // Phase 3 (pop-out terminal windows): pop-out windows supersede the
-  // multi-process instance launcher for the everyday "another terminal window"
-  // case, so this tab is relabeled to signal it's now advanced/testing surface.
-  // The `id` stays "instances" so routing / UI-Bridge sub-tab mapping / specs
-  // are unchanged.
-  { id: "instances", label: "Advanced / Testing" },
-  { id: "otel", label: "OpenTelemetry" },
-  { id: "containers", label: "Container Isolation" },
-  { id: "ci-runner", label: "CI Runner" },
-  { id: "security", label: "Security" },
-  { id: "lock-yield", label: "Lock-yield Policy" },
-  { id: "advanced", label: "Debug" },
-  { id: "updates", label: "Updates" },
-] as const satisfies ReadonlyArray<{ id: SettingsTab; label: string }>;
-
-const VALID_TABS = SETTINGS_TABS.map((t) => t.id);
-
-/**
- * Sub-tab id → main `MainTabId` id mapping for the `ui-bridge-set-tab` event
- * that mirrors the sub-tab into the global activeTab so `/control/tabs`
- * reports the right value after a sub-tab click.
- *
- * Most sub-tabs map by simple `settings-${id}` prefix concatenation; the
- * outliers (where the SETTINGS_TABS id and the MainTabId stem disagree) are
- * listed explicitly. Update both lists when adding a new sub-tab. Iter-2
- * item 1: manual-test-loop.
- */
-const SUB_TAB_TO_MAIN_TAB: Record<SettingsTab, string> = {
-  account: "settings-account",
-  "dev-loop": "settings-dev-loop",
-  "backend-connection": "settings-backend-connection",
-  "devenv-enroll": "settings-backend-connection",
-  ai: "settings-ai",
-  agentic: "settings-agentic",
-  "self-healing": "settings-self-healing",
-  "world-state-verifier": "settings-world-state-verifier",
-  playwright: "settings-playwright",
-  mobile: "settings-mobile",
-  discovery: "settings-discovery",
-  mcp: "settings-mcp",
-  "log-sources": "settings-log-sources",
-  "execution-variables": "settings-execution-variables",
-  notifications: "settings-notifications",
-  general: "settings-general",
-  storage: "settings-storage",
-  backup: "settings-backup",
-  instances: "settings-instances",
-  otel: "settings-otel",
-  containers: "settings-containers",
-  "ci-runner": "settings-ci-runner",
-  security: "settings-security",
-  "lock-yield": "settings-lock-yield",
-  // SETTINGS_TABS id is "advanced" (label "Debug"); MainTabId is "settings-debug"
-  advanced: "settings-debug",
-  updates: "settings-updates",
-};
-
-function migrateStoredTab(stored: string | null): SettingsTab {
-  if (!stored) return "backend-connection";
-  if ((VALID_TABS as readonly string[]).includes(stored)) {
-    return stored as SettingsTab;
-  }
-  return "backend-connection";
-}
+const VALID_TABS = VALID_SETTINGS_TABS;
 
 export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps) {
   const [activeTab, setActiveTabRaw] = useState<SettingsTab>(() => {
     if (defaultTab && (VALID_TABS as readonly string[]).includes(defaultTab)) {
       return defaultTab as SettingsTab;
     }
-    return migrateStoredTab(instanceStorage.getItem(STORAGE_KEY));
+    return migrateSettingsSubTab(instanceStorage.getItem(STORAGE_KEY));
   });
 
   /**
@@ -191,7 +81,7 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
    */
   const setActiveTab = useCallback((next: SettingsTab) => {
     setActiveTabRaw(next);
-    const mainTabId = SUB_TAB_TO_MAIN_TAB[next] ?? `settings-${next}`;
+    const mainTabId: string = SETTINGS_SUB_TAB_TO_MAIN_TAB[next] ?? `settings-${next}`;
     window.dispatchEvent(
       new CustomEvent<{ tab: string }>("ui-bridge-set-tab", {
         detail: { tab: mainTabId },
@@ -235,7 +125,7 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
         id: "reset",
         label: "Reset Settings",
         handler: async () => {
-          setActiveTab("backend-connection");
+          setActiveTab(DEFAULT_SETTINGS_SUB_TAB);
           onLog("info", "Settings reset to defaults");
         },
       },
@@ -323,7 +213,10 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
       case "updates":
         return <UpdateSettings onLog={onLog} />;
       default:
-        return null;
+        // Compile-time exhaustiveness: a new `SettingsTab` with no panel above
+        // fails `tsc` here instead of silently rendering an empty sub-panel
+        // (the same "default: return null" defect class R1 fixes in TabContent).
+        return assertNeverSettingsTab(activeTab);
     }
   })();
 
@@ -354,9 +247,7 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
               aria-selected={isActive}
               onClick={() => setActiveTab(tab.id)}
               className={`px-3 py-1 rounded text-sm transition-colors ${
-                isActive
-                  ? "bg-blue-600 text-white"
-                  : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700"
+                isActive ? "bg-blue-600 text-white" : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700"
               }`}
             >
               {tab.label}
@@ -367,4 +258,13 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
       <div className="flex-1 overflow-y-auto scrollbar-dark">{settingsContent}</div>
     </div>
   );
+}
+
+/**
+ * Compile-time guard: every `SettingsTab` must have a panel in the switch above.
+ * Passing a non-`never` here is a `tsc` error naming the unhandled id.
+ */
+function assertNeverSettingsTab(tab: never): null {
+  console.error(`[Settings] No panel registered for settings sub-tab "${String(tab)}"`);
+  return null;
 }

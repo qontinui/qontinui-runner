@@ -286,113 +286,21 @@ impl RequestHints for TabActivateRequest {
 // Tab id registry (shared between set-tab and activate-tab)
 // ============================================================================
 
-/// Valid `MainTabId` values, mirroring `src/components/app/tab-types.ts`.
-/// Kept in sync manually.
-const VALID_TAB_IDS: &[&str] = &[
-    "prompt-home",
-    "gui-automation",
-    "workflow-queue",
-    "active",
-    "runs",
-    "history",
-    "error-monitor",
-    "processes",
-    "reflection",
-    "observations",
-    "architecture",
-    "generator-eval",
-    "meta-optimizer",
-    "run-recap",
-    "run-actions",
-    "run-image",
-    "run-findings",
-    "run-state-explorer",
-    "run-tests",
-    "run-ai-output",
-    "run-statistics",
-    "run-ai-data",
-    "run-traces",
-    "ai",
-    "logs",
-    "run-summary",
-    "monitor-summary",
-    "monitor-findings",
-    "monitor-issues",
-    "monitor-learnings",
-    "monitor-state-explorer",
-    "monitor-statistics",
-    "monitor-discoveries",
-    "library",
-    "step-builders",
-    "check-builder",
-    "check-group-builder",
-    "shell-command-builder",
-    "task-builder",
-    "context-builder",
-    "playwright-test-builder",
-    "unified-workflow-builder",
-    "state-machine",
-    "specs",
-    "capture",
-    "config-log-sources",
-    "config-findings",
-    "config-hooks",
-    "config-ui-bridge",
-    "triggers",
-    "tasks",
-    "settings",
-    "settings-account",
-    "settings-ai",
-    "settings-agentic",
-    "settings-self-healing",
-    "settings-world-state-verifier",
-    "settings-playwright",
-    "settings-mobile",
-    "settings-discovery",
-    "settings-backend-connection",
-    "settings-mcp",
-    "settings-log-sources",
-    "settings-execution-variables",
-    "settings-general",
-    "settings-storage",
-    "settings-backup",
-    "settings-instances",
-    "settings-debug",
-    "settings-security",
-    "settings-notifications",
-    "settings-otel",
-    "settings-containers",
-    "settings-lock-yield",
-    "accessibility-explorer",
-    "settings-updates",
-    "orchestration-loop",
-    "image-quality-tests",
-    "terminal",
-    "llm-analytics",
-    "cost-control",
-    "evaluation",
-    "skills",
-    "help",
-    "automation-health",
-    "activity-timeline",
-    "watchers",
-    "knowledge-explorer",
-    "event-history",
-    "development-intelligence",
-    "demo-video",
-    "product-tours",
-    "session-recap",
-    "api-surface",
-    "decision-trail",
-    "memory-search",
-    "online-learning",
-    "dag-workflow-editor",
-    "project-explainer",
-    "wrappers",
-    "productivity",
-    "regression",
-    "helper-tasks",
-];
+// `VALID_TAB_IDS` — the valid `MainTabId` values. GENERATED at build time from
+// the TypeScript `VALID_TAB_IDS` array in `src/components/app/tab-types.ts`
+// (see `src-tauri/build.rs::generate_valid_tab_ids`).
+//
+// This slice used to be a hand-copied mirror annotated "Kept in sync manually"
+// — and it was not: it had drifted to 103 entries against the union's 106, so
+// ids the frontend advertised via `GET /control/tabs` were rejected by
+// `tab/activate` as `unknown_tab` (e.g. `memory-federation`). The gate itself
+// is still enforced here; only its CONTENTS are derived, so there is exactly
+// one place to add a tab id.
+//
+// (A `///` doc comment cannot precede an `include!` — rustc's
+// `unused_doc_comments` fires, and cargo-prepush's `clippy --all-targets` is
+// stricter than CI. Hence the plain `//` block.)
+include!(concat!(env!("OUT_DIR"), "/valid_tab_ids.rs"));
 
 // ============================================================================
 // Navigate-and-wait
@@ -1862,20 +1770,86 @@ mod tab_activate_tests {
     }
 
     /// Regression: when a new `MainTabId` is added to
-    /// `src/components/app/tab-types.ts`, the Rust mirror must be updated too —
+    /// `src/components/app/tab-types.ts`, the Rust gate must accept it too —
     /// otherwise `/control/tabs` advertises the tab while `tab/activate`
     /// rejects it as `unknown_tab`. (Surfaced 2026-05-02 for `"wrappers"`.)
+    ///
+    /// Since iter-2 R2 the slice is GENERATED from the TS union, so this can no
+    /// longer drift — these ids are the historical misses, kept as a canary on
+    /// the codegen itself. `memory-federation` was the live drift: present in
+    /// the union, absent from the hand-written Rust mirror.
     #[test]
     fn recently_added_tabs_are_accepted() {
-        // `settings-account` added 2026-05-23 — was advertised by `availableTabs`
-        // but rejected by `tab/activate` because the Rust mirror was missing it.
-        for id in &["wrappers", "productivity", "settings-account"] {
+        for id in &[
+            "wrappers",
+            "productivity",
+            "settings-account",
+            "memory-federation",
+            "settings-notifications",
+        ] {
             validate_tab_id(id).unwrap_or_else(|_| {
                 panic!(
-                    "tab '{id}' missing from VALID_TAB_IDS — sync with src/components/app/tab-types.ts",
+                    "tab '{id}' missing from VALID_TAB_IDS — the slice is generated from \
+                     src/components/app/tab-types.ts by build.rs; check the codegen",
                 )
             });
         }
+    }
+
+    /// R1 companion: ids REMOVED from the `MainTabId` union (because nothing
+    /// renders them) must also disappear from the Rust gate. Before iter-2,
+    /// `tab/activate {"tabId":"monitor-issues"}` returned 200 and left the user
+    /// staring at "This page could not be displayed".
+    #[test]
+    fn retired_tab_ids_are_rejected() {
+        for id in &[
+            "run-summary",
+            "monitor-summary",
+            "monitor-issues",
+            "monitor-learnings",
+            "monitor-discoveries",
+        ] {
+            assert!(
+                validate_tab_id(id).is_err(),
+                "retired tab '{id}' must not be activatable — it has no renderer",
+            );
+        }
+    }
+
+    /// The generated slice must equal the TypeScript `VALID_TAB_IDS` array
+    /// verbatim (same ids, same order). Proves the build-script codegen ran
+    /// against the current source rather than a cached/stale OUT_DIR.
+    #[test]
+    fn valid_tab_ids_match_typescript_union() {
+        // cargo runs tests with CWD = crate root (src-tauri).
+        let source = std::fs::read_to_string("../src/components/app/tab-types.ts")
+            .expect("tab-types.ts must be readable from the crate root");
+        let decl = source
+            .find("const VALID_TAB_IDS")
+            .expect("`const VALID_TAB_IDS` must exist in tab-types.ts");
+        let rest = &source[decl..];
+        let open = rest.find("= [").expect("array literal") + 3;
+        let close = rest[open..].find("];").expect("array terminator") + open;
+        let ts_ids: Vec<&str> = rest[open..close]
+            .split(',')
+            .filter_map(|entry| {
+                let t = entry.trim();
+                t.strip_prefix('"').and_then(|t| t.strip_suffix('"'))
+            })
+            .collect();
+
+        assert_eq!(
+            ts_ids.len(),
+            VALID_TAB_IDS.len(),
+            "Rust VALID_TAB_IDS ({}) and TS VALID_TAB_IDS ({}) differ in length — build.rs codegen \
+             is stale",
+            VALID_TAB_IDS.len(),
+            ts_ids.len(),
+        );
+        assert_eq!(
+            ts_ids, VALID_TAB_IDS,
+            "Rust VALID_TAB_IDS must be generated verbatim from tab-types.ts",
+        );
     }
 
     #[test]

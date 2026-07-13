@@ -26,14 +26,9 @@ export type MainTabId =
   | "run-traces"
   | "ai"
   | "logs"
-  | "run-summary"
-  | "monitor-summary"
   | "monitor-findings"
-  | "monitor-issues"
-  | "monitor-learnings"
   | "monitor-state-explorer"
   | "monitor-statistics"
-  | "monitor-discoveries"
   | "library"
   | "step-builders"
   | "check-builder"
@@ -134,14 +129,9 @@ const VALID_TAB_IDS: MainTabId[] = [
   "run-traces",
   "ai",
   "logs",
-  "run-summary",
-  "monitor-summary",
   "monitor-findings",
-  "monitor-issues",
-  "monitor-learnings",
   "monitor-state-explorer",
   "monitor-statistics",
-  "monitor-discoveries",
   "library",
   "step-builders",
   "check-builder",
@@ -253,14 +243,9 @@ export const TAB_LABELS: Record<MainTabId, string> = {
   "run-traces": "Traces",
   ai: "AI Output (Legacy)",
   logs: "Logs",
-  "run-summary": "Run Summary",
-  "monitor-summary": "Monitor Summary",
   "monitor-findings": "Monitor Findings",
-  "monitor-issues": "Monitor Issues",
-  "monitor-learnings": "Monitor Learnings",
   "monitor-state-explorer": "Monitor State Explorer",
   "monitor-statistics": "Monitor Statistics",
-  "monitor-discoveries": "Monitor Discoveries",
   library: "Library",
   "step-builders": "Step Builders",
   "check-builder": "Check Builder",
@@ -452,63 +437,105 @@ export function setActiveTabAndPersist(
   storage.setItem(ACTIVE_TAB_STORAGE_KEY, tab);
 }
 
+/**
+ * Legacy tab ids kept alive purely as ALIASES: ids that once existed (as a nav
+ * item, a persisted `activeTab`, or a UI Bridge target) but no longer name a
+ * page. They are deliberately NOT in `MainTabId` — nothing may route to them —
+ * but a value persisted by an older build, or a stale UI Bridge caller, still
+ * resolves through this table to the page that superseded them.
+ *
+ * (iter-2 R1: `run-summary`, `monitor-summary`, `monitor-issues`,
+ * `monitor-learnings` and `monitor-discoveries` were removed from `MainTabId`
+ * for exactly this reason — they were "valid" ids with no renderer, so the UI
+ * Bridge happily activated them into a "could not be displayed" page.)
+ */
+const LEGACY_TAB_MIGRATIONS: Record<string, MainTabId> = {
+  run: "gui-automation",
+  history: "runs",
+  "ai-workflows": "run-ai-output",
+  "ai-builder": "unified-workflow-builder",
+  builder: "unified-workflow-builder",
+  prompts: "library",
+  scripts: "library",
+  "script-builder": "library",
+  contexts: "library",
+  scheduler: "tasks",
+  dataset: "capture",
+  extract: "capture",
+  "live-page-generator": "unified-workflow-builder",
+  "spec-discovery": "unified-workflow-builder",
+  "page-sweep": "unified-workflow-builder",
+  "run-plan": "terminal",
+  logs: "run-recap",
+  "run-dashboard": "run-recap",
+  ai: "run-ai-output",
+  "run-summary": "run-recap",
+  "monitor-summary": "run-recap",
+  "monitor-findings": "run-findings",
+  "monitor-issues": "run-findings",
+  "monitor-learnings": "run-recap",
+  "monitor-verification": "run-state-explorer",
+  "monitor-state-explorer": "run-state-explorer",
+  "monitor-statistics": "run-statistics",
+  "monitor-discoveries": "run-recap",
+  monitor: "run-recap",
+  issues: "run-findings",
+  "run-issues": "run-findings",
+  learnings: "run-recap",
+  verification: "run-state-explorer",
+  "run-verification": "run-state-explorer",
+  "run-exploration": "run-state-explorer",
+  "verification-builder": "library",
+  statistics: "run-statistics",
+  "check-builder": "step-builders",
+  "check-group-builder": "step-builders",
+  "shell-command-builder": "step-builders",
+  "task-builder": "step-builders",
+  "context-builder": "step-builders",
+  "playwright-test-builder": "step-builders",
+  "log-sources": "config-log-sources",
+  "log-locations": "config-log-sources",
+};
+
+/**
+ * Resolve a tab id that arrived from OUTSIDE the type system — a UI Bridge
+ * `activate-tab` payload, a `ui-bridge-set-tab` window event, a
+ * `navigateHandler` path, a Tauri event. Returns `null` for anything unknown so
+ * the caller can REFUSE the navigation rather than corrupt `activeTab`.
+ *
+ * Ordering differs from `migrateTabId` on purpose: a live id wins over an alias.
+ * Several ids are BOTH a real tab and a migration key (`check-builder`,
+ * `monitor-findings`, `history`, `logs`, …); an external caller asking for
+ * `check-builder` means the page called "Check Builder", not the alias's
+ * `step-builders` target. `migrateTabId` (persisted-storage restore) keeps its
+ * alias-first ordering unchanged so a stored value still lands where previous
+ * builds sent it.
+ *
+ * iter-2 R3: replaces three unguarded `as MainTabId` casts in
+ * `useAppNavigation` that let any string become the active tab.
+ */
+export function resolveExternalTabId(candidate: string | null | undefined): MainTabId | null {
+  if (!candidate) return null;
+  const trimmed = candidate.trim();
+  if (!trimmed) return null;
+  if (isValidTabId(trimmed)) return trimmed;
+  return LEGACY_TAB_MIGRATIONS[trimmed] ?? null;
+}
+
+/**
+ * Resolve the PERSISTED active-tab value read back from instanceStorage.
+ * Alias-first (see `resolveExternalTabId`), and always yields a tab — an
+ * unreadable/unknown stored value falls back to `prompt-home`.
+ */
 export function migrateTabId(stored: string | null): MainTabId {
   if (!stored) return "prompt-home";
 
-  const migrations: Record<string, MainTabId> = {
-    run: "gui-automation",
-    history: "runs",
-    "ai-workflows": "run-ai-output",
-    "ai-builder": "unified-workflow-builder",
-    builder: "unified-workflow-builder",
-    prompts: "library",
-    scripts: "library",
-    "script-builder": "library",
-    contexts: "library",
-    scheduler: "tasks",
-    dataset: "capture",
-    extract: "capture",
-    "live-page-generator": "unified-workflow-builder",
-    "spec-discovery": "unified-workflow-builder",
-    "page-sweep": "unified-workflow-builder",
-    "run-plan": "terminal",
-    logs: "run-recap",
-    "run-dashboard": "run-recap",
-    ai: "run-ai-output",
-    "run-summary": "run-recap",
-    "monitor-summary": "run-recap",
-    "monitor-findings": "run-findings",
-    "monitor-issues": "run-findings",
-    "monitor-learnings": "run-recap",
-    "monitor-verification": "run-state-explorer",
-    "monitor-state-explorer": "run-state-explorer",
-    "monitor-statistics": "run-statistics",
-    "monitor-discoveries": "run-recap",
-    monitor: "run-recap",
-    issues: "run-findings",
-    "run-issues": "run-findings",
-    learnings: "run-recap",
-    verification: "run-state-explorer",
-    "run-verification": "run-state-explorer",
-    "run-exploration": "run-state-explorer",
-    "verification-builder": "library",
-    statistics: "run-statistics",
-    "check-builder": "step-builders",
-    "check-group-builder": "step-builders",
-    "shell-command-builder": "step-builders",
-    "task-builder": "step-builders",
-    "context-builder": "step-builders",
-    "playwright-test-builder": "step-builders",
-    "log-sources": "config-log-sources",
-    "log-locations": "config-log-sources",
-  };
-
-  if (stored in migrations) {
-    return migrations[stored];
+  if (stored in LEGACY_TAB_MIGRATIONS) {
+    return LEGACY_TAB_MIGRATIONS[stored];
   }
 
-  if (VALID_TAB_IDS.includes(stored as MainTabId)) {
-    return stored as MainTabId;
+  if (isValidTabId(stored)) {
+    return stored;
   }
 
   return "prompt-home";
