@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use super::PgDb;
+use super::{parse_workflow_id, PgDb};
 use crate::unified_workflows::UnifiedWorkflow;
 
 /// Convert Clorinde empty-string (from NULL) to Option::None.
@@ -18,12 +18,23 @@ fn non_empty(s: String) -> Option<String> {
 }
 
 /// Parse JSON string to a typed value, returning the default on failure.
+/// For `tool_tags`, the one remaining JSON-encoded-as-text column — the
+/// other 12 formerly-text JSON columns are `jsonb` (migration
+/// `d7a3f1c8e024_realign_unified_workflows_to_model` and follow-ups) and
+/// Clorinde now hands those back as an already-parsed [`serde_json::Value`];
+/// use [`json_value_or_default`] for those.
 fn json_or_default<T: serde::de::DeserializeOwned + Default>(s: &str) -> T {
     if s.is_empty() {
         T::default()
     } else {
         serde_json::from_str(s).unwrap_or_default()
     }
+}
+
+/// Convert a `jsonb` column's already-parsed [`serde_json::Value`] to a
+/// typed value, returning the default on an unexpected shape.
+fn json_value_or_default<T: serde::de::DeserializeOwned + Default>(v: serde_json::Value) -> T {
+    serde_json::from_value(v).unwrap_or_default()
 }
 
 /// Parse JSON string to Option<Value>, returning None on empty/failure.
@@ -42,15 +53,15 @@ fn json_opt(s: &str) -> Option<serde_json::Value> {
 macro_rules! row_to_workflow {
     ($r:expr) => {{
         UnifiedWorkflow {
-            id: $r.id,
+            id: $r.id.to_string(),
             name: $r.name,
             description: $r.description,
             category: $r.category,
-            tags: json_or_default(&$r.tags),
-            setup_steps: json_or_default(&$r.setup_steps),
-            verification_steps: json_or_default(&$r.verification_steps),
-            agentic_steps: json_or_default(&$r.agentic_steps),
-            completion_steps: json_or_default(&$r.completion_steps),
+            tags: json_value_or_default($r.tags),
+            setup_steps: json_value_or_default($r.setup_steps),
+            verification_steps: json_value_or_default($r.verification_steps),
+            agentic_steps: json_value_or_default($r.agentic_steps),
+            completion_steps: json_value_or_default($r.completion_steps),
             // 0 from the DB means "no cap" (see COALESCE in workflows.sql);
             // any positive value is the explicit cap the user set.
             max_iterations: if $r.max_iterations <= 0 {
@@ -63,14 +74,14 @@ macro_rules! row_to_workflow {
             skip_ai_summary: $r.skip_ai_summary,
             created_at: $r.created_at.to_rfc3339(),
             updated_at: $r.updated_at.to_rfc3339(),
-            log_source_selection: json_or_default(&$r.log_source_selection),
-            context_ids: json_or_default(&$r.context_ids),
-            disabled_context_ids: json_or_default(&$r.disabled_context_ids),
+            log_source_selection: json_value_or_default($r.log_source_selection),
+            context_ids: json_value_or_default($r.context_ids),
+            disabled_context_ids: json_value_or_default($r.disabled_context_ids),
             auto_include_contexts: $r.auto_include_contexts,
             prompt_template: non_empty($r.prompt_template),
             log_watch_enabled: $r.log_watch_enabled,
             health_check_enabled: $r.health_check_enabled,
-            health_check_urls: json_or_default(&$r.health_check_urls),
+            health_check_urls: json_value_or_default($r.health_check_urls),
             timeout_seconds: if $r.timeout_seconds == 0 {
                 None
             } else {
@@ -80,10 +91,10 @@ macro_rules! row_to_workflow {
             generated_by_task_run_id: non_empty($r.generated_by_task_run_id),
             enable_sweep: $r.enable_sweep,
             max_sweep_iterations: $r.max_sweep_iterations as u32,
-            stages: json_or_default(&$r.stages),
+            stages: json_value_or_default($r.stages),
             stop_on_failure: $r.stop_on_failure,
             reflection_mode: $r.reflection_mode,
-            model_overrides: json_or_default(&$r.model_overrides),
+            model_overrides: json_value_or_default($r.model_overrides),
             approval_gate: $r.approval_gate,
             completion_prompts_first: $r.completion_prompts_first,
             is_favorite: $r.is_favorite,
@@ -91,7 +102,7 @@ macro_rules! row_to_workflow {
             cost_annotations: json_opt(&$r.cost_annotations),
             quality_report: json_opt(&$r.quality_report),
             acceptance_criteria: json_opt(&$r.acceptance_criteria),
-            constraint_overrides: json_or_default(&$r.constraint_overrides),
+            constraint_overrides: json_value_or_default($r.constraint_overrides),
             ai_reviewed: $r.ai_reviewed,
             workflow_architecture: {
                 let s = &$r.workflow_architecture;
@@ -139,14 +150,22 @@ impl PgDb {
     }
 
     /// Get a single unified workflow by ID.
+    ///
+    /// A malformed (non-uuid) `id` returns `Ok(None)`, not `Err` — this
+    /// preserves the pre-migration behavior (a bad id just matched no row
+    /// under the old text `WHERE id = $1`), so callers that map `Ok(None)`
+    /// to 404 and `Err` to 500 keep doing the right thing for garbage input.
     pub async fn get_unified_workflow(&self, id: &str) -> Result<Option<UnifiedWorkflow>, String> {
+        let Ok(id_uuid) = parse_workflow_id(id) else {
+            return Ok(None);
+        };
         let conn = self
             .pool
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
         let row = qontinui_db::queries::workflows::get_unified_workflow()
-            .bind(&conn, &id)
+            .bind(&conn, &id_uuid)
             .opt()
             .await
             .map_err(|e| format!("PG get_unified_workflow: {}", e))?;
@@ -193,44 +212,46 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
+        let id_uuid = parse_workflow_id(id)?;
 
-        let tags_json = serde_json::to_string(&request.tags).unwrap_or_else(|_| "[]".to_string());
+        let tags_json =
+            serde_json::to_value(&request.tags).unwrap_or_else(|_| serde_json::json!([]));
         let setup_json =
-            serde_json::to_string(&request.setup_steps).unwrap_or_else(|_| "[]".to_string());
-        let verification_json =
-            serde_json::to_string(&request.verification_steps).unwrap_or_else(|_| "[]".to_string());
-        let agentic_json =
-            serde_json::to_string(&request.agentic_steps).unwrap_or_else(|_| "[]".to_string());
-        let completion_json =
-            serde_json::to_string(&request.completion_steps).unwrap_or_else(|_| "[]".to_string());
+            serde_json::to_value(&request.setup_steps).unwrap_or_else(|_| serde_json::json!([]));
+        let verification_json = serde_json::to_value(&request.verification_steps)
+            .unwrap_or_else(|_| serde_json::json!([]));
+        let agentic_json = serde_json::to_value(&request.agentic_steps)
+            .unwrap_or_else(|_| serde_json::json!([]));
+        let completion_json = serde_json::to_value(&request.completion_steps)
+            .unwrap_or_else(|_| serde_json::json!([]));
         let log_sel_json = request
             .log_source_selection
             .as_ref()
-            .map(|ls| serde_json::to_string(ls).unwrap_or_else(|_| "\"default\"".to_string()))
-            .unwrap_or_else(|| "\"default\"".to_string());
+            .map(|ls| serde_json::to_value(ls).unwrap_or_else(|_| serde_json::json!("default")))
+            .unwrap_or_else(|| serde_json::json!("default"));
         let ctx_json = request
             .context_ids
             .as_ref()
-            .map(|ids| serde_json::to_string(ids).unwrap_or_else(|_| "[]".to_string()))
-            .unwrap_or_else(|| "[]".to_string());
+            .map(|ids| serde_json::to_value(ids).unwrap_or_else(|_| serde_json::json!([])))
+            .unwrap_or_else(|| serde_json::json!([]));
         let dis_ctx_json = request
             .disabled_context_ids
             .as_ref()
-            .map(|ids| serde_json::to_string(ids).unwrap_or_else(|_| "[]".to_string()))
-            .unwrap_or_else(|| "[]".to_string());
+            .map(|ids| serde_json::to_value(ids).unwrap_or_else(|_| serde_json::json!([])))
+            .unwrap_or_else(|| serde_json::json!([]));
         let hc_urls_json = request
             .health_check_urls
             .as_ref()
-            .map(|urls| serde_json::to_string(urls).unwrap_or_else(|_| "[]".to_string()))
-            .unwrap_or_else(|| "[]".to_string());
+            .map(|urls| serde_json::to_value(urls).unwrap_or_else(|_| serde_json::json!([])))
+            .unwrap_or_else(|| serde_json::json!([]));
         let stages_json =
-            serde_json::to_string(&request.stages).unwrap_or_else(|_| "[]".to_string());
+            serde_json::to_value(&request.stages).unwrap_or_else(|_| serde_json::json!([]));
         let model_ov_json =
-            serde_json::to_string(&request.model_overrides.clone().unwrap_or_default())
-                .unwrap_or_else(|_| "{}".to_string());
+            serde_json::to_value(&request.model_overrides.clone().unwrap_or_default())
+                .unwrap_or_else(|_| serde_json::json!({}));
         let constraint_ov_json =
-            serde_json::to_string(&request.constraint_overrides.clone().unwrap_or_default())
-                .unwrap_or_else(|_| "{}".to_string());
+            serde_json::to_value(&request.constraint_overrides.clone().unwrap_or_default())
+                .unwrap_or_else(|_| serde_json::json!({}));
         let tool_tags_json =
             serde_json::to_string(&request.tool_tags).unwrap_or_else(|_| "[]".to_string());
         let timeout_secs: Option<i64> = request.timeout_seconds.map(|t| t as i64);
@@ -258,43 +279,43 @@ impl PgDb {
         qontinui_db::queries::workflows::create_unified_workflow()
             .bind(
                 &conn,
-                &id,
+                &id_uuid,
                 &request.name.as_str(),
                 &desc_opt,
                 &request.category.as_str(),
-                &tags_json.as_str(),
-                &setup_json.as_str(),
-                &verification_json.as_str(),
-                &agentic_json.as_str(),
-                &completion_json.as_str(),
+                &tags_json,
+                &setup_json,
+                &verification_json,
+                &agentic_json,
+                &completion_json,
                 &max_iters,
                 &timeout_secs,
                 &request.provider.as_deref(),
                 &request.model.as_deref(),
                 &request.skip_ai_summary,
-                &log_sel_json.as_str(),
-                &ctx_json.as_str(),
-                &dis_ctx_json.as_str(),
+                &log_sel_json,
+                &ctx_json,
+                &dis_ctx_json,
                 &request.auto_include_contexts.unwrap_or(true),
                 &request.prompt_template.as_deref(),
                 &request.log_watch_enabled.unwrap_or(true),
                 &request.health_check_enabled.unwrap_or(true),
-                &hc_urls_json.as_str(),
+                &hc_urls_json,
                 &request.preflight_check_enabled.unwrap_or(true),
                 &request.generated_by_task_run_id.as_deref(),
                 &request.enable_sweep.unwrap_or(false),
                 &max_sweep,
-                &stages_json.as_str(),
+                &stages_json,
                 &request.stop_on_failure.unwrap_or(false),
                 &request.reflection_mode.unwrap_or(true),
-                &model_ov_json.as_str(),
+                &model_ov_json,
                 &request.approval_gate.unwrap_or(false),
                 &request.completion_prompts_first.unwrap_or(false),
                 &dep_graph_str.as_deref(),
                 &cost_ann_str.as_deref(),
                 &quality_str.as_deref(),
                 &accept_str.as_deref(),
-                &constraint_ov_json.as_str(),
+                &constraint_ov_json,
                 &request.ai_reviewed.unwrap_or(true),
                 &arch_str.as_deref(),
                 &request.strict_cwd,
@@ -476,26 +497,27 @@ impl PgDb {
             });
 
         // Serialize JSON fields
-        let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
-        let setup_json = serde_json::to_string(setup_steps).unwrap_or_else(|_| "[]".to_string());
+        let tags_json = serde_json::to_value(tags).unwrap_or_else(|_| serde_json::json!([]));
+        let setup_json =
+            serde_json::to_value(setup_steps).unwrap_or_else(|_| serde_json::json!([]));
         let verification_json =
-            serde_json::to_string(verification_steps).unwrap_or_else(|_| "[]".to_string());
+            serde_json::to_value(verification_steps).unwrap_or_else(|_| serde_json::json!([]));
         let agentic_json =
-            serde_json::to_string(agentic_steps).unwrap_or_else(|_| "[]".to_string());
+            serde_json::to_value(agentic_steps).unwrap_or_else(|_| serde_json::json!([]));
         let completion_json =
-            serde_json::to_string(completion_steps).unwrap_or_else(|_| "[]".to_string());
-        let log_sel_json = serde_json::to_string(log_source_selection)
-            .unwrap_or_else(|_| "\"default\"".to_string());
-        let ctx_json = serde_json::to_string(context_ids).unwrap_or_else(|_| "[]".to_string());
+            serde_json::to_value(completion_steps).unwrap_or_else(|_| serde_json::json!([]));
+        let log_sel_json = serde_json::to_value(log_source_selection)
+            .unwrap_or_else(|_| serde_json::json!("default"));
+        let ctx_json = serde_json::to_value(context_ids).unwrap_or_else(|_| serde_json::json!([]));
         let dis_ctx_json =
-            serde_json::to_string(disabled_context_ids).unwrap_or_else(|_| "[]".to_string());
+            serde_json::to_value(disabled_context_ids).unwrap_or_else(|_| serde_json::json!([]));
         let hc_urls_json =
-            serde_json::to_string(health_check_urls).unwrap_or_else(|_| "[]".to_string());
-        let stages_json = serde_json::to_string(stages).unwrap_or_else(|_| "[]".to_string());
+            serde_json::to_value(health_check_urls).unwrap_or_else(|_| serde_json::json!([]));
+        let stages_json = serde_json::to_value(stages).unwrap_or_else(|_| serde_json::json!([]));
         let model_ov_json =
-            serde_json::to_string(model_overrides).unwrap_or_else(|_| "{}".to_string());
+            serde_json::to_value(model_overrides).unwrap_or_else(|_| serde_json::json!({}));
         let constraint_ov_json =
-            serde_json::to_string(constraint_overrides).unwrap_or_else(|_| "{}".to_string());
+            serde_json::to_value(constraint_overrides).unwrap_or_else(|_| serde_json::json!({}));
         let tool_tags_json = serde_json::to_string(tool_tags).unwrap_or_else(|_| "[]".to_string());
         let timeout_secs: Option<i64> = timeout_seconds.map(|v| v as i64);
         let max_iters: Option<i64> = max_iterations.map(|n| n as i64);
@@ -515,6 +537,7 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
+        let id_uuid = parse_workflow_id(id)?;
 
         qontinui_db::queries::workflows::update_unified_workflow()
             .bind(
@@ -522,38 +545,38 @@ impl PgDb {
                 &name.as_str(),
                 &desc_opt,
                 &category.as_str(),
-                &tags_json.as_str(),
-                &setup_json.as_str(),
-                &verification_json.as_str(),
-                &agentic_json.as_str(),
-                &completion_json.as_str(),
+                &tags_json,
+                &setup_json,
+                &verification_json,
+                &agentic_json,
+                &completion_json,
                 &max_iters,
                 &timeout_secs,
                 &provider_opt,
                 &model_opt,
                 &skip_ai_summary,
-                &log_sel_json.as_str(),
+                &log_sel_json,
                 &prompt_template,
-                &ctx_json.as_str(),
-                &dis_ctx_json.as_str(),
+                &ctx_json,
+                &dis_ctx_json,
                 &auto_include_contexts,
                 &log_watch_enabled,
                 &health_check_enabled,
-                &hc_urls_json.as_str(),
+                &hc_urls_json,
                 &preflight_check_enabled,
                 &enable_sweep,
                 &max_sweep,
-                &stages_json.as_str(),
+                &stages_json,
                 &stop_on_failure,
                 &approval_gate,
                 &reflection_mode,
-                &model_ov_json.as_str(),
+                &model_ov_json,
                 &completion_prompts_first,
                 &dep_graph_str.as_deref(),
                 &cost_ann_str.as_deref(),
                 &quality_str.as_deref(),
                 &accept_str.as_deref(),
-                &constraint_ov_json.as_str(),
+                &constraint_ov_json,
                 &ai_reviewed,
                 &workflow_architecture.as_deref(),
                 &strict_cwd,
@@ -565,7 +588,7 @@ impl PgDb {
                 &htn_enabled,
                 &htn_ui_bridge_url.map(|s| s.as_str()),
                 &htn_state_machine_path.map(|s| s.as_str()),
-                &id,
+                &id_uuid,
             )
             .opt()
             .await
@@ -576,15 +599,19 @@ impl PgDb {
             .ok_or_else(|| "Failed to retrieve updated workflow".to_string())
     }
 
-    /// Delete a unified workflow.
+    /// Delete a unified workflow. A malformed id just means "nothing to
+    /// delete" (`Ok(false)`) — see `get_unified_workflow`'s doc comment.
     pub async fn delete_unified_workflow(&self, id: &str) -> Result<bool, String> {
+        let Ok(id_uuid) = parse_workflow_id(id) else {
+            return Ok(false);
+        };
         let conn = self
             .pool
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
         let deleted = qontinui_db::queries::workflows::delete_unified_workflow()
-            .bind(&conn, &id)
+            .bind(&conn, &id_uuid)
             .opt()
             .await
             .map_err(|e| format!("PG delete_unified_workflow: {}", e))?;
@@ -625,20 +652,26 @@ impl PgDb {
             .map_err(|e| format!("PG pool error: {}", e))?;
         let limit_i64 = limit as i64;
 
+        // Pre-existing bug, unrelated to the uuid/jsonb migration: this
+        // query used to reference `workflow_config`/`deleted_at`/`metadata`/
+        // `sync_status`/`parent_workflow_id`, none of which exist on
+        // `project.unified_workflows` (see schema.pg.sql.generated) — the
+        // `WHERE deleted_at IS NULL` clause alone means every call errored,
+        // silently swallowed by the caller's `.unwrap_or_default()`, so RAG
+        // examples for workflow generation were always empty. Corrected to
+        // the real column set below.
         let rows = conn
             .query(
                 r#"SELECT id, name, description, category, tags,
                           setup_steps, verification_steps, agentic_steps, completion_steps,
                           stages, max_iterations, provider, model, model_overrides,
                           log_source_selection, prompt_template,
-                          workflow_architecture, workflow_config,
+                          workflow_architecture,
                           auto_include_contexts,
                           acceptance_criteria, quality_report, dependency_graph, cost_annotations,
-                          ai_reviewed, is_favorite, created_at, updated_at, deleted_at,
-                          metadata, sync_status, parent_workflow_id
+                          ai_reviewed, is_favorite, created_at, updated_at
                    FROM unified_workflows
-                   WHERE deleted_at IS NULL
-                     AND (example_status = 'active' OR is_favorite = true)
+                   WHERE example_status = 'active' OR is_favorite = true
                    ORDER BY updated_at DESC
                    LIMIT $1"#,
                 &[&limit_i64],
@@ -646,18 +679,54 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG search_unified_workflows_for_examples: {}", e))?;
 
-        // Use the same row mapping as other workflow queries
-        Ok(rows.into_iter().filter_map(|r| {
-            // Minimal mapping via row_to_workflow macro
-            match serde_json::json!({
-                "id": r.get::<_, String>(0),
-                "name": r.get::<_, String>(1),
-                "description": r.get::<_, Option<String>>(2).unwrap_or_default(),
-                "category": r.get::<_, Option<String>>(3).unwrap_or_else(|| "general".to_string()),
-            }) {
-                val => serde_json::from_value::<crate::unified_workflows::UnifiedWorkflow>(val).ok()
-            }
-        }).collect())
+        // Map every selected column (not just id/name/description/category —
+        // the whole point of this function is to hand the workflow's actual
+        // step content to workflow generation as RAG examples).
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                let quality_report: Option<String> = r.get(19);
+                let dependency_graph: Option<String> = r.get(20);
+                let cost_annotations: Option<String> = r.get(21);
+                let acceptance_criteria: Option<String> = r.get(18);
+                let workflow_architecture_raw: Option<String> = r.get(16);
+                let workflow_architecture = workflow_architecture_raw.and_then(|s| {
+                    serde_json::from_str::<crate::unified_workflows::WorkflowArchitecture>(
+                        &format!("\"{s}\""),
+                    )
+                    .ok()
+                });
+                let val = serde_json::json!({
+                    "id": r.get::<_, uuid::Uuid>(0).to_string(),
+                    "name": r.get::<_, String>(1),
+                    "description": r.get::<_, Option<String>>(2).unwrap_or_default(),
+                    "category": r.get::<_, Option<String>>(3).unwrap_or_else(|| "general".to_string()),
+                    "tags": r.get::<_, Option<serde_json::Value>>(4).unwrap_or_else(|| serde_json::json!([])),
+                    "setup_steps": r.get::<_, Option<serde_json::Value>>(5).unwrap_or_else(|| serde_json::json!([])),
+                    "verification_steps": r.get::<_, Option<serde_json::Value>>(6).unwrap_or_else(|| serde_json::json!([])),
+                    "agentic_steps": r.get::<_, Option<serde_json::Value>>(7).unwrap_or_else(|| serde_json::json!([])),
+                    "completion_steps": r.get::<_, Option<serde_json::Value>>(8).unwrap_or_else(|| serde_json::json!([])),
+                    "stages": r.get::<_, Option<serde_json::Value>>(9).unwrap_or_else(|| serde_json::json!([])),
+                    "max_iterations": r.get::<_, Option<i64>>(10),
+                    "provider": r.get::<_, Option<String>>(11),
+                    "model": r.get::<_, Option<String>>(12),
+                    "model_overrides": r.get::<_, Option<serde_json::Value>>(13).unwrap_or_else(|| serde_json::json!({})),
+                    "log_source_selection": r.get::<_, Option<serde_json::Value>>(14).unwrap_or_else(|| serde_json::json!("default")),
+                    "prompt_template": r.get::<_, Option<String>>(15),
+                    "workflow_architecture": workflow_architecture,
+                    "auto_include_contexts": r.get::<_, Option<bool>>(17).unwrap_or(true),
+                    "acceptance_criteria": acceptance_criteria.and_then(|s| json_opt(&s)),
+                    "quality_report": quality_report.and_then(|s| json_opt(&s)),
+                    "dependency_graph": dependency_graph.and_then(|s| json_opt(&s)),
+                    "cost_annotations": cost_annotations.and_then(|s| json_opt(&s)),
+                    "ai_reviewed": r.get::<_, Option<bool>>(22).unwrap_or(true),
+                    "is_favorite": r.get::<_, Option<bool>>(23).unwrap_or(false),
+                    "created_at": r.get::<_, chrono::DateTime<chrono::FixedOffset>>(24).to_rfc3339(),
+                    "updated_at": r.get::<_, chrono::DateTime<chrono::FixedOffset>>(25).to_rfc3339(),
+                });
+                serde_json::from_value::<crate::unified_workflows::UnifiedWorkflow>(val).ok()
+            })
+            .collect())
     }
 
     /// Toggle favorite status. Returns the new is_favorite value.
@@ -668,8 +737,9 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
+        let id_uuid = parse_workflow_id(id)?;
         let new_val = qontinui_db::queries::workflows::toggle_favorite()
-            .bind(&conn, &id)
+            .bind(&conn, &id_uuid)
             .one()
             .await
             .map_err(|e| format!("PG toggle_favorite: {}", e))?;
@@ -699,8 +769,9 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
+        let id_uuid = parse_workflow_id(id)?;
         qontinui_db::queries::workflows::clear_sync_pending()
-            .bind(&conn, &id)
+            .bind(&conn, &id_uuid)
             .await
             .map_err(|e| format!("PG clear_sync_pending: {}", e))?;
         Ok(())
@@ -713,8 +784,9 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
+        let id_uuid = parse_workflow_id(id)?;
         qontinui_db::queries::workflows::set_sync_pending()
-            .bind(&conn, &id)
+            .bind(&conn, &id_uuid)
             .await
             .map_err(|e| format!("PG set_sync_pending: {}", e))?;
         Ok(())
@@ -737,7 +809,7 @@ impl PgDb {
 
         Ok(rows
             .into_iter()
-            .map(|r| (r.id, r.name, r.source_file_path))
+            .map(|r| (r.id.to_string(), r.name, r.source_file_path))
             .collect())
     }
 
@@ -780,12 +852,17 @@ impl PgDb {
         ))
     }
 
-    /// Update example_status for a workflow.
+    /// Update example_status for a workflow. A malformed id is a no-op
+    /// (`Ok(())`, matching an UPDATE that affects zero rows) — see
+    /// `get_unified_workflow`'s doc comment.
     pub async fn update_example_status(
         &self,
         workflow_id: &str,
         status: &str,
     ) -> Result<(), String> {
+        let Ok(id_uuid) = parse_workflow_id(workflow_id) else {
+            return Ok(());
+        };
         let conn = self
             .pool
             .get()
@@ -793,7 +870,7 @@ impl PgDb {
             .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "UPDATE unified_workflows SET example_status = $1 WHERE id = $2",
-            &[&status, &workflow_id],
+            &[&status, &id_uuid],
         )
         .await
         .map_err(|e| format!("PG update_example_status: {}", e))?;
@@ -826,6 +903,7 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
+        let id_uuid = parse_workflow_id(id)?;
 
         let affected = conn
             .execute(
@@ -847,7 +925,7 @@ impl PgDb {
                            source_yaml   = EXCLUDED.source_yaml,
                            max_iterations= EXCLUDED.max_iterations,
                            updated_at    = NOW()"#,
-                &[&id, &name, &description, &source_yaml, &max_iterations],
+                &[&id_uuid, &name, &description, &source_yaml, &max_iterations],
             )
             .await
             .map_err(|e| format!("PG upsert_workflow_from_yaml: {}", e))?;
@@ -884,6 +962,10 @@ impl PgDb {
         &self,
         workflow_id: &str,
     ) -> Result<Option<String>, String> {
+        // A malformed id is just another way to "not exist" — see doc comment.
+        let Ok(id_uuid) = parse_workflow_id(workflow_id) else {
+            return Ok(None);
+        };
         let conn = self
             .pool
             .get()
@@ -892,7 +974,7 @@ impl PgDb {
         let row = conn
             .query_opt(
                 "SELECT source_yaml FROM unified_workflows WHERE id = $1",
-                &[&workflow_id],
+                &[&id_uuid],
             )
             .await
             .map_err(|e| format!("Failed to query source_yaml: {}", e))?;

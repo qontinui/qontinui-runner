@@ -129,6 +129,31 @@ pub fn pg_available() -> bool {
     PG_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Parse a workflow id string into the uuid `project.unified_workflows.id`
+/// (and its inbound FK columns) actually require — see migration
+/// `d7a3f1c8e024_realign_unified_workflows_to_model`. Runner-generated ids
+/// are always `uuid::Uuid::new_v4().to_string()`, so this only fails on a
+/// malformed caller-supplied id. Shared by `workflows.rs`, `graph_ops.rs`,
+/// `triggers.rs`, and callers outside this module (e.g. `workflow::dag_sync`)
+/// that hand-bind raw SQL against these columns; all parse/format at the
+/// PG-layer boundary and keep `String`/`&str` everywhere else (the wire type
+/// in `qontinui_types::workflow::UnifiedWorkflow`).
+pub(crate) fn parse_workflow_id(id: &str) -> Result<uuid::Uuid, String> {
+    uuid::Uuid::parse_str(id).map_err(|e| format!("invalid workflow id '{}': {}", id, e))
+}
+
+/// [`parse_workflow_id`] for the nullable-FK call sites (`generation_pipeline_events.workflow_id`,
+/// `rule_influence_log.workflow_id`, `workflow_triggers.workflow_id`) — `None`
+/// in, `None` out. `Some("")` is also treated as `None`: the old `text`
+/// column silently accepted an empty-string workflow_id as "no workflow"
+/// (any client that sends `""` rather than omitting the key — e.g. a
+/// non-UI/MCP caller that doesn't replicate `TriggerEditor.tsx`'s own submit
+/// validation — must keep getting that same "no workflow" result, not a
+/// parse error).
+pub(crate) fn parse_optional_workflow_id(id: Option<&str>) -> Result<Option<uuid::Uuid>, String> {
+    id.filter(|s| !s.is_empty()).map(parse_workflow_id).transpose()
+}
+
 /// PR-shepherd Phases 1+2 shape self-heal for the alembic-owned
 /// `project.pr_watch_state` table: the `authoring_session_id` /
 /// `first_fully_green_at` columns, the `task_run_id` NOT NULL drop, and the

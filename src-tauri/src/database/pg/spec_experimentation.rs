@@ -3,7 +3,7 @@
 //! Provides CRUD for spec_compliance_results, spec_accuracy_results,
 //! and spec_versions tables.
 
-use super::PgDb;
+use super::{parse_workflow_id, PgDb};
 use tracing::{debug, info};
 
 /// Lightweight compliance result row.
@@ -123,18 +123,29 @@ impl PgDb {
                 )
             })?;
 
+        // task_runs.workflow_id is text; unified_workflows.id is uuid
+        // (migration d7a3f1c8e024_realign_unified_workflows_to_model).
+        // Deliberately cast the uuid side (uw.id::text) rather than
+        // `tr.workflow_id::uuid`: task_runs predates that migration and can
+        // still carry a pre-migration non-uuid workflow_id (e.g. an old
+        // slug), and an invalid ::uuid cast in Postgres is a hard query
+        // error, not a graceful non-match — it would take down every
+        // spec-compliance lookup the moment one legacy row exists. This
+        // trades the uuid PK index for correctness on a table
+        // (unified_workflows) that's user-workflow-definition-scale, not
+        // task-run-scale, so the seq scan cost is not expected to matter.
         let spec_id: Option<String> = conn
             .query_opt(
                 r#"SELECT uw.id
                    FROM task_runs tr
-                   JOIN unified_workflows uw ON tr.workflow_id = uw.id
+                   JOIN unified_workflows uw ON tr.workflow_id = uw.id::text
                    WHERE tr.id = $1 AND uw.category = 'spec-generated'"#,
                 &[&task_run_id],
             )
             .await
             .ok()
             .flatten()
-            .map(|row| row.get(0));
+            .map(|row| row.get::<_, uuid::Uuid>(0).to_string());
 
         Ok((iteration, result_json, spec_id))
     }
@@ -480,11 +491,12 @@ impl PgDb {
     pub async fn is_spec_generated_workflow(&self, task_run_id: &str) -> Result<bool, String> {
         let conn = self.pool.get().await.map_err(|e| format!("PG pool: {e}"))?;
 
+        // Same text-vs-uuid cast as get_latest_verification_result above.
         let category: Option<String> = conn
             .query_opt(
                 r#"SELECT uw.category
                    FROM task_runs tr
-                   JOIN unified_workflows uw ON tr.workflow_id = uw.id
+                   JOIN unified_workflows uw ON tr.workflow_id = uw.id::text
                    WHERE tr.id = $1"#,
                 &[&task_run_id],
             )
@@ -1125,10 +1137,10 @@ impl PgDb {
                     (SELECT COUNT(*) FROM unified_workflows uw
                      INNER JOIN task_runs tr ON tr.workflow_name = uw.name
                      WHERE tr.id = $1
-                       AND (uw.setup_steps LIKE '%ui_bridge%' OR uw.setup_steps LIKE '%ui-bridge%'
-                            OR uw.verification_steps LIKE '%ui_bridge%' OR uw.verification_steps LIKE '%ui-bridge%'
-                            OR uw.agentic_steps LIKE '%ui_bridge%' OR uw.agentic_steps LIKE '%ui-bridge%'
-                            OR uw.completion_steps LIKE '%ui_bridge%' OR uw.completion_steps LIKE '%ui-bridge%'))
+                       AND (uw.setup_steps::text LIKE '%ui_bridge%' OR uw.setup_steps::text LIKE '%ui-bridge%'
+                            OR uw.verification_steps::text LIKE '%ui_bridge%' OR uw.verification_steps::text LIKE '%ui-bridge%'
+                            OR uw.agentic_steps::text LIKE '%ui_bridge%' OR uw.agentic_steps::text LIKE '%ui-bridge%'
+                            OR uw.completion_steps::text LIKE '%ui_bridge%' OR uw.completion_steps::text LIKE '%ui-bridge%'))
                 ) > 0"#,
                 &[&task_run_id],
             )
@@ -1628,6 +1640,11 @@ impl PgDb {
 
     /// Try to promote a workflow to the example library on success.
     pub async fn try_promote_on_success(&self, workflow_id: &str) -> Result<(), String> {
+        // A malformed id can't match any row anyway — skip promotion silently,
+        // consistent with this function's existing tolerance below.
+        let Ok(workflow_id_uuid) = parse_workflow_id(workflow_id) else {
+            return Ok(());
+        };
         let conn = self.pool.get().await.map_err(|e| format!("PG pool: {e}"))?;
 
         // Check if workflow has enough successful runs
@@ -1637,7 +1654,7 @@ impl PgDb {
                    WHERE workflow_name = (SELECT name FROM unified_workflows WHERE id = $1)
                      AND status IN ('complete', 'completed')
                      AND goal_achieved = true"#,
-                &[&workflow_id],
+                &[&workflow_id_uuid],
             )
             .await
             .map(|r| r.get(0))

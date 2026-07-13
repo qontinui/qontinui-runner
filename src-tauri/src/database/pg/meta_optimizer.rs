@@ -1435,7 +1435,7 @@ impl PgDb {
             .map(|r| {
                 serde_json::json!({
                     "id": r.get::<_, String>(0),
-                    "workflow_id": r.get::<_, String>(1),
+                    "workflow_id": r.get::<_, uuid::Uuid>(1).to_string(),
                     "task_run_id": r.get::<_, Option<String>>(2),
                     "feedback_type": r.get::<_, String>(3),
                     "edited_field": r.get::<_, Option<String>>(4),
@@ -3235,18 +3235,26 @@ impl PgDb {
     // Comparison bridge — most recent active workflow
     // ========================================================================
 
-    /// Get the most recent active (non-deleted) workflow ID.
+    /// Get the most recently updated workflow ID.
+    ///
+    /// `unified_workflows` has no soft-delete column (no `is_deleted` /
+    /// `deleted_at` — see `workflows.rs`'s `search_unified_workflows_for_examples`
+    /// and `dag_sync.rs`'s `export_workflow_as_yaml` for the same phantom-column
+    /// bug on this table), so there is nothing to filter by "active" here.
     pub async fn get_most_recent_workflow_id(&self) -> Result<Option<String>, String> {
         let conn = self
             .pool
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        let row = conn.query_opt(
-            "SELECT id FROM unified_workflows WHERE is_deleted = false ORDER BY updated_at DESC LIMIT 1",
-            &[],
-        ).await.map_err(|e| format!("PG get_most_recent_workflow_id: {}", e))?;
-        Ok(row.map(|r| r.get(0)))
+        let row = conn
+            .query_opt(
+                "SELECT id FROM unified_workflows ORDER BY updated_at DESC LIMIT 1",
+                &[],
+            )
+            .await
+            .map_err(|e| format!("PG get_most_recent_workflow_id: {}", e))?;
+        Ok(row.map(|r| r.get::<_, uuid::Uuid>(0).to_string()))
     }
 
     // ========================================================================

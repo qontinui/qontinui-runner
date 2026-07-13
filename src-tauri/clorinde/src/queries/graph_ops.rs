@@ -9,17 +9,16 @@ pub struct InsertWorkflowVersionParams<
     T5: crate::StringSql,
     T6: crate::StringSql,
     T7: crate::StringSql,
-    T8: crate::StringSql,
 > {
     pub id: T1,
-    pub workflow_id: T2,
+    pub workflow_id: uuid::Uuid,
     pub version_number: i32,
-    pub parent_version_id: T3,
-    pub generation_task_run_id: T4,
-    pub workflow_json: T5,
-    pub diff_summary: T6,
-    pub diff_json: T7,
-    pub trigger: T8,
+    pub parent_version_id: T2,
+    pub generation_task_run_id: T3,
+    pub workflow_json: T4,
+    pub diff_summary: T5,
+    pub diff_json: T6,
+    pub trigger: T7,
 }
 #[derive(Debug)]
 pub struct InsertStepFindingLinkParams<
@@ -52,19 +51,18 @@ pub struct InsertStepProvenanceParams<
     T6: crate::StringSql,
     T7: crate::StringSql,
     T8: crate::StringSql,
-    T9: crate::StringSql,
 > {
     pub id: T1,
-    pub workflow_id: T2,
-    pub workflow_version_id: T3,
-    pub step_name: T4,
+    pub workflow_id: uuid::Uuid,
+    pub workflow_version_id: T2,
+    pub step_name: T3,
     pub step_index: i32,
-    pub phase: T5,
-    pub generating_agent: T6,
+    pub phase: T4,
+    pub generating_agent: T5,
     pub generation_iteration: i32,
-    pub original_step_json: T7,
-    pub final_step_json: T8,
-    pub ui_bridge_event_ids: T9,
+    pub original_step_json: T6,
+    pub final_step_json: T7,
+    pub ui_bridge_event_ids: T8,
 }
 #[derive(Debug)]
 pub struct GetProvenanceByAgentParams<T1: crate::StringSql> {
@@ -78,15 +76,14 @@ pub struct InsertPipelineEventParams<
     T3: crate::StringSql,
     T4: crate::StringSql,
     T5: crate::StringSql,
-    T6: crate::StringSql,
 > {
     pub id: T1,
     pub task_run_id: T2,
-    pub workflow_id: T3,
-    pub event_type: T4,
-    pub phase: T5,
+    pub workflow_id: uuid::Uuid,
+    pub event_type: T3,
+    pub phase: T4,
     pub iteration: i32,
-    pub payload: T6,
+    pub payload: T5,
     pub duration_ms: i64,
     pub token_count: i64,
     pub validation_errors_before: i32,
@@ -100,15 +97,14 @@ pub struct InsertRuleInfluenceParams<
     T4: crate::StringSql,
     T5: crate::StringSql,
     T6: crate::StringSql,
-    T7: crate::StringSql,
 > {
     pub id: T1,
     pub rule_id: T2,
     pub task_run_id: T3,
-    pub workflow_id: T4,
-    pub influence_type: T5,
-    pub evidence: T6,
-    pub phase: T7,
+    pub workflow_id: uuid::Uuid,
+    pub influence_type: T4,
+    pub evidence: T5,
+    pub phase: T6,
 }
 #[derive(Debug)]
 pub struct UpsertCrossRunPatternParams<
@@ -141,7 +137,7 @@ pub struct DetectRecurringFindingsParams<T1: crate::StringSql> {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct WorkflowVersionRow {
     pub id: String,
-    pub workflow_id: String,
+    pub workflow_id: uuid::Uuid,
     pub version_number: i32,
     pub parent_version_id: Option<String>,
     pub generation_task_run_id: Option<String>,
@@ -153,7 +149,7 @@ pub struct WorkflowVersionRow {
 }
 pub struct WorkflowVersionRowBorrowed<'a> {
     pub id: &'a str,
-    pub workflow_id: &'a str,
+    pub workflow_id: uuid::Uuid,
     pub version_number: i32,
     pub parent_version_id: Option<&'a str>,
     pub generation_task_run_id: Option<&'a str>,
@@ -180,7 +176,7 @@ impl<'a> From<WorkflowVersionRowBorrowed<'a>> for WorkflowVersionRow {
     ) -> Self {
         Self {
             id: id.into(),
-            workflow_id: workflow_id.into(),
+            workflow_id,
             version_number,
             parent_version_id: parent_version_id.map(|v| v.into()),
             generation_task_run_id: generation_task_run_id.map(|v| v.into()),
@@ -241,7 +237,7 @@ impl<'a> From<StepFindingLinkRowBorrowed<'a>> for StepFindingLinkRow {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StepProvenanceRow {
     pub id: String,
-    pub workflow_id: String,
+    pub workflow_id: uuid::Uuid,
     pub workflow_version_id: Option<String>,
     pub step_name: String,
     pub step_index: i32,
@@ -255,7 +251,7 @@ pub struct StepProvenanceRow {
 }
 pub struct StepProvenanceRowBorrowed<'a> {
     pub id: &'a str,
-    pub workflow_id: &'a str,
+    pub workflow_id: uuid::Uuid,
     pub workflow_version_id: Option<&'a str>,
     pub step_name: &'a str,
     pub step_index: i32,
@@ -286,7 +282,7 @@ impl<'a> From<StepProvenanceRowBorrowed<'a>> for StepProvenanceRow {
     ) -> Self {
         Self {
             id: id.into(),
-            workflow_id: workflow_id.into(),
+            workflow_id,
             workflow_version_id: workflow_version_id.map(|v| v.into()),
             step_name: step_name.into(),
             step_index,
@@ -304,7 +300,7 @@ impl<'a> From<StepProvenanceRowBorrowed<'a>> for StepProvenanceRow {
 pub struct PipelineEventRow {
     pub id: String,
     pub task_run_id: String,
-    pub workflow_id: String,
+    pub workflow_id: uuid::Uuid,
     pub event_type: String,
     pub phase: String,
     pub iteration: i32,
@@ -318,7 +314,7 @@ pub struct PipelineEventRow {
 pub struct PipelineEventRowBorrowed<'a> {
     pub id: &'a str,
     pub task_run_id: &'a str,
-    pub workflow_id: &'a str,
+    pub workflow_id: uuid::Uuid,
     pub event_type: &'a str,
     pub phase: &'a str,
     pub iteration: i32,
@@ -349,7 +345,7 @@ impl<'a> From<PipelineEventRowBorrowed<'a>> for PipelineEventRow {
         Self {
             id: id.into(),
             task_run_id: task_run_id.into(),
-            workflow_id: workflow_id.into(),
+            workflow_id,
             event_type: event_type.into(),
             phase: phase.into(),
             iteration,
@@ -405,7 +401,7 @@ pub struct RuleInfluenceRow {
     pub id: String,
     pub rule_id: String,
     pub task_run_id: String,
-    pub workflow_id: String,
+    pub workflow_id: uuid::Uuid,
     pub influence_type: String,
     pub evidence: Option<String>,
     pub phase: String,
@@ -415,7 +411,7 @@ pub struct RuleInfluenceRowBorrowed<'a> {
     pub id: &'a str,
     pub rule_id: &'a str,
     pub task_run_id: &'a str,
-    pub workflow_id: &'a str,
+    pub workflow_id: uuid::Uuid,
     pub influence_type: &'a str,
     pub evidence: Option<&'a str>,
     pub phase: &'a str,
@@ -438,7 +434,7 @@ impl<'a> From<RuleInfluenceRowBorrowed<'a>> for RuleInfluenceRow {
             id: id.into(),
             rule_id: rule_id.into(),
             task_run_id: task_run_id.into(),
-            workflow_id: workflow_id.into(),
+            workflow_id,
             influence_type: influence_type.into(),
             evidence: evidence.map(|v| v.into()),
             phase: phase.into(),
@@ -1213,19 +1209,18 @@ impl InsertWorkflowVersionStmt {
         T5: crate::StringSql,
         T6: crate::StringSql,
         T7: crate::StringSql,
-        T8: crate::StringSql,
     >(
         &'s self,
         client: &'c C,
         id: &'a T1,
-        workflow_id: &'a T2,
+        workflow_id: &'a uuid::Uuid,
         version_number: &'a i32,
-        parent_version_id: &'a T3,
-        generation_task_run_id: &'a T4,
-        workflow_json: &'a T5,
-        diff_summary: &'a T6,
-        diff_json: &'a T7,
-        trigger: &'a T8,
+        parent_version_id: &'a T2,
+        generation_task_run_id: &'a T3,
+        workflow_json: &'a T4,
+        diff_summary: &'a T5,
+        diff_json: &'a T6,
+        trigger: &'a T7,
     ) -> Result<u64, tokio_postgres::Error> {
         client
             .execute(
@@ -1255,13 +1250,12 @@ impl<
     T5: crate::StringSql,
     T6: crate::StringSql,
     T7: crate::StringSql,
-    T8: crate::StringSql,
 >
     crate::client::async_::Params<
         'a,
         'a,
         'a,
-        InsertWorkflowVersionParams<T1, T2, T3, T4, T5, T6, T7, T8>,
+        InsertWorkflowVersionParams<T1, T2, T3, T4, T5, T6, T7>,
         std::pin::Pin<
             Box<dyn futures::Future<Output = Result<u64, tokio_postgres::Error>> + Send + 'a>,
         >,
@@ -1271,7 +1265,7 @@ impl<
     fn params(
         &'a self,
         client: &'a C,
-        params: &'a InsertWorkflowVersionParams<T1, T2, T3, T4, T5, T6, T7, T8>,
+        params: &'a InsertWorkflowVersionParams<T1, T2, T3, T4, T5, T6, T7>,
     ) -> std::pin::Pin<
         Box<dyn futures::Future<Output = Result<u64, tokio_postgres::Error>> + Send + 'a>,
     > {
@@ -1304,10 +1298,10 @@ impl GetWorkflowVersionsStmt {
         self.1 = Some(client.prepare(self.0).await?);
         Ok(self)
     }
-    pub fn bind<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>(
+    pub fn bind<'c, 'a, 's, C: GenericClient>(
         &'s self,
         client: &'c C,
-        workflow_id: &'a T1,
+        workflow_id: &'a uuid::Uuid,
     ) -> WorkflowVersionRowQuery<'c, 'a, 's, C, WorkflowVersionRow, 1> {
         WorkflowVersionRowQuery {
             client,
@@ -1349,10 +1343,10 @@ impl GetLatestWorkflowVersionStmt {
         self.1 = Some(client.prepare(self.0).await?);
         Ok(self)
     }
-    pub fn bind<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>(
+    pub fn bind<'c, 'a, 's, C: GenericClient>(
         &'s self,
         client: &'c C,
-        workflow_id: &'a T1,
+        workflow_id: &'a uuid::Uuid,
     ) -> WorkflowVersionRowQuery<'c, 'a, 's, C, WorkflowVersionRow, 1> {
         WorkflowVersionRowQuery {
             client,
@@ -1603,21 +1597,20 @@ impl InsertStepProvenanceStmt {
         T6: crate::StringSql,
         T7: crate::StringSql,
         T8: crate::StringSql,
-        T9: crate::StringSql,
     >(
         &'s self,
         client: &'c C,
         id: &'a T1,
-        workflow_id: &'a T2,
-        workflow_version_id: &'a T3,
-        step_name: &'a T4,
+        workflow_id: &'a uuid::Uuid,
+        workflow_version_id: &'a T2,
+        step_name: &'a T3,
         step_index: &'a i32,
-        phase: &'a T5,
-        generating_agent: &'a T6,
+        phase: &'a T4,
+        generating_agent: &'a T5,
         generation_iteration: &'a i32,
-        original_step_json: &'a T7,
-        final_step_json: &'a T8,
-        ui_bridge_event_ids: &'a T9,
+        original_step_json: &'a T6,
+        final_step_json: &'a T7,
+        ui_bridge_event_ids: &'a T8,
     ) -> Result<u64, tokio_postgres::Error> {
         client
             .execute(
@@ -1650,13 +1643,12 @@ impl<
     T6: crate::StringSql,
     T7: crate::StringSql,
     T8: crate::StringSql,
-    T9: crate::StringSql,
 >
     crate::client::async_::Params<
         'a,
         'a,
         'a,
-        InsertStepProvenanceParams<T1, T2, T3, T4, T5, T6, T7, T8, T9>,
+        InsertStepProvenanceParams<T1, T2, T3, T4, T5, T6, T7, T8>,
         std::pin::Pin<
             Box<dyn futures::Future<Output = Result<u64, tokio_postgres::Error>> + Send + 'a>,
         >,
@@ -1666,7 +1658,7 @@ impl<
     fn params(
         &'a self,
         client: &'a C,
-        params: &'a InsertStepProvenanceParams<T1, T2, T3, T4, T5, T6, T7, T8, T9>,
+        params: &'a InsertStepProvenanceParams<T1, T2, T3, T4, T5, T6, T7, T8>,
     ) -> std::pin::Pin<
         Box<dyn futures::Future<Output = Result<u64, tokio_postgres::Error>> + Send + 'a>,
     > {
@@ -1701,10 +1693,10 @@ impl GetProvenanceForWorkflowStmt {
         self.1 = Some(client.prepare(self.0).await?);
         Ok(self)
     }
-    pub fn bind<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>(
+    pub fn bind<'c, 'a, 's, C: GenericClient>(
         &'s self,
         client: &'c C,
-        workflow_id: &'a T1,
+        workflow_id: &'a uuid::Uuid,
     ) -> StepProvenanceRowQuery<'c, 'a, 's, C, StepProvenanceRow, 1> {
         StepProvenanceRowQuery {
             client,
@@ -1824,17 +1816,16 @@ impl InsertPipelineEventStmt {
         T3: crate::StringSql,
         T4: crate::StringSql,
         T5: crate::StringSql,
-        T6: crate::StringSql,
     >(
         &'s self,
         client: &'c C,
         id: &'a T1,
         task_run_id: &'a T2,
-        workflow_id: &'a T3,
-        event_type: &'a T4,
-        phase: &'a T5,
+        workflow_id: &'a uuid::Uuid,
+        event_type: &'a T3,
+        phase: &'a T4,
         iteration: &'a i32,
-        payload: &'a T6,
+        payload: &'a T5,
         duration_ms: &'a i64,
         token_count: &'a i64,
         validation_errors_before: &'a i32,
@@ -1868,13 +1859,12 @@ impl<
     T3: crate::StringSql,
     T4: crate::StringSql,
     T5: crate::StringSql,
-    T6: crate::StringSql,
 >
     crate::client::async_::Params<
         'a,
         'a,
         'a,
-        InsertPipelineEventParams<T1, T2, T3, T4, T5, T6>,
+        InsertPipelineEventParams<T1, T2, T3, T4, T5>,
         std::pin::Pin<
             Box<dyn futures::Future<Output = Result<u64, tokio_postgres::Error>> + Send + 'a>,
         >,
@@ -1884,7 +1874,7 @@ impl<
     fn params(
         &'a self,
         client: &'a C,
-        params: &'a InsertPipelineEventParams<T1, T2, T3, T4, T5, T6>,
+        params: &'a InsertPipelineEventParams<T1, T2, T3, T4, T5>,
     ) -> std::pin::Pin<
         Box<dyn futures::Future<Output = Result<u64, tokio_postgres::Error>> + Send + 'a>,
     > {
@@ -1966,10 +1956,10 @@ impl GetPhaseStatsStmt {
         self.1 = Some(client.prepare(self.0).await?);
         Ok(self)
     }
-    pub fn bind<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>(
+    pub fn bind<'c, 'a, 's, C: GenericClient>(
         &'s self,
         client: &'c C,
-        workflow_id: &'a T1,
+        workflow_id: &'a uuid::Uuid,
     ) -> PhaseStatsRowQuery<'c, 'a, 's, C, PhaseStatsRow, 1> {
         PhaseStatsRowQuery {
             client,
@@ -2017,17 +2007,16 @@ impl InsertRuleInfluenceStmt {
         T4: crate::StringSql,
         T5: crate::StringSql,
         T6: crate::StringSql,
-        T7: crate::StringSql,
     >(
         &'s self,
         client: &'c C,
         id: &'a T1,
         rule_id: &'a T2,
         task_run_id: &'a T3,
-        workflow_id: &'a T4,
-        influence_type: &'a T5,
-        evidence: &'a T6,
-        phase: &'a T7,
+        workflow_id: &'a uuid::Uuid,
+        influence_type: &'a T4,
+        evidence: &'a T5,
+        phase: &'a T6,
     ) -> Result<u64, tokio_postgres::Error> {
         client
             .execute(
@@ -2054,13 +2043,12 @@ impl<
     T4: crate::StringSql,
     T5: crate::StringSql,
     T6: crate::StringSql,
-    T7: crate::StringSql,
 >
     crate::client::async_::Params<
         'a,
         'a,
         'a,
-        InsertRuleInfluenceParams<T1, T2, T3, T4, T5, T6, T7>,
+        InsertRuleInfluenceParams<T1, T2, T3, T4, T5, T6>,
         std::pin::Pin<
             Box<dyn futures::Future<Output = Result<u64, tokio_postgres::Error>> + Send + 'a>,
         >,
@@ -2070,7 +2058,7 @@ impl<
     fn params(
         &'a self,
         client: &'a C,
-        params: &'a InsertRuleInfluenceParams<T1, T2, T3, T4, T5, T6, T7>,
+        params: &'a InsertRuleInfluenceParams<T1, T2, T3, T4, T5, T6>,
     ) -> std::pin::Pin<
         Box<dyn futures::Future<Output = Result<u64, tokio_postgres::Error>> + Send + 'a>,
     > {

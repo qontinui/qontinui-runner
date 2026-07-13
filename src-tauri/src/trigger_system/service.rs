@@ -537,17 +537,45 @@ impl TriggerService {
             //
             // Non-supervision triggers MUST carry a workflow_id — the
             // SupervisionProposal branch above is the only legitimate
-            // None case and it returns early. Defensive correctness: if
-            // a non-supervision row somehow has workflow_id=NULL (data
-            // corruption, schema migration regression, or future
-            // ActionType variant), log+skip instead of unwrapping.
+            // None case. Defensive correctness: if a non-supervision row
+            // somehow has workflow_id=NULL (an empty-string workflow_id
+            // saved before the workflow-id uuid migration normalizes to
+            // NULL at the PG layer — see parse_optional_workflow_id — or
+            // data corruption, or a future ActionType variant), record it
+            // as a normal failed execution attempt rather than silently
+            // returning: this used to be a live "workflow not found"
+            // failure visible in trigger history, and it must stay visible
+            // and retryable, not vanish into only a backend log line.
             let workflow_id = match trigger.workflow_id.as_deref() {
                 Some(wf) => wf,
                 None => {
-                    error!(
-                        "Trigger '{}' (id={}) has no workflow_id and was not routed via supervision; skipping execution (this is a bug)",
+                    let msg = format!(
+                        "Trigger '{}' (id={}) has no workflow_id and was not routed via \
+                         supervision — nothing to execute",
                         trigger.name, trigger.id
                     );
+                    error!("{}", msg);
+                    self.evaluator.record_execution_start(&trigger.id).await;
+                    let history = TriggerHistoryEntry {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        trigger_id: trigger.id.clone(),
+                        event_type: event.event_type.clone(),
+                        event_data: event.event_data.clone(),
+                        action: "error".to_string(),
+                        task_run_id: None,
+                        error_message: Some(msg),
+                        triggered_at: chrono::Utc::now(),
+                    };
+                    if let Err(e) = self
+                        .deps
+                        .app_state
+                        .pg_db
+                        .record_trigger_history(&history)
+                        .await
+                    {
+                        error!("Failed to record trigger history: {}", e);
+                    }
+                    self.evaluator.record_execution_end(&trigger.id).await;
                     return;
                 }
             };

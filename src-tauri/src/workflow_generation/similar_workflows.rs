@@ -179,14 +179,14 @@ pub async fn find_similar_workflows_pg(
         .map(|r| {
             let rank: f32 = r.get::<_, f32>(8);
             SimilarWorkflow {
-                id: r.get(0),
+                id: r.get::<_, uuid::Uuid>(0).to_string(),
                 name: r.get(1),
                 description: r.get(2),
                 category: r.get(3),
-                setup_step_count: count_json_array(r.get::<_, String>(4).as_str()),
-                verification_step_count: count_json_array(r.get::<_, String>(5).as_str()),
-                agentic_step_count: count_json_array(r.get::<_, String>(6).as_str()),
-                completion_step_count: count_json_array(r.get::<_, String>(7).as_str()),
+                setup_step_count: count_json_array(&r.get::<_, serde_json::Value>(4)),
+                verification_step_count: count_json_array(&r.get::<_, serde_json::Value>(5)),
+                agentic_step_count: count_json_array(&r.get::<_, serde_json::Value>(6)),
+                completion_step_count: count_json_array(&r.get::<_, serde_json::Value>(7)),
                 similarity: rank.min(1.0),
                 full_json: None,
             }
@@ -230,26 +230,31 @@ pub async fn find_gt_reference_workflows_pg(
         let similarity = keyword_overlap_score(&search_terms, &name, &desc);
 
         // Build full JSON for GT workflows
+        let id_str = r.get::<_, uuid::Uuid>(0).to_string();
+        let setup_steps: serde_json::Value = r.get(4);
+        let verification_steps: serde_json::Value = r.get(5);
+        let agentic_steps: serde_json::Value = r.get(6);
+        let completion_steps: serde_json::Value = r.get(7);
         let full_json = serde_json::json!({
-            "id": r.get::<_, String>(0),
+            "id": &id_str,
             "name": &name,
             "description": &desc,
             "category": r.get::<_, String>(3),
-            "setup_steps": serde_json::from_str::<serde_json::Value>(r.get::<_, String>(4).as_str()).unwrap_or_default(),
-            "verification_steps": serde_json::from_str::<serde_json::Value>(r.get::<_, String>(5).as_str()).unwrap_or_default(),
-            "agentic_steps": serde_json::from_str::<serde_json::Value>(r.get::<_, String>(6).as_str()).unwrap_or_default(),
-            "completion_steps": serde_json::from_str::<serde_json::Value>(r.get::<_, String>(7).as_str()).unwrap_or_default(),
+            "setup_steps": &setup_steps,
+            "verification_steps": &verification_steps,
+            "agentic_steps": &agentic_steps,
+            "completion_steps": &completion_steps,
         });
 
         SimilarWorkflow {
-            id: r.get(0),
+            id: id_str,
             name,
             description: desc,
             category: r.get(3),
-            setup_step_count: count_json_array(r.get::<_, String>(4).as_str()),
-            verification_step_count: count_json_array(r.get::<_, String>(5).as_str()),
-            agentic_step_count: count_json_array(r.get::<_, String>(6).as_str()),
-            completion_step_count: count_json_array(r.get::<_, String>(7).as_str()),
+            setup_step_count: count_json_array(&setup_steps),
+            verification_step_count: count_json_array(&verification_steps),
+            agentic_step_count: count_json_array(&agentic_steps),
+            completion_step_count: count_json_array(&completion_steps),
             similarity,
             full_json: Some(serde_json::to_string_pretty(&full_json).unwrap_or_default()),
         }
@@ -297,8 +302,6 @@ fn keyword_overlap_score(terms: &[String], name: &str, description: &str) -> f32
 }
 
 /// Count elements in a JSON array string.
-fn count_json_array(json_str: &str) -> usize {
-    serde_json::from_str::<Vec<serde_json::Value>>(json_str)
-        .map(|v| v.len())
-        .unwrap_or(0)
+fn count_json_array(v: &serde_json::Value) -> usize {
+    v.as_array().map(|a| a.len()).unwrap_or(0)
 }

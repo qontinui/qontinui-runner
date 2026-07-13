@@ -3,6 +3,7 @@
 //! Scans `qontinui-claude-config/.claude/commands/*.md` for command files,
 //! parses each into a workflow, and syncs with the database (create/update/delete).
 
+use crate::database::pg::parse_workflow_id;
 use crate::unified_workflows::CreateUnifiedWorkflowRequest;
 use regex::Regex;
 use serde::Serialize;
@@ -290,6 +291,15 @@ pub async fn sync_slash_commands(
     // Create or update workflows for commands on disk
     for (rel_path, parsed) in &disk_commands {
         if let Some((existing_id, _)) = existing_map.get(rel_path) {
+            let existing_id_uuid = match parse_workflow_id(existing_id) {
+                Ok(u) => u,
+                Err(e) => {
+                    result
+                        .errors
+                        .push(format!("Update {}: {}", parsed.command_name, e));
+                    continue;
+                }
+            };
             // Check if content hash changed — if so, update
             let conn = pg
                 .pool()
@@ -299,7 +309,7 @@ pub async fn sync_slash_commands(
             let current_hash: Option<String> = conn
                 .query_opt(
                     "SELECT source_content_hash FROM unified_workflows WHERE id = $1",
-                    &[existing_id],
+                    &[&existing_id_uuid],
                 )
                 .await
                 .ok()
@@ -309,12 +319,15 @@ pub async fn sync_slash_commands(
             if current_hash.as_deref() == Some(&parsed.content_hash) {
                 result.unchanged += 1;
             } else {
-                // Update the workflow content via direct SQL (simpler than full UpdateRequest)
+                // Update the workflow content via direct SQL (simpler than full UpdateRequest).
+                // agentic_steps/tags are jsonb (migration
+                // d7a3f1c8e024_realign_unified_workflows_to_model) — bind
+                // the parsed Value, not a stringified copy.
                 let req = build_workflow_request(parsed);
-                let agentic_json =
-                    serde_json::to_string(&req.agentic_steps).unwrap_or_else(|_| "[]".to_string());
+                let agentic_json = serde_json::to_value(&req.agentic_steps)
+                    .unwrap_or_else(|_| serde_json::json!([]));
                 let tags_json =
-                    serde_json::to_string(&req.tags).unwrap_or_else(|_| "[]".to_string());
+                    serde_json::to_value(&req.tags).unwrap_or_else(|_| serde_json::json!([]));
                 match conn
                     .execute(
                         r#"UPDATE unified_workflows
@@ -322,7 +335,7 @@ pub async fn sync_slash_commands(
                            source_file_path = $6, source_content_hash = $7, updated_at = NOW()
                        WHERE id = $1"#,
                         &[
-                            existing_id,
+                            &existing_id_uuid,
                             &parsed.title,
                             &parsed.description,
                             &agentic_json,
@@ -348,10 +361,12 @@ pub async fn sync_slash_commands(
             match pg.create_unified_workflow(&req).await {
                 Ok(wf) => {
                     // Set source tracking fields
-                    if let Ok(conn) = pg.pool().get().await {
+                    if let (Ok(conn), Ok(wf_id_uuid)) =
+                        (pg.pool().get().await, parse_workflow_id(&wf.id))
+                    {
                         let _ = conn.execute(
                             "UPDATE unified_workflows SET source_file_path = $2, source_content_hash = $3 WHERE id = $1",
-                            &[&wf.id, &parsed.relative_path, &parsed.content_hash],
+                            &[&wf_id_uuid, &parsed.relative_path, &parsed.content_hash],
                         ).await;
                     }
                     result.created += 1;

@@ -2,7 +2,7 @@
 //!
 //! Provides save/query for the `workflow_generation_feedback` table using raw SQL.
 
-use super::PgDb;
+use super::{parse_workflow_id, PgDb};
 use tracing::info;
 
 impl PgDb {
@@ -33,6 +33,7 @@ impl PgDb {
 
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
+        let workflow_id_uuid = parse_workflow_id(workflow_id)?;
 
         conn.execute(
             r#"INSERT INTO workflow_generation_feedback
@@ -41,7 +42,7 @@ impl PgDb {
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)"#,
             &[
                 &id as &(dyn tokio_postgres::types::ToSql + Sync),
-                &workflow_id,
+                &workflow_id_uuid,
                 &task_run_id as &(dyn tokio_postgres::types::ToSql + Sync),
                 &feedback_type,
                 &edited_field as &(dyn tokio_postgres::types::ToSql + Sync),
@@ -70,6 +71,12 @@ impl PgDb {
         &self,
         workflow_id: &str,
     ) -> Result<Vec<serde_json::Value>, String> {
+        // A malformed id just matches nothing — consistent with every
+        // sibling read function (get_workflow_versions, get_unified_workflow,
+        // etc.) rather than erroring on it.
+        let Ok(workflow_id_uuid) = parse_workflow_id(workflow_id) else {
+            return Ok(vec![]);
+        };
         let conn = self
             .pool
             .get()
@@ -84,7 +91,7 @@ impl PgDb {
                    FROM workflow_generation_feedback
                    WHERE workflow_id = $1
                    ORDER BY created_at DESC"#,
-                &[&workflow_id],
+                &[&workflow_id_uuid],
             )
             .await
             .map_err(|e| format!("PG get_feedback_for_workflow: {}", e))?;
@@ -94,7 +101,7 @@ impl PgDb {
             .map(|r| {
                 serde_json::json!({
                     "id": r.get::<_, String>(0),
-                    "workflow_id": r.get::<_, String>(1),
+                    "workflow_id": r.get::<_, uuid::Uuid>(1).to_string(),
                     "task_run_id": r.get::<_, Option<String>>(2),
                     "feedback_type": r.get::<_, String>(3),
                     "edited_field": r.get::<_, Option<String>>(4),
@@ -186,7 +193,7 @@ impl PgDb {
             .map(|r| {
                 serde_json::json!({
                     "id": r.get::<_, String>(0),
-                    "workflow_id": r.get::<_, String>(1),
+                    "workflow_id": r.get::<_, uuid::Uuid>(1).to_string(),
                     "feedback_type": r.get::<_, String>(2),
                     "edited_field": r.get::<_, Option<String>>(3),
                     "old_value": r.get::<_, Option<String>>(4),

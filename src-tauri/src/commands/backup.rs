@@ -6,7 +6,7 @@
 //! - Getting a summary of what will be exported
 //! - Preview of what will be imported
 
-use crate::database::pg::PgDb;
+use crate::database::pg::{parse_workflow_id, PgDb};
 use crate::database::ImportResult;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -517,6 +517,24 @@ pub async fn import_all_data_impl(
                 skipped += 1;
                 continue;
             }
+            // `unified_workflows.id` is `uuid` (migration
+            // `d7a3f1c8e024_realign_unified_workflows_to_model`) — a backup
+            // exported before that migration can carry a non-uuid id. No
+            // silent compatibility shim for this (project convention: prefer
+            // a clear break over permanent cruft) — skip the item with an
+            // actionable message; the rest of the batch still restores.
+            let id_uuid = match parse_workflow_id(id) {
+                Ok(u) => u,
+                Err(_) => {
+                    errors.push(format!(
+                        "Workflow {} ({}): pre-migration id, not restorable directly — \
+                         re-export from a current runner",
+                        id, name
+                    ));
+                    skipped += 1;
+                    continue;
+                }
+            };
 
             let desc = item
                 .get("description")
@@ -526,41 +544,62 @@ pub async fn import_all_data_impl(
                 .get("category")
                 .and_then(|v| v.as_str())
                 .unwrap_or("general");
+            // These 5 columns are `jsonb` (migration
+            // `d7a3f1c8e024_realign_unified_workflows_to_model`): bind the
+            // parsed Value directly, not a stringified copy — tokio-postgres
+            // rejects a String bound against a jsonb parameter.
             let tags = item
                 .get("tags")
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "[]".to_string());
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([]));
             let setup = item
                 .get("setup_steps")
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "[]".to_string());
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([]));
             let verif = item
                 .get("verification_steps")
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "[]".to_string());
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([]));
             let agentic = item
                 .get("agentic_steps")
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "[]".to_string());
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([]));
             let completion = item
                 .get("completion_steps")
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "[]".to_string());
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([]));
             let max_iters = item
                 .get("max_iterations")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(10);
+            // stages/model_overrides/constraint_overrides are jsonb with NO
+            // column DEFAULT (unlike tags/setup_steps/etc above) — omitting
+            // them here would leave a restored workflow with NULL where a
+            // freshly-created one gets '[]'/'{}'.
+            let stages = item
+                .get("stages")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([]));
+            let model_ov = item
+                .get("model_overrides")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let constraint_ov = item
+                .get("constraint_overrides")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
 
             let sql = if is_overwrite {
-                r#"INSERT INTO unified_workflows (id, name, description, category, tags, setup_steps, verification_steps, agentic_steps, completion_steps, max_iterations)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                r#"INSERT INTO unified_workflows (id, name, description, category, tags, setup_steps, verification_steps, agentic_steps, completion_steps, max_iterations, stages, model_overrides, constraint_overrides)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                    ON CONFLICT (id) DO UPDATE SET
                      name = $2, description = $3, category = $4, tags = $5,
                      setup_steps = $6, verification_steps = $7, agentic_steps = $8,
-                     completion_steps = $9, max_iterations = $10, updated_at = NOW()"#
+                     completion_steps = $9, max_iterations = $10, stages = $11,
+                     model_overrides = $12, constraint_overrides = $13, updated_at = NOW()"#
             } else {
-                r#"INSERT INTO unified_workflows (id, name, description, category, tags, setup_steps, verification_steps, agentic_steps, completion_steps, max_iterations)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                r#"INSERT INTO unified_workflows (id, name, description, category, tags, setup_steps, verification_steps, agentic_steps, completion_steps, max_iterations, stages, model_overrides, constraint_overrides)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                    ON CONFLICT (id) DO NOTHING"#
             };
 
@@ -569,7 +608,7 @@ pub async fn import_all_data_impl(
                     .execute(
                         sql,
                         &[
-                            &id,
+                            &id_uuid,
                             &name,
                             &desc,
                             &category,
@@ -579,6 +618,9 @@ pub async fn import_all_data_impl(
                             &agentic,
                             &completion,
                             &max_iters,
+                            &stages,
+                            &model_ov,
+                            &constraint_ov,
                         ],
                     )
                     .await
