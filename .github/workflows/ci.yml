@@ -529,7 +529,13 @@ jobs:
         # manifests/plists). These are the ONLY two quick-xml advisories in
         # the DB as of 2026-07-02. Revisit when tauri/gtk bump to >= 0.41.
         run: |
-          cargo install cargo-audit
+          # --locked: install cargo-audit against its OWN bundled Cargo.lock.
+          # Without it, cargo resolves cargo-audit's transitive deps to latest
+          # compatible, which pulled in kstring 2.0.3 (MSRV rustc 1.96.0) on
+          # 2026-07-14 — that fails to compile on CI's pinned 1.95.0 toolchain
+          # and reds this job on every PR (an upstream ecosystem drift, not a
+          # runner vulnerability). --locked pins to cargo-audit's tested deps.
+          cargo install cargo-audit --locked
           cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
 
       - name: Setup pnpm
