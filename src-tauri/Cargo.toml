@@ -1,6 +1,6 @@
 [package]
 name = "qontinui-runner"
-version = "1.0.3"
+version = "1.0.5"
 description = "Desktop app for AI-assisted development: orchestrated AI coding sessions with visual feedback, self-verification, and real-time UI inspection"
 authors = ["Qontinui <contact@qontinui.org>"]
 edition = "2021"
