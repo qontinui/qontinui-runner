@@ -146,6 +146,12 @@ impl Default for LoggingConfig {
 pub struct LoggingInitResult {
     /// OTel guard — keeps the TracerProvider alive; drops on shutdown.
     pub _otel_guard: crate::otel::OtelGuard,
+    /// Non-blocking file appender guard — keeps the background writer thread
+    /// alive. If this drops, the worker shuts down and every subsequent log
+    /// line is silently discarded (empty `qontinui-runner.log`). Must outlive
+    /// the process, so it rides in the returned struct alongside `_otel_guard`.
+    /// `None` when file logging is disabled.
+    pub _file_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
 }
 
 pub fn init_logging(config: LoggingConfig) -> anyhow::Result<LoggingInitResult> {
@@ -181,9 +187,14 @@ pub fn init_logging(config: LoggingConfig) -> anyhow::Result<LoggingInitResult> 
     // OTel layer is added first (directly on Registry) so its type matches.
     let registry = Registry::default().with(otel_layer).with(env_filter);
 
+    // Hoisted so the WorkerGuard survives past this function and rides home in
+    // `LoggingInitResult`; dropping it here would kill the writer thread.
+    let mut file_guard = None;
+
     if config.log_to_file {
         let file_appender = rolling::daily(config.log_dir, "qontinui-runner.log");
-        let (non_blocking_file, _guard) = non_blocking(file_appender);
+        let (non_blocking_file, guard) = non_blocking(file_appender);
+        file_guard = Some(guard);
 
         let file_layer = fmt::layer()
             .with_writer(non_blocking_file)
@@ -221,6 +232,7 @@ pub fn init_logging(config: LoggingConfig) -> anyhow::Result<LoggingInitResult> 
 
     Ok(LoggingInitResult {
         _otel_guard: otel_guard,
+        _file_guard: file_guard,
     })
 }
 
