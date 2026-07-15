@@ -90,7 +90,12 @@ icons/source/
 # Development/diagnostic files
 python-bridge/diagnostics/
 temp_dev/
-.qontinui/
+# .qontinui runtime-state dirs stay ignored, but the CI manifest is
+# REPO CONTENT (runner-as-CI-node lane reads .qontinui/ci.toml from the
+# checked-out tree) — `dir/*` + negation, because a fully-ignored dir
+# (`.qontinui/`) can never have children re-included.
+.qontinui/*
+!.qontinui/ci.toml
 
 # Ignore CLAUDE notes file
 CLAUDE.md

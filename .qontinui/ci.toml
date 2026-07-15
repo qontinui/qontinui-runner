@@ -1,0 +1,64 @@
+# CI manifest for the runner-as-CI-node lane
+# (plan qontinui-dev-notes/plans/2026-07-15-runner-as-ci-node-migration.md §4.1).
+#
+# PARITY IS A REVIEW-TIME INVARIANT: these steps mirror the gate commands of
+# .github/workflows/ci.yml's `test` job. When ci.yml's gates change, update
+# this file in the same PR. Step order matches ci.yml: the frontend build
+# must precede every cargo step (tauri::generate_context! reads ../dist at
+# compile time), and lint/typecheck fail fast before paying for the build.
+#
+# Commands are argv arrays (never shell strings); env is limited to the
+# runner's allowlist; cargo runs single-job (this workspace OOMs otherwise)
+# into a persistent per-repo CI target dir the executor supplies.
+
+version = 1
+
+[limits]
+# The runner workspace needs CARGO_BUILD_JOBS=1 (+ large pagefile) to
+# compile at all — memory reference_runner_workspace_ci_compile_needs_swap_jobs1.
+cargo_build_jobs = 1
+
+[[steps]]
+name = "frontend-install"
+command = ["pnpm", "install", "--frozen-lockfile"]
+
+[[steps]]
+name = "frontend-lint"
+command = ["pnpm", "run", "lint"]
+
+[[steps]]
+name = "frontend-typecheck"
+command = ["pnpm", "run", "typecheck"]
+
+[[steps]]
+name = "frontend-test"
+command = ["pnpm", "test"]
+
+[[steps]]
+name = "frontend-build"
+command = ["pnpm", "run", "build"]
+
+[[steps]]
+name = "rust-fmt"
+command = ["cargo", "fmt", "--", "--check"]
+working_dir = "src-tauri"
+
+[[steps]]
+name = "rust-clippy"
+# PLAIN clippy, exactly like ci.yml: lint levels come solely from
+# src-tauri/Cargo.toml [lints.clippy] (T1 correctness/suspicious = deny,
+# T3 style/perf = warn). Adding `-D warnings` here would fail every
+# dispatch on the ~200 pre-existing warn-tier lints CI deliberately
+# tolerates — breaking the verdict-parity this manifest exists for.
+command = ["cargo", "clippy"]
+working_dir = "src-tauri"
+timeout_secs = 7200
+
+[[steps]]
+name = "rust-test"
+command = ["cargo", "test"]
+working_dir = "src-tauri"
+# Skip keychain-backed auth paths in CI (ci.yml parity — keychain prompts
+# hang headless environments).
+env = { QONTINUI_DISABLE_KEYCHAIN = "1" }
+timeout_secs = 7200

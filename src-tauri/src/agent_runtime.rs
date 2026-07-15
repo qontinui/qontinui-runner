@@ -3438,7 +3438,7 @@ fn provision_agent_definitions_from_root(root: &Path, worktree_cwd: &str) -> any
     Ok(())
 }
 
-fn qontinui_root_dir() -> Option<PathBuf> {
+pub(crate) fn qontinui_root_dir() -> Option<PathBuf> {
     if let Ok(s) = std::env::var("QONTINUI_ROOT") {
         let p = PathBuf::from(s);
         if p.is_dir() {
@@ -3460,7 +3460,7 @@ fn qontinui_root_dir() -> Option<PathBuf> {
 /// The local primary-checkout directory NAME for a coord repo slug. Coord uses
 /// `owner/name` slugs (e.g. `qontinui/qontinui-runner`); the runner's primary
 /// checkouts live at `<QONTINUI_ROOT>/<name>`. A bare name passes through.
-fn local_repo_name(repo: &str) -> &str {
+pub(crate) fn local_repo_name(repo: &str) -> &str {
     repo.rsplit('/')
         .next()
         .filter(|s| !s.is_empty())
