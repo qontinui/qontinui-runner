@@ -1417,6 +1417,59 @@ mod tier_tests {
     }
 }
 
+#[cfg(test)]
+mod ci_node_tests {
+    use super::*;
+
+    /// Contract: a fresh install and an empty settings.json both land on the
+    /// fully-inert CI-node default — disabled, 1 slot, EMPTY allowlist
+    /// (nothing runnable), 20 GiB disk floor.
+    #[test]
+    fn ci_node_defaults_are_inert() {
+        for s in [
+            Settings::default(),
+            serde_json::from_str::<Settings>("{}").expect("empty object must deserialize"),
+        ] {
+            assert!(!s.ci_node.enabled);
+            assert_eq!(s.ci_node.max_concurrent_builds, 1);
+            assert!(s.ci_node.repo_allowlist.is_empty());
+            assert_eq!(s.ci_node.min_free_disk_gb, 20);
+        }
+    }
+
+    /// Explicit values round-trip untouched (the setting is hand-edited
+    /// JSON until a Settings UI ships — parse fidelity is the whole UX).
+    #[test]
+    fn ci_node_explicit_values_round_trip() {
+        let parsed: Settings = serde_json::from_str(
+            r#"{"ci_node": {"enabled": true, "max_concurrent_builds": 2,
+                 "repo_allowlist": ["qontinui/qontinui-runner"], "min_free_disk_gb": 50}}"#,
+        )
+        .expect("must deserialize");
+        assert!(parsed.ci_node.enabled);
+        assert_eq!(parsed.ci_node.max_concurrent_builds, 2);
+        assert_eq!(
+            parsed.ci_node.repo_allowlist,
+            vec!["qontinui/qontinui-runner".to_string()]
+        );
+        assert_eq!(parsed.ci_node.min_free_disk_gb, 50);
+        let json = serde_json::to_string(&parsed).unwrap();
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.ci_node, parsed.ci_node);
+    }
+
+    /// A partial ci_node object fills the missing keys from the serde
+    /// defaults (enabled alone must not zero the disk floor or slot count).
+    #[test]
+    fn ci_node_partial_object_fills_defaults() {
+        let parsed: Settings = serde_json::from_str(r#"{"ci_node": {"enabled": true}}"#).unwrap();
+        assert!(parsed.ci_node.enabled);
+        assert_eq!(parsed.ci_node.max_concurrent_builds, 1);
+        assert!(parsed.ci_node.repo_allowlist.is_empty());
+        assert_eq!(parsed.ci_node.min_free_disk_gb, 20);
+    }
+}
+
 // ============================================================================
 // Cloud Relay Settings
 // ============================================================================
@@ -1567,6 +1620,63 @@ impl Default for HelperTasksSettings {
         Self {
             emit_enabled: false,
             emit_kinds: default_helper_task_emit_kinds(),
+        }
+    }
+}
+
+// ============================================================================
+// CI Node Settings (plan 2026-07-15-runner-as-ci-node-migration, Phase 0)
+// ============================================================================
+
+/// Opt-in "act as CI node" settings (plan
+/// `2026-07-15-runner-as-ci-node-migration`, Phase 0). When `enabled`, the
+/// fleet heartbeat advertises the **`ci_node`** capability (deliberately NOT
+/// `ci_runner` — that string would inflate coord's merge-probe capacity while
+/// the dispatch lane is still dark, plan §7.1) plus warmth/platform labels,
+/// and the budget publish reports `max_concurrent_builds` instead of the
+/// hardcoded 0. The `ci_node` executor module only admits dispatches for
+/// repos in `repo_allowlist` — an empty allowlist means NOTHING is runnable
+/// even when enabled.
+///
+/// Default is fully OFF; a missing key in an existing settings.json loads as
+/// the inert default. There is no Settings UI yet — hand-edit settings.json.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CiNodeSettings {
+    /// Master opt-in. Default FALSE — the runner never advertises CI
+    /// capacity or accepts CI dispatches until the owner flips this.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum concurrent CI builds admitted by the executor, and the value
+    /// advertised via the device budget POST when enabled. Default 1.
+    #[serde(default = "default_ci_node_max_concurrent_builds")]
+    pub max_concurrent_builds: u32,
+    /// Repos this device may build. Entries match either the coord
+    /// `owner/name` slug or the bare repo basename. Empty (the default)
+    /// means no repo is runnable — allowlisting is a deliberate act.
+    #[serde(default)]
+    pub repo_allowlist: Vec<String>,
+    /// Minimum free disk (GiB) on the QONTINUI_ROOT volume required to
+    /// START a build; below this the dispatch is refused with a reason
+    /// (this box has hit `os error 112` — disk exhaustion is real).
+    #[serde(default = "default_ci_node_min_free_disk_gb")]
+    pub min_free_disk_gb: u64,
+}
+
+fn default_ci_node_max_concurrent_builds() -> u32 {
+    1
+}
+
+fn default_ci_node_min_free_disk_gb() -> u64 {
+    20
+}
+
+impl Default for CiNodeSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_concurrent_builds: default_ci_node_max_concurrent_builds(),
+            repo_allowlist: Vec::new(),
+            min_free_disk_gb: default_ci_node_min_free_disk_gb(),
         }
     }
 }
@@ -1755,6 +1865,13 @@ pub struct Settings {
     /// `load_settings`) rather than silently flipping to the new default.
     #[serde(default = "default_session_metadata_sync_enabled")]
     pub session_metadata_sync_enabled: bool,
+    /// CI-node opt-in (plan `2026-07-15-runner-as-ci-node-migration`,
+    /// Phase 0). Default fully off — see [`CiNodeSettings`]. Read-only at
+    /// runtime (heartbeat + executor); no save path exists yet, so the
+    /// multi-instance persist guard (`should_persist_migration`) is not in
+    /// play for this field.
+    #[serde(default)]
+    pub ci_node: CiNodeSettings,
 }
 
 fn default_session_metadata_sync_enabled() -> bool {
@@ -2468,6 +2585,15 @@ pub fn save_claude_account_launch_commands(
 /// Get the current AI settings
 pub fn get_ai_settings() -> AiSettings {
     crate::config_facade::get_setting::<AiSettings>()
+}
+
+/// Get the current CI-node settings (plan
+/// `2026-07-15-runner-as-ci-node-migration`). Read-only accessor — the
+/// heartbeat, budget publish, and `ci_node` executor read it; nothing
+/// writes it back (the setting is hand-edited JSON until a Settings UI
+/// ships), so the secondary-runner persist guard is not implicated.
+pub fn get_ci_node_settings() -> CiNodeSettings {
+    load_settings().ci_node
 }
 
 /// Save AI settings.

@@ -638,8 +638,10 @@ where
 /// not stale per [`AuthManager::device_jwt_needs_refresh`]). Filesystem I/O, so
 /// it runs on a blocking thread off the async executor — the same discipline
 /// the proxy handler's first read uses. Used by [`await_device_jwt_remint`] to
-/// detect "a usable JWT is now present" after a refresher kick.
-async fn read_usable_device_jwt() -> Option<String> {
+/// detect "a usable JWT is now present" after a refresher kick, and by the
+/// CI-node reporter (`ci_node::reporting`) as the cheap fresh-read half of
+/// its bearer resolution.
+pub(crate) async fn read_usable_device_jwt() -> Option<String> {
     tokio::task::spawn_blocking(|| {
         let am = crate::auth::AuthManager::new();
         match am.device_jwt_needs_refresh() {
