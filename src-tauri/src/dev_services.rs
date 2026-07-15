@@ -216,13 +216,17 @@ pub fn get_default_dev_services(workspace: &Path) -> Vec<ProcessConfig> {
             name: "Embedding Service (MiniLM-L6-v2)".to_string(),
             // Launch under Poetry (like the backend service above), NOT bare
             // `python`. uvicorn/fastapi/pydantic/sentence-transformers and the
-            // qontinui package live in the python-bridge Poetry env, not in
-            // the system interpreter that bare `python` resolves to — so
+            // qontinui package are declared in python-bridge/pyproject.toml and
+            // live in that Poetry env (fastapi + uvicorn directly;
+            // sentence-transformers via the qontinui `embeddings` extra) — NOT
+            // in the system interpreter that bare `python` resolves to. So
             // `python embedding_server.py` dies at import with
             // `ModuleNotFoundError: No module named 'uvicorn'`, never binds
             // 8001, and the runner reports derived_status=degraded. `poetry
             // run` (cwd = python-bridge, which owns the pyproject/poetry.lock)
-            // resolves the right interpreter.
+            // resolves the right interpreter. NOTE: `build_command` below runs
+            // `poetry install`, which only provisions these because they're
+            // declared in pyproject — keep them declared there, not assumed.
             command: "poetry".to_string(),
             args: vec![
                 "run".to_string(),
