@@ -505,6 +505,68 @@ pub(crate) fn claude_bin_path() -> String {
     std::env::var("QONTINUI_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string())
 }
 
+/// Resolve `claude` to an absolute, directly-launchable executable path for the
+/// condition-check terminal.
+///
+/// The condition-check terminal spawns `claude` as the PTY child DIRECTLY
+/// (portable-pty `CommandBuilder::new(program)` → Windows `CreateProcessW`),
+/// which does NOT apply `PATHEXT`. A bare `"claude"` then resolves against the
+/// terminal's PATH — where the always-on identity-shim dir is PREPENDED — to the
+/// EXTENSIONLESS shim script, and `CreateProcessW` rejects that non-PE file with
+/// `%1 is not a valid Win32 application (os error 193)`. Resolving to an absolute
+/// executable in the RUNNER's env (which has no per-terminal shim dir) sidesteps
+/// both the PATHEXT gap and the shim shadowing. Falls back to [`claude_bin_path`]
+/// when nothing resolves, so behavior is never worse than the bare name.
+fn resolve_claude_bin() -> String {
+    let bare = claude_bin_path();
+    // An explicit `QONTINUI_CLAUDE_BIN` override (or any absolute path) is
+    // launchable as-is — no PATH search, no shim shadowing.
+    if std::path::Path::new(&bare).is_absolute() {
+        return bare;
+    }
+    let path = match std::env::var_os("PATH") {
+        Some(p) => p,
+        None => return bare,
+    };
+    // Skip our own per-terminal shim dirs — they hold the extensionless script
+    // that triggers os error 193 under a direct `CreateProcessW`.
+    let is_shim_dir = |d: &std::path::Path| {
+        let s = d.to_string_lossy().to_ascii_lowercase();
+        s.contains("qontinui-identity-")
+            || s.contains("qontinui-shim")
+            || s.contains("qontinui_install")
+    };
+    #[cfg(windows)]
+    let exts: Vec<String> = std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+        .split(';')
+        .filter(|e| !e.is_empty())
+        .map(|e| e.to_ascii_lowercase())
+        .collect();
+    for dir in std::env::split_paths(&path) {
+        if is_shim_dir(&dir) {
+            continue;
+        }
+        #[cfg(windows)]
+        {
+            for ext in &exts {
+                let cand = dir.join(format!("{bare}{ext}"));
+                if cand.is_file() {
+                    return cand.to_string_lossy().into_owned();
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let cand = dir.join(&bare);
+            if cand.is_file() {
+                return cand.to_string_lossy().into_owned();
+            }
+        }
+    }
+    bare
+}
+
 // =============================================================================
 // Public entrypoint
 // =============================================================================
@@ -2704,9 +2766,12 @@ async fn run_condition_check_terminal(
         .map(|p| p.to_string_lossy().to_string())
         .ok_or_else(|| anyhow::anyhow!("condition-check: no QONTINUI_ROOT resolved"))?;
 
-    // Resolve the SAME `claude` binary the gate path uses, pinned session id, and
+    // Resolve `claude` to an ABSOLUTE launchable path (not the bare name the gate
+    // path uses): the condition-check terminal spawns it directly via
+    // CreateProcessW, so a bare "claude" would resolve to the extensionless
+    // identity-shim script and fail with os error 193. Pinned session id +
     // interactive positional-prompt argv (no `--add-dir`: no sibling worktrees).
-    let claude_bin = claude_bin_path();
+    let claude_bin = resolve_claude_bin();
     let pinned_session_id = uuid::Uuid::new_v4().to_string();
     let command = Some(build_continuation_claude_command(
         claude_bin,
