@@ -34,6 +34,7 @@ mod backup;
 mod build_drift;
 mod check_executor;
 mod check_generation;
+mod ci_node;
 mod claude_accounts;
 mod claude_protocol;
 mod claude_session;
@@ -838,6 +839,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // on coord WS and supervises the resulting `claude` CLI
                 // child processes. No-op when no profile is configured.
                 agent_runtime::spawn_runtime();
+                // Runner-as-CI-node executor (plan 2026-07-15-runner-as-ci-
+                // node-migration, Phase 2). Subscribes (on its own WS
+                // connection, isolated from the agent-spawn subscriber) to
+                // `events.ci.build_requested/<build_cancelled>.<device_id>`
+                // and runs the repo's own `.qontinui/ci.toml` at the
+                // dispatched SHA. Inert unless the `ci_node` setting is
+                // enabled — while disabled it holds no socket and admits
+                // nothing.
+                ci_node::spawn_ci_node_runtime();
                 // Harness markdown→work-unit adapter (plan
                 // 2026-06-18-harness-markdown-to-workunit-adapter, P2 of the
                 // plan-decoupling program) — periodic reconcile scan of the
@@ -4302,6 +4312,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     session::shutdown_marker::mark_clean_shutdown(&marker_path);
                 }
+
+                // Cancel any in-flight CI-node builds so their executors can
+                // attempt a best-effort `cancelled` result POST; the Job
+                // Object (kill-on-close) is the hard backstop for the build
+                // process trees, and coord's dispatch-lease sweeper covers a
+                // result that never makes it out.
+                ci_node::shutdown_all();
 
                 // Close all interactive Claude sessions
                 if let Some(sm) =

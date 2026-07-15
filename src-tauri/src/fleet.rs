@@ -518,10 +518,17 @@ pub async fn publish_budget(
         MachineRole::Agent => derive_max_agents(resources.memory_gb) as i32,
         MachineRole::Build => 0,
     };
-    // Runner is Agent role — leaves build slots to the supervisor on
-    // dev workstations. The supervisor publisher overwrites the
-    // build-side fields when it starts.
-    let max_concurrent_builds: i32 = 0;
+    // Runner is Agent role — historically leaves build slots to the
+    // supervisor on dev workstations (the supervisor publisher overwrites
+    // the build-side fields when it starts). Phase 0 of the runner-as-CI-
+    // node plan: when the owner opts in via the `ci_node` setting, advertise
+    // its `max_concurrent_builds`; disabled keeps the historical 0.
+    let ci = crate::settings::get_ci_node_settings();
+    let max_concurrent_builds: i32 = if ci.enabled {
+        ci.max_concurrent_builds.min(i32::MAX as u32) as i32
+    } else {
+        0
+    };
     let cpu_cores_i: i32 = resources.cpu_cores.min(i32::MAX as u32) as i32;
     let memory_gb_i: i32 = resources.memory_gb.min(i32::MAX as u32) as i32;
     let disk_total_i: i64 = resources.disk_total_gb.min(i64::MAX as u64) as i64;
@@ -670,6 +677,160 @@ fn capture_telemetry_snapshot() -> (u64, u64, Option<chrono::DateTime<chrono::Ut
     }
 }
 
+// =============================================================================
+// CI-node label detection (plan 2026-07-15-runner-as-ci-node-migration,
+// Phase 0). Labels advertise warmth + platform so coord's Phase-3 selection
+// can prefer a device with the repo already checked out:
+//   repo:<basename>  — one per git repo directory under QONTINUI_ROOT
+//   os:<windows|linux|macos>
+//   rust:<channel>   — from the first rust-toolchain.toml among those repos
+//   node:<major>     — from `node --version`
+// Cached for 5 minutes: the scan walks QONTINUI_ROOT and shells out to
+// `node --version`, which is wasteful on the 30s heartbeat cadence (same
+// posture as CLAUDE_PROBE_CACHE above).
+// =============================================================================
+
+static CI_NODE_LABEL_CACHE: Mutex<Option<(Vec<String>, std::time::Instant)>> = Mutex::new(None);
+
+const CI_NODE_LABEL_TTL: Duration = Duration::from_secs(300);
+
+/// Cached CI-node label set for the heartbeat. Detection failures degrade to
+/// fewer labels, never an error — a device with no node on PATH simply lacks
+/// the `node:` label.
+fn ci_node_labels() -> Vec<String> {
+    {
+        if let Ok(g) = CI_NODE_LABEL_CACHE.lock() {
+            if let Some((labels, taken)) = g.as_ref() {
+                if taken.elapsed() < CI_NODE_LABEL_TTL {
+                    return labels.clone();
+                }
+            }
+        }
+    }
+    let labels = detect_ci_node_labels_now();
+    if let Ok(mut g) = CI_NODE_LABEL_CACHE.lock() {
+        *g = Some((labels.clone(), std::time::Instant::now()));
+    }
+    labels
+}
+
+fn detect_ci_node_labels_now() -> Vec<String> {
+    let repos = crate::agent_runtime::qontinui_root_dir()
+        .map(|root| scan_git_repo_basenames(&root))
+        .unwrap_or_default();
+    let rust_channel = crate::agent_runtime::qontinui_root_dir()
+        .and_then(|root| first_rust_toolchain_channel(&root, &repos));
+    build_ci_node_labels(
+        &repos,
+        current_os_label(),
+        rust_channel,
+        node_major_version(),
+    )
+}
+
+/// Pure label assembly (unit-tested without disk or subprocesses).
+fn build_ci_node_labels(
+    repo_basenames: &[String],
+    os: &str,
+    rust_channel: Option<String>,
+    node_major: Option<u32>,
+) -> Vec<String> {
+    let mut labels: Vec<String> = repo_basenames.iter().map(|r| format!("repo:{r}")).collect();
+    labels.push(format!("os:{os}"));
+    if let Some(ch) = rust_channel {
+        labels.push(format!("rust:{ch}"));
+    }
+    if let Some(major) = node_major {
+        labels.push(format!("node:{major}"));
+    }
+    labels
+}
+
+fn current_os_label() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    }
+}
+
+/// Sorted basenames of every direct child of `root` that is a git repo
+/// (contains `.git` as a dir or file — worktrees use a `.git` FILE).
+/// Dot-prefixed dirs (`.ci-worktrees`, `.wt-target-*`, …) are skipped.
+fn scan_git_repo_basenames(root: &std::path::Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        if path.join(".git").exists() {
+            out.push(name.to_string());
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The `channel` value of the first `rust-toolchain.toml` found among the
+/// given repos (sorted order ⇒ deterministic). `None` when no repo pins one.
+fn first_rust_toolchain_channel(root: &std::path::Path, repos: &[String]) -> Option<String> {
+    for repo in repos {
+        let path = root.join(repo).join("rust-toolchain.toml");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Some(ch) = parse_rust_toolchain_channel(&text) {
+            return Some(ch);
+        }
+    }
+    None
+}
+
+/// Extract `toolchain.channel` from a rust-toolchain.toml body.
+fn parse_rust_toolchain_channel(text: &str) -> Option<String> {
+    let value: toml::Value = toml::from_str(text).ok()?;
+    value
+        .get("toolchain")?
+        .get("channel")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+/// `node --version` → major version (e.g. `v20.11.1` → 20). `None` when
+/// node is not on PATH or the output is unparseable.
+fn node_major_version() -> Option<u32> {
+    let out = crate::process_helpers::no_window("node")
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_node_major(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parse a `node --version` string (`v20.11.1`) to its major component.
+fn parse_node_major(raw: &str) -> Option<u32> {
+    raw.trim()
+        .trim_start_matches('v')
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
+}
+
 #[derive(Debug, serde::Serialize)]
 struct HeartbeatPayload {
     device_id: uuid::Uuid,
@@ -715,6 +876,22 @@ struct HeartbeatPayload {
     /// sent (privacy: timestamp only, no content).
     #[serde(skip_serializing_if = "Option::is_none")]
     last_capture_fallback_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// CI-node capability advertisement (plan
+    /// `2026-07-15-runner-as-ci-node-migration`, Phase 0). Present ONLY when
+    /// the `ci_node` setting is enabled — omitted entirely otherwise, so the
+    /// wire shape is unchanged for today's runners. The capability string is
+    /// deliberately `"ci_node"`, NOT `"ci_runner"`: coord's pre-push merge
+    /// probe counts `ci_runner` rows as candidate-CI capacity, and a
+    /// dark-phase runner must not inflate that pool (plan §7.1).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    capabilities: Vec<String>,
+    /// Warmth/platform labels accompanying the `ci_node` capability:
+    /// `repo:<basename>` per git repo present under `QONTINUI_ROOT`,
+    /// `os:<windows|linux|macos>`, `rust:<toolchain channel>` (from the
+    /// first `rust-toolchain.toml` found among those repos), `node:<major>`.
+    /// Omitted entirely when the setting is disabled.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    ci_runner_labels: Vec<String>,
 }
 
 /// Suppress serializing the field when it's the default. Keeps the
@@ -781,6 +958,19 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
     let (capture_preview_count, monitor_crop_count, last_capture_fallback_at) =
         capture_telemetry_snapshot();
 
+    // CI-node advertisement (plan 2026-07-15-runner-as-ci-node-migration,
+    // Phase 0). Settings are read per-tick the same way other heartbeat
+    // inputs are resolved (fresh each tick, no restart needed to opt in/out);
+    // the labels themselves are cached (see `ci_node_labels`) because they
+    // shell out to `node --version` and walk QONTINUI_ROOT.
+    let ci = crate::settings::get_ci_node_settings();
+    let (capabilities, ci_runner_labels) = if ci.enabled {
+        (vec!["ci_node".to_string()], ci_node_labels())
+    } else {
+        // Disabled ⇒ both fields omitted from the wire (skip_serializing_if).
+        (Vec::new(), Vec::new())
+    };
+
     let payload = HeartbeatPayload {
         device_id,
         hostname: device.hostname.clone(),
@@ -790,6 +980,8 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
         capture_preview_count,
         monitor_crop_count,
         last_capture_fallback_at,
+        capabilities,
+        ci_runner_labels,
     };
     let url = format!("{base}/coord/devices/register");
 
@@ -3536,6 +3728,8 @@ mod tests {
             capture_preview_count: 0,
             monitor_crop_count: 0,
             last_capture_fallback_at: None,
+            capabilities: Vec::new(),
+            ci_runner_labels: Vec::new(),
         };
         let body = serde_json::to_value(&p).unwrap();
         assert!(
@@ -3555,6 +3749,8 @@ mod tests {
             capture_preview_count: 0,
             monitor_crop_count: 0,
             last_capture_fallback_at: None,
+            capabilities: Vec::new(),
+            ci_runner_labels: Vec::new(),
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -3580,6 +3776,8 @@ mod tests {
             capture_preview_count: 0,
             monitor_crop_count: 0,
             last_capture_fallback_at: None,
+            capabilities: Vec::new(),
+            ci_runner_labels: Vec::new(),
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -3603,6 +3801,8 @@ mod tests {
             capture_preview_count: 0,
             monitor_crop_count: 0,
             last_capture_fallback_at: None,
+            capabilities: Vec::new(),
+            ci_runner_labels: Vec::new(),
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -3632,6 +3832,8 @@ mod tests {
             capture_preview_count: 7,
             monitor_crop_count: 3,
             last_capture_fallback_at: Some(at),
+            capabilities: Vec::new(),
+            ci_runner_labels: Vec::new(),
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -3662,6 +3864,8 @@ mod tests {
             capture_preview_count: 0,
             monitor_crop_count: 0,
             last_capture_fallback_at: None,
+            capabilities: Vec::new(),
+            ci_runner_labels: Vec::new(),
         };
         let body0 = serde_json::to_value(&p0).unwrap();
         assert!(
@@ -3782,6 +3986,8 @@ mod tests {
             capture_preview_count: 0,
             monitor_crop_count: 0,
             last_capture_fallback_at: None,
+            capabilities: Vec::new(),
+            ci_runner_labels: Vec::new(),
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -3931,5 +4137,103 @@ mod tests {
             Some(t.to_string().as_str()),
             "an explicit tenant_id must appear on the upsert wire"
         );
+    }
+
+    // ── CI-node heartbeat advertisement (runner-as-CI-node Phase 0) ──
+
+    fn heartbeat_payload_with_ci(
+        capabilities: Vec<String>,
+        ci_runner_labels: Vec<String>,
+    ) -> HeartbeatPayload {
+        HeartbeatPayload {
+            device_id: uuid::Uuid::nil(),
+            hostname: "host".into(),
+            claude_code_available: false,
+            tenant_id: uuid::Uuid::nil(),
+            tenant_ids: vec![uuid::Uuid::nil()],
+            capture_preview_count: 0,
+            monitor_crop_count: 0,
+            last_capture_fallback_at: None,
+            capabilities,
+            ci_runner_labels,
+        }
+    }
+
+    /// WIRE-SHAPE GUARD: with the ci_node setting disabled the two new
+    /// fields must be ABSENT from the heartbeat JSON — today's coord (and
+    /// today's runners) must see a byte-identical shape.
+    #[test]
+    fn heartbeat_omits_ci_fields_when_disabled() {
+        let body = serde_json::to_value(heartbeat_payload_with_ci(Vec::new(), Vec::new())).unwrap();
+        assert!(
+            body.get("capabilities").is_none(),
+            "capabilities must be omitted when empty, got {body}"
+        );
+        assert!(
+            body.get("ci_runner_labels").is_none(),
+            "ci_runner_labels must be omitted when empty, got {body}"
+        );
+    }
+
+    /// When enabled, the capability is exactly `ci_node` — NEVER `ci_runner`
+    /// (which would inflate coord's merge-probe capacity, plan §7.1).
+    #[test]
+    fn heartbeat_advertises_ci_node_not_ci_runner() {
+        let body = serde_json::to_value(heartbeat_payload_with_ci(
+            vec!["ci_node".into()],
+            vec!["repo:qontinui-runner".into(), "os:windows".into()],
+        ))
+        .unwrap();
+        let caps = body.get("capabilities").unwrap().as_array().unwrap();
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0].as_str(), Some("ci_node"));
+        assert_ne!(caps[0].as_str(), Some("ci_runner"));
+        let labels = body.get("ci_runner_labels").unwrap().as_array().unwrap();
+        assert_eq!(labels.len(), 2);
+    }
+
+    #[test]
+    fn ci_node_label_assembly_full_set() {
+        let labels = build_ci_node_labels(
+            &["qontinui-coord".to_string(), "qontinui-runner".to_string()],
+            "windows",
+            Some("1.95.0".to_string()),
+            Some(20),
+        );
+        assert_eq!(
+            labels,
+            vec![
+                "repo:qontinui-coord",
+                "repo:qontinui-runner",
+                "os:windows",
+                "rust:1.95.0",
+                "node:20",
+            ]
+        );
+    }
+
+    /// Missing toolchain/node degrade to fewer labels, never an error.
+    #[test]
+    fn ci_node_label_assembly_degrades_gracefully() {
+        let labels = build_ci_node_labels(&[], "linux", None, None);
+        assert_eq!(labels, vec!["os:linux"]);
+    }
+
+    #[test]
+    fn rust_toolchain_channel_parses() {
+        assert_eq!(
+            parse_rust_toolchain_channel("[toolchain]\nchannel = \"1.95.0\"\n"),
+            Some("1.95.0".to_string())
+        );
+        assert_eq!(parse_rust_toolchain_channel("[toolchain]\n"), None);
+        assert_eq!(parse_rust_toolchain_channel("not toml at all ==="), None);
+    }
+
+    #[test]
+    fn node_major_parses() {
+        assert_eq!(parse_node_major("v20.11.1\n"), Some(20));
+        assert_eq!(parse_node_major("22.0.0"), Some(22));
+        assert_eq!(parse_node_major("weird"), None);
+        assert_eq!(parse_node_major(""), None);
     }
 }
