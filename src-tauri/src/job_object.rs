@@ -9,7 +9,8 @@ use tracing::{error, info, warn};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, JobObjectExtendedLimitInformation, SetInformationJobObject,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_JOB_MEMORY,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 
 // CreateJobObjectW requires the Win32_Security feature (for SECURITY_ATTRIBUTES param type).
@@ -104,6 +105,88 @@ pub fn assign_process_to_job(process_handle: HANDLE) {
             if result == 0 {
                 warn!(
                     "Failed to assign process to Job Object (error {})",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
+}
+
+/// A dedicated, OWNED Job Object with a job-wide committed-memory limit —
+/// the CI-build OOM backstop (runner-as-CI-node plan §4.6: "job-object
+/// memory limit as a backstop", load-bearing not polish). Distinct from the
+/// global singleton: a memory limit on the global job would throttle every
+/// runner child (agents, terminals), so CI builds get their own job. The
+/// handle is RAII — dropping it (dispatch end) closes the job, and
+/// kill-on-close reaps any stray build processes with it. A process may
+/// belong to both this job and the global one (nested jobs, Win8+).
+pub struct ScopedMemoryLimitedJob(HANDLE);
+
+// SAFETY: same contract as JobObjectHandle — the handle is only used via
+// thread-safe Job Object APIs and never mutated after creation.
+unsafe impl Send for ScopedMemoryLimitedJob {}
+unsafe impl Sync for ScopedMemoryLimitedJob {}
+
+impl Drop for ScopedMemoryLimitedJob {
+    fn drop(&mut self) {
+        if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+impl ScopedMemoryLimitedJob {
+    /// Create a job with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and a
+    /// `JOB_OBJECT_LIMIT_JOB_MEMORY` commit ceiling of `memory_limit_bytes`
+    /// across all assigned processes. `None` on any API failure — callers
+    /// degrade to the global job only (a missing backstop must not block
+    /// the build).
+    pub fn create(memory_limit_bytes: usize) -> Option<Self> {
+        unsafe {
+            let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                warn!(
+                    "ScopedMemoryLimitedJob: CreateJobObjectW failed (error {})",
+                    std::io::Error::last_os_error()
+                );
+                return None;
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags =
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_JOB_MEMORY;
+            info.JobMemoryLimit = memory_limit_bytes;
+            let result = SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const _,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if result == 0 {
+                warn!(
+                    "ScopedMemoryLimitedJob: SetInformationJobObject failed (error {})",
+                    std::io::Error::last_os_error()
+                );
+                CloseHandle(handle);
+                return None;
+            }
+            Some(Self(handle))
+        }
+    }
+
+    /// Assign a child process to this job. Failure is a logged warning —
+    /// the global job's kill-on-close still applies to the child.
+    ///
+    /// # Safety contract
+    /// `process_handle` must be a valid Windows process HANDLE (the same
+    /// contract as [`assign_process_to_job`]).
+    pub fn assign(&self, process_handle: HANDLE) {
+        unsafe {
+            let result = AssignProcessToJobObject(self.0, process_handle);
+            if result == 0 {
+                warn!(
+                    "ScopedMemoryLimitedJob: assign failed (error {})",
                     std::io::Error::last_os_error()
                 );
             }
