@@ -505,115 +505,6 @@ pub(crate) fn claude_bin_path() -> String {
     std::env::var("QONTINUI_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string())
 }
 
-<<<<<<< HEAD
-/// Resolve `claude` to an absolute, directly-launchable executable path for
-/// PTY-spawned continuation terminals (condition-check, gate-continuation).
-///
-/// These terminals spawn `claude` as the PTY child DIRECTLY (portable-pty
-/// `CommandBuilder::new(program)` → Windows `CreateProcessW`), which does NOT
-/// apply `PATHEXT`. A bare `"claude"` then resolves against the terminal's
-/// PATH — where the always-on identity-shim dir is PREPENDED — to the
-/// EXTENSIONLESS shim script, and `CreateProcessW` rejects that non-PE file
-/// with `%1 is not a valid Win32 application (os error 193)`. Resolving to an
-/// absolute executable in the RUNNER's env (which has no per-terminal shim
-/// dir) sidesteps both the PATHEXT gap and the shim shadowing.
-///
-/// Only `.exe`/`.com` candidates are matched — `CreateProcessW` cannot launch
-/// a `.bat`/`.cmd` script directly (that requires a `cmd.exe /c` wrapper,
-/// which this direct-PTY-spawn path does not build), so matching one here
-/// would trade one os-error-193 cause for another. An npm-only `claude`
-/// install (ships only `claude.cmd`/`claude.ps1`, no `.exe`) has no native
-/// candidate to find; this correctly falls through to the bare-name fallback
-/// below — no worse than pre-fix behavior for that install shape.
-///
-/// Falls back to [`claude_bin_path`] when nothing resolves, so behavior is
-/// never worse than the bare name. Does blocking filesystem stats — callers
-/// on an async task must run this via `spawn_blocking`.
-=======
-/// Resolve `claude` to an absolute, directly-launchable executable path for the
-/// condition-check terminal.
-///
-/// The condition-check terminal spawns `claude` as the PTY child DIRECTLY
-/// (portable-pty `CommandBuilder::new(program)` → Windows `CreateProcessW`),
-/// which does NOT apply `PATHEXT`. A bare `"claude"` then resolves against the
-/// terminal's PATH — where the always-on identity-shim dir is PREPENDED — to the
-/// EXTENSIONLESS shim script, and `CreateProcessW` rejects that non-PE file with
-/// `%1 is not a valid Win32 application (os error 193)`. Resolving to an absolute
-/// executable in the RUNNER's env (which has no per-terminal shim dir) sidesteps
-/// both the PATHEXT gap and the shim shadowing. Falls back to [`claude_bin_path`]
-/// when nothing resolves, so behavior is never worse than the bare name.
->>>>>>> 6325f5d7 (fix: resolve claude to a launchable exe in condition-check terminal)
-fn resolve_claude_bin() -> String {
-    let bare = claude_bin_path();
-    // An explicit `QONTINUI_CLAUDE_BIN` override (or any absolute path) is
-    // launchable as-is — no PATH search, no shim shadowing.
-    if std::path::Path::new(&bare).is_absolute() {
-        return bare;
-    }
-    let path = match std::env::var_os("PATH") {
-        Some(p) => p,
-        None => return bare,
-    };
-<<<<<<< HEAD
-    // Skip our own per-terminal shim/identity dirs — they hold the
-    // extensionless script that triggers os error 193 under a direct
-    // `CreateProcessW`.
-    use crate::install_effects_producer::intercept::shim_materializer::{
-        IDENTITY_DIR_PREFIX, SHIM_DIR_PREFIX,
-    };
-    let is_shim_dir = |d: &std::path::Path| {
-        d.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with(IDENTITY_DIR_PREFIX) || n.starts_with(SHIM_DIR_PREFIX))
-    };
-    // Only extensions CreateProcessW can natively launch — see doc comment.
-    #[cfg(windows)]
-    let exts: &[&str] = &[".exe", ".com"];
-=======
-    // Skip our own per-terminal shim dirs — they hold the extensionless script
-    // that triggers os error 193 under a direct `CreateProcessW`.
-    let is_shim_dir = |d: &std::path::Path| {
-        let s = d.to_string_lossy().to_ascii_lowercase();
-        s.contains("qontinui-identity-")
-            || s.contains("qontinui-shim")
-            || s.contains("qontinui_install")
-    };
-    #[cfg(windows)]
-    let exts: Vec<String> = std::env::var("PATHEXT")
-        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
-        .split(';')
-        .filter(|e| !e.is_empty())
-        .map(|e| e.to_ascii_lowercase())
-        .collect();
->>>>>>> 6325f5d7 (fix: resolve claude to a launchable exe in condition-check terminal)
-    for dir in std::env::split_paths(&path) {
-        if is_shim_dir(&dir) {
-            continue;
-        }
-        #[cfg(windows)]
-        {
-<<<<<<< HEAD
-            for ext in exts {
-=======
-            for ext in &exts {
->>>>>>> 6325f5d7 (fix: resolve claude to a launchable exe in condition-check terminal)
-                let cand = dir.join(format!("{bare}{ext}"));
-                if cand.is_file() {
-                    return cand.to_string_lossy().into_owned();
-                }
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            let cand = dir.join(&bare);
-            if cand.is_file() {
-                return cand.to_string_lossy().into_owned();
-            }
-        }
-    }
-    bare
-}
-
 // =============================================================================
 // Public entrypoint
 // =============================================================================
@@ -2518,19 +2409,14 @@ async fn run_continuation_terminal(
         .clone()
         .unwrap_or_else(|| "Gate continuation".to_string());
 
-    // Resolve `claude` to an ABSOLUTE launchable path, same as the
-    // condition-check terminal and for the same reason: this spawns via the
-    // identical direct-PTY/CreateProcessW backend, so a bare "claude" would
-    // resolve to the extensionless identity-shim script and fail with os
-    // error 193 (see `resolve_claude_bin` doc comment). The prompt is the
-    // trailing positional arg — interactive form, NOT `--print` (see the fn
-    // doc: interactivity is required). Inject `--dangerously-skip-permissions`
-    // (same as the worker-tab spawn path) so the continuation /implement-plan
-    // session does not stall on interactive Bash permission prompts — an
-    // unattended gate continuation has no operator to answer them.
-    let claude_bin = tokio::task::spawn_blocking(resolve_claude_bin)
-        .await
-        .unwrap_or_else(|_| claude_bin_path());
+    // Resolve the SAME `claude` binary the headless path uses (QONTINUI_CLAUDE_BIN
+    // override honored). The prompt is the trailing positional arg — interactive
+    // form, NOT `--print` (see the fn doc: interactivity is required). Inject
+    // `--dangerously-skip-permissions` (same as the worker-tab spawn path) so the
+    // continuation /implement-plan session does not stall on interactive Bash
+    // permission prompts — an unattended gate continuation has no operator to
+    // answer them.
+    let claude_bin = claude_bin_path();
     // Phase 2c — `--add-dir=<sibling>` (attached form — see the
     // build_continuation_claude_command doc) for each non-cwd worktree of this
     // continuation's context so the launched `claude` can edit sibling repos
@@ -2818,25 +2704,9 @@ async fn run_condition_check_terminal(
         .map(|p| p.to_string_lossy().to_string())
         .ok_or_else(|| anyhow::anyhow!("condition-check: no QONTINUI_ROOT resolved"))?;
 
-<<<<<<< HEAD
-    // Resolve `claude` to an ABSOLUTE launchable path (not the bare name a
-    // shell-wrapped spawn could get away with): this terminal spawns
-    // `claude` directly via CreateProcessW, so a bare "claude" would resolve
-    // to the extensionless identity-shim script and fail with os error 193.
-    // Pinned session id + interactive positional-prompt argv (no `--add-dir`:
-    // no sibling worktrees). spawn_blocking: resolve_claude_bin does blocking
-    // PATH filesystem stats.
-    let claude_bin = tokio::task::spawn_blocking(resolve_claude_bin)
-        .await
-        .unwrap_or_else(|_| claude_bin_path());
-=======
-    // Resolve `claude` to an ABSOLUTE launchable path (not the bare name the gate
-    // path uses): the condition-check terminal spawns it directly via
-    // CreateProcessW, so a bare "claude" would resolve to the extensionless
-    // identity-shim script and fail with os error 193. Pinned session id +
+    // Resolve the SAME `claude` binary the gate path uses, pinned session id, and
     // interactive positional-prompt argv (no `--add-dir`: no sibling worktrees).
-    let claude_bin = resolve_claude_bin();
->>>>>>> 6325f5d7 (fix: resolve claude to a launchable exe in condition-check terminal)
+    let claude_bin = claude_bin_path();
     let pinned_session_id = uuid::Uuid::new_v4().to_string();
     let command = Some(build_continuation_claude_command(
         claude_bin,
