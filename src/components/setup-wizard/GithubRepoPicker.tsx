@@ -16,10 +16,6 @@ import {
   ExternalLink,
 } from "lucide-react";
 
-/** GitHub App install URL for the "connect your GitHub" CTA. */
-const GITHUB_APP_INSTALL_URL =
-  "https://github.com/apps/qontinui-merge-orchestrator/installations/new";
-
 /** Map a raw `github_list_repos` failure message to a specific, actionable headline.
  *  Order matters: check the most specific signals first. */
 export function classifyLoadError(raw: string): string {
@@ -227,6 +223,20 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
     );
   }, []);
 
+  // Open the login-gated qontinui.io connect page (NOT the raw GitHub App
+  // install URL) in the system browser. The backend derives the URL from the
+  // configured web origin; the page guarantees a signed-in qontinui.io session
+  // so the post-install claim binds the org to the user's tenant. On failure,
+  // surface it in the same error panel rather than silently doing nothing.
+  const openConnect = useCallback(async () => {
+    try {
+      const url = await invoke<string>("github_connect_url");
+      await openUrl(url);
+    } catch (err) {
+      setError(`Couldn't open the GitHub connect page: ${err}`);
+    }
+  }, []);
+
   const cloneSelected = useCallback(async () => {
     if (selectedRepos.length === 0 || !destParent) return;
     setCloning(true);
@@ -344,15 +354,16 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
           <div className="text-sm">
             <div className="font-medium mb-1">Connect your GitHub</div>
             <p className="text-muted-foreground">
-              Install the Qontinui GitHub App on your organization or account to browse and clone
-              your repositories here.
+              Connect the Qontinui GitHub App to your organization or account to browse and clone
+              your repositories here. You&apos;ll sign in to Qontinui in your browser to finish
+              connecting.
             </p>
           </div>
         </div>
         <div className="flex gap-2">
           <button
             className="btn-primary flex items-center gap-2"
-            onClick={() => void openUrl(GITHUB_APP_INSTALL_URL)}
+            onClick={() => void openConnect()}
           >
             <ExternalLink className="w-4 h-4" />
             Connect GitHub

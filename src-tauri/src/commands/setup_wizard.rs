@@ -209,6 +209,27 @@ pub async fn github_list_repos() -> Result<Value, String> {
     Ok(body)
 }
 
+/// The web URL the setup-wizard "Connect GitHub" button opens.
+///
+/// This is a **login-gated** qontinui.io page (`/connect-runner-github`), NOT
+/// the raw GitHub App `installations/new` URL. Opening the raw install URL in a
+/// session-less system browser meant the post-install claim never bound the org
+/// to the user's tenant (the picker stayed on "Connect GitHub" forever). The
+/// login-gated page guarantees an authenticated qontinui.io session first, so
+/// the post-install Setup-URL redirect completes the claim bound to the caller's
+/// tenant.
+///
+/// Derived from the configured API base (`derive_web_base_url`) so a dev/staging
+/// build pointing at a non-prod backend opens the matching web origin instead of
+/// hard-coding `qontinui.io`.
+#[tauri::command]
+pub fn github_connect_url() -> String {
+    format!(
+        "{}/connect-runner-github",
+        crate::api_config::derive_web_base_url(&crate::api_config::get_api_base_url())
+    )
+}
+
 /// Clone a GitHub repository into a local destination folder, reusing the user's
 /// GitHub App connection for credentials.
 ///
