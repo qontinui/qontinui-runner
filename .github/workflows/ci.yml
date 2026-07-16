@@ -172,20 +172,27 @@ jobs:
           free -h
           df -h
 
-      # 24 GB (was 16 GB): headroom for CARGO_BUILD_JOBS=2 in the test step.
+      # 32 GB (was 16 → 24): headroom for CARGO_BUILD_JOBS=2 in the test step.
       # The May 2026 windows OOMs (runs 25612844640 / 75193978255, PR #65)
       # happened at JOBS=2 with a 16 GB pagefile — two concurrent large-crate
       # rustc codegens exhausted the 16 GB RAM + 16 GB pagefile commit limit.
-      # 24 GB raises the commit ceiling by 8 GB specifically to make JOBS=2
-      # safe again. Observed pagefile usage right before cargo test is only
-      # ~330 MB (2026-07-08 run 28948290993), i.e. the commit spike is
-      # transient peak, not steady-state — disk cost on D: is the only cost.
+      # 24 GB made JOBS=2 pass on 2026-07-08 (run 28977560427, test step
+      # 37m47s vs the 50-min JOBS=1 baseline), but a week of workspace
+      # growth (ci-node module et al.) re-tripped the same signature on
+      # 2026-07-16 (run 29531039112: rustc-LLVM OOM compiling the
+      # qontinui_runner test binary, exit 0xc000001d). Each failure sat
+      # just past the previous ceiling, so 32 GB buys the same +8 GB
+      # increment that fixed it last time. Observed pagefile usage right
+      # before cargo test is only ~330 MB (2026-07-08 run 28948290993) —
+      # the commit spike is transient peak, not steady-state; disk cost on
+      # D: is the only cost. If JOBS=2 OOMs again at 32 GB, stop climbing:
+      # revert the test step to JOBS=1 and keep this pagefile.
       - name: Configure pagefile (Windows — guard against link-time OOM)
         if: matrix.platform == 'windows-latest'
         uses: al-cheb/configure-pagefile-action@v1.4
         with:
-          minimum-size: 24GB
-          maximum-size: 24GB
+          minimum-size: 32GB
+          maximum-size: 32GB
           disk-root: "D:"
 
       # macOS: The accessibility (AX) adapter links against system CoreFoundation
