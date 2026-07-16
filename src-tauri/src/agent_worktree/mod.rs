@@ -1624,7 +1624,9 @@ pub async fn allocate_and_materialize_with_claim(
     }
 
     // Install the git credential helper in each materialized worktree so
-    // that direct `git push` from within the worktree routes through coord.
+    // that direct `git push` from within the worktree routes through coord,
+    // and set http.lowSpeedLimit/Time so interactive pushes can't hang
+    // forever on a stalled server (2026-07-12 incident hardening).
     // Best-effort: failure to install degrades to direct GitHub push (the
     // agent pusher daemon still pushes through coord regardless).
     for w in &materialized {
