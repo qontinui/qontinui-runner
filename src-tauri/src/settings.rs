@@ -1764,6 +1764,11 @@ pub struct Settings {
     /// Key: config_dir path, Value: shell command (e.g. "clg" instead of default CLAUDE_CONFIG_DIR pattern).
     #[serde(default)]
     pub claude_account_launch_commands: std::collections::HashMap<String, String>,
+    /// Default AI launch command template for accounts without a per-account
+    /// override. `None` = built-in default. `{sessionId}` is substituted with
+    /// the fresh pinned session id; without it `--session-id <uuid>` is appended.
+    #[serde(default)]
+    pub claude_default_launch_command: Option<String>,
     /// OpenTelemetry configuration for optional OTLP trace export.
     /// Note: OTel cannot be hot-reloaded; changes require a runner restart.
     #[serde(default)]
@@ -2580,6 +2585,16 @@ pub fn save_claude_account_launch_commands(
     commands: std::collections::HashMap<String, String>,
 ) -> Result<(), String> {
     crate::config_facade::save_claude_account_launch_commands(commands)
+}
+
+/// Get the default AI launch command template (None = built-in default)
+pub fn get_claude_default_launch_command() -> Option<String> {
+    crate::config_facade::get_claude_default_launch_command()
+}
+
+/// Save the default AI launch command template (None clears the override)
+pub fn save_claude_default_launch_command(command: Option<String>) -> Result<(), String> {
+    crate::config_facade::save_claude_default_launch_command(command)
 }
 
 /// Get the current AI settings

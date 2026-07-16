@@ -698,6 +698,23 @@ pub fn save_claude_account_launch_commands(
     crate::claude_accounts::update(move |roster| roster.claude_account_launch_commands = commands)
 }
 
+/// Get the default AI launch command template (None = built-in default).
+pub fn get_claude_default_launch_command() -> Option<String> {
+    load_settings().claude_default_launch_command
+}
+
+/// Save the default AI launch command template (None clears the override).
+///
+/// Writes the machine-global `claude-accounts.json` (NOT the per-instance
+/// settings.json) — see `save_claude_config_dirs`.
+pub fn save_claude_default_launch_command(command: Option<String>) -> Result<(), String> {
+    info!(
+        "Saving default AI launch command (machine-global claude-accounts.json): {:?}",
+        command
+    );
+    crate::claude_accounts::update(move |roster| roster.claude_default_launch_command = command)
+}
+
 /// Get the dev_logs_dir override (used by paths module).
 pub fn get_dev_logs_dir_override() -> Option<String> {
     load_settings().paths.dev_logs_dir
