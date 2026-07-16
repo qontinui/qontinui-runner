@@ -962,7 +962,7 @@ pub fn oneshot_for_settings() -> Box<dyn OneshotLlm> {
                 Box::new(OneshotDisabled::new())
             }
         },
-        // TODO(tier-decoupling): wire Ollama/OpenAiCompatible into the agentic loop.
+        // TODO(tier-decoupling): wire Ollama into the agentic loop.
         // Substrate exists (settings + connection-test functions); oneshot adapter
         // is deferred until full agentic-loop integration ships.
         AiProvider::Ollama => {
@@ -971,9 +971,12 @@ pub fn oneshot_for_settings() -> Box<dyn OneshotLlm> {
             );
             Box::new(OneshotDisabled::new())
         }
+        // The synchronous OpenAI-compatible client now exists
+        // (`ai_provider::openai_compat::run_openai_compat`, dispatched through
+        // routing.rs); only the structured-JSON oneshot adapter remains deferred.
         AiProvider::OpenAiCompatible => {
             warn!(
-                "oneshot_for_settings: OpenAiCompatible oneshot adapter not yet wired → OneshotDisabled (deferred Phase 3.5)"
+                "oneshot_for_settings: OpenAiCompatible sync client is wired via routing.rs, but the structured-JSON oneshot adapter is not yet built → OneshotDisabled"
             );
             Box::new(OneshotDisabled::new())
         }
