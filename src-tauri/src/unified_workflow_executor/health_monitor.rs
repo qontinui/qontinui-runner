@@ -649,14 +649,13 @@ pub async fn build_resume_agentic_context(
     // catch_unwind around the lookup (not just `?`/`.ok()`) preserves the
     // original sync-fn behavior: a panic here degrades to Strategy 2/3
     // instead of aborting the caller's resume path.
-    let phase_result = std::panic::AssertUnwindSafe(
-        pg_db.get_verification_phase_result(execution_id, iteration),
-    )
-    .catch_unwind()
-    .await
-    .ok()
-    .and_then(|r| r.ok())
-    .flatten();
+    let phase_result =
+        std::panic::AssertUnwindSafe(pg_db.get_verification_phase_result(execution_id, iteration))
+            .catch_unwind()
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .flatten();
     if let Some(result_json) = phase_result {
         // Try to deserialize into VerificationPhaseResult and use build_failure_context()
         if let Ok(result) =
