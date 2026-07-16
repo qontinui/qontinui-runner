@@ -1553,7 +1553,7 @@ struct TerminalFocusRequest<'a> {
 /// yanked to this tab. The canonical main-window-label accessor
 /// (`qontinui_runner_lib::get_main_window_label()`, returns `"main"`) matches
 /// the #473 `ui-bridge:invoke-request` scoping.
-fn emit_terminal_focus_request(app: &tauri::AppHandle, terminal_id: &str) {
+pub(crate) fn emit_terminal_focus_request(app: &tauri::AppHandle, terminal_id: &str) {
     use tauri::Emitter;
     let payload = TerminalFocusRequest { terminal_id };
     if let Err(e) = app.emit_to(
@@ -2316,7 +2316,7 @@ async fn run_gate_continuation_inner(
 /// at most 9 zones (a 3×3 grid) per page; beyond that, extra sessions spill
 /// into the page's Unassigned list. The backend picker uses this to spread
 /// continuations across non-full pages instead of overflowing one page.
-const CONTINUATION_PAGE_ZONE_CEILING: usize = 9;
+pub(crate) const CONTINUATION_PAGE_ZONE_CEILING: usize = 9;
 
 /// Choose the page_id a new continuation terminal should land on.
 /// Prefers, in order: the "default" page if under the ceiling, then any other
@@ -2328,7 +2328,7 @@ const CONTINUATION_PAGE_ZONE_CEILING: usize = 9;
 /// treated as empty (so it is chosen when no continuations exist yet). The
 /// picker decides only among the pages PRESENT in `counts` plus the implicit
 /// `"default"`.
-fn pick_continuation_page(
+pub(crate) fn pick_continuation_page(
     counts: &[(String, usize)],
     ceiling: usize,
     mint: impl FnOnce() -> String,
@@ -2376,7 +2376,9 @@ fn pick_continuation_page(
 /// second, independent cutoff for the variadic list AND keeps a prompt that
 /// happens to start with `-` from being parsed as a flag. The combined
 /// `--add-dir=<dir> -- "<prompt>"` shape is live-verified against the CLI.
-fn build_continuation_claude_command(
+// (pub(crate): also composed by `looping_agent_supervisor` — the Tier-0
+// looping-agent spawn reuses this exact argv recipe.)
+pub(crate) fn build_continuation_claude_command(
     claude_bin: String,
     pinned_session_id: &str,
     add_dir_args: Vec<String>,

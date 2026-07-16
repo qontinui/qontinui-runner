@@ -53,6 +53,15 @@ pub mod cognito;
 // command produce an identical report.
 pub mod coord_doctor;
 
+// Tier-0 "Looping Agent" pure core (plan `merge-shepherd-fixer-PLAN.md`
+// Phase 1): registry types + JSON store, rendered-grid idle/context-low
+// predicates, the supervisor's per-tick decision core, and the bundled
+// playbook + prompt builders. Lives in the lib crate so the whole decision
+// surface is type-checked and tested by `cargo test --lib` (the runner bin's
+// module tree is silently skipped by `--lib`); the impure glue that spawns
+// visible tabs lives in the bin at `src/looping_agent_supervisor.rs`.
+pub mod looping_agent;
+
 // Harness markdown -> work-unit adapter (plan
 // `2026-06-18-harness-markdown-to-workunit-adapter`, P2 of the plan-decoupling
 // program). Phase 1 = the pure parser that turns operator plan markdown into a

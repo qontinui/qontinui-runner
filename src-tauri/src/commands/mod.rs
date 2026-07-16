@@ -205,6 +205,7 @@ pub mod library_sync; // Sync library items (checks, macros, etc.) to web backen
 pub mod lock_yield_policy_settings; // Auto-yield-on-idle file-lock policy (Open Q4 / lock-yield-protocol-plan)
 pub mod log_api; // Frontend → Rust log sync (general/image/action/AI/issues/RAG/project)
 pub mod logging;
+pub mod looping_agents; // Tier-0 looping-agent control surface (enable/disable/status)
 pub mod mcp; // MCP client management and tool calling
 pub mod meta_optimizer; // Meta-optimizer recommendations and prompt registry
 pub mod mobile; // Mobile development feedback (ADB, screenshots, logcat)

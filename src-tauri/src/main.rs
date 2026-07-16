@@ -109,6 +109,11 @@ mod known_issues;
 mod launch_env;
 mod log_consolidation;
 mod logging;
+// Tier-0 looping-agent supervisor GLUE (spawn/nudge/relaunch/respawn over the
+// continuation-terminal recipe). The PURE core (registry/idle/policy/playbook)
+// lives in the lib crate at `qontinui_runner_lib::looping_agent` so it is
+// covered by `cargo test --lib`.
+mod looping_agent_supervisor;
 mod macros;
 mod mcp;
 mod mcp_api;
@@ -1612,6 +1617,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::log_api::sync_issues,
             commands::log_api::sync_project_logs,
             commands::log_api::sync_rag_logs,
+            commands::looping_agents::looping_agents_list,
+            commands::looping_agents::looping_agent_status,
+            commands::looping_agents::looping_agent_set_enabled,
             commands::mcp::call_mcp_tool,
             commands::mcp::connect_mcp_server,
             commands::mcp::create_mcp_server,
@@ -2919,6 +2927,17 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         session::reconcile::run_at_boot(&reconcile_lifecycle_store, live).await;
                     emit_session_bound(&reconcile_app_handle, &actions);
                 });
+
+                // Tier-0 looping-agent supervisor (plan merge-shepherd-fixer,
+                // Phase 1): opens/seeds the durable looping-agents registry
+                // (built-in Merge Shepherd, DISABLED until the operator flips
+                // it), manages it for the control-surface commands, and starts
+                // the supervised tick loop (idle-nudge on cadence, context-low
+                // / K-cycle fresh relaunch, dead-tab respawn). Placed after the
+                // lifecycle store manage so restart re-attach can resolve
+                // boot-restored tabs; the loop itself waits a boot-settle delay
+                // before its first tick.
+                looping_agent_supervisor::start(app.handle());
 
                 // Session-tracking health check (plan 2026-07-03-runner-
                 // session-tracking-drift-and-guardrails Phase 3 item 2): every
