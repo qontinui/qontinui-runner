@@ -50,4 +50,56 @@ describe("buildAiLaunchCommand", () => {
       buildAiLaunchCommand(opts).pinnedSessionId,
     );
   });
+
+  it("uses the configured default template and appends --session-id (still pinned)", () => {
+    const { command, pinnedSessionId } = buildAiLaunchCommand({
+      configDir: CFG,
+      isWindows: true,
+      defaultTemplate: "claude --model opus --permission-mode plan",
+      newSessionId: () => "abc",
+    });
+    expect(pinnedSessionId).toBe("abc");
+    expect(command).toBe(
+      `$env:CLAUDE_CONFIG_DIR="${CFG}"; claude --model opus --permission-mode plan --session-id abc`,
+    );
+  });
+
+  it("substitutes the {sessionId} placeholder instead of appending", () => {
+    const { command, pinnedSessionId } = buildAiLaunchCommand({
+      configDir: "/h/.claude-x",
+      isWindows: false,
+      defaultTemplate: "claude --session-id {sessionId} --continue",
+      newSessionId: () => "abc",
+    });
+    expect(pinnedSessionId).toBe("abc");
+    expect(command).toBe(
+      'CLAUDE_CONFIG_DIR="/h/.claude-x" claude --session-id abc --continue',
+    );
+  });
+
+  it("falls back to the built-in default for a blank template", () => {
+    const { command } = buildAiLaunchCommand({
+      configDir: "/h/.claude-x",
+      isWindows: false,
+      defaultTemplate: "   ",
+      newSessionId: () => "abc",
+    });
+    expect(command).toBe(
+      'CLAUDE_CONFIG_DIR="/h/.claude-x" claude --permission-mode bypassPermissions --session-id abc',
+    );
+  });
+
+  it("per-account customCmd wins over the default template", () => {
+    const { command, pinnedSessionId } = buildAiLaunchCommand({
+      configDir: CFG,
+      isWindows: true,
+      customCmd: "clh",
+      defaultTemplate: "claude --model opus",
+      newSessionId: () => {
+        throw new Error("must not mint an id for a custom command");
+      },
+    });
+    expect(command).toBe("clh");
+    expect(pinnedSessionId).toBeNull();
+  });
 });

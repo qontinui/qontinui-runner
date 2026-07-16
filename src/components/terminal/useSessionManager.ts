@@ -258,6 +258,8 @@ export interface UseSessionManagerReturn {
   loading: boolean;
   accountUsage: AccountUsageInfo[];
   launchCommands: Record<string, string>;
+  /** Machine-global default AI launch command template (null = built-in default). */
+  defaultLaunchCommand: string | null;
   fileLocks: FileLockInfo[];
 
   // Filters
@@ -455,6 +457,9 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
   // Per-account launch commands (e.g. "clg" for gmail, "clh" for hotmail)
   const [launchCommands, setLaunchCommands] = useState<Record<string, string>>({});
 
+  // Machine-global default AI launch command template (null = built-in default)
+  const [defaultLaunchCommand, setDefaultLaunchCommand] = useState<string | null>(null);
+
   // Active file locks (for Launch Menu visibility)
   const [fileLocks, setFileLocks] = useState<FileLockInfo[]>([]);
 
@@ -593,6 +598,15 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
         if (result.success && result.data) {
           const data = result.data as { commands: Record<string, string> };
           if (data.commands) setLaunchCommands(data.commands);
+        }
+      } catch {
+        // Silently fail
+      }
+      try {
+        const result = await invoke<CommandResponse>("get_claude_default_launch_command");
+        if (result.success && result.data) {
+          const data = result.data as { command: string | null };
+          if (data.command) setDefaultLaunchCommand(data.command);
         }
       } catch {
         // Silently fail
@@ -1098,6 +1112,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     loading: sessionsLoading || digestsLoading,
     accountUsage,
     launchCommands,
+    defaultLaunchCommand,
     fileLocks,
     searchQuery,
     setSearchQuery,

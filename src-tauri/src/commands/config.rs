@@ -528,6 +528,42 @@ pub fn save_claude_account_launch_commands(
     })
 }
 
+/// Get the default AI launch command template (`None` = built-in default).
+#[tauri::command]
+pub fn get_claude_default_launch_command() -> Result<CommandResponse, String> {
+    let command = settings::get_claude_default_launch_command();
+
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::json!({ "command": command })),
+    })
+}
+
+/// Save the default AI launch command template.
+///
+/// # Arguments
+/// * `command` - Template typed into new AI terminals; empty/whitespace clears
+///   the override back to the built-in default.
+#[tauri::command]
+pub fn save_claude_default_launch_command(
+    command: Option<String>,
+) -> Result<CommandResponse, String> {
+    let normalized = command
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty());
+    info!("Saving default AI launch command: {:?}", normalized);
+
+    settings::save_claude_default_launch_command(normalized.clone())
+        .map_err(|e| format!("Failed to save default AI launch command: {}", e))?;
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Saved default AI launch command".to_string()),
+        data: Some(serde_json::json!({ "command": normalized })),
+    })
+}
+
 pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
     PluginBuilder::new("qontinui_config")
         .invoke_handler(tauri::generate_handler![
@@ -546,6 +582,8 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             save_claude_config_dirs,
             get_claude_account_launch_commands,
             save_claude_account_launch_commands,
+            get_claude_default_launch_command,
+            save_claude_default_launch_command,
         ])
         .build()
 }

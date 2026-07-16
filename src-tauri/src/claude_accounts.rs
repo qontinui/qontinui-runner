@@ -38,10 +38,11 @@ use crate::settings::AccountSelectionMode;
 
 const CLAUDE_ACCOUNTS_FILE: &str = "claude-accounts.json";
 
-/// On-disk shape of `claude-accounts.json`: exactly the four machine-global
+/// On-disk shape of `claude-accounts.json`: exactly the five machine-global
 /// roster fields, with types matching the corresponding `Settings` fields
 /// (`Settings.claude_config_dirs`, `Settings.ai.claude_cli.account_selection_mode`,
-/// `Settings.ai.claude_cli.config_dir`, `Settings.claude_account_launch_commands`).
+/// `Settings.ai.claude_cli.config_dir`, `Settings.claude_account_launch_commands`,
+/// `Settings.claude_default_launch_command`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ClaudeAccountsFile {
     /// Directories containing Claude Code configs (each with a `projects/` subdir).
@@ -56,6 +57,13 @@ pub struct ClaudeAccountsFile {
     /// Custom launch command per account config dir (key: config_dir path).
     #[serde(default)]
     pub claude_account_launch_commands: HashMap<String, String>,
+    /// Default AI launch command template for accounts WITHOUT a per-account
+    /// override. `None` = the built-in default
+    /// (`claude --permission-mode bypassPermissions --session-id <uuid>`).
+    /// `{sessionId}` in the template is substituted with the fresh pinned id;
+    /// without the placeholder the runner appends `--session-id <uuid>`.
+    #[serde(default)]
+    pub claude_default_launch_command: Option<String>,
 }
 
 impl ClaudeAccountsFile {
@@ -65,6 +73,7 @@ impl ClaudeAccountsFile {
         self.claude_config_dirs.is_empty()
             && self.config_dir.is_none()
             && self.claude_account_launch_commands.is_empty()
+            && self.claude_default_launch_command.is_none()
     }
 }
 
@@ -183,6 +192,8 @@ fn migrate_seed(accounts_path: &Path, unscoped_settings: &Path) -> bool {
         #[serde(default)]
         claude_account_launch_commands: HashMap<String, String>,
         #[serde(default)]
+        claude_default_launch_command: Option<String>,
+        #[serde(default)]
         ai: AiProbe,
     }
 
@@ -203,6 +214,7 @@ fn migrate_seed(accounts_path: &Path, unscoped_settings: &Path) -> bool {
         account_selection_mode: probe.ai.claude_cli.account_selection_mode,
         config_dir: probe.ai.claude_cli.config_dir,
         claude_account_launch_commands: probe.claude_account_launch_commands,
+        claude_default_launch_command: probe.claude_default_launch_command,
     };
     if seed.is_empty_roster() {
         return false; // empty roster — leave legacy per-instance behavior intact
@@ -238,7 +250,7 @@ pub fn load_with_migration() -> Option<ClaudeAccountsFile> {
     load()
 }
 
-/// Overwrite the four roster fields on `settings` from `roster` —
+/// Overwrite the five roster fields on `settings` from `roster` —
 /// UNCONDITIONALLY (even with empty values): when `claude-accounts.json`
 /// exists it is the single source of truth, and the stale shadow copies in
 /// per-instance settings.json files must never win. Pure so the precedence
@@ -246,6 +258,7 @@ pub fn load_with_migration() -> Option<ClaudeAccountsFile> {
 pub fn apply_roster_overlay(settings: &mut crate::settings::Settings, roster: ClaudeAccountsFile) {
     settings.claude_config_dirs = roster.claude_config_dirs;
     settings.claude_account_launch_commands = roster.claude_account_launch_commands;
+    settings.claude_default_launch_command = roster.claude_default_launch_command;
     settings.ai.claude_cli.config_dir = roster.config_dir;
     settings.ai.claude_cli.account_selection_mode = roster.account_selection_mode;
 }
@@ -270,6 +283,7 @@ fn roster_from_current_settings() -> ClaudeAccountsFile {
         account_selection_mode: s.ai.claude_cli.account_selection_mode,
         config_dir: s.ai.claude_cli.config_dir,
         claude_account_launch_commands: s.claude_account_launch_commands,
+        claude_default_launch_command: s.claude_default_launch_command,
     }
 }
 
@@ -313,6 +327,7 @@ mod tests {
             account_selection_mode: AccountSelectionMode::LeastUsage,
             config_dir: Some("C:\\Users\\x\\.claude-work".to_string()),
             claude_account_launch_commands: cmds,
+            claude_default_launch_command: None,
         };
         let json = serde_json::to_string_pretty(&file).unwrap();
         assert!(
@@ -360,12 +375,13 @@ mod tests {
     /// the shadow's.
     #[test]
     #[allow(clippy::field_reassign_with_default)] // Settings has ~60 fields; literal construction is impractical
-    fn overlay_overwrites_all_four_fields_unconditionally() {
+    fn overlay_overwrites_all_five_fields_unconditionally() {
         let mut settings = crate::settings::Settings::default();
         settings.claude_config_dirs = vec!["/stale-shadow".into()];
         settings
             .claude_account_launch_commands
             .insert("/stale-shadow".into(), "stale-cmd".into());
+        settings.claude_default_launch_command = Some("stale-default".into());
         settings.ai.claude_cli.config_dir = Some("/stale-shadow".into());
         settings.ai.claude_cli.account_selection_mode = AccountSelectionMode::Manual;
 
@@ -376,11 +392,16 @@ mod tests {
             account_selection_mode: AccountSelectionMode::LeastUsage,
             config_dir: None, // must overwrite the Some(...) shadow
             claude_account_launch_commands: cmds.clone(),
+            claude_default_launch_command: Some("claude --model opus".into()),
         };
         apply_roster_overlay(&mut settings, roster);
 
         assert_eq!(settings.claude_config_dirs, vec!["/global".to_string()]);
         assert_eq!(settings.claude_account_launch_commands, cmds);
+        assert_eq!(
+            settings.claude_default_launch_command,
+            Some("claude --model opus".to_string())
+        );
         assert_eq!(settings.ai.claude_cli.config_dir, None);
         assert_eq!(
             settings.ai.claude_cli.account_selection_mode,
@@ -391,6 +412,7 @@ mod tests {
         apply_roster_overlay(&mut settings, ClaudeAccountsFile::default());
         assert!(settings.claude_config_dirs.is_empty());
         assert!(settings.claude_account_launch_commands.is_empty());
+        assert_eq!(settings.claude_default_launch_command, None);
     }
 
     #[test]

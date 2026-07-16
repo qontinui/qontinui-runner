@@ -928,6 +928,7 @@ function TerminalPageInner({
           configDir,
           isWindows,
           customCmd,
+          defaultTemplate: sessionManager.defaultLaunchCommand ?? undefined,
           newSessionId: () => crypto.randomUUID(),
         });
         writeWhenReady(tabId, `${command}\r`);

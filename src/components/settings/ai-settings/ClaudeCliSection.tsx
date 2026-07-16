@@ -152,6 +152,43 @@ export function ClaudeCliSection({
     [onLog],
   );
 
+  // Machine-global default AI launch command template (used by the Terminal
+  // page's /spawn-ai + launch menu for accounts without a per-account command)
+  const [defaultLaunchCommand, setDefaultLaunchCommand] = useState("");
+  useEffect(() => {
+    (async () => {
+      try {
+        const result = await invoke<TauriResult<{ command: string | null }>>(
+          "get_claude_default_launch_command",
+        );
+        if (result?.success && result.data) {
+          setDefaultLaunchCommand(result.data.command ?? "");
+        }
+      } catch {
+        // Silently fail
+      }
+    })();
+  }, []);
+
+  const defaultCmdSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const saveDefaultLaunchCommand = useCallback(
+    (command: string) => {
+      setDefaultLaunchCommand(command);
+      // Debounce the IPC save to avoid a write per keystroke
+      if (defaultCmdSaveTimerRef.current) clearTimeout(defaultCmdSaveTimerRef.current);
+      defaultCmdSaveTimerRef.current = setTimeout(async () => {
+        try {
+          await invoke("save_claude_default_launch_command", {
+            command: command.trim() || null,
+          });
+        } catch (e) {
+          onLog("error", `Failed to save default launch command: ${e}`);
+        }
+      }, 400);
+    },
+    [onLog],
+  );
+
   const saveClaudeConfigDirs = useCallback(
     async (dirs: string[]) => {
       try {
@@ -361,6 +398,26 @@ export function ClaudeCliSection({
           />
           <p className="text-[10px] text-muted-foreground">
             Specify a custom path to the Claude Code executable if it's not in your PATH.
+          </p>
+        </div>
+
+        <div className="space-y-1.5">
+          <label htmlFor="claude-cli-default-launch-command" className="text-xs font-medium">
+            Default AI Launch Command (Optional)
+          </label>
+          <input
+            id="claude-cli-default-launch-command"
+            type="text"
+            value={defaultLaunchCommand}
+            onChange={(e) => saveDefaultLaunchCommand(e.target.value)}
+            placeholder="claude --permission-mode bypassPermissions"
+            className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
+          />
+          <p className="text-[10px] text-muted-foreground">
+            Typed into every new AI terminal spawned from the Terminal page (launch menu,{" "}
+            <code>/spawn-ai</code>) for accounts without a per-account launch command below. The
+            runner appends <code>--session-id &lt;uuid&gt;</code>, or replaces{" "}
+            <code>{"{sessionId}"}</code> if the template contains it. Leave empty for the default.
           </p>
         </div>
 
