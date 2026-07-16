@@ -210,18 +210,33 @@ impl Default for OllamaSettings {
 }
 
 /// Settings for any OpenAI-compatible HTTP endpoint.
+///
+/// Defaults to DeepSeek (`https://api.deepseek.com`, model `deepseek-chat`),
+/// but any endpoint speaking the OpenAI `/chat/completions` wire format works
+/// — e.g. "http://localhost:8080/v1" for a vLLM server, LM Studio, Together.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAiCompatibleSettings {
-    /// Full base URL — e.g. "http://localhost:8080/v1" for a vLLM server.
-    #[serde(default)]
+    /// Full base URL — e.g. "https://api.deepseek.com" (default) or
+    /// "http://localhost:8080/v1" for a vLLM server.
+    #[serde(default = "default_openai_compatible_base_url")]
     pub base_url: String,
-    /// Model identifier the server expects.
-    #[serde(default)]
+    /// Model identifier the server expects (default: "deepseek-chat").
+    #[serde(default = "default_openai_compatible_model")]
     pub model: String,
     #[serde(default = "default_openai_compatible_timeout")]
     pub timeout_seconds: u64,
     // Note: API key (if any) stored separately in OS keychain via
-    // `ai_keychain().store("openai_compatible", ...)`.
+    // `ai_keychain().store("openai_compatible", ...)`; env fallbacks
+    // DEEPSEEK_API_KEY / OPENAI_COMPATIBLE_API_KEY also work. Keyless local
+    // endpoints (vLLM, LM Studio) need no key at all.
+}
+
+fn default_openai_compatible_base_url() -> String {
+    "https://api.deepseek.com".to_string()
+}
+
+fn default_openai_compatible_model() -> String {
+    "deepseek-chat".to_string()
 }
 
 fn default_openai_compatible_timeout() -> u64 {
@@ -231,8 +246,8 @@ fn default_openai_compatible_timeout() -> u64 {
 impl Default for OpenAiCompatibleSettings {
     fn default() -> Self {
         Self {
-            base_url: String::new(),
-            model: String::new(),
+            base_url: default_openai_compatible_base_url(),
+            model: default_openai_compatible_model(),
             timeout_seconds: default_openai_compatible_timeout(),
         }
     }

@@ -27,6 +27,7 @@ pub mod multimodal;
 pub(crate) mod oauth_refresh;
 pub mod oauth_usage;
 pub mod oneshot;
+mod openai_compat;
 mod process;
 pub mod retry;
 pub(crate) mod routing;
