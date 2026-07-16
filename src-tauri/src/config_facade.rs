@@ -437,6 +437,10 @@ pub mod keychain_keys {
     pub const OPENAI_API_KEY: &str = "openai_api_key";
     pub const ANTHROPIC_API_KEY: &str = "anthropic_api_key";
     pub const PLAYWRIGHT_PASSWORD: &str = "test_password";
+    /// Slot for generic OpenAI-compatible endpoints (DeepSeek, vLLM, …) in
+    /// `ai_keychain()`. Matches the provider string the Settings UI passes to
+    /// `store_ai_api_key("openai_compatible", …)`.
+    pub const OPENAI_COMPATIBLE_API_KEY: &str = "openai_compatible";
 }
 
 // ============================================================================

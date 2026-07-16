@@ -13,6 +13,7 @@ use super::gemini_api::{
 };
 use super::gemini_cli::run_gemini_cli;
 use super::multimodal::MultimodalPrompt;
+use super::openai_compat::run_openai_compat;
 use super::retry::{
     retry_with_backoff, retry_with_backoff_tracked, retry_with_fallback,
     retry_with_fallback_tracked,
@@ -60,11 +61,14 @@ pub fn run_prompt_sync(prompt: &str, doctor_handle: Option<&DoctorHandle>) -> Ai
             AiProvider::GeminiApi => {
                 run_gemini_api(prompt, &ai_settings.gemini_api, None, doctor_handle)
             }
-            // TODO(tier-decoupling): wire Ollama/OpenAiCompatible into the agentic loop
-            AiProvider::Ollama | AiProvider::OpenAiCompatible => AiResponse::error(
-                "Local provider (Ollama / OpenAI-compatible) dispatch is not yet \
-                 wired into the agentic loop. The provider is configured but full \
-                 integration is deferred — use Claude or Gemini for now."
+            AiProvider::OpenAiCompatible => {
+                run_openai_compat(prompt, &ai_settings.openai_compatible, None, doctor_handle)
+            }
+            // TODO(tier-decoupling): wire Ollama into the agentic loop
+            AiProvider::Ollama => AiResponse::error(
+                "Ollama dispatch is not yet wired into the agentic loop. The \
+                 provider is configured but full integration is deferred — use \
+                 Claude, Gemini, or an OpenAI-compatible endpoint for now."
                     .to_string(),
             ),
         }
@@ -215,11 +219,33 @@ pub fn run_prompt_with_routing(
                     run_gemini_api(prompt, &ai_settings.gemini_api, None, doctor_handle)
                 }
             }
-            // TODO(tier-decoupling): wire Ollama/OpenAiCompatible into the agentic loop
-            AiProvider::Ollama | AiProvider::OpenAiCompatible => AiResponse::error(
-                "Local provider (Ollama / OpenAI-compatible) routed dispatch is not \
-                 yet wired into the agentic loop. The provider is configured but \
-                 full integration is deferred — use Claude or Gemini for now."
+            AiProvider::OpenAiCompatible => {
+                // Router model catalogs name Claude/Gemini models — those are
+                // meaningless to an OpenAI-compatible endpoint, so fall back to
+                // the configured model instead of forwarding them.
+                let effective_model = model_override.as_deref().and_then(|m| {
+                    if m.starts_with("claude") || m.starts_with("gemini") {
+                        warn!(
+                            "Cannot route to {} model when using OpenAI-compatible provider",
+                            m
+                        );
+                        None
+                    } else {
+                        Some(m)
+                    }
+                });
+                run_openai_compat(
+                    prompt,
+                    &ai_settings.openai_compatible,
+                    effective_model,
+                    doctor_handle,
+                )
+            }
+            // TODO(tier-decoupling): wire Ollama into the agentic loop
+            AiProvider::Ollama => AiResponse::error(
+                "Ollama routed dispatch is not yet wired into the agentic loop. \
+                 The provider is configured but full integration is deferred — \
+                 use Claude, Gemini, or an OpenAI-compatible endpoint for now."
                     .to_string(),
             ),
         }
@@ -306,6 +332,7 @@ fn resolve_provider_key(provider_str: Option<&str>, default: &AiProvider) -> Str
             "claude_api" => "claude_api".to_string(),
             "gemini_cli" => "gemini_cli".to_string(),
             "gemini_api" => "gemini_api".to_string(),
+            "openai_compatible" => "openai_compatible".to_string(),
             _ => circuit_breaker::provider_key(default),
         }
     } else {
@@ -381,6 +408,7 @@ fn run_prompt_with_overrides_inner(
                 "claude_api" => AiProvider::ClaudeApi,
                 "gemini_cli" => AiProvider::GeminiCli,
                 "gemini_api" => AiProvider::GeminiApi,
+                "openai_compatible" => AiProvider::OpenAiCompatible,
                 _ => ai_settings.provider,
             }
         } else {
@@ -427,11 +455,26 @@ fn run_prompt_with_overrides_inner(
                 temperature_override,
                 max_tokens_override,
             ),
-            // TODO(tier-decoupling): wire Ollama/OpenAiCompatible into the agentic loop
-            AiProvider::Ollama | AiProvider::OpenAiCompatible => AiResponse::error(
-                "Local provider (Ollama / OpenAI-compatible) overridden dispatch is \
-                 not yet wired into the agentic loop. The provider is configured \
-                 but full integration is deferred — use Claude or Gemini for now."
+            AiProvider::OpenAiCompatible => {
+                if temperature_override.is_some() || max_tokens_override.is_some() {
+                    debug!(
+                        "OpenAI-compatible client does not support temperature/max_tokens \
+                         overrides; ignoring"
+                    );
+                }
+                run_openai_compat(
+                    prompt,
+                    &ai_settings.openai_compatible,
+                    Some(model),
+                    doctor_handle,
+                )
+            }
+            // TODO(tier-decoupling): wire Ollama into the agentic loop
+            AiProvider::Ollama => AiResponse::error(
+                "Ollama overridden dispatch is not yet wired into the agentic \
+                 loop. The provider is configured but full integration is \
+                 deferred — use Claude, Gemini, or an OpenAI-compatible endpoint \
+                 for now."
                     .to_string(),
             ),
         };
@@ -470,6 +513,7 @@ pub fn run_structured_prompt(
             "claude_api" => AiProvider::ClaudeApi,
             "gemini_cli" => AiProvider::GeminiCli,
             "gemini_api" => AiProvider::GeminiApi,
+            "openai_compatible" => AiProvider::OpenAiCompatible,
             _ => ai_settings.provider,
         }
     } else {
@@ -662,11 +706,25 @@ pub fn run_prompt_multimodal(
             None,
             None,
         ),
-        // TODO(tier-decoupling): wire Ollama/OpenAiCompatible into the agentic loop
-        AiProvider::Ollama | AiProvider::OpenAiCompatible => AiResponse::error(
-            "Local provider (Ollama / OpenAI-compatible) multimodal dispatch is \
-             not yet wired into the agentic loop. The provider is configured but \
-             full integration is deferred — use Claude or Gemini for now."
+        AiProvider::OpenAiCompatible => {
+            if prompt.has_images() {
+                warn!(
+                    "OpenAI-compatible provider does not support image content blocks; \
+                     falling back to text-only"
+                );
+            }
+            run_openai_compat(
+                &prompt.text_content(),
+                &ai_settings.openai_compatible,
+                None,
+                doctor_handle,
+            )
+        }
+        // TODO(tier-decoupling): wire Ollama into the agentic loop
+        AiProvider::Ollama => AiResponse::error(
+            "Ollama multimodal dispatch is not yet wired into the agentic loop. \
+             The provider is configured but full integration is deferred — use \
+             Claude, Gemini, or an OpenAI-compatible endpoint for now."
                 .to_string(),
         ),
     }
@@ -766,12 +824,38 @@ pub fn run_prompt_with_routing_multimodal(
                 None,
             )
         }
-        // TODO(tier-decoupling): wire Ollama/OpenAiCompatible into the agentic loop
-        AiProvider::Ollama | AiProvider::OpenAiCompatible => AiResponse::error(
-            "Local provider (Ollama / OpenAI-compatible) multimodal-routed \
-             dispatch is not yet wired into the agentic loop. The provider is \
-             configured but full integration is deferred — use Claude or Gemini \
-             for now."
+        AiProvider::OpenAiCompatible => {
+            if prompt.has_images() {
+                warn!(
+                    "OpenAI-compatible provider does not support image content blocks; \
+                     falling back to text-only"
+                );
+            }
+            // Router model catalogs name Claude/Gemini models — meaningless to
+            // an OpenAI-compatible endpoint; fall back to the configured model.
+            let effective_model = model_override.as_deref().and_then(|m| {
+                if m.starts_with("claude") || m.starts_with("gemini") {
+                    warn!(
+                        "Cannot route to {} model when using OpenAI-compatible provider",
+                        m
+                    );
+                    None
+                } else {
+                    Some(m)
+                }
+            });
+            run_openai_compat(
+                &prompt.text_content(),
+                &ai_settings.openai_compatible,
+                effective_model,
+                doctor_handle,
+            )
+        }
+        // TODO(tier-decoupling): wire Ollama into the agentic loop
+        AiProvider::Ollama => AiResponse::error(
+            "Ollama multimodal-routed dispatch is not yet wired into the agentic \
+             loop. The provider is configured but full integration is deferred — \
+             use Claude, Gemini, or an OpenAI-compatible endpoint for now."
                 .to_string(),
         ),
     }
@@ -800,6 +884,7 @@ pub fn run_prompt_with_model_override_multimodal(
             "claude_api" => AiProvider::ClaudeApi,
             "gemini_cli" => AiProvider::GeminiCli,
             "gemini_api" => AiProvider::GeminiApi,
+            "openai_compatible" => AiProvider::OpenAiCompatible,
             _ => ai_settings.provider,
         }
     } else {
@@ -867,12 +952,29 @@ pub fn run_prompt_with_model_override_multimodal(
             temperature_override,
             max_tokens_override,
         ),
-        // TODO(tier-decoupling): wire Ollama/OpenAiCompatible into the agentic loop
-        AiProvider::Ollama | AiProvider::OpenAiCompatible => AiResponse::error(
-            "Local provider (Ollama / OpenAI-compatible) multimodal-overridden \
-             dispatch is not yet wired into the agentic loop. The provider is \
-             configured but full integration is deferred — use Claude or Gemini \
-             for now."
+        AiProvider::OpenAiCompatible => {
+            if prompt.has_images() {
+                warn!("OpenAI-compatible provider does not support multimodal; using text-only fallback");
+            }
+            if temperature_override.is_some() || max_tokens_override.is_some() {
+                debug!(
+                    "OpenAI-compatible client does not support temperature/max_tokens \
+                     overrides; ignoring"
+                );
+            }
+            run_openai_compat(
+                &prompt.text_content(),
+                &ai_settings.openai_compatible,
+                effective_model,
+                doctor_handle,
+            )
+        }
+        // TODO(tier-decoupling): wire Ollama into the agentic loop
+        AiProvider::Ollama => AiResponse::error(
+            "Ollama multimodal-overridden dispatch is not yet wired into the \
+             agentic loop. The provider is configured but full integration is \
+             deferred — use Claude, Gemini, or an OpenAI-compatible endpoint for \
+             now."
                 .to_string(),
         ),
     }
@@ -949,6 +1051,7 @@ pub fn run_prompt_with_structured_output(
             "claude_api" => AiProvider::ClaudeApi,
             "gemini_cli" => AiProvider::GeminiCli,
             "gemini_api" => AiProvider::GeminiApi,
+            "openai_compatible" => AiProvider::OpenAiCompatible,
             _ => ai_settings.provider,
         }
     } else {
@@ -1003,12 +1106,26 @@ pub fn run_prompt_with_structured_output(
                 doctor_handle,
             )
         }
-        // TODO(tier-decoupling): wire Ollama/OpenAiCompatible into the agentic loop
-        AiProvider::Ollama | AiProvider::OpenAiCompatible => AiResponse::error(
-            "Local provider (Ollama / OpenAI-compatible) structured-output \
-             dispatch is not yet wired into the agentic loop. The provider is \
-             configured but full integration is deferred — use Claude or Gemini \
-             for now."
+        // OpenAI-compatible endpoints don't get server-side schema enforcement
+        // here — fall through to the standard path like the CLI providers.
+        // The StructuredOutputMiddleware will handle validation and retries.
+        AiProvider::OpenAiCompatible => {
+            debug!(
+                "OpenAI-compatible provider does not support server-side structured output; \
+                 using standard path"
+            );
+            run_openai_compat(
+                prompt,
+                &ai_settings.openai_compatible,
+                model_override,
+                doctor_handle,
+            )
+        }
+        // TODO(tier-decoupling): wire Ollama into the agentic loop
+        AiProvider::Ollama => AiResponse::error(
+            "Ollama structured-output dispatch is not yet wired into the agentic \
+             loop. The provider is configured but full integration is deferred — \
+             use Claude, Gemini, or an OpenAI-compatible endpoint for now."
                 .to_string(),
         ),
     }
