@@ -14,7 +14,13 @@
 //!     push <coord-origin>/git/<owner>/<repo>.git refs/heads/<branch>:refs/agent/<m>-<a>
 //! ```
 //!
-//! against the coord-hosted git origin (Row 9 Phase 2, §3.4). The push
+//! against the coord-hosted git origin (Row 9 Phase 2, §3.4). Since the
+//! 2026-07-12 incident (89 pushers re-sending full packs every 5 min for
+//! ~5.5h against a 503ing git door — 3,335 silent refusals) each push is
+//! bounded: a hard tokio timeout with `kill_on_drop`, git low-speed
+//! abort thresholds, and per-target exponential backoff (base cadence
+//! doubling to a 1h cap) with failures promoted to `warn!` after
+//! [`NOISY_FAILURE_THRESHOLD`] consecutive misses. The push
 //! is authenticated by the agent's coord-issued JWT handed to git as an
 //! `Authorization: Bearer` header via `-c http.extraHeader` — coord's
 //! git-http gate is Bearer-only and rejects GitHub-style
@@ -76,6 +82,42 @@ const DEFAULT_PUSH_INTERVAL_SECS: u64 = 300;
 /// sustained at 300 agents" math depends on this.
 const DEFAULT_JITTER_SECS: u64 = 60;
 
+/// Hard wall-clock limit on a single `git push` child (2026-07-12
+/// incident hardening: a bare `.output().await` against a stalled
+/// server hangs forever). Overridable via
+/// `QONTINUI_PUSHER_PUSH_TIMEOUT_SECS`.
+const DEFAULT_PUSH_TIMEOUT_SECS: u64 = 120;
+
+/// Ceiling for the per-target exponential backoff (1h). With the
+/// default 5-min cadence the delay ladder is 5m→10m→20m→40m→60m.
+const BACKOFF_CAP_SECS: u64 = 3600;
+
+/// Consecutive-failure count at which transient-failure logging is
+/// promoted from `debug!` to `warn!`. The 2026-07-12 incident produced
+/// 3,335 silent 503 refusals over ~5.5h — after this change the third
+/// consecutive failure per target is loudly visible.
+const NOISY_FAILURE_THRESHOLD: u32 = 3;
+
+/// The tick cadence in seconds (`QONTINUI_PUSHER_INTERVAL_SECS`,
+/// default 300). Also the base of the backoff ladder.
+fn push_interval_secs() -> u64 {
+    std::env::var("QONTINUI_PUSHER_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_PUSH_INTERVAL_SECS)
+}
+
+/// Hard per-push timeout (`QONTINUI_PUSHER_PUSH_TIMEOUT_SECS`,
+/// default 120s). Thin env wrapper — the timeout itself is injected
+/// into [`push_one`] as an argument so tests never mutate global env.
+fn push_timeout() -> Duration {
+    let secs = std::env::var("QONTINUI_PUSHER_PUSH_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_PUSH_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
 /// One worktree the pusher pushes for. Mirrors the shape coord
 /// returns from `POST /agents/allocate`, less the suggested-path
 /// (we hold the actually-materialized path).
@@ -106,6 +148,12 @@ pub struct PusherState {
     /// Shared with every other daemon spawned for this agent (one
     /// refresh path, not one per daemon). See [`crate::agent_token`].
     pub token: SharedToken,
+    /// Per-target retry/backoff bookkeeping, indexed parallel to
+    /// `targets` (2026-07-12 incident hardening). Behind a Mutex only
+    /// because the state lives in an `Arc` — ticks are single-flight
+    /// ([`run`] awaits [`tick_once`] before sleeping again), so the
+    /// lock is never contended; it is NOT concurrency control.
+    pub backoff: tokio::sync::Mutex<Vec<BackoffState>>,
 }
 
 impl PusherState {
@@ -149,14 +197,94 @@ impl PusherState {
             })
             .collect();
         let origin_repo_alias = targets.first().map(|t| t.repo.clone()).unwrap_or_default();
+        let backoff = tokio::sync::Mutex::new(vec![BackoffState::default(); targets.len()]);
         Some(Self {
             agent_id,
             coord_http_base,
             origin_repo_alias,
             targets,
             token,
+            backoff,
         })
     }
+}
+
+/// Per-target push backoff state (2026-07-12 incident hardening).
+/// Pure data — all transitions take `now` / base / cap as arguments so
+/// tests drive the machine without clocks or global env.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackoffState {
+    /// Consecutive failed push attempts (transient, timed-out, or
+    /// permanent). Reset to 0 on any success (incl. up-to-date no-op).
+    pub consecutive_failures: u32,
+    /// Unix seconds before which the target is skipped on a tick.
+    pub next_attempt_epoch_secs: u64,
+}
+
+impl BackoffState {
+    /// True while the target is inside its backoff window.
+    pub fn should_skip(&self, now_secs: u64) -> bool {
+        now_secs < self.next_attempt_epoch_secs
+    }
+
+    /// Record one failed attempt: bump the counter and push
+    /// `next_attempt_epoch_secs` out by the (doubled, capped) delay.
+    pub fn record_failure(&mut self, now_secs: u64, base_secs: u64, cap_secs: u64) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.next_attempt_epoch_secs = now_secs.saturating_add(backoff_delay_secs(
+            base_secs,
+            self.consecutive_failures,
+            cap_secs,
+        ));
+    }
+
+    /// Any successful push (or up-to-date no-op) fully resets the ladder.
+    pub fn record_success(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Delay before the next attempt after `consecutive_failures` failures:
+/// starts at the base cadence and doubles per further failure, capped
+/// (with the defaults: 5m→10m→20m→40m→60m, then 60m forever).
+pub fn backoff_delay_secs(base_secs: u64, consecutive_failures: u32, cap_secs: u64) -> u64 {
+    if consecutive_failures == 0 {
+        return 0;
+    }
+    let mut delay = base_secs.min(cap_secs);
+    for _ in 1..consecutive_failures {
+        if delay >= cap_secs {
+            return cap_secs;
+        }
+        delay = delay.saturating_mul(2);
+    }
+    delay.min(cap_secs)
+}
+
+/// Fold one push attempt's outcome into the target's backoff state.
+/// Returns `true` when the failure streak has reached
+/// [`NOISY_FAILURE_THRESHOLD`] and the caller must log at `warn!`.
+/// Pure over its arguments — unit-testable without env or clocks.
+fn record_outcome(
+    b: &mut BackoffState,
+    failed: bool,
+    now_secs: u64,
+    base_secs: u64,
+    cap_secs: u64,
+) -> bool {
+    if !failed {
+        b.record_success();
+        return false;
+    }
+    b.record_failure(now_secs, base_secs, cap_secs);
+    b.consecutive_failures >= NOISY_FAILURE_THRESHOLD
+}
+
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Spawn the pusher daemon for one agent. Returns immediately;
@@ -173,10 +301,7 @@ impl PusherState {
 /// per Row 9 §3.3 + the `default_scopes` helper). So one token serves
 /// every push target.
 pub fn spawn(state: Arc<PusherState>) -> PusherHandle {
-    let interval_secs = std::env::var("QONTINUI_PUSHER_INTERVAL_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_PUSH_INTERVAL_SECS);
+    let interval_secs = push_interval_secs();
     let jitter_secs = std::env::var("QONTINUI_PUSHER_JITTER_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -262,10 +387,16 @@ async fn run(
 }
 
 /// One push cycle. Refresh the token if it's near expiry; iterate
-/// every push target; report per-target outcomes.
+/// every push target (skipping any inside its backoff window); report
+/// per-target outcomes and update per-target backoff state.
 ///
 /// Public for the integration test — doesn't depend on the spawn
 /// machinery.
+///
+/// Single-flight: [`run`] awaits `tick_once` before sleeping again, so
+/// ticks never overlap for one pusher. The `state.backoff` lock below
+/// is therefore uncontended — it exists only to mutate through the
+/// `Arc`, not as concurrency control; do not add further locking here.
 pub async fn tick_once(state: &Arc<PusherState>) -> Result<()> {
     agent_token::maybe_refresh(
         &state.token,
@@ -278,25 +409,104 @@ pub async fn tick_once(state: &Arc<PusherState>) -> Result<()> {
         let guard = state.token.read().await;
         guard.clone()
     };
-    for target in &state.targets {
-        match push_one(state, target, &token_clone.token).await {
-            Ok(PushOutcome::Pushed) => info!(
-                "agent_pusher: agent_id={} repo={} branch={} pushed",
-                state.agent_id, target.repo, target.branch
-            ),
-            Ok(PushOutcome::UpToDate) => debug!(
-                "agent_pusher: agent_id={} repo={} branch={} up-to-date",
-                state.agent_id, target.repo, target.branch
-            ),
-            Ok(PushOutcome::Transient(msg)) => debug!(
-                "agent_pusher: agent_id={} repo={} branch={} transient push \
-                 failure (best-effort, will retry next tick): {msg}",
-                state.agent_id, target.repo, target.branch
-            ),
-            Err(e) => warn!(
-                "agent_pusher: agent_id={} repo={} branch={} push failed: {e:#}",
-                state.agent_id, target.repo, target.branch
-            ),
+    // Backoff base = the tick cadence: one failure delays the target by
+    // one normal tick, then doubles per consecutive failure up to
+    // BACKOFF_CAP_SECS (2026-07-12 incident: 89 pushers re-sent full
+    // packs every 5 min for ~5.5h against a 503ing door — 3,335
+    // refusals with zero visible signal).
+    let base_secs = push_interval_secs();
+    let timeout = push_timeout();
+    let mut backoff = state.backoff.lock().await;
+    for (idx, target) in state.targets.iter().enumerate() {
+        let b = match backoff.get_mut(idx) {
+            Some(b) => b,
+            None => {
+                // targets/backoff are built parallel; defensive only.
+                backoff.resize_with(idx + 1, BackoffState::default);
+                &mut backoff[idx]
+            }
+        };
+        let now = now_epoch_secs();
+        if b.should_skip(now) {
+            debug!(
+                "agent_pusher: agent_id={} repo={} branch={} skipping — \
+                 {} consecutive failure(s), backing off until epoch {} ({}s left)",
+                state.agent_id,
+                target.repo,
+                target.branch,
+                b.consecutive_failures,
+                b.next_attempt_epoch_secs,
+                b.next_attempt_epoch_secs.saturating_sub(now)
+            );
+            continue;
+        }
+        match push_one(state, target, &token_clone.token, timeout).await {
+            Ok(PushOutcome::Pushed) => {
+                b.record_success();
+                info!(
+                    "agent_pusher: agent_id={} repo={} branch={} pushed",
+                    state.agent_id, target.repo, target.branch
+                );
+            }
+            Ok(PushOutcome::UpToDate) => {
+                b.record_success();
+                debug!(
+                    "agent_pusher: agent_id={} repo={} branch={} up-to-date",
+                    state.agent_id, target.repo, target.branch
+                );
+            }
+            Ok(PushOutcome::Transient(msg)) => {
+                let loud = record_outcome(b, true, now, base_secs, BACKOFF_CAP_SECS);
+                if loud {
+                    warn!(
+                        "agent_pusher: agent_id={} repo={} branch={} transient push \
+                         failure #{} (backing off until epoch {}, ~{}s): {msg}",
+                        state.agent_id,
+                        target.repo,
+                        target.branch,
+                        b.consecutive_failures,
+                        b.next_attempt_epoch_secs,
+                        b.next_attempt_epoch_secs.saturating_sub(now)
+                    );
+                } else {
+                    debug!(
+                        "agent_pusher: agent_id={} repo={} branch={} transient push \
+                         failure #{} (best-effort, next attempt after epoch {}): {msg}",
+                        state.agent_id,
+                        target.repo,
+                        target.branch,
+                        b.consecutive_failures,
+                        b.next_attempt_epoch_secs
+                    );
+                }
+            }
+            Ok(PushOutcome::TimedOut(elapsed)) => {
+                // Always loud — push_one already warned with the
+                // worktree + refspec; this records it for backoff.
+                record_outcome(b, true, now, base_secs, BACKOFF_CAP_SECS);
+                warn!(
+                    "agent_pusher: agent_id={} repo={} branch={} push timed out \
+                     after {:.1}s (failure #{}, backing off until epoch {})",
+                    state.agent_id,
+                    target.repo,
+                    target.branch,
+                    elapsed.as_secs_f64(),
+                    b.consecutive_failures,
+                    b.next_attempt_epoch_secs
+                );
+            }
+            Err(e) => {
+                record_outcome(b, true, now, base_secs, BACKOFF_CAP_SECS);
+                warn!(
+                    "agent_pusher: agent_id={} repo={} branch={} push failed \
+                     (failure #{}, backing off until epoch {}): {e:#}",
+                    state.agent_id,
+                    target.repo,
+                    target.branch,
+                    b.consecutive_failures,
+                    b.next_attempt_epoch_secs
+                );
+            }
         }
     }
     Ok(())
@@ -304,12 +514,18 @@ pub async fn tick_once(state: &Arc<PusherState>) -> Result<()> {
 
 /// Push one branch to coord-origin via `git push`. Returns
 /// [`PushOutcome::Pushed`] if anything moved, [`PushOutcome::UpToDate`]
-/// for a no-op, [`PushOutcome::Transient`] for a retryable failure, and
-/// `Err` for a permanent one (see [`is_transient_push_error`]).
+/// for a no-op, [`PushOutcome::Transient`] for a retryable failure,
+/// [`PushOutcome::TimedOut`] when the child exceeded `push_timeout`
+/// (killed via `kill_on_drop`), and `Err` for a permanent one (see
+/// [`is_transient_push_error`]).
+///
+/// `push_timeout` is injected by the caller (see [`push_timeout()`])
+/// so tests never need to mutate global env.
 async fn push_one(
     state: &Arc<PusherState>,
     target: &PushTarget,
     token: &str,
+    push_timeout: Duration,
 ) -> Result<PushOutcome> {
     let origin_url = build_origin_url(&state.coord_http_base, &target.repo)?;
     // Coordination Phase 5 / Row 4: push the local branch
@@ -332,19 +548,49 @@ async fn push_one(
     // coord's git-http gate is Bearer-only and rejects basic-auth, so the
     // agent JWT goes in an `Authorization: Bearer` header (not the URL).
     // `-c http.extraHeader=...` scopes the header to this one push.
-    let out = crate::process_helpers::tokio_no_window("git")
-        .arg("-C")
-        .arg(&target.worktree_path)
-        .arg("-c")
-        .arg(format!("http.extraHeader=Authorization: Bearer {token}"))
-        .arg("push")
-        .arg("--porcelain")
-        .arg("--no-verify")
-        .arg(&origin_url)
-        .arg(&refspec)
-        .output()
-        .await
-        .with_context(|| format!("invoking git push for {}", target.branch))?;
+    //
+    // Bounds (2026-07-12 incident hardening):
+    // - http.lowSpeedLimit/Time abort a transfer trickling below
+    //   1 KiB/s for 60s (a stalled server otherwise hangs git forever);
+    // - the tokio timeout is the hard wall-clock backstop; on expiry
+    //   the output-future is dropped and `kill_on_drop(true)` reaps the
+    //   git child instead of leaking it.
+    let started = std::time::Instant::now();
+    let out = match tokio::time::timeout(
+        push_timeout,
+        crate::process_helpers::tokio_no_window("git")
+            .arg("-C")
+            .arg(&target.worktree_path)
+            .arg("-c")
+            .arg(format!("http.extraHeader=Authorization: Bearer {token}"))
+            .arg("-c")
+            .arg("http.lowSpeedLimit=1024")
+            .arg("-c")
+            .arg("http.lowSpeedTime=60")
+            .arg("push")
+            .arg("--porcelain")
+            .arg("--no-verify")
+            .arg(&origin_url)
+            .arg(&refspec)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    {
+        Ok(res) => res.with_context(|| format!("invoking git push for {}", target.branch))?,
+        Err(_) => {
+            let elapsed = started.elapsed();
+            warn!(
+                "agent_pusher: git push timed out after {:.1}s (limit {}s) — \
+                 killed child; worktree={} refspec={}",
+                elapsed.as_secs_f64(),
+                push_timeout.as_secs(),
+                target.worktree_path.display(),
+                refspec
+            );
+            return Ok(PushOutcome::TimedOut(elapsed));
+        }
+    };
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         // Exit code 1 with "Everything up-to-date" is normal in some
@@ -425,13 +671,30 @@ fn default_repo_owner() -> String {
 
 /// Outcome of one [`push_one`] attempt. `Transient` carries the git
 /// stderr of a best-effort-retryable failure (coord write-proxy /
-/// replication hiccups, network faults) — logged quietly and retried on
-/// the next tick. Permanent failures (auth / scope / allowlist 4xx, or
-/// anything unrecognized) come back as `Err` and are surfaced loudly.
+/// replication hiccups, network faults) — logged quietly at first,
+/// promoted to `warn!` at [`NOISY_FAILURE_THRESHOLD`] consecutive
+/// failures, and retried with per-target exponential backoff.
+/// Permanent failures (auth / scope / allowlist 4xx, or anything
+/// unrecognized) come back as `Err` and are surfaced loudly.
 enum PushOutcome {
     Pushed,
     UpToDate,
     Transient(String),
+    /// The `git push` child exceeded the hard timeout and was killed
+    /// (`kill_on_drop`). Carries elapsed time; counts as a failure for
+    /// backoff purposes and is always logged at `warn!`.
+    TimedOut(Duration),
+}
+
+impl PushOutcome {
+    /// True for outcomes that count as a failure toward the per-target
+    /// backoff ladder (successes and up-to-date no-ops reset it).
+    /// `tick_once` matches the variants directly for per-arm log
+    /// wording; this is the canonical mapping the unit tests pin down.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn is_failure(&self) -> bool {
+        matches!(self, PushOutcome::Transient(_) | PushOutcome::TimedOut(_))
+    }
 }
 
 /// Classify a `git push` failure as transient (worth a quiet retry) vs
@@ -637,6 +900,112 @@ mod tests {
         }
     }
 
+    // ---- backoff state machine (2026-07-12 incident hardening) ----
+    // All params are injected as arguments — no env mutation (the
+    // parallel test harness races `std::env::set_var`).
+
+    #[test]
+    fn backoff_delay_doubles_from_base_and_caps() {
+        // 5m base, 1h cap: 5m→10m→20m→40m→60m, then 60m forever.
+        assert_eq!(backoff_delay_secs(300, 0, 3600), 0);
+        assert_eq!(backoff_delay_secs(300, 1, 3600), 300);
+        assert_eq!(backoff_delay_secs(300, 2, 3600), 600);
+        assert_eq!(backoff_delay_secs(300, 3, 3600), 1200);
+        assert_eq!(backoff_delay_secs(300, 4, 3600), 2400);
+        assert_eq!(backoff_delay_secs(300, 5, 3600), 3600);
+        assert_eq!(backoff_delay_secs(300, 6, 3600), 3600);
+        assert_eq!(backoff_delay_secs(300, 100, 3600), 3600);
+        // base already over the cap → clamp to cap immediately.
+        assert_eq!(backoff_delay_secs(7200, 1, 3600), 3600);
+        // no overflow panic on absurd counts.
+        assert_eq!(backoff_delay_secs(u64::MAX, 64, 3600), 3600);
+    }
+
+    #[test]
+    fn backoff_failure_ladder_then_reset_on_success() {
+        let mut b = BackoffState::default();
+        let (base, cap) = (300u64, 3600u64);
+        // Fresh state: never skips.
+        assert!(!b.should_skip(1000));
+        // failure 1 → next attempt = now + base.
+        b.record_failure(1000, base, cap);
+        assert_eq!(b.consecutive_failures, 1);
+        assert_eq!(b.next_attempt_epoch_secs, 1300);
+        assert!(b.should_skip(1299));
+        assert!(!b.should_skip(1300));
+        // failure 2 → doubled.
+        b.record_failure(1300, base, cap);
+        assert_eq!(b.consecutive_failures, 2);
+        assert_eq!(b.next_attempt_epoch_secs, 1300 + 600);
+        // walk to the cap.
+        b.record_failure(2000, base, cap); // #3 → 1200
+        b.record_failure(3000, base, cap); // #4 → 2400
+        b.record_failure(4000, base, cap); // #5 → 3600 (cap)
+        assert_eq!(b.next_attempt_epoch_secs, 4000 + 3600);
+        b.record_failure(9000, base, cap); // #6 → still capped
+        assert_eq!(b.consecutive_failures, 6);
+        assert_eq!(b.next_attempt_epoch_secs, 9000 + 3600);
+        // success fully resets the ladder.
+        b.record_success();
+        assert_eq!(b, BackoffState::default());
+        assert!(!b.should_skip(9001));
+        // and the next failure starts back at the base delay.
+        b.record_failure(9001, base, cap);
+        assert_eq!(b.next_attempt_epoch_secs, 9001 + 300);
+    }
+
+    #[test]
+    fn record_outcome_goes_loud_at_third_consecutive_failure() {
+        // The incident produced 3,335 silent refusals — the third
+        // consecutive failure must be loudly visible (warn!).
+        let mut b = BackoffState::default();
+        assert!(!record_outcome(&mut b, true, 100, 300, 3600)); // #1 quiet
+        assert!(!record_outcome(&mut b, true, 500, 300, 3600)); // #2 quiet
+        assert!(record_outcome(&mut b, true, 1200, 300, 3600)); // #3 LOUD
+        assert!(record_outcome(&mut b, true, 2500, 300, 3600)); // #4 stays loud
+                                                                // success resets both the ladder and the loudness.
+        assert!(!record_outcome(&mut b, false, 3000, 300, 3600));
+        assert_eq!(b, BackoffState::default());
+        assert!(!record_outcome(&mut b, true, 3100, 300, 3600)); // quiet again
+    }
+
+    #[test]
+    fn timeout_counts_as_failure_for_backoff() {
+        // A timed-out push (child killed via kill_on_drop) must advance
+        // the backoff ladder exactly like a transient refusal.
+        let timed_out = PushOutcome::TimedOut(Duration::from_secs(120));
+        assert!(timed_out.is_failure());
+        assert!(PushOutcome::Transient("error: 503".into()).is_failure());
+        assert!(!PushOutcome::Pushed.is_failure());
+        assert!(!PushOutcome::UpToDate.is_failure());
+
+        let mut b = BackoffState::default();
+        record_outcome(&mut b, timed_out.is_failure(), 1000, 300, 3600);
+        assert_eq!(b.consecutive_failures, 1);
+        assert_eq!(b.next_attempt_epoch_secs, 1300);
+        assert!(b.should_skip(1100));
+    }
+
+    #[tokio::test]
+    async fn state_constructor_sizes_backoff_parallel_to_targets() {
+        // with_shared_token builds one BackoffState per push target.
+        let allocate = crate::agent_worktree::AllocateResult {
+            agent_id: uuid::Uuid::nil().to_string(),
+            worktrees: vec![],
+            token: "t".into(),
+            token_jti: uuid::Uuid::nil(),
+            token_exp: 0,
+            active_claims: vec![],
+        };
+        let token: SharedToken = Arc::new(tokio::sync::RwLock::new(TokenSlot {
+            token: "t".into(),
+            jti: uuid::Uuid::nil(),
+            exp: 0,
+        }));
+        let state = PusherState::with_shared_token(&allocate, "http://h:1".into(), token).unwrap();
+        assert_eq!(state.targets.len(), state.backoff.lock().await.len());
+    }
+
     #[tokio::test]
     async fn pusher_handle_drops_cleanly() {
         let state = Arc::new(PusherState {
@@ -649,6 +1018,7 @@ mod tests {
                 jti: uuid::Uuid::nil(),
                 exp: chrono::Utc::now().timestamp() + 4 * 3600,
             })),
+            backoff: tokio::sync::Mutex::new(Vec::new()),
         });
         let handle = spawn(state);
         // Drop immediately — should not hang or panic.
