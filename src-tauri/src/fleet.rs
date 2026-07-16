@@ -369,21 +369,22 @@ fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
 }
 
 /// Resolve the coord HTTP base. Source-of-truth chain: env `COORD_HTTP_URL`
-/// → `~/.qontinui/profiles.json` active profile's `coord_url` (ws→http).
+/// → `~/.qontinui/profiles.json` active profile's `coord_url` (ws→http) →
+/// tier-aware default.
 ///
 /// Honors `COORD_HTTP_URL` to match `mcp::agent_worktrees::coord_http_base`,
 /// `commands::claims`, and `commands::productivity`, so per-machine
 /// staging-pointing of the heartbeat no longer requires a profiles.json edit.
-/// Unlike those resolvers this deliberately returns `None` (rather than
-/// defaulting to `http://localhost:9870`) when nothing is configured, so the
-/// heartbeat cleanly skips instead of spamming connection errors every tick.
+/// Option-family mapping of the shared policy: `Configured | TierDefault ⇒
+/// Some` (a tier-defaulted base on a hosted runner is a real, dialable coord
+/// — the heartbeat MUST run against it), while a dev-localhost GUESS keeps
+/// the deliberate `None` so the heartbeat cleanly skips instead of spamming
+/// connection errors at a phantom localhost coord every tick.
 pub(crate) fn coord_http_base() -> Option<String> {
-    // Delegates to the shared resolver, preserving the deliberate `None`
-    // (rather than localhost) when nothing is configured, so the heartbeat
-    // cleanly skips instead of spamming connection errors every tick.
-    match qontinui_runner_lib::profiles::resolve_coord_base() {
-        qontinui_runner_lib::profiles::CoordBase::Configured(base) => Some(base),
-        _ => None,
+    use qontinui_runner_lib::profiles::CoordBase;
+    match qontinui_runner_lib::profiles::coord_base_policy().0 {
+        CoordBase::Configured(base) | CoordBase::TierDefault(base) => Some(base),
+        CoordBase::DevLocalhost(_) | CoordBase::Unset => None,
     }
 }
 

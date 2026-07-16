@@ -16,10 +16,9 @@
 
 pub(crate) fn coord_http_base() -> Result<String, String> {
     // Source-of-truth chain: env `COORD_HTTP_URL` → profile `coord_url`
-    // (ws→http) → default `http://localhost:9870`. Delegates to the shared
-    // resolver; the dev-localhost guess is now logged once per process. This
-    // resolver never errored before (it always fell back to localhost-Ok), so
+    // (ws→http) → tier-aware default (prod coord on a hosted runner,
+    // dev-localhost guess otherwise). Delegates to the shared policy fn. This
+    // resolver never errored before (it always fell back to a default-Ok), so
     // the `Result` contract is preserved by always returning Ok.
-    Ok(qontinui_runner_lib::profiles::coord_base_or_dev_localhost()
-        .unwrap_or_else(|| "http://localhost:9870".to_string()))
+    Ok(qontinui_runner_lib::profiles::coord_base_with_source().0)
 }

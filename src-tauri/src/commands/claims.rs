@@ -13,7 +13,7 @@
 //!
 //! All three commands use the same coord-HTTP-base resolution chain
 //! as `mcp::agent_worktrees::coord_http_base`: env `COORD_HTTP_URL` →
-//! profile `coord_url` (ws→http) → `http://localhost:9870`. JWT is
+//! profile `coord_url` (ws→http) → tier-aware default. JWT is
 //! NOT applied here — `/claims/acquire` is gated behind no auth on
 //! coord today (Phase 2 spec §1.1); `/coord/claims/steal` accepts
 //! either an admin-secret header or a Bearer JWT, with the JWT path
@@ -100,10 +100,10 @@ pub type StealResultDto = serde_json::Value;
 /// dependency that lives behind axum (Tauri commands don't have
 /// access to it without significantly more plumbing).
 fn coord_http_base() -> String {
-    // Delegates to the shared resolver; the dev-localhost guess is now logged
-    // once per process via `coord_base_or_dev_localhost`.
-    qontinui_runner_lib::profiles::coord_base_or_dev_localhost()
-        .unwrap_or_else(|| "http://localhost:9870".to_string())
+    // Delegates to the shared tier-aware policy fn: env → profile →
+    // prod default on a hosted (qontinui_account-tier) runner → dev-localhost
+    // guess (logged once per process) otherwise.
+    qontinui_runner_lib::profiles::coord_base_with_source().0
 }
 
 fn http_client() -> Result<reqwest::Client, String> {

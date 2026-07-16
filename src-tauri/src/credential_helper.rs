@@ -25,10 +25,10 @@ fn config_file_path(session_id: &str) -> PathBuf {
 }
 
 fn coord_http_base() -> String {
-    // Delegates to the shared resolver; the dev-localhost guess is now logged
-    // once per process via `coord_base_or_dev_localhost`.
-    qontinui_runner_lib::profiles::coord_base_or_dev_localhost()
-        .unwrap_or_else(|| "http://localhost:9870".to_string())
+    // Delegates to the shared tier-aware policy fn: env → profile →
+    // prod default on a hosted (qontinui_account-tier) runner → dev-localhost
+    // guess (logged once per process) otherwise.
+    qontinui_runner_lib::profiles::coord_base_with_source().0
 }
 
 async fn fetch_push_token(coord_base: &str, session_id: &str) -> Result<String, String> {

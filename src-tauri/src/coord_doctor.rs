@@ -54,8 +54,8 @@ pub struct DoctorReport {
 
 impl DoctorReport {
     /// Render the copy-pasteable, machine-identical text report. The ordering
-    /// + the trailing verdict line are the contract — keep them stable so the
-    /// output diffs cleanly across machines.
+    /// and the trailing verdict line are the contract — keep them stable so
+    /// the output diffs cleanly across machines.
     pub fn render(&self) -> String {
         let mut out = String::new();
         out.push_str("coord doctor — runner gate-access self-check\n");
@@ -205,7 +205,7 @@ pub fn diagnose(inputs: &DoctorInputs) -> DoctorReport {
         }),
         Check::new("tier", "set runner tier to Qontinui account", || {
             let tier = read_runner_tier();
-            if tier.as_deref() == Some("qontinui_account") {
+            if tier.as_deref() == Some(crate::profiles::QONTINUI_ACCOUNT_TIER) {
                 (true, "runner tier is Qontinui account".into())
             } else {
                 (
@@ -494,30 +494,17 @@ fn macos_keychain_has_claude_credentials() -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Check 2 — runner tier. Minimal read of `settings.json::tier` (the same file
-// `settings::load_settings()` reads), so the lib needn't pull the whole
-// `Settings` struct. Returns the snake_case tier string.
+// Check 2 — runner tier. The tier reader now lives in `crate::profiles`
+// (relocated so the coord-base policy layer and the doctor share ONE reader);
+// this thin delegate keeps the doctor's call sites unchanged.
 // ---------------------------------------------------------------------------
-
-fn settings_json_path() -> Option<PathBuf> {
-    let dir = std::env::var("QONTINUI_CONFIG_DIR")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| dirs::config_dir().map(|d| d.join("com.qontinui.runner")))?;
-    Some(dir.join("settings.json"))
-}
 
 /// The persisted runner tier as the serde snake_case string
 /// (`"local"` | `"local_provider"` | `"qontinui_account"`), or `None` when the
-/// settings file is absent/unreadable (which `Settings::default()` would treat
-/// as `Local`).
+/// settings file is absent/unreadable. Delegates to
+/// [`crate::profiles::read_runner_tier`].
 fn read_runner_tier() -> Option<String> {
-    let path = settings_json_path()?;
-    let bytes = std::fs::read(path).ok()?;
-    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    json.get("tier")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+    crate::profiles::read_runner_tier()
 }
 
 // ---------------------------------------------------------------------------
@@ -695,12 +682,9 @@ fn nonce_is_registered(nonce: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 fn coord_reachable_check() -> (bool, String) {
-    let base = match crate::profiles::resolve_coord_base() {
-        crate::profiles::CoordBase::Configured(b) | crate::profiles::CoordBase::DevLocalhost(b) => {
-            b
-        }
-        crate::profiles::CoordBase::Unset => "http://localhost:9870".to_string(),
-    };
+    // The shared tier-aware policy fn — the doctor and the loopback proxy can
+    // never disagree about the upstream OR its source (plan D4).
+    let (base, source) = crate::profiles::coord_base_with_source();
     let url = format!("{}/mcp", base.trim_end_matches('/'));
     let body = serde_json::json!({
         "jsonrpc": "2.0",
@@ -724,14 +708,21 @@ fn coord_reachable_check() -> (bool, String) {
         rb = rb.header("Authorization", format!("Bearer {bearer}"));
     }
     match rb.send() {
-        Ok(resp) if resp.status().is_success() => {
-            (true, format!("coord /mcp tools/list returned 200 ({url})"))
-        }
+        Ok(resp) if resp.status().is_success() => (
+            true,
+            format!("coord /mcp tools/list returned 200 ({url}, source={source})"),
+        ),
         Ok(resp) => (
             false,
-            format!("coord /mcp returned HTTP {} ({url})", resp.status()),
+            format!(
+                "coord /mcp returned HTTP {} ({url}, source={source})",
+                resp.status()
+            ),
         ),
-        Err(e) => (false, format!("coord /mcp unreachable ({url}): {e}")),
+        Err(e) => (
+            false,
+            format!("coord /mcp unreachable ({url}, source={source}): {e}"),
+        ),
     }
 }
 

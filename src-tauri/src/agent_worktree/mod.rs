@@ -1144,10 +1144,10 @@ fn reanchor_by_agent_id(contents: &str, agent_id: &str, local_root: &str) -> Str
 /// Call coord's `/agents/allocate` and then `git worktree add` for each
 /// returned row.
 ///
-/// `coord_http_base` is the HTTP base URL of qontinui-coord (e.g.
-/// `http://localhost:9870`). The runner's profile stores `coord_url` as
-/// a `ws://` URL — callers should convert via [`coord_ws_to_http`]
-/// before calling here.
+/// `coord_http_base` is the HTTP base URL of qontinui-coord (e.g. the
+/// dev-localhost base, `profiles::DEV_LOCALHOST_COORD_BASE`). The runner's
+/// profile stores `coord_url` as a `ws://` URL — callers should convert via
+/// [`coord_ws_to_http`] before calling here.
 ///
 /// `repo_canonical_paths` maps `repo` slug to the canonical checkout
 /// path on the runner's host. The runner's host typically holds one

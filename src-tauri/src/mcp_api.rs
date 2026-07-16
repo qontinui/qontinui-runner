@@ -862,7 +862,11 @@ async fn coord_mcp_proxy_handler(
             .expect("coord-mcp proxy reqwest client")
     });
 
-    let url = crate::coord_mcp::coord_mcp_url();
+    // Resolve the upstream once, WITH its source, so every error emitted below
+    // can name both the exact URL dialed and how it was chosen (plan
+    // 2026-07-16-runner-prod-coord-base-default-and-502-self-diagnosis, D3) —
+    // a bare 502 that names neither cost real diagnostic time in the incident.
+    let (url, coord_base_source) = crate::coord_mcp::coord_mcp_url_with_source();
     let mut req = client.post(&url).bearer_auth(&bearer).body(body.to_vec());
     for (name, value) in headers.iter() {
         let n = name.as_str();
@@ -897,13 +901,18 @@ async fn coord_mcp_proxy_handler(
     let upstream = match req.send().await {
         Ok(resp) => resp,
         Err(e) => {
-            warn!("coord-mcp proxy: forward to {url} failed: {e}");
+            warn!(
+                "coord-mcp proxy: forward to {url} failed \
+                 (coord_base_source={coord_base_source}): {e}"
+            );
             return (
                 axum::http::StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
                     "success": false,
                     "error": format!("coord /mcp unreachable: {e}"),
                     "code": "COORD_MCP_PROXY_UPSTREAM_UNREACHABLE",
+                    "upstream_url": url,
+                    "coord_base_source": coord_base_source.as_str(),
                 })),
             )
                 .into_response();
@@ -926,13 +935,18 @@ async fn coord_mcp_proxy_handler(
     let bytes = match upstream.bytes().await {
         Ok(b) => b,
         Err(e) => {
-            warn!("coord-mcp proxy: reading coord response body failed: {e}");
+            warn!(
+                "coord-mcp proxy: reading coord response body from {url} failed \
+                 (coord_base_source={coord_base_source}): {e}"
+            );
             return (
                 axum::http::StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
                     "success": false,
                     "error": format!("coord /mcp response read failed: {e}"),
                     "code": "COORD_MCP_PROXY_UPSTREAM_READ_FAILED",
+                    "upstream_url": url,
+                    "coord_base_source": coord_base_source.as_str(),
                 })),
             )
                 .into_response();
@@ -966,6 +980,8 @@ async fn coord_mcp_proxy_handler(
             } else {
                 &upstream_content_type
             },
+            upstream_url = %url,
+            coord_base_source = %coord_base_source,
             "coord-mcp proxy: enveloping non-JSON upstream error from coord"
         );
         return (
@@ -980,6 +996,8 @@ async fn coord_mcp_proxy_handler(
                 "upstreamStatus": status,
                 "upstreamContentType": upstream_content_type,
                 "upstreamBodySnippet": snippet,
+                "upstream_url": url,
+                "coord_base_source": coord_base_source.as_str(),
             })),
         )
             .into_response();
@@ -998,8 +1016,21 @@ async fn coord_mcp_proxy_handler(
     builder
         .body(axum::body::Body::from(bytes))
         .unwrap_or_else(|e| {
-            warn!("coord-mcp proxy: response build failed: {e}");
-            axum::http::StatusCode::BAD_GATEWAY.into_response()
+            warn!(
+                "coord-mcp proxy: response build failed \
+                 (upstream_url={url}, coord_base_source={coord_base_source}): {e}"
+            );
+            (
+                axum::http::StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("coord /mcp response build failed: {e}"),
+                    "code": "COORD_MCP_PROXY_RESPONSE_BUILD_FAILED",
+                    "upstream_url": url,
+                    "coord_base_source": coord_base_source.as_str(),
+                })),
+            )
+                .into_response()
         })
 }
 
@@ -1178,20 +1209,23 @@ async fn coord_claims_read_proxy_handler(
             .into_response();
     }
 
-    let url = claims_upstream_url(
-        &crate::coord_mcp::coord_base_url(),
-        target,
-        raw_query.as_deref(),
-    );
-    forward_claims_get(&url, &bearer).await
+    let (coord_base, coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
+    let url = claims_upstream_url(&coord_base, target, raw_query.as_deref());
+    forward_claims_get(&url, &bearer, coord_base_source).await
 }
 
 /// Forward a claims read to coord and return coord's status + headers + body
-/// verbatim. Split from the handler (URL + bearer as plain params, no
-/// `AuthManager`/env reads) so the forwarding leg is unit-testable against a
-/// local mock coord with a synthetic bearer — the live credential lives in the
-/// encrypted `AuthManager` slot, which a unit test cannot seed.
-async fn forward_claims_get(url: &str, bearer: &str) -> axum::response::Response {
+/// verbatim. Split from the handler (URL + bearer + base-source as plain
+/// params, no `AuthManager`/env reads) so the forwarding leg is unit-testable
+/// against a local mock coord with a synthetic bearer — the live credential
+/// lives in the encrypted `AuthManager` slot, which a unit test cannot seed.
+/// `coord_base_source` names how the upstream base was chosen; it is echoed
+/// into every runner-originated 502 body alongside the URL dialed (D3).
+async fn forward_claims_get(
+    url: &str,
+    bearer: &str,
+    coord_base_source: qontinui_runner_lib::profiles::CoordBaseSource,
+) -> axum::response::Response {
     use axum::response::IntoResponse;
 
     // Shared client: connect fast-fail like the `/coord-mcp` proxy client, but
@@ -1210,13 +1244,18 @@ async fn forward_claims_get(url: &str, bearer: &str) -> axum::response::Response
     let upstream = match client.get(url).bearer_auth(bearer).send().await {
         Ok(resp) => resp,
         Err(e) => {
-            warn!("coord-mcp claims proxy: forward to {url} failed: {e}");
+            warn!(
+                "coord-mcp claims proxy: forward to {url} failed \
+                 (coord_base_source={coord_base_source}): {e}"
+            );
             return (
                 axum::http::StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
                     "success": false,
                     "error": format!("coord claims endpoint unreachable: {e}"),
                     "code": "COORD_CLAIMS_PROXY_UPSTREAM_UNREACHABLE",
+                    "upstream_url": url,
+                    "coord_base_source": coord_base_source.as_str(),
                 })),
             )
                 .into_response();
@@ -1238,13 +1277,18 @@ async fn forward_claims_get(url: &str, bearer: &str) -> axum::response::Response
     let bytes = match upstream.bytes().await {
         Ok(b) => b,
         Err(e) => {
-            warn!("coord-mcp claims proxy: reading coord response body failed: {e}");
+            warn!(
+                "coord-mcp claims proxy: reading coord response body from {url} failed \
+                 (coord_base_source={coord_base_source}): {e}"
+            );
             return (
                 axum::http::StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
                     "success": false,
                     "error": format!("coord claims response read failed: {e}"),
                     "code": "COORD_CLAIMS_PROXY_UPSTREAM_READ_FAILED",
+                    "upstream_url": url,
+                    "coord_base_source": coord_base_source.as_str(),
                 })),
             )
                 .into_response();
@@ -1253,8 +1297,21 @@ async fn forward_claims_get(url: &str, bearer: &str) -> axum::response::Response
     builder
         .body(axum::body::Body::from(bytes))
         .unwrap_or_else(|e| {
-            warn!("coord-mcp claims proxy: response build failed: {e}");
-            axum::http::StatusCode::BAD_GATEWAY.into_response()
+            warn!(
+                "coord-mcp claims proxy: response build failed \
+                 (upstream_url={url}, coord_base_source={coord_base_source}): {e}"
+            );
+            (
+                axum::http::StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("coord claims response build failed: {e}"),
+                    "code": "COORD_CLAIMS_PROXY_RESPONSE_BUILD_FAILED",
+                    "upstream_url": url,
+                    "coord_base_source": coord_base_source.as_str(),
+                })),
+            )
+                .into_response()
         })
 }
 
@@ -1510,19 +1567,23 @@ async fn coord_write_proxy_handler(
             .into_response();
     }
 
-    let url = write_upstream_url(&crate::coord_mcp::coord_base_url(), &target);
-    forward_coord_write_post(&url, &bearer, body).await
+    let (coord_base, coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
+    let url = write_upstream_url(&coord_base, &target);
+    forward_coord_write_post(&url, &bearer, body, coord_base_source).await
 }
 
 /// Forward a write POST to coord and return coord's status + headers + body
-/// verbatim. Split from the handler (URL + bearer + body as plain params, no
-/// `AuthManager`/env reads) so the forwarding leg is unit-testable against a
-/// local mock coord with a synthetic bearer — the live credential lives in the
-/// encrypted `AuthManager` slot, which a unit test cannot seed.
+/// verbatim. Split from the handler (URL + bearer + body + base-source as
+/// plain params, no `AuthManager`/env reads) so the forwarding leg is
+/// unit-testable against a local mock coord with a synthetic bearer — the live
+/// credential lives in the encrypted `AuthManager` slot, which a unit test
+/// cannot seed. `coord_base_source` names how the upstream base was chosen; it
+/// is echoed into every runner-originated 502 body alongside the URL dialed.
 async fn forward_coord_write_post(
     url: &str,
     bearer: &str,
     body: axum::body::Bytes,
+    coord_base_source: qontinui_runner_lib::profiles::CoordBaseSource,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
@@ -1549,13 +1610,18 @@ async fn forward_coord_write_post(
     {
         Ok(resp) => resp,
         Err(e) => {
-            warn!("coord-mcp write proxy: forward to {url} failed: {e}");
+            warn!(
+                "coord-mcp write proxy: forward to {url} failed \
+                 (coord_base_source={coord_base_source}): {e}"
+            );
             return (
                 axum::http::StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
                     "success": false,
                     "error": format!("coord write endpoint unreachable: {e}"),
                     "code": "COORD_WRITE_PROXY_UPSTREAM_UNREACHABLE",
+                    "upstream_url": url,
+                    "coord_base_source": coord_base_source.as_str(),
                 })),
             )
                 .into_response();
@@ -1577,13 +1643,18 @@ async fn forward_coord_write_post(
     let bytes = match upstream.bytes().await {
         Ok(b) => b,
         Err(e) => {
-            warn!("coord-mcp write proxy: reading coord response body failed: {e}");
+            warn!(
+                "coord-mcp write proxy: reading coord response body from {url} failed \
+                 (coord_base_source={coord_base_source}): {e}"
+            );
             return (
                 axum::http::StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
                     "success": false,
                     "error": format!("coord write response read failed: {e}"),
                     "code": "COORD_WRITE_PROXY_UPSTREAM_READ_FAILED",
+                    "upstream_url": url,
+                    "coord_base_source": coord_base_source.as_str(),
                 })),
             )
                 .into_response();
@@ -1592,8 +1663,21 @@ async fn forward_coord_write_post(
     builder
         .body(axum::body::Body::from(bytes))
         .unwrap_or_else(|e| {
-            warn!("coord-mcp write proxy: response build failed: {e}");
-            axum::http::StatusCode::BAD_GATEWAY.into_response()
+            warn!(
+                "coord-mcp write proxy: response build failed \
+                 (upstream_url={url}, coord_base_source={coord_base_source}): {e}"
+            );
+            (
+                axum::http::StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("coord write response build failed: {e}"),
+                    "code": "COORD_WRITE_PROXY_RESPONSE_BUILD_FAILED",
+                    "upstream_url": url,
+                    "coord_base_source": coord_base_source.as_str(),
+                })),
+            )
+                .into_response()
         })
 }
 
@@ -4138,7 +4222,12 @@ mod coord_claims_proxy_tests {
             ClaimsReadTarget::List,
             Some("repo=qontinui-runner&resource=src%2Fmain.rs"),
         );
-        let resp = forward_claims_get(&url, "test-device-jwt").await;
+        let resp = forward_claims_get(
+            &url,
+            "test-device-jwt",
+            qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+        )
+        .await;
         assert_eq!(resp.status(), 200);
         let v = body_json(resp).await;
         assert_eq!(
@@ -4149,7 +4238,12 @@ mod coord_claims_proxy_tests {
 
         // Non-200 coord verdict: status + body verbatim, not reshaped.
         let url = claims_upstream_url(&base, ClaimsReadTarget::ByResource, None);
-        let resp = forward_claims_get(&url, "test-device-jwt").await;
+        let resp = forward_claims_get(
+            &url,
+            "test-device-jwt",
+            qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+        )
+        .await;
         assert_eq!(resp.status(), 403);
         let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
             .await
@@ -4175,11 +4269,20 @@ mod coord_claims_proxy_tests {
             ClaimsReadTarget::List,
             None,
         );
-        let resp = forward_claims_get(&url, "test-device-jwt").await;
+        let resp = forward_claims_get(
+            &url,
+            "test-device-jwt",
+            qontinui_runner_lib::profiles::CoordBaseSource::DevLocalhostFallback,
+        )
+        .await;
         assert_eq!(resp.status(), 502);
         let v = body_json(resp).await;
         assert_eq!(v["success"], false);
         assert_eq!(v["code"], "COORD_CLAIMS_PROXY_UPSTREAM_UNREACHABLE");
+        // D3 self-diagnosis fields: the exact upstream dialed + how it was
+        // chosen must ride in the error body.
+        assert_eq!(v["upstream_url"], url);
+        assert_eq!(v["coord_base_source"], "dev_localhost_fallback");
     }
 }
 
@@ -4503,6 +4606,7 @@ mod coord_write_proxy_tests {
             &url,
             "test-device-jwt",
             axum::body::Bytes::from_static(br#"{"resource_key":"plans/p"}"#),
+            qontinui_runner_lib::profiles::CoordBaseSource::Profile,
         )
         .await;
         assert_eq!(resp.status(), 200);
@@ -4518,8 +4622,13 @@ mod coord_write_proxy_tests {
                 gate_id: "123e4567-e89b-12d3-a456-426614174000".to_string(),
             },
         );
-        let resp =
-            forward_coord_write_post(&url, "test-device-jwt", axum::body::Bytes::new()).await;
+        let resp = forward_coord_write_post(
+            &url,
+            "test-device-jwt",
+            axum::body::Bytes::new(),
+            qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+        )
+        .await;
         assert_eq!(resp.status(), 403);
         let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
             .await
@@ -4545,12 +4654,21 @@ mod coord_write_proxy_tests {
                 slug: "2026-06-15-some-plan".to_string(),
             },
         );
-        let resp =
-            forward_coord_write_post(&url, "test-device-jwt", axum::body::Bytes::new()).await;
+        let resp = forward_coord_write_post(
+            &url,
+            "test-device-jwt",
+            axum::body::Bytes::new(),
+            qontinui_runner_lib::profiles::CoordBaseSource::TierDefault,
+        )
+        .await;
         assert_eq!(resp.status(), 502);
         let v = body_json(resp).await;
         assert_eq!(v["success"], false);
         assert_eq!(v["code"], "COORD_WRITE_PROXY_UPSTREAM_UNREACHABLE");
+        // D3 self-diagnosis fields: the exact upstream dialed + how it was
+        // chosen must ride in the error body.
+        assert_eq!(v["upstream_url"], url);
+        assert_eq!(v["coord_base_source"], "tier_default");
     }
 }
 

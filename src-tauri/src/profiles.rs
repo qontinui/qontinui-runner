@@ -232,8 +232,9 @@ fn legacy_env_fallback() -> ResolvedProfile {
 
 /// Outcome of resolving the coord HTTP base, before any dev-localhost policy
 /// is applied. Lets each caller family pick its own fallback posture:
-/// - String family: `coord_base_or_dev_localhost().unwrap_or_else(localhost)`
-/// - Option family: `Configured ⇒ Some`, otherwise `None` (no-op when unconfigured)
+/// - String family: `coord_base_with_source().0`
+/// - Option family: `Configured | TierDefault ⇒ Some`, otherwise `None`
+///   (no-op when unconfigured on a non-hosted runner)
 /// - Result family: map as appropriate, preserving the call site's contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoordBase {
@@ -244,8 +245,50 @@ pub enum CoordBase {
     /// (`http://localhost:9870`). Treated as "configured enough" for the
     /// String family but as "unconfigured" (None) for the Option family.
     DevLocalhost(String),
+    /// Nothing was configured, but the runner tier is `qontinui_account`
+    /// (hosted fleet), so the production coord base ([`PROD_COORD_BASE`])
+    /// applies. A real, dialable coord: the String family uses it AND the
+    /// Option family maps it to `Some` (unlike `DevLocalhost`) — a hosted
+    /// runner with no profile must still heartbeat/forward against prod.
+    TierDefault(String),
     /// Nothing configured AND the caller did not want a localhost guess.
     Unset,
+}
+
+/// Which arm of the resolution chain produced the effective coord base.
+/// Threaded into proxy 502 error bodies and the doctor's `coord_reachable`
+/// detail so a misconfigured upstream self-diagnoses in one read
+/// (plan 2026-07-16-runner-prod-coord-base-default-and-502-self-diagnosis, D3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoordBaseSource {
+    /// Env `COORD_HTTP_URL` won.
+    Env,
+    /// The active profile's `coord_url` won.
+    Profile,
+    /// Nothing configured; the runner tier is `qontinui_account`, so the
+    /// production default ([`PROD_COORD_BASE`]) applied.
+    TierDefault,
+    /// Nothing configured and no hosted tier — the dev-localhost guess.
+    DevLocalhostFallback,
+}
+
+impl CoordBaseSource {
+    /// Stable wire string: `"env" | "profile" | "tier_default" |
+    /// "dev_localhost_fallback"`. Used verbatim in proxy error JSON.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CoordBaseSource::Env => "env",
+            CoordBaseSource::Profile => "profile",
+            CoordBaseSource::TierDefault => "tier_default",
+            CoordBaseSource::DevLocalhostFallback => "dev_localhost_fallback",
+        }
+    }
+}
+
+impl std::fmt::Display for CoordBaseSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Pure conversion: `ws[s]://host[:port][/ws][/]` → `http[s]://host[:port]`.
@@ -276,18 +319,43 @@ pub fn coord_ws_to_http(coord_url: &str) -> String {
 /// The dev-localhost coord base used when nothing is configured.
 pub const DEV_LOCALHOST_COORD_BASE: &str = "http://localhost:9870";
 
-/// Resolve the coord HTTP base WITHOUT applying any dev-localhost policy.
+/// The production coord base applied when nothing is configured but the
+/// runner tier declares hosted-fleet membership (`qontinui_account`).
+/// Decided in exactly one place (plan
+/// 2026-07-16-runner-prod-coord-base-default-and-502-self-diagnosis, D1).
+pub const PROD_COORD_BASE: &str = "https://coord.qontinui.io";
+
+/// The WebSocket form of [`PROD_COORD_BASE`], as persisted into the active
+/// profile's `coord_url` by [`ensure_coord_url`] at hosted sign-in (D2).
+/// `prod_coord_ws_url_matches_base` proves the pair stays in sync.
+pub const PROD_COORD_WS_URL: &str = "wss://coord.qontinui.io/ws";
+
+/// The `settings.json::tier` value that marks a hosted (production) runner —
+/// the same discriminator the coord doctor's tier check keys on.
+pub const QONTINUI_ACCOUNT_TIER: &str = "qontinui_account";
+
+/// Resolve the coord HTTP base WITHOUT applying any fallback policy.
 ///
 /// Chain: env `COORD_HTTP_URL` (non-empty, trimmed) → active profile's
 /// `coord_url` (ws→http via [`coord_ws_to_http`]) → [`CoordBase::Unset`].
 ///
 /// "Pure-ish": reads the process env and `~/.qontinui/profiles.json`, but does
-/// no logging and no fallback — callers decide the localhost posture.
+/// no logging and no fallback — callers decide the fallback posture (usually
+/// via [`coord_base_policy`] / [`coord_base_with_source`]).
 pub fn resolve_coord_base() -> CoordBase {
+    resolve_coord_base_with_source().0
+}
+
+/// [`resolve_coord_base`] plus WHICH configured arm matched: `Some(Env)` /
+/// `Some(Profile)` for `Configured`, `None` for `Unset` (no arm matched).
+fn resolve_coord_base_with_source() -> (CoordBase, Option<CoordBaseSource>) {
     if let Ok(v) = std::env::var("COORD_HTTP_URL") {
         let t = v.trim();
         if !t.is_empty() {
-            return CoordBase::Configured(t.trim_end_matches('/').to_string());
+            return (
+                CoordBase::Configured(t.trim_end_matches('/').to_string()),
+                Some(CoordBaseSource::Env),
+            );
         }
     }
     // `load_strict` (not `load`) so a missing/invalid profiles.json yields
@@ -295,42 +363,260 @@ pub fn resolve_coord_base() -> CoordBase {
     // the prior Option-family resolvers, which all used `load_strict`.
     if let Ok(p) = load_strict() {
         if let Some(ws) = p.coord_url.as_deref() {
-            return CoordBase::Configured(coord_ws_to_http(ws));
+            return (
+                CoordBase::Configured(coord_ws_to_http(ws)),
+                Some(CoordBaseSource::Profile),
+            );
         }
     }
-    CoordBase::Unset
+    (CoordBase::Unset, None)
+}
+
+// ---------------------------------------------------------------------------
+// Runner-tier reader (relocated from `coord_doctor` so the policy layer and
+// the doctor share ONE tier reader). Minimal read of `settings.json::tier` —
+// the `Settings` struct itself is a main-binary module (not in lib.rs), which
+// is exactly why this reads the JSON file instead of importing the type.
+// ---------------------------------------------------------------------------
+
+/// Path of the runner's `settings.json` (`QONTINUI_CONFIG_DIR` override →
+/// platform config dir + `com.qontinui.runner`). The same file
+/// `settings::load_settings()` reads.
+pub fn settings_json_path() -> Option<PathBuf> {
+    let dir = std::env::var("QONTINUI_CONFIG_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| dirs::config_dir().map(|d| d.join("com.qontinui.runner")))?;
+    Some(dir.join("settings.json"))
+}
+
+/// The persisted runner tier as the serde snake_case string
+/// (`"local"` | `"local_provider"` | `"qontinui_account"`), or `None` when the
+/// settings file is absent/unreadable (which `Settings::default()` would treat
+/// as `Local`).
+pub fn read_runner_tier() -> Option<String> {
+    let path = settings_json_path()?;
+    let bytes = std::fs::read(path).ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    json.get("tier")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Coord-base policy layer: resolver outcome × runner tier → effective base.
+// ---------------------------------------------------------------------------
+
+/// Pure policy core (unit-testable — tier injected as a parameter, no global
+/// settings.json read): decide the effective coord base + its source from the
+/// raw resolver outcome, the configured-arm source, and the runner tier.
+///
+/// - `Configured` passes through with its recorded source.
+/// - `Unset` + tier `"qontinui_account"` ⇒ [`CoordBase::TierDefault`] on
+///   [`PROD_COORD_BASE`] (a hosted runner must never dial dev-localhost).
+/// - `Unset` + any other tier (incl. absent/unreadable settings.json) ⇒ the
+///   existing dev-localhost guess.
+fn apply_tier_policy(
+    resolved: CoordBase,
+    configured_source: Option<CoordBaseSource>,
+    tier: Option<&str>,
+) -> (CoordBase, CoordBaseSource) {
+    match resolved {
+        CoordBase::Configured(base) => (
+            CoordBase::Configured(base),
+            configured_source.unwrap_or(CoordBaseSource::Profile),
+        ),
+        CoordBase::TierDefault(base) => {
+            (CoordBase::TierDefault(base), CoordBaseSource::TierDefault)
+        }
+        CoordBase::DevLocalhost(base) => (
+            CoordBase::DevLocalhost(base),
+            CoordBaseSource::DevLocalhostFallback,
+        ),
+        CoordBase::Unset => {
+            if tier == Some(QONTINUI_ACCOUNT_TIER) {
+                (
+                    CoordBase::TierDefault(PROD_COORD_BASE.to_string()),
+                    CoordBaseSource::TierDefault,
+                )
+            } else {
+                (
+                    CoordBase::DevLocalhost(DEV_LOCALHOST_COORD_BASE.to_string()),
+                    CoordBaseSource::DevLocalhostFallback,
+                )
+            }
+        }
+    }
 }
 
 /// Process-global one-shot WARN guard for the dev-localhost fallback.
 static DEV_LOCALHOST_WARN_ONCE: std::sync::Once = std::sync::Once::new();
 
-/// Resolve the coord HTTP base, applying the dev-localhost policy.
+/// Process-global one-shot INFO guard for the tier-default production base.
+static TIER_DEFAULT_INFO_ONCE: std::sync::Once = std::sync::Once::new();
+
+/// Resolve the coord base, applying the tier-aware fallback policy, keeping
+/// the enum shape so Option-family callers can map each variant explicitly
+/// (`Configured | TierDefault ⇒ Some`, `DevLocalhost | Unset ⇒ None`).
 ///
-/// - `Configured(base)` ⇒ `Some(base)`.
-/// - Nothing configured ⇒ `Some("http://localhost:9870")`, emitting exactly
-///   ONE process-global `tracing::warn!` (across all call sites, for the life
-///   of the process) the first time the localhost guess is used.
-///
-/// Returns `None` only... never, actually — the localhost guess always applies
-/// here. Callers that must stay no-op when unconfigured should call
-/// [`resolve_coord_base`] directly and map `Configured ⇒ Some`, else `None`.
-/// (The `Option` return type is kept so String-family sites can write
-/// `coord_base_or_dev_localhost().unwrap_or_else(|| DEV_LOCALHOST.into())`
-/// without changing should the policy ever grow an opt-out.)
-pub fn coord_base_or_dev_localhost() -> Option<String> {
-    match resolve_coord_base() {
-        CoordBase::Configured(base) => Some(base),
-        CoordBase::DevLocalhost(base) => Some(base),
-        CoordBase::Unset => {
+/// Never returns [`CoordBase::Unset`]: the unset state resolves to either the
+/// tier default (hosted runner) or the dev-localhost guess, each announcing
+/// itself with exactly ONE process-global log line (across all call sites, for
+/// the life of the process) the first time it applies.
+pub fn coord_base_policy() -> (CoordBase, CoordBaseSource) {
+    let (resolved, configured_source) = resolve_coord_base_with_source();
+    // The tier only matters for the Unset arm — skip the settings.json read
+    // when a base is configured.
+    let tier = match resolved {
+        CoordBase::Unset => read_runner_tier(),
+        _ => None,
+    };
+    let (base, source) = apply_tier_policy(resolved, configured_source, tier.as_deref());
+    match source {
+        CoordBaseSource::TierDefault => {
+            TIER_DEFAULT_INFO_ONCE.call_once(|| {
+                info!(
+                    coord_base = PROD_COORD_BASE,
+                    coord_base_source = source.as_str(),
+                    "no coord configured (COORD_HTTP_URL unset, profile has no coord_url) — \
+                     runner tier is qontinui_account, defaulting to the production \
+                     coordinator"
+                );
+            });
+        }
+        CoordBaseSource::DevLocalhostFallback => {
             DEV_LOCALHOST_WARN_ONCE.call_once(|| {
                 warn!(
                     coord_base = DEV_LOCALHOST_COORD_BASE,
+                    coord_base_source = source.as_str(),
                     "no coord configured (COORD_HTTP_URL unset, profile has no coord_url) — \
                      falling back to dev-localhost coord; set COORD_HTTP_URL or profiles.json \
                      coord_url to point at the real coordinator"
                 );
             });
-            Some(DEV_LOCALHOST_COORD_BASE.to_string())
+        }
+        CoordBaseSource::Env | CoordBaseSource::Profile => {}
+    }
+    (base, source)
+}
+
+/// The String-family policy fn: the effective coord HTTP base plus its
+/// source. Successor of the old `coord_base_or_dev_localhost()` — every
+/// String-family call site converges here so a production-tier runner with
+/// nothing configured dials prod coord, not dev-localhost.
+pub fn coord_base_with_source() -> (String, CoordBaseSource) {
+    let (base, source) = coord_base_policy();
+    let base = match base {
+        CoordBase::Configured(b) | CoordBase::DevLocalhost(b) | CoordBase::TierDefault(b) => b,
+        // Structurally unreachable (coord_base_policy never yields Unset);
+        // fall back defensively rather than panicking.
+        CoordBase::Unset => DEV_LOCALHOST_COORD_BASE.to_string(),
+    };
+    (base, source)
+}
+
+// ---------------------------------------------------------------------------
+// D2 — persist `coord_url` at hosted sign-in, create-if-absent only.
+// ---------------------------------------------------------------------------
+
+/// Ensure the active profile in `~/.qontinui/profiles.json` has a `coord_url`,
+/// creating the file / profile entry when missing. NEVER clobbers an existing
+/// value — when `coord_url` is already present (non-null) the file is not
+/// written at all (byte-identical).
+///
+/// Edits the file as `serde_json::Value` (read → mutate only the one missing
+/// key → write), never via the typed [`ProfilesFile`] round-trip, which would
+/// silently DROP any unknown keys a user's file carries.
+pub fn ensure_coord_url(ws_url: &str) -> Result<()> {
+    let path = profiles_path().ok_or_else(|| anyhow!("could not resolve home directory"))?;
+    let env_active = std::env::var("QONTINUI_ENV").ok();
+    ensure_coord_url_at(&path, env_active.as_deref(), ws_url)
+}
+
+/// Path-parameterized core of [`ensure_coord_url`] (hermetic tests point it at
+/// a temp file; `env_active` stands in for the `QONTINUI_ENV` read so tests
+/// never touch process env).
+fn ensure_coord_url_at(
+    path: &std::path::Path,
+    env_active: Option<&str>,
+    ws_url: &str,
+) -> Result<()> {
+    use serde_json::{Map, Value};
+
+    if !path.exists() {
+        // Fresh install: minimal `{active, profiles.{<active>}.coord_url}`.
+        let active = env_active.unwrap_or("dev").to_string();
+        let mut profile = Map::new();
+        profile.insert("coord_url".to_string(), Value::String(ws_url.to_string()));
+        let mut profiles = Map::new();
+        profiles.insert(active.clone(), Value::Object(profile));
+        let mut root = Map::new();
+        root.insert("active".to_string(), Value::String(active));
+        root.insert("profiles".to_string(), Value::Object(profiles));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let mut bytes = serde_json::to_vec_pretty(&Value::Object(root))?;
+        bytes.push(b'\n');
+        std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
+        info!(
+            "ensure_coord_url: created {} with coord_url",
+            path.display()
+        );
+        return Ok(());
+    }
+
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut root: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing {} (refusing to overwrite)", path.display()))?;
+    let root_obj = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{}: root is not a JSON object", path.display()))?;
+
+    // Same active-profile selection as `load_inner`: env → file `active` → dev.
+    let active = env_active
+        .map(str::to_string)
+        .or_else(|| {
+            root_obj
+                .get("active")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "dev".to_string());
+
+    let profiles = root_obj
+        .entry("profiles".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let profiles_obj = profiles
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{}: \"profiles\" is not a JSON object", path.display()))?;
+    let profile = profiles_obj
+        .entry(active.clone())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let profile_obj = profile.as_object_mut().ok_or_else(|| {
+        anyhow!(
+            "{}: profile '{active}' is not a JSON object",
+            path.display()
+        )
+    })?;
+
+    match profile_obj.get("coord_url") {
+        // Present with a real value ⇒ no write at all (byte-identical file).
+        Some(v) if !v.is_null() => Ok(()),
+        // Absent (or JSON null, which deserializes to None anyway): add ONLY
+        // this key; every sibling key — known or unknown — rides along in the
+        // Value tree untouched.
+        _ => {
+            profile_obj.insert("coord_url".to_string(), Value::String(ws_url.to_string()));
+            let mut out = serde_json::to_vec_pretty(&root)?;
+            out.push(b'\n');
+            std::fs::write(path, out).with_context(|| format!("writing {}", path.display()))?;
+            info!(
+                "ensure_coord_url: added coord_url to profile '{active}' in {}",
+                path.display()
+            );
+            Ok(())
         }
     }
 }
@@ -556,18 +842,211 @@ mod tests {
     }
 
     #[test]
-    fn coord_base_or_dev_localhost_never_none() {
-        // The String-family contract: this always yields Some(...). When the
-        // env path is taken it's the configured base; otherwise it's the
-        // localhost guess (Unset) or a profile value.
+    fn coord_base_with_source_env_wins_and_reports_env_source() {
+        // The String-family contract: always yields a base. When the env path
+        // is taken it's the configured base with source `env`, regardless of
+        // any profiles.json / settings.json on the test machine.
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = CoordEnvRestore {
             prev: std::env::var("COORD_HTTP_URL").ok(),
         };
         std::env::set_var("COORD_HTTP_URL", "http://configured:1234");
+        let (base, source) = coord_base_with_source();
+        assert_eq!(base, "http://configured:1234");
+        assert_eq!(source, CoordBaseSource::Env);
+        assert_eq!(source.as_str(), "env");
+    }
+
+    #[test]
+    fn resolve_with_source_env_arm_is_env() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = CoordEnvRestore {
+            prev: std::env::var("COORD_HTTP_URL").ok(),
+        };
+        std::env::set_var("COORD_HTTP_URL", "https://env-coord.example/");
+        let (base, source) = resolve_coord_base_with_source();
         assert_eq!(
-            coord_base_or_dev_localhost().as_deref(),
-            Some("http://configured:1234")
+            base,
+            CoordBase::Configured("https://env-coord.example".to_string())
         );
+        assert_eq!(source, Some(CoordBaseSource::Env));
+    }
+
+    // ------------------------------------------------------------------
+    // apply_tier_policy — the pure matrix core. Tier is a PARAMETER here
+    // (no global settings.json read), so these are fully hermetic.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn policy_configured_env_passes_through_with_env_source() {
+        let (base, source) = apply_tier_policy(
+            CoordBase::Configured("https://c.example".into()),
+            Some(CoordBaseSource::Env),
+            Some(QONTINUI_ACCOUNT_TIER),
+        );
+        assert_eq!(base, CoordBase::Configured("https://c.example".into()));
+        assert_eq!(source, CoordBaseSource::Env);
+    }
+
+    #[test]
+    fn policy_configured_profile_passes_through_with_profile_source() {
+        // Tier must be irrelevant when a base is configured — exercise all
+        // tiers against the profile arm.
+        for tier in [
+            Some("local"),
+            Some("local_provider"),
+            Some(QONTINUI_ACCOUNT_TIER),
+            None,
+        ] {
+            let (base, source) = apply_tier_policy(
+                CoordBase::Configured("https://p.example".into()),
+                Some(CoordBaseSource::Profile),
+                tier,
+            );
+            assert_eq!(base, CoordBase::Configured("https://p.example".into()));
+            assert_eq!(source, CoordBaseSource::Profile, "tier {tier:?}");
+        }
+    }
+
+    #[test]
+    fn policy_unset_hosted_tier_yields_prod_tier_default() {
+        let (base, source) = apply_tier_policy(CoordBase::Unset, None, Some(QONTINUI_ACCOUNT_TIER));
+        assert_eq!(base, CoordBase::TierDefault(PROD_COORD_BASE.to_string()));
+        assert_eq!(source, CoordBaseSource::TierDefault);
+        assert_eq!(source.as_str(), "tier_default");
+    }
+
+    #[test]
+    fn policy_unset_non_hosted_tiers_keep_dev_localhost_guess() {
+        // "local", "local_provider", absent/unreadable settings.json (None),
+        // and even an unknown future tier string all keep the dev guess.
+        for tier in [
+            Some("local"),
+            Some("local_provider"),
+            Some("something_new"),
+            None,
+        ] {
+            let (base, source) = apply_tier_policy(CoordBase::Unset, None, tier);
+            assert_eq!(
+                base,
+                CoordBase::DevLocalhost(DEV_LOCALHOST_COORD_BASE.to_string()),
+                "tier {tier:?}"
+            );
+            assert_eq!(
+                source,
+                CoordBaseSource::DevLocalhostFallback,
+                "tier {tier:?}"
+            );
+            assert_eq!(source.as_str(), "dev_localhost_fallback");
+        }
+    }
+
+    #[test]
+    fn prod_coord_ws_url_matches_base() {
+        // The D2 persisted WS url and the D1 HTTP default must always be the
+        // same coordinator: ws→http normalization maps one onto the other.
+        assert_eq!(coord_ws_to_http(PROD_COORD_WS_URL), PROD_COORD_BASE);
+    }
+
+    // ------------------------------------------------------------------
+    // ensure_coord_url_at — create-if-absent file semantics (hermetic:
+    // path-parameterized, env-active injected, temp dirs).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn ensure_coord_url_absent_file_creates_minimal_structure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".qontinui").join("profiles.json");
+        ensure_coord_url_at(&path, None, PROD_COORD_WS_URL).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(v["active"], "dev");
+        assert_eq!(v["profiles"]["dev"]["coord_url"], PROD_COORD_WS_URL);
+    }
+
+    #[test]
+    fn ensure_coord_url_present_value_is_untouched_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        // Deliberately quirky formatting + unknown keys: no write may occur.
+        let original = "{\"active\":\"prod\",   \"mystery\": [1,2,3],\n \"profiles\":{\"prod\":{\"coord_url\":\"wss://custom.example/ws\",\"extra\":true}}}";
+        std::fs::write(&path, original).unwrap();
+        ensure_coord_url_at(&path, None, PROD_COORD_WS_URL).unwrap();
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&after).unwrap(),
+            original,
+            "a present coord_url must mean NO write at all"
+        );
+    }
+
+    #[test]
+    fn ensure_coord_url_missing_key_added_unknown_siblings_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let original = serde_json::json!({
+            "active": "dev",
+            "unknown_top_level": {"keep": "me"},
+            "profiles": {
+                "dev": {
+                    "database_url": "postgres://u:p@h:5433/db",
+                    "unknown_profile_key": 42
+                },
+                "staging": {"coord_url": "wss://staging.example/ws"}
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&original).unwrap()).unwrap();
+        ensure_coord_url_at(&path, None, PROD_COORD_WS_URL).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        // The one missing key was added…
+        assert_eq!(v["profiles"]["dev"]["coord_url"], PROD_COORD_WS_URL);
+        // …and every other byte of structure survives, including keys the
+        // typed ProfilesFile round-trip would have dropped.
+        assert_eq!(v["unknown_top_level"]["keep"], "me");
+        assert_eq!(v["profiles"]["dev"]["unknown_profile_key"], 42);
+        assert_eq!(
+            v["profiles"]["dev"]["database_url"],
+            "postgres://u:p@h:5433/db"
+        );
+        assert_eq!(
+            v["profiles"]["staging"]["coord_url"],
+            "wss://staging.example/ws"
+        );
+        assert_eq!(v["active"], "dev");
+    }
+
+    #[test]
+    fn ensure_coord_url_env_active_selects_that_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let original = serde_json::json!({
+            "active": "dev",
+            "profiles": {"dev": {}, "cloud": {}}
+        });
+        std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        // env override (QONTINUI_ENV stand-in) targets "cloud", not "dev".
+        ensure_coord_url_at(&path, Some("cloud"), PROD_COORD_WS_URL).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(v["profiles"]["cloud"]["coord_url"], PROD_COORD_WS_URL);
+        assert!(v["profiles"]["dev"].get("coord_url").is_none());
+    }
+
+    #[test]
+    fn ensure_coord_url_active_profile_entry_created_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let original = serde_json::json!({"active": "prod", "profiles": {}});
+        std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        ensure_coord_url_at(&path, None, PROD_COORD_WS_URL).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(v["profiles"]["prod"]["coord_url"], PROD_COORD_WS_URL);
+    }
+
+    #[test]
+    fn ensure_coord_url_unparseable_file_errors_without_clobbering() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(ensure_coord_url_at(&path, None, PROD_COORD_WS_URL).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{not json");
     }
 }
