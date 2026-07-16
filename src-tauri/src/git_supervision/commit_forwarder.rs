@@ -202,8 +202,9 @@ async fn post_commit_observation(coord_http_base: &str, body: &CommitObservation
 
 /// Top-level forwarder entry point: forward one `commit`-kind supervision
 /// event to coord. Best-effort end to end; no-op when disabled, when the
-/// event isn't a commit, when the payload has no usable SHA, or when no
-/// coord base is configured.
+/// event isn't a commit, or when the payload has no usable SHA. The coord
+/// base always resolves (shared tier-aware policy); an unreachable coord is
+/// a soft failure inside [`post_commit_observation`].
 ///
 /// `tokio::spawn`ed by [`spawn_forward_commit_event`] so the ring / Tauri
 /// path is never delayed.
@@ -226,13 +227,12 @@ pub async fn forward_commit_event(event: &GitSupervisionEvent) {
         }
     };
 
-    // Resolve the coord HTTP base the same machine-wide way the Ξ_FS census
-    // / reclaim loops do (`COORD_HTTP_URL` env → active profile `coord_url`,
-    // ws→http). `None` ⇒ no coord configured; cleanly skip. Fall back to the
-    // public default so a configured-but-profileless runner still forwards.
-    let coord_base = crate::agent_worktree::census::coord_http_base_pub()
-        .or_else(|| std::env::var("QONTINUI_COORD_BASE_URL").ok())
-        .unwrap_or_else(|| "https://coord.qontinui.io".to_string());
+    // Resolve the coord HTTP base via the shared tier-aware policy fn
+    // (`COORD_HTTP_URL` env → active profile `coord_url` ws→http → prod
+    // default on a hosted qontinui_account-tier runner → dev-localhost guess
+    // otherwise). This retires the one-off coord-base env var this site alone
+    // honored — the policy fn is the single decision point.
+    let coord_base = qontinui_runner_lib::profiles::coord_base_with_source().0;
 
     post_commit_observation(&coord_base, &body).await;
 }

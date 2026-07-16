@@ -1920,19 +1920,16 @@ pub async fn add_task_dependency(
 
 /// Resolve coord's HTTP base. Same source-of-truth chain as
 /// `mcp::agent_worktrees::coord_http_base`: env `COORD_HTTP_URL` →
-/// profile `coord_url` (ws→http via `coord_ws_to_http`) → default
-/// `http://localhost:9870`.
+/// profile `coord_url` (ws→http via `coord_ws_to_http`) → tier-aware
+/// default (prod coord on a hosted runner, dev-localhost guess otherwise).
 fn coord_http_base_for_fleet() -> String {
-    // Delegates to the shared resolver; the dev-localhost guess is now logged
-    // once per process via `coord_base_or_dev_localhost`.
-    qontinui_runner_lib::profiles::coord_base_or_dev_localhost()
-        .unwrap_or_else(|| "http://localhost:9870".to_string())
+    qontinui_runner_lib::profiles::coord_base_with_source().0
 }
 
 /// `get_coord_http_base` — expose the runner's resolved coord HTTP base
 /// to the frontend so in-app surfaces (e.g. Spawn-from-Plan) reach the
 /// SAME coord the backend session-sync uses, instead of a hardcoded
-/// `localhost:9870`. Mirrors the `get_fleet_health` proxy pattern.
+/// dev-localhost base. Mirrors the `get_fleet_health` proxy pattern.
 #[tauri::command]
 pub fn get_coord_http_base() -> String {
     coord_http_base_for_fleet()

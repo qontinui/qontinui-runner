@@ -740,6 +740,21 @@ async fn finalize_signed_in(
             })?;
         }
     }
+    // 6b. Persist the hosted coordinator endpoint into the active profile's
+    //     `coord_url` — create-if-absent ONLY (never clobbers an operator
+    //     value), so the effective coord base is inspectable on disk and the
+    //     WS consumers that read `coord_url` directly are healed too (plan
+    //     2026-07-16-runner-prod-coord-base-default-and-502-self-diagnosis,
+    //     D2). Non-fatal: sign-in must never fail on this, and the tier
+    //     default (D1) covers the HTTP side regardless.
+    if let Err(e) = qontinui_runner_lib::profiles::ensure_coord_url(
+        qontinui_runner_lib::profiles::PROD_COORD_WS_URL,
+    ) {
+        warn!(
+            "finalize_signed_in: could not persist coord_url into profiles.json (non-fatal): {e}"
+        );
+    }
+
     tokio::spawn(async {
         crate::mcp::backend_relay::commands::kick_cloud_relay().await;
         crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;

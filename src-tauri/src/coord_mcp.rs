@@ -102,39 +102,41 @@ struct NonceBinding {
 /// keys are lowercased; the `.mcp.json` writer emits the canonical-case form.
 pub(crate) const COORD_MCP_PROXY_KEY_HEADER: &str = "x-coord-mcp-proxy-key";
 
-/// Resolve the coord HTTP base: `COORD_HTTP_URL` env first, then the active
-/// profile's `coord_url` (ws→http normalized). `None` when neither is set.
-/// Inline copy of `agent_runtime::coord_http_base` — kept local so this leaf
-/// module does NOT depend on `agent_runtime` (which depends back on us).
-fn coord_http_base() -> Option<String> {
-    // Delegates to the shared resolver. `None` when nothing is configured; the
-    // localhost fallback for the `.mcp.json` write is applied downstream by
-    // `coord_base_url`, unchanged.
-    match qontinui_runner_lib::profiles::resolve_coord_base() {
-        qontinui_runner_lib::profiles::CoordBase::Configured(base) => Some(base),
-        _ => None,
-    }
+/// The coord HTTP base (no path, no trailing slash) plus WHICH resolution arm
+/// produced it: env `COORD_HTTP_URL` → active profile's `coord_url` →
+/// tier-aware default (prod coord on a `qontinui_account`-tier runner,
+/// dev-localhost guess otherwise). Delegates to the shared policy fn
+/// (`profiles::coord_base_with_source`) so a production-tier runner with
+/// nothing configured dials prod coord, never dev-localhost — the 2026-07-16
+/// coord-mcp 502 incident fix. Shared by every loopback proxy forwarder (the
+/// `/mcp` JSON-RPC passthrough AND the nonce-gated claims/write passthroughs
+/// in `mcp_api`) so they all resolve the coord base identically — a proxy
+/// route must never re-derive it from env alone. The source is threaded into
+/// proxy 502 error bodies so a misconfigured upstream self-diagnoses.
+pub(crate) fn coord_base_url_with_source(
+) -> (String, qontinui_runner_lib::profiles::CoordBaseSource) {
+    let (base, source) = qontinui_runner_lib::profiles::coord_base_with_source();
+    (base.trim_end_matches('/').to_string(), source)
 }
 
-/// The coord HTTP base (no path, no trailing slash): `COORD_HTTP_URL` env →
-/// active profile's `coord_url` → localhost fallback. Shared by every loopback
-/// proxy forwarder (the `/mcp` JSON-RPC passthrough AND the nonce-gated claims
-/// read passthrough in `mcp_api`) so they all resolve the coord base
-/// identically — a proxy route must never re-derive it from env alone.
+/// [`coord_base_url_with_source`] without the source, for call sites that
+/// only need the base.
 pub(crate) fn coord_base_url() -> String {
-    let coord_url = std::env::var("COORD_HTTP_URL")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .or_else(coord_http_base)
-        .unwrap_or_else(|| "http://localhost:9870".to_string());
-    coord_url.trim_end_matches('/').to_string()
+    coord_base_url_with_source().0
 }
 
-/// The full coord `/mcp` endpoint URL: [`coord_base_url`] with `/mcp` appended.
-/// Shared by the static-bearer `.mcp.json` writer (agent path) and the loopback
-/// proxy forwarder (`mcp_api::coord_mcp_proxy_handler`).
+/// The full coord `/mcp` endpoint URL + source: [`coord_base_url_with_source`]
+/// with `/mcp` appended. Shared by the static-bearer `.mcp.json` writer (agent
+/// path) and the loopback proxy forwarder (`mcp_api::coord_mcp_proxy_handler`).
+pub(crate) fn coord_mcp_url_with_source() -> (String, qontinui_runner_lib::profiles::CoordBaseSource)
+{
+    let (base, source) = coord_base_url_with_source();
+    (format!("{base}/mcp"), source)
+}
+
+/// [`coord_mcp_url_with_source`] without the source.
 pub(crate) fn coord_mcp_url() -> String {
-    format!("{}/mcp", coord_base_url())
+    coord_mcp_url_with_source().0
 }
 
 /// In-memory nonce registry for the loopback `/coord-mcp` proxy:

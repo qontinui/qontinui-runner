@@ -87,8 +87,6 @@ use super::{Intent, SessionEventKind, SessionRegistry, SessionState};
 const DEFAULT_HEARTBEAT_SECS: u64 = 15;
 /// Default stale threshold — 3 missed heartbeats.
 const DEFAULT_STALE_SECS: u64 = 45;
-/// Fallback coord URL when neither `COORD_HTTP_URL` env nor profile is set.
-const DEFAULT_COORD_URL: &str = "http://localhost:9870";
 
 /// Read a `u64` env var with a sane default.
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -100,14 +98,10 @@ fn env_u64(name: &str, default: u64) -> u64 {
 
 /// Resolve the coord HTTP base URL. Priority: `COORD_HTTP_URL` env →
 /// active profile (`profiles::load_strict().coord_url`, ws→http) →
-/// fallback `http://localhost:9870`.
-///
-/// Delegates to the shared resolver; the dev-localhost guess is now logged
-/// once per process via `coord_base_or_dev_localhost` instead of silently
-/// returned here.
+/// tier-aware default (prod coord on a hosted `qontinui_account`-tier
+/// runner, dev-localhost guess — logged once per process — otherwise).
 fn resolve_coord_url() -> String {
-    qontinui_runner_lib::profiles::coord_base_or_dev_localhost()
-        .unwrap_or_else(|| DEFAULT_COORD_URL.to_string())
+    qontinui_runner_lib::profiles::coord_base_with_source().0
 }
 
 // ---------------------------------------------------------------------------
