@@ -1,8 +1,45 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
 
 use serde_json::json;
 use tracing::{debug, info, warn};
+
+/// coord push tokens expire after 15 minutes (coord `PUSH_TOKEN_TTL_SECS`).
+/// Refresh every 10 so a push that starts just before a tick still has a
+/// 5-minute-fresh token.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// Consecutive failed refresh ticks after which the failure is treated as
+/// terminal (session gone on coord / device auth revoked) and the loop exits.
+const MAX_CONSECUTIVE_REFRESH_FAILURES: u32 = 3;
+
+/// Config files older than this at boot are orphans (crash/kill skipped
+/// cleanup) — younger files may belong to a live session, possibly of
+/// another runner instance sharing the same %TEMP%.
+const SWEEP_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Per-session credential-helper state, keyed by the stringified coord
+/// session UUID (the exact `session_id` passed to
+/// [`setup_credential_helper`]).
+#[derive(Default)]
+struct SessionCredState {
+    /// Working dirs where a repo-local `credential.helper` was installed.
+    /// Drained by [`cleanup_credential_helper`], which unsets the key again.
+    dirs: Vec<PathBuf>,
+    /// Whether a token refresh loop is currently live for this session —
+    /// the dedupe bit that keeps a second `setup_credential_helper` call
+    /// for the SAME session (another working dir) from spawning a second
+    /// loop.
+    refresh_running: bool,
+}
+
+/// In-process registry of live credential-helper installs.
+fn registry() -> &'static Mutex<HashMap<String, SessionCredState>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, SessionCredState>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 fn credential_helper_binary_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
@@ -199,6 +236,166 @@ fn set_git_low_speed_bounds(working_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Derive the credential URL scope (`<scheme>://<host>[:port]`) from a coord
+/// base URL. Handles a trailing slash and keeps non-default ports (e.g.
+/// `http://localhost:9870`). Reuses reqwest's URL parser rather than
+/// hand-rolling a second one.
+fn credential_url_scope(coord_base: &str) -> Result<String, String> {
+    let url = reqwest::Url::parse(coord_base.trim())
+        .map_err(|e| format!("parse coord base {coord_base:?}: {e}"))?;
+    match url.scheme() {
+        // Url::origin() drops any path/query and omits default ports, which
+        // is exactly the scope git's credential.<url>.* matching wants.
+        "http" | "https" => Ok(url.origin().ascii_serialization()),
+        other => Err(format!(
+            "coord base {coord_base:?} has non-http scheme {other:?}"
+        )),
+    }
+}
+
+/// Build a `git config` command targeting either the global config
+/// (production) or an explicit file (tests). `--file` lets tests exercise the
+/// real read-detect-write logic against a temp config without touching the
+/// machine's `~/.gitconfig` and without `std::env::set_var` (which races
+/// under the parallel test harness).
+fn git_config_cmd(config_file: Option<&Path>) -> std::process::Command {
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.arg("config");
+    match config_file {
+        Some(path) => {
+            cmd.arg("--file").arg(path);
+        }
+        None => {
+            cmd.arg("--global");
+        }
+    }
+    cmd
+}
+
+fn git_config_get_all_at(config_file: Option<&Path>, key: &str) -> Result<Vec<String>, String> {
+    let output = git_config_cmd(config_file)
+        .args(["--get-all", key])
+        .output()
+        .map_err(|e| format!("run git config --get-all {key}: {e}"))?;
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut values: Vec<String> = stdout
+            .split('\n')
+            .map(|l| l.trim_end_matches('\r').to_string())
+            .collect();
+        // Drop the artifact of the final newline — but only one element, so a
+        // genuinely empty-valued last entry ("key =") survives.
+        if values.last().is_some_and(|l| l.is_empty()) {
+            values.pop();
+        }
+        return Ok(values);
+    }
+
+    // Exit code 1 = key not present (also what a not-yet-created --file
+    // target yields). Anything else is a real failure.
+    if output.status.code() == Some(1) {
+        return Ok(Vec::new());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "git config --get-all {key} failed ({:?}): {stderr}",
+        output.status.code()
+    ))
+}
+
+fn git_config_add_at(config_file: Option<&Path>, key: &str, value: &str) -> Result<(), String> {
+    let output = git_config_cmd(config_file)
+        .args(["--add", key, value])
+        .output()
+        .map_err(|e| format!("run git config --add {key}: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git config --add {key} failed: {stderr}"));
+    }
+    Ok(())
+}
+
+fn git_config_unset_all_at(config_file: Option<&Path>, key: &str) -> Result<(), String> {
+    let output = git_config_cmd(config_file)
+        .args(["--unset-all", key])
+        .output()
+        .map_err(|e| format!("run git config --unset-all {key}: {e}"))?;
+    match output.status.code() {
+        // 5 = "you try to unset an option which does not exist" — fine, the
+        // desired end state (key absent) already holds.
+        Some(0) | Some(5) => Ok(()),
+        code => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(format!(
+                "git config --unset-all {key} failed ({code:?}): {stderr}"
+            ))
+        }
+    }
+}
+
+/// Idempotently scrub the global git credential config for the coord host.
+///
+/// The system gitconfig sets `credential.helper=manager`, so Git Credential
+/// Manager is consulted first for EVERY host — including coord, where GCM has
+/// no account and pops an interactive VS Code / terminal password prompt.
+/// Hand-added `provider=generic` / `interactive=false` keys demonstrably do
+/// NOT suppress that dialog; the standard-git fix is an EMPTY
+/// `credential.<url>.helper` entry, which clears all previously-defined
+/// helpers for that URL scope while the repo-local qontinui helper (later in
+/// config precedence) still applies.
+///
+/// `config_file`: `None` targets `--global` (production); `Some(path)`
+/// targets `--file <path>` so tests can drive the real logic against a temp
+/// config. Best-effort: returns an aggregated error string, never panics.
+fn ensure_global_credential_hygiene(
+    coord_base: &str,
+    config_file: Option<&Path>,
+) -> Result<(), String> {
+    let url = credential_url_scope(coord_base)?;
+    let mut errors: Vec<String> = Vec::new();
+
+    // 1. Empty-helper reset. Git runs helpers in config order and an empty
+    //    entry resets the list at that point, so any pre-existing NON-empty
+    //    entry for this scope is deliberately left alone — the reset only
+    //    needs the empty entry to EXIST, and `--add` appends without
+    //    clobbering. Read first so the steady path performs zero writes
+    //    (no .gitconfig mtime churn).
+    let helper_key = format!("credential.{url}.helper");
+    match git_config_get_all_at(config_file, &helper_key) {
+        Ok(values) if values.iter().any(|v| v.is_empty()) => {
+            debug!("credential_helper: empty-helper reset already present for {url}");
+        }
+        Ok(_) => {
+            if let Err(e) = git_config_add_at(config_file, &helper_key, "") {
+                errors.push(e);
+            }
+        }
+        Err(e) => errors.push(e),
+    }
+
+    // 2. Drop the hand-added GCM hint keys — they do not suppress the prompt
+    //    and only add confusion. Read-first keeps the steady path write-free.
+    for suffix in ["provider", "interactive"] {
+        let key = format!("credential.{url}.{suffix}");
+        match git_config_get_all_at(config_file, &key) {
+            Ok(values) if values.is_empty() => {}
+            Ok(_) => {
+                if let Err(e) = git_config_unset_all_at(config_file, &key) {
+                    errors.push(e);
+                }
+            }
+            Err(e) => errors.push(e),
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
 pub async fn setup_credential_helper(working_dir: &str, session_id: &str) {
     let working_path = Path::new(working_dir);
     if !is_git_repo(working_path) {
@@ -251,9 +448,13 @@ pub async fn setup_credential_helper(working_dir: &str, session_id: &str) {
 
     let config_path = config_file_path(session_id);
     // NOTE: the helper binary emits ONLY username/password (no
-    // protocol/host/path rewrite), so it needs just the token and the
-    // registered-repo list for its emit decision — no coord_url.
+    // protocol/host/path rewrite). coord_url is NOT emitted back to git —
+    // the helper uses it purely to scope the answer to the coord host:
+    // with credential.useHttpPath=true git consults the helper for EVERY
+    // host a registered repo talks to (github.com included), and without
+    // the host check coord credentials would leak to those hosts.
     let config = json!({
+        "coord_url": coord_base,
         "push_token": push_token,
         "repos": repos,
     });
@@ -270,6 +471,35 @@ pub async fn setup_credential_helper(working_dir: &str, session_id: &str) {
                 config = %config_path.display(),
                 "credential_helper: installed for {working_dir}"
             );
+            // Best-effort global hygiene: keep Git Credential Manager (from
+            // the system gitconfig) from popping an interactive password
+            // prompt for the coord host. Never aborts setup.
+            if let Err(e) = ensure_global_credential_hygiene(&coord_base, None) {
+                warn!("credential_helper: global credential hygiene failed (non-fatal): {e}");
+            }
+            // Phase 4 — record the install in the in-process registry (so
+            // session close can unset the repo-local config again) and
+            // start the push-token refresh loop, deduped per session: a
+            // second setup call for the SAME session registers the extra
+            // working dir but must not spawn a second loop.
+            let spawn_refresh = {
+                let mut reg = registry().lock().expect("credential registry poisoned");
+                let entry = reg.entry(session_id.to_string()).or_default();
+                let dir = working_path.to_path_buf();
+                if !entry.dirs.contains(&dir) {
+                    entry.dirs.push(dir);
+                }
+                let spawn = !entry.refresh_running;
+                entry.refresh_running = true;
+                spawn
+            };
+            if spawn_refresh {
+                tokio::spawn(refresh_loop(
+                    coord_base.clone(),
+                    session_id.to_string(),
+                    config_path.clone(),
+                ));
+            }
         }
         Err(e) => {
             warn!("credential_helper: git config failed: {e}");
@@ -379,13 +609,277 @@ pub fn non_interactive_git_env(scope: GitCredentialScope) -> Vec<(String, String
     out
 }
 
+/// Outcome of one refresh-loop tick. Factored into a type (rather than a
+/// bare bool) so the loop's exit signal is explicit.
+#[derive(Debug, PartialEq, Eq)]
+enum TickOutcome {
+    /// Config rewritten with a fresh token.
+    Refreshed,
+    /// Config file no longer exists (cleanup or the startup sweep removed
+    /// it) — the loop must exit.
+    ConfigGone,
+}
+
+/// One tick of the token refresh loop, factored out of [`refresh_loop`] so
+/// tests can drive it with an injected `fetch` closure (no network, no env
+/// mutation).
+///
+/// Re-reads the CURRENT config file and swaps only `push_token`; `coord_url`
+/// and `repos` are deliberately reused rather than re-fetched — the
+/// canonical-repo set changes only on operator action while the token
+/// expires every 15 minutes, and reading the live file (instead of values
+/// captured when the loop spawned) also preserves any newer repo list a
+/// later re-setup wrote for the same session.
+async fn refresh_tick<F, Fut>(config_path: &Path, fetch: F) -> Result<TickOutcome, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    if !config_path.exists() {
+        return Ok(TickOutcome::ConfigGone);
+    }
+    let fresh_token = fetch().await?;
+    let raw = match std::fs::read_to_string(config_path) {
+        Ok(raw) => raw,
+        // Raced with cleanup between the exists() check and the read — same
+        // exit signal as the up-front check.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(TickOutcome::ConfigGone),
+        Err(e) => return Err(format!("read {}: {e}", config_path.display())),
+    };
+    let mut config: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("parse config: {e}"))?;
+    config["push_token"] = json!(fresh_token);
+    atomic_overwrite(config_path, &config.to_string())?;
+    Ok(TickOutcome::Refreshed)
+}
+
+/// Atomically replace `path` with `contents`: write a sibling temp file in
+/// the SAME directory, then rename it over the original. The helper binary
+/// may read the config at any instant, so the file must never be observable
+/// half-written; same-volume rename is atomic (on Windows `std::fs::rename`
+/// maps to `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`, which replaces an
+/// existing destination). The rename CAN still fail with a Windows sharing
+/// violation if the helper happens to hold the destination open without
+/// FILE_SHARE_DELETE at that instant — fall back to remove+rename with brief
+/// retries: the reader's open window is one small read (microseconds), and
+/// between remove and rename the helper sees "no config" and declines to
+/// answer, which is fail-safe (no stale token is ever served).
+fn atomic_overwrite(path: &Path, contents: &str) -> Result<(), String> {
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("config path has no file name: {}", path.display()))?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| format!("config path has no parent dir: {}", path.display()))?;
+    let tmp = dir.join(format!("{file_name}.tmp-{}", std::process::id()));
+    std::fs::write(&tmp, contents).map_err(|e| format!("write temp {}: {e}", tmp.display()))?;
+
+    if std::fs::rename(&tmp, path).is_ok() {
+        return Ok(());
+    }
+
+    let mut last_err = String::new();
+    for attempt in 0..3 {
+        if attempt > 0 {
+            // Rare fallback path; a bounded blocking sleep beats pulling an
+            // async signature through every (sync) caller.
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                last_err = format!("remove {}: {e}", path.display());
+                continue;
+            }
+        }
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => return Ok(()),
+            Err(e) => last_err = format!("rename {} -> {}: {e}", tmp.display(), path.display()),
+        }
+    }
+    let _ = std::fs::remove_file(&tmp);
+    Err(format!("atomic overwrite failed after retries: {last_err}"))
+}
+
+/// Per-session background loop that re-mints the coord push token before it
+/// expires (coord TTL 15 min, refresh cadence 10 min). Exits when:
+/// (a) the config file no longer exists — [`cleanup_credential_helper`] ran
+///     or the startup sweep removed it; or
+/// (b) [`MAX_CONSECUTIVE_REFRESH_FAILURES`] ticks fail in a row — repeated
+///     failure means the session is gone on coord or device auth is revoked
+///     (terminal; nothing this loop can fix). A single transient failure
+///     just skips the tick.
+/// Write failures count toward the same consecutive-failure budget as fetch
+/// failures: a config file we can never rewrite is equally terminal.
+async fn refresh_loop(coord_base: String, session_id: String, config_path: PathBuf) {
+    let mut consecutive_failures: u32 = 0;
+    loop {
+        tokio::time::sleep(REFRESH_INTERVAL).await;
+        let base = coord_base.clone();
+        let sid = session_id.clone();
+        match refresh_tick(&config_path, move || async move {
+            fetch_push_token(&base, &sid).await
+        })
+        .await
+        {
+            Ok(TickOutcome::Refreshed) => {
+                consecutive_failures = 0;
+                debug!(
+                    session_id = %session_id,
+                    "credential_helper: push token refreshed"
+                );
+            }
+            Ok(TickOutcome::ConfigGone) => {
+                debug!(
+                    session_id = %session_id,
+                    "credential_helper: config file gone — refresh loop exiting"
+                );
+                break;
+            }
+            Err(e) => {
+                consecutive_failures += 1;
+                if consecutive_failures >= MAX_CONSECUTIVE_REFRESH_FAILURES {
+                    warn!(
+                        session_id = %session_id,
+                        "credential_helper: {consecutive_failures} consecutive refresh failures (last: {e}) — refresh loop exiting"
+                    );
+                    break;
+                }
+                debug!(
+                    session_id = %session_id,
+                    "credential_helper: refresh tick failed (transient, {consecutive_failures}/{MAX_CONSECUTIVE_REFRESH_FAILURES}): {e}"
+                );
+            }
+        }
+    }
+    // Clear the dedupe bit so a later re-setup for this session can spawn a
+    // fresh loop. Cleanup may already have removed the whole entry — fine.
+    if let Some(entry) = registry()
+        .lock()
+        .expect("credential registry poisoned")
+        .get_mut(&session_id)
+    {
+        entry.refresh_running = false;
+    }
+}
+
+/// Tear down everything [`setup_credential_helper`] installed for a session:
+/// unset the repo-local `credential.helper` in every working dir the session
+/// registered, then remove the token config file (whose absence is also the
+/// refresh loop's exit signal). Idempotent and best-effort — every failure
+/// is debug!-logged, never propagated, because this runs inside the session
+/// close funnel which must not fail on credential hygiene.
 pub fn cleanup_credential_helper(session_id: &str) {
+    let dirs = registry()
+        .lock()
+        .expect("credential registry poisoned")
+        .remove(session_id)
+        .map(|state| state.dirs)
+        .unwrap_or_default();
+
+    for dir in dirs {
+        if !dir.exists() {
+            debug!(
+                "credential_helper: cleanup skipping missing dir {}",
+                dir.display()
+            );
+            continue;
+        }
+        let output = crate::process_helpers::no_window("git")
+            .args([
+                "-C",
+                &dir.to_string_lossy(),
+                "config",
+                "--local",
+                "--unset-all",
+                "credential.helper",
+            ])
+            .output();
+        match output {
+            // Exit code 5 = key not present — the desired end state already
+            // holds (e.g. the operator hand-cleaned the repo).
+            Ok(out) if out.status.success() || out.status.code() == Some(5) => {}
+            Ok(out) => debug!(
+                "credential_helper: unset credential.helper in {} failed ({:?}): {}",
+                dir.display(),
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            Err(e) => debug!(
+                "credential_helper: run git config --unset-all in {}: {e}",
+                dir.display()
+            ),
+        }
+    }
+
     let config_path = config_file_path(session_id);
     if config_path.exists() {
         if let Err(e) = std::fs::remove_file(&config_path) {
             debug!("credential_helper: cleanup config file failed: {e}");
         }
     }
+}
+
+/// Delete stale credential config files (and orphaned `.tmp-*` siblings from
+/// a failed atomic rewrite) from `dir`. Returns the number deleted. Factored
+/// out of [`spawn_startup_sweep`] so tests can point it at a temp dir with a
+/// synthetic `now`. All errors are debug!-logged and skipped.
+fn sweep_stale_cred_files(dir: &Path, max_age: Duration, now: SystemTime) -> usize {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            debug!("credential_helper: sweep read_dir {}: {e}", dir.display());
+            return 0;
+        }
+    };
+    let mut deleted = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // Prefix match covers both the config files themselves
+        // (qontinui-git-cred-<session>.json) and any orphaned
+        // <name>.json.tmp-<pid> left by an interrupted atomic rewrite.
+        if !name.starts_with("qontinui-git-cred-") {
+            continue;
+        }
+        let modified = match entry.metadata().and_then(|m| m.modified()) {
+            Ok(m) => m,
+            Err(e) => {
+                debug!("credential_helper: sweep metadata {name}: {e}");
+                continue;
+            }
+        };
+        // An mtime in the future yields Err — leave the file alone.
+        let age = match now.duration_since(modified) {
+            Ok(age) => age,
+            Err(_) => continue,
+        };
+        if age <= max_age {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => deleted += 1,
+            Err(e) => debug!("credential_helper: sweep remove {name}: {e}"),
+        }
+    }
+    deleted
+}
+
+/// One-shot, best-effort boot sweep of stale credential config files in
+/// %TEMP% (files older than [`SWEEP_MAX_AGE`]; younger ones may belong to a
+/// live session — possibly another runner instance sharing this temp dir —
+/// and are left alone). Runs on a detached thread so it can never slow or
+/// fail the boot; errors never propagate (debug!-logged inside the sweep).
+pub fn spawn_startup_sweep() {
+    std::thread::spawn(|| {
+        let deleted =
+            sweep_stale_cred_files(&std::env::temp_dir(), SWEEP_MAX_AGE, SystemTime::now());
+        if deleted > 0 {
+            info!("credential_helper: startup sweep deleted {deleted} stale config file(s)");
+        }
+    });
 }
 
 #[cfg(test)]
@@ -516,5 +1010,288 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("credential.helper"), "unexpected error: {err}");
+    }
+
+    const COORD_URL: &str = "https://coord.qontinui.io";
+
+    #[test]
+    fn credential_url_scope_handles_trailing_slash_and_ports() {
+        assert_eq!(
+            credential_url_scope("https://coord.qontinui.io/").unwrap(),
+            "https://coord.qontinui.io"
+        );
+        assert_eq!(
+            credential_url_scope("https://coord.qontinui.io").unwrap(),
+            "https://coord.qontinui.io"
+        );
+        // Non-default port must be kept.
+        assert_eq!(
+            credential_url_scope("http://localhost:9870").unwrap(),
+            "http://localhost:9870"
+        );
+        assert_eq!(
+            credential_url_scope("http://localhost:9870/").unwrap(),
+            "http://localhost:9870"
+        );
+        assert!(credential_url_scope("not a url").is_err());
+        assert!(credential_url_scope("file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn hygiene_fresh_config_adds_empty_helper_and_leaves_hints_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("gitconfig");
+
+        // Trailing slash on coord_base must not leak into the scope key.
+        ensure_global_credential_hygiene("https://coord.qontinui.io/", Some(&cfg)).unwrap();
+
+        let helpers =
+            git_config_get_all_at(Some(&cfg), &format!("credential.{COORD_URL}.helper")).unwrap();
+        assert_eq!(helpers, vec![String::new()], "empty-helper reset missing");
+        assert!(
+            git_config_get_all_at(Some(&cfg), &format!("credential.{COORD_URL}.provider"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            git_config_get_all_at(Some(&cfg), &format!("credential.{COORD_URL}.interactive"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn hygiene_already_hygienic_config_performs_zero_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("gitconfig");
+
+        // First pass establishes the hygienic state.
+        ensure_global_credential_hygiene(COORD_URL, Some(&cfg)).unwrap();
+        let content_before = std::fs::read(&cfg).unwrap();
+        let mtime_before = std::fs::metadata(&cfg).unwrap().modified().unwrap();
+
+        // Second pass must be a pure read — no rewrite, no mtime churn.
+        ensure_global_credential_hygiene(COORD_URL, Some(&cfg)).unwrap();
+        assert_eq!(std::fs::read(&cfg).unwrap(), content_before);
+        assert_eq!(
+            std::fs::metadata(&cfg).unwrap().modified().unwrap(),
+            mtime_before,
+            "steady path rewrote the config file"
+        );
+    }
+
+    #[test]
+    fn hygiene_removes_gcm_hints_and_preserves_unrelated_and_nonempty_helper() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("gitconfig");
+
+        let helper_key = format!("credential.{COORD_URL}.helper");
+        git_config_add_at(Some(&cfg), &helper_key, "manager").unwrap();
+        git_config_add_at(
+            Some(&cfg),
+            &format!("credential.{COORD_URL}.provider"),
+            "generic",
+        )
+        .unwrap();
+        git_config_add_at(
+            Some(&cfg),
+            &format!("credential.{COORD_URL}.interactive"),
+            "false",
+        )
+        .unwrap();
+        // Unrelated keys must survive untouched.
+        git_config_add_at(Some(&cfg), "user.name", "keepme").unwrap();
+        git_config_add_at(
+            Some(&cfg),
+            "credential.https://github.com.provider",
+            "github",
+        )
+        .unwrap();
+
+        ensure_global_credential_hygiene(COORD_URL, Some(&cfg)).unwrap();
+
+        // The pre-existing non-empty helper entry is left alone; the empty
+        // reset entry is appended after it.
+        assert_eq!(
+            git_config_get_all_at(Some(&cfg), &helper_key).unwrap(),
+            vec!["manager".to_string(), String::new()]
+        );
+        assert!(
+            git_config_get_all_at(Some(&cfg), &format!("credential.{COORD_URL}.provider"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            git_config_get_all_at(Some(&cfg), &format!("credential.{COORD_URL}.interactive"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            git_config_get_all_at(Some(&cfg), "user.name").unwrap(),
+            vec!["keepme".to_string()]
+        );
+        assert_eq!(
+            git_config_get_all_at(Some(&cfg), "credential.https://github.com.provider").unwrap(),
+            vec!["github".to_string()]
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 4 — refresh tick, startup sweep, cleanup wiring
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn refresh_tick_replaces_token_and_preserves_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("qontinui-git-cred-test.json");
+        let initial = json!({
+            "coord_url": "https://coord.qontinui.io",
+            "push_token": "stale-token",
+            "repos": ["qontinui-runner", "qontinui-web"],
+        });
+        std::fs::write(&config_path, initial.to_string()).unwrap();
+
+        let outcome = refresh_tick(&config_path, || async { Ok("fresh-token".to_string()) })
+            .await
+            .unwrap();
+        assert_eq!(outcome, TickOutcome::Refreshed);
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(after["push_token"], "fresh-token");
+        // coord_url and repos must survive the rewrite untouched.
+        assert_eq!(after["coord_url"], "https://coord.qontinui.io");
+        assert_eq!(after["repos"], json!(["qontinui-runner", "qontinui-web"]));
+        // The atomic rewrite must not leave its temp file behind.
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_tick_missing_config_signals_exit_without_fetching() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("qontinui-git-cred-gone.json");
+
+        let fetched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fetched_flag = fetched.clone();
+        let outcome = refresh_tick(&config_path, move || {
+            fetched_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            async { Err::<String, String>("unused".to_string()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(outcome, TickOutcome::ConfigGone);
+        assert!(
+            !fetched.load(std::sync::atomic::Ordering::SeqCst),
+            "fetch must not run when the config file is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_tick_fetch_failure_is_transient_and_leaves_config_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("qontinui-git-cred-err.json");
+        let initial = json!({
+            "coord_url": "https://coord.qontinui.io",
+            "push_token": "still-valid",
+            "repos": ["qontinui-runner"],
+        })
+        .to_string();
+        std::fs::write(&config_path, &initial).unwrap();
+
+        let err = refresh_tick(&config_path, || async { Err("401 nope".to_string()) })
+            .await
+            .unwrap_err();
+        assert!(err.contains("401"), "unexpected error: {err}");
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), initial);
+    }
+
+    #[test]
+    fn sweep_deletes_only_old_matching_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = tmp.path().join("qontinui-git-cred-old.json");
+        let fresh = tmp.path().join("qontinui-git-cred-fresh.json");
+        let unrelated_old = tmp.path().join("some-other-file.json");
+        for p in [&old, &fresh, &unrelated_old] {
+            std::fs::write(p, "{}").unwrap();
+        }
+        // Age `old` and the unrelated file to 25h via mtime (filetime is
+        // already a dev-dependency; no clock mocking, no env mutation).
+        let old_mtime = filetime::FileTime::from_system_time(
+            SystemTime::now() - Duration::from_secs(25 * 60 * 60),
+        );
+        filetime::set_file_mtime(&old, old_mtime).unwrap();
+        filetime::set_file_mtime(&unrelated_old, old_mtime).unwrap();
+
+        let deleted = sweep_stale_cred_files(tmp.path(), SWEEP_MAX_AGE, SystemTime::now());
+
+        assert_eq!(deleted, 1);
+        assert!(!old.exists(), "old matching file should be deleted");
+        assert!(fresh.exists(), "fresh file must be left alone");
+        assert!(
+            unrelated_old.exists(),
+            "non-matching file must be left alone"
+        );
+    }
+
+    #[test]
+    fn cleanup_unsets_local_helper_and_removes_config() {
+        // Unique per-run session id: cleanup resolves the config file in the
+        // real %TEMP% (production path), so the name must not collide with
+        // parallel test runs.
+        let session_id = format!(
+            "test-cleanup-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        let repo = tempfile::tempdir().unwrap();
+        let status = crate::process_helpers::no_window("git")
+            .args(["init", "-q", &repo.path().to_string_lossy()])
+            .status()
+            .expect("git init");
+        assert!(status.success());
+        git_config_local(repo.path(), "credential.helper", "C:/bin/helper.exe").unwrap();
+        assert!(git_config_get(repo.path(), "credential.helper").is_some());
+
+        let config_path = config_file_path(&session_id);
+        std::fs::write(&config_path, "{}").unwrap();
+
+        // Register the dir the way setup_credential_helper does, plus a
+        // vanished dir cleanup must skip without erroring.
+        {
+            let mut reg = registry().lock().unwrap();
+            let entry = reg.entry(session_id.clone()).or_default();
+            entry.dirs.push(repo.path().to_path_buf());
+            entry.dirs.push(PathBuf::from(
+                "C:/definitely/not/a/real/dir/qontinui-test-gone",
+            ));
+        }
+
+        cleanup_credential_helper(&session_id);
+
+        assert_eq!(
+            git_config_get(repo.path(), "credential.helper"),
+            None,
+            "local credential.helper should be unset"
+        );
+        assert!(!config_path.exists(), "config file should be removed");
+        assert!(
+            !registry().lock().unwrap().contains_key(&session_id),
+            "registry entry should be drained"
+        );
+        // Idempotent: a second cleanup (double-close) is a no-op.
+        cleanup_credential_helper(&session_id);
     }
 }

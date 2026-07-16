@@ -555,23 +555,21 @@ async fn push_one(
     // - the tokio timeout is the hard wall-clock backstop; on expiry
     //   the output-future is dropped and `kill_on_drop(true)` reaps the
     //   git child instead of leaking it.
+    //
+    // The argument vector (including those bounds and the prompt-proofing
+    // overrides) is built by the pure [`push_args`]; `GIT_TERMINAL_PROMPT`
+    // must be applied here on the command itself.
     let started = std::time::Instant::now();
     let out = match tokio::time::timeout(
         push_timeout,
         crate::process_helpers::tokio_no_window("git")
-            .arg("-C")
-            .arg(&target.worktree_path)
-            .arg("-c")
-            .arg(format!("http.extraHeader=Authorization: Bearer {token}"))
-            .arg("-c")
-            .arg("http.lowSpeedLimit=1024")
-            .arg("-c")
-            .arg("http.lowSpeedTime=60")
-            .arg("push")
-            .arg("--porcelain")
-            .arg("--no-verify")
-            .arg(&origin_url)
-            .arg(&refspec)
+            .args(push_args(
+                &target.worktree_path,
+                token,
+                &origin_url,
+                &refspec,
+            ))
+            .env(GIT_TERMINAL_PROMPT_ENV.0, GIT_TERMINAL_PROMPT_ENV.1)
             .kill_on_drop(true)
             .output(),
     )
@@ -616,6 +614,57 @@ async fn push_one(
     } else {
         PushOutcome::UpToDate
     })
+}
+
+/// Env var forced on every pusher `git push` so git never prompts on a
+/// terminal. Paired with the empty `credential.helper=` / `core.askPass=`
+/// overrides in [`push_args`] — see the comment there.
+const GIT_TERMINAL_PROMPT_ENV: (&str, &str) = ("GIT_TERMINAL_PROMPT", "0");
+
+/// Argument vector for the `git push` invocation in [`push_one`]. Pure
+/// (no I/O) so tests can assert the exact command shape without spawning
+/// git. Callers must ALSO set [`GIT_TERMINAL_PROMPT_ENV`] on the command.
+///
+/// Prompt-proofing: the Bearer `http.extraHeader` is the SOLE intended
+/// auth for this push. Without the overrides below, a 401 (expired /
+/// invalid token) makes git walk the credential chain (GCM → configured
+/// helpers → askpass → terminal), which can pop an interactive password
+/// prompt from this background daemon. `-c credential.helper=` (empty
+/// value) disables the entire helper chain for this process, `-c
+/// core.askPass=` (empty) kills the askpass fallback, and
+/// `GIT_TERMINAL_PROMPT=0` forbids terminal prompting — so a 401 fails
+/// the push (retried next tick after the token refresh) instead of
+/// prompting.
+///
+/// Transfer bounds (2026-07-12 incident hardening): `http.lowSpeedLimit`
+/// / `http.lowSpeedTime` abort a transfer trickling below 1 KiB/s for
+/// 60s. The hard wall-clock backstop is the `tokio::time::timeout` in
+/// [`push_one`], not an argument.
+fn push_args(
+    worktree_path: &std::path::Path,
+    token: &str,
+    origin_url: &str,
+    refspec: &str,
+) -> Vec<std::ffi::OsString> {
+    vec![
+        "-C".into(),
+        worktree_path.into(),
+        "-c".into(),
+        format!("http.extraHeader=Authorization: Bearer {token}").into(),
+        "-c".into(),
+        "credential.helper=".into(),
+        "-c".into(),
+        "core.askPass=".into(),
+        "-c".into(),
+        "http.lowSpeedLimit=1024".into(),
+        "-c".into(),
+        "http.lowSpeedTime=60".into(),
+        "push".into(),
+        "--porcelain".into(),
+        "--no-verify".into(),
+        origin_url.into(),
+        refspec.into(),
+    ]
 }
 
 /// The coord git-origin URL for `repo`: `<base>/git/<owner>/<name>.git`.
@@ -674,7 +723,11 @@ fn default_repo_owner() -> String {
 /// replication hiccups, network faults) — logged quietly at first,
 /// promoted to `warn!` at [`NOISY_FAILURE_THRESHOLD`] consecutive
 /// failures, and retried with per-target exponential backoff.
-/// Permanent failures (auth / scope / allowlist 4xx, or anything
+/// Auth 401s are transient too — the per-tick token refresh in
+/// [`tick_once`] heals an expired token before the next attempt; a
+/// genuinely revoked agent therefore rides the same backoff ladder
+/// (warned from the third consecutive failure) instead of retrying
+/// forever. Permanent failures (scope / allowlist 4xx, or anything
 /// unrecognized) come back as `Err` and are surfaced loudly.
 enum PushOutcome {
     Pushed,
@@ -699,10 +752,10 @@ impl PushOutcome {
 
 /// Classify a `git push` failure as transient (worth a quiet retry) vs
 /// permanent. Transient = coord's git write-proxy / replication being
-/// momentarily unavailable (5xx, "leader unreachable") and ordinary
-/// network faults (DNS / connection / TLS / timeout); these self-heal, so
-/// the best-effort pusher retries next tick without a warn. Everything
-/// else — auth (401), scope/allowlist (400/403/404), and unrecognized
+/// momentarily unavailable (5xx, "leader unreachable"), ordinary network
+/// faults (DNS / connection / TLS / timeout), and auth 401s (see below);
+/// these self-heal, so the best-effort pusher retries next tick without a
+/// warn. Everything else — scope/allowlist (400/403/404) and unrecognized
 /// errors — is treated as permanent and surfaced at `warn` so it gets
 /// attention instead of silently retrying forever.
 fn is_transient_push_error(stderr: &str) -> bool {
@@ -726,6 +779,14 @@ fn is_transient_push_error(stderr: &str) -> bool {
         "temporary failure",
         "ssl",
         "tls",
+        // Auth 401 is transient HERE (not in general): `tick_once`
+        // refreshes the agent token via `agent_token::maybe_refresh`
+        // every tick, so an expired-token 401 genuinely self-heals on
+        // the next tick. A persistently-revoked agent still surfaces
+        // loudly — `maybe_refresh` itself errors and `tick_once`
+        // propagates that to the run loop's `warn!`.
+        "error: 401",
+        "authentication failed",
     ];
     TRANSIENT.iter().any(|needle| s.contains(needle))
 }
@@ -828,16 +889,83 @@ mod tests {
         assert!(is_transient_push_error(
             "fatal: unable to access '...': Connection timed out"
         ));
-        // auth / scope / allowlist + unknown → permanent (surfaced loudly).
-        assert!(!is_transient_push_error(
-            "fatal: Authentication failed for '...'"
-        ));
+        // scope / allowlist + unknown → permanent (surfaced loudly).
         assert!(!is_transient_push_error(
             "error: 403 Forbidden: no git_push scope on token"
         ));
         assert!(!is_transient_push_error(
             "remote: repo not in allowlist\n... error: 400"
         ));
+    }
+
+    #[test]
+    fn push_401_is_transient_because_token_refreshes_per_tick() {
+        // 401 / auth-failed stderr is transient HERE: tick_once refreshes
+        // the agent token every tick, so an expired-token 401 self-heals
+        // on the next tick (a revoked agent still warns loudly via the
+        // maybe_refresh error path). Realistic git stderr shapes:
+        assert!(is_transient_push_error(
+            "fatal: Authentication failed for 'https://coord.qontinui.io/git/qontinui/x.git/'"
+        ));
+        assert!(is_transient_push_error(
+            "fatal: unable to access 'https://coord.qontinui.io/git/qontinui/x.git/': \
+             The requested URL returned error: 401"
+        ));
+        // ...while a genuinely-permanent failure stays permanent.
+        assert!(!is_transient_push_error("fatal: repository not found"));
+    }
+
+    #[test]
+    fn push_args_are_prompt_proof() {
+        // The Bearer extraHeader is the SOLE intended auth: the helper
+        // chain, askpass, and terminal prompting must all be disabled so
+        // a 401 fails the push instead of popping an interactive prompt.
+        let args = push_args(
+            std::path::Path::new("/tmp/wt"),
+            "tok123",
+            "https://coord.example/git/qontinui/x.git",
+            "refs/heads/b:refs/agent/m-a",
+        );
+        let args: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let pos = |needle: &str| {
+            args.iter()
+                .position(|a| a == needle)
+                .unwrap_or_else(|| panic!("missing arg {needle:?} in {args:?}"))
+        };
+        let push_pos = pos("push");
+        // (1) empty credential.helper override, before the subcommand,
+        // preceded by `-c` so it's a config override not a stray arg.
+        let cred = pos("credential.helper=");
+        assert!(cred < push_pos, "credential.helper= must precede 'push'");
+        assert_eq!(args[cred - 1], "-c");
+        // (2) empty core.askPass override, likewise.
+        let askpass = pos("core.askPass=");
+        assert!(askpass < push_pos, "core.askPass= must precede 'push'");
+        assert_eq!(args[askpass - 1], "-c");
+        // (3) the terminal-prompt kill switch lives in the env pair the
+        // caller applies alongside these args.
+        assert_eq!(GIT_TERMINAL_PROMPT_ENV, ("GIT_TERMINAL_PROMPT", "0"));
+        // (4) the 2026-07-12 transfer bounds must survive the move into
+        // push_args: a stalled server otherwise hangs git indefinitely.
+        for bound in ["http.lowSpeedLimit=1024", "http.lowSpeedTime=60"] {
+            let at = pos(bound);
+            assert!(at < push_pos, "{bound} must precede 'push'");
+            assert_eq!(args[at - 1], "-c");
+        }
+        // Sanity: Bearer header config + push targets still present.
+        assert!(args
+            .iter()
+            .any(|a| a == "http.extraHeader=Authorization: Bearer tok123"));
+        assert_eq!(
+            &args[args.len() - 2..],
+            &[
+                "https://coord.example/git/qontinui/x.git".to_string(),
+                "refs/heads/b:refs/agent/m-a".to_string()
+            ]
+        );
     }
 
     #[test]
