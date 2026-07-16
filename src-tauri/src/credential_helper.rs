@@ -163,11 +163,46 @@ fn set_git_credential_helper(
     Ok(())
 }
 
+/// Bound interactive pushes from this worktree: abort any HTTP transfer
+/// trickling below 1 KiB/s for 60s. Without these a `git push` against
+/// a genuinely stalled server hangs indefinitely (2026-07-12 incident:
+/// coord git door 503-refused every push for ~5.5h). Best-effort, same
+/// posture as the credential.helper write.
+fn set_git_low_speed_bounds(working_dir: &Path) -> Result<(), String> {
+    for (key, value) in [("http.lowSpeedLimit", "1024"), ("http.lowSpeedTime", "60")] {
+        let output = crate::process_helpers::no_window("git")
+            .args([
+                "-C",
+                &working_dir.to_string_lossy(),
+                "config",
+                "--local",
+                key,
+                value,
+            ])
+            .output()
+            .map_err(|e| format!("run git config {key}: {e}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("git config --local {key} failed: {stderr}"));
+        }
+    }
+
+    Ok(())
+}
+
 pub async fn setup_credential_helper(working_dir: &str, session_id: &str) {
     let working_path = Path::new(working_dir);
     if !is_git_repo(working_path) {
         debug!("credential_helper: {working_dir} is not a git repo, skipping");
         return;
+    }
+
+    // Set the low-speed bounds before the credential-helper install so
+    // interactive pushes are bounded even when the helper install is
+    // skipped below (binary missing, token fetch failed, no repos).
+    if let Err(e) = set_git_low_speed_bounds(working_path) {
+        warn!("credential_helper: set http.lowSpeed bounds failed: {e}");
     }
 
     let binary_path = match credential_helper_binary_path() {
