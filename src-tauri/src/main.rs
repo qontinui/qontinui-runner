@@ -863,6 +863,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // QONTINUI_WORKTREE_RECLAIM_INTERVAL_SECS). Same machine-
                 // wide, anonymous, device-keyed posture as the census.
                 agent_worktree::reclaim::spawn_reclaim();
+                // Phase 4 (2026-07-15-vscode-coord-git-credential-prompt) —
+                // one-shot best-effort sweep of stale credential-helper
+                // config files (%TEMP%/qontinui-git-cred-*.json older than
+                // 24h). Sessions normally remove their own file via the
+                // SessionRegistry::close funnel; the sweep reaps files
+                // orphaned by crashes/kills. Never fails or slows the boot.
+                credential_helper::spawn_startup_sweep();
                 // Scheduled-maintenance executor (Phase 1, plan
                 // 2026-06-08-coord-scheduled-maintenance-subsystem) — a
                 // sibling of the reclaim pull-loop. Periodically pulls
