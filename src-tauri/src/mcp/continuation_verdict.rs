@@ -46,9 +46,11 @@
 //!   `session_status` field on the card is preferred the moment coord ships
 //!   one). A `session_not_found` 404 means coord IS reachable and has no row ⇒
 //!   status ABSENT (block-eligible), per the phase's decision rule.
-//! - **continuation rules** — `GET {coord}/coord/policy-documents/
-//!   continuation-rules` (the Phase-2 `prompt_documents` stand-in). Any
-//!   failure falls back to [`DEFAULT_CONTINUATION_RULES`].
+//! - **continuation rules** — `GET {coord}/coord/prompt-documents/
+//!   continuation_rules/session-continuation`: coord's versioned
+//!   `prompt_documents` store (Phase 2), which serves the tenant's editable
+//!   umbrella prompt. Any failure falls back to
+//!   [`DEFAULT_CONTINUATION_RULES`].
 //!
 //! `QONTINUI_STOP_HOOK_STATUS_OVERRIDE` is a dev/E2E lever: when set, the
 //! status fetch short-circuits to that value (`absent` ⇒ reachable-but-no-
@@ -88,8 +90,9 @@ const CAP_WINDOW: Duration = Duration::from_secs(3600);
 const CACHE_TTL: Duration = Duration::from_secs(45);
 
 /// Built-in umbrella continuation prompt — the fallback when coord's
-/// continuation-rules document is unreachable/absent (and the seed text the
-/// Phase-2 `continuation_rules` document kind will carry).
+/// continuation-rules document is unreachable/absent. Coord's
+/// `continuation_rules`/`session-continuation` document seeds equivalent
+/// wording, so the fallback and the served default read the same.
 pub const DEFAULT_CONTINUATION_RULES: &str = "Are there follow-ups? If so work on them; \
      if nothing is left, clean up worktrees/branches and mark the session finished \
      (report status via coord_report_status).";
@@ -506,6 +509,21 @@ async fn fetch_continuation_rules() -> String {
     }
 }
 
+/// Coord's `prompt_documents` coordinates for the umbrella prompt: the
+/// document kind and name seeded by coord's `DEFAULT_PROMPT_DOCUMENTS`.
+/// Addressed by `(kind, name)` — coord scopes the row to the caller's tenant
+/// from the bearer token, so the runner never passes a tenant here.
+const RULES_DOC_KIND: &str = "continuation_rules";
+const RULES_DOC_NAME: &str = "session-continuation";
+
+/// The coord URL serving the tenant's continuation-rules document.
+///
+/// `GET` returns the document row with its current `body` — the operator's
+/// edits, or coord's seeded default when never edited.
+fn continuation_rules_url(base: &str) -> String {
+    format!("{base}/coord/prompt-documents/{RULES_DOC_KIND}/{RULES_DOC_NAME}")
+}
+
 async fn fetch_continuation_rules_uncached() -> Option<String> {
     let (base, jwt) = match coord_client_parts() {
         Ok(p) => p,
@@ -515,9 +533,7 @@ async fn fetch_continuation_rules_uncached() -> Option<String> {
         }
     };
     let client = http_client().ok()?;
-    // Phase-2 stand-in: coord's policy-documents surface. When the
-    // `prompt_documents` phases land, this repoints to `kind=continuation_rules`.
-    let url = format!("{base}/coord/policy-documents/continuation-rules");
+    let url = continuation_rules_url(&base);
     let resp = client.get(&url).bearer_auth(&jwt).send().await.ok()?;
     if !resp.status().is_success() {
         debug!(
@@ -836,8 +852,46 @@ mod tests {
     }
 
     #[test]
+    fn rules_url_targets_the_prompt_documents_document() {
+        // Coord's landed surface: GET /coord/prompt-documents/{kind}/{name},
+        // NOT the removed /coord/policy-documents/continuation-rules.
+        let url = continuation_rules_url("https://coord.example.com");
+        assert_eq!(
+            url,
+            "https://coord.example.com/coord/prompt-documents/continuation_rules/session-continuation"
+        );
+        assert!(
+            !url.contains("policy-documents"),
+            "must not target the removed legacy surface: {url}"
+        );
+    }
+
+    #[test]
+    fn rules_parse_coord_prompt_document_shape() {
+        // The exact shape coord's `get_one` serializes: a flat
+        // `PromptDocumentRow` whose `body` carries the operator's text.
+        let coord_doc = json!({
+            "id": "6f1c9b3a-0f4e-4a1c-9c2f-3d8a5e7b1c04",
+            "tenant_id": "1b7e2c48-5a90-4f3d-8e61-92a4c7d0f5b3",
+            "kind": "continuation_rules",
+            "name": "session-continuation",
+            "description": "Stop-hook continuation umbrella prompt",
+            "body": "Operator-edited: finish the follow-ups, then clean up.",
+            "format": "markdown",
+            "default_source": "prompt_doc/continuation_rules/session-continuation/v1",
+            "current_version": 2,
+            "updated_by": "josh@qontinui.io",
+            "updated_at": "2026-07-17T12:00:00Z"
+        });
+        assert_eq!(
+            rules_from_doc_body(&coord_doc),
+            Some("Operator-edited: finish the follow-ups, then clean up.".to_string())
+        );
+    }
+
+    #[test]
     fn rules_parse_direct_and_wrapped_shapes() {
-        let direct = json!({"handle": "continuation-rules", "body": "Do the follow-ups."});
+        let direct = json!({"name": "session-continuation", "body": "Do the follow-ups."});
         assert_eq!(
             rules_from_doc_body(&direct),
             Some("Do the follow-ups.".to_string())
