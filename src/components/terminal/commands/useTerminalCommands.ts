@@ -34,7 +34,11 @@
  * §1 and the per-action keystroke budget in `./audit.md`.
  */
 
+import { invoke } from "@tauri-apps/api/core";
+import type { TerminalInfo } from "@qontinui/shared-types/tauri-events";
+
 import { instanceStorage } from "@/lib/instance-storage";
+import { writeClipboard } from "@/lib/clipboard";
 
 import {
   useTerminalSession,
@@ -44,8 +48,10 @@ import {
 } from "../contexts";
 import type { AccountUsageInfo } from "../useSessionManager";
 import { compareByUsageHeadroom } from "../../settings/types";
-import type { ResultCardSpec } from "../result-card";
+import type { ResultCardSpec, ResultCardSection } from "../result-card";
 import { buildMetricsCardSpec, buildHistoryCardSpec } from "../result-card";
+import type { CommandResponse } from "../types";
+import type { TerminalPageConfig } from "../useTerminalPages";
 import type { CommandAction, CommandResult, ResolverContext } from "./types";
 import { useCommandAction } from "./useCommandAction";
 import { useOrchestrateCommand } from "./orchestrateCommand";
@@ -266,6 +272,26 @@ export function resolveTenantArg(
     return { error: `tenant "${value}" is ambiguous (matches ${prefixed.length} bindings)` };
   }
   return { error: `no tenant binding matches "${value}"` };
+}
+
+/**
+ * Read the persisted page-id → page-name map so `/copy-names` can label each
+ * group with the page's display name. Pages live under the same
+ * `instanceStorage` key `useTerminalPages` uses (`qontinui-terminal-pages`).
+ * Best-effort: an empty/broken store just yields an empty map and the handler
+ * falls back to the raw page id.
+ */
+function readPageNames(): Map<string, string> {
+  const map = new Map<string, string>();
+  try {
+    const pages = instanceStorage.getJSON<TerminalPageConfig[]>("qontinui-terminal-pages", []);
+    for (const p of pages) {
+      if (p && typeof p.id === "string" && typeof p.name === "string") map.set(p.id, p.name);
+    }
+  } catch {
+    /* ignore — fall back to raw ids */
+  }
+  return map;
 }
 
 export function useTerminalCommands(ctx: TerminalCommandsContext): void {
@@ -1143,6 +1169,83 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     handler: async (): Promise<CommandResult> => {
       ctx.showCard(buildHistoryCardSpec(eventHistory ?? []));
       return ok();
+    },
+  });
+
+  // 36. /copy-names — copy every session name (all tabs, all pages) to clipboard
+  // Written for crash-recovery: the operator keeps a written list of session
+  // names so sessions can be restored by hand if the app exits. This gathers
+  // them in one keystroke.
+  //
+  // Cross-page note: useTerminalSession() is scoped to the ACTIVE page only,
+  // so we can't read other pages' tabs from a context. The Rust backend owns
+  // every PTY across every page, so `terminal_list` is the authoritative,
+  // complete source (and its titles survive a React remount — exactly the
+  // crash-recovery property we want). Titles = TerminalInfo.title.
+  useCommandAction({
+    id: "terminal.copy-names",
+    slash: "/copy-names",
+    aliases: ["/copy-sessions", "/session-names"],
+    label: "Copy all session names",
+    description:
+      "Copy the names of every terminal session across ALL pages to the clipboard, " +
+      "one per line and grouped by page. Handy to save before a restart so sessions " +
+      "can be restored manually.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^copy[- ]names$/i, /^copy[- ]sessions$/i, /^session[- ]names$/i],
+    handler: async (): Promise<CommandResult<{ count: number }>> => {
+      let terminals: TerminalInfo[] = [];
+      try {
+        const res = await invoke<CommandResponse>("terminal_list");
+        if (res.success && res.data) {
+          terminals = (res.data as { terminals: TerminalInfo[] }).terminals ?? [];
+        }
+      } catch {
+        return fail("list-failed", "could not read the terminal list from the backend");
+      }
+      if (terminals.length === 0) return fail("no-sessions", "no terminal sessions found");
+
+      // Group by page, creation-ordered within each page (matches tab order).
+      const pageNames = readPageNames();
+      const byPage = new Map<string, TerminalInfo[]>();
+      for (const t of [...terminals].sort((a, b) => a.createdAt - b.createdAt)) {
+        const pid = t.pageId || "default";
+        const list = byPage.get(pid) ?? [];
+        list.push(t);
+        byPage.set(pid, list);
+      }
+      const multiPage = byPage.size > 1;
+
+      const lines: string[] = [];
+      const sections: ResultCardSection[] = [];
+      for (const [pid, list] of byPage) {
+        const pageName = pageNames.get(pid) ?? (pid === "default" ? "Terminal" : pid);
+        if (multiPage) lines.push(`# ${pageName}`);
+        sections.push({
+          heading: multiPage ? pageName : undefined,
+          rows: list.map((t, i) => ({ label: String(i + 1), value: t.title })),
+        });
+        for (const t of list) lines.push(t.title);
+        if (multiPage) lines.push("");
+      }
+      const text = lines.join("\n").trimEnd();
+
+      const copied = await writeClipboard(text);
+      const n = terminals.length;
+      ctx.showCard({
+        title: `${n} session name${n === 1 ? "" : "s"} ${copied ? "copied" : "gathered"}`,
+        subtitle: copied
+          ? "All session names are on your clipboard."
+          : "Clipboard write failed — copy them from below.",
+        sections,
+        footer: {
+          label: "Copy again",
+          onClick: () => {
+            void writeClipboard(text);
+          },
+        },
+      });
+      return copied ? ok({ count: n }) : fail("clipboard-failed", "clipboard write failed");
     },
   });
 

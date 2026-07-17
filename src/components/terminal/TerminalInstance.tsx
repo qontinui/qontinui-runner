@@ -10,6 +10,7 @@ import { TerminalFindBar } from "./TerminalFindBar";
 import { paintGrid, type GridSnapshot } from "./paintGrid";
 import { getTerminalDebug, recordPaintGrid } from "./terminalDebug";
 import { instanceStorage } from "@/lib/instance-storage";
+import { writeClipboard } from "@/lib/clipboard";
 import { consumeInputChunk } from "./consumeInputChunk";
 import { preparePasteData } from "./preparePaste";
 import { wheelToLineDelta, DEFAULT_CELL_HEIGHT_PX } from "./wheelScroll";
@@ -649,10 +650,29 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
           // Ctrl+C: copy selected text, or pass through as SIGINT when nothing selected
           if (event.type === "keydown" && event.key === "c" && event.ctrlKey && !event.shiftKey) {
             if (backend.hasSelection()) {
-              navigator.clipboard.writeText(backend.getSelection()).catch(() => {});
+              // Native clipboard write (see writeClipboard) — navigator.clipboard
+              // silently fails in the webview when unfocused, which is why copy
+              // "often didn't work".
+              void writeClipboard(backend.getSelection());
               return false; // prevent terminal from sending SIGINT
             }
             // No selection → let Ctrl+C pass through as SIGINT
+          }
+
+          // Ctrl+Shift+C: conventional terminal "copy" shortcut. Previously
+          // unhandled, so users relying on it got nothing on the clipboard.
+          // Copy the selection (if any) and swallow the key either way — it has
+          // no other meaning inside a terminal.
+          if (
+            event.type === "keydown" &&
+            event.key.toLowerCase() === "c" &&
+            event.ctrlKey &&
+            event.shiftKey
+          ) {
+            if (backend.hasSelection()) {
+              void writeClipboard(backend.getSelection());
+            }
+            return false;
           }
 
           if (
@@ -778,8 +798,12 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
           if (b.hasSelection()) {
             const selection = b.getSelection();
             if (selection) {
-              navigator.clipboard.writeText(selection).catch(() => {});
-              b.clearSelection();
+              // Native clipboard write (see writeClipboard). Only clear the
+              // highlight once the copy actually succeeds, so a failed write
+              // doesn't also lose the user's selection.
+              void writeClipboard(selection).then((copied) => {
+                if (copied) b.clearSelection();
+              });
             }
             return;
           }
@@ -859,9 +883,10 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
                   const b = backendRef.current;
                   const prepared = preparePasteData(text, b?.bracketedPasteMode ?? false);
                   const bytes = encoder.encode(prepared);
-                  invoke("terminal_write", { terminalId: termId, data: uint8ToBase64(bytes) }).catch(
-                    () => {},
-                  );
+                  invoke("terminal_write", {
+                    terminalId: termId,
+                    data: uint8ToBase64(bytes),
+                  }).catch(() => {});
                 },
               },
               getScrollback: {
@@ -1062,10 +1087,7 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
             { terminalId },
           );
           if (result.success && result.data && !disposed) {
-            bootstrapPaint(
-              result.data,
-              isReconnecting ? "reconnect-bootstrap" : "mount-bootstrap",
-            );
+            bootstrapPaint(result.data, isReconnecting ? "reconnect-bootstrap" : "mount-bootstrap");
           }
         } catch (err) {
           console.warn(`[Terminal ${terminalId}] grid bootstrap failed:`, err);

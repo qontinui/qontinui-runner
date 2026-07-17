@@ -109,6 +109,26 @@ async fn share_to_mobile_impl(text: String) -> Result<ClipboardEntryResponse, Ap
     Ok(entry)
 }
 
+/// Write text to the local OS clipboard.
+///
+/// The browser Async Clipboard API (`navigator.clipboard.writeText`) is
+/// unreliable inside the Tauri WebView2: it requires document focus /
+/// transient user activation and silently rejects otherwise, which is why
+/// terminal copy "often doesn't work". Routing through `arboard` on the
+/// native side writes to the OS clipboard directly with no focus
+/// requirement (same crate the UI Bridge clipboard endpoints already use).
+///
+/// # Arguments
+/// * `text` - The text to place on the clipboard.
+#[tauri::command]
+pub fn clipboard_write_text(text: String) -> Result<(), String> {
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|e| format!("Clipboard init failed: {}", e))?;
+    clipboard
+        .set_text(&text)
+        .map_err(|e| format!("Clipboard write failed: {}", e))
+}
+
 /// Response from POST /api/v1/files/upload
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SharedFileResponse {
@@ -222,6 +242,7 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
         .invoke_handler(tauri::generate_handler![
             share_to_mobile,
             share_file_to_mobile,
+            clipboard_write_text,
         ])
         .build()
 }
