@@ -145,7 +145,7 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     // CONFIRM: a usage-limit *message* is only a hint (conversation text can
     // quote one; a resume repaint can re-render a historical one). Re-probe
     // and require the account to actually be exhausted before acting.
-    crate::commands::ai_settings::refresh_account_usage_snapshot().await;
+    let usage = crate::commands::ai_settings::refresh_account_usage_snapshot().await;
     if !crate::ai_provider::account_known_exhausted(&src) {
         info!(
             terminal_id,
@@ -158,8 +158,21 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
     }
 
     // Keep spawn-time selection off the dead account, and repoint the global
-    // resolved dir so unrelated new sessions stop landing on it.
-    crate::ai_provider::mark_account_rate_limited_with_duration(&src, EXHAUSTED_ACCOUNT_COOLDOWN);
+    // resolved dir so unrelated new sessions stop landing on it. When the
+    // usage stats carry the 5-hour window's actual reset time, cool down
+    // until then (clamped) instead of the blanket hour — the account comes
+    // back into rotation the moment its session window rolls over.
+    let cooldown = usage
+        .iter()
+        .find(|i| i.config_dir == src)
+        .and_then(|i| i.session_resets_at)
+        .and_then(|reset_ts| {
+            let now = chrono::Utc::now().timestamp();
+            let secs = (reset_ts as i64) - now;
+            (secs > 0).then(|| std::time::Duration::from_secs((secs as u64).clamp(300, 6 * 3600)))
+        })
+        .unwrap_or(EXHAUSTED_ACCOUNT_COOLDOWN);
+    crate::ai_provider::mark_account_rate_limited_with_duration(&src, cooldown);
     crate::ai_provider::pick_best_account();
 
     let now_ms = chrono::Utc::now().timestamp_millis();
@@ -210,6 +223,105 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
             emit_skipped(&app, &record, &src, &format!("migration-failed: {e}"));
         }
     }
+}
+
+/// The model the session was last actually running on, from the transcript's
+/// most recent assistant turn (`.message.model`). `None` when the transcript
+/// is unreadable or records no real model (synthetic error turns are
+/// skipped) — the respawn then omits `--model` and the CLI default applies.
+fn transcript_last_model(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    for line in content.lines().rev() {
+        // Cheap pre-filter before parsing multi-KB JSONL lines.
+        if !line.contains("\"assistant\"") || !line.contains("\"model\"") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+            continue;
+        }
+        if let Some(m) = v
+            .get("message")
+            .and_then(|m| m.get("model"))
+            .and_then(|m| m.as_str())
+        {
+            if m.starts_with("claude-") {
+                return Some(m.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Text typed into the migrated session once the resumed CLI is idle.
+const CONTINUE_NUDGE: &str = "This session was automatically migrated to a fresh Claude account \
+after the previous account hit a usage limit. Continue the task you were working on from where \
+it left off; if you were idle awaiting operator input, say so and wait.";
+
+/// How the nudge watcher decides the resumed CLI is ready for input: the Ink
+/// footer hint that is painted exactly when the input box is idle. Matched
+/// against the normalized (lowercased, whitespace-collapsed) grid.
+const READY_MARKER: &str = "? for shortcuts";
+/// Painted while Claude is mid-turn — if visible, the session already picked
+/// itself up (or the operator beat us to it) and no nudge is needed.
+const BUSY_MARKER: &str = "esc to interrupt";
+
+/// Watch the freshly-respawned terminal until the resumed CLI paints its idle
+/// prompt, then submit [`CONTINUE_NUDGE`]. Detached and strictly best-effort:
+/// bounded (~3 min), one submission max, and it stands down when the session
+/// is already busy or the terminal goes away. Deliberately does NOT stand
+/// down on a visible usage-limit message: a `--resume` repaint can re-render
+/// the OLD account's historical banner (see the `usage_limit` module doc),
+/// and a genuinely-dry target is caught by the grid scanner firing a fresh
+/// migration hint on this terminal anyway.
+fn spawn_continue_nudge(terminal_id: String) {
+    use tauri::Manager;
+    tauri::async_runtime::spawn(async move {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let Some(app) = crate::tauri_app_handle::current() else {
+                return;
+            };
+            let Some(tm) = app.try_state::<std::sync::Arc<crate::terminal::TerminalManager>>()
+            else {
+                return;
+            };
+            let Some(session) = tm.get(&terminal_id) else {
+                info!(terminal_id, "continue-nudge: terminal gone — standing down");
+                return;
+            };
+            let text = {
+                let grid = session.grid();
+                let guard = grid.lock().unwrap_or_else(|e| e.into_inner());
+                guard.text_snapshot().text
+            };
+            let normalized = super::output_scan::normalize(&text);
+            if normalized.contains(BUSY_MARKER) {
+                info!(
+                    terminal_id,
+                    "continue-nudge: session already working — no nudge needed"
+                );
+                return;
+            }
+            if normalized.contains(READY_MARKER) {
+                match session.submit_prompt(CONTINUE_NUDGE) {
+                    Ok(()) => info!(terminal_id, "continue-nudge submitted to migrated session"),
+                    Err(e) => warn!(terminal_id, error = %e, "continue-nudge submit failed"),
+                }
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                warn!(
+                    terminal_id,
+                    "continue-nudge: resumed CLI never painted its idle prompt within 3m — giving up"
+                );
+                return;
+            }
+        }
+    });
 }
 
 /// Copy the session transcript from the source account's project dir into
@@ -315,13 +427,27 @@ pub fn migrate_session(
             &record.claude_session_id[..8.min(record.claude_session_id.len())]
         )
     });
-    let command = vec![
+    // Preserve the session's model across the account hop: `--resume` alone
+    // restores the conversation but the model falls back to the target
+    // account's default. The transcript records each assistant turn's model;
+    // the last one is what the session was actually running on.
+    let src_transcript = super::transcript::session_transcript_path(
+        Path::new(src_config_dir),
+        &working_dir,
+        &record.claude_session_id,
+    );
+    let model = transcript_last_model(&src_transcript);
+    let mut command = vec![
         crate::agent_runtime::claude_bin_path(),
         "--permission-mode".to_string(),
         "bypassPermissions".to_string(),
-        "--resume".to_string(),
-        record.claude_session_id.clone(),
     ];
+    if let Some(m) = &model {
+        command.push("--model".to_string());
+        command.push(m.clone());
+    }
+    command.push("--resume".to_string());
+    command.push(record.claude_session_id.clone());
     let capture_hint = crate::commands::terminal::SessionCaptureHint {
         config_dir: Some(dst_config_dir.to_string()),
         working_dir: working_dir.clone(),
@@ -354,6 +480,16 @@ pub fn migrate_session(
     // The lifecycle row was re-opened synchronously by the pinned-id capture
     // hint inside `create_terminal_session_backend` (`--resume <id>` keys the
     // SAME row: new terminal/account, preserved page/zone, origin "pinned").
+
+    // 4. Optionally nudge the resumed session to pick the task back up once
+    // the CLI paints its idle prompt — a bare `--resume` restores context but
+    // then sits at the input box with nobody typing.
+    if crate::settings::get_ai_settings()
+        .claude_cli
+        .auto_continue_after_migration
+    {
+        spawn_continue_nudge(new_terminal_id.clone());
+    }
 
     let outcome = MigrationOutcome {
         new_terminal_id: new_terminal_id.clone(),
@@ -465,6 +601,36 @@ mod tests {
         assert_eq!(dst, dst2);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn transcript_last_model_prefers_latest_real_model() {
+        let tmp =
+            std::env::temp_dir().join(format!("qontinui-acctmig-model-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("t.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n",
+                "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-opus-4-8\",\"content\":[]}}\n",
+                "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-fable-5\",\"content\":[]}}\n",
+                "{\"type\":\"assistant\",\"message\":{\"model\":\"<synthetic>\",\"content\":[]}}\n",
+                "{\"type\":\"user\",\"message\":{\"content\":\"quoted \\\"assistant\\\" \\\"model\\\" text\"}}\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            transcript_last_model(&path).as_deref(),
+            Some("claude-fable-5"),
+            "synthetic error turns and quoting user turns must be skipped"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn transcript_last_model_missing_file_is_none() {
+        assert!(transcript_last_model(Path::new("Z:/nope/never.jsonl")).is_none());
     }
 
     #[test]
