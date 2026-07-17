@@ -9,6 +9,16 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '@@STOP_HOOK_SCRIPT@@'"
+          }
+        ]
+      }
     ]
   },
   "permissions": {

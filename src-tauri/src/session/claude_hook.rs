@@ -39,13 +39,26 @@ use std::path::{Path, PathBuf};
 /// needs from env (`QONTINUI_TERMINAL_ID`, `QONTINUI_INSTALL_INTERCEPT_PORT`)
 /// and stdin, so the same bytes work for every terminal.
 const HOOK_SCRIPT: &str = include_str!("../../resources/session-restore/claude_session_hook.sh");
+/// Stop-hook script template (bundled) — the continuation-verdict `Stop` hook
+/// (plan `2026-07-17-session-autonomy-fabric.md` Phase 1). Like the
+/// SessionStart hook it substitutes nothing: it reads the session key + the
+/// runner API port from env (`QONTINUI_TERMINAL_ID`,
+/// `QONTINUI_RUNNER_API_PORT`) and the Stop payload from stdin, so the same
+/// bytes work for every terminal. Verdict policy lives entirely in the
+/// runner's `POST /sessions/{id}/continuation-verdict` endpoint (D4) —
+/// flag-gated `QONTINUI_STOP_HOOK_CONTINUATION` default `off`, so shipping the
+/// hook to every session is behaviorally inert until the flag is armed.
+const STOP_HOOK_SCRIPT: &str = include_str!("../../resources/session-restore/claude_stop_hook.sh");
 /// Settings template (bundled). `@@HOOK_SCRIPT@@` → the absolute path of the
-/// materialized hook script.
+/// materialized SessionStart hook script; `@@STOP_HOOK_SCRIPT@@` → the
+/// materialized Stop hook script.
 const HOOK_SETTINGS: &str =
     include_str!("../../resources/session-restore/claude_hook_settings.json");
 
 /// File name of the materialized hook script.
 const HOOK_SCRIPT_NAME: &str = "claude_session_hook.sh";
+/// File name of the materialized Stop-hook script.
+const STOP_HOOK_SCRIPT_NAME: &str = "claude_stop_hook.sh";
 /// File name of the materialized `--settings` file.
 const HOOK_SETTINGS_NAME: &str = "claude_hook_settings.json";
 
@@ -92,11 +105,24 @@ pub fn materialize(base_dir: &Path) -> Option<PathBuf> {
     }
     set_executable(&script_path);
 
-    // Substitute the script's absolute path into the settings `command`. JSON
-    // needs backslashes escaped (a Windows path) so the settings file stays
-    // valid JSON Claude can parse.
+    // Stop hook (continuation verdict, session-autonomy-fabric Phase 1) —
+    // rides the SAME settings file, so it inherits the identical delivery +
+    // fail-open posture as the SessionStart hook.
+    let stop_script_path = base_dir.join(STOP_HOOK_SCRIPT_NAME);
+    if let Err(e) = std::fs::write(&stop_script_path, STOP_HOOK_SCRIPT.as_bytes()) {
+        tracing::warn!(error = %e, path = %stop_script_path.display(), "session-restore: claude stop-hook script write failed");
+        return None;
+    }
+    set_executable(&stop_script_path);
+
+    // Substitute the scripts' absolute paths into the settings `command`s.
+    // JSON needs backslashes escaped (a Windows path) so the settings file
+    // stays valid JSON Claude can parse.
     let script_for_json = script_path.to_string_lossy().replace('\\', "\\\\");
-    let settings = HOOK_SETTINGS.replace("@@HOOK_SCRIPT@@", &script_for_json);
+    let stop_script_for_json = stop_script_path.to_string_lossy().replace('\\', "\\\\");
+    let settings = HOOK_SETTINGS
+        .replace("@@HOOK_SCRIPT@@", &script_for_json)
+        .replace("@@STOP_HOOK_SCRIPT@@", &stop_script_for_json);
     let settings_path = base_dir.join(HOOK_SETTINGS_NAME);
     if let Err(e) = std::fs::write(&settings_path, settings.as_bytes()) {
         tracing::warn!(error = %e, path = %settings_path.display(), "session-restore: claude hook settings write failed");
@@ -173,6 +199,32 @@ mod tests {
         assert!(script_text.contains("/control/session-open"));
         assert!(script_text.contains("QONTINUI_INSTALL_INTERCEPT_PORT"));
         assert!(script_text.contains("QONTINUI_TERMINAL_ID"));
+
+        // The SAME settings file registers the Stop continuation-verdict hook
+        // (session-autonomy-fabric Phase 1) pointing at the materialized stop
+        // script — one carrier delivers SessionStart + Stop + pre-approval.
+        let stop_script_path = tmp.path().join(STOP_HOOK_SCRIPT_NAME);
+        assert!(stop_script_path.exists(), "stop-hook script materialized");
+        assert!(
+            !settings_text.contains("@@STOP_HOOK_SCRIPT@@"),
+            "stop placeholder substituted"
+        );
+        let stop_cmd = v["hooks"]["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            stop_cmd.contains(STOP_HOOK_SCRIPT_NAME),
+            "Stop command runs our stop-hook script"
+        );
+
+        // The stop script POSTs to the verdict route, reads the seam env, and
+        // carries the fail-open loop guard (never re-block a hook-forced
+        // continuation).
+        let stop_text = std::fs::read_to_string(&stop_script_path).unwrap();
+        assert!(stop_text.contains("/continuation-verdict"));
+        assert!(stop_text.contains("QONTINUI_RUNNER_API_PORT"));
+        assert!(stop_text.contains("QONTINUI_TERMINAL_ID"));
+        assert!(stop_text.contains("stop_hook_active"));
 
         // The DELIVERY never writes to / reads from the user's config: both
         // materialized files live under the runner's own app-data dir (the
