@@ -376,17 +376,36 @@ fn execute_argv(
 
     unregister(doctor_handle, pid);
 
+    let Some(status) = status else {
+        // TIMED OUT — return NOW, without joining the reader threads.
+        //
+        // `Timeout` carries no output, so joining buys nothing here, and it
+        // can cost everything: `kill_child_tree` is best-effort (taskkill can
+        // fail or be slow under load, and then only `cmd.exe`/`node` dies).
+        // A surviving grandchild still holds the pipe write-ends, so the
+        // readers would never see EOF and the join would block for the
+        // child's full natural lifetime — defeating the very timeout that
+        // just fired. Bounding this path is the whole point of the timeout,
+        // so it must not depend on the tree-kill having fully succeeded.
+        //
+        // The readers are detached: they exit on their own once the orphan
+        // finally closes the pipes.
+        return ExecOutcome::Timeout;
+    };
+
+    // Child is gone, so the pipes are closed (or closing) — these joins are
+    // bounded and collect the output the caller actually gets.
     let stdout = join_pipe_reader(stdout_reader);
     let stderr = join_pipe_reader(stderr_reader);
 
-    match status {
-        None => ExecOutcome::Timeout,
-        Some(status) if status.success() => ExecOutcome::Success { stdout, stderr },
-        Some(status) => ExecOutcome::Failure {
+    if status.success() {
+        ExecOutcome::Success { stdout, stderr }
+    } else {
+        ExecOutcome::Failure {
             code: status.code(),
             stdout,
             stderr,
-        },
+        }
     }
 }
 
@@ -517,10 +536,24 @@ mod tests {
         }
     }
 
+    /// The timeout must be HARD: `execute_argv` returns promptly even when a
+    /// live grandchild (`ping`, under `cmd.exe`) still holds the pipe
+    /// write-ends.
+    ///
+    /// REGRESSION: this path originally joined the reader threads before
+    /// returning `Timeout`. Those joins only finish once every pipe
+    /// write-end closes — so whenever the best-effort `taskkill /T` missed
+    /// the grandchild (it can fail or lag under parallel-suite load), the
+    /// call blocked for the child's FULL natural lifetime instead of the
+    /// deadline. It showed up as a load-dependent flake, but the real defect
+    /// was that a wedged pi — exactly what the timeout exists for — could
+    /// hang a caller for pi's entire runtime. The timeout path now returns
+    /// without joining (it discards output anyway), so the bound holds
+    /// whether or not the tree-kill won.
     #[cfg(windows)]
     #[test]
-    fn execute_argv_kills_on_timeout() {
-        // `ping -n 30 127.0.0.1` runs ~29s; the 1s deadline must kill it.
+    fn execute_argv_timeout_is_bounded_even_if_tree_kill_misses() {
+        // `ping -n 30 127.0.0.1` runs ~29s; the 1s deadline must pre-empt it.
         let argv: Vec<String> = ["cmd-shim", "/c", "ping", "-n", "30", "127.0.0.1"]
             .iter()
             .map(|s| s.to_string())
@@ -530,7 +563,14 @@ mod tests {
             ExecOutcome::Timeout => {}
             other => panic!("expected timeout, got {}", outcome_name(&other)),
         }
-        assert!(started.elapsed() < Duration::from_secs(10));
+        // Generous vs the 1s deadline (CI is slow, and taskkill spawns a
+        // process) but far below the grandchild's ~29s lifetime — so this
+        // fails if the return ever waits on a surviving grandchild again.
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "timeout took {:?} — it must not wait on a surviving grandchild",
+            started.elapsed()
+        );
     }
 
     #[cfg(unix)]
@@ -545,14 +585,18 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn execute_argv_kills_on_timeout() {
+    fn execute_argv_timeout_is_bounded_even_if_tree_kill_misses() {
         let argv: Vec<String> = ["sleep", "30"].iter().map(|s| s.to_string()).collect();
         let started = Instant::now();
         match execute_argv(&argv, None, None, Duration::from_secs(1), None, None) {
             ExecOutcome::Timeout => {}
             other => panic!("expected timeout, got {}", outcome_name(&other)),
         }
-        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "timeout took {:?} — it must not wait on a surviving grandchild",
+            started.elapsed()
+        );
     }
 
     #[test]
