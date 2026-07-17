@@ -276,11 +276,14 @@ pub async fn get_process_log_context(
     after: Option<u32>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<crate::database::ProcessSessionOutputLine>, String> {
+    let around_timestamp = chrono::DateTime::parse_from_rfc3339(&around_timestamp)
+        .map_err(|e| format!("invalid around_timestamp '{}': {}", around_timestamp, e))?
+        .with_timezone(&chrono::Utc);
     state
         .pg_db
         .get_process_log_context(
             &process_name,
-            &around_timestamp,
+            around_timestamp,
             before.unwrap_or(20),
             after.unwrap_or(20),
         )
