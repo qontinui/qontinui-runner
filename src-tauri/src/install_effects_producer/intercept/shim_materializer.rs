@@ -470,6 +470,101 @@ fn locate_stub_exe() -> Option<PathBuf> {
     None
 }
 
+// ===========================================================================
+// PERSISTENT identity shim (plan
+// 2026-07-17-universal-coord-device-identity-for-any-session §6)
+// ===========================================================================
+//
+// Everything above materializes PER-PTY into `temp_dir()/qontinui-identity-<id>`
+// and is prepended to the CHILD env only — so a BARE terminal (one the runner
+// did not spawn) never sees a shim at all, and the shim's self-provisioning
+// fallback (`bin/qontinui_shim.rs`) is dead code for exactly the sessions it
+// targets. This section closes that: a STABLE dir (`profile_cli::identity_shim_dir`)
+// holding one `claude.exe`, added to the USER PATH from the Settings panel.
+//
+// ⚠ That Settings toggle IS the delivery gate (trust-boundary option C). It is
+// an operator opt-in, independent of the runner-side mint flag
+// (`QONTINUI_SESSION_COORD_IDENTITY_ENABLED`) + marker: neither alone grants a
+// bare session identity. Do not collapse them, and do not make either implicit.
+//
+// ⚠ SELF-SPAWN TRAP. A persistent on-PATH `claude.exe` makes the trap the shim's
+// module docs already name materially more likely: if `own_shim_dirs` misses this
+// dir, the stub resolves ITSELF as the "real" claude. `own_shim_dirs` excludes it
+// explicitly via `profile_cli::identity_shim_dir()` — the SAME function used here
+// — which is why that path lives in the lib crate rather than being spelled twice.
+
+/// The identity tool the PERSISTENT dir shadows. Deliberately `claude` only,
+/// not [`IDENTITY_TOOLS`]: the fallback this dir exists to deliver is
+/// `--mcp-config`, which is a claude-CLI flag (`identity_mcp_config_args`
+/// returns nothing for gemini), and the per-PTY concerns that justify shadowing
+/// gemini (a pinned `--session-id`) do not exist in a bare terminal. Shadowing a
+/// tool we would only ever pass through is pure risk with no benefit.
+#[cfg(target_os = "windows")]
+pub const PERSISTENT_IDENTITY_TOOL: &str = "claude";
+
+/// Materialize the persistent identity dir: create
+/// [`crate::profile_cli::identity_shim_dir`] and copy the `qontinui-shim` stub
+/// into it as `claude.exe`, reusing [`copy_exe_stub`] / [`locate_stub_exe`].
+///
+/// Unlike every other materializer here this is **fail-CLOSED** and returns a
+/// `Result`: it runs from an explicit operator click, not from a terminal spawn,
+/// so a failure must be reported to the Settings UI rather than silently
+/// degrading. Adding the dir to PATH without the stub in it would be a silent
+/// no-op that reads as "enabled".
+#[cfg(target_os = "windows")]
+pub fn materialize_persistent_identity() -> Result<PathBuf, String> {
+    let dir = qontinui_runner_lib::profile_cli::identity_shim_dir()
+        .ok_or_else(|| "home directory unresolvable".to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    copy_exe_stub(&dir, PERSISTENT_IDENTITY_TOOL);
+    let stub = dir.join(format!("{PERSISTENT_IDENTITY_TOOL}.exe"));
+    if !stub.is_file() {
+        return Err(format!(
+            "the qontinui-shim stub could not be copied to {} — it is not next to the runner \
+             executable (a dev build without `cargo build --bin qontinui-shim`?). Refusing to \
+             put an empty dir on your PATH.",
+            stub.display()
+        ));
+    }
+    Ok(dir)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn materialize_persistent_identity() -> Result<PathBuf, String> {
+    Err("the persistent identity shim is Windows-only for now".to_string())
+}
+
+/// Delete the persistent identity dir. Idempotent (an absent dir is `Ok`) — the
+/// second half of the reversibility that makes the Settings toggle the right
+/// gate. Called AFTER the PATH entry is removed, so no window exists in which
+/// PATH names a dir whose stub is already gone.
+pub fn remove_persistent_identity() -> Result<(), String> {
+    let Some(dir) = qontinui_runner_lib::profile_cli::identity_shim_dir() else {
+        return Ok(()); // no home dir ⇒ nothing was ever materialized
+    };
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("remove {}: {e}", dir.display())),
+    }
+}
+
+/// Is the persistent identity shim fully installed — the stub materialized AND
+/// its dir on the USER PATH? Both are required: either alone does nothing.
+pub fn persistent_identity_installed() -> Result<bool, String> {
+    let Some(dir) = qontinui_runner_lib::profile_cli::identity_shim_dir() else {
+        return Ok(false);
+    };
+    #[cfg(target_os = "windows")]
+    let stub_present = dir.join(format!("{PERSISTENT_IDENTITY_TOOL}.exe")).is_file();
+    #[cfg(not(target_os = "windows"))]
+    let stub_present = false;
+    if !stub_present {
+        return Ok(false);
+    }
+    qontinui_runner_lib::profile_cli::dir_on_user_path(&dir)
+}
+
 /// Mark a materialized shim executable (Unix). No-op on Windows (resolution is
 /// by extension, not the executable bit).
 #[cfg(unix)]
@@ -707,6 +802,65 @@ mod tests {
                 let mode = std::fs::metadata(&f).unwrap().permissions().mode();
                 assert_eq!(mode & 0o111, 0o111, "{tool} shim must be executable");
             }
+        }
+    }
+
+    /// §6: the PERSISTENT dir is a stable app-data path, NOT a per-PTY temp dir
+    /// — the whole point is that it survives to be on the USER PATH. It must
+    /// also carry neither the per-PTY prefix nor live where `sweep_stale`
+    /// reaps: a swept-away identity dir would leave a PATH entry pointing at
+    /// nothing.
+    #[test]
+    fn persistent_identity_dir_is_stable_and_never_swept() {
+        let Some(dir) = qontinui_runner_lib::profile_cli::identity_shim_dir() else {
+            return; // no home dir in this environment
+        };
+        assert!(
+            !dir.starts_with(std::env::temp_dir()),
+            "the persistent dir must NOT live where sweep_stale reaps, got {}",
+            dir.display()
+        );
+        assert!(
+            !dir.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(IDENTITY_DIR_PREFIX),
+            "must not wear the per-PTY prefix — sweep_stale keys off it"
+        );
+    }
+
+    /// `remove_persistent_identity` is idempotent: an absent dir is `Ok`, and a
+    /// second call is a no-op. Reversibility is the reason the Settings toggle
+    /// beats a dotfile, so uninstall must never fail on a partial install.
+    #[test]
+    fn remove_persistent_identity_is_idempotent() {
+        // Never materialized (or already removed) ⇒ Ok, no panic. Runs against
+        // the real path but only ever REMOVES what this feature owns, and only
+        // when a previous test/opt-in put it there.
+        if qontinui_runner_lib::profile_cli::identity_shim_dir()
+            .map(|d| d.exists())
+            .unwrap_or(false)
+        {
+            return; // the operator has really opted in — don't delete their dir
+        }
+        assert!(remove_persistent_identity().is_ok());
+        assert!(remove_persistent_identity().is_ok(), "idempotent");
+    }
+
+    /// A partial install must read as NOT installed: the stub and the PATH entry
+    /// are both required, so `persistent_identity_installed` can never report
+    /// `true` off an un-materialized dir.
+    #[test]
+    fn persistent_identity_not_installed_without_the_stub() {
+        let installed = persistent_identity_installed().unwrap_or(false);
+        let stub_present = qontinui_runner_lib::profile_cli::identity_shim_dir()
+            .map(|d| d.join("claude.exe").is_file())
+            .unwrap_or(false);
+        if !stub_present {
+            assert!(
+                !installed,
+                "no stub materialized ⇒ must never report installed"
+            );
         }
     }
 

@@ -266,6 +266,14 @@ pub fn drain(app_handle: &tauri::AppHandle, timeout: Duration) -> DrainSummary {
         crate::session::shutdown_marker::marker_path(crate::mcp::types::get_mcp_api_port());
     crate::session::shutdown_marker::mark_clean_shutdown(&marker_path);
 
+    // Retract the out-of-process port advertisement (plan 2026-07-17 §4): a
+    // drain is the supervisor's pre-kill signal, so this runner is about to stop
+    // answering on its port. Leaving the breadcrumb behind would make a bare
+    // session pay a pid probe — and, on a pid recycle, get an outright wrong
+    // answer — for a runner that deliberately went away. A CRASH leaves it
+    // behind, which is exactly what the record's `pid` lets a reader detect.
+    qontinui_runner_lib::runner_breadcrumb::remove_published();
+
     info!(
         "drain: complete drained_sessions={} wip_refs={} claims={} timed_out={} elapsed_ms={}",
         summary.drained_sessions,

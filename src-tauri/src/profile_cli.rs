@@ -13,7 +13,7 @@
 //!
 //! Exit codes: 0 success, 1 runtime failure, 2 usage/serialize error.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
@@ -303,6 +303,34 @@ fn runner_install_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "executable has no parent directory".to_string())
 }
 
+/// The **persistent identity-shim directory** —
+/// `~/.qontinui/runner/identity-shim` (plan
+/// `2026-07-17-universal-coord-device-identity-for-any-session` §6). `None` when
+/// the home dir is unresolvable.
+///
+/// # Why this constant lives in the LIB crate
+///
+/// Same reason as [`crate::runner_breadcrumb`]: the WRITER is the runner bin
+/// (`install_effects_producer::intercept::shim_materializer`, which materializes
+/// `claude.exe` here) and a READER is the standalone `qontinui-shim` `.exe`
+/// (`bin/qontinui_shim.rs::own_shim_dirs`, which MUST exclude this dir from its
+/// real-tool PATH scan or the stub resolves ITSELF). A second bin cannot import
+/// from the runner bin's module tree, so one lib module ⇒ one path ⇒ the two can
+/// never drift. A drift here is not cosmetic: it is an infinite self-spawn loop.
+///
+/// # Why not the runner install dir
+///
+/// [`install_cli_on_user_path`] already puts the install dir on PATH. Dropping a
+/// `claude.exe` shadow in there would make that unrelated opt-in silently also
+/// enable identity shadowing. The two gates must stay independent, so the
+/// identity shim gets its own dir under the established runner app-data root
+/// (`~/.qontinui/runner/`, alongside `session-restore/` and the port
+/// breadcrumb) — a stable location, NOT `temp_dir()` (the per-PTY dirs live
+/// there and are swept).
+pub fn identity_shim_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".qontinui").join("runner").join("identity-shim"))
+}
+
 /// Compute the PATH value with `dir` appended, or `None` when `dir` is already
 /// present. Entries are compared after trimming whitespace + a trailing
 /// separator, case-insensitively (Windows PATH is case-insensitive). Pure —
@@ -326,6 +354,30 @@ fn compute_path_addition(current: &str, dir: &str, sep: char) -> Option<String> 
         let trimmed = current.trim_end_matches(sep);
         Some(format!("{trimmed}{sep}{dir}"))
     }
+}
+
+/// Compute the PATH value with every entry matching `dir` REMOVED, or `None`
+/// when `dir` is not present (nothing to do). Matching is identical to
+/// [`compute_path_addition`]'s (trimmed, trailing-separator- and
+/// case-insensitive), so a dir this function removes is exactly one that
+/// function would consider present — install and uninstall can never disagree
+/// about what "on PATH" means. Every OTHER entry is preserved verbatim,
+/// including duplicates and empty segments the operator may rely on. Pure —
+/// unit-tested.
+fn compute_path_removal(current: &str, dir: &str, sep: char) -> Option<String> {
+    let norm = |s: &str| s.trim().trim_end_matches(['/', '\\']).to_ascii_lowercase();
+    let target = norm(dir);
+    if target.is_empty() {
+        return None;
+    }
+    let kept: Vec<&str> = current
+        .split(sep)
+        .filter(|e| e.trim().is_empty() || norm(e) != target)
+        .collect();
+    if kept.len() == current.split(sep).count() {
+        return None; // not present — nothing to remove
+    }
+    Some(kept.join(&sep.to_string()))
 }
 
 /// Read the current USER-scope `Path` (Windows). Returns "" when unset.
@@ -374,9 +426,10 @@ fn write_user_path(new_value: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether the runner's install dir is already on the user PATH.
-pub fn cli_dir_on_user_path() -> Result<bool, String> {
-    let dir = runner_install_dir()?;
+/// Whether `dir` is already on the user PATH. The generic core behind
+/// [`cli_dir_on_user_path`] and
+/// [`crate::profile_cli::identity_shim_on_user_path`].
+pub fn dir_on_user_path(dir: &Path) -> Result<bool, String> {
     let dir_str = dir.to_string_lossy();
     #[cfg(windows)]
     {
@@ -392,13 +445,25 @@ pub fn cli_dir_on_user_path() -> Result<bool, String> {
     }
 }
 
-/// Add the runner's install dir to the user PATH so `qontinui-runner …` resolves
-/// in a terminal. Idempotent. Windows persists to the USER `Path` via PowerShell;
-/// other platforms are unsupported and return the dir to add manually.
-pub fn install_cli_on_user_path() -> Result<CliPathOutcome, String> {
-    let dir = runner_install_dir()?;
-    let dir_str = dir.to_string_lossy().to_string();
+/// Whether the runner's install dir is already on the user PATH.
+pub fn cli_dir_on_user_path() -> Result<bool, String> {
+    dir_on_user_path(&runner_install_dir()?)
+}
 
+/// Add `dir` to the USER PATH. Idempotent. The generic core behind
+/// [`install_cli_on_user_path`] and
+/// [`install_identity_shim_on_user_path`]: `present_message` /
+/// `added_message` let each caller speak to its own operator-facing surface
+/// while the read → compute → write seam stays single.
+///
+/// Windows persists to the USER `Path` via PowerShell; other platforms are
+/// unsupported and return the dir to add manually.
+pub fn install_dir_on_user_path(
+    dir: &Path,
+    present_message: &str,
+    added_message: &str,
+) -> Result<CliPathOutcome, String> {
+    let dir_str = dir.to_string_lossy().to_string();
     #[cfg(windows)]
     {
         let current = read_user_path()?;
@@ -407,9 +472,7 @@ pub fn install_cli_on_user_path() -> Result<CliPathOutcome, String> {
                 added: false,
                 already_present: true,
                 dir: dir_str,
-                message: "Already on your PATH — `qontinui-runner env enroll …` works in a new \
-                          terminal."
-                    .to_string(),
+                message: present_message.to_string(),
             }),
             Some(new_value) => {
                 write_user_path(&new_value)?;
@@ -417,20 +480,111 @@ pub fn install_cli_on_user_path() -> Result<CliPathOutcome, String> {
                     added: true,
                     already_present: false,
                     dir: dir_str,
-                    message: "Added to your PATH. Open a NEW terminal, then `qontinui-runner env \
-                              enroll …` will work."
-                        .to_string(),
+                    message: added_message.to_string(),
                 })
             }
         }
     }
     #[cfg(not(windows))]
     {
+        let _ = (present_message, added_message);
         Err(format!(
             "Automatic PATH setup is Windows-only for now. Add this directory to your PATH \
              manually: {dir_str}"
         ))
     }
+}
+
+/// Remove `dir` from the USER PATH. Idempotent — a dir that is not present
+/// returns `added: false, already_present: false` and writes nothing.
+///
+/// This is the REVERSE of [`install_dir_on_user_path`] and exists because
+/// reversibility is the whole reason a Settings toggle beats a hand-dropped
+/// dotfile: an operator must be able to revoke, in the same place they enabled,
+/// something they may have forgotten they turned on.
+pub fn remove_dir_from_user_path(
+    dir: &Path,
+    removed_message: &str,
+    absent_message: &str,
+) -> Result<CliPathOutcome, String> {
+    let dir_str = dir.to_string_lossy().to_string();
+    #[cfg(windows)]
+    {
+        let current = read_user_path()?;
+        match compute_path_removal(&current, &dir_str, ';') {
+            None => Ok(CliPathOutcome {
+                added: false,
+                already_present: false,
+                dir: dir_str,
+                message: absent_message.to_string(),
+            }),
+            Some(new_value) => {
+                write_user_path(&new_value)?;
+                Ok(CliPathOutcome {
+                    added: false,
+                    already_present: true,
+                    dir: dir_str,
+                    message: removed_message.to_string(),
+                })
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (removed_message, absent_message);
+        Err(format!(
+            "Automatic PATH setup is Windows-only for now. Remove this directory from your PATH \
+             manually: {dir_str}"
+        ))
+    }
+}
+
+/// Add the runner's install dir to the user PATH so `qontinui-runner …` resolves
+/// in a terminal. Idempotent. Windows persists to the USER `Path` via PowerShell;
+/// other platforms are unsupported and return the dir to add manually.
+pub fn install_cli_on_user_path() -> Result<CliPathOutcome, String> {
+    install_dir_on_user_path(
+        &runner_install_dir()?,
+        "Already on your PATH — `qontinui-runner env enroll …` works in a new terminal.",
+        "Added to your PATH. Open a NEW terminal, then `qontinui-runner env enroll …` will work.",
+    )
+}
+
+/// Whether the persistent identity-shim dir ([`identity_shim_dir`]) is on the
+/// user PATH — i.e. whether this machine has opted in to session coord identity
+/// for bare (non-runner-spawned) terminals.
+pub fn identity_shim_on_user_path() -> Result<bool, String> {
+    let dir = identity_shim_dir().ok_or_else(|| "home directory unresolvable".to_string())?;
+    dir_on_user_path(&dir)
+}
+
+/// Add the persistent identity-shim dir to the USER PATH — **the delivery gate**
+/// for session coord identity (plan §6, trust-boundary option C).
+///
+/// This does NOT materialize the dir; the runner bin's shim materializer does
+/// that first (it owns `copy_exe_stub`). Splitting them keeps this module free
+/// of the Windows-only stub-copy machinery while the PATH seam stays single.
+///
+/// Reverse: [`uninstall_identity_shim_from_user_path`].
+pub fn install_identity_shim_on_user_path() -> Result<CliPathOutcome, String> {
+    let dir = identity_shim_dir().ok_or_else(|| "home directory unresolvable".to_string())?;
+    install_dir_on_user_path(
+        &dir,
+        "Already enabled — new terminals already get coord identity.",
+        "Enabled. Open a NEW terminal; `claude` there will now request coord device identity \
+         from the running runner.",
+    )
+}
+
+/// Remove the persistent identity-shim dir from the USER PATH — the operator's
+/// revocation of the §6 delivery gate. Idempotent.
+pub fn uninstall_identity_shim_from_user_path() -> Result<CliPathOutcome, String> {
+    let dir = identity_shim_dir().ok_or_else(|| "home directory unresolvable".to_string())?;
+    remove_dir_from_user_path(
+        &dir,
+        "Disabled. New terminals resolve the real `claude` directly, exactly as before.",
+        "Already disabled — not on your PATH.",
+    )
 }
 
 #[cfg(test)]
@@ -471,6 +625,70 @@ mod tests {
         );
         // Empty target dir → never adds.
         assert!(compute_path_addition("C:\\a", "", ';').is_none());
+    }
+
+    /// Uninstall is the exact inverse of install: it removes precisely the
+    /// entries `compute_path_addition` would have considered "present", and
+    /// leaves every other entry verbatim.
+    #[test]
+    fn path_removal_is_the_inverse_of_addition() {
+        // Present → removed, neighbours preserved verbatim.
+        assert_eq!(
+            compute_path_removal("C:\\a;C:\\qontinui;C:\\b", "C:\\qontinui", ';').as_deref(),
+            Some("C:\\a;C:\\b")
+        );
+        // Case- and trailing-slash-insensitive, matching the addition rule —
+        // otherwise install would say "present" while uninstall said "absent".
+        assert_eq!(
+            compute_path_removal("C:\\A;C:\\QONTINUI\\;C:\\b", "c:\\qontinui", ';').as_deref(),
+            Some("C:\\A;C:\\b")
+        );
+        // Absent → None (no write at all).
+        assert!(compute_path_removal("C:\\a;C:\\b", "C:\\qontinui", ';').is_none());
+        // A substring that isn't a full entry is NOT removed.
+        assert!(compute_path_removal("C:\\qontinui-runner-old", "C:\\qontinui", ';').is_none());
+        // Empty target → never touches the PATH.
+        assert!(compute_path_removal("C:\\a", "", ';').is_none());
+        // Duplicates are all removed; empty segments survive.
+        assert_eq!(
+            compute_path_removal("C:\\q;;C:\\q;C:\\b", "C:\\q", ';').as_deref(),
+            Some(";C:\\b")
+        );
+        // Round-trip: add then remove returns the original value.
+        let original = "C:\\a;C:\\b";
+        let added = compute_path_addition(original, "C:\\qontinui", ';').unwrap();
+        assert_eq!(
+            compute_path_removal(&added, "C:\\qontinui", ';').as_deref(),
+            Some(original)
+        );
+    }
+
+    /// The identity-shim dir is a STABLE app-data path — never `temp_dir()`
+    /// (swept), and never the runner install dir (whose own PATH opt-in must not
+    /// silently also enable identity shadowing). It is the single source of
+    /// truth the shim bin's `own_shim_dirs` reads to avoid self-spawning.
+    #[test]
+    fn identity_shim_dir_is_stable_app_data_not_temp_or_install_dir() {
+        let Some(dir) = identity_shim_dir() else {
+            return; // no home dir in this environment — nothing to assert
+        };
+        assert!(dir.ends_with("identity-shim"));
+        assert!(
+            dir.parent().unwrap().ends_with(".qontinui/runner")
+                || dir.parent().unwrap().ends_with(".qontinui\\runner"),
+            "must live under the established runner app-data root, got {}",
+            dir.display()
+        );
+        assert!(
+            !dir.starts_with(std::env::temp_dir()),
+            "must NOT live in temp_dir — the per-PTY dirs live there and are swept"
+        );
+        if let Ok(install) = runner_install_dir() {
+            assert_ne!(
+                dir, install,
+                "must NOT be the runner install dir — the two PATH opt-ins are independent"
+            );
+        }
     }
 
     fn v(parts: &[&str]) -> Vec<String> {

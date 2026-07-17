@@ -1758,6 +1758,188 @@ async fn coord_work_unit_deps_get_handler(
 }
 
 // ---------------------------------------------------------------------------
+// Session coord-identity mint route (plan
+// 2026-07-17-universal-coord-device-identity-for-any-session, §1)
+// ---------------------------------------------------------------------------
+
+/// Request body for `POST /coord-mcp/provision-session`.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ProvisionSessionBody {
+    /// The requesting session's working directory. The minted nonce is BOUND to
+    /// this path (`NonceBinding::workdir`), which is what gives a bare session
+    /// correct per-session attribution: coord resolves
+    /// nonce → workdir → task_run_id → `agent_session_id`, and
+    /// `coord_declare_intent`'s peer-overlap derivation is only meaningful if
+    /// that workdir is the session's REAL cwd.
+    cwd: String,
+}
+
+/// `POST /coord-mcp/provision-session` — mint coord device identity for a
+/// session the runner did NOT spawn (plan
+/// `2026-07-17-universal-coord-device-identity-for-any-session` §1).
+///
+/// # Why the route exists
+///
+/// Coord device identity is not ambient: it is injected at spawn time by
+/// `TerminalSession::apply_identity_seam`, whose sole non-test call site is the
+/// runner's own PTY-terminal spawn (`terminal/session.rs:509`). A session
+/// launched any other way — a bare PowerShell/Git-Bash window, VS Code's
+/// integrated terminal, a cron-fired agent — never passes through that seam, so
+/// it gets no `--mcp-config`, no nonce, and authenticates with neither a
+/// `device_id` nor an `agent_id` claim, which is exactly the shape the
+/// device-scoped coord tools reject. A launcher (the identity shim, a *parent*
+/// of `claude`) POSTs here to ask the runner to mint, then passes the returned
+/// document to `claude --mcp-config`. The nonce is minted IN-PROCESS and can
+/// only be minted here — no external process can fabricate one, and none must
+/// ever be given a mechanism to.
+///
+/// # ⚠ SECURITY — this route is the ONE structural exception in its family. Do
+/// # not "fix" the missing nonce check.
+///
+/// Every OTHER `/coord-mcp/*` route is nonce-gated: `coord_mcp_proxy_handler`
+/// 401s an unrecognized `X-Coord-Mcp-Proxy-Key` *before any token I/O*, and the
+/// claims/work-unit/gate/PR forwarders all inherit that discipline. **This route
+/// cannot be nonce-gated — it is what ISSUES the nonce** (chicken-and-egg: a
+/// caller that already held a valid nonce would not need to call it). Its
+/// authorization is therefore [`crate::coord_mcp::session_identity_gate`], which
+/// stands **IN PLACE OF** the nonce check:
+///
+/// 1. the master flag `QONTINUI_SESSION_COORD_IDENTITY_ENABLED` — default OFF,
+///    so the feature ships dark and an un-flagged runner exposes nothing; AND
+/// 2. a per-machine operator opt-in marker
+///    (`~/.qontinui/allow-session-coord-identity`).
+///
+/// Both are required. If you are reading this because the missing nonce check
+/// looked like a bug: it is deliberate, and those two gates are the entire
+/// authorization story. Removing or weakening either grants any local process —
+/// including a compromised dependency's post-install script — the ability to
+/// mint device identity and act as the operator against coord. "It came from
+/// 127.0.0.1" is NOT an authorization signal on a single-user box, where every
+/// process runs as the same OS user.
+///
+/// Three properties contain the blast radius of what is issued (see
+/// `coord_mcp::NonceLifetime`): the nonce is DEVICE-principal (never agent — no
+/// scope elevation), bound to the caller's `cwd`, and Ephemeral — bounded TTL,
+/// never written to disk, and revoked the instant the operator deletes the
+/// marker.
+///
+/// # Contract
+///
+/// Request: `{"cwd": "<absolute path to an existing directory>"}`.
+///
+/// `200` — body IS the `.mcp.json` document, verbatim and ready to write to a
+/// temp file and pass as `--mcp-config <path>`:
+///
+/// ```json
+/// {"mcpServers":{"coord-mcp":{"type":"http",
+///   "url":"http://127.0.0.1:<bound_port>/coord-mcp",
+///   "headers":{"X-Coord-Mcp-Proxy-Key":"<nonce>"}}}}
+/// ```
+///
+/// The URL names THIS runner's own bound port, so the nonce↔port pairing is
+/// automatic and the caller must never re-derive the port (the load-bearing
+/// no-scan rule at `bin/qontinui_cli.rs:434-437`: a nonce paired with a scanned
+/// port 401s).
+///
+/// Every failure is an explicit typed reason with a non-2xx status and a
+/// `{success:false, error, code}` body — NEVER a silent empty (the runner's
+/// no-silent-empty rule), because "denied" and "broken" have different fixes:
+///
+/// | Status | `code` | Meaning |
+/// |---|---|---|
+/// | 400 | `COORD_MCP_PROVISION_INVALID_BODY` | body is not `{cwd:String}` |
+/// | 400 | `COORD_MCP_PROVISION_INVALID_CWD` | `cwd` empty or not an existing dir |
+/// | 403 | `COORD_MCP_PROVISION_DISABLED` | master flag off (the default) |
+/// | 403 | `COORD_MCP_PROVISION_NOT_OPTED_IN` | no opt-in marker on this machine |
+/// | 503 | `COORD_MCP_PROVISION_PORT_UNRESOLVABLE` | bound port unresolvable — fail-closed |
+///
+/// Callers are expected to fail OPEN on every one of these: a launcher that
+/// cannot get identity must still launch the session, un-shimmed.
+async fn coord_provision_session_handler(body: axum::body::Bytes) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let err = |status: axum::http::StatusCode, code: &str, msg: String| {
+        (
+            status,
+            Json(serde_json::json!({
+                "success": false,
+                "error": msg,
+                "code": code,
+            })),
+        )
+            .into_response()
+    };
+
+    // Gate FIRST — before parsing, before any registry or credential touch. In
+    // the default (dark) posture this is one env read and the route is
+    // indistinguishable from one that mints nothing.
+    if let Err(denial) = crate::coord_mcp::session_identity_gate() {
+        warn!(
+            "coord-mcp provision-session: denied ({}) — {}",
+            denial.code(),
+            denial.message()
+        );
+        return err(
+            axum::http::StatusCode::FORBIDDEN,
+            denial.code(),
+            denial.message(),
+        );
+    }
+
+    let req: ProvisionSessionBody = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return err(
+                axum::http::StatusCode::BAD_REQUEST,
+                "COORD_MCP_PROVISION_INVALID_BODY",
+                format!("expected a JSON body of the shape {{\"cwd\": \"<path>\"}}: {e}"),
+            );
+        }
+    };
+
+    // A nonce bound to a directory that does not exist is bound to a fiction:
+    // the workdir binding is what coord resolves back to a session, so a bogus
+    // cwd would silently produce un-attributable identity. Note we do NOT
+    // canonicalize — the seam registers raw cwd strings, and Windows
+    // canonicalization yields `\\?\`-prefixed paths that would never match them.
+    let cwd = req.cwd.trim();
+    if cwd.is_empty() || !std::path::Path::new(cwd).is_dir() {
+        return err(
+            axum::http::StatusCode::BAD_REQUEST,
+            "COORD_MCP_PROVISION_INVALID_CWD",
+            format!("cwd {cwd:?} is empty or not an existing directory"),
+        );
+    }
+
+    // The shared mint core (§2) — fail-closed on an unresolvable bound port.
+    match crate::coord_mcp::provision_session_proxy_config(cwd) {
+        Some(config) => {
+            info!(
+                cwd = %cwd,
+                "coord-mcp provision-session: minted an ephemeral device session config"
+            );
+            (axum::http::StatusCode::OK, Json(config)).into_response()
+        }
+        None => {
+            warn!(
+                cwd = %cwd,
+                "coord-mcp provision-session: bound API port unresolvable — refusing to \
+                 mint (a config on a bootstrap-default port would be dead on any \
+                 secondary/temp runner)"
+            );
+            err(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "COORD_MCP_PROVISION_PORT_UNRESOLVABLE",
+                "the runner's bound API port is unresolvable — refusing to mint a \
+                 session config that would point at a dead port; retry once the \
+                 runtime is up"
+                    .to_string(),
+            )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Loopback PR-creation proxy (plan qontinui-pr-credential-provisioning, 2b)
 // ---------------------------------------------------------------------------
 
@@ -3511,6 +3693,20 @@ pub fn create_router(
         // freshly-read device JWT instead of a 4h-TTL snapshot. Nonce-gated
         // (X-Coord-Mcp-Proxy-Key); see `coord_mcp_proxy_handler`.
         .route("/coord-mcp", post(coord_mcp_proxy_handler))
+        // Session coord-identity MINT route (plan
+        // 2026-07-17-universal-coord-device-identity-for-any-session §1) — how a
+        // session the runner did NOT spawn (a bare terminal, a cron-fired agent)
+        // obtains a device-scoped coord-mcp config at launch.
+        //
+        // ⚠ THE ONE ROUTE IN THIS FAMILY THAT IS NOT NONCE-GATED, and it cannot
+        // be: it is what ISSUES the nonce. It carries the master flag
+        // (`QONTINUI_SESSION_COORD_IDENTITY_ENABLED`, default OFF) + a
+        // per-machine operator opt-in marker IN PLACE OF the nonce check. Read
+        // `coord_provision_session_handler`'s doc before touching this.
+        .route(
+            "/coord-mcp/provision-session",
+            post(coord_provision_session_handler),
+        )
         // Nonce-gated claims READ passthrough for device sessions' hook
         // helper + skill wait-poll (plan 2026-06-11-claims-read-auth-hardening
         // Phase 2). Same gate + live device-JWT injection as /coord-mcp, but

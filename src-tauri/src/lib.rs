@@ -16,6 +16,12 @@ pub mod observable_bridge;
 // (`profile_cli`, `env_agent`) can suppress console-window flashes too.
 pub mod process_helpers;
 pub mod profile_cli;
+// Out-of-process runner discovery: the bound-API-port breadcrumb. In the LIB
+// crate for the same reason as `intercept_core` — the WRITER is the runner bin
+// (`intercept::set_bound_port`) and a READER is the standalone `qontinui-shim`
+// `.exe`, and a second bin cannot import from the runner bin's module tree. One
+// module ⇒ one schema ⇒ writer and reader cannot drift. See the module doc.
+pub mod runner_breadcrumb;
 pub mod profiles;
 pub mod relay_envelopes;
 pub mod schema_export;
