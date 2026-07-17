@@ -285,6 +285,22 @@ pub fn identity_mcp_config_args(tool: IdentityTool, mcp_config_path: Option<&str
     }
 }
 
+/// Does the per-machine opt-in marker (`~/.qontinui/allow-session-coord-identity`)
+/// exist? This is the SAME file the runner-side mint route's gate requires
+/// (`coord_mcp::SESSION_IDENTITY_MARKER_FILE`). That module lives in the runner
+/// BIN crate and so is not importable from this separate bin, so the file name is
+/// mirrored here — a tiny, stable string. Fail-closed: an unresolvable home dir
+/// reads as NOT opted in (never as consent), matching the route's own gate.
+fn session_identity_marker_exists() -> bool {
+    dirs::home_dir()
+        .map(|h| {
+            h.join(".qontinui")
+                .join("allow-session-coord-identity")
+                .exists()
+        })
+        .unwrap_or(false)
+}
+
 /// Ask a live runner to mint coord device identity for THIS process's cwd, and
 /// materialize the returned `.mcp.json` document to a temp file (plan
 /// `2026-07-17-universal-coord-device-identity-for-any-session` §5).
@@ -334,10 +350,30 @@ fn self_provision_mcp_config(tool: IdentityTool) -> Option<tempfile::TempPath> {
     if tool != IdentityTool::Claude {
         return None; // only claude has a --mcp-config flag
     }
+    // Dark-posture short-circuit (plan §6): the mint route's gate requires the
+    // operator's opt-in marker, so with the marker absent this provision would
+    // 403 regardless. Stat it FIRST — ONE filesystem stat — to skip the
+    // breadcrumb read AND the loopback POST on every bare `claude` launch on the
+    // overwhelmingly common machine that never opted in. The shim cannot read the
+    // runner-side master flag, but the marker is the operator's own switch and is
+    // enough to keep the default posture to a single stat. This is only a cheap
+    // early-out; the route re-checks BOTH gates authoritatively (this never
+    // grants identity, it only avoids asking when the answer is certainly no).
+    if !session_identity_marker_exists() {
+        return None;
+    }
     let runner = qontinui_runner_lib::runner_breadcrumb::resolve_live_runner()?;
     let cwd = env::current_dir().ok()?;
     let body = format!("{{\"cwd\":\"{}\"}}", json_escape(&cwd.to_string_lossy()));
-    let resp = http_post(runner.port, PROVISION_SESSION_PATH, &body).ok()?;
+    // Short read timeout on the launch critical path — see [`PROVISION_RW_TIMEOUT`].
+    let resp = http_post_with_timeouts(
+        runner.port,
+        PROVISION_SESSION_PATH,
+        &body,
+        CONNECT_TIMEOUT,
+        PROVISION_RW_TIMEOUT,
+    )
+    .ok()?;
     // A 2xx whose body is not an mcpServers document would make `claude` fail to
     // start on a malformed config — the one way this fallback could BREAK a
     // launch rather than merely not help it. Cheapest possible sanity check.
@@ -947,6 +983,14 @@ fn exec_real_child(real: &Option<PathBuf>, name: &str, args: &[String]) -> Optio
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const RW_TIMEOUT: Duration = Duration::from_secs(20);
+/// Read/write timeout for the self-provision mint POST ([`self_provision_mcp_config`]).
+/// A `.mcp.json` mint is tiny, so the general [`RW_TIMEOUT`] (sized for large
+/// install-effects payloads) is pure downside on the LAUNCH critical path: if the
+/// selected runner's pid is live but its HTTP is wedged, EVERY bare `claude`
+/// launch would stall up to 20s. 3s matches the connect timeout and is ample for
+/// a small local mint. Fail-open: a timeout → `None` → exec the real tool
+/// unchanged. Scoped to this one caller; other callers keep [`RW_TIMEOUT`].
+const PROVISION_RW_TIMEOUT: Duration = Duration::from_secs(3);
 /// Hard cap per phase (connect / read / write) for the diagnostic shim beacon —
 /// deliberately tiny so a wedged loopback can never delay the real tool exec
 /// noticeably. The beacon is log-only; any timeout is silently swallowed.
@@ -1368,6 +1412,38 @@ mod tests {
         // Must not panic on any path; a machine with a live runner in the
         // default (flag-off) posture 403s, which is also None.
         let _ = self_provision_mcp_config(IdentityTool::Claude);
+    }
+
+    /// §6 dark-posture short-circuit: when the opt-in marker is ABSENT,
+    /// `self_provision` returns `None` WITHOUT any breadcrumb read or loopback
+    /// POST — one stat and out. Asserted whenever the local machine has not opted
+    /// in (the common case, incl. CI); a no-op on a box that HAS opted in.
+    /// `dirs::home_dir()` uses the OS known-folder API on Windows, so home cannot
+    /// be redirected via env here — this observes the real posture rather than
+    /// faking one.
+    #[test]
+    fn self_provision_short_circuits_when_not_opted_in() {
+        if !session_identity_marker_exists() {
+            assert!(
+                self_provision_mcp_config(IdentityTool::Claude).is_none(),
+                "marker absent ⇒ no mint attempt, fail-open to None"
+            );
+        }
+    }
+
+    /// §6 wedged-runner guard: the self-provision mint uses a SHORT read timeout
+    /// so a live-but-wedged runner can't stall every bare `claude` launch up to
+    /// the 20s general timeout. Guards against a regression that reverts it.
+    #[test]
+    fn provision_read_timeout_is_short() {
+        assert!(
+            PROVISION_RW_TIMEOUT < RW_TIMEOUT,
+            "the mint POST must not inherit the 20s general read timeout"
+        );
+        assert!(
+            PROVISION_RW_TIMEOUT <= CONNECT_TIMEOUT,
+            "a tiny local mint needs no more than the connect budget"
+        );
     }
 
     /// A minted document lands in a temp file whose path `identity_mcp_config_args`

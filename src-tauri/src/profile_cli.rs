@@ -283,11 +283,28 @@ pub fn identity_shim_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".qontinui").join("runner").join("identity-shim"))
 }
 
-/// Compute the PATH value with `dir` appended, or `None` when `dir` is already
-/// present. Entries are compared after trimming whitespace + a trailing
-/// separator, case-insensitively (Windows PATH is case-insensitive). Pure —
-/// unit-tested.
-fn compute_path_addition(current: &str, dir: &str, sep: char) -> Option<String> {
+/// Where [`install_dir_on_user_path`] places a newly-added dir on the USER PATH.
+/// PATH resolution is first-match-wins, so placement is load-bearing for the
+/// identity shim: a `claude` shadow that must WIN over the real `claude` already
+/// on an earlier PATH entry has to go at the FRONT, or the whole §6 feature is a
+/// silent no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    /// Add at the FRONT — the dir wins resolution over any later entry. The
+    /// identity-shim install needs this (its `claude` shadow must be found before
+    /// the real `claude`).
+    Prepend,
+    /// Add at the END — mere presence is enough, and appending avoids shadowing a
+    /// same-named tool the operator already has earlier. The CLI-enroll toggle
+    /// wants this (it only needs `qontinui-runner` to resolve at all).
+    Append,
+}
+
+/// Compute the PATH value with `dir` added at `placement`, or `None` when `dir`
+/// is already present. Entries are compared after trimming whitespace + a
+/// trailing separator, case-insensitively (Windows PATH is case-insensitive).
+/// Pure — unit-tested.
+fn compute_path_addition(current: &str, dir: &str, sep: char, placement: Placement) -> Option<String> {
     let norm = |s: &str| s.trim().trim_end_matches(['/', '\\']).to_ascii_lowercase();
     let target = norm(dir);
     if target.is_empty() {
@@ -302,9 +319,17 @@ fn compute_path_addition(current: &str, dir: &str, sep: char) -> Option<String> 
     if current.trim().is_empty() {
         Some(dir.to_string())
     } else {
-        // Preserve the existing value verbatim; append with one separator.
-        let trimmed = current.trim_end_matches(sep);
-        Some(format!("{trimmed}{sep}{dir}"))
+        // Preserve the existing value verbatim; join with exactly one separator.
+        match placement {
+            Placement::Append => {
+                let trimmed = current.trim_end_matches(sep);
+                Some(format!("{trimmed}{sep}{dir}"))
+            }
+            Placement::Prepend => {
+                let trimmed = current.trim_start_matches(sep);
+                Some(format!("{dir}{sep}{trimmed}"))
+            }
+        }
     }
 }
 
@@ -383,17 +408,19 @@ fn write_user_path(new_value: &str) -> Result<(), String> {
 /// [`crate::profile_cli::identity_shim_on_user_path`].
 pub fn dir_on_user_path(dir: &Path) -> Result<bool, String> {
     let dir_str = dir.to_string_lossy();
+    // Presence detection is placement-agnostic (a `None` result means "already
+    // present" for either placement), so `Append` here carries no meaning.
     #[cfg(windows)]
     {
         let current = read_user_path()?;
-        Ok(compute_path_addition(&current, &dir_str, ';').is_none())
+        Ok(compute_path_addition(&current, &dir_str, ';', Placement::Append).is_none())
     }
     #[cfg(not(windows))]
     {
         // Best-effort: consult the process PATH. We don't edit shell profiles on
         // Unix (the target boxes are Windows).
         let current = std::env::var("PATH").unwrap_or_default();
-        Ok(compute_path_addition(&current, &dir_str, ':').is_none())
+        Ok(compute_path_addition(&current, &dir_str, ':', Placement::Append).is_none())
     }
 }
 
@@ -402,9 +429,10 @@ pub fn cli_dir_on_user_path() -> Result<bool, String> {
     dir_on_user_path(&runner_install_dir()?)
 }
 
-/// Add `dir` to the USER PATH. Idempotent. The generic core behind
-/// [`install_cli_on_user_path`] and
-/// [`install_identity_shim_on_user_path`]: `present_message` /
+/// Add `dir` to the USER PATH at `placement`. Idempotent. The generic core
+/// behind [`install_cli_on_user_path`] (which appends — mere presence) and
+/// [`install_identity_shim_on_user_path`] (which PREPENDS — its `claude` shadow
+/// must win resolution over the real `claude`): `present_message` /
 /// `added_message` let each caller speak to its own operator-facing surface
 /// while the read → compute → write seam stays single.
 ///
@@ -412,6 +440,7 @@ pub fn cli_dir_on_user_path() -> Result<bool, String> {
 /// unsupported and return the dir to add manually.
 pub fn install_dir_on_user_path(
     dir: &Path,
+    placement: Placement,
     present_message: &str,
     added_message: &str,
 ) -> Result<CliPathOutcome, String> {
@@ -419,7 +448,7 @@ pub fn install_dir_on_user_path(
     #[cfg(windows)]
     {
         let current = read_user_path()?;
-        match compute_path_addition(&current, &dir_str, ';') {
+        match compute_path_addition(&current, &dir_str, ';', placement) {
             None => Ok(CliPathOutcome {
                 added: false,
                 already_present: true,
@@ -439,7 +468,7 @@ pub fn install_dir_on_user_path(
     }
     #[cfg(not(windows))]
     {
-        let _ = (present_message, added_message);
+        let _ = (placement, present_message, added_message);
         Err(format!(
             "Automatic PATH setup is Windows-only for now. Add this directory to your PATH \
              manually: {dir_str}"
@@ -497,6 +526,9 @@ pub fn remove_dir_from_user_path(
 pub fn install_cli_on_user_path() -> Result<CliPathOutcome, String> {
     install_dir_on_user_path(
         &runner_install_dir()?,
+        // Presence is all the CLI-enroll toggle needs; append so it never
+        // shadows a same-named tool the operator already has earlier on PATH.
+        Placement::Append,
         "Already on your PATH — `qontinui-runner env enroll …` works in a new terminal.",
         "Added to your PATH. Open a NEW terminal, then `qontinui-runner env enroll …` will work.",
     )
@@ -522,6 +554,11 @@ pub fn install_identity_shim_on_user_path() -> Result<CliPathOutcome, String> {
     let dir = identity_shim_dir().ok_or_else(|| "home directory unresolvable".to_string())?;
     install_dir_on_user_path(
         &dir,
+        // PREPEND — the shim's `claude` shadow must be resolved BEFORE the real
+        // `claude` that is already on an earlier PATH entry, or this whole opt-in
+        // is a silent no-op (the real tool keeps winning). Mirrors the per-PTY
+        // path's `shim_materializer::prepend_path`.
+        Placement::Prepend,
         "Already enabled — new terminals already get coord identity.",
         "Enabled. Open a NEW terminal; `claude` there will now request coord device identity \
          from the running runner.",
@@ -546,37 +583,86 @@ mod tests {
     #[test]
     fn path_addition_appends_when_absent() {
         assert_eq!(
-            compute_path_addition("C:\\a;C:\\b", "C:\\qontinui", ';').as_deref(),
+            compute_path_addition("C:\\a;C:\\b", "C:\\qontinui", ';', Placement::Append).as_deref(),
             Some("C:\\a;C:\\b;C:\\qontinui")
         );
         // Empty current → just the dir (no leading separator).
         assert_eq!(
-            compute_path_addition("", "C:\\qontinui", ';').as_deref(),
+            compute_path_addition("", "C:\\qontinui", ';', Placement::Append).as_deref(),
             Some("C:\\qontinui")
         );
         // A trailing separator is collapsed (no double `;;`).
         assert_eq!(
-            compute_path_addition("C:\\a;", "C:\\qontinui", ';').as_deref(),
+            compute_path_addition("C:\\a;", "C:\\qontinui", ';', Placement::Append).as_deref(),
             Some("C:\\a;C:\\qontinui")
+        );
+    }
+
+    /// The identity-shim install PREPENDS: its `claude` shadow dir must land at
+    /// the FRONT of a PATH that ALREADY contains a real `claude` dir, or PATH's
+    /// first-match-wins resolution would keep finding the real `claude` and the
+    /// whole §6 feature would be a silent no-op.
+    #[test]
+    fn path_prepend_places_dir_before_an_existing_claude_dir() {
+        // A PATH whose FIRST entry is the real `claude` dir.
+        let path = "C:\\tools\\claude;C:\\Windows\\System32";
+        let shim = "C:\\Users\\me\\.qontinui\\runner\\identity-shim";
+        let result = compute_path_addition(path, shim, ';', Placement::Prepend).unwrap();
+        assert!(
+            result.starts_with(shim),
+            "the shim dir must be FIRST so it wins over the real claude, got {result}"
+        );
+        assert_eq!(
+            result,
+            format!("{shim};{path}"),
+            "prepend joins with exactly one separator and preserves the rest verbatim"
+        );
+        // The real-claude dir is still present, just no longer first.
+        assert!(result.contains("C:\\tools\\claude"));
+
+        // Empty current → just the dir (no dangling separator), same as append.
+        assert_eq!(
+            compute_path_addition("", shim, ';', Placement::Prepend).as_deref(),
+            Some(shim)
+        );
+        // A leading separator is collapsed (no double `;;`).
+        assert_eq!(
+            compute_path_addition(";C:\\a", "C:\\q", ';', Placement::Prepend).as_deref(),
+            Some("C:\\q;C:\\a")
         );
     }
 
     #[test]
     fn path_addition_is_idempotent_and_case_trailing_insensitive() {
-        // Exact match → None.
-        assert!(compute_path_addition("C:\\a;C:\\qontinui", "C:\\qontinui", ';').is_none());
+        // Exact match → None (both placements agree: presence is placement-agnostic).
+        assert!(
+            compute_path_addition("C:\\a;C:\\qontinui", "C:\\qontinui", ';', Placement::Append)
+                .is_none()
+        );
+        assert!(
+            compute_path_addition("C:\\a;C:\\qontinui", "C:\\qontinui", ';', Placement::Prepend)
+                .is_none()
+        );
         // Case-insensitive + trailing-slash-insensitive → still present → None.
         assert!(
-            compute_path_addition("C:\\A;C:\\QONTINUI\\", "c:\\qontinui", ';').is_none(),
+            compute_path_addition("C:\\A;C:\\QONTINUI\\", "c:\\qontinui", ';', Placement::Append)
+                .is_none(),
             "windows PATH is case-insensitive; trailing slash ignored"
         );
         // A substring that isn't a full entry does NOT count as present.
         assert_eq!(
-            compute_path_addition("C:\\qontinui-runner-old", "C:\\qontinui", ';').as_deref(),
+            compute_path_addition(
+                "C:\\qontinui-runner-old",
+                "C:\\qontinui",
+                ';',
+                Placement::Append
+            )
+            .as_deref(),
             Some("C:\\qontinui-runner-old;C:\\qontinui"),
         );
-        // Empty target dir → never adds.
-        assert!(compute_path_addition("C:\\a", "", ';').is_none());
+        // Empty target dir → never adds (either placement).
+        assert!(compute_path_addition("C:\\a", "", ';', Placement::Append).is_none());
+        assert!(compute_path_addition("C:\\a", "", ';', Placement::Prepend).is_none());
     }
 
     /// Uninstall is the exact inverse of install: it removes precisely the
@@ -608,7 +694,7 @@ mod tests {
         );
         // Round-trip: add then remove returns the original value.
         let original = "C:\\a;C:\\b";
-        let added = compute_path_addition(original, "C:\\qontinui", ';').unwrap();
+        let added = compute_path_addition(original, "C:\\qontinui", ';', Placement::Append).unwrap();
         assert_eq!(
             compute_path_removal(&added, "C:\\qontinui", ';').as_deref(),
             Some(original)
