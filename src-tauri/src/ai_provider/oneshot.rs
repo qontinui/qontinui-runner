@@ -971,6 +971,15 @@ pub fn oneshot_for_settings() -> Box<dyn OneshotLlm> {
             );
             Box::new(OneshotDisabled::new())
         }
+        // pi is an agent CLI (like ClaudeCli/GeminiCli); no structured-JSON
+        // oneshot adapter — the sync client is wired via routing.rs.
+        AiProvider::PiCli => {
+            warn!(
+                "oneshot_for_settings: PiCli has no oneshot adapter → OneshotDisabled (pi is \
+                 dispatched via routing.rs)"
+            );
+            Box::new(OneshotDisabled::new())
+        }
         // The synchronous OpenAI-compatible client now exists
         // (`ai_provider::openai_compat::run_openai_compat`, dispatched through
         // routing.rs); only the structured-JSON oneshot adapter remains deferred.
@@ -1247,10 +1256,10 @@ mod tests {
                     "disabled"
                 }
             }
-            // Phase 3.5 (tier-decoupling) — oneshot adapters not yet wired.
-            // Mirrors the real `oneshot_for_settings` body which routes
-            // both variants to `OneshotDisabled` until the adapters land.
-            AiProvider::Ollama | AiProvider::OpenAiCompatible => "disabled",
+            // Mirrors the real `oneshot_for_settings` body: PiCli (agent
+            // CLI) and the deferred Ollama/OpenAiCompatible adapters all
+            // route to `OneshotDisabled`.
+            AiProvider::PiCli | AiProvider::Ollama | AiProvider::OpenAiCompatible => "disabled",
         }
     }
 

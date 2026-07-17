@@ -487,6 +487,7 @@ pub fn save_ai_provider_from_setup(
         "claude_api" => AiProvider::ClaudeApi,
         "gemini_cli" => AiProvider::GeminiCli,
         "gemini_api" => AiProvider::GeminiApi,
+        "pi_cli" => AiProvider::PiCli,
         _ => return Err(format!("Unknown AI provider: {}", provider)),
     };
 
@@ -521,6 +522,14 @@ pub fn save_ai_provider_from_setup(
         AiProvider::GeminiApi => {
             if let Some(m) = model {
                 ai_settings.gemini_api.model = m;
+            }
+        }
+        AiProvider::PiCli => {
+            if let Some(mode) = exec_mode {
+                ai_settings.pi_cli.execution_mode = mode;
+            }
+            if let Some(m) = model {
+                ai_settings.pi_cli.model = Some(m);
             }
         }
         AiProvider::Ollama => {
