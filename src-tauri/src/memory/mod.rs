@@ -10,7 +10,10 @@
 //! - `decay` — Ebbinghaus-inspired forgetting curves with differential decay rates
 //! - `consolidation` — 4-phase periodic consolidation: orient → gather → consolidate → prune
 //! - `tenant_sync` — Consent-gated outbox emitter + drain mirroring high-value
-//!   memories into the tenant agentic-memory web API
+//!   memories into the tenant agentic-memory web API (embeds locally before
+//!   the POST)
+//! - `memory_synthesis` — Consent-gated poller for tenant memory *jobs*
+//!   (`synthesis` + `embedding` kinds), dispatched on the job's `kind`
 
 pub mod consolidation;
 pub mod contradiction;

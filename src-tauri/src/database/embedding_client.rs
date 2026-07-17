@@ -11,6 +11,24 @@ use tracing::{debug, warn};
 // Use 127.0.0.1 to avoid IPv6 resolution delays on Windows
 const DEFAULT_EMBEDDING_URL: &str = "http://127.0.0.1:8001/api/embeddings/compute-text";
 
+/// Canonical tag for the embedding space this client produces — the single
+/// source of truth for every producer that ships vectors off this machine
+/// (tenant memory records, tenant queries, `kind="embedding"` jobs).
+///
+/// **Why the window is in the tag.** A Phase 0 probe of plan
+/// `2026-07-13-runner-paid-embedding` proved the runner's sentence-transformers
+/// stack embeds over a **256-token** window while the web backend's fastembed
+/// truncated at **128** — that window mismatch (not quantization) is why the two
+/// spaces diverged (min cosine 0.71 across a shared corpus). The operator
+/// adopted the native 256 window; 256 is sentence-transformers' default, so the
+/// client needs no `max_seq_length` override to produce it. The tag names the
+/// window because the window is the property that changed, and it is what lets a
+/// consumer tell two otherwise identically-named MiniLM spaces apart.
+///
+/// Bump this string whenever the produced space changes (model, window, or
+/// pooling) so stored vectors stay attributable to the space that made them.
+pub const EMBEDDING_MODEL_TAG: &str = "minilm-l6-v2-256@sentence-transformers";
+
 /// Request payload for the embedding API.
 #[derive(Serialize)]
 struct EmbeddingRequest {

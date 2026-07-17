@@ -1,40 +1,54 @@
-//! Tenant agentic-memory **synthesis poller** — the runner half of plan
-//! `2026-07-11-tenant-memory-v1-1-close-the-loop` (Phase 2).
+//! Tenant agentic-memory **job poller** — the runner half of plan
+//! `2026-07-11-tenant-memory-v1-1-close-the-loop` (Phase 2, synthesis) and
+//! `2026-07-13-runner-paid-embedding` (Phase 3, kind-dispatch + embedding).
 //!
 //! ## What it does
 //!
-//! The web backend groups related tenant memories into *synthesis jobs*: a set
-//! of member episodes/facts that should be distilled into one durable "mental
-//! model". The runner is the compute for that distillation. This poller:
+//! The web backend queues *memory jobs* the runner is the compute for. Each
+//! job carries a [`JobKind`] that says what work it wants. This poller:
 //!
-//! 1. **Claims** a small batch of pending jobs
-//!    (`POST /api/v1/memory/synthesis-jobs/claim {"limit": 4}`).
-//! 2. For each claimed job, feeds its `member_texts` to the **warm Claude
-//!    provider** ([`crate::ai_provider::claude_api_warm`]) under a stable,
-//!    cache-friendly system prompt ("Memory-synthesis v1") and gets back one
-//!    mental-model paragraph.
-//! 3. **Reports** the result back:
-//!    - success → `POST .../{job_id}/result {"result_text": "<text>"}`
-//!    - failure → `POST .../{job_id}/result {"failure": "<reason>"}`
+//! 1. **Claims** a small batch of pending jobs, filtered to the kinds this
+//!    runner can serve
+//!    (`POST /api/v1/memory/jobs/claim {"limit": 4, "kinds": [...]}`).
+//! 2. **Dispatches on `kind`**:
+//!    - [`JobKind::Synthesis`] — feeds `input_texts` to the **warm Claude
+//!      provider** ([`crate::ai_provider::claude_api_warm`]) under a stable,
+//!      cache-friendly system prompt ("Memory-synthesis v1"), gets back one
+//!      mental-model paragraph, then embeds that paragraph locally.
+//!    - [`JobKind::Embedding`] — batches `input_texts` through the local
+//!      embedding service; no LLM is involved.
+//! 3. **Reports** the result back to
+//!    `POST /api/v1/memory/jobs/{job_id}/result`:
+//!    - synthesis → `{"result": {"result_text", "embedding", "embedding_model"}}`
+//!    - embedding → `{"result": {"embeddings": [...], "embedding_model"}}`
+//!      (one vector per `input_texts` entry, same order)
+//!    - failure   → `{"failure": "<reason>"}`
 //!
-//!    The backend does the embed + `mental_model` insert + member supersede.
-//!    The runner NEVER writes memory rows for synthesis — it only claims,
-//!    synthesizes, and posts.
+//!    Both kinds ship a VECTOR, which is what lets the backend drop its own
+//!    embed call entirely. The runner NEVER writes memory rows — it only
+//!    claims, computes, and posts; the backend owns the inserts and supersedes.
 //!
 //! ## Gates + posture (mirrors [`crate::memory::tenant_sync`])
 //!
 //! 1. **Consent gate (hard)** — `Settings.cloud_sync_enabled`. Closed ⇒ the
-//!    tick idles with ZERO network calls (not even the claim).
+//!    tick idles with ZERO network calls (not even the claim). This governs
+//!    EVERY kind: claiming an `embedding` job pulls tenant content onto this
+//!    device exactly as a `synthesis` job does.
 //! 2. **Unpaired** — no device JWT ⇒ idle, no calls, warn once. Jobs are never
 //!    failed for lack of auth.
-//! 3. **No credentials (headless / temp runner)** — the warm provider returns
-//!    a `Disabled` outcome when neither a keychain API key nor a Claude CLI
-//!    OAuth token is available. In that case the poller STOPS the tick and
-//!    leaves the remaining claimed jobs *un-resulted* — the backend reaper
-//!    returns them to `pending` after its timeout. It does NOT post a failure
-//!    (the job is fine; this runner just can't do the work right now).
-//! 4. **Other synthesis errors** (LLM error, empty/oversize output) ⇒ a
-//!    `failure` POST so the job doesn't wedge, then the loop continues.
+//! 3. **This runner can't do the work right now** ⇒ STOP the tick and leave
+//!    the claimed jobs *un-resulted*; the backend reaper returns them to
+//!    `pending` after its lease timeout, and another runner (or this one,
+//!    later) picks them up. Do NOT post a `failure` — a failure burns the
+//!    job's `attempt` and eventually wedges a perfectly good job. Two
+//!    conditions share this branch, and they are the same condition:
+//!    - **No LLM credentials** (headless / temp runner: no keychain API key
+//!      and no Claude CLI OAuth token) — the warm provider returns `Disabled`.
+//!    - **Local embedding service unavailable** — the embed call errors.
+//! 4. **Bad job** (empty input, LLM error, empty/oversize output, unservable
+//!    kind) ⇒ a `failure` POST so the job doesn't wedge, then the loop
+//!    continues. The distinction from (3) is the whole failure taxonomy: (3)
+//!    is about THIS RUNNER, (4) is about THE JOB.
 //! 5. **Never panics / never wedges** — every network or provider error is
 //!    caught, logged via `tracing`, and the loop continues after backoff.
 //!
@@ -51,9 +65,19 @@ use serde_json::{json, Value as JsonValue};
 use tracing::{debug, info, warn};
 
 use super::tenant_sync::{resolve_web_base, BearerProvider, ConsentGate};
+use crate::database::embedding_client::{EmbeddingClient, EMBEDDING_MODEL_TAG};
 
 /// Number of jobs to claim per request (server accepts 1..4).
 const CLAIM_LIMIT: u32 = 4;
+
+/// Job kinds this runner can serve, sent as the claim's `kinds` filter so the
+/// server never hands us work we'd only have to fail.
+const CLAIM_KINDS: [&str; 2] = ["synthesis", "embedding"];
+
+/// Reason string for the "no LLM credentials" arm of [`PollOutcome::Disabled`].
+const DISABLED_NO_LLM: &str = "warm provider has no credentials";
+/// Reason string for the "local embedder down" arm of [`PollOutcome::Disabled`].
+const DISABLED_NO_EMBEDDER: &str = "local embedding service unavailable";
 
 /// Model for synthesis calls. Haiku-class — cheap + fast for a
 /// distill-N-into-one summarization. Mirrors the emitter / coordinator
@@ -122,12 +146,35 @@ pub enum SynthOutcome {
 /// the production impl uses the blocking warm client.
 pub type Synthesizer = Arc<dyn Fn(&[String]) -> SynthOutcome + Send + Sync>;
 
+/// What work a claimed job wants. The server is the authority on the wire
+/// values; [`JobKind::Unknown`] catches a kind this runner build predates so a
+/// newer server can never make an older runner panic (it gets a `failure`
+/// instead — see [`PollOutcome`] rule 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobKind {
+    /// Distill `input_texts` into one mental model, and embed the result.
+    Synthesis,
+    /// Embed each of `input_texts`. No LLM involved.
+    Embedding,
+    #[serde(other)]
+    Unknown,
+}
+
 /// One job as returned by the claim endpoint.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct ClaimedJob {
     job_id: String,
+    kind: JobKind,
+    /// The texts to operate on. For `synthesis` these are the member
+    /// episodes/facts; for `embedding` they are the texts to vectorize.
     #[serde(default)]
-    member_texts: Vec<String>,
+    input_texts: Vec<String>,
+    /// The memory rows this job's result applies to. The runner does not write
+    /// them (the backend owns the inserts) — they are carried for provenance
+    /// and logging, so a job's blast radius is visible in the runner's logs.
+    #[serde(default)]
+    target_ids: Vec<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -136,7 +183,7 @@ struct ClaimResponse {
     jobs: Vec<ClaimedJob>,
 }
 
-/// Result of one [`MemorySynthesisPoller::poll_once`]. Drives the loop cadence
+/// Result of one [`MemoryJobPoller::poll_once`]. Drives the loop cadence
 /// and is surfaced for tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PollOutcome {
@@ -146,31 +193,37 @@ pub enum PollOutcome {
     NoAuth,
     /// Claim returned no jobs.
     Idle,
-    /// Warm provider had no credentials — remaining jobs left for the reaper.
-    Disabled,
+    /// This runner can't do the work right now (no LLM credentials, or the
+    /// local embedding service is down). The tick STOPS and the remaining
+    /// claimed jobs are left un-resulted for the backend reaper — never
+    /// failed. Carries the reason for logs/tests.
+    Disabled(&'static str),
     /// Processed this many jobs (each got a `result` or `failure` POST).
     Processed(usize),
     /// Transient claim/transport failure — retry after backoff.
     Retry(String),
 }
 
-/// Consent-gated, credential-aware memory-synthesis poller.
-pub struct MemorySynthesisPoller {
+/// Consent-gated, credential-aware memory-job poller.
+pub struct MemoryJobPoller {
     gate: ConsentGate,
     bearer: BearerProvider,
     synthesizer: Synthesizer,
+    /// Local embedding service client — both job kinds route through it.
+    embedder: EmbeddingClient,
     warned_no_auth: Once,
 }
 
-impl std::fmt::Debug for MemorySynthesisPoller {
+impl std::fmt::Debug for MemoryJobPoller {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MemorySynthesisPoller").finish()
+        f.debug_struct("MemoryJobPoller").finish()
     }
 }
 
-impl MemorySynthesisPoller {
+impl MemoryJobPoller {
     /// Production constructor: consent from `Settings.cloud_sync_enabled`,
-    /// bearer from the default device-JWT slot, synthesizer = warm Claude.
+    /// bearer from the default device-JWT slot, synthesizer = warm Claude,
+    /// embedder = the local embedding service.
     pub fn new() -> Self {
         Self::with_probes(
             Box::new(crate::settings::get_cloud_sync_enabled),
@@ -189,8 +242,16 @@ impl MemorySynthesisPoller {
             gate,
             bearer,
             synthesizer,
+            embedder: EmbeddingClient::new(),
             warned_no_auth: Once::new(),
         }
+    }
+
+    /// Point the poller at a specific embedding service (tests aim this at a
+    /// local fake, or at an unroutable host to drive the embedder-down path).
+    pub fn with_embedder(mut self, embedder: EmbeddingClient) -> Self {
+        self.embedder = embedder;
+        self
     }
 
     /// Claim one batch and process it. See [`PollOutcome`] for the branches.
@@ -201,7 +262,7 @@ impl MemorySynthesisPoller {
         let Some(bearer) = (self.bearer)() else {
             self.warned_no_auth.call_once(|| {
                 warn!(
-                    "memory_synthesis: no device JWT available — synthesis poller idle until \
+                    "memory_jobs: no device JWT available — job poller idle until \
                      this runner is paired"
                 );
             });
@@ -209,11 +270,11 @@ impl MemorySynthesisPoller {
         };
 
         let base = base.trim_end_matches('/');
-        let claim_url = format!("{base}/api/v1/memory/synthesis-jobs/claim");
+        let claim_url = format!("{base}/api/v1/memory/jobs/claim");
         let resp = client
             .post(&claim_url)
             .header("Authorization", format!("Bearer {bearer}"))
-            .json(&json!({ "limit": CLAIM_LIMIT }))
+            .json(&json!({ "limit": CLAIM_LIMIT, "kinds": CLAIM_KINDS }))
             .send()
             .await;
 
@@ -227,64 +288,157 @@ impl MemorySynthesisPoller {
 
         let mut processed = 0usize;
         for job in jobs {
-            let synth = Arc::clone(&self.synthesizer);
-            let texts = job.member_texts.clone();
-            let outcome = match tokio::task::spawn_blocking(move || synth(&texts)).await {
-                Ok(o) => o,
-                Err(e) => {
-                    // Join failure (panic in the closure) — treat as transient:
-                    // leave the job un-resulted for the reaper, keep going.
-                    warn!(job_id = %job.job_id, error = %e, "memory_synthesis: synth task join failed");
-                    continue;
+            // Dispatch on the job's kind. Each arm yields either a result body
+            // to post, or a Disabled reason that stops the tick and leaves this
+            // job (and the rest of the batch) for the backend reaper.
+            let body = match job.kind {
+                JobKind::Synthesis => match self.run_synthesis_job(&job).await {
+                    Ok(body) => body,
+                    Err(JobHalt::Disabled(reason)) => {
+                        info!(
+                            job_id = %job.job_id,
+                            kind = "synthesis",
+                            %reason,
+                            "memory_jobs: this runner can't do the work right now — leaving \
+                             claimed job(s) un-resulted for the backend reaper"
+                        );
+                        return PollOutcome::Disabled(reason);
+                    }
+                    Err(JobHalt::Skip) => continue,
+                },
+                JobKind::Embedding => match self.run_embedding_job(&job).await {
+                    Ok(body) => body,
+                    Err(JobHalt::Disabled(reason)) => {
+                        info!(
+                            job_id = %job.job_id,
+                            kind = "embedding",
+                            %reason,
+                            "memory_jobs: this runner can't do the work right now — leaving \
+                             claimed job(s) un-resulted for the backend reaper"
+                        );
+                        return PollOutcome::Disabled(reason);
+                    }
+                    Err(JobHalt::Skip) => continue,
+                },
+                JobKind::Unknown => {
+                    // We asked for kinds we can serve, so this is a server
+                    // contract break, not a capability gap. Fail it: leaving it
+                    // un-resulted would have the reaper hand it straight back.
+                    warn!(
+                        job_id = %job.job_id,
+                        "memory_jobs: claimed a job of an unknown kind — posting failure"
+                    );
+                    ResultBody::Failure(
+                        "runner cannot serve this job kind (unknown to this build)".to_string(),
+                    )
                 }
             };
 
-            match outcome {
-                SynthOutcome::Disabled => {
-                    info!(
-                        "memory_synthesis: warm provider disabled (no credentials) — leaving \
-                         claimed job(s) un-resulted for the backend reaper"
-                    );
-                    return PollOutcome::Disabled;
-                }
-                SynthOutcome::Ok {
-                    text,
-                    cache_read_tokens,
-                    cache_creation_tokens,
-                } => {
-                    info!(
-                        job_id = %job.job_id,
-                        result_bytes = text.len(),
-                        cache_read_tokens,
-                        cache_creation_tokens,
-                        "memory_synthesis: synthesized mental model"
-                    );
-                    self.post_result(
-                        client,
-                        base,
-                        &bearer,
-                        &job.job_id,
-                        ResultBody::Success(text),
-                    )
-                    .await;
-                    processed += 1;
-                }
-                SynthOutcome::Failed(reason) => {
-                    warn!(job_id = %job.job_id, %reason, "memory_synthesis: synthesis failed — posting failure");
-                    self.post_result(
-                        client,
-                        base,
-                        &bearer,
-                        &job.job_id,
-                        ResultBody::Failure(reason),
-                    )
-                    .await;
-                    processed += 1;
-                }
-            }
+            self.post_result(client, base, &bearer, &job.job_id, body)
+                .await;
+            processed += 1;
         }
 
         PollOutcome::Processed(processed)
+    }
+
+    /// `kind="synthesis"`: distill the member texts via the warm Claude
+    /// provider, then embed the synthesized text locally. Posting the vector
+    /// alongside the text is what lets the backend drop its own embed call.
+    async fn run_synthesis_job(&self, job: &ClaimedJob) -> Result<ResultBody, JobHalt> {
+        let synth = Arc::clone(&self.synthesizer);
+        let texts = job.input_texts.clone();
+        let outcome = match tokio::task::spawn_blocking(move || synth(&texts)).await {
+            Ok(o) => o,
+            Err(e) => {
+                // Join failure (panic in the closure) — treat as transient:
+                // leave the job un-resulted for the reaper, keep going.
+                warn!(job_id = %job.job_id, error = %e, "memory_jobs: synth task join failed");
+                return Err(JobHalt::Skip);
+            }
+        };
+
+        let (text, cache_read_tokens, cache_creation_tokens) = match outcome {
+            SynthOutcome::Disabled => return Err(JobHalt::Disabled(DISABLED_NO_LLM)),
+            SynthOutcome::Failed(reason) => {
+                warn!(job_id = %job.job_id, %reason, "memory_jobs: synthesis failed — posting failure");
+                return Ok(ResultBody::Failure(reason));
+            }
+            SynthOutcome::Ok {
+                text,
+                cache_read_tokens,
+                cache_creation_tokens,
+            } => (text, cache_read_tokens, cache_creation_tokens),
+        };
+
+        let embedding = self.embed_one(&job.job_id, &text).await?;
+
+        info!(
+            job_id = %job.job_id,
+            targets = job.target_ids.len(),
+            result_bytes = text.len(),
+            cache_read_tokens,
+            cache_creation_tokens,
+            "memory_jobs: synthesized mental model + embedded it locally"
+        );
+        Ok(ResultBody::Synthesis { text, embedding })
+    }
+
+    /// `kind="embedding"`: batch the job's texts through the local embedding
+    /// service. One vector per input, same order — the backend zips them back
+    /// onto `target_ids` positionally.
+    async fn run_embedding_job(&self, job: &ClaimedJob) -> Result<ResultBody, JobHalt> {
+        if job.input_texts.is_empty() {
+            // A bad job, not a runner outage: fail it rather than letting the
+            // reaper hand back an empty job forever.
+            warn!(job_id = %job.job_id, "memory_jobs: embedding job has no input texts — posting failure");
+            return Ok(ResultBody::Failure(
+                "embedding job carried no input texts".to_string(),
+            ));
+        }
+
+        let embeddings = match self
+            .embedder
+            .compute_batch_embeddings(&job.input_texts)
+            .await
+        {
+            Ok(e) => e,
+            Err(e) => {
+                debug!(job_id = %job.job_id, error = %e, "memory_jobs: local embed failed");
+                return Err(JobHalt::Disabled(DISABLED_NO_EMBEDDER));
+            }
+        };
+        if embeddings.len() != job.input_texts.len() {
+            // The embedding service broke its contract. That's this runner
+            // misbehaving, not a bad job — leave the job for the reaper.
+            warn!(
+                job_id = %job.job_id,
+                got = embeddings.len(),
+                want = job.input_texts.len(),
+                "memory_jobs: embedding service returned the wrong vector count"
+            );
+            return Err(JobHalt::Disabled(DISABLED_NO_EMBEDDER));
+        }
+
+        info!(
+            job_id = %job.job_id,
+            targets = job.target_ids.len(),
+            vectors = embeddings.len(),
+            "memory_jobs: embedded job inputs locally"
+        );
+        Ok(ResultBody::Embedding(embeddings))
+    }
+
+    /// Embed one text, mapping a local-embedder outage onto the leave-it-for-
+    /// the-reaper branch rather than a `failure`.
+    async fn embed_one(&self, job_id: &str, text: &str) -> Result<Vec<f32>, JobHalt> {
+        match self.embedder.compute_text_embedding(text).await {
+            Ok(e) => Ok(e),
+            Err(e) => {
+                debug!(job_id, error = %e, "memory_jobs: local embed failed");
+                Err(JobHalt::Disabled(DISABLED_NO_EMBEDDER))
+            }
+        }
     }
 
     /// POST a job result (success or failure). Best-effort: a rejected/failed
@@ -298,9 +452,21 @@ impl MemorySynthesisPoller {
         job_id: &str,
         body: ResultBody,
     ) {
-        let url = format!("{base}/api/v1/memory/synthesis-jobs/{job_id}/result");
+        let url = format!("{base}/api/v1/memory/jobs/{job_id}/result");
         let payload = match &body {
-            ResultBody::Success(text) => json!({ "result_text": text }),
+            ResultBody::Synthesis { text, embedding } => json!({
+                "result": {
+                    "result_text": text,
+                    "embedding": embedding,
+                    "embedding_model": EMBEDDING_MODEL_TAG,
+                }
+            }),
+            ResultBody::Embedding(embeddings) => json!({
+                "result": {
+                    "embeddings": embeddings,
+                    "embedding_model": EMBEDDING_MODEL_TAG,
+                }
+            }),
             ResultBody::Failure(reason) => json!({ "failure": reason }),
         };
         match client
@@ -311,46 +477,60 @@ impl MemorySynthesisPoller {
             .await
         {
             Ok(resp) if resp.status().is_success() => {
-                debug!(
-                    job_id,
-                    kind = body.kind(),
-                    "memory_synthesis: result posted"
-                );
+                debug!(job_id, kind = body.kind(), "memory_jobs: result posted");
             }
             Ok(resp) => {
                 warn!(
                     job_id,
                     status = %resp.status(),
                     kind = body.kind(),
-                    "memory_synthesis: result POST rejected — job left for reaper"
+                    "memory_jobs: result POST rejected — job left for reaper"
                 );
             }
             Err(e) => {
-                warn!(job_id, error = %e, kind = body.kind(), "memory_synthesis: result POST failed — job left for reaper");
+                warn!(job_id, error = %e, kind = body.kind(), "memory_jobs: result POST failed — job left for reaper");
             }
         }
     }
 }
 
-impl Default for MemorySynthesisPoller {
+impl Default for MemoryJobPoller {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Which result body we're posting (for logging only).
+/// What we're posting back for a job.
 enum ResultBody {
-    Success(String),
+    /// A synthesized mental model plus its locally-computed vector.
+    Synthesis { text: String, embedding: Vec<f32> },
+    /// One vector per the job's `input_texts`, in order.
+    Embedding(Vec<Vec<f32>>),
+    /// The job itself is bad — burn an `attempt` so it can't wedge.
     Failure(String),
 }
 
 impl ResultBody {
     fn kind(&self) -> &'static str {
         match self {
-            ResultBody::Success(_) => "result",
+            ResultBody::Synthesis { .. } => "synthesis_result",
+            ResultBody::Embedding(_) => "embedding_result",
             ResultBody::Failure(_) => "failure",
         }
     }
+}
+
+/// Why an arm produced no result body. Distinct from [`ResultBody::Failure`],
+/// which IS a result (a negative one) — these two never post anything.
+enum JobHalt {
+    /// This runner can't do the work right now. Stop the tick; leave the
+    /// claimed jobs un-resulted for the backend reaper. Never a `failure` POST
+    /// — that would burn the job's `attempt` for a condition the job did not
+    /// cause.
+    Disabled(&'static str),
+    /// Skip just this job (e.g. a panicking synthesizer closure) and continue
+    /// the batch. Also leaves the job for the reaper.
+    Skip,
 }
 
 /// Parse the claim response, mapping every failure class to a `Retry` reason.
@@ -435,17 +615,18 @@ fn warm_synthesize(member_texts: &[String]) -> SynthOutcome {
     }
 }
 
-/// Spawn the memory-synthesis poll loop as a Tauri background task. Mirrors
+/// Spawn the memory-job poll loop as a Tauri background task. Mirrors
 /// `memory::scheduler::start_memory_scheduler`'s spawn shape.
-pub fn start_memory_synthesis_poller() -> tauri::async_runtime::JoinHandle<()> {
-    let poller = Arc::new(MemorySynthesisPoller::new());
+pub fn start_memory_job_poller() -> tauri::async_runtime::JoinHandle<()> {
+    let poller = Arc::new(MemoryJobPoller::new());
     tauri::async_runtime::spawn(run_poll_loop(poller))
 }
 
-async fn run_poll_loop(poller: Arc<MemorySynthesisPoller>) {
+async fn run_poll_loop(poller: Arc<MemoryJobPoller>) {
     tokio::time::sleep(INITIAL_DELAY).await;
     info!(
-        "memory_synthesis: synthesis poller started (idle cadence {}s)",
+        kinds = ?CLAIM_KINDS,
+        "memory_jobs: job poller started (idle cadence {}s)",
         TICK_IDLE.as_secs()
     );
 
@@ -453,7 +634,7 @@ async fn run_poll_loop(poller: Arc<MemorySynthesisPoller>) {
         .timeout(Duration::from_secs(30))
         .build()
         .unwrap_or_else(|e| {
-            warn!(error = %e, "memory_synthesis: reqwest client build failed; using default");
+            warn!(error = %e, "memory_jobs: reqwest client build failed; using default");
             reqwest::Client::new()
         });
 
@@ -464,8 +645,8 @@ async fn run_poll_loop(poller: Arc<MemorySynthesisPoller>) {
         let Some(base) = resolve_web_base() else {
             warned_no_base.call_once(|| {
                 warn!(
-                    "memory_synthesis: no web backend base resolvable (QONTINUI_WEB_BASE unset \
-                     and no profile coord_url) — synthesis poller idle until configured"
+                    "memory_jobs: no web backend base resolvable (QONTINUI_WEB_BASE unset \
+                     and no profile coord_url) — job poller idle until configured"
                 );
             });
             tokio::time::sleep(TICK_IDLE).await;
@@ -482,12 +663,12 @@ async fn run_poll_loop(poller: Arc<MemorySynthesisPoller>) {
             | PollOutcome::Idle
             | PollOutcome::ConsentOff
             | PollOutcome::NoAuth
-            | PollOutcome::Disabled => {
+            | PollOutcome::Disabled(_) => {
                 backoff = BACKOFF_INITIAL;
                 tokio::time::sleep(TICK_IDLE).await;
             }
             PollOutcome::Retry(reason) => {
-                debug!(%reason, "memory_synthesis: poll failed; backing off");
+                debug!(%reason, "memory_jobs: poll failed; backing off");
                 tokio::time::sleep(backoff).await;
                 backoff = std::cmp::min(backoff * 2, BACKOFF_MAX);
             }
@@ -511,45 +692,63 @@ mod tests {
     use tokio::sync::Mutex as TokMutex;
 
     #[derive(Default)]
-    struct SynthRecorder {
+    struct JobRecorder {
         claim_calls: usize,
+        /// Bodies of each claim POST — proves the `kinds` filter goes out.
+        claim_bodies: Vec<JsonValue>,
         /// (job_id, body) for each result POST.
         result_calls: Vec<(String, JsonValue)>,
         /// Jobs to serve on the (first) claim; taken so a re-poll sees empty.
         jobs: Vec<JsonValue>,
     }
 
-    fn job(id: &str, texts: &[&str]) -> JsonValue {
+    fn synth_job(id: &str, texts: &[&str]) -> JsonValue {
         json!({
             "job_id": id,
-            "member_texts": texts.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+            "kind": "synthesis",
+            "input_texts": texts.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+            "target_ids": ["11111111-1111-4111-8111-111111111111"],
         })
     }
 
-    async fn spawn_fake_synth_web(jobs: Vec<JsonValue>) -> (String, Arc<TokMutex<SynthRecorder>>) {
-        let rec = Arc::new(TokMutex::new(SynthRecorder {
+    fn embed_job(id: &str, texts: &[&str]) -> JsonValue {
+        json!({
+            "job_id": id,
+            "kind": "embedding",
+            "input_texts": texts.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+            "target_ids": texts
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("2222222{i}-2222-4222-8222-222222222222"))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    async fn spawn_fake_jobs_web(jobs: Vec<JsonValue>) -> (String, Arc<TokMutex<JobRecorder>>) {
+        let rec = Arc::new(TokMutex::new(JobRecorder {
             jobs,
-            ..SynthRecorder::default()
+            ..JobRecorder::default()
         }));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app: Router = Router::new()
             .route(
-                "/api/v1/memory/synthesis-jobs/claim",
+                "/api/v1/memory/jobs/claim",
                 post(
-                    |AxumState(state): AxumState<Arc<TokMutex<SynthRecorder>>>,
-                     Json(_body): Json<JsonValue>| async move {
+                    |AxumState(state): AxumState<Arc<TokMutex<JobRecorder>>>,
+                     Json(body): Json<JsonValue>| async move {
                         let mut g = state.lock().await;
                         g.claim_calls += 1;
+                        g.claim_bodies.push(body);
                         let jobs = std::mem::take(&mut g.jobs);
                         Json(json!({ "jobs": jobs }))
                     },
                 ),
             )
             .route(
-                "/api/v1/memory/synthesis-jobs/{job_id}/result",
+                "/api/v1/memory/jobs/{job_id}/result",
                 post(
-                    |AxumState(state): AxumState<Arc<TokMutex<SynthRecorder>>>,
+                    |AxumState(state): AxumState<Arc<TokMutex<JobRecorder>>>,
                      Path(job_id): Path<String>,
                      Json(body): Json<JsonValue>| async move {
                         let mut g = state.lock().await;
@@ -570,26 +769,81 @@ mod tests {
         (format!("http://{addr}"), rec)
     }
 
-    fn poller(
+    /// Deterministic stand-in for the local embedding service. Serves both
+    /// routes `EmbeddingClient` uses (`compute-text`, and the `compute-batch`
+    /// URL it derives from it) and returns index-keyed 384-dim vectors so a
+    /// test can prove per-input alignment.
+    async fn spawn_fake_embedder() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app: Router = Router::new()
+            .route(
+                "/api/embeddings/compute-batch",
+                post(|Json(body): Json<JsonValue>| async move {
+                    let n = body["texts"].as_array().map(Vec::len).unwrap_or(0);
+                    let embeddings: Vec<Vec<f32>> = (0..n).map(|i| vec![i as f32; 384]).collect();
+                    Json(json!({ "embeddings": embeddings }))
+                }),
+            )
+            .route(
+                "/api/embeddings/compute-text",
+                post(|| async { Json(json!({ "embedding": vec![0.5f32; 384] })) }),
+            );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}/api/embeddings/compute-text")
+    }
+
+    /// A poller whose embedder is up (points at a local fake).
+    async fn poller(
         gate_open: bool,
         bearer: Option<&'static str>,
         synth: Synthesizer,
-    ) -> MemorySynthesisPoller {
-        MemorySynthesisPoller::with_probes(
+    ) -> MemoryJobPoller {
+        let embed_url = spawn_fake_embedder().await;
+        poller_with_embed_url(gate_open, bearer, synth, &embed_url)
+    }
+
+    fn poller_with_embed_url(
+        gate_open: bool,
+        bearer: Option<&'static str>,
+        synth: Synthesizer,
+        embed_url: &str,
+    ) -> MemoryJobPoller {
+        MemoryJobPoller::with_probes(
             Box::new(move || gate_open),
             Box::new(move || bearer.map(str::to_string)),
             synth,
         )
+        .with_embedder(EmbeddingClient::with_url(embed_url))
     }
+
+    /// Nothing listens on port 1 — connection refused for both the batch route
+    /// and `compute_batch_embeddings`' per-text fallback.
+    const EMBEDDER_DOWN_URL: &str = "http://127.0.0.1:1/api/embeddings/compute-text";
+
+    fn ok_synth() -> Synthesizer {
+        Arc::new(|texts: &[String]| SynthOutcome::Ok {
+            text: format!("synth:{}", texts.join("|")),
+            cache_read_tokens: 5,
+            cache_creation_tokens: 2,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Gates — these govern EVERY kind, not just synthesis
+    // -----------------------------------------------------------------------
 
     #[tokio::test(flavor = "multi_thread")]
     async fn consent_gate_off_makes_no_http_calls() {
-        let (base, rec) = spawn_fake_synth_web(vec![job("j1", &["a", "b"])]).await;
+        let (base, rec) = spawn_fake_jobs_web(vec![synth_job("j1", &["a", "b"])]).await;
         let p = poller(
             false,
             Some("test.jwt"),
             Arc::new(|_| SynthOutcome::Disabled),
-        );
+        )
+        .await;
         let outcome = p.poll_once(&reqwest::Client::new(), &base).await;
         assert_eq!(outcome, PollOutcome::ConsentOff);
         let g = rec.lock().await;
@@ -597,10 +851,27 @@ mod tests {
         assert!(g.result_calls.is_empty());
     }
 
+    /// Claiming an `embedding` job pulls tenant content onto this device just
+    /// as a `synthesis` job does, so the SAME consent gate must govern it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn consent_gate_off_blocks_embedding_jobs_too() {
+        let (base, rec) = spawn_fake_jobs_web(vec![embed_job("e1", &["a"])]).await;
+        let p = poller(false, Some("test.jwt"), ok_synth()).await;
+        assert_eq!(
+            p.poll_once(&reqwest::Client::new(), &base).await,
+            PollOutcome::ConsentOff
+        );
+        assert_eq!(
+            rec.lock().await.claim_calls,
+            0,
+            "consent off ⇒ not even a claim for embedding work"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn unpaired_no_bearer_makes_no_http_calls() {
-        let (base, rec) = spawn_fake_synth_web(vec![job("j1", &["a"])]).await;
-        let p = poller(true, None, Arc::new(|_| SynthOutcome::Disabled));
+        let (base, rec) = spawn_fake_jobs_web(vec![synth_job("j1", &["a"])]).await;
+        let p = poller(true, None, Arc::new(|_| SynthOutcome::Disabled)).await;
         let outcome = p.poll_once(&reqwest::Client::new(), &base).await;
         assert_eq!(outcome, PollOutcome::NoAuth);
         let g = rec.lock().await;
@@ -608,15 +879,58 @@ mod tests {
         assert!(g.result_calls.is_empty());
     }
 
+    // -----------------------------------------------------------------------
+    // Claim contract
+    // -----------------------------------------------------------------------
+
     #[tokio::test(flavor = "multi_thread")]
-    async fn claim_synthesize_result_round_trip() {
-        let (base, rec) = spawn_fake_synth_web(vec![job("j1", &["ep one", "ep two"])]).await;
-        let synth: Synthesizer = Arc::new(|texts: &[String]| SynthOutcome::Ok {
-            text: format!("synth:{}", texts.join("|")),
-            cache_read_tokens: 5,
-            cache_creation_tokens: 2,
-        });
-        let p = poller(true, Some("test.jwt"), synth);
+    async fn claim_filters_to_the_kinds_this_runner_serves() {
+        let (base, rec) = spawn_fake_jobs_web(vec![]).await;
+        let p = poller(true, Some("test.jwt"), ok_synth()).await;
+        p.poll_once(&reqwest::Client::new(), &base).await;
+
+        let g = rec.lock().await;
+        assert_eq!(g.claim_bodies.len(), 1);
+        assert_eq!(g.claim_bodies[0]["limit"], CLAIM_LIMIT);
+        assert_eq!(
+            g.claim_bodies[0]["kinds"],
+            json!(["synthesis", "embedding"]),
+            "the claim must name the kinds we can serve, so the server never \
+             hands us work we'd only have to fail"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_claim_is_idle() {
+        let (base, rec) = spawn_fake_jobs_web(vec![]).await;
+        let p = poller(true, Some("test.jwt"), Arc::new(|_| SynthOutcome::Disabled)).await;
+        let outcome = p.poll_once(&reqwest::Client::new(), &base).await;
+        assert_eq!(outcome, PollOutcome::Idle);
+        assert!(rec.lock().await.result_calls.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn claim_transport_error_is_retry() {
+        let p = poller(true, Some("test.jwt"), Arc::new(|_| SynthOutcome::Disabled)).await;
+        // Unroutable — connection refused.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let outcome = p.poll_once(&client, "http://127.0.0.1:1").await;
+        assert!(matches!(outcome, PollOutcome::Retry(_)), "got {outcome:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // kind = "synthesis"
+    // -----------------------------------------------------------------------
+
+    /// Synthesis now posts the text AND its vector — that pair is what lets
+    /// the backend drop its own embed call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn synthesis_job_posts_text_and_its_embedding() {
+        let (base, rec) = spawn_fake_jobs_web(vec![synth_job("j1", &["ep one", "ep two"])]).await;
+        let p = poller(true, Some("test.jwt"), ok_synth()).await;
         let outcome = p.poll_once(&reqwest::Client::new(), &base).await;
         assert_eq!(outcome, PollOutcome::Processed(1));
 
@@ -624,7 +938,14 @@ mod tests {
         assert_eq!(g.claim_calls, 1);
         assert_eq!(g.result_calls.len(), 1);
         assert_eq!(g.result_calls[0].0, "j1");
-        assert_eq!(g.result_calls[0].1["result_text"], "synth:ep one|ep two");
+        let result = &g.result_calls[0].1["result"];
+        assert_eq!(result["result_text"], "synth:ep one|ep two");
+        assert_eq!(
+            result["embedding"].as_array().map(Vec::len),
+            Some(384),
+            "the synthesized text must ship WITH its vector"
+        );
+        assert_eq!(result["embedding_model"], EMBEDDING_MODEL_TAG);
         assert!(
             g.result_calls[0].1.get("failure").is_none(),
             "success path must not send a failure"
@@ -632,11 +953,105 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn disabled_leaves_jobs_unresulted() {
-        let (base, rec) = spawn_fake_synth_web(vec![job("j1", &["a"])]).await;
-        let p = poller(true, Some("test.jwt"), Arc::new(|_| SynthOutcome::Disabled));
+    async fn synthesis_failure_posts_failure() {
+        let (base, rec) = spawn_fake_jobs_web(vec![synth_job("j1", &["a"])]).await;
+        let p = poller(
+            true,
+            Some("test.jwt"),
+            Arc::new(|_| SynthOutcome::Failed("boom".to_string())),
+        )
+        .await;
         let outcome = p.poll_once(&reqwest::Client::new(), &base).await;
-        assert_eq!(outcome, PollOutcome::Disabled);
+        assert_eq!(outcome, PollOutcome::Processed(1));
+
+        let g = rec.lock().await;
+        assert_eq!(g.result_calls.len(), 1);
+        assert_eq!(g.result_calls[0].1["failure"], "boom");
+        assert!(g.result_calls[0].1.get("result").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // kind = "embedding"
+    // -----------------------------------------------------------------------
+
+    /// One vector per `input_texts` entry, SAME ORDER — the backend zips them
+    /// back onto `target_ids` positionally, so an order bug silently attaches
+    /// every vector to the wrong memory. The fake embedder returns index-keyed
+    /// vectors so that bug cannot pass.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn embedding_job_posts_one_vector_per_input_in_order() {
+        let (base, rec) =
+            spawn_fake_jobs_web(vec![embed_job("e1", &["first", "second", "third"])]).await;
+        let p = poller(true, Some("test.jwt"), ok_synth()).await;
+        let outcome = p.poll_once(&reqwest::Client::new(), &base).await;
+        assert_eq!(outcome, PollOutcome::Processed(1));
+
+        let g = rec.lock().await;
+        assert_eq!(g.result_calls.len(), 1);
+        assert_eq!(g.result_calls[0].0, "e1");
+        let result = &g.result_calls[0].1["result"];
+        let embeddings = result["embeddings"].as_array().expect("embeddings array");
+        assert_eq!(embeddings.len(), 3, "one vector per input text");
+        for (i, e) in embeddings.iter().enumerate() {
+            let v = e.as_array().unwrap();
+            assert_eq!(v.len(), 384, "MiniLM-L6-v2 is 384-dimensional");
+            assert_eq!(
+                v[0].as_f64().unwrap(),
+                i as f64,
+                "vector {i} is out of order — the backend zips these onto \
+                 target_ids positionally"
+            );
+        }
+        assert_eq!(result["embedding_model"], EMBEDDING_MODEL_TAG);
+        assert!(
+            result.get("result_text").is_none(),
+            "an embedding job has no text result"
+        );
+    }
+
+    /// The embedding arm must not touch the LLM at all: a synthesizer that
+    /// would panic if called proves the dispatch never routes there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn embedding_job_never_calls_the_llm() {
+        let (base, rec) = spawn_fake_jobs_web(vec![embed_job("e1", &["a"])]).await;
+        let never: Synthesizer =
+            Arc::new(|_| panic!("the embedding arm must never invoke the synthesizer"));
+        let p = poller(true, Some("test.jwt"), never).await;
+        assert_eq!(
+            p.poll_once(&reqwest::Client::new(), &base).await,
+            PollOutcome::Processed(1)
+        );
+        assert!(rec.lock().await.result_calls[0].1["result"]["embeddings"].is_array());
+    }
+
+    /// An embedding job with no inputs is a BAD JOB (not a runner outage), so
+    /// it gets a failure — leaving it un-resulted would have the reaper hand
+    /// the same empty job back forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn embedding_job_with_no_inputs_posts_failure() {
+        let (base, rec) = spawn_fake_jobs_web(vec![embed_job("e1", &[])]).await;
+        let p = poller(true, Some("test.jwt"), ok_synth()).await;
+        assert_eq!(
+            p.poll_once(&reqwest::Client::new(), &base).await,
+            PollOutcome::Processed(1)
+        );
+        let g = rec.lock().await;
+        assert!(g.result_calls[0].1["failure"]
+            .as_str()
+            .unwrap()
+            .contains("no input texts"));
+    }
+
+    // -----------------------------------------------------------------------
+    // "This runner can't do the work right now" — the shared branch
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_llm_credentials_leaves_jobs_unresulted() {
+        let (base, rec) = spawn_fake_jobs_web(vec![synth_job("j1", &["a"])]).await;
+        let p = poller(true, Some("test.jwt"), Arc::new(|_| SynthOutcome::Disabled)).await;
+        let outcome = p.poll_once(&reqwest::Client::new(), &base).await;
+        assert_eq!(outcome, PollOutcome::Disabled(DISABLED_NO_LLM));
 
         let g = rec.lock().await;
         assert_eq!(g.claim_calls, 1, "claim still happens");
@@ -646,42 +1061,98 @@ mod tests {
         );
     }
 
+    /// A local embedder that is down is "this runner can't do the work right
+    /// now", NOT a bad job: it takes the same branch as missing LLM
+    /// credentials. Posting a `failure` here would burn the job's `attempt`
+    /// and eventually wedge a perfectly good job.
     #[tokio::test(flavor = "multi_thread")]
-    async fn synthesis_failure_posts_failure() {
-        let (base, rec) = spawn_fake_synth_web(vec![job("j1", &["a"])]).await;
-        let p = poller(
-            true,
-            Some("test.jwt"),
-            Arc::new(|_| SynthOutcome::Failed("boom".to_string())),
-        );
+    async fn embedder_down_leaves_embedding_job_unresulted() {
+        let (base, rec) = spawn_fake_jobs_web(vec![embed_job("e1", &["a", "b"])]).await;
+        let p = poller_with_embed_url(true, Some("test.jwt"), ok_synth(), EMBEDDER_DOWN_URL);
         let outcome = p.poll_once(&reqwest::Client::new(), &base).await;
-        assert_eq!(outcome, PollOutcome::Processed(1));
+        assert_eq!(outcome, PollOutcome::Disabled(DISABLED_NO_EMBEDDER));
 
         let g = rec.lock().await;
-        assert_eq!(g.result_calls.len(), 1);
-        assert_eq!(g.result_calls[0].1["failure"], "boom");
-        assert!(g.result_calls[0].1.get("result_text").is_none());
+        assert_eq!(g.claim_calls, 1, "claim still happens");
+        assert!(
+            g.result_calls.is_empty(),
+            "embedder down ⇒ NO failure POST (that would burn `attempt`); the \
+             job is left for the backend reaper to return to pending"
+        );
     }
 
+    /// Same posture on the synthesis path: the LLM succeeded, but we cannot
+    /// produce the vector the backend now requires — so the job is left for
+    /// the reaper rather than failed.
     #[tokio::test(flavor = "multi_thread")]
-    async fn empty_claim_is_idle() {
-        let (base, rec) = spawn_fake_synth_web(vec![]).await;
-        let p = poller(true, Some("test.jwt"), Arc::new(|_| SynthOutcome::Disabled));
+    async fn embedder_down_leaves_synthesis_job_unresulted() {
+        let (base, rec) = spawn_fake_jobs_web(vec![synth_job("j1", &["a"])]).await;
+        let p = poller_with_embed_url(true, Some("test.jwt"), ok_synth(), EMBEDDER_DOWN_URL);
         let outcome = p.poll_once(&reqwest::Client::new(), &base).await;
-        assert_eq!(outcome, PollOutcome::Idle);
-        assert!(rec.lock().await.result_calls.is_empty());
+        assert_eq!(outcome, PollOutcome::Disabled(DISABLED_NO_EMBEDDER));
+        assert!(
+            rec.lock().await.result_calls.is_empty(),
+            "a synthesized text we cannot embed must not be posted, and must \
+             not be failed either"
+        );
     }
 
+    /// The tick STOPS on the disabled branch — the rest of the claimed batch
+    /// is left for the reaper too, rather than being burned one by one.
     #[tokio::test(flavor = "multi_thread")]
-    async fn claim_transport_error_is_retry() {
-        let p = poller(true, Some("test.jwt"), Arc::new(|_| SynthOutcome::Disabled));
-        // Unroutable — connection refused.
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .build()
-            .unwrap();
-        let outcome = p.poll_once(&client, "http://127.0.0.1:1").await;
-        assert!(matches!(outcome, PollOutcome::Retry(_)), "got {outcome:?}");
+    async fn embedder_down_stops_the_tick_and_abandons_the_rest_of_the_batch() {
+        let (base, rec) =
+            spawn_fake_jobs_web(vec![embed_job("e1", &["a"]), embed_job("e2", &["b"])]).await;
+        let p = poller_with_embed_url(true, Some("test.jwt"), ok_synth(), EMBEDDER_DOWN_URL);
+        assert_eq!(
+            p.poll_once(&reqwest::Client::new(), &base).await,
+            PollOutcome::Disabled(DISABLED_NO_EMBEDDER)
+        );
+        assert!(
+            rec.lock().await.result_calls.is_empty(),
+            "every claimed job in the batch is left un-resulted"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Kind parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn job_kind_parses_known_kinds_and_tolerates_new_ones() {
+        let parse = |k: &str| -> JobKind {
+            serde_json::from_value(json!({
+                "job_id": "j", "kind": k, "input_texts": [], "target_ids": []
+            }))
+            .map(|j: ClaimedJob| j.kind)
+            .unwrap()
+        };
+        assert_eq!(parse("synthesis"), JobKind::Synthesis);
+        assert_eq!(parse("embedding"), JobKind::Embedding);
+        // A kind from a newer server must not fail deserialization — that
+        // would strand the WHOLE claim batch as a parse Retry.
+        assert_eq!(parse("reranking"), JobKind::Unknown);
+    }
+
+    /// An unservable kind is failed, not left for the reaper: we asked for the
+    /// kinds we serve, so getting another back is a server contract break, and
+    /// the reaper would only hand it straight back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unknown_kind_posts_failure() {
+        let (base, rec) = spawn_fake_jobs_web(vec![json!({
+            "job_id": "x1", "kind": "reranking", "input_texts": ["a"], "target_ids": []
+        })])
+        .await;
+        let p = poller(true, Some("test.jwt"), ok_synth()).await;
+        assert_eq!(
+            p.poll_once(&reqwest::Client::new(), &base).await,
+            PollOutcome::Processed(1)
+        );
+        let g = rec.lock().await;
+        assert!(g.result_calls[0].1["failure"]
+            .as_str()
+            .unwrap()
+            .contains("kind"));
     }
 
     #[test]

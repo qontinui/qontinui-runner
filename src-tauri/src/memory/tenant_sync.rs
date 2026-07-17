@@ -14,6 +14,32 @@
 //! `POST <web_base>/api/v1/memory/records` with the runner's coord-minted
 //! device JWT as the bearer.
 //!
+//! ## Embeddings are computed HERE, not server-side
+//!
+//! Plan `2026-07-13-runner-paid-embedding` (Phase 1) moves the embed off the
+//! web backend and onto the device that already has the model warm. The drain
+//! batches the outgoing records' `content` through the local embedding service
+//! ([`EmbeddingClient::compute_batch_embeddings`]) and stamps each record with
+//! `embedding` (384 f32) + `embedding_model` ([`EMBEDDING_MODEL_TAG`]) before
+//! the POST. The embed happens AFTER the consent + bearer gates, so a
+//! non-consenting or unpaired runner never spends the compute either.
+//!
+//! **A local embedder outage must NEVER block a write.** `embedding` is
+//! nullable by design: the backend writes a NULL-embedding row, which is
+//! immediately retrievable via its FTS arm (degraded, not invisible) and gets
+//! enqueued for later vectorization by the `kind="embedding"` job queue
+//! ([`crate::memory::memory_synthesis`]). So when the embed fails, the drain
+//! OMITS `embedding` + `embedding_model` and ships the records anyway. Making
+//! the vector a hard requirement would turn a soft degradation into data loss:
+//! a broken local embedding server would stall tenant memory sync on this
+//! machine indefinitely and it would never federate.
+//!
+//! Contrast [`crate::memory::memory_synthesis`], where a claimed *job* IS left
+//! un-resulted on an embedder outage. That is not the same situation and the
+//! two must not be unified: a claimed job holds a lease the backend reaper
+//! returns to `pending`, so deferring it loses nothing. A write holds no lease
+//! — deferring it just queues local data forever.
+//!
 //! ## Gates + posture
 //!
 //! 1. **Consent gate (hard)** — `Settings.cloud_sync_enabled` (default
@@ -49,6 +75,7 @@ use serde_json::{json, Value as JsonValue};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::database::embedding_client::{EmbeddingClient, EMBEDDING_MODEL_TAG};
 use crate::session::local_store::{OutboxRecord, OutboxWriter};
 use crate::session::redact::redact_secrets;
 use crate::session::SessionEventKind;
@@ -156,7 +183,8 @@ pub enum FlushOutcome {
     /// No device JWT available (unpaired). Batch kept pending.
     NoAuth,
     /// Transient failure (network, 5xx, 401/403 mid-token-refresh). Batch
-    /// kept pending — retry after backoff.
+    /// kept pending — retry after backoff. A local-embedder outage is NOT in
+    /// this class: it ships un-embedded rather than deferring the write.
     Retry(String),
     /// Non-retryable 4xx — the server refuses this batch permanently. The
     /// batch is ack-dropped so the queue moves forward.
@@ -170,6 +198,9 @@ pub struct TenantMemorySync {
     machine_id: Uuid,
     gate: ConsentGate,
     bearer: BearerProvider,
+    /// Local embedding service client. Every outgoing record's vector is
+    /// computed through this before the POST.
+    embedder: EmbeddingClient,
     warned_no_auth: std::sync::Once,
 }
 
@@ -208,8 +239,16 @@ impl TenantMemorySync {
             machine_id,
             gate,
             bearer,
+            embedder: EmbeddingClient::new(),
             warned_no_auth: std::sync::Once::new(),
         }
+    }
+
+    /// Point the drain at a specific embedding service (tests aim this at a
+    /// local fake; production keeps [`EmbeddingClient::new`]'s default URL).
+    pub fn with_embedder(mut self, embedder: EmbeddingClient) -> Self {
+        self.embedder = embedder;
+        self
     }
 
     /// Enqueue one tenant-memory record. **Consent gate 1 (hard):** when the
@@ -286,7 +325,62 @@ impl TenantMemorySync {
             return FlushOutcome::NoAuth;
         };
 
-        let records: Vec<&JsonValue> = batch.iter().map(|r| &r.payload).collect();
+        // Embed locally (plan `2026-07-13-runner-paid-embedding`, Phase 1): the
+        // backend no longer embeds, so a record without a vector is useless to
+        // it. Runs after the consent + bearer gates so a gated-off runner never
+        // spends the compute.
+        let texts: Vec<String> = batch
+            .iter()
+            .map(|r| {
+                r.payload
+                    .get("content")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        // `None` ⇒ ship un-embedded. `embedding` is nullable and the backend
+        // enqueues NULL-embedding rows for later vectorization, so a local
+        // embedder outage costs freshness of the vector arm — never the write.
+        let embeddings: Option<Vec<Vec<f32>>> =
+            match self.embedder.compute_batch_embeddings(&texts).await {
+                Ok(e) if e.len() == batch.len() => Some(e),
+                Ok(e) => {
+                    // The embedding service broke its contract. Ship the batch
+                    // un-embedded rather than pairing vectors to the wrong
+                    // records — a mis-zipped vector is worse than no vector.
+                    tracing::warn!(
+                        got = e.len(),
+                        want = batch.len(),
+                        "tenant_sync: embedding service returned the wrong vector count — \
+                         shipping records un-embedded for the backend to vectorize later"
+                    );
+                    None
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        batch = batch.len(),
+                        "tenant_sync: local embed failed — shipping records un-embedded; the \
+                         backend stores them NULL-embedding (FTS-retrievable) and enqueues \
+                         them for later vectorization"
+                    );
+                    None
+                }
+            };
+
+        let records: Vec<JsonValue> = batch
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let mut payload = r.payload.clone();
+                if let Some(embeddings) = &embeddings {
+                    payload["embedding"] = json!(embeddings[i]);
+                    payload["embedding_model"] = JsonValue::String(EMBEDDING_MODEL_TAG.to_string());
+                }
+                payload
+            })
+            .collect();
         let url = format!("{}/api/v1/memory/records", base.trim_end_matches('/'));
         let resp = client
             .post(&url)
@@ -559,6 +653,8 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::Mutex as TokMutex;
 
+    /// Enqueue-only sync. The embedder is never reached (enqueue does not
+    /// embed), so these tests stay hermetic without a fake embedding service.
     fn make_sync(
         dir: &std::path::Path,
         gate_open: bool,
@@ -572,6 +668,62 @@ mod tests {
             Box::new(move || bearer.map(str::to_string)),
         );
         (sync, outbox)
+    }
+
+    /// A flushing sync wired to `embed_base`'s fake embedding service. Point
+    /// `embed_base` at an unroutable host to exercise the embedder-down path.
+    fn make_flushing_sync(
+        dir: &std::path::Path,
+        bearer: Option<&'static str>,
+        embed_base: &str,
+    ) -> (TenantMemorySync, Arc<OutboxWriter>) {
+        let (sync, outbox) = make_sync(dir, true, bearer);
+        let sync = sync.with_embedder(EmbeddingClient::with_url(&format!(
+            "{}/api/embeddings/compute-text",
+            embed_base.trim_end_matches('/')
+        )));
+        (sync, outbox)
+    }
+
+    /// Deterministic stand-in for the local embedding service. Serves the
+    /// batch route `EmbeddingClient` derives (`compute-text` → `compute-batch`)
+    /// and records the texts it was asked to embed, so a test can assert
+    /// exactly WHAT egressed to the embedder.
+    async fn spawn_fake_embedder() -> (String, Arc<TokMutex<Vec<String>>>) {
+        let seen: Arc<TokMutex<Vec<String>>> = Arc::new(TokMutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app: Router = Router::new()
+            .route(
+                "/api/embeddings/compute-batch",
+                post(
+                    |AxumState(state): AxumState<Arc<TokMutex<Vec<String>>>>,
+                     Json(body): Json<JsonValue>| async move {
+                        let texts: Vec<String> = body["texts"]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .map(|t| t.as_str().unwrap_or_default().to_string())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        // One distinct 384-dim vector per text, keyed by index
+                        // so a test can prove per-record alignment.
+                        let embeddings: Vec<Vec<f32>> = texts
+                            .iter()
+                            .enumerate()
+                            .map(|(i, _)| vec![i as f32; 384])
+                            .collect();
+                        state.lock().await.extend(texts);
+                        Json(json!({ "embeddings": embeddings }))
+                    },
+                ),
+            )
+            .with_state(seen.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{}", addr), seen)
     }
 
     fn record(title: &str, content: &str) -> TenantMemoryRecord {
@@ -713,7 +865,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn flush_batches_pending_records_with_bearer() {
         let dir = tempdir().unwrap();
-        let (sync, outbox) = make_sync(dir.path(), true, Some("test.jwt"));
+        let (embed_base, embed_seen) = spawn_fake_embedder().await;
+        let (sync, outbox) = make_flushing_sync(dir.path(), Some("test.jwt"), &embed_base);
         sync.enqueue(record("r1", "content one"));
         sync.enqueue(record("r2", "content two"));
         sync.enqueue(record("r3", "content three"));
@@ -741,12 +894,100 @@ mod tests {
             outbox.pending().unwrap().is_empty(),
             "flushed records must be acked"
         );
+
+        // The embed ran locally, over each record's content, in one batch.
+        assert_eq!(
+            embed_seen.lock().await.as_slice(),
+            ["content one", "content two", "content three"],
+            "the drain must embed each record's content locally before the POST"
+        );
+    }
+
+    /// Phase 1 of `2026-07-13-runner-paid-embedding`: the runner ships the
+    /// VECTOR, not just the text — and each record gets ITS OWN vector, in
+    /// order (the fake embedder returns index-keyed vectors so a zip/order bug
+    /// cannot pass).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flush_attaches_a_per_record_embedding_and_model_tag() {
+        let dir = tempdir().unwrap();
+        let (embed_base, _seen) = spawn_fake_embedder().await;
+        let (sync, _outbox) = make_flushing_sync(dir.path(), Some("test.jwt"), &embed_base);
+        sync.enqueue(record("r1", "content one"));
+        sync.enqueue(record("r2", "content two"));
+
+        let (base, rec) = spawn_fake_web(None).await;
+        assert_eq!(
+            sync.flush_once(&reqwest::Client::new(), &base).await,
+            FlushOutcome::Flushed(2)
+        );
+
+        let g = rec.lock().await;
+        let records = g.bodies[0]["records"].as_array().unwrap();
+        for (i, r) in records.iter().enumerate() {
+            let embedding = r["embedding"]
+                .as_array()
+                .unwrap_or_else(|| panic!("record {i} has no embedding: {r}"));
+            assert_eq!(embedding.len(), 384, "MiniLM-L6-v2 is 384-dimensional");
+            assert_eq!(
+                embedding[0].as_f64().unwrap(),
+                i as f64,
+                "record {i} must carry ITS OWN vector — vectors must not be \
+                 transposed or reused across records"
+            );
+            assert_eq!(
+                r["embedding_model"], EMBEDDING_MODEL_TAG,
+                "every shipped vector must name the space that produced it"
+            );
+        }
+    }
+
+    /// A local embedder outage must NEVER block a write. `embedding` is
+    /// nullable: the backend stores a NULL-embedding row (immediately
+    /// FTS-retrievable) and enqueues it for later vectorization. Deferring the
+    /// write instead would turn a soft degradation into data loss — on a
+    /// machine whose embedding server is broken, tenant memory would queue
+    /// locally forever and never federate.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flush_with_embedder_down_ships_records_unembedded() {
+        let dir = tempdir().unwrap();
+        // Nothing listens on port 1 — connection refused for both the batch
+        // route and `compute_batch_embeddings`' per-text fallback.
+        let (sync, outbox) = make_flushing_sync(dir.path(), Some("test.jwt"), "http://127.0.0.1:1");
+        sync.enqueue(record("r1", "content one"));
+
+        let (base, rec) = spawn_fake_web(None).await;
+        let outcome = sync.flush_once(&reqwest::Client::new(), &base).await;
+
+        assert_eq!(
+            outcome,
+            FlushOutcome::Flushed(1),
+            "a local embedder outage must not hold the write hostage"
+        );
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "the record shipped, so it must be acked"
+        );
+
+        let g = rec.lock().await;
+        let records = g.bodies[0]["records"].as_array().unwrap();
+        assert_eq!(records.len(), 1, "the record must still egress");
+        assert_eq!(records[0]["content"], "content one");
+        assert!(
+            records[0].get("embedding").is_none(),
+            "no embedding ⇒ OMIT the field so the backend writes NULL and \
+             enqueues it; never invent a placeholder vector"
+        );
+        assert!(
+            records[0].get("embedding_model").is_none(),
+            "an absent vector must not be tagged with a space that never produced it"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn flush_respects_quota_429_without_dropping() {
         let dir = tempdir().unwrap();
-        let (sync, outbox) = make_sync(dir.path(), true, Some("test.jwt"));
+        let (embed_base, _seen) = spawn_fake_embedder().await;
+        let (sync, outbox) = make_flushing_sync(dir.path(), Some("test.jwt"), &embed_base);
         sync.enqueue(record("r1", "content one"));
         sync.enqueue(record("r2", "content two"));
 
@@ -764,7 +1005,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn flush_drops_permanently_rejected_batches() {
         let dir = tempdir().unwrap();
-        let (sync, outbox) = make_sync(dir.path(), true, Some("test.jwt"));
+        let (embed_base, _seen) = spawn_fake_embedder().await;
+        let (sync, outbox) = make_flushing_sync(dir.path(), Some("test.jwt"), &embed_base);
         sync.enqueue(record("r1", "content one"));
 
         let (base, _rec) = spawn_fake_web(Some(422)).await;
@@ -780,13 +1022,19 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn flush_without_bearer_keeps_records_pending() {
         let dir = tempdir().unwrap();
-        let (sync, outbox) = make_sync(dir.path(), true, None);
+        // Unroutable embedder: if the bearer gate did NOT precede the embed,
+        // this would surface as Retry("embedding: …") instead of NoAuth.
+        let (sync, outbox) = make_flushing_sync(dir.path(), None, "http://127.0.0.1:1");
         sync.enqueue(record("r1", "content one"));
 
         let (base, rec) = spawn_fake_web(None).await;
         let client = reqwest::Client::new();
         let outcome = sync.flush_once(&client, &base).await;
-        assert_eq!(outcome, FlushOutcome::NoAuth);
+        assert_eq!(
+            outcome,
+            FlushOutcome::NoAuth,
+            "the bearer gate must short-circuit BEFORE any embedding compute"
+        );
         assert_eq!(outbox.pending().unwrap().len(), 1);
         assert!(
             rec.lock().await.bodies.is_empty(),
@@ -797,7 +1045,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn flush_transport_error_keeps_records_pending() {
         let dir = tempdir().unwrap();
-        let (sync, outbox) = make_sync(dir.path(), true, Some("test.jwt"));
+        // Embedder up, web backend unreachable — isolates the POST transport
+        // failure from the embed failure.
+        let (embed_base, _seen) = spawn_fake_embedder().await;
+        let (sync, outbox) = make_flushing_sync(dir.path(), Some("test.jwt"), &embed_base);
         sync.enqueue(record("r1", "content one"));
 
         // Unroutable port — connection refused.
@@ -817,7 +1068,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn flush_caps_batches_at_max_batch() {
         let dir = tempdir().unwrap();
-        let (sync, outbox) = make_sync(dir.path(), true, Some("test.jwt"));
+        let (embed_base, _seen) = spawn_fake_embedder().await;
+        let (sync, outbox) = make_flushing_sync(dir.path(), Some("test.jwt"), &embed_base);
         for i in 0..(MAX_BATCH + 5) {
             sync.enqueue(record(&format!("r{i}"), &format!("content {i}")));
         }
