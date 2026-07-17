@@ -386,6 +386,59 @@ async fn get_transcript(
 }
 
 // =============================================================================
+// /sessions/<id>/continuation-verdict
+// =============================================================================
+
+/// Resolve the best coord-facing session key for a continuation-verdict call
+/// — LOCAL state first (the phase's "consult local state" goal):
+///
+/// 1. A runner-registered AI session: the path id is a `task_run_id` the
+///    Tauri-managed [`AiCoordRegistrar`] maps to its coord session UUID.
+/// 2. The Claude session id from the Stop-hook payload (`session_id`) — the
+///    key coord's session-identity resolver understands for PTY/terminal
+///    sessions (where the path id is the runner TERMINAL id, which coord
+///    does not key on).
+/// 3. The raw path id (already a session UUID on some spawn paths).
+///
+/// [`AiCoordRegistrar`]: crate::claude_session::coord_register::AiCoordRegistrar
+fn resolve_session_key(
+    state: &Arc<ApiState>,
+    path_id: &str,
+    hook_input: &serde_json::Value,
+) -> String {
+    if let Some(registrar) = state
+        .app_handle
+        .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()
+    {
+        if let Some(coord_id) = registrar.session_id_for(path_id) {
+            return coord_id.to_string();
+        }
+    }
+    if let Some(sid) = crate::mcp::continuation_verdict::session_id_from(hook_input) {
+        return sid;
+    }
+    path_id.to_string()
+}
+
+/// `POST /sessions/{id}/continuation-verdict` — the Stop-hook decision
+/// endpoint (plan `2026-07-17-session-autonomy-fabric.md` Phase 1, D4). Body
+/// = the raw Claude Stop-hook payload (parsed LENIENTLY — an empty or
+/// non-JSON body reads as `{}` so a curl probe works). Always 200 with
+/// `{decision, prompt?, …}` — every error path inside the verdict fail-opens
+/// to `allow`, because a broken verdict endpoint must never trap a session
+/// at turn-end.
+async fn continuation_verdict(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Json<crate::mcp::continuation_verdict::VerdictResponse> {
+    let hook_input: serde_json::Value =
+        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+    let key = resolve_session_key(&state, &id, &hook_input);
+    Json(crate::mcp::continuation_verdict::continuation_verdict(&key, &hook_input).await)
+}
+
+// =============================================================================
 // Routes
 // =============================================================================
 
@@ -395,4 +448,8 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/sessions/{id}/message", post(send_message))
         .route("/sessions/{id}/touched-files", get(get_touched_files))
         .route("/sessions/{id}/transcript", get(get_transcript))
+        .route(
+            "/sessions/{id}/continuation-verdict",
+            post(continuation_verdict),
+        )
 }
