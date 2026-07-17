@@ -292,6 +292,16 @@ pub struct CliPathOutcome {
     pub dir: String,
     /// Human-readable note for the UI.
     pub message: String,
+    /// For the identity-shim install ONLY: whether the shim will ACTUALLY shadow
+    /// `claude` in a fresh shell. `Some(true)` — it wins resolution; `Some(false)`
+    /// — a real `claude` earlier on PATH (typically on the un-editable SYSTEM
+    /// PATH) still wins, so the opt-in is installed but INERT (the `message` names
+    /// the blocker). `None` — not evaluated (every non-identity path, e.g. the
+    /// CLI-enroll toggle, and non-Windows). Honest reporting: prepending to the
+    /// USER PATH cannot beat a SYSTEM-PATH `claude`, so a bare "added: true" would
+    /// otherwise claim success on a silent no-op.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective: Option<bool>,
 }
 
 /// The runner's install directory — the folder containing the running
@@ -331,6 +341,37 @@ pub fn identity_shim_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".qontinui").join("runner").join("identity-shim"))
 }
 
+/// File name of the per-machine operator opt-in marker for session-provisioned
+/// coord identity, under `~/.qontinui/` (plan
+/// `2026-07-17-universal-coord-device-identity-for-any-session` §1). Its mere
+/// existence is the signal; contents are never read.
+///
+/// # Why this constant lives in the LIB crate
+///
+/// It is the SINGLE source of truth for the opt-in marker, shared by TWO
+/// processes that must agree byte-for-byte:
+/// - the runner-side AUTHORITATIVE gate (`coord_mcp::session_identity_gate`,
+///   in the runner BIN crate), and
+/// - the standalone `qontinui-shim` `.exe`'s dark-posture short-circuit
+///   (`bin/qontinui_shim.rs::session_identity_marker_exists`).
+///
+/// A second bin cannot import from the runner bin's module tree, so — exactly
+/// like [`identity_shim_dir`] and [`crate::runner_breadcrumb`] — the constant
+/// AND its path resolver live here so the gate and the shim can never drift. A
+/// rename that desynced them would silently either keep the shim POSTing on an
+/// un-opted machine, or stop it provisioning on an opted-in one.
+pub const SESSION_IDENTITY_MARKER_FILE: &str = "allow-session-coord-identity";
+
+/// Absolute path of the session-coord-identity opt-in marker
+/// (`~/.qontinui/allow-session-coord-identity`). `None` when the home dir is
+/// unresolvable — every caller treats that as NOT opted in (fail-closed on the
+/// gate side, fail-open on the shim side), never as consent. Both the runner
+/// gate and the shim resolve the marker through THIS one function, so the whole
+/// path (directory + filename) is guaranteed identical, not just the filename.
+pub fn session_identity_marker_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".qontinui").join(SESSION_IDENTITY_MARKER_FILE))
+}
+
 /// Where [`install_dir_on_user_path`] places a newly-added dir on the USER PATH.
 /// PATH resolution is first-match-wins, so placement is load-bearing for the
 /// identity shim: a `claude` shadow that must WIN over the real `claude` already
@@ -348,35 +389,76 @@ pub enum Placement {
     Append,
 }
 
-/// Compute the PATH value with `dir` added at `placement`, or `None` when `dir`
-/// is already present. Entries are compared after trimming whitespace + a
-/// trailing separator, case-insensitively (Windows PATH is case-insensitive).
-/// Pure — unit-tested.
-fn compute_path_addition(current: &str, dir: &str, sep: char, placement: Placement) -> Option<String> {
+/// Compute the PATH value with `dir` added at `placement`, or `None` when no
+/// change is needed. Entries are compared after trimming whitespace + a trailing
+/// separator, case-insensitively (Windows PATH is case-insensitive). Pure —
+/// unit-tested.
+///
+/// The idempotence predicate is **placement-specific**, because PATH resolution
+/// is first-match-wins:
+///
+/// - [`Placement::Append`] — presence ANYWHERE suffices ("no change" ⇒ `None`).
+///   A toggle that only needs the tool to resolve at all does not care WHERE.
+/// - [`Placement::Prepend`] — the predicate is "already at the FRONT", NOT
+///   "present anywhere". A shim dir present but NOT first means the real `claude`
+///   on an earlier entry still wins resolution, so a position-blind "present ⇒
+///   None" would make the identity-shim opt-in a silent no-op (the exact
+///   regression this predicate fixes). So a prepend that finds the dir present
+///   but not first REMOVES every existing occurrence and puts it first (dedup +
+///   move-to-front); only an already-front dir returns `None`.
+fn compute_path_addition(
+    current: &str,
+    dir: &str,
+    sep: char,
+    placement: Placement,
+) -> Option<String> {
     let norm = |s: &str| s.trim().trim_end_matches(['/', '\\']).to_ascii_lowercase();
     let target = norm(dir);
     if target.is_empty() {
         return None;
     }
-    let present = current
-        .split(sep)
-        .any(|e| !e.trim().is_empty() && norm(e) == target);
-    if present {
-        return None;
-    }
+    // Empty current → just the dir (no leading/trailing separator), either way.
     if current.trim().is_empty() {
-        Some(dir.to_string())
-    } else {
-        // Preserve the existing value verbatim; join with exactly one separator.
-        match placement {
-            Placement::Append => {
-                let trimmed = current.trim_end_matches(sep);
-                Some(format!("{trimmed}{sep}{dir}"))
+        return Some(dir.to_string());
+    }
+    match placement {
+        Placement::Append => {
+            // Present ANYWHERE (ignoring empty segments) ⇒ no change.
+            let present = current
+                .split(sep)
+                .any(|e| !e.trim().is_empty() && norm(e) == target);
+            if present {
+                return None;
             }
-            Placement::Prepend => {
-                let trimmed = current.trim_start_matches(sep);
-                Some(format!("{dir}{sep}{trimmed}"))
+            // Preserve the existing value verbatim; join with exactly one separator.
+            let trimmed = current.trim_end_matches(sep);
+            Some(format!("{trimmed}{sep}{dir}"))
+        }
+        Placement::Prepend => {
+            // Already the FIRST non-empty entry ⇒ it already wins resolution ⇒
+            // no change. (Empty leading segments are skipped, matching how
+            // Windows ignores them during command resolution.)
+            let already_first = current
+                .split(sep)
+                .find(|e| !e.trim().is_empty())
+                .map(norm)
+                .as_deref()
+                == Some(target.as_str());
+            if already_first {
+                return None;
             }
+            // Present-but-not-first, or absent: drop EVERY existing occurrence of
+            // the target (keeping empty segments and all other entries verbatim,
+            // exactly as [`compute_path_removal`] does) and put it first. This
+            // both dedups and moves-to-front in a single pass, so the shim's
+            // `claude` shadow wins over a real `claude` that was earlier on PATH.
+            let kept: Vec<&str> = current
+                .split(sep)
+                .filter(|e| e.trim().is_empty() || norm(e) != target)
+                .collect();
+            let rest = kept.join(&sep.to_string());
+            let rest = rest.trim_start_matches(sep);
+            Some(format!("{dir}{sep}{rest}"))
         }
     }
 }
@@ -405,27 +487,37 @@ fn compute_path_removal(current: &str, dir: &str, sep: char) -> Option<String> {
     Some(kept.join(&sep.to_string()))
 }
 
-/// Read the current USER-scope `Path` (Windows). Returns "" when unset.
+/// Read a `Path` variable at the given scope (`"User"` or `"Machine"`) on
+/// Windows. Returns "" when unset. Reading the `Machine` (SYSTEM) scope needs no
+/// elevation — only WRITING it does. `scope` is passed via an env var so it can
+/// never be misread as a PowerShell operator.
 #[cfg(windows)]
-fn read_user_path() -> Result<String, String> {
+fn read_path_scope(scope: &str) -> Result<String, String> {
     let out = crate::process_helpers::no_window("powershell")
+        .env("QONTINUI_PATH_SCOPE", scope)
         .args([
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "[Environment]::GetEnvironmentVariable('Path','User')",
+            "[Environment]::GetEnvironmentVariable('Path', $env:QONTINUI_PATH_SCOPE)",
         ])
         .output()
-        .map_err(|e| format!("read user PATH (powershell): {e}"))?;
+        .map_err(|e| format!("read {scope} PATH (powershell): {e}"))?;
     if !out.status.success() {
         return Err(format!(
-            "read user PATH failed: {}",
+            "read {scope} PATH failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
     Ok(String::from_utf8_lossy(&out.stdout)
         .trim_end_matches(['\r', '\n'])
         .to_string())
+}
+
+/// Read the current USER-scope `Path` (Windows). Returns "" when unset.
+#[cfg(windows)]
+fn read_user_path() -> Result<String, String> {
+    read_path_scope("User")
 }
 
 /// Persist a new USER-scope `Path` (Windows). The value is passed via an env var
@@ -502,6 +594,7 @@ pub fn install_dir_on_user_path(
                 already_present: true,
                 dir: dir_str,
                 message: present_message.to_string(),
+                effective: None,
             }),
             Some(new_value) => {
                 write_user_path(&new_value)?;
@@ -510,6 +603,7 @@ pub fn install_dir_on_user_path(
                     already_present: false,
                     dir: dir_str,
                     message: added_message.to_string(),
+                    effective: None,
                 })
             }
         }
@@ -546,6 +640,7 @@ pub fn remove_dir_from_user_path(
                 already_present: false,
                 dir: dir_str,
                 message: absent_message.to_string(),
+                effective: None,
             }),
             Some(new_value) => {
                 write_user_path(&new_value)?;
@@ -554,6 +649,7 @@ pub fn remove_dir_from_user_path(
                     already_present: true,
                     dir: dir_str,
                     message: removed_message.to_string(),
+                    effective: None,
                 })
             }
         }
@@ -600,7 +696,8 @@ pub fn identity_shim_on_user_path() -> Result<bool, String> {
 /// Reverse: [`uninstall_identity_shim_from_user_path`].
 pub fn install_identity_shim_on_user_path() -> Result<CliPathOutcome, String> {
     let dir = identity_shim_dir().ok_or_else(|| "home directory unresolvable".to_string())?;
-    install_dir_on_user_path(
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut outcome = install_dir_on_user_path(
         &dir,
         // PREPEND — the shim's `claude` shadow must be resolved BEFORE the real
         // `claude` that is already on an earlier PATH entry, or this whole opt-in
@@ -610,7 +707,112 @@ pub fn install_identity_shim_on_user_path() -> Result<CliPathOutcome, String> {
         "Already enabled — new terminals already get coord identity.",
         "Enabled. Open a NEW terminal; `claude` there will now request coord device identity \
          from the running runner.",
-    )
+    )?;
+    // HONESTY check (Windows): a fresh shell composes `Path` as the MACHINE
+    // (SYSTEM) value FOLLOWED by the USER value, and a USER-PATH entry can never
+    // win resolution against a `claude` already on the SYSTEM PATH. So prepending
+    // to the USER PATH can install the opt-in yet leave it INERT. Resolve where
+    // `claude` will ACTUALLY come from in a fresh shell and report the truth
+    // rather than an unqualified "added: true". We do NOT try to edit the SYSTEM
+    // PATH (needs elevation; out of scope).
+    #[cfg(windows)]
+    {
+        match identity_shim_shadow_blocker(&dir) {
+            Some(blocker) => {
+                outcome.effective = Some(false);
+                outcome.message = format!(
+                    "Installed on your USER PATH, but it will NOT take effect: `{}` is \
+                     resolved before the shim (typically because it is on the SYSTEM PATH, \
+                     which a USER-PATH entry cannot override). Remove/relocate that `claude`, \
+                     or place the shim dir ahead of it on the SYSTEM PATH (needs an elevated \
+                     shell), for coord identity to apply to bare terminals.",
+                    blocker.display()
+                );
+            }
+            None => outcome.effective = Some(true),
+        }
+    }
+    Ok(outcome)
+}
+
+/// The candidate `claude` filenames to probe within a PATH dir, in Windows
+/// PATHEXT resolution-preference order (`.EXE` before `.CMD` before `.BAT`),
+/// then the bare name. Only the DIR order decides shadowing; the extension order
+/// is honored for completeness / to report the file a shell would actually run.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn claude_candidate_names() -> [&'static str; 4] {
+    ["claude.exe", "claude.cmd", "claude.bat", "claude"]
+}
+
+/// A real `claude` executable in `dir`, if one exists (PATHEXT order). `None`
+/// otherwise. The `is_file` probe is injected in tests via
+/// [`claude_shadowing_shim`]'s closure, so this concrete filesystem version is
+/// only the production probe.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn probe_claude_in(dir: &Path) -> Option<PathBuf> {
+    claude_candidate_names()
+        .iter()
+        .map(|n| dir.join(n))
+        .find(|c| c.is_file())
+}
+
+/// Given the ORDERED dirs a fresh shell searches, the shim dir, and a probe that
+/// reports a real `claude` in a dir, return the real `claude` that would SHADOW
+/// the shim (resolve before it), or `None` if the shim wins. Pure over its
+/// inputs so the resolution rule is unit-testable with a stubbed PATH — no real
+/// `claude` on disk required. Walking in order: the FIRST of {a dir with a real
+/// `claude`, the shim dir} decides — a real `claude` first ⇒ it shadows; the
+/// shim dir first ⇒ the shim wins (and its own copy is never probed).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn claude_shadowing_shim(
+    dirs: &[PathBuf],
+    shim_dir: &Path,
+    probe: impl Fn(&Path) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    let norm = |p: &Path| {
+        p.to_string_lossy()
+            .trim_end_matches(['/', '\\'])
+            .to_ascii_lowercase()
+    };
+    let shim_norm = norm(shim_dir);
+    for dir in dirs {
+        if norm(dir) == shim_norm {
+            return None; // reached the shim dir first → it wins from here on
+        }
+        if let Some(found) = probe(dir) {
+            return Some(found); // a real claude resolves before the shim
+        }
+    }
+    None // shim not on the list, or no real claude anywhere → nothing shadows it
+}
+
+/// The ordered dirs a fresh Windows shell searches: the MACHINE (`system`) `Path`
+/// entries FOLLOWED by the USER (`user`) `Path` entries — exactly how the OS
+/// composes a new process's `Path`. Empty segments are dropped (they never hold a
+/// resolvable tool).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn fresh_shell_path_dirs(system: &str, user: &str) -> Vec<PathBuf> {
+    system
+        .split(';')
+        .chain(user.split(';'))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// Windows: after the USER-PATH prepend, resolve whether a real `claude` will
+/// shadow the shim in a fresh shell. Reads the SYSTEM then USER `Path` (reading
+/// SYSTEM needs no elevation), composes the fresh-shell search order, and probes
+/// for a real `claude` ahead of the shim dir. A read failure fails OPEN to "not
+/// shadowed" (`None`) — the install already succeeded; we never turn a failed
+/// diagnostic into a failed install.
+#[cfg(windows)]
+fn identity_shim_shadow_blocker(shim_dir: &Path) -> Option<PathBuf> {
+    let system = read_path_scope("Machine").unwrap_or_default();
+    let user = read_user_path().unwrap_or_default();
+    let dirs = fresh_shell_path_dirs(&system, &user);
+    claude_shadowing_shim(&dirs, shim_dir, probe_claude_in)
 }
 
 /// Remove the persistent identity-shim dir from the USER PATH — the operator's
@@ -668,6 +870,44 @@ mod tests {
         // The real-claude dir is still present, just no longer first.
         assert!(result.contains("C:\\tools\\claude"));
 
+        // REGRESSION (FIX A): the shim dir already present but AFTER a real
+        // `claude` dir must be MOVED to the front, and its old occurrence
+        // REMOVED (no duplicate). A position-blind "present ⇒ None" left the real
+        // `claude` (earlier) winning, making the opt-in a silent no-op.
+        let shim_later = format!("C:\\tools\\claude;{shim};C:\\Windows\\System32");
+        let moved = compute_path_addition(&shim_later, shim, ';', Placement::Prepend).unwrap();
+        assert!(
+            moved.starts_with(shim),
+            "the shim dir must be moved to the FRONT, got {moved}"
+        );
+        assert_eq!(
+            moved.matches(shim).count(),
+            1,
+            "the old occurrence must be gone — no duplicate shim entry, got {moved}"
+        );
+        assert_eq!(
+            moved,
+            format!("{shim};C:\\tools\\claude;C:\\Windows\\System32"),
+            "move-to-front preserves the other entries in order"
+        );
+
+        // Already FIRST → None (no churn), even with more entries after it.
+        assert!(
+            compute_path_addition(&format!("{shim};C:\\tools\\claude"), shim, ';', Placement::Prepend)
+                .is_none(),
+            "prepend when the dir is already at the front is a no-op"
+        );
+        // Move-to-front is case-insensitive: a differently-cased existing entry
+        // is still deduped (never left as a stale duplicate).
+        let mixed = format!("C:\\tools\\claude;{}", shim.to_uppercase());
+        let moved_ci = compute_path_addition(&mixed, shim, ';', Placement::Prepend).unwrap();
+        assert!(moved_ci.starts_with(shim));
+        assert_eq!(
+            moved_ci,
+            format!("{shim};C:\\tools\\claude"),
+            "a case-variant existing occurrence is removed, not duplicated"
+        );
+
         // Empty current → just the dir (no dangling separator), same as append.
         assert_eq!(
             compute_path_addition("", shim, ';', Placement::Prepend).as_deref(),
@@ -682,14 +922,18 @@ mod tests {
 
     #[test]
     fn path_addition_is_idempotent_and_case_trailing_insensitive() {
-        // Exact match → None (both placements agree: presence is placement-agnostic).
+        // APPEND: present ANYWHERE → None (placement-agnostic presence suffices).
         assert!(
             compute_path_addition("C:\\a;C:\\qontinui", "C:\\qontinui", ';', Placement::Append)
                 .is_none()
         );
+        // PREPEND idempotence is POSITION-aware: a no-op ONLY when the dir is
+        // already the first entry. Present-but-not-first is NOT idempotent — it
+        // moves to the front (asserted in the dedicated prepend test below).
         assert!(
-            compute_path_addition("C:\\a;C:\\qontinui", "C:\\qontinui", ';', Placement::Prepend)
-                .is_none()
+            compute_path_addition("C:\\qontinui;C:\\a", "C:\\qontinui", ';', Placement::Prepend)
+                .is_none(),
+            "prepend is a no-op only when the dir already wins resolution (is first)"
         );
         // Case-insensitive + trailing-slash-insensitive → still present → None.
         assert!(
@@ -775,6 +1019,54 @@ mod tests {
                 "must NOT be the runner install dir — the two PATH opt-ins are independent"
             );
         }
+    }
+
+    /// FIX D — the identity-shim install reports HONESTLY whether it will shadow
+    /// `claude`. Driven through the pure resolver with a stubbed `is_file` probe
+    /// so no real `claude` on disk is needed (and it runs on every CI leg).
+    #[test]
+    fn identity_shim_shadow_detection_is_position_aware() {
+        let shim = PathBuf::from("C:\\Users\\me\\.qontinui\\runner\\identity-shim");
+        let node = PathBuf::from("C:\\tools\\node");
+        // A real `claude` lives in the node dir only.
+        let probe = |d: &Path| (d == node.as_path()).then(|| d.join("claude.cmd"));
+
+        // A real `claude` on a SYSTEM dir BEFORE the shim → shadowed; the blocker
+        // is named.
+        let dirs = vec![
+            PathBuf::from("C:\\Windows\\System32"),
+            node.clone(),
+            shim.clone(),
+        ];
+        assert_eq!(
+            claude_shadowing_shim(&dirs, &shim, probe),
+            Some(PathBuf::from("C:\\tools\\node\\claude.cmd")),
+            "a real claude ahead of the shim dir shadows it"
+        );
+
+        // Shim dir FIRST → it wins; a later `claude` never shadows it.
+        let dirs_shim_first = vec![shim.clone(), node.clone()];
+        assert_eq!(claude_shadowing_shim(&dirs_shim_first, &shim, probe), None);
+
+        // No real claude anywhere → the shim wins.
+        assert_eq!(claude_shadowing_shim(&dirs, &shim, |_| None), None);
+
+        // Case-insensitive shim-dir match: an upper-cased shim entry still counts
+        // as "reached the shim" (so a claude AFTER it does not shadow).
+        let dirs_ci = vec![PathBuf::from(shim.to_string_lossy().to_uppercase()), node.clone()];
+        assert_eq!(claude_shadowing_shim(&dirs_ci, &shim, probe), None);
+
+        // Fresh-shell composition: SYSTEM entries precede USER entries, empties
+        // dropped.
+        let dirs = fresh_shell_path_dirs("C:\\Windows;;C:\\sys", "C:\\Users\\me\\bin; ");
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("C:\\Windows"),
+                PathBuf::from("C:\\sys"),
+                PathBuf::from("C:\\Users\\me\\bin"),
+            ]
+        );
     }
 
     fn v(parts: &[&str]) -> Vec<String> {

@@ -286,18 +286,16 @@ pub fn identity_mcp_config_args(tool: IdentityTool, mcp_config_path: Option<&str
 }
 
 /// Does the per-machine opt-in marker (`~/.qontinui/allow-session-coord-identity`)
-/// exist? This is the SAME file the runner-side mint route's gate requires
-/// (`coord_mcp::SESSION_IDENTITY_MARKER_FILE`). That module lives in the runner
-/// BIN crate and so is not importable from this separate bin, so the file name is
-/// mirrored here — a tiny, stable string. Fail-closed: an unresolvable home dir
-/// reads as NOT opted in (never as consent), matching the route's own gate.
+/// exist? This is the SAME file the runner-side mint route's gate requires. The
+/// runner-side gate (`coord_mcp::session_identity_gate`) lives in the runner BIN
+/// crate and so is not importable here, so BOTH resolve the marker through the
+/// ONE shared LIB helper (`profile_cli::session_identity_marker_path`) — the
+/// whole path (directory + filename) is guaranteed identical, and a rename can no
+/// longer silently desync the shim from the gate. Fail-closed: an unresolvable
+/// home dir reads as NOT opted in (never as consent), matching the route's gate.
 fn session_identity_marker_exists() -> bool {
-    dirs::home_dir()
-        .map(|h| {
-            h.join(".qontinui")
-                .join("allow-session-coord-identity")
-                .exists()
-        })
+    qontinui_runner_lib::profile_cli::session_identity_marker_path()
+        .map(|p| p.exists())
         .unwrap_or(false)
 }
 

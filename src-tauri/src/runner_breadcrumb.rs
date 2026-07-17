@@ -45,11 +45,14 @@
 //!
 //! # Selection rule
 //!
-//! Prefer the primary ([`preferred_primary_port`] — `QONTINUI_PRIMARY_PORT`,
-//! else `9876`), else ANY live breadcrumb. Temp runners (9877-9899) are
-//! explicitly NOT preferred: they are ephemeral and rebuild-spawned, so a bare
-//! session must not bind its identity to one that will be torn down mid-session.
-//! Prefer-primary handles that; there is no temp-runner affinity.
+//! Prefer the record the WRITER marked [`PortBreadcrumb::primary`], else the
+//! newest live breadcrumb. The reader TRUSTS the denormalized flag and does NOT
+//! re-derive the primary from its own env — the writer and reader are different
+//! processes with independent envs, so re-derivation would disagree (see
+//! [`select_live`]). Temp runners (9877-9899) are explicitly NOT preferred: they
+//! are ephemeral and rebuild-spawned, so a bare session must not bind its
+//! identity to one that will be torn down mid-session. Prefer-primary handles
+//! that; there is no temp-runner affinity.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -279,13 +282,41 @@ pub fn preferred_primary_port() -> u16 {
         .unwrap_or(PRIMARY_PORT)
 }
 
-/// Pick the runner a reader should talk to: the `primary` port's record if it is
-/// live, else the live record with the most recent `started_at_ms` (the newest
-/// runner is the one an operator most likely just started). `None` when nothing
-/// live is advertised.
+/// Pick the runner a reader should talk to: the record the WRITER marked
+/// [`PortBreadcrumb::primary`] if it is live, else the live record with the most
+/// recent `started_at_ms` (the newest runner is the one an operator most likely
+/// just started). `None` when nothing live is advertised.
+///
+/// # Trust the record's flag — do NOT re-derive the primary from the reader's env
+///
+/// The WRITER and the READER are DIFFERENT PROCESSES with INDEPENDENT envs, so
+/// both calling [`preferred_primary_port`] does NOT make them agree: a runner
+/// launched with `QONTINUI_PRIMARY_PORT` set, read by a bare terminal that lacks
+/// it, would disagree on which port is "primary". The [`PortBreadcrumb::primary`]
+/// bool was denormalized into the record precisely so a reader need not — and
+/// must not — re-derive it. Selection here is therefore flag-driven only; no port
+/// argument, no env read. (The WRITER keeps deriving `primary` from its OWN env,
+/// which is correct: the supervisor sets `QONTINUI_PRIMARY_PORT` on a temp runner
+/// to point at the REAL primary, so the temp binds a suffixed name with
+/// `primary=false` and the real primary — no override — binds 9876 with
+/// `primary=true`.)
 ///
 /// `is_live` is injected so the selection rule is unit-testable without spawning
 /// processes; production callers pass [`pid_is_live`] via [`resolve_live_runner`].
+///
+/// # Residual: a primary that lost its conventional port (accepted, not fixed)
+///
+/// A primary that FALLS BACK off 9876 (because 9876 was already taken) has no
+/// `QONTINUI_PRIMARY_PORT` override in its env, so the writer derives
+/// `primary = (bound_port == 9876) == false` and it writes a SUFFIXED name with
+/// `primary=false`. A reader then cannot distinguish it from a temp runner and
+/// may pick a newer temp instead. This narrow "primary lost its conventional
+/// port" case is deliberately left alone: the selection is NOT inverted to chase
+/// it, because doing so would reintroduce env re-derivation or a fragile
+/// heuristic. The cost is bounded by construction — the caller's next step is to
+/// ASK the selected runner to mint, so at worst one refused HTTP call and a
+/// fail-open "no coord identity that session", never a mis-paired nonce (the same
+/// containment the module doc describes for pid reuse).
 ///
 /// # Residual pid-reuse risk (accepted, not fixed here)
 ///
@@ -294,24 +325,15 @@ pub fn preferred_primary_port() -> u16 {
 /// survives: a crashed primary that skipped [`remove_published`] leaves
 /// `api-port.json`, and on Windows its pid can be recycled onto an unrelated live
 /// process, so [`pid_is_live`] returns true and the stale record is preferred
-/// over a fresh temp runner. This is deliberately NOT worked around by "prefer
-/// the newest live record when the primary looks older": the primary is NORMALLY
-/// older than a freshly-spawned temp runner (it comes up at boot; temp runners
-/// spawn later), so that heuristic would invert this module's load-bearing
-/// invariant — "prefer the primary, NEVER bind a bare session to a temp runner
-/// that will be torn down mid-session" — in the common case, to defend a rare
-/// pid-recycle. The cost of the residual edge is bounded by construction: the
-/// caller's next step is to ASK the selected runner to mint, so a wrong-but-live
-/// pid costs one refused HTTP call and a fail-open "no identity", never a
-/// mis-paired nonce (same containment the module doc describes for pid reuse).
+/// over a fresh temp runner. Same bounded cost as above (one refused mint call,
+/// fail-open), so it is likewise not worked around here.
 pub fn select_live(
     all: &[PortBreadcrumb],
-    primary: u16,
     is_live: impl Fn(u32) -> bool,
 ) -> Option<PortBreadcrumb> {
     let live: Vec<&PortBreadcrumb> = all.iter().filter(|b| is_live(b.pid)).collect();
     live.iter()
-        .find(|b| b.port == primary)
+        .find(|b| b.primary)
         .or_else(|| live.iter().max_by_key(|b| b.started_at_ms))
         .map(|b| (*b).clone())
 }
@@ -322,11 +344,7 @@ pub fn select_live(
 /// (fail-open), never as an error worth failing a launch over.
 pub fn resolve_live_runner() -> Option<PortBreadcrumb> {
     let dir = breadcrumb_dir()?;
-    select_live(
-        &list_breadcrumbs_in(&dir),
-        preferred_primary_port(),
-        pid_is_live,
-    )
+    select_live(&list_breadcrumbs_in(&dir), pid_is_live)
 }
 
 #[cfg(test)]
@@ -375,15 +393,21 @@ mod tests {
         assert!(!temp_rec.primary);
         assert_eq!(file_name_for(9877, configured_primary), "api-port-9877.json");
 
-        // Reader side: with the SAME primary notion, the primary wins over the
-        // newer temp runner even though the temp runner started later.
-        let primary_live = rec(configured_primary, 10, 100);
-        let temp_live = rec(9877, 11, 999); // newer, but a temp runner
-        let selected = select_live(&[temp_live, primary_live.clone()], configured_primary, |_| true);
+        // Reader side: the reader TRUSTS the record's `primary` flag (set by the
+        // writer above), so the primary wins over the newer temp runner even
+        // though the temp runner started later — WITHOUT the reader re-deriving
+        // the primary from its own env. Build the primary record the way the
+        // writer would (flag = true on the configured-primary port).
+        let primary_live = PortBreadcrumb {
+            primary: true,
+            ..rec(configured_primary, 10, 100)
+        };
+        let temp_live = rec(9877, 11, 999); // newer, but a temp runner (primary=false)
+        let selected = select_live(&[temp_live, primary_live.clone()], |_| true);
         assert_eq!(
             selected,
             Some(primary_live),
-            "the reader must prefer the configured-primary record over a newer temp runner"
+            "the reader must prefer the flagged-primary record over a newer temp runner"
         );
     }
 
@@ -451,29 +475,58 @@ mod tests {
     /// `pid` exists to catch (a real config pointed at a dead :9879).
     #[test]
     fn select_live_prefers_primary_then_newest_and_never_a_corpse() {
+        // `rec(9876, …)` is flagged primary (9876 == PRIMARY_PORT); the temps are
+        // not. Selection is flag-driven, so the flag — not the port — is what
+        // makes `primary` win.
         let primary = rec(9876, 1, 100);
         let temp_old = rec(9877, 2, 200);
         let temp_new = rec(9878, 3, 300);
         let all = vec![primary.clone(), temp_old.clone(), temp_new.clone()];
 
-        // Everything live → the primary wins even though it is the oldest.
-        assert_eq!(
-            select_live(&all, PRIMARY_PORT, |_| true),
-            Some(primary.clone())
-        );
+        // Everything live → the flagged primary wins even though it is the oldest.
+        assert_eq!(select_live(&all, |_| true), Some(primary.clone()));
 
         // Primary dead → the NEWEST live temp runner wins.
-        assert_eq!(
-            select_live(&all, PRIMARY_PORT, |pid| pid != 1),
-            Some(temp_new)
-        );
+        assert_eq!(select_live(&all, |pid| pid != 1), Some(temp_new));
 
         // Nothing live → None (fail-open: the caller simply gets no identity,
         // and never pairs a nonce with a dead port).
-        assert_eq!(select_live(&all, PRIMARY_PORT, |_| false), None);
+        assert_eq!(select_live(&all, |_| false), None);
+    }
 
-        // An explicit non-9876 primary (QONTINUI_PRIMARY_PORT) is honored.
-        assert_eq!(select_live(&all, 9877, |_| true), Some(temp_old));
+    /// FIX B — the reader TRUSTS the record's `primary` flag and NEVER re-derives
+    /// it from its own env. A live `primary=true` record on port P beats a NEWER
+    /// live record on another port, regardless of any `QONTINUI_PRIMARY_PORT` in
+    /// the reader's env (writer and reader are different processes with
+    /// independent envs, so re-derivation would disagree). `select_live` takes no
+    /// port argument — the signature itself is the guarantee — and this drives it
+    /// with the reader's env deliberately set to a DIFFERENT port to prove it is
+    /// ignored.
+    #[test]
+    fn select_live_trusts_primary_flag_regardless_of_reader_env() {
+        let primary = PortBreadcrumb {
+            primary: true,
+            ..rec(9876, 1, 100)
+        };
+        let newer = rec(9878, 2, 999); // newer, primary=false
+        let all = vec![newer, primary.clone()];
+
+        let prev = std::env::var(PRIMARY_PORT_ENV).ok();
+        // Reader env names a DIFFERENT "primary" — must be ignored by selection.
+        std::env::set_var(PRIMARY_PORT_ENV, "9878");
+        assert_eq!(
+            select_live(&all, |_| true),
+            Some(primary.clone()),
+            "the reader must honor the record's primary flag, not its own env"
+        );
+        // Env unset → same answer; selection is flag-driven, full stop.
+        std::env::remove_var(PRIMARY_PORT_ENV);
+        assert_eq!(select_live(&all, |_| true), Some(primary));
+
+        match prev {
+            Some(v) => std::env::set_var(PRIMARY_PORT_ENV, v),
+            None => std::env::remove_var(PRIMARY_PORT_ENV),
+        }
     }
 
     /// Our own pid is live; pid 0 is not a live user process on any supported

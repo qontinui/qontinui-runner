@@ -177,14 +177,20 @@ pub(crate) const SESSION_IDENTITY_ENABLE_FLAG: &str = "QONTINUI_SESSION_COORD_ID
 
 /// File name of the per-machine operator opt-in marker, under `~/.qontinui/`.
 /// Its mere existence is the signal; contents are never read.
-pub(crate) const SESSION_IDENTITY_MARKER_FILE: &str = "allow-session-coord-identity";
+///
+/// Re-exported from the LIB crate ([`qontinui_runner_lib::profile_cli`]) so this
+/// authoritative runner-side gate and the standalone `qontinui-shim` `.exe` share
+/// ONE source of truth for the marker — a rename can no longer silently desync
+/// the two processes.
+pub(crate) use qontinui_runner_lib::profile_cli::SESSION_IDENTITY_MARKER_FILE;
 
 /// Absolute path of the opt-in marker (`~/.qontinui/allow-session-coord-identity`).
 /// `None` when the home dir is unresolvable — which [`session_identity_gate`]
 /// treats as NOT opted in (fail-closed: an unresolvable home must never read as
-/// consent).
+/// consent). Delegates to the shared lib resolver so the gate and the shim
+/// compute the identical path (directory + filename), not merely the filename.
 pub(crate) fn session_identity_marker_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".qontinui").join(SESSION_IDENTITY_MARKER_FILE))
+    qontinui_runner_lib::profile_cli::session_identity_marker_path()
 }
 
 /// Why the mint route refused. Typed rather than a bare bool so the route can
@@ -628,6 +634,27 @@ fn register_proxy_nonce(workdir: &str) -> String {
 /// class-scoped, so an ephemeral mint leaves the persisted (runner-spawn) set
 /// byte-identical; writing it back would be pointless I/O whose only possible
 /// effect is to clobber the set a concurrent restore just populated.
+///
+/// # Superseded-ephemeral window (intentional; per-nonce revoke deferred)
+///
+/// Removing per-workdir ephemeral eviction (the correct fix for the sibling-DoS,
+/// where a bare mint for a shared cwd would 401 a live sibling's MCP client) has
+/// a deliberate consequence: a SUPERSEDED ephemeral nonce — one whose session
+/// ended or was re-minted — stays VALID until its [`EPHEMERAL_NONCE_TTL`]
+/// (12h) expires. There is no per-nonce revoke. What bounds the exposure:
+/// - per-nonce validity is capped by the TTL (a leaked nonce dies within a
+///   working day and cannot be replayed against the next runner — it never
+///   reaches disk), and
+/// - instant GLOBAL revoke is deleting the opt-in marker
+///   ([`session_identity_marker_path`]), re-checked per request via
+///   [`session_identity_gate`] — the operator's real kill switch that
+///   invalidates ALL ephemeral sessions at once.
+///
+/// Precise per-nonce revoke is INTENTIONALLY deferred to the credential-exposure
+/// plan (`2026-07-17-coord-device-credential-exposure-and-authz-gaps`). Do NOT
+/// shorten the TTL to paper over this — it would 401 live sessions mid-turn
+/// (the MCP client never re-reads its config) — and do NOT re-add cwd-scoped
+/// eviction, which caused the sibling-DoS.
 fn register_session_proxy_nonce(workdir: &str) -> String {
     let (nonce, _snapshot) =
         mint_and_register_nonce(workdir, ProxyPrincipal::Device, NonceLifetime::ephemeral());
@@ -699,47 +726,45 @@ fn mint_and_register_nonce(
     let now = std::time::Instant::now();
     let snapshot = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
-        // Bound the map: opportunistically sweep EVERY expired ephemeral nonce on
-        // each mint. Because an ephemeral mint no longer evicts a prior
-        // same-workdir ephemeral (below), expired ephemerals would otherwise be
-        // reaped only lazily on their own re-lookup ([`live_binding`]) — so on a
-        // long-lived opted-in runner minting across many distinct cwds the map
-        // could grow unbounded. This mirrors how [`grace_evicted_device_nonces`]
-        // self-prunes on insert. Cheap, bounded to mint frequency, and it never
-        // touches a persistent nonce (no expiry) nor an unexpired ephemeral.
-        map.retain(|_, b| match b.lifetime {
-            NonceLifetime::Ephemeral { expires_at } => expires_at > now,
-            NonceLifetime::Persistent => true,
+        // ONE pass does all pre-insert map maintenance (fused from three: an
+        // expired-ephemeral sweep, a graceable collect, and a persistent-eviction
+        // retain). The single `retain` closure decides removal AND collects the
+        // grace set into `evicted_graceable`, so the map is walked once under the
+        // lock. Semantics are byte-for-byte the prior three passes — see this
+        // fn's doc for the eviction rule.
+        let mut evicted_graceable: Vec<String> = Vec::new();
+        map.retain(|n, b| {
+            // (1) Sweep EVERY expired ephemeral, whatever its workdir/class.
+            // Because an ephemeral mint no longer evicts a prior same-workdir
+            // ephemeral, expired ones would otherwise be reaped only lazily on
+            // their own re-lookup ([`live_binding`]) — so a long-lived opted-in
+            // runner minting across many distinct cwds could grow the map
+            // unbounded. Cheap, bounded to mint frequency; never touches a
+            // persistent nonce (no expiry) nor an unexpired ephemeral.
+            if let NonceLifetime::Ephemeral { expires_at } = b.lifetime {
+                if expires_at <= now {
+                    return false;
+                }
+            }
+            // (2) Class-scoped eviction. Only a PERSISTENT mint evicts, and only
+            // the prior PERSISTENT same-workdir nonces (today's PTY re-provision
+            // behavior — never an ephemeral, so the class-scoping holds). An
+            // EPHEMERAL mint evicts NOTHING: two DIFFERENT bare sessions routinely
+            // share a cwd, and an ephemeral eviction is not graced, so removing a
+            // sibling ephemeral nonce would 401 the other session's
+            // already-connected MCP client mid-session. The DEVICE nonces among
+            // the evicted set are collected to ride a short grace TTL (Change 3) —
+            // an in-flight client that cached one keeps validating until it
+            // reconnects; agent nonces are NOT graced (they hard-fail closed on
+            // re-mint), so they are dropped without being collected.
+            if !ephemeral && b.workdir == workdir && !b.lifetime.is_ephemeral() {
+                if b.principal == ProxyPrincipal::Device {
+                    evicted_graceable.push(n.clone());
+                }
+                return false;
+            }
+            true
         });
-        // Eviction is scoped by class (see this fn's doc). Change 3: collect the
-        // DEVICE nonces being evicted for this workdir so they ride a short grace
-        // TTL — an in-flight client that cached one keeps validating until it
-        // reconnects. Agent nonces are NOT graced (they must hard-fail closed on
-        // re-mint), so they are simply dropped by the retain.
-        //
-        // Only a PERSISTENT mint evicts. An EPHEMERAL mint evicts NOTHING: two
-        // DIFFERENT bare sessions routinely share a cwd, and an ephemeral eviction
-        // is not graced, so removing a sibling ephemeral nonce would 401 the other
-        // session's already-connected MCP client mid-session. A prior ephemeral is
-        // left to live out its own TTL (already swept above once expired).
-        let evicted_graceable: Vec<String> = if ephemeral {
-            Vec::new()
-        } else {
-            let graceable: Vec<String> = map
-                .iter()
-                .filter(|(n, b)| {
-                    b.workdir == workdir
-                        && b.principal == ProxyPrincipal::Device
-                        && !b.lifetime.is_ephemeral()
-                        && *n != &nonce
-                })
-                .map(|(n, _)| n.clone())
-                .collect();
-            // Persistent-same-workdir eviction (today's PTY re-provision behavior).
-            // Never touches an ephemeral nonce, so the class-scoping holds.
-            map.retain(|_, b| !(b.workdir == workdir && !b.lifetime.is_ephemeral()));
-            graceable
-        };
         map.insert(
             nonce.clone(),
             NonceBinding {
