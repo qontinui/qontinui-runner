@@ -25,6 +25,7 @@ pub(crate) mod gemma_local_warm;
 pub mod middleware;
 pub mod multimodal;
 pub(crate) mod oauth_refresh;
+pub mod oauth_usage;
 pub mod oneshot;
 mod process;
 pub mod retry;

@@ -112,6 +112,8 @@ pub fn save_ai_settings(
     auto_refine_video_after_iterations: Option<u32>,
     interactive_sessions_enabled: Option<bool>,
     memory_federation_enabled: Option<bool>,
+    auto_migrate_on_token_exhaustion: Option<bool>,
+    auto_continue_after_migration: Option<bool>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Saving AI settings: provider={}, execution_mode={}, timeout={}s, config_dir={:?}, account_selection={:?}, video_after_iterations={:?}, interactive={:?}, memory_federation={:?}",
@@ -156,11 +158,14 @@ pub fn save_ai_settings(
             timeout_seconds,
             config_dir,
             account_selection_mode: selection_mode,
-            // This command's surface doesn't expose the auto-migration
-            // switch; preserve whatever is currently configured.
-            auto_migrate_on_token_exhaustion: existing_settings
-                .claude_cli
-                .auto_migrate_on_token_exhaustion,
+            // `None` (older frontends) preserves whatever is configured.
+            auto_migrate_on_token_exhaustion: auto_migrate_on_token_exhaustion.unwrap_or(
+                existing_settings
+                    .claude_cli
+                    .auto_migrate_on_token_exhaustion,
+            ),
+            auto_continue_after_migration: auto_continue_after_migration
+                .unwrap_or(existing_settings.claude_cli.auto_continue_after_migration),
         },
         claude_api: ClaudeApiSettings { model, max_tokens },
         // Preserve existing Gemini settings
@@ -902,7 +907,7 @@ pub fn save_agentic_settings(
 // ============================================================================
 
 /// Usage information for a single Claude account
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct AccountUsageInfo {
     pub config_dir: String,
     pub label: String,
@@ -920,6 +925,29 @@ pub struct AccountUsageInfo {
     pub period_elapsed_fraction: Option<f64>,
     /// Days remaining until the billing period resets.
     pub period_remaining_days: Option<f64>,
+    /// Session-window (5-hour) utilization 0.0–1.0. Only populated when the
+    /// stats came from the OAuth usage endpoint (`source == "oauth_usage"`).
+    #[serde(default)]
+    pub session_utilization: Option<f64>,
+    /// Unix seconds when the 5-hour session window resets.
+    #[serde(default)]
+    pub session_resets_at: Option<u64>,
+    /// Per-model scoped weekly limits (e.g. the Fable-only cap).
+    #[serde(default)]
+    pub model_limits: Vec<ModelLimitInfo>,
+    /// Where these stats came from: `"oauth_usage"` (free endpoint) or
+    /// `"probe"` (Haiku header probe fallback).
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// One per-model scoped weekly limit, mirrored to the frontend.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ModelLimitInfo {
+    pub model: String,
+    /// Fraction used, 0.0–1.0.
+    pub utilization: f64,
+    pub resets_at: Option<u64>,
 }
 
 /// Compute expected usage fields from the reset timestamp.
@@ -1037,17 +1065,68 @@ pub async fn probe_account_usage(config_dir: String) -> AccountUsageInfo {
                 config_dir,
                 label,
                 utilization: 1.0,
-                rate_limit_type: None,
-                resets_at: None,
-                status: None,
                 error: Some(e),
-                expected_utilization: None,
-                usage_delta: None,
-                period_elapsed_fraction: None,
-                period_remaining_days: None,
+                ..Default::default()
             };
         }
     };
+
+    // Preferred source: the OAuth usage endpoint — zero token cost, exact
+    // session-window (5h) + weekly utilization and reset times (the same
+    // numbers `/usage` shows). Subscription OAuth tokens only; API keys have
+    // no usage windows, so they skip straight to the header probe below.
+    if token.starts_with("sk-ant-oat") {
+        match crate::ai_provider::oauth_usage::fetch(&token).await {
+            Ok(snap) => {
+                let weekly = snap.seven_day.clone();
+                let session = snap.five_hour.clone();
+                let utilization_7d = weekly.as_ref().map(|w| w.utilization).unwrap_or(0.0);
+                let resets_at_7d = weekly.as_ref().and_then(|w| w.resets_at);
+                let (expected, delta, elapsed_frac, remaining_days) =
+                    compute_expected_usage(utilization_7d, resets_at_7d);
+                info!(
+                    "Account '{}' (oauth_usage): 7d={:.0}% 5h={:.0}%",
+                    label,
+                    utilization_7d * 100.0,
+                    session
+                        .as_ref()
+                        .map(|s| s.utilization * 100.0)
+                        .unwrap_or(0.0),
+                );
+                return AccountUsageInfo {
+                    config_dir,
+                    label,
+                    utilization: utilization_7d,
+                    rate_limit_type: Some("seven_day".to_string()),
+                    resets_at: resets_at_7d,
+                    status: snap.blocking_severity.then(|| "blocked".to_string()),
+                    error: None,
+                    expected_utilization: expected,
+                    usage_delta: delta,
+                    period_elapsed_fraction: elapsed_frac,
+                    period_remaining_days: remaining_days,
+                    session_utilization: session.as_ref().map(|s| s.utilization),
+                    session_resets_at: session.as_ref().and_then(|s| s.resets_at),
+                    model_limits: snap
+                        .model_limits
+                        .into_iter()
+                        .map(|m| ModelLimitInfo {
+                            model: m.model,
+                            utilization: m.utilization,
+                            resets_at: m.resets_at,
+                        })
+                        .collect(),
+                    source: Some("oauth_usage".to_string()),
+                };
+            }
+            Err(e) => {
+                info!(
+                    "Account '{}': oauth usage endpoint unavailable ({e}) — falling back to header probe",
+                    label
+                );
+            }
+        }
+    }
 
     // Make a minimal API call — Haiku with max_tokens=1 is the cheapest possible.
     // OAuth tokens (`sk-ant-oat*`) must go via `Authorization: Bearer` +
@@ -1125,20 +1204,18 @@ pub async fn probe_account_usage(config_dir: String) -> AccountUsageInfo {
                 usage_delta: delta,
                 period_elapsed_fraction: elapsed_frac,
                 period_remaining_days: remaining_days,
+                session_utilization: utilization_5h,
+                source: Some("probe".to_string()),
+                ..Default::default()
             }
         }
         Err(e) => AccountUsageInfo {
             config_dir,
             label,
             utilization: 1.0,
-            rate_limit_type: None,
-            resets_at: None,
-            status: None,
             error: Some(format!("Network error: {}", e)),
-            expected_utilization: None,
-            usage_delta: None,
-            period_elapsed_fraction: None,
-            period_remaining_days: None,
+            source: Some("probe".to_string()),
+            ..Default::default()
         },
     }
 }
@@ -1184,10 +1261,20 @@ const EXHAUSTION_UTILIZATION: f64 = 0.99;
 /// now**. True when the probe call itself failed (the probe hits the same
 /// per-account quota the CLI uses — so a 429/403/spend-limit rejection shows
 /// up here even if weekly *token* utilization still looks low), when the
-/// server reports the account rejected/blocked/exceeded, or when weekly
-/// utilization is at/over [`EXHAUSTION_UTILIZATION`].
+/// server reports the account rejected/blocked/exceeded, when weekly
+/// utilization is at/over [`EXHAUSTION_UTILIZATION`], or when the 5-hour
+/// session window is at/over it (the OAuth usage endpoint reports the session
+/// window; the header probe leaves it `None`). The session-window arm is what
+/// lets a "5-hour limit reached" migration hint confirm — the weekly number
+/// alone stays low when only the session window is exhausted.
 fn probe_result_exhausted(info: &AccountUsageInfo) -> bool {
     if info.error.is_some() || info.utilization >= EXHAUSTION_UTILIZATION {
+        return true;
+    }
+    if info
+        .session_utilization
+        .is_some_and(|u| u >= EXHAUSTION_UTILIZATION)
+    {
         return true;
     }
     info.status.as_deref().is_some_and(|s| {
@@ -1225,10 +1312,15 @@ pub fn record_usage_snapshot(results: &[AccountUsageInfo]) {
 /// headless or co-pilot-only runner) still has fresh weekly-usage headroom
 /// data for `pick_best_account`. No-op when fewer than two accounts are
 /// configured (single-account runners have nothing to choose between).
-pub async fn refresh_account_usage_snapshot() {
+///
+/// Returns the fresh per-account results so callers that need more than the
+/// recorded snapshot (e.g. `account_migration`'s reset-time-aware cooldown)
+/// don't have to re-probe. Also mirrors the stats to coord's twin
+/// (best-effort, fire-and-forget).
+pub async fn refresh_account_usage_snapshot() -> Vec<AccountUsageInfo> {
     let config_dirs = crate::settings::get_claude_config_dirs();
     if config_dirs.len() < 2 {
-        return;
+        return Vec::new();
     }
     let futures: Vec<_> = config_dirs
         .into_iter()
@@ -1236,6 +1328,91 @@ pub async fn refresh_account_usage_snapshot() {
         .collect();
     let results = futures::future::join_all(futures).await;
     record_usage_snapshot(&results);
+    usage_twin_report::report_to_coord(&results).await;
+    results
+}
+
+/// Mirror per-account usage stats into coord's digital twin.
+///
+/// Best-effort and strictly fire-and-forget, mirroring the discipline of
+/// `terminal::auto_response::report`: bounded timeout, no retries, any
+/// failure is a `debug!` and a return. A coord that predates the
+/// `/coord/claude-accounts/usage` route 404s — silently tolerated so the
+/// runner PR can land independently of the coord one.
+mod usage_twin_report {
+    use serde::Serialize;
+    use tracing::debug;
+
+    /// Wire shape — SHARED CONTRACT with coord's
+    /// `POST /coord/claude-accounts/usage` ingest. Account identity is the
+    /// config-dir basename (label), never the full local path. Utilizations
+    /// are 0.0–1.0 fractions; reset times unix seconds.
+    #[derive(Serialize)]
+    struct WireAccount<'a> {
+        label: &'a str,
+        weekly_utilization: f64,
+        weekly_resets_at: Option<u64>,
+        session_utilization: Option<f64>,
+        session_resets_at: Option<u64>,
+        model_limits: &'a [super::ModelLimitInfo],
+        exhausted: bool,
+        source: Option<&'a str>,
+        error: bool,
+    }
+
+    #[derive(Serialize)]
+    struct WireBody<'a> {
+        accounts: Vec<WireAccount<'a>>,
+    }
+
+    pub(super) async fn report_to_coord(results: &[super::AccountUsageInfo]) {
+        if std::env::var_os("QONTINUI_ACCOUNT_USAGE_REPORT_DISABLED").is_some() {
+            return;
+        }
+        let base = match qontinui_runner_lib::profiles::resolve_coord_base() {
+            qontinui_runner_lib::profiles::CoordBase::Configured(base) => base,
+            _ => return,
+        };
+        let url = format!("{}/coord/claude-accounts/usage", base.trim_end_matches('/'));
+        let body = WireBody {
+            accounts: results
+                .iter()
+                .map(|r| WireAccount {
+                    label: &r.label,
+                    weekly_utilization: r.utilization,
+                    weekly_resets_at: r.resets_at,
+                    session_utilization: r.session_utilization,
+                    session_resets_at: r.session_resets_at,
+                    model_limits: &r.model_limits,
+                    exhausted: super::probe_result_exhausted(r),
+                    source: r.source.as_deref(),
+                    error: r.error.is_some(),
+                })
+                .collect(),
+        };
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let req = qontinui_runner_lib::auth::attach_device_auth(client.post(&url));
+        match req.json(&body).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                debug!(
+                    accounts = results.len(),
+                    "account usage mirrored to coord twin"
+                );
+            }
+            Ok(resp) => {
+                debug!(status = %resp.status(), "coord account-usage ingest non-2xx (older coord?) — skipped");
+            }
+            Err(e) => {
+                debug!(error = %e, "coord account-usage report failed — skipped");
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -1831,14 +2008,24 @@ mod exhaustion_tests {
             label: "acct".to_string(),
             utilization,
             rate_limit_type: Some("seven_day".to_string()),
-            resets_at: None,
             status: status.map(|s| s.to_string()),
             error: error.map(|s| s.to_string()),
-            expected_utilization: None,
-            usage_delta: None,
-            period_elapsed_fraction: None,
-            period_remaining_days: None,
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn session_window_exhaustion_confirms() {
+        // A hit 5-hour window must read as exhausted even while the weekly
+        // number is low — this is the gate that used to be blind to
+        // "5-hour limit reached" migrations.
+        let mut info = usage(0.20, None, None);
+        info.session_utilization = Some(1.0);
+        assert!(probe_result_exhausted(&info));
+        info.session_utilization = Some(0.5);
+        assert!(!probe_result_exhausted(&info));
+        info.session_utilization = None;
+        assert!(!probe_result_exhausted(&info));
     }
 
     #[test]
