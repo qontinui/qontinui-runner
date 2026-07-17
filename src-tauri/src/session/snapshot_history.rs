@@ -43,6 +43,24 @@
 //!   snapshot-read API; do not add one for restore code.
 //! - **Derived, not competing.** The registry stays the single mutable
 //!   store; this history is a write-only projection of it (no split-brain).
+//!
+//! ## Restorability is stamped at WRITE time, never inferred at read time
+//!
+//! A recovery tuple naming a session id that has no transcript on disk is not
+//! recoverable at all — the 2026-07-08 phantom-id incident recorded exactly
+//! that (`confirmed:false` + an id no `--resume` could ever load). `confirmed`
+//! alone did not reveal it, because the registry's own confirmation flag is a
+//! statement about a hook, not about the disk. So each entry additionally
+//! carries [`SnapshotSession::transcript_exists`] and
+//! [`SnapshotSession::restorable`] — a stat of the expected `*.jsonl` taken at
+//! the instant the snapshot is written, when the file is still there to stat.
+//!
+//! This is a **self-description, not a read API**: the fields exist so a human
+//! (or an assistant) reading a months-old line can tell a recoverable session
+//! from a phantom WITHOUT re-deriving disk state that has since changed. The
+//! module invariant above still holds — restore code must not read this file.
+//! The probe is optional ([`TranscriptProbe`]); unattached, both fields are
+//! omitted from the JSON entirely (`null` ⇒ "not probed", never "false").
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -74,6 +92,43 @@ const COMPACT_TRIGGER_RECORDS: usize = 4096;
 /// Once over the trigger, re-check compaction only every this many appends
 /// (amortizes the full-file rewrite; ~every 21h at heartbeat cadence).
 const COMPACT_CHECK_EVERY: usize = 256;
+
+/// Write-time existence probe for a session's on-disk transcript — the
+/// evidence that makes a recorded id actually `--resume`-able.
+///
+/// Injected (rather than called directly) so the store can stamp
+/// [`SnapshotSession::transcript_exists`] without this module taking a
+/// dependency on the disk layout, and so tests are deterministic.
+/// [`crate::session::reconcile::DiskTranscriptIndex`] is the real
+/// implementation.
+pub trait TranscriptProbe: std::fmt::Debug + Send + Sync {
+    /// Whether a transcript file exists for `session_id` (scoped by
+    /// `working_dir`, the transcript's project path — `None` when the record
+    /// carries no cwd, which the disk implementation treats as "cannot prove").
+    fn transcript_exists(&self, session_id: &str, working_dir: Option<&str>) -> bool;
+}
+
+/// Is this recorded identity actually resumable? Both gates are required and
+/// each rules out a real, observed failure mode:
+///
+/// - **`transcript_exists`** — the 2026-07-08 phantom class: a provisional id
+///   pinned at spawn for a shell that never ran a provider. `--resume` on it
+///   cannot work; nothing on disk backs it.
+/// - **`confirmed`** — the unproven-bind class: an id the runner has evidence
+///   FOR but no proof OF (a typed `--session-id` whose transcript hasn't landed
+///   yet, or a degraded `reconciled` mtime guess that may name a FOREIGN
+///   session in the same cwd). Resuming that would hijack someone else's
+///   session, so the grade is quarantined until confirmation.
+///
+/// NOTE this is *identity* restorability — "this id can be `--resume`d" — and
+/// is deliberately distinct from
+/// [`SessionLifecycleStore::restorable_records`](crate::session::session_lifecycle_store::SessionLifecycleStore::restorable_records),
+/// which answers the different question of whether a record is still within the
+/// boot-restore grace window. A session can be identity-restorable but out of
+/// grace, or in grace but a phantom.
+pub fn is_restorable_identity(confirmed: bool, transcript_exists: bool) -> bool {
+    confirmed && transcript_exists
+}
 
 /// Snapshot reason: a meaningful registry change (open/close/move/rename).
 pub const REASON_CHANGE: &str = "change";
@@ -115,12 +170,38 @@ pub struct SnapshotSession {
     /// Whether a provider hook confirmed a REAL session started here
     /// (`confirmed_at` set). Unconfirmed records may be phantom shells.
     pub confirmed: bool,
+    /// Whether a transcript for [`Self::claude_session_id`] existed on disk at
+    /// SNAPSHOT time — stamped from the injected [`TranscriptProbe`]. `None`
+    /// (field omitted) means "not probed" (no probe attached), which is
+    /// deliberately distinct from `Some(false)` = "probed, and the id is a
+    /// phantom".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_exists: Option<bool>,
+    /// Whether this entry's id was actually resumable at snapshot time —
+    /// [`is_restorable_identity`] of `confirmed` + `transcript_exists`. `None`
+    /// when unprobed. This is the field the phantom-id incident lacked: it
+    /// distinguishes a recovery tuple worth typing `--resume` for from one that
+    /// never could have worked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restorable: Option<bool>,
     /// Unix millis the session was first opened (stable across snapshots).
     pub opened_at: i64,
 }
 
-impl From<&TerminalSessionRecord> for SnapshotSession {
-    fn from(rec: &TerminalSessionRecord) -> Self {
+impl SnapshotSession {
+    /// Project a registry record into a snapshot entry, stamping the
+    /// restorability tuple from `probe` when one is attached.
+    ///
+    /// The stat happens HERE, at write time, because that is the only moment the
+    /// answer is knowable: the history outlives the registry, the grace window,
+    /// and often the transcript itself, so a reader months later cannot re-derive
+    /// it. With `probe: None` both fields stay `None` — the store works
+    /// standalone (tests, ephemeral fallbacks) and an unprobed entry never
+    /// masquerades as a proven-phantom one.
+    pub fn from_record(rec: &TerminalSessionRecord, probe: Option<&dyn TranscriptProbe>) -> Self {
+        let confirmed = rec.confirmed_at.is_some();
+        let transcript_exists =
+            probe.map(|p| p.transcript_exists(&rec.claude_session_id, rec.working_dir.as_deref()));
         SnapshotSession {
             claude_session_id: rec.claude_session_id.clone(),
             config_dir: rec.config_dir.clone(),
@@ -131,9 +212,19 @@ impl From<&TerminalSessionRecord> for SnapshotSession {
             title: rec.title.clone(),
             state: rec.state.clone(),
             close_reason: rec.close_reason.clone(),
-            confirmed: rec.confirmed_at.is_some(),
+            confirmed,
+            transcript_exists,
+            restorable: transcript_exists.map(|e| is_restorable_identity(confirmed, e)),
             opened_at: rec.opened_at,
         }
+    }
+}
+
+/// Unprobed projection — equivalent to [`SnapshotSession::from_record`] with no
+/// probe. Retained so callers that have no probe to offer stay unchanged.
+impl From<&TerminalSessionRecord> for SnapshotSession {
+    fn from(rec: &TerminalSessionRecord) -> Self {
+        SnapshotSession::from_record(rec, None)
     }
 }
 
@@ -437,6 +528,8 @@ mod tests {
             state: "open".to_string(),
             close_reason: None,
             confirmed: true,
+            transcript_exists: None,
+            restorable: None,
             opened_at: 1_000,
         }
     }
@@ -647,5 +740,89 @@ mod tests {
         assert_eq!(s.close_reason.as_deref(), Some("pty-exit"));
         assert!(s.confirmed);
         assert_eq!(s.opened_at, 123);
+        // Unprobed ⇒ the restorability fields are ABSENT, not `false`.
+        assert_eq!(s.transcript_exists, None);
+        assert_eq!(s.restorable, None);
+        let wire = serde_json::to_value(&s).unwrap();
+        assert!(
+            wire.get("transcriptExists").is_none() && wire.get("restorable").is_none(),
+            "an unprobed entry must not claim a phantom verdict it never checked"
+        );
+    }
+
+    /// A probe stub whose answer is fixed per session id.
+    #[derive(Debug)]
+    struct FakeProbe(std::collections::HashSet<String>);
+    impl TranscriptProbe for FakeProbe {
+        fn transcript_exists(&self, session_id: &str, _wd: Option<&str>) -> bool {
+            self.0.contains(session_id)
+        }
+    }
+
+    fn probe_rec(id: &str, confirmed: bool) -> TerminalSessionRecord {
+        TerminalSessionRecord {
+            claude_session_id: id.to_string(),
+            config_dir: Some("C:/cfg".to_string()),
+            working_dir: Some("D:/repo".to_string()),
+            page_id: "p".to_string(),
+            zone_index: 0,
+            title: Some("t".to_string()),
+            terminal_id: "term-1".to_string(),
+            opened_at: 1,
+            last_seen_at: 2,
+            state: "open".to_string(),
+            closed_at: None,
+            close_reason: None,
+            provider: "claude".to_string(),
+            origin: Some("authoritative".to_string()),
+            restore_pending_at: None,
+            confirmed_at: confirmed.then_some(500),
+        }
+    }
+
+    /// B5: the write-time stamp separates a genuinely recoverable entry from
+    /// the 2026-07-08 phantom — which `confirmed` alone could not do.
+    #[test]
+    fn from_record_stamps_restorability_from_the_probe() {
+        let probe = FakeProbe(["real".to_string()].into_iter().collect());
+
+        // Healthy: confirmed + a transcript on disk ⇒ restorable.
+        let healthy = SnapshotSession::from_record(&probe_rec("real", true), Some(&probe));
+        assert_eq!(healthy.transcript_exists, Some(true));
+        assert_eq!(healthy.restorable, Some(true));
+
+        // THE INCIDENT: confirmed:false AND no transcript ⇒ phantom, and the
+        // line now SAYS so.
+        let phantom = SnapshotSession::from_record(&probe_rec("0b32d739", false), Some(&probe));
+        assert_eq!(phantom.transcript_exists, Some(false));
+        assert_eq!(phantom.restorable, Some(false));
+
+        // Confirmed but the transcript is gone (pruned/aged) — a hook once
+        // fired, yet `--resume` would find nothing. Not restorable.
+        let no_transcript =
+            SnapshotSession::from_record(&probe_rec("vanished", true), Some(&probe));
+        assert_eq!(no_transcript.restorable, Some(false));
+
+        // Transcript exists but the bind was never confirmed — an unproven
+        // guess that may name a FOREIGN session. Quarantined, not restorable.
+        let unconfirmed = SnapshotSession::from_record(&probe_rec("real", false), Some(&probe));
+        assert_eq!(unconfirmed.transcript_exists, Some(true));
+        assert_eq!(unconfirmed.restorable, Some(false));
+
+        // Both gates are required, and the wire is camelCase.
+        let wire = serde_json::to_value(&healthy).unwrap();
+        assert_eq!(
+            wire.get("transcriptExists").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(wire.get("restorable").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[test]
+    fn is_restorable_identity_requires_both_gates() {
+        assert!(is_restorable_identity(true, true));
+        assert!(!is_restorable_identity(true, false));
+        assert!(!is_restorable_identity(false, true));
+        assert!(!is_restorable_identity(false, false));
     }
 }

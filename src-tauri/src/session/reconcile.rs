@@ -536,6 +536,7 @@ pub fn run_reconcile<I: TranscriptIndex>(
 
 /// Real [`TranscriptIndex`] backed by [`crate::terminal::transcript`] — scans
 /// every known Claude config dir for transcripts of a project path.
+#[derive(Debug)]
 pub struct DiskTranscriptIndex {
     config_dirs: Vec<PathBuf>,
 }
@@ -576,6 +577,208 @@ impl TranscriptIndex for DiskTranscriptIndex {
                 .exists()
         })
     }
+}
+
+/// The same on-disk existence stat, exposed to the snapshot history's write-time
+/// restorability stamp. One implementation, one answer: the field a recovery
+/// line carries means exactly what the phantom PRUNE above means.
+impl crate::session::snapshot_history::TranscriptProbe for DiskTranscriptIndex {
+    fn transcript_exists(&self, session_id: &str, working_dir: Option<&str>) -> bool {
+        TranscriptIndex::transcript_exists(self, session_id, working_dir)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Provider session index — the in-provider session NAME (`/rename`) + its id,
+// keyed by the live claude process's pid.
+// ---------------------------------------------------------------------------
+
+/// What the provider itself says about one live session: the id it is actually
+/// running under, and the name the operator sees in the TUI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderSessionMeta {
+    /// The provider's own session id for this process — the cross-check that
+    /// stops a stale/pid-reused file from retitling the wrong session.
+    pub session_id: String,
+    /// The in-provider session name (`/rename`), when set.
+    pub name: Option<String>,
+}
+
+/// Lookup of [`ProviderSessionMeta`] by the live claude process's pid. Injected
+/// so the title correlation is unit-testable without disk.
+pub trait ProviderSessionIndex {
+    fn meta_for_pid(&self, pid: u32) -> Option<ProviderSessionMeta>;
+}
+
+/// Real [`ProviderSessionIndex`], backed by the provider's OWN live-session
+/// index at `<config_dir>/sessions/<pid>.json`.
+///
+/// ## Why this file and not the transcript
+///
+/// An in-Claude `/rename` sets the session's name but emits NO OSC-0 title, so
+/// the runner's existing rename sink
+/// ([`SessionLifecycleStore::update_title_by_terminal`]) — which is driven by
+/// terminal title escapes — is never called for it, and the registry keeps the
+/// spawn-time title forever. The obvious alternative source, a `summary` record
+/// in the transcript JSONL, **does not exist**: a sweep of every transcript
+/// under every config root found zero `{"type":"summary"}` records, and
+/// `TranscriptSession::display_name` is *derived* from the first user message,
+/// not from the rename. It would restate the spawn-time guess, not the operator's
+/// intent.
+///
+/// The provider instead maintains this small JSON file per live session —
+/// `{pid, sessionId, cwd, startedAt, name, status, …}` — whose `name` IS the
+/// in-TUI name and whose `pid` is the claude image the binder already anchors on
+/// ([`claude_anchor_in_subtree`](crate::process_capture::process_tree::claude_anchor_in_subtree)).
+/// It is read-only to us and best-effort: an absent/unparseable file, or a
+/// provider version that stops writing it, degrades to "no refresh this tick"
+/// and the title simply stays as it is.
+#[derive(Debug)]
+pub struct DiskProviderSessionIndex {
+    config_dirs: Vec<PathBuf>,
+}
+
+impl DiskProviderSessionIndex {
+    pub fn discover() -> Self {
+        Self {
+            config_dirs: crate::terminal::transcript::find_claude_config_dirs(),
+        }
+    }
+}
+
+/// Wire shape of `<config_dir>/sessions/<pid>.json`. Every field is optional to
+/// us: this is a foreign file we neither own nor version, so an added/removed
+/// key must never fail the parse.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderSessionFile {
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+impl ProviderSessionIndex for DiskProviderSessionIndex {
+    fn meta_for_pid(&self, pid: u32) -> Option<ProviderSessionMeta> {
+        for dir in &self.config_dirs {
+            let path = dir.join("sessions").join(format!("{pid}.json"));
+            let Ok(raw) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(parsed) = serde_json::from_str::<ProviderSessionFile>(&raw) else {
+                continue;
+            };
+            let session_id = parsed.session_id.filter(|s| !s.trim().is_empty())?;
+            return Some(ProviderSessionMeta {
+                session_id,
+                name: parsed.name.filter(|n| !n.trim().is_empty()),
+            });
+        }
+        None
+    }
+}
+
+/// Pure: should this record's title be refreshed to the provider's session name,
+/// and to what? `None` = leave it alone.
+///
+/// Guards, each closing a way this could rename the WRONG session:
+/// - **id match** — the file is keyed by pid, and pids are reused. A file whose
+///   `sessionId` is not this record's is either stale or describes a different
+///   session; adopting its name would mislabel a live tab.
+/// - **non-empty name** — an absent/blank name is "the operator never renamed
+///   it", which must not erase the spawn-time title.
+/// - **already current** — keeps the caller's write a no-op (the sink also
+///   guards, but not re-entering it keeps the reconcile tick allocation-free in
+///   the steady state).
+pub fn decide_title_refresh(
+    rec: &TerminalSessionRecord,
+    meta: Option<&ProviderSessionMeta>,
+) -> Option<String> {
+    let meta = meta?;
+    if meta.session_id != rec.claude_session_id {
+        return None;
+    }
+    let name = meta.name.as_deref()?.trim();
+    if name.is_empty() || rec.title.as_deref() == Some(name) {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// One title the pass refreshed — returned for logging/tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TitleRefresh {
+    pub terminal_id: String,
+    pub title: String,
+}
+
+/// Refresh each live PTY's registry title from the provider's own session name,
+/// routing through the EXISTING rename sink
+/// ([`SessionLifecycleStore::update_title_by_terminal`]) rather than adding a
+/// parallel title writer — so an in-Claude `/rename` converges on the registry
+/// within one reconcile tick, exactly like an OSC-0 rename does immediately.
+///
+/// Only terminals with a bound open record are considered: the title belongs to
+/// a record, and an unbound PTY has none to update.
+///
+/// Precedence note: the other writer into the same sink is `terminal_set_title`
+/// (xterm.js's OSC-0 `onTitleChange`). These do not fight in practice — the very
+/// symptom this fixes is that a provider session emits no OSC-0 title, so the
+/// registry title sits frozen at its spawn-time value. Were a PTY to emit OSC-0
+/// titles continuously, the two would alternate at one write per tick; the
+/// `info!` below makes that visible rather than silent.
+pub fn refresh_titles<N: ProviderSessionIndex>(
+    store: &SessionLifecycleStore,
+    live: &[LivePty],
+    index: &N,
+) -> Vec<TitleRefresh> {
+    let mut out = Vec::new();
+    for pty in live {
+        let Some(ai_pid) = pty.ai_pid else { continue };
+        let Some(rec) = store.find_open_by_terminal(&pty.terminal_id) else {
+            continue;
+        };
+        let meta = index.meta_for_pid(ai_pid);
+        let Some(title) = decide_title_refresh(&rec, meta.as_ref()) else {
+            continue;
+        };
+        store.update_title_by_terminal(&pty.terminal_id, &title);
+        tracing::info!(
+            terminal_id = %pty.terminal_id,
+            claude_session = %rec.claude_session_id,
+            title = %title,
+            "session reconcile: adopted the provider's in-session name as the registry title"
+        );
+        out.push(TitleRefresh {
+            terminal_id: pty.terminal_id.clone(),
+            title,
+        });
+    }
+    out
+}
+
+/// Title-refresh driver: resolve each live PTY's claude anchor from an
+/// ALREADY-TAKEN process snapshot, then converge registry titles on the
+/// provider's own session names. Returns the refreshes made (for logging/tests).
+///
+/// ## Why this is its OWN pass, not part of [`run_reconcile_pass`]
+///
+/// The bind pass is guarded by a steady-state check ("some live PTY lacks a
+/// CONFIRMED record") so a fully-bound fleet does zero disk work per tick. A
+/// rename, however, happens on a session that is bound, confirmed, and healthy —
+/// i.e. EXACTLY when that guard is false. Folding the title refresh into the
+/// bind pass would therefore mean it never runs for the case it exists to serve.
+///
+/// The cost it adds to the poll tick is one small read per live claude anchor
+/// (the provider file is tiny and in the OS cache), not a transcript scan.
+/// Fail-open: a missing/unreadable provider index refreshes nothing.
+pub fn refresh_titles_pass(
+    store: &SessionLifecycleStore,
+    live: &[LivePty],
+    snapshot: &ProcessSnapshot,
+) -> Vec<TitleRefresh> {
+    let live = anchor_live_ptys(live, snapshot);
+    refresh_titles(store, &live, &DiskProviderSessionIndex::discover())
 }
 
 /// Parse an ISO-8601 timestamp into Unix epoch seconds (best-effort).
@@ -1016,6 +1219,179 @@ mod tests {
         fn transcript_exists(&self, session_id: &str, _wd: Option<&str>) -> bool {
             self.existing_ids.contains(session_id)
         }
+    }
+
+    /// A registry record fixture — `id` on `terminal`, titled `title`.
+    fn title_rec(id: &str, terminal: &str, title: Option<&str>) -> TerminalSessionRecord {
+        TerminalSessionRecord {
+            claude_session_id: id.to_string(),
+            config_dir: None,
+            working_dir: Some("C:/repo".to_string()),
+            page_id: "default".to_string(),
+            zone_index: -1,
+            title: title.map(str::to_string),
+            terminal_id: terminal.to_string(),
+            opened_at: 0,
+            last_seen_at: 0,
+            state: "open".to_string(),
+            closed_at: None,
+            close_reason: None,
+            provider: DEFAULT_PROVIDER.to_string(),
+            origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
+            restore_pending_at: None,
+            confirmed_at: Some(1),
+        }
+    }
+
+    fn meta(session_id: &str, name: Option<&str>) -> ProviderSessionMeta {
+        ProviderSessionMeta {
+            session_id: session_id.to_string(),
+            name: name.map(str::to_string),
+        }
+    }
+
+    /// A fake provider-session index over in-memory fixtures.
+    struct FakeProviderIndex(HashMap<u32, ProviderSessionMeta>);
+    impl ProviderSessionIndex for FakeProviderIndex {
+        fn meta_for_pid(&self, pid: u32) -> Option<ProviderSessionMeta> {
+            self.0.get(&pid).cloned()
+        }
+    }
+
+    /// B6: an in-Claude `/rename` reaches the registry — the provider's own
+    /// session name replaces the stale spawn-time title.
+    #[test]
+    fn decide_title_refresh_adopts_the_provider_session_name() {
+        let rec = title_rec("sess-1", "term-1", Some("qontinui"));
+        assert_eq!(
+            decide_title_refresh(&rec, Some(&meta("sess-1", Some("runner-test")))),
+            Some("runner-test".to_string()),
+            "the operator's in-session name wins over the spawn-time title"
+        );
+        // A record that never had a title still adopts one.
+        let untitled = title_rec("sess-1", "term-1", None);
+        assert_eq!(
+            decide_title_refresh(&untitled, Some(&meta("sess-1", Some("runner-test")))),
+            Some("runner-test".to_string())
+        );
+    }
+
+    /// B6 guards: every way a refresh could mislabel the WRONG session is
+    /// refused. The id cross-check is the load-bearing one — the provider file
+    /// is keyed by PID, and pids are reused.
+    #[test]
+    fn decide_title_refresh_guards() {
+        let rec = title_rec("sess-1", "term-1", Some("qontinui"));
+        // (a) The file describes a DIFFERENT session (stale file / pid reuse).
+        assert_eq!(
+            decide_title_refresh(&rec, Some(&meta("other-sess", Some("someone-elses-name")))),
+            None,
+            "a pid-reused file must never retitle this session"
+        );
+        // (b) No provider file at all.
+        assert_eq!(decide_title_refresh(&rec, None), None);
+        // (c) Never renamed → must not erase the existing title.
+        assert_eq!(
+            decide_title_refresh(&rec, Some(&meta("sess-1", None))),
+            None
+        );
+        // (d) Blank/whitespace name is not a name.
+        assert_eq!(
+            decide_title_refresh(&rec, Some(&meta("sess-1", Some("   ")))),
+            None
+        );
+        // (e) Already current → no write.
+        assert_eq!(
+            decide_title_refresh(&rec, Some(&meta("sess-1", Some("qontinui")))),
+            None
+        );
+    }
+
+    /// B6 end-to-end over the store: `refresh_titles` routes the provider name
+    /// through the EXISTING `update_title_by_terminal` sink, so one reconcile
+    /// tick converges the registry title. An unbound PTY is skipped.
+    #[test]
+    fn refresh_titles_persists_the_rename_through_the_existing_sink() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(title_rec("sess-1", "term-1", Some("qontinui")));
+
+        let live = vec![
+            pty_anchored("term-1", 4242, 1_000, "C:/repo"),
+            // A live PTY with no record — nothing to title.
+            pty_anchored("unbound-term", 5150, 1_000, "C:/repo"),
+        ];
+        let index = FakeProviderIndex(
+            [
+                (4242, meta("sess-1", Some("runner-test"))),
+                (5150, meta("ghost", Some("ignored"))),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let refreshed = refresh_titles(&store, &live, &index);
+        assert_eq!(
+            refreshed,
+            vec![TitleRefresh {
+                terminal_id: "term-1".to_string(),
+                title: "runner-test".to_string(),
+            }],
+            "only the bound terminal is retitled"
+        );
+        assert_eq!(
+            store
+                .find_open_by_terminal("term-1")
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("runner-test"),
+            "the rename is DURABLE in the registry, not just in the TUI"
+        );
+
+        // Idempotent: a second tick with the same name writes nothing.
+        assert!(
+            refresh_titles(&store, &live, &index).is_empty(),
+            "a converged title does not re-write every tick"
+        );
+    }
+
+    /// The real provider index parses the provider's own live-session file
+    /// (`<config_dir>/sessions/<pid>.json`) — camelCase `sessionId`, and tolerant
+    /// of the unknown keys a foreign file carries.
+    #[test]
+    fn disk_provider_session_index_parses_the_provider_session_file() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        std::fs::write(
+            dir.path().join("sessions").join("31520.json"),
+            r#"{"pid":31520,"sessionId":"ef07e29d-ed7d-4bb3-a85c-d6e3fe92c2f3","cwd":"D:\\qontinui-root","startedAt":1784135767563,"version":"2.1.210","kind":"interactive","name":"coord-push-to-branch-mcp","status":"idle"}"#,
+        )
+        .unwrap();
+        let index = DiskProviderSessionIndex {
+            config_dirs: vec![dir.path().to_path_buf()],
+        };
+        assert_eq!(
+            index.meta_for_pid(31520),
+            Some(meta(
+                "ef07e29d-ed7d-4bb3-a85c-d6e3fe92c2f3",
+                Some("coord-push-to-branch-mcp")
+            ))
+        );
+        // An absent pid is a clean None, never an error.
+        assert_eq!(index.meta_for_pid(9999), None);
+
+        // A file with no name yet (never renamed) parses, name None.
+        std::fs::write(
+            dir.path().join("sessions").join("42.json"),
+            r#"{"pid":42,"sessionId":"abc","status":"idle"}"#,
+        )
+        .unwrap();
+        assert_eq!(index.meta_for_pid(42), Some(meta("abc", None)));
+
+        // Garbage never panics or poisons the pass.
+        std::fs::write(dir.path().join("sessions").join("43.json"), "not json").unwrap();
+        assert_eq!(index.meta_for_pid(43), None);
     }
 
     /// RUNG 2: a typed `--session-id` IS the identity — bind authoritative.

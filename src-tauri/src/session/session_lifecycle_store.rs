@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::session::restore_record_emitter::RestoreRecordEmitter;
-use crate::session::snapshot_history::{SnapshotHistory, SnapshotSession};
+use crate::session::snapshot_history::{SnapshotHistory, SnapshotSession, TranscriptProbe};
 
 /// Closed records older than this are pruned (24h in millis).
 const CLOSED_RETENTION_MS: i64 = 86_400_000;
@@ -248,6 +248,13 @@ pub struct SessionLifecycleStore {
     /// registry write on the network (the drain loop does the pushing).
     /// Unattached (tests, ephemeral fallbacks) → no-op.
     restore_emitter: OnceLock<Arc<RestoreRecordEmitter>>,
+    /// Optional write-time transcript-existence probe, stamped onto every
+    /// snapshot-history entry ([`SnapshotSession::restorable`] /
+    /// `transcript_exists`). Read ONLY on the snapshot projection path — the
+    /// registry itself never consults it, so an attached probe cannot change
+    /// restore behavior, only describe it. Unattached → the fields are omitted
+    /// ("not probed"), never stamped `false`.
+    transcript_probe: OnceLock<Arc<dyn TranscriptProbe>>,
 }
 
 impl SessionLifecycleStore {
@@ -263,6 +270,7 @@ impl SessionLifecycleStore {
             map: Mutex::new(map),
             snapshot_history: OnceLock::new(),
             restore_emitter: OnceLock::new(),
+            transcript_probe: OnceLock::new(),
         })
     }
 
@@ -284,6 +292,29 @@ impl SessionLifecycleStore {
         }
     }
 
+    /// Attach the write-time transcript-existence probe (once, at startup) used
+    /// to stamp the restorability tuple onto snapshot-history entries. Without
+    /// it those fields are simply omitted — the store works standalone.
+    pub fn attach_transcript_probe(&self, probe: Arc<dyn TranscriptProbe>) {
+        if self.transcript_probe.set(probe).is_err() {
+            warn!("session_lifecycle_store: transcript probe already attached — ignoring");
+        }
+    }
+
+    /// Project the registry into snapshot entries, stamping restorability from
+    /// the attached probe (if any). Shared by the change + heartbeat sinks so
+    /// both stamp identically.
+    fn snapshot_sessions(
+        &self,
+        snapshot: impl IntoIterator<Item = TerminalSessionRecord>,
+    ) -> Vec<SnapshotSession> {
+        let probe = self.transcript_probe.get();
+        snapshot
+            .into_iter()
+            .map(|rec| SnapshotSession::from_record(&rec, probe.map(|p| p.as_ref())))
+            .collect()
+    }
+
     /// Mirror one just-written OPEN record to coord via the attached
     /// emitter, if any. Called AFTER the registry persist; best-effort by
     /// construction (the emitter gates, debounces, and swallows failures —
@@ -303,7 +334,7 @@ impl SessionLifecycleStore {
     /// registry path).
     fn snapshot_change(&self, snapshot: &HashMap<String, TerminalSessionRecord>) {
         if let Some(history) = self.snapshot_history.get() {
-            history.record_change(snapshot.values().map(SnapshotSession::from).collect());
+            history.record_change(self.snapshot_sessions(snapshot.values().cloned()));
         }
     }
 
@@ -315,14 +346,17 @@ impl SessionLifecycleStore {
         let Some(history) = self.snapshot_history.get() else {
             return;
         };
-        let sessions = match self.map.lock() {
-            Ok(m) => m.values().map(SnapshotSession::from).collect(),
+        // Clone the records OUT of the lock before projecting: the probe stats
+        // the disk, and holding the registry mutex across filesystem I/O would
+        // let a slow/hung volume block every session write in the runner.
+        let records: Vec<TerminalSessionRecord> = match self.map.lock() {
+            Ok(m) => m.values().cloned().collect(),
             Err(e) => {
                 warn!(error = %e, "session_lifecycle_store: lock poisoned on snapshot_heartbeat");
                 return;
             }
         };
-        history.record_heartbeat(sessions);
+        history.record_heartbeat(self.snapshot_sessions(records));
     }
 
     /// Insert or refresh a session by `claude_session_id`. If a record
@@ -1697,6 +1731,63 @@ mod tests {
             .map(|r| r.claude_session_id)
             .collect();
         assert_eq!(open_ids, vec!["open-sess".to_string()]);
+    }
+
+    /// B5 (phantom-id plan): with a transcript probe attached, every history
+    /// entry carries the write-time restorability verdict — so a recovery line
+    /// naming a phantom id says so, instead of looking identical to a healthy
+    /// one (the 2026-07-08 failure). Without a probe the fields stay absent.
+    #[test]
+    fn snapshot_history_stamps_restorability_when_a_probe_is_attached() {
+        #[derive(Debug)]
+        struct FakeProbe;
+        impl TranscriptProbe for FakeProbe {
+            fn transcript_exists(&self, session_id: &str, _wd: Option<&str>) -> bool {
+                session_id == "sess-1"
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let history_path = dir.path().join("session-snapshots.jsonl");
+        store.attach_snapshot_history(Arc::new(
+            crate::session::snapshot_history::SnapshotHistory::open(&history_path).unwrap(),
+        ));
+        store.attach_transcript_probe(Arc::new(FakeProbe));
+
+        let last_line = |path: &Path| -> serde_json::Value {
+            let contents = std::fs::read_to_string(path).unwrap_or_default();
+            let line = contents.lines().filter(|l| !l.trim().is_empty()).last();
+            serde_json::from_str(line.expect("a snapshot line")).unwrap()
+        };
+
+        // A transcript-backed, CONFIRMED session → restorable:true.
+        let mut healthy = rec("sess-1");
+        healthy.confirmed_at = Some(42);
+        store.record_open(healthy);
+        let s = &last_line(&history_path)["sessions"][0];
+        assert_eq!(s["claudeSessionId"], "sess-1");
+        assert_eq!(s["transcriptExists"], true);
+        assert_eq!(
+            s["restorable"], true,
+            "the newest entry carries restorable:true + a real id"
+        );
+
+        // A phantom (no transcript, unconfirmed) → the line names it as such.
+        let mut phantom = rec("0b32d739");
+        phantom.terminal_id = "943aa0b6".to_string();
+        phantom.confirmed_at = None;
+        store.record_open(phantom);
+        let sessions = last_line(&history_path)["sessions"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let p = sessions
+            .iter()
+            .find(|s| s["claudeSessionId"] == "0b32d739")
+            .expect("the phantom is in the snapshot");
+        assert_eq!(p["transcriptExists"], false);
+        assert_eq!(p["restorable"], false, "the phantom is flagged, not silent");
     }
 
     /// Phase 4 (session-snapshot history): layout-meaningful mutations
