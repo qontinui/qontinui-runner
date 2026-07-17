@@ -60,6 +60,7 @@ pub async fn generate_context_with_ai(
         settings::AiProvider::ClaudeApi => "claude_api",
         settings::AiProvider::GeminiCli => "gemini_cli",
         settings::AiProvider::GeminiApi => "gemini_api",
+        settings::AiProvider::PiCli => "pi_cli",
         settings::AiProvider::Ollama => "ollama",
         settings::AiProvider::OpenAiCompatible => "openai_compatible",
     };
@@ -162,6 +163,7 @@ pub async fn generate_api_request_with_ai(
         settings::AiProvider::ClaudeApi => "claude_api",
         settings::AiProvider::GeminiCli => "gemini_cli",
         settings::AiProvider::GeminiApi => "gemini_api",
+        settings::AiProvider::PiCli => "pi_cli",
         settings::AiProvider::Ollama => "ollama",
         settings::AiProvider::OpenAiCompatible => "openai_compatible",
     };
@@ -263,6 +265,7 @@ pub async fn generate_task_prompt_with_ai(
         settings::AiProvider::ClaudeApi => "claude_api",
         settings::AiProvider::GeminiCli => "gemini_cli",
         settings::AiProvider::GeminiApi => "gemini_api",
+        settings::AiProvider::PiCli => "pi_cli",
         settings::AiProvider::Ollama => "ollama",
         settings::AiProvider::OpenAiCompatible => "openai_compatible",
     };
@@ -383,6 +386,7 @@ pub async fn suggest_exploration_strategy_with_ai(
         settings::AiProvider::ClaudeApi => "claude_api",
         settings::AiProvider::GeminiCli => "gemini_cli",
         settings::AiProvider::GeminiApi => "gemini_api",
+        settings::AiProvider::PiCli => "pi_cli",
         settings::AiProvider::Ollama => "ollama",
         settings::AiProvider::OpenAiCompatible => "openai_compatible",
     };
@@ -523,6 +527,7 @@ pub async fn generate_test_and_agentic_step(
         settings::AiProvider::ClaudeApi => "claude_api",
         settings::AiProvider::GeminiCli => "gemini_cli",
         settings::AiProvider::GeminiApi => "gemini_api",
+        settings::AiProvider::PiCli => "pi_cli",
         settings::AiProvider::Ollama => "ollama",
         settings::AiProvider::OpenAiCompatible => "openai_compatible",
     };
@@ -645,6 +650,7 @@ pub async fn explore_flow_step(
         settings::AiProvider::ClaudeApi => "claude_api",
         settings::AiProvider::GeminiCli => "gemini_cli",
         settings::AiProvider::GeminiApi => "gemini_api",
+        settings::AiProvider::PiCli => "pi_cli",
         settings::AiProvider::Ollama => "ollama",
         settings::AiProvider::OpenAiCompatible => "openai_compatible",
     };
@@ -1014,6 +1020,22 @@ pub fn build_provider_settings(ai_settings: &crate::settings::AiSettings) -> ser
                 "model": ai_settings.gemini_api.model,
                 "max_output_tokens": ai_settings.gemini_api.max_output_tokens,
                 "temperature": ai_settings.gemini_api.temperature,
+            })
+        }
+        settings::AiProvider::PiCli => {
+            let execution_mode = match ai_settings.pi_cli.execution_mode {
+                settings::CliExecutionMode::Auto => "auto",
+                settings::CliExecutionMode::WindowsNative => "native",
+                settings::CliExecutionMode::Wsl => "wsl",
+                settings::CliExecutionMode::Native => "native",
+            };
+            serde_json::json!({
+                "execution_mode": execution_mode,
+                "custom_path": ai_settings.pi_cli.custom_path,
+                "provider": ai_settings.pi_cli.provider,
+                "model": ai_settings.pi_cli.model,
+                "tools": ai_settings.pi_cli.tools,
+                "timeout_seconds": ai_settings.pi_cli.timeout_seconds,
             })
         }
         // TODO(tier-decoupling): wire Ollama/OpenAiCompatible into the agentic loop

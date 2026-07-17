@@ -12,7 +12,7 @@ use crate::orchestrator::{CompressionConfig, RetryConfig};
 use crate::settings::{
     self, AccountSelectionMode, AiProvider, AiSettings, ClaudeApiSettings, ClaudeCliSettings,
     CliExecutionMode, GeminiApiSettings, GeminiAuthMethod, GeminiCliSettings, OllamaSettings,
-    OpenAiCompatibleSettings,
+    OpenAiCompatibleSettings, PiCliSettings,
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -123,6 +123,7 @@ pub fn save_ai_settings(
         "claude_api" => AiProvider::ClaudeApi,
         "gemini_cli" => AiProvider::GeminiCli,
         "gemini_api" => AiProvider::GeminiApi,
+        "pi_cli" => AiProvider::PiCli,
         "ollama" => AiProvider::Ollama,
         "openai_compatible" => AiProvider::OpenAiCompatible,
         _ => return Err(format!("Invalid provider: {}", provider)),
@@ -166,6 +167,8 @@ pub fn save_ai_settings(
         // Preserve existing Gemini settings
         gemini_cli: existing_settings.gemini_cli,
         gemini_api: existing_settings.gemini_api,
+        // Preserve existing pi CLI settings
+        pi_cli: existing_settings.pi_cli,
         // Preserve existing Ollama / OpenAI-compatible settings (Tier 0 substrate)
         ollama: existing_settings.ollama,
         openai_compatible: existing_settings.openai_compatible,
@@ -262,7 +265,8 @@ pub fn save_gemini_settings(
             max_output_tokens,
             temperature,
         },
-        // Preserve existing Ollama / OpenAI-compatible settings
+        // Preserve existing pi CLI / Ollama / OpenAI-compatible settings
+        pi_cli: existing_settings.pi_cli,
         ollama: existing_settings.ollama,
         openai_compatible: existing_settings.openai_compatible,
         auto_refine_video_after_iterations: existing_settings.auto_refine_video_after_iterations,
@@ -394,6 +398,7 @@ async fn test_ai_connection_impl() -> Result<CommandResponse, AppError> {
         AiProvider::ClaudeApi => test_claude_api_connection(&ai_settings.claude_api).await,
         AiProvider::GeminiCli => test_gemini_cli_connection(&ai_settings.gemini_cli).await,
         AiProvider::GeminiApi => test_gemini_api_connection(&ai_settings.gemini_api).await,
+        AiProvider::PiCli => test_pi_cli_connection(&ai_settings.pi_cli).await,
         AiProvider::Ollama => test_ollama_connection(&ai_settings.ollama).await,
         AiProvider::OpenAiCompatible => {
             test_openai_compatible_connection(&ai_settings.openai_compatible).await
@@ -623,6 +628,83 @@ async fn test_gemini_cli_connection(settings: &GeminiCliSettings) -> Result<Stri
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(format!("Gemini CLI returned error: {}", stderr.trim()))
+    }
+}
+
+/// Test pi CLI connection
+///
+/// `pi --version` verifies the binary resolves and runs; it does NOT verify
+/// provider auth (pi validates the API key only when a prompt actually runs).
+async fn test_pi_cli_connection(settings: &PiCliSettings) -> Result<String, String> {
+    let system = std::env::consts::OS;
+
+    let effective_mode = match settings.execution_mode {
+        CliExecutionMode::Auto => {
+            if system == "windows" {
+                CliExecutionMode::WindowsNative
+            } else {
+                CliExecutionMode::Native
+            }
+        }
+        mode => mode,
+    };
+
+    let pi_program = settings.custom_path.as_deref().unwrap_or("pi");
+
+    info!(
+        "Testing pi CLI connection with mode: {:?}, program: {}, provider: {:?}",
+        effective_mode, pi_program, settings.provider
+    );
+
+    let output = match effective_mode {
+        CliExecutionMode::WindowsNative | CliExecutionMode::Auto => {
+            // On Windows, use cmd.exe /c to handle the .cmd shim from npm install
+            crate::process_helpers::tokio_cmd_no_window()
+                .args(["/c", pi_program, "--version"])
+                .output()
+                .await
+                .map_err(|e| {
+                    String::from(AppError::Raw(format!(
+                        "Failed to execute pi CLI: {}. Is pi installed (npm i -g \
+                         @earendil-works/pi-coding-agent) and in PATH?",
+                        e
+                    )))
+                })?
+        }
+        CliExecutionMode::Wsl => crate::process_helpers::tokio_no_window("wsl")
+            .args([pi_program, "--version"])
+            .output()
+            .await
+            .map_err(|e| {
+                String::from(AppError::Raw(format!(
+                    "Failed to execute pi via WSL: {}. Is WSL installed?",
+                    e
+                )))
+            })?,
+        CliExecutionMode::Native => crate::process_helpers::tokio_no_window(pi_program)
+            .args(["--version"])
+            .output()
+            .await
+            .map_err(|e| {
+                String::from(AppError::Raw(format!(
+                    "Failed to execute pi CLI: {}. Is pi installed (npm i -g \
+                     @earendil-works/pi-coding-agent) and in PATH?",
+                    e
+                )))
+            })?,
+    };
+
+    if output.status.success() {
+        let version = String::from_utf8_lossy(&output.stdout);
+        Ok(format!(
+            "pi CLI connected successfully (provider: {}, model: {}). {}",
+            settings.provider.as_deref().unwrap_or("pi default"),
+            settings.model.as_deref().unwrap_or("pi default"),
+            version.trim()
+        ))
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("pi CLI returned error: {}", stderr.trim()))
     }
 }
 
@@ -872,6 +954,7 @@ pub fn save_agentic_settings(
         claude_api: existing_settings.claude_api,
         gemini_cli: existing_settings.gemini_cli,
         gemini_api: existing_settings.gemini_api,
+        pi_cli: existing_settings.pi_cli,
         ollama: existing_settings.ollama,
         openai_compatible: existing_settings.openai_compatible,
         auto_refine_video_after_iterations: existing_settings.auto_refine_video_after_iterations,

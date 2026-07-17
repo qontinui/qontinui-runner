@@ -27,6 +27,9 @@ pub mod multimodal;
 pub(crate) mod oauth_refresh;
 pub mod oneshot;
 mod openai_compat;
+// pub(crate): the subagent dispatch layer (Phase 4) calls
+// `pi_cli::run_pi_cli_in_dir` directly to stage a temp working dir.
+pub(crate) mod pi_cli;
 mod process;
 pub mod retry;
 pub(crate) mod routing;
