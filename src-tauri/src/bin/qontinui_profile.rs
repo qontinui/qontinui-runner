@@ -18,6 +18,8 @@
 //! qontinui_profile device show                # print device_id + coord registration status
 //! qontinui_profile device path                # print the machine.json path
 //! qontinui_profile device pair                # pair the device with a web user (browser or --auth-token)
+//! qontinui_profile env capture                # push this box's secret-free config to the twin
+//! qontinui_profile env pull                   # preview what would change here to match canonical
 //! ```
 //!
 //! ## Unified Devices Registry — naming
@@ -126,14 +128,15 @@ enum Cmd {
     /// Manage the machine-side dev-environment capture agent
     /// (feat/devenv-environments). `enroll` binds this machine to a web
     /// environment via a per-machine API key; `capture` pushes a secret-free
-    /// config envelope; `show` prints enrollment state.
+    /// config envelope; `pull` previews what would change here to match the
+    /// canonical machine; `show` prints enrollment state.
     Env {
         #[command(subcommand)]
         sub: EnvCmd,
     },
 }
 
-// `EnvCmd` (the `env enroll/capture/show` subcommand tree) lives in
+// `EnvCmd` (the `env enroll/capture/pull/show` subcommand tree) lives in
 // `qontinui_runner_lib::profile_cli` so this bin AND the main runner binary's
 // pre-GUI CLI mode share one implementation.
 
@@ -1478,6 +1481,26 @@ mod tests {
         match cli.cmd {
             Some(Cmd::Env { sub: EnvCmd::Show }) => {}
             other => panic!("expected Env::Show, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn env_pull_parses_bare_and_with_json() {
+        let cli = Cli::try_parse_from(["qontinui_profile", "env", "pull"]).expect("parses");
+        match cli.cmd {
+            Some(Cmd::Env {
+                sub: EnvCmd::Pull { json },
+            }) => assert!(!json, "--json defaults off"),
+            other => panic!("expected Env::Pull, got {:?}", other),
+        }
+
+        let cli =
+            Cli::try_parse_from(["qontinui_profile", "env", "pull", "--json"]).expect("parses");
+        match cli.cmd {
+            Some(Cmd::Env {
+                sub: EnvCmd::Pull { json },
+            }) => assert!(json),
+            other => panic!("expected Env::Pull {{json}}, got {:?}", other),
         }
     }
 }

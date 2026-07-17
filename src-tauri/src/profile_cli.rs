@@ -1,6 +1,7 @@
 //! Pre-GUI CLI mode for the runner binary + the standalone `qontinui_profile`.
 //!
-//! The `env enroll` / `env capture` / `env show` subcommands are shared between:
+//! The `env enroll` / `env capture` / `env pull` / `env show` subcommands are
+//! shared between:
 //! - the standalone `bin/qontinui_profile.rs` (its `Cmd::Env` arm delegates to
 //!   [`run_env`]), and
 //! - the **main runner binary** — `main.rs` calls [`try_run_cli`] at the very top
@@ -24,7 +25,8 @@ use crate::env_agent::enroll::{self, EnrollParams};
 
 /// The `env` subcommand tree — the machine-side dev-environment capture agent.
 /// `enroll` binds this machine to a web environment via a per-machine API key;
-/// `capture` pushes a secret-free config envelope; `show` prints enrollment state.
+/// `capture` pushes a secret-free config envelope; `pull` previews what would
+/// change here to match the canonical machine; `show` prints enrollment state.
 #[derive(Subcommand, Debug)]
 pub enum EnvCmd {
     /// Enroll this machine into a web environment via an enrollment code.
@@ -52,6 +54,14 @@ pub enum EnvCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Pull the environment's canonical config and show what WOULD change on
+    /// this machine to match it. Read-only — `pull` never modifies this box;
+    /// the decision to apply is taken locally, later.
+    Pull {
+        /// Emit the plan as JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print enrollment state (from env-agent.json) + whether a machine key is
     /// stored.
     Show,
@@ -66,6 +76,7 @@ pub fn run_env(cmd: EnvCmd) -> u8 {
             environment,
         } => cmd_env_enroll(&code, backend.as_deref(), environment.as_deref()),
         EnvCmd::Capture { dry_run } => cmd_env_capture(dry_run),
+        EnvCmd::Pull { json } => cmd_env_pull(json),
         EnvCmd::Show => cmd_env_show(),
     }
 }
@@ -147,6 +158,43 @@ fn cmd_env_capture(dry_run: bool) -> u8 {
                 eprintln!("error: capture/push failed: {e}");
                 1
             }
+        }
+    }
+}
+
+/// `env pull` — fetch canonical, diff this box against it, print the plan.
+/// Read-only by construction: the pull path has no mutation branch at all, so
+/// there is no `--dry-run` to forget (unlike `capture`, where dry-run is opt-in).
+fn cmd_env_pull(as_json: bool) -> u8 {
+    // Same PG-pool publish as capture — without it the `db_schema` collector
+    // yields nothing and the plan would wrongly look clean on that section.
+    let profile = crate::profiles::load();
+    if let Err(e) = crate::env_agent::publish_pg_pool_from_url(&profile.database_url) {
+        eprintln!("note: db_schema collector unavailable — {e}");
+    }
+
+    match crate::env_agent::pull::pull_and_plan_blocking() {
+        Ok(plan) => {
+            if as_json {
+                let v = crate::env_agent::pull::plan_to_json(&plan);
+                match serde_json::to_string_pretty(&v) {
+                    Ok(s) => {
+                        println!("{s}");
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("error: serialize plan failed: {e}");
+                        2
+                    }
+                }
+            } else {
+                print!("{}", crate::env_agent::pull::render_plan(&plan));
+                0
+            }
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            1
         }
     }
 }
