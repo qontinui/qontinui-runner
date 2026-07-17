@@ -14,6 +14,7 @@ use super::gemini_api::{
 use super::gemini_cli::run_gemini_cli;
 use super::multimodal::MultimodalPrompt;
 use super::openai_compat::run_openai_compat;
+use super::pi_cli::run_pi_cli;
 use super::retry::{
     retry_with_backoff, retry_with_backoff_tracked, retry_with_fallback,
     retry_with_fallback_tracked,
@@ -64,6 +65,7 @@ pub fn run_prompt_sync(prompt: &str, doctor_handle: Option<&DoctorHandle>) -> Ai
             AiProvider::OpenAiCompatible => {
                 run_openai_compat(prompt, &ai_settings.openai_compatible, None, doctor_handle)
             }
+            AiProvider::PiCli => run_pi_cli(prompt, &ai_settings.pi_cli, None, doctor_handle),
             // TODO(tier-decoupling): wire Ollama into the agentic loop
             AiProvider::Ollama => AiResponse::error(
                 "Ollama dispatch is not yet wired into the agentic loop. The \
@@ -241,6 +243,19 @@ pub fn run_prompt_with_routing(
                     doctor_handle,
                 )
             }
+            AiProvider::PiCli => {
+                // Same guard as OpenAiCompatible: don't forward Claude/Gemini
+                // router-catalog model names to pi.
+                let effective_model = model_override.as_deref().and_then(|m| {
+                    if m.starts_with("claude") || m.starts_with("gemini") {
+                        warn!("Cannot route to {} model when using pi CLI provider", m);
+                        None
+                    } else {
+                        Some(m)
+                    }
+                });
+                run_pi_cli(prompt, &ai_settings.pi_cli, effective_model, doctor_handle)
+            }
             // TODO(tier-decoupling): wire Ollama into the agentic loop
             AiProvider::Ollama => AiResponse::error(
                 "Ollama routed dispatch is not yet wired into the agentic loop. \
@@ -333,6 +348,7 @@ fn resolve_provider_key(provider_str: Option<&str>, default: &AiProvider) -> Str
             "gemini_cli" => "gemini_cli".to_string(),
             "gemini_api" => "gemini_api".to_string(),
             "openai_compatible" => "openai_compatible".to_string(),
+            "pi_cli" => "pi_cli".to_string(),
             _ => circuit_breaker::provider_key(default),
         }
     } else {
@@ -409,6 +425,7 @@ fn run_prompt_with_overrides_inner(
                 "gemini_cli" => AiProvider::GeminiCli,
                 "gemini_api" => AiProvider::GeminiApi,
                 "openai_compatible" => AiProvider::OpenAiCompatible,
+                "pi_cli" => AiProvider::PiCli,
                 _ => ai_settings.provider,
             }
         } else {
@@ -469,6 +486,12 @@ fn run_prompt_with_overrides_inner(
                     doctor_handle,
                 )
             }
+            AiProvider::PiCli => {
+                if temperature_override.is_some() || max_tokens_override.is_some() {
+                    debug!("pi CLI does not support temperature/max_tokens overrides; ignoring");
+                }
+                run_pi_cli(prompt, &ai_settings.pi_cli, Some(model), doctor_handle)
+            }
             // TODO(tier-decoupling): wire Ollama into the agentic loop
             AiProvider::Ollama => AiResponse::error(
                 "Ollama overridden dispatch is not yet wired into the agentic \
@@ -514,6 +537,7 @@ pub fn run_structured_prompt(
             "gemini_cli" => AiProvider::GeminiCli,
             "gemini_api" => AiProvider::GeminiApi,
             "openai_compatible" => AiProvider::OpenAiCompatible,
+            "pi_cli" => AiProvider::PiCli,
             _ => ai_settings.provider,
         }
     } else {
@@ -720,6 +744,20 @@ pub fn run_prompt_multimodal(
                 doctor_handle,
             )
         }
+        AiProvider::PiCli => {
+            if prompt.has_images() {
+                warn!(
+                    "pi CLI provider does not support image content blocks; falling back to \
+                     text-only"
+                );
+            }
+            run_pi_cli(
+                &prompt.text_content(),
+                &ai_settings.pi_cli,
+                None,
+                doctor_handle,
+            )
+        }
         // TODO(tier-decoupling): wire Ollama into the agentic loop
         AiProvider::Ollama => AiResponse::error(
             "Ollama multimodal dispatch is not yet wired into the agentic loop. \
@@ -851,6 +889,30 @@ pub fn run_prompt_with_routing_multimodal(
                 doctor_handle,
             )
         }
+        AiProvider::PiCli => {
+            if prompt.has_images() {
+                warn!(
+                    "pi CLI provider does not support image content blocks; falling back to \
+                     text-only"
+                );
+            }
+            // Same guard as OpenAiCompatible: don't forward Claude/Gemini
+            // router-catalog model names to pi.
+            let effective_model = model_override.as_deref().and_then(|m| {
+                if m.starts_with("claude") || m.starts_with("gemini") {
+                    warn!("Cannot route to {} model when using pi CLI provider", m);
+                    None
+                } else {
+                    Some(m)
+                }
+            });
+            run_pi_cli(
+                &prompt.text_content(),
+                &ai_settings.pi_cli,
+                effective_model,
+                doctor_handle,
+            )
+        }
         // TODO(tier-decoupling): wire Ollama into the agentic loop
         AiProvider::Ollama => AiResponse::error(
             "Ollama multimodal-routed dispatch is not yet wired into the agentic \
@@ -885,6 +947,7 @@ pub fn run_prompt_with_model_override_multimodal(
             "gemini_cli" => AiProvider::GeminiCli,
             "gemini_api" => AiProvider::GeminiApi,
             "openai_compatible" => AiProvider::OpenAiCompatible,
+            "pi_cli" => AiProvider::PiCli,
             _ => ai_settings.provider,
         }
     } else {
@@ -965,6 +1028,20 @@ pub fn run_prompt_with_model_override_multimodal(
             run_openai_compat(
                 &prompt.text_content(),
                 &ai_settings.openai_compatible,
+                effective_model,
+                doctor_handle,
+            )
+        }
+        AiProvider::PiCli => {
+            if prompt.has_images() {
+                warn!("pi CLI provider does not support multimodal; using text-only fallback");
+            }
+            if temperature_override.is_some() || max_tokens_override.is_some() {
+                debug!("pi CLI does not support temperature/max_tokens overrides; ignoring");
+            }
+            run_pi_cli(
+                &prompt.text_content(),
+                &ai_settings.pi_cli,
                 effective_model,
                 doctor_handle,
             )
@@ -1052,6 +1129,7 @@ pub fn run_prompt_with_structured_output(
             "gemini_cli" => AiProvider::GeminiCli,
             "gemini_api" => AiProvider::GeminiApi,
             "openai_compatible" => AiProvider::OpenAiCompatible,
+            "pi_cli" => AiProvider::PiCli,
             _ => ai_settings.provider,
         }
     } else {
@@ -1120,6 +1198,10 @@ pub fn run_prompt_with_structured_output(
                 model_override,
                 doctor_handle,
             )
+        }
+        AiProvider::PiCli => {
+            debug!("pi CLI does not support server-side structured output; using standard path");
+            run_pi_cli(prompt, &ai_settings.pi_cli, model_override, doctor_handle)
         }
         // TODO(tier-decoupling): wire Ollama into the agentic loop
         AiProvider::Ollama => AiResponse::error(

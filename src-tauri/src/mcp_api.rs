@@ -470,6 +470,7 @@ async fn health(
         crate::settings::AiProvider::ClaudeApi => "claude_api",
         crate::settings::AiProvider::GeminiCli => "gemini_cli",
         crate::settings::AiProvider::GeminiApi => "gemini_api",
+        crate::settings::AiProvider::PiCli => "pi_cli",
         crate::settings::AiProvider::Ollama => "ollama",
         crate::settings::AiProvider::OpenAiCompatible => "openai_compatible",
     };
@@ -478,6 +479,8 @@ async fn health(
         crate::settings::AiProvider::ClaudeApi => Some(ai_settings.claude_api.model.clone()),
         crate::settings::AiProvider::GeminiCli => Some(ai_settings.gemini_cli.model.clone()),
         crate::settings::AiProvider::GeminiApi => Some(ai_settings.gemini_api.model.clone()),
+        // pi manages its own model selection when none is configured
+        crate::settings::AiProvider::PiCli => ai_settings.pi_cli.model.clone(),
         crate::settings::AiProvider::Ollama => Some(ai_settings.ollama.model.clone()),
         crate::settings::AiProvider::OpenAiCompatible => {
             Some(ai_settings.openai_compatible.model.clone())

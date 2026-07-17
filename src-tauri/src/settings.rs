@@ -40,6 +40,9 @@ pub enum AiProvider {
     ClaudeApi, // Claude API (per-token billing)
     GeminiCli, // Gemini CLI (OAuth or API key auth)
     GeminiApi, // Gemini API (direct HTTP calls)
+    /// pi coding agent CLI (`@earendil-works/pi-coding-agent`), print mode.
+    /// Multi-provider by design; the runner defaults it to DeepSeek.
+    PiCli,
     /// Local Ollama instance (Tier 0). Default endpoint: http://127.0.0.1:11434
     Ollama,
     /// Generic OpenAI-compatible HTTP endpoint (vLLM, Gemma, LM Studio, etc.).
@@ -284,6 +287,58 @@ impl Default for GeminiCliSettings {
     }
 }
 
+/// Settings for pi CLI execution (`@earendil-works/pi-coding-agent`).
+///
+/// pi is an agent CLI like Claude Code / Gemini CLI; the runner drives it in
+/// print mode (`pi -p --no-session <prompt>`). `provider`/`model` are always
+/// passed explicitly when set — pi silently ignores an unknown `--provider`
+/// (falls back to the operator's `~/.pi/agent/settings.json` default), so
+/// leaving them implicit would make provider selection machine-dependent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PiCliSettings {
+    #[serde(default)]
+    pub execution_mode: CliExecutionMode,
+    /// Custom path to the pi executable (default: `pi` on PATH — the npm
+    /// `pi.cmd` shim on Windows, driven via `cmd /c`).
+    #[serde(default)]
+    pub custom_path: Option<String>,
+    /// pi provider name (e.g. "deepseek"). Default "deepseek".
+    #[serde(default = "default_pi_cli_provider")]
+    pub provider: Option<String>,
+    /// pi model pattern (e.g. "deepseek-v4-flash"). `None` uses pi's default
+    /// model for the selected provider.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Comma-separated tool allowlist forwarded as `--tools` (e.g.
+    /// "read,grep,find,ls" for a read-only run). `None` uses pi's defaults
+    /// (`read, bash, edit, write`).
+    #[serde(default)]
+    pub tools: Option<String>,
+    #[serde(default = "default_pi_cli_timeout")]
+    pub timeout_seconds: u64,
+}
+
+fn default_pi_cli_provider() -> Option<String> {
+    Some("deepseek".to_string())
+}
+
+fn default_pi_cli_timeout() -> u64 {
+    600
+}
+
+impl Default for PiCliSettings {
+    fn default() -> Self {
+        Self {
+            execution_mode: CliExecutionMode::Auto,
+            custom_path: None,
+            provider: default_pi_cli_provider(),
+            model: None,
+            tools: None,
+            timeout_seconds: default_pi_cli_timeout(),
+        }
+    }
+}
+
 /// Settings for Gemini API (direct HTTP calls)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeminiApiSettings {
@@ -313,6 +368,9 @@ pub struct AiSettings {
     pub gemini_cli: GeminiCliSettings,
     #[serde(default)]
     pub gemini_api: GeminiApiSettings,
+    /// pi CLI settings (`@earendil-works/pi-coding-agent` agent CLI).
+    #[serde(default)]
+    pub pi_cli: PiCliSettings,
     /// Local Ollama instance settings (Tier 0).
     #[serde(default)]
     pub ollama: OllamaSettings,
@@ -377,6 +435,7 @@ impl Default for AiSettings {
             claude_api: ClaudeApiSettings::default(),
             gemini_cli: GeminiCliSettings::default(),
             gemini_api: GeminiApiSettings::default(),
+            pi_cli: PiCliSettings::default(),
             ollama: OllamaSettings::default(),
             openai_compatible: OpenAiCompatibleSettings::default(),
             auto_refine_video_after_iterations: default_auto_refine_video_after_iterations(),
