@@ -210,10 +210,16 @@ impl Default for OllamaSettings {
 pub struct OpenAiCompatibleSettings {
     /// Full base URL — e.g. "https://api.deepseek.com" (default) or
     /// "http://localhost:8080/v1" for a vLLM server.
-    #[serde(default = "default_openai_compatible_base_url")]
+    #[serde(
+        default = "default_openai_compatible_base_url",
+        deserialize_with = "deserialize_base_url_or_default"
+    )]
     pub base_url: String,
     /// Model identifier the server expects (default: "deepseek-chat").
-    #[serde(default = "default_openai_compatible_model")]
+    #[serde(
+        default = "default_openai_compatible_model",
+        deserialize_with = "deserialize_model_or_default"
+    )]
     pub model: String,
     #[serde(default = "default_openai_compatible_timeout")]
     pub timeout_seconds: u64,
@@ -229,6 +235,46 @@ fn default_openai_compatible_base_url() -> String {
 
 fn default_openai_compatible_model() -> String {
     "deepseek-chat".to_string()
+}
+
+/// Treat an absent, null, OR EMPTY `base_url` as unset and fall back to the
+/// default.
+///
+/// `#[serde(default = ...)]` alone is not enough: it fires only when the key
+/// is MISSING. Every runner install that saved AI settings while this field
+/// had no meaningful default persisted `"base_url": ""` — which deserializes
+/// as an empty string and silently keeps the default from ever applying. The
+/// provider then fails with "base_url is empty" on a machine the operator
+/// never configured by hand. Normalizing here (rather than at one call site)
+/// means every reader — the API client, the connection test, the UI — sees
+/// the same effective value, with no settings-file migration.
+fn deserialize_base_url_or_default<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(non_empty_or(
+        Option::<String>::deserialize(deserializer)?,
+        default_openai_compatible_base_url,
+    ))
+}
+
+/// Same empty-is-unset normalization as [`deserialize_base_url_or_default`],
+/// for `model`.
+fn deserialize_model_or_default<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(non_empty_or(
+        Option::<String>::deserialize(deserializer)?,
+        default_openai_compatible_model,
+    ))
+}
+
+fn non_empty_or(raw: Option<String>, default: fn() -> String) -> String {
+    match raw {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => default(),
+    }
 }
 
 fn default_openai_compatible_timeout() -> u64 {
@@ -3040,4 +3086,56 @@ pub fn save_lock_yield_policy_settings(policy: LockYieldPolicySettings) -> Resul
     let mut settings = load_settings();
     settings.lock_yield_policy = policy;
     save_settings(&settings)
+}
+
+#[cfg(test)]
+mod openai_compatible_defaults_tests {
+    use super::*;
+
+    /// Fresh install: no `openai_compatible` key at all → serde `default`
+    /// fires and DeepSeek is configured out of the box (plan D3).
+    #[test]
+    fn missing_block_gets_deepseek_defaults() {
+        let parsed: OpenAiCompatibleSettings =
+            serde_json::from_str("{}").expect("empty object must deserialize");
+        assert_eq!(parsed.base_url, "https://api.deepseek.com");
+        assert_eq!(parsed.model, "deepseek-chat");
+    }
+
+    /// REGRESSION: every runner install that saved AI settings before this
+    /// field had a meaningful default persisted `"base_url": ""` /
+    /// `"model": ""`. Serde `default` does NOT fire for a present-but-empty
+    /// value, so without the empty-is-unset normalization those installs get
+    /// an empty base_url and the provider dies with "base_url is empty" —
+    /// D3's DeepSeek default would reach ONLY fresh installs. Caught by the
+    /// Phase 4 manual E2E on a real box, not by unit tests that construct
+    /// settings directly.
+    #[test]
+    fn persisted_empty_strings_get_deepseek_defaults() {
+        let on_disk = r#"{"base_url":"","model":"","timeout_seconds":600}"#;
+        let parsed: OpenAiCompatibleSettings =
+            serde_json::from_str(on_disk).expect("legacy settings must deserialize");
+        assert_eq!(parsed.base_url, "https://api.deepseek.com");
+        assert_eq!(parsed.model, "deepseek-chat");
+        assert_eq!(parsed.timeout_seconds, 600);
+    }
+
+    #[test]
+    fn whitespace_and_null_are_also_unset() {
+        let parsed: OpenAiCompatibleSettings =
+            serde_json::from_str(r#"{"base_url":"   ","model":null}"#).expect("must deserialize");
+        assert_eq!(parsed.base_url, "https://api.deepseek.com");
+        assert_eq!(parsed.model, "deepseek-chat");
+    }
+
+    /// A real operator-configured endpoint must survive untouched — the
+    /// normalization only replaces empties, it never overrides a value.
+    #[test]
+    fn configured_endpoint_is_preserved() {
+        let parsed: OpenAiCompatibleSettings =
+            serde_json::from_str(r#"{"base_url":"http://localhost:8080/v1","model":"llama-3"}"#)
+                .expect("must deserialize");
+        assert_eq!(parsed.base_url, "http://localhost:8080/v1");
+        assert_eq!(parsed.model, "llama-3");
+    }
 }

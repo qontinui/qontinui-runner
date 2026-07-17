@@ -3507,6 +3507,7 @@ pub fn create_router(
         .merge(crate::mcp::physical_device_api::routes())
         .merge(crate::mcp::plans::routes())
         .merge(crate::mcp::coordinator::routes())
+        .merge(crate::mcp::subagent_api::routes())
         .merge(crate::mcp::completion_reports::routes())
         // Approach-D Conductor/Engine Phase 2 §3 — the `orchestration_report_subtask`
         // MCP tool (POST /orchestration/report-subtask). Mounted alongside the
