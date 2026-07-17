@@ -80,6 +80,9 @@ pub struct SpawnSessionRequest {
     /// roles or a generic "respond helpfully" session that did not know what it
     /// was for, so the work had to be started by a human retyping it.
     ///
+    /// This is also the carrier for the context-exhaustion watcher's
+    /// handoff-summary prompt (session-autonomy-fabric Phase 7).
+    ///
     /// Ignored when `role` is set: a role's slash command IS its prompt, and
     /// silently concatenating the two would produce a session running a
     /// half-command. Supply `args` to parameterise a role instead — the 400
@@ -585,6 +588,32 @@ async fn continuation_verdict(
 }
 
 // =============================================================================
+// /sessions/<id>/context-low
+// =============================================================================
+
+/// `POST /sessions/{id}/context-low` — the PreCompact hook's landing pad
+/// (plan `2026-07-17-session-autonomy-fabric.md` Phase 7). `{id}` is the
+/// runner terminal id the hook script sends (`QONTINUI_TERMINAL_ID`, falling
+/// back to the Claude session id) — the same key space as the grid-scan
+/// watcher, so BOTH signals share one once-per-session debounce. Body = the
+/// raw Claude PreCompact payload (parsed LENIENTLY — empty/non-JSON reads as
+/// `{}` so a curl probe works). Always 200: the endpoint is fail-open by
+/// design (a broken watcher must never break a hook), and all policy lives in
+/// `terminal::context_watcher::on_precompact_signal` (flag-gated
+/// `QONTINUI_CONTEXT_HANDOFF`, default `off`).
+async fn context_low(Path(id): Path<String>, body: axum::body::Bytes) -> Json<serde_json::Value> {
+    let payload: serde_json::Value =
+        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+    let outcome = crate::terminal::context_watcher::on_precompact_signal(&id, &payload);
+    Json(serde_json::json!({
+        "fired": outcome.fired,
+        "mode": outcome.mode,
+        "reason": outcome.reason,
+        "session": id,
+    }))
+}
+
+// =============================================================================
 // Routes
 // =============================================================================
 
@@ -651,4 +680,49 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/sessions/{id}/continuation-verdict",
             post(continuation_verdict),
         )
+        .route("/sessions/{id}/context-low", post(context_low))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── initial_prompt_for precedence (Phase 7 seeded spawns) ──────────
+
+    #[test]
+    fn role_slash_command_wins_over_initial_prompt() {
+        let p = initial_prompt_for(Some("/auto-review"), None, Some("seeded prompt"));
+        assert_eq!(p, "/auto-review");
+        let p = initial_prompt_for(Some("/coordinate"), Some(" repo=x "), Some("seeded"));
+        assert_eq!(p, "/coordinate repo=x");
+    }
+
+    #[test]
+    fn initial_prompt_seeds_roleless_spawns() {
+        let p = initial_prompt_for(None, None, Some("You are the continuation of…"));
+        assert_eq!(p, "You are the continuation of…");
+        // Args without a role are ignored (existing behaviour).
+        let p = initial_prompt_for(None, Some("args"), Some("seeded"));
+        assert_eq!(p, "seeded");
+    }
+
+    #[test]
+    fn empty_initial_prompt_falls_back_to_generic() {
+        for ip in [None, Some(""), Some("   ")] {
+            let p = initial_prompt_for(None, None, ip);
+            assert!(p.contains("AI assistant"), "generic fallback for {ip:?}");
+        }
+    }
+
+    #[test]
+    fn spawn_request_deserializes_initial_prompt_leniently() {
+        let req: SpawnSessionRequest =
+            serde_json::from_str(r#"{"task_name":"t","initial_prompt":"go"}"#).unwrap();
+        assert_eq!(req.initial_prompt.as_deref(), Some("go"));
+        assert!(req.role.is_none());
+        // Absent field defaults to None — existing callers are unaffected.
+        let req: SpawnSessionRequest = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(req.initial_prompt.is_none());
+        assert_eq!(req.task_name, "Coordinator-spawned session");
+    }
 }

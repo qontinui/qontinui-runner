@@ -246,6 +246,12 @@ fn scan_interval() -> Duration {
 
 /// Spawn the periodic grid scanner for the process lifetime. Detached; each
 /// tick is best-effort and the loop never exits.
+///
+/// The tick also drives the context-exhaustion watcher
+/// ([`super::context_watcher::scan_terminals_once`], session-autonomy-fabric
+/// Phase 7) — it rides the SAME rendered-grid cadence instead of adding a
+/// second poll loop, and is a zero-cost early-out while its flag
+/// (`QONTINUI_CONTEXT_HANDOFF`) is dark.
 pub fn spawn_grid_scan_loop() {
     tauri::async_runtime::spawn(async move {
         let mut ticker = tokio::time::interval(scan_interval());
@@ -254,6 +260,7 @@ pub fn spawn_grid_scan_loop() {
         loop {
             ticker.tick().await;
             scan_grids_once();
+            super::context_watcher::scan_terminals_once();
         }
     });
 }
