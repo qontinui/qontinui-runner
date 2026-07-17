@@ -109,8 +109,21 @@ pub fn breadcrumb_dir() -> Option<PathBuf> {
 /// `-<port>` suffix, so a temp runner (9877+) can never clobber the primary's
 /// record. The bare name is ALSO what makes "prefer the primary" a single read
 /// rather than a directory sweep.
+///
+/// "Primary" is [`preferred_primary_port`] — the SAME notion the reader
+/// ([`select_live`]) uses, NOT the hardcoded [`PRIMARY_PORT`]. A primary that
+/// bound a `QONTINUI_PRIMARY_PORT`-configured port must get the bare name (and
+/// the [`PortBreadcrumb::primary`] flag) the reader is looking for, or a bare
+/// session would skip it and mint against a temp runner instead.
 pub fn breadcrumb_file_name(port: u16) -> String {
-    if port == PRIMARY_PORT {
+    file_name_for(port, preferred_primary_port())
+}
+
+/// Inner, env-free helper: the file name `port` gets when `primary` is the
+/// primary port. Split out so writer/reader agreement is unit-testable with an
+/// explicit primary rather than through the process-global env var.
+fn file_name_for(port: u16, primary: u16) -> String {
+    if port == primary {
         "api-port.json".to_string()
     } else {
         format!("api-port-{port}.json")
@@ -138,14 +151,24 @@ fn published_path() -> &'static std::sync::Mutex<Option<PathBuf>> {
     PUBLISHED_PATH.get_or_init(|| std::sync::Mutex::new(None))
 }
 
-/// Build the record this process would publish for `port`.
+/// Build the record this process would publish for `port`. The `primary` flag is
+/// derived from [`preferred_primary_port`] — the SAME notion the reader uses — so
+/// a `QONTINUI_PRIMARY_PORT`-configured primary advertises itself as primary
+/// rather than being mislabeled a temp runner (see [`breadcrumb_file_name`]).
 pub fn breadcrumb_for(port: u16) -> PortBreadcrumb {
+    breadcrumb_for_with_primary(port, preferred_primary_port())
+}
+
+/// Inner, env-free helper behind [`breadcrumb_for`]: build the record treating
+/// `primary` as the primary port. Split out so the writer's primary-labeling is
+/// unit-testable with an explicit primary rather than the process-global env.
+fn breadcrumb_for_with_primary(port: u16, primary: u16) -> PortBreadcrumb {
     PortBreadcrumb {
         schema: BREADCRUMB_SCHEMA,
         port,
         pid: std::process::id(),
         started_at_ms: *STARTED_AT_MS.get_or_init(|| chrono::Utc::now().timestamp_millis()),
-        primary: port == PRIMARY_PORT,
+        primary: port == primary,
     }
 }
 
@@ -233,6 +256,14 @@ pub fn list_breadcrumbs_in(dir: &Path) -> Vec<PortBreadcrumb> {
 /// runner to mint, so a wrong-but-live pid costs one refused/refusing HTTP call,
 /// never a mis-paired nonce.
 pub fn pid_is_live(pid: u32) -> bool {
+    // pid 0 is never a runner: on Windows it is the System Idle Process (which
+    // sysinfo DOES report as live), on Unix it is the swapper/"any process in
+    // caller's group" sentinel. A breadcrumb whose pid is 0 is malformed, and
+    // trusting it would hand a bare session a dead port — so reject it outright,
+    // before the process-table refresh.
+    if pid == 0 {
+        return false;
+    }
     let pid = sysinfo::Pid::from_u32(pid);
     let mut sys = sysinfo::System::new();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
@@ -255,6 +286,24 @@ pub fn preferred_primary_port() -> u16 {
 ///
 /// `is_live` is injected so the selection rule is unit-testable without spawning
 /// processes; production callers pass [`pid_is_live`] via [`resolve_live_runner`].
+///
+/// # Residual pid-reuse risk (accepted, not fixed here)
+///
+/// The primary preference is applied WITHIN the already-liveness-filtered set, so
+/// a plainly-dead primary corpse is skipped for the newest live runner. One edge
+/// survives: a crashed primary that skipped [`remove_published`] leaves
+/// `api-port.json`, and on Windows its pid can be recycled onto an unrelated live
+/// process, so [`pid_is_live`] returns true and the stale record is preferred
+/// over a fresh temp runner. This is deliberately NOT worked around by "prefer
+/// the newest live record when the primary looks older": the primary is NORMALLY
+/// older than a freshly-spawned temp runner (it comes up at boot; temp runners
+/// spawn later), so that heuristic would invert this module's load-bearing
+/// invariant — "prefer the primary, NEVER bind a bare session to a temp runner
+/// that will be torn down mid-session" — in the common case, to defend a rare
+/// pid-recycle. The cost of the residual edge is bounded by construction: the
+/// caller's next step is to ASK the selected runner to mint, so a wrong-but-live
+/// pid costs one refused HTTP call and a fail-open "no identity", never a
+/// mis-paired nonce (same containment the module doc describes for pid reuse).
 pub fn select_live(
     all: &[PortBreadcrumb],
     primary: u16,
@@ -295,11 +344,67 @@ mod tests {
     }
 
     /// The primary gets the bare file name; every other port is suffixed — so a
-    /// temp runner can never clobber the primary's record.
+    /// temp runner can never clobber the primary's record. (With
+    /// `QONTINUI_PRIMARY_PORT` unset, the primary defaults to [`PRIMARY_PORT`].)
     #[test]
     fn file_name_namespaces_non_primary_ports() {
         assert_eq!(breadcrumb_file_name(PRIMARY_PORT), "api-port.json");
         assert_eq!(breadcrumb_file_name(9879), "api-port-9879.json");
+    }
+
+    /// FIX 4 — writer/reader agree on which port is "primary". When the primary
+    /// binds a `QONTINUI_PRIMARY_PORT`-configured fallback (9878), the WRITER must
+    /// mark that record primary + give it the bare name, and the READER must
+    /// select it over a live 9877 temp runner. Driven through the env-free inner
+    /// helpers with an explicit primary so the agreement is deterministic (no
+    /// process-global env), then cross-checked against `select_live`.
+    #[test]
+    fn writer_and_reader_agree_on_a_configured_primary_port() {
+        let configured_primary = 9878;
+
+        // Writer side: the configured-primary record is labeled primary and gets
+        // the bare (un-suffixed) file name the reader looks for first.
+        let primary_rec = breadcrumb_for_with_primary(configured_primary, configured_primary);
+        assert!(
+            primary_rec.primary,
+            "a record on the configured primary port must be marked primary"
+        );
+        assert_eq!(file_name_for(configured_primary, configured_primary), "api-port.json");
+        // A temp runner (9877) under the same configured primary stays non-primary.
+        let temp_rec = breadcrumb_for_with_primary(9877, configured_primary);
+        assert!(!temp_rec.primary);
+        assert_eq!(file_name_for(9877, configured_primary), "api-port-9877.json");
+
+        // Reader side: with the SAME primary notion, the primary wins over the
+        // newer temp runner even though the temp runner started later.
+        let primary_live = rec(configured_primary, 10, 100);
+        let temp_live = rec(9877, 11, 999); // newer, but a temp runner
+        let selected = select_live(&[temp_live, primary_live.clone()], configured_primary, |_| true);
+        assert_eq!(
+            selected,
+            Some(primary_live),
+            "the reader must prefer the configured-primary record over a newer temp runner"
+        );
+    }
+
+    /// FIX 4 — the PUBLIC (env-reading) writer entry points honor
+    /// `QONTINUI_PRIMARY_PORT`, proving the wiring, not just the inner helpers.
+    #[test]
+    fn public_writer_honors_primary_port_env() {
+        // Save/restore so this never leaks into a sibling test.
+        let prev = std::env::var(PRIMARY_PORT_ENV).ok();
+        std::env::set_var(PRIMARY_PORT_ENV, "9878");
+
+        assert_eq!(breadcrumb_file_name(9878), "api-port.json");
+        assert!(breadcrumb_for(9878).primary);
+        // The hardcoded default port is NOT primary once the env names a different one.
+        assert_eq!(breadcrumb_file_name(PRIMARY_PORT), "api-port-9876.json");
+        assert!(!breadcrumb_for(PRIMARY_PORT).primary);
+
+        match prev {
+            Some(v) => std::env::set_var(PRIMARY_PORT_ENV, v),
+            None => std::env::remove_var(PRIMARY_PORT_ENV),
+        }
     }
 
     /// Round-trip through the atomic writer + reader, and reject a record whose

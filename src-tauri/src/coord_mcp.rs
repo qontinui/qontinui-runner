@@ -661,18 +661,28 @@ pub(crate) fn register_agent_proxy_nonce(workdir: &str, agent_id: Uuid) -> Strin
 /// ([`persist_proxy_nonces_with_store`]) instead of the default store reached
 /// via the process-global `QONTINUI_SECURE_STORAGE_DIR`.
 ///
-/// **Eviction is scoped to `lifetime`'s class** (plan 2026-07-17 §1/E). Within
-/// the Persistent class this is byte-for-byte the previous behavior (every
-/// runner-spawn nonce was Persistent, so "same workdir" and "same workdir + same
-/// class" select the same set). The scoping exists for the new cross-class case:
-/// a BARE session minting for a cwd must never evict the nonce of a live PTY
-/// terminal running in that same cwd. Unscoped, an unprivileged mint-route call
-/// naming the operator's repo root would 401 that terminal's MCP client the
-/// moment its 90s grace elapsed — a trivially-reachable denial of service, and a
-/// direct violation of "a runner-spawned terminal is unaffected". Two live
-/// nonces for one workdir is already a sanctioned state (it is exactly what the
-/// grace window creates), and both map to the same workdir, so
-/// [`workdir_for_nonce`] stays correct either way.
+/// **Eviction rule (plan 2026-07-17 §1/E):**
+/// - A **PERSISTENT** mint evicts the prior persistent-same-workdir nonce (the
+///   runner-spawn re-provision case) and graces the evicted DEVICE ones. Within
+///   the Persistent class this is byte-for-byte the previous behavior (every
+///   runner-spawn nonce was Persistent, so "same workdir" and "same workdir +
+///   same class" select the same set).
+/// - An **EPHEMERAL** mint evicts **NOTHING**. Two DIFFERENT bare sessions
+///   routinely share a cwd, and an ephemeral eviction is NOT graced (grace is
+///   for runner-initiated re-provisions only), so removing a sibling ephemeral
+///   nonce would 401 the other bare session's already-connected MCP client the
+///   instant it was superseded — mid-session. Each ephemeral nonce is
+///   independent and TTL-bounded, so a prior one is left to live out its own
+///   TTL. The map stays bounded via the expired-ephemeral sweep below rather
+///   than via eviction.
+///
+/// Either way an ephemeral mint never touches a persistent nonce (and vice
+/// versa): the scoping exists so a BARE session minting for a cwd can never
+/// evict the nonce of a live PTY terminal running in that same cwd — an
+/// unprivileged mint-route call naming the operator's repo root must never 401
+/// that terminal's MCP client. Two live nonces for one workdir is a sanctioned
+/// state, and both map to the same workdir, so [`workdir_for_nonce`] stays
+/// correct either way.
 fn mint_and_register_nonce(
     workdir: &str,
     principal: ProxyPrincipal,
@@ -686,21 +696,37 @@ fn mint_and_register_nonce(
         uuid::Uuid::new_v4().simple()
     );
     let ephemeral = lifetime.is_ephemeral();
+    let now = std::time::Instant::now();
     let snapshot = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
-        // Change 3: collect the DEVICE nonces being evicted for this workdir so
-        // they ride a short grace TTL — an in-flight client that cached one keeps
-        // validating until it reconnects. Agent nonces are NOT graced (they must
-        // hard-fail closed on re-mint), so they are simply dropped by `retain`.
-        // Ephemeral nonces are NOT graced either: grace exists to protect a
-        // runner-spawn client across a re-provision the RUNNER initiated, whereas
-        // an ephemeral re-mint is the bare session asking for a replacement it
-        // already holds — extending the superseded one would only widen the
-        // accept set past its bounded lifetime, which is the one property it has.
+        // Bound the map: opportunistically sweep EVERY expired ephemeral nonce on
+        // each mint. Because an ephemeral mint no longer evicts a prior
+        // same-workdir ephemeral (below), expired ephemerals would otherwise be
+        // reaped only lazily on their own re-lookup ([`live_binding`]) — so on a
+        // long-lived opted-in runner minting across many distinct cwds the map
+        // could grow unbounded. This mirrors how [`grace_evicted_device_nonces`]
+        // self-prunes on insert. Cheap, bounded to mint frequency, and it never
+        // touches a persistent nonce (no expiry) nor an unexpired ephemeral.
+        map.retain(|_, b| match b.lifetime {
+            NonceLifetime::Ephemeral { expires_at } => expires_at > now,
+            NonceLifetime::Persistent => true,
+        });
+        // Eviction is scoped by class (see this fn's doc). Change 3: collect the
+        // DEVICE nonces being evicted for this workdir so they ride a short grace
+        // TTL — an in-flight client that cached one keeps validating until it
+        // reconnects. Agent nonces are NOT graced (they must hard-fail closed on
+        // re-mint), so they are simply dropped by the retain.
+        //
+        // Only a PERSISTENT mint evicts. An EPHEMERAL mint evicts NOTHING: two
+        // DIFFERENT bare sessions routinely share a cwd, and an ephemeral eviction
+        // is not graced, so removing a sibling ephemeral nonce would 401 the other
+        // session's already-connected MCP client mid-session. A prior ephemeral is
+        // left to live out its own TTL (already swept above once expired).
         let evicted_graceable: Vec<String> = if ephemeral {
             Vec::new()
         } else {
-            map.iter()
+            let graceable: Vec<String> = map
+                .iter()
                 .filter(|(n, b)| {
                     b.workdir == workdir
                         && b.principal == ProxyPrincipal::Device
@@ -708,9 +734,12 @@ fn mint_and_register_nonce(
                         && *n != &nonce
                 })
                 .map(|(n, _)| n.clone())
-                .collect()
+                .collect();
+            // Persistent-same-workdir eviction (today's PTY re-provision behavior).
+            // Never touches an ephemeral nonce, so the class-scoping holds.
+            map.retain(|_, b| !(b.workdir == workdir && !b.lifetime.is_ephemeral()));
+            graceable
         };
-        map.retain(|_, b| !(b.workdir == workdir && b.lifetime.is_ephemeral() == ephemeral));
         map.insert(
             nonce.clone(),
             NonceBinding {
@@ -2040,13 +2069,79 @@ mod tests {
                 .map(|b| b.principal.clone()),
             Some(ProxyPrincipal::Device)
         ));
-        // An ephemeral re-mint DOES evict the prior ephemeral nonce for the same
-        // workdir (same-class eviction) and is NOT graced — grace exists for
-        // runner-initiated re-provisions, not for a bare session replacing a key
-        // it already holds.
+        // An ephemeral mint evicts NOTHING: two DIFFERENT bare sessions routinely
+        // share a cwd, and ephemeral evictions are not graced — so a second
+        // ephemeral mint for this workdir must leave the FIRST one registered, or
+        // the first session's already-connected MCP client would 401 mid-session.
+        // Both bindings coexist, each living out its own TTL.
+        {
+            let map = proxy_nonces().lock().unwrap();
+            assert!(
+                map.contains_key(&bare_nonce),
+                "an ephemeral mint must NOT evict a prior same-workdir ephemeral nonce"
+            );
+            assert!(
+                map.contains_key(&bare_again),
+                "the freshly-minted ephemeral nonce is registered alongside it"
+            );
+        }
+    }
+
+    /// Bound the map: an EXPIRED ephemeral binding is swept from the live map on
+    /// the next mint (whatever the new mint's workdir/class), so a long-lived
+    /// opted-in runner minting across many distinct cwds cannot leak unbounded
+    /// ephemeral bindings. A live (unexpired) ephemeral and a persistent binding
+    /// both survive the sweep.
+    #[test]
+    fn expired_ephemeral_nonces_are_swept_on_mint() {
+        let wd = format!("D:/sweep-test/{}", uuid::Uuid::now_v7());
+
+        // Seed one already-expired ephemeral and one live ephemeral, both for a
+        // DIFFERENT workdir than the mint below (so the sweep, not eviction, is
+        // what removes the expired one).
+        let expired = format!("expired-sweep-{}", uuid::Uuid::now_v7().simple());
+        let live = format!("live-sweep-{}", uuid::Uuid::now_v7().simple());
+        {
+            let mut map = proxy_nonces().lock().unwrap();
+            map.insert(
+                expired.clone(),
+                NonceBinding {
+                    workdir: format!("{wd}/other-expired"),
+                    principal: ProxyPrincipal::Device,
+                    lifetime: NonceLifetime::Ephemeral {
+                        expires_at: std::time::Instant::now()
+                            - std::time::Duration::from_secs(1),
+                    },
+                },
+            );
+            map.insert(
+                live.clone(),
+                NonceBinding {
+                    workdir: format!("{wd}/other-live"),
+                    principal: ProxyPrincipal::Device,
+                    lifetime: NonceLifetime::Ephemeral {
+                        expires_at: std::time::Instant::now()
+                            + std::time::Duration::from_secs(3600),
+                    },
+                },
+            );
+        }
+
+        // Any mint triggers the opportunistic sweep.
+        let persistent = register_proxy_nonce(&wd);
+
+        let map = proxy_nonces().lock().unwrap();
         assert!(
-            !proxy_nonces().lock().unwrap().contains_key(&bare_nonce),
-            "an ephemeral re-mint evicts the prior same-class nonce for that workdir"
+            !map.contains_key(&expired),
+            "an expired ephemeral binding is swept from the map on the next mint"
+        );
+        assert!(
+            map.contains_key(&live),
+            "a live (unexpired) ephemeral binding survives the sweep"
+        );
+        assert!(
+            map.contains_key(&persistent),
+            "the freshly-minted persistent nonce is registered"
         );
     }
 
