@@ -72,8 +72,6 @@ interface TerminalInstanceProps {
   onUserInputLine?: (input: string) => void;
   /** Called when the shell emits an OSC 633 shell integration event. */
   onShellIntegration?: (event: ShellIntegrationEvent) => void;
-  /** Called with decoded text whenever PTY output is received. */
-  onOutput?: (text: string) => void;
   /**
    * Called with the latest OSC 0 / OSC 2 title observed by the Rust grid.
    * Fires from the bootstrap paint and from the ~1s ack-timer title poll
@@ -171,7 +169,6 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
       onFirstInput,
       onUserInputLine,
       onShellIntegration,
-      onOutput,
       onTitleChange,
     },
     ref,
@@ -202,8 +199,6 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
     onReconnectedRef.current = onReconnected;
     const onShellIntegrationRef = useRef(onShellIntegration);
     onShellIntegrationRef.current = onShellIntegration;
-    const onOutputRef = useRef(onOutput);
-    onOutputRef.current = onOutput;
     const onTitleChangeRef = useRef(onTitleChange);
     onTitleChangeRef.current = onTitleChange;
     // Phase 1 (pop-out windows): owner-gated stdin. Only the window that owns
@@ -220,7 +215,6 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
      * every title poll (~1s ack-timer cadence) when the title is unchanged.
      */
     const lastTitleRef = useRef<string | null>(null);
-    const outputDecoderRef = useRef(new TextDecoder());
     const firstInputReportedRef = useRef(false);
     const inputAccumulatorRef = useRef("");
     // Fractional carry for the Shift+wheel local-scroll override — sub-line
@@ -526,9 +520,15 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
           // A chunk emitted before the ring snapshot can still be DELIVERED
           // after the replay (event delivery and invoke responses are not
           // mutually ordered) — trim it to its unreplayed suffix so the
-          // boundary bytes aren't written twice. onOutput/ack bookkeeping
-          // below stays on the full chunk: the content reached the terminal
-          // either way (via the ring), only the duplicate write is skipped.
+          // boundary bytes aren't written twice. ack bookkeeping below stays on
+          // the full chunk: the content reached the terminal either way (via
+          // the ring), only the duplicate write is skipped.
+          //
+          // Session-state tracking is NOT fed from here anymore — the global
+          // `terminal-output` tap in `TerminalSessionContext` decodes + feeds
+          // `handleOutput` independently of this instance's mount state (Phase 2
+          // of the flow-grid virtualization plan). This listener is now purely
+          // the xterm write/render path.
           const unreplayed = trimReplayedChunk(
             { bytes, offset: event.payload.offset },
             replayedThrough,
@@ -541,14 +541,6 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
             coalesceQueue.push(unreplayed);
             coalesceLen += unreplayed.length;
             scheduleFlush();
-          }
-          if (onOutputRef.current) {
-            try {
-              const text = outputDecoderRef.current.decode(bytes, { stream: true });
-              onOutputRef.current(text);
-            } catch {
-              /* ignore decode errors */
-            }
           }
           bytesReceivedRef.current += bytes.length;
         });

@@ -701,6 +701,18 @@ function TerminalPageInner({
   // poll-dead-race remediation plan). Plain (non-Claude) shells have no
   // `claudeSessionId`; they are still listed (with `claudeSessionId: null`)
   // so the roster is a faithful census of all tracked terminals.
+  //
+  // Flow-grid virtualization (Phase 3) note: a far-offscreen ("assigned-virtual")
+  // zone renders only a CompactZoneCard and mounts NO TerminalInstance, so it has
+  // no `terminal-input-<id>` interactive element to type into. This roster still
+  // lists that session (it is sourced from `tabs`, not from mounted zones), so
+  // automation can always SEE every session. To *type into* a virtualized
+  // session, automation must either (a) scroll its cell into view first so the
+  // instance cold-mounts and re-registers `terminal-input-<id>`, or (b) use the
+  // layout-independent backend input route — `invoke("terminal_write", { terminalId, data })`
+  // (base64 payload), which addresses the PTY by id and is unaffected by mount
+  // state. The frontend's own quick-approve/reject/send actions already take
+  // route (b) automatically via `writeToTerminalById`.
   const terminalSessionRoster = useMemo(() => {
     const assignments = zoneLayout.assignments;
     const roster = tabs.map((t) => {

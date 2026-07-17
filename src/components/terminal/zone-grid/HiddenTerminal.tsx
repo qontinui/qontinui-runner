@@ -13,7 +13,6 @@ export function HiddenTerminal({
   onFirstInput,
   onUserInputLine,
   onShellIntegration,
-  onOutput,
   onReconnected,
   onTitleChange,
 }: {
@@ -23,7 +22,6 @@ export function HiddenTerminal({
   onFirstInput: (terminalId: string, input: string) => void;
   onUserInputLine?: (terminalId: string, input: string) => void;
   onShellIntegration: (tabId: string, event: ShellIntegrationEvent) => void;
-  onOutput: (tabId: string, text: string) => void;
   onReconnected: (tabId: string) => void;
   onTitleChange?: (tabId: string, title: string) => void;
 }) {
@@ -41,7 +39,6 @@ export function HiddenTerminal({
           onUserInputLine ? (input) => onUserInputLine(tab.id, input) : undefined
         }
         onShellIntegration={(event) => onShellIntegration(tab.id, event)}
-        onOutput={(text) => onOutput(tab.id, text)}
         onTitleChange={onTitleChange ? (title) => onTitleChange(tab.id, title) : undefined}
       />
     </div>

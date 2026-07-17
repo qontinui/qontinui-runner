@@ -1,7 +1,7 @@
 import { useEffect, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { LAYOUT_PRESETS } from "./useZoneLayout";
+import { LAYOUT_PRESETS, FLOW_GRID_ID } from "./useZoneLayout";
 import type { TerminalRefsMap } from "./writeWhenReady";
 import {
   typeResumeAndVerify,
@@ -568,8 +568,15 @@ export function useTerminalInitialization({
         // The restored layout is a starting point only — auto-grow may expand
         // it later so every live session keeps a visible zone.
         if (saved && saved.layoutId !== zoneLayout.layoutId) {
-          const preset = LAYOUT_PRESETS.find((p) => p.id === saved.layoutId);
-          if (preset) zoneLayout.setLayoutId(preset.id);
+          // Accept a persisted `flow-grid` id (synthesized, not in the preset
+          // table) alongside the static presets — else restoring into flow mode
+          // silently drops back to the default and re-hides sessions past the 9th.
+          if (
+            saved.layoutId === FLOW_GRID_ID ||
+            LAYOUT_PRESETS.some((p) => p.id === saved.layoutId)
+          ) {
+            zoneLayout.setLayoutId(saved.layoutId);
+          }
         }
 
         // 3) Bind every open Claude record to its RECORDED zone — Claude zones

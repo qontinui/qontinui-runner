@@ -14,6 +14,7 @@ import { PlanViewer } from "./PlanViewer";
 import { SuggestionChip } from "./suggestions";
 import { ZoneHoverActions } from "./ZoneHoverActions";
 import type { LayoutPreset } from "./useZoneLayout";
+import { FLOW_GRID_ID, FLOW_COLS, MIN_TILE_HEIGHT_PX } from "./useZoneLayout";
 import {
   STATE_BORDER_COLORS,
   STATE_COLORS,
@@ -33,6 +34,15 @@ import {
   useTransitionEffects,
   useUIStateCx,
 } from "./contexts";
+import { classifyTabs, type TabClassification } from "./classifyTabs";
+import { useZoneVirtualization } from "./useZoneVirtualization";
+import {
+  scrollCellIntoView,
+  focusedTabIdFor,
+  newestAddedTabId,
+  zoneForTab,
+} from "./flowScrollRouting";
+import { writeToTerminalById } from "./writeToTerminalById";
 
 export type ViewMode = "auto" | "full" | "compact";
 
@@ -152,7 +162,11 @@ export function ZoneGrid({
   const stateDurations = stateTracking.stateDurations;
   const staleTabs = stateTracking.staleTabs;
   const activityData = stateTracking.activityData;
-  const onOutput = stateTracking.handleOutput;
+  // Session-state tracking is fed by the single global `terminal-output` tap in
+  // `TerminalSessionContext.PageSessionScope` (Phase 2), NOT by instance
+  // `onOutput` callbacks — so tracking survives Phase 3 instance unmounting.
+  // ZoneGrid no longer routes output into `handleOutput`; instances keep their
+  // own `terminal-output` listener purely for the xterm write/render path.
   const onReconnected = markReconnected;
   /**
    * Layer 4 polish (OSC 0/2 title): plumb the latest title from the Rust
@@ -225,11 +239,111 @@ export function ZoneGrid({
   const gridRef = useRef<HTMLDivElement>(null);
   const prevLayoutIdRef = useRef(layout.id);
 
+  // Flow-grid mode (past-9 synthesized scrolling grid): uniform tiles, no
+  // resize handles, no per-layout ratio persistence — the row count changes on
+  // every tab open/close, which would otherwise thrash the `zone-*-ratios-*`
+  // storage keyed on `layout.id`. All ratio machinery below is skipped here.
+  const isFlowMode = layout.id === FLOW_GRID_ID;
+
+  // Flow-grid virtualization (Phase 3): observe each zone cell against the
+  // scrolling grid container (`gridRef`) and expose the set of tab-ids near the
+  // viewport. `registerCell`/`cellFor` also form the reusable zone-cell DOM
+  // registry Phase 4 (scroll routing) consumes. No-op outside flow mode.
+  const { nearViewport, registerCell, unregisterCell, cellFor } = useZoneVirtualization(
+    gridRef,
+    isFlowMode,
+  );
+  const setFocusedZone = zoneLayout.setFocusedZone;
+
+  // ── Phase 4: scroll-aware attention routing (flow mode only) ─────────────
+  //
+  // Every attention path — keyboard nav (`focusNextZone`/`focusPrevZone`), the
+  // needs-input jump (`focusNextNeedsInput`, which also un-maximizes), the
+  // error jump + stuck-lock jump (StatusStrip pills), and a freshly docked
+  // session (effect below) — funnels through the single `focusedZone` state,
+  // so this one effect keyed on the focused TAB covers them all. When the
+  // focused tab changes in flow mode, scroll its (Phase-3-registered) cell into
+  // view. Preset layouts never scroll (all zones already visible), so it no-ops
+  // outside flow mode. `scrollIntoView({block:"nearest"})` minimizes movement,
+  // so re-focusing an already-visible cell doesn't fight the operator's manual
+  // scroll — and because we only scroll when `focusedTabId` actually CHANGES,
+  // plain scrolling (which leaves `focusedZone` untouched) never triggers one.
+  const focusedTabId = focusedTabIdFor(assignments, focusedZone);
+  const prevFocusedTabIdRef = useRef<string | null>(null);
+  const didSeedFocusScrollRef = useRef(false);
   useEffect(() => {
+    if (!isFlowMode) {
+      // Leaving flow mode: forget the baseline so re-entering doesn't scroll
+      // from a stale focused tab.
+      prevFocusedTabIdRef.current = focusedTabId;
+      didSeedFocusScrollRef.current = false;
+      return;
+    }
+    if (!didSeedFocusScrollRef.current) {
+      // First flow-mode pass — seed the baseline WITHOUT scrolling so the
+      // persisted focused zone / the operator's restored scroll position on
+      // mount is left untouched.
+      didSeedFocusScrollRef.current = true;
+      prevFocusedTabIdRef.current = focusedTabId;
+      return;
+    }
+    if (focusedTabId === prevFocusedTabIdRef.current) return;
+    prevFocusedTabIdRef.current = focusedTabId;
+    if (!focusedTabId) return;
+    // `cellFor` may return a virtual cell; scrolling it flips it to
+    // `assigned-live` via the observer + overscan (the instance cold-mounts
+    // async — we intentionally don't touch the instance here).
+    scrollCellIntoView(cellFor(focusedTabId));
+  }, [isFlowMode, focusedTabId, cellFor]);
+
+  // ── Phase 4: focus + scroll a newly docked session (flow mode only) ──────
+  //
+  // A new session (gate-continuation dock / new-session dock via the
+  // `terminal-created` ingest, or an operator-created tab) lands in the LAST
+  // flow row — the furthest-scrolled spot the operator can't see. Its zone is
+  // assigned ASYNCHRONOUSLY by the creation-order auto-fill / auto-grow
+  // reconcile in `useZoneLayout` (a couple of effect passes after ingest), so
+  // we watch `tabs` for a genuinely-new id and, once it holds a zone, route it
+  // through `focusedZone` — the SAME mechanism the scroll effect above watches,
+  // so there's exactly one scroll path. Seeding the baseline on the first pass
+  // (and on flow-mode entry) means a restore burst / initial mount never
+  // hijacks the operator's focus, and preset mode is untouched entirely.
+  const prevTabIdsRef = useRef<Set<string> | null>(null);
+  const pendingFocusTabIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    const currentIds = tabs.map((t) => t.id);
+    if (!isFlowMode) {
+      // Keep the baseline current in preset mode so switching INTO flow mode
+      // doesn't treat every already-open tab as newly added.
+      prevTabIdsRef.current = new Set(currentIds);
+      pendingFocusTabIdRef.current = null;
+      return;
+    }
+    const prev = prevTabIdsRef.current;
+    prevTabIdsRef.current = new Set(currentIds);
+    if (prev === null) {
+      // First flow-mode pass — seed without focusing (restore/initial burst).
+      return;
+    }
+    const added = newestAddedTabId(prev, currentIds);
+    if (added) pendingFocusTabIdRef.current = added;
+    const pending = pendingFocusTabIdRef.current;
+    if (!pending) return;
+    const zone = zoneForTab(assignments, pending);
+    // Not placed yet — keep it pending; the reconcile that assigns the zone
+    // re-runs this effect (assignments is a dep) and we route focus then.
+    if (zone === null) return;
+    pendingFocusTabIdRef.current = null;
+    if (zone !== focusedZone) setFocusedZone(zone);
+  }, [isFlowMode, tabs, assignments, focusedZone, setFocusedZone]);
+
+  useEffect(() => {
+    if (isFlowMode) return;
     instanceStorage.setJSON(pk(`zone-col-ratios-${layout.id}`), gridState.colRatios);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gridState.colRatios, layout.id]);
   useEffect(() => {
+    if (isFlowMode) return;
     instanceStorage.setJSON(pk(`zone-row-ratios-${layout.id}`), gridState.rowRatios);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gridState.rowRatios, layout.id]);
@@ -239,6 +353,9 @@ export function ZoneGrid({
   const didMountLoadRef = useRef(false);
   useEffect(() => {
     if (didMountLoadRef.current || pageId === "default") return;
+    // Inline the flow check (vs the `isFlowMode` const) so exhaustive-deps only
+    // tracks `layout.id`, already a dep — flow mode has no ratios to load.
+    if (layout.id === FLOW_GRID_ID) return;
     didMountLoadRef.current = true;
     const parsedCols = instanceStorage.getJSON<number[]>(pk(`zone-col-ratios-${layout.id}`), []);
     dispatch({
@@ -255,6 +372,9 @@ export function ZoneGrid({
   useEffect(() => {
     if (prevLayoutIdRef.current !== layout.id) {
       prevLayoutIdRef.current = layout.id;
+      // Flow mode uses uniform tiles — skip ratio reads/resets entirely (the
+      // deps below re-fire on every row-count change as tabs open/close).
+      if (isFlowMode) return;
       const parsedCols = instanceStorage.getJSON<number[]>(pk(`zone-col-ratios-${layout.id}`), []);
       dispatch({
         type: "SET_COL_RATIOS",
@@ -273,9 +393,11 @@ export function ZoneGrid({
   useEffect(() => {
     if (resetRatiosKey !== undefined && resetRatiosKey !== prevResetKeyRef.current) {
       prevResetKeyRef.current = resetRatiosKey;
+      if (isFlowMode) return;
       dispatch({ type: "SET_COL_RATIOS", ratios: Array(layout.columns).fill(1) });
       dispatch({ type: "SET_ROW_RATIOS", ratios: Array(layout.rows).fill(1) });
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [resetRatiosKey, layout.columns, layout.rows]);
 
   useEffect(() => {
@@ -307,16 +429,20 @@ export function ZoneGrid({
   // their lifecycle effects evict each other. Centralizing classification
   // in one Map keyed off `assignments` guarantees that for any tab.id,
   // exactly one of {visible inline, hidden} renders per render pass.
-  const tabClassification = useMemo(() => {
-    const m = new Map<string, "assigned" | "hidden">();
-    const assignedIds = new Set(
-      Object.values(assignments).filter((id): id is string => id != null),
-    );
-    for (const t of tabs) {
-      m.set(t.id, assignedIds.has(t.id) ? "assigned" : "hidden");
-    }
-    return m;
-  }, [tabs, assignments]);
+  //
+  // Phase 3 (flow-grid virtualization) extends this to a THREE-way result in
+  // flow mode: `assigned-live` (near viewport → mount a real TerminalInstance),
+  // `assigned-virtual` (far offscreen → CompactZoneCard, zero instances), and
+  // `hidden`. The exactly-one-owner invariant relaxes to exactly-one-OR-zero (a
+  // virtual zone owns zero mounts) while the dual-mount race stays impossible
+  // (each tab.id maps to exactly one classification). Preset (non-flow) layouts
+  // keep the two-way `assigned`/`hidden` result unchanged. The decision itself
+  // lives in the pure `classifyTabs` so the invariant is unit-testable without
+  // an IntersectionObserver.
+  const tabClassification = useMemo(
+    () => classifyTabs(tabs, assignments, isFlowMode, nearViewport),
+    [tabs, assignments, isFlowMode, nearViewport],
+  );
 
   const unassignedTerminals = tabs.filter(
     (t) => tabClassification.get(t.id) === "hidden" && t.type !== "plan",
@@ -332,7 +458,6 @@ export function ZoneGrid({
         onFirstInput={onFirstInput}
         onUserInputLine={onUserInputLine}
         onShellIntegration={onShellIntegration}
-        onOutput={onOutput}
         onReconnected={onReconnected}
         onTitleChange={onTitleChange}
       />
@@ -364,11 +489,15 @@ export function ZoneGrid({
           const zoneTab = tabs.find((t) => t.id === zoneTabId);
           if (!zoneTab) return null;
           // Layer 1 invariant: only render the visible inline TerminalInstance
-          // when the centralized classification agrees this tab is "assigned".
-          // If classification still says "hidden" (e.g. assignments updated mid
-          // render before the memo recomputed for this tab), defer the visible
-          // mount so the hidden mount stays the sole owner this render pass.
-          if (tabClassification.get(zoneTab.id) !== "assigned") return null;
+          // when the centralized classification agrees this tab is NOT hidden
+          // (i.e. `assigned` in preset mode, or `assigned-live`/`assigned-virtual`
+          // in flow mode — the maximized/single view is a full-screen single
+          // terminal, not the scrolling grid, so it mounts every assigned zone
+          // as before rather than virtualizing). If classification still says
+          // "hidden" (e.g. assignments updated mid render before the memo
+          // recomputed), defer the visible mount so the hidden mount stays the
+          // sole owner this render pass.
+          if (tabClassification.get(zoneTab.id) === "hidden") return null;
 
           const isVisible = zoneIdx === singleViewZone;
           const ref = terminalRefs.get(zoneTab.id);
@@ -394,7 +523,6 @@ export function ZoneGrid({
                     onUserInputLine ? (input) => onUserInputLine(zoneTab.id, input) : undefined
                   }
                   onShellIntegration={(event) => onShellIntegration(zoneTab.id, event)}
-                  onOutput={(text) => onOutput(zoneTab.id, text)}
                   onTitleChange={(title) => onTitleChange(zoneTab.id, title)}
                 />
               )}
@@ -412,12 +540,25 @@ export function ZoneGrid({
     <div
       ref={gridRef}
       className="h-full w-full relative"
-      style={{
-        display: "grid",
-        gridTemplateColumns: gridState.colRatios.map((r) => `${r}fr`).join(" "),
-        gridTemplateRows: gridState.rowRatios.map((r) => `${r}fr`).join(" "),
-        gap: "2px",
-      }}
+      style={
+        isFlowMode
+          ? {
+              // Flow-grid: fixed 3 equal columns, rows at least MIN_TILE_HEIGHT_PX
+              // tall (expanding to fill when few) and the container scrolls once
+              // rows overflow. No ratio machinery / resize handles — uniform tiles.
+              display: "grid",
+              gridTemplateColumns: `repeat(${FLOW_COLS}, 1fr)`,
+              gridTemplateRows: `repeat(${layout.rows}, minmax(${MIN_TILE_HEIGHT_PX}px, 1fr))`,
+              gap: "2px",
+              overflowY: "auto",
+            }
+          : {
+              display: "grid",
+              gridTemplateColumns: gridState.colRatios.map((r) => `${r}fr`).join(" "),
+              gridTemplateRows: gridState.rowRatios.map((r) => `${r}fr`).join(" "),
+              gap: "2px",
+            }
+      }
       onDragEnd={() => dispatch({ type: "SET_DROP_TARGET", zone: null })}
     >
       {/* eslint-disable-next-line react-hooks/refs -- ZoneCell receives the stable terminalRefs Map-cache (see above). */}
@@ -429,6 +570,9 @@ export function ZoneGrid({
           tabs={tabs}
           assignments={assignments}
           tabClassification={tabClassification}
+          isFlowMode={isFlowMode}
+          registerCell={registerCell}
+          unregisterCell={unregisterCell}
           focusedZone={focusedZone}
           sessionStates={sessionStates}
           lastOutputLines={lastOutputLines}
@@ -439,7 +583,6 @@ export function ZoneGrid({
           onFirstInput={onFirstInput}
           onUserInputLine={onUserInputLine}
           onShellIntegration={onShellIntegration}
-          onOutput={onOutput}
           onReconnected={onReconnected}
           onTitleChange={onTitleChange}
           onAssignTab={onAssignTab}
@@ -486,7 +629,8 @@ export function ZoneGrid({
         />
       ))}
 
-      {layout.columns > 1 &&
+      {!isFlowMode &&
+        layout.columns > 1 &&
         Array.from({ length: layout.columns - 1 }, (_, i) => {
           const leftFr = gridState.colRatios.slice(0, i + 1).reduce((a, b) => a + b, 0);
           const totalFr = gridState.colRatios.reduce((a, b) => a + b, 0);
@@ -531,7 +675,8 @@ export function ZoneGrid({
           );
         })}
 
-      {layout.rows > 1 &&
+      {!isFlowMode &&
+        layout.rows > 1 &&
         Array.from({ length: layout.rows - 1 }, (_, i) => {
           const topFr = gridState.rowRatios.slice(0, i + 1).reduce((a, b) => a + b, 0);
           const totalFr = gridState.rowRatios.reduce((a, b) => a + b, 0);
@@ -608,16 +753,13 @@ export function ZoneGrid({
               onFocus={() => onZoneClick(gridState.contextMenu!.zoneIndex)}
               onMaximize={() => onZoneDoubleClick(gridState.contextMenu!.zoneIndex)}
               onApprove={() => {
-                if (cmTab) {
-                  const ref = terminalRefs.get(cmTab.id);
-                  ref?.current?.writeToTerminal("y\r");
-                }
+                // Route through writeToTerminalById so approving from a
+                // virtualized (unmounted) zone falls back to `terminal_write`
+                // instead of silently no-op'ing on a missing instance ref.
+                if (cmTab) writeToTerminalById(terminalRefs, cmTab.id, "y\r");
               }}
               onReject={() => {
-                if (cmTab) {
-                  const ref = terminalRefs.get(cmTab.id);
-                  ref?.current?.writeToTerminal("n\r");
-                }
+                if (cmTab) writeToTerminalById(terminalRefs, cmTab.id, "n\r");
               }}
               onSwap={(targetZone) => {
                 if (cmTab && onAssignTab) {
@@ -650,6 +792,9 @@ function ZoneCell({
   tabs,
   assignments,
   tabClassification,
+  isFlowMode,
+  registerCell,
+  unregisterCell,
   focusedZone,
   sessionStates,
   lastOutputLines,
@@ -660,7 +805,6 @@ function ZoneCell({
   onFirstInput,
   onUserInputLine,
   onShellIntegration,
-  onOutput,
   onReconnected,
   onTitleChange,
   onAssignTab,
@@ -703,7 +847,10 @@ function ZoneCell({
   zoneIdx: number;
   tabs: TerminalTab[];
   assignments: ZoneAssignments;
-  tabClassification: Map<string, "assigned" | "hidden">;
+  tabClassification: Map<string, TabClassification>;
+  isFlowMode: boolean;
+  registerCell: (tabId: string, el: HTMLElement) => void;
+  unregisterCell: (tabId: string) => void;
   focusedZone: number;
   sessionStates: Record<string, SessionState>;
   lastOutputLines: Record<string, string[]>;
@@ -714,7 +861,6 @@ function ZoneCell({
   onFirstInput: (terminalId: string, input: string) => void;
   onUserInputLine?: (terminalId: string, input: string) => void;
   onShellIntegration: (tabId: string, event: ShellIntegrationEvent) => void;
-  onOutput: (tabId: string, text: string) => void;
   onReconnected: (tabId: string) => void;
   onTitleChange: (tabId: string, title: string) => void;
   onAssignTab?: (zoneIndex: number, tabId: string) => void;
@@ -755,6 +901,30 @@ function ZoneCell({
 }) {
   const tabId = assignments[zoneIdx];
   const tab = tabs.find((t) => t.id === tabId);
+  const classification = tab ? tabClassification.get(tab.id) : undefined;
+  // A far-offscreen assigned zone in flow mode: render only the CompactZoneCard,
+  // NO TerminalInstance. Plan tabs are never virtualized (PlanViewer is already
+  // lightweight and carries no xterm parser).
+  const isVirtual = classification === "assigned-virtual" && tab?.type !== "plan";
+  // Mount the inline TerminalInstance only for a non-plan tab the classifier
+  // owns as live (`assigned` in preset mode, `assigned-live` near the viewport
+  // in flow mode). Virtual + hidden mount zero instances here.
+  const shouldMountInstance =
+    !!tab &&
+    tab.type !== "plan" &&
+    (classification === "assigned" || classification === "assigned-live");
+
+  // Reusable zone-cell DOM registry (Phase 3 observer target + Phase 4 scroll
+  // routing). Register only in flow mode — preset layouts never scroll.
+  const cellRef = useCallback(
+    (el: HTMLDivElement | null) => {
+      if (!isFlowMode || !tabId) return;
+      if (el) registerCell(tabId, el);
+      else unregisterCell(tabId);
+    },
+    [isFlowMode, tabId, registerCell, unregisterCell],
+  );
+
   const isFocused = zoneIdx === focusedZone;
   const state = (tab ? (sessionStates[tab.id as string] ?? "idle") : "idle") as SessionState;
   const borderColor = isFocused
@@ -766,6 +936,10 @@ function ZoneCell({
   const isPinned = pinnedZones?.has(zoneIdx);
   const useCompact =
     tab && tab.type !== "plan" && !isFocused && !isPinned && (autoCompact || forceCompact);
+  // The card overlays the instance region whenever we render CompactZoneCard —
+  // either the operator forced compact/auto-compact (instance stays mounted but
+  // hidden) OR the zone is virtualized (no instance at all this render).
+  const showCompactCard = useCompact || isVirtual;
   const isFlashing = tab && flashingTabs?.has(tab.id);
   const isStale = tab && staleTabs?.has(tab.id);
   const searchMatch =
@@ -803,6 +977,7 @@ function ZoneCell({
 
   return (
     <div
+      ref={cellRef}
       className={`group relative overflow-hidden ${isFlashing ? "zone-flash" : ""} ${
         outputSearchQuery && !searchMatch ? "opacity-40" : ""
       }`}
@@ -929,24 +1104,15 @@ function ZoneCell({
 
       {tab ? (
         <>
-          {useCompact && (
+          {showCompactCard && (
             <CompactZoneCard
               tab={tab}
               state={state}
               zoneIndex={zoneIdx}
               lastLines={lastOutputLines[tab.id] ?? []}
-              onQuickApprove={() => {
-                const ref = terminalRefs.get(tab.id);
-                ref?.current?.writeToTerminal("y\r");
-              }}
-              onQuickReject={() => {
-                const ref = terminalRefs.get(tab.id);
-                ref?.current?.writeToTerminal("n\r");
-              }}
-              onSendCommand={(text) => {
-                const ref = terminalRefs.get(tab.id);
-                ref?.current?.writeToTerminal(`${text}\r`);
-              }}
+              onQuickApprove={() => writeToTerminalById(terminalRefs, tab.id, "y\r")}
+              onQuickReject={() => writeToTerminalById(terminalRefs, tab.id, "n\r")}
+              onSendCommand={(text) => writeToTerminalById(terminalRefs, tab.id, `${text}\r`)}
               duration={stateDurations?.[tab.id]}
               isStale={isStale ?? false}
               searchQuery={outputSearchQuery}
@@ -968,7 +1134,7 @@ function ZoneCell({
               tagColor={firstTagColor}
             />
           )}
-          {!useCompact && showLabels && (
+          {!showCompactCard && showLabels && (
             <ZoneLabel
               tab={tab}
               state={state}
@@ -993,7 +1159,7 @@ function ZoneCell({
               filterActive={!!zoneFilters[zoneIdx]}
             />
           )}
-          {!useCompact && showFilterInput === zoneIdx && (
+          {!showCompactCard && showFilterInput === zoneIdx && (
             <div
               className="absolute left-0 right-0 flex items-center gap-2 px-2 py-1 bg-[#1a1b26] border-b border-[#2a2d3d] z-10"
               style={{ top: showLabels ? "20px" : "0px" }}
@@ -1030,7 +1196,7 @@ function ZoneCell({
               )}
             </div>
           )}
-          {!useCompact && isMultiZone && (
+          {!showCompactCard && isMultiZone && (
             <ZoneQuickActions
               zoneIndex={zoneIdx}
               isPinned={isPinned}
@@ -1056,9 +1222,9 @@ function ZoneCell({
             </div>
           ) : (
             <div
-              className={`h-full w-full ${useCompact ? "hidden" : ""}`}
+              className={`h-full w-full ${showCompactCard ? "hidden" : ""}`}
               style={{
-                paddingTop: useCompact
+                paddingTop: showCompactCard
                   ? undefined
                   : showLabels
                     ? showFilterInput === zoneIdx
@@ -1069,16 +1235,19 @@ function ZoneCell({
                       : undefined,
               }}
             >
-              {/* Layer 1 invariant: only mount the inline visible TerminalInstance
-                  when the centralized classification agrees this tab is "assigned".
-                  Otherwise the hidden mount (rendered by renderHiddenTabs) is the
-                  sole owner this render pass — preventing the dual-mount race that
-                  evicts UI Bridge registrations and leaves blank panes. */}
-              {tabClassification.get(tab.id) === "assigned" && (
+              {/* Layer 1 invariant: mount the inline visible TerminalInstance
+                  only when the centralized classification owns this tab as live
+                  (`assigned` in preset mode, `assigned-live` near the viewport in
+                  flow mode). A virtualized (`assigned-virtual`) zone mounts ZERO
+                  instances — its CompactZoneCard above is the sole renderer, and
+                  the hidden mount (renderHiddenTabs) owns unassigned tabs. This
+                  keeps the dual-mount race impossible (exactly-one-or-zero owner
+                  per tab) that would otherwise evict UI Bridge registrations. */}
+              {shouldMountInstance && (
                 <TerminalInstance
                   ref={terminalRefs.get(tab.id)}
                   terminalId={tab.id}
-                  visible={!useCompact}
+                  visible={!showCompactCard}
                   isReconnecting={tab.isReconnecting}
                   onReconnected={() => onReconnected(tab.id)}
                   onExit={(code) => onExit(tab.id, code)}
@@ -1087,7 +1256,6 @@ function ZoneCell({
                     onUserInputLine ? (input) => onUserInputLine(tab.id, input) : undefined
                   }
                   onShellIntegration={(event) => onShellIntegration(tab.id, event)}
-                  onOutput={(text) => onOutput(tab.id, text)}
                   onTitleChange={(title) => onTitleChange(tab.id, title)}
                 />
               )}

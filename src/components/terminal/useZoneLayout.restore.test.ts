@@ -21,7 +21,9 @@ import {
   applyLayoutAssignments,
   pickLayout,
   computeAutoGrowLayoutId,
+  resolveLayout,
   LAYOUT_PRESETS,
+  FLOW_GRID_ID,
 } from "./useZoneLayout";
 
 /** Mirror of the hook's derived `unassignedTabIds` over a pure assignment map. */
@@ -171,15 +173,29 @@ describe("Phase 1 auto-grow — layout grows to fit live tabs across ALL ingest 
     expect(second).toBeNull();
   });
 
-  it("at full-grid, unassignedTabIds.length === max(0, N-9)", () => {
-    const fullGridZones = zoneCount("full-grid");
-    expect(fullGridZones).toBe(9);
+  it("every live tab gets a zone at any count — past 9, flow-grid drives unassigned to 0", () => {
+    expect(zoneCount("full-grid")).toBe(9);
     for (const n of [5, 9, 12, 20]) {
       const tabIds = Array.from({ length: n }, (_, i) => `t${i}`);
-      // After growing for N tabs (capped at full-grid) and reconciling:
+      // After growing for N tabs and reconciling with the resolved layout's zone
+      // count (flow-grid synthesizes N zones past 9), NO tab is left unassigned.
       const layoutId = pickLayout(n);
-      const assignments = reconcileAssignments({}, tabIds, zoneCount(layoutId));
-      expect(unassignedCount(assignments, tabIds)).toBe(Math.max(0, n - 9));
+      const layout = resolveLayout(layoutId, n);
+      const assignments = reconcileAssignments({}, tabIds, layout.zones.length);
+      expect(unassignedCount(assignments, tabIds)).toBe(0);
+    }
+  });
+
+  it("grows into flow-grid past the 9th tab, then self-sizes (no unassigned tabs)", () => {
+    // full-grid (9 zones) is full; the 10th tab grows into flow-grid.
+    expect(computeAutoGrowLayoutId("full-grid", 10)).toBe(FLOW_GRID_ID);
+    // In flow-grid the layout carries exactly one zone per live tab.
+    for (const n of [10, 13, 20]) {
+      const tabIds = Array.from({ length: n }, (_, i) => `t${i}`);
+      const layout = resolveLayout(FLOW_GRID_ID, n);
+      expect(layout.zones).toHaveLength(n);
+      const assignments = reconcileAssignments({}, tabIds, layout.zones.length);
+      expect(unassignedCount(assignments, tabIds)).toBe(0);
     }
   });
 
