@@ -19,6 +19,16 @@
           }
         ]
       }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '@@PRECOMPACT_HOOK_SCRIPT@@'"
+          }
+        ]
+      }
     ]
   },
   "permissions": {
