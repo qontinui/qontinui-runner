@@ -63,7 +63,7 @@ use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -133,6 +133,14 @@ pub fn routes() -> Router<Arc<ApiState>> {
         // reveal whether the shim actually ran for a given terminal and whether it
         // will deliver `--session-id` / `--settings`. Log-only; no store write.
         .route("/control/shim-beacon", post(post_shim_beacon))
+        // Session-restore health probe (phantom-id plan B7): the one call that
+        // answers "can these sessions actually be restored?", joining the
+        // registry against the transcript store so nobody has to hand-correlate
+        // `terminal-sessions.json` with disk globs again.
+        .route(
+            "/control/sessions/restore-health",
+            get(get_sessions_restore_health),
+        )
         // Phase 4: private-registry credential CRUD. Mounted alongside the
         // Phase-1 run route so a single `install_effects_producer::routes()`
         // merge in `mcp_api.rs` covers the whole producer surface.
@@ -226,6 +234,112 @@ async fn post_session_open(
             Ok(Json(ApiResponse::success(())))
         }
     }
+}
+
+/// One open session's restore health — the tuple that previously had to be
+/// hand-joined from `terminal-sessions.json` + disk globs.
+///
+/// camelCase on the wire (the runner's convention for `/control/*`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRestoreHealth {
+    pub terminal_id: String,
+    pub claude_session_id: String,
+    /// The evidence grade the record was written under (`authoritative` /
+    /// `observed` / `reconciled`); `null` for a legacy row that asserted none.
+    pub origin: Option<String>,
+    /// A provider hook (or a confirmed bind) proved a real session exists.
+    pub confirmed: bool,
+    /// A `*.jsonl` transcript for `claudeSessionId` exists on disk — the
+    /// PHANTOM tell when false.
+    pub transcript_exists: bool,
+    /// `confirmed && transcriptExists` — this id can actually be `--resume`d.
+    pub restorable: bool,
+    pub title: Option<String>,
+    pub working_dir: Option<String>,
+}
+
+/// Response body of `GET /control/sessions/restore-health`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreHealthResponse {
+    /// Every OPEN registry record, healthy or phantom.
+    pub sessions: Vec<SessionRestoreHealth>,
+    /// Count of open sessions that are NOT restorable — the number an operator
+    /// actually wants: `0` means restore works right now.
+    pub unrestorable: usize,
+}
+
+/// Pure projection of the open records + a transcript probe into the health
+/// report. Separated from the route so the join is unit-testable without a
+/// Tauri app handle or a live disk.
+pub fn project_restore_health(
+    open: Vec<crate::session::session_lifecycle_store::TerminalSessionRecord>,
+    probe: &dyn crate::session::snapshot_history::TranscriptProbe,
+) -> RestoreHealthResponse {
+    use crate::session::snapshot_history::is_restorable_identity;
+    let mut sessions: Vec<SessionRestoreHealth> = open
+        .into_iter()
+        .map(|rec| {
+            let confirmed = rec.confirmed_at.is_some();
+            let transcript_exists =
+                probe.transcript_exists(&rec.claude_session_id, rec.working_dir.as_deref());
+            SessionRestoreHealth {
+                terminal_id: rec.terminal_id,
+                claude_session_id: rec.claude_session_id,
+                origin: rec.origin,
+                confirmed,
+                transcript_exists,
+                restorable: is_restorable_identity(confirmed, transcript_exists),
+                title: rec.title,
+                working_dir: rec.working_dir,
+            }
+        })
+        .collect();
+    // Stable order so repeated probes diff cleanly.
+    sessions.sort_by(|a, b| {
+        a.terminal_id
+            .cmp(&b.terminal_id)
+            .then_with(|| a.claude_session_id.cmp(&b.claude_session_id))
+    });
+    let unrestorable = sessions.iter().filter(|s| !s.restorable).count();
+    RestoreHealthResponse {
+        sessions,
+        unrestorable,
+    }
+}
+
+/// `GET /control/sessions/restore-health`. Reports, per OPEN session, whether it
+/// can actually be restored — `{confirmed, transcriptExists, restorable}` joined
+/// against the transcript store.
+///
+/// Read-only: it stats the disk and touches no registry state, so probing it is
+/// always safe. Degrades to an empty report (200) when the lifecycle store isn't
+/// in Tauri state, matching the other `/control/*` handlers — a diagnostic must
+/// never be the thing that errors.
+async fn get_sessions_restore_health(
+    State(state): State<Arc<ApiState>>,
+) -> Json<ApiResponse<RestoreHealthResponse>> {
+    use crate::session::reconcile::DiskTranscriptIndex;
+    use crate::session::session_lifecycle_store::SessionLifecycleStore;
+    use tauri::Manager;
+
+    let store = state
+        .app_handle
+        .try_state::<Arc<SessionLifecycleStore>>()
+        .map(|s| s.inner().clone());
+    let Some(store) = store else {
+        warn!("control/sessions/restore-health: lifecycle store not in Tauri state — empty report");
+        return Json(ApiResponse::success(RestoreHealthResponse {
+            sessions: Vec::new(),
+            unrestorable: 0,
+        }));
+    };
+    let index = DiskTranscriptIndex::discover();
+    Json(ApiResponse::success(project_restore_health(
+        store.open_records(),
+        &index,
+    )))
 }
 
 /// Body of `POST /control/shim-beacon` — a fire-and-forget diagnostic the
@@ -1274,6 +1388,108 @@ mod tests {
     use super::*;
     use axum::routing::post as axpost;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    // -------------------------------------------------------------------
+    // Session restore health (phantom-id plan B7)
+    // -------------------------------------------------------------------
+
+    #[derive(Debug)]
+    struct FakeProbe(std::collections::HashSet<String>);
+    impl crate::session::snapshot_history::TranscriptProbe for FakeProbe {
+        fn transcript_exists(&self, session_id: &str, _wd: Option<&str>) -> bool {
+            self.0.contains(session_id)
+        }
+    }
+
+    fn health_rec(
+        id: &str,
+        terminal: &str,
+        confirmed: bool,
+    ) -> crate::session::session_lifecycle_store::TerminalSessionRecord {
+        crate::session::session_lifecycle_store::TerminalSessionRecord {
+            claude_session_id: id.to_string(),
+            config_dir: None,
+            working_dir: Some("D:/qontinui-root".to_string()),
+            page_id: "default".to_string(),
+            zone_index: 0,
+            title: Some("runner-test".to_string()),
+            terminal_id: terminal.to_string(),
+            opened_at: 1,
+            last_seen_at: 2,
+            state: "open".to_string(),
+            closed_at: None,
+            close_reason: None,
+            provider: "claude".to_string(),
+            origin: Some("authoritative".to_string()),
+            restore_pending_at: None,
+            confirmed_at: confirmed.then_some(3),
+        }
+    }
+
+    /// B7: the report answers the question the incident required a hand-join of
+    /// `terminal-sessions.json` + disk globs to answer — flagging the phantom
+    /// and counting what is actually broken.
+    #[test]
+    fn project_restore_health_flags_phantoms_and_counts_unrestorable() {
+        let probe = FakeProbe(["real-sess".to_string()].into_iter().collect());
+        let report = project_restore_health(
+            vec![
+                // The 2026-07-08 phantom: an id with no transcript anywhere.
+                health_rec("0b32d739", "943aa0b6", false),
+                // A healthy, resumable session.
+                health_rec("real-sess", "aaa11111", true),
+            ],
+            &probe,
+        );
+
+        assert_eq!(report.sessions.len(), 2);
+        // Sorted by terminal id — "943aa0b6" sorts before "aaa11111".
+        let phantom = &report.sessions[0];
+        assert_eq!(phantom.claude_session_id, "0b32d739");
+        assert!(!phantom.transcript_exists, "no transcript on disk");
+        assert!(!phantom.confirmed);
+        assert!(!phantom.restorable, "the phantom is flagged non-restorable");
+
+        let healthy = &report.sessions[1];
+        assert_eq!(healthy.claude_session_id, "real-sess");
+        assert!(healthy.transcript_exists && healthy.confirmed && healthy.restorable);
+
+        assert_eq!(report.unrestorable, 1, "exactly one broken session");
+    }
+
+    /// The wire shape is camelCase, and `restorable` is the both-gates verdict
+    /// (a confirmed record whose transcript is gone is NOT restorable).
+    #[test]
+    fn restore_health_wire_shape_and_confirmed_without_transcript() {
+        let probe = FakeProbe(std::collections::HashSet::new());
+        let report = project_restore_health(vec![health_rec("vanished", "term-1", true)], &probe);
+        assert!(
+            !report.sessions[0].restorable,
+            "confirmed but no transcript ⇒ --resume would find nothing"
+        );
+        let wire = serde_json::to_value(&report).unwrap();
+        let s = &wire.get("sessions").unwrap()[0];
+        for key in [
+            "terminalId",
+            "claudeSessionId",
+            "confirmed",
+            "transcriptExists",
+            "restorable",
+            "title",
+        ] {
+            assert!(s.get(key).is_some(), "camelCase field {key} present");
+        }
+        assert_eq!(wire.get("unrestorable").and_then(|v| v.as_u64()), Some(1));
+    }
+
+    /// An empty registry is a clean, honest report — never an error.
+    #[test]
+    fn project_restore_health_empty_registry() {
+        let probe = FakeProbe(std::collections::HashSet::new());
+        let report = project_restore_health(Vec::new(), &probe);
+        assert!(report.sessions.is_empty());
+        assert_eq!(report.unrestorable, 0);
+    }
 
     // -------------------------------------------------------------------
     // Request-body deserialization defaults

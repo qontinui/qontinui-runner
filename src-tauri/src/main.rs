@@ -2534,6 +2534,19 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
+                // Write-time restorability stamp for the snapshot history
+                // (phantom-id plan B5): every history entry records whether its
+                // id had a transcript on disk AT THE MOMENT it was written. The
+                // 2026-07-08 incident's recovery lines named ids that no
+                // `--resume` could ever load, and nothing in the line said so —
+                // by the time a human reads the history, the disk state that
+                // would reveal it is long gone. Read-only + snapshot-path only:
+                // the registry never consults the probe, so this can describe
+                // restore behavior but not change it.
+                lifecycle_store.attach_transcript_probe(std::sync::Arc::new(
+                    session::reconcile::DiskTranscriptIndex::discover(),
+                ));
+
                 // Restore-registry cloud mirror (plan 2026-07-09-runner-
                 // session-history-cloud-sync §3.4, Phase 4; gate split off
                 // into its own toggle by plan
@@ -2891,6 +2904,36 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             .await;
                             emit_session_bound(&poll_app_handle, &actions);
                         }
+
+                        // Title convergence (phantom-id plan B6). An in-Claude
+                        // `/rename` emits NO OSC-0 title, so the runner's rename
+                        // sink never fires for it and the registry keeps the
+                        // spawn-time name forever (a restore then reopens the
+                        // pane mislabelled). This adopts the provider's own
+                        // session name from its live-session index.
+                        //
+                        // Deliberately OUTSIDE the `needs_reconcile` guard: that
+                        // guard is false precisely when every live PTY is bound
+                        // and confirmed — which is exactly the state a session
+                        // gets renamed in. Gating this on it would mean it never
+                        // ran. Reuses this tick's `snap`; fail-open.
+                        let live_for_titles: Vec<session::reconcile::LivePty> = live
+                            .iter()
+                            .map(|i| session::reconcile::LivePty {
+                                terminal_id: i.id.clone(),
+                                pid: i.pid,
+                                working_dir: i.working_dir.clone(),
+                                page_id: i.page_id.clone(),
+                                title: i.title.clone(),
+                                ai_pid: None,
+                                ai_start_unix: None,
+                            })
+                            .collect();
+                        session::reconcile::refresh_titles_pass(
+                            &poll_lifecycle_store,
+                            &live_for_titles,
+                            &snap,
+                        );
 
                         poll_lifecycle_store.prune(chrono::Utc::now().timestamp_millis());
                     }
