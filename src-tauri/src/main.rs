@@ -193,6 +193,7 @@ mod step_types;
 mod steps;
 mod storage;
 pub(crate) mod str_utils;
+mod subagent;
 mod summary_generator;
 mod tauri_app_handle;
 mod tauri_command_audit;
@@ -1932,6 +1933,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::storage::save_findings_data,
             commands::storage::save_screenshot_to_disk,
             commands::storage::save_video_to_disk,
+            commands::subagent::analyze_with_subagent,
             commands::task_sync::full_sync_ai_task,
             commands::task_sync::sync_ai_findings,
             commands::task_sync::sync_ai_session_ended,

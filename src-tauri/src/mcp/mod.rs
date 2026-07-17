@@ -137,6 +137,7 @@ pub mod step_evaluation_api;
 pub mod step_type_knowledge_api;
 pub mod step_type_metadata_api;
 pub mod streaming;
+pub mod subagent_api;
 pub mod task_run_inspection;
 pub mod task_run_queries;
 pub mod task_run_structured_output;

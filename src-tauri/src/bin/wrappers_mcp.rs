@@ -262,7 +262,7 @@ fn refresh_tools(
 }
 
 fn tools_list_payload(tools: &[ToolEntry]) -> Value {
-    let arr: Vec<Value> = tools
+    let mut arr: Vec<Value> = tools
         .iter()
         .map(|t| {
             json!({
@@ -272,7 +272,109 @@ fn tools_list_payload(tools: &[ToolEntry]) -> Value {
             })
         })
         .collect();
+    arr.push(subagent_tool_entry());
     json!({ "tools": arr })
+}
+
+// ---------------------------------------------------------------------------
+// Static built-in tools (not wrapper-backed)
+// ---------------------------------------------------------------------------
+
+/// Name of the static subagent-analysis tool. Dispatched BEFORE the dynamic
+/// `wrapper_*` reverse map, so a wrapper action can never shadow it.
+const SUBAGENT_TOOL_NAME: &str = "analyze_with_subagent";
+
+/// Static tool entry for subagent analysis (plan
+/// 2026-07-15-runner-pi-deepseek-subagent-analysis, Phase 4). Backed by the
+/// runner's `POST /subagent/analyze` route, not by a wrapper.
+fn subagent_tool_entry() -> Value {
+    json!({
+        "name": SUBAGENT_TOOL_NAME,
+        "description": "Offload a file-analysis task to a subagent and get the analysis text \
+            back as the tool result, without spending main-session context reading the files. \
+            provider 'pi' stages read-only copies of the files in a temp dir and lets the pi \
+            coding agent (DeepSeek-backed by default) explore them agentically; provider \
+            'deepseek' inlines the file contents into a single one-shot DeepSeek API call \
+            (text files only, 256KB/file, 1MB total).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "provider": {
+                    "type": "string",
+                    "enum": ["pi", "deepseek"],
+                    "description": "Subagent to use: 'pi' (agentic exploration) or 'deepseek' (one-shot inline analysis)."
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "The analysis question or instruction."
+                },
+                "file_refs": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Absolute paths of the files to analyze."
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "description": "Wall-clock budget in seconds (default 300)."
+                }
+            },
+            "required": ["provider", "prompt"]
+        }
+    })
+}
+
+/// Handle a `tools/call` for the static subagent tool: POST the arguments
+/// straight through to the runner's `/subagent/analyze` route (the body
+/// shapes match by construction) and unwrap the `ApiResponse<String>`
+/// envelope.
+fn dispatch_subagent_call(base: &str, arguments: Value) -> Value {
+    let timeout_secs = arguments
+        .get("timeout_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(300);
+
+    // Client timeout = subagent budget + headroom for staging/queueing.
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(timeout_secs + 60))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return tool_error(format!("http client init failed: {}", e)),
+    };
+
+    let url = format!("{}/subagent/analyze", base);
+    let resp = match client.post(&url).json(&arguments).send() {
+        Ok(r) => r,
+        Err(e) => return tool_error(format!("subagent dispatch HTTP error: {}", e)),
+    };
+
+    let status = resp.status();
+    let parsed: Value = match resp.json() {
+        Ok(v) => v,
+        Err(e) => return tool_error(format!("subagent dispatch returned non-JSON: {}", e)),
+    };
+
+    let success = parsed
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !status.is_success() || !success {
+        let msg = parsed
+            .get("error")
+            .and_then(Value::as_str)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("{} returned {}: {}", url, status, parsed));
+        return tool_error(format!("subagent analysis failed: {}", msg));
+    }
+
+    let text = parsed
+        .get("data")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    json!({
+        "content": [{ "type": "text", "text": text }],
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -433,6 +535,13 @@ fn handle_request(base: &str, cache: &Arc<Mutex<ToolCache>>, req: JsonRpcRequest
                     ));
                 }
             };
+            // Static tools dispatch before the dynamic wrapper catalog (and
+            // without touching the cache), so a wrapper action can never
+            // shadow them.
+            if parsed.name == SUBAGENT_TOOL_NAME {
+                let result = dispatch_subagent_call(base, parsed.arguments);
+                return Some(rpc_success(id, result));
+            }
             let mut guard = cache.lock().expect("tool cache mutex poisoned");
             let ToolCache { tools, reverse_map } = &mut *guard;
             // If the client never re-listed, a wrapper installed since
@@ -838,8 +947,35 @@ mod tests {
         }];
         let p = tools_list_payload(&tools);
         let arr = p["tools"].as_array().unwrap();
-        assert_eq!(arr.len(), 1);
+        // Dynamic wrapper tools first, then the static built-ins.
+        assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["name"], "wrapper_v0__do_thing");
         assert_eq!(arr[0]["inputSchema"], json!({"type": "object"}));
+        assert_eq!(arr[1]["name"], SUBAGENT_TOOL_NAME);
+    }
+
+    #[test]
+    fn subagent_tool_entry_shape() {
+        let entry = subagent_tool_entry();
+        assert_eq!(entry["name"], "analyze_with_subagent");
+        let required: Vec<&str> = entry["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(required, vec!["provider", "prompt"]);
+        assert_eq!(
+            entry["inputSchema"]["properties"]["provider"]["enum"],
+            json!(["pi", "deepseek"])
+        );
+    }
+
+    #[test]
+    fn static_tool_is_listed_even_with_empty_wrapper_catalog() {
+        let p = tools_list_payload(&[]);
+        let arr = p["tools"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"], SUBAGENT_TOOL_NAME);
     }
 }
