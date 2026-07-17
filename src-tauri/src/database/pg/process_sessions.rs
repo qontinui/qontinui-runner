@@ -21,7 +21,7 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        let now = Utc::now().to_rfc3339();
+        let now = Utc::now();
 
         conn.execute(
             r#"
@@ -49,7 +49,7 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        let now = Utc::now().to_rfc3339();
+        let now = Utc::now();
         let err_count = error_count as i32;
 
         conn.execute(
@@ -228,7 +228,7 @@ impl PgDb {
     pub async fn get_process_log_context(
         &self,
         process_name: &str,
-        around_timestamp: &str,
+        around_timestamp: chrono::DateTime<Utc>,
         before: u32,
         after: u32,
     ) -> Result<Vec<ProcessSessionOutputLine>, String> {
@@ -246,8 +246,8 @@ impl PgDb {
                 r#"
                 SELECT id FROM coord.process_sessions
                 WHERE process_name = $1
-                  AND started_at <= $2::timestamptz
-                  AND (stopped_at IS NULL OR stopped_at >= $2::timestamptz)
+                  AND started_at <= $2
+                  AND (stopped_at IS NULL OR stopped_at >= $2)
                 ORDER BY started_at DESC
                 LIMIT 1
                 "#,
@@ -263,6 +263,9 @@ impl PgDb {
 
         let before_i64 = before as i64;
         let after_i64 = after as i64;
+        // process_session_output.timestamp is a `text` column (not
+        // timestamptz), so compare against the RFC3339 string form here.
+        let around_timestamp_str = around_timestamp.to_rfc3339();
 
         // Fetch `before` lines at or before the timestamp, plus `after` lines after it.
         // Combine and sort by id ASC.
@@ -287,7 +290,7 @@ impl PgDb {
                     LIMIT $4
                 )
                 "#,
-                &[&session_id, &around_timestamp, &before_i64, &after_i64],
+                &[&session_id, &around_timestamp_str, &before_i64, &after_i64],
             )
             .await
             .map_err(|e| format!("PG get_process_log_context (rows): {}", e))?;
@@ -387,7 +390,7 @@ impl PgDb {
     /// runner's startup time and will be excluded.
     pub async fn mark_orphaned_running_sessions_as_failed(
         &self,
-        started_before: &str,
+        started_before: chrono::DateTime<Utc>,
     ) -> Result<u64, String> {
         let conn = self
             .pool
@@ -395,14 +398,14 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
-        let now = Utc::now().to_rfc3339();
+        let now = Utc::now();
         let affected = conn
             .execute(
                 "UPDATE coord.process_sessions \
                  SET state = 'failed', \
-                     stopped_at = COALESCE(stopped_at, $1::timestamptz) \
+                     stopped_at = COALESCE(stopped_at, $1) \
                  WHERE state NOT IN ('stopped', 'failed') \
-                   AND started_at < $2::timestamptz",
+                   AND started_at < $2",
                 &[&now, &started_before],
             )
             .await
