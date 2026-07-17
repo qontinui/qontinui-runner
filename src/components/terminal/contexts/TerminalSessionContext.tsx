@@ -66,6 +66,8 @@ import {
   type RefObject,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { TerminalOutputEvent } from "@qontinui/shared-types/tauri-events";
 import { useWindowAssignments, MAIN_WINDOW_LABEL } from "./WindowAssignmentsContext";
 
 import { useTerminalManager } from "../useTerminalManager";
@@ -96,6 +98,7 @@ import { useTranscriptSessions } from "../useTranscriptSessions";
 import { useSessionManager } from "../useSessionManager";
 import { deriveSyntheticTabs } from "../syntheticTabs";
 import { useZoneLabelsAndTags } from "../useZoneLabelsAndTags";
+import { TerminalOutputCoalescer, base64ToBytes } from "../terminalOutputTap";
 
 import { instanceStorage } from "@/lib/instance-storage";
 
@@ -436,6 +439,96 @@ const PageSessionScope = memo(function PageSessionScope({
   useEffect(() => {
     processOutputRef.current = processOutput;
   }, [processOutput]);
+
+  // ---- Global terminal-output tap (Phase 2 — flow-grid virtualization) ----
+  //
+  // Session-state tracking (`sessionStates`, `lastOutputLines`, `staleTabs`,
+  // `activityData`, …) used to be fed ONLY by `onOutput` callbacks fired from
+  // MOUNTED `TerminalInstance` components. Phase 3 unmounts offscreen instances
+  // to virtualize large grids — which would make those sessions state-blind.
+  // This single always-mounted listener decouples tracking from instance mount
+  // state: it taps `terminal-output` once per page-scope and feeds
+  // `stateTracking.handleOutput` for every one of THIS page's tabs regardless of
+  // which instances are currently rendered. `TerminalInstance` keeps its OWN
+  // `terminal-output` listener for the xterm write path; only the *tracking*
+  // feed moved here (the `onOutput`→`handleOutput` wiring in `ZoneGrid` is gone).
+  //
+  // Placed at the per-`PageSessionScope` level (not once at the provider root):
+  // each scope already owns exactly one page's tab roster AND that page's
+  // `useSessionStateTracking` instance, and every `terminal-output` event's
+  // `terminalId` belongs to exactly one page. So the scope both (a) knows which
+  // tabs are "its own" and (b) holds the right `handleOutput` — a provider-root
+  // tap would have to re-derive the owning page per event and route across
+  // per-page trackers. Scopes are all always-mounted (see the class comment), so
+  // one listener per scope stays alive across layout/zone/page switches.
+  //
+  // Decode + throttle live in the pure `terminalOutputTap` leaf (OOM lesson
+  // from incident #532): one streaming `TextDecoder` per terminalId (byte-for-
+  // byte identical to each instance's `outputDecoderRef`), and per-tab text
+  // coalesced across a `requestAnimationFrame` so `handleOutput` is called once
+  // per tab per frame, not once per raw event. Ordering is preserved per tab.
+  const coalescerRef = useRef(new TerminalOutputCoalescer());
+  const handleOutputRef = useRef(stateTracking.handleOutput);
+  useEffect(() => {
+    handleOutputRef.current = stateTracking.handleOutput;
+  }, [stateTracking.handleOutput]);
+
+  // Current owned-tab roster, read by the (stable) listener via a ref so a tab
+  // open/close never re-subscribes the listener. Only real tabs have PTYs that
+  // emit `terminal-output`; synthetic (test-fixture) tabs never do, so the real
+  // `tabs` set is the correct ownership filter (matches what the instances that
+  // previously fed tracking covered).
+  const tabIdSetRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const ids = new Set(tabs.map((t) => t.id));
+    tabIdSetRef.current = ids;
+    // Drop decoders/buffers for tabs that closed so they don't accumulate.
+    coalescerRef.current.retain(ids);
+  }, [tabs]);
+
+  useEffect(() => {
+    const coalescer = coalescerRef.current;
+    let rafHandle: ReturnType<typeof requestAnimationFrame> | null = null;
+    let unlisten: UnlistenFn | null = null;
+    let disposed = false;
+
+    const flush = () => {
+      rafHandle = null;
+      const fn = handleOutputRef.current;
+      for (const [tabId, text] of coalescer.drain()) {
+        fn(tabId, text);
+      }
+    };
+    const scheduleFlush = () => {
+      if (rafHandle !== null) return;
+      rafHandle = requestAnimationFrame(flush);
+    };
+
+    (async () => {
+      const un = await listen<TerminalOutputEvent>("terminal-output", (event) => {
+        const tid = event.payload.terminalId;
+        // Drop events for tabs this scope doesn't own (another page/window) or
+        // doesn't know about — exactly one scope owns any given terminalId.
+        if (!tabIdSetRef.current.has(tid)) return;
+        coalescer.push(tid, base64ToBytes(event.payload.data));
+        scheduleFlush();
+      });
+      if (disposed) {
+        un();
+        return;
+      }
+      unlisten = un;
+    })();
+
+    return () => {
+      disposed = true;
+      if (rafHandle !== null) cancelAnimationFrame(rafHandle);
+      // Do NOT flush on teardown: the scope only unmounts when its whole page is
+      // removed, so its tracker + tabs are going away too — a trailing sub-frame
+      // update would target unmounted state. Just release the listener.
+      unlisten?.();
+    };
+  }, []);
 
   // ---- ShellInfra ----
   const fileConflicts = useFileConflicts();

@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { LAYOUT_PRESETS, type SessionState } from "./useZoneLayout";
+import { LAYOUT_PRESETS, FLOW_GRID_ID, type SessionState } from "./useZoneLayout";
 import type { UIAction } from "./useUIState";
 import type { Metrics } from "./useEventHistory";
 import { getById } from "./commands";
@@ -208,6 +208,11 @@ export function useKeyboardShortcuts({
       }
       if (e.ctrlKey && e.shiftKey && e.key === "L") {
         e.preventDefault();
+        // In flow-grid (synthetic id, not in LAYOUT_PRESETS) `findIndex` returns
+        // -1 and the cycle would jump to preset[0]/`single`, collapsing 10+ live
+        // sessions back into a 1-zone layout. v1 wart: no-op the cycle in flow
+        // mode rather than cycling into a preset that re-hides sessions.
+        if (zoneLayout.layoutId === FLOW_GRID_ID) return;
         const currentIdx = LAYOUT_PRESETS.findIndex((l) => l.id === zoneLayout.layoutId);
         const nextIdx = (currentIdx + 1) % LAYOUT_PRESETS.length;
         zoneLayout.setLayoutId(LAYOUT_PRESETS[nextIdx].id);

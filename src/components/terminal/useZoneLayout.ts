@@ -135,6 +135,72 @@ export const LAYOUT_PRESETS: LayoutPreset[] = [
 /** Largest preset by zone count — the auto-grow ceiling. `full-grid` (9). */
 export const MAX_LAYOUT_ID = "full-grid";
 
+// ── Flow-grid (past-9 scrolling synthesis) ─────────────────────────────────
+//
+// Phase 1 of the terminal flow-grid plan: the fixed `LAYOUT_PRESETS` cap out at
+// `full-grid` (9 zones). Past 9 live tabs we STOP using presets and synthesize a
+// scrolling flow-grid instead — a fixed 3-column grid whose rows grow downward
+// so EVERY session gets a real, visible zone (no invisible offscreen tabs). The
+// synthesized preset carries the reserved id {@link FLOW_GRID_ID}; it is never a
+// member of `LAYOUT_PRESETS` (it's produced on demand by {@link resolveLayout}),
+// so every layout-id lookup/validation site must special-case this id or route
+// through `resolveLayout`, or the grow into flow mode silently no-ops.
+
+/** Reserved id for the synthesized past-9 scrolling flow-grid (NOT in `LAYOUT_PRESETS`). */
+export const FLOW_GRID_ID = "flow-grid";
+
+/** Fixed column count for the flow-grid. Deferred: viewport-derived columns. */
+export const FLOW_COLS = 3;
+
+/**
+ * Minimum flow-grid tile height in px (≈24 PTY rows at the default font). Below
+ * this a terminal is decorative, so rows keep at least this height and the page
+ * scrolls rather than shrinking tiles into uselessness.
+ */
+export const MIN_TILE_HEIGHT_PX = 300;
+
+/**
+ * Synthesize the scrolling flow-grid preset for `tabCount` live tabs: a fixed
+ * {@link FLOW_COLS}-column grid with `ceil(tabCount / FLOW_COLS)` rows, one zone
+ * per tab laid out left-to-right, top-to-bottom. Pure — the zone `col`/`row`
+ * strings match the shape of the static `LAYOUT_PRESETS` zones (single-track
+ * `"N"` values), so `ZoneGrid`/`ZoneCell` render them identically.
+ *
+ * Rows shrink naturally as tabs close: the id stays {@link FLOW_GRID_ID} and the
+ * row count is derived from the CURRENT tab count, so this is NOT a grow-only
+ * violation — it's the same layout id re-sized, not a shrink to a smaller preset.
+ */
+export function synthesizeFlowGrid(tabCount: number): LayoutPreset {
+  const count = Math.max(tabCount, 1);
+  const rows = Math.ceil(count / FLOW_COLS);
+  const zones: ZoneDefinition[] = [];
+  for (let i = 0; i < count; i++) {
+    zones.push({
+      col: String((i % FLOW_COLS) + 1),
+      row: String(Math.floor(i / FLOW_COLS) + 1),
+    });
+  }
+  return {
+    id: FLOW_GRID_ID,
+    name: "Flow Grid",
+    columns: FLOW_COLS,
+    rows,
+    zones,
+  };
+}
+
+/**
+ * Resolve a layout id to a concrete preset: the static preset table UNION the
+ * on-demand flow-grid synthesis. `FLOW_GRID_ID` synthesizes a preset sized to
+ * `tabCount`; any other id is looked up in `LAYOUT_PRESETS`, falling back to the
+ * first preset (`single`) for unknown ids. EVERY layout-id lookup that must
+ * accept a persisted/auto-grown flow-grid id goes through here.
+ */
+export function resolveLayout(layoutId: string, tabCount: number): LayoutPreset {
+  if (layoutId === FLOW_GRID_ID) return synthesizeFlowGrid(tabCount);
+  return LAYOUT_PRESETS.find((l) => l.id === layoutId) ?? LAYOUT_PRESETS[0];
+}
+
 /**
  * Pick the smallest layout preset whose zone count fits `totalTabs` live tabs,
  * capped at the largest preset (`full-grid`, 9 zones). Pure — exported so the
@@ -142,12 +208,14 @@ export const MAX_LAYOUT_ID = "full-grid";
  * unit test can all share ONE mapping (the prior copy lived inline in
  * `TerminalPage.tsx`).
  *
- * Mapping: 1→single, 2→split, 3-4→quad, 5-6→six-pack, ≥7→full-grid. Skips the
- * asymmetric presets (triptych / 1-plus-4 / command-center) deliberately — the
- * grow path wants the smallest *uniform* grid that fits, matching the legacy
- * inline behavior this extracted.
+ * Mapping: 1→single, 2→split, 3-4→quad, 5-6→six-pack, 7-9→full-grid,
+ * ≥10→flow-grid (the synthesized past-9 scrolling grid — no fixed preset ceiling
+ * anymore). Skips the asymmetric presets (triptych / 1-plus-4 / command-center)
+ * deliberately — the grow path wants the smallest *uniform* grid that fits,
+ * matching the legacy inline behavior this extracted.
  */
 export function pickLayout(totalTabs: number): string {
+  if (totalTabs >= 10) return FLOW_GRID_ID;
   if (totalTabs >= 7) return "full-grid";
   if (totalTabs >= 5) return "six-pack";
   if (totalTabs >= 3) return "quad";
@@ -166,8 +234,11 @@ export function pickLayout(totalTabs: number): string {
  *     STRICTLY GREATER than the current layout's; fewer tabs → null.
  *   - **capacity-driven**: only grows when `tabCount` exceeds the current
  *     layout's zone capacity.
- *   - **capped at `full-grid`** (via `pickLayout`); at 9+ tabs the target is
- *     already `full-grid`, so once there it returns null (no thrash).
+ *   - **grows INTO `flow-grid` at tab 10** (via `pickLayout`): the flow-grid
+ *     synthesizes exactly `tabCount` zones, so it "always fits". Once IN
+ *     flow-grid it returns null — the layout re-sizes itself to the live tab
+ *     count by construction (zones == tabCount), so there is nothing to grow to
+ *     and no thrash.
  *
  * There is deliberately NO operator-pinned escape hatch: every live session
  * must render in a zone. A pin latch used to suppress growth here, which let
@@ -178,12 +249,14 @@ export function computeAutoGrowLayoutId(
   currentLayoutId: string,
   tabCount: number,
 ): string | null {
-  const current = LAYOUT_PRESETS.find((l) => l.id === currentLayoutId) ?? LAYOUT_PRESETS[0];
+  // Already in flow-grid: `synthesizeFlowGrid(tabCount)` gives one zone per tab,
+  // so the layout is always full-capacity — no grow target, no render loop.
+  if (currentLayoutId === FLOW_GRID_ID) return null;
+  const current = resolveLayout(currentLayoutId, tabCount);
   // Only act when live tabs overflow the current capacity.
   if (tabCount <= current.zones.length) return null;
   const targetId = pickLayout(tabCount);
-  const target = LAYOUT_PRESETS.find((l) => l.id === targetId);
-  if (!target) return null;
+  const target = resolveLayout(targetId, tabCount);
   // Grow only — never pick a target with fewer/equal zones than current.
   if (target.zones.length <= current.zones.length) return null;
   return targetId;
@@ -387,7 +460,11 @@ export function useZoneLayout(
   // async restore window; the reservation is cleared once the zone is filled.
   const reservedZonesRef = useRef<Set<number>>(new Set());
 
-  const layout = LAYOUT_PRESETS.find((l) => l.id === layoutId) ?? LAYOUT_PRESETS[0];
+  // Resolve through `resolveLayout` so a persisted/auto-grown `flow-grid` id
+  // materializes a synthesized preset sized to the CURRENT live tab count
+  // (zones == tabIds.length in flow mode), instead of silently falling back to
+  // `single` and re-hiding every session past the 9th.
+  const layout = resolveLayout(layoutId, tabIds.length);
 
   // Persist on changes.
   useEffect(() => {
@@ -410,8 +487,11 @@ export function useZoneLayout(
   // programmatic auto-grow effect.
   const applyLayout = useCallback(
     (id: string) => {
-      const newLayout = LAYOUT_PRESETS.find((l) => l.id === id);
-      if (!newLayout) return;
+      // `resolveLayout` accepts the synthetic `flow-grid` id (auto-grow calls
+      // `applyLayout` directly, so a plain `LAYOUT_PRESETS.find` returning
+      // undefined would EAT the grow into flow mode). Unknown ids resolve to
+      // `single` rather than no-op — `setLayoutId` already gates bad input.
+      const newLayout = resolveLayout(id, tabIds.length);
 
       setLayoutIdState(id);
       setMaximizedZone(null);
@@ -455,7 +535,10 @@ export function useZoneLayout(
    */
   const setLayoutId = useCallback(
     (id: string) => {
-      if (!LAYOUT_PRESETS.some((l) => l.id === id)) return;
+      // Accept the synthetic flow-grid id alongside the static presets — a
+      // persisted/auto-grown `flow-grid` must be re-applyable, else restoring
+      // into flow mode silently drops back to a preset and re-hides sessions.
+      if (id !== FLOW_GRID_ID && !LAYOUT_PRESETS.some((l) => l.id === id)) return;
       applyLayout(id);
     },
     [applyLayout],
