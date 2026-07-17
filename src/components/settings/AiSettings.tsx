@@ -113,6 +113,10 @@ export function AiSettings({ onLog }: AiSettingsProps) {
             account_selection_mode:
               result.data.claude_cli?.account_selection_mode ||
               DEFAULT_AI_SETTINGS.claude_cli.account_selection_mode,
+            auto_migrate_on_token_exhaustion:
+              result.data.claude_cli?.auto_migrate_on_token_exhaustion ?? true,
+            auto_continue_after_migration:
+              result.data.claude_cli?.auto_continue_after_migration ?? true,
           },
           claude_api: {
             model: result.data.claude_api?.model || DEFAULT_AI_SETTINGS.claude_api.model,
@@ -224,6 +228,8 @@ export function AiSettings({ onLog }: AiSettingsProps) {
         timeoutSeconds: settings.claude_cli.timeout_seconds,
         configDir: settings.claude_cli.config_dir || null,
         accountSelectionMode: settings.claude_cli.account_selection_mode || "least_usage",
+        autoMigrateOnTokenExhaustion: settings.claude_cli.auto_migrate_on_token_exhaustion ?? true,
+        autoContinueAfterMigration: settings.claude_cli.auto_continue_after_migration ?? true,
         model: settings.claude_api.model,
         maxTokens: settings.claude_api.max_tokens,
         autoRefineVideoAfterIterations: settings.auto_refine_video_after_iterations,

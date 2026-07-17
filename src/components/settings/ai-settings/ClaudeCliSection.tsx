@@ -582,6 +582,36 @@ export function ClaudeCliSection({
                       </button>
                     </div>
 
+                    {usage?.session_utilization != null && !usage.error && (
+                      <div className="text-[10px] text-muted-foreground mt-1 ml-6">
+                        Session (5h){" "}
+                        <span
+                          className={
+                            usage.session_utilization >= 0.99
+                              ? getAccentColors("red").text
+                              : usage.session_utilization >= 0.8
+                                ? getAccentColors("yellow").text
+                                : ""
+                          }
+                        >
+                          {Math.round(usage.session_utilization * 100)}%
+                        </span>
+                        {usage.session_resets_at != null && (
+                          <span className="ml-1">
+                            &middot; resets{" "}
+                            {new Date(usage.session_resets_at * 1000).toLocaleTimeString([], {
+                              hour: "2-digit",
+                              minute: "2-digit",
+                            })}
+                          </span>
+                        )}
+                        {(usage.model_limits ?? []).map((ml) => (
+                          <span key={ml.model} className="ml-2">
+                            &middot; {ml.model} week {Math.round(ml.utilization * 100)}%
+                          </span>
+                        ))}
+                      </div>
+                    )}
                     {usage?.resets_at && !usage.error && (
                       <div className="text-[10px] text-muted-foreground mt-1 ml-6">
                         Weekly limit resets {new Date(usage.resets_at * 1000).toLocaleString()}
@@ -715,6 +745,62 @@ export function ClaudeCliSection({
                   </div>
                 </button>
               </div>
+            </div>
+          )}
+
+          {claudeConfigDirs.length > 1 && (
+            <div className="space-y-2 pt-2">
+              <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide">
+                Token-Exhaustion Failover
+              </span>
+              <label className="flex items-start gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={settings.claude_cli.auto_migrate_on_token_exhaustion ?? true}
+                  onChange={(e) =>
+                    setSettings((prev) => ({
+                      ...prev,
+                      claude_cli: {
+                        ...prev.claude_cli,
+                        auto_migrate_on_token_exhaustion: e.target.checked,
+                      },
+                    }))
+                  }
+                  className="mt-0.5 accent-primary"
+                />
+                <span>
+                  <span className="text-xs font-medium block">
+                    Auto-migrate exhausted sessions
+                  </span>
+                  <span className="text-[10px] text-muted-foreground block">
+                    When a session hits its usage limit, respawn it — same conversation and
+                    model — on the account with the most headroom.
+                  </span>
+                </span>
+              </label>
+              <label className="flex items-start gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={settings.claude_cli.auto_continue_after_migration ?? true}
+                  onChange={(e) =>
+                    setSettings((prev) => ({
+                      ...prev,
+                      claude_cli: {
+                        ...prev.claude_cli,
+                        auto_continue_after_migration: e.target.checked,
+                      },
+                    }))
+                  }
+                  className="mt-0.5 accent-primary"
+                />
+                <span>
+                  <span className="text-xs font-medium block">Auto-continue after migration</span>
+                  <span className="text-[10px] text-muted-foreground block">
+                    Nudge the migrated session to pick its task back up once the CLI is idle,
+                    instead of waiting at the prompt.
+                  </span>
+                </span>
+              </label>
             </div>
           )}
 

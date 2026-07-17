@@ -105,6 +105,20 @@ export interface ClaudeCliSettings {
   config_dir?: string;
   /** How to select which account to use when multiple config dirs exist */
   account_selection_mode?: AccountSelectionMode;
+  /** Auto-migrate a token-exhausted terminal session to a fresh account
+   * (transcript copy + `claude --resume` respawn). Runner default: true. */
+  auto_migrate_on_token_exhaustion?: boolean;
+  /** After a migration respawn, nudge the resumed session to continue its
+   * task once the CLI is idle. Runner default: true. */
+  auto_continue_after_migration?: boolean;
+}
+
+/** One per-model scoped weekly limit (e.g. the Fable-only cap). */
+export interface ModelLimitInfo {
+  model: string;
+  /** Fraction used, 0.0–1.0 */
+  utilization: number;
+  resets_at: number | null;
 }
 
 export interface AccountUsageInfo {
@@ -123,6 +137,14 @@ export interface AccountUsageInfo {
   period_elapsed_fraction: number | null;
   /** Days remaining until reset */
   period_remaining_days: number | null;
+  /** Session-window (5-hour) utilization 0.0–1.0 (OAuth usage source only) */
+  session_utilization?: number | null;
+  /** Unix seconds when the 5-hour session window resets */
+  session_resets_at?: number | null;
+  /** Per-model scoped weekly limits */
+  model_limits?: ModelLimitInfo[];
+  /** Stats source: "oauth_usage" (free endpoint) or "probe" (Haiku probe) */
+  source?: string | null;
 }
 
 /** Weekly utilization at/above which an account is treated as "out of
@@ -141,8 +163,13 @@ export function isAccountExhausted(a: {
   utilization: number;
   status?: string | null;
   error?: string | null;
+  session_utilization?: number | null;
 }): boolean {
   if (a.error != null || a.utilization >= EXHAUSTION_UTILIZATION) return true;
+  // A hit 5-hour session window blocks requests even while weekly reads low.
+  if (a.session_utilization != null && a.session_utilization >= EXHAUSTION_UTILIZATION) {
+    return true;
+  }
   const s = (a.status ?? "").toLowerCase();
   return s.includes("reject") || s.includes("block") || s.includes("exceed");
 }

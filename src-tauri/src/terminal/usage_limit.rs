@@ -55,6 +55,13 @@ const USAGE_LIMIT_PATTERNS: &[&str] = &[
     "hit your usage limit",
     "out of extra usage",
     "session limit reached",
+    // Generic catch-alls LAST (specific patterns above win the label). The
+    // CLI's phrasing shifts across releases ("Opus weekly limit reached",
+    // "limit reached ∙ resets 3am", "You're out of usage until…") — a missed
+    // hint strands a session on a dead account, while a false hint costs one
+    // probe-confirmed no-op.
+    "limit reached",
+    "out of usage",
 ];
 
 /// Minimum gap between two hint firings for the same terminal. A limit message

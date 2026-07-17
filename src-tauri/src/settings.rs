@@ -88,9 +88,19 @@ pub struct ClaudeCliSettings {
     /// No-op when fewer than two accounts are configured.
     #[serde(default = "default_auto_migrate_on_token_exhaustion")]
     pub auto_migrate_on_token_exhaustion: bool,
+    /// After an automatic account migration respawns `claude --resume`, type a
+    /// short continuation prompt into the resumed session (once the CLI paints
+    /// its idle prompt) so autonomous work picks up where it left off instead
+    /// of sitting idle at the input box. Manual migrations honor it too.
+    #[serde(default = "default_auto_continue_after_migration")]
+    pub auto_continue_after_migration: bool,
 }
 
 fn default_auto_migrate_on_token_exhaustion() -> bool {
+    true
+}
+
+fn default_auto_continue_after_migration() -> bool {
     true
 }
 
@@ -103,6 +113,7 @@ impl Default for ClaudeCliSettings {
             config_dir: None,
             account_selection_mode: AccountSelectionMode::LeastUsage,
             auto_migrate_on_token_exhaustion: default_auto_migrate_on_token_exhaustion(),
+            auto_continue_after_migration: default_auto_continue_after_migration(),
         }
     }
 }
