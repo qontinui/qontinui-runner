@@ -12,7 +12,7 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 /// The raw instance name from the env, if set and non-empty.
 pub fn instance_name() -> Option<String> {
@@ -46,16 +46,80 @@ pub fn runner_kind() -> qontinui_types::wire::runner_kind::RunnerKind {
     }
 }
 
+/// Pure decision core for [`data_subdir`] — every input injected, so it is
+/// testable without touching process-global env (which races the parallel test
+/// harness; `scheduler_service`'s tests mutate `QONTINUI_PORT` concurrently).
+///
+/// - `name`: `QONTINUI_INSTANCE_NAME`, the supervisor's explicit instance id.
+/// - `primary_port`: `QONTINUI_PRIMARY_PORT` — set only on a runner that has a
+///   primary to proxy to, i.e. never on the primary itself.
+/// - `api_port`: this runner's API port. Only the primary owns
+///   [`crate::mcp::types::MCP_API_PORT`].
+///
+/// Returns `None` — the unscoped, primary-owned path — ONLY for a runner that
+/// presents no secondary signal at all.
+fn resolve_data_subdir(
+    name: Option<&str>,
+    primary_port: Option<u16>,
+    api_port: u16,
+) -> Option<String> {
+    if let Some(n) = name {
+        return Some(format!("instance-{}", sanitize(n)));
+    }
+    if primary_port.is_some() || api_port != crate::mcp::types::MCP_API_PORT {
+        // Secondary by another signal, but nameless — quarantine, never the
+        // primary's path.
+        return Some(format!("instance-unnamed-{api_port}"));
+    }
+    None
+}
+
 /// Returns the per-instance path segment, or `None` for the primary runner.
 ///
 /// Primary:   `None`                            → callers leave paths alone
 /// Secondary: `Some("instance-<sanitized>")`    → callers append to per-runner dirs
+///
+/// Fails CLOSED (see [`scope_path`]): a runner that is a secondary by any other
+/// signal but carries no instance name is quarantined under
+/// `instance-unnamed-<port>` rather than being handed the primary's `None`.
 pub fn data_subdir() -> Option<String> {
-    instance_name().map(|n| format!("instance-{}", sanitize(&n)))
+    let name = instance_name();
+    let primary = primary_port();
+    let api_port = crate::mcp::types::get_mcp_api_port();
+    let sub = resolve_data_subdir(name.as_deref(), primary, api_port);
+
+    if name.is_none() && sub.is_some() {
+        // Loud, not silent: this is a supervisor bug (it is contracted to set
+        // QONTINUI_INSTANCE_NAME on every non-primary spawn) and the operator
+        // needs to see it — but the runner still gets a usable, ISOLATED path.
+        error!(
+            port = api_port,
+            primary_port = ?primary,
+            subdir = ?sub,
+            "instance: this runner is a SECONDARY (primary port set, or a non-default API port) \
+             but QONTINUI_INSTANCE_NAME is unset — refusing primary-scoped state and quarantining \
+             under an unnamed-instance dir. The supervisor must set QONTINUI_INSTANCE_NAME."
+        );
+    }
+    sub
 }
 
 /// Append the instance subdir to `base` when this runner is a secondary.
 /// Returns `base` unchanged for the primary runner.
+///
+/// **Fail-closed on the isolation boundary.** This used to key on
+/// `QONTINUI_INSTANCE_NAME` alone, so a secondary launched without that env var
+/// silently resolved to the PRIMARY's paths and could clobber the operator's
+/// live pane layout / session outbox — the whole isolation depended on the
+/// supervisor never forgetting the env, with no runner-side assertion. A
+/// secondary detected by any other signal now gets a quarantined
+/// `instance-unnamed-<port>` dir plus an `error!`, never the primary's.
+///
+/// Why quarantine rather than abort: the property that matters is "never open
+/// primary-scoped state", and every caller here (logs, prompts, configs, the
+/// pane store) is on the boot path — aborting would turn a supervisor env slip
+/// into a dead runner, while quarantining keeps it working in isolation. The
+/// primary itself (default port, no primary to proxy to) is untouched.
 pub fn scope_path(base: &Path) -> PathBuf {
     match data_subdir() {
         Some(sub) => base.join(sub),
@@ -220,18 +284,96 @@ mod tests {
         std::env::remove_var("QONTINUI_INSTANCE_NAME");
     }
 
-    /// The PRIMARY runner (no `QONTINUI_INSTANCE_NAME`) must keep resolving to
-    /// the UNSCOPED legacy path so its pre-existing pending outbox rows are
-    /// never orphaned by this change.
+    const PRIMARY: u16 = crate::mcp::types::MCP_API_PORT;
+
+    /// The PRIMARY runner (no `QONTINUI_INSTANCE_NAME`, default port, no
+    /// primary to proxy to) must keep resolving to the UNSCOPED legacy path so
+    /// its pre-existing pending outbox rows are never orphaned.
+    ///
+    /// Asserted on the pure core rather than through the env: the fail-closed
+    /// check reads `QONTINUI_PORT`, which `scheduler_service`'s tests mutate on
+    /// other harness threads — an env-based assertion here would flake.
     #[test]
-    fn scope_path_is_noop_for_primary() {
-        let _env = env_lock();
-        std::env::remove_var("QONTINUI_INSTANCE_NAME");
-        let base = Path::new(".qontinui").join("runner");
+    fn primary_keeps_the_unscoped_path() {
+        assert_eq!(resolve_data_subdir(None, None, PRIMARY), None);
+    }
+
+    /// Item 1 residual (fail-open on the isolation boundary): the isolation
+    /// used to key on `QONTINUI_INSTANCE_NAME` alone, so a secondary spawned
+    /// without it silently resolved to the PRIMARY's paths and could clobber
+    /// the operator's live pane layout. A secondary detected by ANY other
+    /// signal must refuse primary-scoped state.
+    #[test]
+    fn nameless_secondary_refuses_primary_scoped_state() {
+        // Non-default API port ⇒ not the primary.
         assert_eq!(
-            scope_path(&base),
-            base,
-            "primary must keep the legacy unscoped outbox path"
+            resolve_data_subdir(None, None, 9877),
+            Some("instance-unnamed-9877".to_string()),
+        );
+        // Has a primary to proxy to ⇒ not the primary, even on the default
+        // port (the belt-and-braces signal).
+        assert_eq!(
+            resolve_data_subdir(None, Some(PRIMARY), PRIMARY),
+            Some("instance-unnamed-9876".to_string()),
+        );
+        // The property that actually matters: never the primary's own path.
+        let base = Path::new(".qontinui").join("runner");
+        for sub in [
+            resolve_data_subdir(None, None, 9877),
+            resolve_data_subdir(None, Some(PRIMARY), PRIMARY),
+        ] {
+            let scoped = base.join(sub.expect("a nameless secondary must be quarantined"));
+            assert_ne!(scoped, base, "must not resolve to the primary's path");
+        }
+    }
+
+    /// Regression (empty-Terminal-page incident): `window-assignments` used to
+    /// be namespaced by API PORT. Temp-runner ports (9877-9899) are RECYCLED
+    /// across spawns, so a fresh temp runner inherited the stale
+    /// `window-assignments-9877.json` of an unrelated month-old runner —
+    /// including a pop-out window bound to page "default". The frontend then
+    /// hid that page from the main window (a pop-out "owns" it), so the
+    /// Terminal tab rendered ZERO panes despite dozens of live PTYs, with no
+    /// console error. Instance names are unique per spawn; the port is not an
+    /// instance identity. This pins the wiring contract `main.rs` relies on.
+    #[test]
+    fn window_assignments_path_cannot_be_inherited_across_instances() {
+        let base = Path::new(".qontinui").join("runner");
+        let path_for = |name: &str, port: u16| {
+            base.join(resolve_data_subdir(Some(name), None, port).unwrap())
+                .join("window-assignments.json")
+        };
+
+        // Two runners that reuse the SAME recycled port must not share a file.
+        let first = path_for("test-19f6faa3bf8-0", 9877);
+        let recycled = path_for("test-19f6fd50c26-2", 9877);
+        assert_ne!(
+            first, recycled,
+            "a recycled port must not resurrect a prior runner's pop-out windows"
+        );
+
+        // And neither may ever resolve to the primary's own file.
+        let primary = base.join("window-assignments.json");
+        assert_ne!(first, primary);
+        assert_ne!(recycled, primary);
+        assert_eq!(
+            resolve_data_subdir(None, None, PRIMARY),
+            None,
+            "the primary keeps the legacy unscoped window-assignments path"
+        );
+    }
+
+    /// An explicit instance name always wins — the normal supervised path is
+    /// unchanged by the fail-closed guard, on any port.
+    #[test]
+    fn instance_name_wins_over_the_fallback() {
+        assert_eq!(
+            resolve_data_subdir(Some("test-runner 7!"), Some(PRIMARY), 9877),
+            Some("instance-test-runner_7_".to_string()),
+        );
+        assert_eq!(
+            resolve_data_subdir(Some("test-9877"), None, PRIMARY),
+            Some("instance-test-9877".to_string()),
         );
     }
 }
