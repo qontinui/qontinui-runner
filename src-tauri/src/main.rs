@@ -4040,7 +4040,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // user opts in. Claims synthesis jobs from the web memory API,
             // distills them via the warm Claude provider, and posts results.
             info!("Starting tenant memory-synthesis poller");
-            memory::memory_synthesis::start_memory_synthesis_poller();
+            memory::memory_synthesis::start_memory_job_poller();
 
             // Auto-start MCP servers marked with auto_start in background
             let app_state_for_mcp_auto = app.state::<Arc<AppState>>().inner().clone();

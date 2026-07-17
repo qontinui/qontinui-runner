@@ -568,11 +568,19 @@ fn retrieve_graph(graph: &KnowledgeGraph, query: &str, limit: usize) -> Vec<Memo
 /// Tenant-shared agentic memory via the web backend's hybrid-RRF endpoint
 /// (`POST /api/v1/memory/query`).
 ///
+/// The query vector is computed LOCALLY (plan
+/// `2026-07-13-runner-paid-embedding`, Phase 1) and sent as `query_embedding`,
+/// so the backend never embeds. This closes the asymmetry with
+/// [`retrieve_embeddings`], which has always embedded locally for the runner's
+/// own knowledge search: both arms now search the same space.
+///
 /// Degrades silently to an empty result set on ANY failure — consent gate
 /// off, no web base configured, unpaired (no device JWT), timeout, non-2xx,
 /// or an unparseable body. The unified query must never fail (or slow past
 /// [`TENANT_QUERY_TIMEOUT`]) because the tenant arm is unavailable.
 async fn retrieve_tenant_memory(query: &str, limit: usize) -> Vec<MemoryResult> {
+    use crate::database::embedding_client::EmbeddingClient;
+
     // Consent gate: with cloud sync off, the query text must not egress.
     if !crate::settings::get_cloud_sync_enabled() {
         return Vec::new();
@@ -585,8 +593,26 @@ async fn retrieve_tenant_memory(query: &str, limit: usize) -> Vec<MemoryResult> 
         tracing::debug!("Unified memory: tenant arm skipped (no device JWT — unpaired)");
         return Vec::new();
     };
+
+    // Embed after the gates, so a gated-off runner never spends the compute.
+    // A local embedder outage costs the vector half of the server's hybrid
+    // search, not the arm: the request still goes out and the backend answers
+    // FTS-only. Degrading a query to fewer results is this arm's whole
+    // posture — unlike the WRITE path, where an un-embedded record would be
+    // permanently unsearchable and so must be retried instead.
+    let query_embedding = match EmbeddingClient::new().compute_text_embedding(query).await {
+        Ok(e) => Some(e),
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "Unified memory: local embed failed — tenant query degrading to FTS-only"
+            );
+            None
+        }
+    };
+
     let client = tenant_query_client();
-    retrieve_tenant_memory_at(client, &base, &bearer, query, limit).await
+    retrieve_tenant_memory_at(client, &base, &bearer, query, limit, query_embedding).await
 }
 
 /// Hard latency ceiling for the tenant-memory arm — the fan-out must not
@@ -606,18 +632,29 @@ fn tenant_query_client() -> &'static reqwest::Client {
 
 /// Endpoint-parameterized core of [`retrieve_tenant_memory`] so tests can
 /// point it at a fake server without env/profile mutation.
+///
+/// `query_embedding` is the locally-computed query vector. `None` (local
+/// embedder unavailable) omits the field, leaving the server to answer
+/// FTS-only.
 pub(crate) async fn retrieve_tenant_memory_at(
     client: &reqwest::Client,
     base: &str,
     bearer: &str,
     query: &str,
     limit: usize,
+    query_embedding: Option<Vec<f32>>,
 ) -> Vec<MemoryResult> {
+    use crate::database::embedding_client::EMBEDDING_MODEL_TAG;
+
     let url = format!("{}/api/v1/memory/query", base.trim_end_matches('/'));
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "query_text": query,
         "limit": limit.clamp(1, 50),
     });
+    if let Some(embedding) = query_embedding {
+        body["query_embedding"] = serde_json::json!(embedding);
+        body["embedding_model"] = serde_json::Value::String(EMBEDDING_MODEL_TAG.to_string());
+    }
     let resp = client
         .post(&url)
         .header("Authorization", format!("Bearer {bearer}"))
@@ -1571,9 +1608,10 @@ mod tenant_memory_arm_tests {
     use axum::{
         http::StatusCode as AxumStatus, response::IntoResponse, routing::post, Json, Router,
     };
-    use serde_json::json;
+    use serde_json::{json, Value as JsonValue};
     use std::time::Duration;
     use tokio::net::TcpListener;
+    use tokio::sync::Mutex as TokMutex;
 
     async fn spawn_server(app: Router) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1631,7 +1669,8 @@ mod tenant_memory_arm_tests {
             }),
         );
         let base = spawn_server(app).await;
-        let results = retrieve_tenant_memory_at(&client(), &base, "test.jwt", "login", 8).await;
+        let results =
+            retrieve_tenant_memory_at(&client(), &base, "test.jwt", "login", 8, None).await;
 
         assert_eq!(results.len(), 2);
         let top = &results[0];
@@ -1661,7 +1700,7 @@ mod tenant_memory_arm_tests {
         );
         let base = spawn_server(app).await;
         let started = std::time::Instant::now();
-        let results = retrieve_tenant_memory_at(&client(), &base, "test.jwt", "q", 8).await;
+        let results = retrieve_tenant_memory_at(&client(), &base, "test.jwt", "q", 8, None).await;
         assert!(results.is_empty(), "timeout must degrade to local-only");
         assert!(
             started.elapsed() < Duration::from_secs(4),
@@ -1683,15 +1722,84 @@ mod tenant_memory_arm_tests {
         );
         let base = spawn_server(app).await;
         assert!(
-            retrieve_tenant_memory_at(&client(), &base, "test.jwt", "q", 8)
+            retrieve_tenant_memory_at(&client(), &base, "test.jwt", "q", 8, None)
                 .await
                 .is_empty()
         );
         // Connection refused (nothing listens on port 1).
-        assert!(
-            retrieve_tenant_memory_at(&client(), "http://127.0.0.1:1", "test.jwt", "q", 8)
-                .await
-                .is_empty()
+        assert!(retrieve_tenant_memory_at(
+            &client(),
+            "http://127.0.0.1:1",
+            "test.jwt",
+            "q",
+            8,
+            None
+        )
+        .await
+        .is_empty());
+    }
+
+    /// Records what the arm actually PUT ON THE WIRE, so the Phase 1 contract
+    /// (`query_embedding` + `embedding_model`) is asserted against the request
+    /// body rather than inferred from the response.
+    async fn spawn_body_recorder() -> (String, Arc<TokMutex<Vec<JsonValue>>>) {
+        let seen: Arc<TokMutex<Vec<JsonValue>>> = Arc::new(TokMutex::new(Vec::new()));
+        let app = Router::new()
+            .route(
+                "/api/v1/memory/query",
+                post(
+                    |axum::extract::State(state): axum::extract::State<
+                        Arc<TokMutex<Vec<JsonValue>>>,
+                    >,
+                     Json(body): Json<JsonValue>| async move {
+                        state.lock().await.push(body);
+                        (AxumStatus::OK, Json(json!({"hits": []}))).into_response()
+                    },
+                ),
+            )
+            .with_state(seen.clone());
+        (spawn_server(app).await, seen)
+    }
+
+    /// Phase 1 of `2026-07-13-runner-paid-embedding`: the runner sends the
+    /// locally-computed query VECTOR, tagged with the space that produced it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sends_locally_computed_query_embedding_with_model_tag() {
+        let (base, seen) = spawn_body_recorder().await;
+        let embedding: Vec<f32> = (0..384).map(|i| i as f32 * 0.01).collect();
+        retrieve_tenant_memory_at(&client(), &base, "test.jwt", "login", 8, Some(embedding)).await;
+
+        let g = seen.lock().await;
+        assert_eq!(g.len(), 1);
+        let body = &g[0];
+        assert_eq!(
+            body["query_text"], "login",
+            "text still rides along for FTS"
         );
+        let sent = body["query_embedding"]
+            .as_array()
+            .expect("query_embedding must be on the wire");
+        assert_eq!(sent.len(), 384);
+        assert_eq!(
+            body["embedding_model"],
+            crate::database::embedding_client::EMBEDDING_MODEL_TAG
+        );
+    }
+
+    /// A local embedder outage costs the vector half of the server's hybrid
+    /// search, not the arm: the query still goes out, FTS-only.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn omits_query_embedding_when_local_embed_unavailable() {
+        let (base, seen) = spawn_body_recorder().await;
+        retrieve_tenant_memory_at(&client(), &base, "test.jwt", "login", 8, None).await;
+
+        let g = seen.lock().await;
+        assert_eq!(g.len(), 1, "the query must still go out, FTS-only");
+        assert!(
+            g[0].get("query_embedding").is_none(),
+            "no embedding ⇒ omit the field; never send a placeholder vector"
+        );
+        assert!(g[0].get("embedding_model").is_none());
+        assert_eq!(g[0]["query_text"], "login");
     }
 }
