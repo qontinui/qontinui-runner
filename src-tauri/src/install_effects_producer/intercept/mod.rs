@@ -122,8 +122,25 @@ static BOUND_PORT: AtomicU16 = AtomicU16::new(0);
 /// Record the actually-bound runner API port. Called from `mcp_api.rs` right
 /// after `app_state.api_port.store(...)` so the terminal env-seam (which has no
 /// `app_state`) can read the correct port for the shim loopback.
+///
+/// This is ALSO the single moment the true bound port is known to the process,
+/// so it is where the OUT-of-process breadcrumb is published (plan
+/// `2026-07-17-universal-coord-device-identity-for-any-session` §4). A separate
+/// process — the identity shim launching `claude` in a bare terminal — has no
+/// way to read [`BOUND_PORT`] or the managed `AppState`; the breadcrumb is its
+/// only honest answer. See `qontinui_runner_lib::runner_breadcrumb`.
 pub fn set_bound_port(port: u16) {
     BOUND_PORT.store(port, Ordering::Relaxed);
+    // Skipped under `cfg(test)` so the bin crate's unit tests (which call this
+    // with synthetic ports) never write a fake runner advertisement into the
+    // DEVELOPER's real `~/.qontinui/runner/` — a bare session on this machine
+    // would then try to mint against a port nothing is listening on. Same
+    // discipline as `coord_mcp::nonce_persistence_enabled`'s `!cfg!(test)`
+    // default. The publish path itself is unit-tested in `runner_breadcrumb`
+    // against a temp dir.
+    if !cfg!(test) {
+        qontinui_runner_lib::runner_breadcrumb::publish(port);
+    }
 }
 
 /// The bound runner API port for the shim loopback. Falls back to the bootstrap

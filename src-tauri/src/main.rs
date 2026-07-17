@@ -1394,6 +1394,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::devenv_enroll::devenv_enroll,
             commands::devenv_enroll::devenv_enroll_status,
             commands::devenv_enroll::devenv_install_cli_path,
+            // Session coord-identity delivery gate (plan 2026-07-17 §6) — the
+            // Settings opt-in that puts the persistent identity shim on PATH so
+            // BARE terminals can request coord device identity. Reversible.
+            commands::session_identity::session_identity_status,
+            commands::session_identity::session_identity_install,
+            commands::session_identity::session_identity_uninstall,
             commands::discoveries::clear_discovery,
             commands::discoveries::clear_failed_discoveries,
             commands::discoveries::get_discovery_summary,
@@ -4330,6 +4336,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         crate::mcp::types::get_mcp_api_port(),
                     );
                     session::shutdown_marker::mark_clean_shutdown(&marker_path);
+
+                    // Retract the out-of-process port advertisement (plan
+                    // 2026-07-17 §4). Same catch-all reasoning as the marker
+                    // above: an X-button / programmatic exit is a PLANNED exit,
+                    // so the runner must stop advertising a port it is about to
+                    // release. Idempotent with `drain()`'s own retraction.
+                    qontinui_runner_lib::runner_breadcrumb::remove_published();
                 }
 
                 // Cancel any in-flight CI-node builds so their executors can

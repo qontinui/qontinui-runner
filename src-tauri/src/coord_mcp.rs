@@ -87,13 +87,210 @@ impl ProxyPrincipal {
     }
 }
 
+/// How long a registered nonce lives, and whether it may be persisted.
+///
+/// Split introduced by plan
+/// `2026-07-17-universal-coord-device-identity-for-any-session` (§1/E). The two
+/// classes exist because they answer to OPPOSITE constraints:
+///
+/// - [`NonceLifetime::Persistent`] — every nonce minted by the trusted in-process
+///   spawn code (the identity seam, the terminal chokepoint, the boot self-heal).
+///   Today's semantics, UNCHANGED: no expiry, mirrored to the encrypted store
+///   when the principal is Device ([`persist_proxy_nonces`]), graced on eviction.
+///   Persistence + the grace window exist BECAUSE the MCP client reads its config
+///   exactly once at connect (see the module doc): a nonce that dies under a live
+///   client 401s it with no way to recover, so these must outlive a restart.
+/// - [`NonceLifetime::Ephemeral`] — minted ONLY by the
+///   `/coord-mcp/provision-session` route, i.e. on behalf of a session the runner
+///   did not spawn and cannot vouch for. Bounded expiry, NEVER persisted, and
+///   revoked the moment the machine is opted back out ([`session_identity_gate`]).
+///
+/// **A short TTL fights the persistence design — so it is scoped, not global.**
+/// Shortening every nonce would 401 every live agent across a routine runner
+/// rebuild, which is precisely the failure nonce persistence was built to fix.
+/// Only the route's own nonces are bounded; the seam's are untouched. That is
+/// also why eviction is class-scoped in [`mint_and_register_nonce`]: a bare
+/// session minting for a cwd must never evict a live PTY terminal's nonce for
+/// that same cwd.
+#[derive(Clone, Debug, PartialEq)]
+enum NonceLifetime {
+    /// Runner-spawn provenance — no expiry, persistable, graced. Today's shape.
+    Persistent,
+    /// Mint-route provenance — dies at `expires_at`, never reaches disk, and is
+    /// revoked live by opting the machine out.
+    Ephemeral {
+        expires_at: std::time::Instant,
+    },
+}
+
+impl NonceLifetime {
+    /// A fresh mint-route lifetime: now + [`EPHEMERAL_NONCE_TTL`].
+    fn ephemeral() -> Self {
+        NonceLifetime::Ephemeral {
+            expires_at: std::time::Instant::now() + EPHEMERAL_NONCE_TTL,
+        }
+    }
+
+    fn is_ephemeral(&self) -> bool {
+        matches!(self, NonceLifetime::Ephemeral { .. })
+    }
+}
+
+/// Bounded lifetime of a mint-route ([`NonceLifetime::Ephemeral`]) nonce.
+///
+/// **Why 12h and not minutes.** The obvious reading of "short-TTL" — a few
+/// minutes — is WRONG here and would ship a broken feature: the MCP client reads
+/// its `--mcp-config` once at connect and never re-reads it (module doc), so the
+/// nonce must stay valid for the WHOLE session, not just long enough to hand it
+/// over. A minutes-scale TTL would silently 401 a bare session mid-turn. 12h
+/// bounds a leaked nonce to at most one working day while covering any plausible
+/// session.
+///
+/// What actually contains the exposure is the combination, not the number: an
+/// ephemeral nonce (a) expires, (b) NEVER reaches disk — so unlike a seam nonce
+/// it cannot be replayed after a runner restart, and (c) stops validating the
+/// instant the operator removes the opt-in marker. Compare a Persistent nonce,
+/// which is unbounded AND survives restarts by design.
+const EPHEMERAL_NONCE_TTL: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
+
 /// What a registered proxy nonce maps to: the session workdir it was provisioned
-/// into PLUS the identity ([`ProxyPrincipal`]) whose bearer the proxy may inject
-/// for it.
+/// into, the identity ([`ProxyPrincipal`]) whose bearer the proxy may inject for
+/// it, and its [`NonceLifetime`] (which decides expiry, persistence, and grace).
 #[derive(Clone, Debug)]
 struct NonceBinding {
     workdir: String,
     principal: ProxyPrincipal,
+    lifetime: NonceLifetime,
+}
+
+// ---------------------------------------------------------------------------
+// Session-provisioned coord identity: the TWO gates (plan 2026-07-17 §1/§3)
+// ---------------------------------------------------------------------------
+
+/// Master enable flag for session-provisioned coord identity — the
+/// `POST /coord-mcp/provision-session` mint route. **Default OFF: the feature
+/// ships dark**, exactly like [`crate::install_effects_producer::intercept::shim_materializer::ENABLE_FLAG`]
+/// (`QONTINUI_INSTALL_INTERCEPT_ENABLED`), whose constant shape this copies.
+/// Flag off ⇒ the route denies every request ⇒ zero behavior change for every
+/// existing session, spawned or bare.
+pub(crate) const SESSION_IDENTITY_ENABLE_FLAG: &str = "QONTINUI_SESSION_COORD_IDENTITY_ENABLED";
+
+/// File name of the per-machine operator opt-in marker, under `~/.qontinui/`.
+/// Its mere existence is the signal; contents are never read.
+pub(crate) const SESSION_IDENTITY_MARKER_FILE: &str = "allow-session-coord-identity";
+
+/// Absolute path of the opt-in marker (`~/.qontinui/allow-session-coord-identity`).
+/// `None` when the home dir is unresolvable — which [`session_identity_gate`]
+/// treats as NOT opted in (fail-closed: an unresolvable home must never read as
+/// consent).
+pub(crate) fn session_identity_marker_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".qontinui").join(SESSION_IDENTITY_MARKER_FILE))
+}
+
+/// Why the mint route refused. Typed rather than a bare bool so the route can
+/// return an explicit, actionable reason — the runner's "no silent empty
+/// responses" rule. A denied caller must be able to tell "the feature is dark"
+/// from "this machine has not opted in", because the fixes are different.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionIdentityDenial {
+    /// The master flag is unset/falsy — the feature is dark on this runner.
+    FlagOff,
+    /// The flag is on but the operator has not dropped the opt-in marker.
+    NotOptedIn,
+}
+
+impl SessionIdentityDenial {
+    /// Machine-readable code for the route's JSON error body.
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            SessionIdentityDenial::FlagOff => "COORD_MCP_PROVISION_DISABLED",
+            SessionIdentityDenial::NotOptedIn => "COORD_MCP_PROVISION_NOT_OPTED_IN",
+        }
+    }
+
+    /// Human/agent-actionable explanation — names the exact lever to flip.
+    pub(crate) fn message(&self) -> String {
+        match self {
+            SessionIdentityDenial::FlagOff => format!(
+                "session-provisioned coord identity is disabled on this runner — \
+                 set {SESSION_IDENTITY_ENABLE_FLAG}=1 in the runner's environment \
+                 and restart it to enable"
+            ),
+            SessionIdentityDenial::NotOptedIn => {
+                let path = session_identity_marker_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| format!("~/.qontinui/{SESSION_IDENTITY_MARKER_FILE}"));
+                format!(
+                    "this machine has not opted in to session-provisioned coord \
+                     identity — create the marker file {path} to opt in (delete it \
+                     to revoke, which also invalidates already-minted session nonces)"
+                )
+            }
+        }
+    }
+}
+
+/// Pure resolver for [`session_identity_gate`] — both gates, no I/O, so the
+/// default-OFF posture is unit-testable without touching process-global env or
+/// the operator's real home dir.
+fn resolve_session_identity_gate(
+    flag_on: bool,
+    marker_exists: bool,
+) -> Result<(), SessionIdentityDenial> {
+    if !flag_on {
+        return Err(SessionIdentityDenial::FlagOff);
+    }
+    if !marker_exists {
+        return Err(SessionIdentityDenial::NotOptedIn);
+    }
+    Ok(())
+}
+
+/// The authorization gate for session-provisioned coord identity: the master
+/// flag AND the per-machine opt-in marker. BOTH are required — neither alone
+/// grants identity.
+///
+/// # Why two gates instead of a nonce check
+///
+/// Every OTHER `/coord-mcp/*` route is nonce-gated, which is a strong gate: a
+/// caller must already hold a runner-minted per-session key. The mint route
+/// structurally CANNOT be nonce-gated — it is what issues the nonce. So these
+/// two gates stand IN PLACE OF that check, and they are the entire authorization
+/// story for the route. See [`crate::mcp_api::coord_provision_session_handler`].
+///
+/// # Why "same machine" is not itself an authorization signal
+///
+/// On a single-user dev box every process runs as the same OS user, so reaching
+/// `127.0.0.1` proves nothing — a compromised dependency's post-install script
+/// could mint device identity and act as the operator against coord. The marker
+/// converts "any local process" into "any local process on a machine the
+/// operator deliberately, revocably opted in", which is a decision the operator
+/// made rather than one the network topology made for them.
+///
+/// # Live, not just mint-time
+///
+/// This is re-checked on every request that presents an
+/// [`NonceLifetime::Ephemeral`] nonce ([`live_binding`]), so deleting the marker
+/// REVOKES already-minted session nonces instead of merely blocking new ones. It
+/// is the operator's actual off switch. Cheap by construction: only ephemeral
+/// bindings pay the check, so a runner-spawned terminal never does.
+pub(crate) fn session_identity_gate() -> Result<(), SessionIdentityDenial> {
+    // Flag first, short-circuiting: in the default (dark) posture this costs one
+    // env read and never touches the filesystem.
+    let flag_on = matches!(
+        std::env::var(SESSION_IDENTITY_ENABLE_FLAG)
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    );
+    if !flag_on {
+        return Err(SessionIdentityDenial::FlagOff);
+    }
+    let marker_exists = session_identity_marker_path()
+        .map(|p| p.exists())
+        .unwrap_or(false);
+    resolve_session_identity_gate(flag_on, marker_exists)
 }
 
 /// Header carrying the per-session loopback nonce that authenticates a
@@ -266,9 +463,17 @@ fn graced_nonce_is_valid(nonce: &str) -> bool {
 /// the encrypted store persists (OQ3): agent bindings are dropped so they never
 /// reach disk. The store contract is unchanged (`HashMap<String, String>`), so
 /// the persistence/restore seams and their tests stay green.
+///
+/// [`NonceLifetime::Ephemeral`] bindings are dropped too (plan 2026-07-17 §1/E).
+/// A mint-route nonce is issued to a session the runner did not spawn, so it
+/// must not outlive this process: the store has no expiry column, so a persisted
+/// ephemeral nonce would silently restore as an UNBOUNDED one — laundering the
+/// weaker class into the stronger one across a restart. Non-persistence is also
+/// half of what makes the TTL meaningful (a leaked nonce cannot be replayed
+/// against the next runner).
 fn device_nonce_snapshot(map: &HashMap<String, NonceBinding>) -> HashMap<String, String> {
     map.iter()
-        .filter(|(_, b)| b.principal == ProxyPrincipal::Device)
+        .filter(|(_, b)| b.principal == ProxyPrincipal::Device && !b.lifetime.is_ephemeral())
         .map(|(n, b)| (n.clone(), b.workdir.clone()))
         .collect()
 }
@@ -382,6 +587,11 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> us
             map.entry(nonce).or_insert(NonceBinding {
                 workdir,
                 principal: ProxyPrincipal::Device,
+                // Only Persistent bindings are ever written to the store
+                // (`device_nonce_snapshot`), so a restored entry is
+                // unconditionally Persistent — the restore cannot resurrect an
+                // ephemeral mint-route nonce as an unbounded one.
+                lifetime: NonceLifetime::Persistent,
             });
         }
         map.len()
@@ -390,14 +600,35 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> us
     restored
 }
 
-/// Mint + register a fresh per-session proxy nonce for `workdir`, returning it.
-/// Any prior nonce registered for the same workdir is evicted — a re-provision
-/// rewrites `.mcp.json`, so the old nonce is unreachable and keeping it would
-/// only widen the accept set. The updated set is mirrored to the encrypted
-/// store (Phase 3b) so it survives a restart.
+/// Mint + register a fresh PERSISTENT per-session DEVICE proxy nonce for
+/// `workdir`, returning it. Any prior persistent nonce registered for the same
+/// workdir is evicted — a re-provision rewrites `.mcp.json`, so the old nonce is
+/// unreachable and keeping it would only widen the accept set. The updated set is
+/// mirrored to the encrypted store (Phase 3b) so it survives a restart.
+///
+/// This is the RUNNER-SPAWN path (the identity seam, the terminal chokepoint,
+/// the boot self-heal). Its semantics are deliberately unchanged by plan
+/// 2026-07-17 — see [`register_session_proxy_nonce`] for the mint-route path.
 fn register_proxy_nonce(workdir: &str) -> String {
-    let (nonce, snapshot) = mint_and_register_nonce(workdir, ProxyPrincipal::Device);
+    let (nonce, snapshot) =
+        mint_and_register_nonce(workdir, ProxyPrincipal::Device, NonceLifetime::Persistent);
     persist_proxy_nonces(&snapshot);
+    nonce
+}
+
+/// Mint + register a fresh EPHEMERAL DEVICE proxy nonce for `workdir` — the
+/// `/coord-mcp/provision-session` mint route's path (plan 2026-07-17 §1/E).
+/// Identical principal and cwd-binding to [`register_proxy_nonce`]; the ONLY
+/// differences are the [`NonceLifetime`] consequences: bounded expiry, revoked
+/// by opting the machine out, and never persisted.
+///
+/// Deliberately NOT persisted — not even a store round-trip. Eviction is
+/// class-scoped, so an ephemeral mint leaves the persisted (runner-spawn) set
+/// byte-identical; writing it back would be pointless I/O whose only possible
+/// effect is to clobber the set a concurrent restore just populated.
+fn register_session_proxy_nonce(workdir: &str) -> String {
+    let (nonce, _snapshot) =
+        mint_and_register_nonce(workdir, ProxyPrincipal::Device, NonceLifetime::ephemeral());
     nonce
 }
 
@@ -407,7 +638,14 @@ fn register_proxy_nonce(workdir: &str) -> String {
 /// [`persist_proxy_nonces`] drops non-device bindings. The per-request bearer
 /// comes from the agent's own [`AGENT_TOKENS`] slot, never the device JWT.
 pub(crate) fn register_agent_proxy_nonce(workdir: &str, agent_id: Uuid) -> String {
-    let (nonce, snapshot) = mint_and_register_nonce(workdir, ProxyPrincipal::Agent { agent_id });
+    // Persistent lifetime = today's semantics (no expiry). It is NOT a disk
+    // persistence decision: `device_nonce_snapshot` drops every agent binding
+    // regardless, so an agent nonce still hard-fails closed across a restart.
+    let (nonce, snapshot) = mint_and_register_nonce(
+        workdir,
+        ProxyPrincipal::Agent { agent_id },
+        NonceLifetime::Persistent,
+    );
     // Mirror to the store as a no-op for the agent entry (device entries in the
     // same snapshot, if any, are still persisted) — `persist_proxy_nonces`
     // filters agent bindings out, so this never writes the agent nonce to disk.
@@ -415,14 +653,28 @@ pub(crate) fn register_agent_proxy_nonce(workdir: &str, agent_id: Uuid) -> Strin
     nonce
 }
 
-/// Mint a fresh nonce, evict any prior nonce for `workdir`, insert it, and
-/// return `(nonce, snapshot)` — WITHOUT persisting. Split from the persistence
-/// step so a test can mint and then mirror to an INJECTED store
+/// Mint a fresh nonce, evict any prior SAME-CLASS nonce for `workdir`, insert
+/// it, and return `(nonce, snapshot)` — WITHOUT persisting. Split from the
+/// persistence step so a test can mint and then mirror to an INJECTED store
 /// ([`persist_proxy_nonces_with_store`]) instead of the default store reached
 /// via the process-global `QONTINUI_SECURE_STORAGE_DIR`.
+///
+/// **Eviction is scoped to `lifetime`'s class** (plan 2026-07-17 §1/E). Within
+/// the Persistent class this is byte-for-byte the previous behavior (every
+/// runner-spawn nonce was Persistent, so "same workdir" and "same workdir + same
+/// class" select the same set). The scoping exists for the new cross-class case:
+/// a BARE session minting for a cwd must never evict the nonce of a live PTY
+/// terminal running in that same cwd. Unscoped, an unprivileged mint-route call
+/// naming the operator's repo root would 401 that terminal's MCP client the
+/// moment its 90s grace elapsed — a trivially-reachable denial of service, and a
+/// direct violation of "a runner-spawned terminal is unaffected". Two live
+/// nonces for one workdir is already a sanctioned state (it is exactly what the
+/// grace window creates), and both map to the same workdir, so
+/// [`workdir_for_nonce`] stays correct either way.
 fn mint_and_register_nonce(
     workdir: &str,
     principal: ProxyPrincipal,
+    lifetime: NonceLifetime,
 ) -> (String, HashMap<String, NonceBinding>) {
     // Two v4 UUIDs (~244 bits of randomness) — v4, NOT v7: the v7 prefix is a
     // timestamp, which would gut the entropy this nonce exists to provide.
@@ -431,28 +683,41 @@ fn mint_and_register_nonce(
         uuid::Uuid::new_v4().simple(),
         uuid::Uuid::new_v4().simple()
     );
+    let ephemeral = lifetime.is_ephemeral();
     let snapshot = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
         // Change 3: collect the DEVICE nonces being evicted for this workdir so
         // they ride a short grace TTL — an in-flight client that cached one keeps
         // validating until it reconnects. Agent nonces are NOT graced (they must
         // hard-fail closed on re-mint), so they are simply dropped by `retain`.
-        let evicted_device: Vec<String> = map
-            .iter()
-            .filter(|(n, b)| {
-                b.workdir == workdir && b.principal == ProxyPrincipal::Device && *n != &nonce
-            })
-            .map(|(n, _)| n.clone())
-            .collect();
-        map.retain(|_, b| b.workdir != workdir);
+        // Ephemeral nonces are NOT graced either: grace exists to protect a
+        // runner-spawn client across a re-provision the RUNNER initiated, whereas
+        // an ephemeral re-mint is the bare session asking for a replacement it
+        // already holds — extending the superseded one would only widen the
+        // accept set past its bounded lifetime, which is the one property it has.
+        let evicted_graceable: Vec<String> = if ephemeral {
+            Vec::new()
+        } else {
+            map.iter()
+                .filter(|(n, b)| {
+                    b.workdir == workdir
+                        && b.principal == ProxyPrincipal::Device
+                        && !b.lifetime.is_ephemeral()
+                        && *n != &nonce
+                })
+                .map(|(n, _)| n.clone())
+                .collect()
+        };
+        map.retain(|_, b| !(b.workdir == workdir && b.lifetime.is_ephemeral() == ephemeral));
         map.insert(
             nonce.clone(),
             NonceBinding {
                 workdir: workdir.to_string(),
                 principal,
+                lifetime,
             },
         );
-        grace_evicted_device_nonces(&evicted_device);
+        grace_evicted_device_nonces(&evicted_graceable);
         map.clone()
     };
     (nonce, snapshot)
@@ -473,33 +738,65 @@ pub(crate) fn session_self_id_enabled() -> bool {
 }
 
 /// The session WORKDIR a registered proxy nonce was provisioned into (the
-/// terminal's cwd / isolated worktree path). `None` for an empty or
-/// unregistered nonce. Backs session-fabric Phase 0 caller self-identification:
-/// the proxy maps nonce → workdir → task_run_id → coord `agent_session_id`.
+/// terminal's cwd / isolated worktree path). `None` for an empty, unregistered,
+/// or no-longer-valid nonce ([`live_binding`]). Backs session-fabric Phase 0
+/// caller self-identification: the proxy maps nonce → workdir → task_run_id →
+/// coord `agent_session_id`.
 pub(crate) fn workdir_for_nonce(nonce: &str) -> Option<String> {
+    live_binding(nonce).map(|b| b.workdir)
+}
+
+/// Resolve `nonce`'s binding IF it is currently VALID, applying the
+/// [`NonceLifetime`] rules (plan 2026-07-17 §1/E). The single chokepoint every
+/// live-map lookup goes through, so expiry and revocation can never be enforced
+/// on one path and forgotten on another.
+///
+/// - [`NonceLifetime::Persistent`] — always valid while registered. Today's
+///   behavior, untouched: a runner-spawned session pays nothing (no clock read,
+///   no filesystem stat) and can never be revoked out from under itself.
+/// - [`NonceLifetime::Ephemeral`] — valid only while (a) inside its TTL and
+///   (b) the machine is STILL opted in. Expiry LAZILY evicts, so the map stays
+///   bounded and the deadline fails closed exactly on time. An opt-OUT does NOT
+///   evict: revocation must be reversible — re-creating the marker restores a
+///   live session's identity, whereas evicting would kill it permanently (the
+///   MCP client never re-reads its config, so it could never pick up a re-mint).
+///
+/// The map lock is released before the gate's filesystem check — a proxy request
+/// must never hold the registry lock across I/O.
+fn live_binding(nonce: &str) -> Option<NonceBinding> {
     if nonce.is_empty() {
         return None;
     }
-    proxy_nonces()
+    let binding = proxy_nonces()
         .lock()
         .expect("proxy nonce map poisoned")
         .get(nonce)
-        .map(|b| b.workdir.clone())
+        .cloned()?;
+    match binding.lifetime {
+        NonceLifetime::Persistent => Some(binding),
+        NonceLifetime::Ephemeral { expires_at } => {
+            if expires_at <= std::time::Instant::now() {
+                proxy_nonces()
+                    .lock()
+                    .expect("proxy nonce map poisoned")
+                    .remove(nonce);
+                return None;
+            }
+            session_identity_gate().is_ok().then_some(binding)
+        }
+    }
 }
 
-/// True iff `nonce` is a currently-registered per-session proxy key OR a DEVICE
-/// nonce still inside its post-eviction grace TTL (Change 3). The live-map lock
-/// is taken and released before the grace check so the two maps are never held
-/// at once.
+/// True iff `nonce` is a currently-registered AND currently-valid per-session
+/// proxy key ([`live_binding`] — expiry + revocation applied) OR a DEVICE nonce
+/// still inside its post-eviction grace TTL (Change 3). The live-map lock is
+/// taken and released before the grace check so the two maps are never held at
+/// once.
 pub(crate) fn proxy_nonce_is_valid(nonce: &str) -> bool {
     if nonce.is_empty() {
         return false;
     }
-    let in_live = proxy_nonces()
-        .lock()
-        .expect("proxy nonce map poisoned")
-        .contains_key(nonce);
-    in_live || graced_nonce_is_valid(nonce)
+    live_binding(nonce).is_some() || graced_nonce_is_valid(nonce)
 }
 
 /// Resolve the [`ProxyPrincipal`] a registered nonce is bound to. `None` for an
@@ -511,11 +808,7 @@ pub(crate) fn proxy_principal_for_nonce(nonce: &str) -> Option<ProxyPrincipal> {
     if nonce.is_empty() {
         return None;
     }
-    let live = proxy_nonces()
-        .lock()
-        .expect("proxy nonce map poisoned")
-        .get(nonce)
-        .map(|b| b.principal.clone());
+    let live = live_binding(nonce).map(|b| b.principal);
     // Grace fallback (Change 3): only DEVICE nonces are ever graced, so a graced
     // hit resolves to a Device principal — the handler then injects the live
     // device JWT and `proxy_request_gate` still enforces device-nonce ⇒
@@ -699,7 +992,25 @@ pub(crate) fn resolve_bound_api_port() -> Option<u16> {
 /// that outlive their snapshot (the MCP client never re-reads `.mcp.json`).
 pub(crate) fn write_coord_mcp_proxy_config(primary_wt: &str, bound_port: u16) {
     let nonce = register_proxy_nonce(primary_wt);
-    let mcp_config = serde_json::json!({
+    write_mcp_json(primary_wt, &coord_mcp_proxy_config_json(bound_port, &nonce));
+}
+
+/// THE coord-mcp proxy config document — the single writer of this JSON shape
+/// (plan 2026-07-17 §2). Every emitter goes through here: the in-cwd
+/// `.mcp.json` writers ([`write_coord_mcp_proxy_config`],
+/// [`write_coord_mcp_agent_proxy_config`]), the app-data `--mcp-config` file the
+/// identity seam delivers ([`provision_coord_mcp_config_file`]), and the
+/// `/coord-mcp/provision-session` mint route
+/// ([`provision_session_proxy_config`]). Four call sites had independently
+/// duplicated this literal; one writer means the loopback-URL/nonce-header
+/// contract cannot drift between the path a runner-spawned session gets and the
+/// path a bare session gets.
+///
+/// Note what is NOT here: an `Authorization` bearer. The proxy injects a live
+/// per-request one keyed off the nonce's principal — baking a static token is
+/// the failure this shape exists to avoid.
+fn coord_mcp_proxy_config_json(bound_port: u16, nonce: &str) -> serde_json::Value {
+    serde_json::json!({
         "mcpServers": {
             "coord-mcp": {
                 "type": "http",
@@ -709,8 +1020,7 @@ pub(crate) fn write_coord_mcp_proxy_config(primary_wt: &str, bound_port: u16) {
                 }
             }
         }
-    });
-    write_mcp_json(primary_wt, &mcp_config);
+    })
 }
 
 /// Write the AGENT-path `.mcp.json`: identical shape to
@@ -730,18 +1040,7 @@ pub(crate) fn write_coord_mcp_agent_proxy_config(
     agent_id: Uuid,
 ) {
     let nonce = register_agent_proxy_nonce(primary_wt, agent_id);
-    let mcp_config = serde_json::json!({
-        "mcpServers": {
-            "coord-mcp": {
-                "type": "http",
-                "url": format!("http://127.0.0.1:{bound_port}/coord-mcp"),
-                "headers": {
-                    "X-Coord-Mcp-Proxy-Key": nonce,
-                }
-            }
-        }
-    });
-    write_mcp_json(primary_wt, &mcp_config);
+    write_mcp_json(primary_wt, &coord_mcp_proxy_config_json(bound_port, &nonce));
 }
 
 /// Filename of the Phase-1a degraded-only breadcrumb dropped into a session
@@ -792,8 +1091,14 @@ pub(crate) fn probe_and_breadcrumb_proxy(workdir: &str, port: u16) {
     // exactly as the session's MCP client will.
     let nonce = {
         let map = proxy_nonces().lock().expect("proxy nonce map poisoned");
+        // The RUNNER-SPAWN nonce specifically: the caller just wrote one for
+        // this workdir, and a bare session may hold an ephemeral nonce for the
+        // same cwd. Probing with the ephemeral one would make this probe's
+        // verdict depend on the opt-in marker — and a revoked ephemeral nonce
+        // would 401, dropping a bogus "UNREACHABLE" breadcrumb into the user's
+        // cwd for a config that is in fact healthy.
         map.iter()
-            .find(|(_, b)| b.workdir.as_str() == workdir)
+            .find(|(_, b)| b.workdir.as_str() == workdir && !b.lifetime.is_ephemeral())
             .map(|(n, _)| n.clone())
     };
     let Some(nonce) = nonce else {
@@ -1164,20 +1469,9 @@ fn mcp_config_file_name(workdir: &str) -> String {
 /// persisted ([`register_proxy_nonce`]), so an already-written file keeps
 /// validating across an orphan-outliving-a-restart edge.
 pub(crate) fn provision_coord_mcp_config_file(workdir: &str) -> Option<std::path::PathBuf> {
-    // Phase 3a fail-closed: never point --mcp-config at a bootstrap-default port.
-    let bound_port = resolve_bound_api_port()?;
-    let nonce = register_proxy_nonce(workdir); // DEVICE principal, persisted
-    let mcp_config = serde_json::json!({
-        "mcpServers": {
-            "coord-mcp": {
-                "type": "http",
-                "url": format!("http://127.0.0.1:{bound_port}/coord-mcp"),
-                "headers": {
-                    "X-Coord-Mcp-Proxy-Key": nonce,
-                }
-            }
-        }
-    });
+    // The shared mint core (§2): fail-closed port resolve + a DEVICE, cwd-bound
+    // nonce. `Persistent` = the runner-spawn class — today's semantics exactly.
+    let mcp_config = mint_device_proxy_config(workdir, NonceLifetime::Persistent)?;
     let dir = crate::session::claude_hook::session_restore_dir().join("coord-mcp");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         warn!(
@@ -1194,7 +1488,7 @@ pub(crate) fn provision_coord_mcp_config_file(workdir: &str) -> Option<std::path
     ) {
         Ok(()) => {
             info!(
-                "coord_mcp: wrote --mcp-config file {} for workdir {workdir} (bound :{bound_port})",
+                "coord_mcp: wrote --mcp-config file {} for workdir {workdir}",
                 file.display()
             );
             Some(file)
@@ -1208,6 +1502,55 @@ pub(crate) fn provision_coord_mcp_config_file(workdir: &str) -> Option<std::path
             None
         }
     }
+}
+
+/// **The ONE mint path** (plan 2026-07-17 §2): resolve the bound port
+/// fail-closed, mint a DEVICE-principal nonce bound to `workdir`, and return the
+/// proxy config document. Both consumers go through here —
+/// [`provision_coord_mcp_config_file`] (the identity seam, which then
+/// materializes the doc as an app-data file) and
+/// [`provision_session_proxy_config`] (the `/coord-mcp/provision-session` mint
+/// route, which returns the doc over loopback). One mint path ⇒ ONE security
+/// invariant to review, rather than a route that could drift from the seam.
+///
+/// The invariant, stated once: **the port is fail-closed and the nonce is DEVICE
+/// + cwd-bound.** `resolve_bound_api_port()` returns `None` outside a live Tauri
+/// runtime (no managed `AppState`), and this returns `None` with it rather than
+/// falling back to the bootstrap-default `:9876` — which is right only by luck
+/// on a single-runner box and dead on any temp runner (the F1 root cause, and
+/// exactly the stale-:9879 config this plan's Phase-0 probe found in the wild).
+/// The route cannot bypass this: it has no port argument to pass.
+///
+/// `lifetime` is the ONLY axis the two callers differ on — see [`NonceLifetime`]
+/// for why the mint route's nonces are bounded and the seam's are not.
+fn mint_device_proxy_config(workdir: &str, lifetime: NonceLifetime) -> Option<serde_json::Value> {
+    let bound_port = resolve_bound_api_port()?;
+    let nonce = if lifetime.is_ephemeral() {
+        register_session_proxy_nonce(workdir)
+    } else {
+        register_proxy_nonce(workdir)
+    };
+    Some(coord_mcp_proxy_config_json(bound_port, &nonce))
+}
+
+/// Mint coord identity for a session the runner did NOT spawn: the
+/// `--mcp-config` document a bare terminal's launcher can hand to `claude`
+/// (plan 2026-07-17 §1). Returns the same document shape the identity seam
+/// delivers, via the same [`mint_device_proxy_config`] core — the nonce is
+/// DEVICE-principal, bound to `workdir`, [`NonceLifetime::Ephemeral`], and
+/// never persisted.
+///
+/// **The caller MUST have passed [`session_identity_gate`] first.** This
+/// function does not gate — it is the mint, and the route
+/// ([`crate::mcp_api::coord_provision_session_handler`]) is the only caller and
+/// owns the gate. Keeping the gate at the route rather than here means the
+/// denial can carry an actionable HTTP status + reason instead of degrading to
+/// an untyped `None` that is indistinguishable from an unresolvable port.
+///
+/// `None` = the bound port is unresolvable ⇒ the route must 503 rather than mint
+/// a nonce paired with a port nothing is listening on.
+pub(crate) fn provision_session_proxy_config(workdir: &str) -> Option<serde_json::Value> {
+    mint_device_proxy_config(workdir, NonceLifetime::ephemeral())
 }
 
 /// Read the per-session proxy NONCE out of an existing coord-mcp `.mcp.json`, if
@@ -1347,12 +1690,17 @@ fn qontinui_root_dir() -> Option<std::path::PathBuf> {
 fn adopt_on_disk_nonce(workdir: &str, nonce: &str) {
     let snapshot = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
-        map.retain(|_, b| b.workdir != workdir);
+        // Persistent class only — an adopted nonce came from a runner-written
+        // `.mcp.json`, and must NOT evict a bare session's ephemeral nonce for
+        // the same workdir (the class-scoping rationale in
+        // `mint_and_register_nonce`).
+        map.retain(|_, b| !(b.workdir == workdir && !b.lifetime.is_ephemeral()));
         map.insert(
             nonce.to_string(),
             NonceBinding {
                 workdir: workdir.to_string(),
                 principal: ProxyPrincipal::Device,
+                lifetime: NonceLifetime::Persistent,
             },
         );
         map.clone()
@@ -1556,6 +1904,222 @@ mod tests {
         std::fs::write(&mcp, "not json {").unwrap();
         assert!(!workdir_declares_coord_mcp(&wd));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Session-provisioned coord identity (plan 2026-07-17 §1/§2/§3)
+    // -----------------------------------------------------------------------
+
+    /// The route's authorization gate — the substitute for the nonce check every
+    /// sibling `/coord-mcp/*` route has. BOTH gates are required, and the
+    /// DEFAULT (flag unset) is denied: the feature ships dark, so an un-flagged
+    /// runner exposes nothing. Pure resolver ⇒ no env/home-dir mutation.
+    #[test]
+    fn session_identity_gate_requires_flag_and_marker_and_defaults_denied() {
+        // Default posture: flag off ⇒ FlagOff, regardless of the marker. This is
+        // the "flag OFF ⇒ zero behavior change" acceptance criterion.
+        assert_eq!(
+            resolve_session_identity_gate(false, false),
+            Err(SessionIdentityDenial::FlagOff)
+        );
+        assert_eq!(
+            resolve_session_identity_gate(false, true),
+            Err(SessionIdentityDenial::FlagOff),
+            "an opted-in machine must STILL be denied while the master flag is dark"
+        );
+        // Flag on but not opted in ⇒ a DISTINCT reason (different fix).
+        assert_eq!(
+            resolve_session_identity_gate(true, false),
+            Err(SessionIdentityDenial::NotOptedIn)
+        );
+        // Both ⇒ allowed.
+        assert_eq!(resolve_session_identity_gate(true, true), Ok(()));
+
+        // The two denials never collapse into one code — a caller must be able
+        // to tell "the feature is dark" from "this machine has not opted in".
+        assert_ne!(
+            SessionIdentityDenial::FlagOff.code(),
+            SessionIdentityDenial::NotOptedIn.code()
+        );
+        // ...and the not-opted-in message names the marker path to create.
+        assert!(SessionIdentityDenial::NotOptedIn
+            .message()
+            .contains(SESSION_IDENTITY_MARKER_FILE));
+    }
+
+    /// The live process gate: with the master flag unset (the default in a test
+    /// process, and in production), `session_identity_gate` denies with
+    /// `FlagOff` WITHOUT touching the filesystem for the marker.
+    #[test]
+    fn session_identity_gate_is_dark_by_default_in_this_process() {
+        assert_eq!(
+            session_identity_gate(),
+            Err(SessionIdentityDenial::FlagOff),
+            "the master flag is unset by default ⇒ the mint route is dark"
+        );
+    }
+
+    /// §1/E — the mint route's nonces are EPHEMERAL: revoked the moment the
+    /// machine is opted out (the operator's real off switch, re-checked per
+    /// request rather than only at mint), while a runner-spawn PERSISTENT nonce
+    /// for the SAME workdir is completely unaffected.
+    ///
+    /// This is the "a runner-spawned terminal must be completely unaffected"
+    /// invariant, in its sharpest form: the two classes coexist for one workdir,
+    /// and neither can evict or revoke the other.
+    #[test]
+    fn ephemeral_nonce_is_revoked_by_the_gate_while_persistent_is_untouched() {
+        let dir = std::env::temp_dir().join(format!("coord-mcp-eph-{}", uuid::Uuid::now_v7()));
+        let wd = dir.to_string_lossy().to_string();
+
+        // A live PTY terminal's nonce for this cwd (runner-spawn class).
+        let pty_nonce = register_proxy_nonce(&wd);
+        // A bare session mints for the SAME cwd (mint-route class).
+        let bare_nonce = register_session_proxy_nonce(&wd);
+        assert_ne!(pty_nonce, bare_nonce);
+
+        // The bare mint did NOT evict the PTY nonce — an unprivileged mint-route
+        // call naming the operator's repo root must never 401 a live terminal.
+        assert!(
+            proxy_nonce_is_valid(&pty_nonce),
+            "an ephemeral mint for a workdir must not evict that workdir's PTY nonce"
+        );
+        assert_eq!(workdir_for_nonce(&pty_nonce).as_deref(), Some(wd.as_str()));
+
+        // The master flag is off in this test process ⇒ the gate denies ⇒ the
+        // ephemeral nonce is revoked live, while the persistent one is not.
+        assert!(
+            !proxy_nonce_is_valid(&bare_nonce),
+            "an ephemeral nonce must stop validating while the machine is opted out"
+        );
+        assert_eq!(
+            proxy_principal_for_nonce(&bare_nonce),
+            None,
+            "a revoked ephemeral nonce resolves to no principal (the proxy 401s)"
+        );
+        assert!(
+            proxy_nonce_is_valid(&pty_nonce),
+            "revocation of the mint-route class must never touch the runner-spawn class"
+        );
+
+        // Both mint DEVICE principals — the route can never elevate to agent.
+        let bare_again = register_session_proxy_nonce(&wd);
+        assert!(matches!(
+            proxy_nonces()
+                .lock()
+                .unwrap()
+                .get(&bare_again)
+                .map(|b| b.principal.clone()),
+            Some(ProxyPrincipal::Device)
+        ));
+        // An ephemeral re-mint DOES evict the prior ephemeral nonce for the same
+        // workdir (same-class eviction) and is NOT graced — grace exists for
+        // runner-initiated re-provisions, not for a bare session replacing a key
+        // it already holds.
+        assert!(
+            !proxy_nonces().lock().unwrap().contains_key(&bare_nonce),
+            "an ephemeral re-mint evicts the prior same-class nonce for that workdir"
+        );
+    }
+
+    /// §1/E — an ephemeral nonce fails closed at its deadline and is lazily
+    /// evicted (so the map stays bounded), while a persistent nonce has no
+    /// expiry at all. Drives the expiry through `live_binding` directly rather
+    /// than waiting out [`EPHEMERAL_NONCE_TTL`].
+    #[test]
+    fn ephemeral_nonce_expires_and_evicts_while_persistent_never_expires() {
+        let wd = format!("D:/expiry-test/{}", uuid::Uuid::now_v7());
+
+        // An already-expired ephemeral binding.
+        let expired = "expired-nonce-for-lifetime-test".to_string();
+        proxy_nonces().lock().unwrap().insert(
+            expired.clone(),
+            NonceBinding {
+                workdir: wd.clone(),
+                principal: ProxyPrincipal::Device,
+                lifetime: NonceLifetime::Ephemeral {
+                    expires_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
+                },
+            },
+        );
+        assert!(
+            !proxy_nonce_is_valid(&expired),
+            "an ephemeral nonce past its deadline fails closed"
+        );
+        assert!(
+            !proxy_nonces().lock().unwrap().contains_key(&expired),
+            "an expired ephemeral nonce is lazily evicted so the map stays bounded"
+        );
+
+        // A persistent nonce is valid indefinitely — no clock involved. This is
+        // the property nonce persistence + the restart grace window depend on
+        // (the MCP client never re-reads its config), and the reason the TTL is
+        // scoped to the mint route instead of applied globally.
+        let persistent = register_proxy_nonce(&wd);
+        assert!(proxy_nonce_is_valid(&persistent));
+    }
+
+    /// §1/E — an ephemeral nonce NEVER reaches disk. The store has no expiry
+    /// column, so a persisted ephemeral nonce would restore as an UNBOUNDED
+    /// one — laundering the weaker class into the stronger one across a restart.
+    /// The runner-spawn nonce in the same snapshot still persists.
+    #[test]
+    fn ephemeral_nonces_are_never_persisted() {
+        let (dir, store) = temp_store("ephemeral-never-persisted");
+        let wd = format!("D:/persist-test/{}", uuid::Uuid::now_v7());
+
+        let persistent = register_proxy_nonce(&wd);
+        let ephemeral = register_session_proxy_nonce(&wd);
+
+        let snapshot = proxy_nonces().lock().unwrap().clone();
+        persist_proxy_nonces_with_store(&store, &snapshot);
+
+        let loaded = store.load_coord_mcp_nonces();
+        assert!(
+            loaded.contains_key(&persistent),
+            "a runner-spawn device nonce still persists (restart survival is its whole point)"
+        );
+        assert!(
+            !loaded.contains_key(&ephemeral),
+            "a mint-route nonce must never reach disk — it would restore unbounded"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// §2 — the seam and the mint route emit the SAME document shape from the
+    /// same writer: loopback URL on the passed bound port, the nonce header, and
+    /// NO baked bearer. One writer means the bare-session path can never drift
+    /// from the runner-spawn path.
+    #[test]
+    fn proxy_config_json_is_one_shape_for_both_mint_paths() {
+        let v = coord_mcp_proxy_config_json(9877, "abc123");
+        let server = &v["mcpServers"]["coord-mcp"];
+        assert_eq!(server["type"], "http");
+        assert_eq!(server["url"], "http://127.0.0.1:9877/coord-mcp");
+        assert_eq!(server["headers"]["X-Coord-Mcp-Proxy-Key"], "abc123");
+        assert!(
+            server["headers"].get("Authorization").is_none(),
+            "the proxy shape must never bake a static bearer"
+        );
+    }
+
+    /// §2 — the mint route inherits the seam's fail-closed port check because it
+    /// shares the mint core: with no Tauri runtime / managed AppState,
+    /// `resolve_bound_api_port` is `None`, so the route mints NOTHING (and its
+    /// handler 503s) rather than pairing a nonce with a bootstrap-default port
+    /// that is dead on any secondary/temp runner.
+    #[test]
+    fn provision_session_proxy_config_fail_closed_without_bound_port() {
+        let dir = std::env::temp_dir().join(format!("coord-mcp-sessprov-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wd = dir.to_string_lossy().to_string();
+
+        assert!(
+            provision_session_proxy_config(&wd).is_none(),
+            "no bound port ⇒ the mint route refuses to mint (fail-closed, shared with the seam)"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2257,7 +2821,8 @@ mod tests {
         // Mint a nonce in the live map, then mirror the snapshot to the INJECTED
         // store (the `register_proxy_nonce` body, split across its seams).
         let workdir = store_dir.join("session-wd").to_string_lossy().to_string();
-        let (nonce, snapshot) = mint_and_register_nonce(&workdir, ProxyPrincipal::Device);
+        let (nonce, snapshot) =
+            mint_and_register_nonce(&workdir, ProxyPrincipal::Device, NonceLifetime::Persistent);
         persist_proxy_nonces_with_store(&store, &snapshot);
         assert!(proxy_nonce_is_valid(&nonce));
 
@@ -2299,13 +2864,17 @@ mod tests {
         // Mint an AGENT nonce, then persist the snapshot to the injected store.
         let agent_id = uuid::Uuid::new_v4();
         let agent_wd = store_dir.join("agent-wd").to_string_lossy().to_string();
-        let (agent_nonce, snapshot) =
-            mint_and_register_nonce(&agent_wd, ProxyPrincipal::Agent { agent_id });
+        let (agent_nonce, snapshot) = mint_and_register_nonce(
+            &agent_wd,
+            ProxyPrincipal::Agent { agent_id },
+            NonceLifetime::Persistent,
+        );
         persist_proxy_nonces_with_store(&store, &snapshot);
 
         // Also mint a DEVICE nonce and persist.
         let dev_wd = store_dir.join("dev-wd").to_string_lossy().to_string();
-        let (dev_nonce, snapshot) = mint_and_register_nonce(&dev_wd, ProxyPrincipal::Device);
+        let (dev_nonce, snapshot) =
+            mint_and_register_nonce(&dev_wd, ProxyPrincipal::Device, NonceLifetime::Persistent);
         persist_proxy_nonces_with_store(&store, &snapshot);
 
         let persisted = store.load_coord_mcp_nonces();
@@ -2348,8 +2917,11 @@ mod tests {
              never write the developer's real store"
         );
         // And minting still registers in-memory (the persist step is skipped).
-        let (nonce, _snapshot) =
-            mint_and_register_nonce("/tmp/coord-mcp-persist-off-wd", ProxyPrincipal::Device);
+        let (nonce, _snapshot) = mint_and_register_nonce(
+            "/tmp/coord-mcp-persist-off-wd",
+            ProxyPrincipal::Device,
+            NonceLifetime::Persistent,
+        );
         assert!(
             proxy_nonce_is_valid(&nonce),
             "minting must register the nonce in-memory regardless of persistence"

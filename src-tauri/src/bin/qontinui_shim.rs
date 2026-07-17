@@ -82,8 +82,14 @@ const TERMINAL_ID_ENV: &str = "QONTINUI_TERMINAL_ID";
 const CLAUDE_HOOK_SETTINGS_ENV: &str = "QONTINUI_CLAUDE_HOOK_SETTINGS";
 /// Env var carrying the absolute path of the runner-materialized coord-mcp
 /// `--mcp-config` file (identity mode, tool==claude only) — the universal
-/// coord-mcp delivery seam. Empty/unset ⇒ append nothing (fail-open).
+/// coord-mcp delivery seam. Empty/unset ⇒ the [`self_provision_mcp_config`]
+/// fallback, then append nothing (fail-open).
 const MCP_CONFIG_ENV: &str = "QONTINUI_MCP_CONFIG";
+
+/// The runner's session coord-identity mint route (plan
+/// `2026-07-17-universal-coord-device-identity-for-any-session` §1). POST
+/// `{"cwd": "<abs dir>"}`; a 200's BODY IS the `.mcp.json` document.
+const PROVISION_SESSION_PATH: &str = "/coord-mcp/provision-session";
 
 fn main() -> std::process::ExitCode {
     // argv[0] → which tool we are impersonating. Fail-open to passthrough on
@@ -279,6 +285,83 @@ pub fn identity_mcp_config_args(tool: IdentityTool, mcp_config_path: Option<&str
     }
 }
 
+/// Ask a live runner to mint coord device identity for THIS process's cwd, and
+/// materialize the returned `.mcp.json` document to a temp file (plan
+/// `2026-07-17-universal-coord-device-identity-for-any-session` §5).
+///
+/// # Why the shim, and why here
+///
+/// Claude Code reads `--mcp-config` / `.mcp.json` **exactly once, at launch**
+/// (`coord_mcp.rs:14-16`), so MCP identity can only be injected by a **parent**
+/// of `claude` — never by a hook, whose env dies with its subprocess and which
+/// runs one process too late regardless. This stub is that parent. Until now it
+/// read [`MCP_CONFIG_ENV`] and nothing else, which the runner's PTY-spawn seam
+/// sets; a BARE terminal has no such env, so it got no coord identity at all.
+/// This is the one fallback that closes that, and it changes only *who asks* —
+/// the runner still mints (a nonce is registered in-process and no external
+/// process can, or ever should be able to, fabricate one).
+///
+/// # Fail-OPEN on every step — the hardest invariant in this file
+///
+/// Every failure returns `None`, the caller appends nothing, and the real tool
+/// execs unchanged. There is no `unwrap`/`expect`, no panic, and no stderr on
+/// any of it: in the DEFAULT posture (master flag off) the route answers a typed
+/// 403 on every launch, and a line of stderr per `claude` invocation would be
+/// noise that reports normal, intended behavior. The failure paths, all silent:
+/// no live runner advertised (the common bare-machine case — costs nothing, the
+/// breadcrumb is simply absent), unresolvable cwd, connect refused / timeout,
+/// any non-2xx (403 flag-off, 403 not-opted-in, 400 bad cwd, 503 port
+/// unresolvable), a body that is not an mcpServers document, or a temp-file
+/// write failure.
+///
+/// # Nonce↔port pairing is automatic, and must stay that way
+///
+/// The document comes back FROM the runner that minted it, so its URL names that
+/// same runner's port. This is what satisfies the load-bearing no-scan rule at
+/// `bin/qontinui_cli.rs:434-437` (a nonce paired with a scanned port 401s). Do
+/// not "improve" this by re-deriving the port — [`resolve_live_runner`] returns
+/// a record only so we know WHOM to ask.
+///
+/// # Credential hygiene
+///
+/// The returned document carries a live device credential. It goes to a
+/// [`tempfile::TempPath`] — created 0600 on Unix, in `temp_dir()` and so never
+/// in a repo working tree (nothing to accidentally commit, no
+/// worktree-claim-guard interaction, and no project-`.mcp.json` approval prompt
+/// that would block headless `claude -p`). The caller holds the `TempPath` for
+/// exactly the lifetime of the `claude` child and it is deleted on drop.
+fn self_provision_mcp_config(tool: IdentityTool) -> Option<tempfile::TempPath> {
+    if tool != IdentityTool::Claude {
+        return None; // only claude has a --mcp-config flag
+    }
+    let runner = qontinui_runner_lib::runner_breadcrumb::resolve_live_runner()?;
+    let cwd = env::current_dir().ok()?;
+    let body = format!("{{\"cwd\":\"{}\"}}", json_escape(&cwd.to_string_lossy()));
+    let resp = http_post(runner.port, PROVISION_SESSION_PATH, &body).ok()?;
+    // A 2xx whose body is not an mcpServers document would make `claude` fail to
+    // start on a malformed config — the one way this fallback could BREAK a
+    // launch rather than merely not help it. Cheapest possible sanity check.
+    if !resp.contains("\"mcpServers\"") {
+        return None;
+    }
+    write_temp_mcp_config(&resp)
+}
+
+/// Write a minted `.mcp.json` document to a self-deleting temp file and return
+/// its path. `None` on any IO failure (fail-open). Split from
+/// [`self_provision_mcp_config`] so the file's shape/lifetime is testable
+/// without a live runner.
+fn write_temp_mcp_config(document: &str) -> Option<tempfile::TempPath> {
+    let mut file = tempfile::Builder::new()
+        .prefix("qontinui-coord-mcp-")
+        .suffix(".json")
+        .tempfile()
+        .ok()?;
+    file.write_all(document.as_bytes()).ok()?;
+    file.flush().ok()?;
+    Some(file.into_temp_path())
+}
+
 /// Compose the final identity argv (everything after the program): the
 /// ORIGINAL args byte-exact, then the `--settings` pair (claude hook), then the
 /// `--mcp-config` pair (coord-mcp delivery), then `--session-id <pinned>` ONLY
@@ -325,7 +408,30 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
         .filter(|s| !s.trim().is_empty());
     let user_chose = user_chose_session(args);
     let settings = identity_settings_args(tool, env::var(CLAUDE_HOOK_SETTINGS_ENV).ok().as_deref());
-    let mcp_config = identity_mcp_config_args(tool, env::var(MCP_CONFIG_ENV).ok().as_deref());
+    let mut mcp_config = identity_mcp_config_args(tool, env::var(MCP_CONFIG_ENV).ok().as_deref());
+
+    // SELF-PROVISION fallback (plan 2026-07-17 §5): env named no usable config,
+    // so ask a live runner to mint one for this cwd. Fires ONLY for a session
+    // the runner did not spawn — a runner-spawned terminal already has
+    // MCP_CONFIG_ENV set by `apply_identity_seam`, so `mcp_config` is non-empty
+    // above and this is skipped. That idempotence is STRUCTURAL, which is why
+    // there is deliberately no out-of-process `workdir_declares_coord_mcp`
+    // re-check here: one mint per launch, no nonce race, no double coord-mcp
+    // entry. The recursion guard already returned above, so a nested invocation
+    // never reaches this either.
+    //
+    // Bind the TempPath to a local that outlives `exec_real` below: it deletes
+    // on drop, and dropping it early would yank a live credential file out from
+    // under a `claude` that has not read it yet. `claude` reads the config once,
+    // at launch, so deleting it when the child exits is both safe and tidy.
+    let minted_config: Option<tempfile::TempPath> = if mcp_config.is_empty() {
+        self_provision_mcp_config(tool)
+    } else {
+        None
+    };
+    if let Some(path) = minted_config.as_ref() {
+        mcp_config = identity_mcp_config_args(tool, path.to_str());
+    }
 
     // Fire-and-forget DIAGNOSTIC beacon on EVERY (non-nested) invocation —
     // INCLUDING the don't-double-pin passthrough that sends no session-open —
@@ -373,7 +479,12 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
     }
 
     let final_args = identity_argv(args, &settings, &mcp_config, pinned.as_deref(), user_chose);
-    exec_real(&real, tool.program(), &final_args)
+    let code = exec_real(&real, tool.program(), &final_args);
+    // Explicit, not incidental: the minted config holds a live device credential
+    // and is deleted HERE — after the child that read it has exited. Dropping it
+    // any earlier would delete the file before `claude` reads it at launch.
+    drop(minted_config);
+    code
 }
 
 /// JSON body for the `/control/shim-beacon` diagnostic POST. Same fields the
@@ -695,28 +806,44 @@ fn log_unavailable_once() {
     );
 }
 
-/// This stub's own directory candidates (so the real-tool scan can skip them):
-/// `current_exe().parent()` PLUS the env hint the materializer sets. BOTH are
-/// excluded because the seams inject two shim dirs (install + identity) and
-/// `SHIM_DIR_ENV` only names one of them — but the exe physically lives in the
-/// dir it was copied to, so `current_exe().parent()` always covers the copy the
-/// OS actually resolved. Missing either exclusion could let the stub resolve
-/// ITSELF as the "real" tool.
+/// This stub's own directory candidates (so the real-tool scan can skip them).
+/// Missing ANY of these lets the stub resolve **ITSELF** as the "real" tool —
+/// the self-spawn trap. Three sources, each covering a case the others do not:
+///
+/// 1. **`current_exe().parent()`** — the dir the OS actually resolved this copy
+///    from. Covers whichever shim dir won PATH resolution. Fallible.
+/// 2. **`SHIM_DIR_ENV`** — the materializer's hint. The seams inject two shim
+///    dirs (install + identity) and this names only one, hence (1) as well.
+/// 3. **The PERSISTENT identity dir** (`profile_cli::identity_shim_dir()`, plan
+///    2026-07-17 §6) — new, and the reason this list needed a third entry. Until
+///    §6 every shim dir was per-PTY, so (1) sufficed in practice. A persistent
+///    `claude.exe` on the USER PATH changes the odds: it is on PATH for EVERY
+///    process, forever, and (1) is the ONLY thing that excluded it — a fallible
+///    call, and one that is defeated outright when a runner-spawned terminal
+///    prepends its per-PTY dir (then `current_exe().parent()` is the per-PTY
+///    dir, and an unexcluded persistent dir sits further down the same PATH,
+///    holding an identically-named stub). Excluding it BY PATH — reading the
+///    same lib-crate function the materializer writes to, so the two can never
+///    drift — makes the two dirs COMPOSE (per-PTY wins, persistent is skipped,
+///    the real claude resolves) instead of the stub finding its own twin.
 fn own_shim_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::with_capacity(2);
+    let mut dirs = Vec::with_capacity(3);
+    let mut push = |p: PathBuf| {
+        if !p.as_os_str().is_empty() && !dirs.contains(&p) {
+            dirs.push(p);
+        }
+    };
     if let Some(p) = env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf))
     {
-        dirs.push(p);
+        push(p);
     }
     if let Ok(d) = env::var(SHIM_DIR_ENV) {
-        if !d.is_empty() {
-            let p = PathBuf::from(d);
-            if !dirs.contains(&p) {
-                dirs.push(p);
-            }
-        }
+        push(PathBuf::from(d));
+    }
+    if let Some(p) = qontinui_runner_lib::profile_cli::identity_shim_dir() {
+        push(p);
     }
     dirs
 }
@@ -1217,6 +1344,145 @@ mod tests {
         assert!(identity_mcp_config_args(IdentityTool::Claude, Some("")).is_empty());
         assert!(identity_mcp_config_args(IdentityTool::Claude, Some("  ")).is_empty());
         assert!(identity_mcp_config_args(IdentityTool::Claude, None).is_empty());
+    }
+
+    /// §5 fail-open: gemini has no `--mcp-config` flag, so the fallback must
+    /// never fire for it — the check is BEFORE any runner discovery, so this
+    /// also proves gemini pays zero cost (no breadcrumb read, no HTTP).
+    #[test]
+    fn self_provision_never_fires_for_gemini() {
+        assert!(self_provision_mcp_config(IdentityTool::Gemini).is_none());
+    }
+
+    /// §5 fail-open, the whole-chain assertion: with NOTHING listening on the
+    /// loopback and (in CI) no breadcrumb at all, the fallback returns `None`
+    /// rather than panicking or erroring — so the caller appends nothing and
+    /// execs the real tool unchanged. This is the shim's hardest invariant.
+    ///
+    /// It cannot assert `Some` without a live runner + the flag + the marker, so
+    /// the useful assertion is the fail-open one: whatever the local machine's
+    /// posture, this call must return, never panic. (On the operator's box a
+    /// live runner in the DEFAULT posture answers 403 → also `None`.)
+    #[test]
+    fn self_provision_fails_open_without_a_reachable_minting_runner() {
+        // Must not panic on any path; a machine with a live runner in the
+        // default (flag-off) posture 403s, which is also None.
+        let _ = self_provision_mcp_config(IdentityTool::Claude);
+    }
+
+    /// A minted document lands in a temp file whose path `identity_mcp_config_args`
+    /// accepts — i.e. the §5 fallback composes with the existing env path rather
+    /// than bypassing its `is_file` check. And the credential file is deleted
+    /// when the `TempPath` drops (the `claude` child has exited by then).
+    #[test]
+    fn minted_config_materializes_a_readable_temp_file_then_self_deletes() {
+        let doc = r#"{"mcpServers":{"coord-mcp":{"type":"http","url":"http://127.0.0.1:9876/coord-mcp","headers":{"X-Coord-Mcp-Proxy-Key":"nonce-1"}}}}"#;
+        let path = write_temp_mcp_config(doc).expect("temp config must materialize");
+        let as_str = path.to_str().expect("temp path is utf-8").to_string();
+
+        // Round-trips byte-exact: the runner's document is what claude reads.
+        assert_eq!(std::fs::read_to_string(&as_str).unwrap(), doc);
+        // It is NOT in a repo working tree — no stray file to commit, no
+        // worktree-guard interaction, no project-.mcp.json approval prompt.
+        assert!(PathBuf::from(&as_str).starts_with(env::temp_dir()));
+        // The existing arg builder accepts it (is_file passes) — one code path
+        // for the env config and the minted one.
+        assert_eq!(
+            identity_mcp_config_args(IdentityTool::Claude, Some(&as_str)),
+            vec!["--mcp-config".to_string(), as_str.clone()]
+        );
+        // On Unix the live credential is owner-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&as_str).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "a live credential must not be group/world readable");
+        }
+
+        // Dropping the handle deletes it — the credential does not outlive the
+        // session that used it.
+        drop(path);
+        assert!(!PathBuf::from(&as_str).exists());
+    }
+
+    /// §6 SELF-SPAWN TRAP. With the PERSISTENT identity dir on PATH holding a
+    /// `claude.exe`, AND a per-PTY identity dir prepended over it (the
+    /// runner-spawned-terminal ordering), resolution must skip BOTH and find the
+    /// real claude. If the persistent dir were not excluded, the stub would
+    /// resolve its own twin — the infinite self-spawn the module docs name.
+    ///
+    /// Drives the pure core with an explicit PATH + explicit own-dirs, mirroring
+    /// `own_shim_dirs`'s third entry, so it never mutates process-global env
+    /// (that mutation reddened CI on 2026-07-11).
+    #[test]
+    fn persistent_identity_dir_is_excluded_and_composes_with_a_per_pty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let per_pty = tmp.path().join("qontinui-identity-term-1");
+        let persistent = tmp.path().join("identity-shim");
+        let realbin = tmp.path().join("realbin");
+        for d in [&per_pty, &persistent, &realbin] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let exe = if cfg!(windows) { "claude.exe" } else { "claude" };
+        // An identically-named stub in BOTH of our dirs — the whole trap.
+        std::fs::write(per_pty.join(exe), b"stub").unwrap();
+        std::fs::write(persistent.join(exe), b"stub").unwrap();
+        std::fs::write(realbin.join(exe), b"real").unwrap();
+
+        // The real ordering: per-PTY prepended, persistent (USER PATH) after it.
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let path = format!(
+            "{}{sep}{}{sep}{}",
+            per_pty.display(),
+            persistent.display(),
+            realbin.display()
+        );
+
+        let got = resolve_real_in(
+            "claude",
+            &[per_pty.clone(), persistent.clone()],
+            OsStr::new(&path),
+        )
+        .expect("must resolve the REAL claude");
+        assert_eq!(
+            normalize_dir(got.parent().unwrap()),
+            normalize_dir(&realbin),
+            "must skip the per-PTY dir AND the persistent dir — never resolve itself"
+        );
+
+        // The persistent dir alone (a BARE terminal: no per-PTY dir on PATH,
+        // and SHIM_DIR_ENV unset) must also skip itself.
+        let bare_path = format!("{}{sep}{}", persistent.display(), realbin.display());
+        let got_bare = resolve_real_in("claude", &[persistent.clone()], OsStr::new(&bare_path))
+            .expect("must resolve the REAL claude from a bare terminal");
+        assert_eq!(
+            normalize_dir(got_bare.parent().unwrap()),
+            normalize_dir(&realbin)
+        );
+    }
+
+    /// `own_shim_dirs` must ACTUALLY contain the persistent identity dir — the
+    /// exclusion above is only real if the production list carries it. This is
+    /// the regression that fails if someone drops the third entry: the
+    /// `current_exe().parent()` entry does NOT cover it (that is the per-PTY dir
+    /// whenever a runner-spawned terminal prepends one), and it is fallible.
+    #[test]
+    fn own_shim_dirs_carries_the_persistent_identity_dir() {
+        let Some(persistent) = qontinui_runner_lib::profile_cli::identity_shim_dir() else {
+            return; // no home dir in this environment — nothing to assert
+        };
+        let dirs = own_shim_dirs();
+        assert!(
+            dirs.iter().any(|d| d == &persistent),
+            "own_shim_dirs must exclude the persistent identity dir {} — otherwise a \
+             persistent on-PATH claude.exe resolves itself (self-spawn loop); got {dirs:?}",
+            persistent.display()
+        );
+        // No duplicates — the dedup in `push` holds even when two sources agree.
+        let mut sorted = dirs.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), dirs.len(), "own_shim_dirs must not duplicate");
     }
 
     #[test]
