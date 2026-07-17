@@ -46,10 +46,14 @@
 //!   `session_status` field on the card is preferred the moment coord ships
 //!   one). A `session_not_found` 404 means coord IS reachable and has no row ⇒
 //!   status ABSENT (block-eligible), per the phase's decision rule.
-//! - **continuation rules** — `GET {coord}/coord/prompt-documents/
+//! - **continuation rules** — `GET {coord}/coord/agent-prompt-documents/
 //!   continuation_rules/session-continuation`: coord's versioned
 //!   `prompt_documents` store (Phase 2), which serves the tenant's editable
-//!   umbrella prompt. Any failure falls back to
+//!   umbrella prompt. Read over the DEVICE-authed door, not the operator
+//!   `/coord/prompt-documents/*` one — the latter 403s a device JWT, and
+//!   because this fetch fail-opens that 403 would silently pin every session
+//!   to [`DEFAULT_CONTINUATION_RULES`] forever (see
+//!   [`continuation_rules_url`]). Any failure falls back to
 //!   [`DEFAULT_CONTINUATION_RULES`].
 //!
 //! `QONTINUI_STOP_HOOK_STATUS_OVERRIDE` is a dev/E2E lever: when set, the
@@ -520,8 +524,25 @@ const RULES_DOC_NAME: &str = "session-continuation";
 ///
 /// `GET` returns the document row with its current `body` — the operator's
 /// edits, or coord's seeded default when never edited.
+///
+/// ## Why `agent-prompt-documents`, not `prompt-documents`
+///
+/// Coord serves this same row on two doors. `/coord/prompt-documents/*` is the
+/// OPERATOR door: it resolves tenancy through coord's `TenantId` extractor,
+/// which resolves solely from a verified Cognito operator context and 403s
+/// everything else — including this fetch's device JWT (confirmed against
+/// prod). Because the fetch fail-opens, pointing here did not break anything
+/// loudly; it silently ignored every operator edit and always used
+/// [`DEFAULT_CONTINUATION_RULES`], which defeats the whole point of an
+/// operator-editable steering document.
+///
+/// `/coord/agent-prompt-documents/*` is the device/agent door onto the same
+/// rows (coord's `require_jwt` sub-router, tenant lifted server-side from the
+/// JWT). That is the correct auth layer for a daemon with no operator in the
+/// loop — the same split as `/coord/session-messages/*` and
+/// `/coord/agent-desired-state`.
 fn continuation_rules_url(base: &str) -> String {
-    format!("{base}/coord/prompt-documents/{RULES_DOC_KIND}/{RULES_DOC_NAME}")
+    format!("{base}/coord/agent-prompt-documents/{RULES_DOC_KIND}/{RULES_DOC_NAME}")
 }
 
 async fn fetch_continuation_rules_uncached() -> Option<String> {
@@ -853,16 +874,42 @@ mod tests {
 
     #[test]
     fn rules_url_targets_the_prompt_documents_document() {
-        // Coord's landed surface: GET /coord/prompt-documents/{kind}/{name},
-        // NOT the removed /coord/policy-documents/continuation-rules.
+        // Coord's DEVICE-authed door:
+        // GET /coord/agent-prompt-documents/{kind}/{name} — NOT the removed
+        // /coord/policy-documents/continuation-rules.
         let url = continuation_rules_url("https://coord.example.com");
         assert_eq!(
             url,
-            "https://coord.example.com/coord/prompt-documents/continuation_rules/session-continuation"
+            "https://coord.example.com/coord/agent-prompt-documents/continuation_rules/session-continuation"
         );
         assert!(
             !url.contains("policy-documents"),
             "must not target the removed legacy surface: {url}"
+        );
+    }
+
+    /// The fetch MUST target coord's device/agent door, never the operator
+    /// `TenantId`-gated one.
+    ///
+    /// This is a real regression guard, not a tautology: this fetch carries a
+    /// DEVICE JWT and fail-opens on any error, and `/coord/prompt-documents/*`
+    /// 403s a device JWT (confirmed against prod). Pointing there is therefore
+    /// SILENT — no outage, no log line an operator would chase, just every
+    /// operator edit ignored forever in favour of the built-in default. The
+    /// path is the only thing distinguishing the two, so it gets pinned.
+    #[test]
+    fn rules_url_uses_the_device_authed_door_not_the_operator_one() {
+        let url = continuation_rules_url("https://coord.example.com");
+        assert!(
+            url.contains("/coord/agent-prompt-documents/"),
+            "must use the require_jwt door a device JWT can actually read: {url}"
+        );
+        // The operator route is a strict prefix-free counterpart: assert on the
+        // full segment so `agent-prompt-documents` cannot satisfy it.
+        assert!(
+            !url.contains("/coord/prompt-documents/"),
+            "the operator TenantId door 403s this fetch's device JWT, and the \
+             fail-open posture would hide that forever: {url}"
         );
     }
 
