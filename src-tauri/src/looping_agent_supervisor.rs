@@ -44,9 +44,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tauri::Manager;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
+use qontinui_runner_lib::looping_agent::desired_state::{
+    self, CoordDesiredState, DesiredSource, EffectiveDesired,
+};
 use qontinui_runner_lib::looping_agent::idle::{snapshot_context_low, snapshot_looks_idle};
+use qontinui_runner_lib::looping_agent::lease::{self, HeldSlot};
 use qontinui_runner_lib::looping_agent::playbook;
 use qontinui_runner_lib::looping_agent::policy::{self, Action, Liveness, SpawnReason, TickInput};
 use qontinui_runner_lib::looping_agent::registry::{
@@ -86,6 +90,42 @@ static SHUTDOWN_TX: OnceLock<tokio::sync::watch::Sender<bool>> = OnceLock::new()
 /// which is correct — the failure cause may have been the dying process).
 /// Option-wrapped so the static is const-initializable (house style).
 static SPAWN_FAILURES: Mutex<Option<HashMap<String, (u32, i64)>>> = Mutex::new(None);
+
+/// Slot leases this supervisor currently holds: `agent_id -> HeldSlot`
+/// (Phase 8).
+///
+/// In-memory ONLY, and that is correct rather than a gap: coord's Redis is the
+/// authority on who holds a slot, and this map is just a local memo of what we
+/// believe. A runner restart forgets it, re-acquires on the next tick, and gets
+/// `renewed` back for its own still-live lease (the owner token is
+/// machine-scoped — see `looping_agent_coord::claim_body`), so the slot is
+/// re-adopted rather than stranded. Persisting it would create a second,
+/// disagreeing source of truth — the exact tier-0-CHECK-vs-tier-1-RECORD
+/// mismatch that produced the #1025 spawn storm.
+static HELD_SLOTS: Mutex<Option<HashMap<String, HeldSlot>>> = Mutex::new(None);
+
+fn held_slot_for(agent_id: &str) -> Option<HeldSlot> {
+    let guard = HELD_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().and_then(|m| m.get(agent_id)).cloned()
+}
+
+fn set_held_slot(agent_id: &str, slot: HeldSlot) {
+    let mut guard = HELD_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .get_or_insert_with(HashMap::new)
+        .insert(agent_id.to_string(), slot);
+}
+
+fn clear_held_slot(agent_id: &str) -> Option<HeldSlot> {
+    let mut guard = HELD_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_mut().and_then(|m| m.remove(agent_id))
+}
+
+/// Last-logged effective posture per agent, so the posture line is
+/// edge-triggered rather than emitted every 5s tick (the same
+/// log-only-on-transition discipline `fleet_policy_poller` uses).
+#[allow(clippy::type_complexity)]
+static LAST_POSTURE: Mutex<Option<HashMap<String, (bool, u32, DesiredSource)>>> = Mutex::new(None);
 
 /// Registry file path, port-namespaced like the session lifecycle store so a
 /// temp/secondary runner (9877+) never adopts — or double-spawns — the
@@ -188,7 +228,16 @@ async fn run_loop() {
     }
 }
 
-/// One supervisor pass over every enabled+running agent.
+/// One supervisor pass over every agent.
+///
+/// Phase 8: the pass no longer short-circuits on the local registry flag. COORD
+/// is now the declared source of truth ("this tenant wants N merge shepherds,
+/// armed"), so an agent whose LOCAL flag is off may still be running per coord
+/// — and, just as importantly, an agent that is locally enabled but holds a
+/// slot lease it must release when coord disarms still needs a visit. The pure
+/// [`desired_state::resolve`] does the fold per agent; the fail-safe direction
+/// (disarmed/absent/unreachable → the local posture, whose seed is
+/// `enabled=false`) lives there and is unit-tested there.
 async fn tick_once() {
     let Some(app) = crate::tauri_app_handle::current() else {
         return; // headless/unit-test context — nothing to supervise
@@ -199,11 +248,27 @@ async fn tick_once() {
     else {
         return;
     };
+
+    // One poll per tick, shared by every agent (cached ~45s inside).
+    let coord_rules = crate::looping_agent_coord::desired_state_rules().await;
+
     for rec in registry.list() {
-        if !rec.def.enabled || rec.def.desired_state != DesiredState::Running {
-            continue;
-        }
-        supervise_one(&app, &registry, &rec).await;
+        supervise_one(&app, &registry, &rec, coord_rules.as_deref()).await;
+    }
+}
+
+/// Map a registry `playbook_ref` to its coord `agent_playbook` document name
+/// and its `coord.sessions.role` wire value.
+///
+/// Phase 1 knows exactly one agent, so this is a match rather than a registry
+/// column; adding a role means adding an arm here and a variant to coord's
+/// `SessionRole`. An unknown ref yields `None` and the agent is supervised
+/// purely from its local registry posture — it can never chase a coord slot,
+/// because a lease key needs a role to be built from.
+fn role_for_agent(playbook_ref: &str) -> Option<&'static str> {
+    match playbook_ref {
+        MERGE_SHEPHERD_ID => Some("merge_shepherd"),
+        _ => None,
     }
 }
 
@@ -272,12 +337,41 @@ fn resolve_live_session(
 }
 
 /// Supervise a single agent for one tick: observe, decide (pure), act.
+///
+/// Phase 8 threads two new things through the same observe→decide→act shape:
+/// the coord-declared desired state (which replaces the local flag as the
+/// posture input) and the claim-first slot lease (which gates every
+/// session-creating action).
 async fn supervise_one(
     app: &tauri::AppHandle,
     registry: &Arc<LoopingAgentRegistry>,
     rec: &LoopingAgentRecord,
+    coord_rules: Option<&[CoordDesiredState]>,
 ) {
     let now_ms = chrono::Utc::now().timestamp_millis();
+
+    // -- Posture: coord's declaration folded over the local registry (pure). --
+    let role = role_for_agent(&rec.def.playbook_ref);
+    let coord_rule = match (coord_rules, role) {
+        (Some(rules), Some(role)) => desired_state::rule_for_role(rules, role),
+        // No coord answer (unreachable / never polled) or an agent with no
+        // fleet role → the resolver's local-registry fallback.
+        _ => None,
+    };
+    let effective = desired_state::resolve(
+        rec.def.enabled,
+        rec.def.desired_state == DesiredState::Running,
+        coord_rule,
+    );
+    log_posture_transition(&rec.def.id, &effective);
+
+    // -- Slot lease reconciliation (claim-first — D3 / the #1025 lesson). --
+    //
+    // MUST happen BEFORE `policy::decide` is acted on: `gate_action` rewrites
+    // any session-creating action to `None` unless we hold a lease, so the
+    // lease state is an INPUT to acting, never a check performed afterwards.
+    let holds_lease = reconcile_slot_lease(app, rec, &effective).await;
+
     let (liveness, live) = resolve_live_session(app, rec);
 
     // Re-attach bookkeeping: adopt a lifecycle-resolved terminal id so the
@@ -311,8 +405,13 @@ async fn supervise_one(
     }
 
     let input = TickInput {
-        enabled: rec.def.enabled,
-        desired_running: rec.def.desired_state == DesiredState::Running,
+        // Phase 8: BOTH posture inputs now come from the resolved effective
+        // state, not from the local registry row. `resolve` has already folded
+        // `def.enabled` / `def.desired_state` in as the fallback arm, so an
+        // armed coord rule can run an agent whose local flag is off, and an
+        // armed `count=0` can stop one whose local flag is on.
+        enabled: effective.running,
+        desired_running: effective.running,
         tab_alive: liveness != Liveness::Dead,
         ever_spawned: rec.runtime.last_spawn_at_ms.is_some(),
         spawn_backoff_elapsed: spawn_backoff_elapsed(&rec.def.id, now_ms),
@@ -332,10 +431,17 @@ async fn supervise_one(
         relaunch_every_cycles: rec.def.lifecycle_policy.relaunch_every_cycles,
     };
 
-    match policy::decide(&input) {
+    // CLAIM-FIRST: the gate makes a lease-less spawn/relaunch structurally
+    // impossible. This is the whole point of the phase — not "check whether a
+    // shepherd exists and spawn if not" (a TOCTOU race every runner in the
+    // fleet loses simultaneously — #1025), but "you already won the atomic
+    // slot, therefore you may spawn".
+    let action = lease::gate_action(policy::decide(&input), holds_lease);
+
+    match action {
         Action::None => {}
         Action::Spawn(reason) => {
-            let prompt = spawn_prompt(&rec.def, reason != SpawnReason::FirstSpawn);
+            let prompt = spawn_prompt(&rec.def, reason != SpawnReason::FirstSpawn).await;
             let focus = reason == SpawnReason::FirstSpawn;
             do_spawn(app, registry, &rec.def, prompt, focus, false).await;
         }
@@ -382,29 +488,189 @@ async fn supervise_one(
                     );
                 }
             }
-            let prompt = spawn_prompt(&rec.def, true);
+            let prompt = spawn_prompt(&rec.def, true).await;
             do_spawn(app, registry, &rec.def, prompt, false, true).await;
         }
     }
 }
 
-/// Build the spawn prompt: the bundled playbook + config + the one-cycle
-/// contract; relaunches add the "read your journal and continue" framing.
-fn spawn_prompt(def: &LoopingAgentDef, is_relaunch: bool) -> String {
-    let pb = playbook::playbook_for(&def.playbook_ref).unwrap_or_else(|| {
-        warn!(
+/// Build the spawn prompt: the playbook + config + the one-cycle contract;
+/// relaunches add the "read your journal and continue" framing.
+///
+/// Phase 8: the playbook is FETCHED FROM COORD at spawn
+/// (`GET /coord/agent-playbook/:name`) so the versioned, web-edited document is
+/// the source of truth. The runner-bundled `include_str!` copy remains the seed
+/// and the offline fallback — resolved by the pure
+/// [`playbook::resolve_playbook`], which is where the "blank body = absent"
+/// and "unknown ref still yields a usable playbook" rules are pinned.
+///
+/// The fetch happens per spawn rather than per tick: spawns are rare (first
+/// enable, relaunch, death-respawn) and each one is the exact moment the
+/// freshest instructions matter, so there is nothing to cache.
+async fn spawn_prompt(def: &LoopingAgentDef, is_relaunch: bool) -> String {
+    let coord_body = crate::looping_agent_coord::fetch_playbook(&def.playbook_ref).await;
+    if coord_body.is_none() {
+        debug!(
             agent = %def.id,
             playbook_ref = %def.playbook_ref,
-            "looping_agent_supervisor: unknown playbook_ref — falling back to the bundled \
-             merge-shepherd playbook"
+            "looping_agent_supervisor: no coord-served playbook — using the bundled fallback"
         );
-        playbook::MERGE_SHEPHERD_PLAYBOOK
-    });
+    }
+    let pb = playbook::resolve_playbook(coord_body.as_deref(), &def.playbook_ref);
     if is_relaunch {
         playbook::relaunch_prompt(pb, &def.journal_path, &def.repos)
     } else {
         playbook::initial_prompt(pb, &def.journal_path, &def.repos)
     }
+}
+
+/// Reconcile this agent's slot lease for one tick and report whether we hold
+/// one. **The claim-first heart of Phase 8** (D3).
+///
+/// Lifecycle:
+/// * Not running (disarmed / locally stopped) + we hold a lease → RELEASE it,
+///   so a peer can fill the slot immediately instead of waiting out the TTL.
+/// * Running + we hold a lease → HEARTBEAT. `stolen` drops it (coord's
+///   authoritative answer); a transport error keeps it (see
+///   `lease::still_held_after_heartbeat`).
+/// * Running + no lease → ACQUIRE, walking the candidate slots in order. The
+///   FIRST `claimed`/`renewed` is ours and is the permission to spawn. All
+///   slots `held` → other live shepherds own them → we do nothing at all.
+///
+/// Returns `true` only when this supervisor genuinely holds a slot. Every
+/// "can't tell" path returns `false`, because the one thing that must never
+/// happen is spawning on an assumption.
+async fn reconcile_slot_lease(
+    app: &tauri::AppHandle,
+    rec: &LoopingAgentRecord,
+    effective: &EffectiveDesired,
+) -> bool {
+    let agent_id = &rec.def.id;
+
+    // Identity needed to build the lease key. Missing either one means we
+    // cannot name the slot — so we cannot hold it, so we must not spawn.
+    // (A tenant-less runner is unpaired; a role-less agent has no fleet slot.)
+    let Some(role) = role_for_agent(&rec.def.playbook_ref) else {
+        return false;
+    };
+    let Some(tenant_id) = crate::fleet::resolve_tenant_id() else {
+        debug!(
+            agent = %agent_id,
+            "looping_agent_supervisor: no tenant binding — cannot claim a slot lease, not spawning"
+        );
+        return false;
+    };
+    let Some(machine_id) = app
+        .try_state::<Arc<crate::session::SessionRegistry>>()
+        .map(|s| s.inner().machine_id())
+    else {
+        return false;
+    };
+
+    let held = held_slot_for(agent_id);
+    let claude_session_id = rec.runtime.claude_session_id.clone();
+
+    // -- Clean stop: release what we hold. --
+    if !effective.running {
+        if let Some(slot) = clear_held_slot(agent_id) {
+            info!(
+                agent = %agent_id,
+                resource_key = %slot.resource_key,
+                "looping_agent_supervisor: agent is no longer desired — releasing its slot lease"
+            );
+            crate::looping_agent_coord::release_slot(&slot.resource_key, &machine_id, agent_id)
+                .await;
+        }
+        return false;
+    }
+
+    // -- Hold: heartbeat it. --
+    if let Some(slot) = &held {
+        let outcome = crate::looping_agent_coord::heartbeat_slot(
+            &slot.resource_key,
+            &machine_id,
+            agent_id,
+            claude_session_id.as_deref(),
+        )
+        .await;
+        if lease::still_held_after_heartbeat(&outcome) {
+            return true;
+        }
+        // Stolen: another supervisor owns this slot now. Drop our memo and fall
+        // through to the acquire path — if a slot is genuinely free we take it,
+        // otherwise we do nothing this tick.
+        warn!(
+            agent = %agent_id,
+            resource_key = %slot.resource_key,
+            "looping_agent_supervisor: slot lease lost (stolen/expired) — another runner owns \
+             this slot now"
+        );
+        clear_held_slot(agent_id);
+    }
+
+    // -- Acquire: claim-first. The FIRST win is the permission to spawn. --
+    for slot in lease::candidate_slots(effective.slots, None) {
+        let resource_key = lease::slot_resource_key(&tenant_id.to_string(), role, slot);
+        let outcome = crate::looping_agent_coord::acquire_slot(
+            &resource_key,
+            &machine_id,
+            agent_id,
+            claude_session_id.as_deref(),
+        )
+        .await;
+        match &outcome {
+            _ if lease::spawn_permitted(&outcome) => {
+                info!(
+                    agent = %agent_id,
+                    %resource_key,
+                    "looping_agent_supervisor: acquired slot lease — spawn permitted"
+                );
+                set_held_slot(agent_id, HeldSlot { slot, resource_key });
+                return true;
+            }
+            lease::AcquireOutcome::Held { current_holder } => {
+                debug!(
+                    agent = %agent_id,
+                    %resource_key,
+                    holder = current_holder.as_deref().unwrap_or("unknown"),
+                    "looping_agent_supervisor: slot held by another runner — trying the next"
+                );
+            }
+            lease::AcquireOutcome::Unavailable(e) => {
+                // Coord unreachable is NOT a free slot. Stop walking (the rest
+                // will fail identically) and spawn nothing.
+                debug!(
+                    agent = %agent_id,
+                    %resource_key,
+                    error = %e,
+                    "looping_agent_supervisor: slot acquire unavailable — not spawning"
+                );
+                return false;
+            }
+            // `spawn_permitted` already covered Acquired.
+            lease::AcquireOutcome::Acquired => unreachable!(),
+        }
+    }
+    false
+}
+
+/// Edge-triggered posture logging: emit a line only when an agent's effective
+/// posture CHANGES, never once per 5s tick.
+fn log_posture_transition(agent_id: &str, effective: &EffectiveDesired) {
+    let mut guard = LAST_POSTURE.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    let now = (effective.running, effective.slots, effective.source);
+    if map.get(agent_id) == Some(&now) {
+        return;
+    }
+    map.insert(agent_id.to_string(), now);
+    info!(
+        agent = %agent_id,
+        running = effective.running,
+        slots = effective.slots,
+        source = ?effective.source,
+        "looping_agent_supervisor: effective desired state changed"
+    );
 }
 
 /// Whether the agent's spawn-failure backoff window has elapsed.

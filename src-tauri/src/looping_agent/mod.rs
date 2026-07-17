@@ -17,6 +17,14 @@
 //! - [`registry`] — the durable runner-local registry of looping-agent
 //!   definitions + runtime state (JSON store, atomic writes, tolerant load),
 //!   seeded with the built-in Merge Shepherd (DISABLED by default).
+//! - [`desired_state`] — (Phase 8) the pure fold of COORD's fleet-wide
+//!   declaration ("this tenant wants N merge shepherds, armed") over the local
+//!   registry flag. Fail-safe: a disarmed or unreachable coord falls back to
+//!   the local posture, never to permission.
+//! - [`lease`] — (Phase 8) the pure core of CLAIM-FIRST spawning: the slot
+//!   resource key (`role:<tenant>:<role>:<slot>`), the acquire/heartbeat
+//!   outcome folds, and the gate that makes a lease-less spawn structurally
+//!   impossible. The #1025 spawn-storm lesson, encoded.
 //! - [`idle`] — the rendered-VT-grid idle / context-low predicates. Grid
 //!   scanning (not raw-byte scanning) is the fleet's proven approach: Claude
 //!   Code paints whole frames as synchronized-output updates that hide text
@@ -32,7 +40,9 @@
 //! a thin composition of these cores over the existing
 //! `run_continuation_terminal` spawn recipe.
 
+pub mod desired_state;
 pub mod idle;
+pub mod lease;
 pub mod playbook;
 pub mod policy;
 pub mod registry;
