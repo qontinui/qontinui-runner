@@ -27,6 +27,36 @@ pub fn playbook_for(playbook_ref: &str) -> Option<&'static str> {
     }
 }
 
+/// Resolve the playbook body to spawn with: **coord wins, bundled is the
+/// fallback** (session-autonomy-fabric Phase 8).
+///
+/// This is the inversion the plan calls for. Until now the bundled
+/// `include_str!` copy WAS the source of truth, which meant changing a
+/// shepherd's instructions required a runner release — a Windows CI train ride
+/// of ~2h plus an auto-update rollout, for editing prose. Coord's
+/// `agent_playbook` prompt document (Phase 2, edited in the web UI, versioned)
+/// becomes the truth; the bundled copy stays as the seed and the OFFLINE
+/// FALLBACK.
+///
+/// Fallback order:
+/// 1. `coord_body`, when coord served a non-blank document.
+/// 2. The bundled playbook for `playbook_ref`.
+/// 3. The bundled merge-shepherd playbook (an unknown ref is a registry bug —
+///    a shepherd with a stale playbook is strictly better than one with none).
+///
+/// A blank/whitespace-only coord body is treated as ABSENT rather than as an
+/// empty playbook: spawning an agent with no instructions is worse than
+/// spawning it with the bundled ones, and an empty document is far more likely
+/// a mis-save than a deliberate instruction to do nothing.
+pub fn resolve_playbook<'a>(coord_body: Option<&'a str>, playbook_ref: &str) -> &'a str {
+    if let Some(body) = coord_body {
+        if !body.trim().is_empty() {
+            return body;
+        }
+    }
+    playbook_for(playbook_ref).unwrap_or(MERGE_SHEPHERD_PLAYBOOK)
+}
+
 /// The one-cycle contract appended to every spawn/relaunch prompt.
 const ONE_CYCLE_CONTRACT: &str = "Run ONE cycle now, then STOP and wait — do not loop, sleep, or \
      schedule anything yourself; the runner's supervisor will prompt you to \
@@ -117,6 +147,59 @@ mod tests {
     fn empty_repos_means_all_tenant_repos() {
         let p = initial_prompt("PB", "C:/j.jsonl", &[]);
         assert!(p.contains("all repos this tenant owns"));
+    }
+
+    // -- Phase 8: coord-served playbook, bundled fallback -------------------
+
+    #[test]
+    fn a_coord_served_playbook_wins_over_the_bundled_copy() {
+        // The inversion: coord is the source of truth so editing a shepherd's
+        // instructions is a web edit, not a runner release.
+        let body = "# Merge Shepherd (edited in the web UI)\nDo the new thing.";
+        assert_eq!(resolve_playbook(Some(body), "merge-shepherd"), body);
+    }
+
+    #[test]
+    fn an_unreachable_coord_falls_back_to_the_bundled_playbook() {
+        // `None` = coord unreachable / 404 / auth failure. The shepherd still
+        // spawns with real instructions — offline tolerance is the whole point
+        // of keeping the bundled copy.
+        assert_eq!(
+            resolve_playbook(None, "merge-shepherd"),
+            MERGE_SHEPHERD_PLAYBOOK
+        );
+    }
+
+    #[test]
+    fn a_blank_coord_body_is_treated_as_absent_not_as_an_empty_playbook() {
+        // A mis-saved empty document must not spawn an instruction-less agent.
+        for blank in ["", "   ", "\n\n\t "] {
+            assert_eq!(
+                resolve_playbook(Some(blank), "merge-shepherd"),
+                MERGE_SHEPHERD_PLAYBOOK,
+                "a blank coord body ({blank:?}) must fall back to the bundled playbook"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_playbook_ref_still_yields_a_usable_playbook() {
+        // A registry bug must degrade to a stale playbook, never to none.
+        assert_eq!(
+            resolve_playbook(None, "no-such-playbook"),
+            MERGE_SHEPHERD_PLAYBOOK
+        );
+    }
+
+    #[test]
+    fn the_resolved_playbook_flows_into_the_spawn_prompt() {
+        // End of the seam: whatever resolve_playbook picks is what the agent
+        // actually reads.
+        let coord_body = "COORD PLAYBOOK BODY";
+        let pb = resolve_playbook(Some(coord_body), "merge-shepherd");
+        let prompt = initial_prompt(pb, "C:/j.jsonl", &[]);
+        assert!(prompt.starts_with("COORD PLAYBOOK BODY"));
+        assert!(prompt.contains("Run ONE cycle now"));
     }
 
     #[test]

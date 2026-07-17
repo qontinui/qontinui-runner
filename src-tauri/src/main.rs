@@ -113,6 +113,7 @@ mod logging;
 // continuation-terminal recipe). The PURE core (registry/idle/policy/playbook)
 // lives in the lib crate at `qontinui_runner_lib::looping_agent` so it is
 // covered by `cargo test --lib`.
+mod looping_agent_coord;
 mod looping_agent_supervisor;
 mod macros;
 mod mcp;
