@@ -452,8 +452,8 @@ impl TerminalSession {
         cmd.env("QONTINUI_RUNNER_TERMINAL", "1");
         let runner_api_port = crate::mcp::types::get_mcp_api_port();
         cmd.env("QONTINUI_RUNNER_API_PORT", runner_api_port.to_string());
-        // Canonical runner-context briefing (capabilities + coord + twin +
-        // guardrails), rendered from the SINGLE source of truth. The shell
+        // Canonical runner-context briefing (pull-first autonomy protocol +
+        // links), rendered from the SINGLE source of truth. The shell
         // integration wrapper reads this env var and passes it to
         // `--append-system-prompt` for interactive `claude` panes. Autonomous
         // direct-exec spawns bypass shell integration and inject the same text

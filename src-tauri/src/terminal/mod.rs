@@ -33,43 +33,58 @@ pub use manager::TerminalManager;
 ///     `QONTINUI_RUNNER_CONTEXT` env var that [`session`] injects at spawn; the
 ///     `shell-integration.{ps1,bash,zsh}` wrapper passes it to
 ///     `--append-system-prompt`.
-///   - Autonomous direct-exec spawns (gate continuations, fleet/batch) never
-///     source shell integration, so they inject it into the argv directly via
+///   - Autonomous direct-exec spawns (gate continuations, fleet/batch, the
+///     looping-agent supervisor) never source shell integration, so they
+///     inject it into the argv directly via
 ///     `agent_runtime::build_continuation_claude_command`.
+///
+/// Pull-first lean protocol (session-autonomy-fabric Phase 5): this briefing
+/// carries PROTOCOL + LINKS, never policy content. Policy/playbook bodies live
+/// in coord's versioned prompt documents and are fetched on demand, so editing
+/// a policy never requires a runner release. It also carries NO narration
+/// instructions — transparency is structural (tool calls land in the
+/// transcript).
 ///
 /// It deliberately carries NO tenant/agent identity — that is an RCE-class
 /// invariant (a prompt must never cross tenants) and is deferred to the vetted
-/// session-identity fabric plan. Only tenant-agnostic capability + guardrail
-/// guidance lives here.
+/// session-identity fabric plan. Only tenant-agnostic protocol guidance lives
+/// here.
 pub fn runner_context(api_port: u16) -> String {
+    // Coord HTTP base for the tool-less fallback links. Resolved the same way
+    // every coord proxy route resolves it (COORD_HTTP_URL env → active
+    // profile → localhost fallback) so the prompt never disagrees with the
+    // runner's own coord client.
+    let coord_url = crate::coord_mcp::coord_base_url();
     format!(
-        "You are running inside the Qontinui Runner — an AI-driven development \
-environment, NOT a plain checkout. You have live access to multi-agent \
-coordination (coord) and the digital twin, so your actions have real blast radius.
+        "You are running inside the Qontinui Runner — an autonomous multi-agent \
+development environment. Runner HTTP API: http://127.0.0.1:{api_port}.
 
-Coordination (coord): you are one of several agents sharing this repo through a \
-live merge train. BEFORE you edit files or write a plan, call \
-coord_declare_intent so peers can see your scope and you can sequence around \
-them. Check coord_is_merge_safe / gate status before landing. Verify a change \
-actually landed by its CONTENT on origin/main — never trust a green workflow or \
-a PR \"merged\" state alone. Open PRs with `qontinui-pr create` (preferred — \
-works without a personal GitHub login on this machine); `gh pr create` also \
-works where a personal `gh auth login` exists.
+You work autonomously. No human is watching this session; do not wait for \
+human replies or pause for approval you can resolve yourself.
 
-Digital twin: inspect and verify UI through the UI Bridge tooling (/ui-bridge, \
-/visual-audit, /page-health). Never use Playwright for the runner, qontinui-web, \
-or qontinui-mobile.
+Policies and playbooks are pull-first documents, not baked into this prompt. \
+Discover them via the coord MCP tools: coord_list_prompt_documents (names + \
+descriptions, cheap) and coord_get_prompt_document (full body on demand). \
+HTTP fallback if those tools are unavailable: \
+GET {coord_url}/coord/prompt-documents (list, optional ?kind= filter) and \
+GET {coord_url}/coord/prompt-documents/{{kind}}/{{name}}.
 
-Runner HTTP API at http://localhost:{api_port} (on Windows use Invoke-WebRequest, \
-not curl):
-- GET /task-runs/running — running task runs
-- GET /task-runs/{{id}}/output?tail_chars=N — live AI conversation output
-- GET /unified-workflows — saved workflows; POST /unified-workflows/execute-inline runs one inline
-Runner SQLite DB (Windows): ~/AppData/Roaming/com.qontinui.runner/runner.db \
-(tables: task_runs, task_run_events, unified_workflows).
+When you would ask the user a question: fetch the relevant policy and DECIDE, \
+recording it via coord_request_policy / coord_record_decision. Only a \
+question a human must answer goes to coord_ask_question — after asking, you \
+will be left alone until it is answered.
 
-Guardrail: confirm before outward-facing or irreversible actions unless you are \
-already authorized to proceed."
+Report status transitions via coord_report_status \
+(working | blocked | waiting_human | finished). Set finished only after \
+cleanup (worktrees, branches) is done.
+
+Before starting new work, check the communal work ledger so you do not \
+duplicate a peer: coord_who_is_working_on, then coord_declare_intent to \
+record your own scope.
+
+If context runs low, act BEFORE exhaustion: request a handoff \
+(coord_request_handoff) or spawn a continuation session seeded with a \
+summary via POST http://127.0.0.1:{api_port}/sessions/spawn."
     )
 }
 
