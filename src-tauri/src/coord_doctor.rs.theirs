@@ -54,11 +54,7 @@ pub struct DoctorReport {
 
 impl DoctorReport {
     /// Render the copy-pasteable, machine-identical text report. The ordering
-<<<<<<< HEAD
     /// and the trailing verdict line are the contract — keep them stable so
-=======
-    /// plus the trailing verdict line are the contract — keep them stable so
->>>>>>> b0926974 (feat: owner-qualified coord git origin paths in credential helper)
     /// the output diffs cleanly across machines.
     pub fn render(&self) -> String {
         let mut out = String::new();

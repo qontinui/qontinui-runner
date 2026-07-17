@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "base_sha": "9763bab79574c69a3a233f8bdcb990ead0b4f4ad",
+  "ours_sha": "45e41a30d19c6d0608f5693eff064f4249be4efb",
+  "theirs_sha": "ae00bfa06d6a68f84c7d6faaeeda097e548cfb23",
+  "entries": [
+    {
+      "path": "src-tauri/build.rs",
+      "base_oid": "986b715bc96c376e172c542877f60f66f3978c78",
+      "ours_oid": "15dd236d2a0238d379594b1f73ba10a9cc207313",
+      "theirs_oid": "f3353d676a3ecb3cfd9a1ec4a2928a24984821e4",
+      "base_path": "src-tauri/build.rs.base",
+      "ours_path": "src-tauri/build.rs.ours",
+      "theirs_path": "src-tauri/build.rs.theirs",
+      "hunks": [
+        "<<<<<<< HEAD\n            } else if ft.is_file() && path.extension().and_then(|e| e.to_str()) == Some(\"tsx\") {\n=======\n            } else if ft.is_file()\n                && path.extension().and_then(|e| e.to_str()) == Some(\"tsx\")\n            {\n>>>>>>> b0926974 (feat: owner-qualified coord git origin paths in credential helper)\n"
+      ]
+    },
+    {
+      "path": "src-tauri/src/cognito.rs",
+      "base_oid": "a9c8c098fdc8fefd97f65dc7578ecba9a33fa151",
+      "ours_oid": "851bd5121a0b84be3e67e1b41299dc2c7d1614a5",
+      "theirs_oid": "47aa0e59436372c313dca7066a56b94ea57352d8",
+      "base_path": "src-tauri/src/cognito.rs.base",
+      "ours_path": "src-tauri/src/cognito.rs.ours",
+      "theirs_path": "src-tauri/src/cognito.rs.theirs",
+      "hunks": [
+        "<<<<<<< HEAD\n                    // `signal_shutdown` captures nothing, so it is `Copy` —\n                    // the `async move` block below copies it implicitly.\n=======\n>>>>>>> b0926974 (feat: owner-qualified coord git origin paths in credential helper)\n"
+      ]
+    },
+    {
+      "path": "src-tauri/src/coord_doctor.rs",
+      "base_oid": "b1abccc019275210e2a316308404ecb9a58457d9",
+      "ours_oid": "657c194d47d50654dc41b51fe9c8e8537ef2dd5f",
+      "theirs_oid": "7695c87b58bd77333ccee48ca7d0eff493754ab4",
+      "base_path": "src-tauri/src/coord_doctor.rs.base",
+      "ours_path": "src-tauri/src/coord_doctor.rs.ours",
+      "theirs_path": "src-tauri/src/coord_doctor.rs.theirs",
+      "hunks": [
+        "<<<<<<< HEAD\n    /// and the trailing verdict line are the contract — keep them stable so\n=======\n    /// plus the trailing verdict line are the contract — keep them stable so\n>>>>>>> b0926974 (feat: owner-qualified coord git origin paths in credential helper)\n"
+      ]
+    },
+    {
+      "path": "src-tauri/src/observable_bridge/git_ops.rs",
+      "base_oid": "a6cd9e4fbd5ff2ffb6655344b856319d0bfab534",
+      "ours_oid": "bbe5556805bc935c10da1880393bf855fe035a04",
+      "theirs_oid": "436bd93c91ffb39cc4e5490d6e2e6678a232c430",
+      "base_path": "src-tauri/src/observable_bridge/git_ops.rs.base",
+      "ours_path": "src-tauri/src/observable_bridge/git_ops.rs.ours",
+      "theirs_path": "src-tauri/src/observable_bridge/git_ops.rs.theirs",
+      "hunks": [
+        "<<<<<<< HEAD\n        if std::fs::rename(&backup, &pre_push).is_err() && std::fs::copy(&backup, &pre_push).is_ok()\n=======\n        if std::fs::rename(&backup, &pre_push).is_err()\n            && std::fs::copy(&backup, &pre_push).is_ok()\n>>>>>>> b0926974 (feat: owner-qualified coord git origin paths in credential helper)\n"
+      ]
+    }
+  ]
+}

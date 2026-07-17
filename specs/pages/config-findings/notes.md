@@ -1,3 +1,0 @@
-# CategoryManager
-
-_(notes)_

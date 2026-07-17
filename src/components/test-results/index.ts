@@ -1,1 +1,0 @@
-export { TestResultsTab } from "./TestResultsTab";
