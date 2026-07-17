@@ -2388,23 +2388,41 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Phase 1 (pop-out terminal windows) — persisted window↔session
                 // ownership + the runner's own window registry. Co-located with
-                // the pane store under `.qontinui/runner`, same atomic-write
-                // pattern. `ensure_main` records the "main" window on boot.
-                // Namespaced by API port (mirrors the lifecycle store above) so
-                // each runner instance owns its own windows — without this a
-                // temp runner (9877+) would read/clobber the primary's
-                // window-assignments and try to render its pop-outs.
-                let wa_api_port = crate::mcp::types::get_mcp_api_port();
-                let wa_file_name = if wa_api_port == 9876 {
-                    "window-assignments.json".to_string()
-                } else {
-                    format!("window-assignments-{wa_api_port}.json")
+                // — and scoped identically to — the pane store above, same
+                // atomic-write pattern. `ensure_main` records the "main" window
+                // on boot.
+                //
+                // Scoped by INSTANCE, not by API port. Port-namespacing looks
+                // equivalent but is not: temp-runner ports (9877-9899) are
+                // RECYCLED across spawns, so every fresh temp runner inherited
+                // the `window-assignments-<port>.json` of whatever unrelated
+                // runner last held that port. A month-old file recording a
+                // pop-out window bound to page "default" then made the frontend
+                // hide that page from the main window (it believes a pop-out
+                // owns it) — and since every PTY/record is `pageId: "default"`,
+                // the Terminal tab rendered ZERO panes despite dozens of live
+                // PTYs, with no console error. `reconcile_orphans` never healed
+                // it: it sweeps dangling `session_owner` entries, not stale
+                // *window* entries. Instance names are unique per spawn, so
+                // scoping here cannot inherit a foreign runner's windows. The
+                // primary (no instance name) keeps the legacy unscoped path, so
+                // the operator's real pop-out layout is preserved.
+                let window_assignments_path =
+                    instance::scope_path(
+                        &dirs::home_dir()
+                            .unwrap_or_else(|| std::path::PathBuf::from("."))
+                            .join(".qontinui")
+                            .join("runner"),
+                    )
+                    .join("window-assignments.json");
+                // The ephemeral fallback must stay instance-unique for the same
+                // reason the real path is instance-scoped — a shared temp file
+                // would re-introduce exactly the cross-instance inheritance
+                // this scoping removes.
+                let wa_file_name = match instance::data_subdir() {
+                    Some(sub) => format!("window-assignments-{sub}.json"),
+                    None => "window-assignments.json".to_string(),
                 };
-                let window_assignments_path = dirs::home_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join(".qontinui")
-                    .join("runner")
-                    .join(&wa_file_name);
                 let window_assignments = std::sync::Arc::new(
                     match window_assignments::WindowAssignments::open(&window_assignments_path) {
                         Ok(s) => s,
@@ -2768,6 +2786,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             // restore record keeps its OLD terminal_id until
                             // the re-assert, so it naturally matches nothing.
                             let restore_pending = rec.restore_pending_at.is_some();
+                            // Never-confirmed records are PROVISIONAL by
+                            // design (every PTY gets one at spawn so restore
+                            // has a pre-minted identity). A bare shell that
+                            // never ran a provider must not be closed
+                            // `poll-dead` — classify rewrites that to the
+                            // non-restorable `never-started` close.
+                            let confirmed = rec.confirmed_at.is_some();
                             let action = classify(
                                 live_is_alive,
                                 claude_present,
@@ -2775,6 +2800,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 prior_no_match,
                                 snapshot_ok,
                                 restore_pending,
+                                confirmed,
                             );
 
                             match action {
@@ -2810,6 +2836,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     tracing::info!(
                                         claude_session = %rec.claude_session_id,
                                         "session lifecycle poll: closing dead session"
+                                    );
+                                }
+                                PollAction::CloseNeverStarted => {
+                                    // Provisional record, provider never
+                                    // started (bare shell). Nothing died —
+                                    // retire it non-restorably rather than
+                                    // reporting a phantom `poll-dead`.
+                                    poll_lifecycle_store
+                                        .record_close(&rec.claude_session_id, "never-started");
+                                    consecutive_dead.remove(&rec.claude_session_id);
+                                    consecutive_no_match.remove(&rec.claude_session_id);
+                                    tracing::info!(
+                                        claude_session = %rec.claude_session_id,
+                                        terminal = %rec.terminal_id,
+                                        "session lifecycle poll: retiring never-confirmed provisional record (no provider ever started)"
                                     );
                                 }
                                 PollAction::NoMatchWait => {

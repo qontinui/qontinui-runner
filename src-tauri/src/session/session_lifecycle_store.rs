@@ -991,6 +991,12 @@ pub enum PollAction {
     NeedsConfirm,
     /// The session is dead — flip it to `closed` (reason `"poll-dead"`).
     Close,
+    /// The record's shell is dead (or claude never appeared) AND the record was
+    /// never confirmed — no provider session ever started in this terminal, so
+    /// there is nothing that died. Close it `"never-started"`, which is
+    /// non-restorable (the restore grace match covers only `"pty-exit"` /
+    /// `"poll-dead"`), instead of libelling a bare shell as a dead session.
+    CloseNeverStarted,
     /// No live terminal matched this record this tick, and it has not yet
     /// reached [`NO_TERMINAL_ORPHAN_TICKS`] consecutive no-match ticks —
     /// increment the no-match counter and wait (debounce registration races).
@@ -1038,6 +1044,18 @@ pub enum PollAction {
 ///   (which keeps its OLD `terminal_id` until the deferred re-assert) must
 ///   never accumulate no-match ticks: `None` + pending ⇒ Skip, not
 ///   `NoMatchWait`.
+/// - `confirmed`: whether the record carries a `confirmed_at` — i.e. a provider
+///   session actually started in this terminal (`POST /control/session-open`,
+///   or a transcript-anchored reconcile bind). Every PTY gets a PROVISIONAL
+///   record at spawn by design (`apply_identity_seam`, `confirmed_at: None`) so
+///   restore has a pre-minted identity; a bare PowerShell pane that never runs
+///   a provider therefore holds an unconfirmed record forever. Such a record
+///   has no session to lose, so it must never be closed `"poll-dead"` — that
+///   reason means "a live session died" and buys a
+///   [`RESTORABLE_POLL_DEAD_MS`] restore grace, which is exactly wrong here.
+///   Handled symmetrically to `restore_pending`: a parameter that rewrites the
+///   base outcome rather than a new lifecycle state (the record already carries
+///   the fact).
 pub fn classify(
     live_is_alive: Option<bool>,
     claude_present: bool,
@@ -1045,6 +1063,7 @@ pub fn classify(
     consecutive_no_match: u32,
     snapshot_ok: bool,
     restore_pending: bool,
+    confirmed: bool,
 ) -> PollAction {
     if !snapshot_ok {
         return PollAction::Skip;
@@ -1082,6 +1101,13 @@ pub fn classify(
     // against it.
     if restore_pending && base != PollAction::KeepAlive {
         return PollAction::Skip;
+    }
+    // Never-confirmed guard: a provisional record whose provider never started
+    // cannot have "died". Rewrite the poll-dead close to the non-restorable
+    // `never-started` close so a bare shell is not preserved as a restore
+    // candidate — and so `poll-dead` keeps meaning what it says.
+    if !confirmed && base == PollAction::Close {
+        return PollAction::CloseNeverStarted;
     }
     base
 }
@@ -1926,22 +1952,49 @@ mod tests {
 
     // --- classify() — every branch -----------------------------------------
 
+    /// Every case below the marker predates the `confirmed` dimension and
+    /// asserts the behaviour of a CONFIRMED record (a provider session really
+    /// started). Pinning that one dimension here keeps those cases reading as
+    /// the liveness matrix they are; the never-confirmed dimension is covered
+    /// separately by `classify_never_confirmed_*`.
+    fn classify_confirmed(
+        live_is_alive: Option<bool>,
+        claude_present: bool,
+        consecutive_dead: u32,
+        consecutive_no_match: u32,
+        snapshot_ok: bool,
+        restore_pending: bool,
+    ) -> PollAction {
+        classify(
+            live_is_alive,
+            claude_present,
+            consecutive_dead,
+            consecutive_no_match,
+            snapshot_ok,
+            restore_pending,
+            true,
+        )
+    }
+
     #[test]
     fn classify_skip_on_snapshot_failure() {
         // snapshot_ok=false dominates every other input.
         assert_eq!(
-            classify(Some(false), false, 5, 0, false, false),
+            classify_confirmed(Some(false), false, 5, 0, false, false),
             PollAction::Skip
         );
         assert_eq!(
-            classify(Some(true), true, 0, 0, false, false),
+            classify_confirmed(Some(true), true, 0, 0, false, false),
             PollAction::Skip
         );
-        assert_eq!(classify(None, false, 0, 0, false, false), PollAction::Skip);
+        assert_eq!(
+            classify_confirmed(None, false, 0, 0, false, false),
+            PollAction::Skip
+        );
         // Even a no-match streak past the orphan threshold must Skip (not
         // CloseNoTerminal) when the snapshot failed.
         assert_eq!(
-            classify(None, false, 0, NO_TERMINAL_ORPHAN_TICKS + 5, false, false),
+            classify_confirmed(None, false, 0, NO_TERMINAL_ORPHAN_TICKS + 5, false, false),
             PollAction::Skip
         );
     }
@@ -1953,14 +2006,14 @@ mod tests {
         // NOT close on a brief registration race.
         for prior in 0..NO_TERMINAL_ORPHAN_TICKS {
             assert_eq!(
-                classify(None, false, 0, prior, true, false),
+                classify_confirmed(None, false, 0, prior, true, false),
                 PollAction::NoMatchWait,
                 "no match, {prior} prior no-match ticks must NoMatchWait"
             );
         }
         // claude_present/dead-tick inputs are irrelevant to the no-match arm.
         assert_eq!(
-            classify(None, true, 9, 0, true, false),
+            classify_confirmed(None, true, 9, 0, true, false),
             PollAction::NoMatchWait
         );
     }
@@ -1971,11 +2024,11 @@ mod tests {
         // orphan — close it with the (non-restorable) "no-terminal" reason.
         // With a 45s poll the close lands on the 4th consecutive tick ≈ 3min.
         assert_eq!(
-            classify(None, false, 0, NO_TERMINAL_ORPHAN_TICKS, true, false),
+            classify_confirmed(None, false, 0, NO_TERMINAL_ORPHAN_TICKS, true, false),
             PollAction::CloseNoTerminal
         );
         assert_eq!(
-            classify(None, false, 0, NO_TERMINAL_ORPHAN_TICKS + 5, true, false),
+            classify_confirmed(None, false, 0, NO_TERMINAL_ORPHAN_TICKS + 5, true, false),
             PollAction::CloseNoTerminal
         );
     }
@@ -1985,11 +2038,11 @@ mod tests {
         // A dead pty closes regardless of claude_present — the unambiguous
         // confident-dead signal.
         assert_eq!(
-            classify(Some(false), false, 0, 0, true, false),
+            classify_confirmed(Some(false), false, 0, 0, true, false),
             PollAction::Close
         );
         assert_eq!(
-            classify(Some(false), true, 0, 0, true, false),
+            classify_confirmed(Some(false), true, 0, 0, true, false),
             PollAction::Close
         );
     }
@@ -2000,11 +2053,11 @@ mod tests {
         // even with zero prior dead ticks (the idle-agent bug) and even after
         // a long prior claude-absent streak (claude came back).
         assert_eq!(
-            classify(Some(true), true, 0, 0, true, false),
+            classify_confirmed(Some(true), true, 0, 0, true, false),
             PollAction::KeepAlive
         );
         assert_eq!(
-            classify(Some(true), true, 9, 0, true, false),
+            classify_confirmed(Some(true), true, 9, 0, true, false),
             PollAction::KeepAlive
         );
     }
@@ -2018,11 +2071,11 @@ mod tests {
         // perfectly alive. With `claude_present` the answer is KeepAlive on the
         // very first tick, forever, no matter how long it idles.
         assert_eq!(
-            classify(Some(true), true, 0, 0, true, false),
+            classify_confirmed(Some(true), true, 0, 0, true, false),
             PollAction::KeepAlive
         );
         assert_eq!(
-            classify(
+            classify_confirmed(
                 Some(true),
                 true,
                 LIVE_SHELL_DEAD_TICKS + 100,
@@ -2043,11 +2096,11 @@ mod tests {
         // predated keeping the 3-tick debounce; Change #2 keeps it, so Close
         // requires the full streak.)
         assert_eq!(
-            classify(Some(true), false, LIVE_SHELL_DEAD_TICKS - 1, 0, true, false),
+            classify_confirmed(Some(true), false, LIVE_SHELL_DEAD_TICKS - 1, 0, true, false),
             PollAction::NeedsConfirm
         );
         assert_eq!(
-            classify(Some(true), false, LIVE_SHELL_DEAD_TICKS, 0, true, false),
+            classify_confirmed(Some(true), false, LIVE_SHELL_DEAD_TICKS, 0, true, false),
             PollAction::Close
         );
     }
@@ -2059,14 +2112,14 @@ mod tests {
         // brief blip (a transient snapshot miss / in-flight relaunch).
         for prior in 0..LIVE_SHELL_DEAD_TICKS {
             assert_eq!(
-                classify(Some(true), false, prior, 0, true, false),
+                classify_confirmed(Some(true), false, prior, 0, true, false),
                 PollAction::NeedsConfirm,
                 "live shell, claude absent, {prior} prior ticks must NeedsConfirm"
             );
         }
         // Specifically: the second tick (prior == 1) no longer closes.
         assert_eq!(
-            classify(Some(true), false, 1, 0, true, false),
+            classify_confirmed(Some(true), false, 1, 0, true, false),
             PollAction::NeedsConfirm
         );
     }
@@ -2077,11 +2130,11 @@ mod tests {
         // claude-absent ticks does a live shell finally close (operator quit
         // claude; the bare shell PID lingers).
         assert_eq!(
-            classify(Some(true), false, LIVE_SHELL_DEAD_TICKS, 0, true, false),
+            classify_confirmed(Some(true), false, LIVE_SHELL_DEAD_TICKS, 0, true, false),
             PollAction::Close
         );
         assert_eq!(
-            classify(Some(true), false, LIVE_SHELL_DEAD_TICKS + 5, 0, true, false),
+            classify_confirmed(Some(true), false, LIVE_SHELL_DEAD_TICKS + 5, 0, true, false),
             PollAction::Close
         );
     }
@@ -2092,32 +2145,35 @@ mod tests {
         // Dead pty (the restore shell died / was never matched) → Skip, NOT
         // Close — the durable `open` record must survive for the next attempt.
         assert_eq!(
-            classify(Some(false), false, 0, 0, true, true),
+            classify_confirmed(Some(false), false, 0, 0, true, true),
             PollAction::Skip
         );
         // Plain shell with no claude present, even past the debounce ticks
         // (the exact poll-dead flip the incident hit) → Skip.
         assert_eq!(
-            classify(Some(true), false, LIVE_SHELL_DEAD_TICKS, 0, true, true),
+            classify_confirmed(Some(true), false, LIVE_SHELL_DEAD_TICKS, 0, true, true),
             PollAction::Skip
         );
         assert_eq!(
-            classify(Some(true), false, LIVE_SHELL_DEAD_TICKS + 5, 0, true, true),
+            classify_confirmed(Some(true), false, LIVE_SHELL_DEAD_TICKS + 5, 0, true, true),
             PollAction::Skip
         );
         // Below the debounce it must not even accumulate NeedsConfirm ticks.
         assert_eq!(
-            classify(Some(true), false, 0, 0, true, true),
+            classify_confirmed(Some(true), false, 0, 0, true, true),
             PollAction::Skip
         );
         // No matching pty → Skip, NOT NoMatchWait: a mid-restore row keeps
         // its OLD terminal_id until the re-assert and must never accumulate
         // no-match ticks toward an orphan close.
-        assert_eq!(classify(None, false, 0, 0, true, true), PollAction::Skip);
+        assert_eq!(
+            classify_confirmed(None, false, 0, 0, true, true),
+            PollAction::Skip
+        );
         // Even a streak past the orphan threshold must not close while the
         // restore-pending marker is set.
         assert_eq!(
-            classify(None, false, 0, NO_TERMINAL_ORPHAN_TICKS + 1, true, true),
+            classify_confirmed(None, false, 0, NO_TERMINAL_ORPHAN_TICKS + 1, true, true),
             PollAction::Skip
         );
     }
@@ -2128,8 +2184,115 @@ mod tests {
         // even while restore-pending — the caller uses this to self-heal a
         // stale marker.
         assert_eq!(
-            classify(Some(true), true, 0, 0, true, true),
+            classify_confirmed(Some(true), true, 0, 0, true, true),
             PollAction::KeepAlive
+        );
+    }
+
+    /// Item 3 regression: 39 of 42 records on the primary read
+    /// `closed/"poll-dead"` while their PTY was demonstrably alive. Every PTY
+    /// gets a provisional record at spawn; a bare PowerShell pane never runs a
+    /// provider, so `claude_present` is false forever and the debounce
+    /// inevitably expires. Such a record must never be called `poll-dead`.
+    #[test]
+    fn classify_never_confirmed_bare_shell_is_never_poll_dead() {
+        // The exact observed shape: live shell, no claude, debounce expired.
+        assert_eq!(
+            classify(
+                Some(true),
+                false,
+                LIVE_SHELL_DEAD_TICKS,
+                0,
+                true,
+                false,
+                false
+            ),
+            PollAction::CloseNeverStarted,
+        );
+        assert_eq!(
+            classify(
+                Some(true),
+                false,
+                LIVE_SHELL_DEAD_TICKS + 5,
+                0,
+                true,
+                false,
+                false
+            ),
+            PollAction::CloseNeverStarted,
+        );
+        // A dead pty for a never-started record is likewise nothing dying.
+        assert_eq!(
+            classify(Some(false), false, 0, 0, true, false, false),
+            PollAction::CloseNeverStarted,
+        );
+        // The verification case: a bare terminal after two poll cycles has not
+        // reached the debounce, so it is still merely NeedsConfirm — and under
+        // no input does it produce Close.
+        for prior in 0..=(LIVE_SHELL_DEAD_TICKS + 5) {
+            assert_ne!(
+                classify(Some(true), false, prior, 0, true, false, false),
+                PollAction::Close,
+                "a never-confirmed record must never classify poll-dead ({prior} ticks)"
+            );
+        }
+    }
+
+    /// The guard must be narrow: it only rewrites the `poll-dead` close. A
+    /// CONFIRMED record keeps closing `poll-dead` (the operator-quit-claude
+    /// cleanup), and the never-confirmed guard never resurrects a record or
+    /// suppresses the orphan / keep-alive arms.
+    #[test]
+    fn classify_never_confirmed_leaves_other_arms_intact() {
+        // Confirmed + same inputs ⇒ still the real poll-dead close.
+        assert_eq!(
+            classify(
+                Some(true),
+                false,
+                LIVE_SHELL_DEAD_TICKS,
+                0,
+                true,
+                false,
+                true
+            ),
+            PollAction::Close,
+        );
+        // An unconfirmed record with a live claude is a real session mid-bind
+        // (the hook lands within seconds) — KeepAlive, not a close.
+        assert_eq!(
+            classify(Some(true), true, 0, 0, true, false, false),
+            PollAction::KeepAlive,
+        );
+        // Orphan close keeps its own already-non-restorable reason.
+        assert_eq!(
+            classify(None, false, 0, NO_TERMINAL_ORPHAN_TICKS, true, false, false),
+            PollAction::CloseNoTerminal,
+        );
+        // Uncertainty still dominates: snapshot failure and restore-pending.
+        assert_eq!(
+            classify(Some(false), false, 0, 0, false, false, false),
+            PollAction::Skip,
+        );
+        assert_eq!(
+            classify(Some(false), false, 0, 0, true, true, false),
+            PollAction::Skip,
+        );
+    }
+
+    /// `never-started` must be non-restorable — the whole point of not calling
+    /// it `poll-dead`, which buys a [`RESTORABLE_POLL_DEAD_MS`] restore grace.
+    #[test]
+    fn never_started_close_is_not_restorable() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.record_open(rec("bare-shell"));
+        store.record_close("bare-shell", "never-started");
+
+        let now = Utc::now().timestamp_millis();
+        assert!(
+            store.restorable_records(now, None).is_empty(),
+            "a never-started (bare shell) record must never be a restore candidate"
         );
     }
 
