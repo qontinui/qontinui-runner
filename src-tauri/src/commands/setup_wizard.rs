@@ -130,7 +130,9 @@ pub async fn suggest_workspace_sources_for_setup(workspace_path: String) -> Resu
 
 /// Resolve the runner's Cognito bearer for authenticated web-backend calls.
 /// `None` when the user isn't signed in (Tier 0/1 or no Cognito session).
-async fn cognito_bearer() -> Option<String> {
+/// Shared with `commands::new_project`, which talks to the same
+/// `/api/v1/operations/github/*` proxy surface.
+pub(crate) async fn cognito_bearer() -> Option<String> {
     let auth_manager = crate::auth::AuthManager::new();
     crate::mcp::device_jwt_refresher::ensure_fresh_cognito_bearer(&auth_manager)
         .await
