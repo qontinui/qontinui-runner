@@ -1749,12 +1749,23 @@ pub async fn resume_ai_sessions(
         let (workdir_override, system_notes, reacquired_ctx, claim_status, wip_status) =
             reacquire_and_restore_session_worktree(&task_run_id, &pg).await;
 
-        // Effective working dir: the re-acquired worktree, else the shared cwd
-        // the session originally ran in.
+        // Effective working dir: the re-acquired worktree, else the dedicated
+        // relay-chat workdir this task run originally spawned in (its presence
+        // on disk is the marker — see `backend_relay::relay_session_workdir`),
+        // else the shared cwd. Restoring the relay workdir is what keeps the
+        // transcript-keyed `--resume` lossless AND keeps the session's coord
+        // digital-twin tools: re-provision coord-mcp there (re-mint evicts the
+        // stale nonce and rewrites `.mcp.json` for the respawned CLI).
         let working_dir = workdir_override.clone().unwrap_or_else(|| {
-            std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| ".".to_string())
+            match crate::mcp::backend_relay::existing_relay_session_workdir(&task_run_id) {
+                Some(relay_dir) => {
+                    crate::coord_mcp::provision_coord_mcp_for_session(&relay_dir, Some(my_port));
+                    relay_dir
+                }
+                None => std::env::current_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| ".".to_string()),
+            }
         });
 
         // ── (B) Prefer lossless `--resume`; honestly label the summary ─────

@@ -1871,6 +1871,50 @@ async fn handle_chat_session_state(api_state: &Arc<ApiState>, data: &Value) -> O
     }
 }
 
+/// Path of the dedicated per-session workdir for a relay chat session:
+/// `~/.qontinui/runner/relay-chat/<task_run_id>`. `None` when no home dir is
+/// resolvable (never fall back to "." — that's the runner's repo checkout).
+fn relay_chat_dir(task_run_id: &str) -> Option<std::path::PathBuf> {
+    Some(
+        dirs::home_dir()?
+            .join(".qontinui")
+            .join("runner")
+            .join("relay-chat")
+            .join(task_run_id),
+    )
+}
+
+/// Create (or reuse) the dedicated per-session workdir for a relay chat
+/// session, mirroring `looping_agent_supervisor::agent_home_dir`. The relay
+/// session must not run in the runner's own cwd (`src-tauri` — a repo checkout
+/// where a `bypassPermissions` AI session is a hazard and a provisioned
+/// `.mcp.json` would dirty the tree). `None` when the dir can't be created —
+/// the caller then falls back to the legacy runner-cwd spawn WITHOUT
+/// provisioning coord-mcp (never write `.mcp.json` into the checkout).
+fn relay_session_workdir(task_run_id: &str) -> Option<String> {
+    let dir = relay_chat_dir(task_run_id)?;
+    match std::fs::create_dir_all(&dir) {
+        Ok(()) => Some(dir.to_string_lossy().to_string()),
+        Err(e) => {
+            warn!(
+                "relay chat: failed to create session workdir {}: {e} — falling back to runner cwd",
+                dir.display()
+            );
+            None
+        }
+    }
+}
+
+/// The relay workdir for `task_run_id` when it already exists on disk — the
+/// marker that this task run was spawned as a relay chat in a dedicated
+/// workdir. Used by boot-time session restore (`commands::ai_session`) to
+/// respawn into the original cwd (transcripts are keyed on the encoded cwd,
+/// so this is what keeps `--resume` lossless) and by close-time cleanup.
+pub(crate) fn existing_relay_session_workdir(task_run_id: &str) -> Option<String> {
+    let dir = relay_chat_dir(task_run_id)?;
+    dir.is_dir().then(|| dir.to_string_lossy().to_string())
+}
+
 async fn handle_chat_create(api_state: &Arc<ApiState>, data: &Value) -> Option<Value> {
     info!("Handling chat_create command");
     let task_name = data
@@ -1913,9 +1957,26 @@ async fn handle_chat_create(api_state: &Arc<ApiState>, data: &Value) -> Option<V
             return;
         };
 
-        let working_dir = std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| ".".to_string());
+        let working_dir = match relay_session_workdir(&bg_task_run_id) {
+            Some(dir) => {
+                // Provision coord-mcp into the dedicated workdir BEFORE spawn
+                // so the session gets coord's digital-twin tools
+                // (coord_query_* / coord_is_*) over the loopback live-token
+                // proxy — the spawned CLI auto-discovers the cwd `.mcp.json`,
+                // same as agent worktrees. Fail-open: with no device JWT the
+                // helper logs, writes a degraded breadcrumb, and the session
+                // still answers (just without twin tools).
+                let bound_port = Some(crate::mcp::types::runner_api_port(&bg_state.app_state));
+                crate::coord_mcp::provision_coord_mcp_for_session(&dir, bound_port);
+                dir
+            }
+            // Legacy fallback (no home dir / create failed): the runner's own
+            // cwd, deliberately WITHOUT coord-mcp provisioning — never write
+            // `.mcp.json` or breadcrumbs into the repo checkout.
+            None => std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| ".".to_string()),
+        };
 
         let system_prompt = "You are an AI assistant in a session initiated from the \
             qontinui mobile app. Respond helpfully and conversationally. The user may ask \
@@ -2060,6 +2121,19 @@ async fn handle_chat_close(api_state: &Arc<ApiState>, data: &Value) -> Option<Va
 
     if let Some(sm) = session_manager {
         let _ = sm.remove(&task_run_id);
+    }
+
+    // Best-effort cleanup of the per-session relay workdir: revoke its proxy
+    // nonce (a never-reused workdir's nonce is otherwise valid + persisted
+    // forever) and delete the dir. Sessions that end without a chat_close
+    // (process death) leave their dir behind — acceptable residue; the nonce
+    // itself is the security-relevant part and any later provisioning cycle
+    // persists only live bindings.
+    if let Some(dir) = existing_relay_session_workdir(&task_run_id) {
+        crate::coord_mcp::evict_proxy_nonces_for_workdir(&dir);
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            warn!("relay chat: failed to remove session workdir {dir}: {e}");
+        }
     }
 
     let _ = api_state
