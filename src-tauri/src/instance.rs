@@ -175,20 +175,7 @@ fn sanitize(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// `QONTINUI_INSTANCE_NAME` is process-global mutable state; tests that
-    /// set/remove it race when the harness runs them on parallel threads
-    /// (one test's `remove_var` lands between another's `set_var` and its
-    /// assert — flakes on windows-latest). Every env-touching test holds this
-    /// lock for its full body. Poisoning is harmless — each test resets the
-    /// var on entry — so recover with `into_inner`. Mirrors the ENV_GUARD
-    /// pattern in `claude_session/coord_register.rs`.
-    static ENV_GUARD: Mutex<()> = Mutex::new(());
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner())
-    }
+    use crate::test_env::env_lock;
 
     #[test]
     fn sanitize_keeps_safe_chars() {

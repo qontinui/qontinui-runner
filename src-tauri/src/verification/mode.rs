@@ -166,11 +166,7 @@ pub fn show_screenshot_evidence() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Env vars are process-global, so tests that manipulate them would
-    /// race if run in parallel. Serialize through this mutex.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::test_env::env_lock;
 
     /// RAII guard that restores `key` to its pre-test value on drop,
     /// including the panic path. Without this, a panic inside `f()` would
@@ -190,7 +186,7 @@ mod tests {
     }
 
     fn with_env<F: FnOnce()>(key: &'static str, value: Option<&str>, f: F) {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock();
         let _restore = EnvRestore {
             key,
             prev: env::var(key).ok(),

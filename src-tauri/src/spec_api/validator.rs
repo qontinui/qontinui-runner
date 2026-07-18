@@ -391,6 +391,7 @@ mod tests {
     use crate::spec_api::types::{
         IrAssertion, IrAssertionTarget, IrPageSpec, IrState, IrTransition,
     };
+    use crate::test_env::env_lock;
     use qontinui_types::ui_bridge::UIBridgeSnapshot;
 
     // -------- Helpers ----------------------------------------------------
@@ -580,14 +581,9 @@ mod tests {
 
     // -------- Gate 3: coverage ------------------------------------------
 
-    /// Serializes env-var tests so they don't race when cargo runs tests
-    /// in parallel. Every gate_coverage_* test mutates or reads
-    /// `QONTINUI_SPEC_COVERAGE_FLOOR`; they all take this lock.
-    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn gate_coverage_passes_at_full_coverage() {
-        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = env_lock();
         std::env::remove_var("QONTINUI_SPEC_COVERAGE_FLOOR");
         // 3-state chain s0→s1→s2 — every state touched, every state
         // reachable from s0. Ratio = 1.0 ≥ default 0.80 floor.
@@ -598,7 +594,7 @@ mod tests {
 
     #[test]
     fn gate_coverage_rejects_when_below_floor() {
-        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = env_lock();
         // 5 states, chain transitions linking ALL states — coverage = 1.0.
         // Set floor to >1.0 to guarantee failure regardless of inputs.
         let ir = chain_ir("cov-fail", 5, true);
@@ -616,7 +612,7 @@ mod tests {
 
     #[test]
     fn gate_coverage_disconnected_subgraph_below_default_floor() {
-        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = env_lock();
         // Ensure the env var is not set from a prior test that may not have
         // cleaned up if it panicked mid-run.
         std::env::remove_var("QONTINUI_SPEC_COVERAGE_FLOOR");
@@ -748,7 +744,7 @@ mod tests {
 
     #[test]
     fn all_gates_pass_smoke() {
-        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = env_lock();
         std::env::remove_var("QONTINUI_SPEC_COVERAGE_FLOOR");
         // Single-state IR with one assertion + no transitions. Distinctness
         // passes (no peers to be identical-with); gate-2 round-trips

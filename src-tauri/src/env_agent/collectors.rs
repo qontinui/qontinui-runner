@@ -677,6 +677,8 @@ fn collect_claude_accounts_from(
 mod tests {
     use super::*;
 
+    use crate::test_env::env_lock;
+
     #[test]
     fn sanitize_url_strips_password() {
         let s = sanitize_url("postgres://user:supersecret@dbhost:5432/mydb").unwrap();
@@ -721,6 +723,7 @@ mod tests {
     /// the value, to the env_contract section.
     #[test]
     fn secret_safety_env_contract_emits_name_not_value() {
+        let _env_lock = env_lock();
         let var = "QONTINUI_SECRET_TOKEN_TEST_UNIQUE";
         std::env::set_var(var, "supersecret123");
         let section = collect_env_contract();

@@ -350,6 +350,7 @@ pub fn resolve_live_runner() -> Option<PortBreadcrumb> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::env_lock;
 
     fn rec(port: u16, pid: u32, started_at_ms: i64) -> PortBreadcrumb {
         PortBreadcrumb {
@@ -421,6 +422,7 @@ mod tests {
     /// `QONTINUI_PRIMARY_PORT`, proving the wiring, not just the inner helpers.
     #[test]
     fn public_writer_honors_primary_port_env() {
+        let _env_lock = env_lock();
         // Save/restore so this never leaks into a sibling test.
         let prev = std::env::var(PRIMARY_PORT_ENV).ok();
         std::env::set_var(PRIMARY_PORT_ENV, "9878");
@@ -510,6 +512,7 @@ mod tests {
     /// ignored.
     #[test]
     fn select_live_trusts_primary_flag_regardless_of_reader_env() {
+        let _env_lock = env_lock();
         let primary = PortBreadcrumb {
             primary: true,
             ..rec(9876, 1, 100)

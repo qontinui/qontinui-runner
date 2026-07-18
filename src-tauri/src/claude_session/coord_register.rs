@@ -775,21 +775,8 @@ fn coord_http_base() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use crate::test_env::env_lock;
     use tempfile::tempdir;
-
-    /// `QONTINUI_SESSION_AUTOMATION_REGISTER` is process-global mutable
-    /// state; tests that set/remove it race when the harness runs them on
-    /// parallel threads (one test's `remove_var` lands between another's
-    /// `set_var("0")` and its assert — seen flaking on windows-latest).
-    /// Every env-touching test holds this lock for its full body. Poisoning
-    /// is harmless — each test resets the var on entry — so recover with
-    /// `into_inner`.
-    static ENV_GUARD: Mutex<()> = Mutex::new(());
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner())
-    }
 
     fn registrar() -> (AiCoordRegistrar, tempfile::TempDir) {
         let dir = tempdir().unwrap();

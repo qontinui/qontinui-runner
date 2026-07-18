@@ -370,15 +370,7 @@ pub fn reset_action_guards_for_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Env vars are process-global mutable state; tests that set/remove them
-    /// race under the parallel test harness. Every env-touching test holds
-    /// this lock for its full body (same idiom as `coord_register`'s tests).
-    static ENV_GUARD: Mutex<()> = Mutex::new(());
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner())
-    }
+    use crate::test_env::env_lock;
 
     fn seed(n: u64) -> PendingPrSeed {
         PendingPrSeed {

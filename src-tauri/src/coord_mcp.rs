@@ -1948,6 +1948,8 @@ where
 mod tests {
     use super::*;
 
+    use crate::test_env::env_lock;
+
     /// `workdir_declares_coord_mcp` — the identity-seam skip gate — is true iff
     /// `<workdir>/.mcp.json` declares a `coord-mcp` server (any shape), false for
     /// absent / unparseable / non-coord `.mcp.json`.
@@ -3098,6 +3100,7 @@ mod tests {
     /// (static-bearer) config are left untouched.
     #[test]
     fn reconcile_session_configs_rewrites_stale_leaves_agent() {
+        let _env_lock = env_lock();
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         let base = std::env::temp_dir().join(format!("coord-mcp-recon-{}", uuid::Uuid::now_v7()));
 

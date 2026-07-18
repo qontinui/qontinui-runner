@@ -372,6 +372,8 @@ fn scrub_osc_payload(seq: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    use crate::test_env::env_lock;
+
     // ── helpers ────────────────────────────────────────────────────────────
 
     /// Run a single chunk through a fresh hook for `terminal_id`.
@@ -669,6 +671,7 @@ mod tests {
 
     #[test]
     fn env_gate_default_on() {
+        let _env_lock = env_lock();
         // Without the env var set, sanitization is enabled. (We can't reliably
         // mutate process env in a parallel test run, so just assert the
         // default-unset branch via a name that won't be set.)

@@ -735,6 +735,8 @@ fn coord_reachable_check() -> (bool, String) {
 mod tests {
     use super::*;
 
+    use crate::test_env::env_lock;
+
     fn green(name: &'static str) -> Check<'static> {
         Check::new(name, "fix-it", || (true, "green".into()))
     }
@@ -915,6 +917,7 @@ mod tests {
 
     #[test]
     fn provisioning_gate_enforce_env_parsing() {
+        let _env_lock = env_lock();
         // Save/restore the process-global so this test is self-contained. This
         // is the ONLY test that touches the flag; no sibling reads it, so the
         // save/restore is sufficient (and there's no parallel reader to race).

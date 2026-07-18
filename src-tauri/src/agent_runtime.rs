@@ -4000,6 +4000,8 @@ async fn report_spawn_failed(
 mod tests {
     use super::*;
 
+    use crate::test_env::env_lock;
+
     /// Sentinel returned by the test mint closure so a mint outcome is
     /// unambiguous and deterministic (no uuid in tests).
     const MINTED: &str = "MINTED";
@@ -4811,6 +4813,7 @@ mod tests {
 
     #[test]
     fn claude_bin_respects_env_override() {
+        let _env_lock = env_lock();
         let prev = std::env::var("QONTINUI_CLAUDE_BIN").ok();
         std::env::set_var("QONTINUI_CLAUDE_BIN", "/some/fake/claude-fixture");
         assert_eq!(claude_bin_path(), "/some/fake/claude-fixture");
@@ -4828,6 +4831,7 @@ mod tests {
     /// path is build-target-dependent.
     #[tokio::test]
     async fn fake_claude_e2e_smoke() {
+        let _env_lock = env_lock();
         if std::env::var("QONTINUI_AGENT_RUNTIME_E2E").ok().as_deref() != Some("1") {
             return;
         }
@@ -4869,6 +4873,7 @@ mod tests {
     /// headless path uses).
     #[test]
     fn terminal_continuation_command_is_interactive_positional_prompt() {
+        let _env_lock = env_lock();
         let prev = std::env::var("QONTINUI_CLAUDE_BIN").ok();
         std::env::set_var("QONTINUI_CLAUDE_BIN", "/fake/claude");
 
@@ -4974,6 +4979,7 @@ mod tests {
     /// `fake_claude_e2e_smoke`).
     #[tokio::test]
     async fn gate_continuation_headless_spawns_child() {
+        let _env_lock = env_lock();
         if std::env::var("QONTINUI_AGENT_RUNTIME_E2E").ok().as_deref() != Some("1") {
             return;
         }
@@ -5260,9 +5266,17 @@ mod tests {
     /// `OnceLock`-backed singleton). Tests that touch it run under a shared mutex
     /// (`CONT_GUARD_LOCK`) so they don't race each other's registry state.
     fn clear_continuation_registry() {
-        continuation_sessions().lock().unwrap().clear();
+        // Poison-recovering to match `CONT_GUARD_LOCK` / the shared `env_lock`:
+        // a prior test that panicked while holding this registry mutex must not
+        // cascade-poison the continuation-guard tests that reset it here.
+        continuation_sessions()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
     }
 
+    /// Poison-recovering (`unwrap_or_else(into_inner)`), matching the shared
+    /// `env_lock()`: a panicking guard test must not cascade-poison the rest.
     static CONT_GUARD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// REGRESSION (P3 must not regress #450): a SAME gate_id delivered twice is
@@ -5286,7 +5300,8 @@ mod tests {
     /// dead sessions first, so once the first session dies the anchor is free.
     #[test]
     fn anchor_key_guard_dedups_live_then_frees_on_death() {
-        let _g = CONT_GUARD_LOCK.lock().unwrap();
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
         // Raise the cap out of the way so this test isolates the dedup path.
         std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
@@ -5332,7 +5347,8 @@ mod tests {
     /// anchor — it always proceeds (the gate_id set is its only dedup).
     #[test]
     fn no_anchor_key_never_dedups() {
-        let _g = CONT_GUARD_LOCK.lock().unwrap();
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
         std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
@@ -5354,7 +5370,8 @@ mod tests {
     /// don't consume cap slots. Env override is honored.
     #[test]
     fn continuation_cap_refuses_at_limit() {
-        let _g = CONT_GUARD_LOCK.lock().unwrap();
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
         std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "2");
         let live_all = |_id: &str| true;
@@ -5389,7 +5406,8 @@ mod tests {
     /// is already running", not "capped".
     #[test]
     fn dedup_takes_precedence_over_cap() {
-        let _g = CONT_GUARD_LOCK.lock().unwrap();
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
         std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "1");
         let live_all = |_id: &str| true;
@@ -5409,7 +5427,8 @@ mod tests {
     /// default for an unset / non-numeric value.
     #[test]
     fn continuation_session_cap_env_parsing() {
-        let _g = CONT_GUARD_LOCK.lock().unwrap();
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let prev = std::env::var("QONTINUI_CONTINUATION_SESSION_CAP").ok();
 
         std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
@@ -5431,7 +5450,8 @@ mod tests {
     /// loaded registry still proceeds (the primary spawns every continuation).
     #[test]
     fn unbounded_default_cap_never_refuses_on_count() {
-        let _g = CONT_GUARD_LOCK.lock().unwrap();
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
         std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
         assert_eq!(continuation_session_cap(), usize::MAX);
@@ -5668,7 +5688,7 @@ mod tests {
     /// gone afterward (the freed slot is reflected immediately, not lazily).
     #[test]
     fn continuation_exit_triggers_repoll_and_deregisters() {
-        let _g = CONT_GUARD_LOCK.lock().unwrap();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
 
         register_continuation_session("term-cont-1".to_string(), Some("anchor-1".into()));
@@ -5709,7 +5729,7 @@ mod tests {
     /// defense-in-depth guard `notify_continuation_terminal_exit` relies on.
     #[test]
     fn operator_tab_exit_does_not_trigger_repoll() {
-        let _g = CONT_GUARD_LOCK.lock().unwrap();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
 
         // A live continuation exists, but the OPERATOR tab (different id) closes.
@@ -5736,7 +5756,7 @@ mod tests {
     /// catch-up covers it). Guards the "PTY waiter has no runtime" path.
     #[test]
     fn notify_continuation_exit_without_runtime_is_safe() {
-        let _g = CONT_GUARD_LOCK.lock().unwrap();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
 
         register_continuation_session("term-cont-2".to_string(), None);
@@ -5825,6 +5845,7 @@ mod tests {
     #[test]
     #[cfg(any(debug_assertions, feature = "test-fixtures"))]
     fn compressed_jwt_exp_honors_env_override() {
+        let _env_lock = env_lock();
         let prior = std::env::var(AGENT_JWT_EXP_COMPRESS_ENV).ok();
 
         // A far-future real expiry (~4h out), like a real agent JWT.

@@ -455,6 +455,8 @@ fn run_git(repo_dir: &std::path::Path, args: &[&str]) -> Result<String, String> 
 mod tests {
     use super::*;
 
+    use crate::test_env::env_lock;
+
     /// Initialize a throwaway git repo in `dir` with one committed file so
     /// `stash create` has a base commit to diff against.
     fn init_repo(dir: &std::path::Path) {
@@ -638,6 +640,7 @@ mod tests {
 
     #[test]
     fn configured_timeout_defaults_when_unset() {
+        let _env_lock = env_lock();
         // Don't mutate the global env in a way that races other tests; just
         // assert the default is returned when the override is absent/invalid.
         std::env::remove_var("QONTINUI_DRAIN_TIMEOUT_MS");

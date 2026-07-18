@@ -445,8 +445,11 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    use crate::test_env::env_lock;
+
     #[test]
     fn flag_defaults_off() {
+        let _env_lock = env_lock();
         // With the env unset, the executor stays dark.
         std::env::remove_var(RUNNER_PROBES_FLAG);
         assert!(!probes_enabled());
