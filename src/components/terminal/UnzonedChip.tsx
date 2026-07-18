@@ -57,6 +57,11 @@ export function UnzonedChip({ unassignedCount, onOpen }: UnzonedChipProps) {
     >
       <button
         type="button"
+        // Author-controlled, text-independent id. The auto-registered id would
+        // otherwise be minted from the button's first-seen text ("N more") and
+        // freeze there while the live count changes — the stale-first-seen-id
+        // defect. `data-ui-bridge-id` wins over auto-derivation in the SDK.
+        data-ui-bridge-id="terminal.unzoned-chip-toggle"
         onClick={onOpen}
         className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium leading-none whitespace-nowrap hover:bg-white/5 transition-colors"
         style={{ color: "#e0af68" }}

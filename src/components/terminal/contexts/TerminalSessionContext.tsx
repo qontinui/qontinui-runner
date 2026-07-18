@@ -276,7 +276,13 @@ const PageSessionScope = memo(function PageSessionScope({
   );
 
   const tabIds = useMemo(() => tabs.map((t) => t.id), [tabs]);
-  const zoneLayout = useZoneLayout(tabIds, pageId, myWindowLabel);
+  // Live-tab set so the zone layout can exclude exited tombstones from the
+  // hidden-but-LIVE "N more" count (and surface them separately).
+  const liveTabIds = useMemo(
+    () => new Set(tabs.filter((t) => t.isAlive).map((t) => t.id)),
+    [tabs],
+  );
+  const zoneLayout = useZoneLayout(tabIds, pageId, myWindowLabel, liveTabIds);
 
   // Page-namespaced zone labels / notes / pins / tags. Moved into the scope
   // (from ZoneMetadataProvider) so each page owns its own labels regardless of

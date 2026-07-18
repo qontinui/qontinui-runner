@@ -2209,10 +2209,14 @@ pub async fn ui_bridge_execute_component_action_handler(
         action_id, id
     );
 
+    // Accept both `{"params":{...}}` and the bare `{"layoutId":"single"}`
+    // shape the action's `paramSchema` advertises — merged_params() folds any
+    // flat top-level keys into params (element-action route parity).
+    let merged_params = request.merged_params();
     let payload = serde_json::json!({
         "componentId": id,
         "actionId": action_id,
-        "params": request.params
+        "params": merged_params
     });
 
     let ws_path = format!("/ui-bridge/control/component/{}/action/{}", id, action_id);
