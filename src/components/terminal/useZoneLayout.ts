@@ -440,6 +440,16 @@ export function useZoneLayout(
   tabIds: string[],
   pageId: string = "default",
   windowLabel: string = "main",
+  /**
+   * IDs of tabs whose process is still alive. Used to split the exposed
+   * unassigned set into hidden-but-LIVE (`unassignedTabIds`) vs exited
+   * tombstones (`exitedUnassignedTabIds`) so dead sessions don't inflate the
+   * UnzonedChip / control-panel "N more" honesty count. Defaults to "all tabs
+   * live" when omitted, preserving prior behavior for any caller that doesn't
+   * thread liveness. Assignment/reconcile logic keeps using the full `tabIds`
+   * — a dead-but-assigned tab still renders a tombstone card in its zone.
+   */
+  liveTabIds?: ReadonlySet<string>,
 ) {
   const [persistedState] = useState(() => loadPersistedState(pageId, windowLabel));
 
@@ -597,8 +607,18 @@ export function useZoneLayout(
     });
   }, []);
 
-  /** Get the list of tab IDs not assigned to any visible zone */
-  const unassignedTabIds = tabIds.filter((id) => !Object.values(assignments).includes(id));
+  /**
+   * Unassigned tab IDs, split by liveness. `unassignedTabIds` is the
+   * hidden-but-LIVE set that the UnzonedChip / control-panel "N more" count is
+   * contractually about — exited tombstones are excluded so a dead session
+   * never inflates it. `exitedUnassignedTabIds` surfaces those tombstones
+   * separately (e.g. "N exited") and drives the dismiss affordance. When no
+   * liveness set is threaded, every tab is treated as live (prior behavior).
+   */
+  const assignedTabIdSet = new Set(Object.values(assignments));
+  const isLive = (id: string) => (liveTabIds ? liveTabIds.has(id) : true);
+  const unassignedTabIds = tabIds.filter((id) => !assignedTabIdSet.has(id) && isLive(id));
+  const exitedUnassignedTabIds = tabIds.filter((id) => !assignedTabIdSet.has(id) && !isLive(id));
 
   /** Is this a multi-zone layout? */
   const isMultiZone = layout.zones.length > 1;
@@ -651,6 +671,7 @@ export function useZoneLayout(
     setMaximizedZone,
     toggleMaximize,
     unassignedTabIds,
+    exitedUnassignedTabIds,
     isMultiZone,
     focusNextNeedsInput,
   };

@@ -701,7 +701,7 @@ export const ZoneControlPanel = React.memo(function ZoneControlPanel({
 }: ZoneControlPanelProps) {
   // Read from contexts
   const session = useTerminalSession();
-  const { tabs, zoneLayout, createTerminal, pageId } = session;
+  const { tabs, zoneLayout, createTerminal, closeTerminal, pageId } = session;
   const assignments = zoneLayout.assignments;
   const focusedZone = zoneLayout.focusedZone;
   const zoneCount = zoneLayout.layout.zones.length;
@@ -976,10 +976,17 @@ export const ZoneControlPanel = React.memo(function ZoneControlPanel({
     return zones.filter((z) => activeFilters.has(z.state));
   }, [zones, activeFilters]);
 
-  // Find unassigned tabs
+  // Find unassigned tabs, split by liveness. Live unassigned = hidden-but-live
+  // (the honest "N more" set); exited unassigned = tombstones surfaced
+  // separately with a dismiss affordance so dead sessions never inflate the
+  // live count.
   const assignedTabIds = useMemo(() => new Set(Object.values(assignments)), [assignments]);
   const unassignedTabs = useMemo(
-    () => tabs.filter((t) => !assignedTabIds.has(t.id)),
+    () => tabs.filter((t) => !assignedTabIds.has(t.id) && t.isAlive),
+    [tabs, assignedTabIds],
+  );
+  const exitedUnassignedTabs = useMemo(
+    () => tabs.filter((t) => !assignedTabIds.has(t.id) && !t.isAlive),
     [tabs, assignedTabIds],
   );
 
@@ -1115,7 +1122,7 @@ export const ZoneControlPanel = React.memo(function ZoneControlPanel({
           ))
         )}
 
-        {/* Unassigned tabs section */}
+        {/* Unassigned tabs section — hidden-but-LIVE sessions only. */}
         {unassignedTabs.length > 0 && (
           <div className="mt-3 pt-2 border-t border-[#2a2d3d]/50">
             <div className="px-2 text-[10px] font-semibold text-[#414868] uppercase tracking-wider mb-1">
@@ -1133,10 +1140,44 @@ export const ZoneControlPanel = React.memo(function ZoneControlPanel({
                     style={{ backgroundColor: STATE_COLORS[state] }}
                   />
                   <span className="flex-1 text-[11px] truncate">{tab.title}</span>
-                  {!tab.isAlive && <span className="text-[9px] text-[#f7768e]/50">exited</span>}
                 </div>
               );
             })}
+          </div>
+        )}
+
+        {/* Exited tombstones — dead sessions, counted separately from the live
+            "Unassigned" count, each with a bridge-addressable dismiss action. */}
+        {exitedUnassignedTabs.length > 0 && (
+          <div
+            className="mt-3 pt-2 border-t border-[#2a2d3d]/50"
+            data-page-element="exited-sessions"
+          >
+            <div className="px-2 text-[10px] font-semibold text-[#414868] uppercase tracking-wider mb-1">
+              Exited ({exitedUnassignedTabs.length})
+            </div>
+            {exitedUnassignedTabs.map((tab) => (
+              <div
+                key={tab.id}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded text-[#565f89]/70 group"
+              >
+                <span className="w-1.5 h-1.5 rounded-full shrink-0 bg-[#f7768e]/60" />
+                <span className="flex-1 text-[11px] truncate">{tab.title}</span>
+                <span className="text-[9px] text-[#f7768e]/50 shrink-0">
+                  exited ({tab.exitCode ?? "?"})
+                </span>
+                <button
+                  type="button"
+                  onClick={() => closeTerminal(tab.id)}
+                  data-ui-bridge-id={`terminal.dismiss-exited-${tab.id}`}
+                  title="Dismiss this exited session"
+                  aria-label={`Dismiss exited session ${tab.title}`}
+                  className="shrink-0 p-0.5 rounded text-[#565f89] hover:text-[#f7768e] hover:bg-[#2a2d3d] transition-colors"
+                >
+                  <X className="w-3 h-3" />
+                </button>
+              </div>
+            ))}
           </div>
         )}
       </div>

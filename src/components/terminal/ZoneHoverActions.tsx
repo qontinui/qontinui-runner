@@ -350,11 +350,14 @@ export function ZoneHoverActions({ zoneIdx, onExportZone }: ZoneHoverActionsProp
           )}
         </div>
 
-        {/* Close */}
+        {/* Close — also the addressable dismiss for an in-zone exited
+            tombstone. Stamped per-tab so automation can dismiss a specific
+            dead session (text-independent, stable). */}
         <button
           type="button"
           onClick={handleClose}
           disabled={!hasTab}
+          {...(hasTab && tabId ? { "data-ui-bridge-id": `terminal.close-session-${tabId}` } : {})}
           className="p-1 rounded text-[#565f89] hover:text-[#f7768e] hover:bg-[#f7768e]/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           title="Close session (Ctrl+Shift+W)"
           aria-label="Close session"

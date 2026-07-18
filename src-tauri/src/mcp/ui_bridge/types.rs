@@ -57,12 +57,43 @@ impl RequestHints for UIBridgeActionRequest {
     }
 }
 
-/// Request to execute an action on a component
+/// Request to execute an action on a component.
+///
+/// Accepts BOTH the wrapped shape `{"params":{...}}` and the bare shape the
+/// action's own `paramSchema` advertises (`{"layoutId":"single"}`). Flat
+/// top-level keys are captured via `#[serde(flatten)] extra` and merged into
+/// `params` by [`Self::merged_params`] — the same predictable "the schema IS
+/// the contract" handling the element-action route already uses
+/// (`UIBridgeActionRequest.extra` + the merge in `elements.rs`).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UIBridgeComponentActionRequest {
     #[serde(default)]
     pub(crate) params: Option<serde_json::Value>,
+    /// Capture any extra top-level fields (the bare `{"layoutId":"single"}`
+    /// shape) so they can be merged into `params`.
+    #[serde(flatten)]
+    pub(crate) extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl UIBridgeComponentActionRequest {
+    /// Resolve the effective params object, merging any flat top-level keys
+    /// (`extra`) into an explicit `params` object. Explicit `params` wins on
+    /// key collision (`.entry(k).or_insert(v)`), mirroring the element-action
+    /// merge precedence in `elements.rs`.
+    pub(crate) fn merged_params(self) -> Option<serde_json::Value> {
+        if self.extra.is_empty() {
+            return self.params;
+        }
+        let mut base = match self.params {
+            Some(serde_json::Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        };
+        for (k, v) in self.extra {
+            base.entry(k).or_insert(v);
+        }
+        Some(serde_json::Value::Object(base))
+    }
 }
 
 impl RequestHints for UIBridgeComponentActionRequest {}
@@ -544,6 +575,49 @@ pub fn recovery_hint_for(code: &UiBridgeErrorCode) -> RecoveryHint {
         UiBridgeErrorCode::InvalidTabId => RecoveryHint::Unrecoverable,
         UiBridgeErrorCode::ActionNotSupported => RecoveryHint::Unrecoverable,
         UiBridgeErrorCode::InternalError => RecoveryHint::Unrecoverable,
+    }
+}
+
+#[cfg(test)]
+mod component_action_params_tests {
+    //! Lock down that the component-action request accepts BOTH the wrapped
+    //! `{"params":{...}}` shape and the bare shape the action's `paramSchema`
+    //! advertises (`{"layoutId":"single"}`) — the friction fix for the
+    //! undocumented wrapper trap.
+
+    use super::UIBridgeComponentActionRequest;
+
+    fn parse(body: serde_json::Value) -> Option<serde_json::Value> {
+        serde_json::from_value::<UIBridgeComponentActionRequest>(body)
+            .expect("deserialize")
+            .merged_params()
+    }
+
+    #[test]
+    fn bare_shape_is_accepted_as_params() {
+        let out = parse(serde_json::json!({ "layoutId": "single" }));
+        assert_eq!(out, Some(serde_json::json!({ "layoutId": "single" })));
+    }
+
+    #[test]
+    fn wrapped_shape_still_works() {
+        let out = parse(serde_json::json!({ "params": { "layoutId": "quad" } }));
+        assert_eq!(out, Some(serde_json::json!({ "layoutId": "quad" })));
+    }
+
+    #[test]
+    fn explicit_params_wins_over_flat_collision() {
+        let out = parse(serde_json::json!({
+            "params": { "layoutId": "quad" },
+            "layoutId": "single"
+        }));
+        assert_eq!(out, Some(serde_json::json!({ "layoutId": "quad" })));
+    }
+
+    #[test]
+    fn empty_body_yields_no_params() {
+        let out = parse(serde_json::json!({}));
+        assert_eq!(out, None);
     }
 }
 
