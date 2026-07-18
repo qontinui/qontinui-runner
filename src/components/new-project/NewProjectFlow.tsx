@@ -564,7 +564,10 @@ export function NewProjectFlow({ onCreated, onClose }: NewProjectFlowProps) {
               <Pencil className="w-4 h-4" />
               Edit details
             </button>
-            {result?.resumeToken && (
+            {/* A name conflict can't be resumed — the name must change first, so
+                steer to "Edit details" rather than a doomed retry. All other
+                failures (auth, network, push) are resumable from the token. */}
+            {result?.resumeToken && result.error?.field !== "name" && (
               <button
                 className="btn-primary flex items-center gap-2"
                 onClick={() => void runCreate(result.resumeToken)}
