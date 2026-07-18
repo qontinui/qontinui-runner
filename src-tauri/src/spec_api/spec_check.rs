@@ -47,192 +47,23 @@ fn invoke_emit(app_id: &str, snapshot_id: &str, page_ids: Vec<String>, invoked_v
     });
 }
 
-/// Adapt a snapshot payload that may be in either the canonical
-/// [`UIBridgeSnapshot`] shape OR the SDK control-mode shape returned by
-/// `GET /ui-bridge/control/snapshot`. Tries strict parse first; on failure
-/// walks the elements array and fills in the canonical required fields
-/// (`identifier`, `state`, `registeredAt`, `mounted`, `type`) from whatever
-/// the control-mode element carries, then re-parses.
+/// Strict-parse a caller-supplied snapshot as the canonical
+/// [`UIBridgeSnapshot`].
 ///
-/// The two shapes differ because the SDK control-mode serializer emits
-/// elements without the canonical `identifier` / `state` / `registeredAt` /
-/// `mounted` fields. Pre-2026-05-17, callers couldn't round-trip
-/// `/control/snapshot` → `/spec-check.snapshot` (422 missing field). This
-/// adapter is the boundary fix; a v1.1 follow-up unifies the SDK shape
-/// upstream in ui-bridge-auto.
-pub(crate) fn adapt_supplied_snapshot(
+/// ui-bridge >= 0.22.0 emits a canonical SUPERSET on every control-mode
+/// path (elements/components carry `identifier`/`state`/`registeredAt`/
+/// `mounted`, component actions are `ComponentActionInfo` objects, undoRedo
+/// uses `canUndo`/`canRedo`), and serde tolerates the SDK's extra wire
+/// fields, so no boundary adapter sits between the wire and the type any
+/// more (plan 2026-05-17-sdk-canonical-shape-unification deleted
+/// `adapt_supplied_snapshot` + its three shape-patching helpers). A
+/// malformed or pre-0.22.0 payload fails loudly with the serde path in the
+/// existing 422/502 error surface.
+pub(crate) fn parse_supplied_snapshot(
     value: serde_json::Value,
 ) -> Result<UIBridgeSnapshot, String> {
-    // Path 1: strict canonical parse.
-    if let Ok(snap) = serde_json::from_value::<UIBridgeSnapshot>(value.clone()) {
-        return Ok(snap);
-    }
-
-    // Path 2: walk elements + components and synthesize missing canonical
-    // fields. Either array may need fixup independently — strict parse can
-    // fail because of either, so don't require the other to be present.
-    let mut root = match value {
-        serde_json::Value::Object(m) => m,
-        _ => return Err("snapshot payload must be a JSON object".into()),
-    };
-    let timestamp = root.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
-
-    if let Some(elements_arr) = root.get_mut("elements").and_then(|v| v.as_array_mut()) {
-        for el in elements_arr.iter_mut() {
-            if let serde_json::Value::Object(obj) = el {
-                adapt_element_object(obj, timestamp);
-            }
-        }
-    }
-    if let Some(components_arr) = root.get_mut("components").and_then(|v| v.as_array_mut()) {
-        for c in components_arr.iter_mut() {
-            if let serde_json::Value::Object(obj) = c {
-                adapt_component_object(obj, timestamp);
-            }
-        }
-    }
-    if let Some(serde_json::Value::Object(undo)) = root.get_mut("undoRedo") {
-        adapt_undo_redo_object(undo);
-    }
-
-    serde_json::from_value::<UIBridgeSnapshot>(serde_json::Value::Object(root))
-        .map_err(|e| format!("snapshot adapt failed after fill: {e}"))
-}
-
-/// Patch a single SDK control-mode element object into the canonical
-/// [`qontinui_types::ui_bridge::UIBridgeElement`] shape: synthesize the
-/// required structural fields (`type`, `identifier`, `state`,
-/// `registeredAt`, `mounted`) from whatever the wire carries.
-fn adapt_element_object(obj: &mut serde_json::Map<String, serde_json::Value>, timestamp: i64) {
-    // `type` (renamed serde field; raw JSON key is "type")
-    obj.entry("type")
-        .or_insert_with(|| serde_json::Value::String("generic".into()));
-
-    // `identifier` — synthesize from `id` if absent
-    if !obj.contains_key("identifier") {
-        let id_str = obj
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        obj.insert(
-            "identifier".into(),
-            serde_json::json!({
-                "uiId": id_str,
-                "xpath": "",
-                "selector": "",
-            }),
-        );
-    }
-
-    // `state` — synthesize from `bbox` + visibility hints if absent
-    if !obj.contains_key("state") {
-        let (x, y, width, height) = obj
-            .get("bbox")
-            .and_then(|b| b.as_object())
-            .map(|b| {
-                (
-                    b.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                    b.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                    b.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                    b.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                )
-            })
-            .unwrap_or((0.0, 0.0, 0.0, 0.0));
-        let visible = obj
-            .get("visible")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(width > 0.0 && height > 0.0);
-        obj.insert(
-            "state".into(),
-            serde_json::json!({
-                "visible": visible,
-                "enabled": true,
-                "focused": false,
-                "rect": {
-                    "x": x, "y": y, "width": width, "height": height,
-                    "top": y, "left": x,
-                    "right": x + width, "bottom": y + height,
-                },
-            }),
-        );
-    }
-
-    // `registeredAt` — fall back to snapshot timestamp, then 0
-    obj.entry("registeredAt")
-        .or_insert_with(|| serde_json::Value::from(timestamp));
-
-    // `mounted` — default true
-    obj.entry("mounted")
-        .or_insert_with(|| serde_json::Value::Bool(true));
-}
-
-/// Patch the SDK control-mode `undoRedo` sub-object into the canonical
-/// [`qontinui_types::ui_bridge::UIBridgeUndoContext`] shape:
-///  - `undoAvailable` → `canUndo`, `redoAvailable` → `canRedo` (same data,
-///    different wire names).
-///  - Leaves `summary` and any matching optional fields alone.
-///  - Does NOT rename if the canonical names are already present (caller
-///    sent a canonical-shape blob).
-fn adapt_undo_redo_object(obj: &mut serde_json::Map<String, serde_json::Value>) {
-    if !obj.contains_key("canUndo") {
-        if let Some(v) = obj.remove("undoAvailable") {
-            obj.insert("canUndo".into(), v);
-        }
-    }
-    if !obj.contains_key("canRedo") {
-        if let Some(v) = obj.remove("redoAvailable") {
-            obj.insert("canRedo".into(), v);
-        }
-    }
-}
-
-/// Patch a single SDK control-mode component object into the canonical
-/// [`qontinui_types::ui_bridge::UIBridgeComponent`] shape:
-///  - `actions: ["str", ...]` → `actions: [{ id: "str" }, ...]` (the canonical
-///    type wants `Vec<ComponentActionInfo>` with `id`, optional `label`,
-///    optional `description`; the SDK wire carries bare action-name strings).
-///  - Synthesize `registeredAt` from the snapshot timestamp + `mounted: true`.
-///  - Strip every wire field outside the canonical set so
-///    `#[schemars(deny_unknown_fields)]` doesn't reject. Observed
-///    wire-only field on the runner today: `actionInvocationPath`. Whitelist
-///    rather than blacklist so future SDK additions don't silently break us.
-fn adapt_component_object(obj: &mut serde_json::Map<String, serde_json::Value>, timestamp: i64) {
-    // 1. Convert `actions: [str]` to `actions: [{id: str}]`.
-    if let Some(serde_json::Value::Array(arr)) = obj.get_mut("actions") {
-        let needs_conversion = arr.iter().any(|v| v.is_string());
-        if needs_conversion {
-            let converted: Vec<serde_json::Value> = arr
-                .iter()
-                .map(|v| match v {
-                    serde_json::Value::String(s) => serde_json::json!({ "id": s }),
-                    serde_json::Value::Object(_) => v.clone(), // already canonical
-                    _ => serde_json::json!({ "id": v.to_string() }),
-                })
-                .collect();
-            *arr = converted;
-        }
-    }
-
-    // 2. Defaults for required fields.
-    obj.entry("registeredAt")
-        .or_insert_with(|| serde_json::Value::from(timestamp));
-    obj.entry("mounted")
-        .or_insert_with(|| serde_json::Value::Bool(true));
-
-    // 3. Whitelist-prune: keep only the canonical key set. The schema is
-    //    `#[schemars(deny_unknown_fields)]`, so any extra wire key (e.g.
-    //    the observed `actionInvocationPath`) trips deserialize.
-    const CANONICAL_COMPONENT_KEYS: &[&str] = &[
-        "id",
-        "name",
-        "description",
-        "actions",
-        "elementIds",
-        "registeredAt",
-        "mounted",
-    ];
-    obj.retain(|k, _| CANONICAL_COMPONENT_KEYS.contains(&k.as_str()));
+    serde_json::from_value::<UIBridgeSnapshot>(value)
+        .map_err(|e| format!("strict canonical parse: {e}"))
 }
 
 /// Roll up a single `SpecCheckResult` (or many) into the `SpecCheckCompleted`
@@ -368,15 +199,13 @@ pub(crate) async fn fetch_fresh_snapshot(
             // strict `serde_json::from_value::<UIBridgeSnapshot>` would parse
             // the envelope as a default zero-element snapshot, silently
             // producing matchRate=0 on every downstream evaluate(). Unwrap
-            // `data` (mirroring fetch_self_snapshot, ~line 408 below) and
-            // route through adapt_supplied_snapshot so the SDK control-mode
-            // shape (no canonical `identifier`/`state`/`registeredAt`/
-            // `mounted` fields on elements) is normalized before strict
-            // parse. Then synthesize the fingerprint directly — avoids a
-            // serde round-trip through wrap_snapshot.
+            // `data` (mirroring fetch_self_snapshot below) and strict-parse:
+            // ui-bridge >= 0.22.0 emits the canonical superset directly.
+            // Then synthesize the fingerprint directly — avoids a serde
+            // round-trip through wrap_snapshot.
             let inner = value.get("data").cloned().unwrap_or(value.clone());
-            let snapshot = adapt_supplied_snapshot(inner).map_err(|e| {
-                spec_check::SnapshotFetchError::Malformed(format!("sdk-snapshot adapt: {e}"))
+            let snapshot = parse_supplied_snapshot(inner).map_err(|e| {
+                spec_check::SnapshotFetchError::Malformed(format!("sdk-snapshot parse: {e}"))
             })?;
             let content_sha256 =
                 qontinui_types::canonical_hash::canonical_hash(&value).map_err(|e| {
@@ -410,9 +239,9 @@ pub(crate) async fn fetch_fresh_snapshot(
 /// previously, `fetch_fresh_snapshot` returned `NotConnected` unconditionally
 /// in this case, leaving the runner unable to spec-check its own UI.
 ///
-/// The SDK control-mode shape differs from the canonical [`UIBridgeSnapshot`];
-/// we route the response through [`adapt_supplied_snapshot`] (Issue 2 adapter)
-/// before wrapping. App identity is synthesized — `app_id = "self"`.
+/// ui-bridge >= 0.22.0 emits the canonical [`UIBridgeSnapshot`] superset on
+/// the control-mode wire, so the response strict-parses via
+/// [`parse_supplied_snapshot`]. App identity is synthesized — `app_id = "self"`.
 async fn fetch_self_snapshot() -> Result<
     (
         UIBridgeSnapshot,
@@ -456,8 +285,8 @@ async fn fetch_self_snapshot() -> Result<
     // `{success, data}`. The inner `data` is the snapshot shape.
     let inner = body.get("data").cloned().unwrap_or(body);
 
-    let snapshot = adapt_supplied_snapshot(inner)
-        .map_err(|e| E::Malformed(format!("self-snapshot adapt: {e}")))?;
+    let snapshot = parse_supplied_snapshot(inner)
+        .map_err(|e| E::Malformed(format!("self-snapshot parse: {e}")))?;
 
     let fingerprint = qontinui_types::spec_check::BridgeFingerprint {
         app_id: "self".to_string(),
@@ -558,10 +387,10 @@ pub struct SpecCheckRequest {
     /// yields a 400 deserialize error rather than a silent default.
     pub app_id: String,
     pub page_id: String,
-    /// Optional caller-supplied snapshot. Accepted in either the canonical
-    /// [`UIBridgeSnapshot`] shape OR the SDK control-mode shape (the output
-    /// of `GET /ui-bridge/control/snapshot`); converted via
-    /// [`adapt_supplied_snapshot`] before evaluation.
+    /// Optional caller-supplied snapshot in the canonical
+    /// [`UIBridgeSnapshot`] shape — which ui-bridge >= 0.22.0 emits directly
+    /// on `GET /ui-bridge/control/snapshot`; strict-parsed via
+    /// [`parse_supplied_snapshot`] before evaluation.
     #[serde(default)]
     pub snapshot: Option<serde_json::Value>,
 }
@@ -640,12 +469,12 @@ pub async fn post_spec_check(
     // Fetch snapshot (fresh or supplied).
     let (snapshot, fingerprint, snapshot_id, content_hash) = match req.snapshot {
         Some(raw) => {
-            // Caller-supplied path: try-strict-then-adapt to accept both the
-            // canonical UIBridgeSnapshot shape and the SDK control-mode shape
-            // out of GET /ui-bridge/control/snapshot. Skip wrap_snapshot;
+            // Caller-supplied path: strict canonical parse — ui-bridge >=
+            // 0.22.0 emits the canonical superset on
+            // GET /ui-bridge/control/snapshot. Skip wrap_snapshot;
             // synthesize the fingerprint locally. Snapshot identity for
             // replay is the caller's responsibility.
-            let s = match adapt_supplied_snapshot(raw) {
+            let s = match parse_supplied_snapshot(raw) {
                 Ok(s) => s,
                 Err(detail) => {
                     return (
@@ -771,9 +600,9 @@ pub struct BatchRequest {
 #[serde(rename_all = "camelCase")]
 pub struct BatchSnapshot {
     pub source: String, // "fresh" | "supplied"
-    /// Optional supplied snapshot. Same wire-shape flexibility as
-    /// [`SpecCheckRequest::snapshot`] — canonical [`UIBridgeSnapshot`] or
-    /// SDK control-mode output; adapted via [`adapt_supplied_snapshot`].
+    /// Optional supplied snapshot. Same wire shape as
+    /// [`SpecCheckRequest::snapshot`] — the canonical [`UIBridgeSnapshot`]
+    /// superset; strict-parsed via [`parse_supplied_snapshot`].
     #[serde(default)]
     pub blob: Option<serde_json::Value>,
 }
@@ -817,7 +646,7 @@ pub async fn post_spec_check_batch(
             Err(err) => return snapshot_error_to_response(err),
         },
         "supplied" => match req.snapshot.blob {
-            Some(raw) => match adapt_supplied_snapshot(raw) {
+            Some(raw) => match parse_supplied_snapshot(raw) {
                 Ok(s) => {
                     // Mirror the single supplied path: bind the synthesized
                     // fingerprint to the requested app; no raw bytes hashed
@@ -842,7 +671,7 @@ pub async fn post_spec_check_batch(
                         StatusCode::UNPROCESSABLE_ENTITY,
                         Json(SpecError::with_detail(
                             "snapshot-malformed",
-                            json!({ "cause": "supplied-snapshot-adapt-failed", "detail": detail }),
+                            json!({ "cause": "supplied-snapshot-parse-failed", "detail": detail }),
                         )),
                     )
                         .into_response();
@@ -1413,9 +1242,9 @@ mod tests {
     async fn snapshot_error_malformed_forwards_inner_detail() {
         // Bug C / 2026-05-17: the user-facing envelope must carry the inner
         // String so /spec-check (and self-snapshot) callers don't lose the
-        // adapter's "snapshot adapt failed after fill: ..." message under
+        // strict parser's "strict canonical parse: ..." serde path under
         // the opaque "malformed" label.
-        let inner = "self-snapshot adapt: invalid type: string \"x\", expected struct Foo";
+        let inner = "self-snapshot parse: invalid type: string \"x\", expected struct Foo";
         let resp = snapshot_error_to_response(spec_check::SnapshotFetchError::Malformed(
             inner.to_string(),
         ));
@@ -1726,228 +1555,95 @@ mod tests {
     }
 
     // ------------------------------------------------------------------------
-    // adapt_supplied_snapshot — try-strict-then-adapt
+    // parse_supplied_snapshot — strict canonical parse (adapter deleted,
+    // plan 2026-05-17-sdk-canonical-shape-unification)
     // ------------------------------------------------------------------------
 
     #[test]
-    fn adapt_supplied_snapshot_passes_through_canonical_shape() {
-        // A snapshot already in the canonical shape should round-trip
-        // without modification.
+    fn parse_supplied_snapshot_accepts_canonical_shape() {
+        // A snapshot in the canonical shape round-trips without modification.
         let s: UIBridgeSnapshot =
             serde_json::from_value(minimal_snapshot_json()).expect("fixture parses");
         let raw = serde_json::to_value(&s).expect("serialize");
-        let adapted = adapt_supplied_snapshot(raw).expect("strict-parse path");
-        assert_eq!(adapted.timestamp, s.timestamp);
-        assert_eq!(adapted.elements.len(), s.elements.len());
+        let parsed = parse_supplied_snapshot(raw).expect("strict-parse path");
+        assert_eq!(parsed.timestamp, s.timestamp);
+        assert_eq!(parsed.elements.len(), s.elements.len());
     }
 
     #[test]
-    fn adapt_supplied_snapshot_fills_missing_fields_from_control_mode() {
-        // Mimic the SDK control-mode element shape: `id`, `actions`, `bbox`,
-        // `category` present; `identifier`, `state`, `registeredAt`,
-        // `mounted`, `type` absent. Adapter must synthesize.
-        let raw = json!({
-            "timestamp": 1_700_000_000_000_i64,
-            "elements": [
-                {
-                    "id": "button-submit",
-                    "category": "interactive",
-                    "actions": ["focus", "click", "hover"],
-                    "bbox": { "x": 100.0, "y": 200.0, "width": 80.0, "height": 24.0 },
-                    "role": "button",
-                    "text": "Submit",
-                }
-            ],
-            "components": []
-        });
-        let adapted = adapt_supplied_snapshot(raw).expect("control-mode adapt");
-        assert_eq!(adapted.elements.len(), 1);
-        let el = &adapted.elements[0];
-        assert_eq!(el.id, "button-submit");
-        assert_eq!(el.element_type, "generic"); // synthesized default
-        assert_eq!(el.identifier.ui_id.as_deref(), Some("button-submit"));
-        assert!(el.mounted);
-        assert!(el.state.visible); // 80x24 bbox → derived visible=true
-        assert_eq!(el.state.rect.x, 100.0);
-        assert_eq!(el.state.rect.width, 80.0);
-        assert_eq!(el.state.rect.right, 180.0);
-        assert_eq!(el.state.rect.bottom, 224.0);
-        assert_eq!(el.role.as_deref(), Some("button")); // preserved from input
-        assert_eq!(el.text.as_deref(), Some("Submit"));
+    fn parse_supplied_snapshot_rejects_non_object_payload() {
+        assert!(parse_supplied_snapshot(json!("not an object")).is_err());
     }
 
     #[test]
-    fn adapt_supplied_snapshot_marks_invisible_when_bbox_zero() {
-        // Zero-bbox should derive state.visible = false (matches the SDK's
-        // `bbox.width > 0 && bbox.height > 0` convention).
-        let raw = json!({
-            "timestamp": 0i64,
-            "elements": [{
-                "id": "hidden",
-                "bbox": { "x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0 },
-            }],
-        });
-        let adapted = adapt_supplied_snapshot(raw).expect("adapt");
-        assert!(!adapted.elements[0].state.visible);
-    }
-
-    #[test]
-    fn adapt_supplied_snapshot_rejects_non_object_payload() {
-        let raw = json!([1, 2, 3]);
-        assert!(adapt_supplied_snapshot(raw).is_err());
-    }
-
-    #[test]
-    fn adapt_supplied_snapshot_accepts_missing_elements_as_empty() {
-        // Canonical UIBridgeSnapshot.elements carries #[serde(default)], so
-        // a payload with `timestamp` but no `elements` is a valid empty
-        // snapshot at the strict-parse layer. The adapter must NOT reject
-        // it (it never reaches the fill-path).
-        let raw = json!({ "timestamp": 42 });
-        let snap = adapt_supplied_snapshot(raw).expect("missing elements is valid empty");
-        assert_eq!(snap.timestamp, 42);
+    fn parse_supplied_snapshot_accepts_missing_elements_as_empty() {
+        // `elements`/`components`/`workflows` are `#[serde(default)]` on the
+        // canonical type; an empty snapshot object is a valid empty snapshot.
+        let snap = parse_supplied_snapshot(json!({ "timestamp": 5i64 }))
+            .expect("missing arrays are valid empty");
         assert!(snap.elements.is_empty());
+        assert_eq!(snap.timestamp, 5);
     }
 
     #[test]
-    fn adapt_supplied_snapshot_preserves_explicit_visible_flag() {
-        // If the SDK emits `visible: false` even with a non-zero bbox,
-        // honor the explicit value.
+    fn parse_supplied_snapshot_rejects_pre_0_22_control_mode_shape() {
+        // The pre-0.22.0 SDK wire (no identifier/state/registeredAt/mounted,
+        // bare-string component actions) must fail LOUDLY with a serde path
+        // now that the shape-patching adapter is gone — silent shape-patching
+        // is exactly what the unification removed.
         let raw = json!({
-            "timestamp": 0i64,
+            "timestamp": 1000i64,
             "elements": [{
-                "id": "off-screen-but-sized",
-                "bbox": { "x": 0.0, "y": 0.0, "width": 50.0, "height": 50.0 },
-                "visible": false,
-            }],
+                "id": "btn-1",
+                "actions": ["click"],
+                "bbox": { "x": 1.0, "y": 2.0, "width": 30.0, "height": 40.0 },
+            }]
         });
-        let adapted = adapt_supplied_snapshot(raw).expect("adapt");
-        assert!(!adapted.elements[0].state.visible);
-    }
-
-    #[test]
-    fn adapt_supplied_snapshot_adapts_components_action_strings_and_strips_unknown_fields() {
-        // Bug A / 2026-05-17: live /control/snapshot components have:
-        //  - `actions: ["create-terminal", "list-terminals"]` (strings, not
-        //    ComponentActionInfo objects)
-        //  - extra wire field `actionInvocationPath` (not on the canonical
-        //    `UIBridgeComponent`; `#[schemars(deny_unknown_fields)]` rejects)
-        //  - no `registeredAt` or `mounted`
-        // The adapter must fix all three.
-        let raw = json!({
-            "timestamp": 1_700_000_000_000_i64,
-            "elements": [],
-            "components": [
-                {
-                    "id": "terminal-page",
-                    "name": "TerminalPage",
-                    "description": "main terminal view",
-                    "actions": ["create-terminal", "list-terminals"],
-                    "elementIds": ["btn-1", "btn-2"],
-                    // wire-only field; deny_unknown_fields would reject:
-                    "actionInvocationPath": "/terminal-page",
-                }
-            ]
-        });
-        let adapted = adapt_supplied_snapshot(raw).expect("components must adapt");
-        assert_eq!(adapted.components.len(), 1);
-        let c = &adapted.components[0];
-        assert_eq!(c.id, "terminal-page");
-        assert_eq!(c.name, "TerminalPage");
-        assert_eq!(c.actions.len(), 2);
-        assert_eq!(c.actions[0].id, "create-terminal");
-        assert!(c.actions[0].label.is_none());
-        assert_eq!(c.actions[1].id, "list-terminals");
-        assert_eq!(c.registered_at, 1_700_000_000_000_i64);
-        assert!(c.mounted);
-        assert_eq!(
-            c.element_ids.as_deref(),
-            Some(&["btn-1".to_string(), "btn-2".to_string()][..])
+        let err = parse_supplied_snapshot(raw).expect_err("legacy wire must be rejected");
+        assert!(
+            err.contains("strict canonical parse"),
+            "error should carry the strict-parse prefix; got {err}"
         );
     }
 
     #[test]
-    fn adapt_supplied_snapshot_preserves_canonical_component_actions() {
-        // If a caller already sends actions in the canonical
-        // ComponentActionInfo[] shape (id + optional label/description),
-        // the adapter must not double-wrap.
-        let raw = json!({
-            "timestamp": 0i64,
-            "elements": [],
-            "components": [{
-                "id": "x",
-                "name": "X",
-                "actions": [{ "id": "do-thing", "label": "Do It" }],
-            }]
-        });
-        let adapted = adapt_supplied_snapshot(raw).expect("canonical actions pass through");
-        let c = &adapted.components[0];
-        assert_eq!(c.actions.len(), 1);
-        assert_eq!(c.actions[0].id, "do-thing");
-        assert_eq!(c.actions[0].label.as_deref(), Some("Do It"));
-    }
+    fn parse_supplied_snapshot_accepts_live_0_22_fixture() {
+        // Captured from ui-bridge 0.22.0 `createSnapshot()` (the payload
+        // `GET /ui-bridge/control/snapshot` serves): the canonical superset
+        // with every SDK extra on the wire (tagName, category/kind, stableRef,
+        // origin, componentActionBasePath, actionInvocationPath, scope,
+        // registration metadata, visibility, undoDepth, ...). Strict parse
+        // must succeed and read the canonical fields through the extras.
+        let raw: serde_json::Value = serde_json::from_str(include_str!(
+            "fixtures/sdk_0_22_control_snapshot.json"
+        ))
+        .expect("fixture is valid JSON");
+        let snap = parse_supplied_snapshot(raw).expect("0.22.0 wire strict-parses");
 
-    #[test]
-    fn adapt_supplied_snapshot_renames_undo_redo_wire_names() {
-        // Bug iter-3 / 2026-05-17: wire emits `undoAvailable` + `redoAvailable`;
-        // canonical UIBridgeUndoContext expects `canUndo` + `canRedo`.
-        // Without the rename, /spec-check returns 502 with
-        // "missing field `canUndo`" any time the supplied snapshot (or the
-        // self-snapshot fallback) carries an undoRedo block.
-        let raw = json!({
-            "timestamp": 0i64,
-            "elements": [],
-            "components": [],
-            "undoRedo": {
-                "undoAvailable": true,
-                "redoAvailable": false,
-                "summary": "Undo: Foo",
-            }
-        });
-        let adapted = adapt_supplied_snapshot(raw).expect("undoRedo must adapt");
-        let undo = adapted.undo_redo.expect("undo_redo populated");
+        assert_eq!(snap.elements.len(), 2);
+        let el = &snap.elements[0];
+        assert_eq!(el.id, "save-btn");
+        assert_eq!(el.element_type, "button");
+        assert!(!el.identifier.xpath.is_empty());
+        assert!(el.mounted);
+        assert!(el.registered_at > 0);
+
+        assert_eq!(snap.components.len(), 1);
+        let comp = &snap.components[0];
+        assert_eq!(comp.id, "editor");
+        assert!(comp.mounted);
+        assert_eq!(comp.actions.len(), 2);
+        assert_eq!(comp.actions[0].id, "save");
+        assert_eq!(comp.actions[0].label.as_deref(), Some("Save"));
+        assert_eq!(comp.actions[1].id, "reset");
+
+        let undo = snap.undo_redo.expect("undoRedo present");
         assert!(undo.can_undo);
         assert!(!undo.can_redo);
-        assert_eq!(undo.summary, "Undo: Foo");
-    }
+        assert_eq!(undo.summary, "Can undo (Typing).");
 
-    #[test]
-    fn adapt_supplied_snapshot_preserves_canonical_undo_redo_names() {
-        // If the caller already sends canUndo/canRedo, the adapter must
-        // not double-rename or clobber.
-        let raw = json!({
-            "timestamp": 0i64,
-            "elements": [],
-            "components": [],
-            "undoRedo": {
-                "canUndo": true,
-                "canRedo": true,
-                "summary": "Canonical input",
-            }
-        });
-        let adapted = adapt_supplied_snapshot(raw).expect("canonical passes through");
-        let undo = adapted.undo_redo.expect("undo_redo populated");
-        assert!(undo.can_undo);
-        assert!(undo.can_redo);
-    }
-
-    #[test]
-    fn adapt_supplied_snapshot_walks_components_when_elements_absent() {
-        // Regression for the pre-Bug-A behavior where the walker required
-        // an `elements` array even when only `components` needed fixup.
-        let raw = json!({
-            "timestamp": 0i64,
-            "components": [{
-                "id": "c1",
-                "name": "C1",
-                "actions": ["only-action"],
-                "actionInvocationPath": "drops me",
-            }]
-        });
-        let adapted = adapt_supplied_snapshot(raw).expect("missing elements is fine");
-        assert!(adapted.elements.is_empty());
-        assert_eq!(adapted.components.len(), 1);
-        assert_eq!(adapted.components[0].actions[0].id, "only-action");
+        assert_eq!(snap.workflows.len(), 1);
+        assert_eq!(snap.workflows[0].step_count, 1);
     }
 
     // ------------------------------------------------------------------------
