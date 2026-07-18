@@ -313,9 +313,29 @@ pub async fn get_account_usage(
     })))
 }
 
+/// GET /analytics/prepaid-balance
+///
+/// Probes configured prepaid (pay-as-you-go) providers for their remaining
+/// credit balance. Currently DeepSeek only; returns an empty list when no
+/// prepaid provider / API key is configured. Distinct from
+/// `/analytics/account-usage` because prepaid balance is a money amount, not a
+/// rolling utilization percentage.
+pub async fn get_prepaid_balance(
+    State(_state): State<Arc<ApiState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let balances = crate::ai_provider::prepaid_balance::get_prepaid_balances().await;
+    let count = balances.len();
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": balances,
+        "count": count,
+    })))
+}
+
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/analytics/account-usage", get(get_account_usage))
+        .route("/analytics/prepaid-balance", get(get_prepaid_balance))
         .route(
             "/analytics/token-usage/summary",
             get(get_token_usage_summary),
