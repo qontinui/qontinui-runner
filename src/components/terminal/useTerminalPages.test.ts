@@ -90,12 +90,28 @@ describe("reconcilePages", () => {
     expect(out).toBe(persisted);
   });
 
-  it("never synthesizes a tab for 'default' even when only the durable source reports it", () => {
+  it("does not duplicate 'default' when it is already persisted (both backend sources report it)", () => {
     const persisted = [DEFAULT];
     const out = reconcilePages(persisted, ["default", "default"]);
-    // Nothing missing → same reference returned, single default tab.
+    // Already known → nothing missing → same reference returned, single default tab.
     expect(out).toBe(persisted);
     expect(out.map((p) => p.id)).toEqual(["default"]);
+  });
+
+  it("synthesizes a 'Terminal' tab for 'default' when the operator layout dropped it but the backend still parks terminals there", () => {
+    // The orphaning bug: once the operator has created pages, `loadPages` no
+    // longer injects the default page, so it is ABSENT from `persisted`. A
+    // terminal created via `POST /terminals` with no pageId lands on "default"
+    // and must still get a visible, selectable tab (regression for the
+    // 2026-07-18 fan-out, where API-spawned terminals vanished onto "default").
+    const persisted: TerminalPageConfig[] = [
+      { id: "op-a", name: "My Work", createdAt: 100 },
+      { id: "op-b", name: "Logs", createdAt: 200 },
+    ];
+    const out = reconcilePages(persisted, ["default", "op-a"]);
+    expect(out.map((p) => p.id)).toEqual(["op-a", "op-b", "default"]);
+    // "default" keeps its canonical name, not a sequential "Page N".
+    expect(out.find((p) => p.id === "default")!.name).toBe("Terminal");
   });
 
   it("normalizes an empty/falsy backend id to 'default' (no spurious tab)", () => {

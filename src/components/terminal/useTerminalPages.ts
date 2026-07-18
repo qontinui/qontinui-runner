@@ -56,7 +56,12 @@ function savePages(pages: TerminalPageConfig[]) {
  * Pure reconciliation: union the persisted page tabs with the distinct backend
  * page_ids, synthesizing a tab for any backend id NOT already persisted so a
  * minted page (and continuations restored onto it) get a visible, selectable
- * tab. "default" is always present already (loadPages) — never synthesized.
+ * tab. This INCLUDES "default": `loadPages` only injects the default page when
+ * NO pages are persisted, so once the operator has created their own pages the
+ * default page is absent from the persisted list — a terminal parked on
+ * "default" (e.g. any created via `POST /terminals` with no `pageId`) would
+ * then render nowhere. Synthesizing it here (named "Terminal", its canonical
+ * name) is what keeps such a terminal reachable instead of orphaned.
  * Operator-created pages and their names are left intact (only ADD missing ids;
  * never rename/remove existing). Synthesized names are sequential ("Page N")
  * based on the count of existing non-default pages, so they're deterministic
@@ -103,7 +108,6 @@ export function reconcilePages(
   const missing: string[] = [];
   for (const rawId of backendPageIds) {
     const id = rawId || "default";
-    if (id === "default") continue;
     if (known.has(id)) continue;
     known.add(id); // dedupe across both backend sources
     missing.push(id);
@@ -114,7 +118,9 @@ export function reconcilePages(
   const now = Date.now();
   const synthesized = missing.map((id) => ({
     id,
-    name: `Page ${nextN++}`,
+    // "default" keeps its canonical name (matches `loadPages`); any other
+    // minted id gets a sequential "Page N".
+    name: id === "default" ? "Terminal" : `Page ${nextN++}`,
     createdAt: now,
   }));
   return [...persisted, ...synthesized];
