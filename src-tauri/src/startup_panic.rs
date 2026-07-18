@@ -201,15 +201,7 @@ pub fn install_startup_panic_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Tests in this module manipulate process-wide env vars
-    /// (`QONTINUI_RUNNER_LOG_DIR`, `QONTINUI_RUNNER_ID`), so they must be
-    /// serialised against each other. `cargo test` runs tests in a
-    /// multi-threaded pool by default; without this guard a set-var in one
-    /// test races with a remove-var in another and the file-creation
-    /// tests intermittently write to the wrong directory.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::test_env::env_lock;
 
     /// Scope-guard that clears the env vars this module touches on drop,
     /// so a test-panic can't leak state into sibling tests.
@@ -224,7 +216,7 @@ mod tests {
 
     #[test]
     fn format_panic_log_includes_all_fields() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = env_lock();
         let _g = EnvGuard;
         std::env::set_var("QONTINUI_RUNNER_ID", "test-runner-42");
         let body = format_panic_log(
@@ -256,7 +248,7 @@ mod tests {
 
     #[test]
     fn resolve_log_dir_honors_env_var() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = env_lock();
         let _g = EnvGuard;
         let tmp = std::env::temp_dir().join("qontinui-startup-panic-test-env");
         std::env::set_var("QONTINUI_RUNNER_LOG_DIR", &tmp);
@@ -265,7 +257,7 @@ mod tests {
 
     #[test]
     fn resolve_log_dir_ignores_empty_env_var() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = env_lock();
         let _g = EnvGuard;
         std::env::set_var("QONTINUI_RUNNER_LOG_DIR", "   ");
         let dir = resolve_log_dir();
@@ -277,7 +269,7 @@ mod tests {
 
     #[test]
     fn write_panic_log_creates_file_with_expected_content() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = env_lock();
         let _g = EnvGuard;
         let tmp = std::env::temp_dir().join("qontinui-startup-panic-test-write");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -303,7 +295,7 @@ mod tests {
 
     #[test]
     fn write_panic_log_overwrites_existing_file() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = env_lock();
         let _g = EnvGuard;
         let tmp = std::env::temp_dir().join("qontinui-startup-panic-test-overwrite");
         let _ = std::fs::remove_dir_all(&tmp);

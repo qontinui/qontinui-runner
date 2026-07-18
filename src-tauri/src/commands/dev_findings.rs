@@ -151,6 +151,8 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
 mod tests {
     use super::*;
 
+    use crate::test_env::env_lock;
+
     // These assertions all touch the same process-global env var
     // (`QONTINUI_DEV_ENDPOINTS`), so they cannot run as separate
     // `#[test]` functions — cargo's default thread pool would let them
@@ -162,6 +164,7 @@ mod tests {
     // by construction.
     #[test]
     fn gate_reads_env_var() {
+        let _env_lock = env_lock();
         std::env::remove_var(DEV_ENV_VAR);
         assert!(
             !is_dev_endpoints_enabled(),

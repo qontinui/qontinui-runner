@@ -345,6 +345,8 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
 mod tests {
     use super::*;
 
+    use crate::test_env::env_lock;
+
     #[test]
     fn route_entries_match_route_count() {
         // Keep in lockstep with the `.route(` calls in `routes()`.
@@ -357,6 +359,7 @@ mod tests {
 
     #[test]
     fn view_control_is_disabled_unless_flag_is_exactly_1() {
+        let _env_lock = env_lock();
         // P1's capability gate. Default (unset) MUST be disabled — a released
         // operator build must not expose the view-open footgun.
         std::env::remove_var(VIEW_CONTROL_FLAG);

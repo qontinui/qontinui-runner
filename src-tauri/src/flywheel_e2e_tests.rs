@@ -51,6 +51,7 @@ use crate::spec_api::types::{
 use crate::spec_api::validator::{
     gate_b_execution_green_with_snapshot, gate_coverage, ValidatorError,
 };
+use crate::test_env::env_lock;
 use crate::workflow_generation::coverage::{coverage_of, generate_regression_suite};
 use crate::workflow_generation::spec_authoring::{merge_patch_into_ir, IrPatch};
 
@@ -66,7 +67,8 @@ use tempfile::TempDir;
 
 /// Holds a temp specs root + makes it the resolved `QONTINUI_SPECS_ROOT` for
 /// the duration of a single test. NOT for parallel use — set via env var,
-/// so each test serializes on `ENV_GUARD` if it relies on the override.
+/// so each test serializes on the shared `crate::test_env::env_lock` if it
+/// relies on the override.
 struct TestEnv {
     tmp: TempDir,
 }
@@ -632,12 +634,12 @@ async fn flywheel_patch_preserves_hand_authored() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn flywheel_validator_rejects_low_coverage() {
-    // Serialize on the env-var guard — gate_coverage reads
-    // QONTINUI_SPEC_COVERAGE_FLOOR and the validator's unit tests share
-    // the same env-var with their own Mutex; we don't have access to that
-    // Mutex from an integration test, so we make sure the env var is unset
-    // and accept that parallel test execution against the same env var
-    // (other tests in this file don't touch it) is safe here.
+    // Serialize on the shared crate-wide env lock — gate_coverage reads
+    // QONTINUI_SPEC_COVERAGE_FLOOR, the SAME var the validator's unit tests
+    // mutate. Holding `env_lock()` (the one process-wide lock in
+    // `crate::test_env`) for the whole body is what keeps this integration
+    // test from racing those unit tests' set_var/remove_var on that var.
+    let _env_lock = env_lock();
     std::env::remove_var("QONTINUI_SPEC_COVERAGE_FLOOR");
 
     let ir = disconnected_ir("test-page-e");

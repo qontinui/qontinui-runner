@@ -1332,6 +1332,8 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::Mutex as TokMutex;
 
+    use crate::test_env::env_lock;
+
     /// In-memory transport that lets sessions start without touching
     /// PTY / Claude / workflow subsystems.
     struct NoopTransport(SessionKind);
@@ -2216,6 +2218,7 @@ mod tests {
     /// Belt-and-suspenders: env_u64 falls back on bad input.
     #[test]
     fn env_u64_falls_back_on_unparseable() {
+        let _env_lock = env_lock();
         let var = "__COORD_SYNC_TEST_ENV_U64";
         std::env::set_var(var, "not-a-number");
         assert_eq!(env_u64(var, 42), 42);

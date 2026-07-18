@@ -226,8 +226,11 @@ pub fn get_ipc_response_url() -> String {
 mod tests {
     use super::*;
 
+    use crate::test_env::env_lock;
+
     #[test]
     fn supervisor_url_uses_default_port() {
+        let _env_lock = env_lock();
         // We can't reliably clear env in a multi-test process, so just assert
         // the default port appears in the fallback path.
         std::env::remove_var("QONTINUI_SUPERVISOR_URL");

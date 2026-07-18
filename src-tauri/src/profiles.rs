@@ -624,6 +624,7 @@ fn ensure_coord_url_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::env_lock;
 
     #[test]
     fn parses_minimal_profiles_file() {
@@ -793,8 +794,6 @@ mod tests {
     // `feedback_env_var_tests_serialize`).
     // ------------------------------------------------------------------
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     struct CoordEnvRestore {
         prev: Option<String>,
     }
@@ -809,7 +808,7 @@ mod tests {
 
     #[test]
     fn resolve_coord_base_env_wins() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = env_lock();
         let _restore = CoordEnvRestore {
             prev: std::env::var("COORD_HTTP_URL").ok(),
         };
@@ -824,7 +823,7 @@ mod tests {
 
     #[test]
     fn resolve_coord_base_empty_env_is_ignored() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = env_lock();
         let _restore = CoordEnvRestore {
             prev: std::env::var("COORD_HTTP_URL").ok(),
         };
@@ -846,7 +845,7 @@ mod tests {
         // The String-family contract: always yields a base. When the env path
         // is taken it's the configured base with source `env`, regardless of
         // any profiles.json / settings.json on the test machine.
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = env_lock();
         let _restore = CoordEnvRestore {
             prev: std::env::var("COORD_HTTP_URL").ok(),
         };
@@ -859,7 +858,7 @@ mod tests {
 
     #[test]
     fn resolve_with_source_env_arm_is_env() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = env_lock();
         let _restore = CoordEnvRestore {
             prev: std::env::var("COORD_HTTP_URL").ok(),
         };

@@ -459,11 +459,19 @@ pub fn spawn_env_capture() {
 mod tests {
     use super::*;
 
+    use crate::test_env::{env_lock, EnvVarRestore};
+
     /// Secret-safety (end-to-end envelope): a secret-bearing env var and a
     /// password-bearing DSN must never appear in the serialized envelope; the
     /// var NAME must appear with value "present".
     #[test]
     fn secret_safety_envelope_never_leaks_secrets() {
+        let _env_lock = env_lock();
+        // Restore both vars on the way out (incl. panic): DATABASE_URL is set in
+        // dev / DB-gated CI, and blindly removing it would leak a wrong-DB /
+        // missing-DSN state to sibling tests in this binary.
+        let _restore =
+            EnvVarRestore::capture(&["QONTINUI_SECRET_TOKEN_ENVELOPE_TEST", "DATABASE_URL"]);
         // Arrange a secret-bearing allowlisted env var + a password DSN.
         std::env::set_var("QONTINUI_SECRET_TOKEN_ENVELOPE_TEST", "supersecret123");
         std::env::set_var("DATABASE_URL", "postgres://u:pw@h:5432/db");
@@ -482,8 +490,7 @@ mod tests {
         };
         let json = serde_json::to_string(&envelope).expect("serialize envelope");
 
-        std::env::remove_var("QONTINUI_SECRET_TOKEN_ENVELOPE_TEST");
-        std::env::remove_var("DATABASE_URL");
+        // (env vars restored by `_restore` on scope exit.)
 
         // The secret VALUE must appear nowhere.
         assert!(

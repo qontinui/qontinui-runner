@@ -247,6 +247,52 @@ mod worktree;
 mod wrappers;
 mod zombie_sweep;
 
+/// Test-only: shared process-wide env lock for the runner-bin test binary.
+/// `std::env` is process-global, so two tests touching the same var in
+/// parallel race — one clobbers the value mid-read, the code-under-test sees
+/// the wrong value, and CI reddens non-deterministically (the flake class
+/// fixed 2026-07-11; cf. `qontinui_shim::resolve_real_in`). ONE lock per test
+/// binary is the correct granularity (the lib test binary defines its own in
+/// `lib.rs`). Poison-recovering so a panicking test can't cascade-fail the
+/// rest. Every test that touches `std::env` holds this for its whole body.
+#[cfg(test)]
+pub(crate) mod test_env {
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// RAII guard that restores the captured env vars to their pre-capture
+    /// values on drop (including the panic path). Use for tests that mutate a
+    /// process-global var which may already be set in the environment (e.g.
+    /// `QONTINUI_PORT`) so the test can't leak its value — or its removal — to
+    /// sibling tests in the same binary.
+    pub(crate) struct EnvVarRestore {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvVarRestore {
+        pub(crate) fn capture(keys: &[&'static str]) -> Self {
+            let saved = keys.iter().map(|&k| (k, std::env::var_os(k))).collect();
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvVarRestore {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+}
+
 use commands::AppState;
 use display::profiles::ActionLogProfile;
 use display::DisplayProcessor;
