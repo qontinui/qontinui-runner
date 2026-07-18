@@ -71,6 +71,8 @@ export function startBackgroundObserver(): void {
           label: el.label,
           actions: [...el.actions, ...(el.customActions ? Object.keys(el.customActions) : [])],
           state: el.getState(),
+          registeredAt: el.registeredAt,
+          mounted: el.mounted,
           category: el.category,
           contentMetadata: el.contentMetadata,
           mediaMetadata: el.mediaMetadata,
@@ -81,6 +83,8 @@ export function startBackgroundObserver(): void {
           name: comp.name,
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           actions: comp.actions.map((a: any) => a.id),
+          registeredAt: comp.registeredAt,
+          mounted: comp.mounted,
         })),
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         workflows: workflows.map((wf: any) => ({
