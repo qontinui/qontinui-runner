@@ -190,9 +190,19 @@ impl ClaudeSession {
         // Resolve the account config dir up front: it feeds BOTH the shared
         // launch-command builder (the per-account operator template) and the
         // child's CLAUDE_CONFIG_DIR env set below.
+        //
+        // A per-request `pinned_config_dir` on the session ctx (already
+        // validated by the spawn handler via `resolve_requested_account`)
+        // overrides the global account resolution; `None` reproduces the
+        // default behaviour byte-for-byte.
         let ai_settings = crate::settings::get_ai_settings();
-        let effective_config_dir =
-            crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli);
+        let pinned_config_dir = session_ctx
+            .as_ref()
+            .and_then(|c| c.pinned_config_dir.as_deref());
+        let effective_config_dir = crate::ai_provider::get_effective_config_dir_with_override(
+            &ai_settings.claude_cli,
+            pinned_config_dir,
+        );
 
         // Required trailing flags for the interactive stream-json chat. The
         // shared launch seam (below) layers the operator template + the

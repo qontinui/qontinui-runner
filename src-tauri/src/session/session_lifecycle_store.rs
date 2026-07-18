@@ -841,6 +841,38 @@ impl SessionLifecycleStore {
         self.snapshot_change(&snapshot);
     }
 
+    /// Mirror a terminal-page move into the durable registry, resolved by
+    /// `terminal_id`. The `POST /terminals/{id}/move` surface mutates the
+    /// in-memory `TerminalSession.page_id`; without this flush the durable
+    /// record stays frozen at the spawn-time page, so a restart would restore
+    /// the pane on its original page rather than where the operator moved it.
+    /// Sibling of [`Self::update_title_by_terminal`]. No-op (no write) if no
+    /// open record references the terminal, or the page is already current.
+    pub fn update_page_by_terminal(&self, terminal_id: &str, page_id: &str) {
+        let snapshot = {
+            let mut m = match self.map.lock() {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = %e, "session_lifecycle_store: lock poisoned on update_page_by_terminal");
+                    return;
+                }
+            };
+            let Some(rec) = m
+                .values_mut()
+                .find(|r| r.state == "open" && r.terminal_id == terminal_id)
+            else {
+                return; // no open record hosts this terminal — nothing to flush
+            };
+            if rec.page_id == page_id {
+                return; // already current — nothing to flush
+            }
+            rec.page_id = page_id.to_string();
+            m.clone()
+        };
+        self.persist(&snapshot);
+        self.snapshot_change(&snapshot);
+    }
+
     /// Mark a present session as restore-pending (a boot-restore is about to
     /// type / has typed `claude --resume` and the handshake is not yet
     /// verified). While the marker is set the liveness poll skips the record

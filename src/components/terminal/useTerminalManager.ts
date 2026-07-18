@@ -474,6 +474,70 @@ export function useTerminalManager(
     };
   }, [markAsBypass]);
 
+  // Live terminal-page moves (plan `2026-07-18-runner-api-account-selection.md`
+  // Phase 5). `POST /terminals/{id}/move` mutates a terminal's page on the Rust
+  // side and emits `terminal-page-changed` { id, pageId }. Every page's manager
+  // is mounted simultaneously (session-provider lift), so each instance decides,
+  // from its OWN `pageId`, whether the move concerns it — the same
+  // unmount-source / mount-target model `WindowAssignmentsContext` uses for
+  // `session-assignment-changed`, and a sibling of the `terminal-created` ingest
+  // above:
+  //   - TARGET page (`event.pageId === pageId`) → adopt the tab (mount) if not
+  //     already present. The move event carries only `{ id, pageId }`, so we
+  //     fetch authoritative info via `terminal_list` (which reflects the
+  //     just-applied page move) and fold it in through `reduceCreatedTerminal`.
+  //   - SOURCE page (holds the tab, but is no longer its page) → evict the tab
+  //     (unmount) WITHOUT calling `terminal_close`: the PTY lives on and now
+  //     belongs to the target page.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    listen<{ id: string; pageId: string }>("terminal-page-changed", (event) => {
+      const { id, pageId: targetPageId } = event.payload;
+      if (!id) return;
+      const target = targetPageId || "default";
+      if (target === pageId) {
+        // Adopt onto THIS (target) page. `reduceCreatedTerminal` dedups by id,
+        // so an idempotent re-delivery for a tab we already hold is a no-op.
+        invoke<CommandResponse>("terminal_list")
+          .then((result) => {
+            if (!result.success || !result.data) return;
+            const terminals = (result.data as { terminals: TerminalInfo[] }).terminals;
+            const info = terminals.find((t) => t.id === id);
+            if (!info) return;
+            const pendingTaskRunId = pendingWorkerMarks.current.get(id);
+            if (pendingTaskRunId !== undefined) pendingWorkerMarks.current.delete(id);
+            const pendingBypass = pendingBypassMarks.current.has(id);
+            if (pendingBypass) pendingBypassMarks.current.delete(id);
+            setTabs((prev) => reduceCreatedTerminal(prev, info, pendingTaskRunId, pendingBypass));
+            ingestedIds.current.add(id);
+            setActiveId(id);
+            logger.info(`Terminal ${id} moved onto page ${pageId}`);
+          })
+          .catch((err) => {
+            logger.warn(`terminal-page-changed adopt failed for ${id}: ${err}`);
+          });
+      } else {
+        // Evict from THIS page if we hold it — do NOT close the PTY.
+        setTabs((prev) => {
+          if (!prev.some((t) => t.id === id)) return prev;
+          const closedIndex = prev.findIndex((t) => t.id === id);
+          const next = prev.filter((t) => t.id !== id);
+          setActiveId((currentActive) => {
+            if (currentActive !== id) return currentActive;
+            return next[Math.min(closedIndex, next.length - 1)]?.id ?? null;
+          });
+          ingestedIds.current.delete(id);
+          return next;
+        });
+      }
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, [pageId]);
+
   /**
    * Reconnect to existing Rust PTY sessions that survived a React remount.
    *

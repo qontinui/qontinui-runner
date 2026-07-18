@@ -111,6 +111,24 @@ pub fn get_effective_config_dir(cli_settings: &settings::ClaudeCliSettings) -> O
     }
 }
 
+/// Like [`get_effective_config_dir`], but honours an explicit per-request
+/// account override.
+///
+/// When `override_dir` is `Some`, it is returned verbatim — the caller is
+/// responsible for validating it first (per-request account selection resolves
+/// it via [`super::account_usage::resolve_requested_account`], which restricts
+/// the choice to credential-valid roster dirs). When `None`, delegates to the
+/// global [`get_effective_config_dir`] resolution (unchanged default behaviour).
+pub fn get_effective_config_dir_with_override(
+    cli_settings: &settings::ClaudeCliSettings,
+    override_dir: Option<&str>,
+) -> Option<String> {
+    match override_dir {
+        Some(dir) => Some(dir.to_string()),
+        None => get_effective_config_dir(cli_settings),
+    }
+}
+
 /// Mark an account as rate-limited with the default cooldown duration.
 ///
 /// Used by paths that don't have access to a precise `Retry-After` value

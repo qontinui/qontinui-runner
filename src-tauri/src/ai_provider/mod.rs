@@ -38,12 +38,16 @@ pub(crate) mod routing;
 mod types;
 
 // Re-export public API
-pub use account_usage::{pick_best_account, pick_migration_target};
+pub use account_usage::{
+    pick_best_account, pick_migration_target, resolve_requested_account, AccountSelectError,
+    ResolvedAccount,
+};
 pub use cache_aware_builder::StructuredPrompt;
 pub use config::{
     account_known_exhausted, get_account_statuses, get_effective_config_dir,
-    get_resolved_config_dir, mark_account_rate_limited_with_duration, record_account_usage,
-    rotate_account_on_rate_limit, set_resolved_config_dir, switch_to_account,
+    get_effective_config_dir_with_override, get_resolved_config_dir,
+    mark_account_rate_limited_with_duration, record_account_usage, rotate_account_on_rate_limit,
+    set_resolved_config_dir, switch_to_account,
 };
 pub use multimodal::{ContentBlock, ImageSource, MultimodalPrompt};
 pub use oneshot::{
