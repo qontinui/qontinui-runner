@@ -845,8 +845,13 @@ mod tests {
 
         // Already FIRST → None (no churn), even with more entries after it.
         assert!(
-            compute_path_addition(&format!("{shim};C:\\tools\\claude"), shim, ';', Placement::Prepend)
-                .is_none(),
+            compute_path_addition(
+                &format!("{shim};C:\\tools\\claude"),
+                shim,
+                ';',
+                Placement::Prepend
+            )
+            .is_none(),
             "prepend when the dir is already at the front is a no-op"
         );
         // Move-to-front is case-insensitive: a differently-cased existing entry
@@ -875,22 +880,35 @@ mod tests {
     #[test]
     fn path_addition_is_idempotent_and_case_trailing_insensitive() {
         // APPEND: present ANYWHERE → None (placement-agnostic presence suffices).
-        assert!(
-            compute_path_addition("C:\\a;C:\\qontinui", "C:\\qontinui", ';', Placement::Append)
-                .is_none()
-        );
+        assert!(compute_path_addition(
+            "C:\\a;C:\\qontinui",
+            "C:\\qontinui",
+            ';',
+            Placement::Append
+        )
+        .is_none());
         // PREPEND idempotence is POSITION-aware: a no-op ONLY when the dir is
         // already the first entry. Present-but-not-first is NOT idempotent — it
         // moves to the front (asserted in the dedicated prepend test below).
         assert!(
-            compute_path_addition("C:\\qontinui;C:\\a", "C:\\qontinui", ';', Placement::Prepend)
-                .is_none(),
+            compute_path_addition(
+                "C:\\qontinui;C:\\a",
+                "C:\\qontinui",
+                ';',
+                Placement::Prepend
+            )
+            .is_none(),
             "prepend is a no-op only when the dir already wins resolution (is first)"
         );
         // Case-insensitive + trailing-slash-insensitive → still present → None.
         assert!(
-            compute_path_addition("C:\\A;C:\\QONTINUI\\", "c:\\qontinui", ';', Placement::Append)
-                .is_none(),
+            compute_path_addition(
+                "C:\\A;C:\\QONTINUI\\",
+                "c:\\qontinui",
+                ';',
+                Placement::Append
+            )
+            .is_none(),
             "windows PATH is case-insensitive; trailing slash ignored"
         );
         // A substring that isn't a full entry does NOT count as present.
@@ -938,7 +956,8 @@ mod tests {
         );
         // Round-trip: add then remove returns the original value.
         let original = "C:\\a;C:\\b";
-        let added = compute_path_addition(original, "C:\\qontinui", ';', Placement::Append).unwrap();
+        let added =
+            compute_path_addition(original, "C:\\qontinui", ';', Placement::Append).unwrap();
         assert_eq!(
             compute_path_removal(&added, "C:\\qontinui", ';').as_deref(),
             Some(original)
@@ -1005,7 +1024,10 @@ mod tests {
 
         // Case-insensitive shim-dir match: an upper-cased shim entry still counts
         // as "reached the shim" (so a claude AFTER it does not shadow).
-        let dirs_ci = vec![PathBuf::from(shim.to_string_lossy().to_uppercase()), node.clone()];
+        let dirs_ci = vec![
+            PathBuf::from(shim.to_string_lossy().to_uppercase()),
+            node.clone(),
+        ];
         assert_eq!(claude_shadowing_shim(&dirs_ci, &shim, probe), None);
 
         // Fresh-shell composition: SYSTEM entries precede USER entries, empties

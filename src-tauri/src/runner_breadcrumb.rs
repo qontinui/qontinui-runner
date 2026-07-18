@@ -387,11 +387,17 @@ mod tests {
             primary_rec.primary,
             "a record on the configured primary port must be marked primary"
         );
-        assert_eq!(file_name_for(configured_primary, configured_primary), "api-port.json");
+        assert_eq!(
+            file_name_for(configured_primary, configured_primary),
+            "api-port.json"
+        );
         // A temp runner (9877) under the same configured primary stays non-primary.
         let temp_rec = breadcrumb_for_with_primary(9877, configured_primary);
         assert!(!temp_rec.primary);
-        assert_eq!(file_name_for(9877, configured_primary), "api-port-9877.json");
+        assert_eq!(
+            file_name_for(9877, configured_primary),
+            "api-port-9877.json"
+        );
 
         // Reader side: the reader TRUSTS the record's `primary` flag (set by the
         // writer above), so the primary wins over the newer temp runner even
@@ -548,7 +554,10 @@ mod tests {
         *published_path().lock().unwrap() = Some(path.clone());
 
         remove_published();
-        assert!(!path.exists(), "the published record is removed on shutdown");
+        assert!(
+            !path.exists(),
+            "the published record is removed on shutdown"
+        );
         remove_published(); // no-op, no panic
     }
 }

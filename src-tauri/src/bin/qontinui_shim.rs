@@ -1470,7 +1470,11 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&as_str).unwrap().permissions().mode();
-            assert_eq!(mode & 0o077, 0, "a live credential must not be group/world readable");
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "a live credential must not be group/world readable"
+            );
         }
 
         // Dropping the handle deletes it — the credential does not outlive the
@@ -1497,7 +1501,11 @@ mod tests {
         for d in [&per_pty, &persistent, &realbin] {
             std::fs::create_dir_all(d).unwrap();
         }
-        let exe = if cfg!(windows) { "claude.exe" } else { "claude" };
+        let exe = if cfg!(windows) {
+            "claude.exe"
+        } else {
+            "claude"
+        };
         // An identically-named stub in BOTH of our dirs — the whole trap.
         std::fs::write(per_pty.join(exe), b"stub").unwrap();
         std::fs::write(persistent.join(exe), b"stub").unwrap();
