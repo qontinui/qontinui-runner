@@ -1059,7 +1059,7 @@ mod tests {
         ];
         assert_eq!(
             claude_shadowing_shim(&dirs, &shim, probe),
-            Some(PathBuf::from("C:\\tools\\node\\claude.cmd")),
+            Some(node.join("claude.cmd")),
             "a real claude ahead of the shim dir shadows it"
         );
 
