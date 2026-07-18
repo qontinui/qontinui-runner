@@ -1614,10 +1614,9 @@ mod tests {
         // origin, componentActionBasePath, actionInvocationPath, scope,
         // registration metadata, visibility, undoDepth, ...). Strict parse
         // must succeed and read the canonical fields through the extras.
-        let raw: serde_json::Value = serde_json::from_str(include_str!(
-            "fixtures/sdk_0_22_control_snapshot.json"
-        ))
-        .expect("fixture is valid JSON");
+        let raw: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/sdk_0_22_control_snapshot.json"))
+                .expect("fixture is valid JSON");
         let snap = parse_supplied_snapshot(raw).expect("0.22.0 wire strict-parses");
 
         assert_eq!(snap.elements.len(), 2);
