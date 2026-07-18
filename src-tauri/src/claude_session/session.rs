@@ -1032,6 +1032,7 @@ impl ClaudeSession {
         let state_for_waiter = state_tracker.clone();
         let writer_for_waiter = stdin_writer.clone();
         let session_id_for_waiter = session_id.to_string();
+        let working_dir_for_waiter = working_dir.to_string();
         let pid_tracker_for_waiter = pid_tracker.clone();
         let child_pid_for_waiter = child_pid;
         let app_handle_for_waiter = app_handle.clone();
@@ -1125,6 +1126,7 @@ impl ClaudeSession {
                     &app_handle_for_waiter,
                     &session_id_for_waiter,
                     session_ctx_for_waiter.as_ref(),
+                    &working_dir_for_waiter,
                 );
             }
 
@@ -1780,6 +1782,7 @@ impl ClaudeSession {
         app_handle: &tauri::AppHandle,
         session_id: &str,
         session_ctx: Option<&AiSessionContext>,
+        working_dir: &str,
     ) {
         use crate::ai_provider::{get_effective_config_dir, rotate_account_on_rate_limit};
         use tauri::Manager;
@@ -1824,15 +1827,11 @@ impl ClaudeSession {
             }
         };
 
-        let working_dir = std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| ".".to_string());
-
         // Clone session_ctx for the new session
         let new_session_ctx = session_ctx.cloned();
 
         match Self::spawn(
-            &working_dir,
+            working_dir,
             session_id,
             app_handle,
             new_session_ctx,

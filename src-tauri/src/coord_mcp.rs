@@ -460,6 +460,31 @@ fn mint_and_register_nonce(
     (nonce, snapshot)
 }
 
+/// Evict every proxy nonce bound to `workdir` and persist the shrunken set.
+/// Close-time cleanup for PER-SESSION workdirs (relay chat): unlike the stable
+/// per-agent dirs, a per-session workdir is never reused, so the same-workdir
+/// eviction inside [`mint_and_register_nonce`] never fires for it — without
+/// this call its device nonce would stay valid (and persisted) forever.
+/// Evicted device nonces ride the same grace TTL as a re-mint so an in-flight
+/// client fails closed only after the window; agent nonces drop immediately.
+pub(crate) fn evict_proxy_nonces_for_workdir(workdir: &str) {
+    let snapshot = {
+        let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
+        let evicted_device: Vec<String> = map
+            .iter()
+            .filter(|(_, b)| b.workdir == workdir && b.principal == ProxyPrincipal::Device)
+            .map(|(n, _)| n.clone())
+            .collect();
+        if evicted_device.is_empty() && !map.values().any(|b| b.workdir == workdir) {
+            return; // nothing bound to this workdir — skip the persist write
+        }
+        map.retain(|_, b| b.workdir != workdir);
+        grace_evicted_device_nonces(&evicted_device);
+        map.clone()
+    };
+    persist_proxy_nonces(&snapshot);
+}
+
 /// Request header the runner proxy injects on forwarded `coord_*` calls: the
 /// calling terminal's coord `agent_session_id`, so coord self-identifies the
 /// caller deterministically instead of guessing the device's most-recent
