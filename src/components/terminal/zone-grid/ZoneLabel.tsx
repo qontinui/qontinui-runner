@@ -124,15 +124,23 @@ export function SessionPrDropdown({ claudeSessionId }: { claudeSessionId?: strin
  * `data-zone-index`, `data-resume-failed`) so UI Bridge clients can verify
  * session↔zone placement without scraping internals.
  *
+ * When the tab is bound to a Claude session, the label carries a short
+ * session-id suffix (`(<first 8 chars>)`): PTY-launched Claude sessions all
+ * share the raw shell path as their title, so without the suffix every zone
+ * registers an identical label and `ai/find` by label can't tell them apart.
+ * The suffix makes each label unique per bound session.
+ *
  * Pure + exported for unit tests (the hook call itself needs a DOM).
  */
 export function zoneHeaderElementSpec(
   zoneIndex: number,
   title: string,
+  claudeSessionId?: string,
 ): { id: string; label: string } {
+  const base = `Zone ${zoneIndex + 1}: ${title}`;
   return {
     id: `terminal-zone-header-${zoneIndex}`,
-    label: `Zone ${zoneIndex + 1}: ${title}`,
+    label: claudeSessionId ? `${base} (${claudeSessionId.slice(0, 8)})` : base,
   };
 }
 
@@ -180,7 +188,7 @@ export function ZoneLabel({
   // Item 8: expose session/zone identity to UI Bridge clients. The label is
   // the session title so `ai/find` by title resolves to this header; the
   // session binding rides as data attributes on the registered node.
-  const headerSpec = zoneHeaderElementSpec(zoneIndex, tab.title);
+  const headerSpec = zoneHeaderElementSpec(zoneIndex, tab.title, tab.claudeSessionId);
   const { ref: headerRef } = useUIElement({
     id: headerSpec.id,
     type: "generic",
