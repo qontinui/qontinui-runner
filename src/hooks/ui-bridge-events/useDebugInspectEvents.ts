@@ -378,12 +378,15 @@ export function useDebugInspectEvents(
 
         case "undo": {
           const undoTrackerUndo = getUndoTracker();
+          // ui-bridge 0.22.0 renamed the wire field undoAvailable → canUndo
+          // (canonical-shape unification); accept both so a stale SDK pin
+          // keeps the no-op guard working.
           const undoState = undoTrackerUndo?.getSnapshotUndoContext() as
-            | { undoAvailable?: boolean }
+            | { canUndo?: boolean; undoAvailable?: boolean }
             | undefined;
 
           if (undoTrackerUndo?.executeUndo) {
-            if (undoState && undoState.undoAvailable === false) {
+            if (undoState && (undoState.canUndo ?? undoState.undoAvailable) === false) {
               await sendResponse({
                 requestId,
                 type,
@@ -424,12 +427,13 @@ export function useDebugInspectEvents(
 
         case "redo": {
           const undoTrackerRedo = getUndoTracker();
+          // See the undo case: canRedo is the 0.22.0 canonical wire name.
           const redoState = undoTrackerRedo?.getSnapshotUndoContext() as
-            | { redoAvailable?: boolean }
+            | { canRedo?: boolean; redoAvailable?: boolean }
             | undefined;
 
           if (undoTrackerRedo?.executeRedo) {
-            if (redoState && redoState.redoAvailable === false) {
+            if (redoState && (redoState.canRedo ?? redoState.redoAvailable) === false) {
               await sendResponse({
                 requestId,
                 type,
