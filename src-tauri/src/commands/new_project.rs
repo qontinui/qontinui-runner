@@ -46,6 +46,13 @@ use crate::settings::SavedProject;
 /// Tauri event carrying per-step progress for the New Project checklist UI.
 pub const NEW_PROJECT_PROGRESS_EVENT: &str = "new-project://progress";
 
+/// Filename of the flow-owned marker written under a new project's `.git/`
+/// directory in `init_local`. It proves to a later resume that this tree is one
+/// this flow created (so scaffold may safely overwrite it), distinguishing it
+/// from an arbitrary pre-existing repo the caller might point `resume_from` at.
+/// Living inside `.git/` means it is never staged, committed, or pushed.
+pub(crate) const FLOW_MARKER: &str = "qontinui-new-project";
+
 /// Step names in execution order. `resume_from` must be one of these.
 pub const STEP_ORDER: [&str; 8] = [
     "validate",
@@ -697,13 +704,17 @@ pub async fn create_new_project(
                     format!("Location does not exist: {}", parent.display()),
                 ));
             }
-            // target must not exist, or be an empty dir, or (resuming) be our
-            // partial project (has .git).
+            // target must not exist, or be an empty dir, or (resuming) be a
+            // partial project THIS flow created — proven by the flow-owned
+            // marker written under .git/ in init_local, NOT merely by the
+            // presence of a .git dir (which any repo has). Without this a
+            // resume pointed at an arbitrary existing repo would let scaffold
+            // overwrite and commit over it.
             if target.exists() {
                 let empty = std::fs::read_dir(&target)
                     .map(|mut e| e.next().is_none())
                     .unwrap_or(false);
-                let ours = resuming && target.join(".git").exists();
+                let ours = resuming && target.join(".git").join(FLOW_MARKER).exists();
                 if !empty && !ours {
                     return Err(NewProjectError::with_field(
                         "target_exists",
@@ -782,11 +793,15 @@ pub async fn create_new_project(
                     format!("Failed to create {}: {}", target.display(), e),
                 )
             })?;
-            if target.join(".git").exists() {
-                // Idempotent: already initialized (resume or re-run).
-                return Ok(());
+            if !target.join(".git").exists() {
+                git_ok(&["init", "-b", "main"], Some(&target)).await?;
             }
-            git_ok(&["init", "-b", "main"], Some(&target)).await
+            // Flow-owned marker inside .git/ (never committed, never leaves this
+            // machine) proving a later resume that this tree is one WE created —
+            // see the `ours` gate in validate. Best-effort: a resume simply
+            // falls back to the target_exists guard if it's missing.
+            let _ = std::fs::write(target.join(".git").join(FLOW_MARKER), b"1");
+            Ok(())
         }
         .await;
         match outcome {
@@ -813,6 +828,12 @@ pub async fn create_new_project(
             format!("Writing '{}' template", req.template),
         );
         let outcome: Result<usize, NewProjectError> = async {
+            if step_index(step).unwrap_or(0) < resume_idx {
+                // Already scaffolded on a previous run. Re-writing would clobber
+                // any edits the user made to the scaffolded files between the
+                // failure and the retry, and stage them into the next commit.
+                return Ok(0);
+            }
             let files = templates::template_files(&req.template, &name, &app_id)
                 .map_err(|msg| NewProjectError::with_field("invalid_template", "template", msg))?;
             let count = files.len();
@@ -940,7 +961,14 @@ pub async fn create_new_project(
                 {
                     git_ok(&["remote", "set-url", "origin", &clean_url], Some(&target)).await?;
                 }
-                git_ok(&["remote", "set-url", "origin", &auth_url], Some(&target)).await?;
+                if let Err(mut e) =
+                    git_ok(&["remote", "set-url", "origin", &auth_url], Some(&target)).await
+                {
+                    // This is the one token-bearing git call outside the push
+                    // redaction below; scrub before the error can surface.
+                    e.message = redact(&e.message, &token);
+                    return Err(e);
+                }
 
                 let push_result = git_ok(&["push", "-u", "origin", "main"], Some(&target)).await;
 
