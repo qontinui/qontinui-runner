@@ -1141,6 +1141,46 @@ fn reanchor_by_agent_id(contents: &str, agent_id: &str, local_root: &str) -> Str
     out
 }
 
+/// Build the JSON body for coord's `POST /agents/allocate`.
+///
+/// Phase 1B: declared_overlap_paths is optional; when present, coord
+/// skips its LLM-based derivation step and uses our paths directly.
+/// When absent, coord derives from `intent` (or falls back to empty).
+///
+/// Body key is `device_id` to match coord's `AllocateRequest.device_id`
+/// (`qontinui-coord/src/agent_worktrees.rs:77`) after the
+/// `coord.machines → coord.devices` rename. The runner-side variable
+/// stays `machine_id` for symmetry with claims acquire/heartbeat/release,
+/// which coord's `claims.rs` still expects as `machine_id`.
+/// Serialize each RepoRequest directly so its `skip_serializing_if` on
+/// `parent_sha` drops the key entirely when `None` — coord then
+/// deserializes `parent_sha: None` and runs `decide_parent_sha`. A
+/// hand-built `json!({ "parent_sha": r.parent_sha })` would instead emit
+/// an explicit `null`, which is still `None` to coord but loses the
+/// skip-on-none contract the serialization test pins.
+///
+/// `agent_session_id` is ALWAYS emitted — as a JSON string when present,
+/// as `null` when absent — matching the [`claim_request_body`] convention.
+/// Coord's `AllocateRequest` deserializes it as `#[serde(default)]
+/// Option<Uuid>` (null and absent both map to `None`) and persists it on
+/// the worktree rows, keying the per-session footprint-confidence
+/// downgrade (plan 2026-06-06-twin-worktree-phase7-informed-isolation).
+fn allocate_request_body(
+    machine_id: &uuid::Uuid,
+    agent_session_id: Option<uuid::Uuid>,
+    repos: &[RepoRequest],
+    intent: Option<&str>,
+    declared_overlap_paths: Option<&[String]>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "device_id": machine_id.to_string(),
+        "repos": repos,
+        "intent": intent,
+        "declared_overlap_paths": declared_overlap_paths,
+        "agent_session_id": agent_session_id,
+    })
+}
+
 /// Call coord's `/agents/allocate` and then `git worktree add` for each
 /// returned row.
 ///
@@ -1260,27 +1300,13 @@ pub async fn allocate_and_materialize_with_claim(
         }
     }
 
-    // Phase 1B: declared_overlap_paths is optional; when present, coord
-    // skips its LLM-based derivation step and uses our paths directly.
-    // When absent, coord derives from `intent` (or falls back to empty).
-    //
-    // Body key is `device_id` to match coord's `AllocateRequest.device_id`
-    // (`qontinui-coord/src/agent_worktrees.rs:77`) after the
-    // `coord.machines → coord.devices` rename. The runner-side variable
-    // stays `machine_id` for symmetry with claims acquire/heartbeat/release,
-    // which coord's `claims.rs` still expects as `machine_id`.
-    // Serialize each RepoRequest directly so its `skip_serializing_if` on
-    // `parent_sha` drops the key entirely when `None` — coord then
-    // deserializes `parent_sha: None` and runs `decide_parent_sha`. A
-    // hand-built `json!({ "parent_sha": r.parent_sha })` would instead emit
-    // an explicit `null`, which is still `None` to coord but loses the
-    // skip-on-none contract the serialization test pins.
-    let body = serde_json::json!({
-        "device_id": machine_id.to_string(),
-        "repos": repos,
-        "intent": intent,
-        "declared_overlap_paths": declared_overlap_paths,
-    });
+    let body = allocate_request_body(
+        machine_id,
+        agent_session_id,
+        repos,
+        intent,
+        declared_overlap_paths,
+    );
 
     let url = format!("{}/agents/allocate", coord_http_base.trim_end_matches('/'));
     let resp = crate::auth::attach_device_auth(reqwest::Client::new().post(&url).json(&body))
@@ -2072,6 +2098,57 @@ mod tests {
         assert!(ctx.phase.is_none());
         // worktree claims use the coord-default 300s TTL.
         assert_eq!(default_ttl_seconds_for(ctx.kind), 300);
+    }
+
+    #[test]
+    fn allocate_body_sends_session_id_and_drops_absent_parent_sha() {
+        // Ξ_Worktree Phase 7.6(d): the allocate body MUST carry
+        // `agent_session_id` so coord can key the per-session footprint-drift
+        // confidence downgrade on the conversation. Present → a hyphenated
+        // string; absent → explicit null (never a missing key). Also pins the
+        // RepoRequest `skip_serializing_if` contract: a `None` parent_sha drops
+        // the key entirely (coord then runs `decide_parent_sha`), while a
+        // `Some` is emitted verbatim.
+        let machine = uuid::Uuid::parse_str("44444444-4444-4444-4444-444444444444").unwrap();
+        let session = uuid::Uuid::parse_str("55555555-5555-5555-5555-555555555555").unwrap();
+        let repos = vec![
+            RepoRequest {
+                repo: "qontinui-coord".to_string(),
+                parent_sha: None,
+            },
+            RepoRequest {
+                repo: "qontinui-web".to_string(),
+                parent_sha: Some("deadbeef".to_string()),
+            },
+        ];
+        let paths = vec!["qontinui-coord/src/**".to_string()];
+
+        // Session present → string; declared paths forwarded verbatim.
+        let body = allocate_request_body(
+            &machine,
+            Some(session),
+            &repos,
+            Some("editing coord"),
+            Some(paths.as_slice()),
+        );
+        assert_eq!(body["device_id"], machine.to_string());
+        assert_eq!(body["agent_session_id"], session.to_string());
+        assert_eq!(body["intent"], "editing coord");
+        assert_eq!(body["declared_overlap_paths"][0], "qontinui-coord/src/**");
+        // parent_sha dropped for the None repo, present for the Some repo.
+        assert!(!body["repos"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("parent_sha"));
+        assert_eq!(body["repos"][1]["parent_sha"], "deadbeef");
+
+        // Session absent → the key is still present and explicitly null.
+        let body2 = allocate_request_body(&machine, None, &repos, None, None);
+        assert!(
+            body2.as_object().unwrap().contains_key("agent_session_id"),
+            "agent_session_id key must always be present on the wire"
+        );
+        assert!(body2["agent_session_id"].is_null());
     }
 
     #[test]
