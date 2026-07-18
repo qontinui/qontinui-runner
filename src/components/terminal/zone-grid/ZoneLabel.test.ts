@@ -28,4 +28,26 @@ describe("zoneHeaderElementSpec", () => {
       zoneHeaderElementSpec(1, "same title").id,
     );
   });
+
+  it("suffixes the label with the first 8 chars of the bound Claude session id", () => {
+    const spec = zoneHeaderElementSpec(0, "powershell.exe", "abcdef12-3456-7890-abcd-ef1234567890");
+    expect(spec).toEqual({
+      id: "terminal-zone-header-0",
+      label: "Zone 1: powershell.exe (abcdef12)",
+    });
+  });
+
+  it("short-id suffix disambiguates zones sharing an identical PTY title", () => {
+    const a = zoneHeaderElementSpec(0, "same shell path", "11111111-aaaa");
+    const b = zoneHeaderElementSpec(1, "same shell path", "22222222-bbbb");
+    expect(a.label).not.toBe(b.label);
+  });
+
+  it("omits the suffix when no session id is bound", () => {
+    expect(zoneHeaderElementSpec(2, "bash").label).toBe("Zone 3: bash");
+  });
+
+  it("omits the suffix for an empty-string session id", () => {
+    expect(zoneHeaderElementSpec(2, "bash", "").label).toBe("Zone 3: bash");
+  });
 });
