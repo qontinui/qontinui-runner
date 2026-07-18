@@ -43,6 +43,7 @@
 //! [`pick_best_account`] is a no-op when `account_selection_mode != LeastUsage`
 //! or no accounts are configured.
 
+use crate::claude_session::federation::derive_account_name;
 use crate::settings::{self, AccountSelectionMode};
 use std::path::Path;
 use std::time::Duration;
@@ -240,6 +241,132 @@ fn short_label(config_dir: &str) -> &str {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(config_dir)
+}
+
+// ============================================================================
+// Per-request account selection (explicit account override)
+// ============================================================================
+
+/// Why a caller-supplied `account` could not be resolved to a spawnable
+/// config dir. Both variants map to a 4xx at the HTTP layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountSelectError {
+    /// The requested account matched no roster entry — neither an exact
+    /// `config_dir` path nor a `derive_account_name` friendly name.
+    NotInRoster {
+        requested: String,
+        roster: Vec<String>,
+    },
+    /// The requested account is in the roster but has no live credentials
+    /// (logged out / unrefreshable) — it would 401 the moment a `claude`
+    /// subprocess spawned under it.
+    NotLoggedIn { config_dir: String },
+}
+
+impl AccountSelectError {
+    /// A clear, caller-facing message suitable for a 4xx body.
+    pub fn message(&self) -> String {
+        match self {
+            AccountSelectError::NotInRoster { requested, roster } => {
+                format!(
+                    "account '{}' not in roster; available: {}",
+                    requested,
+                    roster.join(", ")
+                )
+            }
+            AccountSelectError::NotLoggedIn { config_dir } => {
+                format!(
+                    "account at {} has no valid credentials (logged out)",
+                    config_dir
+                )
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for AccountSelectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message())
+    }
+}
+
+impl std::error::Error for AccountSelectError {}
+
+/// A caller-requested account resolved to a validated, spawnable config dir.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAccount {
+    /// The roster config dir to pin as `CLAUDE_CONFIG_DIR`.
+    pub config_dir: String,
+    /// The friendly account name (`derive_account_name(config_dir)`).
+    pub account_name: String,
+    /// `Some(secs)` when the account is currently rate-limited — the caller
+    /// asked for it explicitly, so we spawn anyway but surface the risk.
+    pub cooldown_remaining_secs: Option<u64>,
+}
+
+/// Resolve a caller-supplied `account` (a friendly name like `"hotmail"` OR a
+/// full roster `config_dir` path) to a validated config dir. Does NOT consult
+/// `account_selection_mode` — this is an explicit per-request override.
+///
+/// Only roster dirs (`settings::get_claude_config_dirs()`) are selectable: an
+/// arbitrary path that happens to hold credentials is rejected with
+/// `NotInRoster` so the API cannot point a spawn at an off-roster directory.
+///
+/// Errors:
+/// - [`AccountSelectError::NotInRoster`] — no roster match (→ 400).
+/// - [`AccountSelectError::NotLoggedIn`] — matched but no live creds (→ 409).
+///
+/// A cooldown never fails resolution; it is surfaced via
+/// [`ResolvedAccount::cooldown_remaining_secs`] so the caller decides.
+pub fn resolve_requested_account(account: &str) -> Result<ResolvedAccount, AccountSelectError> {
+    resolve_from(
+        account,
+        &settings::get_claude_config_dirs(),
+        |d| super::oauth_refresh::has_valid_credentials(d),
+        |d| super::config::time_until_cooled_down(d),
+    )
+}
+
+/// Pure core of [`resolve_requested_account`], parameterised over the
+/// credential-validity and cooldown lookups so it can be unit-tested without
+/// the settings/creds/state singletons (mirrors [`pick_from`]).
+///
+/// Resolution order:
+/// 1. Match `account` against an exact roster entry, else a roster dir whose
+///    `derive_account_name` equals `account` case-insensitively. No match ⇒
+///    `NotInRoster` (with the available friendly names for the error body).
+/// 2. `has_valid_creds(dir)` false ⇒ `NotLoggedIn`.
+/// 3. Populate `cooldown_remaining_secs` from `cooldown(dir)`.
+fn resolve_from(
+    account: &str,
+    roster: &[String],
+    has_valid_creds: impl Fn(&str) -> bool,
+    cooldown: impl Fn(&str) -> Option<Duration>,
+) -> Result<ResolvedAccount, AccountSelectError> {
+    let dir = roster
+        .iter()
+        .find(|d| d.as_str() == account)
+        .or_else(|| {
+            roster
+                .iter()
+                .find(|d| derive_account_name(d).eq_ignore_ascii_case(account))
+        })
+        .ok_or_else(|| AccountSelectError::NotInRoster {
+            requested: account.to_string(),
+            roster: roster.iter().map(|d| derive_account_name(d)).collect(),
+        })?;
+
+    if !has_valid_creds(dir) {
+        return Err(AccountSelectError::NotLoggedIn {
+            config_dir: dir.clone(),
+        });
+    }
+
+    Ok(ResolvedAccount {
+        config_dir: dir.clone(),
+        account_name: derive_account_name(dir),
+        cooldown_remaining_secs: cooldown(dir).map(|d| d.as_secs()),
+    })
 }
 
 #[cfg(test)]
@@ -684,5 +811,109 @@ mod tests {
         let d = dirs(&["/cooled", "/a", "/b"]);
         let chosen = pick_target_from(&d, |_| true, |x| x == "/cooled", |_| None, |_| false);
         assert_eq!(chosen.as_deref(), Some("/a"));
+    }
+
+    // --- resolve_from: per-request account selection ------------------------
+    //
+    // `resolve_from` is parameterised over the credential-validity + cooldown
+    // lookups, so these tests inject closures and fixture roster dirs — no
+    // global settings/creds/state needed. Windows-style fixture dirs exercise
+    // the cross-platform `derive_account_name` split.
+
+    fn win_roster() -> Vec<String> {
+        dirs(&[
+            "C:\\claude\\.claude-hotmail",
+            "C:\\claude\\.claude-gmail",
+            "C:\\claude\\.claude-paktis",
+        ])
+    }
+
+    #[test]
+    fn resolve_in_roster_by_friendly_name() {
+        let roster = win_roster();
+        let resolved = resolve_from("gmail", &roster, |_| true, |_| None)
+            .expect("friendly name should resolve");
+        assert_eq!(resolved.config_dir, "C:\\claude\\.claude-gmail");
+        assert_eq!(resolved.account_name, "gmail");
+        assert_eq!(resolved.cooldown_remaining_secs, None);
+    }
+
+    #[test]
+    fn resolve_in_roster_by_friendly_name_case_insensitive() {
+        let roster = win_roster();
+        let resolved = resolve_from("HotMail", &roster, |_| true, |_| None)
+            .expect("case-insensitive friendly name should resolve");
+        assert_eq!(resolved.config_dir, "C:\\claude\\.claude-hotmail");
+        assert_eq!(resolved.account_name, "hotmail");
+    }
+
+    #[test]
+    fn resolve_in_roster_by_exact_path() {
+        let roster = win_roster();
+        let resolved = resolve_from("C:\\claude\\.claude-paktis", &roster, |_| true, |_| None)
+            .expect("exact path should resolve");
+        assert_eq!(resolved.config_dir, "C:\\claude\\.claude-paktis");
+        assert_eq!(resolved.account_name, "paktis");
+    }
+
+    #[test]
+    fn resolve_off_roster_name_errors_with_roster_list() {
+        let roster = win_roster();
+        let err = resolve_from("nonexistent", &roster, |_| true, |_| None)
+            .expect_err("off-roster name must error");
+        match err {
+            AccountSelectError::NotInRoster { requested, roster } => {
+                assert_eq!(requested, "nonexistent");
+                assert_eq!(roster, vec!["hotmail", "gmail", "paktis"]);
+            }
+            other => panic!("expected NotInRoster, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_logged_out_account_errors() {
+        let roster = win_roster();
+        // Matched by name but has_valid_creds returns false → NotLoggedIn.
+        let err = resolve_from("gmail", &roster, |_| false, |_| None)
+            .expect_err("logged-out account must error");
+        match err {
+            AccountSelectError::NotLoggedIn { config_dir } => {
+                assert_eq!(config_dir, "C:\\claude\\.claude-gmail");
+            }
+            other => panic!("expected NotLoggedIn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_cooled_down_account_populates_remaining_secs() {
+        let roster = win_roster();
+        let resolved = resolve_from(
+            "hotmail",
+            &roster,
+            |_| true,
+            |d| {
+                if d == "C:\\claude\\.claude-hotmail" {
+                    Some(Duration::from_secs(90))
+                } else {
+                    None
+                }
+            },
+        )
+        .expect("cooled-down account still resolves (warn, not fail)");
+        assert_eq!(resolved.account_name, "hotmail");
+        assert_eq!(resolved.cooldown_remaining_secs, Some(90));
+    }
+
+    #[test]
+    fn resolve_error_message_lists_available_names() {
+        let roster = win_roster();
+        let err = resolve_from("bogus", &roster, |_| true, |_| None).unwrap_err();
+        let msg = err.message();
+        assert!(msg.contains("bogus"), "message names the request: {}", msg);
+        assert!(
+            msg.contains("hotmail") && msg.contains("gmail") && msg.contains("paktis"),
+            "message lists available accounts: {}",
+            msg
+        );
     }
 }

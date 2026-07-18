@@ -238,9 +238,15 @@ fn resolve_device_id() -> Option<Uuid> {
 
 /// Pull a human-readable account label off the `effective_config_dir`.
 /// E.g. `C:\claude\.claude-hotmail` → `"hotmail"`; `~/.claude` →
-/// `"default"`. The label is purely for telemetry — the bridge keys on
-/// `device_id` + `tenant_id`, not account name.
-fn derive_account_name(config_dir: &str) -> String {
+/// `"default"`.
+///
+/// Used both for telemetry (the bridge keys on `device_id` + `tenant_id`,
+/// not account name) and as a **selection key**: per-request account
+/// selection (`ai_provider::account_usage::resolve_requested_account`)
+/// matches a caller-supplied friendly name against `derive_account_name`
+/// of each roster config dir, so this is the single source of truth for
+/// the name derivation — do not duplicate the path-parsing elsewhere.
+pub(crate) fn derive_account_name(config_dir: &str) -> String {
     // Cross-platform path parsing: `std::path::Path::new` on Linux treats
     // `\` as part of the filename, so a Windows-style path like
     // `"C:\\claude\\.claude-hotmail"` resolves to one big basename on

@@ -349,8 +349,11 @@ pub struct TerminalSession {
     title: Arc<Mutex<String>>,
     /// Working directory the shell was started in.
     working_dir: String,
-    /// Which terminal page this session belongs to.
-    page_id: String,
+    /// Which terminal page this session belongs to. Mutated post-spawn by
+    /// [`Self::set_page`] (the `POST /terminals/{id}/move` surface routes
+    /// through `TerminalManager::set_page` to here), so it mirrors `title`'s
+    /// `Arc<Mutex<String>>` shape rather than a frozen spawn-time `String`.
+    page_id: Arc<Mutex<String>>,
     /// Thread-safe writer to PTY stdin.
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     /// Handle to the PTY master (needed for resize).
@@ -1005,7 +1008,7 @@ impl TerminalSession {
             id,
             title: Arc::new(Mutex::new(title)),
             working_dir: cwd,
-            page_id,
+            page_id: Arc::new(Mutex::new(page_id)),
             writer,
             master: Arc::new(Mutex::new(master)),
             child_pid,
@@ -1602,7 +1605,7 @@ impl TerminalSession {
                     app_handle.clone(),
                     self.id.clone(),
                     self.working_dir.clone(),
-                    self.page_id.clone(),
+                    self.page_id(),
                     title,
                     parsed,
                 );
@@ -1756,7 +1759,7 @@ impl TerminalSession {
             exit_code: self.exit_code.lock().ok().and_then(|ec| *ec),
             created_at: self.created_at,
             total_bytes_produced: self.total_bytes_produced.load(Ordering::Relaxed),
-            page_id: self.page_id.clone(),
+            page_id: self.page_id(),
         }
     }
 
@@ -1774,6 +1777,30 @@ impl TerminalSession {
             // with no invariants to preserve, so this is safe.
             Err(e) => *e.into_inner() = title,
         }
+    }
+
+    /// Move this session onto a different terminal page. The
+    /// `POST /terminals/{id}/move` surface routes through
+    /// `TerminalManager::set_page` to here; subsequent `info()` calls (and
+    /// `GET /terminals` / `GET /terminal-pages`) see the new value, and the
+    /// manager emits a `terminal-page-changed` event so the grid re-mounts
+    /// the tab under its new page. Mirrors [`Self::set_title`] exactly.
+    pub fn set_page(&self, page_id: String) {
+        match self.page_id.lock() {
+            Ok(mut g) => *g = page_id,
+            // Poisoned: recover and overwrite. page_id is a pure-text field
+            // with no invariants to preserve, so this is safe.
+            Err(e) => *e.into_inner() = page_id,
+        }
+    }
+
+    /// Read the session's current page id (see [`Self::set_page`]).
+    /// Poison-tolerant: page_id is pure text with no invariants to preserve.
+    pub fn page_id(&self) -> String {
+        self.page_id
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|e| e.into_inner().clone())
     }
 
     /// Take the one-shot receiver that resolves when the reader thread
@@ -2071,7 +2098,7 @@ mod tests {
             id: "test".to_string(),
             title: Arc::new(Mutex::new("test".to_string())),
             working_dir: ".".to_string(),
-            page_id: "default".to_string(),
+            page_id: Arc::new(Mutex::new("default".to_string())),
             writer: Arc::new(Mutex::new(writer)),
             master: Arc::new(Mutex::new(create_noop_master())),
             child_pid: None,

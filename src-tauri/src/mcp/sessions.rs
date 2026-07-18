@@ -86,6 +86,13 @@ pub struct SpawnSessionRequest {
     /// below makes that explicit rather than letting the field vanish.
     #[serde(default)]
     pub prompt: Option<String>,
+    /// Optional per-request Claude account override — a friendly name
+    /// (`"hotmail"`, matching `derive_account_name`) OR a full roster
+    /// `config_dir` path. When set, the spawned session's `CLAUDE_CONFIG_DIR`
+    /// is pinned to that (validated) account instead of the global resolution.
+    /// Omitting it reproduces today's behaviour exactly.
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 fn default_session_name() -> String {
@@ -108,6 +115,15 @@ pub struct SpawnSessionResponse {
     /// 403 with the reason.)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spawn_authorization_warning: Option<String>,
+    /// The friendly account name pinned for this spawn, echoed back.
+    /// `None` when no `account` was requested (global resolution used).
+    pub account: Option<String>,
+    /// The config dir pinned as `CLAUDE_CONFIG_DIR`. `None` when no `account`
+    /// was requested.
+    pub config_dir: Option<String>,
+    /// A human-readable warning when the pinned account is currently
+    /// rate-limited (spawned anyway per the caller's explicit request).
+    pub cooldown_warning: Option<String>,
 }
 
 /// The new session's first user message.
@@ -197,6 +213,35 @@ async fn spawn_session(
         _ => None,
     };
 
+    // Resolve an explicit per-request account override, if any. Fail with a
+    // clear 4xx BEFORE creating any state — bogus name → 400, logged-out → 409.
+    let resolved_account = match req.account.as_deref() {
+        Some(account) if !account.is_empty() => {
+            match crate::ai_provider::resolve_requested_account(account) {
+                Ok(resolved) => Some(resolved),
+                Err(e @ crate::ai_provider::AccountSelectError::NotInRoster { .. }) => {
+                    return Err((StatusCode::BAD_REQUEST, e.message()));
+                }
+                Err(e @ crate::ai_provider::AccountSelectError::NotLoggedIn { .. }) => {
+                    return Err((StatusCode::CONFLICT, e.message()));
+                }
+            }
+        }
+        _ => None,
+    };
+
+    // Echo fields + cooldown warning derived from the resolved account.
+    let resp_account = resolved_account.as_ref().map(|r| r.account_name.clone());
+    let resp_config_dir = resolved_account.as_ref().map(|r| r.config_dir.clone());
+    let resp_cooldown_warning = resolved_account.as_ref().and_then(|r| {
+        r.cooldown_remaining_secs.map(|secs| {
+            format!(
+                "account '{}' is rate-limited for another {}s; spawning anyway per explicit request",
+                r.account_name, secs
+            )
+        })
+    });
+
     let task_run_id = uuid::Uuid::new_v4().to_string();
 
     let input = CreateTaskRunInput::new(&task_run_id, &req.task_name)
@@ -227,7 +272,10 @@ async fn spawn_session(
     let initial_prompt =
         initial_prompt_for(slash_command, req.args.as_deref(), req.prompt.as_deref());
 
-    let session_ctx = AiSessionContext::setup(&task_run_id, &req.task_name);
+    let mut session_ctx = AiSessionContext::setup(&task_run_id, &req.task_name);
+    if let Some(ref resolved) = resolved_account {
+        session_ctx.pinned_config_dir = Some(resolved.config_dir.clone());
+    }
 
     let dispatched = slash_command.is_some();
     let role_for_response = req.role.clone();
@@ -297,6 +345,9 @@ async fn spawn_session(
                 role: role_for_response,
                 dispatched_slash_command: dispatched,
                 spawn_authorization_warning: authz_warning,
+                account: resp_account,
+                config_dir: resp_config_dir,
+                cooldown_warning: resp_cooldown_warning,
             }))
         }
         Ok(Err(e)) => {
@@ -311,6 +362,9 @@ async fn spawn_session(
                 role: role_for_response,
                 dispatched_slash_command: false,
                 spawn_authorization_warning: authz_warning,
+                account: resp_account,
+                config_dir: resp_config_dir,
+                cooldown_warning: resp_cooldown_warning,
             }))
         }
         Err(join_err) => {
@@ -325,6 +379,9 @@ async fn spawn_session(
                 role: role_for_response,
                 dispatched_slash_command: false,
                 spawn_authorization_warning: authz_warning,
+                account: resp_account,
+                config_dir: resp_config_dir,
+                cooldown_warning: resp_cooldown_warning,
             }))
         }
     }

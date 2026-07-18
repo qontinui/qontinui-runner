@@ -443,6 +443,12 @@ pub struct AiSessionContext {
     /// MCP tools available to this session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub available_tools: Option<Vec<String>>,
+
+    /// When `Some`, pins `CLAUDE_CONFIG_DIR` for this spawn to a caller-chosen,
+    /// already-validated account config dir (per-request account selection).
+    /// `None` reproduces the default global account resolution byte-for-byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_config_dir: Option<String>,
 }
 
 impl AiSessionContext {
@@ -465,6 +471,7 @@ impl AiSessionContext {
             is_continuation: false,
             continued_from: None,
             available_tools: None,
+            pinned_config_dir: None,
         }
     }
 
