@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import { Plus, X, Shuffle, SquareArrowOutUpRight } from "lucide-react";
+import { Plus, X, Shuffle, SquareArrowOutUpRight, FilePlus } from "lucide-react";
 import type { TerminalPageConfig } from "./useTerminalPages";
 
 interface TerminalPageTabBarProps {
@@ -14,6 +14,8 @@ interface TerminalPageTabBarProps {
   onPopOut?: () => void;
   /** Detach an entire page (all its terminals + layout) into its own window. */
   onPopOutPage?: (pageId: string) => void;
+  /** Open the standalone "New Project" modal (Terminal-page front door). */
+  onNewProject?: () => void;
   /**
    * True in a page-pinned pop-out window — it shows ONE fixed page, so render a
    * minimal static title bar instead of the interactive multi-page tab strip.
@@ -31,6 +33,7 @@ export function TerminalPageTabBar({
   onReorganize,
   onPopOut,
   onPopOutPage,
+  onNewProject,
   isPinned,
 }: TerminalPageTabBarProps) {
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -189,6 +192,17 @@ export function TerminalPageTabBar({
           title="Open a new pop-out terminal window"
         >
           <SquareArrowOutUpRight className="w-3 h-3" />
+        </button>
+      )}
+      {onNewProject && (
+        <button
+          onClick={onNewProject}
+          aria-label="Create a new project"
+          className="ml-auto flex items-center gap-1 px-2 py-1 rounded text-[11px] text-[#9ece6a] hover:text-[#c0f090] hover:bg-[#9ece6a]/10 transition-colors"
+          title="Create a new project (local folder + optional GitHub repo)"
+        >
+          <FilePlus className="w-3.5 h-3.5" />
+          New Project
         </button>
       )}
     </div>

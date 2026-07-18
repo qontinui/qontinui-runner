@@ -1,9 +1,20 @@
 import { useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { FolderOpen, Search, Loader2, Package, CheckSquare, Square, HardDrive, GitBranch } from "lucide-react";
+import {
+  FolderOpen,
+  Search,
+  Loader2,
+  Package,
+  CheckSquare,
+  Square,
+  HardDrive,
+  GitBranch,
+  FilePlus,
+} from "lucide-react";
 import type { SavedProject } from "../../hooks/useSavedProjects";
 import { GithubRepoPicker } from "./GithubRepoPicker";
+import { NewProjectFlow } from "../new-project/NewProjectFlow";
 
 interface Project {
   path: string;
@@ -67,7 +78,7 @@ export function ProjectStep({
   onNext,
   onBack,
 }: ProjectStepProps) {
-  const [mode, setMode] = useState<"local" | "github">("local");
+  const [mode, setMode] = useState<"local" | "github" | "create">("local");
   const [scanPath, setScanPath] = useState("");
   const [discoveredProjects, setDiscoveredProjects] = useState<Project[]>([]);
   const [scanning, setScanning] = useState(false);
@@ -93,6 +104,26 @@ export function ProjectStep({
       setScanned(true);
     },
     [selectedProjects, onProjectsChange],
+  );
+
+  /**
+   * A freshly-created project (from NewProjectFlow) flows into the wizard's
+   * selection exactly like a cloned repo. NewProjectFlow returns the persisted
+   * `SavedProject` (camelCase `projectType`); map it to the wizard's internal
+   * `Project` shape and reuse the de-duping merge path.
+   */
+  const handleCreatedProject = useCallback(
+    (created: SavedProject) => {
+      handleClonedProjects([
+        {
+          path: created.path,
+          name: created.name,
+          type: created.projectType,
+          manifest: created.manifest,
+        },
+      ]);
+    },
+    [handleClonedProjects],
   );
 
   const pickFolder = useCallback(async () => {
@@ -196,29 +227,48 @@ export function ProjectStep({
           <GitBranch className="w-4 h-4" />
           Clone from GitHub
         </button>
+        <button
+          className={`btn-secondary flex items-center gap-2 ${
+            mode === "create" ? "border-primary/50 text-primary" : ""
+          }`}
+          onClick={() => setMode("create")}
+        >
+          <FilePlus className="w-4 h-4" />
+          Create new
+        </button>
       </div>
 
       {mode === "github" && <GithubRepoPicker onProjectsCloned={handleClonedProjects} />}
 
+      {mode === "create" && (
+        <div className="max-w-xl mx-auto w-full">
+          <NewProjectFlow onCreated={handleCreatedProject} />
+        </div>
+      )}
+
       {/* Folder picker */}
       {mode === "local" && (
-      <div className="flex gap-2 items-center max-w-xl mx-auto w-full">
-        <button className="btn-secondary flex items-center gap-2 shrink-0" onClick={pickFolder}>
-          <FolderOpen className="w-4 h-4" />
-          Browse
-        </button>
-        <div className="flex-1 panel px-3 py-2 text-sm truncate min-w-0">
-          {scanPath || <span className="text-muted-foreground">No folder selected</span>}
+        <div className="flex gap-2 items-center max-w-xl mx-auto w-full">
+          <button className="btn-secondary flex items-center gap-2 shrink-0" onClick={pickFolder}>
+            <FolderOpen className="w-4 h-4" />
+            Browse
+          </button>
+          <div className="flex-1 panel px-3 py-2 text-sm truncate min-w-0">
+            {scanPath || <span className="text-muted-foreground">No folder selected</span>}
+          </div>
+          <button
+            className="btn-primary flex items-center gap-2 shrink-0"
+            onClick={scanWorkspace}
+            disabled={!scanPath || scanning}
+          >
+            {scanning ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <Search className="w-4 h-4" />
+            )}
+            Scan
+          </button>
         </div>
-        <button
-          className="btn-primary flex items-center gap-2 shrink-0"
-          onClick={scanWorkspace}
-          disabled={!scanPath || scanning}
-        >
-          {scanning ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
-          Scan
-        </button>
-      </div>
       )}
 
       {error && (

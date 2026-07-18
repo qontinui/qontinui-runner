@@ -75,6 +75,7 @@ import { Sidebar } from "./components/navigation";
 import { TerminalPage } from "./components/terminal";
 import { TerminalPageTabBar } from "./components/terminal/TerminalPageTabBar";
 import { SessionRecoveryBanner } from "./components/terminal/SessionRecoveryBanner";
+import { NewProjectModal } from "./components/new-project/NewProjectModal";
 import { useTerminalPages } from "./components/terminal/useTerminalPages";
 import { useTerminalWindowActions } from "./components/terminal/useTerminalWindowActions";
 import { TerminalPageProvider } from "./components/terminal/TerminalPageContext";
@@ -179,6 +180,7 @@ function AppContent() {
   const terminalPages = useTerminalPages();
   const { popOutPage } = useTerminalWindowActions();
   const [showReorganize, setShowReorganize] = useState(false);
+  const [showNewProject, setShowNewProject] = useState(false);
 
   const handleReorganize = useCallback(
     async (plan: ReorganizePlan) => {
@@ -621,6 +623,7 @@ function AppContent() {
                   onRemovePage={terminalPages.removePage}
                   onRenamePage={terminalPages.renamePage}
                   onReorganize={() => setShowReorganize(true)}
+                  onNewProject={() => setShowNewProject(true)}
                   isPinned={terminalPages.isPinned}
                   onPopOut={() => {
                     // Open a new pop-out OS window (same process) that hosts its
@@ -649,6 +652,7 @@ function AppContent() {
                   than owning any session state.
                 */}
                 <SessionRecoveryBanner />
+                <NewProjectModal isOpen={showNewProject} onClose={() => setShowNewProject(false)} />
                 {showReorganize && (
                   <ReorganizeDialog
                     pages={terminalPages.pages}
