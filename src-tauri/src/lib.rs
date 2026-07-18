@@ -21,9 +21,9 @@ pub mod profile_cli;
 // (`intercept::set_bound_port`) and a READER is the standalone `qontinui-shim`
 // `.exe`, and a second bin cannot import from the runner bin's module tree. One
 // module ⇒ one schema ⇒ writer and reader cannot drift. See the module doc.
-pub mod runner_breadcrumb;
 pub mod profiles;
 pub mod relay_envelopes;
+pub mod runner_breadcrumb;
 pub mod schema_export;
 pub mod tauri_event_payloads;
 

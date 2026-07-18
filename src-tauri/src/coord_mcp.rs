@@ -118,9 +118,7 @@ enum NonceLifetime {
     Persistent,
     /// Mint-route provenance — dies at `expires_at`, never reaches disk, and is
     /// revoked live by opting the machine out.
-    Ephemeral {
-        expires_at: std::time::Instant,
-    },
+    Ephemeral { expires_at: std::time::Instant },
 }
 
 impl NonceLifetime {
@@ -2134,8 +2132,7 @@ mod tests {
                     workdir: format!("{wd}/other-expired"),
                     principal: ProxyPrincipal::Device,
                     lifetime: NonceLifetime::Ephemeral {
-                        expires_at: std::time::Instant::now()
-                            - std::time::Duration::from_secs(1),
+                        expires_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
                     },
                 },
             );

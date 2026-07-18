@@ -556,7 +556,9 @@ pub fn persistent_identity_installed() -> Result<bool, String> {
         return Ok(false);
     };
     #[cfg(target_os = "windows")]
-    let stub_present = dir.join(format!("{PERSISTENT_IDENTITY_TOOL}.exe")).is_file();
+    let stub_present = dir
+        .join(format!("{PERSISTENT_IDENTITY_TOOL}.exe"))
+        .is_file();
     #[cfg(not(target_os = "windows"))]
     let stub_present = false;
     if !stub_present {
