@@ -50,7 +50,9 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tracing::{debug, info, warn};
@@ -108,6 +110,195 @@ pub(super) async fn wait_first_census_posted(timeout: Duration) -> bool {
         _ = notified => true,
         _ = tokio::time::sleep(timeout) => {
             FIRST_CENSUS_POSTED.load(std::sync::atomic::Ordering::Acquire)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The shared census SNAPSHOT (the on-demand survey's data source).
+//
+// `build_census` is a MULTI-MINUTE walk on a real machine: ~400 worktrees
+// under `D:/qontinui-root`, each costing ~7 `git` subprocess spawns for the
+// worktree plus 3 for its canonical checkout (~2s/row measured), plus a
+// recursive file walk of every non-junctioned `node_modules`/`target`. Running
+// it INLINE per HTTP request made `GET /agent-worktrees/reclaimable` hang for
+// the whole walk — a UI panel's primary fetch must never do that.
+//
+// So the periodic task publishes its result here and the on-demand survey
+// READS this snapshot. A snapshot is only ever used for DISPLAY: the survey
+// always reports how old it is (`census_age_secs`), and the removal path
+// re-evaluates every runner guard against LIVE disk before deleting anything
+// (see `on_demand::execute_targets`) — a stale census can never authorize a
+// deletion.
+// ---------------------------------------------------------------------------
+
+/// The most recent completed census walk, with the wall-clock time it was
+/// taken and how long it took to build. Cheap to clone (the payload is behind
+/// an `Arc`) so readers never hold the lock across `await`.
+#[derive(Debug, Clone)]
+pub(super) struct CensusSnapshot {
+    pub(super) req: Arc<WorktreeCensusReq>,
+    pub(super) taken_at: chrono::DateTime<chrono::Utc>,
+    pub(super) build_ms: u64,
+}
+
+static LATEST_CENSUS: OnceLock<RwLock<Option<CensusSnapshot>>> = OnceLock::new();
+
+/// Wakes survey waiters the moment a new snapshot lands (same idiom as
+/// [`FIRST_CENSUS_NOTIFY`], one level up: that one fires on a successful POST,
+/// this one on a completed WALK — the survey does not care whether coord
+/// accepted the census).
+static CENSUS_SNAPSHOT_NOTIFY: OnceLock<tokio::sync::Notify> = OnceLock::new();
+
+/// A census walk is running right now. Guards against piling a second
+/// multi-minute disk walk on top of the first (a `?refresh=1` spam, or a
+/// periodic tick landing mid-refresh).
+static CENSUS_BUILD_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// How many census walks this process has STARTED. Purely observational — the
+/// regression test asserts the survey does not increment it.
+static CENSUS_BUILDS_STARTED: AtomicU64 = AtomicU64::new(0);
+
+fn latest_census_cell() -> &'static RwLock<Option<CensusSnapshot>> {
+    LATEST_CENSUS.get_or_init(|| RwLock::new(None))
+}
+
+fn snapshot_notify() -> &'static tokio::sync::Notify {
+    CENSUS_SNAPSHOT_NOTIFY.get_or_init(tokio::sync::Notify::new)
+}
+
+/// The most recent snapshot, or `None` before the first walk of this boot
+/// completes. NEVER blocks and NEVER triggers a walk.
+pub(super) fn latest_census() -> Option<CensusSnapshot> {
+    latest_census_cell()
+        .read()
+        .ok()
+        .and_then(|g| g.as_ref().cloned())
+}
+
+/// True while a census walk is in flight.
+pub(super) fn census_build_active() -> bool {
+    CENSUS_BUILD_ACTIVE.load(Ordering::Acquire)
+}
+
+/// Count of census walks STARTED in this process (test observability).
+pub(super) fn census_builds_started() -> u64 {
+    CENSUS_BUILDS_STARTED.load(Ordering::Acquire)
+}
+
+/// Publish a completed walk and wake every waiter.
+fn publish_census(req: WorktreeCensusReq, build_ms: u64) -> Arc<WorktreeCensusReq> {
+    let arc = Arc::new(req);
+    let snapshot = CensusSnapshot {
+        req: Arc::clone(&arc),
+        taken_at: chrono::Utc::now(),
+        build_ms,
+    };
+    if let Ok(mut g) = latest_census_cell().write() {
+        *g = Some(snapshot);
+    }
+    snapshot_notify().notify_waiters();
+    arc
+}
+
+/// Test-only publisher so the survey's cache path is exercisable without a
+/// multi-minute disk walk.
+#[cfg(test)]
+pub(super) fn publish_census_for_test(req: WorktreeCensusReq) {
+    publish_census(req, 0);
+}
+
+/// What one call to [`build_and_publish`] did.
+pub(super) enum BuildOutcome {
+    /// A walk ran and its result is now the published snapshot.
+    Built(Arc<WorktreeCensusReq>),
+    /// Another walk was already in flight — deliberately did NOT start a
+    /// second one.
+    AlreadyRunning,
+    /// Identity / workspace root unresolvable; nothing to census.
+    Skipped,
+}
+
+/// Run the census walk once (on the blocking pool) and publish the snapshot.
+///
+/// This is the ONLY place a walk is started, so the "at most one walk at a
+/// time" invariant holds for the periodic tick and the explicit refresh alike.
+pub(super) async fn build_and_publish() -> Result<BuildOutcome, String> {
+    if CENSUS_BUILD_ACTIVE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        debug!("worktree_census: a census walk is already in flight — not starting a second");
+        return Ok(BuildOutcome::AlreadyRunning);
+    }
+    CENSUS_BUILDS_STARTED.fetch_add(1, Ordering::AcqRel);
+    let started = Instant::now();
+    // build_census stats real files under every worktree's node_modules/
+    // target and shells out to git — a synchronous multi-MINUTE disk walk.
+    // Run it on the blocking pool so the shared fleet-publishers runtime's
+    // async worker isn't pinned for the duration (the starvation class
+    // PR #391 isolated the heartbeat from).
+    let built = tokio::task::spawn_blocking(build_census).await;
+    CENSUS_BUILD_ACTIVE.store(false, Ordering::Release);
+    let build_ms = started.elapsed().as_millis() as u64;
+    let req = built.map_err(|e| format!("census walk panicked: {e}"))?;
+    match req {
+        Some(r) => {
+            info!(
+                "worktree_census: census walk completed in {}ms ({} worktrees, {} volumes)",
+                build_ms,
+                r.worktrees.len(),
+                r.volumes.len()
+            );
+            Ok(BuildOutcome::Built(publish_census(r, build_ms)))
+        }
+        None => Ok(BuildOutcome::Skipped),
+    }
+}
+
+/// Kick a census walk in the BACKGROUND (the `?refresh=1` path). Returns
+/// `true` when a new walk was started, `false` when one was already running.
+/// Never awaits the walk — the caller must stay bounded.
+pub(super) fn spawn_census_rebuild() -> bool {
+    if census_build_active() {
+        return false;
+    }
+    tokio::spawn(async {
+        if let Err(e) = build_and_publish().await {
+            warn!("worktree_census: on-demand refresh failed: {e}");
+        }
+    });
+    true
+}
+
+/// Wait up to `timeout` for a snapshot strictly newer than `after`
+/// (`after: None` ⇒ any snapshot at all). Returns `None` on timeout — the
+/// caller then degrades to whatever [`latest_census`] holds, or to an honest
+/// "census not ready yet" state. NEVER starts a walk.
+pub(super) async fn wait_for_census_after(
+    after: Option<chrono::DateTime<chrono::Utc>>,
+    timeout: Duration,
+) -> Option<CensusSnapshot> {
+    let fresh_enough = |s: &CensusSnapshot| after.is_none_or(|prev| s.taken_at > prev);
+    let deadline = Instant::now() + timeout;
+    loop {
+        // Register the waiter BEFORE reading, so a publish between the read
+        // and the await cannot be missed.
+        let notified = snapshot_notify().notified();
+        if let Some(s) = latest_census() {
+            if fresh_enough(&s) {
+                return Some(s);
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return latest_census().filter(fresh_enough);
+        }
+        tokio::select! {
+            _ = notified => {}
+            _ = tokio::time::sleep(remaining) => {
+                return latest_census().filter(fresh_enough);
+            }
         }
     }
 }
@@ -886,17 +1077,11 @@ pub fn build_census() -> Option<WorktreeCensusReq> {
 /// a successful POST; `Err` only on a built-payload transport / non-2xx
 /// failure (the caller logs + retries next tick).
 pub async fn tick_once() -> Result<(), String> {
-    // build_census stats real files under every worktree's node_modules/
-    // target and shells out to git — a synchronous multi-second disk walk.
-    // Run it on the blocking pool so the shared fleet-publishers runtime's
-    // async worker isn't pinned for the duration (the starvation class
-    // PR #391 isolated the heartbeat from).
-    let req = match tokio::task::spawn_blocking(build_census)
-        .await
-        .map_err(|e| format!("census walk panicked: {e}"))?
-    {
-        Some(r) => r,
-        None => return Ok(()),
+    // One walk at a time, published to the shared snapshot BEFORE the POST so
+    // the on-demand survey benefits even when coord is unreachable.
+    let req = match build_and_publish().await? {
+        BuildOutcome::Built(r) => r,
+        BuildOutcome::AlreadyRunning | BuildOutcome::Skipped => return Ok(()),
     };
     let base = match coord_http_base() {
         Some(b) => b,
@@ -917,7 +1102,7 @@ pub async fn tick_once() -> Result<(), String> {
         .map_err(|e| format!("build census http client: {e}"))?;
     let resp = client
         .post(&url)
-        .json(&req)
+        .json(req.as_ref())
         .send()
         .await
         .map_err(|e| format!("POST {url}: {e}"))?;

@@ -48,14 +48,33 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::canonical_paths::default_canonical_path;
-use super::census::{self, WorktreeCensus};
+use super::census::{self, CensusSnapshot, WorktreeCensus};
 use super::reclaim::{self, ReclaimAction, ReclaimInstruction, ReclaimPull, ReclaimStep};
+
+// ---------------------------------------------------------------------------
+// Bounded-wait policy — the endpoint must ALWAYS answer.
+// ---------------------------------------------------------------------------
+
+/// How long the survey will wait for a census snapshot before answering
+/// anyway. Small on purpose: a census WALK takes minutes on a real machine, so
+/// waiting for one is never the plan — this only smooths the case where a walk
+/// is about to finish.
+const DEFAULT_CENSUS_WAIT_SECS: u64 = 2;
+
+/// Hard ceiling on the caller-supplied `?waitSecs=`. The endpoint answers
+/// within this plus coord's own bounded (15s) pull, no matter what.
+const MAX_CENSUS_WAIT_SECS: u64 = 10;
+
+/// A snapshot older than this is labelled `stale` rather than `fresh`. Twice
+/// the 300s census cadence, so a single missed tick does not cry wolf.
+const CENSUS_STALE_AFTER_SECS: u64 = 600;
 
 // ---------------------------------------------------------------------------
 // Skip reasons — the refusal vocabulary. One token per guard.
@@ -280,6 +299,65 @@ pub struct SurveySummary {
     pub reclaimable_bytes: u64,
 }
 
+/// Freshness of the disk census the survey is derived from. This is the
+/// UX-honesty contract: the panel MUST be able to say "as of Nm ago", and MUST
+/// never render a pending census as an authoritative "nothing to clean".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CensusStatus {
+    /// No census walk has completed yet this boot — `items` is empty because
+    /// we do not KNOW, not because there is nothing.
+    #[default]
+    Pending,
+    /// Snapshot within [`CENSUS_STALE_AFTER_SECS`].
+    Fresh,
+    /// Snapshot older than that — still shown, but flagged.
+    Stale,
+}
+
+impl CensusStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CensusStatus::Pending => "pending",
+            CensusStatus::Fresh => "fresh",
+            CensusStatus::Stale => "stale",
+        }
+    }
+}
+
+/// Query string of `GET /agent-worktrees/reclaimable`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SurveyQuery {
+    /// `?refresh=1` — kick a fresh census walk in the BACKGROUND. Not the
+    /// default path, and never awaited beyond [`SurveyQuery::wait`]: a walk
+    /// takes minutes, so the response still comes from the cached snapshot
+    /// with `census_refreshing: true`.
+    #[serde(default)]
+    pub refresh: Option<String>,
+    /// Bounded override of the snapshot wait, capped at
+    /// [`MAX_CENSUS_WAIT_SECS`].
+    #[serde(default)]
+    pub wait_secs: Option<u64>,
+}
+
+impl SurveyQuery {
+    pub fn refresh_requested(&self) -> bool {
+        matches!(
+            self.refresh.as_deref(),
+            Some("1" | "true" | "yes" | "on" | "")
+        )
+    }
+
+    pub fn wait(&self) -> Duration {
+        Duration::from_secs(
+            self.wait_secs
+                .unwrap_or(DEFAULT_CENSUS_WAIT_SECS)
+                .min(MAX_CENSUS_WAIT_SECS),
+        )
+    }
+}
+
 /// Body of `GET /agent-worktrees/reclaimable`.
 #[derive(Debug, Clone, Serialize)]
 pub struct Survey {
@@ -298,6 +376,24 @@ pub struct Survey {
     pub canonical_excluded: usize,
     pub items: Vec<SurveyItem>,
     pub summary: SurveySummary,
+
+    // --- Census freshness (UX honesty — never present stale data as live) ---
+    /// `pending` | `fresh` | `stale`.
+    pub census_status: CensusStatus,
+    /// RFC3339 wall-clock time the underlying disk census was taken.
+    /// `None` while `census_status == pending`.
+    pub census_taken_at: Option<String>,
+    /// Age of that snapshot in seconds — what the panel renders as
+    /// "as of Nm ago".
+    pub census_age_secs: Option<u64>,
+    /// How long the snapshot's walk took to build (ms). Explains the cadence
+    /// to the operator: on a real machine this is minutes.
+    pub census_build_ms: Option<u64>,
+    /// A census walk is running right now (periodic tick or `?refresh=1`).
+    pub census_refreshing: bool,
+    /// One operator-facing sentence describing the data's provenance. Always
+    /// present, and explicitly says "not ready" rather than implying empty.
+    pub census_note: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -344,6 +440,13 @@ pub struct ReclaimOutcome {
     pub removed: Vec<RemovedItem>,
     pub skipped: Vec<SkippedItem>,
     pub dry_run: bool,
+    /// Freshness of the census the CANDIDATE SET was derived from. The guards
+    /// themselves are always re-evaluated against live disk immediately before
+    /// removal — this only tells the caller how current the *candidate list*
+    /// was, so `pending` (nothing surveyed yet) is never mistaken for
+    /// "nothing was reclaimable".
+    pub census_status: CensusStatus,
+    pub census_age_secs: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -371,15 +474,52 @@ struct Assembled {
     coord_reason: Option<String>,
 }
 
-/// Build the survey: coord's decision ⋈ this device's on-disk census, with
-/// the runner-local G6 guard applied on top.
+/// Build the survey: coord's decision ⋈ this device's most recent on-disk
+/// census snapshot, with the runner-local G6 guard applied on top.
 ///
-/// Never errors on a coord failure — it degrades to `coord_reachable: false`
-/// with every item blocked as `coord-unreachable`, which is the honest
-/// fail-safe (no decision ⇒ no eligibility).
-pub async fn survey() -> Result<Survey, String> {
-    // coord's decision first (async), then the disk walk (blocking).
-    let pull = reclaim::fetch_pull().await;
+/// ## Why this reads a CACHED census
+///
+/// [`census::build_census`] is a multi-minute walk (~400 worktrees under the
+/// workspace root, ~10 `git` spawns per row plus recursive sizing of every
+/// non-junctioned `node_modules`/`target`). Running it inline per request made
+/// this endpoint hang for the whole walk. It now reads the snapshot the
+/// periodic census task publishes, and REPORTS ITS AGE — never presenting a
+/// stale snapshot as live. Removal still re-checks live disk
+/// ([`execute_targets`]), so a stale snapshot can never authorize a deletion.
+///
+/// ## Always answers
+///
+/// Cold start (no snapshot yet) waits at most [`SurveyQuery::wait`] and then
+/// returns `census_status: "pending"` with an empty `items` and an explicit
+/// note — an honest "not ready", never a hang and never a misleading
+/// "nothing to clean".
+///
+/// Never errors on a coord failure either — it degrades to
+/// `coord_reachable: false` with every item blocked as `coord-unreachable`,
+/// the honest fail-safe (no decision ⇒ no eligibility).
+pub async fn survey(query: SurveyQuery) -> Result<Survey, String> {
+    let previous = census::latest_census();
+
+    // `?refresh=1` — kick a walk in the BACKGROUND. Deliberately not the
+    // default path, and never awaited past the bounded wait below.
+    if query.refresh_requested() && census::spawn_census_rebuild() {
+        info!("agent_worktrees: survey requested an explicit census refresh (background)");
+    }
+
+    // coord's decision and the bounded snapshot wait run CONCURRENTLY, so the
+    // worst case is max(coord 15s timeout, wait ≤10s), not their sum.
+    let wait_for = if query.refresh_requested() {
+        // Wait for something strictly NEWER than what we already had.
+        previous.as_ref().map(|s| s.taken_at)
+    } else {
+        // Any snapshot at all; returns instantly when one already exists.
+        None
+    };
+    let (pull, waited) = tokio::join!(
+        reclaim::fetch_pull(),
+        census::wait_for_census_after(wait_for, query.wait())
+    );
+
     let (device_id, pull, coord_error) = match pull {
         Ok(Some((id, p))) => (Some(id), Some(p), None),
         Ok(None) => (
@@ -393,23 +533,71 @@ pub async fn survey() -> Result<Survey, String> {
         }
     };
 
-    let census_req = tokio::task::spawn_blocking(census::build_census)
-        .await
-        .map_err(|e| format!("census walk panicked: {e}"))?;
-    let Some(census_req) = census_req else {
-        return Ok(Survey {
-            device_id,
-            coord_reachable: pull.is_some(),
+    // `waited` is the newer snapshot when one arrived in time; otherwise fall
+    // back to whatever we already had (possibly still `None` on cold start).
+    let snapshot = waited.or_else(census::latest_census).or(previous);
+
+    Ok(assemble_survey(
+        snapshot.as_ref(),
+        pull.as_ref(),
+        device_id,
+        coord_error,
+        census::census_build_active(),
+        chrono::Utc::now(),
+    ))
+}
+
+/// PURE assembly of the survey response from an (optional) census snapshot and
+/// an (optional) coord pull. Split out from [`survey`] so the cold-start /
+/// freshness behaviour is unit-testable without a disk walk or coord.
+fn assemble_survey(
+    snapshot: Option<&CensusSnapshot>,
+    pull: Option<&ReclaimPull>,
+    coord_device_id: Option<Uuid>,
+    coord_error: Option<String>,
+    census_refreshing: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Survey {
+    let coord_reachable = pull.is_some();
+    let remove_armed = pull.is_some_and(|p| p.remove_armed);
+    let rejunction_armed = pull.is_some_and(|p| p.rejunction_armed);
+
+    let Some(snapshot) = snapshot else {
+        // Cold start: we do NOT know what is on disk, and we say so.
+        return Survey {
+            device_id: coord_device_id,
+            coord_reachable,
             coord_error,
-            remove_armed: pull.as_ref().is_some_and(|p| p.remove_armed),
-            rejunction_armed: pull.as_ref().is_some_and(|p| p.rejunction_armed),
+            remove_armed,
+            rejunction_armed,
             canonical_excluded: 0,
             items: Vec::new(),
             summary: SurveySummary::default(),
-        });
+            census_status: CensusStatus::Pending,
+            census_taken_at: None,
+            census_age_secs: None,
+            census_build_ms: None,
+            census_refreshing,
+            census_note: if census_refreshing {
+                "No disk snapshot yet — the first census walk of this session is still \
+                 running. This list is not 'nothing to clean up', it is 'not known yet'."
+                    .to_string()
+            } else {
+                "No disk snapshot yet — the census has not completed a walk this session. \
+                 This list is not 'nothing to clean up', it is 'not known yet'."
+                    .to_string()
+            },
+        };
     };
 
-    let (items, canonical_excluded) = build_survey_items(&census_req.worktrees, pull.as_ref());
+    let age_secs = (now - snapshot.taken_at).num_seconds().max(0) as u64;
+    let status = if age_secs <= CENSUS_STALE_AFTER_SECS {
+        CensusStatus::Fresh
+    } else {
+        CensusStatus::Stale
+    };
+
+    let (items, canonical_excluded) = build_survey_items(&snapshot.req.worktrees, pull);
     let summary = SurveySummary {
         reapable: items.iter().filter(|i| i.status == "reapable").count(),
         blocked: items.iter().filter(|i| i.status == "blocked").count(),
@@ -420,16 +608,48 @@ pub async fn survey() -> Result<Survey, String> {
             .sum(),
     };
 
-    Ok(Survey {
-        device_id: Some(census_req.device_id),
-        coord_reachable: pull.is_some(),
+    Survey {
+        device_id: Some(snapshot.req.device_id),
+        coord_reachable,
         coord_error,
-        remove_armed: pull.as_ref().is_some_and(|p| p.remove_armed),
-        rejunction_armed: pull.as_ref().is_some_and(|p| p.rejunction_armed),
+        remove_armed,
+        rejunction_armed,
         canonical_excluded,
         items,
         summary,
-    })
+        census_status: status,
+        census_taken_at: Some(snapshot.taken_at.to_rfc3339()),
+        census_age_secs: Some(age_secs),
+        census_build_ms: Some(snapshot.build_ms),
+        census_refreshing,
+        census_note: format!(
+            "Disk state as of {} ago{}{}. Removal always re-checks live disk before \
+             deleting anything.",
+            humanize_secs(age_secs),
+            if status == CensusStatus::Stale {
+                " (stale — the census walk is overdue)"
+            } else {
+                ""
+            },
+            if census_refreshing {
+                "; a fresh walk is running now"
+            } else {
+                ""
+            }
+        ),
+    }
+}
+
+/// `95` → `"1m 35s"`. Small, allocation-cheap, and only used for the note.
+fn humanize_secs(secs: u64) -> String {
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{}m {}s", mins, secs % 60);
+    }
+    format!("{}h {}m", mins / 60, mins % 60)
 }
 
 /// True when `path` IS the canonical checkout of `repo` (not a worktree of
@@ -578,14 +798,24 @@ fn census_junctioned_sinks(w: &WorktreeCensus) -> Vec<String> {
 /// the local guards against live disk (`root_exists`, `git status --porcelain`
 /// for G1, and a fresh G6 build probe) immediately before removal, because the
 /// survey the operator looked at may be seconds or minutes old.
+///
+/// That last sentence is now load-bearing rather than defensive: the survey's
+/// disk facts come from the cached census snapshot (see [`survey`]), so the
+/// candidate list IS minutes old by construction. It proposes; live disk
+/// disposes. `coord`'s half of the decision is never cached — `fetch_pull`
+/// runs per call.
 pub async fn reclaim_now(req: ReclaimRequest) -> Result<ReclaimOutcome, String> {
-    let survey = survey().await?;
+    // The candidate set comes from the cached census (bounded, always answers);
+    // every guard below is then re-run against LIVE disk in `execute_targets`.
+    let survey = survey(SurveyQuery::default()).await?;
     let requested: Option<Vec<String>> = req
         .ids
         .map(|ids| ids.iter().map(|s| norm_path(s)).collect::<Vec<_>>());
 
     let mut outcome = ReclaimOutcome {
         dry_run: req.dry_run,
+        census_status: survey.census_status,
+        census_age_secs: survey.census_age_secs,
         ..Default::default()
     };
 
@@ -653,8 +883,14 @@ fn execute_targets(targets: Vec<SurveyItem>, dry_run: bool) -> ReclaimOutcome {
         let path = PathBuf::from(&item.worktree_path);
 
         // --- Live re-check of every runner-owned guard --------------------
+        // This is why serving the SURVEY from a cached census is safe: the
+        // cache only ever proposes CANDIDATES. Every runner-owned guard below
+        // is re-evaluated against live disk right here, immediately before the
+        // removal — a stale census can never authorize a deletion.
         let facts = CandidateFacts {
-            coord_reapable: true, // coord cleared it in the survey we just built
+            // coord cleared it in the pull we just made (that half is always
+            // live — `fetch_pull` is not cached).
+            coord_reapable: true,
             coord_block_reason: None,
             // G1 — the authoritative, execution-time dirty check.
             is_dirty: reclaim::worktree_is_dirty(&path),
@@ -1109,6 +1345,196 @@ mod tests {
         assert_eq!(excluded, 1, "the canonical checkout must be filtered out");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].worktree_path, wt);
+    }
+
+    // -----------------------------------------------------------------
+    // Census-cache regression tests — the ship-blocking hang this fixes.
+    //
+    // `survey()` used to call `census::build_census` inline on every
+    // request. On a real machine that walk is MINUTES (~400 worktrees ×
+    // ~10 git spawns + recursive sizing), so `GET
+    // /agent-worktrees/reclaimable` hung indefinitely. These lock in the
+    // two properties that fix it: the survey reads a CACHED snapshot and
+    // never starts a walk, and it always answers even with no snapshot.
+    // -----------------------------------------------------------------
+
+    fn census_req(rows: Vec<WorktreeCensus>) -> census::WorktreeCensusReq {
+        census::WorktreeCensusReq {
+            device_id: Uuid::nil(),
+            tenant_id: None,
+            volumes: Vec::new(),
+            worktrees: rows,
+        }
+    }
+
+    /// A snapshot taken exactly `age` before `now` — exact, so the rendered
+    /// "as of" label is deterministic.
+    fn snapshot_of(
+        rows: Vec<WorktreeCensus>,
+        now: chrono::DateTime<chrono::Utc>,
+        age: chrono::Duration,
+    ) -> CensusSnapshot {
+        CensusSnapshot {
+            req: std::sync::Arc::new(census_req(rows)),
+            taken_at: now - age,
+            build_ms: 802_431,
+        }
+    }
+
+    #[tokio::test]
+    async fn survey_reads_the_cached_census_and_never_starts_a_walk() {
+        // Publish a snapshot the way the periodic census task would…
+        let wt = "D:/qontinui-root/qontinui-runner-wt-cached";
+        census::publish_census_for_test(census_req(vec![census_row(wt, false, Some(false))]));
+
+        let walks_before = census::census_builds_started();
+        let started = std::time::Instant::now();
+        let s = survey(SurveyQuery::default())
+            .await
+            .expect("survey must always answer");
+        let elapsed = started.elapsed();
+
+        // …and the survey must SERVE it without rebuilding the census.
+        assert_eq!(
+            census::census_builds_started(),
+            walks_before,
+            "the survey must not trigger a census walk — that is the hang"
+        );
+        // Bounded: coord's pull is capped at 15s, the snapshot wait at 10s,
+        // and they run concurrently.
+        assert!(
+            elapsed < std::time::Duration::from_secs(25),
+            "survey took {elapsed:?} — it must answer promptly"
+        );
+        assert_ne!(s.census_status, CensusStatus::Pending);
+        assert!(s.census_taken_at.is_some());
+        assert!(s.census_age_secs.is_some());
+        assert!(s.items.iter().any(|i| i.worktree_path == wt));
+    }
+
+    #[tokio::test]
+    async fn bounded_wait_returns_even_when_no_snapshot_ever_arrives() {
+        // A snapshot strictly newer than "now + 1h" can never arrive, so this
+        // exercises the pure timeout arm deterministically.
+        let unreachable = chrono::Utc::now() + chrono::Duration::hours(1);
+        let started = std::time::Instant::now();
+        let got =
+            census::wait_for_census_after(Some(unreachable), Duration::from_millis(150)).await;
+        let elapsed = started.elapsed();
+        assert!(got.is_none(), "no such snapshot can exist");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the wait must be bounded, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn cold_start_without_a_snapshot_is_pending_and_says_so() {
+        // The endpoint must ALWAYS answer — and an empty list before the first
+        // walk must read as "not known yet", never as "nothing to clean up".
+        let s = assemble_survey(None, None, None, None, true, chrono::Utc::now());
+        assert_eq!(s.census_status, CensusStatus::Pending);
+        assert!(s.items.is_empty());
+        assert_eq!(s.summary.reapable, 0);
+        assert!(s.census_taken_at.is_none());
+        assert!(s.census_age_secs.is_none());
+        assert!(s.census_refreshing);
+        assert!(
+            s.census_note.contains("not known yet"),
+            "the note must not imply an empty disk: {}",
+            s.census_note
+        );
+    }
+
+    #[test]
+    fn survey_reports_snapshot_age_and_flags_a_stale_one() {
+        let wt = "D:/qontinui-root/qontinui-runner-wt-aged";
+        let now = chrono::Utc::now();
+
+        let fresh = snapshot_of(
+            vec![census_row(wt, false, Some(false))],
+            now,
+            chrono::Duration::seconds(120),
+        );
+        let s = assemble_survey(Some(&fresh), None, None, None, false, now);
+        assert_eq!(s.census_status, CensusStatus::Fresh);
+        assert_eq!(s.census_age_secs, Some(120));
+        assert!(s.census_note.contains("2m 0s ago"), "{}", s.census_note);
+        assert_eq!(s.census_build_ms, Some(802_431));
+
+        let old = snapshot_of(
+            vec![census_row(wt, false, Some(false))],
+            now,
+            chrono::Duration::seconds(1800),
+        );
+        let s = assemble_survey(Some(&old), None, None, None, false, now);
+        assert_eq!(s.census_status, CensusStatus::Stale);
+        assert!(s.census_note.contains("stale"), "{}", s.census_note);
+        // Stale data is still SHOWN — flagged, not hidden.
+        assert_eq!(s.items.len(), 1);
+    }
+
+    #[test]
+    fn refresh_is_opt_in_and_the_wait_is_capped() {
+        assert!(!SurveyQuery::default().refresh_requested());
+        for v in ["1", "true", "yes", "on", ""] {
+            let q = SurveyQuery {
+                refresh: Some(v.to_string()),
+                wait_secs: None,
+            };
+            assert!(q.refresh_requested(), "{v}");
+        }
+        let q = SurveyQuery {
+            refresh: Some("0".to_string()),
+            wait_secs: Some(9_999),
+        };
+        assert!(!q.refresh_requested());
+        assert_eq!(q.wait(), Duration::from_secs(MAX_CENSUS_WAIT_SECS));
+        assert_eq!(
+            SurveyQuery::default().wait(),
+            Duration::from_secs(DEFAULT_CENSUS_WAIT_SECS)
+        );
+    }
+
+    #[test]
+    fn removal_rechecks_live_disk_and_refuses_a_vanished_worktree() {
+        // The safety invariant a cached census must never weaken: the CANDIDATE
+        // set may be minutes old, but `execute_targets` re-evaluates every
+        // runner guard against LIVE disk before deleting. A path that no longer
+        // exists is refused with `absent` — never removed on the cache's word.
+        let gone = "D:/qontinui-root/qontinui-runner-wt-vanished-9d3f1a";
+        assert!(!Path::new(gone).exists(), "test fixture must not exist");
+        let item = SurveyItem {
+            id: norm_path(gone),
+            worktree_path: gone.to_string(),
+            repo: "qontinui-runner".to_string(),
+            branch: None,
+            status: "reapable", // the cached survey said GO…
+            reason: None,
+            reason_detail: None,
+            is_dirty: false,
+            building: false,
+            pinned: false,
+            landed_in_main: Some(true),
+            attributable_bytes: 4096,
+            junctioned_paths: Vec::new(),
+            coord_reason: Some("worktree:lifecycle:pr_merged".to_string()),
+        };
+        let outcome = execute_targets(vec![item], /* dry_run */ false);
+        // …and the live re-check said NO.
+        assert!(outcome.removed.is_empty());
+        assert_eq!(outcome.skipped.len(), 1);
+        assert_eq!(outcome.skipped[0].reason, "absent");
+        assert!(!outcome.skipped[0].detail.is_empty(), "never a silent drop");
+    }
+
+    #[test]
+    fn humanize_secs_renders_the_as_of_label() {
+        assert_eq!(humanize_secs(0), "0s");
+        assert_eq!(humanize_secs(59), "59s");
+        assert_eq!(humanize_secs(95), "1m 35s");
+        assert_eq!(humanize_secs(3_600), "1h 0m");
+        assert_eq!(humanize_secs(7_860), "2h 11m");
     }
 
     #[test]

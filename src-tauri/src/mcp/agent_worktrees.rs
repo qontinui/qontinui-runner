@@ -62,14 +62,14 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::Json,
     routing::{get, post},
     Router,
 };
 
-use crate::agent_worktree::on_demand::{self, ReclaimRequest};
+use crate::agent_worktree::on_demand::{self, ReclaimRequest, SurveyQuery};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
 // ============================================================================
@@ -104,12 +104,35 @@ pub fn routes() -> Router<Arc<ApiState>> {
 ///       { "id": "…-wt-b", "status": "blocked", "reason": "dirty",
 ///         "reason_detail": "Uncommitted work in this tree (G1) — …" }
 ///     ],
-///     "summary": { "reapable": 1, "blocked": 1, "reclaimable_bytes": 4096 } } }
+///     "summary": { "reapable": 1, "blocked": 1, "reclaimable_bytes": 4096 },
+///     "census_status": "fresh",   // "pending" | "fresh" | "stale"
+///     "census_taken_at": "2026-07-19T11:49:48Z",
+///     "census_age_secs": 214,
+///     "census_build_ms": 802431,
+///     "census_refreshing": false,
+///     "census_note": "Disk state as of 3m 34s ago. Removal always re-checks live disk…" } }
 /// ```
+///
+/// ### Bounded by construction
+///
+/// The disk census is a MULTI-MINUTE walk, so this route reads the snapshot
+/// published by the periodic census task rather than rebuilding one per
+/// request (which made it hang indefinitely). It answers within the bounded
+/// coord pull (15s) plus a ≤10s snapshot wait, always — a cold start with no
+/// snapshot yet returns `census_status: "pending"` with an empty `items` and a
+/// note saying so, never an implied "nothing to clean up".
+///
+/// ### Query params
+///
+/// * `?refresh=1` — kick a fresh census walk in the BACKGROUND. The response
+///   still comes from the cached snapshot (with `census_refreshing: true`);
+///   the walk is never awaited beyond `waitSecs`.
+/// * `?waitSecs=N` — bounded override of the snapshot wait (capped at 10).
 async fn reclaimable_handler(
     State(_state): State<Arc<ApiState>>,
+    Query(query): Query<SurveyQuery>,
 ) -> Result<Json<ApiResponse<on_demand::Survey>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match on_demand::survey().await {
+    match on_demand::survey(query).await {
         Ok(survey) => Ok(Json(ApiResponse::success(survey))),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,

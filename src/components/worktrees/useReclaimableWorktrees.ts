@@ -48,6 +48,17 @@ export interface WorktreeSurveyItem {
   coord_reason: string | null;
 }
 
+/**
+ * Freshness of the on-disk census the survey is derived from.
+ *
+ * The disk census is a MULTI-MINUTE walk on a real machine, so the endpoint
+ * serves the snapshot published by the runner's periodic census task rather
+ * than rebuilding one per request. That makes the age load-bearing: the panel
+ * must say "as of Nm ago" and must never render `pending` as an authoritative
+ * "nothing to clean up".
+ */
+export type CensusStatus = "pending" | "fresh" | "stale";
+
 export interface WorktreeSurvey {
   device_id: string | null;
   coord_reachable: boolean;
@@ -57,6 +68,14 @@ export interface WorktreeSurvey {
   canonical_excluded: number;
   items: WorktreeSurveyItem[];
   summary: { reapable: number; blocked: number; reclaimable_bytes: number };
+  /** `pending` = no walk has completed yet — the list is UNKNOWN, not empty. */
+  census_status: CensusStatus;
+  census_taken_at: string | null;
+  census_age_secs: number | null;
+  census_build_ms: number | null;
+  /** A census walk is running right now. */
+  census_refreshing: boolean;
+  census_note: string;
 }
 
 export interface ReclaimOutcome {
@@ -74,6 +93,9 @@ export interface ReclaimOutcome {
     detail: string;
   }>;
   dry_run: boolean;
+  /** Freshness of the CANDIDATE set. Guards are always re-checked live. */
+  census_status: CensusStatus;
+  census_age_secs: number | null;
 }
 
 interface ApiEnvelope<T> {
@@ -93,6 +115,17 @@ export function formatBytes(bytes: number): string {
     i += 1;
   }
   return `${v >= 100 || i === 0 ? Math.round(v) : v.toFixed(1)} ${units[i]}`;
+}
+
+/** `95` → `"1m ago"`. The "as of" label — honest about snapshot age. */
+export function formatAge(secs: number | null): string {
+  if (secs === null || secs < 0) return "unknown";
+  if (secs < 60) return `${secs}s ago`;
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ${mins % 60}m ago`;
+  return `${Math.floor(hours / 24)}d ${hours % 24}h ago`;
 }
 
 /** Short label for a blocked reason — the badge text. */
@@ -119,7 +152,12 @@ export interface UseReclaimableWorktrees {
   /** Result of the last reclaim call, for the inline receipt. */
   lastOutcome: ReclaimOutcome | null;
   reclaiming: boolean;
-  refresh: () => Promise<void>;
+  /**
+   * Re-read the survey. `rescan` additionally asks the runner to start a fresh
+   * disk walk in the BACKGROUND (`?refresh=1`) — the response still comes back
+   * promptly from the cached snapshot with `census_refreshing: true`.
+   */
+  refresh: (rescan?: boolean) => Promise<void>;
   /** `ids` omitted = every currently-reapable worktree. */
   reclaim: (ids?: string[], dryRun?: boolean) => Promise<void>;
 }
@@ -131,11 +169,13 @@ export function useReclaimableWorktrees(enabled: boolean): UseReclaimableWorktre
   const [lastOutcome, setLastOutcome] = useState<ReclaimOutcome | null>(null);
   const [reclaiming, setReclaiming] = useState(false);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (rescan = false) => {
     setLoading(true);
     setError(null);
     try {
-      const res = await apiFetch<ApiEnvelope<WorktreeSurvey>>("/agent-worktrees/reclaimable");
+      const res = await apiFetch<ApiEnvelope<WorktreeSurvey>>(
+        `/agent-worktrees/reclaimable${rescan ? "?refresh=1" : ""}`,
+      );
       if (!res.success || !res.data) throw new Error(res.error ?? "survey failed");
       setSurvey(res.data);
     } catch (e) {
@@ -181,6 +221,18 @@ export function useReclaimableWorktrees(enabled: boolean): UseReclaimableWorktre
       clearTimeout(timer);
     };
   }, [enabled, refresh]);
+
+  // While a census walk is in flight the snapshot WILL change under us, so
+  // re-poll (cheaply — the endpoint just reads the cache) until it settles.
+  // Without this a cold-start panel would sit on "pending" forever until the
+  // operator manually refreshed.
+  const settling =
+    enabled && survey !== null && (survey.census_refreshing || survey.census_status === "pending");
+  useEffect(() => {
+    if (!settling) return;
+    const timer = setInterval(() => void refresh(), 20_000);
+    return () => clearInterval(timer);
+  }, [settling, refresh]);
 
   return { survey, loading, error, lastOutcome, reclaiming, refresh, reclaim };
 }
