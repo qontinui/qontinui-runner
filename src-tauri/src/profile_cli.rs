@@ -30,7 +30,7 @@ use crate::env_agent::enroll::{self, EnrollParams};
 #[derive(Subcommand, Debug)]
 pub enum EnvCmd {
     /// Enroll this machine into a web environment via an enrollment code.
-    /// POSTs `{enrollment_code, machine_id, hostname}` to
+    /// POSTs `{enrollment_code, hostname, coord_device_id}` to
     /// `{backend}/api/v1/devenv/agent/enroll`; on success stores the returned
     /// `mk_<token>` machine key and writes `~/.qontinui/env-agent.json` with the
     /// RESPONSE environment_id.
@@ -81,6 +81,21 @@ pub fn run_env(cmd: EnvCmd) -> u8 {
     }
 }
 
+/// The operator-facing note printed when this machine has no usable local
+/// identity file. Keyed off the EXPLICIT presence signal
+/// (`LocalMachineIdentity::machine_json_present`) — never off an enroll wire
+/// field, which is `None` on every enroll by design.
+fn missing_machine_json_note(identity: &enroll::LocalMachineIdentity) -> Option<&'static str> {
+    if identity.machine_json_present {
+        return None;
+    }
+    Some(
+        "note: no readable ~/.qontinui/machine.json — enrolling with null \
+         hostname/coord_device_id (run `qontinui_profile device init` first for a \
+         stable identity)",
+    )
+}
+
 fn cmd_env_enroll(code: &str, backend_arg: Option<&str>, environment_arg: Option<&str>) -> u8 {
     if code.trim().is_empty() {
         eprintln!("error: --code requires a non-empty enrollment code");
@@ -93,20 +108,20 @@ fn cmd_env_enroll(code: &str, backend_arg: Option<&str>, environment_arg: Option
             return 2;
         }
     };
-    let (machine_id, hostname, coord_device_id) = enroll::local_machine_identity();
-    if machine_id.is_none() {
-        eprintln!(
-            "note: no readable ~/.qontinui/machine.json — enrolling with null \
-             machine_id/hostname (run `qontinui_profile device init` first for a \
-             stable identity)"
-        );
+    let identity = enroll::local_machine_identity();
+    if let Some(note) = missing_machine_json_note(&identity) {
+        eprintln!("{note}");
     }
     match enroll::run_enroll(EnrollParams {
         code: code.to_string(),
         backend,
-        machine_id,
-        hostname,
-        coord_device_id,
+        // ALWAYS None for a locally-initiated enroll: the devenv machine UUID is
+        // what enroll RETURNS, and the enrollment code already identifies the
+        // machine. Coord's device_id is a different identity space and travels in
+        // `coord_device_id` — sending it here caused `409 machine_id_mismatch`.
+        machine_id: None,
+        hostname: identity.hostname,
+        coord_device_id: identity.coord_device_id,
         environment_override: environment_arg.map(|s| s.to_string()),
     }) {
         Ok(outcome) => {
@@ -829,6 +844,39 @@ pub fn uninstall_identity_shim_from_user_path() -> Result<CliPathOutcome, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The note must fire ONLY on a genuinely missing/unreadable `machine.json`.
+    /// It used to key off the enroll wire field `machine_id`, which is now `None`
+    /// on every enroll by design — keying off that would spam the note on every
+    /// successful enroll.
+    #[test]
+    fn missing_machine_json_note_keys_off_presence_not_wire_field() {
+        // Present + readable → silent, even though the enroll wire `machine_id`
+        // is None.
+        let present = enroll::LocalMachineIdentity {
+            machine_json_present: true,
+            hostname: Some("box-1".to_string()),
+            coord_device_id: Some(uuid::Uuid::nil()),
+        };
+        assert!(missing_machine_json_note(&present).is_none());
+
+        // Present but with an unparseable (non-UUID) device_id → still silent:
+        // the file IS readable.
+        let present_no_uuid = enroll::LocalMachineIdentity {
+            machine_json_present: true,
+            hostname: None,
+            coord_device_id: None,
+        };
+        assert!(missing_machine_json_note(&present_no_uuid).is_none());
+
+        // Genuinely absent → the note still fires.
+        let absent = enroll::LocalMachineIdentity::default();
+        let note = missing_machine_json_note(&absent).expect("note must fire when file is absent");
+        assert!(
+            note.contains("no readable ~/.qontinui/machine.json"),
+            "{note}"
+        );
+    }
 
     #[test]
     fn path_addition_appends_when_absent() {
