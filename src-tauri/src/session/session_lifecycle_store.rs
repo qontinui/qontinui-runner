@@ -1060,14 +1060,16 @@ impl SessionLifecycleStore {
                 // one). Same key as the read-time dedupe in `restorable_records`.
                 let mut ranked = ids;
                 ranked.sort_by(|a, b| {
-                    let ka = m
-                        .get(a.as_str())
-                        .map(open_authority_key)
-                        .unwrap_or((false, i64::MIN, i64::MIN));
-                    let kb = m
-                        .get(b.as_str())
-                        .map(open_authority_key)
-                        .unwrap_or((false, i64::MIN, i64::MIN));
+                    let ka = m.get(a.as_str()).map(open_authority_key).unwrap_or((
+                        false,
+                        i64::MIN,
+                        i64::MIN,
+                    ));
+                    let kb = m.get(b.as_str()).map(open_authority_key).unwrap_or((
+                        false,
+                        i64::MIN,
+                        i64::MIN,
+                    ));
                     kb.cmp(&ka)
                 });
                 for id in ranked.into_iter().skip(1) {
@@ -1895,7 +1897,11 @@ mod tests {
             assert_eq!(r.close_reason.as_deref(), Some("superseded-terminal-reuse"));
         }
         // Distinct-terminal row untouched.
-        assert_eq!(store.get("solo").unwrap().state, "open", "distinct terminal untouched");
+        assert_eq!(
+            store.get("solo").unwrap().state,
+            "open",
+            "distinct terminal untouched"
+        );
         // A pre-closed row is not the "kept" one and is not re-closed/mutated.
         assert_eq!(
             store.get("already-closed").unwrap().close_reason.as_deref(),
@@ -1939,7 +1945,10 @@ mod tests {
             "the confirmed real session survives despite an older last_seen"
         );
         let phantom = store.get("phantom-newer").unwrap();
-        assert_eq!(phantom.state, "closed", "the unconfirmed newer phantom is closed");
+        assert_eq!(
+            phantom.state, "closed",
+            "the unconfirmed newer phantom is closed"
+        );
         assert_eq!(
             phantom.close_reason.as_deref(),
             Some("superseded-terminal-reuse")
@@ -2994,7 +3003,13 @@ mod tests {
                 // from the restorable set (the grace-gate victim P3 rescues).
                 fixture_rec("open-victim", "open", crash - 72 * 3_600_000, None, None),
                 // User-closed row with an intentional close reason.
-                fixture_rec("user-closed", "closed", crash, Some(crash), Some("no-terminal")),
+                fixture_rec(
+                    "user-closed",
+                    "closed",
+                    crash,
+                    Some(crash),
+                    Some("no-terminal"),
+                ),
             ],
         );
         let store = SessionLifecycleStore::open(&path).unwrap();
@@ -3456,8 +3471,8 @@ mod tests {
         assert_eq!(
             kept,
             vec![
-                "b-newer".to_string(),     // newest on terminal B
-                "conf-old".to_string(),    // confirmed beats newer unconfirmed on A
+                "b-newer".to_string(),      // newest on terminal B
+                "conf-old".to_string(),     // confirmed beats newer unconfirmed on A
                 "empty-term-1".to_string(), // empty terminal_id: uncorrelatable, both pass
                 "empty-term-2".to_string(),
             ]
