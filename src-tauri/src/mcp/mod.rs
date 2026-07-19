@@ -136,6 +136,7 @@ pub mod state_machine;
 pub mod step_evaluation_api;
 pub mod step_type_knowledge_api;
 pub mod step_type_metadata_api;
+pub mod steward;
 pub mod streaming;
 pub mod subagent_api;
 pub mod task_run_inspection;
