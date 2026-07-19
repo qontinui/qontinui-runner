@@ -50,6 +50,15 @@ pub struct TranscriptSession {
     /// cannot reach.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub injected_tab: Option<InjectedTabSpec>,
+    /// The REAL `--resume` name for this session: the label set via Claude's
+    /// `/rename` (a `custom-title` transcript record — the LAST one wins) or
+    /// Claude's auto-generated `summary`. Distinct from [`Self::display_name`],
+    /// which is a first-user-message preview and is KEPT. `None` for a
+    /// transcript that carries neither record. Computed by
+    /// [`extract_resume_name_from_path`]; omitted from the wire when absent so
+    /// the legacy shape is preserved (mirrors the `injected_*` idiom above).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_name: Option<String>,
 }
 
 /// Synthetic-tab spec carried on a *tab-backed* injected fake (see
@@ -204,6 +213,143 @@ pub fn session_transcript_path(config_dir: &Path, project_path: &str, session_id
         .join(format!("{}.jsonl", session_id))
 }
 
+// ── Resume-name extraction (previous-sessions listing) ───────────────────────
+//
+// The `--resume` name a user actually sees is NOT the first-message preview
+// [`generate_display_name`] computes. It lives in the transcript JSONL as a
+// `{"type":"custom-title","customTitle":"…"}` record (Claude's `/rename`
+// appends one — the LAST is the current name) or, absent a rename, Claude's
+// auto `{"type":"summary","summary":"…"}` record (near the HEAD). These helpers
+// recover it. Kept separate from `display_name` (still the useful first-message
+// preview).
+
+/// Scan `lines` for the LAST `custom-title` record and return its
+/// `customTitle`. A cheap substring pre-check avoids parsing every line.
+fn last_custom_title<'a>(lines: impl Iterator<Item = &'a str>) -> Option<String> {
+    let mut found = None;
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() || !line.contains("custom-title") {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if v.get("type").and_then(|t| t.as_str()) == Some("custom-title") {
+                if let Some(title) = v.get("customTitle").and_then(|t| t.as_str()) {
+                    let t = title.trim();
+                    if !t.is_empty() {
+                        found = Some(t.to_string());
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Scan `lines` for the LAST `summary` record and return its `summary`.
+fn last_summary<'a>(lines: impl Iterator<Item = &'a str>) -> Option<String> {
+    let mut found = None;
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() || !line.contains("\"summary\"") {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if v.get("type").and_then(|t| t.as_str()) == Some("summary") {
+                if let Some(s) = v.get("summary").and_then(|t| t.as_str()) {
+                    let s = s.trim();
+                    if !s.is_empty() {
+                        found = Some(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// The `--resume` name for an in-memory transcript string: the LAST
+/// `custom-title` (a `/rename`), else the last `summary` (Claude's auto-title),
+/// else `None`. In-memory variant — used by unit tests; the production path
+/// uses [`extract_resume_name_from_path`] to avoid loading a multi-MB file.
+fn extract_resume_name(content: &str) -> Option<String> {
+    last_custom_title(content.lines()).or_else(|| last_summary(content.lines()))
+}
+
+/// Read the last `max` bytes of `path` as a string, dropping the leading
+/// partial line (the seek may land mid-line). Returns the whole file when it is
+/// smaller than `max`. `None` on any I/O error (fail-soft).
+fn read_tail_bytes(path: &Path, max: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len <= max {
+        let mut s = String::new();
+        file.read_to_string(&mut s).ok()?;
+        Some(s)
+    } else {
+        file.seek(SeekFrom::End(-(max as i64))).ok()?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).ok()?;
+        let s = String::from_utf8_lossy(&bytes).into_owned();
+        Some(match s.find('\n') {
+            Some(pos) => s[pos + 1..].to_string(),
+            None => s,
+        })
+    }
+}
+
+/// Read the first `max_lines` lines of `path` as a newline-joined string.
+/// `None` on any I/O error (fail-soft).
+fn read_head_lines(path: &Path, max_lines: usize) -> Option<String> {
+    use std::io::{BufRead, BufReader};
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    let mut out = String::new();
+    for line in reader.lines().take(max_lines) {
+        out.push_str(&line.ok()?);
+        out.push('\n');
+    }
+    Some(out)
+}
+
+/// Bounded-read [`extract_resume_name`] for the production path: a `/rename`
+/// `custom-title` is appended near the END (scan the last ~64 KB) and Claude's
+/// auto `summary` sits near the HEAD (scan the first ~40 lines), so the whole
+/// (multi-MB) transcript is never loaded. Returns the LAST `custom-title`, else
+/// the last `summary` in the head slice, else `None`.
+pub fn extract_resume_name_from_path(path: &Path) -> Option<String> {
+    if let Some(name) = read_tail_bytes(path, 64 * 1024).and_then(|tail| last_custom_title(tail.lines()))
+    {
+        return Some(name);
+    }
+    let head = read_head_lines(path, 40)?;
+    last_summary(head.lines())
+}
+
+/// Best human name for the transcript at `path` for the "previous sessions"
+/// listing: the `/rename`/`summary` resume name ([`extract_resume_name_from_path`])
+/// if present, else the first-user-message preview ([`generate_display_name`]).
+/// `None` only when the file is unreadable/empty — the caller supplies its own
+/// title/date default.
+pub fn resume_or_preview_name_from_path(path: &Path) -> Option<String> {
+    if let Some(name) = extract_resume_name_from_path(path) {
+        return Some(name);
+    }
+    let head = read_head_lines(path, 60)?;
+    let preview = extract_first_user_preview(&head);
+    let last_modified = fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .map(|t| {
+            chrono::DateTime::<chrono::Utc>::from(t)
+                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                .to_string()
+        })
+        .unwrap_or_default();
+    Some(generate_display_name(&preview, &last_modified))
+}
+
 // ── Session Listing ──────────────────────────────────────────────────────────
 
 /// List Claude Code sessions for a given project path.
@@ -328,6 +474,10 @@ pub fn list_sessions(
         // Extract started_at from first record's timestamp
         let started_at = extract_first_timestamp(&content);
 
+        // The real `--resume` name (last `/rename` custom-title, else the auto
+        // summary) — bounded head+tail read off disk, not the whole file.
+        let resume_name = extract_resume_name_from_path(&path);
+
         let session = TranscriptSession {
             session_id,
             project_path: project_path.to_string(),
@@ -342,6 +492,7 @@ pub fn list_sessions(
             // frontend computes `liveStatus` from tab/digest correlation.
             injected_live_status: None,
             injected_tab: None,
+            resume_name,
         };
 
         if let Some(mt) = mtime {
@@ -1063,6 +1214,7 @@ pub fn get_latest_session_id(
                         let started_at = extract_first_timestamp(&content);
                         let display_name =
                             generate_display_name(&first_message_preview, &last_modified);
+                        let resume_name = extract_resume_name_from_path(&session_file);
 
                         return Some(TranscriptSession {
                             session_id: session_id.to_string(),
@@ -1077,6 +1229,7 @@ pub fn get_latest_session_id(
                             // Real on-disk session — no override.
                             injected_live_status: None,
                             injected_tab: None,
+                            resume_name,
                         });
                     }
                 }
@@ -1868,6 +2021,96 @@ mod tests {
         );
         let name = generate_display_name(&preview, "2025-03-07T14:30:00Z");
         assert_eq!(name, "UI Bridge Integration");
+    }
+
+    // ── Resume-name extraction tests (previous-sessions listing) ─────────────
+
+    #[test]
+    fn extract_resume_name_single_rename() {
+        let content = "\
+{\"type\":\"summary\",\"summary\":\"Auto title\"}
+{\"type\":\"user\",\"uuid\":\"u1\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}
+{\"type\":\"custom-title\",\"customTitle\":\"My renamed session\",\"sessionId\":\"abc\"}";
+        assert_eq!(
+            extract_resume_name(content).as_deref(),
+            Some("My renamed session")
+        );
+    }
+
+    #[test]
+    fn extract_resume_name_multiple_renames_last_wins() {
+        let content = "\
+{\"type\":\"custom-title\",\"customTitle\":\"First name\",\"sessionId\":\"abc\"}
+{\"type\":\"assistant\",\"uuid\":\"a1\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}
+{\"type\":\"custom-title\",\"customTitle\":\"Second name\",\"sessionId\":\"abc\"}
+{\"type\":\"custom-title\",\"customTitle\":\"Final name\",\"sessionId\":\"abc\"}";
+        assert_eq!(
+            extract_resume_name(content).as_deref(),
+            Some("Final name"),
+            "the LAST custom-title is the current resume name"
+        );
+    }
+
+    #[test]
+    fn extract_resume_name_summary_fallback_when_no_custom_title() {
+        let content = "\
+{\"type\":\"summary\",\"summary\":\"Fix the login bug\"}
+{\"type\":\"user\",\"uuid\":\"u1\",\"message\":{\"role\":\"user\",\"content\":\"go\"}}";
+        assert_eq!(
+            extract_resume_name(content).as_deref(),
+            Some("Fix the login bug")
+        );
+    }
+
+    #[test]
+    fn extract_resume_name_custom_title_beats_later_summary() {
+        // A custom-title anywhere wins over a summary, even a later one.
+        let content = "\
+{\"type\":\"custom-title\",\"customTitle\":\"Renamed\",\"sessionId\":\"abc\"}
+{\"type\":\"summary\",\"summary\":\"Some auto summary\"}";
+        assert_eq!(extract_resume_name(content).as_deref(), Some("Renamed"));
+    }
+
+    #[test]
+    fn extract_resume_name_none_when_neither() {
+        let content = "\
+{\"type\":\"user\",\"uuid\":\"u1\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}
+{\"type\":\"assistant\",\"uuid\":\"a1\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}";
+        assert_eq!(extract_resume_name(content), None);
+    }
+
+    #[test]
+    fn extract_resume_name_from_path_reads_tail_custom_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess.jsonl");
+        // A summary near the head, a lot of filler, then the rename at the end.
+        let mut content = String::from("{\"type\":\"summary\",\"summary\":\"Auto\"}\n");
+        for i in 0..500 {
+            content.push_str(&format!(
+                "{{\"type\":\"assistant\",\"uuid\":\"a{i}\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"line {i}\"}}]}}}}\n"
+            ));
+        }
+        content.push_str("{\"type\":\"custom-title\",\"customTitle\":\"Tail rename\",\"sessionId\":\"z\"}\n");
+        std::fs::write(&path, content).unwrap();
+        assert_eq!(
+            extract_resume_name_from_path(&path).as_deref(),
+            Some("Tail rename")
+        );
+    }
+
+    #[test]
+    fn extract_resume_name_from_path_summary_head_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess.jsonl");
+        let content = "\
+{\"type\":\"summary\",\"summary\":\"Head summary title\"}
+{\"type\":\"user\",\"uuid\":\"u1\",\"message\":{\"role\":\"user\",\"content\":\"go\"}}
+";
+        std::fs::write(&path, content).unwrap();
+        assert_eq!(
+            extract_resume_name_from_path(&path).as_deref(),
+            Some("Head summary title")
+        );
     }
 
     #[test]

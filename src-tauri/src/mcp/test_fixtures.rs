@@ -355,6 +355,7 @@ pub fn project_test_session(
         display_name: session.name.clone(),
         injected_live_status,
         injected_tab,
+        resume_name: None,
     }
 }
 
@@ -1592,6 +1593,7 @@ mod tests {
             display_name: "Real one".to_string(),
             injected_live_status: None,
             injected_tab: None,
+            resume_name: None,
         };
 
         let merged = merge_with_injected(vec![real], injected_test_sessions());

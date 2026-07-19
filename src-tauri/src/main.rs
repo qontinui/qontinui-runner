@@ -2022,6 +2022,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal::terminal_resize,
             commands::terminal::terminal_save_scrollback,
             commands::terminal::terminal_session_clear_restore_pending,
+            commands::terminal::terminal_session_list_history,
             commands::terminal::terminal_session_list_open,
             commands::terminal::terminal_session_mark_restore_pending,
             commands::terminal::terminal_session_record_close,

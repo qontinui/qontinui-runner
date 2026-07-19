@@ -18,7 +18,7 @@
 //!   transcript JSON. Reuses the workspace-scanning logic from
 //!   `commands::transcript`.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -386,6 +386,54 @@ async fn get_transcript(
 }
 
 // =============================================================================
+// /sessions/history
+// =============================================================================
+
+/// Query params for `GET /sessions/history` — snake_case keys (`since_ms`,
+/// `page_id`, `account`, `include_shells`, `limit`), mapped onto
+/// [`crate::session::past_sessions::PastSessionsOpts`].
+#[derive(Debug, Default, Deserialize)]
+pub struct HistoryQuery {
+    pub since_ms: Option<i64>,
+    pub page_id: Option<String>,
+    pub account: Option<String>,
+    pub include_shells: Option<bool>,
+    pub limit: Option<usize>,
+}
+
+/// `GET /sessions/history` — the DISPLAY-only "previous sessions" listing: the
+/// full registry (open + closed) merged with the append-only snapshot HISTORY
+/// (ids older than the 24 h registry retention), each row carrying its real
+/// `--resume` name, account, resume command, and a re-probed
+/// `transcriptExists` / `restorable`. Returns the same `Vec<PastSession>` JSON
+/// as the `terminal_session_list_history` Tauri command, under `{ sessions }`.
+async fn list_history(
+    State(state): State<Arc<ApiState>>,
+    Query(q): Query<HistoryQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state
+        .app_handle
+        .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "session lifecycle store unavailable".to_string(),
+        ))?;
+    // Port-scoped snapshot file, matching main.rs's write-side derivation.
+    let port = crate::mcp::types::get_mcp_api_port();
+    let snapshot_path = crate::session::snapshot_history::snapshot_path_for_port(port);
+    let opts = crate::session::past_sessions::PastSessionsOpts {
+        since_ms: q.since_ms,
+        page_id: q.page_id,
+        account: q.account,
+        include_shells: q.include_shells.unwrap_or(false),
+        limit: q.limit,
+    };
+    let sessions =
+        crate::session::past_sessions::build_past_sessions(store.inner(), &snapshot_path, &opts);
+    Ok(Json(serde_json::json!({ "sessions": sessions })))
+}
+
+// =============================================================================
 // /sessions/<id>/continuation-verdict
 // =============================================================================
 
@@ -446,6 +494,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/sessions/spawn", post(spawn_session))
         .route("/sessions/{id}/message", post(send_message))
+        .route("/sessions/history", get(list_history))
         .route("/sessions/{id}/touched-files", get(get_touched_files))
         .route("/sessions/{id}/transcript", get(get_transcript))
         .route(
