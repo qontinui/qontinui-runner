@@ -3874,6 +3874,7 @@ pub fn create_router(
         .merge(crate::mcp::task_run_inspection::routes())
         .merge(crate::mcp::task_runs::routes())
         .merge(crate::mcp::terminals::routes())
+        .merge(crate::mcp::steward::routes())
         .merge(crate::mcp::testing::routes())
         .merge(crate::mcp::triggers::routes())
         .merge(crate::mcp::ui_bridge::routes())

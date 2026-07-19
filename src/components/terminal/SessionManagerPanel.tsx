@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { TerminalSquare, X, CheckSquare } from "lucide-react";
 import { SessionManagerHeader } from "./SessionManagerHeader";
+import { StewardControl } from "./StewardControl";
 import { SessionCard } from "./SessionCard";
 import type {
   UseSessionManagerReturn,
@@ -135,6 +136,7 @@ export function SessionManagerPanel({
 
   return (
     <div className="w-[340px] h-full flex flex-col border-r border-[#2a2d3d] bg-[#13141f] shrink-0">
+      <StewardControl />
       <SessionManagerHeader
         loading={loading}
         searchQuery={searchQuery}
