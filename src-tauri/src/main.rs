@@ -54,6 +54,7 @@ mod coord_questions;
 mod coordinator;
 mod cost_management;
 mod crash_dumps;
+mod crash_observability;
 mod credential_helper;
 mod database;
 mod debug_lifecycle;
@@ -344,6 +345,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         ..LoggingConfig::default()
     })?;
     setup_panic_handler();
+
+    // Best-effort live crash writer for the CATCHABLE subset (Windows
+    // deliverable structured exceptions). The panic hooks above already write
+    // a `crash_*.txt` for unwinding panics on every platform; this adds a
+    // `SetUnhandledExceptionFilter` for SEH-deliverable faults. NEITHER hook
+    // catches the `0xc0000409` / BEX64 `__fastfail` abort family — that is
+    // covered by the boot-harvest below (`crash_observability::
+    // harvest_boot_crash_evidence`, wired into Tauri `.setup`).
+    crash_observability::install_live_crash_writer();
 
     // Start health monitoring to detect resource exhaustion
     health_monitor::start_health_monitor();
@@ -2148,6 +2158,17 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     info!("boot classification: previous shutdown was clean — planned restart");
                 }
+
+                // Phase 4 (P1) crash observability — when the prior shutdown
+                // was unclean, harvest the crash evidence WER already recorded
+                // and drop a `.dev-logs/crash_<unix-ms>.txt` breadcrumb so this
+                // abort family (notably the `0xc0000409`/BEX64 `__fastfail`
+                // that bypasses every live catch) is no longer silent in
+                // `.dev-logs`. No-op on a clean/first boot; fail-open, never
+                // blocks boot (WER query runs on a background thread). Runs
+                // BEFORE `crash_dumps::scan_on_startup` so the breadcrumb can
+                // surface on `/health` this boot.
+                crash_observability::harvest_boot_crash_evidence(boot);
             }
 
             // Plan 2026-05-18-agent-spawn-coordination Phase 3 — stash a
