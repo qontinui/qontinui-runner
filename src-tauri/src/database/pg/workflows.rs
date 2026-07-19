@@ -220,8 +220,8 @@ impl PgDb {
             serde_json::to_value(&request.setup_steps).unwrap_or_else(|_| serde_json::json!([]));
         let verification_json = serde_json::to_value(&request.verification_steps)
             .unwrap_or_else(|_| serde_json::json!([]));
-        let agentic_json = serde_json::to_value(&request.agentic_steps)
-            .unwrap_or_else(|_| serde_json::json!([]));
+        let agentic_json =
+            serde_json::to_value(&request.agentic_steps).unwrap_or_else(|_| serde_json::json!([]));
         let completion_json = serde_json::to_value(&request.completion_steps)
             .unwrap_or_else(|_| serde_json::json!([]));
         let log_sel_json = request

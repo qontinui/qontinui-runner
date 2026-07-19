@@ -224,41 +224,44 @@ pub async fn find_gt_reference_workflows_pg(
         .await
         .map_err(|e| format!("PG find_gt_reference_workflows: {}", e))?;
 
-    let mut results: Vec<SimilarWorkflow> = rows.iter().map(|r| {
-        let name: String = r.get(1);
-        let desc: String = r.get(2);
-        let similarity = keyword_overlap_score(&search_terms, &name, &desc);
+    let mut results: Vec<SimilarWorkflow> = rows
+        .iter()
+        .map(|r| {
+            let name: String = r.get(1);
+            let desc: String = r.get(2);
+            let similarity = keyword_overlap_score(&search_terms, &name, &desc);
 
-        // Build full JSON for GT workflows
-        let id_str = r.get::<_, uuid::Uuid>(0).to_string();
-        let setup_steps: serde_json::Value = r.get(4);
-        let verification_steps: serde_json::Value = r.get(5);
-        let agentic_steps: serde_json::Value = r.get(6);
-        let completion_steps: serde_json::Value = r.get(7);
-        let full_json = serde_json::json!({
-            "id": &id_str,
-            "name": &name,
-            "description": &desc,
-            "category": r.get::<_, String>(3),
-            "setup_steps": &setup_steps,
-            "verification_steps": &verification_steps,
-            "agentic_steps": &agentic_steps,
-            "completion_steps": &completion_steps,
-        });
+            // Build full JSON for GT workflows
+            let id_str = r.get::<_, uuid::Uuid>(0).to_string();
+            let setup_steps: serde_json::Value = r.get(4);
+            let verification_steps: serde_json::Value = r.get(5);
+            let agentic_steps: serde_json::Value = r.get(6);
+            let completion_steps: serde_json::Value = r.get(7);
+            let full_json = serde_json::json!({
+                "id": &id_str,
+                "name": &name,
+                "description": &desc,
+                "category": r.get::<_, String>(3),
+                "setup_steps": &setup_steps,
+                "verification_steps": &verification_steps,
+                "agentic_steps": &agentic_steps,
+                "completion_steps": &completion_steps,
+            });
 
-        SimilarWorkflow {
-            id: id_str,
-            name,
-            description: desc,
-            category: r.get(3),
-            setup_step_count: count_json_array(&setup_steps),
-            verification_step_count: count_json_array(&verification_steps),
-            agentic_step_count: count_json_array(&agentic_steps),
-            completion_step_count: count_json_array(&completion_steps),
-            similarity,
-            full_json: Some(serde_json::to_string_pretty(&full_json).unwrap_or_default()),
-        }
-    }).collect();
+            SimilarWorkflow {
+                id: id_str,
+                name,
+                description: desc,
+                category: r.get(3),
+                setup_step_count: count_json_array(&setup_steps),
+                verification_step_count: count_json_array(&verification_steps),
+                agentic_step_count: count_json_array(&agentic_steps),
+                completion_step_count: count_json_array(&completion_steps),
+                similarity,
+                full_json: Some(serde_json::to_string_pretty(&full_json).unwrap_or_default()),
+            }
+        })
+        .collect();
 
     // Sort by similarity descending
     results.sort_by(|a, b| {

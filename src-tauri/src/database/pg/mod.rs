@@ -151,7 +151,9 @@ pub(crate) fn parse_workflow_id(id: &str) -> Result<uuid::Uuid, String> {
 /// validation — must keep getting that same "no workflow" result, not a
 /// parse error).
 pub(crate) fn parse_optional_workflow_id(id: Option<&str>) -> Result<Option<uuid::Uuid>, String> {
-    id.filter(|s| !s.is_empty()).map(parse_workflow_id).transpose()
+    id.filter(|s| !s.is_empty())
+        .map(parse_workflow_id)
+        .transpose()
 }
 
 /// PR-shepherd Phases 1+2 shape self-heal for the alembic-owned
