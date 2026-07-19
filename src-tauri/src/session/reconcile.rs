@@ -627,7 +627,8 @@ pub trait ProviderSessionIndex {
 /// `{"type":"custom-title","customTitle":…}` (a `/rename`) and its
 /// `{"type":"ai-title","aiTitle":…}` sibling — both appended, newest-wins.
 /// `TranscriptSession::display_name` now prefers those over the
-/// first-user-message heuristic (`transcript::extract_session_title`), so the
+/// first-user-message heuristic (`transcript::generate_display_name`) — the
+/// title reader is `transcript::extract_session_title` — so the
 /// old claim here that it "is *derived* from the first user message, not from
 /// the rename" no longer holds.
 ///

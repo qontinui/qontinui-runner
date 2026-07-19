@@ -1176,36 +1176,76 @@ const GENERIC_PREFIXES: &[&str] = &[
 /// every `list_sessions` payload.
 const MAX_DISPLAY_NAME_CHARS: usize = 50;
 
-/// Substring every title record shares (`"custom-title"` / `"ai-title"`), used
-/// as a cheap pre-filter before the per-line JSON parse.
-const TITLE_RECORD_MARKER: &str = "-title\"";
+/// Quoted record-kind names, used as a pre-filter before the per-line JSON
+/// parse. Matching the quoted KIND (not a bare `-title"` fragment) keeps prose
+/// that merely mentions the word from forcing a parse of every such line.
+const TITLE_KIND_MARKERS: [&str; 2] = ["\"custom-title\"", "\"ai-title\""];
 
-/// Normalize a raw title into something safe to render on one line.
+/// True when a chunk of text could contain a title record. Cheap substring
+/// test; a true result still has to survive the JSON parse and the `type` check.
+fn may_carry_title_record(text: &str) -> bool {
+    TITLE_KIND_MARKERS.iter().any(|m| text.contains(m))
+}
+
+/// Minimum characters that must precede a space before the word-boundary
+/// backoff is worth taking — below this, cutting at the space would discard
+/// most of the name, so a mid-word cut reads better.
+const MIN_WORD_BOUNDARY_CHARS: usize = 20;
+
+/// Truncate to [`MAX_DISPLAY_NAME_CHARS`], backing off to the last word
+/// boundary when one sits reasonably far in.
 ///
-/// A `/rename` argument is arbitrary operator text, so it can carry ANSI escapes
-/// (pasted from a terminal), embedded newlines, or enough length to break the
-/// card layout. Strips ANSI via the shared [`crate::terminal::strip_ansi`],
-/// flattens all whitespace to single spaces, then truncates at a word boundary
-/// with the same ceiling the heuristic path uses.
-fn sanitize_title(raw: &str) -> String {
-    let stripped = super::strip_ansi(raw);
-    // Flatten newlines/tabs/runs — a title is a single-line label.
-    let flat = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= MAX_DISPLAY_NAME_CHARS {
-        return flat;
+/// Char-based throughout: byte slicing here would panic on any multi-byte input
+/// (CJK, Cyrillic, accented Latin, emoji) whose boundary straddles the cut, and
+/// a byte-vs-char threshold would over-truncate the same text — a 3-byte-per-char
+/// script reaches byte 20 after ~7 characters.
+fn truncate_display_name(text: &str) -> String {
+    if text.chars().count() <= MAX_DISPLAY_NAME_CHARS {
+        return text.to_string();
     }
-    // Truncate on a char boundary first (never split a multi-byte char), then
-    // back off to the last word boundary if one sits reasonably close.
-    let cut = flat
+    let cut = text
         .char_indices()
         .nth(MAX_DISPLAY_NAME_CHARS)
         .map(|(i, _)| i)
-        .unwrap_or(flat.len());
-    let head = &flat[..cut];
-    match head.rfind(' ') {
-        Some(sp) if sp > 20 => format!("{}...", &head[..sp]),
-        _ => format!("{head}..."),
+        .unwrap_or(text.len());
+    let head = &text[..cut];
+    if let Some(sp) = head.rfind(' ') {
+        if head[..sp].chars().count() > MIN_WORD_BOUNDARY_CHARS {
+            return format!("{}...", &head[..sp]);
+        }
     }
+    format!("{head}...")
+}
+
+/// Normalize a raw title into something safe to render on one line, or `None`
+/// when nothing renderable survives.
+///
+/// A `/rename` argument is arbitrary operator text: it can carry ANSI escapes
+/// (pasted from a terminal), markup, embedded newlines, or enough length to
+/// break the card layout. Applies the same scrubbing every heuristic-derived
+/// name gets — so titled and untitled sessions in one list look consistent.
+///
+/// Returns `None` when the result is empty (e.g. a title made only of escape
+/// sequences), so the caller falls through to the next source instead of
+/// rendering a blank, unidentifiable card.
+fn sanitize_title(raw: &str) -> Option<String> {
+    let stripped = super::strip_ansi(raw);
+    // Defense in depth: `strip_ansi` terminates OSC only on BEL, so an
+    // ST-terminated (`ESC \`) sequence can leave stray control bytes behind.
+    // Map every remaining control char to a space rather than deleting it, so
+    // words either side stay separated.
+    let decontrolled: String = stripped
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let no_tags = strip_xml_tags(&decontrolled);
+    // Flatten newlines/tabs/runs — a title is a single-line label.
+    let flat = no_tags.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = flat.trim().trim_start_matches('#').trim();
+    if flat.is_empty() {
+        return None;
+    }
+    Some(truncate_display_name(flat))
 }
 
 /// Extract the session's own Claude Code title, if it has one.
@@ -1231,7 +1271,7 @@ fn extract_session_title(content: &str) -> Option<String> {
     // whole buffer is far cheaper than the per-line loop below, and lets an
     // untitled file skip it entirely (this runs per file across a directory of
     // hundreds of large transcripts).
-    if !content.contains(TITLE_RECORD_MARKER) {
+    if !may_carry_title_record(content) {
         return None;
     }
 
@@ -1240,7 +1280,7 @@ fn extract_session_title(content: &str) -> Option<String> {
 
     // Reverse scan: the first record of a kind walking backwards is the newest.
     for line in content.lines().rev() {
-        if !line.contains(TITLE_RECORD_MARKER) {
+        if !may_carry_title_record(line) {
             continue;
         }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -1258,22 +1298,22 @@ fn extract_session_title(content: &str) -> Option<String> {
             continue; // superseded by a newer record of the same kind
         }
 
-        let title = v
-            .get(key)
-            .and_then(|t| t.as_str())
-            .map(str::trim)
-            .unwrap_or_default();
+        // A MISSING/non-string field is an unusable record, not a clear — keep
+        // scanning so a valid older rename still wins. Only a present-but-blank
+        // (or unrenderable) value counts as the operator clearing the title.
+        let Some(raw) = v.get(key).and_then(|t| t.as_str()) else {
+            continue;
+        };
+        let rendered = sanitize_title(raw);
         if is_custom {
             custom_seen = true;
-            if !title.is_empty() {
-                return Some(sanitize_title(title)); // explicit rename outranks
+            if let Some(title) = rendered {
+                return Some(title); // an explicit rename outranks any ai-title
             }
-            // Blank = the operator cleared it; fall through to the ai-title.
+            // Cleared: fall through to the ai-title, then to the heuristic.
         } else {
             ai_seen = true;
-            if !title.is_empty() {
-                ai_title = Some(sanitize_title(title));
-            }
+            ai_title = rendered;
         }
         if custom_seen && ai_seen {
             break;
@@ -1318,24 +1358,11 @@ fn generate_display_name(first_preview: &Option<String>, last_modified: &str) ->
                 .find(|l| l.len() >= 5)
                 .unwrap_or(after_prefix);
 
-            // Strip "..." suffix from the preview if present
-            let clean = first_line.trim_end_matches("...");
-            if clean.len() <= 50 {
-                return first_line.to_string();
-            }
-            // Find a word boundary near 50 chars
-            let truncated = &clean[..clean.len().min(50)];
-            if let Some(last_space) = truncated.rfind(' ') {
-                if last_space > 20 {
-                    return format!("{}...", &clean[..last_space]);
-                }
-            }
-            // No good word boundary — truncate at char boundary
-            let mut end = 50.min(clean.len());
-            while end > 0 && !clean.is_char_boundary(end) {
-                end -= 1;
-            }
-            return format!("{}...", &clean[..end]);
+            // Shared with the title path so both label sources obey one
+            // ceiling — and so neither can byte-slice a multi-byte character
+            // (the previous `&clean[..50]` here panicked on CJK/emoji input,
+            // taking down the whole session listing).
+            return truncate_display_name(first_line.trim_end_matches("..."));
         }
     }
 
@@ -2018,6 +2045,81 @@ mod tests {
     fn test_extract_session_title_tolerates_spaced_json() {
         let content = "{\"type\": \"custom-title\", \"customTitle\": \"spaced\"}\n";
         assert_eq!(extract_session_title(content).as_deref(), Some("spaced"));
+    }
+
+    #[test]
+    fn test_generate_display_name_does_not_panic_on_multibyte() {
+        // A byte-slice at index 50 lands mid-character here; the old code
+        // panicked and took the whole session listing down with it.
+        let preview =
+            Some("修复登录界面的显示问题并验证会话标题能正确恢复以及边界情况的处理".to_string());
+        let name = generate_display_name(&preview, "2025-03-07T14:30:00Z");
+        assert!(!name.is_empty());
+        assert!(name.chars().count() <= MAX_DISPLAY_NAME_CHARS + 3);
+    }
+
+    #[test]
+    fn test_truncate_display_name_is_char_based_not_byte_based() {
+        // Emoji are 4 bytes each: a byte-based cut would panic or truncate early.
+        let text = "🙂".repeat(80);
+        let got = truncate_display_name(&text);
+        assert_eq!(got.chars().count(), MAX_DISPLAY_NAME_CHARS + 3);
+        assert!(got.ends_with("..."));
+    }
+
+    #[test]
+    fn test_truncate_display_name_word_backoff_threshold_counts_chars() {
+        // The only space sits 2 CHARACTERS in (but well past byte 20 in a
+        // 3-byte-per-char script). Backing off to it would discard ~95% of the
+        // title, so the cut must stay at the character ceiling instead.
+        let text = format!("重构 {}", "会".repeat(80));
+        let got = truncate_display_name(&text);
+        assert!(
+            got.chars().count() > 20,
+            "over-truncated to {:?} ({} chars)",
+            got,
+            got.chars().count()
+        );
+    }
+
+    #[test]
+    fn test_sanitize_title_returns_none_when_nothing_renderable_survives() {
+        // A title made only of escape sequences must NOT render as a blank card
+        // — it has to fall through to the next source.
+        assert_eq!(sanitize_title("\u{1b}[1m\u{1b}[22m"), None);
+        assert_eq!(sanitize_title("   "), None);
+    }
+
+    #[test]
+    fn test_extract_session_title_all_escape_title_falls_through_to_ai() {
+        let content = concat!(
+            "{\"type\":\"ai-title\",\"aiTitle\":\"generated name\"}\n",
+            "{\"type\":\"custom-title\",\"customTitle\":\"\\u001b[1m\\u001b[22m\"}\n",
+        );
+        assert_eq!(
+            extract_session_title(content).as_deref(),
+            Some("generated name")
+        );
+    }
+
+    #[test]
+    fn test_extract_session_title_missing_field_is_not_a_clear() {
+        // A record whose title field is absent/null is UNUSABLE, not a clear:
+        // the older valid rename must still win.
+        let content = concat!(
+            "{\"type\":\"custom-title\",\"customTitle\":\"real name\"}\n",
+            "{\"type\":\"custom-title\",\"customTitle\":null}\n",
+        );
+        assert_eq!(extract_session_title(content).as_deref(), Some("real name"));
+    }
+
+    #[test]
+    fn test_sanitize_title_strips_markup_like_the_heuristic_path() {
+        assert_eq!(
+            sanitize_title("<b>fix login</b>").as_deref(),
+            Some("fix login")
+        );
+        assert_eq!(sanitize_title("## Plan").as_deref(), Some("Plan"));
     }
 
     #[test]
