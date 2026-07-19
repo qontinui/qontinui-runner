@@ -352,6 +352,15 @@ jobs:
         # are `deny` there, so a correctness lint still exits non-zero and fails
         # this required check; T3 style/complexity/perf stay `warn` (emitted,
         # non-blocking). See plan 2026-07-05-lint-tiers-and-diff-scoped-gates.
+        env:
+          # Disable the sccache spike wrapper for clippy ONLY. `cargo clippy`
+          # invokes `sccache clippy-driver … -vV`, but sccache can only front
+          # rustc — it dies on the clippy-driver version probe (exit 2 → cargo
+          # exit 101), which red-flagged this required check on the 2026-07-17
+          # spike. clippy produces no cacheable rustc artifacts anyway, so
+          # unwrapping it loses zero cache benefit. An empty RUSTC_WRAPPER is
+          # treated as unset by cargo; the test/tauri-build steps keep sccache.
+          RUSTC_WRAPPER: ""
         run: |
           cd src-tauri
           cargo clippy
