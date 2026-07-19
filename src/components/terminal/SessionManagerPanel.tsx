@@ -1,9 +1,11 @@
 import { useMemo, useState } from "react";
-import { TerminalSquare, X, CheckSquare } from "lucide-react";
+import { TerminalSquare, X, CheckSquare, History, Radio } from "lucide-react";
 import { SessionManagerHeader } from "./SessionManagerHeader";
 import { StewardControl } from "./StewardControl";
 import { SessionCard } from "./SessionCard";
 import { WorktreesPanel } from "../worktrees/WorktreesPanel";
+import { PastSessionsView } from "./PastSessionsView";
+import type { PastSession } from "./usePastSessions";
 import type {
   UseSessionManagerReturn,
   UnifiedSession,
@@ -24,6 +26,14 @@ interface SessionManagerPanelProps {
    * derives this from the per-tab `fileLockStates` keyed on `tab.id`.
    */
   sessionLockStates?: Map<string, LockState>;
+  /**
+   * Resume a past (historical) session by id. Wired in `TerminalPage` to the
+   * real terminal resume path (`shellIntegration.handleResumeSession`) — it
+   * creates a tab and queues `claude --resume <id>` with the session's config
+   * dir. Consumed only by the "Previous" view; undefined ⇒ Resume falls back to
+   * copying the command.
+   */
+  onResumePastSession?: (session: PastSession) => void;
 }
 
 /** Human-readable status group labels. */
@@ -97,7 +107,9 @@ export function SessionManagerPanel({
   selectedSessionId,
   sessionConflictCounts,
   sessionLockStates,
+  onResumePastSession,
 }: SessionManagerPanelProps) {
+  const [view, setView] = useState<"live" | "previous">("live");
   const {
     sessions,
     loading,
@@ -144,6 +156,38 @@ export function SessionManagerPanel({
 
   return (
     <div className="w-[340px] h-full flex flex-col border-r border-[#2a2d3d] bg-[#13141f] shrink-0">
+      {/* Live | Previous view toggle */}
+      <div className="flex items-center gap-1 px-2 py-1.5 border-b border-[#2a2d3d]">
+        <button
+          onClick={() => setView("live")}
+          className={`flex-1 flex items-center justify-center gap-1 px-2 py-1 rounded text-[10px] font-medium transition-colors ${
+            view === "live"
+              ? "bg-[#7aa2f7]/15 text-[#7aa2f7]"
+              : "text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d]"
+          }`}
+          title="Live sessions currently on this runner"
+        >
+          <Radio className="w-3 h-3" />
+          Live
+        </button>
+        <button
+          onClick={() => setView("previous")}
+          className={`flex-1 flex items-center justify-center gap-1 px-2 py-1 rounded text-[10px] font-medium transition-colors ${
+            view === "previous"
+              ? "bg-[#7aa2f7]/15 text-[#7aa2f7]"
+              : "text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d]"
+          }`}
+          title="Every session previously on this runner — resume by name"
+        >
+          <History className="w-3 h-3" />
+          Previous
+        </button>
+      </div>
+
+      {view === "previous" ? (
+        <PastSessionsView onResumePastSession={onResumePastSession} />
+      ) : (
+        <>
       <StewardControl />
       <SessionManagerHeader
         loading={loading}
@@ -267,6 +311,8 @@ export function SessionManagerPanel({
         worktree affordance opens it focused on that session's worktree.
       */}
       <WorktreesPanel defaultOpen={worktreeFocus !== null} highlightPath={worktreeFocus} />
+        </>
+      )}
     </div>
   );
 }

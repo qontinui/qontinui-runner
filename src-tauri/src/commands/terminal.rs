@@ -1035,6 +1035,36 @@ pub fn terminal_session_list_open(
     })
 }
 
+/// List EVERY previous Claude terminal session for display — the "previous
+/// sessions" surface. Unlike [`terminal_session_list_open`] (which returns only
+/// the RESTORABLE set), this merges the full registry (open + closed) with the
+/// append-only snapshot HISTORY (ids older than the 24 h registry retention)
+/// and enriches each with its real `--resume` name, account, resume command,
+/// and a re-probed `transcript_exists` / `restorable`. DISPLAY-only: it never
+/// drives restore, and the snapshot history's write-only invariant is
+/// preserved.
+///
+/// `opts` (all optional): `sinceMs`, `pageId`, `account`, `includeShells`,
+/// `limit`. Sorted newest-first by `lastSeenAt`.
+#[tauri::command]
+pub fn terminal_session_list_history(
+    store: tauri::State<'_, Arc<SessionLifecycleStore>>,
+    opts: Option<crate::session::past_sessions::PastSessionsOpts>,
+) -> Result<CommandResponse, String> {
+    let opts = opts.unwrap_or_default();
+    // Port-scoped snapshot file, matching main.rs's write-side derivation
+    // (`get_mcp_api_port`) so we read the same history that was written.
+    let port = crate::mcp::types::get_mcp_api_port();
+    let snapshot_path = crate::session::snapshot_history::snapshot_path_for_port(port);
+    let sessions =
+        crate::session::past_sessions::build_past_sessions(store.inner(), &snapshot_path, &opts);
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::json!({ "sessions": sessions })),
+    })
+}
+
 /// Manually migrate a Claude terminal session to a different configured
 /// account: copy its transcript into the target account's project dir, close
 /// the old pane, and respawn `claude --resume` under the target account (see
@@ -1673,6 +1703,7 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
             terminal_session_record_open,
             terminal_session_record_close,
             terminal_session_list_open,
+            terminal_session_list_history,
             terminal_session_mark_restore_pending,
             terminal_session_clear_restore_pending,
         ])

@@ -511,6 +511,70 @@ fn compact_file(
     Ok(kept.len())
 }
 
+// ── Display-only reader (previous-sessions listing) ──────────────────────────
+//
+// The module invariant (docs above) is that the RESTORE path must never read
+// this file. The reader below is DISPLAY-ONLY: it powers the "previous
+// sessions" listing, which needs ids OLDER than the mutable registry's ~24 h
+// retention (the registry prunes closed rows; this append-only history keeps
+// them for 14 days). It MUST NOT be wired into `restorable_records`,
+// `terminal_session_list_open`, or reconcile — doing so would resurrect the
+// split-brain the write-only invariant exists to prevent.
+
+/// Resolve the production snapshot-history path for a runner lifecycle `port`,
+/// mirroring main.rs's port-scoped naming (`session-snapshots.jsonl` for the
+/// primary 9876, else `session-snapshots-<port>.jsonl`) under the runner's
+/// session-restore app-data dir. Pure — display callers/tests may pass an
+/// explicit path instead.
+pub fn snapshot_path_for_port(port: u16) -> PathBuf {
+    let file = if port == 9876 {
+        "session-snapshots.jsonl".to_string()
+    } else {
+        format!("session-snapshots-{}.jsonl", port)
+    };
+    crate::session::claude_hook::session_restore_dir().join(file)
+}
+
+/// **Display-only** reader: the LATEST [`SnapshotSession`] per
+/// `claude_session_id` across the whole history (a session appears in many
+/// snapshots; the one from the newest [`SnapshotRecord`] wins). Powers the
+/// "previous sessions" listing so ids older than the registry's retention still
+/// surface.
+///
+/// MUST NOT be called from any restore path — see the section comment above and
+/// the module invariant. Fail-open by construction: a missing/empty file → an
+/// empty vec (no error), and a malformed line is skipped, never fatal.
+pub fn read_all_snapshot_sessions(path: &Path) -> Vec<SnapshotSession> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(), // missing / unreadable — fail open
+    };
+    // Track the newest record `ts` seen per session id so a later snapshot
+    // overwrites an earlier one.
+    let mut latest: std::collections::HashMap<String, (i64, SnapshotSession)> =
+        std::collections::HashMap::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let rec: SnapshotRecord = match serde_json::from_str(line) {
+            Ok(r) => r,
+            Err(_) => continue, // skip a corrupt line — do not abort
+        };
+        for s in rec.sessions {
+            let is_newer = latest
+                .get(&s.claude_session_id)
+                .map(|(ts, _)| rec.ts >= *ts)
+                .unwrap_or(true);
+            if is_newer {
+                latest.insert(s.claude_session_id.clone(), (rec.ts, s));
+            }
+        }
+    }
+    latest.into_values().map(|(_, s)| s).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -816,6 +880,58 @@ mod tests {
             Some(true)
         );
         assert_eq!(wire.get("restorable").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    // ── Display-only reader tests (previous-sessions listing) ────────────────
+
+    /// The reader dedupes by id, keeping the entry from the NEWEST record.
+    #[test]
+    fn read_all_dedupes_newest_per_id() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session-snapshots.jsonl");
+        let h = SnapshotHistory::open(&path).unwrap();
+
+        // Two records: `a` moves zone 1 → 5 between them; `b` only in the first.
+        h.record_change_at(1_000, vec![sess("a", 1), sess("b", 2)]);
+        h.record_change_at(2_000, vec![sess("a", 5)]);
+
+        let mut out = read_all_snapshot_sessions(&path);
+        out.sort_by(|x, y| x.claude_session_id.cmp(&y.claude_session_id));
+        assert_eq!(out.len(), 2, "one entry per distinct id");
+        let a = out.iter().find(|s| s.claude_session_id == "a").unwrap();
+        assert_eq!(a.zone_index, 5, "newest record wins for a");
+        assert!(
+            out.iter().any(|s| s.claude_session_id == "b"),
+            "an id present only in an older record still surfaces"
+        );
+    }
+
+    /// A corrupt line is skipped; the good records around it still return.
+    #[test]
+    fn read_all_fails_open_on_corrupt_line() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session-snapshots.jsonl");
+        let h = SnapshotHistory::open(&path).unwrap();
+        h.record_change_at(1_000, vec![sess("good1", 1)]);
+        h.record_change_at(2_000, vec![sess("good2", 2)]);
+        // Splice a garbage line into the middle of the file.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<&str> = raw.lines().collect();
+        lines.insert(1, "{ this is not json");
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let out = read_all_snapshot_sessions(&path);
+        let ids: std::collections::HashSet<_> =
+            out.iter().map(|s| s.claude_session_id.as_str()).collect();
+        assert!(ids.contains("good1") && ids.contains("good2"));
+    }
+
+    /// A missing file returns an empty vec (no error).
+    #[test]
+    fn read_all_missing_file_is_empty() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.jsonl");
+        assert!(read_all_snapshot_sessions(&path).is_empty());
     }
 
     #[test]

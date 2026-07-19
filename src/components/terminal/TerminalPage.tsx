@@ -5,6 +5,7 @@ import { createLogger } from "@/lib/logger";
 import { TerminalNotification } from "./TerminalNotification";
 import { FileConflictBanner } from "./FileConflictBanner";
 import { SessionManagerPanel } from "./SessionManagerPanel";
+import type { PastSession } from "./usePastSessions";
 import { ZoneGrid } from "./ZoneGrid";
 import { useTerminalWindowActions } from "./useTerminalWindowActions";
 import { useTenant } from "@/contexts/TenantContext";
@@ -744,7 +745,28 @@ function TerminalPageInner({
   const transitionEffects = useTransitionEffects();
   const { handleRestartInZone } = transitionEffects;
 
-  const { workflowGen, sessionManager } = session;
+  const { workflowGen, sessionManager, shellIntegration } = session;
+
+  // Resume a historical (Previous Sessions) record by id. Reuses the exact live
+  // resume path (`handleResumeSession`): create a tab and queue
+  // `claude --resume <id>` with the session's config dir. We synthesize the
+  // minimal `TranscriptSession` shape it consumes from the PastSession fields.
+  const handleResumePastSession = useCallback(
+    (ps: PastSession) => {
+      shellIntegration.handleResumeSession({
+        session_id: ps.claudeSessionId,
+        project_path: ps.workingDir ?? "",
+        config_dir: ps.configDir ?? "",
+        message_count: 0,
+        last_modified: "",
+        started_at: null,
+        first_message_preview: null,
+        has_plans: false,
+        display_name: ps.resumeName,
+      });
+    },
+    [shellIntegration],
+  );
 
   const {
     state: uiState,
@@ -1122,6 +1144,7 @@ function TerminalPageInner({
               selectedSessionId={workflowGen.selectedTranscriptSessionId}
               sessionConflictCounts={fileConflicts.sessionConflictCounts}
               sessionLockStates={sessionLockStates}
+              onResumePastSession={handleResumePastSession}
             />
           )}
 
