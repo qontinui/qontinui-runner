@@ -865,40 +865,50 @@ impl SessionLifecycleStore {
     /// than their grace windows, are excluded — a user who closes a tab does
     /// not want it resurrected, and a long-dead close is stale.
     ///
-    /// ## Cohort anchor (open rows)
+    /// ## Anchored recency (open rows)
     ///
     /// An open row is admitted iff
     /// `anchor - last_seen_at <= RESTORABLE_OPEN_ANCHOR_GRACE_MS`, where the
-    /// `anchor` is the registry's last moment of life — but derived from the
-    /// **death cohort**, NOT the global max, and NOT wall-clock now.
+    /// `anchor` is the registry's LAST moment of genuine session life — the max
+    /// of every row's `last_seen_at`/`closed_at`, NOT wall-clock now.
     ///
     /// A wall-clock rule (`now - last_seen <= grace`) would restore NOTHING
-    /// after any downtime longer than the grace (a crash, an hours-later
-    /// boot). A plain global-max anchor fixes that but is fragile: a SINGLE
-    /// stray-later timestamp (an intermediate boot/auto-restart's shutdown
-    /// marker, or a registry row that intermediate boot happened to touch)
-    /// pulls the anchor hours past the crash band, so every crash-time row
-    /// then fails `anchor - last_seen <= grace` and is silently dropped — the
-    /// 2026-07-19 mass-strand (81 confirmed sessions lost after a ~1h46m
-    /// delayed restart).
+    /// after any downtime longer than the grace (a crash, an hours-later boot);
+    /// the row-relative anchor is downtime-proof — when the whole registry dies
+    /// together the anchor equals the crash instant, so `anchor - last_seen ≈ 0`
+    /// and the cohort survives regardless of how long the runner was down.
     ///
-    /// The cohort anchor immunizes against that outlier. Candidate
-    /// life-timestamps (every row's `last_seen_at`, every closed row's
-    /// `closed_at`, and — only on a CLEAN boot — `prior_marker_at`) are
-    /// single-linkage clustered at `grace`; the anchor is the MAX timestamp of
-    /// the DENSEST cluster (ties → newest cluster). The dense crash band is
-    /// far denser than a lone stray, so the anchor tracks the band's newest
-    /// instant and the whole cohort survives regardless of downtime — exactly
-    /// the documented long-downtime intent — while the stray no longer evicts
-    /// it. Rows newer than the anchor (negative diff) stay admitted.
+    /// The anchor is derived ONLY from real session rows, never a boot marker.
+    /// `prior_marker_at` is the prior shutdown marker's `at` — the shutdown
+    /// instant on a clean exit, but the crashed process's OWN boot instant on a
+    /// crash (see [`crate::session::shutdown_marker`]). Worse, an INTERMEDIATE
+    /// boot/auto-restart during the downtime rewrites that marker to its own
+    /// later boot time. Feeding that later marker into the anchor is exactly
+    /// what pulled the 2026-07-19 anchor ~1h46m past the crash band and stranded
+    /// 81 confirmed sessions. So the marker contributes to the anchor ONLY on a
+    /// CLEAN boot (`boot_was_clean == true`), where it is an honest
+    /// last-moment-of-life signal that correctly excludes a stale lone ghost; on
+    /// an unclean (crash) boot it is dropped and the crash rows supply the
+    /// anchor themselves. A genuinely-newer session row (one that really was
+    /// alive later) legitimately advances the anchor; a crash cohort more than
+    /// `grace` older than that is stale and excluded — but is still offered,
+    /// quarantined, through the disk-only transcript net (see
+    /// `commands::terminal::terminal_session_list_open`), so it is never lost.
     ///
-    /// `prior_marker_at` is the prior shutdown marker's `at` (the shutdown
-    /// instant on a clean exit; the crashed process's OWN boot instant on a
-    /// crash — see [`crate::session::shutdown_marker`]). On a crash the marker
-    /// is a boot artifact, not session liveness, so it is EXCLUDED from the
-    /// anchor when `boot_was_clean` is `false`; the crash band supplies the
-    /// anchor. It is captured ONCE at boot — see
-    /// [`crate::session::shutdown_marker::boot_classification`].
+    /// ## One-live-session-per-terminal (open rows)
+    ///
+    /// A PTY hosts at most ONE live provider session, but the durable registry
+    /// can hold several `open` rows on one `terminal_id` (P4: a reused terminal
+    /// whose prior runs' exit-closes never fired — see
+    /// [`Self::repair_terminal_id_collisions`]). Restore maps a terminal to a
+    /// single session, so returning N open rows on one terminal collapses them.
+    /// The persistent boot repair fixes the durable store, but it must not RACE
+    /// the frontend's on-mount restore read, so the read is deduped here too:
+    /// among admitted `open` rows sharing a non-empty `terminal_id` we keep the
+    /// single most-authoritative one (CONFIRMED over unconfirmed, then newest
+    /// `last_seen_at`, then newest `opened_at`) and drop the rest. This is
+    /// idempotent with the boot repair and immunizes the read regardless of when
+    /// the repair persists.
     pub fn restorable_records(
         &self,
         now_ms: i64,
@@ -907,24 +917,24 @@ impl SessionLifecycleStore {
     ) -> Vec<TerminalSessionRecord> {
         match self.map.lock() {
             Ok(m) => {
-                // Candidate life-timestamps: every row's last_seen_at, every
-                // closed row's closed_at, and — only on a clean boot — the
-                // prior shutdown marker. On an unclean (crash) boot the marker
-                // is the crashed process's own boot instant (a boot artifact,
-                // not session liveness), so it is excluded and the crash
-                // cohort supplies the anchor.
-                let mut candidates: Vec<i64> = m
+                // The registry's last moment of genuine session life: the max
+                // over every row's last_seen_at and every closed row's
+                // closed_at, PLUS the prior shutdown marker ONLY on a clean
+                // boot. On an unclean (crash) boot the marker is a boot artifact
+                // (the crashed/intermediate process's boot instant), not session
+                // liveness, so it is excluded and the rows supply the anchor.
+                let anchor = m
                     .values()
                     .flat_map(|r| [Some(r.last_seen_at), r.closed_at])
+                    .chain(std::iter::once(if boot_was_clean {
+                        prior_marker_at
+                    } else {
+                        None
+                    }))
                     .flatten()
-                    .collect();
-                if boot_was_clean {
-                    if let Some(marker_at) = prior_marker_at {
-                        candidates.push(marker_at);
-                    }
-                }
-                let anchor = cohort_anchor(candidates, RESTORABLE_OPEN_ANCHOR_GRACE_MS);
-                m.values()
+                    .max();
+                let admitted: Vec<TerminalSessionRecord> = m
+                    .values()
                     .filter(|r| {
                         if r.state == "open" {
                             return match anchor {
@@ -952,7 +962,8 @@ impl SessionLifecycleStore {
                         false
                     })
                     .cloned()
-                    .collect()
+                    .collect();
+                dedupe_open_by_terminal(admitted)
             }
             Err(e) => {
                 warn!(error = %e, "session_lifecycle_store: lock poisoned on restorable_records");
@@ -1037,17 +1048,26 @@ impl SessionLifecycleStore {
                 if ids.len() < 2 {
                     continue; // no collision on this terminal
                 }
-                // Rank the colliding rows newest-first; keep [0], close the rest.
+                // Rank the colliding rows by restore authority — keep [0]
+                // (the row most likely to BE the live session), close the rest.
+                // A CONFIRMED row must always outrank an unconfirmed one: the
+                // record_open invariant is that an unconfirmed row never evicts
+                // a confirmed one, and a naive newest-`last_seen` sort would
+                // violate it (a later zone-move / boot re-assert can give an
+                // unconfirmed phantom a marginally newer `last_seen_at` than the
+                // real confirmed session, so we'd keep the phantom and close —
+                // and thereby exclude from the disk-only rescue net — the real
+                // one). Same key as the read-time dedupe in `restorable_records`.
                 let mut ranked = ids;
                 ranked.sort_by(|a, b| {
                     let ka = m
                         .get(a.as_str())
-                        .map(|r| (r.last_seen_at, r.opened_at))
-                        .unwrap_or((i64::MIN, i64::MIN));
+                        .map(open_authority_key)
+                        .unwrap_or((false, i64::MIN, i64::MIN));
                     let kb = m
                         .get(b.as_str())
-                        .map(|r| (r.last_seen_at, r.opened_at))
-                        .unwrap_or((i64::MIN, i64::MIN));
+                        .map(open_authority_key)
+                        .unwrap_or((false, i64::MIN, i64::MIN));
                     kb.cmp(&ka)
                 });
                 for id in ranked.into_iter().skip(1) {
@@ -1082,53 +1102,55 @@ impl SessionLifecycleStore {
     }
 }
 
-/// Compute the cohort anchor from a set of candidate life-timestamps.
-///
-/// A single stray-later timestamp (an intermediate boot's shutdown marker, or
-/// a registry row an intermediate boot happened to touch) must NOT be able to
-/// pull the admission anchor away from the dense band of rows that actually
-/// died together at crash time. We therefore single-linkage cluster the
-/// candidates at `grace` — sort ascending, and start a NEW cluster whenever
-/// the gap to the previous timestamp exceeds `grace` — and take the anchor to
-/// be the MAX timestamp of the DENSEST cluster (most member timestamps; ties
-/// broken toward the NEWEST cluster). The crash band is far denser than a lone
-/// stray, so the anchor tracks the band's newest instant and is immune to the
-/// outlier. Returns `None` for an empty candidate set (caller admits
-/// defensively).
-fn cohort_anchor(mut candidates: Vec<i64>, grace: i64) -> Option<i64> {
-    if candidates.is_empty() {
-        return None;
-    }
-    candidates.sort_unstable();
+/// Restore-authority key for an `open` row on a contested terminal, greatest =
+/// most likely to be the LIVE session. A CONFIRMED row (a provider hook proved
+/// a real session ran) outranks any unconfirmed one regardless of timestamps;
+/// among equal confirmation, the newest `last_seen_at` then `opened_at` wins.
+/// Shared by the read-time dedupe ([`dedupe_open_by_terminal`]) and the boot
+/// repair ([`SessionLifecycleStore::repair_terminal_id_collisions`]) so both
+/// agree on which colliding row to keep.
+fn open_authority_key(rec: &TerminalSessionRecord) -> (bool, i64, i64) {
+    (rec.confirmed_at.is_some(), rec.last_seen_at, rec.opened_at)
+}
 
-    // Walk the sorted timestamps, closing a cluster whenever the gap to the
-    // previous timestamp exceeds `grace`. Track the best (densest, then
-    // newest) cluster's max. `>=` on the length comparison keeps the NEWEST
-    // cluster on a size tie, since clusters are visited oldest-first.
-    let mut best_len = 0usize;
-    let mut best_max = candidates[0];
-    let mut cur_len = 0usize;
-    let mut cur_max = candidates[0];
-    let mut prev = candidates[0];
-    for &t in &candidates {
-        if t - prev > grace {
-            // Gap exceeds the grace — close the current cluster before this
-            // timestamp opens a new one.
-            if cur_len >= best_len {
-                best_len = cur_len;
-                best_max = cur_max;
-            }
-            cur_len = 0;
+/// Collapse admitted `open` rows that share a non-empty `terminal_id` down to
+/// the single most-authoritative one (see [`open_authority_key`]). A PTY hosts
+/// at most one live session, so the restore read must never return N open rows
+/// for one terminal (P4 collision) — that would collapse them onto one terminal
+/// at restore. This is the read-side guard that makes the restore immune to a
+/// registry collision REGARDLESS of whether the persistent boot repair has run
+/// yet (it is spawn-delayed and can race the frontend's on-mount read). Closed
+/// rows and open rows with an empty `terminal_id` (uncorrelatable) pass through
+/// untouched; input order is otherwise preserved.
+fn dedupe_open_by_terminal(records: Vec<TerminalSessionRecord>) -> Vec<TerminalSessionRecord> {
+    // Winner id per contested terminal_id.
+    let mut winner: HashMap<&str, &TerminalSessionRecord> = HashMap::new();
+    for r in &records {
+        if r.state != "open" || r.terminal_id.trim().is_empty() {
+            continue;
         }
-        cur_len += 1;
-        cur_max = t; // sorted ascending → the last member is the cluster max
-        prev = t;
+        winner
+            .entry(r.terminal_id.as_str())
+            .and_modify(|best| {
+                if open_authority_key(r) > open_authority_key(best) {
+                    *best = r;
+                }
+            })
+            .or_insert(r);
     }
-    // Close the final cluster.
-    if cur_len >= best_len {
-        best_max = cur_max;
-    }
-    Some(best_max)
+    records
+        .iter()
+        .filter(|r| {
+            if r.state != "open" || r.terminal_id.trim().is_empty() {
+                return true; // closed / uncorrelatable rows always pass
+            }
+            // Keep only the winning open row for this terminal.
+            winner
+                .get(r.terminal_id.as_str())
+                .is_some_and(|best| best.claude_session_id == r.claude_session_id)
+        })
+        .cloned()
+        .collect()
 }
 
 fn load_map(path: &Path) -> HashMap<String, TerminalSessionRecord> {
@@ -1883,6 +1905,45 @@ mod tests {
 
         // Idempotent: a second pass closes nothing.
         assert_eq!(store.repair_terminal_id_collisions(), 0, "idempotent");
+    }
+
+    /// The boot repair must be CONFIRMED-aware: a CONFIRMED real session on a
+    /// reused terminal must survive even when an UNCONFIRMED phantom (a later
+    /// zone-move / boot re-assert) carries a marginally NEWER `last_seen_at`.
+    /// A naive newest-only rank would close the real session — and, since it is
+    /// then `closed`, exclude it from the disk-only rescue net too — keeping a
+    /// placeholder phantom instead. Mirrors `open_authority_key`.
+    #[test]
+    fn repair_terminal_id_collisions_keeps_confirmed_over_newer_unconfirmed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let mk = |id: &str, last_seen: i64, confirmed: Option<i64>| {
+            let mut r = fixture_rec(id, "open", last_seen, None, None);
+            r.terminal_id = "shared".to_string();
+            r.confirmed_at = confirmed;
+            r
+        };
+        write_fixture(
+            &path,
+            vec![
+                mk("real-confirmed", 1_000, Some(1_000)),
+                mk("phantom-newer", 2_000, None),
+            ],
+        );
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        assert_eq!(store.repair_terminal_id_collisions(), 1);
+        assert_eq!(
+            store.get("real-confirmed").unwrap().state,
+            "open",
+            "the confirmed real session survives despite an older last_seen"
+        );
+        let phantom = store.get("phantom-newer").unwrap();
+        assert_eq!(phantom.state, "closed", "the unconfirmed newer phantom is closed");
+        assert_eq!(
+            phantom.close_reason.as_deref(),
+            Some("superseded-terminal-reuse")
+        );
     }
 
     /// `rekey_session` moves a row from the old id to the new id, updating the
@@ -3206,24 +3267,22 @@ mod tests {
         );
     }
 
-    /// The 2026-07-19 mass-strand, reproduced. A dense crash cohort dies
-    /// together at ~T; the runner is restarted ~2h later; both a later
-    /// shutdown marker (T+90m, written by an intermediate boot) AND a lone
-    /// registry row that intermediate boot touched (T+90m) would, under the
-    /// old global-max anchor, pull the anchor 90m past the cohort and evict
-    /// every crash row (`anchor - last_seen = 90m > 10m grace`). The cohort
-    /// anchor (densest cluster = the crash band) plus marker-gating on the
-    /// unclean boot keep the whole cohort restorable — the exact incident.
+    /// The 2026-07-19 mass-strand, reproduced. A crash cohort dies together at
+    /// ~T; the runner is restarted ~2h later; an INTERMEDIATE boot during the
+    /// downtime rewrote the shutdown marker to a later instant (T+90m). Under
+    /// the old anchor that later marker `at` fed the global max and evicted
+    /// every crash row (`anchor - last_seen = 90m > 10m grace`) — 81 sessions
+    /// lost. Gating the marker to CLEAN boots only (this boot is unclean) keeps
+    /// the whole cohort restorable: the rows supply the anchor themselves, at ~T.
     #[test]
-    fn restorable_records_crash_cohort_survives_later_marker_and_stray_row() {
+    fn restorable_records_crash_cohort_survives_delayed_restart_marker_gated() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("terminal-sessions.json");
         let t = 1_700_000_000_000_i64; // crash instant
         let ninety_min = 90 * 60_000_i64;
         let now = t + 2 * 3_600_000; // restarted 2h later
 
-        // Five open rows that stopped together in a tight band at ~T (the
-        // crash cohort), plus one lone "intermediate-boot" open row 90m later.
+        // Five open rows that stopped together at ~T (the crash cohort).
         write_fixture(
             &path,
             vec![
@@ -3232,36 +3291,39 @@ mod tests {
                 fixture_rec("crash-2", "open", t - 2_000, None, None),
                 fixture_rec("crash-3", "open", t - 3_000, None, None),
                 fixture_rec("crash-4", "open", t - 4_000, None, None),
-                fixture_rec("intermediate-ghost", "open", t + ninety_min, None, None),
             ],
         );
         let store = SessionLifecycleStore::open(&path).unwrap();
 
         // Unclean (crash) boot: the intermediate marker at T+90m is EXCLUDED
-        // from the anchor. Even so the stray registry row at T+90m stays a
-        // candidate — the cohort anchor must still resolve to the dense crash
-        // band, not the lone stray.
+        // from the anchor, so the crash rows anchor themselves and all survive.
         let marker_at = Some(t + ninety_min);
         let ids = restorable_ids(&store, now, marker_at, false);
+        assert_eq!(
+            ids,
+            vec![
+                "crash-0".to_string(),
+                "crash-1".to_string(),
+                "crash-2".to_string(),
+                "crash-3".to_string(),
+                "crash-4".to_string(),
+            ],
+            "the whole crash cohort survives a delayed restart (got {ids:?})"
+        );
 
-        for id in ["crash-0", "crash-1", "crash-2", "crash-3", "crash-4"] {
-            assert!(
-                ids.contains(&id.to_string()),
-                "the entire crash cohort must survive a delayed restart; missing {id} (got {ids:?})"
-            );
-        }
-        // The lone later row is newer than the anchor (negative diff) → it is
-        // admitted too (a fresh row is never dropped); the load-bearing point
-        // is that it did NOT evict the cohort.
-        assert!(ids.contains(&"intermediate-ghost".to_string()));
+        // Control: on a CLEAN boot the same later marker IS an honest
+        // last-moment-of-life signal and correctly evicts the now-stale cohort.
+        assert!(
+            restorable_ids(&store, now, marker_at, true).is_empty(),
+            "a clean-boot marker 90m newer than the cohort excludes it"
+        );
     }
 
-    /// A genuine stale lone ghost (its terminal died 72h before the crash)
-    /// stays EXCLUDED even though a fresh crash cohort now anchors the
-    /// registry: the cohort anchor sits at the crash band, and the ghost is
-    /// far outside grace below it. The cohort fix must not over-admit.
+    /// A genuine stale lone ghost (its terminal died 72h before the crash) stays
+    /// EXCLUDED: a fresh crash band supplies the anchor and the ghost is far
+    /// outside grace below it.
     #[test]
-    fn restorable_records_cohort_anchor_still_excludes_stale_ghost() {
+    fn restorable_records_still_excludes_stale_ghost() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("terminal-sessions.json");
         let t = 1_700_000_000_000_i64;
@@ -3278,8 +3340,6 @@ mod tests {
         );
         let store = SessionLifecycleStore::open(&path).unwrap();
 
-        // Unclean boot, no honest marker: the crash band anchors; the 72h
-        // ghost is well outside grace and must not resurrect.
         let ids = restorable_ids(&store, now, None, false);
         assert_eq!(
             ids,
@@ -3288,18 +3348,20 @@ mod tests {
                 "crash-1".to_string(),
                 "crash-2".to_string(),
             ],
-            "the crash cohort restores; the 72h stale ghost stays excluded"
+            "the crash band restores; the 72h stale ghost stays excluded"
         );
     }
 
-    /// A mixed registry: a dense crash cohort at T plus a smaller,
-    /// legitimately newer band 30m later (e.g. sessions an intermediate boot
-    /// actually restored and that were live again). The densest cluster (the
-    /// crash band) anchors; the newer band is newer than the anchor and is
-    /// admitted too — so BOTH bands restore. A newer band never evicts the
-    /// crash band, and legit newer sessions are not dropped.
+    /// A genuinely-newer band advances the anchor and a crash band more than
+    /// `grace` OLDER is EXCLUDED from the (full-restore) set — it is stale
+    /// relative to the last moment of life, exactly as an old lone ghost is.
+    /// (It is not lost: `terminal_session_list_open` still offers such a
+    /// grace-gated open row through the QUARANTINED disk-only transcript net —
+    /// see the P3 tests.) This pins the fix for the densest-cohort
+    /// over-admission regression: an older-but-larger band must NOT re-admit
+    /// stale sessions by pinning the anchor into the past.
     #[test]
-    fn restorable_records_mixed_cohort_admits_both_bands() {
+    fn restorable_records_newer_band_excludes_older_crash_band() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("terminal-sessions.json");
         let t = 1_700_000_000_000_i64;
@@ -3309,13 +3371,13 @@ mod tests {
         write_fixture(
             &path,
             vec![
-                // Dense crash band (5 rows) at ~T.
-                fixture_rec("crash-0", "open", t, None, None),
-                fixture_rec("crash-1", "open", t - 1_000, None, None),
-                fixture_rec("crash-2", "open", t - 2_000, None, None),
-                fixture_rec("crash-3", "open", t - 3_000, None, None),
-                fixture_rec("crash-4", "open", t - 4_000, None, None),
-                // Smaller, legitimately-newer band (2 rows) 30m later.
+                // A LARGER but OLDER band (5 rows) at ~T.
+                fixture_rec("old-0", "open", t, None, None),
+                fixture_rec("old-1", "open", t - 1_000, None, None),
+                fixture_rec("old-2", "open", t - 2_000, None, None),
+                fixture_rec("old-3", "open", t - 3_000, None, None),
+                fixture_rec("old-4", "open", t - 4_000, None, None),
+                // A SMALLER but genuinely-NEWER band (2 rows) 30m later.
                 fixture_rec("newer-0", "open", t + thirty_min, None, None),
                 fixture_rec("newer-1", "open", t + thirty_min - 1_000, None, None),
             ],
@@ -3325,56 +3387,80 @@ mod tests {
         let ids = restorable_ids(&store, now, None, false);
         assert_eq!(
             ids,
-            vec![
-                "crash-0".to_string(),
-                "crash-1".to_string(),
-                "crash-2".to_string(),
-                "crash-3".to_string(),
-                "crash-4".to_string(),
-                "newer-0".to_string(),
-                "newer-1".to_string(),
-            ],
-            "both the crash band and the legit newer band restore"
+            vec!["newer-0".to_string(), "newer-1".to_string()],
+            "only the newest band restores; the 30m-older band is stale (got {ids:?})"
         );
     }
 
-    /// Unit coverage for the cohort-anchor core: a lone stray-later timestamp
-    /// cannot pull the anchor off the densest band; empty → None; ties resolve
-    /// to the newest cluster.
+    /// The read-time one-live-session-per-terminal dedupe: when several admitted
+    /// OPEN rows share a `terminal_id`, `restorable_records` returns exactly the
+    /// most-authoritative one (CONFIRMED over unconfirmed, else newest), so the
+    /// restore read never collapses N rows onto one terminal — regardless of
+    /// whether the persistent boot repair has run yet.
     #[test]
-    fn cohort_anchor_picks_densest_then_newest() {
-        let grace = RESTORABLE_OPEN_ANCHOR_GRACE_MS;
+    fn restorable_records_dedupes_collided_open_rows_prefers_confirmed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let t = 1_700_000_000_000_i64;
+        let now = t + 60_000;
 
-        // Empty → None (caller admits defensively).
-        assert_eq!(cohort_anchor(vec![], grace), None);
-
-        // Single timestamp → itself.
-        assert_eq!(cohort_anchor(vec![42], grace), Some(42));
-
-        // A dense band at ~1000 plus one stray far later: anchor = band max,
-        // NOT the stray.
-        let band_max = 1_000;
-        let stray = band_max + grace * 100;
-        assert_eq!(
-            cohort_anchor(
-                vec![stray, band_max - 300, band_max - 100, band_max, band_max - 200],
-                grace,
-            ),
-            Some(band_max),
-            "the lone stray must not become the anchor"
+        let mk = |id: &str, terminal: &str, last_seen: i64, confirmed: Option<i64>| {
+            let mut r = fixture_rec(id, "open", last_seen, None, None);
+            r.terminal_id = terminal.to_string();
+            r.confirmed_at = confirmed;
+            r
+        };
+        write_fixture(
+            &path,
+            vec![
+                // Same terminal: an older CONFIRMED real session and a newer
+                // UNCONFIRMED phantom (a later re-assert). Confirmed must win.
+                mk("confirmed-real", "shared", t - 5_000, Some(t - 5_000)),
+                mk("unconfirmed-newer", "shared", t, None),
+                // A distinct terminal — always kept.
+                mk("solo", "other", t, None),
+            ],
         );
+        let store = SessionLifecycleStore::open(&path).unwrap();
 
-        // Two equal-size (single-member) clusters: tie breaks toward the
-        // NEWEST cluster.
-        let a = 1_000;
-        let b = a + grace * 10;
-        assert_eq!(cohort_anchor(vec![a, b], grace), Some(b));
-
-        // Contiguous timestamps exactly `grace` apart stay ONE cluster
-        // (gap must EXCEED grace to split) → anchor = the last.
+        let mut ids = restorable_ids(&store, now, None, false);
+        ids.sort();
         assert_eq!(
-            cohort_anchor(vec![0, grace, 2 * grace], grace),
-            Some(2 * grace)
+            ids,
+            vec!["confirmed-real".to_string(), "solo".to_string()],
+            "the confirmed row wins the shared terminal; the phantom is dropped; solo kept"
+        );
+    }
+
+    /// Unit coverage for the read-time dedupe helper: confirmed beats a newer
+    /// unconfirmed on the same terminal; distinct terminals both survive; an
+    /// empty terminal_id is uncorrelatable and passes through; closed rows pass.
+    #[test]
+    fn dedupe_open_by_terminal_prefers_confirmed_then_newest() {
+        let mk = |id: &str, state: &str, terminal: &str, last_seen: i64, confirmed: Option<i64>| {
+            let mut r = fixture_rec(id, state, last_seen, None, None);
+            r.terminal_id = terminal.to_string();
+            r.confirmed_at = confirmed;
+            r
+        };
+        let out = dedupe_open_by_terminal(vec![
+            mk("conf-old", "open", "A", 1_000, Some(1_000)),
+            mk("unconf-new", "open", "A", 2_000, None),
+            mk("b-newer", "open", "B", 3_000, None),
+            mk("b-older", "open", "B", 1_500, None),
+            mk("empty-term-1", "open", "", 4_000, None),
+            mk("empty-term-2", "open", "", 5_000, None),
+        ]);
+        let mut kept: Vec<String> = out.into_iter().map(|r| r.claude_session_id).collect();
+        kept.sort();
+        assert_eq!(
+            kept,
+            vec![
+                "b-newer".to_string(),     // newest on terminal B
+                "conf-old".to_string(),    // confirmed beats newer unconfirmed on A
+                "empty-term-1".to_string(), // empty terminal_id: uncorrelatable, both pass
+                "empty-term-2".to_string(),
+            ]
         );
     }
 }
