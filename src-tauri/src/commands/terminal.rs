@@ -943,9 +943,10 @@ pub fn terminal_session_record_close(
 /// `localStorage`.
 ///
 /// Returns the restorable set (see `restorable_records`): `open` records
-/// whose `last_seen_at` is recent relative to the registry's ANCHOR (its last
-/// moment of life — max of every row's timestamps plus the prior shutdown
-/// marker's `at`), PLUS `closed`/`pty-exit` and `closed`/`poll-dead` records
+/// whose `last_seen_at` is recent relative to the registry's cohort ANCHOR
+/// (the newest instant of the densest death cohort — see `restorable_records`;
+/// the prior shutdown marker contributes only on a clean boot), PLUS
+/// `closed`/`pty-exit` and `closed`/`poll-dead` records
 /// still within their grace windows (graceful-restart case, where
 /// `handleExit` flipped every live PTY to `closed`). User-closed, orphan
 /// (`no-terminal`) and stale-ghost records are excluded so the restore path
@@ -959,9 +960,15 @@ pub fn terminal_session_list_open(
     // captured ONCE at boot (main.rs setup, before this command can run) —
     // the on-disk marker itself already says `clean:false` for the NOW-
     // running process and must never be re-read for restore decisions.
-    let prior_marker_at =
-        crate::session::shutdown_marker::boot_classification().and_then(|c| c.prior_marker_at);
-    let mut sessions = store.restorable_records(now, prior_marker_at);
+    let boot = crate::session::shutdown_marker::boot_classification();
+    let prior_marker_at = boot.and_then(|c| c.prior_marker_at);
+    // On a crash (unclean) boot the marker is the crashed process's own boot
+    // instant — a boot artifact, not session liveness — so it must NOT feed
+    // the cohort anchor (its stray-later `at` is exactly what pulled the
+    // 2026-07-19 anchor ~1h46m past the crash band and stranded 81 sessions).
+    // Only a CLEAN shutdown marker is an honest last-moment-of-life signal.
+    let boot_was_clean = boot.map(|c| !c.crash_recovery).unwrap_or(false);
+    let mut sessions = store.restorable_records(now, prior_marker_at, boot_was_clean);
 
     // G3 (session-restore-redesign Phase 3): UNION the registry restorable set
     // with the TRANSCRIPT-DERIVED disk-only recovery net. A session that was
