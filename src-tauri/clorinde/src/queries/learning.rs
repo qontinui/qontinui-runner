@@ -214,8 +214,8 @@ pub struct GetLearningStatsSummary {
     pub avg_iterations: f64,
     pub avg_cost: f64,
 }
-use crate::client::async_::GenericClient;
 use futures::{self, StreamExt, TryStreamExt};
+use crate::client::async_::GenericClient;
 pub struct StringQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
     client: &'c C,
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
@@ -239,22 +239,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -263,18 +275,19 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
@@ -285,8 +298,9 @@ pub struct GetLearningOutcomesQuery<'c, 'a, 's, C: GenericClient, T, const N: us
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
     query: &'static str,
     cached: Option<&'s tokio_postgres::Statement>,
-    extractor:
-        fn(&tokio_postgres::Row) -> Result<GetLearningOutcomesBorrowed, tokio_postgres::Error>,
+    extractor: fn(
+        &tokio_postgres::Row,
+    ) -> Result<GetLearningOutcomesBorrowed, tokio_postgres::Error>,
     mapper: fn(GetLearningOutcomesBorrowed) -> T,
 }
 impl<'c, 'a, 's, C, T: 'c, const N: usize> GetLearningOutcomesQuery<'c, 'a, 's, C, T, N>
@@ -307,22 +321,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -331,18 +357,19 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
@@ -353,8 +380,9 @@ pub struct GetLearningPatternsQuery<'c, 'a, 's, C: GenericClient, T, const N: us
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
     query: &'static str,
     cached: Option<&'s tokio_postgres::Statement>,
-    extractor:
-        fn(&tokio_postgres::Row) -> Result<GetLearningPatternsBorrowed, tokio_postgres::Error>,
+    extractor: fn(
+        &tokio_postgres::Row,
+    ) -> Result<GetLearningPatternsBorrowed, tokio_postgres::Error>,
     mapper: fn(GetLearningPatternsBorrowed) -> T,
 }
 impl<'c, 'a, 's, C, T: 'c, const N: usize> GetLearningPatternsQuery<'c, 'a, 's, C, T, N>
@@ -375,22 +403,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -399,18 +439,19 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
@@ -439,22 +480,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -463,32 +516,49 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
     }
 }
-pub struct GetLearningStatsSummaryQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
+pub struct GetLearningStatsSummaryQuery<
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+    T,
+    const N: usize,
+> {
     client: &'c C,
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
     query: &'static str,
     cached: Option<&'s tokio_postgres::Statement>,
-    extractor: fn(&tokio_postgres::Row) -> Result<GetLearningStatsSummary, tokio_postgres::Error>,
+    extractor: fn(
+        &tokio_postgres::Row,
+    ) -> Result<GetLearningStatsSummary, tokio_postgres::Error>,
     mapper: fn(GetLearningStatsSummary) -> T,
 }
-impl<'c, 'a, 's, C, T: 'c, const N: usize> GetLearningStatsSummaryQuery<'c, 'a, 's, C, T, N>
+impl<
+    'c,
+    'a,
+    's,
+    C,
+    T: 'c,
+    const N: usize,
+> GetLearningStatsSummaryQuery<'c, 'a, 's, C, T, N>
 where
     C: GenericClient,
 {
@@ -506,22 +576,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -530,18 +612,19 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
@@ -655,16 +738,14 @@ impl<
     T11: crate::StringSql,
     T12: crate::StringSql,
     T13: crate::StringSql,
->
-    crate::client::async_::Params<
-        'c,
-        'a,
-        's,
-        RecordLearningOutcomeParams<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13>,
-        StringQuery<'c, 'a, 's, C, String, 21>,
-        C,
-    > for RecordLearningOutcomeStmt
-{
+> crate::client::async_::Params<
+    'c,
+    'a,
+    's,
+    RecordLearningOutcomeParams<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13>,
+    StringQuery<'c, 'a, 's, C, String, 21>,
+    C,
+> for RecordLearningOutcomeStmt {
     fn params(
         &'s self,
         client: &'c C,
@@ -804,14 +885,7 @@ impl SaveLearningPatternStmt {
     ) -> StringQuery<'c, 'a, 's, C, String, 6> {
         StringQuery {
             client,
-            params: [
-                id,
-                pattern_type,
-                description,
-                confidence,
-                occurrences,
-                context,
-            ],
+            params: [id, pattern_type, description, confidence, occurrences, context],
             query: self.0,
             cached: self.1.as_ref(),
             extractor: |row| Ok(row.try_get(0)?),
@@ -828,16 +902,14 @@ impl<
     T2: crate::StringSql,
     T3: crate::StringSql,
     T4: crate::StringSql,
->
-    crate::client::async_::Params<
-        'c,
-        'a,
-        's,
-        SaveLearningPatternParams<T1, T2, T3, T4>,
-        StringQuery<'c, 'a, 's, C, String, 6>,
-        C,
-    > for SaveLearningPatternStmt
-{
+> crate::client::async_::Params<
+    'c,
+    'a,
+    's,
+    SaveLearningPatternParams<T1, T2, T3, T4>,
+    StringQuery<'c, 'a, 's, C, String, 6>,
+    C,
+> for SaveLearningPatternStmt {
     fn params(
         &'s self,
         client: &'c C,

@@ -3,7 +3,7 @@
 //! Covers: workflow_versions, step_finding_links, step_provenance,
 //! generation_pipeline_events, rule_influence_log, cross_run_patterns.
 
-use super::PgDb;
+use super::{parse_optional_workflow_id, parse_workflow_id, PgDb};
 use crate::database::cross_run_ops::CrossRunPattern;
 use crate::database::graph_ops::{PipelineEvent, WorkflowVersion};
 
@@ -29,6 +29,7 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
+        let workflow_id_uuid = parse_workflow_id(workflow_id)?;
         conn.execute(
             r#"INSERT INTO workflow_versions
                (id, workflow_id, version_number, parent_version_id,
@@ -37,7 +38,7 @@ impl PgDb {
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
             &[
                 &id.as_str(),
-                &workflow_id,
+                &workflow_id_uuid,
                 &version_number,
                 &parent_version_id,
                 &generation_task_run_id,
@@ -56,6 +57,11 @@ impl PgDb {
         &self,
         workflow_id: &str,
     ) -> Result<Vec<WorkflowVersion>, String> {
+        // A malformed id just matches nothing — see get_unified_workflow's
+        // Ok(None) doc comment for why this degrades instead of erroring.
+        let Ok(workflow_id_uuid) = parse_workflow_id(workflow_id) else {
+            return Ok(vec![]);
+        };
         let conn = self
             .pool()
             .get()
@@ -69,7 +75,7 @@ impl PgDb {
                    FROM workflow_versions
                    WHERE workflow_id = $1
                    ORDER BY version_number DESC"#,
-                &[&workflow_id],
+                &[&workflow_id_uuid],
             )
             .await
             .map_err(|e| format!("PG get_workflow_versions: {}", e))?;
@@ -77,7 +83,7 @@ impl PgDb {
             .iter()
             .map(|r| WorkflowVersion {
                 id: r.get(0),
-                workflow_id: r.get(1),
+                workflow_id: r.get::<_, uuid::Uuid>(1).to_string(),
                 version_number: r.get(2),
                 parent_version_id: r.get(3),
                 generation_task_run_id: r.get(4),
@@ -209,6 +215,7 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
+        let workflow_id_uuid = parse_workflow_id(workflow_id)?;
         conn.execute(
             r#"INSERT INTO step_provenance
                (id, workflow_id, workflow_version_id, step_name, step_index,
@@ -217,7 +224,7 @@ impl PgDb {
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"#,
             &[
                 &id.as_str(),
-                &workflow_id,
+                &workflow_id_uuid,
                 &workflow_version_id,
                 &step_name,
                 &step_index,
@@ -257,6 +264,7 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
+        let workflow_id_uuid = parse_optional_workflow_id(workflow_id)?;
         conn.execute(
             r#"INSERT INTO generation_pipeline_events
                (id, task_run_id, workflow_id, event_type, phase, iteration,
@@ -266,7 +274,7 @@ impl PgDb {
             &[
                 &id.as_str(),
                 &task_run_id,
-                &workflow_id,
+                &workflow_id_uuid,
                 &event_type,
                 &phase,
                 &iteration,
@@ -309,7 +317,7 @@ impl PgDb {
             .map(|r| PipelineEvent {
                 id: r.get(0),
                 task_run_id: r.get(1),
-                workflow_id: r.get(2),
+                workflow_id: r.get::<_, Option<uuid::Uuid>>(2).map(|u| u.to_string()),
                 event_type: r.get(3),
                 phase: r.get(4),
                 iteration: r.get(5),
@@ -342,6 +350,7 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
+        let workflow_id_uuid = parse_optional_workflow_id(workflow_id)?;
         conn.execute(
             r#"INSERT INTO rule_influence_log
                (id, rule_id, task_run_id, workflow_id, influence_type, evidence, phase)
@@ -350,7 +359,7 @@ impl PgDb {
                 &id.as_str(),
                 &rule_id,
                 &task_run_id,
-                &workflow_id,
+                &workflow_id_uuid,
                 &influence_type,
                 &evidence,
                 &phase,
@@ -433,6 +442,9 @@ impl PgDb {
         &self,
         workflow_id: &str,
     ) -> Result<Vec<crate::database::graph_ops::StepProvenance>, String> {
+        let Ok(workflow_id_uuid) = parse_workflow_id(workflow_id) else {
+            return Ok(vec![]);
+        };
         let conn = self
             .pool
             .get()
@@ -447,7 +459,7 @@ impl PgDb {
                    FROM step_provenance
                    WHERE workflow_id = $1
                    ORDER BY step_index ASC, created_at ASC"#,
-                &[&workflow_id],
+                &[&workflow_id_uuid],
             )
             .await
             .map_err(|e| format!("PG get_provenance_for_workflow: {}", e))?;
@@ -456,7 +468,7 @@ impl PgDb {
             .iter()
             .map(|r| crate::database::graph_ops::StepProvenance {
                 id: r.get(0),
-                workflow_id: r.get(1),
+                workflow_id: r.get::<_, uuid::Uuid>(1).to_string(),
                 workflow_version_id: r.get(2),
                 step_name: r.get(3),
                 step_index: r.get(4),
@@ -500,7 +512,7 @@ impl PgDb {
                 id: r.get(0),
                 rule_id: r.get(1),
                 task_run_id: r.get(2),
-                workflow_id: r.get(3),
+                workflow_id: r.get::<_, Option<uuid::Uuid>>(3).map(|u| u.to_string()),
                 influence_type: r.get(4),
                 evidence: r.get(5),
                 phase: r.get(6),
@@ -553,6 +565,9 @@ impl PgDb {
         &self,
         workflow_id: &str,
     ) -> Result<Vec<crate::database::graph_ops::PhaseStats>, String> {
+        let Ok(workflow_id_uuid) = parse_workflow_id(workflow_id) else {
+            return Ok(vec![]);
+        };
         let conn = self
             .pool
             .get()
@@ -572,7 +587,7 @@ impl PgDb {
                    WHERE workflow_id = $1 AND phase IS NOT NULL
                    GROUP BY phase
                    ORDER BY phase"#,
-                &[&workflow_id],
+                &[&workflow_id_uuid],
             )
             .await
             .map_err(|e| format!("PG get_phase_stats: {}", e))?;
@@ -859,7 +874,7 @@ impl PgDb {
             .await
         {
             for r in &rows {
-                let id: String = r.get(0);
+                let id: String = r.get::<_, uuid::Uuid>(0).to_string();
                 let name: String = r.get(1);
                 let description: String = r.get(2);
                 let category: String = r.get(3);

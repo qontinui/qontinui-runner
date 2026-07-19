@@ -1,12 +1,12 @@
 // This file was generated with `clorinde`. Do not modify.
 
 pub use generic_client::GenericClient;
+mod generic_client;
 #[cfg(feature = "deadpool")]
 mod deadpool;
-mod generic_client;
 use tokio_postgres::{
-    Error, Row, RowStream, Statement,
     types::{BorrowToSql, ToSql},
+    Error, Row, RowStream, Statement,
 };
 /// This trait allows you to bind parameters to a query using a single
 /// struct, rather than passing each bind parameter as a function parameter.

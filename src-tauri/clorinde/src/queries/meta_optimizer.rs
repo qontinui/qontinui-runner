@@ -125,14 +125,16 @@ impl<'a> From<UpdateRecommendationStatusBorrowed<'a>> for UpdateRecommendationSt
         }
     }
 }
-use crate::client::async_::GenericClient;
 use futures::{self, StreamExt, TryStreamExt};
+use crate::client::async_::GenericClient;
 pub struct GetRecommendationQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
     client: &'c C,
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
     query: &'static str,
     cached: Option<&'s tokio_postgres::Statement>,
-    extractor: fn(&tokio_postgres::Row) -> Result<GetRecommendationBorrowed, tokio_postgres::Error>,
+    extractor: fn(
+        &tokio_postgres::Row,
+    ) -> Result<GetRecommendationBorrowed, tokio_postgres::Error>,
     mapper: fn(GetRecommendationBorrowed) -> T,
 }
 impl<'c, 'a, 's, C, T: 'c, const N: usize> GetRecommendationQuery<'c, 'a, 's, C, T, N>
@@ -153,22 +155,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -177,24 +191,32 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
     }
 }
-pub struct UpdateRecommendationStatusQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
+pub struct UpdateRecommendationStatusQuery<
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+    T,
+    const N: usize,
+> {
     client: &'c C,
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
     query: &'static str,
@@ -204,7 +226,14 @@ pub struct UpdateRecommendationStatusQuery<'c, 'a, 's, C: GenericClient, T, cons
     ) -> Result<UpdateRecommendationStatusBorrowed, tokio_postgres::Error>,
     mapper: fn(UpdateRecommendationStatusBorrowed) -> T,
 }
-impl<'c, 'a, 's, C, T: 'c, const N: usize> UpdateRecommendationStatusQuery<'c, 'a, 's, C, T, N>
+impl<
+    'c,
+    'a,
+    's,
+    C,
+    T: 'c,
+    const N: usize,
+> UpdateRecommendationStatusQuery<'c, 'a, 's, C, T, N>
 where
     C: GenericClient,
 {
@@ -222,22 +251,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -246,24 +287,32 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
     }
 }
-pub struct ChronoDateTimechronoFixedOffsetQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
+pub struct ChronoDateTimechronoFixedOffsetQuery<
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+    T,
+    const N: usize,
+> {
     client: &'c C,
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
     query: &'static str,
@@ -273,7 +322,14 @@ pub struct ChronoDateTimechronoFixedOffsetQuery<'c, 'a, 's, C: GenericClient, T,
     ) -> Result<chrono::DateTime<chrono::FixedOffset>, tokio_postgres::Error>,
     mapper: fn(chrono::DateTime<chrono::FixedOffset>) -> T,
 }
-impl<'c, 'a, 's, C, T: 'c, const N: usize> ChronoDateTimechronoFixedOffsetQuery<'c, 'a, 's, C, T, N>
+impl<
+    'c,
+    'a,
+    's,
+    C,
+    T: 'c,
+    const N: usize,
+> ChronoDateTimechronoFixedOffsetQuery<'c, 'a, 's, C, T, N>
 where
     C: GenericClient,
 {
@@ -291,22 +347,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -315,18 +383,19 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
@@ -385,7 +454,10 @@ impl GetRecommendationStmt {
         }
     }
 }
-pub struct UpdateRecommendationStatusStmt(&'static str, Option<tokio_postgres::Statement>);
+pub struct UpdateRecommendationStatusStmt(
+    &'static str,
+    Option<tokio_postgres::Statement>,
+);
 pub fn update_recommendation_status() -> UpdateRecommendationStatusStmt {
     UpdateRecommendationStatusStmt(
         "UPDATE meta_optimizer_recommendations SET status = $1, applied_at = NOW() WHERE id = $2 RETURNING id, optimizer_type, recommendation_type, status, applied_at",
@@ -400,7 +472,14 @@ impl UpdateRecommendationStatusStmt {
         self.1 = Some(client.prepare(self.0).await?);
         Ok(self)
     }
-    pub fn bind<'c, 'a, 's, C: GenericClient, T1: crate::StringSql, T2: crate::StringSql>(
+    pub fn bind<
+        'c,
+        'a,
+        's,
+        C: GenericClient,
+        T1: crate::StringSql,
+        T2: crate::StringSql,
+    >(
         &'s self,
         client: &'c C,
         status: &'a T1,
@@ -426,16 +505,21 @@ impl UpdateRecommendationStatusStmt {
         }
     }
 }
-impl<'c, 'a, 's, C: GenericClient, T1: crate::StringSql, T2: crate::StringSql>
-    crate::client::async_::Params<
-        'c,
-        'a,
-        's,
-        UpdateRecommendationStatusParams<T1, T2>,
-        UpdateRecommendationStatusQuery<'c, 'a, 's, C, UpdateRecommendationStatus, 2>,
-        C,
-    > for UpdateRecommendationStatusStmt
-{
+impl<
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+    T1: crate::StringSql,
+    T2: crate::StringSql,
+> crate::client::async_::Params<
+    'c,
+    'a,
+    's,
+    UpdateRecommendationStatusParams<T1, T2>,
+    UpdateRecommendationStatusQuery<'c, 'a, 's, C, UpdateRecommendationStatus, 2>,
+    C,
+> for UpdateRecommendationStatusStmt {
     fn params(
         &'s self,
         client: &'c C,
@@ -444,7 +528,10 @@ impl<'c, 'a, 's, C: GenericClient, T1: crate::StringSql, T2: crate::StringSql>
         self.bind(client, &params.status, &params.id)
     }
 }
-pub struct GetRecommendationAppliedAtStmt(&'static str, Option<tokio_postgres::Statement>);
+pub struct GetRecommendationAppliedAtStmt(
+    &'static str,
+    Option<tokio_postgres::Statement>,
+);
 pub fn get_recommendation_applied_at() -> GetRecommendationAppliedAtStmt {
     GetRecommendationAppliedAtStmt(
         "SELECT COALESCE(applied_at, NOW()) as applied_at FROM meta_optimizer_recommendations WHERE id = $1",
@@ -463,8 +550,14 @@ impl GetRecommendationAppliedAtStmt {
         &'s self,
         client: &'c C,
         id: &'a T1,
-    ) -> ChronoDateTimechronoFixedOffsetQuery<'c, 'a, 's, C, chrono::DateTime<chrono::FixedOffset>, 1>
-    {
+    ) -> ChronoDateTimechronoFixedOffsetQuery<
+        'c,
+        'a,
+        's,
+        C,
+        chrono::DateTime<chrono::FixedOffset>,
+        1,
+    > {
         ChronoDateTimechronoFixedOffsetQuery {
             client,
             params: [id],

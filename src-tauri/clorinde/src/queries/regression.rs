@@ -49,7 +49,8 @@ pub struct GetAssertionExecutionsForSuiteBorrowed<'a> {
     pub failure_kind: &'a str,
     pub error_message: &'a str,
 }
-impl<'a> From<GetAssertionExecutionsForSuiteBorrowed<'a>> for GetAssertionExecutionsForSuite {
+impl<'a> From<GetAssertionExecutionsForSuiteBorrowed<'a>>
+for GetAssertionExecutionsForSuite {
     fn from(
         GetAssertionExecutionsForSuiteBorrowed {
             case_id,
@@ -104,8 +105,8 @@ impl<'a> From<GetRecentDiagnosesForSuiteBorrowed<'a>> for GetRecentDiagnosesForS
         }
     }
 }
-use crate::client::async_::GenericClient;
 use futures::{self, StreamExt, TryStreamExt};
+use crate::client::async_::GenericClient;
 pub struct UuidUuidQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
     client: &'c C,
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
@@ -118,7 +119,10 @@ impl<'c, 'a, 's, C, T: 'c, const N: usize> UuidUuidQuery<'c, 'a, 's, C, T, N>
 where
     C: GenericClient,
 {
-    pub fn map<R>(self, mapper: fn(uuid::Uuid) -> R) -> UuidUuidQuery<'c, 'a, 's, C, R, N> {
+    pub fn map<R>(
+        self,
+        mapper: fn(uuid::Uuid) -> R,
+    ) -> UuidUuidQuery<'c, 'a, 's, C, R, N> {
         UuidUuidQuery {
             client: self.client,
             params: self.params,
@@ -129,22 +133,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -153,24 +169,32 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
     }
 }
-pub struct GetAssertionExecutionsForSuiteQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
+pub struct GetAssertionExecutionsForSuiteQuery<
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+    T,
+    const N: usize,
+> {
     client: &'c C,
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
     query: &'static str,
@@ -180,7 +204,14 @@ pub struct GetAssertionExecutionsForSuiteQuery<'c, 'a, 's, C: GenericClient, T, 
     ) -> Result<GetAssertionExecutionsForSuiteBorrowed, tokio_postgres::Error>,
     mapper: fn(GetAssertionExecutionsForSuiteBorrowed) -> T,
 }
-impl<'c, 'a, 's, C, T: 'c, const N: usize> GetAssertionExecutionsForSuiteQuery<'c, 'a, 's, C, T, N>
+impl<
+    'c,
+    'a,
+    's,
+    C,
+    T: 'c,
+    const N: usize,
+> GetAssertionExecutionsForSuiteQuery<'c, 'a, 's, C, T, N>
 where
     C: GenericClient,
 {
@@ -198,22 +229,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -222,24 +265,32 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
     }
 }
-pub struct GetRecentDiagnosesForSuiteQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
+pub struct GetRecentDiagnosesForSuiteQuery<
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+    T,
+    const N: usize,
+> {
     client: &'c C,
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
     query: &'static str,
@@ -249,7 +300,14 @@ pub struct GetRecentDiagnosesForSuiteQuery<'c, 'a, 's, C: GenericClient, T, cons
     ) -> Result<GetRecentDiagnosesForSuiteBorrowed, tokio_postgres::Error>,
     mapper: fn(GetRecentDiagnosesForSuiteBorrowed) -> T,
 }
-impl<'c, 'a, 's, C, T: 'c, const N: usize> GetRecentDiagnosesForSuiteQuery<'c, 'a, 's, C, T, N>
+impl<
+    'c,
+    'a,
+    's,
+    C,
+    T: 'c,
+    const N: usize,
+> GetRecentDiagnosesForSuiteQuery<'c, 'a, 's, C, T, N>
 where
     C: GenericClient,
 {
@@ -267,22 +325,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -291,18 +361,19 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
@@ -340,16 +411,21 @@ impl SaveRegressionSuiteStmt {
         }
     }
 }
-impl<'c, 'a, 's, C: GenericClient, T1: crate::StringSql, T2: crate::JsonSql>
-    crate::client::async_::Params<
-        'c,
-        'a,
-        's,
-        SaveRegressionSuiteParams<T1, T2>,
-        UuidUuidQuery<'c, 'a, 's, C, uuid::Uuid, 3>,
-        C,
-    > for SaveRegressionSuiteStmt
-{
+impl<
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+    T1: crate::StringSql,
+    T2: crate::JsonSql,
+> crate::client::async_::Params<
+    'c,
+    'a,
+    's,
+    SaveRegressionSuiteParams<T1, T2>,
+    UuidUuidQuery<'c, 'a, 's, C, uuid::Uuid, 3>,
+    C,
+> for SaveRegressionSuiteStmt {
     fn params(
         &'s self,
         client: &'c C,
@@ -404,16 +480,21 @@ impl RecordRegressionRunStmt {
         }
     }
 }
-impl<'c, 'a, 's, C: GenericClient, T1: crate::StringSql, T2: crate::JsonSql>
-    crate::client::async_::Params<
-        'c,
-        'a,
-        's,
-        RecordRegressionRunParams<T1, T2>,
-        UuidUuidQuery<'c, 'a, 's, C, uuid::Uuid, 8>,
-        C,
-    > for RecordRegressionRunStmt
-{
+impl<
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+    T1: crate::StringSql,
+    T2: crate::JsonSql,
+> crate::client::async_::Params<
+    'c,
+    'a,
+    's,
+    RecordRegressionRunParams<T1, T2>,
+    UuidUuidQuery<'c, 'a, 's, C, uuid::Uuid, 8>,
+    C,
+> for RecordRegressionRunStmt {
     fn params(
         &'s self,
         client: &'c C,
@@ -432,7 +513,10 @@ impl<'c, 'a, 's, C: GenericClient, T1: crate::StringSql, T2: crate::JsonSql>
         )
     }
 }
-pub struct RecordRegressionDiagnosisStmt(&'static str, Option<tokio_postgres::Statement>);
+pub struct RecordRegressionDiagnosisStmt(
+    &'static str,
+    Option<tokio_postgres::Statement>,
+);
 pub fn record_regression_diagnosis() -> RecordRegressionDiagnosisStmt {
     RecordRegressionDiagnosisStmt(
         "INSERT INTO regression_diagnoses (id, run_id, diagnosis_json) VALUES ($1::uuid, $2::uuid, $3::jsonb) RETURNING id",
@@ -464,16 +548,20 @@ impl RecordRegressionDiagnosisStmt {
         }
     }
 }
-impl<'c, 'a, 's, C: GenericClient, T1: crate::JsonSql>
-    crate::client::async_::Params<
-        'c,
-        'a,
-        's,
-        RecordRegressionDiagnosisParams<T1>,
-        UuidUuidQuery<'c, 'a, 's, C, uuid::Uuid, 3>,
-        C,
-    > for RecordRegressionDiagnosisStmt
-{
+impl<
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+    T1: crate::JsonSql,
+> crate::client::async_::Params<
+    'c,
+    'a,
+    's,
+    RecordRegressionDiagnosisParams<T1>,
+    UuidUuidQuery<'c, 'a, 's, C, uuid::Uuid, 3>,
+    C,
+> for RecordRegressionDiagnosisStmt {
     fn params(
         &'s self,
         client: &'c C,
@@ -482,7 +570,10 @@ impl<'c, 'a, 's, C: GenericClient, T1: crate::JsonSql>
         self.bind(client, &params.id, &params.run_id, &params.diagnosis_json)
     }
 }
-pub struct RecordAssertionExecutionsBatchStmt(&'static str, Option<tokio_postgres::Statement>);
+pub struct RecordAssertionExecutionsBatchStmt(
+    &'static str,
+    Option<tokio_postgres::Statement>,
+);
 pub fn record_assertion_executions_batch() -> RecordAssertionExecutionsBatchStmt {
     RecordAssertionExecutionsBatchStmt(
         "INSERT INTO regression_assertion_executions ( id, run_id, case_id, assertion_id, assertion_kind, status, started_at, duration_ms, failure_kind, failure_evidence_json, error_message ) SELECT (e->>'id')::uuid, (e->>'run_id')::uuid, e->>'case_id', e->>'assertion_id', e->>'assertion_kind', e->>'status', (e->>'started_at')::timestamptz, (e->>'duration_ms')::int, e->>'failure_kind', e->'failure_evidence_json', e->>'error_message' FROM jsonb_array_elements($1::jsonb) AS e",
@@ -505,7 +596,10 @@ impl RecordAssertionExecutionsBatchStmt {
         client.execute(self.0, &[executions_json]).await
     }
 }
-pub struct GetAssertionExecutionsForSuiteStmt(&'static str, Option<tokio_postgres::Statement>);
+pub struct GetAssertionExecutionsForSuiteStmt(
+    &'static str,
+    Option<tokio_postgres::Statement>,
+);
 pub fn get_assertion_executions_for_suite() -> GetAssertionExecutionsForSuiteStmt {
     GetAssertionExecutionsForSuiteStmt(
         "SELECT ae.case_id, ae.assertion_id, ae.started_at::TEXT AS started_at, ae.status, ae.assertion_kind, ae.duration_ms, ae.failure_kind, ae.error_message FROM regression_assertion_executions ae JOIN regression_runs r ON r.id = ae.run_id WHERE r.suite_id = $1::uuid ORDER BY ae.started_at ASC",
@@ -524,16 +618,22 @@ impl GetAssertionExecutionsForSuiteStmt {
         &'s self,
         client: &'c C,
         suite_id: &'a uuid::Uuid,
-    ) -> GetAssertionExecutionsForSuiteQuery<'c, 'a, 's, C, GetAssertionExecutionsForSuite, 1> {
+    ) -> GetAssertionExecutionsForSuiteQuery<
+        'c,
+        'a,
+        's,
+        C,
+        GetAssertionExecutionsForSuite,
+        1,
+    > {
         GetAssertionExecutionsForSuiteQuery {
             client,
             params: [suite_id],
             query: self.0,
             cached: self.1.as_ref(),
-            extractor: |row: &tokio_postgres::Row| -> Result<
-                GetAssertionExecutionsForSuiteBorrowed,
-                tokio_postgres::Error,
-            > {
+            extractor: |
+                row: &tokio_postgres::Row,
+            | -> Result<GetAssertionExecutionsForSuiteBorrowed, tokio_postgres::Error> {
                 Ok(GetAssertionExecutionsForSuiteBorrowed {
                     case_id: row.try_get(0)?,
                     assertion_id: row.try_get(1)?,
@@ -549,7 +649,10 @@ impl GetAssertionExecutionsForSuiteStmt {
         }
     }
 }
-pub struct GetRecentDiagnosesForSuiteStmt(&'static str, Option<tokio_postgres::Statement>);
+pub struct GetRecentDiagnosesForSuiteStmt(
+    &'static str,
+    Option<tokio_postgres::Statement>,
+);
 pub fn get_recent_diagnoses_for_suite() -> GetRecentDiagnosesForSuiteStmt {
     GetRecentDiagnosesForSuiteStmt(
         "SELECT d.id, d.run_id, d.diagnosis_json, d.created_at::TEXT AS created_at FROM regression_diagnoses d JOIN regression_runs r ON r.id = d.run_id WHERE r.suite_id = $1::uuid ORDER BY d.created_at DESC LIMIT $2",
@@ -589,16 +692,19 @@ impl GetRecentDiagnosesForSuiteStmt {
         }
     }
 }
-impl<'c, 'a, 's, C: GenericClient>
-    crate::client::async_::Params<
-        'c,
-        'a,
-        's,
-        GetRecentDiagnosesForSuiteParams,
-        GetRecentDiagnosesForSuiteQuery<'c, 'a, 's, C, GetRecentDiagnosesForSuite, 2>,
-        C,
-    > for GetRecentDiagnosesForSuiteStmt
-{
+impl<
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+> crate::client::async_::Params<
+    'c,
+    'a,
+    's,
+    GetRecentDiagnosesForSuiteParams,
+    GetRecentDiagnosesForSuiteQuery<'c, 'a, 's, C, GetRecentDiagnosesForSuite, 2>,
+    C,
+> for GetRecentDiagnosesForSuiteStmt {
     fn params(
         &'s self,
         client: &'c C,

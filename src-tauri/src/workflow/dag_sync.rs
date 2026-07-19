@@ -10,9 +10,47 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-use crate::database::pg::PgDb;
+use crate::database::pg::{parse_workflow_id, PgDb};
 use crate::workflow::dag_parser::parse_dag_workflow;
 use crate::workflow::dag_schema::DagWorkflowDef;
+
+/// Fixed namespace for deterministic YAML-workflow ids (see
+/// [`stable_yaml_workflow_id`]). Do NOT change this constant — doing so
+/// would mint a new id for every existing YAML-imported workflow on next
+/// sync. Mirrors the `Uuid::new_v5` pattern used elsewhere in this crate
+/// (e.g. `drain::AI_SESSION_NS`).
+///
+/// Value: `4f1a7c3e-9b2d-5e64-8a17-2c6f0d9b3a41`
+const YAML_WORKFLOW_NS: uuid::Uuid = uuid::Uuid::from_bytes([
+    0x4f, 0x1a, 0x7c, 0x3e, 0x9b, 0x2d, 0x5e, 0x64, 0x8a, 0x17, 0x2c, 0x6f, 0x0d, 0x9b, 0x3a, 0x41,
+]);
+
+/// Deterministic stable id for a first-time YAML workflow import, derived
+/// from the workflow name. `unified_workflows.id` is `uuid` (migration
+/// `d7a3f1c8e024_realign_unified_workflows_to_model`), so this can't be the
+/// old human-readable slug directly — but the same workflow name must still
+/// import to the same id across environments/resets, matching the
+/// pre-migration `slugify`-based behavior this replaces. Hashes the
+/// lowercased/punctuation-collapsed name (not the raw name) so a
+/// case/punctuation-only rename of `name:` in the YAML still resolves to the
+/// same id instead of minting a duplicate row — the same normalization the
+/// deleted `slugify()` implicitly gave this via its slug output.
+fn stable_yaml_workflow_id(workflow_name: &str) -> String {
+    let normalized = workflow_name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    uuid::Uuid::new_v5(
+        &YAML_WORKFLOW_NS,
+        format!("yaml-workflow:{normalized}").as_bytes(),
+    )
+    .to_string()
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public types
@@ -130,11 +168,14 @@ pub async fn import_workflow_file(file_path: &Path, pg_db: &Arc<PgDb>) -> Import
         }
     };
 
-    // 4. Derive a stable ID
+    // 4. Derive a stable ID: the existing row's id if this workflow was
+    // imported before, otherwise a deterministic v5 id from the name (see
+    // `stable_yaml_workflow_id`) — reproducible across environments/DB
+    // resets, matching the pre-migration `slugify`-based behavior.
     let workflow_id = existing
         .as_ref()
         .map(|w| w.id.clone())
-        .unwrap_or_else(|| slugify(&workflow_name));
+        .unwrap_or_else(|| stable_yaml_workflow_id(&workflow_name));
 
     let was_updated = existing.is_some();
 
@@ -207,17 +248,27 @@ pub async fn export_workflow_as_yaml(
     pg_db: &Arc<PgDb>,
 ) -> Result<String, String> {
     // 1. Fetch the source_yaml directly (may not be in UnifiedWorkflow struct)
+    // A malformed id can't match any row — surface the same "not found"
+    // message a genuinely-missing row gets below, not a different-looking
+    // parse error (matches every sibling PgDb read function's Ok(None) /
+    // "just doesn't match" treatment of a bad id).
+    let Ok(workflow_id_uuid) = parse_workflow_id(workflow_id) else {
+        return Err(format!("Workflow not found: {}", workflow_id));
+    };
     let conn = pg_db
         .pool()
         .get()
         .await
         .map_err(|e| format!("PG pool error: {}", e))?;
 
+    // `unified_workflows` has no soft-delete column — a deleted row is just
+    // gone, so no `deleted_at IS NULL` filter is needed (or possible; the
+    // column doesn't exist).
     let row = conn
         .query_opt(
             "SELECT source_yaml, name, description, max_iterations \
-             FROM unified_workflows WHERE id = $1 AND deleted_at IS NULL",
-            &[&workflow_id],
+             FROM unified_workflows WHERE id = $1",
+            &[&workflow_id_uuid],
         )
         .await
         .map_err(|e| format!("PG query error: {}", e))?
@@ -302,26 +353,50 @@ pub async fn export_workflow_as_yaml(
 // Utility helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Generate a stable workflow ID from a name (lowercase, hyphen-separated).
-///
-/// ```
-/// # use qontinui_runner::workflow::dag_sync::slugify; // example only
-/// assert_eq!(slugify("My Workflow! v2"), "my-workflow-v2");
-/// ```
-pub fn slugify(name: &str) -> String {
-    name.to_lowercase()
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '-' })
-        .collect::<String>()
-        .split('-')
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("-")
-}
-
 /// Return the conventional workflow directory for a project root.
 ///
 /// The directory is `<project_path>/.qontinui/workflows`.
 pub fn workflow_directory(project_path: &Path) -> PathBuf {
     project_path.join(".qontinui").join("workflows")
+}
+
+#[cfg(test)]
+mod stable_yaml_workflow_id_tests {
+    use super::stable_yaml_workflow_id;
+
+    /// The whole point of this helper: re-importing the same-named workflow
+    /// on a fresh/different database must land on the same id.
+    #[test]
+    fn same_name_is_deterministic_across_calls() {
+        assert_eq!(
+            stable_yaml_workflow_id("My Workflow"),
+            stable_yaml_workflow_id("My Workflow")
+        );
+    }
+
+    #[test]
+    fn different_names_produce_different_ids() {
+        assert_ne!(
+            stable_yaml_workflow_id("Workflow A"),
+            stable_yaml_workflow_id("Workflow B")
+        );
+    }
+
+    /// A case/punctuation-only rename of `name:` in the YAML must resolve to
+    /// the same id, or re-sync inserts a duplicate row instead of updating
+    /// the existing one (the exact regression this normalization fixes).
+    #[test]
+    fn case_and_punctuation_only_changes_are_the_same_id() {
+        let base = stable_yaml_workflow_id("My Workflow");
+        assert_eq!(base, stable_yaml_workflow_id("my workflow"));
+        assert_eq!(base, stable_yaml_workflow_id("MY WORKFLOW"));
+        assert_eq!(base, stable_yaml_workflow_id("My Workflow!"));
+        assert_eq!(base, stable_yaml_workflow_id("  My   Workflow  "));
+    }
+
+    #[test]
+    fn produces_a_well_formed_uuid() {
+        let id = stable_yaml_workflow_id("Any Name");
+        assert!(uuid::Uuid::parse_str(&id).is_ok(), "not a valid uuid: {id}");
+    }
 }

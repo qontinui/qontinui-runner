@@ -84,7 +84,7 @@ impl KnowledgeGraph {
         .map_err(|e| format!("PG load_workflows: {}", e))?;
 
         for row in &rows {
-            let id: String = row.get(0);
+            let id: String = row.get::<_, uuid::Uuid>(0).to_string();
             let name: String = row.get(1);
             let desc: Option<String> = row.get(2);
             let category: Option<String> = row.get(3);
@@ -755,7 +755,7 @@ impl KnowledgeGraph {
 
         for row in &rows {
             let run_id: String = row.get(0);
-            let wf_id: String = row.get(1);
+            let wf_id: String = row.get::<_, uuid::Uuid>(1).to_string();
             let from_key = format!("task_run:{}", run_id);
             let to_key = format!("workflow:{}", wf_id);
             self.add_edge_by_key(&from_key, &to_key, GraphEdge::new(GraphEdgeKind::BelongsTo));
@@ -1115,7 +1115,7 @@ impl KnowledgeGraph {
 
         for row in &rows {
             let rule_id: String = row.get(0);
-            let workflow_id: String = row.get(1);
+            let workflow_id: String = row.get::<_, uuid::Uuid>(1).to_string();
 
             let rule_key = format!("rule:{}", rule_id);
             let wf_key = format!("workflow:{}", workflow_id);
@@ -1290,7 +1290,7 @@ impl KnowledgeGraph {
             .map_err(|e| format!("PG link_skills (provenance): {}", e))?;
 
         for row in &rows {
-            let workflow_id: String = row.get(0);
+            let workflow_id: String = row.get::<_, uuid::Uuid>(0).to_string();
             let skill_id: String = row.get(1);
 
             let skill_key = format!("skill:{}", skill_id);

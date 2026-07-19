@@ -152,6 +152,47 @@ fn is_valid_column(col: &str) -> bool {
     !col.is_empty() && col.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
+/// `(table, column)` pairs this generic query tool needs to bind as
+/// `uuid::Uuid` rather than `String` — the two columns migration
+/// `d7a3f1c8e024_realign_unified_workflows_to_model` changed from `text` to
+/// `uuid`. Every other column of every other allowed table stays `text`, so
+/// this stays a narrow allowlist rather than a blanket "try uuid first"
+/// heuristic (which would misbind a text column that happens to hold a
+/// uuid-shaped string).
+fn is_uuid_column_pg(table: &str, column: &str) -> bool {
+    matches!(
+        (table, column),
+        ("unified_workflows", "id")
+            | ("unified_workflows", "created_by_user_id")
+            | ("unified_workflows", "project_id")
+            | ("workflow_generation_feedback", "workflow_id")
+    )
+}
+
+/// `unified_workflows` columns the same migration converted from `text` to
+/// `jsonb` — a filter on one of these needs to bind a parsed
+/// [`serde_json::Value`], not a raw `String`, for the same reason
+/// [`is_uuid_column_pg`] exists.
+fn is_jsonb_column_pg(table: &str, column: &str) -> bool {
+    table == "unified_workflows"
+        && matches!(
+            column,
+            "tags"
+                | "setup_steps"
+                | "verification_steps"
+                | "agentic_steps"
+                | "completion_steps"
+                | "context_ids"
+                | "disabled_context_ids"
+                | "log_source_selection"
+                | "health_check_urls"
+                | "stages"
+                | "model_overrides"
+                | "constraint_overrides"
+                | "definition"
+        )
+}
+
 /// Execute a SQL-only query via PostgreSQL with parameterized filters.
 async fn execute_sql_query_pg(
     state: &Arc<ApiState>,
@@ -178,16 +219,52 @@ async fn execute_sql_query_pg(
         }
     };
 
-    // Build WHERE clause with $N parameters
+    // Build WHERE clause with $N parameters. Most columns bind as text, but
+    // some (see is_uuid_column_pg / is_jsonb_column_pg) are `uuid`/`jsonb`
+    // post-migration — a plain String bind against those fails at the
+    // tokio-postgres type-check layer before the query ever reaches
+    // Postgres.
+    let zero_match_response = || QueryRunnerDataResponse {
+        count: 0,
+        results: vec![],
+        metadata: QueryMetadata {
+            query_type: "sql".to_string(),
+            table: request.table.clone(),
+            filters_applied: request.filters.len(),
+            embedding_used: false,
+        },
+    };
     let mut where_parts: Vec<String> = Vec::new();
-    let mut param_values: Vec<String> = Vec::new();
+    let mut param_values: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
     for (key, value) in &request.filters {
         if !is_valid_column(key) {
             continue;
         }
-        let idx = param_values.len() + 1;
-        where_parts.push(format!("{} = ${}", key, idx));
-        param_values.push(value.clone());
+        if is_uuid_column_pg(&request.table, key) {
+            let Ok(uuid_val) = uuid::Uuid::parse_str(value) else {
+                // A value that can't parse as uuid can never match this
+                // column — the query must return zero rows, NOT silently
+                // drop the filter and run unscoped (that would return
+                // arbitrary other rows as if they matched).
+                return Ok(zero_match_response());
+            };
+            let idx = param_values.len() + 1;
+            where_parts.push(format!("{} = ${}", key, idx));
+            param_values.push(Box::new(uuid_val));
+        } else if is_jsonb_column_pg(&request.table, key) {
+            let Ok(json_val) = serde_json::from_str::<serde_json::Value>(value) else {
+                // Same reasoning as the uuid branch above: an unparseable
+                // value can never match a jsonb column.
+                return Ok(zero_match_response());
+            };
+            let idx = param_values.len() + 1;
+            where_parts.push(format!("{} = ${}", key, idx));
+            param_values.push(Box::new(json_val));
+        } else {
+            let idx = param_values.len() + 1;
+            where_parts.push(format!("{} = ${}", key, idx));
+            param_values.push(Box::new(value.clone()));
+        }
     }
 
     let where_clause = if where_parts.is_empty() {
@@ -246,7 +323,7 @@ async fn execute_sql_query_pg(
     // Build parameter references
     let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = param_values
         .iter()
-        .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
+        .map(|v| v.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
         .collect();
 
     let rows: Vec<tokio_postgres::Row> = conn
@@ -320,6 +397,11 @@ fn pg_column_to_json(row: &tokio_postgres::Row, idx: usize) -> serde_json::Value
         Type::JSONB | Type::JSON => row
             .try_get::<_, serde_json::Value>(idx)
             .ok()
+            .unwrap_or(serde_json::Value::Null),
+        Type::UUID => row
+            .try_get::<_, uuid::Uuid>(idx)
+            .ok()
+            .map(|v| serde_json::Value::String(v.to_string()))
             .unwrap_or(serde_json::Value::Null),
         Type::TIMESTAMPTZ => row
             .try_get::<_, chrono::DateTime<chrono::Utc>>(idx)

@@ -5,26 +5,26 @@ pub struct CreateUnifiedWorkflowParams<
     T1: crate::StringSql,
     T2: crate::StringSql,
     T3: crate::StringSql,
-    T4: crate::StringSql,
-    T5: crate::StringSql,
-    T6: crate::StringSql,
-    T7: crate::StringSql,
-    T8: crate::StringSql,
+    T4: crate::JsonSql,
+    T5: crate::JsonSql,
+    T6: crate::JsonSql,
+    T7: crate::JsonSql,
+    T8: crate::JsonSql,
     T9: crate::StringSql,
     T10: crate::StringSql,
-    T11: crate::StringSql,
-    T12: crate::StringSql,
-    T13: crate::StringSql,
+    T11: crate::JsonSql,
+    T12: crate::JsonSql,
+    T13: crate::JsonSql,
     T14: crate::StringSql,
-    T15: crate::StringSql,
+    T15: crate::JsonSql,
     T16: crate::StringSql,
-    T17: crate::StringSql,
-    T18: crate::StringSql,
+    T17: crate::JsonSql,
+    T18: crate::JsonSql,
     T19: crate::StringSql,
     T20: crate::StringSql,
     T21: crate::StringSql,
     T22: crate::StringSql,
-    T23: crate::StringSql,
+    T23: crate::JsonSql,
     T24: crate::StringSql,
     T25: crate::StringSql,
     T26: crate::StringSql,
@@ -32,81 +32,80 @@ pub struct CreateUnifiedWorkflowParams<
     T28: crate::StringSql,
     T29: crate::StringSql,
     T30: crate::StringSql,
-    T31: crate::StringSql,
 > {
-    pub id: T1,
-    pub name: T2,
-    pub description: Option<T3>,
-    pub category: T4,
-    pub tags: T5,
-    pub setup_steps: T6,
-    pub verification_steps: T7,
-    pub agentic_steps: T8,
-    pub completion_steps: T9,
+    pub id: uuid::Uuid,
+    pub name: T1,
+    pub description: Option<T2>,
+    pub category: T3,
+    pub tags: T4,
+    pub setup_steps: T5,
+    pub verification_steps: T6,
+    pub agentic_steps: T7,
+    pub completion_steps: T8,
     pub max_iterations: Option<i64>,
     pub timeout_seconds: Option<i64>,
-    pub provider: Option<T10>,
-    pub model: Option<T11>,
+    pub provider: Option<T9>,
+    pub model: Option<T10>,
     pub skip_ai_summary: bool,
-    pub log_source_selection: T12,
-    pub context_ids: T13,
-    pub disabled_context_ids: T14,
+    pub log_source_selection: T11,
+    pub context_ids: T12,
+    pub disabled_context_ids: T13,
     pub auto_include_contexts: bool,
-    pub prompt_template: Option<T15>,
+    pub prompt_template: Option<T14>,
     pub log_watch_enabled: bool,
     pub health_check_enabled: bool,
-    pub health_check_urls: T16,
+    pub health_check_urls: T15,
     pub preflight_check_enabled: bool,
-    pub generated_by_task_run_id: Option<T17>,
+    pub generated_by_task_run_id: Option<T16>,
     pub enable_sweep: bool,
     pub max_sweep_iterations: i64,
-    pub stages: T18,
+    pub stages: T17,
     pub stop_on_failure: bool,
     pub reflection_mode: bool,
-    pub model_overrides: T19,
+    pub model_overrides: T18,
     pub approval_gate: bool,
     pub completion_prompts_first: bool,
-    pub dependency_graph: Option<T20>,
-    pub cost_annotations: Option<T21>,
-    pub quality_report: Option<T22>,
-    pub acceptance_criteria: Option<T23>,
-    pub constraint_overrides: T24,
+    pub dependency_graph: Option<T19>,
+    pub cost_annotations: Option<T20>,
+    pub quality_report: Option<T21>,
+    pub acceptance_criteria: Option<T22>,
+    pub constraint_overrides: T23,
     pub ai_reviewed: bool,
-    pub workflow_architecture: Option<T25>,
+    pub workflow_architecture: Option<T24>,
     pub strict_cwd: bool,
-    pub tool_tags: T26,
-    pub rollback_policy: Option<T27>,
+    pub tool_tags: T25,
+    pub rollback_policy: Option<T26>,
     pub enforce_token_budget: bool,
-    pub flow_control_json: Option<T28>,
-    pub phase_timeouts_json: Option<T29>,
+    pub flow_control_json: Option<T27>,
+    pub phase_timeouts_json: Option<T28>,
     pub htn_enabled: bool,
-    pub htn_ui_bridge_url: Option<T30>,
-    pub htn_state_machine_path: Option<T31>,
+    pub htn_ui_bridge_url: Option<T29>,
+    pub htn_state_machine_path: Option<T30>,
 }
 #[derive(Debug)]
 pub struct UpdateUnifiedWorkflowParams<
     T1: crate::StringSql,
     T2: crate::StringSql,
     T3: crate::StringSql,
-    T4: crate::StringSql,
-    T5: crate::StringSql,
-    T6: crate::StringSql,
-    T7: crate::StringSql,
-    T8: crate::StringSql,
+    T4: crate::JsonSql,
+    T5: crate::JsonSql,
+    T6: crate::JsonSql,
+    T7: crate::JsonSql,
+    T8: crate::JsonSql,
     T9: crate::StringSql,
     T10: crate::StringSql,
-    T11: crate::StringSql,
+    T11: crate::JsonSql,
     T12: crate::StringSql,
-    T13: crate::StringSql,
-    T14: crate::StringSql,
-    T15: crate::StringSql,
-    T16: crate::StringSql,
-    T17: crate::StringSql,
+    T13: crate::JsonSql,
+    T14: crate::JsonSql,
+    T15: crate::JsonSql,
+    T16: crate::JsonSql,
+    T17: crate::JsonSql,
     T18: crate::StringSql,
     T19: crate::StringSql,
     T20: crate::StringSql,
     T21: crate::StringSql,
-    T22: crate::StringSql,
+    T22: crate::JsonSql,
     T23: crate::StringSql,
     T24: crate::StringSql,
     T25: crate::StringSql,
@@ -114,7 +113,6 @@ pub struct UpdateUnifiedWorkflowParams<
     T27: crate::StringSql,
     T28: crate::StringSql,
     T29: crate::StringSql,
-    T30: crate::StringSql,
 > {
     pub name: T1,
     pub description: Option<T2>,
@@ -162,68 +160,63 @@ pub struct UpdateUnifiedWorkflowParams<
     pub htn_enabled: bool,
     pub htn_ui_bridge_url: Option<T28>,
     pub htn_state_machine_path: Option<T29>,
-    pub id: T30,
+    pub id: uuid::Uuid,
 }
 #[derive(Debug)]
 pub struct UpsertSlashCommandWorkflowParams<
     T1: crate::StringSql,
     T2: crate::StringSql,
-    T3: crate::StringSql,
+    T3: crate::JsonSql,
     T4: crate::StringSql,
     T5: crate::StringSql,
-    T6: crate::StringSql,
 > {
-    pub id: T1,
-    pub name: T2,
-    pub description: Option<T3>,
-    pub agentic_steps: T4,
-    pub source_file_path: T5,
-    pub source_content_hash: Option<T6>,
+    pub id: uuid::Uuid,
+    pub name: T1,
+    pub description: Option<T2>,
+    pub agentic_steps: T3,
+    pub source_file_path: T4,
+    pub source_content_hash: Option<T5>,
 }
 #[derive(Debug)]
-pub struct UpdateSlashCommandContentParams<
-    T1: crate::StringSql,
-    T2: crate::StringSql,
-    T3: crate::StringSql,
-> {
+pub struct UpdateSlashCommandContentParams<T1: crate::JsonSql, T2: crate::StringSql> {
     pub agentic_steps: T1,
     pub source_content_hash: Option<T2>,
-    pub id: T3,
+    pub id: uuid::Uuid,
 }
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ListUnifiedWorkflows {
-    pub id: String,
+    pub id: uuid::Uuid,
     pub name: String,
     pub description: String,
     pub category: String,
-    pub tags: String,
-    pub setup_steps: String,
-    pub verification_steps: String,
-    pub agentic_steps: String,
-    pub completion_steps: String,
+    pub tags: serde_json::Value,
+    pub setup_steps: serde_json::Value,
+    pub verification_steps: serde_json::Value,
+    pub agentic_steps: serde_json::Value,
+    pub completion_steps: serde_json::Value,
     pub max_iterations: i64,
     pub provider: String,
     pub model: String,
     pub skip_ai_summary: bool,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
     pub updated_at: chrono::DateTime<chrono::FixedOffset>,
-    pub log_source_selection: String,
-    pub context_ids: String,
-    pub disabled_context_ids: String,
+    pub log_source_selection: serde_json::Value,
+    pub context_ids: serde_json::Value,
+    pub disabled_context_ids: serde_json::Value,
     pub auto_include_contexts: bool,
     pub prompt_template: String,
     pub log_watch_enabled: bool,
     pub health_check_enabled: bool,
-    pub health_check_urls: String,
+    pub health_check_urls: serde_json::Value,
     pub timeout_seconds: i64,
     pub preflight_check_enabled: bool,
     pub generated_by_task_run_id: String,
     pub enable_sweep: bool,
     pub max_sweep_iterations: i64,
-    pub stages: String,
+    pub stages: serde_json::Value,
     pub stop_on_failure: bool,
     pub reflection_mode: bool,
-    pub model_overrides: String,
+    pub model_overrides: serde_json::Value,
     pub approval_gate: bool,
     pub completion_prompts_first: bool,
     pub is_favorite: bool,
@@ -231,7 +224,7 @@ pub struct ListUnifiedWorkflows {
     pub cost_annotations: String,
     pub quality_report: String,
     pub acceptance_criteria: String,
-    pub constraint_overrides: String,
+    pub constraint_overrides: serde_json::Value,
     pub ai_reviewed: bool,
     pub workflow_architecture: String,
     pub rollback_policy: String,
@@ -245,38 +238,38 @@ pub struct ListUnifiedWorkflows {
     pub htn_state_machine_path: String,
 }
 pub struct ListUnifiedWorkflowsBorrowed<'a> {
-    pub id: &'a str,
+    pub id: uuid::Uuid,
     pub name: &'a str,
     pub description: &'a str,
     pub category: &'a str,
-    pub tags: &'a str,
-    pub setup_steps: &'a str,
-    pub verification_steps: &'a str,
-    pub agentic_steps: &'a str,
-    pub completion_steps: &'a str,
+    pub tags: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub setup_steps: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub verification_steps: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub agentic_steps: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub completion_steps: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub max_iterations: i64,
     pub provider: &'a str,
     pub model: &'a str,
     pub skip_ai_summary: bool,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
     pub updated_at: chrono::DateTime<chrono::FixedOffset>,
-    pub log_source_selection: &'a str,
-    pub context_ids: &'a str,
-    pub disabled_context_ids: &'a str,
+    pub log_source_selection: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub context_ids: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub disabled_context_ids: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub auto_include_contexts: bool,
     pub prompt_template: &'a str,
     pub log_watch_enabled: bool,
     pub health_check_enabled: bool,
-    pub health_check_urls: &'a str,
+    pub health_check_urls: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub timeout_seconds: i64,
     pub preflight_check_enabled: bool,
     pub generated_by_task_run_id: &'a str,
     pub enable_sweep: bool,
     pub max_sweep_iterations: i64,
-    pub stages: &'a str,
+    pub stages: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub stop_on_failure: bool,
     pub reflection_mode: bool,
-    pub model_overrides: &'a str,
+    pub model_overrides: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub approval_gate: bool,
     pub completion_prompts_first: bool,
     pub is_favorite: bool,
@@ -284,7 +277,7 @@ pub struct ListUnifiedWorkflowsBorrowed<'a> {
     pub cost_annotations: &'a str,
     pub quality_report: &'a str,
     pub acceptance_criteria: &'a str,
-    pub constraint_overrides: &'a str,
+    pub constraint_overrides: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub ai_reviewed: bool,
     pub workflow_architecture: &'a str,
     pub rollback_policy: &'a str,
@@ -354,38 +347,41 @@ impl<'a> From<ListUnifiedWorkflowsBorrowed<'a>> for ListUnifiedWorkflows {
         }: ListUnifiedWorkflowsBorrowed<'a>,
     ) -> Self {
         Self {
-            id: id.into(),
+            id,
             name: name.into(),
             description: description.into(),
             category: category.into(),
-            tags: tags.into(),
-            setup_steps: setup_steps.into(),
-            verification_steps: verification_steps.into(),
-            agentic_steps: agentic_steps.into(),
-            completion_steps: completion_steps.into(),
+            tags: serde_json::from_str(tags.0.get()).unwrap(),
+            setup_steps: serde_json::from_str(setup_steps.0.get()).unwrap(),
+            verification_steps: serde_json::from_str(verification_steps.0.get())
+                .unwrap(),
+            agentic_steps: serde_json::from_str(agentic_steps.0.get()).unwrap(),
+            completion_steps: serde_json::from_str(completion_steps.0.get()).unwrap(),
             max_iterations,
             provider: provider.into(),
             model: model.into(),
             skip_ai_summary,
             created_at,
             updated_at,
-            log_source_selection: log_source_selection.into(),
-            context_ids: context_ids.into(),
-            disabled_context_ids: disabled_context_ids.into(),
+            log_source_selection: serde_json::from_str(log_source_selection.0.get())
+                .unwrap(),
+            context_ids: serde_json::from_str(context_ids.0.get()).unwrap(),
+            disabled_context_ids: serde_json::from_str(disabled_context_ids.0.get())
+                .unwrap(),
             auto_include_contexts,
             prompt_template: prompt_template.into(),
             log_watch_enabled,
             health_check_enabled,
-            health_check_urls: health_check_urls.into(),
+            health_check_urls: serde_json::from_str(health_check_urls.0.get()).unwrap(),
             timeout_seconds,
             preflight_check_enabled,
             generated_by_task_run_id: generated_by_task_run_id.into(),
             enable_sweep,
             max_sweep_iterations,
-            stages: stages.into(),
+            stages: serde_json::from_str(stages.0.get()).unwrap(),
             stop_on_failure,
             reflection_mode,
-            model_overrides: model_overrides.into(),
+            model_overrides: serde_json::from_str(model_overrides.0.get()).unwrap(),
             approval_gate,
             completion_prompts_first,
             is_favorite,
@@ -393,7 +389,8 @@ impl<'a> From<ListUnifiedWorkflowsBorrowed<'a>> for ListUnifiedWorkflows {
             cost_annotations: cost_annotations.into(),
             quality_report: quality_report.into(),
             acceptance_criteria: acceptance_criteria.into(),
-            constraint_overrides: constraint_overrides.into(),
+            constraint_overrides: serde_json::from_str(constraint_overrides.0.get())
+                .unwrap(),
             ai_reviewed,
             workflow_architecture: workflow_architecture.into(),
             rollback_policy: rollback_policy.into(),
@@ -410,38 +407,38 @@ impl<'a> From<ListUnifiedWorkflowsBorrowed<'a>> for ListUnifiedWorkflows {
 }
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GetUnifiedWorkflow {
-    pub id: String,
+    pub id: uuid::Uuid,
     pub name: String,
     pub description: String,
     pub category: String,
-    pub tags: String,
-    pub setup_steps: String,
-    pub verification_steps: String,
-    pub agentic_steps: String,
-    pub completion_steps: String,
+    pub tags: serde_json::Value,
+    pub setup_steps: serde_json::Value,
+    pub verification_steps: serde_json::Value,
+    pub agentic_steps: serde_json::Value,
+    pub completion_steps: serde_json::Value,
     pub max_iterations: i64,
     pub provider: String,
     pub model: String,
     pub skip_ai_summary: bool,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
     pub updated_at: chrono::DateTime<chrono::FixedOffset>,
-    pub log_source_selection: String,
-    pub context_ids: String,
-    pub disabled_context_ids: String,
+    pub log_source_selection: serde_json::Value,
+    pub context_ids: serde_json::Value,
+    pub disabled_context_ids: serde_json::Value,
     pub auto_include_contexts: bool,
     pub prompt_template: String,
     pub log_watch_enabled: bool,
     pub health_check_enabled: bool,
-    pub health_check_urls: String,
+    pub health_check_urls: serde_json::Value,
     pub timeout_seconds: i64,
     pub preflight_check_enabled: bool,
     pub generated_by_task_run_id: String,
     pub enable_sweep: bool,
     pub max_sweep_iterations: i64,
-    pub stages: String,
+    pub stages: serde_json::Value,
     pub stop_on_failure: bool,
     pub reflection_mode: bool,
-    pub model_overrides: String,
+    pub model_overrides: serde_json::Value,
     pub approval_gate: bool,
     pub completion_prompts_first: bool,
     pub is_favorite: bool,
@@ -449,7 +446,7 @@ pub struct GetUnifiedWorkflow {
     pub cost_annotations: String,
     pub quality_report: String,
     pub acceptance_criteria: String,
-    pub constraint_overrides: String,
+    pub constraint_overrides: serde_json::Value,
     pub ai_reviewed: bool,
     pub workflow_architecture: String,
     pub rollback_policy: String,
@@ -463,38 +460,38 @@ pub struct GetUnifiedWorkflow {
     pub htn_state_machine_path: String,
 }
 pub struct GetUnifiedWorkflowBorrowed<'a> {
-    pub id: &'a str,
+    pub id: uuid::Uuid,
     pub name: &'a str,
     pub description: &'a str,
     pub category: &'a str,
-    pub tags: &'a str,
-    pub setup_steps: &'a str,
-    pub verification_steps: &'a str,
-    pub agentic_steps: &'a str,
-    pub completion_steps: &'a str,
+    pub tags: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub setup_steps: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub verification_steps: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub agentic_steps: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub completion_steps: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub max_iterations: i64,
     pub provider: &'a str,
     pub model: &'a str,
     pub skip_ai_summary: bool,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
     pub updated_at: chrono::DateTime<chrono::FixedOffset>,
-    pub log_source_selection: &'a str,
-    pub context_ids: &'a str,
-    pub disabled_context_ids: &'a str,
+    pub log_source_selection: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub context_ids: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub disabled_context_ids: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub auto_include_contexts: bool,
     pub prompt_template: &'a str,
     pub log_watch_enabled: bool,
     pub health_check_enabled: bool,
-    pub health_check_urls: &'a str,
+    pub health_check_urls: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub timeout_seconds: i64,
     pub preflight_check_enabled: bool,
     pub generated_by_task_run_id: &'a str,
     pub enable_sweep: bool,
     pub max_sweep_iterations: i64,
-    pub stages: &'a str,
+    pub stages: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub stop_on_failure: bool,
     pub reflection_mode: bool,
-    pub model_overrides: &'a str,
+    pub model_overrides: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub approval_gate: bool,
     pub completion_prompts_first: bool,
     pub is_favorite: bool,
@@ -502,7 +499,7 @@ pub struct GetUnifiedWorkflowBorrowed<'a> {
     pub cost_annotations: &'a str,
     pub quality_report: &'a str,
     pub acceptance_criteria: &'a str,
-    pub constraint_overrides: &'a str,
+    pub constraint_overrides: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub ai_reviewed: bool,
     pub workflow_architecture: &'a str,
     pub rollback_policy: &'a str,
@@ -572,38 +569,41 @@ impl<'a> From<GetUnifiedWorkflowBorrowed<'a>> for GetUnifiedWorkflow {
         }: GetUnifiedWorkflowBorrowed<'a>,
     ) -> Self {
         Self {
-            id: id.into(),
+            id,
             name: name.into(),
             description: description.into(),
             category: category.into(),
-            tags: tags.into(),
-            setup_steps: setup_steps.into(),
-            verification_steps: verification_steps.into(),
-            agentic_steps: agentic_steps.into(),
-            completion_steps: completion_steps.into(),
+            tags: serde_json::from_str(tags.0.get()).unwrap(),
+            setup_steps: serde_json::from_str(setup_steps.0.get()).unwrap(),
+            verification_steps: serde_json::from_str(verification_steps.0.get())
+                .unwrap(),
+            agentic_steps: serde_json::from_str(agentic_steps.0.get()).unwrap(),
+            completion_steps: serde_json::from_str(completion_steps.0.get()).unwrap(),
             max_iterations,
             provider: provider.into(),
             model: model.into(),
             skip_ai_summary,
             created_at,
             updated_at,
-            log_source_selection: log_source_selection.into(),
-            context_ids: context_ids.into(),
-            disabled_context_ids: disabled_context_ids.into(),
+            log_source_selection: serde_json::from_str(log_source_selection.0.get())
+                .unwrap(),
+            context_ids: serde_json::from_str(context_ids.0.get()).unwrap(),
+            disabled_context_ids: serde_json::from_str(disabled_context_ids.0.get())
+                .unwrap(),
             auto_include_contexts,
             prompt_template: prompt_template.into(),
             log_watch_enabled,
             health_check_enabled,
-            health_check_urls: health_check_urls.into(),
+            health_check_urls: serde_json::from_str(health_check_urls.0.get()).unwrap(),
             timeout_seconds,
             preflight_check_enabled,
             generated_by_task_run_id: generated_by_task_run_id.into(),
             enable_sweep,
             max_sweep_iterations,
-            stages: stages.into(),
+            stages: serde_json::from_str(stages.0.get()).unwrap(),
             stop_on_failure,
             reflection_mode,
-            model_overrides: model_overrides.into(),
+            model_overrides: serde_json::from_str(model_overrides.0.get()).unwrap(),
             approval_gate,
             completion_prompts_first,
             is_favorite,
@@ -611,7 +611,8 @@ impl<'a> From<GetUnifiedWorkflowBorrowed<'a>> for GetUnifiedWorkflow {
             cost_annotations: cost_annotations.into(),
             quality_report: quality_report.into(),
             acceptance_criteria: acceptance_criteria.into(),
-            constraint_overrides: constraint_overrides.into(),
+            constraint_overrides: serde_json::from_str(constraint_overrides.0.get())
+                .unwrap(),
             ai_reviewed,
             workflow_architecture: workflow_architecture.into(),
             rollback_policy: rollback_policy.into(),
@@ -628,38 +629,38 @@ impl<'a> From<GetUnifiedWorkflowBorrowed<'a>> for GetUnifiedWorkflow {
 }
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GetUnifiedWorkflowByName {
-    pub id: String,
+    pub id: uuid::Uuid,
     pub name: String,
     pub description: String,
     pub category: String,
-    pub tags: String,
-    pub setup_steps: String,
-    pub verification_steps: String,
-    pub agentic_steps: String,
-    pub completion_steps: String,
+    pub tags: serde_json::Value,
+    pub setup_steps: serde_json::Value,
+    pub verification_steps: serde_json::Value,
+    pub agentic_steps: serde_json::Value,
+    pub completion_steps: serde_json::Value,
     pub max_iterations: i64,
     pub provider: String,
     pub model: String,
     pub skip_ai_summary: bool,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
     pub updated_at: chrono::DateTime<chrono::FixedOffset>,
-    pub log_source_selection: String,
-    pub context_ids: String,
-    pub disabled_context_ids: String,
+    pub log_source_selection: serde_json::Value,
+    pub context_ids: serde_json::Value,
+    pub disabled_context_ids: serde_json::Value,
     pub auto_include_contexts: bool,
     pub prompt_template: String,
     pub log_watch_enabled: bool,
     pub health_check_enabled: bool,
-    pub health_check_urls: String,
+    pub health_check_urls: serde_json::Value,
     pub timeout_seconds: i64,
     pub preflight_check_enabled: bool,
     pub generated_by_task_run_id: String,
     pub enable_sweep: bool,
     pub max_sweep_iterations: i64,
-    pub stages: String,
+    pub stages: serde_json::Value,
     pub stop_on_failure: bool,
     pub reflection_mode: bool,
-    pub model_overrides: String,
+    pub model_overrides: serde_json::Value,
     pub approval_gate: bool,
     pub completion_prompts_first: bool,
     pub is_favorite: bool,
@@ -667,7 +668,7 @@ pub struct GetUnifiedWorkflowByName {
     pub cost_annotations: String,
     pub quality_report: String,
     pub acceptance_criteria: String,
-    pub constraint_overrides: String,
+    pub constraint_overrides: serde_json::Value,
     pub ai_reviewed: bool,
     pub workflow_architecture: String,
     pub rollback_policy: String,
@@ -681,38 +682,38 @@ pub struct GetUnifiedWorkflowByName {
     pub htn_state_machine_path: String,
 }
 pub struct GetUnifiedWorkflowByNameBorrowed<'a> {
-    pub id: &'a str,
+    pub id: uuid::Uuid,
     pub name: &'a str,
     pub description: &'a str,
     pub category: &'a str,
-    pub tags: &'a str,
-    pub setup_steps: &'a str,
-    pub verification_steps: &'a str,
-    pub agentic_steps: &'a str,
-    pub completion_steps: &'a str,
+    pub tags: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub setup_steps: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub verification_steps: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub agentic_steps: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub completion_steps: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub max_iterations: i64,
     pub provider: &'a str,
     pub model: &'a str,
     pub skip_ai_summary: bool,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
     pub updated_at: chrono::DateTime<chrono::FixedOffset>,
-    pub log_source_selection: &'a str,
-    pub context_ids: &'a str,
-    pub disabled_context_ids: &'a str,
+    pub log_source_selection: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub context_ids: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub disabled_context_ids: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub auto_include_contexts: bool,
     pub prompt_template: &'a str,
     pub log_watch_enabled: bool,
     pub health_check_enabled: bool,
-    pub health_check_urls: &'a str,
+    pub health_check_urls: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub timeout_seconds: i64,
     pub preflight_check_enabled: bool,
     pub generated_by_task_run_id: &'a str,
     pub enable_sweep: bool,
     pub max_sweep_iterations: i64,
-    pub stages: &'a str,
+    pub stages: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub stop_on_failure: bool,
     pub reflection_mode: bool,
-    pub model_overrides: &'a str,
+    pub model_overrides: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub approval_gate: bool,
     pub completion_prompts_first: bool,
     pub is_favorite: bool,
@@ -720,7 +721,7 @@ pub struct GetUnifiedWorkflowByNameBorrowed<'a> {
     pub cost_annotations: &'a str,
     pub quality_report: &'a str,
     pub acceptance_criteria: &'a str,
-    pub constraint_overrides: &'a str,
+    pub constraint_overrides: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub ai_reviewed: bool,
     pub workflow_architecture: &'a str,
     pub rollback_policy: &'a str,
@@ -790,38 +791,41 @@ impl<'a> From<GetUnifiedWorkflowByNameBorrowed<'a>> for GetUnifiedWorkflowByName
         }: GetUnifiedWorkflowByNameBorrowed<'a>,
     ) -> Self {
         Self {
-            id: id.into(),
+            id,
             name: name.into(),
             description: description.into(),
             category: category.into(),
-            tags: tags.into(),
-            setup_steps: setup_steps.into(),
-            verification_steps: verification_steps.into(),
-            agentic_steps: agentic_steps.into(),
-            completion_steps: completion_steps.into(),
+            tags: serde_json::from_str(tags.0.get()).unwrap(),
+            setup_steps: serde_json::from_str(setup_steps.0.get()).unwrap(),
+            verification_steps: serde_json::from_str(verification_steps.0.get())
+                .unwrap(),
+            agentic_steps: serde_json::from_str(agentic_steps.0.get()).unwrap(),
+            completion_steps: serde_json::from_str(completion_steps.0.get()).unwrap(),
             max_iterations,
             provider: provider.into(),
             model: model.into(),
             skip_ai_summary,
             created_at,
             updated_at,
-            log_source_selection: log_source_selection.into(),
-            context_ids: context_ids.into(),
-            disabled_context_ids: disabled_context_ids.into(),
+            log_source_selection: serde_json::from_str(log_source_selection.0.get())
+                .unwrap(),
+            context_ids: serde_json::from_str(context_ids.0.get()).unwrap(),
+            disabled_context_ids: serde_json::from_str(disabled_context_ids.0.get())
+                .unwrap(),
             auto_include_contexts,
             prompt_template: prompt_template.into(),
             log_watch_enabled,
             health_check_enabled,
-            health_check_urls: health_check_urls.into(),
+            health_check_urls: serde_json::from_str(health_check_urls.0.get()).unwrap(),
             timeout_seconds,
             preflight_check_enabled,
             generated_by_task_run_id: generated_by_task_run_id.into(),
             enable_sweep,
             max_sweep_iterations,
-            stages: stages.into(),
+            stages: serde_json::from_str(stages.0.get()).unwrap(),
             stop_on_failure,
             reflection_mode,
-            model_overrides: model_overrides.into(),
+            model_overrides: serde_json::from_str(model_overrides.0.get()).unwrap(),
             approval_gate,
             completion_prompts_first,
             is_favorite,
@@ -829,7 +833,8 @@ impl<'a> From<GetUnifiedWorkflowByNameBorrowed<'a>> for GetUnifiedWorkflowByName
             cost_annotations: cost_annotations.into(),
             quality_report: quality_report.into(),
             acceptance_criteria: acceptance_criteria.into(),
-            constraint_overrides: constraint_overrides.into(),
+            constraint_overrides: serde_json::from_str(constraint_overrides.0.get())
+                .unwrap(),
             ai_reviewed,
             workflow_architecture: workflow_architecture.into(),
             rollback_policy: rollback_policy.into(),
@@ -846,38 +851,38 @@ impl<'a> From<GetUnifiedWorkflowByNameBorrowed<'a>> for GetUnifiedWorkflowByName
 }
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SearchUnifiedWorkflows {
-    pub id: String,
+    pub id: uuid::Uuid,
     pub name: String,
     pub description: String,
     pub category: String,
-    pub tags: String,
-    pub setup_steps: String,
-    pub verification_steps: String,
-    pub agentic_steps: String,
-    pub completion_steps: String,
+    pub tags: serde_json::Value,
+    pub setup_steps: serde_json::Value,
+    pub verification_steps: serde_json::Value,
+    pub agentic_steps: serde_json::Value,
+    pub completion_steps: serde_json::Value,
     pub max_iterations: i64,
     pub provider: String,
     pub model: String,
     pub skip_ai_summary: bool,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
     pub updated_at: chrono::DateTime<chrono::FixedOffset>,
-    pub log_source_selection: String,
-    pub context_ids: String,
-    pub disabled_context_ids: String,
+    pub log_source_selection: serde_json::Value,
+    pub context_ids: serde_json::Value,
+    pub disabled_context_ids: serde_json::Value,
     pub auto_include_contexts: bool,
     pub prompt_template: String,
     pub log_watch_enabled: bool,
     pub health_check_enabled: bool,
-    pub health_check_urls: String,
+    pub health_check_urls: serde_json::Value,
     pub timeout_seconds: i64,
     pub preflight_check_enabled: bool,
     pub generated_by_task_run_id: String,
     pub enable_sweep: bool,
     pub max_sweep_iterations: i64,
-    pub stages: String,
+    pub stages: serde_json::Value,
     pub stop_on_failure: bool,
     pub reflection_mode: bool,
-    pub model_overrides: String,
+    pub model_overrides: serde_json::Value,
     pub approval_gate: bool,
     pub completion_prompts_first: bool,
     pub is_favorite: bool,
@@ -885,7 +890,7 @@ pub struct SearchUnifiedWorkflows {
     pub cost_annotations: String,
     pub quality_report: String,
     pub acceptance_criteria: String,
-    pub constraint_overrides: String,
+    pub constraint_overrides: serde_json::Value,
     pub ai_reviewed: bool,
     pub workflow_architecture: String,
     pub rollback_policy: String,
@@ -899,38 +904,38 @@ pub struct SearchUnifiedWorkflows {
     pub htn_state_machine_path: String,
 }
 pub struct SearchUnifiedWorkflowsBorrowed<'a> {
-    pub id: &'a str,
+    pub id: uuid::Uuid,
     pub name: &'a str,
     pub description: &'a str,
     pub category: &'a str,
-    pub tags: &'a str,
-    pub setup_steps: &'a str,
-    pub verification_steps: &'a str,
-    pub agentic_steps: &'a str,
-    pub completion_steps: &'a str,
+    pub tags: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub setup_steps: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub verification_steps: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub agentic_steps: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub completion_steps: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub max_iterations: i64,
     pub provider: &'a str,
     pub model: &'a str,
     pub skip_ai_summary: bool,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
     pub updated_at: chrono::DateTime<chrono::FixedOffset>,
-    pub log_source_selection: &'a str,
-    pub context_ids: &'a str,
-    pub disabled_context_ids: &'a str,
+    pub log_source_selection: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub context_ids: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub disabled_context_ids: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub auto_include_contexts: bool,
     pub prompt_template: &'a str,
     pub log_watch_enabled: bool,
     pub health_check_enabled: bool,
-    pub health_check_urls: &'a str,
+    pub health_check_urls: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub timeout_seconds: i64,
     pub preflight_check_enabled: bool,
     pub generated_by_task_run_id: &'a str,
     pub enable_sweep: bool,
     pub max_sweep_iterations: i64,
-    pub stages: &'a str,
+    pub stages: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub stop_on_failure: bool,
     pub reflection_mode: bool,
-    pub model_overrides: &'a str,
+    pub model_overrides: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub approval_gate: bool,
     pub completion_prompts_first: bool,
     pub is_favorite: bool,
@@ -938,7 +943,7 @@ pub struct SearchUnifiedWorkflowsBorrowed<'a> {
     pub cost_annotations: &'a str,
     pub quality_report: &'a str,
     pub acceptance_criteria: &'a str,
-    pub constraint_overrides: &'a str,
+    pub constraint_overrides: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub ai_reviewed: bool,
     pub workflow_architecture: &'a str,
     pub rollback_policy: &'a str,
@@ -1008,38 +1013,41 @@ impl<'a> From<SearchUnifiedWorkflowsBorrowed<'a>> for SearchUnifiedWorkflows {
         }: SearchUnifiedWorkflowsBorrowed<'a>,
     ) -> Self {
         Self {
-            id: id.into(),
+            id,
             name: name.into(),
             description: description.into(),
             category: category.into(),
-            tags: tags.into(),
-            setup_steps: setup_steps.into(),
-            verification_steps: verification_steps.into(),
-            agentic_steps: agentic_steps.into(),
-            completion_steps: completion_steps.into(),
+            tags: serde_json::from_str(tags.0.get()).unwrap(),
+            setup_steps: serde_json::from_str(setup_steps.0.get()).unwrap(),
+            verification_steps: serde_json::from_str(verification_steps.0.get())
+                .unwrap(),
+            agentic_steps: serde_json::from_str(agentic_steps.0.get()).unwrap(),
+            completion_steps: serde_json::from_str(completion_steps.0.get()).unwrap(),
             max_iterations,
             provider: provider.into(),
             model: model.into(),
             skip_ai_summary,
             created_at,
             updated_at,
-            log_source_selection: log_source_selection.into(),
-            context_ids: context_ids.into(),
-            disabled_context_ids: disabled_context_ids.into(),
+            log_source_selection: serde_json::from_str(log_source_selection.0.get())
+                .unwrap(),
+            context_ids: serde_json::from_str(context_ids.0.get()).unwrap(),
+            disabled_context_ids: serde_json::from_str(disabled_context_ids.0.get())
+                .unwrap(),
             auto_include_contexts,
             prompt_template: prompt_template.into(),
             log_watch_enabled,
             health_check_enabled,
-            health_check_urls: health_check_urls.into(),
+            health_check_urls: serde_json::from_str(health_check_urls.0.get()).unwrap(),
             timeout_seconds,
             preflight_check_enabled,
             generated_by_task_run_id: generated_by_task_run_id.into(),
             enable_sweep,
             max_sweep_iterations,
-            stages: stages.into(),
+            stages: serde_json::from_str(stages.0.get()).unwrap(),
             stop_on_failure,
             reflection_mode,
-            model_overrides: model_overrides.into(),
+            model_overrides: serde_json::from_str(model_overrides.0.get()).unwrap(),
             approval_gate,
             completion_prompts_first,
             is_favorite,
@@ -1047,7 +1055,8 @@ impl<'a> From<SearchUnifiedWorkflowsBorrowed<'a>> for SearchUnifiedWorkflows {
             cost_annotations: cost_annotations.into(),
             quality_report: quality_report.into(),
             acceptance_criteria: acceptance_criteria.into(),
-            constraint_overrides: constraint_overrides.into(),
+            constraint_overrides: serde_json::from_str(constraint_overrides.0.get())
+                .unwrap(),
             ai_reviewed,
             workflow_architecture: workflow_architecture.into(),
             rollback_policy: rollback_policy.into(),
@@ -1064,38 +1073,38 @@ impl<'a> From<SearchUnifiedWorkflowsBorrowed<'a>> for SearchUnifiedWorkflows {
 }
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GetPendingSyncWorkflows {
-    pub id: String,
+    pub id: uuid::Uuid,
     pub name: String,
     pub description: String,
     pub category: String,
-    pub tags: String,
-    pub setup_steps: String,
-    pub verification_steps: String,
-    pub agentic_steps: String,
-    pub completion_steps: String,
+    pub tags: serde_json::Value,
+    pub setup_steps: serde_json::Value,
+    pub verification_steps: serde_json::Value,
+    pub agentic_steps: serde_json::Value,
+    pub completion_steps: serde_json::Value,
     pub max_iterations: i64,
     pub provider: String,
     pub model: String,
     pub skip_ai_summary: bool,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
     pub updated_at: chrono::DateTime<chrono::FixedOffset>,
-    pub log_source_selection: String,
-    pub context_ids: String,
-    pub disabled_context_ids: String,
+    pub log_source_selection: serde_json::Value,
+    pub context_ids: serde_json::Value,
+    pub disabled_context_ids: serde_json::Value,
     pub auto_include_contexts: bool,
     pub prompt_template: String,
     pub log_watch_enabled: bool,
     pub health_check_enabled: bool,
-    pub health_check_urls: String,
+    pub health_check_urls: serde_json::Value,
     pub timeout_seconds: i64,
     pub preflight_check_enabled: bool,
     pub generated_by_task_run_id: String,
     pub enable_sweep: bool,
     pub max_sweep_iterations: i64,
-    pub stages: String,
+    pub stages: serde_json::Value,
     pub stop_on_failure: bool,
     pub reflection_mode: bool,
-    pub model_overrides: String,
+    pub model_overrides: serde_json::Value,
     pub approval_gate: bool,
     pub completion_prompts_first: bool,
     pub is_favorite: bool,
@@ -1103,7 +1112,7 @@ pub struct GetPendingSyncWorkflows {
     pub cost_annotations: String,
     pub quality_report: String,
     pub acceptance_criteria: String,
-    pub constraint_overrides: String,
+    pub constraint_overrides: serde_json::Value,
     pub ai_reviewed: bool,
     pub workflow_architecture: String,
     pub rollback_policy: String,
@@ -1117,38 +1126,38 @@ pub struct GetPendingSyncWorkflows {
     pub htn_state_machine_path: String,
 }
 pub struct GetPendingSyncWorkflowsBorrowed<'a> {
-    pub id: &'a str,
+    pub id: uuid::Uuid,
     pub name: &'a str,
     pub description: &'a str,
     pub category: &'a str,
-    pub tags: &'a str,
-    pub setup_steps: &'a str,
-    pub verification_steps: &'a str,
-    pub agentic_steps: &'a str,
-    pub completion_steps: &'a str,
+    pub tags: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub setup_steps: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub verification_steps: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub agentic_steps: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub completion_steps: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub max_iterations: i64,
     pub provider: &'a str,
     pub model: &'a str,
     pub skip_ai_summary: bool,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
     pub updated_at: chrono::DateTime<chrono::FixedOffset>,
-    pub log_source_selection: &'a str,
-    pub context_ids: &'a str,
-    pub disabled_context_ids: &'a str,
+    pub log_source_selection: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub context_ids: postgres_types::Json<&'a serde_json::value::RawValue>,
+    pub disabled_context_ids: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub auto_include_contexts: bool,
     pub prompt_template: &'a str,
     pub log_watch_enabled: bool,
     pub health_check_enabled: bool,
-    pub health_check_urls: &'a str,
+    pub health_check_urls: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub timeout_seconds: i64,
     pub preflight_check_enabled: bool,
     pub generated_by_task_run_id: &'a str,
     pub enable_sweep: bool,
     pub max_sweep_iterations: i64,
-    pub stages: &'a str,
+    pub stages: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub stop_on_failure: bool,
     pub reflection_mode: bool,
-    pub model_overrides: &'a str,
+    pub model_overrides: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub approval_gate: bool,
     pub completion_prompts_first: bool,
     pub is_favorite: bool,
@@ -1156,7 +1165,7 @@ pub struct GetPendingSyncWorkflowsBorrowed<'a> {
     pub cost_annotations: &'a str,
     pub quality_report: &'a str,
     pub acceptance_criteria: &'a str,
-    pub constraint_overrides: &'a str,
+    pub constraint_overrides: postgres_types::Json<&'a serde_json::value::RawValue>,
     pub ai_reviewed: bool,
     pub workflow_architecture: &'a str,
     pub rollback_policy: &'a str,
@@ -1226,38 +1235,41 @@ impl<'a> From<GetPendingSyncWorkflowsBorrowed<'a>> for GetPendingSyncWorkflows {
         }: GetPendingSyncWorkflowsBorrowed<'a>,
     ) -> Self {
         Self {
-            id: id.into(),
+            id,
             name: name.into(),
             description: description.into(),
             category: category.into(),
-            tags: tags.into(),
-            setup_steps: setup_steps.into(),
-            verification_steps: verification_steps.into(),
-            agentic_steps: agentic_steps.into(),
-            completion_steps: completion_steps.into(),
+            tags: serde_json::from_str(tags.0.get()).unwrap(),
+            setup_steps: serde_json::from_str(setup_steps.0.get()).unwrap(),
+            verification_steps: serde_json::from_str(verification_steps.0.get())
+                .unwrap(),
+            agentic_steps: serde_json::from_str(agentic_steps.0.get()).unwrap(),
+            completion_steps: serde_json::from_str(completion_steps.0.get()).unwrap(),
             max_iterations,
             provider: provider.into(),
             model: model.into(),
             skip_ai_summary,
             created_at,
             updated_at,
-            log_source_selection: log_source_selection.into(),
-            context_ids: context_ids.into(),
-            disabled_context_ids: disabled_context_ids.into(),
+            log_source_selection: serde_json::from_str(log_source_selection.0.get())
+                .unwrap(),
+            context_ids: serde_json::from_str(context_ids.0.get()).unwrap(),
+            disabled_context_ids: serde_json::from_str(disabled_context_ids.0.get())
+                .unwrap(),
             auto_include_contexts,
             prompt_template: prompt_template.into(),
             log_watch_enabled,
             health_check_enabled,
-            health_check_urls: health_check_urls.into(),
+            health_check_urls: serde_json::from_str(health_check_urls.0.get()).unwrap(),
             timeout_seconds,
             preflight_check_enabled,
             generated_by_task_run_id: generated_by_task_run_id.into(),
             enable_sweep,
             max_sweep_iterations,
-            stages: stages.into(),
+            stages: serde_json::from_str(stages.0.get()).unwrap(),
             stop_on_failure,
             reflection_mode,
-            model_overrides: model_overrides.into(),
+            model_overrides: serde_json::from_str(model_overrides.0.get()).unwrap(),
             approval_gate,
             completion_prompts_first,
             is_favorite,
@@ -1265,7 +1277,8 @@ impl<'a> From<GetPendingSyncWorkflowsBorrowed<'a>> for GetPendingSyncWorkflows {
             cost_annotations: cost_annotations.into(),
             quality_report: quality_report.into(),
             acceptance_criteria: acceptance_criteria.into(),
-            constraint_overrides: constraint_overrides.into(),
+            constraint_overrides: serde_json::from_str(constraint_overrides.0.get())
+                .unwrap(),
             ai_reviewed,
             workflow_architecture: workflow_architecture.into(),
             rollback_policy: rollback_policy.into(),
@@ -1282,12 +1295,12 @@ impl<'a> From<GetPendingSyncWorkflowsBorrowed<'a>> for GetPendingSyncWorkflows {
 }
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ListSlashCommandSources {
-    pub id: String,
+    pub id: uuid::Uuid,
     pub name: String,
     pub source_file_path: String,
 }
 pub struct ListSlashCommandSourcesBorrowed<'a> {
-    pub id: &'a str,
+    pub id: uuid::Uuid,
     pub name: &'a str,
     pub source_file_path: &'a str,
 }
@@ -1300,7 +1313,7 @@ impl<'a> From<ListSlashCommandSourcesBorrowed<'a>> for ListSlashCommandSources {
         }: ListSlashCommandSourcesBorrowed<'a>,
     ) -> Self {
         Self {
-            id: id.into(),
+            id,
             name: name.into(),
             source_file_path: source_file_path.into(),
         }
@@ -1344,15 +1357,16 @@ impl<'a> From<GetWorkflowStatsBorrowed<'a>> for GetWorkflowStats {
         }
     }
 }
-use crate::client::async_::GenericClient;
 use futures::{self, StreamExt, TryStreamExt};
+use crate::client::async_::GenericClient;
 pub struct ListUnifiedWorkflowsQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
     client: &'c C,
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
     query: &'static str,
     cached: Option<&'s tokio_postgres::Statement>,
-    extractor:
-        fn(&tokio_postgres::Row) -> Result<ListUnifiedWorkflowsBorrowed, tokio_postgres::Error>,
+    extractor: fn(
+        &tokio_postgres::Row,
+    ) -> Result<ListUnifiedWorkflowsBorrowed, tokio_postgres::Error>,
     mapper: fn(ListUnifiedWorkflowsBorrowed) -> T,
 }
 impl<'c, 'a, 's, C, T: 'c, const N: usize> ListUnifiedWorkflowsQuery<'c, 'a, 's, C, T, N>
@@ -1373,22 +1387,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -1397,18 +1423,19 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
@@ -1419,8 +1446,9 @@ pub struct GetUnifiedWorkflowQuery<'c, 'a, 's, C: GenericClient, T, const N: usi
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
     query: &'static str,
     cached: Option<&'s tokio_postgres::Statement>,
-    extractor:
-        fn(&tokio_postgres::Row) -> Result<GetUnifiedWorkflowBorrowed, tokio_postgres::Error>,
+    extractor: fn(
+        &tokio_postgres::Row,
+    ) -> Result<GetUnifiedWorkflowBorrowed, tokio_postgres::Error>,
     mapper: fn(GetUnifiedWorkflowBorrowed) -> T,
 }
 impl<'c, 'a, 's, C, T: 'c, const N: usize> GetUnifiedWorkflowQuery<'c, 'a, 's, C, T, N>
@@ -1441,22 +1469,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -1465,33 +1505,49 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
     }
 }
-pub struct GetUnifiedWorkflowByNameQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
+pub struct GetUnifiedWorkflowByNameQuery<
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+    T,
+    const N: usize,
+> {
     client: &'c C,
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
     query: &'static str,
     cached: Option<&'s tokio_postgres::Statement>,
-    extractor:
-        fn(&tokio_postgres::Row) -> Result<GetUnifiedWorkflowByNameBorrowed, tokio_postgres::Error>,
+    extractor: fn(
+        &tokio_postgres::Row,
+    ) -> Result<GetUnifiedWorkflowByNameBorrowed, tokio_postgres::Error>,
     mapper: fn(GetUnifiedWorkflowByNameBorrowed) -> T,
 }
-impl<'c, 'a, 's, C, T: 'c, const N: usize> GetUnifiedWorkflowByNameQuery<'c, 'a, 's, C, T, N>
+impl<
+    'c,
+    'a,
+    's,
+    C,
+    T: 'c,
+    const N: usize,
+> GetUnifiedWorkflowByNameQuery<'c, 'a, 's, C, T, N>
 where
     C: GenericClient,
 {
@@ -1509,22 +1565,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -1533,37 +1601,41 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
     }
 }
-pub struct StringQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
+pub struct UuidUuidQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
     client: &'c C,
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
     query: &'static str,
     cached: Option<&'s tokio_postgres::Statement>,
-    extractor: fn(&tokio_postgres::Row) -> Result<&str, tokio_postgres::Error>,
-    mapper: fn(&str) -> T,
+    extractor: fn(&tokio_postgres::Row) -> Result<uuid::Uuid, tokio_postgres::Error>,
+    mapper: fn(uuid::Uuid) -> T,
 }
-impl<'c, 'a, 's, C, T: 'c, const N: usize> StringQuery<'c, 'a, 's, C, T, N>
+impl<'c, 'a, 's, C, T: 'c, const N: usize> UuidUuidQuery<'c, 'a, 's, C, T, N>
 where
     C: GenericClient,
 {
-    pub fn map<R>(self, mapper: fn(&str) -> R) -> StringQuery<'c, 'a, 's, C, R, N> {
-        StringQuery {
+    pub fn map<R>(
+        self,
+        mapper: fn(uuid::Uuid) -> R,
+    ) -> UuidUuidQuery<'c, 'a, 's, C, R, N> {
+        UuidUuidQuery {
             client: self.client,
             params: self.params,
             query: self.query,
@@ -1573,22 +1645,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -1597,18 +1681,19 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
@@ -1619,11 +1704,19 @@ pub struct SearchUnifiedWorkflowsQuery<'c, 'a, 's, C: GenericClient, T, const N:
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
     query: &'static str,
     cached: Option<&'s tokio_postgres::Statement>,
-    extractor:
-        fn(&tokio_postgres::Row) -> Result<SearchUnifiedWorkflowsBorrowed, tokio_postgres::Error>,
+    extractor: fn(
+        &tokio_postgres::Row,
+    ) -> Result<SearchUnifiedWorkflowsBorrowed, tokio_postgres::Error>,
     mapper: fn(SearchUnifiedWorkflowsBorrowed) -> T,
 }
-impl<'c, 'a, 's, C, T: 'c, const N: usize> SearchUnifiedWorkflowsQuery<'c, 'a, 's, C, T, N>
+impl<
+    'c,
+    'a,
+    's,
+    C,
+    T: 'c,
+    const N: usize,
+> SearchUnifiedWorkflowsQuery<'c, 'a, 's, C, T, N>
 where
     C: GenericClient,
 {
@@ -1641,22 +1734,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -1665,18 +1770,19 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
@@ -1705,22 +1811,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -1729,33 +1847,49 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
     }
 }
-pub struct GetPendingSyncWorkflowsQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
+pub struct GetPendingSyncWorkflowsQuery<
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+    T,
+    const N: usize,
+> {
     client: &'c C,
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
     query: &'static str,
     cached: Option<&'s tokio_postgres::Statement>,
-    extractor:
-        fn(&tokio_postgres::Row) -> Result<GetPendingSyncWorkflowsBorrowed, tokio_postgres::Error>,
+    extractor: fn(
+        &tokio_postgres::Row,
+    ) -> Result<GetPendingSyncWorkflowsBorrowed, tokio_postgres::Error>,
     mapper: fn(GetPendingSyncWorkflowsBorrowed) -> T,
 }
-impl<'c, 'a, 's, C, T: 'c, const N: usize> GetPendingSyncWorkflowsQuery<'c, 'a, 's, C, T, N>
+impl<
+    'c,
+    'a,
+    's,
+    C,
+    T: 'c,
+    const N: usize,
+> GetPendingSyncWorkflowsQuery<'c, 'a, 's, C, T, N>
 where
     C: GenericClient,
 {
@@ -1773,22 +1907,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -1797,33 +1943,49 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
     }
 }
-pub struct ListSlashCommandSourcesQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
+pub struct ListSlashCommandSourcesQuery<
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+    T,
+    const N: usize,
+> {
     client: &'c C,
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
     query: &'static str,
     cached: Option<&'s tokio_postgres::Statement>,
-    extractor:
-        fn(&tokio_postgres::Row) -> Result<ListSlashCommandSourcesBorrowed, tokio_postgres::Error>,
+    extractor: fn(
+        &tokio_postgres::Row,
+    ) -> Result<ListSlashCommandSourcesBorrowed, tokio_postgres::Error>,
     mapper: fn(ListSlashCommandSourcesBorrowed) -> T,
 }
-impl<'c, 'a, 's, C, T: 'c, const N: usize> ListSlashCommandSourcesQuery<'c, 'a, 's, C, T, N>
+impl<
+    'c,
+    'a,
+    's,
+    C,
+    T: 'c,
+    const N: usize,
+> ListSlashCommandSourcesQuery<'c, 'a, 's, C, T, N>
 where
     C: GenericClient,
 {
@@ -1841,22 +2003,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -1865,18 +2039,19 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
@@ -1887,7 +2062,9 @@ pub struct GetWorkflowStatsQuery<'c, 'a, 's, C: GenericClient, T, const N: usize
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
     query: &'static str,
     cached: Option<&'s tokio_postgres::Statement>,
-    extractor: fn(&tokio_postgres::Row) -> Result<GetWorkflowStatsBorrowed, tokio_postgres::Error>,
+    extractor: fn(
+        &tokio_postgres::Row,
+    ) -> Result<GetWorkflowStatsBorrowed, tokio_postgres::Error>,
     mapper: fn(GetWorkflowStatsBorrowed) -> T,
 }
 impl<'c, 'a, 's, C, T: 'c, const N: usize> GetWorkflowStatsQuery<'c, 'a, 's, C, T, N>
@@ -1908,22 +2085,34 @@ where
         }
     }
     pub async fn one(self) -> Result<T, tokio_postgres::Error> {
-        let row =
-            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        let row = crate::client::async_::one(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
         Ok((self.mapper)((self.extractor)(&row)?))
     }
     pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
         self.iter().await?.try_collect().await
     }
     pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
-        let opt_row =
-            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
-        Ok(opt_row
-            .map(|row| {
-                let extracted = (self.extractor)(&row)?;
-                Ok((self.mapper)(extracted))
-            })
-            .transpose()?)
+        let opt_row = crate::client::async_::opt(
+                self.client,
+                self.query,
+                &self.params,
+                self.cached,
+            )
+            .await?;
+        Ok(
+            opt_row
+                .map(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+                .transpose()?,
+        )
     }
     pub async fn iter(
         self,
@@ -1932,18 +2121,19 @@ where
         tokio_postgres::Error,
     > {
         let stream = crate::client::async_::raw(
-            self.client,
-            self.query,
-            crate::slice_iter(&self.params),
-            self.cached,
-        )
-        .await?;
+                self.client,
+                self.query,
+                crate::slice_iter(&self.params),
+                self.cached,
+            )
+            .await?;
         let mapped = stream
             .map(move |res| {
-                res.and_then(|row| {
-                    let extracted = (self.extractor)(&row)?;
-                    Ok((self.mapper)(extracted))
-                })
+                res
+                    .and_then(|row| {
+                        let extracted = (self.extractor)(&row)?;
+                        Ok((self.mapper)(extracted))
+                    })
             })
             .into_stream();
         Ok(mapped)
@@ -2049,10 +2239,10 @@ impl GetUnifiedWorkflowStmt {
         self.1 = Some(client.prepare(self.0).await?);
         Ok(self)
     }
-    pub fn bind<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>(
+    pub fn bind<'c, 'a, 's, C: GenericClient>(
         &'s self,
         client: &'c C,
-        id: &'a T1,
+        id: &'a uuid::Uuid,
     ) -> GetUnifiedWorkflowQuery<'c, 'a, 's, C, GetUnifiedWorkflow, 1> {
         GetUnifiedWorkflowQuery {
             client,
@@ -2229,26 +2419,26 @@ impl CreateUnifiedWorkflowStmt {
         T1: crate::StringSql,
         T2: crate::StringSql,
         T3: crate::StringSql,
-        T4: crate::StringSql,
-        T5: crate::StringSql,
-        T6: crate::StringSql,
-        T7: crate::StringSql,
-        T8: crate::StringSql,
+        T4: crate::JsonSql,
+        T5: crate::JsonSql,
+        T6: crate::JsonSql,
+        T7: crate::JsonSql,
+        T8: crate::JsonSql,
         T9: crate::StringSql,
         T10: crate::StringSql,
-        T11: crate::StringSql,
-        T12: crate::StringSql,
-        T13: crate::StringSql,
+        T11: crate::JsonSql,
+        T12: crate::JsonSql,
+        T13: crate::JsonSql,
         T14: crate::StringSql,
-        T15: crate::StringSql,
+        T15: crate::JsonSql,
         T16: crate::StringSql,
-        T17: crate::StringSql,
-        T18: crate::StringSql,
+        T17: crate::JsonSql,
+        T18: crate::JsonSql,
         T19: crate::StringSql,
         T20: crate::StringSql,
         T21: crate::StringSql,
         T22: crate::StringSql,
-        T23: crate::StringSql,
+        T23: crate::JsonSql,
         T24: crate::StringSql,
         T25: crate::StringSql,
         T26: crate::StringSql,
@@ -2256,60 +2446,59 @@ impl CreateUnifiedWorkflowStmt {
         T28: crate::StringSql,
         T29: crate::StringSql,
         T30: crate::StringSql,
-        T31: crate::StringSql,
     >(
         &'s self,
         client: &'c C,
-        id: &'a T1,
-        name: &'a T2,
-        description: &'a Option<T3>,
-        category: &'a T4,
-        tags: &'a T5,
-        setup_steps: &'a T6,
-        verification_steps: &'a T7,
-        agentic_steps: &'a T8,
-        completion_steps: &'a T9,
+        id: &'a uuid::Uuid,
+        name: &'a T1,
+        description: &'a Option<T2>,
+        category: &'a T3,
+        tags: &'a T4,
+        setup_steps: &'a T5,
+        verification_steps: &'a T6,
+        agentic_steps: &'a T7,
+        completion_steps: &'a T8,
         max_iterations: &'a Option<i64>,
         timeout_seconds: &'a Option<i64>,
-        provider: &'a Option<T10>,
-        model: &'a Option<T11>,
+        provider: &'a Option<T9>,
+        model: &'a Option<T10>,
         skip_ai_summary: &'a bool,
-        log_source_selection: &'a T12,
-        context_ids: &'a T13,
-        disabled_context_ids: &'a T14,
+        log_source_selection: &'a T11,
+        context_ids: &'a T12,
+        disabled_context_ids: &'a T13,
         auto_include_contexts: &'a bool,
-        prompt_template: &'a Option<T15>,
+        prompt_template: &'a Option<T14>,
         log_watch_enabled: &'a bool,
         health_check_enabled: &'a bool,
-        health_check_urls: &'a T16,
+        health_check_urls: &'a T15,
         preflight_check_enabled: &'a bool,
-        generated_by_task_run_id: &'a Option<T17>,
+        generated_by_task_run_id: &'a Option<T16>,
         enable_sweep: &'a bool,
         max_sweep_iterations: &'a i64,
-        stages: &'a T18,
+        stages: &'a T17,
         stop_on_failure: &'a bool,
         reflection_mode: &'a bool,
-        model_overrides: &'a T19,
+        model_overrides: &'a T18,
         approval_gate: &'a bool,
         completion_prompts_first: &'a bool,
-        dependency_graph: &'a Option<T20>,
-        cost_annotations: &'a Option<T21>,
-        quality_report: &'a Option<T22>,
-        acceptance_criteria: &'a Option<T23>,
-        constraint_overrides: &'a T24,
+        dependency_graph: &'a Option<T19>,
+        cost_annotations: &'a Option<T20>,
+        quality_report: &'a Option<T21>,
+        acceptance_criteria: &'a Option<T22>,
+        constraint_overrides: &'a T23,
         ai_reviewed: &'a bool,
-        workflow_architecture: &'a Option<T25>,
+        workflow_architecture: &'a Option<T24>,
         strict_cwd: &'a bool,
-        tool_tags: &'a T26,
-        rollback_policy: &'a Option<T27>,
+        tool_tags: &'a T25,
+        rollback_policy: &'a Option<T26>,
         enforce_token_budget: &'a bool,
-        flow_control_json: &'a Option<T28>,
-        phase_timeouts_json: &'a Option<T29>,
+        flow_control_json: &'a Option<T27>,
+        phase_timeouts_json: &'a Option<T28>,
         htn_enabled: &'a bool,
-        htn_ui_bridge_url: &'a Option<T30>,
-        htn_state_machine_path: &'a Option<T31>,
-    ) -> StringQuery<'c, 'a, 's, C, String, 48> {
-        StringQuery {
+        htn_ui_bridge_url: &'a Option<T29>,
+        htn_state_machine_path: &'a Option<T30>,
+    ) -> UuidUuidQuery<'c, 'a, 's, C, uuid::Uuid, 48> {
+        UuidUuidQuery {
             client,
             params: [
                 id,
@@ -2364,7 +2553,7 @@ impl CreateUnifiedWorkflowStmt {
             query: self.0,
             cached: self.1.as_ref(),
             extractor: |row| Ok(row.try_get(0)?),
-            mapper: |it| it.into(),
+            mapper: |it| it,
         }
     }
 }
@@ -2376,26 +2565,26 @@ impl<
     T1: crate::StringSql,
     T2: crate::StringSql,
     T3: crate::StringSql,
-    T4: crate::StringSql,
-    T5: crate::StringSql,
-    T6: crate::StringSql,
-    T7: crate::StringSql,
-    T8: crate::StringSql,
+    T4: crate::JsonSql,
+    T5: crate::JsonSql,
+    T6: crate::JsonSql,
+    T7: crate::JsonSql,
+    T8: crate::JsonSql,
     T9: crate::StringSql,
     T10: crate::StringSql,
-    T11: crate::StringSql,
-    T12: crate::StringSql,
-    T13: crate::StringSql,
+    T11: crate::JsonSql,
+    T12: crate::JsonSql,
+    T13: crate::JsonSql,
     T14: crate::StringSql,
-    T15: crate::StringSql,
+    T15: crate::JsonSql,
     T16: crate::StringSql,
-    T17: crate::StringSql,
-    T18: crate::StringSql,
+    T17: crate::JsonSql,
+    T18: crate::JsonSql,
     T19: crate::StringSql,
     T20: crate::StringSql,
     T21: crate::StringSql,
     T22: crate::StringSql,
-    T23: crate::StringSql,
+    T23: crate::JsonSql,
     T24: crate::StringSql,
     T25: crate::StringSql,
     T26: crate::StringSql,
@@ -2403,49 +2592,45 @@ impl<
     T28: crate::StringSql,
     T29: crate::StringSql,
     T30: crate::StringSql,
-    T31: crate::StringSql,
->
-    crate::client::async_::Params<
-        'c,
-        'a,
-        's,
-        CreateUnifiedWorkflowParams<
-            T1,
-            T2,
-            T3,
-            T4,
-            T5,
-            T6,
-            T7,
-            T8,
-            T9,
-            T10,
-            T11,
-            T12,
-            T13,
-            T14,
-            T15,
-            T16,
-            T17,
-            T18,
-            T19,
-            T20,
-            T21,
-            T22,
-            T23,
-            T24,
-            T25,
-            T26,
-            T27,
-            T28,
-            T29,
-            T30,
-            T31,
-        >,
-        StringQuery<'c, 'a, 's, C, String, 48>,
-        C,
-    > for CreateUnifiedWorkflowStmt
-{
+> crate::client::async_::Params<
+    'c,
+    'a,
+    's,
+    CreateUnifiedWorkflowParams<
+        T1,
+        T2,
+        T3,
+        T4,
+        T5,
+        T6,
+        T7,
+        T8,
+        T9,
+        T10,
+        T11,
+        T12,
+        T13,
+        T14,
+        T15,
+        T16,
+        T17,
+        T18,
+        T19,
+        T20,
+        T21,
+        T22,
+        T23,
+        T24,
+        T25,
+        T26,
+        T27,
+        T28,
+        T29,
+        T30,
+    >,
+    UuidUuidQuery<'c, 'a, 's, C, uuid::Uuid, 48>,
+    C,
+> for CreateUnifiedWorkflowStmt {
     fn params(
         &'s self,
         client: &'c C,
@@ -2480,9 +2665,8 @@ impl<
             T28,
             T29,
             T30,
-            T31,
         >,
-    ) -> StringQuery<'c, 'a, 's, C, String, 48> {
+    ) -> UuidUuidQuery<'c, 'a, 's, C, uuid::Uuid, 48> {
         self.bind(
             client,
             &params.id,
@@ -2559,25 +2743,25 @@ impl UpdateUnifiedWorkflowStmt {
         T1: crate::StringSql,
         T2: crate::StringSql,
         T3: crate::StringSql,
-        T4: crate::StringSql,
-        T5: crate::StringSql,
-        T6: crate::StringSql,
-        T7: crate::StringSql,
-        T8: crate::StringSql,
+        T4: crate::JsonSql,
+        T5: crate::JsonSql,
+        T6: crate::JsonSql,
+        T7: crate::JsonSql,
+        T8: crate::JsonSql,
         T9: crate::StringSql,
         T10: crate::StringSql,
-        T11: crate::StringSql,
+        T11: crate::JsonSql,
         T12: crate::StringSql,
-        T13: crate::StringSql,
-        T14: crate::StringSql,
-        T15: crate::StringSql,
-        T16: crate::StringSql,
-        T17: crate::StringSql,
+        T13: crate::JsonSql,
+        T14: crate::JsonSql,
+        T15: crate::JsonSql,
+        T16: crate::JsonSql,
+        T17: crate::JsonSql,
         T18: crate::StringSql,
         T19: crate::StringSql,
         T20: crate::StringSql,
         T21: crate::StringSql,
-        T22: crate::StringSql,
+        T22: crate::JsonSql,
         T23: crate::StringSql,
         T24: crate::StringSql,
         T25: crate::StringSql,
@@ -2585,7 +2769,6 @@ impl UpdateUnifiedWorkflowStmt {
         T27: crate::StringSql,
         T28: crate::StringSql,
         T29: crate::StringSql,
-        T30: crate::StringSql,
     >(
         &'s self,
         client: &'c C,
@@ -2635,9 +2818,9 @@ impl UpdateUnifiedWorkflowStmt {
         htn_enabled: &'a bool,
         htn_ui_bridge_url: &'a Option<T28>,
         htn_state_machine_path: &'a Option<T29>,
-        id: &'a T30,
-    ) -> StringQuery<'c, 'a, 's, C, String, 47> {
-        StringQuery {
+        id: &'a uuid::Uuid,
+    ) -> UuidUuidQuery<'c, 'a, 's, C, uuid::Uuid, 47> {
+        UuidUuidQuery {
             client,
             params: [
                 name,
@@ -2691,7 +2874,7 @@ impl UpdateUnifiedWorkflowStmt {
             query: self.0,
             cached: self.1.as_ref(),
             extractor: |row| Ok(row.try_get(0)?),
-            mapper: |it| it.into(),
+            mapper: |it| it,
         }
     }
 }
@@ -2703,25 +2886,25 @@ impl<
     T1: crate::StringSql,
     T2: crate::StringSql,
     T3: crate::StringSql,
-    T4: crate::StringSql,
-    T5: crate::StringSql,
-    T6: crate::StringSql,
-    T7: crate::StringSql,
-    T8: crate::StringSql,
+    T4: crate::JsonSql,
+    T5: crate::JsonSql,
+    T6: crate::JsonSql,
+    T7: crate::JsonSql,
+    T8: crate::JsonSql,
     T9: crate::StringSql,
     T10: crate::StringSql,
-    T11: crate::StringSql,
+    T11: crate::JsonSql,
     T12: crate::StringSql,
-    T13: crate::StringSql,
-    T14: crate::StringSql,
-    T15: crate::StringSql,
-    T16: crate::StringSql,
-    T17: crate::StringSql,
+    T13: crate::JsonSql,
+    T14: crate::JsonSql,
+    T15: crate::JsonSql,
+    T16: crate::JsonSql,
+    T17: crate::JsonSql,
     T18: crate::StringSql,
     T19: crate::StringSql,
     T20: crate::StringSql,
     T21: crate::StringSql,
-    T22: crate::StringSql,
+    T22: crate::JsonSql,
     T23: crate::StringSql,
     T24: crate::StringSql,
     T25: crate::StringSql,
@@ -2729,48 +2912,44 @@ impl<
     T27: crate::StringSql,
     T28: crate::StringSql,
     T29: crate::StringSql,
-    T30: crate::StringSql,
->
-    crate::client::async_::Params<
-        'c,
-        'a,
-        's,
-        UpdateUnifiedWorkflowParams<
-            T1,
-            T2,
-            T3,
-            T4,
-            T5,
-            T6,
-            T7,
-            T8,
-            T9,
-            T10,
-            T11,
-            T12,
-            T13,
-            T14,
-            T15,
-            T16,
-            T17,
-            T18,
-            T19,
-            T20,
-            T21,
-            T22,
-            T23,
-            T24,
-            T25,
-            T26,
-            T27,
-            T28,
-            T29,
-            T30,
-        >,
-        StringQuery<'c, 'a, 's, C, String, 47>,
-        C,
-    > for UpdateUnifiedWorkflowStmt
-{
+> crate::client::async_::Params<
+    'c,
+    'a,
+    's,
+    UpdateUnifiedWorkflowParams<
+        T1,
+        T2,
+        T3,
+        T4,
+        T5,
+        T6,
+        T7,
+        T8,
+        T9,
+        T10,
+        T11,
+        T12,
+        T13,
+        T14,
+        T15,
+        T16,
+        T17,
+        T18,
+        T19,
+        T20,
+        T21,
+        T22,
+        T23,
+        T24,
+        T25,
+        T26,
+        T27,
+        T28,
+        T29,
+    >,
+    UuidUuidQuery<'c, 'a, 's, C, uuid::Uuid, 47>,
+    C,
+> for UpdateUnifiedWorkflowStmt {
     fn params(
         &'s self,
         client: &'c C,
@@ -2804,9 +2983,8 @@ impl<
             T27,
             T28,
             T29,
-            T30,
         >,
-    ) -> StringQuery<'c, 'a, 's, C, String, 47> {
+    ) -> UuidUuidQuery<'c, 'a, 's, C, uuid::Uuid, 47> {
         self.bind(
             client,
             &params.name,
@@ -2874,18 +3052,18 @@ impl DeleteUnifiedWorkflowStmt {
         self.1 = Some(client.prepare(self.0).await?);
         Ok(self)
     }
-    pub fn bind<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>(
+    pub fn bind<'c, 'a, 's, C: GenericClient>(
         &'s self,
         client: &'c C,
-        id: &'a T1,
-    ) -> StringQuery<'c, 'a, 's, C, String, 1> {
-        StringQuery {
+        id: &'a uuid::Uuid,
+    ) -> UuidUuidQuery<'c, 'a, 's, C, uuid::Uuid, 1> {
+        UuidUuidQuery {
             client,
             params: [id],
             query: self.0,
             cached: self.1.as_ref(),
             extractor: |row| Ok(row.try_get(0)?),
-            mapper: |it| it.into(),
+            mapper: |it| it,
         }
     }
 }
@@ -2990,10 +3168,10 @@ impl ToggleFavoriteStmt {
         self.1 = Some(client.prepare(self.0).await?);
         Ok(self)
     }
-    pub fn bind<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>(
+    pub fn bind<'c, 'a, 's, C: GenericClient>(
         &'s self,
         client: &'c C,
-        id: &'a T1,
+        id: &'a uuid::Uuid,
     ) -> BoolQuery<'c, 'a, 's, C, bool, 1> {
         BoolQuery {
             client,
@@ -3105,10 +3283,10 @@ impl ClearSyncPendingStmt {
         self.1 = Some(client.prepare(self.0).await?);
         Ok(self)
     }
-    pub async fn bind<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>(
+    pub async fn bind<'c, 'a, 's, C: GenericClient>(
         &'s self,
         client: &'c C,
-        id: &'a T1,
+        id: &'a uuid::Uuid,
     ) -> Result<u64, tokio_postgres::Error> {
         client.execute(self.0, &[id]).await
     }
@@ -3128,10 +3306,10 @@ impl SetSyncPendingStmt {
         self.1 = Some(client.prepare(self.0).await?);
         Ok(self)
     }
-    pub async fn bind<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>(
+    pub async fn bind<'c, 'a, 's, C: GenericClient>(
         &'s self,
         client: &'c C,
-        id: &'a T1,
+        id: &'a uuid::Uuid,
     ) -> Result<u64, tokio_postgres::Error> {
         client.execute(self.0, &[id]).await
     }
@@ -3173,7 +3351,10 @@ impl ListSlashCommandSourcesStmt {
         }
     }
 }
-pub struct UpsertSlashCommandWorkflowStmt(&'static str, Option<tokio_postgres::Statement>);
+pub struct UpsertSlashCommandWorkflowStmt(
+    &'static str,
+    Option<tokio_postgres::Statement>,
+);
 pub fn upsert_slash_command_workflow() -> UpsertSlashCommandWorkflowStmt {
     UpsertSlashCommandWorkflowStmt(
         "INSERT INTO unified_workflows ( id, name, description, category, setup_steps, agentic_steps, max_iterations, source_file_path, source_content_hash ) VALUES ( $1, $2, $3, 'slash-command', '[]', $4, NULL, $5, $6 ) ON CONFLICT(id) DO UPDATE SET name = EXCLUDED.name, description = EXCLUDED.description, agentic_steps = EXCLUDED.agentic_steps, source_content_hash = EXCLUDED.source_content_hash, updated_at = NOW() RETURNING id",
@@ -3195,21 +3376,20 @@ impl UpsertSlashCommandWorkflowStmt {
         C: GenericClient,
         T1: crate::StringSql,
         T2: crate::StringSql,
-        T3: crate::StringSql,
+        T3: crate::JsonSql,
         T4: crate::StringSql,
         T5: crate::StringSql,
-        T6: crate::StringSql,
     >(
         &'s self,
         client: &'c C,
-        id: &'a T1,
-        name: &'a T2,
-        description: &'a Option<T3>,
-        agentic_steps: &'a T4,
-        source_file_path: &'a T5,
-        source_content_hash: &'a Option<T6>,
-    ) -> StringQuery<'c, 'a, 's, C, String, 6> {
-        StringQuery {
+        id: &'a uuid::Uuid,
+        name: &'a T1,
+        description: &'a Option<T2>,
+        agentic_steps: &'a T3,
+        source_file_path: &'a T4,
+        source_content_hash: &'a Option<T5>,
+    ) -> UuidUuidQuery<'c, 'a, 's, C, uuid::Uuid, 6> {
+        UuidUuidQuery {
             client,
             params: [
                 id,
@@ -3222,7 +3402,7 @@ impl UpsertSlashCommandWorkflowStmt {
             query: self.0,
             cached: self.1.as_ref(),
             extractor: |row| Ok(row.try_get(0)?),
-            mapper: |it| it.into(),
+            mapper: |it| it,
         }
     }
 }
@@ -3233,25 +3413,22 @@ impl<
     C: GenericClient,
     T1: crate::StringSql,
     T2: crate::StringSql,
-    T3: crate::StringSql,
+    T3: crate::JsonSql,
     T4: crate::StringSql,
     T5: crate::StringSql,
-    T6: crate::StringSql,
->
-    crate::client::async_::Params<
-        'c,
-        'a,
-        's,
-        UpsertSlashCommandWorkflowParams<T1, T2, T3, T4, T5, T6>,
-        StringQuery<'c, 'a, 's, C, String, 6>,
-        C,
-    > for UpsertSlashCommandWorkflowStmt
-{
+> crate::client::async_::Params<
+    'c,
+    'a,
+    's,
+    UpsertSlashCommandWorkflowParams<T1, T2, T3, T4, T5>,
+    UuidUuidQuery<'c, 'a, 's, C, uuid::Uuid, 6>,
+    C,
+> for UpsertSlashCommandWorkflowStmt {
     fn params(
         &'s self,
         client: &'c C,
-        params: &'a UpsertSlashCommandWorkflowParams<T1, T2, T3, T4, T5, T6>,
-    ) -> StringQuery<'c, 'a, 's, C, String, 6> {
+        params: &'a UpsertSlashCommandWorkflowParams<T1, T2, T3, T4, T5>,
+    ) -> UuidUuidQuery<'c, 'a, 's, C, uuid::Uuid, 6> {
         self.bind(
             client,
             &params.id,
@@ -3304,7 +3481,10 @@ impl GetWorkflowStatsStmt {
         }
     }
 }
-pub struct UpdateSlashCommandContentStmt(&'static str, Option<tokio_postgres::Statement>);
+pub struct UpdateSlashCommandContentStmt(
+    &'static str,
+    Option<tokio_postgres::Statement>,
+);
 pub fn update_slash_command_content() -> UpdateSlashCommandContentStmt {
     UpdateSlashCommandContentStmt(
         "UPDATE unified_workflows SET agentic_steps = $1, source_content_hash = $2, updated_at = NOW() WHERE id = $3 RETURNING id",
@@ -3319,51 +3499,43 @@ impl UpdateSlashCommandContentStmt {
         self.1 = Some(client.prepare(self.0).await?);
         Ok(self)
     }
-    pub fn bind<
-        'c,
-        'a,
-        's,
-        C: GenericClient,
-        T1: crate::StringSql,
-        T2: crate::StringSql,
-        T3: crate::StringSql,
-    >(
+    pub fn bind<'c, 'a, 's, C: GenericClient, T1: crate::JsonSql, T2: crate::StringSql>(
         &'s self,
         client: &'c C,
         agentic_steps: &'a T1,
         source_content_hash: &'a Option<T2>,
-        id: &'a T3,
-    ) -> StringQuery<'c, 'a, 's, C, String, 3> {
-        StringQuery {
+        id: &'a uuid::Uuid,
+    ) -> UuidUuidQuery<'c, 'a, 's, C, uuid::Uuid, 3> {
+        UuidUuidQuery {
             client,
             params: [agentic_steps, source_content_hash, id],
             query: self.0,
             cached: self.1.as_ref(),
             extractor: |row| Ok(row.try_get(0)?),
-            mapper: |it| it.into(),
+            mapper: |it| it,
         }
     }
 }
-impl<'c, 'a, 's, C: GenericClient, T1: crate::StringSql, T2: crate::StringSql, T3: crate::StringSql>
-    crate::client::async_::Params<
-        'c,
-        'a,
-        's,
-        UpdateSlashCommandContentParams<T1, T2, T3>,
-        StringQuery<'c, 'a, 's, C, String, 3>,
-        C,
-    > for UpdateSlashCommandContentStmt
-{
+impl<
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+    T1: crate::JsonSql,
+    T2: crate::StringSql,
+> crate::client::async_::Params<
+    'c,
+    'a,
+    's,
+    UpdateSlashCommandContentParams<T1, T2>,
+    UuidUuidQuery<'c, 'a, 's, C, uuid::Uuid, 3>,
+    C,
+> for UpdateSlashCommandContentStmt {
     fn params(
         &'s self,
         client: &'c C,
-        params: &'a UpdateSlashCommandContentParams<T1, T2, T3>,
-    ) -> StringQuery<'c, 'a, 's, C, String, 3> {
-        self.bind(
-            client,
-            &params.agentic_steps,
-            &params.source_content_hash,
-            &params.id,
-        )
+        params: &'a UpdateSlashCommandContentParams<T1, T2>,
+    ) -> UuidUuidQuery<'c, 'a, 's, C, uuid::Uuid, 3> {
+        self.bind(client, &params.agentic_steps, &params.source_content_hash, &params.id)
     }
 }

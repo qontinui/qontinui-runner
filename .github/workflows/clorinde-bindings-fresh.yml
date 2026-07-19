@@ -238,6 +238,23 @@ jobs:
           DATABASE_URL: postgresql://qontinui_user:qontinui_dev_password@localhost:5433/qontinui_db
         run: clorinde live --search-path "project,public"
 
+      # clorinde emits `pub mod X;` in queries.rs by iterating a HashMap,
+      # so the line order is randomized per-process (same set, different
+      # order) even with zero schema drift. Left unsorted, every run
+      # "detects drift" against the previous run's own commit, auto-commits,
+      # and re-triggers itself forever. Sort the declarations so identical
+      # module sets always serialize identically. Root-caused 2026-07-18
+      # after PR #769's clorinde-verify job looped ~250 commits / ~12.5h.
+      - name: Stabilize clorinde module ordering
+        working-directory: qontinui-runner/src-tauri
+        run: |
+          {
+            echo '// This file was generated with `clorinde`. Do not modify.'
+            echo
+            grep '^pub mod ' clorinde/src/queries.rs | sort
+          } > clorinde/src/queries.rs.sorted
+          mv clorinde/src/queries.rs.sorted clorinde/src/queries.rs
+
       # Drift detection: if `git diff` on src-tauri/clorinde/ is empty,
       # the checked-in bindings match a fresh regen. Otherwise we have
       # drift.

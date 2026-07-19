@@ -700,7 +700,30 @@ pub async fn import_unified_workflow(
     let original_id = workflow.id.clone();
     let mut overwritten = false;
 
-    // Check if workflow with this ID already exists
+    // "keep"/"overwrite" both mean reuse this exact id — only possible if
+    // it's actually a valid uuid (unified_workflows.id requires one, per
+    // migration d7a3f1c8e024_realign_unified_workflows_to_model). No silent
+    // substitution here (no compatibility shim for pre-migration ids):
+    // reject clearly and point at the fix, rather than the "generate" arm's
+    // approach of just minting a fresh one silently. Checked once, before
+    // the match, since both arms need the identical validation.
+    let strategy = request.conflict_strategy.as_str();
+    if matches!(strategy, "keep" | "overwrite") && uuid::Uuid::parse_str(&workflow.id).is_err() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!(
+                "Workflow id '{}' is not a valid uuid (unified_workflows.id requires one) — \
+                 this is likely a pre-migration export; use conflict_strategy 'generate' \
+                 instead of '{}', or provide a valid uuid.",
+                workflow.id, strategy
+            ))),
+        ));
+    }
+
+    // Check if workflow with this ID already exists. A non-uuid id (e.g. a
+    // pre-migration export headed for the "generate" arm) just can't match
+    // anything, which `get_unified_workflow` already degrades to `Ok(None)`
+    // for.
     let existing = state
         .app_state
         .pg_db
@@ -709,7 +732,7 @@ pub async fn import_unified_workflow(
         .ok()
         .flatten();
 
-    match request.conflict_strategy.as_str() {
+    match strategy {
         "keep" => {
             // Try to use the original ID, fail if it exists
             if existing.is_some() {

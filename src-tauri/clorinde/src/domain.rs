@@ -1,12 +1,9 @@
 // This file was generated with `clorinde`. Do not modify.
 
+use postgres_protocol::types::{array_to_sql, ArrayDimension};
+use postgres_types::{private::BytesMut, IsNull, Kind, ToSql, Type};
+use std::{error::Error, fmt::{Debug, Formatter}};
 use super::{type_traits::ArraySql, utils::escape_domain};
-use postgres_protocol::types::{ArrayDimension, array_to_sql};
-use postgres_types::{IsNull, Kind, ToSql, Type, private::BytesMut};
-use std::{
-    error::Error,
-    fmt::{Debug, Formatter},
-};
 pub struct Domain<T: ToSql>(pub T);
 impl<T: ToSql + Debug> Debug for Domain<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -14,7 +11,11 @@ impl<T: ToSql + Debug> Debug for Domain<T> {
     }
 }
 impl<T: ToSql> ToSql for Domain<T> {
-    fn to_sql(&self, ty: &Type, out: &mut BytesMut) -> Result<IsNull, Box<dyn Error + Sync + Send>>
+    fn to_sql(
+        &self,
+        ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>>
     where
         Self: Sized,
     {
@@ -41,7 +42,11 @@ impl<T: ToSql + Sync, A: ArraySql<Item = T>> Debug for DomainArray<'_, T, A> {
     }
 }
 impl<'a, T: ToSql + Sync + 'a, A: ArraySql<Item = T>> ToSql for DomainArray<'a, T, A> {
-    fn to_sql(&self, ty: &Type, w: &mut BytesMut) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+    fn to_sql(
+        &self,
+        ty: &Type,
+        w: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
         self.0.escape_domain_to_sql(ty, w)
     }
     fn accepts(ty: &Type) -> bool {

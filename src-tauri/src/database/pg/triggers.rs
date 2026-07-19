@@ -1,6 +1,6 @@
 //! PostgreSQL trigger system CRUD operations (raw SQL).
 
-use super::PgDb;
+use super::{parse_optional_workflow_id, PgDb};
 use crate::trigger_system::types::{
     TriggerCondition, TriggerConfig, TriggerHistoryEntry, WorkflowTrigger,
 };
@@ -120,6 +120,7 @@ impl PgDb {
         let retry_count = trigger.retry_count as i32;
         let retry_delay_seconds = trigger.retry_delay_seconds as i64;
         let trigger_count = trigger.trigger_count as i64;
+        let workflow_id_uuid = parse_optional_workflow_id(trigger.workflow_id.as_deref())?;
 
         conn.execute(
             r#"
@@ -139,7 +140,7 @@ impl PgDb {
                 &trigger.description as &(dyn tokio_postgres::types::ToSql + Sync),
                 &trigger.trigger_type as &(dyn tokio_postgres::types::ToSql + Sync),
                 &config_json as &(dyn tokio_postgres::types::ToSql + Sync),
-                &trigger.workflow_id as &(dyn tokio_postgres::types::ToSql + Sync),
+                &workflow_id_uuid as &(dyn tokio_postgres::types::ToSql + Sync),
                 &overrides_json as &(dyn tokio_postgres::types::ToSql + Sync),
                 &conditions_json as &(dyn tokio_postgres::types::ToSql + Sync),
                 &debounce_ms as &(dyn tokio_postgres::types::ToSql + Sync),
@@ -183,6 +184,7 @@ impl PgDb {
         let max_concurrent = trigger.max_concurrent as i32;
         let retry_count = trigger.retry_count as i32;
         let retry_delay_seconds = trigger.retry_delay_seconds as i64;
+        let workflow_id_uuid = parse_optional_workflow_id(trigger.workflow_id.as_deref())?;
 
         conn.execute(
             r#"
@@ -199,7 +201,7 @@ impl PgDb {
                 &trigger.description as &(dyn tokio_postgres::types::ToSql + Sync),
                 &trigger.trigger_type as &(dyn tokio_postgres::types::ToSql + Sync),
                 &config_json as &(dyn tokio_postgres::types::ToSql + Sync),
-                &trigger.workflow_id as &(dyn tokio_postgres::types::ToSql + Sync),
+                &workflow_id_uuid as &(dyn tokio_postgres::types::ToSql + Sync),
                 &overrides_json as &(dyn tokio_postgres::types::ToSql + Sync),
                 &conditions_json as &(dyn tokio_postgres::types::ToSql + Sync),
                 &debounce_ms as &(dyn tokio_postgres::types::ToSql + Sync),
@@ -504,7 +506,9 @@ impl PgDb {
             description: row.try_get(2)?,
             trigger_type: row.try_get(3)?,
             trigger_config,
-            workflow_id: row.try_get(5)?,
+            workflow_id: row
+                .try_get::<_, Option<uuid::Uuid>>(5)?
+                .map(|u| u.to_string()),
             workflow_overrides,
             conditions,
             debounce_ms: row.try_get::<_, Option<i64>>(8)?.unwrap_or(1000) as u64,
