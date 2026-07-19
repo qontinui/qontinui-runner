@@ -614,7 +614,7 @@ function AppContent() {
                 className={`absolute inset-0 flex flex-col ${activeTab === "terminal" ? "" : "hidden"}`}
               >
                 <TerminalPageTabBar
-                  pages={terminalPages.pages}
+                  pages={terminalPages.visiblePages}
                   activePageId={terminalPages.activePageId}
                   onSelectPage={terminalPages.setActivePageId}
                   onAddPage={terminalPages.addPage}
