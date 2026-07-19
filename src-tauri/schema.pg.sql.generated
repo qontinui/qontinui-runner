@@ -1421,7 +1421,9 @@ CREATE TABLE coord.canonical_repos (
     mirror_state jsonb DEFAULT '{}'::jsonb NOT NULL,
     last_reconciled_at timestamp with time zone,
     tenant_id uuid,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    ci_lane text DEFAULT 'github'::text NOT NULL,
+    CONSTRAINT ck_canonical_repos_ci_lane CHECK ((ci_lane = ANY (ARRAY['github'::text, 'shadow'::text, 'runner'::text])))
 );
 
 
@@ -1435,6 +1437,29 @@ CREATE TABLE coord.ci_baselines (
     last_main_run_id bigint,
     failure_pattern jsonb DEFAULT '{}'::jsonb NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: ci_dispatches; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.ci_dispatches (
+    dispatch_id uuid NOT NULL,
+    tenant_id uuid NOT NULL,
+    repo text NOT NULL,
+    proposal_id uuid NOT NULL,
+    head_sha text NOT NULL,
+    device_id uuid NOT NULL,
+    state text DEFAULT 'queued'::text NOT NULL,
+    check_name text NOT NULL,
+    lease_expires_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    started_at timestamp with time zone,
+    completed_at timestamp with time zone,
+    log_tail text,
+    summary jsonb,
+    CONSTRAINT ck_ci_dispatches_state CHECK ((state = ANY (ARRAY['queued'::text, 'dispatched'::text, 'running'::text, 'succeeded'::text, 'failed'::text, 'lost'::text, 'cancelled'::text])))
 );
 
 
@@ -1495,6 +1520,27 @@ COMMENT ON COLUMN coord.claims_audit.stolen_by_machine_id IS 'machine_id of the 
 --
 
 COMMENT ON COLUMN coord.claims_audit.steal_reason IS 'Free-text rationale supplied to POST /coord/claims/steal; NULL on all other event paths';
+
+
+--
+-- Name: claude_account_usage; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.claude_account_usage (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    device_id uuid NOT NULL,
+    account_label text NOT NULL,
+    weekly_utilization double precision DEFAULT 0 NOT NULL,
+    weekly_resets_at timestamp with time zone,
+    session_utilization double precision,
+    session_resets_at timestamp with time zone,
+    model_limits jsonb DEFAULT '[]'::jsonb NOT NULL,
+    exhausted boolean DEFAULT false NOT NULL,
+    source text,
+    error boolean DEFAULT false NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
 
 
 --
@@ -1836,6 +1882,20 @@ CREATE TABLE coord.conflicts (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     resolved_at timestamp with time zone,
     CONSTRAINT conflicts_status_chk CHECK ((status = ANY (ARRAY['open'::text, 'resolved'::text, 'abandoned'::text])))
+);
+
+
+--
+-- Name: consistent_snapshots; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.consistent_snapshots (
+    snapshot_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    computed_at timestamp with time zone DEFAULT now() NOT NULL,
+    repo_shas jsonb NOT NULL,
+    consistent boolean NOT NULL,
+    reason text,
+    tenant_id uuid
 );
 
 
@@ -2279,7 +2339,7 @@ CREATE TABLE coord.device_status (
     free_text text,
     details jsonb DEFAULT '{}'::jsonb NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    tenant_id uuid
+    tenant_id uuid NOT NULL
 );
 
 
@@ -2335,6 +2395,9 @@ CREATE TABLE coord.devices (
     capture_preview_count bigint DEFAULT 0 NOT NULL,
     monitor_crop_count bigint DEFAULT 0 NOT NULL,
     last_capture_fallback_at timestamp with time zone,
+    renderer_memory_bytes bigint DEFAULT 0 NOT NULL,
+    renderer_reload_total bigint DEFAULT 0 NOT NULL,
+    renderer_reload_storming boolean DEFAULT false NOT NULL,
     CONSTRAINT devices_role_chk CHECK (((role IS NULL) OR (role = ANY (ARRAY['agent'::text, 'build'::text, 'cache'::text, 'coord'::text])))),
     CONSTRAINT devices_state_chk CHECK ((state = ANY (ARRAY['healthy'::text, 'degraded'::text, 'partitioned'::text, 'abandoned'::text])))
 );
@@ -2438,6 +2501,30 @@ CREATE TABLE coord.events (
     device_id uuid,
     payload jsonb DEFAULT '{}'::jsonb NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: expectation_probes; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.expectation_probes (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    expectation_id uuid NOT NULL,
+    session_id uuid,
+    device_id text NOT NULL,
+    probe_kind text NOT NULL,
+    probe_args jsonb DEFAULT '{}'::jsonb NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    verdict text,
+    result jsonb,
+    requested_at timestamp with time zone DEFAULT now() NOT NULL,
+    delivered_at timestamp with time zone,
+    completed_at timestamp with time zone,
+    expires_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 
@@ -2591,7 +2678,6 @@ CREATE TABLE coord.gates (
     gate_id uuid DEFAULT gen_random_uuid() NOT NULL,
     claim_kind text,
     resource_key text,
-    plan_id uuid,
     phase_name text,
     predicate jsonb NOT NULL,
     verdict text DEFAULT 'open'::text NOT NULL,
@@ -2629,7 +2715,7 @@ CREATE TABLE coord.gates (
     progress_computed_at timestamp with time zone,
     shadow_reap_signal text,
     shadow_reap_at timestamp with time zone,
-    CONSTRAINT ck_gates_anchor CHECK ((((claim_kind IS NOT NULL) AND (resource_key IS NOT NULL) AND (plan_id IS NULL) AND (work_unit_id IS NULL) AND (phase_name IS NULL)) OR ((claim_kind IS NULL) AND (resource_key IS NULL) AND (plan_id IS NOT NULL) AND (work_unit_id IS NULL) AND (phase_name IS NOT NULL)) OR ((claim_kind IS NULL) AND (resource_key IS NULL) AND (plan_id IS NULL) AND (work_unit_id IS NOT NULL) AND (phase_name IS NOT NULL)))),
+    CONSTRAINT ck_gates_anchor CHECK ((((claim_kind IS NOT NULL) AND (resource_key IS NOT NULL) AND (work_unit_id IS NULL) AND (phase_name IS NULL)) OR ((claim_kind IS NULL) AND (resource_key IS NULL) AND (work_unit_id IS NOT NULL) AND (phase_name IS NOT NULL)))),
     CONSTRAINT coord_gates_clearance_audience_check CHECK ((clearance_audience = ANY (ARRAY['operator'::text, 'agent'::text]))),
     CONSTRAINT gates_verdict_check CHECK ((verdict = ANY (ARRAY['open'::text, 'cleared'::text, 'failed'::text, 'misconfigured'::text])))
 );
@@ -2739,7 +2825,7 @@ CREATE TABLE coord.git_write_ledger (
     applied_result jsonb,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     applied_at timestamp with time zone,
-    CONSTRAINT git_write_ledger_initiator_chk CHECK ((initiator = ANY (ARRAY['outbound_mirror'::text, 'merge_scheduler'::text, 'restack_engine'::text, 'conflict_engine'::text, 'agent_ref_migrate'::text]))),
+    CONSTRAINT git_write_ledger_initiator_chk CHECK ((initiator = ANY (ARRAY['outbound_mirror'::text, 'merge_scheduler'::text, 'restack_engine'::text, 'conflict_engine'::text, 'agent_ref_migrate'::text, 'mcp_push_tool'::text]))),
     CONSTRAINT git_write_ledger_op_chk CHECK ((op = ANY (ARRAY['push'::text, 'force_push'::text, 'delete'::text, 'mirror'::text, 'update_ref_delete'::text]))),
     CONSTRAINT git_write_ledger_status_chk CHECK ((status = ANY (ARRAY['pending'::text, 'applied'::text, 'failed'::text, 'refused'::text])))
 );
@@ -2762,6 +2848,23 @@ CREATE SEQUENCE coord.git_write_ledger_id_seq
 --
 
 ALTER SEQUENCE coord.git_write_ledger_id_seq OWNED BY coord.git_write_ledger.id;
+
+
+--
+-- Name: github_user_tokens; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.github_user_tokens (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    account_login text NOT NULL,
+    encrypted_refresh_token text NOT NULL,
+    access_token_cache text,
+    access_token_expires_at timestamp with time zone,
+    scopes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
 
 
 --
@@ -3207,6 +3310,93 @@ CREATE TABLE coord.memory_federation_reports (
 
 
 --
+-- Name: memory_links; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.memory_links (
+    link_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    source_id uuid NOT NULL,
+    target_id uuid NOT NULL,
+    relation text NOT NULL,
+    description text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT memory_links_relation_check CHECK ((relation = ANY (ARRAY['depends_on'::text, 'implements'::text, 'supersedes'::text, 'related'::text])))
+);
+
+
+--
+-- Name: memory_observations; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.memory_observations (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    observed_at timestamp with time zone DEFAULT now() NOT NULL,
+    row_count bigint NOT NULL,
+    bytes bigint NOT NULL,
+    embedding_coverage double precision NOT NULL,
+    model_versions text[] DEFAULT '{}'::text[] NOT NULL,
+    latest_write_at timestamp with time zone,
+    quota_utilization double precision NOT NULL,
+    drift_class text NOT NULL
+);
+
+
+--
+-- Name: memory_records; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.memory_records (
+    memory_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    scope text DEFAULT 'tenant'::text NOT NULL,
+    scope_ref text,
+    kind text NOT NULL,
+    title text NOT NULL,
+    content text NOT NULL,
+    content_hash text NOT NULL,
+    embedding public.vector(384),
+    embedding_model text,
+    content_tsv tsvector GENERATED ALWAYS AS (to_tsvector('english'::regconfig, ((title || ' '::text) || content))) STORED,
+    importance real DEFAULT 0.5 NOT NULL,
+    access_count integer DEFAULT 0 NOT NULL,
+    last_accessed_at timestamp with time zone,
+    valid_from timestamp with time zone DEFAULT now() NOT NULL,
+    valid_until timestamp with time zone,
+    superseded_by uuid,
+    consolidated_from uuid[],
+    source jsonb DEFAULT '{}'::jsonb NOT NULL,
+    is_tombstone boolean DEFAULT false NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT memory_records_kind_check CHECK ((kind = ANY (ARRAY['observation'::text, 'fact'::text, 'mental_model'::text, 'episode'::text, 'feedback'::text, 'reference'::text, 'rule'::text, 'library'::text]))),
+    CONSTRAINT memory_records_scope_check CHECK ((scope = ANY (ARRAY['tenant'::text, 'runner'::text, 'agent'::text, 'session'::text])))
+);
+
+
+--
+-- Name: memory_synthesis_jobs; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.memory_synthesis_jobs (
+    job_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    member_ids uuid[] NOT NULL,
+    member_texts jsonb NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    claimed_by text,
+    claimed_at timestamp with time zone,
+    finished_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    result_text text,
+    attempt integer DEFAULT 0 NOT NULL,
+    member_set_hash text NOT NULL,
+    CONSTRAINT memory_synthesis_jobs_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'claimed'::text, 'done'::text, 'failed'::text])))
+);
+
+
+--
 -- Name: merge_batches; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -3534,6 +3724,29 @@ ALTER SEQUENCE coord.origin_resolution_observations_id_seq OWNED BY coord.origin
 
 
 --
+-- Name: outbound_budget_observations; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.outbound_budget_observations (
+    dependency text NOT NULL,
+    resource text NOT NULL,
+    remaining bigint,
+    limit_total bigint,
+    reset_at timestamp with time zone,
+    burn_rate_per_min double precision,
+    cooldown_until timestamp with time zone,
+    top_consumers jsonb,
+    caller_breakdown jsonb,
+    drift_class text,
+    drift_subclass text,
+    serving_stale_reads integer,
+    replica_id text,
+    observed_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT outbound_budget_observations_drift_class_chk CHECK (((drift_class IS NULL) OR (drift_class = ANY (ARRAY['nominal'::text, 'burning'::text, 'cooling_down'::text, 'exhausted'::text, 'unknown'::text]))))
+);
+
+
+--
 -- Name: page_spec_paths; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -3595,42 +3808,77 @@ CREATE TABLE coord.plan_pr_citations (
 
 
 --
--- Name: plan_status_history; Type: TABLE; Schema: coord; Owner: -
+-- Name: policy_clauses; Type: TABLE; Schema: coord; Owner: -
 --
 
-CREATE TABLE coord.plan_status_history (
-    history_id uuid DEFAULT gen_random_uuid() NOT NULL,
-    plan_id uuid NOT NULL,
-    from_status text,
-    to_status text NOT NULL,
-    transitioned_at timestamp with time zone DEFAULT now() NOT NULL,
-    by_actor text,
-    reason text
-);
-
-
---
--- Name: plans; Type: TABLE; Schema: coord; Owner: -
---
-
-CREATE TABLE coord.plans (
+CREATE TABLE coord.policy_clauses (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
-    markdown_path text NOT NULL,
-    version_hash text NOT NULL,
-    status text DEFAULT 'draft'::text NOT NULL,
-    title text,
-    summary text,
+    tenant_id uuid NOT NULL,
+    document_id uuid NOT NULL,
+    clause_id text NOT NULL,
+    category text NOT NULL,
+    status text NOT NULL,
+    tier text,
+    trigger text,
+    action text,
+    bounds text,
+    escalate_if text,
+    anti_triggers text[] DEFAULT '{}'::text[] NOT NULL,
+    depends_on text[] DEFAULT '{}'::text[] NOT NULL,
+    links text[] DEFAULT '{}'::text[] NOT NULL,
+    "position" integer DEFAULT 0 NOT NULL,
+    source jsonb DEFAULT '{}'::jsonb NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    slug text,
-    content text,
-    authored_by text,
-    origin_path text,
-    archive_path text,
-    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
-    tenant_id uuid NOT NULL,
-    ingested_status text
+    created_by text,
+    updated_by text,
+    CONSTRAINT policy_clauses_status_check CHECK ((status = ANY (ARRAY['gap'::text, 'proposed'::text, 'confirmed'::text, 'active'::text, 'retired'::text]))),
+    CONSTRAINT policy_clauses_tier_check CHECK (((tier IS NULL) OR (tier = ANY (ARRAY['proceed'::text, 'proceed+log'::text, 'proceed+notify'::text, 'ask-first'::text, 'never'::text]))))
 );
+
+
+--
+-- Name: COLUMN policy_clauses.category; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.policy_clauses.category IS 'Denormalized copy of the parent coord.prompt_documents.name. Invariant category == parent document name is enforced at the app layer (coord checks on write); no cross-table SQL CHECK.';
+
+
+--
+-- Name: policy_documents; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.policy_documents (
+    id bigint NOT NULL,
+    tenant_id uuid NOT NULL,
+    handle text NOT NULL,
+    title text NOT NULL,
+    body text NOT NULL,
+    format text DEFAULT 'markdown'::text NOT NULL,
+    default_source text,
+    updated_by text,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT policy_documents_format_check CHECK ((format = ANY (ARRAY['markdown'::text, 'rubric'::text])))
+);
+
+
+--
+-- Name: policy_documents_id_seq; Type: SEQUENCE; Schema: coord; Owner: -
+--
+
+CREATE SEQUENCE coord.policy_documents_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: policy_documents_id_seq; Type: SEQUENCE OWNED BY; Schema: coord; Owner: -
+--
+
+ALTER SEQUENCE coord.policy_documents_id_seq OWNED BY coord.policy_documents.id;
 
 
 --
@@ -3681,6 +3929,8 @@ CREATE TABLE coord.policy_rules (
     mode text DEFAULT 'deterministic'::text NOT NULL,
     autonomy_level text DEFAULT 'always_escalate'::text NOT NULL,
     payload jsonb,
+    default_source text,
+    overrides_system_rule_id uuid,
     CONSTRAINT policy_rules_mode_kind_check CHECK (((((mode = 'deterministic'::text) AND (kind IS NOT NULL) AND (kind = ANY (ARRAY['baseline_waiver'::text, 'block_override'::text, 'escalation_rule'::text, 'question_auto_answer'::text, 'session_conflict_rule'::text]))) OR ((mode = ANY (ARRAY['guidance'::text, 'data_driven'::text])) AND ((kind IS NULL) OR (kind = ANY (ARRAY['baseline_waiver'::text, 'block_override'::text, 'escalation_rule'::text, 'question_auto_answer'::text, 'session_conflict_rule'::text]))))) AND ((decision_domain IS NULL) OR (decision_domain <> ''::text))))
 );
 
@@ -3730,6 +3980,25 @@ COMMENT ON COLUMN coord.pr_check_runs.status IS 'queued | in_progress | complete
 --
 
 COMMENT ON COLUMN coord.pr_check_runs.conclusion IS 'success | failure | neutral | cancelled | timed_out | action_required | skipped | stale';
+
+
+--
+-- Name: pr_check_runs_latest; Type: VIEW; Schema: coord; Owner: -
+--
+
+CREATE VIEW coord.pr_check_runs_latest AS
+ SELECT DISTINCT ON (repo, head_sha, name) repo,
+    head_sha,
+    check_id,
+    name,
+    status,
+    conclusion,
+    started_at,
+    completed_at,
+    details_url,
+    updated_at
+   FROM coord.pr_check_runs
+  ORDER BY repo, head_sha, name, started_at DESC NULLS LAST, check_id DESC;
 
 
 --
@@ -3904,6 +4173,66 @@ CREATE TABLE coord.process_sessions (
 
 
 --
+-- Name: prompt_document_versions; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.prompt_document_versions (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    document_id uuid NOT NULL,
+    version_number integer NOT NULL,
+    body text NOT NULL,
+    description text,
+    edited_by text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: prompt_documents; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.prompt_documents (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    name text NOT NULL,
+    description text,
+    kind text NOT NULL,
+    body text NOT NULL,
+    format text DEFAULT 'markdown'::text NOT NULL,
+    default_source text,
+    current_version integer DEFAULT 1 NOT NULL,
+    updated_by text,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    attrs jsonb,
+    CONSTRAINT prompt_documents_format_check CHECK ((format = ANY (ARRAY['markdown'::text, 'rubric'::text]))),
+    CONSTRAINT prompt_documents_kind_check CHECK ((kind = ANY (ARRAY['policy'::text, 'response_prompt'::text, 'continuation_rules'::text, 'agent_playbook'::text])))
+);
+
+
+--
+-- Name: prompt_injection_events; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.prompt_injection_events (
+    event_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    source text NOT NULL,
+    agent_session_id uuid,
+    session_name text,
+    terminal_id text,
+    agent_id uuid,
+    device_id uuid,
+    trigger_kind text NOT NULL,
+    trigger_text text,
+    injected_prompt text NOT NULL,
+    policy_id uuid,
+    rule_id text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    metadata jsonb
+);
+
+
+--
 -- Name: release_observations; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -3973,7 +4302,11 @@ CREATE TABLE coord.repo_branches (
     close_cause text,
     touched_alembic_down_revisions text[],
     merge_commit_sha text,
-    merged_at timestamp with time zone
+    merged_at timestamp with time zone,
+    last_refreshed_source character varying(32),
+    author_agent_session_id uuid,
+    author_bound_at timestamp with time zone,
+    author_source text
 );
 
 
@@ -4179,6 +4512,43 @@ ALTER SEQUENCE coord.runner_sessions_id_seq OWNED BY coord.device_connections.id
 
 
 --
+-- Name: scheduler_ticks; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.scheduler_ticks (
+    id bigint NOT NULL,
+    repo text NOT NULL,
+    tick_at timestamp with time zone DEFAULT now() NOT NULL,
+    main_sha text,
+    queue_depth integer,
+    lease_state text,
+    no_reap_verdict text,
+    budget_state text,
+    decision_code text NOT NULL,
+    duration_ms integer
+);
+
+
+--
+-- Name: scheduler_ticks_id_seq; Type: SEQUENCE; Schema: coord; Owner: -
+--
+
+CREATE SEQUENCE coord.scheduler_ticks_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: scheduler_ticks_id_seq; Type: SEQUENCE OWNED BY; Schema: coord; Owner: -
+--
+
+ALTER SEQUENCE coord.scheduler_ticks_id_seq OWNED BY coord.scheduler_ticks.id;
+
+
+--
 -- Name: schema_drift_events; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -4253,6 +4623,32 @@ ALTER SEQUENCE coord.session_events_id_seq OWNED BY coord.session_events.id;
 
 
 --
+-- Name: session_expectations; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.session_expectations (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    session_id uuid,
+    device_id text,
+    work_unit_id text,
+    phase text,
+    expected_kind text NOT NULL,
+    expected_ref jsonb DEFAULT '{}'::jsonb NOT NULL,
+    soft_deadline_at timestamp with time zone NOT NULL,
+    hard_deadline_at timestamp with time zone,
+    status text DEFAULT 'open'::text NOT NULL,
+    ladder_rung smallint DEFAULT 0 NOT NULL,
+    last_checkin_at timestamp with time zone,
+    progress_seq bigint DEFAULT 0 NOT NULL,
+    progress_note text,
+    created_by text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
 -- Name: session_file_snapshots; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -4301,7 +4697,8 @@ CREATE TABLE coord.session_output (
     chunk_offset bigint NOT NULL,
     payload bytea NOT NULL,
     compressed_size integer NOT NULL,
-    recorded_at timestamp with time zone DEFAULT now() NOT NULL
+    recorded_at timestamp with time zone DEFAULT now() NOT NULL,
+    stream text DEFAULT 'pty'::text NOT NULL
 );
 
 
@@ -4343,6 +4740,8 @@ CREATE TABLE coord.sessions (
     expected_at timestamp with time zone,
     provider text,
     claude_code_session_id uuid,
+    work_unit_slug text,
+    role text,
     CONSTRAINT sessions_session_kind_check CHECK ((session_kind = ANY (ARRAY['terminal_shell'::text, 'terminal_claude'::text, 'agentic'::text, 'workflow'::text, 'automation'::text, 'debug'::text]))),
     CONSTRAINT sessions_state_check CHECK ((state = ANY (ARRAY['expected'::text, 'active'::text, 'pending_resolution'::text, 'stale'::text, 'closed'::text])))
 );
@@ -4389,7 +4788,6 @@ CREATE TABLE coord.stack_edges (
 
 CREATE TABLE coord.tasks (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
-    plan_id uuid,
     plan_version_hash text,
     phase_name text,
     sequence_in_phase integer,
@@ -4409,7 +4807,21 @@ CREATE TABLE coord.tasks (
     assignment_brief_extras jsonb,
     identity_hash text,
     origin text,
+    work_unit_id uuid,
     CONSTRAINT tasks_done_requires_report CHECK (((status <> 'done'::text) OR ((completion_report IS NOT NULL) AND (completion_source IS NOT NULL))))
+);
+
+
+--
+-- Name: tenant_devices; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.tenant_devices (
+    tenant_id uuid NOT NULL,
+    device_id uuid NOT NULL,
+    paired_by_user_id uuid,
+    paired_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_active_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 
@@ -4448,6 +4860,7 @@ CREATE TABLE coord.tenant_merge_settings (
     credibility_weighted_pass_min double precision,
     blast_radius_gate_enabled boolean,
     layering_gate_enabled boolean,
+    auto_fix_red_main boolean,
     CONSTRAINT ck_tms_credibility_weighted_pass_min_range CHECK (((credibility_weighted_pass_min IS NULL) OR ((credibility_weighted_pass_min >= (0)::double precision) AND (credibility_weighted_pass_min <= (1)::double precision)))),
     CONSTRAINT tenant_merge_settings_rollout_state_check CHECK (((rollout_state IS NULL) OR (rollout_state = ANY (ARRAY['dry_run'::text, 'shadow'::text, 'live'::text]))))
 );
@@ -4465,6 +4878,8 @@ CREATE TABLE coord.tenant_policies (
     output_cold_quota_bytes bigint DEFAULT '10737418240'::bigint NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    memory_quota_bytes bigint DEFAULT 268435456 NOT NULL,
+    memory_row_quota bigint DEFAULT 500000 NOT NULL,
     CONSTRAINT tenant_policies_claim_steal_visibility_check CHECK ((claim_steal_visibility = ANY (ARRAY['public_to_tenant'::text, 'involved_only'::text, 'audit_only'::text])))
 );
 
@@ -4489,6 +4904,7 @@ CREATE TABLE coord.tenant_repo_profiles (
     blast_radius_gate_enabled_override boolean,
     layering_gate_enabled_override boolean,
     config_yaml_overrides jsonb,
+    auto_fix_red_main boolean,
     CONSTRAINT ck_trp_credibility_weighted_pass_min_override_range CHECK (((credibility_weighted_pass_min_override IS NULL) OR ((credibility_weighted_pass_min_override >= (0)::double precision) AND (credibility_weighted_pass_min_override <= (1)::double precision)))),
     CONSTRAINT tenant_repo_profiles_rollout_state_check CHECK (((rollout_state IS NULL) OR (rollout_state = ANY (ARRAY['dry_run'::text, 'shadow'::text, 'live'::text])))),
     CONSTRAINT tenant_repo_profiles_source_check CHECK ((profile_source = ANY (ARRAY['audit'::text, 'user_edit'::text, 'drift_accept'::text, 'manual'::text, 'preset'::text])))
@@ -4733,6 +5149,18 @@ CREATE TABLE coord.user_overrides (
 
 
 --
+-- Name: webhook_pulse; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.webhook_pulse (
+    repo text NOT NULL,
+    event_type text NOT NULL,
+    received_count bigint DEFAULT 0 NOT NULL,
+    last_received_at timestamp with time zone
+);
+
+
+--
 -- Name: wip_attribution; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -4840,6 +5268,23 @@ CREATE TABLE coord.work_units (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     owner_actor_key text
+);
+
+
+--
+-- Name: worker_heartbeats; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.worker_heartbeats (
+    name text NOT NULL,
+    replica_id text NOT NULL,
+    leader_gated boolean DEFAULT false NOT NULL,
+    interval_secs integer,
+    last_tick_at timestamp with time zone NOT NULL,
+    last_outcome text,
+    consecutive_errors integer DEFAULT 0 NOT NULL,
+    last_decision_code text,
+    last_detail_code text
 );
 
 
@@ -10045,9 +10490,9 @@ CREATE TABLE project.scheduled_workflow_runs (
     last_execution_id character varying(255),
     last_status character varying(32),
     last_error text,
-    redbeat_entry_id character varying(255),
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    next_fire_at timestamp with time zone
 );
 
 
@@ -10080,10 +10525,10 @@ COMMENT ON COLUMN project.scheduled_workflow_runs.last_status IS '''dispatched''
 
 
 --
--- Name: COLUMN scheduled_workflow_runs.redbeat_entry_id; Type: COMMENT; Schema: project; Owner: -
+-- Name: COLUMN scheduled_workflow_runs.next_fire_at; Type: COMMENT; Schema: project; Owner: -
 --
 
-COMMENT ON COLUMN project.scheduled_workflow_runs.redbeat_entry_id IS 'Redbeat scheduler key for this row, conventionally ''qontinui:schedule:{id}''. Present when a redbeat entry exists in Redis; cleared when the entry is removed (disable/delete).';
+COMMENT ON COLUMN project.scheduled_workflow_runs.next_fire_at IS 'When this schedule next fires. Computed with croniter from cron_expression on create/update and advanced after each fire. NULL means unscheduled — the scheduler re-anchors it onto its cron on first sight (it does not fire it).';
 
 
 --
@@ -14156,6 +14601,13 @@ ALTER TABLE ONLY coord.origin_resolution_observations ALTER COLUMN id SET DEFAUL
 
 
 --
+-- Name: policy_documents id; Type: DEFAULT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.policy_documents ALTER COLUMN id SET DEFAULT nextval('coord.policy_documents_id_seq'::regclass);
+
+
+--
 -- Name: process_session_output id; Type: DEFAULT; Schema: coord; Owner: -
 --
 
@@ -14174,6 +14626,13 @@ ALTER TABLE ONLY coord.release_observations ALTER COLUMN id SET DEFAULT nextval(
 --
 
 ALTER TABLE ONLY coord.route_serving_observations ALTER COLUMN id SET DEFAULT nextval('coord.route_serving_observations_id_seq'::regclass);
+
+
+--
+-- Name: scheduler_ticks id; Type: DEFAULT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.scheduler_ticks ALTER COLUMN id SET DEFAULT nextval('coord.scheduler_ticks_id_seq'::regclass);
 
 
 --
@@ -14876,6 +15335,14 @@ ALTER TABLE ONLY coord.ci_baselines
 
 
 --
+-- Name: ci_dispatches ci_dispatches_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.ci_dispatches
+    ADD CONSTRAINT ci_dispatches_pkey PRIMARY KEY (dispatch_id);
+
+
+--
 -- Name: ci_runs ci_runs_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -14889,6 +15356,14 @@ ALTER TABLE ONLY coord.ci_runs
 
 ALTER TABLE ONLY coord.claims_audit
     ADD CONSTRAINT claims_audit_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: claude_account_usage claude_account_usage_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.claude_account_usage
+    ADD CONSTRAINT claude_account_usage_pkey PRIMARY KEY (id);
 
 
 --
@@ -14985,6 +15460,14 @@ ALTER TABLE ONLY coord.conflict_resolutions
 
 ALTER TABLE ONLY coord.conflicts
     ADD CONSTRAINT conflicts_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: consistent_snapshots consistent_snapshots_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.consistent_snapshots
+    ADD CONSTRAINT consistent_snapshots_pkey PRIMARY KEY (snapshot_id);
 
 
 --
@@ -15100,6 +15583,14 @@ ALTER TABLE ONLY coord.dev_action_stats
 
 
 --
+-- Name: device_status device_status_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.device_status
+    ADD CONSTRAINT device_status_pkey PRIMARY KEY (device_id, tenant_id);
+
+
+--
 -- Name: devices devices_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -15129,6 +15620,14 @@ ALTER TABLE ONLY coord.error_observations
 
 ALTER TABLE ONLY coord.events
     ADD CONSTRAINT events_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: expectation_probes expectation_probes_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.expectation_probes
+    ADD CONSTRAINT expectation_probes_pkey PRIMARY KEY (id);
 
 
 --
@@ -15217,6 +15716,22 @@ ALTER TABLE ONLY coord.git_replicas
 
 ALTER TABLE ONLY coord.git_write_ledger
     ADD CONSTRAINT git_write_ledger_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: github_user_tokens github_user_tokens_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.github_user_tokens
+    ADD CONSTRAINT github_user_tokens_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: github_user_tokens github_user_tokens_tenant_id_account_login_key; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.github_user_tokens
+    ADD CONSTRAINT github_user_tokens_tenant_id_account_login_key UNIQUE (tenant_id, account_login);
 
 
 --
@@ -15332,14 +15847,6 @@ ALTER TABLE ONLY coord.leader_lease
 
 
 --
--- Name: device_status machine_status_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
---
-
-ALTER TABLE ONLY coord.device_status
-    ADD CONSTRAINT machine_status_pkey PRIMARY KEY (device_id);
-
-
---
 -- Name: maintenance_runs maintenance_runs_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -15377,6 +15884,38 @@ ALTER TABLE ONLY coord.memories
 
 ALTER TABLE ONLY coord.memory_federation_reports
     ADD CONSTRAINT memory_federation_reports_pkey PRIMARY KEY (report_id);
+
+
+--
+-- Name: memory_links memory_links_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.memory_links
+    ADD CONSTRAINT memory_links_pkey PRIMARY KEY (link_id);
+
+
+--
+-- Name: memory_observations memory_observations_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.memory_observations
+    ADD CONSTRAINT memory_observations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: memory_records memory_records_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.memory_records
+    ADD CONSTRAINT memory_records_pkey PRIMARY KEY (memory_id);
+
+
+--
+-- Name: memory_synthesis_jobs memory_synthesis_jobs_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.memory_synthesis_jobs
+    ADD CONSTRAINT memory_synthesis_jobs_pkey PRIMARY KEY (job_id);
 
 
 --
@@ -15500,6 +16039,14 @@ ALTER TABLE ONLY coord.origin_resolution_observations
 
 
 --
+-- Name: outbound_budget_observations outbound_budget_observations_dependency_resource_uq; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.outbound_budget_observations
+    ADD CONSTRAINT outbound_budget_observations_dependency_resource_uq UNIQUE (dependency, resource);
+
+
+--
 -- Name: page_spec_paths page_spec_paths_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -15564,19 +16111,19 @@ ALTER TABLE ONLY coord.plan_pr_citations
 
 
 --
--- Name: plan_status_history plan_status_history_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+-- Name: policy_clauses policy_clauses_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
-ALTER TABLE ONLY coord.plan_status_history
-    ADD CONSTRAINT plan_status_history_pkey PRIMARY KEY (history_id);
+ALTER TABLE ONLY coord.policy_clauses
+    ADD CONSTRAINT policy_clauses_pkey PRIMARY KEY (id);
 
 
 --
--- Name: plans plans_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+-- Name: policy_documents policy_documents_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
-ALTER TABLE ONLY coord.plans
-    ADD CONSTRAINT plans_pkey PRIMARY KEY (id);
+ALTER TABLE ONLY coord.policy_documents
+    ADD CONSTRAINT policy_documents_pkey PRIMARY KEY (id);
 
 
 --
@@ -15684,6 +16231,30 @@ ALTER TABLE ONLY coord.process_sessions
 
 
 --
+-- Name: prompt_document_versions prompt_document_versions_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.prompt_document_versions
+    ADD CONSTRAINT prompt_document_versions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: prompt_documents prompt_documents_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.prompt_documents
+    ADD CONSTRAINT prompt_documents_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: prompt_injection_events prompt_injection_events_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.prompt_injection_events
+    ADD CONSTRAINT prompt_injection_events_pkey PRIMARY KEY (event_id);
+
+
+--
 -- Name: release_observations release_observations_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -15780,6 +16351,14 @@ ALTER TABLE ONLY coord.device_connections
 
 
 --
+-- Name: scheduler_ticks scheduler_ticks_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.scheduler_ticks
+    ADD CONSTRAINT scheduler_ticks_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: schema_drift_events schema_drift_events_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -15804,6 +16383,14 @@ ALTER TABLE ONLY coord.session_events
 
 
 --
+-- Name: session_expectations session_expectations_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.session_expectations
+    ADD CONSTRAINT session_expectations_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: session_file_snapshots session_file_snapshots_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -15824,7 +16411,7 @@ ALTER TABLE ONLY coord.session_messages
 --
 
 ALTER TABLE ONLY coord.session_output
-    ADD CONSTRAINT session_output_pkey PRIMARY KEY (session_id, chunk_offset);
+    ADD CONSTRAINT session_output_pkey PRIMARY KEY (session_id, stream, chunk_offset);
 
 
 --
@@ -15865,6 +16452,14 @@ ALTER TABLE ONLY coord.stack_edges
 
 ALTER TABLE ONLY coord.tasks
     ADD CONSTRAINT tasks_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: tenant_devices tenant_devices_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.tenant_devices
+    ADD CONSTRAINT tenant_devices_pkey PRIMARY KEY (tenant_id, device_id);
 
 
 --
@@ -15996,6 +16591,22 @@ ALTER TABLE ONLY coord.unit_retrospectives
 
 
 --
+-- Name: claude_account_usage uq_claude_account_usage_identity; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.claude_account_usage
+    ADD CONSTRAINT uq_claude_account_usage_identity UNIQUE (tenant_id, device_id, account_label);
+
+
+--
+-- Name: policy_clauses uq_policy_clauses_document_clause; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.policy_clauses
+    ADD CONSTRAINT uq_policy_clauses_document_clause UNIQUE (document_id, clause_id);
+
+
+--
 -- Name: test_coverage_map uq_test_coverage_map_repo_head_test; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -16017,6 +16628,14 @@ ALTER TABLE ONLY coord.test_credibility_priors
 
 ALTER TABLE ONLY coord.user_overrides
     ADD CONSTRAINT user_overrides_pkey PRIMARY KEY (override_id);
+
+
+--
+-- Name: webhook_pulse webhook_pulse_repo_event_type_uq; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.webhook_pulse
+    ADD CONSTRAINT webhook_pulse_repo_event_type_uq UNIQUE (repo, event_type);
 
 
 --
@@ -16073,6 +16692,14 @@ ALTER TABLE ONLY coord.work_unit_status_history
 
 ALTER TABLE ONLY coord.work_units
     ADD CONSTRAINT work_units_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: worker_heartbeats worker_heartbeats_name_replica_id_uq; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.worker_heartbeats
+    ADD CONSTRAINT worker_heartbeats_name_replica_id_uq UNIQUE (name, replica_id);
 
 
 --
@@ -17844,14 +18471,6 @@ ALTER TABLE ONLY project.scheduled_workflow_runs
 
 
 --
--- Name: scheduled_workflow_runs scheduled_workflow_runs_redbeat_entry_id_key; Type: CONSTRAINT; Schema: project; Owner: -
---
-
-ALTER TABLE ONLY project.scheduled_workflow_runs
-    ADD CONSTRAINT scheduled_workflow_runs_redbeat_entry_id_key UNIQUE (redbeat_entry_id);
-
-
---
 -- Name: scheduler_history scheduler_history_pkey; Type: CONSTRAINT; Schema: project; Owner: -
 --
 
@@ -19465,6 +20084,13 @@ CREATE INDEX coord_sessions_parent_idx ON coord.sessions USING btree (parent_ses
 
 
 --
+-- Name: coord_sessions_tenant_role_idx; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX coord_sessions_tenant_role_idx ON coord.sessions USING btree (tenant_id, role) WHERE (role IS NOT NULL);
+
+
+--
 -- Name: coord_sessions_tenant_state_idx; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -19843,6 +20469,20 @@ CREATE INDEX idx_ci_baselines_updated ON coord.ci_baselines USING btree (updated
 
 
 --
+-- Name: idx_ci_dispatches_device_state; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_ci_dispatches_device_state ON coord.ci_dispatches USING btree (device_id, state);
+
+
+--
+-- Name: idx_ci_dispatches_repo_head_sha; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_ci_dispatches_repo_head_sha ON coord.ci_dispatches USING btree (repo, head_sha);
+
+
+--
 -- Name: idx_claims_audit_agent_session; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -20063,7 +20703,7 @@ CREATE INDEX idx_deploy_safety_posterior_observed_at ON coord.deploy_safety_post
 -- Name: idx_device_status_tenant; Type: INDEX; Schema: coord; Owner: -
 --
 
-CREATE INDEX idx_device_status_tenant ON coord.device_status USING btree (tenant_id, updated_at DESC) WHERE (tenant_id IS NOT NULL);
+CREATE INDEX idx_device_status_tenant ON coord.device_status USING btree (tenant_id, updated_at DESC);
 
 
 --
@@ -20221,13 +20861,6 @@ CREATE INDEX idx_gates_open ON coord.gates USING btree (verdict) WHERE (verdict 
 
 
 --
--- Name: idx_gates_plan; Type: INDEX; Schema: coord; Owner: -
---
-
-CREATE INDEX idx_gates_plan ON coord.gates USING btree (plan_id, phase_name) WHERE (plan_id IS NOT NULL);
-
-
---
 -- Name: idx_gates_shadow_reap; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -20288,6 +20921,13 @@ CREATE INDEX idx_git_write_ledger_intended_deletions ON coord.git_write_ledger U
 --
 
 CREATE INDEX idx_git_write_ledger_repo_created ON coord.git_write_ledger USING btree (repo, created_at DESC);
+
+
+--
+-- Name: idx_github_user_tokens_by_tenant; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_github_user_tokens_by_tenant ON coord.github_user_tokens USING btree (tenant_id);
 
 
 --
@@ -20515,6 +21155,62 @@ CREATE INDEX idx_memories_tenant_id ON coord.memories USING btree (tenant_id) WH
 
 
 --
+-- Name: idx_memory_links_tenant_source; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_memory_links_tenant_source ON coord.memory_links USING btree (tenant_id, source_id);
+
+
+--
+-- Name: idx_memory_links_tenant_target; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_memory_links_tenant_target ON coord.memory_links USING btree (tenant_id, target_id);
+
+
+--
+-- Name: idx_memory_observations_tenant_observed; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_memory_observations_tenant_observed ON coord.memory_observations USING btree (tenant_id, observed_at DESC);
+
+
+--
+-- Name: idx_memory_records_content_tsv; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_memory_records_content_tsv ON coord.memory_records USING gin (content_tsv);
+
+
+--
+-- Name: idx_memory_records_embedding_hnsw; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_memory_records_embedding_hnsw ON coord.memory_records USING hnsw (embedding public.vector_cosine_ops) WITH (m='16', ef_construction='64');
+
+
+--
+-- Name: idx_memory_records_tenant_kind_created; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_memory_records_tenant_kind_created ON coord.memory_records USING btree (tenant_id, kind, created_at DESC);
+
+
+--
+-- Name: idx_memory_records_tenant_scope; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_memory_records_tenant_scope ON coord.memory_records USING btree (tenant_id, scope, scope_ref);
+
+
+--
+-- Name: idx_memory_synthesis_jobs_pending; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_memory_synthesis_jobs_pending ON coord.memory_synthesis_jobs USING btree (tenant_id, created_at) WHERE (status = 'pending'::text);
+
+
+--
 -- Name: idx_merge_batches_parent; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -20697,6 +21393,27 @@ CREATE INDEX idx_pending_pr_deps_tenant_id ON coord.pending_pr_dependencies USIN
 
 
 --
+-- Name: idx_pie_session; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_pie_session ON coord.prompt_injection_events USING btree (agent_session_id) WHERE (agent_session_id IS NOT NULL);
+
+
+--
+-- Name: idx_pie_source; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_pie_source ON coord.prompt_injection_events USING btree (tenant_id, source);
+
+
+--
+-- Name: idx_pie_tenant_created; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_pie_tenant_created ON coord.prompt_injection_events USING btree (tenant_id, created_at DESC);
+
+
+--
 -- Name: idx_plan_pr_citations_plan_slug; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -20708,41 +21425,6 @@ CREATE INDEX idx_plan_pr_citations_plan_slug ON coord.plan_pr_citations USING bt
 --
 
 CREATE INDEX idx_plan_pr_citations_repo_pr ON coord.plan_pr_citations USING btree (repo, pr_number);
-
-
---
--- Name: idx_plan_status_history_plan; Type: INDEX; Schema: coord; Owner: -
---
-
-CREATE INDEX idx_plan_status_history_plan ON coord.plan_status_history USING btree (plan_id, transitioned_at DESC);
-
-
---
--- Name: idx_plans_path; Type: INDEX; Schema: coord; Owner: -
---
-
-CREATE UNIQUE INDEX idx_plans_path ON coord.plans USING btree (markdown_path);
-
-
---
--- Name: idx_plans_status; Type: INDEX; Schema: coord; Owner: -
---
-
-CREATE INDEX idx_plans_status ON coord.plans USING btree (status);
-
-
---
--- Name: idx_plans_tenant_id; Type: INDEX; Schema: coord; Owner: -
---
-
-CREATE INDEX idx_plans_tenant_id ON coord.plans USING btree (tenant_id) WHERE (tenant_id IS NOT NULL);
-
-
---
--- Name: idx_plans_updated_at; Type: INDEX; Schema: coord; Owner: -
---
-
-CREATE INDEX idx_plans_updated_at ON coord.plans USING btree (updated_at DESC);
 
 
 --
@@ -21124,6 +21806,20 @@ CREATE INDEX idx_route_serving_observations_observed_at ON coord.route_serving_o
 
 
 --
+-- Name: idx_scheduler_ticks_repo_tick_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_scheduler_ticks_repo_tick_at ON coord.scheduler_ticks USING btree (repo, tick_at DESC);
+
+
+--
+-- Name: idx_scheduler_ticks_tick_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_scheduler_ticks_tick_at ON coord.scheduler_ticks USING btree (tick_at);
+
+
+--
 -- Name: idx_schema_drift_events_event_at; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -21250,31 +21946,24 @@ CREATE UNIQUE INDEX idx_tasks_emergent_per_session ON coord.tasks USING btree (a
 
 
 --
--- Name: idx_tasks_phase; Type: INDEX; Schema: coord; Owner: -
---
-
-CREATE INDEX idx_tasks_phase ON coord.tasks USING btree (plan_id, phase_name, sequence_in_phase);
-
-
---
--- Name: idx_tasks_plan; Type: INDEX; Schema: coord; Owner: -
---
-
-CREATE INDEX idx_tasks_plan ON coord.tasks USING btree (plan_id);
-
-
---
--- Name: idx_tasks_plan_identity_hash; Type: INDEX; Schema: coord; Owner: -
---
-
-CREATE UNIQUE INDEX idx_tasks_plan_identity_hash ON coord.tasks USING btree (plan_id, identity_hash) WHERE (identity_hash IS NOT NULL);
-
-
---
 -- Name: idx_tasks_status; Type: INDEX; Schema: coord; Owner: -
 --
 
 CREATE INDEX idx_tasks_status ON coord.tasks USING btree (status);
+
+
+--
+-- Name: idx_tasks_work_unit; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_tasks_work_unit ON coord.tasks USING btree (work_unit_id) WHERE (work_unit_id IS NOT NULL);
+
+
+--
+-- Name: idx_tenant_devices_device; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_tenant_devices_device ON coord.tenant_devices USING btree (device_id);
 
 
 --
@@ -21565,6 +22254,13 @@ CREATE INDEX ix_ci_runs_inflight ON coord.ci_runs USING btree (repo, head_branch
 
 
 --
+-- Name: ix_claude_account_usage_tenant_updated; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_claude_account_usage_tenant_updated ON coord.claude_account_usage USING btree (tenant_id, updated_at DESC);
+
+
+--
 -- Name: ix_commit_observations_changed_files_gin; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -21621,6 +22317,20 @@ CREATE INDEX ix_commit_verifications_signature ON coord.commit_verifications USI
 
 
 --
+-- Name: ix_consistent_snapshots_latest; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_consistent_snapshots_latest ON coord.consistent_snapshots USING btree (consistent, computed_at DESC);
+
+
+--
+-- Name: ix_consistent_snapshots_tenant; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_consistent_snapshots_tenant ON coord.consistent_snapshots USING btree (tenant_id) WHERE (tenant_id IS NOT NULL);
+
+
+--
 -- Name: ix_continuation_dispatches_active; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -21632,6 +22342,20 @@ CREATE INDEX ix_continuation_dispatches_active ON coord.continuation_dispatches 
 --
 
 CREATE INDEX ix_coord_sessions_task_run_id ON coord.sessions USING btree (task_run_id) WHERE (task_run_id IS NOT NULL);
+
+
+--
+-- Name: ix_expectation_probes_expectation; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_expectation_probes_expectation ON coord.expectation_probes USING btree (expectation_id, status);
+
+
+--
+-- Name: ix_expectation_probes_pending; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_expectation_probes_pending ON coord.expectation_probes USING btree (device_id, status, requested_at) WHERE (status = ANY (ARRAY['pending'::text, 'delivered'::text]));
 
 
 --
@@ -21663,6 +22387,20 @@ CREATE INDEX ix_migration_reservations_repo_active ON coord.migration_reservatio
 
 
 --
+-- Name: ix_policy_clauses_document_position; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_policy_clauses_document_position ON coord.policy_clauses USING btree (document_id, "position");
+
+
+--
+-- Name: ix_policy_clauses_tenant; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_policy_clauses_tenant ON coord.policy_clauses USING btree (tenant_id);
+
+
+--
 -- Name: ix_primary_trees_app_id; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -21691,6 +22429,13 @@ CREATE INDEX ix_runner_sessions_user_id ON coord.device_connections USING btree 
 
 
 --
+-- Name: ix_session_expectations_open; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_session_expectations_open ON coord.session_expectations USING btree (tenant_id, status, soft_deadline_at) WHERE (status = ANY (ARRAY['open'::text, 'overdue'::text, 'escalating'::text]));
+
+
+--
 -- Name: ix_test_targets_app; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -21712,6 +22457,13 @@ CREATE UNIQUE INDEX uq_alerts_active_key ON coord.alerts USING btree (alert_key)
 
 
 --
+-- Name: uq_ci_dispatches_active_proposal; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_ci_dispatches_active_proposal ON coord.ci_dispatches USING btree (proposal_id) WHERE (state = ANY (ARRAY['queued'::text, 'dispatched'::text, 'running'::text]));
+
+
+--
 -- Name: uq_continuation_dispatches_gate; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -21726,6 +22478,27 @@ CREATE UNIQUE INDEX uq_fleet_runtime_policy_scope ON coord.fleet_runtime_policy 
 
 
 --
+-- Name: uq_memory_links_edge; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_memory_links_edge ON coord.memory_links USING btree (tenant_id, source_id, target_id, relation);
+
+
+--
+-- Name: uq_memory_records_tenant_content_hash_live; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_memory_records_tenant_content_hash_live ON coord.memory_records USING btree (tenant_id, content_hash) WHERE ((is_tombstone = false) AND (superseded_by IS NULL) AND (valid_until IS NULL));
+
+
+--
+-- Name: uq_memory_synthesis_jobs_live_member_set; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_memory_synthesis_jobs_live_member_set ON coord.memory_synthesis_jobs USING btree (tenant_id, member_set_hash) WHERE (status = ANY (ARRAY['pending'::text, 'claimed'::text, 'done'::text]));
+
+
+--
 -- Name: uq_plan_pr_citations_dedupe; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -21733,10 +22506,17 @@ CREATE UNIQUE INDEX uq_plan_pr_citations_dedupe ON coord.plan_pr_citations USING
 
 
 --
--- Name: uq_plans_slug; Type: INDEX; Schema: coord; Owner: -
+-- Name: uq_policy_documents_tenant_handle; Type: INDEX; Schema: coord; Owner: -
 --
 
-CREATE UNIQUE INDEX uq_plans_slug ON coord.plans USING btree (slug) WHERE (slug IS NOT NULL);
+CREATE UNIQUE INDEX uq_policy_documents_tenant_handle ON coord.policy_documents USING btree (tenant_id, handle);
+
+
+--
+-- Name: uq_policy_rules_tenant_override; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_policy_rules_tenant_override ON coord.policy_rules USING btree (tenant_id, overrides_system_rule_id) WHERE (overrides_system_rule_id IS NOT NULL);
 
 
 --
@@ -21744,6 +22524,20 @@ CREATE UNIQUE INDEX uq_plans_slug ON coord.plans USING btree (slug) WHERE (slug 
 --
 
 CREATE UNIQUE INDEX uq_priority_sets_tenant_name_repo ON coord.priority_sets USING btree (tenant_id, set_name, COALESCE(repo, ''::text)) WHERE (enabled = true);
+
+
+--
+-- Name: uq_prompt_document_versions_doc_version; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_prompt_document_versions_doc_version ON coord.prompt_document_versions USING btree (document_id, version_number);
+
+
+--
+-- Name: uq_prompt_documents_tenant_kind_name; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_prompt_documents_tenant_kind_name ON coord.prompt_documents USING btree (tenant_id, kind, name);
 
 
 --
@@ -27081,6 +27875,13 @@ CREATE INDEX ix_render_logs_session_timestamp ON project.render_logs USING btree
 
 
 --
+-- Name: ix_scheduled_workflow_runs_next_fire_at; Type: INDEX; Schema: project; Owner: -
+--
+
+CREATE INDEX ix_scheduled_workflow_runs_next_fire_at ON project.scheduled_workflow_runs USING btree (next_fire_at);
+
+
+--
 -- Name: ix_scheduled_workflow_runs_user_id; Type: INDEX; Schema: project; Owner: -
 --
 
@@ -28527,7 +29328,7 @@ ALTER TABLE ONLY coord.device_status
 --
 
 ALTER TABLE ONLY coord.device_status
-    ADD CONSTRAINT device_status_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES coord.tenants(tenant_id) ON DELETE SET NULL;
+    ADD CONSTRAINT device_status_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES coord.tenants(tenant_id) ON DELETE CASCADE;
 
 
 --
@@ -28579,6 +29380,14 @@ ALTER TABLE ONLY coord.git_ops
 
 
 --
+-- Name: github_user_tokens github_user_tokens_tenant_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.github_user_tokens
+    ADD CONSTRAINT github_user_tokens_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES coord.tenants(tenant_id) ON DELETE CASCADE;
+
+
+--
 -- Name: gui_lock gui_lock_holder_session_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -28624,6 +29433,54 @@ ALTER TABLE ONLY coord.memories
 
 ALTER TABLE ONLY coord.memory_federation_reports
     ADD CONSTRAINT memory_federation_reports_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES coord.tenants(tenant_id);
+
+
+--
+-- Name: memory_links memory_links_source_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.memory_links
+    ADD CONSTRAINT memory_links_source_id_fkey FOREIGN KEY (source_id) REFERENCES coord.memory_records(memory_id) ON DELETE CASCADE;
+
+
+--
+-- Name: memory_links memory_links_target_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.memory_links
+    ADD CONSTRAINT memory_links_target_id_fkey FOREIGN KEY (target_id) REFERENCES coord.memory_records(memory_id) ON DELETE CASCADE;
+
+
+--
+-- Name: memory_links memory_links_tenant_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.memory_links
+    ADD CONSTRAINT memory_links_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES coord.tenants(tenant_id) ON DELETE RESTRICT;
+
+
+--
+-- Name: memory_records memory_records_superseded_by_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.memory_records
+    ADD CONSTRAINT memory_records_superseded_by_fkey FOREIGN KEY (superseded_by) REFERENCES coord.memory_records(memory_id);
+
+
+--
+-- Name: memory_records memory_records_tenant_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.memory_records
+    ADD CONSTRAINT memory_records_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES coord.tenants(tenant_id) ON DELETE RESTRICT;
+
+
+--
+-- Name: memory_synthesis_jobs memory_synthesis_jobs_tenant_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.memory_synthesis_jobs
+    ADD CONSTRAINT memory_synthesis_jobs_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES coord.tenants(tenant_id) ON DELETE CASCADE;
 
 
 --
@@ -28715,19 +29572,19 @@ ALTER TABLE ONLY coord.operators
 
 
 --
--- Name: plan_status_history plan_status_history_plan_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
+-- Name: policy_clauses policy_clauses_document_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
 --
 
-ALTER TABLE ONLY coord.plan_status_history
-    ADD CONSTRAINT plan_status_history_plan_id_fkey FOREIGN KEY (plan_id) REFERENCES coord.plans(id) ON DELETE CASCADE;
+ALTER TABLE ONLY coord.policy_clauses
+    ADD CONSTRAINT policy_clauses_document_id_fkey FOREIGN KEY (document_id) REFERENCES coord.prompt_documents(id) ON DELETE CASCADE;
 
 
 --
--- Name: plans plans_tenant_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
+-- Name: policy_rules policy_rules_overrides_system_rule_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
 --
 
-ALTER TABLE ONLY coord.plans
-    ADD CONSTRAINT plans_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES coord.tenants(tenant_id) ON DELETE SET NULL;
+ALTER TABLE ONLY coord.policy_rules
+    ADD CONSTRAINT policy_rules_overrides_system_rule_id_fkey FOREIGN KEY (overrides_system_rule_id) REFERENCES coord.policy_rules(policy_id) ON DELETE CASCADE;
 
 
 --
@@ -28776,6 +29633,14 @@ ALTER TABLE ONLY coord.primary_trees
 
 ALTER TABLE ONLY coord.process_session_output
     ADD CONSTRAINT process_session_output_session_id_fkey FOREIGN KEY (session_id) REFERENCES coord.process_sessions(id) ON DELETE CASCADE;
+
+
+--
+-- Name: prompt_document_versions prompt_document_versions_document_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.prompt_document_versions
+    ADD CONSTRAINT prompt_document_versions_document_id_fkey FOREIGN KEY (document_id) REFERENCES coord.prompt_documents(id) ON DELETE CASCADE;
 
 
 --
@@ -28859,11 +29724,19 @@ ALTER TABLE ONLY coord.speculative_chains
 
 
 --
--- Name: tasks tasks_plan_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
+-- Name: tenant_devices tenant_devices_device_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
 --
 
-ALTER TABLE ONLY coord.tasks
-    ADD CONSTRAINT tasks_plan_id_fkey FOREIGN KEY (plan_id) REFERENCES coord.plans(id) ON DELETE CASCADE;
+ALTER TABLE ONLY coord.tenant_devices
+    ADD CONSTRAINT tenant_devices_device_id_fkey FOREIGN KEY (device_id) REFERENCES coord.devices(device_id) ON DELETE CASCADE;
+
+
+--
+-- Name: tenant_devices tenant_devices_tenant_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.tenant_devices
+    ADD CONSTRAINT tenant_devices_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES coord.tenants(tenant_id) ON DELETE CASCADE;
 
 
 --
