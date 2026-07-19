@@ -978,17 +978,32 @@ pub fn terminal_session_list_open(
     // and is silently lost. `disk_only_restore_candidates` scans every Claude
     // config dir (dynamic account enumeration via `find_claude_config_dirs` —
     // NOT a hardcoded account list) for recently-active transcripts and offers
-    // the registry-ABSENT ones under the account that holds each transcript. We
-    // exclude EVERY id the registry already tracks (`all_ids`, not just the
-    // restorable subset) so a restorable row keeps its real page/zone/layout
-    // and a user-CLOSED / orphan row is never resurrected by a fresh mtime.
+    // the registry-ABSENT ones under the account that holds each transcript.
+    //
+    // Exclusion set (P3 fix): the restorable-set ids UNION every CLOSED row's
+    // id — deliberately NOT `all_ids()`. `all_ids()` also excluded registry
+    // rows that are `open` yet DROPPED by the restorable grace gate (the
+    // Phase-1 cohort-anchor victims: an open row a crash-restart couldn't
+    // admit), making them invisible to BOTH paths — not restorable AND not
+    // disk-recoverable. By excluding only restorable + closed ids, exactly
+    // those open grace-gate victims can now LEAK into the quarantined
+    // disk-only net (if a fresh transcript exists). Closed rows never leak:
+    // whether user-closed (`no-terminal`/explicit) or a grace-EXPIRED
+    // `pty-exit`/`poll-dead`, their close encodes a "do not restore" decision,
+    // so a fresh mtime must not resurrect them (the don't-resurrect-a-closed-
+    // tab property the old `all_ids` exclusion was buying). In-grace
+    // `pty-exit`/`poll-dead` closes are already in the restorable set, so they
+    // stay excluded too — the union just additionally covers grace-expired and
+    // user closes.
+    //
     // These candidates are `origin=reconciled`+unconfirmed, so the frontend
     // classifier quarantines them behind the one-click verified-resume
     // handshake — never a blind `--resume`. Fail-open by construction: a scan
     // failure yields zero extra candidates, degrading to today's registry-only
     // set.
-    let registry_ids = store.all_ids();
-    let disk_only = crate::session::reconcile::disk_only_restore_candidates(now, &registry_ids);
+    let mut excluded = store.closed_ids();
+    excluded.extend(sessions.iter().map(|r| r.claude_session_id.clone()));
+    let disk_only = crate::session::reconcile::disk_only_restore_candidates(now, &excluded);
     if !disk_only.is_empty() {
         tracing::info!(
             count = disk_only.len(),
