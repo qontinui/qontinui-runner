@@ -16,6 +16,7 @@ import { describe, it, expect } from "vitest";
 
 import {
   reconcilePages,
+  computeVisiblePages,
   pageIdsFromTerminals,
   pageIdsFromSessions,
   type TerminalPageConfig,
@@ -130,5 +131,55 @@ describe("reconcilePages", () => {
     const out = reconcilePages([DEFAULT], ["a", "b"]);
     const names = out.filter((p) => p.id !== "default").map((p) => p.name);
     expect(names).toEqual(["Page 1", "Page 2"]);
+  });
+});
+
+describe("computeVisiblePages (default-tab visibility)", () => {
+  const OP_A: TerminalPageConfig = { id: "op-a", name: "My Work", createdAt: 100 };
+  const OP_B: TerminalPageConfig = { id: "op-b", name: "Logs", createdAt: 200 };
+
+  it("hides the empty 'default' page from the tab strip when other pages exist", () => {
+    // The P6 boot bug: default persisted but holds no live/restorable session.
+    const out = computeVisiblePages([OP_A, DEFAULT], new Set());
+    expect(out.map((p) => p.id)).toEqual(["op-a"]);
+  });
+
+  it("shows the 'default' page as soon as it hosts ≥1 session (681e1112f home preserved)", () => {
+    // An API-created terminal (POST /terminals, no pageId) lands on "default";
+    // reconcile puts "default" in occupiedPageIds → the tab must reappear.
+    const out = computeVisiblePages([OP_A, DEFAULT], new Set(["default"]));
+    expect(out.map((p) => p.id)).toEqual(["op-a", "default"]);
+  });
+
+  it("always shows a USER page even when it hosts zero sessions", () => {
+    // Only "default" is special-cased; an operator-created empty page still
+    // renders its tab (they made it on purpose — predictability).
+    const out = computeVisiblePages([OP_A, OP_B, DEFAULT], new Set(["op-a"]));
+    // op-a occupied, op-b empty (still shown), default empty (hidden).
+    expect(out.map((p) => p.id)).toEqual(["op-a", "op-b"]);
+  });
+
+  it("shows a solo empty 'default' rather than rendering an empty tab strip (first boot)", () => {
+    // Never leave the active page without a visible tab: if hiding the empty
+    // default would leave nothing, show it anyway.
+    const out = computeVisiblePages([DEFAULT], new Set());
+    expect(out.map((p) => p.id)).toEqual(["default"]);
+  });
+
+  it("active-page fallback: hiding an active empty default leaves a visible page to activate", () => {
+    // The hook's normalize-active effect activates visiblePages[0] when the
+    // active id has no visible tab. With default active+hidden, the first
+    // visible page is a real, selectable tab — never the hidden default.
+    const visible = computeVisiblePages([DEFAULT, OP_A], new Set(["op-a"]));
+    expect(visible.map((p) => p.id)).toEqual(["op-a"]);
+    expect(visible.some((p) => p.id === "default")).toBe(false);
+    expect(visible.length).toBeGreaterThan(0);
+    expect(visible[0].id).toBe("op-a");
+  });
+
+  it("returns the input array (same order) untouched when nothing needs hiding", () => {
+    const pages = [OP_A, DEFAULT];
+    const out = computeVisiblePages(pages, new Set(["op-a", "default"]));
+    expect(out.map((p) => p.id)).toEqual(["op-a", "default"]);
   });
 });

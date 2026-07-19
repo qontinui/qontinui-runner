@@ -100,6 +100,41 @@ export function pageIdsFromSessions(sessions: Array<{ pageId?: string }>): strin
   return sessions.map((s) => s.pageId ?? "default");
 }
 
+/**
+ * The pages to RENDER as tabs in the tab strip. Identical to `pages` except the
+ * INTERNAL "default" page is hidden while it hosts zero live/restorable sessions.
+ *
+ * Commit 681e1112f renders "default" as a tab so API-created terminals (a
+ * `POST /terminals` with no `pageId` lands on "default") have a reachable home;
+ * but on a normal boot with nothing parked there that surfaced an empty,
+ * confusing "Terminal" tab (the 2026-07-19 mass-strand boot). We keep
+ * 681e1112f's benefit WITHOUT the empty-boot tab: `occupiedPageIds` is the set
+ * of page ids that currently host at least one live terminal OR restorable
+ * session (built by `reconcile` from the SAME `terminal_list` +
+ * `terminal_session_list_open` sources that synthesize the tab), so the moment a
+ * terminal or restorable session lands on "default" it re-enters that set and
+ * the tab reappears instantly.
+ *
+ * Only "default" is special-cased. A USER-created page always shows its tab even
+ * when empty — the operator made it on purpose, so predictability wins over
+ * auto-hiding.
+ *
+ * Never returns an empty list: if hiding the empty default would leave no tabs
+ * at all (default is the only page and nothing is parked on it — e.g. the very
+ * first boot), we show it anyway. A single empty default tab is strictly better
+ * than a blank tab strip with no active/visible tab.
+ *
+ * Pure + exported so the derivation is unit-testable without React/Tauri (same
+ * precedent as `reconcilePages`).
+ */
+export function computeVisiblePages(
+  pages: TerminalPageConfig[],
+  occupiedPageIds: ReadonlySet<string>,
+): TerminalPageConfig[] {
+  const visible = pages.filter((p) => p.id !== "default" || occupiedPageIds.has("default"));
+  return visible.length > 0 ? visible : pages;
+}
+
 export function reconcilePages(
   persisted: TerminalPageConfig[],
   backendPageIds: Iterable<string>,
@@ -144,6 +179,18 @@ export function useTerminalPages() {
   const [boundPages, setBoundPages] = useState<Record<string, string>>(getPageBindings);
   useEffect(() => subscribePageBindings(() => setBoundPages(getPageBindings())), []);
 
+  // Page ids that currently host at least one live terminal OR restorable
+  // session — the "occupied" signal that decides whether the internal "default"
+  // page earns a visible tab (see `computeVisiblePages`). Populated by
+  // `reconcile` from the exact same backend sources that synthesize tabs, so a
+  // terminal landing on "default" both mints its tab AND lights it as occupied
+  // in one pass. Empty until the first reconcile resolves; a truly-empty default
+  // is hidden (or shown solo via the never-empty fallback), which is the desired
+  // boot behavior.
+  const [occupiedPageIds, setOccupiedPageIds] = useState<ReadonlySet<string>>(
+    () => new Set<string>(),
+  );
+
   const setActivePageId = useCallback(
     (id: string) => {
       if (isPinned) return; // pinned window: active page is fixed
@@ -163,6 +210,16 @@ export function useTerminalPages() {
     }
     return allPages.filter((p) => !boundPages[p.id]);
   }, [isPinned, pinnedPageId, allPages, boundPages]);
+
+  // The subset of `pages` rendered as TABS: same as `pages` but the internal
+  // "default" page is hidden while it hosts zero live/restorable sessions (keeps
+  // 681e1112f's API-terminal home without the empty-boot "Terminal" tab). Drives
+  // the tab strip AND the active-page fallback below, so the active page is
+  // always one with a visible tab. See `computeVisiblePages`.
+  const visiblePages = useMemo<TerminalPageConfig[]>(
+    () => computeVisiblePages(pages, occupiedPageIds),
+    [pages, occupiedPageIds],
+  );
 
   const addPage = useCallback(
     (name: string) => {
@@ -309,6 +366,13 @@ export function useTerminalPages() {
       // Best effort
     }
 
+    // Record occupancy from the SAME unioned id set: `ids` is exactly the page
+    // ids that currently host ≥1 live terminal (terminal_list) or restorable
+    // session (terminal_session_list_open). This is what `computeVisiblePages`
+    // reads to decide whether the "default" tab is earned. A fresh Set so the
+    // memo sees a new reference and recomputes.
+    setOccupiedPageIds(new Set(ids));
+
     setPages((prev) => {
       const next = reconcilePages(prev, ids);
       if (next === prev) return prev; // nothing missing — no persist / no re-render
@@ -357,12 +421,14 @@ export function useTerminalPages() {
   }, [reconcile, isPinned]);
 
   // Keep the active page valid for the MAIN window: when the active page gets
-  // detached into a pop-out (or otherwise disappears from the visible set),
-  // fall back to the first visible page. If EVERY page is detached, mint a
-  // fresh docked page so the main window always has something to show.
+  // detached into a pop-out (or is the empty "default" page we now hide), fall
+  // back to the first visible page so the operator is never stranded on a page
+  // with no tab. If EVERY page is detached, mint a fresh docked page so the main
+  // window always has something to show. Derived from `visiblePages` (not
+  // `pages`) so the hidden-empty-default case triggers the fallback too.
   useEffect(() => {
     if (isPinned) return;
-    const visibleIds = pages.map((p) => p.id);
+    const visibleIds = visiblePages.map((p) => p.id);
     if (visibleIds.length === 0) {
       // Intentional sync from an EXTERNAL system (page bindings written by other
       // windows): the active page was detached out from under us with no docked
@@ -376,10 +442,18 @@ export function useTerminalPages() {
     if (!visibleIds.includes(activePageId)) {
       setActivePageId(visibleIds[0]);
     }
-  }, [isPinned, pages, activePageId, addPage, setActivePageId]);
+  }, [isPinned, visiblePages, activePageId, addPage, setActivePageId]);
 
   return {
     pages,
+    /**
+     * The pages to render as TABS — `pages` minus the internal "default" page
+     * when it hosts no live/restorable session (see `computeVisiblePages`).
+     * Consumers that HOST sessions (session provider, reorganize) use `pages`
+     * (the full set, so a hidden-but-live default still hosts its terminals);
+     * only the tab strip renders `visiblePages`.
+     */
+    visiblePages,
     activePageId,
     setActivePageId,
     addPage,
