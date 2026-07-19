@@ -319,7 +319,8 @@ fn read_head_lines(path: &Path, max_lines: usize) -> Option<String> {
 /// (multi-MB) transcript is never loaded. Returns the LAST `custom-title`, else
 /// the last `summary` in the head slice, else `None`.
 pub fn extract_resume_name_from_path(path: &Path) -> Option<String> {
-    if let Some(name) = read_tail_bytes(path, 64 * 1024).and_then(|tail| last_custom_title(tail.lines()))
+    if let Some(name) =
+        read_tail_bytes(path, 64 * 1024).and_then(|tail| last_custom_title(tail.lines()))
     {
         return Some(name);
     }
@@ -2090,7 +2091,9 @@ mod tests {
                 "{{\"type\":\"assistant\",\"uuid\":\"a{i}\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"line {i}\"}}]}}}}\n"
             ));
         }
-        content.push_str("{\"type\":\"custom-title\",\"customTitle\":\"Tail rename\",\"sessionId\":\"z\"}\n");
+        content.push_str(
+            "{\"type\":\"custom-title\",\"customTitle\":\"Tail rename\",\"sessionId\":\"z\"}\n",
+        );
         std::fs::write(&path, content).unwrap();
         assert_eq!(
             extract_resume_name_from_path(&path).as_deref(),
