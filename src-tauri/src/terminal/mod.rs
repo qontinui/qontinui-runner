@@ -74,6 +74,11 @@ recording it via coord_request_policy / coord_record_decision. Only a \
 question a human must answer goes to coord_ask_question — after asking, you \
 will be left alone until it is answered.
 
+When no policy clause covers a decision and you apply a category-default tier \
+to proceed, report the gap so a clause can be authored: \
+coord_ask_question(policy_gap={{category, proposed_clause, tier_applied}}). \
+With tier_applied set it records non-blocking (pre-answered) — you do not wait.
+
 Report status transitions via coord_report_status \
 (working | blocked | waiting_human | finished). Set finished only after \
 cleanup (worktrees, branches) is done.
