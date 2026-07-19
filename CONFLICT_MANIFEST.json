@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "base_sha": "501146bc62672a2e4e2f0dca678224d9e18db07d",
+  "ours_sha": "24573c2e7af25817ca2a7a3f2f3d8e9dc8b2c4af",
+  "theirs_sha": "74da12fb87a6cd3a92469e3d9e45de3cf2167782",
+  "entries": [
+    {
+      "path": "src/components/terminal/SessionManagerPanel.tsx",
+      "base_oid": "3a22b82c95de9ef580f662a9befa3bb62a0b23d5",
+      "ours_oid": "2bbd7f88b8daa7eadbd9cf6b331f2a6b59c03026",
+      "theirs_oid": "b4e424ac72594cb4f9fcf24c34ed1d533627f118",
+      "base_path": "src/components/terminal/SessionManagerPanel.tsx.base",
+      "ours_path": "src/components/terminal/SessionManagerPanel.tsx.ours",
+      "theirs_path": "src/components/terminal/SessionManagerPanel.tsx.theirs",
+      "hunks": [
+        "<<<<<<< HEAD\nimport { TerminalSquare, X, CheckSquare } from \"lucide-react\";\nimport { SessionManagerHeader } from \"./SessionManagerHeader\";\nimport { SessionCard } from \"./SessionCard\";\nimport { WorktreesPanel } from \"../worktrees/WorktreesPanel\";\n=======\nimport { TerminalSquare, X, CheckSquare, History, Radio } from \"lucide-react\";\nimport { SessionManagerHeader } from \"./SessionManagerHeader\";\nimport { SessionCard } from \"./SessionCard\";\nimport { PastSessionsView } from \"./PastSessionsView\";\nimport type { PastSession } from \"./usePastSessions\";\n>>>>>>> 5ef427df (feat(runner): previous-sessions listing with real /resume names)\n",
+        "<<<<<<< HEAD\n\n      {/*\n        Worktrees panel — sibling of the session list. The on-demand,\n        human-consented cleanup trigger (plan\n        `2026-07-19-worktree-cleanup-lifecycle-tracking` Phase 4). Collapsed\n        by default so it costs nothing until asked for; `SessionCard`'s\n        worktree affordance opens it focused on that session's worktree.\n      */}\n      <WorktreesPanel defaultOpen={worktreeFocus !== null} highlightPath={worktreeFocus} />\n=======\n        </>\n      )}\n>>>>>>> 5ef427df (feat(runner): previous-sessions listing with real /resume names)\n"
+      ]
+    }
+  ]
+}
