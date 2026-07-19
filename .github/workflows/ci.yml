@@ -235,35 +235,44 @@ jobs:
       # Phase 1. A COMPILATION cache for the workspace's OWN crates. rust-cache
       # (above) restores dependency artifacts but PRUNES workspace-member
       # artifacts at save time, so qontinui-runner's crates recompile every run
-      # at three differing flag-sets (Clippy / cargo test / tauri build; the
-      # cache-comment above measured ~17+12+13 min of that). sccache caches
-      # those rustc invocations across steps AND across runs via the GHA backend
-      # (same branch-isolation as rust-cache — `main` saves warm candidates/PRs).
+      # at differing flag-sets (cargo test / tauri build — clippy is unwrapped
+      # below). sccache caches those rustc invocations across steps AND runs.
       # It COMPOSES WITH rust-cache; it does not replace it.
       #
-      # FAIL-OPEN by construction, in THREE parts (the 2026-07-17 red proved the
-      # original two were not enough): (1) the install is continue-on-error;
-      # (2) RUSTC_WRAPPER is exported ONLY when the sccache binary is present;
-      # (3) a preflight probe (below) round-trips the cache backend and UNSETS
-      # the wrapper if it can't be reached — so a GHA-cache outage or a mis-wired
-      # token can NEVER red a required check (test / seam-gate); the build just
-      # falls back to plain rustc. This is a MEASURED SPIKE: compare
-      # `sccache --show-stats` hit-rate + step wall-clock against warm rust-cache
-      # over >=10 runs before making it load-bearing (a green run != "adopt").
+      # BACKEND = LOCAL DISK, cached via actions/cache. The GHA backend was tried
+      # first (2026-07-17 → 2026-07-19) and is UNWORKABLE with the current
+      # sccache: 0.16.0 is the LATEST release and speaks only the RETIRED Actions
+      # Cache v1 API, while GitHub now serves Cache Service v2 (runners export
+      # ACTIONS_CACHE_SERVICE_V2=on + ACTIONS_RESULTS_URL=…results-receiver…).
+      # sccache's ghac backend can't init against v2, OpenDAL falls through to an
+      # S3 credential provider, and every compile died on "request to AWS EC2
+      # Metadata Services failed". There is no newer sccache to bump to. Local
+      # disk has zero network/credential surface; actions/cache gives the same
+      # cross-run warmth (branch-isolated — `main` saves warm PRs/candidates).
       #
-      # SCCACHE_GHA_ENABLED MUST be `env:` on the action step, NOT written to
-      # $GITHUB_ENV afterward: the action reads it at eval time and re-exports
-      # the GitHub Actions cache token (ACTIONS_RESULTS_URL + ACTIONS_RUNTIME_TOKEN,
-      # otherwise invisible to plain run-steps) into $GITHUB_ENV for the compile
-      # steps. Setting it after the fact left the auto-started sccache server with
-      # no backend, so it fell through to an S3/AWS path and died on
-      # "request to AWS EC2 Metadata Services failed" — the spike's original red.
+      # FAIL-OPEN by construction: (1) install is continue-on-error; (2)
+      # RUSTC_WRAPPER is exported ONLY when the sccache binary is present; (3) a
+      # preflight probe (below) confirms the server starts + a compile round-trips
+      # the disk cache, and UNSETS the wrapper otherwise — so a broken cache can
+      # NEVER red a required check (test / seam-gate); the build falls back to
+      # plain rustc. This is a MEASURED SPIKE: compare `sccache --show-stats`
+      # hit-rate + step wall-clock against warm rust-cache over >=10 runs before
+      # making it load-bearing (a green run != "adopt").
       - name: Install sccache (spike; fail-open)
         id: sccache_install
         continue-on-error: true
         uses: mozilla/sccache-action@v0.0.10
-        env:
-          SCCACHE_GHA_ENABLED: "true"
+
+      # Restore/save the sccache local-disk cache. github.run_id keeps each save
+      # unique (immutable-key friendly); the prefix restore-key warms from the
+      # most recent prior run on this branch or its base (default) branch.
+      - name: Cache sccache compilation artifacts (spike)
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-v1-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-v1-${{ runner.os }}-
 
       - name: Enable sccache wrapper if available
         shell: bash
@@ -272,26 +281,25 @@ jobs:
             echo "sccache present: $(command -v sccache) — $(sccache --version 2>/dev/null | head -1)"
             {
               echo "RUSTC_WRAPPER=sccache"
+              # Local-disk backend; bound its size for actions/cache limits.
+              echo "SCCACHE_DIR=${RUNNER_TEMP}/sccache"
+              echo "SCCACHE_CACHE_SIZE=3G"
               # sccache cannot cache incremental artifacts; CI is effectively
               # non-incremental anyway, so disabling it lets the cache populate.
               echo "CARGO_INCREMENTAL=0"
               echo "SCCACHE_ERROR_LOG=${RUNNER_TEMP}/sccache.log"
               echo "SCCACHE_LOG=warn"
             } >> "$GITHUB_ENV"
-            # NB: do NOT start the server here — this step's process env does not
-            # yet carry the GHA backend vars (they land in $GITHUB_ENV for the
-            # NEXT step). The server auto-starts in the preflight below, where the
-            # backend is fully configured. Starting it here booted it backendless.
           else
             echo "::warning::sccache unavailable — building without a compilation cache (fail-open, rustc direct)."
           fi
 
-      # Preflight probe — the only reliable fail-open guard. RUSTC_WRAPPER +
-      # SCCACHE_GHA_ENABLED + the re-exported tokens are all applied by now, so a
-      # trivial `sccache rustc` genuinely exercises the backend. If it fails, the
-      # wrapper is cleared for every later step (plain rustc, no red); if it
-      # succeeds, stats are zeroed so the end-of-job measurement reflects the real
-      # build, not this probe.
+      # Preflight probe — the fail-open guard. SCCACHE_DIR + RUSTC_WRAPPER are
+      # applied by now, so the server starts against the disk cache and a trivial
+      # compile round-trips it. Local disk has no credential/network failure mode,
+      # so this is a binary-present + server-healthy check; on any failure the
+      # wrapper is cleared for every later step (plain rustc, no red). On success
+      # stats are zeroed so the end-of-job measurement reflects the real build.
       - name: sccache preflight (fail-open probe)
         if: env.RUSTC_WRAPPER == 'sccache'
         shell: bash
@@ -301,10 +309,10 @@ jobs:
           echo 'pub fn _p() -> u8 { 0 }' > "$probe"
           if sccache rustc --crate-name sccache_probe --crate-type lib "$probe" \
                --out-dir "${RUNNER_TEMP}/sccache_probe_out" 2> "$err"; then
-            echo "sccache preflight OK — backend reachable, wrapper stays active."
+            echo "sccache preflight OK — server healthy, disk cache writable."
             sccache --zero-stats >/dev/null 2>&1 || true
           else
-            echo "::warning::sccache preflight FAILED — disabling the wrapper for this run (fail-open, plain rustc). Backend error:"
+            echo "::warning::sccache preflight FAILED — disabling the wrapper for this run (fail-open, plain rustc). Error:"
             sed 's/^/  sccache-probe: /' "$err" 2>/dev/null || true
             # Clear the wrapper for all subsequent steps and stop the bad server.
             echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
