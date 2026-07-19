@@ -415,7 +415,16 @@ impl SessionLifecycleStore {
             entry.page_id = rec.page_id;
             entry.zone_index = rec.zone_index;
             entry.title = rec.title;
-            entry.terminal_id = rec.terminal_id;
+            // terminal_id is STICKY against an empty/placeholder incoming (like
+            // the `config_dir` guard above): a write that omits the terminal —
+            // an empty/whitespace-only id (a disk-only record, a provider that
+            // didn't report it) — must NOT clobber a real binding. Clobbering it
+            // would orphan the row AND dodge the single-tenant-terminal invariant
+            // below (which is gated on a non-empty terminal_id). Take the incoming
+            // value only when it names a terminal.
+            if !rec.terminal_id.trim().is_empty() {
+                entry.terminal_id = rec.terminal_id;
+            }
             entry.provider = rec.provider;
             // Unasserted origin (zone-move backstop / boot re-assert) must not
             // degrade an authoritative binding to reconciled — preserve on
@@ -458,17 +467,32 @@ impl SessionLifecycleStore {
             // pinned id at SHELL spawn, but an account/CLI launcher then TYPES
             // `claude --session-id <its own id>` into that shell, so the seam's
             // row and the launcher's row bind the same terminal under two ids —
-            // the seam row is the orphan (unconfirmed, no transcript). Only
-            // unconfirmed victims are closed: a confirmed row represents a
-            // session that actually started and is retired by the normal
-            // exit / poll-dead path, never here.
+            // the seam row is the orphan (unconfirmed, no transcript).
+            //
+            // Two eviction arms, distinguished so the registry + logs stay
+            // readable:
+            //   * UNCONFIRMED sibling → `"superseded"` — the phantom seam row
+            //     above. Retired by ANY authoritative-or-confirmed incoming.
+            //   * CONFIRMED sibling → `"superseded-terminal-reuse"` — a PRIOR
+            //     real run whose exit-close never fired (crash / missed poll) on
+            //     a PTY that a long-lived shell then reused for the next `claude`
+            //     run. A terminal hosts ONE live session at a time, so when a NEW
+            //     CONFIRMED session binds it the prior confirmed run is a
+            //     superseded previous tenant and must be closed — otherwise these
+            //     accumulate as stale `open` confirmed rows and collapse onto one
+            //     terminal at restore (the P4 mass-strand). Gated on
+            //     `new_is_confirmed`: only a NEW CONFIRMED binding retires a prior
+            //     confirmed sibling — an authoritative-but-UNCONFIRMED incoming
+            //     (itself not yet proven) must NOT evict a confirmed row.
             if (new_is_authoritative || new_is_confirmed) && !new_terminal_id.is_empty() {
                 for other in m.values_mut() {
-                    if other.claude_session_id != new_id
-                        && other.terminal_id == new_terminal_id
-                        && other.state == "open"
-                        && other.confirmed_at.is_none()
+                    if other.claude_session_id == new_id
+                        || other.terminal_id != new_terminal_id
+                        || other.state != "open"
                     {
+                        continue;
+                    }
+                    if other.confirmed_at.is_none() {
                         other.state = "closed".to_string();
                         other.closed_at = Some(now);
                         other.close_reason = Some("superseded".to_string());
@@ -477,6 +501,16 @@ impl SessionLifecycleStore {
                             superseded = %other.claude_session_id,
                             by = %new_id,
                             "session-restore: evicted unconfirmed phantom sibling — new authoritative session bound the terminal"
+                        );
+                    } else if new_is_confirmed {
+                        other.state = "closed".to_string();
+                        other.closed_at = Some(now);
+                        other.close_reason = Some("superseded-terminal-reuse".to_string());
+                        info!(
+                            terminal_id = %new_terminal_id,
+                            superseded = %other.claude_session_id,
+                            by = %new_id,
+                            "session-restore: retired prior confirmed session on a reused terminal — new confirmed session bound it"
                         );
                     }
                 }
@@ -956,6 +990,83 @@ impl SessionLifecycleStore {
             m.clone()
         };
         self.persist(&snapshot);
+    }
+
+    /// One-time boot repair for the P4 registry corruption (plan
+    /// `2026-07-19-runner-session-restore-mass-strand-and-git-popup`, Phase 3):
+    /// many CONFIRMED `open` rows accumulated onto a SINGLE reused `terminal_id`
+    /// (a long-lived PTY hosting sequential `claude` runs, each prior run's
+    /// exit-close never firing), so restore mapped N rows onto one terminal and
+    /// they collapsed.
+    ///
+    /// For each group of `open` rows sharing a non-empty `terminal_id`, KEEP the
+    /// newest live tenant — max `last_seen_at`, tie-broken by `opened_at` — and
+    /// CLOSE the older ones with `close_reason = "superseded-terminal-reuse"`
+    /// (the same reason `record_open`'s confirmed-reuse eviction stamps, so the
+    /// boot repair and the ongoing invariant are indistinguishable in the
+    /// registry). A terminal hosts ONE live session, so this collapses to the
+    /// live tenant rather than fanning out synthetic ids — 53 of the 54 observed
+    /// rows are DEAD prior runs and preserving them as distinct restorable rows
+    /// would resurrect 53 phantoms.
+    ///
+    /// Idempotent: a healthy registry (≤1 open row per terminal) closes nothing.
+    /// Returns the number of rows closed (INFO-logged by the boot caller — no
+    /// silent cap).
+    pub fn repair_terminal_id_collisions(&self) -> usize {
+        let now = Utc::now().timestamp_millis();
+        let (snapshot, closed) = {
+            let mut m = match self.map.lock() {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = %e, "session_lifecycle_store: lock poisoned on repair_terminal_id_collisions");
+                    return 0;
+                }
+            };
+            // Group the OPEN rows by their (non-empty) terminal_id.
+            let mut by_terminal: HashMap<String, Vec<String>> = HashMap::new();
+            for rec in m.values() {
+                if rec.state == "open" && !rec.terminal_id.trim().is_empty() {
+                    by_terminal
+                        .entry(rec.terminal_id.clone())
+                        .or_default()
+                        .push(rec.claude_session_id.clone());
+                }
+            }
+            let mut closed = 0usize;
+            for (_terminal, ids) in by_terminal {
+                if ids.len() < 2 {
+                    continue; // no collision on this terminal
+                }
+                // Rank the colliding rows newest-first; keep [0], close the rest.
+                let mut ranked = ids;
+                ranked.sort_by(|a, b| {
+                    let ka = m
+                        .get(a.as_str())
+                        .map(|r| (r.last_seen_at, r.opened_at))
+                        .unwrap_or((i64::MIN, i64::MIN));
+                    let kb = m
+                        .get(b.as_str())
+                        .map(|r| (r.last_seen_at, r.opened_at))
+                        .unwrap_or((i64::MIN, i64::MIN));
+                    kb.cmp(&ka)
+                });
+                for id in ranked.into_iter().skip(1) {
+                    if let Some(rec) = m.get_mut(id.as_str()) {
+                        rec.state = "closed".to_string();
+                        rec.closed_at = Some(now);
+                        rec.close_reason = Some("superseded-terminal-reuse".to_string());
+                        closed += 1;
+                    }
+                }
+            }
+            if closed == 0 {
+                return 0; // nothing collapsed — skip the write
+            }
+            (m.clone(), closed)
+        };
+        self.persist(&snapshot);
+        self.snapshot_change(&snapshot);
+        closed
     }
 
     /// Best-effort atomic flush. A write failure is logged, not propagated —
@@ -1615,6 +1726,163 @@ mod tests {
             "open",
             "an unconfirmed observed bind does not supersede its sibling"
         );
+    }
+
+    /// Terminal-reuse invariant (Phase 3 / P4): when a NEW CONFIRMED session
+    /// binds a terminal, a PRIOR CONFIRMED `open` row on that SAME terminal (a
+    /// dead prior run whose exit-close never fired) is retired with
+    /// `close_reason == "superseded-terminal-reuse"`. A confirmed row on a
+    /// DIFFERENT terminal is untouched.
+    #[test]
+    fn record_open_new_confirmed_retires_prior_confirmed_on_reused_terminal() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+
+        // A prior confirmed run on term-reuse (its exit-close never fired).
+        let mut prior = auth_on("prior-run", "term-reuse");
+        prior.confirmed_at = Some(100);
+        store.record_open(prior);
+
+        // A confirmed run on a DIFFERENT terminal — must survive untouched.
+        let mut elsewhere = auth_on("other-term-run", "term-other");
+        elsewhere.confirmed_at = Some(100);
+        store.record_open(elsewhere);
+
+        // A NEW confirmed session binds the SAME reused terminal.
+        let mut next = auth_on("next-run", "term-reuse");
+        next.confirmed_at = Some(200);
+        store.record_open(next);
+
+        let prior = store.get("prior-run").unwrap();
+        assert_eq!(prior.state, "closed", "prior confirmed run retired");
+        assert_eq!(
+            prior.close_reason.as_deref(),
+            Some("superseded-terminal-reuse"),
+            "retired with the terminal-reuse reason (distinct from the phantom `superseded`)"
+        );
+        assert_eq!(
+            store.get("next-run").unwrap().state,
+            "open",
+            "the new confirmed session stays open"
+        );
+        assert_eq!(
+            store.get("other-term-run").unwrap().state,
+            "open",
+            "a confirmed row on a different terminal is untouched"
+        );
+    }
+
+    /// The confirmed-reuse arm is gated on the INCOMING being confirmed: an
+    /// authoritative-but-UNCONFIRMED incoming must NOT retire a confirmed
+    /// sibling on the same terminal (it is not yet itself proven).
+    #[test]
+    fn record_open_unconfirmed_incoming_does_not_retire_confirmed_sibling() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+
+        let mut confirmed = auth_on("confirmed-run", "term-x");
+        confirmed.confirmed_at = Some(100);
+        store.record_open(confirmed);
+
+        // Authoritative but UNCONFIRMED incoming on the same terminal.
+        store.record_open(auth_on("unconfirmed-incoming", "term-x"));
+
+        assert_eq!(
+            store.get("confirmed-run").unwrap().state,
+            "open",
+            "an authoritative-but-unconfirmed incoming must not retire a confirmed sibling"
+        );
+    }
+
+    /// Part B: an incoming record with an empty/whitespace-only `terminal_id`
+    /// must NOT clobber an existing non-empty binding (mirroring the `config_dir`
+    /// sticky guard); a later non-empty terminal still updates it.
+    #[test]
+    fn record_open_empty_terminal_id_does_not_clobber_binding() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+
+        let mut r = rec("sess-term");
+        r.terminal_id = "term-real".to_string();
+        store.record_open(r);
+        assert_eq!(store.get("sess-term").unwrap().terminal_id, "term-real");
+
+        // A later write that omits the terminal (whitespace-only) preserves it.
+        let mut r2 = rec("sess-term");
+        r2.terminal_id = "   ".to_string();
+        store.record_open(r2);
+        assert_eq!(
+            store.get("sess-term").unwrap().terminal_id,
+            "term-real",
+            "an empty/whitespace incoming terminal_id preserves the real binding"
+        );
+
+        // A later non-empty terminal DOES update (sticky is not frozen).
+        let mut r3 = rec("sess-term");
+        r3.terminal_id = "term-moved".to_string();
+        store.record_open(r3);
+        assert_eq!(
+            store.get("sess-term").unwrap().terminal_id,
+            "term-moved",
+            "a later non-empty terminal_id updates the binding"
+        );
+    }
+
+    /// Part C: `repair_terminal_id_collisions` collapses N `open` rows sharing
+    /// one terminal_id down to the NEWEST open (by last_seen_at), closing the
+    /// rest as `superseded-terminal-reuse`; rows on distinct terminals are
+    /// untouched; the return value is the number closed.
+    #[test]
+    fn repair_terminal_id_collisions_collapses_to_newest_open() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+
+        // Three open rows collided on "shared", plus a distinct-terminal open
+        // row and an already-closed row (which must not count).
+        let mk = |id: &str, terminal: &str, last_seen: i64, state: &str| {
+            let mut r = fixture_rec(
+                id,
+                state,
+                last_seen,
+                (state == "closed").then_some(last_seen),
+                (state == "closed").then_some("pty-exit"),
+            );
+            r.terminal_id = terminal.to_string();
+            r
+        };
+        write_fixture(
+            &path,
+            vec![
+                mk("old-a", "shared", 1_000, "open"),
+                mk("newest", "shared", 3_000, "open"),
+                mk("old-b", "shared", 2_000, "open"),
+                mk("solo", "other-term", 5_000, "open"),
+                mk("already-closed", "shared", 9_000, "closed"),
+            ],
+        );
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        let closed = store.repair_terminal_id_collisions();
+        assert_eq!(closed, 2, "the two older open rows on the shared terminal");
+
+        // Newest open on the shared terminal survives.
+        assert_eq!(store.get("newest").unwrap().state, "open");
+        for dead in ["old-a", "old-b"] {
+            let r = store.get(dead).unwrap();
+            assert_eq!(r.state, "closed", "{dead} collapsed");
+            assert_eq!(r.close_reason.as_deref(), Some("superseded-terminal-reuse"));
+        }
+        // Distinct-terminal row untouched.
+        assert_eq!(store.get("solo").unwrap().state, "open", "distinct terminal untouched");
+        // A pre-closed row is not the "kept" one and is not re-closed/mutated.
+        assert_eq!(
+            store.get("already-closed").unwrap().close_reason.as_deref(),
+            Some("pty-exit"),
+            "an already-closed row is ignored (not counted, not re-stamped)"
+        );
+
+        // Idempotent: a second pass closes nothing.
+        assert_eq!(store.repair_terminal_id_collisions(), 0, "idempotent");
     }
 
     /// `rekey_session` moves a row from the old id to the new id, updating the
