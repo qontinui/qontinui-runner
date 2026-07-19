@@ -895,6 +895,184 @@ pub(crate) fn proxy_principal_for_nonce(nonce: &str) -> Option<ProxyPrincipal> {
     live.or_else(|| graced_nonce_is_valid(nonce).then_some(ProxyPrincipal::Device))
 }
 
+// ============================================================================
+// Revocation + session-restore reaping (credential-hygiene Task 5)
+// ============================================================================
+
+/// Revoke ONE proxy nonce by value: removed from the live registry AND the
+/// grace registry (revocation is total — grace only ever survives
+/// supersession, never an explicit revoke), and the shrunken set is mirrored
+/// to the encrypted store so the revocation survives a restart. Idempotent.
+pub(crate) fn revoke_proxy_nonce(nonce: &str) {
+    if nonce.is_empty() {
+        return;
+    }
+    let snapshot = {
+        let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
+        if map.remove(nonce).is_none() {
+            None
+        } else {
+            Some(map.clone())
+        }
+    };
+    let graced_removed = graced_nonces()
+        .lock()
+        .expect("graced nonce map poisoned")
+        .remove(nonce)
+        .is_some();
+    if let Some(snapshot) = snapshot {
+        persist_proxy_nonces(&snapshot);
+        info!("coord_mcp: revoked proxy nonce (live registry)");
+    } else if graced_removed {
+        info!("coord_mcp: revoked proxy nonce (grace registry only)");
+    }
+}
+
+/// Revoke every proxy nonce bound to `agent_id` (live map only — agent nonces
+/// are never graced nor persisted). Called at agent teardown alongside
+/// [`remove_agent_token`] so a torn-down agent's nonce disappears entirely
+/// instead of lingering as a permanently-401ing map entry.
+pub(crate) fn revoke_agent_proxy_nonces(agent_id: Uuid) {
+    let removed = {
+        let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
+        let before = map.len();
+        map.retain(|_, b| b.principal != ProxyPrincipal::Agent { agent_id });
+        before - map.len()
+    };
+    if removed > 0 {
+        info!("coord_mcp: revoked {removed} agent proxy nonce(s) for agent {agent_id}");
+    }
+}
+
+/// Session-close credential release for a DEVICE session's workdir: revoke the
+/// workdir's registered nonce(s) and reap the app-data
+/// `session-restore/coord-mcp` config file that carried the nonce. The caller
+/// is responsible for the "last session in this workdir" check (two tabs can
+/// share a workdir); this fn additionally refuses to touch the long-lived
+/// `qontinui-root` ROOT config, whose nonce serves every root-launched session
+/// and is healed at boot, not per-session.
+///
+/// Any graced predecessor of the revoked nonce is left to expire on its own
+/// [`NONCE_GRACE_TTL`] (≤90s, DEVICE-only, process-local) — the grace registry
+/// is keyed only by nonce, and a superseded nonce riding grace is already
+/// evicted from the live map.
+pub(crate) fn release_workdir_on_session_close(workdir: &str) {
+    if workdir.trim().is_empty() {
+        return;
+    }
+    // Never revoke the repo-root config's nonce on an individual session close
+    // — it is the shared, boot-self-healed credential for ALL root sessions.
+    if let Some(root) = qontinui_root_dir() {
+        let same = std::fs::canonicalize(workdir)
+            .ok()
+            .zip(std::fs::canonicalize(&root).ok())
+            .map(|(a, b)| a == b)
+            .unwrap_or_else(|| Path::new(workdir) == root.as_path());
+        if same {
+            return;
+        }
+    }
+    let (revoked, snapshot) = {
+        let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
+        let before = map.len();
+        map.retain(|_, b| b.workdir != workdir);
+        let revoked = before - map.len();
+        (revoked, (revoked > 0).then(|| map.clone()))
+    };
+    if let Some(snapshot) = snapshot {
+        persist_proxy_nonces(&snapshot);
+    }
+    // Reap the app-data --mcp-config file for this workdir (its nonce is dead).
+    let cfg = crate::session::claude_hook::session_restore_dir()
+        .join("coord-mcp")
+        .join(mcp_config_file_name(workdir));
+    if cfg.exists() {
+        if let Err(e) = std::fs::remove_file(&cfg) {
+            warn!(
+                "coord_mcp: failed to reap session-restore config {}: {e}",
+                cfg.display()
+            );
+        }
+    }
+    if revoked > 0 {
+        info!("coord_mcp: session close revoked {revoked} proxy nonce(s) for {workdir}");
+    }
+}
+
+/// True iff something is LISTENING on `127.0.0.1:port` (a short connect probe).
+/// Used by the session-restore reaper to distinguish "another live runner's
+/// config" (keep) from "a dead runner's leftover" (reap).
+fn loopback_port_alive(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        std::time::Duration::from_millis(400),
+    )
+    .is_ok()
+}
+
+/// Reap stale `~/.qontinui/runner/session-restore/coord-mcp/*.json` configs
+/// (credential-hygiene Task 5): these files each carry a live proxy nonce and
+/// were historically never deleted. Called on runner start (after the nonce
+/// restore, so the registered set is authoritative) and — per-file — on
+/// session close ([`release_workdir_on_session_close`]). Returns the number of
+/// files removed. Decision per file:
+///
+/// - unparseable / not the proxy shape → reap (not a working credential file);
+/// - names THIS runner's bound port → keep iff its nonce is currently
+///   registered and valid, else reap (a 401-only file is pure liability);
+/// - names ANOTHER port → keep iff that port is alive (a sibling/temp runner
+///   shares this per-user dir and owns its own nonces), reap if dead.
+pub(crate) fn reap_stale_session_restore_configs(bound_port: u16) -> usize {
+    let dir = crate::session::claude_hook::session_restore_dir().join("coord-mcp");
+    reap_stale_session_restore_configs_in(&dir, bound_port, &loopback_port_alive)
+}
+
+/// Injectable core of [`reap_stale_session_restore_configs`]: the directory
+/// and the port-liveness probe are parameters so tests never touch the real
+/// app-data dir nor open sockets.
+fn reap_stale_session_restore_configs_in(
+    dir: &Path,
+    bound_port: u16,
+    port_alive: &dyn Fn(u16) -> bool,
+) -> usize {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return 0, // absent dir → nothing to reap
+    };
+    let mut reaped = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let port = read_proxy_port_from(&path);
+        let nonce = read_proxy_nonce(&path);
+        let keep = match (port, nonce) {
+            (Some(p), Some(n)) if p == bound_port => proxy_nonce_is_valid(&n),
+            (Some(p), Some(_)) => port_alive(p),
+            // No parseable proxy port/nonce: not a working credential file.
+            _ => false,
+        };
+        if keep {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                reaped += 1;
+                info!(
+                    "coord_mcp: reaped stale session-restore config {}",
+                    path.display()
+                );
+            }
+            Err(e) => warn!(
+                "coord_mcp: failed to reap stale session-restore config {}: {e}",
+                path.display()
+            ),
+        }
+    }
+    reaped
+}
+
 /// Pre-forward gate for the loopback `/coord-mcp` proxy route. Pure over its
 /// inputs (no I/O) so the 401 paths are unit-testable without a live coord:
 ///
@@ -1217,11 +1395,29 @@ pub(crate) fn probe_and_breadcrumb_proxy(workdir: &str, port: u16) {
     });
 }
 
+/// Write the session's `.mcp.json` INTO the workdir (a git working tree for
+/// worktree sessions).
+///
+/// KEPT deliberately (credential-hygiene Task 9 review, 2026-07-17): the
+/// app-data `--mcp-config` delivery (`provision_coord_mcp_config_file`) is the
+/// newer shape, but the in-workdir file has a hard consumer that cannot take
+/// `--mcp-config`: **`qontinui-pr`** (`src/bin/qontinui_cli.rs`,
+/// `find_session_mcp_config`) discovers the per-session proxy nonce + issuing
+/// runner port EXCLUSIVELY by a `.mcp.json` walk-up from cwd — it is a
+/// standalone CLI invoked ad hoc inside the session, with no launch seam to
+/// hand it a config path (only the PORT has an env override,
+/// `QONTINUI_RUNNER_API_PORT`; the nonce deliberately travels with the port in
+/// the same file so they can never cross runners). Headless agent spawns and
+/// the boot root/session reconcile also provision through this writer. The
+/// compensating hardening: the write is owner-only (Task 6), so a leftover
+/// file is at least never world-readable.
 fn write_mcp_json(primary_wt: &str, mcp_config: &serde_json::Value) {
     let mcp_path = Path::new(primary_wt).join(".mcp.json");
-    match std::fs::write(
+    match crate::fs_perms::write_owner_only(
         &mcp_path,
-        serde_json::to_string_pretty(mcp_config).unwrap_or_default(),
+        serde_json::to_string_pretty(mcp_config)
+            .unwrap_or_default()
+            .as_bytes(),
     ) {
         Ok(()) => {
             info!("coord_mcp: wrote .mcp.json for coord-mcp in {}", primary_wt);
@@ -1475,7 +1671,12 @@ fn coord_mcp_safe_to_write(workdir: &str) -> bool {
 /// Returns `None` for an absent/unparseable file or a non-proxy (static-bearer)
 /// shape — the latter is the agent path, which the reconcile must never touch.
 fn read_proxy_port(workdir: &str) -> Option<u16> {
-    let path = Path::new(workdir).join(".mcp.json");
+    read_proxy_port_from(&Path::new(workdir).join(".mcp.json"))
+}
+
+/// [`read_proxy_port`] over an explicit config-file path (the session-restore
+/// reaper's files live in app-data, not at `<workdir>/.mcp.json`).
+fn read_proxy_port_from(path: &Path) -> Option<u16> {
     let s = std::fs::read_to_string(path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&s).ok()?;
     let url = v
@@ -1561,9 +1762,11 @@ pub(crate) fn provision_coord_mcp_config_file(workdir: &str) -> Option<std::path
         return None;
     }
     let file = dir.join(mcp_config_file_name(workdir));
-    match std::fs::write(
+    match crate::fs_perms::write_owner_only(
         &file,
-        serde_json::to_string_pretty(&mcp_config).unwrap_or_default(),
+        serde_json::to_string_pretty(&mcp_config)
+            .unwrap_or_default()
+            .as_bytes(),
     ) {
         Ok(()) => {
             info!(
@@ -3437,5 +3640,120 @@ mod tests {
             !graced_nonces().lock().unwrap().contains_key(&nonce),
             "an expired grace entry must be lazily evicted on the failing check"
         );
+    }
+
+    /// Credential-hygiene Task 5 — a REVOKED nonce no longer validates, both
+    /// from the live registry and from the grace registry (revocation is
+    /// total; grace only survives supersession, never an explicit revoke).
+    #[test]
+    fn revoked_nonce_no_longer_validates_including_grace() {
+        // Live revoke.
+        let wd = format!("D:/revoke-wt-{}", uuid::Uuid::now_v7());
+        let nonce = register_proxy_nonce(&wd);
+        assert!(proxy_nonce_is_valid(&nonce));
+        revoke_proxy_nonce(&nonce);
+        assert!(
+            !proxy_nonce_is_valid(&nonce),
+            "a revoked live nonce must not validate"
+        );
+        // Idempotent.
+        revoke_proxy_nonce(&nonce);
+
+        // Graced revoke: re-mint moves the first nonce onto grace, where it
+        // still validates — an explicit revoke must kill that too.
+        let wd2 = format!("D:/revoke-grace-wt-{}", uuid::Uuid::now_v7());
+        let old = register_proxy_nonce(&wd2);
+        let _new = register_proxy_nonce(&wd2);
+        assert!(
+            proxy_nonce_is_valid(&old),
+            "precondition: the superseded nonce rides the grace TTL"
+        );
+        revoke_proxy_nonce(&old);
+        assert!(
+            !proxy_nonce_is_valid(&old),
+            "revocation must purge the grace registry too"
+        );
+    }
+
+    /// Credential-hygiene Task 5 — session-close release: revokes the
+    /// workdir's live nonce and reaps the app-data session-restore config file
+    /// for that workdir. (Graced predecessors are left to expire on their own
+    /// ≤90s TTL — the grace registry is keyed only by nonce.)
+    #[test]
+    fn release_workdir_on_session_close_revokes_and_reaps() {
+        let wd = format!("D:/close-wt-{}", uuid::Uuid::now_v7());
+        let current = register_proxy_nonce(&wd);
+        assert!(proxy_nonce_is_valid(&current));
+
+        // Seed the app-data config file the release must reap.
+        let cfg_dir = crate::session::claude_hook::session_restore_dir().join("coord-mcp");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let cfg = cfg_dir.join(mcp_config_file_name(&wd));
+        std::fs::write(&cfg, "{}").unwrap();
+
+        release_workdir_on_session_close(&wd);
+
+        assert!(
+            !proxy_nonce_is_valid(&current),
+            "session close must revoke the workdir's live nonce"
+        );
+        assert!(
+            !cfg.exists(),
+            "session close must reap the workdir's session-restore config file"
+        );
+    }
+
+    /// Credential-hygiene Task 5 — the session-restore reaper: a config whose
+    /// port is dead is reaped on start; one naming THIS runner's port is kept
+    /// iff its nonce is registered; a live FOREIGN port's config is kept
+    /// (another runner owns it); garbage is reaped.
+    #[test]
+    fn reaper_drops_dead_port_and_unregistered_nonce_configs() {
+        let dir = std::env::temp_dir().join(format!("coord-mcp-reap-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bound_port = 9876u16;
+
+        let cfg_body = |port: u16, nonce: &str| {
+            format!(
+                r#"{{"mcpServers":{{"coord-mcp":{{"type":"http","url":"http://127.0.0.1:{port}/coord-mcp","headers":{{"X-Coord-Mcp-Proxy-Key":"{nonce}"}}}}}}}}"#
+            )
+        };
+
+        // (a) Our port, REGISTERED nonce → keep.
+        let wd = format!("D:/reap-live-wt-{}", uuid::Uuid::now_v7());
+        let live_nonce = register_proxy_nonce(&wd);
+        let keep_ours = dir.join("keep-ours.json");
+        std::fs::write(&keep_ours, cfg_body(bound_port, &live_nonce)).unwrap();
+
+        // (b) Our port, UNREGISTERED nonce → reap.
+        let reap_stale_nonce = dir.join("reap-stale-nonce.json");
+        std::fs::write(&reap_stale_nonce, cfg_body(bound_port, "not-registered")).unwrap();
+
+        // (c) Foreign DEAD port → reap. (d) Foreign LIVE port → keep.
+        let reap_dead_port = dir.join("reap-dead-port.json");
+        std::fs::write(&reap_dead_port, cfg_body(9899, "whatever")).unwrap();
+        let keep_live_port = dir.join("keep-live-port.json");
+        std::fs::write(&keep_live_port, cfg_body(9877, "sibling")).unwrap();
+
+        // (e) Garbage file → reap.
+        let reap_garbage = dir.join("reap-garbage.json");
+        std::fs::write(&reap_garbage, "not json {").unwrap();
+
+        // Injected liveness: only :9877 is "alive".
+        let reaped = reap_stale_session_restore_configs_in(&dir, bound_port, &|p| p == 9877);
+
+        assert_eq!(reaped, 3, "stale-nonce + dead-port + garbage are reaped");
+        assert!(keep_ours.exists(), "our-port registered-nonce config kept");
+        assert!(
+            keep_live_port.exists(),
+            "a live foreign-port config belongs to a sibling runner — kept"
+        );
+        assert!(!reap_stale_nonce.exists());
+        assert!(!reap_dead_port.exists());
+        assert!(!reap_garbage.exists());
+
+        // Cleanup.
+        revoke_proxy_nonce(&live_nonce);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

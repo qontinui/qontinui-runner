@@ -1,12 +1,49 @@
-//! Secure file-based storage for authentication tokens.
+//! Encrypted file-based storage for authentication tokens.
 //!
 //! This module provides encrypted file storage as a reliable alternative to
 //! the OS keychain, which has proven unreliable on Windows.
 //!
-//! Security model:
-//! - Tokens are encrypted using AES-256-GCM
-//! - Encryption key is derived from machine-specific identifiers
+//! # Security model — read this before relying on it
+//!
+//! Tokens are encrypted with AES-256-GCM, but the key is DERIVED FROM PUBLIC,
+//! LOCALLY-READABLE INPUTS (hostname ‖ service name ‖ a static string ‖
+//! username — see [`SecureStorage::derive_key`]). Any process that can read
+//! the file and knows (or guesses) the hostname + username can re-derive the
+//! key. The honest guarantees are therefore:
+//!
+//! - **Same-machine/user binding**: the ciphertext only decrypts trivially on
+//!   this host under this username; a file exfiltrated off-box does not
+//!   decrypt without also knowing those identifiers (obfuscation, not proof
+//!   against a determined attacker — the identifiers are low-entropy).
+//! - **Tamper evidence**: AES-GCM authentication means a modified file fails
+//!   to decrypt rather than yielding attacker-controlled token values.
+//! - **NOT at-rest confidentiality against a local reader**: a local process
+//!   running as the same user (or any process that can read the file plus the
+//!   public inputs) can recover the plaintext. Do not describe this store as
+//!   protecting tokens from local malware.
+//!
+//! ## Why the key is not bound to an OS secret (DPAPI / Keychain / keyring)
+//!
+//! Considered and deliberately not done (2026-07-17 credential-hygiene plan,
+//! Task 7):
+//! - Confidentiality against a *same-user* local process — the gap called out
+//!   above — is not attainable via DPAPI or a keyring either: any same-user
+//!   process can call `CryptUnprotectData` / read the keyring entry, so the
+//!   binding would not close the stated gap, only the off-box one.
+//! - The OS keychain's unreliability on Windows is the documented reason this
+//!   module exists; putting the *decryption key* for the runner's identity
+//!   credential behind it would reintroduce that failure mode into the
+//!   boot-critical path (and headless Linux runners often have no
+//!   secret-service at all).
+//! - Re-keying live stores in the field risks stranding paired runners.
+//!
+//! The compensating control is filesystem-level: every write of the store is
+//! owner-only (`0600` / protected owner-only DACL via [`crate::fs_perms`]),
+//! which is what actually stops OTHER local users reading it.
+//!
+//! Additional properties:
 //! - Storage file is placed in the app's data directory
+//! - The file is written owner-only (Unix `0600`; Windows protected DACL)
 //!
 //! ## Stored value format (Phase 3 Unified Devices Registry)
 //!
@@ -131,11 +168,13 @@ struct StoredTokens {
     device_machine_key: Option<String>,
 }
 
-/// Secure file-based storage manager.
+/// Encrypted file-based storage manager.
 ///
 /// Provides encrypted storage for authentication tokens using AES-256-GCM.
-/// The encryption key is derived from machine-specific identifiers to ensure
-/// tokens can only be read on the same machine.
+/// The encryption key is derived from machine-specific identifiers to BIND
+/// tokens to this machine/user. See the module docs for the honest guarantee:
+/// this is same-machine binding + tamper evidence, NOT confidentiality
+/// against a local same-user reader.
 pub struct SecureStorage {
     storage_path: PathBuf,
 }
@@ -266,12 +305,26 @@ impl SecureStorage {
     }
 
     /// Saves tokens to encrypted storage.
+    ///
+    /// The file is written owner-only (`crate::fs_perms::write_owner_only`):
+    /// Unix `0600`, Windows protected owner-only DACL. A failure to apply the
+    /// permission hardening is logged but does NOT fail the save — losing the
+    /// credential write over the hardening step would be worse (and the
+    /// content is still AES-GCM-bound to this machine/user).
     fn save_tokens(&self, tokens: &StoredTokens) -> Result<()> {
         let json = serde_json::to_vec(tokens).context("Failed to serialize tokens")?;
 
         let encrypted = self.encrypt(&json)?;
 
-        fs::write(&self.storage_path, encrypted).context("Failed to write storage file")?;
+        crate::fs_perms::write_owner_only(&self.storage_path, &encrypted)
+            .or_else(|e| {
+                tracing::warn!(
+                    "secure_storage: owner-only write failed ({e}); retrying as a plain \
+                     write so the credential is not lost"
+                );
+                fs::write(&self.storage_path, &encrypted)
+            })
+            .context("Failed to write storage file")?;
 
         debug!("Saved tokens to secure storage");
         Ok(())

@@ -152,3 +152,8 @@ target-rebuild/
 target-types-task/
 target-wt/
 *.log.err
+
+# coord-mcp device credential (nonce/JWT) written into the worktree as
+# .mcp.json at launch — a live credential, never commit it.
+# (Was only in .git/info/exclude — local-only, lost on fresh clone/CI.)
+.mcp.json
