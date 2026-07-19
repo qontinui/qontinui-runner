@@ -465,6 +465,21 @@ impl TerminalSession {
             crate::terminal::runner_context(runner_api_port),
         );
 
+        // P7 — non-interactive git credential posture (plan Phase 6). Ensures no
+        // git op run from this terminal (ANY cwd, including the non-repo umbrella
+        // root or an unregistered repo) can reach Git Credential Manager's
+        // blocking GUI popup: GCM is forced non-interactive, terminal prompts are
+        // off, and github.com access falls back to the user's `gh` auth via an
+        // env-layered credential.helper. Set BEFORE `extra_env` below so a caller
+        // may still intentionally override, and BEFORE the per-session `--local`
+        // coord helper (installed elsewhere) which — being read earlier in git's
+        // config precedence — still wins for coord-registered repos. See
+        // `credential_helper::non_interactive_git_env` for the full precedence
+        // rationale.
+        for (k, v) in crate::credential_helper::non_interactive_git_env() {
+            cmd.env(k, v);
+        }
+
         // Phase 2c — caller-supplied launch env (e.g.
         // `QONTINUI_SESSION_WORKTREES`, the agent-agnostic pointer to every
         // materialized sibling worktree of this session). Set after the

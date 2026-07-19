@@ -3699,6 +3699,17 @@ async fn spawn_claude_child(workdir: &str, initial_prompt: &str) -> anyhow::Resu
     for (k, v) in agent_git_identity_env() {
         cmd.env(k, v);
     }
+    // P7 — non-interactive git credential posture (plan Phase 6). Same env block
+    // the interactive terminal PTY gets: forces Git Credential Manager
+    // non-interactive, disables terminal prompts, and layers a github.com `gh
+    // auth git-credential` fallback so any git op this autonomous agent (or a
+    // child it spawns) runs — in any cwd — fails cleanly non-interactively rather
+    // than blocking on GCM's GUI popup. Registered-repo pushes still use the
+    // per-session `--local` coord helper (higher precedence). See
+    // `credential_helper::non_interactive_git_env` for the precedence rationale.
+    for (k, v) in crate::credential_helper::non_interactive_git_env() {
+        cmd.env(k, v);
+    }
     // `-p` / `--print` means "single-shot prompt mode" for Claude Code
     // CLI; not all versions support stdin-as-prompt cleanly, so we send
     // the prompt over stdin AND close stdin after.
