@@ -205,6 +205,10 @@ export type UIBridgeRequestType =
   // Runner-specific
   | "navigate_tab"
   | "clear_storage"
+  // Document/window-level key dispatch (POST /ui-bridge/control/key).
+  // Element-free by design: global shortcut listeners live on `window`, so
+  // the element-scoped `execute_action` + `keyboard` path cannot reach them.
+  | "dispatch_key"
   // Tab control (F4 — first-class tab activation)
   | "tabs_list"
   | "tab_activate"
@@ -273,7 +277,8 @@ export type ControlEventTypes =
   | "assert_element"
   | "resolve_stable_ref"
   | "clear_storage"
-  | "receive_heartbeat";
+  | "receive_heartbeat"
+  | "dispatch_key";
 
 export type DiscoveryEventTypes =
   | "discover"

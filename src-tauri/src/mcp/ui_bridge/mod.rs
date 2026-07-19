@@ -33,6 +33,7 @@ pub mod helpers;
 pub mod history;
 pub mod intents;
 pub mod intents_registry;
+pub mod keyboard;
 pub mod misc;
 pub mod network;
 pub mod page;
@@ -359,6 +360,7 @@ pub(super) fn route_manifest() -> &'static [(&'static str, &'static str)] {
         all.extend_from_slice(history::route_entries());
         all.extend_from_slice(intents::route_entries());
         all.extend_from_slice(intents_registry::route_entries());
+        all.extend_from_slice(keyboard::route_entries());
         all.extend_from_slice(misc::route_entries());
         all.extend_from_slice(network::route_entries());
         all.extend_from_slice(page::route_entries());
@@ -441,6 +443,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .merge(history::routes())
         .merge(intents::routes())
         .merge(intents_registry::routes())
+        .merge(keyboard::routes())
         .merge(misc::routes())
         .merge(network::routes())
         .merge(page::routes())
@@ -769,6 +772,16 @@ mod manifest_drift_tests {
             ("POST", "/ui-bridge/control/render-log"),
             ("POST", "/ui-bridge/control/assert"),
             ("GET", "/ui-bridge/control/keyboard-shortcuts"),
+            // (b) Document/window-level key dispatch (mcp/ui_bridge/keyboard.rs).
+            // The SDK's `keyboard` action is element-scoped and therefore
+            // cannot fire a global shortcut whose listener is on `window`
+            // (e.g. Ctrl+Shift+B → session-manager sidebar). The runner ships
+            // the element-free equivalent first because a runner-side route
+            // works immediately, whereas an SDK change reaches nothing until
+            // @qontinui/ui-bridge is published AND consumers bump their pin.
+            // PROMOTE to the SDK's UI_BRIDGE_ROUTES (and delete this entry)
+            // when the SDK side is wired.
+            ("POST", "/ui-bridge/control/key"),
             ("GET", "/ui-bridge/control/element/{}/tree"),
             ("POST", "/ui-bridge/control/element/{}/assert"),
             ("POST", "/ui-bridge/control/batch-actions"),
