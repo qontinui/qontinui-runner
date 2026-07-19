@@ -521,6 +521,122 @@ export function useControlEvents(
           return true;
         }
 
+        case "dispatch_key": {
+          // Document/window-level key dispatch — backs
+          // `POST /ui-bridge/control/key` (src-tauri/src/mcp/ui_bridge/keyboard.rs).
+          //
+          // This lives here (and not in the element-scoped `execute_action`
+          // path) because the runner's global shortcut listeners are attached
+          // to `window`, not to any registered element — e.g. Ctrl+Shift+B,
+          // which toggles `workflowGen.showSidebar` and is the only way to
+          // render the session-manager sidebar / Worktrees panel. The
+          // per-element action gate correctly refuses `keyboard` on elements
+          // that don't advertise it, so automation had no way in before this.
+          //
+          // ⚠ `target: "activeElement"` is the ONE target that can type into a
+          // focused field. On a runner that field is frequently a terminal
+          // bound to a LIVE Claude/PowerShell session, so an unintended
+          // dispatch injects text into someone's real work. It is opt-in only;
+          // the Rust layer defaults `target` to `"window"`, which reaches the
+          // shortcut listeners but cannot land text anywhere.
+          const params = (payload.params ?? {}) as {
+            keys?: Array<{
+              key?: string;
+              modifiers?: {
+                ctrl?: boolean;
+                shift?: boolean;
+                alt?: boolean;
+                meta?: boolean;
+              };
+            }>;
+            target?: string;
+          };
+          const keys = Array.isArray(params.keys) ? params.keys : [];
+          if (keys.length === 0) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: "keys is required and must be a non-empty array",
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+
+          const targetName = params.target || "window";
+          let target: EventTarget | null;
+          switch (targetName) {
+            case "window":
+              target = window;
+              break;
+            case "document":
+              target = document;
+              break;
+            case "body":
+              target = document.body;
+              break;
+            case "activeElement":
+              target = document.activeElement ?? document.body;
+              break;
+            default:
+              target = null;
+          }
+          if (!target) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: `Unknown dispatch target '${targetName}' — expected window, document, body, or activeElement`,
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+
+          // Only printable characters (single char, no ctrl/alt/meta) produce a
+          // keypress event — same rule as the SDK's `sendKeys` handler
+          // (ui-bridge/packages/ui-bridge/src/react/commandHandlers.ts).
+          const shouldKeypress = (
+            key: string,
+            mods: { ctrl?: boolean; alt?: boolean; meta?: boolean },
+          ) => key.length === 1 && !mods.ctrl && !mods.alt && !mods.meta;
+
+          let dispatched = 0;
+          let defaultPrevented = false;
+          for (const keyDesc of keys) {
+            const key = keyDesc?.key;
+            if (!key) continue;
+            const mods = keyDesc.modifiers ?? {};
+            const eventInit: KeyboardEventInit = {
+              key,
+              bubbles: true,
+              cancelable: true,
+              ctrlKey: !!mods.ctrl,
+              shiftKey: !!mods.shift,
+              altKey: !!mods.alt,
+              metaKey: !!mods.meta,
+            };
+            const keydown = new KeyboardEvent("keydown", eventInit);
+            target.dispatchEvent(keydown);
+            // `dispatchEvent` returns false when a listener called
+            // preventDefault() — i.e. a handler actually consumed the shortcut.
+            defaultPrevented = keydown.defaultPrevented;
+            if (shouldKeypress(key, mods)) {
+              target.dispatchEvent(new KeyboardEvent("keypress", eventInit));
+            }
+            target.dispatchEvent(new KeyboardEvent("keyup", eventInit));
+            dispatched += 1;
+          }
+
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: { dispatched, target: targetName, defaultPrevented },
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
         case "receive_heartbeat": {
           await sendResponse({
             requestId,
