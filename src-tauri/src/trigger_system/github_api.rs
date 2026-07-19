@@ -27,29 +27,13 @@ pub fn extract_next_url(link_header: &str) -> Option<String> {
     None
 }
 
-/// Build the `GET /pulls?head=<owner>:<branch>` URL for
-/// [`GitHubClient::list_open_prs_by_head`], percent-encoding each interpolated
+/// Build the `GET /pulls?state=all&head=<owner>:<branch>` URL for
+/// [`GitHubClient::list_prs_for_head`], percent-encoding each interpolated
 /// segment. The branch is the load-bearing one: git ref names legally contain
 /// URL-reserved characters (`#` most notably), and an unencoded `#` truncates
 /// the query as a fragment — GitHub then ignores the malformed `head` filter
-/// and returns ALL open PRs, so the seeder would attribute someone else's PR
-/// to this session. Pure, unit-tested.
-fn open_prs_by_head_url(owner: &str, repo: &str, branch: &str) -> String {
-    format!(
-        "https://api.github.com/repos/{}/{}/pulls?state=open&head={}:{}&per_page=10",
-        urlencoding::encode(owner),
-        urlencoding::encode(repo),
-        urlencoding::encode(owner),
-        urlencoding::encode(branch)
-    )
-}
-
-/// Build the `GET /pulls?state=all&head=<owner>:<branch>` URL for
-/// [`GitHubClient::list_prs_for_head`]. Same percent-encoding rationale as
-/// [`open_prs_by_head_url`] (an unencoded `#` in a ref name truncates the
-/// query as a URL fragment and drops the `head` filter), but `state=all` so a
-/// merged/closed PR — the green case the session dropdown must render — still
-/// resolves. Pure, unit-tested.
+/// and returns ALL PRs. `state=all` so a merged/closed PR — the green case the
+/// session dropdown must render — still resolves. Pure, unit-tested.
 fn prs_by_head_url(owner: &str, repo: &str, branch: &str) -> String {
     format!(
         "https://api.github.com/repos/{}/{}/pulls?state=all&head={}:{}&per_page=20",
@@ -323,63 +307,12 @@ impl GitHubClient {
         })
     }
 
-    /// List open PRs whose head branch is `<owner>:<branch>`.
-    ///
-    /// Phase-1 fallback resolution for PR-shepherd seeds: when a
-    /// `gh pr create` observation couldn't recover the PR URL from its
-    /// tool_result, the branch is resolved to a PR number here on the next
-    /// watcher poll. One page suffices — a single head branch realistically
-    /// backs at most one open PR.
-    pub async fn list_open_prs_by_head(
-        &self,
-        owner: &str,
-        repo: &str,
-        branch: &str,
-    ) -> Result<Vec<PrStatus>, String> {
-        let url = open_prs_by_head_url(owner, repo, branch);
-        let resp = self
-            .send_with_rate_limit(self.client.get(&url).headers(self.headers()))
-            .await?;
-
-        if !resp.status().is_success() {
-            return Err(format!(
-                "GitHub API returned {}: {}",
-                resp.status(),
-                resp.text().await.unwrap_or_default()
-            ));
-        }
-
-        let body: Vec<serde_json::Value> = resp
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse PR list response: {}", e))?;
-
-        Ok(body
-            .iter()
-            .filter_map(|pr| {
-                let number = pr["number"].as_u64()?;
-                Some(PrStatus {
-                    number,
-                    state: pr["state"].as_str().unwrap_or("unknown").to_string(),
-                    // The list endpoint has no `merged` boolean; `merged_at`
-                    // is the equivalent signal (always null for open PRs).
-                    merged: pr["merged_at"].is_string(),
-                    mergeable: pr["mergeable"].as_bool(),
-                    head_sha: pr["head"]["sha"].as_str().unwrap_or("").to_string(),
-                    title: pr["title"].as_str().unwrap_or("").to_string(),
-                    html_url: pr["html_url"].as_str().unwrap_or("").to_string(),
-                })
-            })
-            .collect())
-    }
-
     /// List ALL PRs (open, closed, or merged) whose head branch is
     /// `<owner>:<branch>`, for the runner-local session-PR attribution
-    /// reconciler. Unlike [`list_open_prs_by_head`](Self::list_open_prs_by_head)
-    /// (Phase-1 seeder, open-only), this uses `state=all` so a session's
-    /// already-merged/closed PR still resolves — the dropdown's green ("all
-    /// merged") state depends on seeing the merged rows. One page (20) suffices;
-    /// a single head branch realistically backs at most one or two PRs.
+    /// reconciler. Uses `state=all` so a session's already-merged/closed PR
+    /// still resolves — the dropdown's green ("all merged") state depends on
+    /// seeing the merged rows. One page (20) suffices; a single head branch
+    /// realistically backs at most one or two PRs.
     pub async fn list_prs_for_head(
         &self,
         owner: &str,
@@ -701,35 +634,6 @@ impl GitHubClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn pr_shepherd_head_lookup_url_percent_encodes_the_branch() {
-        // A plain branch passes through unchanged (except ':' which separates
-        // owner:branch and must stay literal).
-        assert_eq!(
-            open_prs_by_head_url("qontinui", "qontinui-runner", "feat/pr-shepherd"),
-            "https://api.github.com/repos/qontinui/qontinui-runner/pulls?state=open&head=qontinui:feat%2Fpr-shepherd&per_page=10"
-        );
-
-        // '#' is legal in git ref names but reserved in URLs: unencoded it
-        // truncates the query as a fragment, dropping the head filter — GitHub
-        // would return ALL open PRs and the seeder would attribute someone
-        // else's PR to this session.
-        let url = open_prs_by_head_url("qontinui", "qontinui-runner", "fix/issue#42");
-        assert!(
-            !url.contains('#'),
-            "raw '#' must never survive into the URL: {url}"
-        );
-        assert!(url.contains("head=qontinui:fix%2Fissue%2342"), "{url}");
-        assert!(
-            url.ends_with("&per_page=10"),
-            "query must not be truncated: {url}"
-        );
-
-        // Other reserved characters ('&', '?', spaces) are encoded too.
-        let url = open_prs_by_head_url("o", "r", "a&b?c d");
-        assert!(url.contains("head=o:a%26b%3Fc%20d"), "{url}");
-    }
 
     #[test]
     fn session_pr_head_lookup_url_is_state_all_and_percent_encodes_the_branch() {
