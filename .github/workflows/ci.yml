@@ -241,17 +241,29 @@ jobs:
       # (same branch-isolation as rust-cache — `main` saves warm candidates/PRs).
       # It COMPOSES WITH rust-cache; it does not replace it.
       #
-      # FAIL-OPEN by construction: the install is continue-on-error, and
-      # RUSTC_WRAPPER is exported (into $GITHUB_ENV) ONLY when the sccache binary
-      # is actually present. An sccache/action outage therefore falls back to
-      # plain rustc and can NEVER red a required check (test / seam-gate). This
-      # is a MEASURED SPIKE: compare `sccache --show-stats` hit-rate + step
-      # wall-clock against warm rust-cache over >=10 runs before making it
-      # load-bearing (do not treat a green run here as "adopt").
+      # FAIL-OPEN by construction, in THREE parts (the 2026-07-17 red proved the
+      # original two were not enough): (1) the install is continue-on-error;
+      # (2) RUSTC_WRAPPER is exported ONLY when the sccache binary is present;
+      # (3) a preflight probe (below) round-trips the cache backend and UNSETS
+      # the wrapper if it can't be reached — so a GHA-cache outage or a mis-wired
+      # token can NEVER red a required check (test / seam-gate); the build just
+      # falls back to plain rustc. This is a MEASURED SPIKE: compare
+      # `sccache --show-stats` hit-rate + step wall-clock against warm rust-cache
+      # over >=10 runs before making it load-bearing (a green run != "adopt").
+      #
+      # SCCACHE_GHA_ENABLED MUST be `env:` on the action step, NOT written to
+      # $GITHUB_ENV afterward: the action reads it at eval time and re-exports
+      # the GitHub Actions cache token (ACTIONS_RESULTS_URL + ACTIONS_RUNTIME_TOKEN,
+      # otherwise invisible to plain run-steps) into $GITHUB_ENV for the compile
+      # steps. Setting it after the fact left the auto-started sccache server with
+      # no backend, so it fell through to an S3/AWS path and died on
+      # "request to AWS EC2 Metadata Services failed" — the spike's original red.
       - name: Install sccache (spike; fail-open)
         id: sccache_install
         continue-on-error: true
         uses: mozilla/sccache-action@v0.0.10
+        env:
+          SCCACHE_GHA_ENABLED: "true"
 
       - name: Enable sccache wrapper if available
         shell: bash
@@ -260,18 +272,43 @@ jobs:
             echo "sccache present: $(command -v sccache) — $(sccache --version 2>/dev/null | head -1)"
             {
               echo "RUSTC_WRAPPER=sccache"
-              echo "SCCACHE_GHA_ENABLED=true"
               # sccache cannot cache incremental artifacts; CI is effectively
               # non-incremental anyway, so disabling it lets the cache populate.
               echo "CARGO_INCREMENTAL=0"
               echo "SCCACHE_ERROR_LOG=${RUNNER_TEMP}/sccache.log"
               echo "SCCACHE_LOG=warn"
             } >> "$GITHUB_ENV"
-            # Reset counters so the end-of-job --show-stats reflects THIS run.
-            sccache --start-server >/dev/null 2>&1 || true
-            sccache --zero-stats >/dev/null 2>&1 || true
+            # NB: do NOT start the server here — this step's process env does not
+            # yet carry the GHA backend vars (they land in $GITHUB_ENV for the
+            # NEXT step). The server auto-starts in the preflight below, where the
+            # backend is fully configured. Starting it here booted it backendless.
           else
             echo "::warning::sccache unavailable — building without a compilation cache (fail-open, rustc direct)."
+          fi
+
+      # Preflight probe — the only reliable fail-open guard. RUSTC_WRAPPER +
+      # SCCACHE_GHA_ENABLED + the re-exported tokens are all applied by now, so a
+      # trivial `sccache rustc` genuinely exercises the backend. If it fails, the
+      # wrapper is cleared for every later step (plain rustc, no red); if it
+      # succeeds, stats are zeroed so the end-of-job measurement reflects the real
+      # build, not this probe.
+      - name: sccache preflight (fail-open probe)
+        if: env.RUSTC_WRAPPER == 'sccache'
+        shell: bash
+        run: |
+          probe="${RUNNER_TEMP}/sccache_probe.rs"
+          err="${RUNNER_TEMP}/sccache_probe.err"
+          echo 'pub fn _p() -> u8 { 0 }' > "$probe"
+          if sccache rustc --crate-name sccache_probe --crate-type lib "$probe" \
+               --out-dir "${RUNNER_TEMP}/sccache_probe_out" 2> "$err"; then
+            echo "sccache preflight OK — backend reachable, wrapper stays active."
+            sccache --zero-stats >/dev/null 2>&1 || true
+          else
+            echo "::warning::sccache preflight FAILED — disabling the wrapper for this run (fail-open, plain rustc). Backend error:"
+            sed 's/^/  sccache-probe: /' "$err" 2>/dev/null || true
+            # Clear the wrapper for all subsequent steps and stop the bad server.
+            echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+            sccache --stop-server >/dev/null 2>&1 || true
           fi
 
       - name: Install frontend dependencies
