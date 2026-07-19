@@ -161,3 +161,8 @@ target-wt/
 # MSYS/Cygwin crash dumps (bash.exe.stackdump, du.exe.stackdump, ...).
 # Build-environment noise on Windows dev boxes, never source.
 *.stackdump
+
+# coord-mcp device credential (nonce/JWT) written into the worktree as
+# .mcp.json at launch — a live credential, never commit it.
+# (Was only in .git/info/exclude — local-only, lost on fresh clone/CI.)
+.mcp.json

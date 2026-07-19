@@ -1028,6 +1028,201 @@ fn lifecycle_workdir_matches(
     }
 }
 
+/// JSON-RPC methods the loopback `/coord-mcp` proxy forwards (credential-
+/// hygiene Task 4). Everything else is rejected BEFORE any bearer is read or
+/// any byte reaches coord. The MCP handshake + tool surface is exactly:
+/// `initialize` / `notifications/*` housekeeping / `ping` / `tools/list` /
+/// `tools/call` — and `tools/call` is further gated per tool name by
+/// [`coord_mcp_tool_is_allowed`]. Sorted for `binary_search`.
+const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
+    "initialize",
+    "notifications/cancelled",
+    "notifications/initialized",
+    "notifications/progress",
+    "ping",
+    "tools/call",
+    "tools/list",
+];
+
+/// Coord MCP tools a proxied session may invoke (credential-hygiene Task 4).
+///
+/// Same posture as the sibling [`ClaimsReadTarget`] / [`CoordWriteTarget`]
+/// enums: the per-session nonce authenticates a *session*, not an operator,
+/// so its authority is an ENUMERATED set — the legitimate session-coordination
+/// surface (introspection reads + the coordination writes: declare-intent,
+/// work-unit upsert/transition, gate register/attest, claims, expectations,
+/// findings/messaging/memory, orient/status/conflict-check/blockers). A leaked
+/// nonce must not reach anything beyond that with the runner's device
+/// identity. Coord is being hardened server-side in parallel; this list is
+/// defense-in-depth, not the sole authority.
+///
+/// DELIBERATELY EXCLUDED (add only with a security rationale): the onboarding
+/// / enrollment family (`coord_onboard_*`, `coord_onboarding_doctor`),
+/// privilege escalation (`coord_attest_escalate_override`), merge authority
+/// (`coord_request_merge`, `coord_cancel_merge`, `coord_pr_merge_verdict`,
+/// `coord_pr_merge_profile`), code publication (`coord_create_pr`,
+/// `coord_push_to_branch` — sessions open PRs via the dedicated
+/// `/vcs/pull-requests` loopback route, not this proxy), reservations
+/// (`coord_migration_reserve`, `coord_reserve_resource`), and policy/state
+/// mutation (`coord_request_policy`, `coord_flag_state`, `coord_flag_states`).
+///
+/// MUST stay sorted — membership is a `binary_search`.
+const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
+    "coord_ack_message",
+    "coord_am_i_clear",
+    "coord_ask_question",
+    "coord_attest_gate",
+    "coord_blockers",
+    "coord_build_info",
+    "coord_change_conflict",
+    "coord_check_gate_predicate",
+    "coord_check_install_safety",
+    "coord_check_publish_safety",
+    "coord_claim_acquire",
+    "coord_claim_check",
+    "coord_claim_heartbeat",
+    "coord_claim_release",
+    "coord_conflict_check",
+    "coord_declare_intent",
+    "coord_diff_impact",
+    "coord_edit_predict",
+    "coord_edit_predict_and_check",
+    "coord_edit_verify",
+    "coord_expectation_checkin",
+    "coord_expectation_close",
+    "coord_expectation_register",
+    "coord_explain_isolation_decision",
+    "coord_explain_pr_close",
+    "coord_explain_ref_event",
+    "coord_explain_worktree",
+    "coord_find_references",
+    "coord_gate_doctor",
+    "coord_gate_inspect",
+    "coord_gate_status",
+    "coord_get_answer",
+    "coord_inbox",
+    "coord_is_commit_live",
+    "coord_is_merge_safe",
+    "coord_layering_triage",
+    "coord_list_worktrees",
+    "coord_memory_record",
+    "coord_memory_search",
+    "coord_merge_order",
+    "coord_migration_queue",
+    "coord_orient",
+    "coord_post_finding",
+    "coord_pr_status",
+    "coord_predict_resource_collisions",
+    "coord_recent_errors",
+    "coord_recent_findings",
+    "coord_record_decision",
+    "coord_register_gate",
+    "coord_report_status",
+    "coord_request_handoff",
+    "coord_resolve_origin",
+    "coord_resolve_pr_author_session",
+    "coord_resolve_session",
+    "coord_secret_presence",
+    "coord_send_message",
+    "coord_signature",
+    "coord_slo_metrics",
+    "coord_symbol_lookup",
+    "coord_twin_catalog",
+    "coord_typecheck_file",
+    "coord_who_is_working_on",
+    "coord_work_unit_list",
+    "coord_work_unit_transition",
+    "coord_work_unit_upsert",
+    "coord_yield",
+];
+
+/// Read-only tool FAMILIES allowed by prefix. `coord_query_*` is coord's
+/// naming convention for its read-only twin/drift/state queries (~25 tools,
+/// all reads); enumerating each would drift out of date with every new query
+/// while adding no authority a session doesn't already have via the other
+/// reads.
+const COORD_MCP_ALLOWED_TOOL_PREFIXES: &[&str] = &["coord_query_"];
+
+fn coord_mcp_tool_is_allowed(name: &str) -> bool {
+    COORD_MCP_ALLOWED_TOOLS.binary_search(&name).is_ok()
+        || COORD_MCP_ALLOWED_TOOL_PREFIXES
+            .iter()
+            .any(|p| name.starts_with(p))
+}
+
+/// A gate rejection: the JSON-RPC `id` to echo (Null when unparseable) plus a
+/// human-actionable message.
+struct CoordMcpBodyRejection {
+    id: serde_json::Value,
+    message: String,
+}
+
+/// Allowlist gate over the `/coord-mcp` proxy's JSON-RPC body (credential-
+/// hygiene Task 4): the `method` must be in [`COORD_MCP_ALLOWED_METHODS`] and
+/// a `tools/call` must name an allowed tool ([`coord_mcp_tool_is_allowed`]).
+/// Batch (array) bodies are validated per element — one bad element rejects
+/// the whole request (coord's `/mcp` is single-shot per POST anyway). Pure
+/// over its input so the rejection matrix is unit-testable.
+fn coord_mcp_body_gate(body: &[u8]) -> Result<(), CoordMcpBodyRejection> {
+    let parsed: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(CoordMcpBodyRejection {
+                id: serde_json::Value::Null,
+                message: format!("request body is not valid JSON-RPC: {e}"),
+            });
+        }
+    };
+    match &parsed {
+        serde_json::Value::Array(elems) => {
+            if elems.is_empty() {
+                return Err(CoordMcpBodyRejection {
+                    id: serde_json::Value::Null,
+                    message: "empty JSON-RPC batch".to_string(),
+                });
+            }
+            for elem in elems {
+                coord_mcp_request_gate_one(elem)?;
+            }
+            Ok(())
+        }
+        _ => coord_mcp_request_gate_one(&parsed),
+    }
+}
+
+/// Gate ONE JSON-RPC request object. See [`coord_mcp_body_gate`].
+fn coord_mcp_request_gate_one(req: &serde_json::Value) -> Result<(), CoordMcpBodyRejection> {
+    let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let reject = |message: String| {
+        Err(CoordMcpBodyRejection {
+            id: id.clone(),
+            message,
+        })
+    };
+    let method = match req.get("method").and_then(|m| m.as_str()) {
+        Some(m) => m,
+        None => return reject("JSON-RPC request has no string `method`".to_string()),
+    };
+    if COORD_MCP_ALLOWED_METHODS.binary_search(&method).is_err() {
+        return reject(format!(
+            "JSON-RPC method {method:?} is not on the /coord-mcp proxy allowlist"
+        ));
+    }
+    if method == "tools/call" {
+        let tool = match req.pointer("/params/name").and_then(|n| n.as_str()) {
+            Some(t) => t,
+            None => return reject("tools/call has no string `params.name`".to_string()),
+        };
+        if !coord_mcp_tool_is_allowed(tool) {
+            return reject(format!(
+                "tool {tool:?} is not on the /coord-mcp proxy allowlist for \
+                 device/agent sessions"
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn coord_mcp_proxy_handler(
     axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
     headers: axum::http::HeaderMap,
@@ -1069,6 +1264,32 @@ async fn coord_mcp_proxy_handler(
                 .into_response();
         }
     };
+
+    // Credential-hygiene Task 4: allowlist the JSON-RPC method + tool BEFORE
+    // any token I/O — a nonce authenticates a *session*, not an operator, so a
+    // request outside the enumerated coordination surface is never forwarded
+    // (mirrors the sibling ClaimsReadTarget/CoordWriteTarget posture). -32601
+    // ("method not found") deliberately does not disclose whether the tool
+    // exists upstream.
+    if let Err(reject) = coord_mcp_body_gate(&body) {
+        warn!(
+            "coord-mcp proxy: refused non-allowlisted JSON-RPC request: {}",
+            reject.message
+        );
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": reject.id,
+                "error": {
+                    "code": -32601,
+                    "message": reject.message,
+                    "data": { "code": "COORD_MCP_PROXY_METHOD_NOT_ALLOWED" },
+                },
+            })),
+        )
+            .into_response();
+    }
 
     // Pick the bearer by principal:
     //  - Device → the live device JWT read from AuthManager (filesystem I/O, so
@@ -3471,6 +3692,17 @@ pub fn create_router(
             // rotation just happened (the exact incident this plan fixes).
             let restored = crate::coord_mcp::restore_proxy_nonces_from_store();
 
+            // Credential-hygiene Task 5 — reap stale app-data session-restore
+            // coord-mcp configs (dead port, or our port with an
+            // unregistered/expired nonce). AFTER the restore so the registered
+            // set is authoritative; on a blocking thread because it does TCP
+            // liveness probes + file I/O.
+            let reaped = tokio::task::spawn_blocking(move || {
+                crate::coord_mcp::reap_stale_session_restore_configs(reconcile_bound_port)
+            })
+            .await
+            .unwrap_or(0);
+
             // Phase 3c — reconcile live session `.mcp.json` ports. Pull the live
             // session workdirs from the managed lifecycle store (open records).
             use tauri::Manager;
@@ -3517,6 +3749,7 @@ pub fn create_router(
             });
             info!(
                 "coord_mcp boot reconcile: restored {restored} persisted nonce(s), \
+                 reaped {reaped} stale session-restore config(s), \
                  rewrote {session_rewritten} session config(s), root self-heal = {root_action:?} \
                  (instance {reconcile_instance}, bound port :{reconcile_bound_port})"
             );
@@ -4863,6 +5096,134 @@ mod self_id_chain_tests {
             select_lifecycle_caller(&records, "D:/repo", None, |_| true),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod coord_mcp_body_gate_tests {
+    use super::{
+        coord_mcp_body_gate, coord_mcp_tool_is_allowed, COORD_MCP_ALLOWED_METHODS,
+        COORD_MCP_ALLOWED_TOOLS,
+    };
+
+    fn gate(v: serde_json::Value) -> Result<(), (serde_json::Value, String)> {
+        coord_mcp_body_gate(v.to_string().as_bytes()).map_err(|r| (r.id, r.message))
+    }
+
+    /// Both membership tables are sorted — `binary_search` correctness.
+    #[test]
+    fn allowlist_tables_are_sorted() {
+        assert!(
+            COORD_MCP_ALLOWED_METHODS.windows(2).all(|w| w[0] < w[1]),
+            "COORD_MCP_ALLOWED_METHODS must be sorted + deduped"
+        );
+        assert!(
+            COORD_MCP_ALLOWED_TOOLS.windows(2).all(|w| w[0] < w[1]),
+            "COORD_MCP_ALLOWED_TOOLS must be sorted + deduped"
+        );
+    }
+
+    /// The MCP handshake + the legitimate coordination surface forwards.
+    #[test]
+    fn allows_handshake_and_coordination_tools() {
+        for method in ["initialize", "tools/list", "ping", "notifications/initialized"] {
+            assert!(
+                gate(serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":{}}))
+                    .is_ok(),
+                "{method} must pass the gate"
+            );
+        }
+        for tool in [
+            "coord_declare_intent",
+            "coord_who_is_working_on",
+            "coord_work_unit_upsert",
+            "coord_work_unit_transition",
+            "coord_register_gate",
+            "coord_attest_gate",
+            "coord_orient",
+            "coord_report_status",
+            "coord_conflict_check",
+            "coord_blockers",
+            "coord_post_finding",
+            "coord_send_message",
+            "coord_query_health", // prefix family
+        ] {
+            assert!(
+                gate(serde_json::json!({
+                    "jsonrpc":"2.0","id":2,"method":"tools/call",
+                    "params":{"name":tool,"arguments":{}}
+                }))
+                .is_ok(),
+                "{tool} must pass the gate"
+            );
+        }
+    }
+
+    /// Non-allowlisted tools are refused with the request's id echoed —
+    /// including the deliberately-excluded privileged families.
+    #[test]
+    fn rejects_privileged_and_unknown_tools() {
+        for tool in [
+            "coord_onboard_enroll_installation",
+            "coord_attest_escalate_override",
+            "coord_request_merge",
+            "coord_cancel_merge",
+            "coord_create_pr",
+            "coord_push_to_branch",
+            "coord_migration_reserve",
+            "coord_request_policy",
+            "coord_flag_state",
+            "totally_made_up_tool",
+        ] {
+            let (id, msg) = gate(serde_json::json!({
+                "jsonrpc":"2.0","id":7,"method":"tools/call",
+                "params":{"name":tool,"arguments":{}}
+            }))
+            .expect_err(&format!("{tool} must be refused"));
+            assert_eq!(id, serde_json::json!(7), "the request id is echoed");
+            assert!(msg.contains(tool), "message names the refused tool: {msg}");
+            assert!(!coord_mcp_tool_is_allowed(tool));
+        }
+    }
+
+    /// Non-allowlisted METHODS are refused — the generic-passthrough hole this
+    /// gate closes (resources/prompts/logging/arbitrary methods).
+    #[test]
+    fn rejects_non_allowlisted_methods_and_malformed_bodies() {
+        for method in ["resources/read", "prompts/get", "logging/setLevel", "shutdown"] {
+            assert!(
+                gate(serde_json::json!({"jsonrpc":"2.0","id":1,"method":method})).is_err(),
+                "{method} must be refused"
+            );
+        }
+        // No method at all.
+        assert!(gate(serde_json::json!({"jsonrpc":"2.0","id":1})).is_err());
+        // tools/call with no tool name.
+        assert!(
+            gate(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}))
+                .is_err()
+        );
+        // Not JSON at all.
+        let err = coord_mcp_body_gate(b"not json {").unwrap_err();
+        assert_eq!(err.id, serde_json::Value::Null);
+    }
+
+    /// A batch is validated per element: one disallowed element rejects the
+    /// whole request (and an empty batch is refused outright).
+    #[test]
+    fn batch_bodies_are_validated_per_element() {
+        assert!(gate(serde_json::json!([
+            {"jsonrpc":"2.0","id":1,"method":"tools/list"},
+            {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"coord_orient"}},
+        ]))
+        .is_ok());
+        let (id, _) = gate(serde_json::json!([
+            {"jsonrpc":"2.0","id":1,"method":"tools/list"},
+            {"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"coord_request_merge"}},
+        ]))
+        .unwrap_err();
+        assert_eq!(id, serde_json::json!(9), "the offending element's id is echoed");
+        assert!(gate(serde_json::json!([])).is_err(), "empty batch refused");
     }
 }
 

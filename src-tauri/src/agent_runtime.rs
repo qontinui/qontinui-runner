@@ -1135,8 +1135,12 @@ fn spawn_run_task(payload: LaunchPayload) {
         // Drop the registry entry once the run task is fully done.
         agent_stops().lock().unwrap().remove(&agent_id);
         // Drop the agent's live-token slot so its proxy nonce hard-fails closed
-        // (the agent process is gone; any lingering `.mcp.json` nonce must 401).
+        // (the agent process is gone; any lingering `.mcp.json` nonce must 401)
+        // — and revoke the nonce registration itself (credential-hygiene
+        // Task 5): a torn-down agent's nonce should disappear from the
+        // registry, not linger as a permanently-401ing entry.
         crate::coord_mcp::remove_agent_token(agent_id);
+        crate::coord_mcp::revoke_agent_proxy_nonces(agent_id);
         // Stop the per-agent durability + observability daemons (pusher/poller).
         crate::agent_daemons::stop_for_agent(agent_id);
     });
