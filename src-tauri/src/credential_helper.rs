@@ -484,7 +484,11 @@ mod tests {
     #[test]
     fn non_interactive_git_env_all_hosts_is_fully_non_interactive() {
         let env = non_interactive_git_env(GitCredentialScope::AllHosts);
-        let get = |k: &str| env.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
+        let get = |k: &str| {
+            env.iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.as_str())
+        };
 
         // AllHosts (autonomous agent) never blocks on any host's UI.
         assert_eq!(get("GCM_INTERACTIVE"), Some("never"));
