@@ -214,8 +214,11 @@ fn build_enriched(
     confirmed: bool,
     title: Option<String>,
 ) -> PastSession {
-    let transcript_path =
-        resolve_transcript_path(config_dir.as_deref(), working_dir.as_deref(), &claude_session_id);
+    let transcript_path = resolve_transcript_path(
+        config_dir.as_deref(),
+        working_dir.as_deref(),
+        &claude_session_id,
+    );
     let transcript_exists = transcript_path.is_some();
     let restorable = confirmed && transcript_exists;
 
@@ -468,8 +471,7 @@ mod tests {
         );
         assert_eq!(sessions[3].cohort_id, base + 10 * 60_000);
         // Exactly two distinct cohorts.
-        let distinct: std::collections::HashSet<_> =
-            sessions.iter().map(|s| s.cohort_id).collect();
+        let distinct: std::collections::HashSet<_> = sessions.iter().map(|s| s.cohort_id).collect();
         assert_eq!(distinct.len(), 2);
     }
 }
