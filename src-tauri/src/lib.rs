@@ -40,6 +40,7 @@ pub mod fs_atomic;
 // that needs the encrypted token store outside the Tauri runtime). Both
 // modules are Tauri-free.
 pub mod auth;
+pub mod fs_perms;
 pub mod secure_storage;
 
 // Machine-side dev-environment capture agent (feat/devenv-environments). Runs

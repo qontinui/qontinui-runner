@@ -90,6 +90,7 @@ mod fleet_commands;
 mod flow_control;
 mod follow_up;
 mod fs_atomic;
+mod fs_perms;
 mod git_status_subset;
 // D5 Phase 1 — Git Supervision Channel. Consumes git/spec events from the
 // existing `trigger_system` (via the `SupervisionProposal` action variant)
