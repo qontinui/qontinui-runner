@@ -806,34 +806,65 @@ impl SessionLifecycleStore {
     /// than their grace windows, are excluded — a user who closes a tab does
     /// not want it resurrected, and a long-dead close is stale.
     ///
-    /// ## Anchored recency (open rows)
+    /// ## Cohort anchor (open rows)
     ///
     /// An open row is admitted iff
-    /// `anchor - last_seen_at <= RESTORABLE_OPEN_ANCHOR_GRACE_MS`, where
-    /// `anchor = max(every last_seen_at, every closed_at, prior_marker_at)` —
-    /// the registry's last moment of life, NOT wall-clock now. A wall-clock
-    /// rule (`now - last_seen <= grace`) would restore NOTHING after any
-    /// downtime longer than the grace (crash, hours-later boot), while a
-    /// clean-boot hard exclusion would silently lose a real on-screen session
-    /// whose `pty-exit` close never flushed. `prior_marker_at` is the prior
-    /// shutdown marker's `at` (shutdown instant on a clean exit, the crashed
-    /// process's boot instant on a crash), captured ONCE at boot — see
+    /// `anchor - last_seen_at <= RESTORABLE_OPEN_ANCHOR_GRACE_MS`, where the
+    /// `anchor` is the registry's last moment of life — but derived from the
+    /// **death cohort**, NOT the global max, and NOT wall-clock now.
+    ///
+    /// A wall-clock rule (`now - last_seen <= grace`) would restore NOTHING
+    /// after any downtime longer than the grace (a crash, an hours-later
+    /// boot). A plain global-max anchor fixes that but is fragile: a SINGLE
+    /// stray-later timestamp (an intermediate boot/auto-restart's shutdown
+    /// marker, or a registry row that intermediate boot happened to touch)
+    /// pulls the anchor hours past the crash band, so every crash-time row
+    /// then fails `anchor - last_seen <= grace` and is silently dropped — the
+    /// 2026-07-19 mass-strand (81 confirmed sessions lost after a ~1h46m
+    /// delayed restart).
+    ///
+    /// The cohort anchor immunizes against that outlier. Candidate
+    /// life-timestamps (every row's `last_seen_at`, every closed row's
+    /// `closed_at`, and — only on a CLEAN boot — `prior_marker_at`) are
+    /// single-linkage clustered at `grace`; the anchor is the MAX timestamp of
+    /// the DENSEST cluster (ties → newest cluster). The dense crash band is
+    /// far denser than a lone stray, so the anchor tracks the band's newest
+    /// instant and the whole cohort survives regardless of downtime — exactly
+    /// the documented long-downtime intent — while the stray no longer evicts
+    /// it. Rows newer than the anchor (negative diff) stay admitted.
+    ///
+    /// `prior_marker_at` is the prior shutdown marker's `at` (the shutdown
+    /// instant on a clean exit; the crashed process's OWN boot instant on a
+    /// crash — see [`crate::session::shutdown_marker`]). On a crash the marker
+    /// is a boot artifact, not session liveness, so it is EXCLUDED from the
+    /// anchor when `boot_was_clean` is `false`; the crash band supplies the
+    /// anchor. It is captured ONCE at boot — see
     /// [`crate::session::shutdown_marker::boot_classification`].
     pub fn restorable_records(
         &self,
         now_ms: i64,
         prior_marker_at: Option<i64>,
+        boot_was_clean: bool,
     ) -> Vec<TerminalSessionRecord> {
         match self.map.lock() {
             Ok(m) => {
-                // The registry's last moment of life across every row, plus
-                // the prior shutdown marker.
-                let anchor = m
+                // Candidate life-timestamps: every row's last_seen_at, every
+                // closed row's closed_at, and — only on a clean boot — the
+                // prior shutdown marker. On an unclean (crash) boot the marker
+                // is the crashed process's own boot instant (a boot artifact,
+                // not session liveness), so it is excluded and the crash
+                // cohort supplies the anchor.
+                let mut candidates: Vec<i64> = m
                     .values()
                     .flat_map(|r| [Some(r.last_seen_at), r.closed_at])
-                    .chain(std::iter::once(prior_marker_at))
                     .flatten()
-                    .max();
+                    .collect();
+                if boot_was_clean {
+                    if let Some(marker_at) = prior_marker_at {
+                        candidates.push(marker_at);
+                    }
+                }
+                let anchor = cohort_anchor(candidates, RESTORABLE_OPEN_ANCHOR_GRACE_MS);
                 m.values()
                     .filter(|r| {
                         if r.state == "open" {
@@ -913,6 +944,55 @@ impl SessionLifecycleStore {
             );
         }
     }
+}
+
+/// Compute the cohort anchor from a set of candidate life-timestamps.
+///
+/// A single stray-later timestamp (an intermediate boot's shutdown marker, or
+/// a registry row an intermediate boot happened to touch) must NOT be able to
+/// pull the admission anchor away from the dense band of rows that actually
+/// died together at crash time. We therefore single-linkage cluster the
+/// candidates at `grace` — sort ascending, and start a NEW cluster whenever
+/// the gap to the previous timestamp exceeds `grace` — and take the anchor to
+/// be the MAX timestamp of the DENSEST cluster (most member timestamps; ties
+/// broken toward the NEWEST cluster). The crash band is far denser than a lone
+/// stray, so the anchor tracks the band's newest instant and is immune to the
+/// outlier. Returns `None` for an empty candidate set (caller admits
+/// defensively).
+fn cohort_anchor(mut candidates: Vec<i64>, grace: i64) -> Option<i64> {
+    if candidates.is_empty() {
+        return None;
+    }
+    candidates.sort_unstable();
+
+    // Walk the sorted timestamps, closing a cluster whenever the gap to the
+    // previous timestamp exceeds `grace`. Track the best (densest, then
+    // newest) cluster's max. `>=` on the length comparison keeps the NEWEST
+    // cluster on a size tie, since clusters are visited oldest-first.
+    let mut best_len = 0usize;
+    let mut best_max = candidates[0];
+    let mut cur_len = 0usize;
+    let mut cur_max = candidates[0];
+    let mut prev = candidates[0];
+    for &t in &candidates {
+        if t - prev > grace {
+            // Gap exceeds the grace — close the current cluster before this
+            // timestamp opens a new one.
+            if cur_len >= best_len {
+                best_len = cur_len;
+                best_max = cur_max;
+            }
+            cur_len = 0;
+        }
+        cur_len += 1;
+        cur_max = t; // sorted ascending → the last member is the cluster max
+        prev = t;
+    }
+    // Close the final cluster.
+    if cur_len >= best_len {
+        best_max = cur_max;
+    }
+    Some(best_max)
 }
 
 fn load_map(path: &Path) -> HashMap<String, TerminalSessionRecord> {
@@ -1614,7 +1694,7 @@ mod tests {
         assert!(store.get("phantom").is_none(), "stays removed after reload");
         assert!(
             store
-                .restorable_records(Utc::now().timestamp_millis(), None)
+                .restorable_records(Utc::now().timestamp_millis(), None, true)
                 .is_empty(),
             "a removed phantom is never restorable"
         );
@@ -1739,7 +1819,7 @@ mod tests {
         let store = SessionLifecycleStore::open(&path).unwrap();
 
         let mut ids: Vec<String> = store
-            .restorable_records(now, None)
+            .restorable_records(now, None, true)
             .into_iter()
             .map(|r| r.claude_session_id)
             .collect();
@@ -2382,7 +2462,7 @@ mod tests {
 
         let now = Utc::now().timestamp_millis();
         assert!(
-            store.restorable_records(now, None).is_empty(),
+            store.restorable_records(now, None, true).is_empty(),
             "a never-started (bare shell) record must never be a restore candidate"
         );
     }
@@ -2399,7 +2479,7 @@ mod tests {
 
         let now = Utc::now().timestamp_millis();
         assert!(
-            store.restorable_records(now, None).is_empty(),
+            store.restorable_records(now, None, true).is_empty(),
             "a no-terminal close (even seconds old) must not be restorable"
         );
     }
@@ -2498,9 +2578,10 @@ mod tests {
         store: &SessionLifecycleStore,
         now: i64,
         prior_marker_at: Option<i64>,
+        boot_was_clean: bool,
     ) -> Vec<String> {
         let mut ids: Vec<String> = store
-            .restorable_records(now, prior_marker_at)
+            .restorable_records(now, prior_marker_at, boot_was_clean)
             .into_iter()
             .map(|r| r.claude_session_id)
             .collect();
@@ -2559,10 +2640,10 @@ mod tests {
             "fixture-onscreen-0002".to_string(),
         ];
         // With the clean-shutdown marker anchoring the registry…
-        assert_eq!(restorable_ids(&store, now, Some(shutdown)), expected);
+        assert_eq!(restorable_ids(&store, now, Some(shutdown), true), expected);
         // …and even without it: the pty-exit closes already anchor the
         // registry at the shutdown instant, so the 72h ghost stays out.
-        assert_eq!(restorable_ids(&store, now, None), expected);
+        assert_eq!(restorable_ids(&store, now, None, true), expected);
     }
 
     /// Anchored recency is downtime-proof: open rows fresh AT THE CRASH
@@ -2588,8 +2669,10 @@ mod tests {
         // The crashed process's marker (`clean:false`, stamped at ITS boot,
         // a day earlier) must not shrink the anchor below the fresh rows.
         let prior_marker_at = Some(crash - 86_400_000);
+        // Unclean boot: the crashed process's own marker is excluded from the
+        // anchor; the dense crash cohort supplies it.
         assert_eq!(
-            restorable_ids(&store, now, prior_marker_at),
+            restorable_ids(&store, now, prior_marker_at, false),
             vec!["fresh-a".to_string(), "fresh-b".to_string()],
             "fresh-at-crash open rows restore after multi-hour downtime; ghost excluded"
         );
@@ -2622,7 +2705,7 @@ mod tests {
         );
         let store = SessionLifecycleStore::open(&path).unwrap();
         assert_eq!(
-            restorable_ids(&store, now, Some(shutdown)),
+            restorable_ids(&store, now, Some(shutdown), true),
             vec!["flushed".to_string(), "unflushed".to_string()],
             "an open row within grace of the anchor restores even on a clean boot"
         );
@@ -2645,13 +2728,16 @@ mod tests {
         let store = SessionLifecycleStore::open(&path).unwrap();
 
         assert!(
-            restorable_ids(&store, now, Some(shutdown)).is_empty(),
-            "the marker anchor must exclude a lone stale ghost"
+            restorable_ids(&store, now, Some(shutdown), true).is_empty(),
+            "the clean-boot marker anchor must exclude a lone stale ghost"
         );
         // Documented fallback: with no marker and no sibling rows the ghost
         // self-anchors and is admitted (defensive — better than losing a
         // real lone session on a registry with no other signal).
-        assert_eq!(restorable_ids(&store, now, None), vec!["ghost".to_string()]);
+        assert_eq!(
+            restorable_ids(&store, now, None, true),
+            vec!["ghost".to_string()]
+        );
     }
 
     #[test]
@@ -2686,7 +2772,7 @@ mod tests {
         let store = SessionLifecycleStore::open(&path).unwrap();
 
         let ids: Vec<String> = store
-            .restorable_records(now, None)
+            .restorable_records(now, None, true)
             .into_iter()
             .map(|r| r.claude_session_id)
             .collect();
@@ -2697,6 +2783,178 @@ mod tests {
         assert!(
             !ids.contains(&"poll-dead-stale".to_string()),
             "poll-dead aged past grace must NOT be restorable; got {ids:?}"
+        );
+    }
+
+    /// The 2026-07-19 mass-strand, reproduced. A dense crash cohort dies
+    /// together at ~T; the runner is restarted ~2h later; both a later
+    /// shutdown marker (T+90m, written by an intermediate boot) AND a lone
+    /// registry row that intermediate boot touched (T+90m) would, under the
+    /// old global-max anchor, pull the anchor 90m past the cohort and evict
+    /// every crash row (`anchor - last_seen = 90m > 10m grace`). The cohort
+    /// anchor (densest cluster = the crash band) plus marker-gating on the
+    /// unclean boot keep the whole cohort restorable — the exact incident.
+    #[test]
+    fn restorable_records_crash_cohort_survives_later_marker_and_stray_row() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let t = 1_700_000_000_000_i64; // crash instant
+        let ninety_min = 90 * 60_000_i64;
+        let now = t + 2 * 3_600_000; // restarted 2h later
+
+        // Five open rows that stopped together in a tight band at ~T (the
+        // crash cohort), plus one lone "intermediate-boot" open row 90m later.
+        write_fixture(
+            &path,
+            vec![
+                fixture_rec("crash-0", "open", t, None, None),
+                fixture_rec("crash-1", "open", t - 1_000, None, None),
+                fixture_rec("crash-2", "open", t - 2_000, None, None),
+                fixture_rec("crash-3", "open", t - 3_000, None, None),
+                fixture_rec("crash-4", "open", t - 4_000, None, None),
+                fixture_rec("intermediate-ghost", "open", t + ninety_min, None, None),
+            ],
+        );
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        // Unclean (crash) boot: the intermediate marker at T+90m is EXCLUDED
+        // from the anchor. Even so the stray registry row at T+90m stays a
+        // candidate — the cohort anchor must still resolve to the dense crash
+        // band, not the lone stray.
+        let marker_at = Some(t + ninety_min);
+        let ids = restorable_ids(&store, now, marker_at, false);
+
+        for id in ["crash-0", "crash-1", "crash-2", "crash-3", "crash-4"] {
+            assert!(
+                ids.contains(&id.to_string()),
+                "the entire crash cohort must survive a delayed restart; missing {id} (got {ids:?})"
+            );
+        }
+        // The lone later row is newer than the anchor (negative diff) → it is
+        // admitted too (a fresh row is never dropped); the load-bearing point
+        // is that it did NOT evict the cohort.
+        assert!(ids.contains(&"intermediate-ghost".to_string()));
+    }
+
+    /// A genuine stale lone ghost (its terminal died 72h before the crash)
+    /// stays EXCLUDED even though a fresh crash cohort now anchors the
+    /// registry: the cohort anchor sits at the crash band, and the ghost is
+    /// far outside grace below it. The cohort fix must not over-admit.
+    #[test]
+    fn restorable_records_cohort_anchor_still_excludes_stale_ghost() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let t = 1_700_000_000_000_i64;
+        let now = t + 3_600_000; // 1h later
+
+        write_fixture(
+            &path,
+            vec![
+                fixture_rec("crash-0", "open", t, None, None),
+                fixture_rec("crash-1", "open", t - 1_000, None, None),
+                fixture_rec("crash-2", "open", t - 2_000, None, None),
+                fixture_rec("stale-ghost", "open", t - 72 * 3_600_000, None, None),
+            ],
+        );
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        // Unclean boot, no honest marker: the crash band anchors; the 72h
+        // ghost is well outside grace and must not resurrect.
+        let ids = restorable_ids(&store, now, None, false);
+        assert_eq!(
+            ids,
+            vec![
+                "crash-0".to_string(),
+                "crash-1".to_string(),
+                "crash-2".to_string(),
+            ],
+            "the crash cohort restores; the 72h stale ghost stays excluded"
+        );
+    }
+
+    /// A mixed registry: a dense crash cohort at T plus a smaller,
+    /// legitimately newer band 30m later (e.g. sessions an intermediate boot
+    /// actually restored and that were live again). The densest cluster (the
+    /// crash band) anchors; the newer band is newer than the anchor and is
+    /// admitted too — so BOTH bands restore. A newer band never evicts the
+    /// crash band, and legit newer sessions are not dropped.
+    #[test]
+    fn restorable_records_mixed_cohort_admits_both_bands() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let t = 1_700_000_000_000_i64;
+        let thirty_min = 30 * 60_000_i64;
+        let now = t + 2 * 3_600_000;
+
+        write_fixture(
+            &path,
+            vec![
+                // Dense crash band (5 rows) at ~T.
+                fixture_rec("crash-0", "open", t, None, None),
+                fixture_rec("crash-1", "open", t - 1_000, None, None),
+                fixture_rec("crash-2", "open", t - 2_000, None, None),
+                fixture_rec("crash-3", "open", t - 3_000, None, None),
+                fixture_rec("crash-4", "open", t - 4_000, None, None),
+                // Smaller, legitimately-newer band (2 rows) 30m later.
+                fixture_rec("newer-0", "open", t + thirty_min, None, None),
+                fixture_rec("newer-1", "open", t + thirty_min - 1_000, None, None),
+            ],
+        );
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        let ids = restorable_ids(&store, now, None, false);
+        assert_eq!(
+            ids,
+            vec![
+                "crash-0".to_string(),
+                "crash-1".to_string(),
+                "crash-2".to_string(),
+                "crash-3".to_string(),
+                "crash-4".to_string(),
+                "newer-0".to_string(),
+                "newer-1".to_string(),
+            ],
+            "both the crash band and the legit newer band restore"
+        );
+    }
+
+    /// Unit coverage for the cohort-anchor core: a lone stray-later timestamp
+    /// cannot pull the anchor off the densest band; empty → None; ties resolve
+    /// to the newest cluster.
+    #[test]
+    fn cohort_anchor_picks_densest_then_newest() {
+        let grace = RESTORABLE_OPEN_ANCHOR_GRACE_MS;
+
+        // Empty → None (caller admits defensively).
+        assert_eq!(cohort_anchor(vec![], grace), None);
+
+        // Single timestamp → itself.
+        assert_eq!(cohort_anchor(vec![42], grace), Some(42));
+
+        // A dense band at ~1000 plus one stray far later: anchor = band max,
+        // NOT the stray.
+        let band_max = 1_000;
+        let stray = band_max + grace * 100;
+        assert_eq!(
+            cohort_anchor(
+                vec![stray, band_max - 300, band_max - 100, band_max, band_max - 200],
+                grace,
+            ),
+            Some(band_max),
+            "the lone stray must not become the anchor"
+        );
+
+        // Two equal-size (single-member) clusters: tie breaks toward the
+        // NEWEST cluster.
+        let a = 1_000;
+        let b = a + grace * 10;
+        assert_eq!(cohort_anchor(vec![a, b], grace), Some(b));
+
+        // Contiguous timestamps exactly `grace` apart stay ONE cluster
+        // (gap must EXCEED grace to split) → anchor = the last.
+        assert_eq!(
+            cohort_anchor(vec![0, grace, 2 * grace], grace),
+            Some(2 * grace)
         );
     }
 }
