@@ -56,7 +56,6 @@ pub mod orchestration_loop;
 pub mod phase_results;
 pub mod pipeline_traces;
 pub mod plans;
-pub mod pr_shepherd_ops;
 pub mod pr_watch_ops;
 pub mod process_sessions;
 pub mod productivity_knowledge;
@@ -156,38 +155,6 @@ pub(crate) fn parse_optional_workflow_id(id: Option<&str>) -> Result<Option<uuid
         .map(parse_workflow_id)
         .transpose()
 }
-
-/// PR-shepherd Phases 1+2 shape self-heal for the alembic-owned
-/// `project.pr_watch_state` table: the `authoring_session_id` /
-/// `first_fully_green_at` columns, the `task_run_id` NOT NULL drop, and the
-/// session-keyed partial unique index. Idempotent; no-ops when the table does
-/// not exist (alembic owns the CREATE).
-///
-/// Run from TWO sites:
-/// - boot (`verify_and_provision`) — the normal path;
-/// - `pr_watch_ops::get_active_pr_watches`, on detecting SQLSTATE 42703
-///   (undefined column) — covering the runner-booted-before-alembic ordering,
-///   where alembic creates the table in its canonical shape (without these
-///   columns) AFTER the boot-time pass already no-oped. Without that re-run,
-///   every watcher poll would fail until a runner restart.
-pub(crate) const PR_WATCH_STATE_SELF_HEAL_SQL: &str = "DO $prshep$
-             BEGIN
-               IF EXISTS (
-                 SELECT 1 FROM information_schema.tables
-                 WHERE table_schema = 'project' AND table_name = 'pr_watch_state'
-               ) THEN
-                 ALTER TABLE project.pr_watch_state
-                     ADD COLUMN IF NOT EXISTS authoring_session_id TEXT;
-                 ALTER TABLE project.pr_watch_state
-                     ADD COLUMN IF NOT EXISTS first_fully_green_at TIMESTAMPTZ;
-                 ALTER TABLE project.pr_watch_state
-                     ALTER COLUMN task_run_id DROP NOT NULL;
-                 CREATE UNIQUE INDEX IF NOT EXISTS idx_prw_session_pr
-                     ON project.pr_watch_state (authoring_session_id, pr_number)
-                     WHERE task_run_id IS NULL;
-               END IF;
-             END
-             $prshep$;";
 
 /// PostgreSQL connection pool backed by deadpool-postgres.
 pub struct PgDb {
@@ -611,39 +578,6 @@ impl PgDb {
         .await
         .map_err(|e| format!("Stream E.1 proposal_events.app_id self-heal failed: {}", e))?;
 
-        // PR-shepherd Phases 1+2 (plan 2026-07-04-runner-pr-shepherd): extend
-        // `project.pr_watch_state` with the seeding + green-but-unmerged
-        // columns. The table is alembic-owned (qontinui-web
-        // `consolidation_phase1_20_tail_specialty.py`) and Atlas-excluded, so
-        // — like the CR-5 jsonb conversion above — the runner self-heals the
-        // shape on its next startup; a companion alembic revision in
-        // qontinui-web should carry the same columns so the regenerated
-        // `schema.pg.sql.generated` eventually reflects them (no Clorinde
-        // `queries/*.sql` references these columns, so the snapshot needs no
-        // hand-edit meanwhile). Gated on table existence so a bare PG where
-        // the migrator hasn't run boots cleanly. Idempotent throughout.
-        //
-        // - `authoring_session_id` (nullable): the coord session id for
-        //   watches seeded from INTERACTIVE sessions, which have no task run
-        //   to attribute. `task_run_id` drops its NOT NULL for the same
-        //   reason; because the existing `(task_run_id, pr_number)` unique
-        //   constraint can never conflict on NULL `task_run_id`, session-keyed
-        //   rows dedup via the partial unique index below instead.
-        // - `first_fully_green_at` (nullable): when all non-skipped checks
-        //   first passed on the current head — the green-but-unmerged
-        //   detector's clock. Reset on head change or any red/pending flip.
-        //
-        // NOTE: this boot-time pass is NOT the only run site. If the table does
-        // not exist yet at boot (fresh PG, migrator not run), the DO block
-        // no-ops here — and alembic may then create the table in its CANONICAL
-        // shape WITHOUT these columns. `pr_watch_ops::get_active_pr_watches`
-        // detects the resulting undefined-column error (SQLSTATE 42703) and
-        // re-runs this same idempotent block (`PR_WATCH_STATE_SELF_HEAL_SQL`)
-        // before retrying, so watcher polls recover without a runner restart.
-        conn.batch_execute(PR_WATCH_STATE_SELF_HEAL_SQL)
-            .await
-            .map_err(|e| format!("PR-shepherd pr_watch_state self-heal failed: {}", e))?;
-
         // Approach-D Conductor/Engine Phase 1 — runner-owned `orchestration`
         // schema (durable run + subtask DAG ledger).
         //
@@ -699,43 +633,6 @@ impl PgDb {
         )
         .await
         .map_err(|e| format!("Phase 1 orchestration schema self-heal failed: {}", e))?;
-
-        // PR-shepherd Phase 5 (plan 2026-07-04-runner-pr-shepherd): the
-        // remediation dedup marker. One row per remediation the device-local
-        // shepherd authored for a coord defect (or an orphaned-red fix) — it is
-        // BOTH the cooldown arbiter (skip a fresh remediation for the same
-        // defect class within `QONTINUI_PR_SHEPHERD_REMEDIATION_COOLDOWN`) AND
-        // the steward-coexistence record. Runner-owned `project.*` namespace, so
-        // — like `project.apps` / `orchestration.*` above — the runner self-heals
-        // the shape with a plain CREATE TABLE IF NOT EXISTS; there is no coord.*
-        // table here and thus no `require_table`. Idempotent.
-        //
-        // - `defect_class`: the CoordDefectClass kebab id (or `orphaned-red`).
-        // - `repo` + `pr`: the PR the remediation targets. Per-PR classes
-        //   (`orphaned-red`) dedup on (class, repo, pr); coord-defect classes
-        //   dedup class-wide (one coord fix covers all PRs).
-        // - `plan_path`: the generated remediation plan file (empty for the
-        //   inline-prompt orphaned-red triage spawn).
-        // - `spawned_session`: the child TaskRun id when a session was spawned;
-        //   NULL when spawn was disabled (plan written, no session).
-        conn.batch_execute(
-            "CREATE SCHEMA IF NOT EXISTS project; \
-             CREATE TABLE IF NOT EXISTS project.pr_shepherd_remediations ( \
-                 id              TEXT PRIMARY KEY, \
-                 defect_class    TEXT NOT NULL, \
-                 repo            TEXT NOT NULL DEFAULT '', \
-                 pr              BIGINT NOT NULL, \
-                 plan_path       TEXT NOT NULL DEFAULT '', \
-                 spawned_session TEXT, \
-                 created_at      TIMESTAMPTZ NOT NULL DEFAULT now() \
-             ); \
-             ALTER TABLE project.pr_shepherd_remediations \
-                 ADD COLUMN IF NOT EXISTS repo TEXT NOT NULL DEFAULT ''; \
-             CREATE INDEX IF NOT EXISTS idx_pr_shepherd_remediations_class_created \
-                 ON project.pr_shepherd_remediations (defect_class, created_at DESC);",
-        )
-        .await
-        .map_err(|e| format!("PR-shepherd remediations self-heal failed: {}", e))?;
 
         info!("PostgreSQL connected (deadpool, max_size=8, schema=runner)");
 

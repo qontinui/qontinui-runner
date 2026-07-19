@@ -28,12 +28,9 @@
 //! Record in trigger_history
 //! ```
 
-pub mod coord_pr_merge_client;
 pub mod evaluator;
 pub mod executor;
 pub mod github_api;
-pub mod pr_shepherd;
-pub mod pr_shepherd_remediation;
 pub mod service;
 pub mod types;
 pub mod watchers;
