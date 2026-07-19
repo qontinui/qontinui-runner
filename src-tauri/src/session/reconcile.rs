@@ -923,6 +923,22 @@ pub async fn run_at_boot(
     store: &SessionLifecycleStore,
     live: Vec<LivePty>,
 ) -> Vec<ReconcileAction> {
+    // One-time P4 registry-corruption repair (plan
+    // `2026-07-19-runner-session-restore-mass-strand-and-git-popup`, Phase 3):
+    // collapse any `open` rows already sharing a `terminal_id` down to the single
+    // live tenant BEFORE the frontend classifies the restorable set, so a
+    // terminal-reuse pileup (sequential `claude` runs on one long-lived PTY whose
+    // prior exit-closes never fired) restores as ONE session, not N collapsed
+    // rows. Idempotent — a healthy registry closes nothing. Runs before the
+    // nothing-to-do fast path so a registry that holds ONLY stale collided rows
+    // (no live PTYs) is still repaired.
+    let repaired = store.repair_terminal_id_collisions();
+    if repaired > 0 {
+        tracing::info!(
+            closed = repaired,
+            "session reconcile: boot repair collapsed terminal_id collisions to the live tenant (P4 registry corruption)"
+        );
+    }
     if live.is_empty() && store.open_records().is_empty() {
         return Vec::new(); // nothing to do
     }
