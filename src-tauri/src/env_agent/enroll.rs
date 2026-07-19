@@ -25,6 +25,10 @@ use super::config::EnvAgentConfig;
 #[derive(Debug, Serialize)]
 struct EnrollRequest {
     enrollment_code: String,
+    /// The **devenv** machine UUID. `None` on every locally-initiated enroll —
+    /// see [`EnrollParams::machine_id`]. The backend only sanity-checks it when
+    /// non-null (`payload.machine_id is not None and != machine.id`), so a null
+    /// here is the correct "don't assert an identity I can't know" signal.
     machine_id: Option<String>,
     hostname: Option<String>,
     /// This machine's coord device identity (UUID). Omitted from the wire
@@ -54,8 +58,17 @@ pub struct EnrollParams {
     pub code: String,
     /// Web backend base URL (no trailing slash needed — trimmed here).
     pub backend: String,
-    /// Stable machine identity from `~/.qontinui/machine.json`, or `None` to let
-    /// the backend assign one.
+    /// The **devenv** machine UUID (`devenv_machines.id`), asserted only when we
+    /// already know it — i.e. a server-issued enroll directive supplied it. The
+    /// agent CANNOT derive this locally: enroll is what RETURNS it, and the
+    /// enrollment code already identifies the machine server-side. Leave `None`
+    /// in every locally-initiated enroll.
+    ///
+    /// This is a DIFFERENT identity space from coord's `device_id` in
+    /// `~/.qontinui/machine.json` — sending the latter here made the backend's
+    /// `payload.machine_id != machine.id` sanity check fail unconditionally with
+    /// `409 machine_id_mismatch` on every re-enroll. Coord's identity travels in
+    /// [`EnrollParams::coord_device_id`] instead.
     pub machine_id: Option<String>,
     /// This machine's hostname, or `None`.
     pub hostname: Option<String>,
@@ -187,13 +200,29 @@ pub fn resolve_backend_base(explicit: Option<&str>) -> Result<String, String> {
     Ok(crate::pair::derive_web_base_from_coord(&coord_base))
 }
 
-/// Read `~/.qontinui/machine.json` → `(machine_id, hostname, coord_device_id)`,
-/// all optional. A missing/unreadable/unparseable file yields `(None, None, None)`
-/// — enroll tolerates null identity (the backend may assign a machine_id).
+/// This machine's local identity as read from `~/.qontinui/machine.json`.
+///
+/// Deliberately does NOT carry a devenv `machine_id`: that file holds **coord's**
+/// device identity, which lives in a different identity space than the devenv
+/// `devenv_machines.id`. See [`EnrollParams::machine_id`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocalMachineIdentity {
+    /// `true` when `~/.qontinui/machine.json` was found, readable, AND parseable.
+    /// This is the explicit presence signal callers should use to decide whether
+    /// to warn the operator — never infer it from a wire field.
+    pub machine_json_present: bool,
+    /// This machine's hostname, or `None` when absent/blank.
+    pub hostname: Option<String>,
+    /// Coord's device identity (`device_id`) parsed as a UUID, or `None` when the
+    /// file is absent or the value is not a UUID.
+    pub coord_device_id: Option<uuid::Uuid>,
+}
+
+/// Parse the bytes of a `~/.qontinui/machine.json` into a [`LocalMachineIdentity`].
 /// Accepts the legacy `machine_id` key as an alias for `device_id`, matching the
-/// CLI reader. The third element is the same `device_id` value parsed as a UUID
-/// (coord's device identity), or `None` when it is absent/unparseable.
-pub fn local_machine_identity() -> (Option<String>, Option<String>, Option<uuid::Uuid>) {
+/// CLI reader. Unparseable input yields the default (absent) identity. Split out
+/// from [`local_machine_identity`] so it is unit-testable without a real HOME.
+fn parse_machine_json(bytes: &[u8]) -> LocalMachineIdentity {
     #[derive(Deserialize)]
     struct DeviceFile {
         #[serde(alias = "machine_id")]
@@ -201,25 +230,33 @@ pub fn local_machine_identity() -> (Option<String>, Option<String>, Option<uuid:
         #[serde(default)]
         hostname: String,
     }
-    let Some(home) = dirs::home_dir() else {
-        return (None, None, None);
-    };
-    let path = home.join(".qontinui").join("machine.json");
-    let Ok(bytes) = std::fs::read(&path) else {
-        return (None, None, None);
-    };
-    match serde_json::from_slice::<DeviceFile>(&bytes) {
-        Ok(f) => {
-            let hostname = if f.hostname.trim().is_empty() {
+    match serde_json::from_slice::<DeviceFile>(bytes) {
+        Ok(f) => LocalMachineIdentity {
+            machine_json_present: true,
+            hostname: if f.hostname.trim().is_empty() {
                 None
             } else {
                 Some(f.hostname)
-            };
-            let coord_device_id = uuid::Uuid::parse_str(f.device_id.trim()).ok();
-            (Some(f.device_id), hostname, coord_device_id)
-        }
-        Err(_) => (None, None, None),
+            },
+            coord_device_id: uuid::Uuid::parse_str(f.device_id.trim()).ok(),
+        },
+        Err(_) => LocalMachineIdentity::default(),
     }
+}
+
+/// Read `~/.qontinui/machine.json` into a [`LocalMachineIdentity`]. A
+/// missing/unreadable/unparseable file yields the default (all-absent) identity
+/// — enroll tolerates a null identity, the backend identifies the machine from
+/// the enrollment code.
+pub fn local_machine_identity() -> LocalMachineIdentity {
+    let Some(home) = dirs::home_dir() else {
+        return LocalMachineIdentity::default();
+    };
+    let path = home.join(".qontinui").join("machine.json");
+    let Ok(bytes) = std::fs::read(&path) else {
+        return LocalMachineIdentity::default();
+    };
+    parse_machine_json(&bytes)
 }
 
 #[cfg(test)]
@@ -292,5 +329,80 @@ mod tests {
             v.get("coord_device_id").is_none(),
             "coord_device_id key must be absent when None, got: {v}"
         );
+    }
+
+    /// A PRESENT, readable `machine.json` must NOT put coord's `device_id` into
+    /// the devenv `machine_id` wire field — that conflation is what made the
+    /// backend's `payload.machine_id != machine.id` check fail unconditionally
+    /// (`409 machine_id_mismatch`) on every re-enroll of a bound machine.
+    #[test]
+    fn present_machine_json_yields_no_devenv_machine_id_but_keeps_coord_device_id() {
+        let identity = parse_machine_json(
+            br#"{"device_id":"11111111-2222-3333-4444-555555555555","hostname":"box-1"}"#,
+        );
+        assert!(identity.machine_json_present);
+        assert_eq!(identity.hostname.as_deref(), Some("box-1"));
+        assert_eq!(
+            identity.coord_device_id,
+            Some(uuid::Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap())
+        );
+
+        // Build the wire body exactly as every locally-initiated enroll does.
+        let body = EnrollRequest {
+            enrollment_code: "ENR-ABC".to_string(),
+            machine_id: None,
+            hostname: identity.hostname.clone(),
+            coord_device_id: identity.coord_device_id,
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        let wire_machine_id = v.get("machine_id");
+        assert!(
+            match wire_machine_id {
+                None => true,
+                Some(m) => m.is_null(),
+            },
+            "devenv machine_id must never be asserted from local identity, got: {v}"
+        );
+        assert_eq!(
+            v.get("coord_device_id").and_then(|c| c.as_str()),
+            Some("11111111-2222-3333-4444-555555555555"),
+            "coord identity must still travel in coord_device_id, got: {v}"
+        );
+    }
+
+    /// The legacy `machine_id` alias still parses, and still does NOT become the
+    /// devenv `machine_id` — it is coord's identity under an old key name.
+    #[test]
+    fn legacy_machine_id_key_parses_as_coord_device_id() {
+        let identity =
+            parse_machine_json(br#"{"machine_id":"11111111-2222-3333-4444-555555555555"}"#);
+        assert!(identity.machine_json_present);
+        assert!(identity.hostname.is_none(), "blank hostname → None");
+        assert!(identity.coord_device_id.is_some());
+    }
+
+    /// A non-UUID `device_id` is still a PRESENT file: the presence signal must
+    /// not collapse into "is the coord UUID parseable", or the CLI would warn
+    /// about a file that exists and is readable.
+    #[test]
+    fn non_uuid_device_id_is_still_present() {
+        let identity = parse_machine_json(br#"{"device_id":"not-a-uuid","hostname":"box-1"}"#);
+        assert!(identity.machine_json_present);
+        assert!(identity.coord_device_id.is_none());
+    }
+
+    /// Unreadable/unparseable content ⇒ the all-absent identity, which is what
+    /// drives the CLI's "no readable machine.json" note.
+    #[test]
+    fn unparseable_machine_json_yields_absent_identity() {
+        for bad in [&b"{"[..], &b""[..], &b"{\"hostname\":\"box-1\"}"[..]] {
+            let identity = parse_machine_json(bad);
+            assert_eq!(
+                identity,
+                LocalMachineIdentity::default(),
+                "unparseable input must yield the absent identity"
+            );
+            assert!(!identity.machine_json_present);
+        }
     }
 }

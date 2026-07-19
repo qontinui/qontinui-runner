@@ -42,13 +42,16 @@ pub async fn devenv_enroll(
 ) -> Result<CommandResponse, String> {
     let outcome = tokio::task::spawn_blocking(move || {
         let backend = enroll::resolve_backend_base(backend.as_deref())?;
-        let (machine_id, hostname, coord_device_id) = enroll::local_machine_identity();
+        let identity = enroll::local_machine_identity();
         enroll::run_enroll(EnrollParams {
             code,
             backend,
-            machine_id,
-            hostname,
-            coord_device_id,
+            // The devenv machine UUID is what enroll RETURNS — never asserted by a
+            // locally-initiated enroll. Coord's identity travels in
+            // `coord_device_id`.
+            machine_id: None,
+            hostname: identity.hostname,
+            coord_device_id: identity.coord_device_id,
             environment_override: None,
         })
     })
