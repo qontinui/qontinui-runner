@@ -479,11 +479,30 @@ fn labelled_value(message: &str, label: &str) -> Option<String> {
 #[cfg(any(windows, test))]
 fn find_exception_code(message: &str) -> Option<String> {
     if let Some(v) = labelled_value(message, "Exception code:") {
+        // An explicit label is authoritative — take it verbatim.
         return Some(normalize_hex(&v).unwrap_or(v));
     }
+    // No label — scan bare `0x…` tokens, but accept ONLY error-severity codes.
+    // A crash exception code (STATUS_STACK_BUFFER_OVERRUN 0xc0000409, access
+    // violation 0xc0000005, …) is an NTSTATUS with the severity field set to
+    // ERROR, i.e. the top hex nibble is >= 0x8. This rejects the many benign
+    // 8-hex `0x…` tokens WER messages carry — `time stamp: 0x00000000`, offsets,
+    // fault-offset 0x0000… — which would otherwise be reported as a bogus
+    // exception code and mislead triage.
     message
         .split(|c: char| c.is_whitespace() || c == ',' || c == '.')
-        .find_map(normalize_hex)
+        .filter_map(normalize_hex)
+        .find(|code| is_error_severity_hex(code))
+}
+
+/// True iff a normalized `0x????????` code has its NTSTATUS severity field set
+/// to error/warning (top nibble >= 0x8) — the shape of a real fault code.
+#[cfg(any(windows, test))]
+fn is_error_severity_hex(code: &str) -> bool {
+    code.strip_prefix("0x")
+        .and_then(|h| h.chars().next())
+        .and_then(|c| c.to_digit(16))
+        .is_some_and(|nibble| nibble >= 0x8)
 }
 
 /// Normalize a `0x????????` (8 hex digits) token to lowercase `0x…`. `None`
@@ -758,6 +777,23 @@ mod tests {
         );
         // A short hex is not an exception code.
         assert_eq!(find_exception_code("value 0x1234 here"), None);
+        // A benign 8-hex token (no `Exception code:` label) must NOT be reported
+        // as the exception code — it has success/info severity (top nibble < 8).
+        assert_eq!(
+            find_exception_code("Faulting application ..., time stamp: 0x00000000, offset 0x0007a1b2"),
+            None,
+            "a low-severity 0x00000000 timestamp is not a fault code"
+        );
+        // But an explicit label is authoritative even for an all-zero value.
+        assert_eq!(
+            find_exception_code("Exception code: 0x00000000"),
+            Some("0x00000000".to_string())
+        );
+        // A real access-violation code found bare is accepted (severity 0xc).
+        assert_eq!(
+            find_exception_code("... 0xc0000005 ..."),
+            Some("0xc0000005".to_string())
+        );
     }
 
     #[test]
