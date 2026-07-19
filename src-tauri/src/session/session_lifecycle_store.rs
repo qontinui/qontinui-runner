@@ -783,6 +783,21 @@ impl SessionLifecycleStore {
         }
     }
 
+    /// Clone of EVERY record — OPEN and CLOSED alike (closed rows are retained
+    /// until the 24 h prune). Unlike [`open_records`](Self::open_records) this
+    /// applies no state filter. Used by the DISPLAY-only "previous sessions"
+    /// listing ([`crate::session::past_sessions`]), which merges these with the
+    /// snapshot-history reader; it is NOT a restore surface.
+    pub fn all_records(&self) -> Vec<TerminalSessionRecord> {
+        match self.map.lock() {
+            Ok(m) => m.values().cloned().collect(),
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on all_records");
+                Vec::new()
+            }
+        }
+    }
+
     /// Clone of every record that should be RESTORED on boot. This is the
     /// subset of records the restore path resurrects:
     ///

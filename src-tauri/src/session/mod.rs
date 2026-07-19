@@ -64,6 +64,7 @@ pub mod intent;
 pub mod local_store;
 pub mod output_pipe;
 pub mod pane_store;
+pub mod past_sessions;
 pub mod provider_adapter;
 pub mod reconcile;
 pub mod redact;
