@@ -19,6 +19,7 @@
 //! never a value. The plan can therefore report "this box is missing secret X"
 //! and can never copy X.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -55,7 +56,39 @@ pub struct CanonicalConfig {
     /// Section name → policy string. Server-authoritative; see [`SectionPolicy`].
     #[serde(default)]
     pub section_policy: Map<String, Value>,
+    /// Section name → list of key names whose value is **derived from the repo**
+    /// (a crate version, a package.json version, …). Such a key converges by
+    /// pulling the repo, never by an apply, so it is reported but is never an
+    /// action — see [`SectionPlan::actionable`].
+    ///
+    /// The contract gives **every section in the response an entry** (an empty
+    /// list when nothing in it is derived), so "classified, none derived" is
+    /// distinguishable from "section absent". An absent field entirely means an
+    /// older backend, and yields exactly the pre-`derived_keys` behavior.
+    ///
+    /// `serde(default)` alone would NOT make this safe: it fills a *missing* key,
+    /// not an explicit `null`. [`map_or_default`] covers the null case too.
+    #[serde(default, deserialize_with = "map_or_default")]
+    pub derived_keys: Map<String, Value>,
 }
+
+/// Deserialize a JSON object, treating an explicit `null` as an empty map.
+///
+/// The `serde(default)` trap: `#[serde(default)]` only fires on a *missing* key.
+/// A contract-legal `"derived_keys": null` would otherwise be a hard parse error
+/// and take down the whole pull.
+fn map_or_default<'de, D>(d: D) -> Result<Map<String, Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Map<String, Value>>::deserialize(d)?.unwrap_or_default())
+}
+
+/// The section whose capture is **process-scoped**: its values come from the
+/// capturing process's own environment, so a runner-supervisor capture and a
+/// plain-shell capture legitimately disagree. Only affects preview accuracy —
+/// the section is `secret_report_only` and is never applied.
+const ENV_CONTRACT_SECTION: &str = "env_contract";
 
 /// What this runner is permitted to do with a section, as decided by the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +175,9 @@ pub struct SectionPlan {
     /// Distinguishes "no local data" from "in sync", which an empty `changes`
     /// list alone cannot express.
     pub local_section_absent: bool,
+    /// Keys in this section whose value is repo-derived (from the server's
+    /// `derived_keys`). Reported, never acted on.
+    pub derived_keys: BTreeSet<String>,
 }
 
 impl SectionPlan {
@@ -150,8 +186,16 @@ impl SectionPlan {
         self.changes.is_empty() && !self.local_section_absent
     }
 
+    /// True when this key's value is derived from the repo — it converges by
+    /// pulling the repo, not by anything this runner could apply.
+    pub fn is_derived(&self, key: &str) -> bool {
+        self.derived_keys.contains(key)
+    }
+
     /// Changes this runner would actually act on, given the policy. Only
-    /// `Applyable` sections yield actions, and `Extra` keys never do.
+    /// `Applyable` sections yield actions; `Extra` keys never do, and neither do
+    /// repo-derived keys **regardless of policy** — applying one would fight the
+    /// repo rather than reconcile the box.
     pub fn actionable(&self) -> Vec<&Change> {
         if self.policy != Applyable {
             return Vec::new();
@@ -159,6 +203,7 @@ impl SectionPlan {
         self.changes
             .iter()
             .filter(|c| !matches!(c, Change::Extra { .. }))
+            .filter(|c| !self.is_derived(c.key()))
             .collect()
     }
 }
@@ -282,11 +327,26 @@ pub fn compute_plan(
                 .unwrap_or(ReportOnly);
             let can = canonical.sections.get(name);
             let loc = local_sections.get(name);
+            // Absent field / absent section / non-array value all degrade to
+            // "nothing derived here" — i.e. exactly the pre-`derived_keys`
+            // behavior, never to a wrongly-suppressed action.
+            let derived_keys: BTreeSet<String> = canonical
+                .derived_keys
+                .get(name)
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
             SectionPlan {
                 section: name.clone(),
                 policy,
                 changes: diff_section(can, loc),
                 local_section_absent: can.is_some() && loc.is_none(),
+                derived_keys,
             }
         })
         .collect();
@@ -473,19 +533,38 @@ pub fn render_plan(plan: &ApplyPlan) -> String {
             );
         }
         for c in &s.changes {
+            // A derived key is shown (the drift is real and worth knowing) but
+            // marked, so nobody reads it as something an apply could fix.
+            let mark = if s.is_derived(c.key()) {
+                " [derived - converges by pulling the repo, not by an apply]"
+            } else {
+                ""
+            };
             match c {
                 Change::Missing { key, canonical } => out.push_str(&format!(
-                    "    - {key}: missing here (canonical: {canonical})\n"
+                    "    - {key}: missing here (canonical: {canonical}){mark}\n"
                 )),
                 Change::Differs {
                     key,
                     local,
                     canonical,
-                } => out.push_str(&format!("    ~ {key}: {local} -> {canonical}\n")),
+                } => out.push_str(&format!("    ~ {key}: {local} -> {canonical}{mark}\n")),
                 Change::Extra { key, local } => {
-                    out.push_str(&format!("    + {key}: {local} (not in canonical)\n"))
+                    out.push_str(&format!("    + {key}: {local} (not in canonical){mark}\n"))
                 }
             }
+        }
+        // Preview-accuracy caveat, not an apply-safety one: env_contract is
+        // captured from the CAPTURING PROCESS's environment, so the runner
+        // supervisor's env (QONTINUI_API_URL, QONTINUI_RUNNER_ID, …) differs from
+        // a plain shell's. The rows are NOT suppressed — a genuinely missing
+        // secret must still show.
+        if s.section == ENV_CONTRACT_SECTION && !s.changes.is_empty() {
+            out.push_str(
+                "    note: this section reflects the environment of the process that captured \
+                 it,\n          so differences here may be process-scope artifacts rather than \
+                 real gaps.\n",
+            );
         }
         out.push('\n');
     }
@@ -515,20 +594,25 @@ pub fn plan_to_json(plan: &ApplyPlan) -> Value {
             let changes: Vec<Value> = s
                 .changes
                 .iter()
-                .map(|c| match c {
-                    Change::Missing { key, canonical } => serde_json::json!({
-                        "kind": "missing", "key": key, "canonical": canonical,
-                    }),
-                    Change::Differs {
-                        key,
-                        local,
-                        canonical,
-                    } => serde_json::json!({
-                        "kind": "differs", "key": key, "local": local, "canonical": canonical,
-                    }),
-                    Change::Extra { key, local } => serde_json::json!({
-                        "kind": "extra", "key": key, "local": local,
-                    }),
+                .map(|c| {
+                    let derived = s.is_derived(c.key());
+                    match c {
+                        Change::Missing { key, canonical } => serde_json::json!({
+                            "kind": "missing", "key": key, "canonical": canonical,
+                            "derived": derived,
+                        }),
+                        Change::Differs {
+                            key,
+                            local,
+                            canonical,
+                        } => serde_json::json!({
+                            "kind": "differs", "key": key, "local": local,
+                            "canonical": canonical, "derived": derived,
+                        }),
+                        Change::Extra { key, local } => serde_json::json!({
+                            "kind": "extra", "key": key, "local": local, "derived": derived,
+                        }),
+                    }
                 })
                 .collect();
             serde_json::json!({
@@ -537,6 +621,8 @@ pub fn plan_to_json(plan: &ApplyPlan) -> Value {
                 "local_section_absent": s.local_section_absent,
                 "in_sync": s.is_clean(),
                 "actionable_count": s.actionable().len(),
+                "derived_keys": s.derived_keys.iter().collect::<Vec<_>>(),
+                "process_scoped": s.section == ENV_CONTRACT_SECTION,
                 "changes": changes,
             })
         })
@@ -571,6 +657,10 @@ mod tests {
     }
 
     fn canonical_with(sections: Value, policy: Value) -> CanonicalConfig {
+        canonical_with_derived(sections, policy, json!({}))
+    }
+
+    fn canonical_with_derived(sections: Value, policy: Value, derived: Value) -> CanonicalConfig {
         CanonicalConfig {
             canonical_machine_id: Some("canon-machine".to_string()),
             canonical_machine_name: Some("spaceship".to_string()),
@@ -578,6 +668,7 @@ mod tests {
             captured_at: Some("2026-07-17T00:00:00Z".to_string()),
             sections: sections.as_object().unwrap().clone(),
             section_policy: policy.as_object().unwrap().clone(),
+            derived_keys: derived.as_object().unwrap().clone(),
         }
     }
 
@@ -899,6 +990,250 @@ mod tests {
         );
         assert_eq!(extract_error_code("not json"), None);
         assert_eq!(extract_error_code(r#"{"detail":"plain string"}"#), None);
+    }
+
+    // ------------------------------------------------------------------
+    // derived_keys
+    // ------------------------------------------------------------------
+
+    /// The acceptance oracle in miniature: a repo-derived key in an APPLYABLE
+    /// section is still reported (the drift is real) but is never an action —
+    /// it converges by pulling the repo, which no apply on this box can do.
+    /// A non-derived sibling in the SAME section must stay actionable, so the
+    /// suppression is key-scoped and not section-scoped.
+    #[test]
+    fn derived_key_is_reported_but_never_actionable() {
+        let plan = compute_plan(
+            &canonical_with_derived(
+                json!({"versions": {"runner_crate_version": "0.9.0", "node": "22.1.0"}}),
+                json!({"versions": "applyable"}),
+                json!({"versions": ["runner_crate_version"]}),
+            ),
+            json!({"versions": {"runner_crate_version": "0.8.0", "node": "20.9.0"}})
+                .as_object()
+                .unwrap(),
+            "env-1",
+            "other",
+        );
+        let s = &plan.sections[0];
+        assert_eq!(s.policy, Applyable);
+        // Both drifts are REPORTED.
+        assert_eq!(s.changes.len(), 2);
+        assert!(s.is_derived("runner_crate_version"));
+        assert!(!s.is_derived("node"));
+        // Only the non-derived one is actionable.
+        let actionable: Vec<&str> = s.actionable().iter().map(|c| c.key()).collect();
+        assert_eq!(actionable, vec!["node"]);
+        assert_eq!(plan.actionable_count(), 1);
+
+        let text = render_plan(&plan);
+        assert!(text.contains("runner_crate_version"));
+        assert!(text.contains("[derived - converges by pulling the repo, not by an apply]"));
+        // The marker is key-scoped: the non-derived row must not carry it.
+        let node_line = text
+            .lines()
+            .find(|l| l.contains("node:"))
+            .expect("node row rendered");
+        assert!(!node_line.contains("[derived"));
+    }
+
+    /// When every drift in an applyable section is derived, the plan reports
+    /// ZERO actionable changes — the acceptance oracle for the canonical box.
+    #[test]
+    fn all_derived_section_reports_zero_actionable() {
+        let plan = compute_plan(
+            &canonical_with_derived(
+                json!({"versions": {
+                    "runner_crate_version": "0.9.0",
+                    "node_package_version": "1.4.0",
+                }}),
+                json!({"versions": "applyable"}),
+                json!({"versions": ["runner_crate_version", "node_package_version"]}),
+            ),
+            json!({"versions": {
+                "runner_crate_version": "0.8.0",
+                "node_package_version": "1.3.0",
+            }})
+            .as_object()
+            .unwrap(),
+            "env-1",
+            "other",
+        );
+        assert_eq!(plan.sections[0].changes.len(), 2);
+        assert_eq!(plan.actionable_count(), 0);
+        assert!(render_plan(&plan).contains("No changes are auto-applyable"));
+    }
+
+    /// An EMPTY list for a section means "classified, none derived" — it must
+    /// not suppress anything. This is the contract's distinguishable case.
+    #[test]
+    fn empty_derived_list_suppresses_nothing() {
+        let plan = compute_plan(
+            &canonical_with_derived(
+                json!({"versions": {"node": "22.1.0"}}),
+                json!({"versions": "applyable"}),
+                json!({"versions": []}),
+            ),
+            json!({"versions": {"node": "20.9.0"}}).as_object().unwrap(),
+            "env-1",
+            "other",
+        );
+        assert!(plan.sections[0].derived_keys.is_empty());
+        assert_eq!(plan.actionable_count(), 1);
+    }
+
+    /// An older backend sends no `derived_keys` at all — behavior must be
+    /// byte-identical to the pre-`derived_keys` runner.
+    #[test]
+    fn absent_derived_keys_preserves_current_behavior() {
+        let sections = json!({"versions": {"runner_crate_version": "0.9.0", "node": "22.1.0"}});
+        let policy = json!({"versions": "applyable"});
+        let local = json!({"versions": {"runner_crate_version": "0.8.0", "node": "20.9.0"}});
+
+        // Field entirely absent on the wire.
+        let parsed: CanonicalConfig = serde_json::from_str(
+            r#"{"canonical_machine_id":"canon-machine",
+                "sections":{"versions":{"runner_crate_version":"0.9.0","node":"22.1.0"}},
+                "section_policy":{"versions":"applyable"}}"#,
+        )
+        .expect("payload without derived_keys parses");
+        assert!(parsed.derived_keys.is_empty());
+
+        let from_wire = compute_plan(&parsed, local.as_object().unwrap(), "env-1", "other");
+        let reference = compute_plan(
+            &canonical_with(sections, policy),
+            local.as_object().unwrap(),
+            "env-1",
+            "other",
+        );
+        // Both drifts actionable, exactly as before the field existed.
+        assert_eq!(from_wire.actionable_count(), 2);
+        assert_eq!(from_wire.actionable_count(), reference.actionable_count());
+        assert!(!render_plan(&reference).contains("[derived"));
+        assert!(reference.sections[0].derived_keys.is_empty());
+    }
+
+    /// The `serde(default)` trap, pinned: `#[serde(default)]` fills a MISSING
+    /// key, not an explicit `null`. A contract-legal `"derived_keys": null` must
+    /// deserialize to an empty map rather than blowing up the whole pull.
+    #[test]
+    fn explicit_null_derived_keys_deserializes() {
+        let parsed: CanonicalConfig = serde_json::from_str(
+            r#"{"canonical_machine_id":"m","sections":{},"section_policy":{},
+                "derived_keys":null}"#,
+        )
+        .expect("explicit null derived_keys parses");
+        assert!(parsed.derived_keys.is_empty());
+    }
+
+    /// A malformed `derived_keys` (not an array, non-string members) degrades to
+    /// "nothing derived" — never to a wrongly-suppressed action.
+    #[test]
+    fn malformed_derived_keys_degrades_to_nothing_derived() {
+        let plan = compute_plan(
+            &canonical_with_derived(
+                json!({"versions": {"node": "22.1.0"}}),
+                json!({"versions": "applyable"}),
+                json!({"versions": "node"}), // string, not a list
+            ),
+            json!({"versions": {"node": "20.9.0"}}).as_object().unwrap(),
+            "env-1",
+            "other",
+        );
+        assert!(plan.sections[0].derived_keys.is_empty());
+        assert_eq!(plan.actionable_count(), 1);
+    }
+
+    /// `--json` consumers must see derived-ness per change, and the section's
+    /// actionable_count must already exclude it.
+    #[test]
+    fn plan_to_json_marks_derived_changes() {
+        let plan = compute_plan(
+            &canonical_with_derived(
+                json!({"versions": {"node": "22.1.0", "runner_crate_version": "0.9.0"}}),
+                json!({"versions": "applyable"}),
+                json!({"versions": ["runner_crate_version"]}),
+            ),
+            json!({"versions": {"node": "20.9.0", "runner_crate_version": "0.8.0"}})
+                .as_object()
+                .unwrap(),
+            "env-1",
+            "other",
+        );
+        let v = plan_to_json(&plan);
+        let changes = v["sections"][0]["changes"].as_array().unwrap();
+        for c in changes {
+            let expected = c["key"] == "runner_crate_version";
+            assert_eq!(c["derived"], expected, "derived flag for {}", c["key"]);
+        }
+        assert_eq!(v["sections"][0]["derived_keys"][0], "runner_crate_version");
+        assert_eq!(v["sections"][0]["actionable_count"], 1);
+        assert_eq!(v["actionable_count"], 1);
+    }
+
+    // ------------------------------------------------------------------
+    // env_contract process-scope caveat
+    // ------------------------------------------------------------------
+
+    /// The caveat renders when env_contract has changes — and the rows are NOT
+    /// suppressed, because a genuinely missing secret must still show.
+    #[test]
+    fn env_contract_caveat_renders_when_it_has_changes() {
+        let plan = compute_plan(
+            &canonical_with(
+                json!({"env_contract": {"QONTINUI_API_URL": "present"}}),
+                json!({"env_contract": "secret_report_only"}),
+            ),
+            json!({"env_contract": {}}).as_object().unwrap(),
+            "env-1",
+            "other",
+        );
+        let text = render_plan(&plan);
+        assert!(text.contains("process that captured it"));
+        assert!(text.contains("process-scope artifacts"));
+        // The row itself survives the caveat.
+        assert!(text.contains("QONTINUI_API_URL"));
+    }
+
+    /// No env_contract changes ⇒ no caveat. It must not be unconditional noise,
+    /// and must not attach to some other drifting section.
+    #[test]
+    fn env_contract_caveat_absent_without_env_contract_changes() {
+        // env_contract in sync, a different section drifting.
+        let plan = compute_plan(
+            &canonical_with(
+                json!({
+                    "env_contract": {"QONTINUI_API_URL": "present"},
+                    "versions": {"node": "22.1.0"},
+                }),
+                json!({"env_contract": "secret_report_only", "versions": "applyable"}),
+            ),
+            json!({
+                "env_contract": {"QONTINUI_API_URL": "present"},
+                "versions": {"node": "20.9.0"},
+            })
+            .as_object()
+            .unwrap(),
+            "env-1",
+            "other",
+        );
+        let text = render_plan(&plan);
+        assert!(text.contains("node"));
+        assert!(!text.contains("process-scope artifacts"));
+
+        // And a fully in-sync plan never renders it either.
+        let synced = compute_plan(
+            &canonical_with(
+                json!({"env_contract": {"QONTINUI_API_URL": "present"}}),
+                json!({"env_contract": "secret_report_only"}),
+            ),
+            json!({"env_contract": {"QONTINUI_API_URL": "present"}})
+                .as_object()
+                .unwrap(),
+            "env-1",
+            "other",
+        );
+        assert!(!render_plan(&synced).contains("process-scope artifacts"));
     }
 
     #[test]
