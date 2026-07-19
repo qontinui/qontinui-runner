@@ -287,60 +287,96 @@ pub async fn setup_credential_helper_for_worktree(worktree_path: &Path, session_
 /// EVERY process the runner spawns (interactive terminal PTYs + autonomous
 /// direct-exec agents). Plan Phase 6 / P7.
 ///
-/// Goal: no runner-spawned `git` op may ever reach Git Credential Manager's
-/// blocking GUI popup — regardless of cwd. This covers the cases the
-/// per-session `--local` coord helper (`setup_credential_helper`) never
-/// touches: the non-repo umbrella root (`D:\qontinui-root`), unregistered
-/// repos, and terminals that `cd` elsewhere. `GIT_TERMINAL_PROMPT=0` alone was
-/// insufficient — it suppresses only the *terminal* prompt, not GCM's window.
+/// Which hosts the non-interactive git posture applies to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GitCredentialScope {
+    /// Suppress ONLY github.com's GUI popup; leave every other host's
+    /// interactive auth intact. For an interactive human TERMINAL, where a user
+    /// may still legitimately want GCM to prompt for gitlab/azure/bitbucket.
+    GithubOnly,
+    /// Non-interactive for ALL hosts. For an AUTONOMOUS agent, which has no
+    /// human to answer a GUI/terminal prompt — a popup there is an infinite
+    /// hang, so a clean non-interactive failure is strictly better.
+    AllHosts,
+}
+
+/// Env that gives a runner-spawned `git` a non-interactive GitHub credential
+/// posture, so it never reaches Git Credential Manager's blocking GUI popup for
+/// GitHub — covering the cases the per-session `--local` coord helper
+/// (`setup_credential_helper`) never touches: the non-repo umbrella root
+/// (`D:\qontinui-root`), unregistered repos, and terminals that `cd` elsewhere.
 ///
-/// The env set:
-/// - `GCM_INTERACTIVE=never` — Git Credential Manager must never show its
-///   GUI/interactive prompt; it fails non-interactively instead (returns a
-///   stored credential if it has one, otherwise nothing — no window).
-/// - `GIT_TERMINAL_PROMPT=0` — git never prompts for credentials on the
-///   terminal either.
+/// Always emitted (both scopes):
 /// - a github.com-scoped `credential.helper` of `!gh auth git-credential`,
 ///   layered via git's `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`
-///   env mechanism (NO file writes; applies to ALL cwds). This routes
-///   unregistered / umbrella-root github access through the user's own `gh`
-///   auth non-interactively instead of a popup.
+///   env mechanism (NO file writes; applies to ALL cwds) — routes unregistered /
+///   umbrella-root GitHub access through the user's own `gh` auth.
+///
+/// [`GitCredentialScope::GithubOnly`] additionally sets
+/// `credential.https://github.com.interactive=false` (GCM honors URL-scoped
+/// settings) so GCM does not pop its GUI for github.com specifically — WITHOUT
+/// the global `GCM_INTERACTIVE`/`GIT_TERMINAL_PROMPT` that would also break a
+/// human's first-time interactive auth to gitlab/azure/bitbucket in a terminal.
+/// Worst case (an older GCM that ignores the scoped key) is the pre-fix status
+/// quo for github.com — it can never REGRESS another host.
+///
+/// [`GitCredentialScope::AllHosts`] additionally sets `GCM_INTERACTIVE=never`
+/// and `GIT_TERMINAL_PROMPT=0` globally — correct for an autonomous agent, which
+/// must never block on ANY credential UI.
 ///
 /// PRECEDENCE — why this does NOT clobber the per-session coord helper for
 /// REGISTERED repos: `credential.helper` is MULTI-VALUED. Git accumulates every
 /// configured helper into an ordered list and queries them in config-read order
 /// (system → global → local → worktree → `GIT_CONFIG_*` env) until one returns a
 /// username+password. A repo's `--local` coord helper is therefore read — and
-/// tried — BEFORE this env-injected helper: for a coord-registered repo the
-/// coord helper emits the push token and git never reaches the `gh` fallback. We
-/// deliberately do NOT reset the helper list (no empty-string entry): a reset
-/// injected via env would be read after — and thus wipe — the local coord
-/// helper, breaking registered-repo pushes.
+/// tried — BEFORE this env-injected github.com helper: for a coord-registered
+/// repo the coord helper emits the push token and git never reaches the `gh`
+/// fallback. We deliberately do NOT reset the helper list (no empty-string
+/// entry): a github.com-scoped reset injected via env is read AFTER — and would
+/// thus wipe — the local coord helper, breaking registered-repo pushes.
 ///
-/// For an UNREGISTERED repo / the umbrella root there is no local coord helper;
-/// the machine default (`manager` = GCM) is tried first, but `GCM_INTERACTIVE=never`
-/// turns its would-be popup into a silent non-interactive miss and git falls
-/// through to `!gh auth git-credential`. If `gh` is absent that too fails
-/// non-interactively (`GIT_TERMINAL_PROMPT=0`) — a clean error, never a window.
+/// The github.com config pair(s) are APPENDED after any `GIT_CONFIG_*` already
+/// present in the child's inherited environment (we read `GIT_CONFIG_COUNT` and
+/// index from there), so a caller/parent that already injected git config keeps
+/// it rather than having `KEY_0`/`VALUE_0`/`COUNT` silently overwritten.
 ///
 /// Set on the child env BEFORE any caller-supplied `extra_env` so a caller can
 /// still intentionally override. Not platform-gated: GCM is Windows-centric but
 /// every var here is harmless (and correct) cross-platform.
-pub fn non_interactive_git_env() -> Vec<(String, String)> {
-    vec![
-        ("GCM_INTERACTIVE".to_string(), "never".to_string()),
-        ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
-        // One env-injected config pair: github.com-scoped credential.helper.
-        ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
-        (
-            "GIT_CONFIG_KEY_0".to_string(),
-            "credential.https://github.com.helper".to_string(),
-        ),
-        (
-            "GIT_CONFIG_VALUE_0".to_string(),
-            "!gh auth git-credential".to_string(),
-        ),
-    ]
+pub fn non_interactive_git_env(scope: GitCredentialScope) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+
+    // The env-layered git config entries. Always the github.com gh helper;
+    // GithubOnly adds the github.com-scoped GCM interactivity off-switch.
+    let mut cfg: Vec<(&str, &str)> = vec![(
+        "credential.https://github.com.helper",
+        "!gh auth git-credential",
+    )];
+    match scope {
+        GitCredentialScope::GithubOnly => {
+            cfg.push(("credential.https://github.com.interactive", "false"));
+        }
+        GitCredentialScope::AllHosts => {
+            out.push(("GCM_INTERACTIVE".to_string(), "never".to_string()));
+            out.push(("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()));
+        }
+    }
+
+    // Append to any inherited GIT_CONFIG_* rather than overwriting index 0.
+    let base: usize = std::env::var("GIT_CONFIG_COUNT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    for (i, (k, v)) in cfg.iter().enumerate() {
+        let idx = base + i;
+        out.push((format!("GIT_CONFIG_KEY_{idx}"), (*k).to_string()));
+        out.push((format!("GIT_CONFIG_VALUE_{idx}"), (*v).to_string()));
+    }
+    out.push((
+        "GIT_CONFIG_COUNT".to_string(),
+        (base + cfg.len()).to_string(),
+    ));
+    out
 }
 
 pub fn cleanup_credential_helper(session_id: &str) {
@@ -395,50 +431,74 @@ mod tests {
         );
     }
 
-    #[test]
-    fn non_interactive_git_env_has_gcm_and_gh_fallback() {
-        let env = non_interactive_git_env();
-        let get = |k: &str| -> Option<&str> {
-            env.iter()
-                .find(|(key, _)| key == k)
-                .map(|(_, v)| v.as_str())
+    // Collect the env-injected git config into (key -> value) pairs, honoring
+    // GIT_CONFIG_COUNT, so a test can assert the LOGICAL config regardless of
+    // index offset.
+    fn injected_git_config(env: &[(String, String)]) -> Vec<(String, String)> {
+        let get = |k: &str| -> Option<String> {
+            env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone())
         };
-
-        // GCM must never pop its GUI; terminal prompts also off.
-        assert_eq!(get("GCM_INTERACTIVE"), Some("never"));
-        assert_eq!(get("GIT_TERMINAL_PROMPT"), Some("0"));
-
-        // The github.com fallback helper is layered via GIT_CONFIG_* env so it
-        // applies to every cwd with no file write. COUNT must match the number
-        // of KEY_n/VALUE_n pairs actually present, or git ignores the block.
         let count: usize = get("GIT_CONFIG_COUNT")
             .expect("GIT_CONFIG_COUNT set")
             .parse()
             .expect("GIT_CONFIG_COUNT numeric");
-        assert_eq!(count, 1, "exactly one env-injected config pair");
-        for i in 0..count {
-            assert!(
-                get(&format!("GIT_CONFIG_KEY_{i}")).is_some(),
-                "GIT_CONFIG_KEY_{i} present"
-            );
-            assert!(
-                get(&format!("GIT_CONFIG_VALUE_{i}")).is_some(),
-                "GIT_CONFIG_VALUE_{i} present"
-            );
-        }
-        assert_eq!(
-            get("GIT_CONFIG_KEY_0"),
-            Some("credential.https://github.com.helper")
-        );
-        assert_eq!(get("GIT_CONFIG_VALUE_0"), Some("!gh auth git-credential"));
+        (0..count)
+            .map(|i| {
+                (
+                    get(&format!("GIT_CONFIG_KEY_{i}"))
+                        .unwrap_or_else(|| panic!("GIT_CONFIG_KEY_{i}")),
+                    get(&format!("GIT_CONFIG_VALUE_{i}"))
+                        .unwrap_or_else(|| panic!("GIT_CONFIG_VALUE_{i}")),
+                )
+            })
+            .collect()
+    }
 
-        // We must NOT inject an empty-string reset entry — a reset read from env
-        // (after local config) would wipe the per-session --local coord helper
-        // and break registered-repo pushes.
+    #[test]
+    fn non_interactive_git_env_github_only_scopes_to_github_leaves_other_hosts() {
+        let env = non_interactive_git_env(GitCredentialScope::GithubOnly);
+        let has = |k: &str| env.iter().any(|(key, _)| key == k);
+
+        // GithubOnly must NOT set the GLOBAL non-interactive vars — a human
+        // terminal keeps interactive auth for gitlab/azure/bitbucket.
+        assert!(!has("GCM_INTERACTIVE"), "no global GCM_INTERACTIVE");
+        assert!(!has("GIT_TERMINAL_PROMPT"), "no global GIT_TERMINAL_PROMPT");
+
+        let cfg = injected_git_config(&env);
+        assert!(cfg.contains(&(
+            "credential.https://github.com.helper".to_string(),
+            "!gh auth git-credential".to_string()
+        )));
+        // GCM off for github.com specifically (not globally).
+        assert!(cfg.contains(&(
+            "credential.https://github.com.interactive".to_string(),
+            "false".to_string()
+        )));
         assert!(
             !env.iter()
                 .any(|(k, v)| k.starts_with("GIT_CONFIG_VALUE_") && v.is_empty()),
-            "no empty-string credential.helper reset entry"
+            "no empty-string reset entry (would wipe the --local coord helper)"
+        );
+    }
+
+    #[test]
+    fn non_interactive_git_env_all_hosts_is_fully_non_interactive() {
+        let env = non_interactive_git_env(GitCredentialScope::AllHosts);
+        let get = |k: &str| env.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
+
+        // AllHosts (autonomous agent) never blocks on any host's UI.
+        assert_eq!(get("GCM_INTERACTIVE"), Some("never"));
+        assert_eq!(get("GIT_TERMINAL_PROMPT"), Some("0"));
+
+        let cfg = injected_git_config(&env);
+        assert!(cfg.contains(&(
+            "credential.https://github.com.helper".to_string(),
+            "!gh auth git-credential".to_string()
+        )));
+        assert!(
+            !env.iter()
+                .any(|(k, v)| k.starts_with("GIT_CONFIG_VALUE_") && v.is_empty()),
+            "no empty-string reset entry"
         );
     }
 
