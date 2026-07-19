@@ -114,6 +114,31 @@ pub struct ReclaimPull {
     pub remove_armed: bool,
     #[serde(default)]
     pub instructions: Vec<ReclaimInstruction>,
+    /// Forward-compatible: the candidates coord DEFERRED, with the typed
+    /// reason its §4 gate refused them for. Absent on today's coord (the
+    /// route only ships cleared instructions), so the runner's on-demand
+    /// survey ([`super::on_demand`]) falls back to deriving blocked items
+    /// from its own census. `#[serde(default)]` keeps an empty vec the safe
+    /// default — never a deserialization failure that would kill the poller.
+    #[serde(default)]
+    pub blocked: Vec<BlockedWorktree>,
+}
+
+/// One coord-deferred worktree: the path plus the gate reason that held it
+/// back. `reason` carries coord's `DeferReason` snake_case token
+/// (`dirty` | `not_landed` | `other_live_reference` | `serialize_claim_active`
+/// | `grace_pending` | `not_a_candidate`), or `pinned` once Phase 2 lands.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlockedWorktree {
+    pub worktree_path: String,
+    #[serde(default)]
+    pub repo: String,
+    #[serde(default)]
+    pub reason: String,
+    /// Phase-2 retention pin (`auto` | `pinned`). `None` on a pre-Phase-2
+    /// coord — treated as unpinned.
+    #[serde(default)]
+    pub retention: Option<String>,
 }
 
 /// What coord wants done to one worktree.
@@ -160,6 +185,12 @@ pub struct ReclaimInstruction {
     /// `["target", "node_modules"]`).
     #[serde(default)]
     pub junctioned_paths: Vec<String>,
+    /// Phase-2 retention pin (`auto` | `pinned`), forward-compatible.
+    /// `None` on a pre-Phase-2 coord — treated as unpinned. coord's own
+    /// gate will withhold a pinned worktree, so this is belt-and-braces for
+    /// the on-demand path.
+    #[serde(default)]
+    pub retention: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -296,7 +327,7 @@ pub fn plan_reclaim(
 
 /// Execute one planned step. Idempotent: a missing worktree / already-
 /// unlinked junction is `Ok(())`, not an error.
-fn execute_step(step: &ReclaimStep) -> Result<(), String> {
+pub(super) fn execute_step(step: &ReclaimStep) -> Result<(), String> {
     match step {
         ReclaimStep::Skip(reason) => {
             info!("worktree_reclaim: skip — {reason}");
@@ -349,7 +380,7 @@ fn unlink_junction(path: &Path) -> Result<(), String> {
 /// falls back to a plain `remove_dir_all`. Safe to call only AFTER every
 /// junction has been unlinked (the caller's plan guarantees the ordering).
 /// Idempotent: a missing dir is `Ok(())`.
-fn remove_worktree(path: &Path) -> Result<(), String> {
+pub(super) fn remove_worktree(path: &Path) -> Result<(), String> {
     if !path.exists() {
         debug!(
             "worktree_reclaim: worktree {} already gone — no-op",
@@ -463,7 +494,7 @@ fn create_junction(link: &Path, _target: &Path) -> Result<(), String> {
 
 /// Re-verify dirtiness at execution time (defense in depth — the pull may
 /// be stale). `true` when `git status --porcelain` is non-empty.
-fn worktree_is_dirty(path: &Path) -> bool {
+pub(super) fn worktree_is_dirty(path: &Path) -> bool {
     let path_str = match path.to_str() {
         Some(s) => s,
         None => return false,
@@ -675,22 +706,43 @@ fn execute_pull(pull: &ReclaimPull) {
             canonical.as_deref(),
             root_exists,
         );
-        for step in &steps {
-            if let Err(e) = execute_step(step) {
-                warn!("worktree_reclaim: step {step:?} failed: {e}");
-                // Continue — idempotent retry next tick. We do NOT abort
-                // the remaining steps blindly, but if a junction unlink
-                // failed we MUST NOT proceed to the worktree removal.
-                if matches!(step, ReclaimStep::UnlinkJunction(_)) {
-                    warn!(
-                        "worktree_reclaim: aborting remaining steps for {} — a junction unlink \
-                         failed, recursive removal would be unsafe (INV-W4)",
-                        instr.worktree_path
-                    );
-                    break;
-                }
+        let _ = execute_steps(&instr.worktree_path, &steps);
+    }
+}
+
+/// Execute an ordered [`ReclaimStep`] plan, honoring the INV-W4 abort rule:
+/// a FAILED `UnlinkJunction` stops the plan immediately, because the
+/// remaining `RemoveWorktree` would then recurse through a still-live
+/// reparse point and gut the canonical tree. Any other step failure is
+/// logged and the plan continues (each step is idempotent, so a retry —
+/// the next poll tick, or the operator pressing the button again — is
+/// safe).
+///
+/// Returns `Ok(())` when every step succeeded, `Err(msg)` describing the
+/// first failure otherwise. Shared by the background poller
+/// ([`execute_pull`]) and the on-demand endpoint
+/// ([`super::on_demand::reclaim_now`]) so there is exactly ONE place a
+/// worktree removal can be carried out.
+pub(super) fn execute_steps(worktree_path: &str, steps: &[ReclaimStep]) -> Result<(), String> {
+    let mut first_err: Option<String> = None;
+    for step in steps {
+        if let Err(e) = execute_step(step) {
+            warn!("worktree_reclaim: step {step:?} failed: {e}");
+            if first_err.is_none() {
+                first_err = Some(e);
+            }
+            if matches!(step, ReclaimStep::UnlinkJunction(_)) {
+                warn!(
+                    "worktree_reclaim: aborting remaining steps for {worktree_path} — a junction \
+                     unlink failed, recursive removal would be unsafe (INV-W4)"
+                );
+                break;
             }
         }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
 }
 
@@ -698,21 +750,33 @@ fn execute_pull(pull: &ReclaimPull) {
 // Pull + tick + spawn (mirrors census.rs identity/base resolution).
 // ---------------------------------------------------------------------------
 
-/// One reclaim cycle: pull + execute. Returns `Ok(())` on a clean skip or
-/// a successful pull; `Err` only on a transport / non-2xx failure.
-pub async fn tick_once() -> Result<(), String> {
+/// Fetch this device's pending reclaim decision from coord.
+///
+/// `Ok(None)` = cleanly not applicable (no `device_id` in
+/// `~/.qontinui/machine.json`, or no coord base configured) — the caller
+/// skips without treating it as an error. `Err` = a real transport / non-2xx
+/// failure.
+///
+/// This is coord's DECISION surface and the single source of reap
+/// eligibility for BOTH triggers: the background poller ([`tick_once`]) and
+/// the on-demand endpoint ([`super::on_demand`]). Note the instruction list
+/// is computed by coord's G1–G5 gate **regardless of arming** — the
+/// `remove_armed` / `rejunction_armed` booleans only tell the *silent
+/// background* path whether it may act. The consented on-demand path reads
+/// the same cleared set without needing the silent path armed.
+pub(super) async fn fetch_pull() -> Result<Option<(Uuid, ReclaimPull)>, String> {
     let device_id = match super::census::load_device_id_pub() {
         Some(id) => id,
         None => {
             debug!("worktree_reclaim: no device_id — skipping");
-            return Ok(());
+            return Ok(None);
         }
     };
     let base = match super::census::coord_http_base_pub() {
         Some(b) => b,
         None => {
             debug!("worktree_reclaim: no coord_url configured — skipping");
-            return Ok(());
+            return Ok(None);
         }
     };
 
@@ -739,6 +803,15 @@ pub async fn tick_once() -> Result<(), String> {
         .json()
         .await
         .map_err(|e| format!("decode reclaim pull: {e}"))?;
+    Ok(Some((device_id, pull)))
+}
+
+/// One reclaim cycle: pull + execute. Returns `Ok(())` on a clean skip or
+/// a successful pull; `Err` only on a transport / non-2xx failure.
+pub async fn tick_once() -> Result<(), String> {
+    let Some((_device_id, pull)) = fetch_pull().await? else {
+        return Ok(());
+    };
 
     // execute_pull runs synchronous git/cmd subprocesses and filesystem
     // removals — potentially long (junction unlinks + worktree deletes).
@@ -812,6 +885,7 @@ mod tests {
             reason: "worktree:orphan".to_string(),
             is_dirty,
             junctioned_paths: junctioned.iter().map(|s| s.to_string()).collect(),
+            retention: None,
         }
     }
 

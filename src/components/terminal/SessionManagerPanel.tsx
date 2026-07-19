@@ -1,7 +1,8 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { TerminalSquare, X, CheckSquare } from "lucide-react";
 import { SessionManagerHeader } from "./SessionManagerHeader";
 import { SessionCard } from "./SessionCard";
+import { WorktreesPanel } from "../worktrees/WorktreesPanel";
 import type {
   UseSessionManagerReturn,
   UnifiedSession,
@@ -133,6 +134,13 @@ export function SessionManagerPanel({
 
   const groups = useMemo(() => groupSessions(sessions, groupBy), [sessions, groupBy]);
 
+  /**
+   * Cross-link target from `SessionCard`: the worktree path of the session
+   * whose "manage worktree" affordance was clicked. Opens + highlights the
+   * row in the Worktrees panel below.
+   */
+  const [worktreeFocus, setWorktreeFocus] = useState<string | null>(null);
+
   return (
     <div className="w-[340px] h-full flex flex-col border-r border-[#2a2d3d] bg-[#13141f] shrink-0">
       <SessionManagerHeader
@@ -241,12 +249,22 @@ export function SessionManagerPanel({
                   onTogglePin={togglePin}
                   onSetLabel={setSessionLabel}
                   onAfterPromote={refresh}
+                  onOpenWorktrees={setWorktreeFocus}
                 />
               ))}
             </div>
           ))
         )}
       </div>
+
+      {/*
+        Worktrees panel — sibling of the session list. The on-demand,
+        human-consented cleanup trigger (plan
+        `2026-07-19-worktree-cleanup-lifecycle-tracking` Phase 4). Collapsed
+        by default so it costs nothing until asked for; `SessionCard`'s
+        worktree affordance opens it focused on that session's worktree.
+      */}
+      <WorktreesPanel defaultOpen={worktreeFocus !== null} highlightPath={worktreeFocus} />
     </div>
   );
 }

@@ -64,6 +64,7 @@ pub mod fs_backstop;
 pub mod fs_observer;
 pub mod isolated_edit;
 pub mod maintenance_executor;
+pub mod on_demand;
 pub mod reclaim;
 
 /// Env var that controls the worktree-per-session spawn path. **Default ON**

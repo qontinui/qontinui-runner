@@ -3883,6 +3883,12 @@ pub fn create_router(
         .merge(crate::mcp::websocket::routes())
         .merge(crate::mcp::window_manager::routes())
         .merge(crate::mcp::worktrees::routes())
+        // `/agent-worktrees/*` — on-demand cleanup of AGENT worktrees. A
+        // DIFFERENT resource from `worktrees::routes()` directly above (which
+        // owns the task-run "isolated run" worktrees under `.worktrees`, incl.
+        // a differently-meaning `POST /worktrees/remove`). Kept in its own
+        // namespace so the two destructive routes can never be confused.
+        .merge(crate::mcp::agent_worktrees::routes())
         .merge(crate::install_effects_producer::routes())
         .merge(crate::mcp::token_analytics::routes())
         .merge(crate::mcp::otel_status::routes())

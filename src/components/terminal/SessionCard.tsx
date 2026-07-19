@@ -14,6 +14,7 @@ import {
   CheckCircle2,
   Lock,
   RotateCcw,
+  FolderGit2,
 } from "lucide-react";
 import type { UnifiedSession, SessionLiveStatus } from "./useSessionManager";
 import type { LockState } from "./useFileLockTracking";
@@ -61,6 +62,14 @@ interface SessionCardProps {
   onSetLabel: (sessionId: string, label: string | null) => void;
   /** Optional: notify parent that the session list should refresh after a promotion. */
   onAfterPromote?: () => void;
+  /**
+   * Cross-link into the Worktrees cleanup panel (plan
+   * `2026-07-19-worktree-cleanup-lifecycle-tracking` Phase 4). Called with
+   * the session's worktree path so the panel opens focused on that row —
+   * this card's worktree metadata is the only other worktree surface in the
+   * runner, so it is where the link belongs.
+   */
+  onOpenWorktrees?: (worktreePath: string) => void;
 }
 
 const STATUS_DOT: Record<SessionLiveStatus, { color: string; pulse: boolean; label: string }> = {
@@ -125,6 +134,23 @@ function formatLockSince(ms?: number): string {
   return `${deltaHr}h`;
 }
 
+/**
+ * Does this path look like an isolated AGENT worktree (rather than a
+ * canonical repo checkout)? Matches the three shapes the runner + coord
+ * materialize: the sibling `<repo>-wt-*` convention, the external
+ * `qontinui-worktrees/` root, and the per-repo `.claude/worktrees/` dir.
+ *
+ * Advisory only — it decides whether to OFFER the cross-link. The panel
+ * itself is authoritative about what exists and what is reclaimable.
+ */
+function isWorktreePath(path: string | undefined | null): boolean {
+  if (!path) return false;
+  const p = path.replace(/\\/g, "/").toLowerCase();
+  return (
+    p.includes("-wt-") || p.includes("/qontinui-worktrees/") || p.includes("/.claude/worktrees/")
+  );
+}
+
 export function SessionCard({
   session,
   isSelected,
@@ -141,6 +167,7 @@ export function SessionCard({
   onTogglePin,
   onSetLabel,
   onAfterPromote,
+  onOpenWorktrees,
 }: SessionCardProps) {
   const baseStatusInfo = STATUS_DOT[session.liveStatus];
   // An orphaned "frozen" session has no live PTY in this window — it's simply
@@ -489,6 +516,18 @@ export function SessionCard({
               Promoted to worktree{" "}
               <span className="font-mono">{promoteState.data.branch_name}</span>
             </span>
+            {onOpenWorktrees && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onOpenWorktrees(promoteState.data.worktree_path);
+                }}
+                className="shrink-0 underline text-[#7aa2f7]/90 hover:text-[#7aa2f7]"
+                title="Show this worktree in the Worktrees cleanup panel"
+              >
+                manage
+              </button>
+            )}
           </div>
         )}
         {promoteState.kind === "error" && (
@@ -552,6 +591,24 @@ export function SessionCard({
         >
           <TerminalSquare className="w-3.5 h-3.5" />
         </button>
+        {/*
+          Cross-link into the Worktrees cleanup panel for a session that is
+          ALREADY running in an isolated worktree (the promote affordance
+          below is for sessions that aren't). Same panel, focused on this
+          session's worktree row.
+        */}
+        {onOpenWorktrees && isWorktreePath(session.projectPath) && (
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onOpenWorktrees(session.projectPath);
+            }}
+            className="p-1 rounded text-[#565f89] hover:text-[#bb9af7] hover:bg-[#bb9af7]/10 transition-colors"
+            title={`Show this session's worktree in the Worktrees cleanup panel: ${session.projectPath}`}
+          >
+            <FolderGit2 className="w-3.5 h-3.5" />
+          </button>
+        )}
         {canPromote && !promoted && (
           <button
             onClick={handlePromote}
