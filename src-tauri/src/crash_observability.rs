@@ -135,8 +135,7 @@ pub fn harvest_boot_crash_evidence(boot: BootClassification) {
 
         // 1) Minimal, instant breadcrumb — better than silence, and enough for
         //    the startup scan to flag `derived_status: errored` this boot.
-        let minimal =
-            format_harvest_breadcrumb(detected_at_ms, prior, &CrashEvidence::empty());
+        let minimal = format_harvest_breadcrumb(detected_at_ms, prior, &CrashEvidence::empty());
         if let Err(e) = write_breadcrumb(&path, &minimal) {
             warn!(
                 error = %e,
@@ -160,8 +159,7 @@ pub fn harvest_boot_crash_evidence(boot: BootClassification) {
                     if evidence.is_empty() {
                         return;
                     }
-                    let enriched =
-                        format_harvest_breadcrumb(detected_at_ms, prior, &evidence);
+                    let enriched = format_harvest_breadcrumb(detected_at_ms, prior, &evidence);
                     if write_breadcrumb(&path, &enriched).is_ok() {
                         info!(
                             path = %path.display(),
@@ -710,8 +708,7 @@ mod tests {
 
     #[test]
     fn breadcrumb_with_empty_evidence_is_still_a_valid_crash_dump() {
-        let body =
-            format_harvest_breadcrumb(1_752_000_000_000, None, &CrashEvidence::empty());
+        let body = format_harvest_breadcrumb(1_752_000_000_000, None, &CrashEvidence::empty());
         assert!(body.starts_with("=== QONTINUI RUNNER CRASH DUMP ==="));
         assert!(body.contains("No WER / Application-event-log detail was available"));
         assert!(body.contains("Prior shutdown marker at: n/a (no prior marker)"));
@@ -733,7 +730,10 @@ mod tests {
                    Faulting process id: 0x1a2b\n";
         let ev = parse_windows_event_output(out);
         assert_eq!(ev.exception_code.as_deref(), Some("0xc0000409"));
-        assert_eq!(ev.faulting_module.as_deref(), Some("qontinui-runner-primary.exe"));
+        assert_eq!(
+            ev.faulting_module.as_deref(),
+            Some("qontinui-runner-primary.exe")
+        );
         assert_eq!(ev.source.as_deref(), Some("Application Error"));
         assert_eq!(
             ev.event_time.as_deref(),
@@ -780,7 +780,9 @@ mod tests {
         // A benign 8-hex token (no `Exception code:` label) must NOT be reported
         // as the exception code — it has success/info severity (top nibble < 8).
         assert_eq!(
-            find_exception_code("Faulting application ..., time stamp: 0x00000000, offset 0x0007a1b2"),
+            find_exception_code(
+                "Faulting application ..., time stamp: 0x00000000, offset 0x0007a1b2"
+            ),
             None,
             "a low-severity 0x00000000 timestamp is not a fault code"
         );
