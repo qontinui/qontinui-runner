@@ -323,10 +323,7 @@ pub fn list_sessions(
 
         // Extract first user message preview (scan first ~20 lines)
         let first_message_preview = extract_first_user_preview(&content);
-        // Prefer the session's own Claude Code title (`/rename`, else the
-        // auto-generated one); fall back to the first-user-message heuristic.
-        let display_name = extract_session_title(&content)
-            .unwrap_or_else(|| generate_display_name(&first_message_preview, &last_modified));
+        let display_name = resolve_display_name(&content, &first_message_preview, &last_modified);
 
         // Extract started_at from first record's timestamp
         let started_at = extract_first_timestamp(&content);
@@ -1064,11 +1061,8 @@ pub fn get_latest_session_id(
                         let has_plans = content.contains("\"planContent\"");
                         let first_message_preview = extract_first_user_preview(&content);
                         let started_at = extract_first_timestamp(&content);
-                        // Same title precedence as `list_sessions` — see
-                        // `extract_session_title`.
-                        let display_name = extract_session_title(&content).unwrap_or_else(|| {
-                            generate_display_name(&first_message_preview, &last_modified)
-                        });
+                        let display_name =
+                            resolve_display_name(&content, &first_message_preview, &last_modified);
 
                         return Some(TranscriptSession {
                             session_id: session_id.to_string(),
@@ -1175,6 +1169,45 @@ const GENERIC_PREFIXES: &[&str] = &[
     "Here is my plan:",
 ];
 
+/// Upper bound on a rendered session title, matching the ceiling
+/// `generate_display_name` applies to its heuristic names. Titles reach the
+/// Session Manager card label AND its hover tooltip, so an unbounded one
+/// (a `/rename` with a pasted paragraph) would blow out the row and inflate
+/// every `list_sessions` payload.
+const MAX_DISPLAY_NAME_CHARS: usize = 50;
+
+/// Substring every title record shares (`"custom-title"` / `"ai-title"`), used
+/// as a cheap pre-filter before the per-line JSON parse.
+const TITLE_RECORD_MARKER: &str = "-title\"";
+
+/// Normalize a raw title into something safe to render on one line.
+///
+/// A `/rename` argument is arbitrary operator text, so it can carry ANSI escapes
+/// (pasted from a terminal), embedded newlines, or enough length to break the
+/// card layout. Strips ANSI via the shared [`crate::terminal::strip_ansi`],
+/// flattens all whitespace to single spaces, then truncates at a word boundary
+/// with the same ceiling the heuristic path uses.
+fn sanitize_title(raw: &str) -> String {
+    let stripped = super::strip_ansi(raw);
+    // Flatten newlines/tabs/runs — a title is a single-line label.
+    let flat = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= MAX_DISPLAY_NAME_CHARS {
+        return flat;
+    }
+    // Truncate on a char boundary first (never split a multi-byte char), then
+    // back off to the last word boundary if one sits reasonably close.
+    let cut = flat
+        .char_indices()
+        .nth(MAX_DISPLAY_NAME_CHARS)
+        .map(|(i, _)| i)
+        .unwrap_or(flat.len());
+    let head = &flat[..cut];
+    match head.rfind(' ') {
+        Some(sp) if sp > 20 => format!("{}...", &head[..sp]),
+        _ => format!("{head}..."),
+    }
+}
+
 /// Extract the session's own Claude Code title, if it has one.
 ///
 /// Claude Code writes two title record kinds into the transcript:
@@ -1186,42 +1219,80 @@ const GENERIC_PREFIXES: &[&str] = &[
 /// LAST record of a kind is the current title — reading the first would pin the
 /// name a session was born with and miss every later rename.
 ///
+/// Only the NEWEST record of each kind is consulted: a blank newest record is a
+/// deliberate clear, and resurrecting the older name it superseded would make
+/// the clear impossible to perform.
+///
 /// Returns `None` when the session has neither (older transcripts, or a session
 /// too young to have been titled yet), leaving the caller on the
 /// first-user-message heuristic.
 fn extract_session_title(content: &str) -> Option<String> {
-    let mut ai_title: Option<String> = None;
+    // Fast path: most transcripts carry no title record at all. One scan of the
+    // whole buffer is far cheaper than the per-line loop below, and lets an
+    // untitled file skip it entirely (this runs per file across a directory of
+    // hundreds of large transcripts).
+    if !content.contains(TITLE_RECORD_MARKER) {
+        return None;
+    }
 
-    // Reverse scan: the first match walking backwards is the newest record.
+    let mut ai_title: Option<String> = None;
+    let (mut custom_seen, mut ai_seen) = (false, false);
+
+    // Reverse scan: the first record of a kind walking backwards is the newest.
     for line in content.lines().rev() {
-        let is_custom = line.contains("\"type\":\"custom-title\"")
-            || line.contains("\"type\": \"custom-title\"");
-        let is_ai =
-            line.contains("\"type\":\"ai-title\"") || line.contains("\"type\": \"ai-title\"");
-        if !is_custom && !is_ai {
+        if !line.contains(TITLE_RECORD_MARKER) {
             continue;
         }
-
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        let key = if is_custom { "customTitle" } else { "aiTitle" };
-        let title = v.get(key).and_then(|t| t.as_str()).map(str::trim);
-        let Some(title) = title.filter(|t| !t.is_empty()) else {
-            continue;
+        // Dispatch on the PARSED `type`, never on the substring pre-filter: a
+        // record whose title text merely quotes another record's shape would
+        // otherwise be routed to the wrong key and silently dropped.
+        let (key, is_custom) = match v.get("type").and_then(|t| t.as_str()) {
+            Some("custom-title") => ("customTitle", true),
+            Some("ai-title") => ("aiTitle", false),
+            _ => continue,
         };
-
-        // An explicit rename outranks any generated title, so stop here.
-        if is_custom {
-            return Some(title.to_string());
+        if (is_custom && custom_seen) || (!is_custom && ai_seen) {
+            continue; // superseded by a newer record of the same kind
         }
-        // Newest ai-title only — keep scanning in case a custom-title exists.
-        if ai_title.is_none() {
-            ai_title = Some(title.to_string());
+
+        let title = v
+            .get(key)
+            .and_then(|t| t.as_str())
+            .map(str::trim)
+            .unwrap_or_default();
+        if is_custom {
+            custom_seen = true;
+            if !title.is_empty() {
+                return Some(sanitize_title(title)); // explicit rename outranks
+            }
+            // Blank = the operator cleared it; fall through to the ai-title.
+        } else {
+            ai_seen = true;
+            if !title.is_empty() {
+                ai_title = Some(sanitize_title(title));
+            }
+        }
+        if custom_seen && ai_seen {
+            break;
         }
     }
 
     ai_title
+}
+
+/// Resolve the label shown for a session: its own Claude Code title when it has
+/// one, else the first-user-message heuristic. Shared by both
+/// `TranscriptSession` construction sites so the precedence lives in one place.
+fn resolve_display_name(
+    content: &str,
+    first_message_preview: &Option<String>,
+    last_modified: &str,
+) -> String {
+    extract_session_title(content)
+        .unwrap_or_else(|| generate_display_name(first_message_preview, last_modified))
 }
 
 /// Generate a human-readable display name from the session's first user message.
@@ -1947,6 +2018,84 @@ mod tests {
     fn test_extract_session_title_tolerates_spaced_json() {
         let content = "{\"type\": \"custom-title\", \"customTitle\": \"spaced\"}\n";
         assert_eq!(extract_session_title(content).as_deref(), Some("spaced"));
+    }
+
+    #[test]
+    fn test_extract_session_title_dispatches_on_parsed_type_not_substring() {
+        // An ai-title whose TEXT quotes a custom-title record must still be read
+        // from `aiTitle` — dispatching on the substring pre-filter would look up
+        // `customTitle`, find nothing, and silently drop the newest title.
+        let content =
+            "{\"type\":\"ai-title\",\"aiTitle\":\"Parse \\\"type\\\":\\\"custom-title\\\" records\"}\n";
+        assert_eq!(
+            extract_session_title(content).as_deref(),
+            Some("Parse \"type\":\"custom-title\" records")
+        );
+    }
+
+    #[test]
+    fn test_extract_session_title_blank_newest_does_not_resurrect_older() {
+        // Clearing the title must stick: the older custom-title it superseded
+        // must not come back.
+        let content = concat!(
+            "{\"type\":\"custom-title\",\"customTitle\":\"old embarrassing name\"}\n",
+            "{\"type\":\"ai-title\",\"aiTitle\":\"generated\"}\n",
+            "{\"type\":\"custom-title\",\"customTitle\":\"  \"}\n",
+        );
+        // Falls through to the ai-title, never back to the cleared name.
+        assert_eq!(extract_session_title(content).as_deref(), Some("generated"));
+    }
+
+    #[test]
+    fn test_extract_session_title_blank_newest_and_no_ai_falls_to_heuristic() {
+        let content = concat!(
+            "{\"type\":\"custom-title\",\"customTitle\":\"old name\"}\n",
+            "{\"type\":\"custom-title\",\"customTitle\":\"\"}\n",
+        );
+        assert_eq!(extract_session_title(content), None);
+    }
+
+    #[test]
+    fn test_extract_session_title_uses_newest_ai_title() {
+        let content = concat!(
+            "{\"type\":\"ai-title\",\"aiTitle\":\"first guess\"}\n",
+            "{\"type\":\"ai-title\",\"aiTitle\":\"refined guess\"}\n",
+        );
+        assert_eq!(
+            extract_session_title(content).as_deref(),
+            Some("refined guess")
+        );
+    }
+
+    #[test]
+    fn test_extract_session_title_is_bounded_and_single_line() {
+        let long = "a".repeat(400);
+        let content = format!("{{\"type\":\"custom-title\",\"customTitle\":\"{long}\"}}\n");
+        let got = extract_session_title(&content).unwrap();
+        assert!(
+            got.chars().count() <= MAX_DISPLAY_NAME_CHARS + 3,
+            "unbounded title leaked: {} chars",
+            got.chars().count()
+        );
+        assert!(got.ends_with("..."));
+    }
+
+    #[test]
+    fn test_extract_session_title_strips_ansi_and_newlines() {
+        let content =
+            "{\"type\":\"custom-title\",\"customTitle\":\"fix \\u001b[1mbold\\u001b[22m\\nsecond\"}\n";
+        let got = extract_session_title(content).unwrap();
+        assert!(!got.contains('\u{1b}'), "ANSI leaked: {got:?}");
+        assert!(!got.contains('\n'), "newline leaked: {got:?}");
+        assert_eq!(got, "fix bold second");
+    }
+
+    #[test]
+    fn test_extract_session_title_ignores_unrelated_title_like_records() {
+        // A record whose `type` is neither kind must not be mined for a title,
+        // even though it trips the cheap `-title"` pre-filter.
+        let content = "{\"type\":\"page-title\",\"customTitle\":\"not a session title\"}\n";
+        assert_eq!(extract_session_title(content), None);
     }
 
     #[test]

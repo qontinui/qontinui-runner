@@ -620,11 +620,22 @@ pub trait ProviderSessionIndex {
 /// ([`SessionLifecycleStore::update_title_by_terminal`]) — which is driven by
 /// terminal title escapes — is never called for it, and the registry keeps the
 /// spawn-time title forever. The obvious alternative source, a `summary` record
-/// in the transcript JSONL, **does not exist**: a sweep of every transcript
-/// under every config root found zero `{"type":"summary"}` records, and
-/// `TranscriptSession::display_name` is *derived* from the first user message,
-/// not from the rename. It would restate the spawn-time guess, not the operator's
-/// intent.
+/// in the transcript JSONL, is not a `summary` record — a sweep of every
+/// transcript under every config root found zero `{"type":"summary"}` records.
+///
+/// **Corrected 2026-07-19:** the rename IS recoverable from the transcript, via
+/// `{"type":"custom-title","customTitle":…}` (a `/rename`) and its
+/// `{"type":"ai-title","aiTitle":…}` sibling — both appended, newest-wins.
+/// `TranscriptSession::display_name` now prefers those over the
+/// first-user-message heuristic (`transcript::extract_session_title`), so the
+/// old claim here that it "is *derived* from the first user message, not from
+/// the rename" no longer holds.
+///
+/// This provider is still the authority for the TAB title: it reflects the live
+/// session's current name even when the transcript has not been titled yet.
+/// **Known gap:** the two sources are not reconciled, so a session whose
+/// provider file is absent, stale, or pid-reused can show its spawn-time name on
+/// the tab and its renamed title on the Session Manager card at the same time.
 ///
 /// The provider instead maintains this small JSON file per live session —
 /// `{pid, sessionId, cwd, startedAt, name, status, …}` — whose `name` IS the
