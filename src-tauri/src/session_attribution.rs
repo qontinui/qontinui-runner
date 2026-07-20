@@ -168,26 +168,6 @@ pub(crate) fn extract_attributions_from_new_bytes(
     out
 }
 
-/// Resolve the runner's port-namespaced lifecycle-store path, mirroring the
-/// construction in `main.rs` (port 9876 → base name, every other port →
-/// `-<port>` suffix). The store is re-opened fresh each cycle so we pick up the
-/// latest atomically-persisted state without holding the Tauri-managed handle
-/// (the fleet publishers run on a dedicated OS thread spawned before Tauri
-/// setup, so the managed `Arc` isn't reachable here).
-fn lifecycle_store_path() -> PathBuf {
-    let port = crate::mcp::types::get_mcp_api_port();
-    let file_name = if port == 9876 {
-        "terminal-sessions.json".to_string()
-    } else {
-        format!("terminal-sessions-{}.json", port)
-    };
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".qontinui")
-        .join("runner")
-        .join(file_name)
-}
-
 /// Locate a hosted session's transcript jsonl, given its `config_dir`
 /// (`CLAUDE_CONFIG_DIR`) and `working_dir` (the cwd Claude was launched from =
 /// the encoded project path). Returns the first existing path:
@@ -261,7 +241,7 @@ pub async fn run_attribution_cycle() -> Result<(), String> {
     // 2. Enumerate the sessions this runner hosts. Re-open the durable store
     //    fresh each cycle so we read the latest atomically-persisted state.
     let store = match crate::session::session_lifecycle_store::SessionLifecycleStore::open(
-        lifecycle_store_path(),
+        crate::session::session_lifecycle_store::store_path(),
     ) {
         Ok(s) => s,
         Err(e) => {

@@ -2561,23 +2561,30 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // `.qontinui/runner` (same home-dir resolution + temp-dir
                 // fallback). A background poll (spawned below) lazily flips
                 // dead sessions to `closed`.
-                // Namespace the registry file by API port so each runner
-                // instance owns its own sessions — mirrors the frontend
-                // `instance-storage.ts` convention (port 9876 → base name,
-                // every other port → `-<port>` suffix). Without this a temp
-                // runner (9877+) would read the primary's open records and
-                // try to `claude --resume` the primary's live sessions.
-                let lifecycle_api_port = crate::mcp::types::get_mcp_api_port();
-                let lifecycle_file_name = if lifecycle_api_port == 9876 {
-                    "terminal-sessions.json".to_string()
-                } else {
-                    format!("terminal-sessions-{}.json", lifecycle_api_port)
+                // Scope the registry file by durable INSTANCE identity, not by
+                // API port. Port-namespacing looks equivalent but is not:
+                // temp-runner ports (9877-9899) are RECYCLED across unrelated
+                // spawns, so a fresh runner on a reused port used to `open()`
+                // the previous occupant's `terminal-sessions-<port>.json` and
+                // auto-restore its foreign PTYs (observed: 164 stale Jul-13
+                // records → 81 phantom open records → 27 foreign `claude
+                // --resume`s). The primary (no instance name) keeps the legacy
+                // unscoped path unchanged; a secondary gets its own
+                // `instance-<name>/` dir. Same instance-scoping convention as
+                // #788's window-assignments fix (`store_path` reuses
+                // `instance::scope_path`); the five call sites that previously
+                // re-derived this path are all routed through the canonical
+                // `session_lifecycle_store::store_path` now.
+                let lifecycle_store_path =
+                    session::session_lifecycle_store::store_path();
+                // The ephemeral temp-dir fallback must stay instance-unique for
+                // the same reason the real path is instance-scoped — a shared
+                // temp file would re-introduce exactly the cross-instance
+                // inheritance this scoping removes (mirrors `wa_file_name`).
+                let lifecycle_fallback_name = match instance::data_subdir() {
+                    Some(sub) => format!("terminal-sessions-{sub}.json"),
+                    None => "terminal-sessions.json".to_string(),
                 };
-                let lifecycle_store_path = dirs::home_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join(".qontinui")
-                    .join("runner")
-                    .join(&lifecycle_file_name);
                 let lifecycle_store = std::sync::Arc::new(
                     match session::session_lifecycle_store::SessionLifecycleStore::open(
                         &lifecycle_store_path,
@@ -2590,8 +2597,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 "session: lifecycle store open failed — using ephemeral fallback"
                             );
                             let fallback = std::env::temp_dir().join(format!(
-                                "qontinui-runner-{}",
-                                lifecycle_file_name
+                                "qontinui-runner-{lifecycle_fallback_name}"
                             ));
                             session::session_lifecycle_store::SessionLifecycleStore::open(&fallback)
                                 .expect("session: ephemeral lifecycle store open failed")
@@ -2603,19 +2609,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // session set, written on every layout-meaningful registry
                 // change plus a periodic heartbeat (driven from the liveness
                 // poll below). Lives in the runner's own app-data
-                // (`~/.qontinui/runner/session-restore/`), port-scoped like
+                // (`~/.qontinui/runner/session-restore/`), INSTANCE-scoped like
                 // the lifecycle file so temp runners never pollute the
                 // primary's history. NEVER read by the restore path — it is
                 // the manual/assistant fallback when auto-restore restores
                 // nothing. Fail-open: an open failure just leaves the sink
                 // unattached (registry keeps working, history is skipped).
-                let snapshot_history_file = if lifecycle_api_port == 9876 {
-                    "session-snapshots.jsonl".to_string()
-                } else {
-                    format!("session-snapshots-{}.jsonl", lifecycle_api_port)
-                };
-                let snapshot_history_path = session::claude_hook::session_restore_dir()
-                    .join(&snapshot_history_file);
+                let snapshot_history_path =
+                    session::session_lifecycle_store::snapshot_history_path();
                 match session::snapshot_history::SnapshotHistory::open(&snapshot_history_path) {
                     Ok(history) => {
                         lifecycle_store.attach_snapshot_history(std::sync::Arc::new(history));

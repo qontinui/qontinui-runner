@@ -1003,22 +1003,6 @@ pub struct ClearLifecycleResponse {
     pub path: String,
 }
 
-/// Resolve the port-namespaced lifecycle-store path for the runner bound to
-/// `api_port`, mirroring `main.rs`'s wiring exactly: port 9876 → base name,
-/// any other port → `-<port>` suffix; under `<home>/.qontinui/runner`.
-fn lifecycle_store_path_for_port(api_port: u16) -> std::path::PathBuf {
-    let file_name = if api_port == 9876 {
-        "terminal-sessions.json".to_string()
-    } else {
-        format!("terminal-sessions-{}.json", api_port)
-    };
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".qontinui")
-        .join("runner")
-        .join(file_name)
-}
-
 /// Build a full `TerminalSessionRecord` from a seed spec resolved against
 /// `now_ms`. Returns an error string on an invalid `state`.
 fn record_from_seed(
@@ -1135,11 +1119,13 @@ fn list_lifecycle_open_at(path: &Path) -> Vec<String> {
 }
 
 async fn seed_lifecycle_store_handler(
-    axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
+    axum::extract::State(_state): axum::extract::State<Arc<ApiState>>,
     Json(req): Json<SeedLifecycleRequest>,
 ) -> Result<Json<SeedLifecycleResponse>, (StatusCode, Json<InjectSessionError>)> {
-    let api_port = crate::mcp::types::runner_api_port(&state.app_state);
-    let path = lifecycle_store_path_for_port(api_port);
+    // This control route runs INSIDE the target runner, so its own instance
+    // identity already selects the correct file — resolve the canonical
+    // self-scoped path (no port arg needed once the port is no longer the key).
+    let path = crate::session::session_lifecycle_store::store_path();
     let now_ms = chrono::Utc::now().timestamp_millis();
     match seed_lifecycle_store_at(&path, &req, now_ms) {
         Ok(seeded) => {
@@ -1165,10 +1151,11 @@ async fn seed_lifecycle_store_handler(
 }
 
 async fn list_lifecycle_open_handler(
-    axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
+    axum::extract::State(_state): axum::extract::State<Arc<ApiState>>,
 ) -> Json<ListLifecycleOpenResponse> {
-    let api_port = crate::mcp::types::runner_api_port(&state.app_state);
-    let path = lifecycle_store_path_for_port(api_port);
+    // Runs inside the target runner — its own instance identity selects the
+    // correct file (canonical self-scoped path).
+    let path = crate::session::session_lifecycle_store::store_path();
     Json(ListLifecycleOpenResponse {
         success: true,
         open_session_ids: list_lifecycle_open_at(&path),
@@ -1177,10 +1164,14 @@ async fn list_lifecycle_open_handler(
 }
 
 async fn clear_lifecycle_store_handler(
-    axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
+    axum::extract::State(_state): axum::extract::State<Arc<ApiState>>,
 ) -> Json<ClearLifecycleResponse> {
-    let api_port = crate::mcp::types::runner_api_port(&state.app_state);
-    let path = lifecycle_store_path_for_port(api_port);
+    // A control route that clears "self". It runs INSIDE the target runner, so
+    // its own instance identity selects the correct file; under instance
+    // scoping the former `api_port` query param is redundant with self-identity
+    // (a port-named file is no longer the key) — clear the current instance's
+    // own store, the only coherent meaning here.
+    let path = crate::session::session_lifecycle_store::store_path();
     let removed = std::fs::remove_file(&path).is_ok();
     info!(
         "test_fixtures: cleared lifecycle store path={} removed={}",

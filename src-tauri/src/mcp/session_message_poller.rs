@@ -807,7 +807,7 @@ async fn deliver_once(
         .try_state::<Arc<crate::terminal::TerminalManager>>()
         .map(|t| t.inner().clone());
     let lifecycle_store = crate::session::session_lifecycle_store::SessionLifecycleStore::open(
-        lifecycle_store_path(),
+        crate::session::session_lifecycle_store::store_path(),
     )?;
 
     let now = Instant::now();
@@ -951,16 +951,6 @@ async fn deliver_once(
         debug!("session_message_poller: delivered {delivered} message(s) this tick");
     }
     Ok(())
-}
-
-/// The runner's lifecycle store path (`~/.qontinui/runner/terminal-sessions.json`).
-/// Mirrors `session_bus::lifecycle_store_path` and the boot path in `main.rs`.
-fn lifecycle_store_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".qontinui")
-        .join("runner")
-        .join("terminal-sessions.json")
 }
 
 // ===========================================================================
