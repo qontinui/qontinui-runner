@@ -13,6 +13,7 @@
 pub mod coord_register;
 pub mod dispatcher;
 pub mod federation;
+pub mod launch_spec;
 pub mod manager;
 pub mod resume;
 pub mod runner;

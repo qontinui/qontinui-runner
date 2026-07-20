@@ -803,6 +803,19 @@ async fn spawn_looping_agent_terminal(
     // relaunch.
     let claude_bin = crate::agent_runtime::claude_bin_path();
     let pinned_session_id = uuid::Uuid::new_v4().to_string();
+
+    // Account selection (fail-loud): never spawn a `claude` that dies
+    // instantly with a 401 under a quota-exhausted/unauthenticated default.
+    // Resolved BEFORE the argv build so its per-account launch command can layer
+    // into the shared launch seam.
+    let _ = tokio::task::spawn_blocking(crate::ai_provider::pick_best_account).await;
+    let selected_config_dir = {
+        let ai = crate::settings::get_ai_settings();
+        crate::ai_provider::get_effective_config_dir(&ai.claude_cli)
+    };
+    let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
+        selected_config_dir.as_deref(),
+    );
     let command = Some(crate::agent_runtime::build_continuation_claude_command(
         claude_bin,
         &pinned_session_id,
@@ -811,15 +824,9 @@ async fn spawn_looping_agent_terminal(
         Some(crate::terminal::runner_context(
             crate::mcp::types::get_mcp_api_port(),
         )),
+        &launch_cfg,
     ));
 
-    // Account selection (fail-loud): never spawn a `claude` that dies
-    // instantly with a 401 under a quota-exhausted/unauthenticated default.
-    let _ = tokio::task::spawn_blocking(crate::ai_provider::pick_best_account).await;
-    let selected_config_dir = {
-        let ai = crate::settings::get_ai_settings();
-        crate::ai_provider::get_effective_config_dir(&ai.claude_cli)
-    };
     if selected_config_dir.is_none()
         && !crate::ai_provider::oauth_refresh::default_location_has_valid_credentials()
     {

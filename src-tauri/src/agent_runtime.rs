@@ -2384,29 +2384,44 @@ pub(crate) fn build_continuation_claude_command(
     add_dir_args: Vec<String>,
     prompt: String,
     system_prompt: Option<String>,
+    launch_cfg: &crate::claude_session::launch_spec::LaunchConfig,
 ) -> Vec<String> {
-    let mut command_vec = vec![
-        claude_bin,
-        "--dangerously-skip-permissions".to_string(),
-        "--session-id".to_string(),
-        pinned_session_id.to_string(),
-    ];
-    // Autonomous spawns exec `claude` directly (no shell wrapping), so unlike
-    // interactive panes they never pick up the shell-integration wrapper's
-    // `--append-system-prompt`. Inject the canonical runner-context briefing
-    // here so the fleet/gate-continuation sessions — the ones acting
-    // unattended against coord and the twin — carry the same capability +
-    // guardrail context an operator's pane gets. Placed among the flags,
-    // BEFORE the `--` end-of-options terminator, so it never disturbs the
-    // trailing-positional-prompt discipline the regression tests below guard.
+    use crate::claude_session::launch_spec::{render_argv, LaunchSpec, PermissionMode};
+
+    // `extra_required` is the caller-authoritative, verbatim tail — never
+    // reordered or deduped by the seam. It carries, IN ORDER:
+    //
+    //  - the canonical runner-context briefing as `--append-system-prompt <sp>`.
+    //    Autonomous spawns exec `claude` directly (no shell wrapping), so unlike
+    //    interactive panes they never pick up the shell-integration wrapper's
+    //    briefing; injecting it here gives fleet/gate-continuation sessions the
+    //    same capability + guardrail context an operator's pane gets.
+    //  - the attached-form `--add-dir=<sibling>` tokens.
+    //  - the `--` end-of-options terminator immediately before the trailing
+    //    positional prompt.
+    //
+    // Everything sits BEFORE the `--`, so the trailing-positional-prompt
+    // discipline the regression tests below guard is preserved. `spec.permission`
+    // (DangerouslySkip) and `spec.session_id` (the pinned id) are emitted ahead
+    // of this tail by the seam, and the operator's launch template layers in
+    // between — with no operator config the output is byte-identical to the
+    // historical hand-built argv.
+    let mut extra_required = Vec::with_capacity(add_dir_args.len() + 4);
     if let Some(sp) = system_prompt {
-        command_vec.push("--append-system-prompt".to_string());
-        command_vec.push(sp);
+        extra_required.push("--append-system-prompt".to_string());
+        extra_required.push(sp);
     }
-    command_vec.extend(add_dir_args);
-    command_vec.push("--".to_string());
-    command_vec.push(prompt);
-    command_vec
+    extra_required.extend(add_dir_args);
+    extra_required.push("--".to_string());
+    extra_required.push(prompt);
+
+    let spec = LaunchSpec {
+        permission: PermissionMode::DangerouslySkip,
+        session_id: Some(pinned_session_id.to_string()),
+        extra_required,
+        ..Default::default()
+    };
+    render_argv(&spec, launch_cfg, &claude_bin)
 }
 
 /// Run a gate continuation as a VISIBLE terminal session (Decision 1/2/3).
@@ -2509,6 +2524,29 @@ async fn run_continuation_terminal(
     // synchronously at spawn instead of mtime-guessing from transcripts.
     // Fresh uuid per spawn attempt — never reused (CLI fails loudly on reuse).
     let pinned_session_id = uuid::Uuid::new_v4().to_string();
+
+    // Account selection: pin the most-available (token-bearing) account so the
+    // continuation does not spawn under a quota-exhausted default and die
+    // instantly (the bug: continuations spawned under the runner's boot account
+    // even when it was out of tokens). The resolved dir is threaded to the PTY
+    // as `CLAUDE_CONFIG_DIR` via `capture_hint.config_dir` (consumed by
+    // `create_terminal_session_backend`) AND resolves the per-account operator
+    // launch template for the shared launch seam below. Resolved BEFORE the argv
+    // build so its per-account command can layer in. spawn_blocking: the
+    // selector reads settings + cooldown state.
+    let _ = tokio::task::spawn_blocking(crate::ai_provider::pick_best_account).await;
+    let selected_config_dir = {
+        let ai = crate::settings::get_ai_settings();
+        crate::ai_provider::get_effective_config_dir(&ai.claude_cli)
+    };
+
+    // Compose the spawn argv through the shared launch seam so the operator's
+    // global + per-account launch flags layer onto the required autonomous
+    // flags (see build_continuation_claude_command). With no operator config
+    // the argv is byte-identical to the historical hand-built vector.
+    let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
+        selected_config_dir.as_deref(),
+    );
     let command = Some(build_continuation_claude_command(
         claude_bin,
         &pinned_session_id,
@@ -2517,23 +2555,11 @@ async fn run_continuation_terminal(
         Some(crate::terminal::runner_context(
             crate::mcp::types::get_mcp_api_port(),
         )),
+        &launch_cfg,
     ));
 
     // First repo (if any) is the session's intent_repo for coord attribution.
     let intent_repo = payload.repos.first().cloned();
-
-    // Account selection: pin the most-available (token-bearing) account so the
-    // continuation does not spawn under a quota-exhausted default and die
-    // instantly (the bug: continuations spawned under the runner's boot account
-    // even when it was out of tokens). The resolved dir is threaded to the PTY
-    // as `CLAUDE_CONFIG_DIR` via `capture_hint.config_dir` (consumed by
-    // `create_terminal_session_backend`). spawn_blocking: the selector reads
-    // settings + cooldown state.
-    let _ = tokio::task::spawn_blocking(crate::ai_provider::pick_best_account).await;
-    let selected_config_dir = {
-        let ai = crate::settings::get_ai_settings();
-        crate::ai_provider::get_effective_config_dir(&ai.claude_cli)
-    };
 
     // Fail loud, not a 401 zombie: `None` here means no credential-valid account
     // was resolved, so `CLAUDE_CONFIG_DIR` would be left unset and the PTY would
@@ -2794,6 +2820,19 @@ async fn run_condition_check_terminal(
         .await
         .unwrap_or_else(|_| claude_bin_path());
     let pinned_session_id = uuid::Uuid::new_v4().to_string();
+
+    // Account selection (fail-loud) — identical posture to the gate path so the
+    // spawned `claude` never dies instantly under a quota-exhausted default.
+    // Resolved BEFORE the argv build so its per-account launch command can layer
+    // into the shared launch seam.
+    let _ = tokio::task::spawn_blocking(crate::ai_provider::pick_best_account).await;
+    let selected_config_dir = {
+        let ai = crate::settings::get_ai_settings();
+        crate::ai_provider::get_effective_config_dir(&ai.claude_cli)
+    };
+    let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
+        selected_config_dir.as_deref(),
+    );
     let command = Some(build_continuation_claude_command(
         claude_bin,
         &pinned_session_id,
@@ -2802,15 +2841,9 @@ async fn run_condition_check_terminal(
         Some(crate::terminal::runner_context(
             crate::mcp::types::get_mcp_api_port(),
         )),
+        &launch_cfg,
     ));
 
-    // Account selection (fail-loud) — identical posture to the gate path so the
-    // spawned `claude` never dies instantly under a quota-exhausted default.
-    let _ = tokio::task::spawn_blocking(crate::ai_provider::pick_best_account).await;
-    let selected_config_dir = {
-        let ai = crate::settings::get_ai_settings();
-        crate::ai_provider::get_effective_config_dir(&ai.claude_cli)
-    };
     if selected_config_dir.is_none()
         && !crate::ai_provider::oauth_refresh::default_location_has_valid_credentials()
     {
@@ -4261,6 +4294,7 @@ mod tests {
             vec!["--add-dir=D:/wt/sibling".to_string()],
             "do the thing".to_string(),
             None,
+            &crate::claude_session::launch_spec::LaunchConfig::default(),
         );
         assert_eq!(
             cmd.join("|"),
@@ -4285,6 +4319,7 @@ mod tests {
             ],
             "run /implement-plan plans/x.md".to_string(),
             None,
+            &crate::claude_session::launch_spec::LaunchConfig::default(),
         );
         assert_eq!(
             cmd.last().map(String::as_str),
@@ -4312,6 +4347,7 @@ mod tests {
             vec![],
             "-prompt with dash".to_string(),
             None,
+            &crate::claude_session::launch_spec::LaunchConfig::default(),
         );
         assert_eq!(
             cmd.join("|"),
@@ -4332,6 +4368,7 @@ mod tests {
             vec!["--add-dir=D:/wt/coord".to_string()],
             "do the thing".to_string(),
             Some("You are inside the Qontinui Runner.".to_string()),
+            &crate::claude_session::launch_spec::LaunchConfig::default(),
         );
         // The prompt stays the trailing positional behind `--`.
         assert_eq!(cmd.last().map(String::as_str), Some("do the thing"));

@@ -437,17 +437,28 @@ pub fn migrate_session(
         &record.claude_session_id,
     );
     let model = transcript_last_model(&src_transcript);
-    let mut command = vec![
-        crate::agent_runtime::claude_bin_path(),
-        "--permission-mode".to_string(),
-        "bypassPermissions".to_string(),
-    ];
-    if let Some(m) = &model {
-        command.push("--model".to_string());
-        command.push(m.clone());
-    }
-    command.push("--resume".to_string());
-    command.push(record.claude_session_id.clone());
+    // Compose the respawn argv through the shared launch seam so the operator's
+    // global + per-account (destination) launch flags layer onto the required
+    // resume flags. `permission = BypassPermissions` preserves today's emitted
+    // `--permission-mode bypassPermissions` (a resumed autonomous session must
+    // not stall on its first tool-approval prompt with nobody watching). The
+    // #782 transcript-sniffed model is fed as `spec.model`, so it wins over any
+    // template `--model` and the session keeps its actual model across the hop.
+    // `resume_id` names the exact session id. With no operator config the argv
+    // is byte-identical to the historical hand-built
+    // `claude --permission-mode bypassPermissions [--model m] --resume <id>`.
+    let launch_cfg =
+        crate::claude_session::launch_spec::LaunchConfig::from_settings(Some(dst_config_dir));
+    let command = crate::claude_session::launch_spec::render_argv(
+        &crate::claude_session::launch_spec::LaunchSpec {
+            permission: crate::claude_session::launch_spec::PermissionMode::BypassPermissions,
+            resume_id: Some(record.claude_session_id.clone()),
+            model: model.clone(),
+            ..Default::default()
+        },
+        &launch_cfg,
+        &crate::agent_runtime::claude_bin_path(),
+    );
     let capture_hint = crate::commands::terminal::SessionCaptureHint {
         config_dir: Some(dst_config_dir.to_string()),
         working_dir: working_dir.clone(),
