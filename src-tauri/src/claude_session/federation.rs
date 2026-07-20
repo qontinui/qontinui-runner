@@ -218,7 +218,7 @@ pub fn build_federation_ctx(
     cli_settings: &ClaudeCliSettings,
     session_tenant: Option<Uuid>,
 ) -> Result<SessionContext, FederationSkipReason> {
-    let tenant_id = match session_tenant.or_else(resolve_tenant_id) {
+    let tenant_id = match resolve_session_context_tenant(session_tenant) {
         Some(t) => t,
         None => {
             warn!(
@@ -484,6 +484,21 @@ pub fn log_bridge_report(category: &str, ctx: &SessionContext, report: Result<Re
     }
 }
 
+/// The tenant a spawned session's memory federation binds to — the value
+/// that populates [`SessionContext::tenant_id`] (B2). The session's
+/// RECORDED tenant wins (`session_tenant`, threaded by the spawn site from
+/// `machine.json::active_tenant_id` — spawn input else the active pin —
+/// the SAME source `session::mod::stamp_session_tenant` uses for the coord
+/// record), so the coord record + JWT slot + memory pool agree by
+/// construction. Only when the session recorded no tenant (single-tenant
+/// install, no active pin) does this fall back to the device DEFAULT
+/// binding via [`resolve_tenant_id`]. Split out so the B2 precedence is
+/// hermetically testable without the file/home-dir reads the rest of
+/// identity resolution needs.
+fn resolve_session_context_tenant(session_tenant: Option<Uuid>) -> Option<Uuid> {
+    session_tenant.or_else(resolve_tenant_id)
+}
+
 /// Resolve the device DEFAULT binding's tenant UUID (Phase 8b semantics —
 /// the fallback for sessions with no recorded tenant of their own).
 /// Mirrors `fleet.rs::resolve_tenant_id` but that's private to `fleet`;
@@ -661,5 +676,26 @@ mod tests {
         });
         rx.recv_timeout(std::time::Duration::from_secs(5))
             .expect("future must run to completion via the fallback runtime");
+    }
+
+    #[test]
+    fn federation_binds_recorded_session_tenant_over_device_default() {
+        // B2 REGRESSION: a session's memory-federation `SessionContext.tenant_id`
+        // is populated by `resolve_session_context_tenant`. A session that
+        // RECORDED tenant B (the spawn input, else the `machine.json` active pin
+        // threaded by the spawn site — the same source
+        // `stamp_session_tenant` uses for the coord record + JWT slot) MUST
+        // federate B's pool. The recorded value has to WIN over the
+        // `paired_user.json::default_tenant_id` fallback (`resolve_tenant_id`);
+        // that fallback following a DIFFERENT source is the exact coord/memory
+        // split-brain B2 fixes. If the resolver ever ignores the threaded tenant
+        // and consults the default instead, coord would record B while memory
+        // pulled/pushed A — this assertion guards that.
+        let recorded = Uuid::new_v4();
+        assert_eq!(
+            resolve_session_context_tenant(Some(recorded)),
+            Some(recorded),
+            "recorded session tenant must win over the paired-default fallback",
+        );
     }
 }

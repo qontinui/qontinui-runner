@@ -312,10 +312,16 @@ impl ClaudeSession {
                 session_id,
                 working_dir,
                 &ai_settings.claude_cli,
-                // Phase 8b: interactive sessions have no explicit spawn
-                // tenant yet — device default. A spawn input recording a
-                // session tenant threads it here.
-                None,
+                // Phase 8b (B2): thread the session's RECORDED tenant so the
+                // memory pool agrees with the coord record + JWT slot by
+                // construction. `stamp_session_tenant` records the coord side
+                // from `machine.json::active_tenant_id` (spawn input else
+                // this pin); resolving the SAME source here — rather than
+                // letting `build_federation_ctx` fall back to
+                // `paired_user.json::default_tenant_id` — is what closes the
+                // coord/memory split-brain. `None` on a single-tenant install
+                // (coord resolves the sole binding server-side).
+                crate::session::dual_write::resolve_active_tenant_id(),
             ) {
                 Ok(ctx) => Some(ctx),
                 Err(reason) => {
