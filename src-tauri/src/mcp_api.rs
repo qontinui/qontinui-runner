@@ -1191,11 +1191,12 @@ async fn coord_claims_read_proxy_handler(
     let session_tenant = nonce
         .as_deref()
         .and_then(crate::coord_mcp::proxy_session_tenant_for_nonce);
-    let bearer =
-        tokio::task::spawn_blocking(move || crate::auth::device_bearer_for(session_tenant.as_ref()))
-            .await
-            .ok()
-            .flatten();
+    let bearer = tokio::task::spawn_blocking(move || {
+        crate::auth::device_bearer_for(session_tenant.as_ref())
+    })
+    .await
+    .ok()
+    .flatten();
 
     if let Err((status, msg)) = crate::coord_mcp::proxy_request_gate(
         nonce.as_deref(),
@@ -1556,11 +1557,12 @@ async fn coord_write_proxy_handler(
     let session_tenant = nonce
         .as_deref()
         .and_then(crate::coord_mcp::proxy_session_tenant_for_nonce);
-    let bearer =
-        tokio::task::spawn_blocking(move || crate::auth::device_bearer_for(session_tenant.as_ref()))
-            .await
-            .ok()
-            .flatten();
+    let bearer = tokio::task::spawn_blocking(move || {
+        crate::auth::device_bearer_for(session_tenant.as_ref())
+    })
+    .await
+    .ok()
+    .flatten();
 
     if let Err((status, msg)) = crate::coord_mcp::proxy_request_gate(
         nonce.as_deref(),
