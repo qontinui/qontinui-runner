@@ -1401,6 +1401,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::comparison::get_comparison_status,
             commands::comparison::list_comparisons,
             commands::comparison::start_comparison,
+            commands::config::build_ai_launch_command,
             commands::config::get_auto_load_last_config,
             commands::config::get_claude_account_launch_commands,
             commands::config::get_claude_config_dirs,

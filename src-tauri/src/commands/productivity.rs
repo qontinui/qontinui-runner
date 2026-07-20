@@ -826,10 +826,47 @@ http://localhost:{port}/coordinator/state and /coordinator/act.{plan_line}\n",
     // are server-enforced as advisory regardless of the agent's claim
     // (mcp/coordinator.rs::must_advise_only). Per the project CLAUDE.md
     // the flag now bypasses prompts for writes to .claude/, .git/, etc.
+    //
+    // The flag head is rendered through the shared launch-spec builder so the
+    // operator's configured `claude_default_launch_command` flags (e.g.
+    // `--model`) layer in — the DangerouslySkip posture is caller-authoritative
+    // and can never be downgraded by that template. The trailing
+    // `(Get-Content -Raw '<path>')` is a LIVE PowerShell subexpression that must
+    // stay unquoted, so it is appended here rather than routed through
+    // `extra_required` (which shell-quotes its tokens).
     Ok(format!(
-        "claude --dangerously-skip-permissions (Get-Content -Raw '{}')",
+        "{} (Get-Content -Raw '{}')",
+        claude_autonomous_launch_head(),
         escaped_path
     ))
+}
+
+/// The `claude --dangerously-skip-permissions [+ operator template flags]` head
+/// shared by the Coordinator and Worker PowerShell launch lines.
+///
+/// Routed through the shared launch-spec builder ([`render_pty_command`]) so the
+/// operator's machine-global `claude_default_launch_command` flags layer in,
+/// while the caller-authoritative `--dangerously-skip-permissions` posture is
+/// preserved (an operator template carrying a conflicting permission flag has it
+/// dropped, never applied). Ambient account — no `CLAUDE_CONFIG_DIR` prefix, as
+/// the Coordinator/Worker run under the runner's own account today. Windows PTY
+/// (PowerShell), so `is_windows = true`.
+///
+/// With an empty/absent global template this returns exactly
+/// `claude --dangerously-skip-permissions` — byte-identical to the historical
+/// hard-coded string, and still carrying the `--dangerously-skip-permissions`
+/// anchor that [`append_claude_add_dir`] splices `--add-dir` flags after.
+fn claude_autonomous_launch_head() -> String {
+    use crate::claude_session::launch_spec::{
+        render_pty_command, LaunchConfig, LaunchSpec, PermissionMode,
+    };
+    let spec = LaunchSpec {
+        permission: PermissionMode::DangerouslySkip,
+        config_dir: None,
+        ..Default::default()
+    };
+    let cfg = LaunchConfig::from_settings(None);
+    render_pty_command(&spec, &cfg, true)
 }
 
 /// Auto-numbered "Worker N" title — finds the highest existing N across
@@ -1193,8 +1230,10 @@ pub async fn spawn_worker_session(
     // assign-task → POST /sessions/<id>/message. The
     // --dangerously-skip-permissions flag lets the worker run the
     // dispatched task without per-tool approval prompts (matches the
-    // Coordinator's flag for the same reason).
-    let initial_command = "claude --dangerously-skip-permissions".to_string();
+    // Coordinator's flag for the same reason). Routed through the shared
+    // launch-spec builder so the operator's global launch flags layer in
+    // (byte-identical to the historical bare string when unconfigured).
+    let initial_command = claude_autonomous_launch_head();
 
     // Phase 2c — `QONTINUI_SESSION_WORKTREES` (agent-agnostic, all sibling
     // worktrees) onto the PTY + `--add-dir <sibling>` appended to the claude

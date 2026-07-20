@@ -564,6 +564,61 @@ pub fn save_claude_default_launch_command(
     })
 }
 
+/// Build the PTY launch command for a new AI (`/spawn-ai`) session, routed
+/// through the shared launch-spec builder ([`crate::claude_session::launch_spec`]).
+///
+/// This is the single source of truth for the #779 frontend `aiLaunchCommand.ts`
+/// (now a thin wrapper): the operator's per-account override and machine-global
+/// `claude_default_launch_command` flags layer in here, so the PTY-typed spawn
+/// and the argv spawn sites can never drift.
+///
+/// # Arguments
+/// * `config_dir` - The account's `CLAUDE_CONFIG_DIR` (env-prefixed onto the
+///   command; also selects the per-account override template).
+/// * `session_id` - Fresh UUIDv4 minted by the frontend (it needs the id
+///   synchronously to record the tab), pinned as `--session-id`/`{sessionId}`.
+/// * `is_windows` - PowerShell (`$env:…`) vs POSIX (`VAR=…`) env-prefix + quoting.
+///
+/// Returns `{ command, pinnedSessionId }` matching the `AiLaunchCommand` TS
+/// contract. `pinnedSessionId` is the passed `session_id` when a real `claude`
+/// command was built; `null` when the per-account override was an opaque alias
+/// returned verbatim (no pin — the mtime-capture fallback then applies). The
+/// alias case is detected the same way the frontend did: a pinned command
+/// contains the id; a verbatim alias does not.
+#[tauri::command]
+pub fn build_ai_launch_command(
+    config_dir: String,
+    session_id: Option<String>,
+    is_windows: bool,
+) -> Result<CommandResponse, String> {
+    use crate::claude_session::launch_spec::{
+        render_pty_command, LaunchConfig, LaunchSpec, PermissionMode,
+    };
+
+    let cfg = LaunchConfig::from_settings(Some(&config_dir));
+    let spec = LaunchSpec {
+        config_dir: Some(config_dir),
+        permission: PermissionMode::BypassPermissions,
+        session_id: session_id.clone(),
+        ..Default::default()
+    };
+    let command = render_pty_command(&spec, &cfg, is_windows);
+
+    let pinned_session_id = match &session_id {
+        Some(id) if command.contains(id.as_str()) => Some(id.clone()),
+        _ => None,
+    };
+
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::json!({
+            "command": command,
+            "pinnedSessionId": pinned_session_id,
+        })),
+    })
+}
+
 pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
     PluginBuilder::new("qontinui_config")
         .invoke_handler(tauri::generate_handler![
@@ -584,6 +639,7 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             save_claude_account_launch_commands,
             get_claude_default_launch_command,
             save_claude_default_launch_command,
+            build_ai_launch_command,
         ])
         .build()
 }

@@ -935,13 +935,14 @@ function TerminalPageInner({
       const spawnAt = Date.now();
       for (const tabId of createdTabIds) {
         // Fresh uuid per tab/retype (a reused --session-id fails loudly) —
-        // the registry records synchronously, no transcript mtime guess.
-        const { command, pinnedSessionId } = buildAiLaunchCommand({
+        // the registry records synchronously, no transcript mtime guess. The
+        // Rust launch-spec builder reads the operator's per-account override +
+        // global template from settings itself; the frontend only supplies the
+        // fresh id it needs synchronously for updateTab/recordSessionOpen.
+        const { command, pinnedSessionId } = await buildAiLaunchCommand({
           configDir,
           isWindows,
-          customCmd,
-          defaultTemplate: sessionManager.defaultLaunchCommand ?? undefined,
-          newSessionId: () => crypto.randomUUID(),
+          sessionId: crypto.randomUUID(),
         });
         writeWhenReady(tabId, `${command}\r`);
         if (pinnedSessionId) {

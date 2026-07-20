@@ -188,16 +188,24 @@ impl ClaudeSession {
 
         // Spawn CLI with stream-json input AND output
         let mut cmd = crate::process_helpers::cmd_no_window();
-        let mut cli_args = vec![
-            "/c".to_string(),
-            "claude".to_string(),
+
+        // Resolve the account config dir up front: it feeds BOTH the shared
+        // launch-command builder (the per-account operator template) and the
+        // child's CLAUDE_CONFIG_DIR env set below.
+        let ai_settings = crate::settings::get_ai_settings();
+        let effective_config_dir =
+            crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli);
+
+        // Required trailing flags for the interactive stream-json chat. The
+        // shared launch seam (below) layers the operator template + the
+        // caller-authoritative permission/session/model on top of these; this
+        // vector is the non-negotiable, verbatim tail.
+        let mut extra_required = vec![
             "--output-format".to_string(),
             "stream-json".to_string(),
             "--input-format".to_string(),
             "stream-json".to_string(),
             "--verbose".to_string(),
-            "--permission-mode".to_string(),
-            "bypassPermissions".to_string(),
         ];
 
         // ── Claude CLI session id (restart survival) ──────────────────────
@@ -208,28 +216,27 @@ impl ClaudeSession {
         // own `session_id` (== task_run_id) as the CLI id so resume is
         // deterministic without persisting a separate Claude-internal id.
         // `None` preserves today's behavior (CLI generates a random id).
-        if let Some(ctx) = cli_session_ctx {
-            if ctx.is_resume {
-                cli_args.push("--resume".to_string());
-                cli_args.push(ctx.cli_session_id.clone());
+        let (session_id_pin, resume_id_pin) = match cli_session_ctx {
+            Some(ctx) if ctx.is_resume => {
                 info!(
                     "Resuming Claude CLI session {} for interactive session {}",
                     ctx.cli_session_id, session_id
                 );
-            } else {
-                cli_args.push("--session-id".to_string());
-                cli_args.push(ctx.cli_session_id.clone());
+                (None, Some(ctx.cli_session_id.clone()))
+            }
+            Some(ctx) => {
                 info!(
                     "Pinning Claude CLI session id {} for interactive session {}",
                     ctx.cli_session_id, session_id
                 );
+                (Some(ctx.cli_session_id.clone()), None)
             }
-        }
+            None => (None, None),
+        };
 
-        // Add model override if specified (e.g., from per-stage config)
+        // Model override (e.g., from per-stage config) is fed to the seam below
+        // as `spec.model` so it wins over any template `--model`.
         if let Some(model) = model_override {
-            cli_args.push("--model".to_string());
-            cli_args.push(model.to_string());
             info!(
                 "Using model override for interactive session {}: {}",
                 session_id, model
@@ -240,19 +247,20 @@ impl ClaudeSession {
         // Same carrier as the inline runner: allow/deny flags plus, for
         // argument-scoped denies, an ephemeral --settings <file> JSON block.
         // None ⇒ no-op (no extra args, no settings file), preserving today's
-        // interactive spawn byte-for-byte.
+        // interactive spawn. These are non-negotiable required flags, so they
+        // ride `extra_required` (verbatim tail, never reordered/deduped).
         let tool_policy_settings_path: Option<std::path::PathBuf>;
         if let Some(policy) = tool_policy {
             let (extra_args, settings_json) =
                 crate::claude_session::tool_policy_args::build_tool_policy_cli(policy);
-            cli_args.extend(extra_args);
+            extra_required.extend(extra_args);
             tool_policy_settings_path = if let Some(json) = settings_json {
                 let settings_file = std::env::temp_dir()
                     .join(format!("claude_session_settings_{}.json", session_id));
                 std::fs::write(&settings_file, &json)
                     .map_err(|e| format!("Failed to write tool-policy settings file: {}", e))?;
-                cli_args.push("--settings".to_string());
-                cli_args.push(settings_file.to_string_lossy().to_string());
+                extra_required.push("--settings".to_string());
+                extra_required.push(settings_file.to_string_lossy().to_string());
                 info!(
                     "Applied tool-policy settings for interactive session {} at {}",
                     session_id,
@@ -271,6 +279,29 @@ impl ClaudeSession {
         // unused warning when no policy is present.
         let _ = &tool_policy_settings_path;
 
+        // Compose the flag vector through the shared launch seam, then re-apply
+        // the `/c` shell wrapper (the interactive pane spawns `cmd /c claude …`).
+        // The operator's global template + per-account command layer in here;
+        // with no operator config the composed tail is byte-identical to the
+        // historical hand-built argv.
+        let spec = crate::claude_session::launch_spec::LaunchSpec {
+            permission: crate::claude_session::launch_spec::PermissionMode::BypassPermissions,
+            session_id: session_id_pin,
+            resume_id: resume_id_pin,
+            model: model_override.map(|m| m.to_string()),
+            extra_required,
+            ..Default::default()
+        };
+        let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
+            effective_config_dir.as_deref(),
+        );
+        let mut cli_args = vec!["/c".to_string()];
+        cli_args.extend(crate::claude_session::launch_spec::render_argv(
+            &spec,
+            &launch_cfg,
+            "claude",
+        ));
+
         let cli_arg_refs: Vec<&str> = cli_args.iter().map(|s| s.as_str()).collect();
         cmd.args(&cli_arg_refs)
             .current_dir(working_dir)
@@ -283,9 +314,6 @@ impl ClaudeSession {
             .stderr(Stdio::piped());
 
         // Set CLAUDE_CONFIG_DIR to the resolved account (for multi-account support)
-        let ai_settings = crate::settings::get_ai_settings();
-        let effective_config_dir =
-            crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli);
         // Silently refresh OAuth credentials if expired before spawning the subprocess.
         crate::ai_provider::oauth_refresh::try_ensure_valid_credentials(
             effective_config_dir.as_deref(),

@@ -366,62 +366,62 @@ fn run_claude_session_inline(
     //
     // Alternative considered: Using "acceptEdits" mode would still require user interaction
     // for bash commands, which breaks automation. Full bypass is necessary for autonomous operation.
-    let mut cli_args = vec![
-        "/c",
-        "claude",
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--permission-mode",
-        "bypassPermissions",
+    // Required trailing flags for the `--print`/stream-json workflow spawn. The
+    // shared launch seam (below) layers the operator template + the caller-
+    // authoritative permission/session/model on top; this vector is the
+    // non-negotiable, verbatim tail.
+    let mut extra_required = vec![
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--verbose".to_string(),
     ];
-    // Add model override if specified (e.g., from per-stage config)
-    let model_flag;
+
+    // Model override (e.g., from per-stage config) is fed to the seam as
+    // `spec.model` so it wins over any template `--model`.
     if let Some(model) = model_override {
-        model_flag = model.to_string();
-        cli_args.push("--model");
-        cli_args.push(&model_flag);
         info!("Using model override for session {}: {}", session_id, model);
     }
-    // Add CLI session ID for restart survival.
-    // --session-id sets the ID for a new session; --resume resumes a previous one.
-    let cli_session_id_str;
-    if let Some(ctx) = cli_session_ctx {
-        cli_session_id_str = ctx.cli_session_id.clone();
-        if ctx.is_resume {
-            cli_args.push("--resume");
-            cli_args.push(&cli_session_id_str);
+
+    // CLI session ID for restart survival, fed to the seam as session/resume.
+    // --session-id pins a NEW session; --resume resumes a previous one.
+    let (session_id_pin, resume_id_pin) = match cli_session_ctx {
+        Some(ctx) if ctx.is_resume => {
             info!(
                 "Resuming Claude CLI session {} for runner session {}",
-                cli_session_id_str, session_id
+                ctx.cli_session_id, session_id
             );
-        } else {
-            cli_args.push("--session-id");
-            cli_args.push(&cli_session_id_str);
+            (None, Some(ctx.cli_session_id.clone()))
+        }
+        Some(ctx) => {
             info!(
                 "Using Claude CLI session ID {} for runner session {}",
-                cli_session_id_str, session_id
+                ctx.cli_session_id, session_id
             );
+            (Some(ctx.cli_session_id.clone()), None)
         }
-    }
+        None => (None, None),
+    };
 
     // ── Blueprint tool policy (Phase 3) ───────────────────────────────────
     // Translate the policy into CLI flags (--allowedTools/--disallowedTools)
     // plus, for argument-scoped denies, an ephemeral --settings <file> JSON
     // block (the carrier that works under bypassPermissions). When the policy
-    // is None this is a complete no-op: zero extra args, no settings file —
-    // byte-for-byte identical to the historical spawn.
-    let tool_policy_args: Vec<String>;
+    // is None this is a complete no-op: zero extra args, no settings file.
+    // These are non-negotiable required flags, so they ride `extra_required`
+    // (the verbatim tail, never reordered or deduped).
     let tool_policy_settings_path: Option<std::path::PathBuf>;
     if let Some(policy) = tool_policy {
         let (extra_args, settings_json) =
             crate::claude_session::tool_policy_args::build_tool_policy_cli(policy);
-        tool_policy_args = extra_args;
+        let extra_arg_count = extra_args.len();
+        extra_required.extend(extra_args);
         tool_policy_settings_path = if let Some(json) = settings_json {
             let settings_file =
                 temp_dir.join(format!("claude_session_settings_{}.json", session_id));
             match std::fs::write(&settings_file, &json) {
                 Ok(()) => {
+                    extra_required.push("--settings".to_string());
+                    extra_required.push(settings_file.to_string_lossy().to_string());
                     info!(
                         "Wrote tool-policy settings for session {} to {}",
                         session_id,
@@ -438,25 +438,41 @@ fn run_claude_session_inline(
         } else {
             None
         };
-        for a in &tool_policy_args {
-            cli_args.push(a.as_str());
-        }
-        if let Some(ref path) = tool_policy_settings_path {
-            cli_args.push("--settings");
-            // path lives until cmd.spawn(); push its &str view.
-            cli_args.push(path.to_str().unwrap_or_default());
-        }
         info!(
             "Applied tool policy for session {}: {} extra arg(s), settings={}",
             session_id,
-            tool_policy_args.len(),
+            extra_arg_count,
             tool_policy_settings_path.is_some()
         );
     } else {
-        tool_policy_args = Vec::new();
         tool_policy_settings_path = None;
     }
-    let _ = &tool_policy_settings_path; // keep path alive for cli_args borrow
+    let _ = &tool_policy_settings_path;
+
+    // Compose the flag vector through the shared launch seam, then re-apply the
+    // `/c` shell wrapper (this path spawns `cmd /c claude …`). The operator's
+    // global template + per-account command layer in here; with no operator
+    // config the composed tail is byte-identical to the historical argv.
+    let spec = crate::claude_session::launch_spec::LaunchSpec {
+        permission: crate::claude_session::launch_spec::PermissionMode::BypassPermissions,
+        session_id: session_id_pin,
+        resume_id: resume_id_pin,
+        model: model_override.map(|m| m.to_string()),
+        extra_required,
+        ..Default::default()
+    };
+    let launch_cfg = {
+        let ai = crate::settings::get_ai_settings();
+        crate::claude_session::launch_spec::LaunchConfig::from_settings(
+            crate::ai_provider::get_effective_config_dir(&ai.claude_cli).as_deref(),
+        )
+    };
+    let mut cli_args = vec!["/c".to_string()];
+    cli_args.extend(crate::claude_session::launch_spec::render_argv(
+        &spec,
+        &launch_cfg,
+        "claude",
+    ));
 
     let mut cmd = crate::process_helpers::cmd_no_window();
     cmd.args(&cli_args)
