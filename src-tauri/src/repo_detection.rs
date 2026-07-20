@@ -15,7 +15,10 @@ type CanonicalRepos = HashMap<String, Option<String>>;
 
 static REGISTERED_REPOS_CACHE: once_cell::sync::Lazy<RwLock<(Instant, CanonicalRepos)>> =
     once_cell::sync::Lazy::new(|| {
-        RwLock::new((Instant::now() - Duration::from_secs(120), CanonicalRepos::new()))
+        RwLock::new((
+            Instant::now() - Duration::from_secs(120),
+            CanonicalRepos::new(),
+        ))
     });
 
 const CACHE_TTL: Duration = Duration::from_secs(60);
@@ -300,7 +303,9 @@ mod tests {
     #[test]
     fn canonical_repos_tolerates_missing_or_malformed_body() {
         assert!(parse_canonical_repos(&serde_json::json!({})).is_empty());
-        assert!(parse_canonical_repos(&serde_json::json!({ "canonical_repos": "nope" })).is_empty());
+        assert!(
+            parse_canonical_repos(&serde_json::json!({ "canonical_repos": "nope" })).is_empty()
+        );
     }
 
     #[test]
