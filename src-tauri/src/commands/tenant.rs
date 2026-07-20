@@ -95,10 +95,13 @@ fn write_active_tenant_id(path: &Path, tenant_id: &str) -> Result<(), String> {
 ///    the runner UI has something to render before the operator pins)
 ///
 /// Returns `{ active_tenant_id: string | null, source: "machine.json" |
-/// "paired_user.json" | null, candidates: [] }`. Phase 4 ships the
-/// `candidates` field empty — Phase 5 dashboard will populate it from a
-/// coord round-trip. The frontend uses the empty list as "operator is in
-/// exactly one tenant" and elides the switcher accordingly.
+/// "paired_user.json" | null, candidates: [tenant_id, …] }`. `candidates`
+/// is the set of tenants this device is LOCALLY bound to, read straight
+/// from `paired_user.json` v2 (`pair::read_paired_binding_tenant_ids`,
+/// which migrates a legacy single-entry file into a one-element set) — a
+/// local file read, NO coord round-trip, so the switcher renders offline.
+/// The frontend treats `candidates.length <= 1` as "operator is in exactly
+/// one tenant" and elides the switcher accordingly.
 #[tauri::command]
 pub fn get_active_tenant() -> Result<CommandResponse, String> {
     let machine_path = machine_file_path()
@@ -112,13 +115,20 @@ pub fn get_active_tenant() -> Result<CommandResponse, String> {
         (None, None)
     };
 
+    // The device's bound tenants live locally in `paired_user.json` v2 — the
+    // switcher must render OFFLINE, so this is a local read, not a coord query.
+    let candidates: Vec<String> = qontinui_runner_lib::pair::read_paired_binding_tenant_ids()
+        .into_iter()
+        .map(|t| t.to_string())
+        .collect();
+
     Ok(CommandResponse {
         success: true,
         message: None,
         data: Some(serde_json::json!({
             "active_tenant_id": tenant,
             "source": source,
-            "candidates": Vec::<String>::new(),
+            "candidates": candidates,
         })),
     })
 }

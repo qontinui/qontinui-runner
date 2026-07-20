@@ -748,10 +748,20 @@ async fn coord_mcp_proxy_handler(
     //    too. An absent slot (torn-down / restarted agent) is a hard 401.
     let bearer = match &principal {
         crate::coord_mcp::ProxyPrincipal::Device => {
+            // B3: select the bearer for the SESSION's tenant (frozen on the
+            // nonce at provision time), NOT the legacy `access_token` slot.
+            // `device_bearer_for(Some(t))` serves the legacy slot only when `t`
+            // IS the default binding; for a NON-default tenant it returns the
+            // tenant's own slot, or `None` on a miss — it NEVER presents another
+            // tenant's credential. A `None` session tenant (single-tenant / no
+            // active pin) resolves the legacy default slot, unchanged pre-B3.
+            let session_tenant = nonce
+                .as_deref()
+                .and_then(crate::coord_mcp::proxy_session_tenant_for_nonce);
             // Read the live device JWT (filesystem I/O → off the async executor),
-            // the same fresh token `backend_relay` reads.
-            let mut tok = tokio::task::spawn_blocking(|| {
-                crate::auth::AuthManager::new().get_access_token().ok()
+            // the same fresh token `backend_relay` reads for this tenant.
+            let mut tok = tokio::task::spawn_blocking(move || {
+                crate::auth::device_bearer_for(session_tenant.as_ref())
             })
             .await
             .ok()
@@ -761,9 +771,11 @@ async fn coord_mcp_proxy_handler(
             // transient-backoff gap (Phases 1-2) — NOT a dead session. Kick the
             // refresher and wait a tightly-bounded time for a re-mint before
             // degrading, so an in-flight tool call the AI makes mid-turn rides
-            // through the gap instead of erroring on a bare 401.
+            // through the gap instead of erroring on a bare 401. For a
+            // non-default tenant with no slot this stays empty (never the legacy
+            // slot) → the degrade path below, per the B3 invariant.
             if tok.as_deref().map(str::trim).unwrap_or("").is_empty() {
-                tok = crate::coord_mcp::await_device_jwt_remint().await;
+                tok = crate::coord_mcp::await_device_jwt_remint_for(session_tenant).await;
             }
             match tok {
                 Some(t) if !t.trim().is_empty() => Some(t),
@@ -1170,10 +1182,17 @@ async fn coord_claims_read_proxy_handler(
         }
     }
 
-    // Live read — the same fresh device JWT the `/coord-mcp` proxy injects.
-    // AuthManager does filesystem I/O, so keep it off the async executor.
+    // Live read — the same fresh device JWT the `/coord-mcp` proxy injects, for
+    // the SESSION's tenant (B3): select via `device_bearer_for` off the nonce's
+    // frozen tenant, never the legacy default slot. A non-default slot miss
+    // resolves `None` here → the gate 401s (the safe degrade), never another
+    // tenant's credential. AuthManager does filesystem I/O, so keep it off the
+    // async executor.
+    let session_tenant = nonce
+        .as_deref()
+        .and_then(crate::coord_mcp::proxy_session_tenant_for_nonce);
     let bearer =
-        tokio::task::spawn_blocking(|| crate::auth::AuthManager::new().get_access_token().ok())
+        tokio::task::spawn_blocking(move || crate::auth::device_bearer_for(session_tenant.as_ref()))
             .await
             .ok()
             .flatten();
@@ -1528,10 +1547,17 @@ async fn coord_write_proxy_handler(
         }
     }
 
-    // Live read — the same fresh device JWT the `/coord-mcp` proxy injects.
-    // AuthManager does filesystem I/O, so keep it off the async executor.
+    // Live read — the same fresh device JWT the `/coord-mcp` proxy injects, for
+    // the SESSION's tenant (B3): select via `device_bearer_for` off the nonce's
+    // frozen tenant, never the legacy default slot. A non-default slot miss
+    // resolves `None` here → the gate 401s (the safe degrade), never another
+    // tenant's credential. AuthManager does filesystem I/O, so keep it off the
+    // async executor.
+    let session_tenant = nonce
+        .as_deref()
+        .and_then(crate::coord_mcp::proxy_session_tenant_for_nonce);
     let bearer =
-        tokio::task::spawn_blocking(|| crate::auth::AuthManager::new().get_access_token().ok())
+        tokio::task::spawn_blocking(move || crate::auth::device_bearer_for(session_tenant.as_ref()))
             .await
             .ok()
             .flatten();
@@ -2116,11 +2142,17 @@ async fn vcs_create_pull_request_handler(
     // as `coord_mcp_proxy_handler`.
     let bearer = match &principal {
         crate::coord_mcp::ProxyPrincipal::Device => {
+            // B3: select the bearer for the SESSION's tenant (frozen on the
+            // nonce), NOT the legacy default slot — a non-default miss returns
+            // `None` (the degrade path below), never another tenant's token.
+            let session_tenant = nonce
+                .as_deref()
+                .and_then(crate::coord_mcp::proxy_session_tenant_for_nonce);
             // Live read — the same fresh device JWT the `/coord-mcp` proxy
             // injects. AuthManager does filesystem I/O, so keep it off the
             // async executor.
-            let mut tok = tokio::task::spawn_blocking(|| {
-                crate::auth::AuthManager::new().get_access_token().ok()
+            let mut tok = tokio::task::spawn_blocking(move || {
+                crate::auth::device_bearer_for(session_tenant.as_ref())
             })
             .await
             .ok()
@@ -2131,7 +2163,7 @@ async fn vcs_create_pull_request_handler(
             // same idiom as the coord-mcp proxy. Only a JWT that is STILL
             // missing after the wait reports the hard 503.
             if tok.as_deref().map(str::trim).unwrap_or("").is_empty() {
-                tok = crate::coord_mcp::await_device_jwt_remint().await;
+                tok = crate::coord_mcp::await_device_jwt_remint_for(session_tenant).await;
             }
             match tok {
                 Some(t) if !t.trim().is_empty() => Some(t),

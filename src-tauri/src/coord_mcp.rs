@@ -46,14 +46,18 @@
 //!   Phase 4 validates membership at spawn). Two concurrent agent sessions
 //!   for two tenants each present their own tenant's claim with zero
 //!   runner-side selection logic.
-//! - **Device principal — DEFAULT binding by construction.** Device-path
-//!   nonces serve operator terminals and gate-continuation shells, which
-//!   run under the device's default binding (`machine.json::
-//!   active_tenant_id`, default-for-new-sessions); the injected live device
-//!   JWT is the legacy slot = the default binding's credential. A future
-//!   spawn path that provisions a device-proxied session under a
-//!   NON-default binding must select via `auth::device_bearer_for` rather
-//!   than widen this path silently.
+//! - **Device principal — the SESSION's tenant by construction (B3).** A
+//!   device nonce freezes the tenant it was provisioned under
+//!   (`machine.json::active_tenant_id` — the same source
+//!   `stamp_session_tenant` records on the session's coord row) on its
+//!   [`NonceBinding::session_tenant`]. The proxy injects that tenant's
+//!   credential via `auth::device_bearer_for(session_tenant)`, NOT the
+//!   legacy `access_token` slot: when the session tenant IS the default
+//!   binding this serves the legacy slot unchanged, but a NON-default
+//!   session presents ITS tenant's device JWT — or, on a slot miss,
+//!   degrades to the refresh/401 path and sends nothing (never another
+//!   tenant's token). Restored / adopted nonces carry no tenant (`None`)
+//!   and fall back to the legacy default slot, the pre-B3 behavior.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -159,6 +163,17 @@ struct NonceBinding {
     workdir: String,
     principal: ProxyPrincipal,
     lifetime: NonceLifetime,
+    /// The tenant this session was provisioned under, frozen at mint time
+    /// (`machine.json::active_tenant_id` — the same value
+    /// `stamp_session_tenant` records on the session's coord row). The
+    /// DEVICE proxy path selects its injected bearer with
+    /// `auth::device_bearer_for(session_tenant.as_ref())` so the proxy acts
+    /// as the SESSION's tenant, not whatever binding happens to own the
+    /// legacy `access_token` slot (B3). `None` on a single-tenant install
+    /// with no active pin (→ `device_bearer_for(None)` = the legacy default
+    /// slot, byte-identical to pre-B3 behavior). Unused for Agent nonces —
+    /// their bearer is the agent JWT, whose tenant claim is frozen at mint.
+    session_tenant: Option<Uuid>,
 }
 
 // ---------------------------------------------------------------------------
@@ -598,6 +613,13 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> us
                 // unconditionally Persistent — the restore cannot resurrect an
                 // ephemeral mint-route nonce as an unbounded one.
                 lifetime: NonceLifetime::Persistent,
+                // The persisted store carries only (nonce, workdir), not the
+                // session's tenant — so a restored nonce falls back to the
+                // legacy default slot (`device_bearer_for(None)`), the pre-B3
+                // behavior. A restored device session pre-dates this restart;
+                // its original tenant is unrecoverable, and defaulting is the
+                // safe (never cross-tenant) choice.
+                session_tenant: None,
             });
         }
         map.len()
@@ -722,6 +744,12 @@ fn mint_and_register_nonce(
     );
     let ephemeral = lifetime.is_ephemeral();
     let now = std::time::Instant::now();
+    // Freeze the session's tenant at mint time (B3): the active pin the
+    // session was born under — the SAME source `stamp_session_tenant` reads
+    // for the coord record. Resolved OUTSIDE the map lock (it is a file read)
+    // so the registry mutex is never held across I/O. `None` on a
+    // single-tenant install (→ legacy default slot at inject time).
+    let session_tenant = crate::session::dual_write::resolve_active_tenant_id();
     let snapshot = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
         // ONE pass does all pre-insert map maintenance (fused from three: an
@@ -769,6 +797,7 @@ fn mint_and_register_nonce(
                 workdir: workdir.to_string(),
                 principal,
                 lifetime,
+                session_tenant,
             },
         );
         grace_evicted_device_nonces(&evicted_graceable);
@@ -895,6 +924,23 @@ pub(crate) fn proxy_principal_for_nonce(nonce: &str) -> Option<ProxyPrincipal> {
     live.or_else(|| graced_nonce_is_valid(nonce).then_some(ProxyPrincipal::Device))
 }
 
+/// The tenant a DEVICE proxy nonce was provisioned under (B3), frozen at mint
+/// time on its [`NonceBinding`]. The `/coord-mcp` proxy handler feeds this into
+/// [`crate::auth::device_bearer_for`] so it injects the SESSION's tenant's
+/// device JWT — never blindly the legacy `access_token` slot (the default
+/// binding), which is the cross-tenant split-brain B3 closes.
+///
+/// `None` means "inject the legacy default slot" (`device_bearer_for(None)`),
+/// which is correct for every case that returns it: a nonce provisioned on a
+/// single-tenant install (no active pin), a restored nonce (tenant not
+/// persisted), or a graced nonce (no live binding). A miss for a live
+/// NON-default tenant is NOT this function's concern — that is enforced inside
+/// `device_bearer_for`, which returns `None` (→ the proxy's refresh/401 path)
+/// on a non-default slot miss rather than falling back to the legacy slot.
+pub(crate) fn proxy_session_tenant_for_nonce(nonce: &str) -> Option<Uuid> {
+    live_binding(nonce).and_then(|b| b.session_tenant)
+}
+
 /// Pre-forward gate for the loopback `/coord-mcp` proxy route. Pure over its
 /// inputs (no I/O) so the 401 paths are unit-testable without a live coord:
 ///
@@ -1014,10 +1060,28 @@ where
 /// CI-node reporter (`ci_node::reporting`) as the cheap fresh-read half of
 /// its bearer resolution.
 pub(crate) async fn read_usable_device_jwt() -> Option<String> {
-    tokio::task::spawn_blocking(|| {
+    read_usable_device_jwt_for(None).await
+}
+
+/// Tenant-selecting variant of [`read_usable_device_jwt`] (B3). Selects the
+/// bearer via [`crate::auth::device_bearer_for`] for `tenant` instead of the
+/// legacy `access_token` slot, so the DEVICE proxy path presents the SESSION's
+/// tenant credential. The freshness gate ([`AuthManager::device_jwt_needs_refresh`])
+/// is unchanged — it is the device-wide "is this runner broadly authed" check.
+///
+/// CRITICAL (B3 security invariant): for a NON-default `tenant`, `device_bearer_for`
+/// returns `None` on a slot miss — it NEVER falls back to the legacy default
+/// slot. So a non-default session whose tenant has no keyring slot resolves to
+/// `None` here, and the caller degrades to the proxy's refresh/401 path rather
+/// than silently acting as the default tenant. `None` ⇒ legacy default slot
+/// (the pre-B3 behavior every existing default-binding session relies on).
+pub(crate) async fn read_usable_device_jwt_for(tenant: Option<Uuid>) -> Option<String> {
+    tokio::task::spawn_blocking(move || {
         let am = crate::auth::AuthManager::new();
         match am.device_jwt_needs_refresh() {
-            Ok(false) => am.get_access_token().ok().filter(|t| !t.trim().is_empty()),
+            Ok(false) => {
+                crate::auth::device_bearer_for(tenant.as_ref()).filter(|t| !t.trim().is_empty())
+            }
             _ => None,
         }
     })
@@ -1034,9 +1098,20 @@ pub(crate) async fn read_usable_device_jwt() -> Option<String> {
 /// caller then degrades to [`device_jwt_refreshing_error`]). Agent-bound proxy
 /// requests do NOT use this — they refresh via their own `AGENT_TOKENS` slot.
 pub(crate) async fn await_device_jwt_remint() -> Option<String> {
+    await_device_jwt_remint_for(None).await
+}
+
+/// Tenant-selecting variant of [`await_device_jwt_remint`] (B3). Polls
+/// [`read_usable_device_jwt_for`] for `tenant` after kicking the refresher, so
+/// the bounded re-mint wait resolves the SESSION's tenant credential. For a
+/// NON-default `tenant` with no keyring slot this stays `None` for the whole
+/// window (`device_bearer_for` never serves the legacy slot for it) — the
+/// handler then degrades to [`device_jwt_refreshing_error`], never the default
+/// tenant's token.
+pub(crate) async fn await_device_jwt_remint_for(tenant: Option<Uuid>) -> Option<String> {
     crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
     await_remint_with(
-        read_usable_device_jwt,
+        move || read_usable_device_jwt_for(tenant),
         DEVICE_JWT_REMINT_WAIT,
         DEVICE_JWT_REMINT_POLL,
     )
@@ -1780,6 +1855,12 @@ fn adopt_on_disk_nonce(workdir: &str, nonce: &str) {
                 workdir: workdir.to_string(),
                 principal: ProxyPrincipal::Device,
                 lifetime: NonceLifetime::Persistent,
+                // An adopted on-disk nonce carries no tenant (the `.mcp.json`
+                // stores only URL + nonce), and its original session's tenant
+                // is unrecoverable across the restart — fall back to the legacy
+                // default slot (`device_bearer_for(None)`), the pre-B3 behavior
+                // for these device nonces (never cross-tenant).
+                session_tenant: None,
             },
         );
         map.clone()
@@ -2136,6 +2217,7 @@ mod tests {
                     lifetime: NonceLifetime::Ephemeral {
                         expires_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
                     },
+                    session_tenant: None,
                 },
             );
             map.insert(
@@ -2147,6 +2229,7 @@ mod tests {
                         expires_at: std::time::Instant::now()
                             + std::time::Duration::from_secs(3600),
                     },
+                    session_tenant: None,
                 },
             );
         }
@@ -2187,6 +2270,7 @@ mod tests {
                 lifetime: NonceLifetime::Ephemeral {
                     expires_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
                 },
+                session_tenant: None,
             },
         );
         assert!(
