@@ -39,6 +39,53 @@ use tracing::{info, warn};
 use crate::session::restore_record_emitter::RestoreRecordEmitter;
 use crate::session::snapshot_history::{SnapshotHistory, SnapshotSession, TranscriptProbe};
 
+/// The runner's own app-data root, `~/.qontinui/runner`, keeping the existing
+/// "." fallback for a home-less environment. Base for the instance-scoped
+/// path helpers below.
+fn runner_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".qontinui")
+        .join("runner")
+}
+
+/// Canonical, instance-scoped lifecycle-store path — the single source of
+/// truth every consumer must resolve through (boot writer, fleet publishers,
+/// message poller, session bus, the test-fixture control routes).
+///
+/// - Primary (`instance::data_subdir() == None`) → the legacy UNSCOPED
+///   `~/.qontinui/runner/terminal-sessions.json`, byte-for-byte identical to
+///   the pre-fix primary path, so its crash-recovery reattach is unchanged.
+/// - Named/temp secondary → `~/.qontinui/runner/instance-<name>/terminal-sessions.json`.
+///
+/// This replaces the previous API-PORT keying. Temp-runner ports (9877-9899)
+/// are RECYCLED across unrelated spawns, so a fresh runner on a reused port
+/// used to `open()` the previous occupant's `terminal-sessions-<port>.json`
+/// and auto-restore its foreign PTYs. The durable instance identity is unique
+/// per spawn and stable per named runner, so no such inheritance is possible.
+/// Mirrors the #788 `window-assignments` convention (scope the DIRECTORY via
+/// `instance::scope_path`, keep the filename plain) and reuses its fail-closed
+/// `instance-unnamed-<port>` quarantine for free.
+pub fn store_path() -> PathBuf {
+    crate::instance::scope_path(&runner_dir()).join("terminal-sessions.json")
+}
+
+/// Canonical, instance-scoped snapshot-history path, sibling to
+/// [`store_path`]: primary →
+/// `~/.qontinui/runner/session-restore/session-snapshots.jsonl`; secondary →
+/// `~/.qontinui/runner/instance-<name>/session-restore/session-snapshots.jsonl`.
+///
+/// DELIBERATELY re-derives the `session-restore/` segment under the scoped
+/// base rather than calling `crate::session::claude_hook::session_restore_dir()`:
+/// that dir is ALSO the Claude SessionStart-hook materialization dir and must
+/// stay UNSCOPED (scoping it globally would move hook delivery — out of scope).
+/// Do NOT "consolidate" the two into one call.
+pub fn snapshot_history_path() -> PathBuf {
+    crate::instance::scope_path(&runner_dir())
+        .join("session-restore")
+        .join("session-snapshots.jsonl")
+}
+
 /// Closed records older than this are pruned (24h in millis).
 const CLOSED_RETENTION_MS: i64 = 86_400_000;
 /// Open records not seen for this long are pruned (7d in millis).

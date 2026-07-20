@@ -350,6 +350,61 @@ mod tests {
         );
     }
 
+    /// Sibling to `window_assignments_path_cannot_be_inherited_across_instances`
+    /// for the terminal-session lifecycle store + snapshot history (plan
+    /// `2026-07-20-runner-port-keyed-state-inheritance`). The store used to be
+    /// namespaced by API PORT; recycled temp-runner ports (9877-9899) let a
+    /// fresh runner inherit a prior occupant's `terminal-sessions-<port>.json`
+    /// (observed: 164 stale Jul-13 records → 81 phantom open rows → 27 foreign
+    /// `claude --resume`s). Instance names are unique per spawn and durable per
+    /// named runner, so scoping by instance identity makes that inheritance
+    /// impossible. Pins the wiring contract
+    /// `session_lifecycle_store::{store_path, snapshot_history_path}` rely on:
+    /// both compose `scope_path(runner_dir).join(<plain filename>)`, so this
+    /// pure `resolve_data_subdir` assertion covers their path composition
+    /// without touching process-global env (which races the parallel harness).
+    #[test]
+    fn lifecycle_store_and_snapshot_paths_cannot_be_inherited_across_instances() {
+        let base = Path::new(".qontinui").join("runner");
+        let store_for = |name: &str, port: u16| {
+            base.join(resolve_data_subdir(Some(name), None, port).unwrap())
+                .join("terminal-sessions.json")
+        };
+        let snapshot_for = |name: &str, port: u16| {
+            base.join(resolve_data_subdir(Some(name), None, port).unwrap())
+                .join("session-restore")
+                .join("session-snapshots.jsonl")
+        };
+
+        // (a) Two runners reusing the SAME recycled port 9877 with distinct
+        // instance names must resolve to distinct store + snapshot files — no
+        // recycled-port inheritance.
+        assert_ne!(
+            store_for("test-19f6faa3bf8-0", 9877),
+            store_for("test-19f6fd50c26-2", 9877),
+            "a recycled port must not resurrect a prior runner's session records"
+        );
+        assert_ne!(
+            snapshot_for("test-19f6faa3bf8-0", 9877),
+            snapshot_for("test-19f6fd50c26-2", 9877),
+            "a recycled port must not resurrect a prior runner's snapshot history"
+        );
+
+        // (b) Neither secondary may ever resolve to the PRIMARY's own files —
+        // this is the property that stops a secondary reading the primary's
+        // store (the pre-existing latent bug the plain-unscoped call sites had).
+        let primary_store = base.join("terminal-sessions.json");
+        let primary_snapshot = base.join("session-restore").join("session-snapshots.jsonl");
+        assert_ne!(store_for("test-19f6faa3bf8-0", 9877), primary_store);
+        assert_ne!(store_for("test-19f6fd50c26-2", 9877), primary_store);
+        assert_ne!(snapshot_for("test-19f6faa3bf8-0", 9877), primary_snapshot);
+
+        // (c) The primary keeps the legacy UNSCOPED lifecycle/snapshot path
+        // (`data_subdir() == None` ⇒ `scope_path` returns the base unchanged),
+        // so its crash-recovery reattach is byte-for-byte preserved.
+        assert_eq!(resolve_data_subdir(None, None, PRIMARY), None);
+    }
+
     /// An explicit instance name always wins — the normal supervised path is
     /// unchanged by the fail-closed guard, on any port.
     #[test]

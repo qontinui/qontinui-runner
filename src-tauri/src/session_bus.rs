@@ -69,18 +69,6 @@ fn coord_base() -> Option<String> {
     }
 }
 
-/// The runner's lifecycle store path (`~/.qontinui/runner/terminal-sessions.json`)
-/// — the `claude_session_id -> terminal_id` map. Mirrors the boot path in
-/// `main.rs`. (Instance-runner suffixed files are a follow-up; the primary
-/// covers the common case.)
-fn lifecycle_store_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".qontinui")
-        .join("runner")
-        .join("terminal-sessions.json")
-}
-
 /// Spawn the periodic delivery executor on the ambient tokio runtime. A no-op
 /// (logs + returns) when disabled.
 pub fn spawn_session_bus_executor() {
@@ -135,7 +123,7 @@ async fn deliver_once() -> anyhow::Result<()> {
 
     // 2. Map target sessions to their live terminals.
     let store = crate::session::session_lifecycle_store::SessionLifecycleStore::open(
-        lifecycle_store_path(),
+        crate::session::session_lifecycle_store::store_path(),
     )?;
     let open = store.open_records();
     let self_base = crate::api_config::get_runner_api_url();
