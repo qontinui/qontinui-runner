@@ -71,13 +71,29 @@ export interface TerminalCommandsContext {
    * closure at `TerminalPage.tsx:559` (passed down as `onLaunchAiSession`
    * to `TerminalTabBar`).
    */
-  spawnAi: (count: number, configDir: string, context?: string) => Promise<string[] | void>;
+  spawnAi: (
+    count: number,
+    configDir: string,
+    context?: string,
+    /**
+     * F3 — `/spawn-ai --tenant <slug|uuid>`. Omitted → the page's
+     * spawn-tenant selection (F2) applies.
+     */
+    tenantId?: string,
+  ) => Promise<string[] | void>;
   /**
    * Snapshot of the available Claude Code accounts, in the original
    * `useSessionManager` shape (NOT sorted). Handlers sort locally when
    * resolving `account: "best"`.
    */
   accounts: AccountUsageInfo[];
+  /**
+   * Tenant ids this device is bound to (`useTenant().candidates`). Used to
+   * resolve `/spawn-ai --tenant <value>` — see `resolveTenantArg`. Empty on a
+   * single-tenant / unpaired device, which makes any `--tenant` fail loudly
+   * rather than bind to something the device has no credential for.
+   */
+  tenantCandidates: readonly string[];
   /**
    * Sort the zone-grid by session state — `needs-input` first, then
    * `error`, then the rest. Mirrors `useZoneActions.handleSortZones`,
@@ -123,6 +139,11 @@ const SCHEMA = {
     account:
       'string — either a Claude account label (e.g. "gmail", "hotmail") or the literal "best" to pick the lowest-utilization account',
     context: "string (optional initial prompt auto-typed after `claude` starts)",
+    // F3 — declared as a FLAG (leading `--`), so it is never bound
+    // positionally and can sit anywhere on the line without shifting
+    // `context`. See `parse.ts::FLAG_PREFIX`.
+    "--tenant":
+      "string (optional tenant slug or uuid this spawn binds to; defaults to the device's active tenant)",
   },
   spawnWith: {
     count: "number (>= 1, defaults to 1)",
@@ -185,6 +206,66 @@ function resolveAccountConfigDir(
     (a) => a.label.toLowerCase() === raw || a.config_dir.toLowerCase() === raw,
   );
   return match?.config_dir ?? null;
+}
+
+/**
+ * F3 — pull a `--tenant <slug|uuid>` / `--tenant=<slug|uuid>` out of a
+ * free-form context string.
+ *
+ * Needed because `/spawn-ai` reaches the handler by TWO routes and only one
+ * of them is flag-aware: the slash route runs `parseArgs`, which strips
+ * declared flags before binding (`parse.ts::extractFlags`), but the Tier-2
+ * natural-language route binds regex named groups, so a `--tenant` typed
+ * anywhere lands inside the wide `(?<context>.+)` group. Running this over
+ * `context` normalizes both routes — and is a harmless no-op on the slash
+ * route, where the flag is already gone.
+ *
+ * Returns the tenant (if any) and the context with the flag removed, so the
+ * flag is never typed into the spawned session as part of its prompt.
+ */
+export function splitTenantFlag(context: string | undefined): {
+  tenant?: string;
+  context?: string;
+} {
+  if (!context) return {};
+  const match = context.match(/(?:^|\s)--tenant(?:=|\s+)([\w-]+)(?=\s|$)/i);
+  if (!match) return { context };
+  const stripped = (
+    context.slice(0, match.index) + context.slice((match.index ?? 0) + match[0].length)
+  )
+    .replace(/\s+/g, " ")
+    .trim();
+  return { tenant: match[1], context: stripped.length > 0 ? stripped : undefined };
+}
+
+/**
+ * F3 — resolve a `--tenant` argument to a bound tenant id.
+ *
+ * The backend takes a tenant UUID, but the operator sees the SHORT form
+ * everywhere in the UI (the zone badge and the spawn picker both render an
+ * 8-char stem), so a bare stem must work. Accepted, in order:
+ *  - exact match against a bound tenant id;
+ *  - a unique case-insensitive PREFIX of exactly one bound tenant id.
+ *
+ * Returns `{ error }` rather than falling back when the value matches nothing
+ * or is ambiguous: silently spawning under a different tenant than the
+ * operator typed is precisely the mis-binding this feature exists to
+ * prevent. `undefined` input → `{}` (no tenant requested, not an error).
+ */
+export function resolveTenantArg(
+  raw: string | undefined,
+  candidates: readonly string[],
+): { tenantId?: string; error?: string } {
+  const value = raw?.trim();
+  if (!value) return {};
+  if (candidates.includes(value)) return { tenantId: value };
+  const lower = value.toLowerCase();
+  const prefixed = candidates.filter((c) => c.toLowerCase().startsWith(lower));
+  if (prefixed.length === 1) return { tenantId: prefixed[0] };
+  if (prefixed.length > 1) {
+    return { error: `tenant "${value}" is ambiguous (matches ${prefixed.length} bindings)` };
+  }
+  return { error: `no tenant binding matches "${value}"` };
 }
 
 export function useTerminalCommands(ctx: TerminalCommandsContext): void {
@@ -316,8 +397,16 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       if (count < 1) return fail("invalid-count", "count must be >= 1");
       const configDir = resolveAccountConfigDir(args.account, ctx.accounts);
       if (!configDir) return fail("no-account", "no matching Claude account");
-      const context = typeof args.context === "string" ? args.context : undefined;
-      const result = await ctx.spawnAi(count, configDir, context);
+      // F3 — `--tenant` arrives either already-parsed (slash route, via the
+      // `"--tenant"` schema key) or still embedded in `context` (Tier-2
+      // regex route). `splitTenantFlag` normalizes the second case.
+      const rawContext = typeof args.context === "string" ? args.context : undefined;
+      const split = splitTenantFlag(rawContext);
+      const rawTenant =
+        (typeof args.tenant === "string" ? args.tenant.trim() : "") || split.tenant || undefined;
+      const { tenantId, error } = resolveTenantArg(rawTenant, ctx.tenantCandidates);
+      if (error) return fail("unknown-tenant", error);
+      const result = await ctx.spawnAi(count, configDir, split.context, tenantId);
       return ok(Array.isArray(result) ? result : []);
     },
   });

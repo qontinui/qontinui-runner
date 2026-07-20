@@ -20,9 +20,29 @@
  * Backslash escapes aren't supported in Phase 2 — operators wanting
  * a literal `"` in their context can use the palette or wait for the
  * AI tier.
+ *
+ * Named flags: a `paramSchema` key written as `"--name"` opts that field
+ * OUT of positional binding; it is filled only by `--name value` or
+ * `--name=value` anywhere on the line (see `FLAG_PREFIX`). Added for
+ * `/spawn-ai --tenant <slug|uuid>`, whose optionality can't be expressed
+ * positionally alongside a free-form trailing prompt.
  */
 
 import type { CommandAction } from "./types";
+
+/**
+ * Marker that makes a `paramSchema` key a NAMED FLAG rather than a positional
+ * field. A key declared as `"--tenant"` is never positionally bound; it is
+ * only filled by `--tenant <value>` / `--tenant=<value>` on the input line,
+ * and lands in the parsed args under its bare name (`tenant`).
+ *
+ * Why: `/spawn-ai`'s last positional field is a free-form prompt, and the
+ * catch-all rule below joins every excess token into it. A positional
+ * optional field placed before it would shift on omission, and one placed
+ * after it would be swallowed by the tail. Flags sidestep both — they can
+ * appear anywhere on the line and are removed before positional binding.
+ */
+export const FLAG_PREFIX = "--";
 
 /**
  * Split a string into whitespace-separated tokens, treating
@@ -65,9 +85,59 @@ export function coerceToken(token: string): string | number {
 }
 
 /**
+ * Split declared `--flags` (see [`FLAG_PREFIX`]) out of a token stream.
+ * Returns the parsed flag values keyed by bare name, plus the remaining
+ * tokens in order for positional binding.
+ *
+ * Exported for unit tests — the ordering guarantee (flags never disturb
+ * positional fields) is the whole point of the pre-pass.
+ */
+export function extractFlags(
+  tokens: string[],
+  schemaKeys: string[],
+): { flags: Record<string, unknown>; rest: string[] } {
+  // Only keys the action DECLARED as flags (`--name` in its paramSchema) are
+  // recognized. An unknown `--foo` stays in the positional stream so a
+  // free-form `context` prompt containing a dash-dash word survives intact.
+  const known = new Set(
+    schemaKeys.filter((k) => k.startsWith(FLAG_PREFIX)).map((k) => k.slice(FLAG_PREFIX.length)),
+  );
+  const flags: Record<string, unknown> = {};
+  const rest: string[] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (!token.startsWith(FLAG_PREFIX)) {
+      rest.push(token);
+      continue;
+    }
+    const body = token.slice(FLAG_PREFIX.length);
+    const eq = body.indexOf("=");
+    // `--name=value`
+    if (eq > 0) {
+      const name = body.slice(0, eq);
+      if (known.has(name)) {
+        flags[name] = coerceToken(body.slice(eq + 1));
+        continue;
+      }
+      rest.push(token);
+      continue;
+    }
+    // `--name value` — consumes the NEXT token as the value.
+    if (known.has(body) && i + 1 < tokens.length) {
+      flags[body] = coerceToken(tokens[i + 1]);
+      i++;
+      continue;
+    }
+    rest.push(token);
+  }
+  return { flags, rest };
+}
+
+/**
  * Extract the args portion of the input (everything after the slash
  * form's trailing whitespace) and project it onto the action's
- * paramSchema field order.
+ * paramSchema field order. Declared `--flags` are pulled out first and
+ * merged in under their bare names.
  */
 export function parseArgs(input: string, action: CommandAction): Record<string, unknown> {
   const trimmed = input.trim();
@@ -75,9 +145,14 @@ export function parseArgs(input: string, action: CommandAction): Record<string, 
   if (firstSpace === -1) return {};
   const rest = trimmed.slice(firstSpace + 1).trim();
   if (rest.length === 0) return {};
-  const tokens = tokenize(rest);
-  const fieldOrder = action.paramSchema ? Object.keys(action.paramSchema) : [];
-  const args: Record<string, unknown> = {};
+  const schemaKeys = action.paramSchema ? Object.keys(action.paramSchema) : [];
+  // Pull declared `--flags` out BEFORE positional binding, so an optional
+  // flag anywhere in the line can't shift the positional fields (and can't be
+  // swallowed by the free-form catch-all tail below).
+  const { flags, rest: positional } = extractFlags(tokenize(rest), schemaKeys);
+  const tokens = positional;
+  const fieldOrder = schemaKeys.filter((k) => !k.startsWith(FLAG_PREFIX));
+  const args: Record<string, unknown> = { ...flags };
   // Bind the first N tokens to the first N fields. Excess tokens are
   // silently dropped — the resolver doesn't reject "too many args"
   // because most actions accept a trailing free-form last arg

@@ -9,7 +9,7 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { parseArgs, tokenize, coerceToken } from "./parse";
+import { parseArgs, tokenize, coerceToken, extractFlags } from "./parse";
 import { __resetForTest, register } from "./registry";
 import { resolve } from "./resolve";
 import type { CommandAction } from "./types";
@@ -201,5 +201,82 @@ describe("parse — parseArgs", () => {
   it("returns empty for actions with no paramSchema", () => {
     const noSchema = action({ id: "approve-all", slash: "/approve-all" });
     expect(parseArgs("/approve-all ignored", noSchema)).toEqual({});
+  });
+});
+
+// F3 — `/spawn-ai --tenant <slug|uuid>`. The contract that matters is that a
+// declared flag NEVER disturbs positional binding, in any position, and is
+// never swallowed by the free-form catch-all tail.
+describe("parse — declared --flags", () => {
+  const spawnAi = action({
+    id: "spawn-ai",
+    slash: "/spawn-ai",
+    paramSchema: { count: "n", account: "s", context: "s", "--tenant": "s" },
+  });
+
+  it("extracts `--tenant value` without shifting the positional fields", () => {
+    expect(parseArgs("/spawn-ai 3 best --tenant pizzeria fix the bug", spawnAi)).toEqual({
+      count: 3,
+      account: "best",
+      context: "fix the bug",
+      tenant: "pizzeria",
+    });
+  });
+
+  it("extracts the `--tenant=value` form", () => {
+    expect(parseArgs("/spawn-ai 3 best --tenant=pizzeria", spawnAi)).toEqual({
+      count: 3,
+      account: "best",
+      tenant: "pizzeria",
+    });
+  });
+
+  it("accepts the flag AFTER the free-form context without eating the prompt", () => {
+    expect(parseArgs("/spawn-ai 3 best fix the bug --tenant pizzeria", spawnAi)).toEqual({
+      count: 3,
+      account: "best",
+      context: "fix the bug",
+      tenant: "pizzeria",
+    });
+  });
+
+  it("leaves the positional shape unchanged when the flag is absent", () => {
+    expect(parseArgs("/spawn-ai 3 best fix the bug", spawnAi)).toEqual({
+      count: 3,
+      account: "best",
+      context: "fix the bug",
+    });
+  });
+
+  it("keeps an UNDECLARED --flag as ordinary prompt text", () => {
+    expect(parseArgs("/spawn-ai 3 best rerun with --verbose set", spawnAi)).toEqual({
+      count: 3,
+      account: "best",
+      context: "rerun with --verbose set",
+    });
+  });
+
+  it("does not consume a trailing flag with no value", () => {
+    expect(parseArgs("/spawn-ai 3 best --tenant", spawnAi)).toEqual({
+      count: 3,
+      account: "best",
+      context: "--tenant",
+    });
+  });
+});
+
+describe("parse — extractFlags", () => {
+  it("returns tokens untouched when the schema declares no flags", () => {
+    expect(extractFlags(["3", "best", "--tenant", "x"], ["count", "account"])).toEqual({
+      flags: {},
+      rest: ["3", "best", "--tenant", "x"],
+    });
+  });
+
+  it("coerces numeric flag values like positional tokens do", () => {
+    expect(extractFlags(["--zone", "4"], ["--zone"])).toEqual({
+      flags: { zone: 4 },
+      rest: [],
+    });
   });
 });

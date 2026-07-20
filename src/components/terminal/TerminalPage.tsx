@@ -7,6 +7,7 @@ import { FileConflictBanner } from "./FileConflictBanner";
 import { SessionManagerPanel } from "./SessionManagerPanel";
 import { ZoneGrid } from "./ZoneGrid";
 import { useTerminalWindowActions } from "./useTerminalWindowActions";
+import { useTenant } from "@/contexts/TenantContext";
 import { ZoneLayoutPicker } from "./ZoneLayoutPicker";
 import { DocFinderModal } from "./DocFinderModal";
 import { ZoneMinimap } from "./ZoneMinimap";
@@ -91,6 +92,9 @@ function TerminalPageInner({
   onNavigateToActive: _onNavigateToActive,
   onSessionCountChange,
 }: TerminalPageProps) {
+  // F2 — the tenant the next spawn binds to (`SpawnTenantPicker` writes it)
+  // and the device's persisted pin as the fallback.
+  const { spawnTenantId, activeTenantId, candidates: tenantCandidates } = useTenant();
   // Phase 4 — single context replaces the prior 4-way split. Field set
   // is identical (the new context spreads the same returns).
   const session = useTerminalSession();
@@ -895,14 +899,27 @@ function TerminalPageInner({
   // prior inline definitions; no useCallback wrap since the originals
   // weren't memoized either and downstream consumers don't depend on
   // stable identity.
+  // F2/F3 — resolve the tenant a spawn binds to. An explicit per-invocation
+  // tenant (the `/spawn-ai --tenant` flag) wins; otherwise the picker's
+  // current selection; otherwise the device's active pin. `undefined` leaves
+  // `tenant_id` off the wire and Rust stamps its own default (pre-F2
+  // behavior), which is what an unpaired device gets.
+  const resolveTenantForSpawn = (explicit?: string): string | undefined => {
+    const chosen = explicit?.trim() || spawnTenantId || activeTenantId;
+    return chosen ?? undefined;
+  };
+
   const handleQuickLaunch = async (count: number, autoCommand?: string): Promise<string[]> => {
     const totalTabs = tabs.length + count;
     const layoutId = pickLayout(totalTabs);
     zoneLayout.setLayoutId(layoutId);
     const title = autoCommand ? autoCommand.slice(0, 20) : undefined;
+    // Plain shells have no `--tenant` grammar (F3 is `/spawn-ai` only), so
+    // they always take the picker's current selection.
+    const spawnTenant = resolveTenantForSpawn();
     const createdTabIds: string[] = [];
     for (let i = 0; i < count; i++) {
-      const tabId = await createAndAssignTerminal(title);
+      const tabId = await createAndAssignTerminal(title, undefined, spawnTenant);
       if (tabId) createdTabIds.push(tabId);
     }
     if (autoCommand && createdTabIds.length > 0) {
@@ -917,10 +934,12 @@ function TerminalPageInner({
     count: number,
     configDir: string,
     context?: string,
+    tenantId?: string,
   ): Promise<string[]> => {
     const totalTabs = tabs.length + count;
     const layoutId = pickLayout(totalTabs);
     zoneLayout.setLayoutId(layoutId);
+    const spawnTenant = resolveTenantForSpawn(tenantId);
 
     const isWindows = navigator.platform.startsWith("Win");
     const customCmd = sessionManager.launchCommands?.[configDir];
@@ -928,7 +947,7 @@ function TerminalPageInner({
     const label = customCmd ?? dirName.match(/^\.claude-(.+)$/)?.[1] ?? "claude";
     const createdTabIds: string[] = [];
     for (let i = 0; i < count; i++) {
-      const tabId = await createAndAssignTerminal(label);
+      const tabId = await createAndAssignTerminal(label, undefined, spawnTenant);
       if (tabId) createdTabIds.push(tabId);
     }
     if (createdTabIds.length > 0) {
@@ -994,6 +1013,7 @@ function TerminalPageInner({
     spawnPlain: handleQuickLaunch,
     spawnAi: handleLaunchAiSession,
     accounts: spawnAccounts,
+    tenantCandidates,
     sortZones: handleSortZones,
     exportAll: handleExportOutput,
     openDocFinder: () => setShowDocFinder(true),

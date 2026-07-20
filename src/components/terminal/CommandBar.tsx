@@ -38,6 +38,9 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 
 import { instanceStorage } from "@/lib/instance-storage";
 
+import { useTerminalSession } from "./contexts/TerminalSessionContext";
+import { SpawnTenantPicker } from "./SpawnTenantPicker";
+
 import {
   type CommandAction,
   type CommandResult,
@@ -102,6 +105,15 @@ export function CommandBar() {
   const [status, setStatus] = useState<StatusLine | null>(null);
   const [recents, setRecents] = useState<string[]>(() =>
     instanceStorage.getJSON<string[]>(RECENTS_STORAGE_KEY, []),
+  );
+
+  // Working dir of the focused tab — the repo the spawn-tenant inference
+  // reads. Undefined on an empty page (no tabs yet), which the picker treats
+  // as "no inference, use the active pin".
+  const { tabs, activeId } = useTerminalSession();
+  const activeTabCwd = useMemo(
+    () => tabs.find((t) => t.id === activeId)?.workingDir,
+    [tabs, activeId],
   );
 
   const inputRef = useRef<HTMLInputElement>(null);
@@ -544,6 +556,10 @@ export function CommandBar() {
           focused ? "bg-[#13141f]/95 border-[#7aa2f7]/40" : "bg-[#13141f]/80 border-[#2a2d3d]"
         }`}
       >
+        {/* F2 — tenant for the next spawn, immediately left of the console
+            the operator types `/spawn-ai` into. Self-hides on single-tenant
+            devices. */}
+        <SpawnTenantPicker cwd={activeTabCwd} />
         <span className="text-[10px] text-[#565f89] font-mono select-none">›</span>
         <input
           ref={inputRef}
