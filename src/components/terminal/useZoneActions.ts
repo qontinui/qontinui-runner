@@ -30,7 +30,11 @@ interface UseZoneActionsParams {
   transitionEffects: {
     setUnseenNeedsInput: React.Dispatch<React.SetStateAction<Set<string>>>;
   };
-  createTerminal: (title?: string, workingDir?: string) => Promise<string | null>;
+  createTerminal: (
+    title?: string,
+    workingDir?: string,
+    tenantId?: string,
+  ) => Promise<string | null>;
   createPlanTab: (filePath: string) => string | null;
   incrementMetric: (key: keyof Metrics, amount?: number) => void;
   setNotification: React.Dispatch<
@@ -104,9 +108,9 @@ export function useZoneActions({
   );
 
   const createAndAssignTerminal = useCallback(
-    async (title?: string, workingDir?: string) => {
+    async (title?: string, workingDir?: string, tenantId?: string) => {
       incrementMetric("sessionsCreated");
-      const tabId = await createTerminal(title, workingDir);
+      const tabId = await createTerminal(title, workingDir, tenantId);
       if (!tabId) return tabId;
 
       const totalTabs = tabs.length + 1;

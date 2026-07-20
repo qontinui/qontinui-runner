@@ -13,6 +13,7 @@ import {
 import type { TerminalTab } from "../useTerminalManager";
 import type { ZoneAssignments, SessionState } from "../useZoneLayout";
 import { isNonDurablePty, NON_DURABLE_TOOLTIP, NON_DURABLE_LABEL } from "../sessionDurability";
+import { TenantBadge } from "../TenantBadge";
 import { STATE_BORDER_COLORS, STATE_BG_COLORS, STATE_LABELS, TREND_ICONS } from "./constants";
 import { isActionableLine, isYesNoPrompt, computeOutputTrend } from "./utils";
 import { ActivitySparkline } from "./ActivitySparkline";
@@ -323,6 +324,9 @@ export function CompactZoneCard({
             {NON_DURABLE_LABEL}
           </span>
         )}
+        {/* F1 — tenant parity with the full-zone header (`ZoneLabel`), so the
+            compact multi-zone overview isn't the one place tenancy is invisible. */}
+        <TenantBadge tenantId={tab.tenantId} className="rounded-full py-0.5" />
         {lastLines.length > 0 && (
           <button
             className={`p-0.5 rounded transition-colors shrink-0 ${

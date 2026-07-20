@@ -15,6 +15,7 @@ import React, { useMemo, useState, useCallback, useRef, useEffect } from "react"
 import type { TerminalTab } from "./useTerminalManager";
 import { instanceStorage } from "@/lib/instance-storage";
 import { useTerminalSession, useZoneMetadata, useUIStateCx } from "./contexts";
+import { SpawnTenantPicker } from "./SpawnTenantPicker";
 import {
   LayoutGrid,
   ChevronLeft,
@@ -1201,6 +1202,10 @@ export const ZoneControlPanel = React.memo(function ZoneControlPanel({
             New Session
           </button>
         )}
+        {/* F2 — same next-spawn tenant selection the CommandBar shows, so the
+            click path and the console path agree. Self-hides on single-tenant
+            devices. */}
+        <SpawnTenantPicker cwd={tabs.find((t) => t.id === session.activeId)?.workingDir} />
         <span className="ml-auto text-[10px] text-[#414868]">
           {totalSessions} session{totalSessions !== 1 ? "s" : ""}
         </span>

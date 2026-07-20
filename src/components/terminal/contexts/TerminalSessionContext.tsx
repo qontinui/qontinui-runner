@@ -258,8 +258,8 @@ const PageSessionScope = memo(function PageSessionScope({
   // default "main". Assign it immediately after creation (the broadcast event
   // then drops it from main and claims it here). No-op in the main window.
   const createTerminalForWindow = useCallback<typeof createTerminal>(
-    async (title?: string, workingDir?: string) => {
-      const id = await createTerminal(title, workingDir);
+    async (title?: string, workingDir?: string, tenantId?: string) => {
+      const id = await createTerminal(title, workingDir, tenantId);
       if (id && myWindowLabel !== MAIN_WINDOW_LABEL) {
         try {
           await invoke("assign_session_to_window", {

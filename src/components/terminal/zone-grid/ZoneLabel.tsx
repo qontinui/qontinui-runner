@@ -6,6 +6,7 @@ import type { TerminalTab } from "../useTerminalManager";
 import type { ZoneAssignments, SessionState } from "../useZoneLayout";
 import { STATE_BORDER_COLORS } from "./constants";
 import { isNonDurablePty, NON_DURABLE_TOOLTIP, NON_DURABLE_LABEL } from "../sessionDurability";
+import { TenantBadge } from "../TenantBadge";
 import { useTerminalWindowActions } from "../useTerminalWindowActions";
 import { useSessionPrs, summarizePrs, prGithubUrl, prLabel } from "../useSessionPrs";
 
@@ -259,6 +260,10 @@ export function ZoneLabel({
           {NON_DURABLE_LABEL}
         </span>
       )}
+
+      {/* F1 — which tenant this session is acting as. Self-hides on
+          single-tenant devices and on tabs with no recorded tenant. */}
+      <TenantBadge tenantId={tab.tenantId} />
 
       {/* Per-session PR status: green = every authored PR merged, red = at
           least one unmerged; the panel lists PR numbers unmerged-first so a

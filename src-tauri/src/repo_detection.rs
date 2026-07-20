@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
@@ -6,9 +6,16 @@ use tauri::Emitter;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
-static REGISTERED_REPOS_CACHE: once_cell::sync::Lazy<RwLock<(Instant, HashSet<String>)>> =
+/// `repo slug → owning tenant id` as coord reports it on
+/// `GET /coord/canonical-repos`. The value is `None` for repos coord has
+/// registered but not tenant-scoped (`canonical_repos.tenant_id IS NULL`,
+/// the unscoped-pilot default), which is distinct from "repo absent" — the
+/// KEY set is what `is_repo_registered` answers from.
+type CanonicalRepos = HashMap<String, Option<String>>;
+
+static REGISTERED_REPOS_CACHE: once_cell::sync::Lazy<RwLock<(Instant, CanonicalRepos)>> =
     once_cell::sync::Lazy::new(|| {
-        RwLock::new((Instant::now() - Duration::from_secs(120), HashSet::new()))
+        RwLock::new((Instant::now() - Duration::from_secs(120), CanonicalRepos::new()))
     });
 
 const CACHE_TTL: Duration = Duration::from_secs(60);
@@ -66,7 +73,7 @@ fn coord_http_base() -> String {
     qontinui_runner_lib::profiles::coord_base_with_source().0
 }
 
-async fn fetch_registered_repos() -> Result<HashSet<String>, String> {
+async fn fetch_registered_repos() -> Result<CanonicalRepos, String> {
     let base = coord_http_base();
     let base = base.trim_end_matches('/');
     let url = format!("{base}/coord/canonical-repos");
@@ -93,34 +100,104 @@ async fn fetch_registered_repos() -> Result<HashSet<String>, String> {
         .await
         .map_err(|e| format!("parse canonical-repos body: {e}"))?;
 
-    let repos = body
-        .get("canonical_repos")
+    Ok(parse_canonical_repos(&body))
+}
+
+/// Project coord's `GET /coord/canonical-repos` body into `repo → tenant_id`.
+/// Split out from the transport so the shape contract is unit-testable.
+fn parse_canonical_repos(body: &serde_json::Value) -> CanonicalRepos {
+    body.get("canonical_repos")
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|item| item.get("repo").and_then(|r| r.as_str()).map(String::from))
-                .collect::<HashSet<String>>()
+                .filter_map(|item| {
+                    let repo = item.get("repo").and_then(|r| r.as_str())?;
+                    let tenant = item
+                        .get("tenant_id")
+                        .and_then(|t| t.as_str())
+                        .map(String::from);
+                    Some((repo.to_string(), tenant))
+                })
+                .collect()
         })
-        .unwrap_or_default();
-
-    Ok(repos)
+        .unwrap_or_default()
 }
 
-pub async fn is_repo_registered(slug: &str) -> bool {
+/// Read the canonical-repo map, refreshing through coord when the cache is
+/// cold. `Err` is reserved for a genuine coord failure so callers can tell
+/// "coord said no tenant" from "coord didn't answer".
+async fn canonical_repos() -> Result<CanonicalRepos, String> {
     {
         let cache = REGISTERED_REPOS_CACHE.read().await;
         if cache.0.elapsed() < CACHE_TTL {
-            return cache.1.contains(slug);
+            return Ok(cache.1.clone());
         }
     }
+    let fresh = fetch_registered_repos().await?;
+    let mut cache = REGISTERED_REPOS_CACHE.write().await;
+    *cache = (Instant::now(), fresh.clone());
+    Ok(fresh)
+}
 
-    match fetch_registered_repos().await {
-        Ok(repos) => {
-            let contains = repos.contains(slug);
-            let mut cache = REGISTERED_REPOS_CACHE.write().await;
-            *cache = (Instant::now(), repos);
-            contains
+/// F2 — repo→tenant inference for the spawn picker's DEFAULT selection.
+///
+/// Accepts either an explicit `owner/name` slug or a `working_dir` to derive
+/// one from (`git remote get-url origin`), so the caller can pass the active
+/// tab's cwd without re-implementing slug parsing in TypeScript. `repo` wins
+/// when both are supplied.
+///
+/// Returns the tenant id coord associates with the repo, or `None` when the
+/// repo is unknown / not tenant-scoped / coord is unreachable. The frontend
+/// treats `None` as "keep the active pin" and shows no error: inference is a
+/// smart default, never a hard lock, so an unreachable coord must degrade
+/// silently rather than block a spawn. That is also why coord failures return
+/// `Ok(None)` rather than `Err`.
+///
+/// Source is coord's `canonical_repos.tenant_id` — the only repo→tenant view
+/// a device JWT can read today. The authoritative ownership set lives in
+/// `coord.tenant_repos`, which coord exposes only to Cognito-scoped operators
+/// (`tenant_scope::TenantId` 403s a bare device JWT); when coord grows a
+/// device-reachable `tenants_for_repo` route this fn should move to it.
+#[tauri::command]
+pub async fn tenant_for_repo(
+    repo: Option<String>,
+    working_dir: Option<String>,
+) -> Result<Option<String>, String> {
+    let explicit = repo
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    let slug = match explicit {
+        Some(s) => Some(s),
+        None => match working_dir.filter(|d| !d.trim().is_empty()) {
+            // `git remote get-url` shells out — keep it off the async runtime.
+            Some(dir) => tokio::task::spawn_blocking(move || detect_repo_slug(&dir))
+                .await
+                .ok()
+                .flatten(),
+            None => None,
+        },
+    };
+
+    let slug = match slug {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+
+    match canonical_repos().await {
+        Ok(map) => Ok(map.get(&slug).cloned().flatten()),
+        Err(e) => {
+            debug!("repo_detection: tenant_for_repo({slug}) failed: {e}");
+            Ok(None)
         }
+    }
+}
+
+pub async fn is_repo_registered(slug: &str) -> bool {
+    match canonical_repos().await {
+        Ok(repos) => repos.contains_key(slug),
         Err(e) => {
             debug!("repo_detection: failed to fetch registered repos: {e}");
             false
@@ -196,6 +273,35 @@ pub async fn register_repo_with_coord(repo: String) -> Result<serde_json::Value,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_repos_projects_repo_to_tenant() {
+        let body = serde_json::json!({
+            "canonical_repos": [
+                { "repo": "acme/pizzeria", "tenant_id": "6b1f4b0e-0000-4000-8000-000000000001" },
+                { "repo": "acme/unscoped", "tenant_id": serde_json::Value::Null },
+                { "tenant_id": "6b1f4b0e-0000-4000-8000-000000000002" },
+            ]
+        });
+        let map = parse_canonical_repos(&body);
+        // Tenant-scoped repo resolves.
+        assert_eq!(
+            map.get("acme/pizzeria").cloned().flatten().as_deref(),
+            Some("6b1f4b0e-0000-4000-8000-000000000001")
+        );
+        // Registered but unscoped: PRESENT as a key (so `is_repo_registered`
+        // still says yes) with no tenant to infer.
+        assert!(map.contains_key("acme/unscoped"));
+        assert_eq!(map.get("acme/unscoped").cloned().flatten(), None);
+        // An item with no `repo` is skipped entirely rather than keyed on "".
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn canonical_repos_tolerates_missing_or_malformed_body() {
+        assert!(parse_canonical_repos(&serde_json::json!({})).is_empty());
+        assert!(parse_canonical_repos(&serde_json::json!({ "canonical_repos": "nope" })).is_empty());
+    }
 
     #[test]
     fn parse_https_url() {

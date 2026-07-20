@@ -54,7 +54,22 @@ pub async fn terminal_create(
     // the label into the pane identity so same-(title,cwd) panes in different
     // windows don't collide on one coord session.
     window_label: Option<String>,
+    // Phase 8b / F2 — the tenant the operator picked for THIS spawn. `None`
+    // (every legacy caller) keeps the prior behavior exactly: the registry
+    // stamps the device default (`machine.json::active_tenant_id`). A
+    // malformed uuid is rejected rather than silently falling back, so a
+    // typo'd `/spawn-ai --tenant` can never bind the session to the wrong
+    // tenant.
+    tenant_id: Option<String>,
 ) -> Result<CommandResponse, String> {
+    let spawn_tenant_id: Option<uuid::Uuid> = match tenant_id.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(raw) => Some(
+            uuid::Uuid::parse_str(raw)
+                .map_err(|e| format!("terminal:tenant_invalid: {raw} is not a tenant uuid: {e}"))?,
+        ),
+    };
+
     // R2 (session-lifecycle-cleanup) — derive the STABLE pane identity from
     // the create-time triple the frontend round-trips on restore
     // (`page_id`, `title`, original `working_dir`). Computed BEFORE
@@ -171,9 +186,10 @@ pub async fn terminal_create(
             .collect(),
         share_output: true,
         redact_secrets: None,
-        // Operator-opened tab — no explicit spawn tenant; the registry
-        // stamps the device default (default-for-new-sessions).
-        tenant_id: None,
+        // The tenant the spawn picker (F2) / `--tenant` flag (F3) chose for
+        // this tab. `None` → the registry stamps the device default
+        // (default-for-new-sessions), which is the pre-F2 behavior.
+        tenant_id: spawn_tenant_id,
     };
     // R2 — RESUME the pane's prior coord session if one is persisted,
     // otherwise register fresh. Resuming PATCHes the EXISTING coord row

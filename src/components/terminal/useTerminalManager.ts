@@ -54,6 +54,16 @@ export interface TerminalTab {
    * note or the tab is otherwise used.
    */
   restoreTerminalOnly?: boolean;
+  /**
+   * F1/F2 — the tenant this session was spawned under, as sent to
+   * `terminal_create` (and therefore exactly what the Rust registry stamped
+   * onto `Intent.tenant_id`). Immortal for the tab's life: switching the
+   * device's active tenant never migrates a running session, so this is NOT
+   * re-read from `TenantContext`. Absent on tabs restored from a durable
+   * record written before F2 — `TenantBadge` renders nothing rather than
+   * guessing.
+   */
+  tenantId?: string;
   /** Claude Code session ID running in this tab (set on resume). */
   claudeSessionId?: string;
   /** Claude config dir for the session (set on resume). */
@@ -465,13 +475,19 @@ export function useTerminalManager(pageId: string = "default", windowLabel: stri
   }, []);
 
   const createTerminal = useCallback(
-    async (title?: string, workingDir?: string): Promise<string | null> => {
+    async (title?: string, workingDir?: string, tenantId?: string): Promise<string | null> => {
       try {
         const displayTitle = title ?? `Terminal ${nextTitleNum.current++}`;
         const result = await invoke<CommandResponse>("terminal_create", {
           title: displayTitle,
           workingDir: workingDir ?? null,
           pageId: pageId !== "default" ? pageId : null,
+          // F2/F3 — the tenant the operator picked for THIS spawn. Sent
+          // EXPLICITLY (the caller resolves picker-choice ?? active pin) so
+          // the stamped tenant is exactly what the picker showed, with no
+          // read-then-stamp race against a concurrent tenant switch. `null`
+          // (unpaired device) keeps Rust's device-default stamping.
+          tenantId: tenantId ?? null,
           // Phase 2 (pop-out windows): tag the pane with its owning window so
           // its coord-session identity doesn't collide with a same-(title,cwd)
           // pane in another window. "main" → omitted (legacy/back-compat key).
@@ -489,11 +505,18 @@ export function useTerminalManager(pageId: string = "default", windowLabel: stri
           exitCode: info.exitCode ?? null,
           workingDir: info.workingDir || undefined,
           createdAt: info.createdAt,
+          tenantId,
         };
 
         setTabs((prev) => {
-          // Deduplicate: the terminal-created event listener may have already added this tab
-          if (prev.some((t) => t.id === info.id)) return prev;
+          // Deduplicate: the terminal-created event listener may have already
+          // added this tab. It cannot know the spawn tenant (the event payload
+          // carries no tenant), so patch it on rather than dropping it — the
+          // race would otherwise silently un-badge every tab whose event won.
+          if (prev.some((t) => t.id === info.id)) {
+            if (!tenantId) return prev;
+            return prev.map((t) => (t.id === info.id ? { ...t, tenantId } : t));
+          }
           return [...prev, tab];
         });
         setActiveId(info.id);

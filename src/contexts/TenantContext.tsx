@@ -75,6 +75,23 @@ export interface TenantContextValue {
   setActiveTenant: (tenantId: string) => Promise<void>;
   /** Re-pull from Rust. */
   refresh: () => Promise<void>;
+  /**
+   * F2 — the tenant the NEXT spawn will bind to. `null` means "nothing has
+   * been resolved yet; fall back to `activeTenantId`".
+   *
+   * This is deliberately SEPARATE from `activeTenantId`: the active tenant is
+   * the persisted device default (written to machine.json), whereas this is a
+   * transient, un-persisted, per-spawn selection driven by repo→tenant
+   * inference and the operator's picker. Setting it never writes machine.json
+   * and — per D12 — never migrates a RUNNING session; a session's tenant is
+   * stamped at spawn and immortal.
+   *
+   * Written by `SpawnTenantPicker` (the sole writer); read by the spawn
+   * handlers on the terminal page.
+   */
+  spawnTenantId: string | null;
+  /** Set the tenant for the next spawn. See {@link spawnTenantId}. */
+  setSpawnTenantId: (tenantId: string | null) => void;
 }
 
 const TenantContext = createContext<TenantContextValue | null>(null);
@@ -87,6 +104,7 @@ export function TenantProvider({ children }: TenantProviderProps) {
   const [activeTenantId, setActiveTenantId] = useState<string | null>(null);
   const [source, setSource] = useState<TenantContextValue["source"]>(null);
   const [candidates, setCandidates] = useState<string[]>([]);
+  const [spawnTenantId, setSpawnTenantId] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -142,8 +160,10 @@ export function TenantProvider({ children }: TenantProviderProps) {
       showSwitcher,
       setActiveTenant,
       refresh,
+      spawnTenantId,
+      setSpawnTenantId,
     }),
-    [activeTenantId, source, candidates, showSwitcher, setActiveTenant, refresh],
+    [activeTenantId, source, candidates, showSwitcher, setActiveTenant, refresh, spawnTenantId],
   );
 
   return <TenantContext.Provider value={value}>{children}</TenantContext.Provider>;

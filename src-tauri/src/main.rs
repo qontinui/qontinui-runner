@@ -1865,6 +1865,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::regression::record_regression_run,
             commands::regression::save_regression_suite,
             repo_detection::register_repo_with_coord,
+            repo_detection::tenant_for_repo,
             commands::saved_projects::add_saved_project,
             commands::saved_projects::list_saved_projects,
             commands::saved_projects::remove_saved_project,
