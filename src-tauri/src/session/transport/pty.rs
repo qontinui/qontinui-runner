@@ -80,6 +80,9 @@ impl Transport for PtyTransport {
                 self.app_handle.clone(),
                 None,
                 None,
+                // Thread the intent's tenant so this transport-spawned shell's
+                // coord-mcp acts as the session's tenant, not the active pin.
+                intent.tenant_id,
             )
             .map_err(TransportError::Runtime)?;
 

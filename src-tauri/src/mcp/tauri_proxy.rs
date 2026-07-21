@@ -243,6 +243,9 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 state.app_handle.clone(),
                 None,
                 extra_env,
+                // This proxy surface exposes no tenant selector → device active
+                // pin (unchanged); F2/F3 tenant choice is a frontend-only path.
+                None,
             ) {
                 Ok(info) => {
                     if let Some(ctx) = isolated_ctx {

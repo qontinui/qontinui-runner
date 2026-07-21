@@ -283,6 +283,7 @@ pub async fn steward_start_handler(
         app_handle,
         None, // command override — interactive shell, we type the command in
         None, // extra_env
+        None, // session_tenant — steward runs under the device active pin
     ) {
         Ok(info) => {
             info!("HTTP: Created merge-train-steward terminal: {}", info.id);

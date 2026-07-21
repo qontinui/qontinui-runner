@@ -47,8 +47,9 @@
 //!   for two tenants each present their own tenant's claim with zero
 //!   runner-side selection logic.
 //! - **Device principal — the SESSION's tenant by construction (B3).** A
-//!   device nonce freezes the tenant it was provisioned under
-//!   (`machine.json::active_tenant_id` — the same source
+//!   device nonce freezes the tenant it was provisioned under (the explicit
+//!   F2/F3 spawn tenant if the operator picked one, else
+//!   `machine.json::active_tenant_id` — the same precedence
 //!   `stamp_session_tenant` records on the session's coord row) on its
 //!   [`NonceBinding::session_tenant`]. The proxy injects that tenant's
 //!   credential via `auth::device_bearer_for(session_tenant)`, NOT the
@@ -163,16 +164,20 @@ struct NonceBinding {
     workdir: String,
     principal: ProxyPrincipal,
     lifetime: NonceLifetime,
-    /// The tenant this session was provisioned under, frozen at mint time
-    /// (`machine.json::active_tenant_id` — the same value
-    /// `stamp_session_tenant` records on the session's coord row). The
-    /// DEVICE proxy path selects its injected bearer with
+    /// The tenant this session was provisioned under, frozen at mint time: the
+    /// EXPLICIT spawn tenant the operator picked for this terminal (F2 picker /
+    /// F3 `--tenant`, threaded from `terminal_create`) if any, else
+    /// `machine.json::active_tenant_id` — the SAME precedence
+    /// `stamp_session_tenant` uses for the session's coord row + JWT slot, so
+    /// all three surfaces agree even when the spawn tenant differs from the
+    /// active pin. The DEVICE proxy path selects its injected bearer with
     /// `auth::device_bearer_for(session_tenant.as_ref())` so the proxy acts
     /// as the SESSION's tenant, not whatever binding happens to own the
     /// legacy `access_token` slot (B3). `None` on a single-tenant install
-    /// with no active pin (→ `device_bearer_for(None)` = the legacy default
-    /// slot, byte-identical to pre-B3 behavior). Unused for Agent nonces —
-    /// their bearer is the agent JWT, whose tenant claim is frozen at mint.
+    /// with no active pin and no explicit spawn tenant (→ `device_bearer_for(None)`
+    /// = the legacy default slot, byte-identical to pre-B3 behavior). Unused for
+    /// Agent nonces — their bearer is the agent JWT, whose tenant claim is frozen
+    /// at mint.
     session_tenant: Option<Uuid>,
 }
 
@@ -637,9 +642,13 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> us
 /// This is the RUNNER-SPAWN path (the identity seam, the terminal chokepoint,
 /// the boot self-heal). Its semantics are deliberately unchanged by plan
 /// 2026-07-17 — see [`register_session_proxy_nonce`] for the mint-route path.
-fn register_proxy_nonce(workdir: &str) -> String {
-    let (nonce, snapshot) =
-        mint_and_register_nonce(workdir, ProxyPrincipal::Device, NonceLifetime::Persistent);
+fn register_proxy_nonce(workdir: &str, spawn_tenant: Option<Uuid>) -> String {
+    let (nonce, snapshot) = mint_and_register_nonce(
+        workdir,
+        ProxyPrincipal::Device,
+        NonceLifetime::Persistent,
+        spawn_tenant,
+    );
     persist_proxy_nonces(&snapshot);
     nonce
 }
@@ -675,9 +684,13 @@ fn register_proxy_nonce(workdir: &str) -> String {
 /// shorten the TTL to paper over this — it would 401 live sessions mid-turn
 /// (the MCP client never re-reads its config) — and do NOT re-add cwd-scoped
 /// eviction, which caused the sibling-DoS.
-fn register_session_proxy_nonce(workdir: &str) -> String {
-    let (nonce, _snapshot) =
-        mint_and_register_nonce(workdir, ProxyPrincipal::Device, NonceLifetime::ephemeral());
+fn register_session_proxy_nonce(workdir: &str, spawn_tenant: Option<Uuid>) -> String {
+    let (nonce, _snapshot) = mint_and_register_nonce(
+        workdir,
+        ProxyPrincipal::Device,
+        NonceLifetime::ephemeral(),
+        spawn_tenant,
+    );
     nonce
 }
 
@@ -690,10 +703,14 @@ pub(crate) fn register_agent_proxy_nonce(workdir: &str, agent_id: Uuid) -> Strin
     // Persistent lifetime = today's semantics (no expiry). It is NOT a disk
     // persistence decision: `device_nonce_snapshot` drops every agent binding
     // regardless, so an agent nonce still hard-fails closed across a restart.
+    // Agent nonces ignore the session tenant entirely — their bearer is the
+    // agent's own coord-minted JWT whose tenant claim is frozen at mint — so
+    // `None`; the `session_tenant` field stays unused for Agent bindings.
     let (nonce, snapshot) = mint_and_register_nonce(
         workdir,
         ProxyPrincipal::Agent { agent_id },
         NonceLifetime::Persistent,
+        None,
     );
     // Mirror to the store as a no-op for the agent entry (device entries in the
     // same snapshot, if any, are still persisted) — `persist_proxy_nonces`
@@ -734,6 +751,13 @@ fn mint_and_register_nonce(
     workdir: &str,
     principal: ProxyPrincipal,
     lifetime: NonceLifetime,
+    // The tenant the operator EXPLICITLY picked for THIS spawn (F2 picker / F3
+    // `--tenant`), threaded from the terminal spawn site. `Some(t)` freezes `t`
+    // on the nonce regardless of the active pin; `None` (every non-terminal
+    // caller — boot self-heal, gate-continuation, the mint route, agent nonces)
+    // falls back to the active pin below, byte-identical to pre-existing
+    // behavior.
+    spawn_tenant: Option<Uuid>,
 ) -> (String, HashMap<String, NonceBinding>) {
     // Two v4 UUIDs (~244 bits of randomness) — v4, NOT v7: the v7 prefix is a
     // timestamp, which would gut the entropy this nonce exists to provide.
@@ -744,12 +768,16 @@ fn mint_and_register_nonce(
     );
     let ephemeral = lifetime.is_ephemeral();
     let now = std::time::Instant::now();
-    // Freeze the session's tenant at mint time (B3): the active pin the
-    // session was born under — the SAME source `stamp_session_tenant` reads
-    // for the coord record. Resolved OUTSIDE the map lock (it is a file read)
-    // so the registry mutex is never held across I/O. `None` on a
-    // single-tenant install (→ legacy default slot at inject time).
-    let session_tenant = crate::session::dual_write::resolve_active_tenant_id();
+    // Freeze the session's tenant at mint time (B3): the EXPLICIT spawn tenant
+    // (F2/F3) wins, else the active pin the session was born under — the SAME
+    // precedence `stamp_session_tenant` uses for the coord record + JWT slot, so
+    // the coord-mcp proxy acts as the session's tenant instead of a stale pin
+    // (the split-brain B3 closes, which an F2/F3 non-pin terminal spawn would
+    // otherwise reintroduce). Resolved OUTSIDE the map lock (it is a file read)
+    // so the registry mutex is never held across I/O. `None` on a single-tenant
+    // install with no pin (→ legacy default slot at inject time).
+    let session_tenant =
+        spawn_tenant.or_else(crate::session::dual_write::resolve_active_tenant_id);
     let snapshot = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
         // ONE pass does all pre-insert map maintenance (fused from three: an
@@ -1145,7 +1173,12 @@ pub(crate) fn resolve_bound_api_port() -> Option<u16> {
 /// survives the 4h token TTL that kills static-bearer configs in sessions
 /// that outlive their snapshot (the MCP client never re-reads `.mcp.json`).
 pub(crate) fn write_coord_mcp_proxy_config(primary_wt: &str, bound_port: u16) {
-    let nonce = register_proxy_nonce(primary_wt);
+    // The callers of this in-cwd writer (gate-continuation provisioning, boot
+    // self-heal, on-disk adoption) run under the device's active pin — none
+    // carries an explicit F2/F3 spawn tenant — so `None` → the active pin, the
+    // pre-existing behavior. The explicit-spawn-tenant path is the app-data
+    // `--mcp-config` seam ([`provision_coord_mcp_config_file`]), which threads it.
+    let nonce = register_proxy_nonce(primary_wt, None);
     write_mcp_json(primary_wt, &coord_mcp_proxy_config_json(bound_port, &nonce));
 }
 
@@ -1622,10 +1655,16 @@ fn mcp_config_file_name(workdir: &str) -> String {
 /// into the user's cwd (the pollution non-goal). The nonce is DEVICE-principal and
 /// persisted ([`register_proxy_nonce`]), so an already-written file keeps
 /// validating across an orphan-outliving-a-restart edge.
-pub(crate) fn provision_coord_mcp_config_file(workdir: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn provision_coord_mcp_config_file(
+    workdir: &str,
+    spawn_tenant: Option<Uuid>,
+) -> Option<std::path::PathBuf> {
     // The shared mint core (§2): fail-closed port resolve + a DEVICE, cwd-bound
     // nonce. `Persistent` = the runner-spawn class — today's semantics exactly.
-    let mcp_config = mint_device_proxy_config(workdir, NonceLifetime::Persistent)?;
+    // `spawn_tenant` is the tenant the operator picked for this terminal (F2/F3),
+    // frozen on the nonce so the session's coord-mcp acts as its OWN tenant, not
+    // the active pin (B3-under-F2/F3). `None` (legacy callers) → the active pin.
+    let mcp_config = mint_device_proxy_config(workdir, NonceLifetime::Persistent, spawn_tenant)?;
     let dir = crate::session::claude_hook::session_restore_dir().join("coord-mcp");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         warn!(
@@ -1677,12 +1716,16 @@ pub(crate) fn provision_coord_mcp_config_file(workdir: &str) -> Option<std::path
 ///
 /// `lifetime` is the ONLY axis the two callers differ on — see [`NonceLifetime`]
 /// for why the mint route's nonces are bounded and the seam's are not.
-fn mint_device_proxy_config(workdir: &str, lifetime: NonceLifetime) -> Option<serde_json::Value> {
+fn mint_device_proxy_config(
+    workdir: &str,
+    lifetime: NonceLifetime,
+    spawn_tenant: Option<Uuid>,
+) -> Option<serde_json::Value> {
     let bound_port = resolve_bound_api_port()?;
     let nonce = if lifetime.is_ephemeral() {
-        register_session_proxy_nonce(workdir)
+        register_session_proxy_nonce(workdir, spawn_tenant)
     } else {
-        register_proxy_nonce(workdir)
+        register_proxy_nonce(workdir, spawn_tenant)
     };
     Some(coord_mcp_proxy_config_json(bound_port, &nonce))
 }
@@ -1704,7 +1747,10 @@ fn mint_device_proxy_config(workdir: &str, lifetime: NonceLifetime) -> Option<se
 /// `None` = the bound port is unresolvable ⇒ the route must 503 rather than mint
 /// a nonce paired with a port nothing is listening on.
 pub(crate) fn provision_session_proxy_config(workdir: &str) -> Option<serde_json::Value> {
-    mint_device_proxy_config(workdir, NonceLifetime::ephemeral())
+    // The `/coord-mcp/provision-session` mint route serves a BARE session that
+    // asked the runner for coord identity — it carries no explicit spawn tenant,
+    // so `None` → the active pin (unchanged).
+    mint_device_proxy_config(workdir, NonceLifetime::ephemeral(), None)
 }
 
 /// Read the per-session proxy NONCE out of an existing coord-mcp `.mcp.json`, if
@@ -2136,9 +2182,9 @@ mod tests {
         let wd = dir.to_string_lossy().to_string();
 
         // A live PTY terminal's nonce for this cwd (runner-spawn class).
-        let pty_nonce = register_proxy_nonce(&wd);
+        let pty_nonce = register_proxy_nonce(&wd, None);
         // A bare session mints for the SAME cwd (mint-route class).
-        let bare_nonce = register_session_proxy_nonce(&wd);
+        let bare_nonce = register_session_proxy_nonce(&wd, None);
         assert_ne!(pty_nonce, bare_nonce);
 
         // The bare mint did NOT evict the PTY nonce — an unprivileged mint-route
@@ -2166,7 +2212,7 @@ mod tests {
         );
 
         // Both mint DEVICE principals — the route can never elevate to agent.
-        let bare_again = register_session_proxy_nonce(&wd);
+        let bare_again = register_session_proxy_nonce(&wd, None);
         assert!(matches!(
             proxy_nonces()
                 .lock()
@@ -2235,7 +2281,7 @@ mod tests {
         }
 
         // Any mint triggers the opportunistic sweep.
-        let persistent = register_proxy_nonce(&wd);
+        let persistent = register_proxy_nonce(&wd, None);
 
         let map = proxy_nonces().lock().unwrap();
         assert!(
@@ -2286,7 +2332,7 @@ mod tests {
         // the property nonce persistence + the restart grace window depend on
         // (the MCP client never re-reads its config), and the reason the TTL is
         // scoped to the mint route instead of applied globally.
-        let persistent = register_proxy_nonce(&wd);
+        let persistent = register_proxy_nonce(&wd, None);
         assert!(proxy_nonce_is_valid(&persistent));
     }
 
@@ -2299,8 +2345,8 @@ mod tests {
         let (dir, store) = temp_store("ephemeral-never-persisted");
         let wd = format!("D:/persist-test/{}", uuid::Uuid::now_v7());
 
-        let persistent = register_proxy_nonce(&wd);
-        let ephemeral = register_session_proxy_nonce(&wd);
+        let persistent = register_proxy_nonce(&wd, None);
+        let ephemeral = register_session_proxy_nonce(&wd, None);
 
         let snapshot = proxy_nonces().lock().unwrap().clone();
         persist_proxy_nonces_with_store(&store, &snapshot);
@@ -2365,7 +2411,7 @@ mod tests {
         let wd = dir.to_string_lossy().to_string();
 
         assert!(
-            provision_coord_mcp_config_file(&wd).is_none(),
+            provision_coord_mcp_config_file(&wd, None).is_none(),
             "no bound port ⇒ no --mcp-config file (fail-closed)"
         );
         // And no cwd pollution — the degraded breadcrumb belongs to the workdir
@@ -2479,7 +2525,7 @@ mod tests {
             format!("h.{payload}.s")
         };
         let dir = std::env::temp_dir().join(format!("coord-mcp-gate-{}", uuid::Uuid::new_v4()));
-        let nonce = register_proxy_nonce(&dir.to_string_lossy());
+        let nonce = register_proxy_nonce(&dir.to_string_lossy(), None);
         let device = mk("device");
         let dev_p = ProxyPrincipal::Device;
 
@@ -2588,7 +2634,7 @@ mod tests {
         // And a device principal must reject an agent bearer.
         let dev_dir =
             std::env::temp_dir().join(format!("coord-mcp-dgate-{}", uuid::Uuid::new_v4()));
-        let dev_nonce = register_proxy_nonce(&dev_dir.to_string_lossy());
+        let dev_nonce = register_proxy_nonce(&dev_dir.to_string_lossy(), None);
         assert_eq!(
             proxy_request_gate(Some(&dev_nonce), Some(&mk("agent")), &device_p)
                 .unwrap_err()
@@ -2638,7 +2684,7 @@ mod tests {
         // bearer is still a hard 401 backstop (the proxy handler only reaches
         // the gate AFTER the bounded re-mint produced a usable bearer).
         let dir = std::env::temp_dir().join(format!("coord-mcp-p3-{}", uuid::Uuid::new_v4()));
-        let nonce = register_proxy_nonce(&dir.to_string_lossy());
+        let nonce = register_proxy_nonce(&dir.to_string_lossy(), None);
         let dev_p = ProxyPrincipal::Device;
         assert_eq!(
             proxy_request_gate(Some(&nonce), None, &dev_p)
@@ -3051,8 +3097,12 @@ mod tests {
         // Mint a nonce in the live map, then mirror the snapshot to the INJECTED
         // store (the `register_proxy_nonce` body, split across its seams).
         let workdir = store_dir.join("session-wd").to_string_lossy().to_string();
-        let (nonce, snapshot) =
-            mint_and_register_nonce(&workdir, ProxyPrincipal::Device, NonceLifetime::Persistent);
+        let (nonce, snapshot) = mint_and_register_nonce(
+            &workdir,
+            ProxyPrincipal::Device,
+            NonceLifetime::Persistent,
+            None,
+        );
         persist_proxy_nonces_with_store(&store, &snapshot);
         assert!(proxy_nonce_is_valid(&nonce));
 
@@ -3098,13 +3148,18 @@ mod tests {
             &agent_wd,
             ProxyPrincipal::Agent { agent_id },
             NonceLifetime::Persistent,
+            None,
         );
         persist_proxy_nonces_with_store(&store, &snapshot);
 
         // Also mint a DEVICE nonce and persist.
         let dev_wd = store_dir.join("dev-wd").to_string_lossy().to_string();
-        let (dev_nonce, snapshot) =
-            mint_and_register_nonce(&dev_wd, ProxyPrincipal::Device, NonceLifetime::Persistent);
+        let (dev_nonce, snapshot) = mint_and_register_nonce(
+            &dev_wd,
+            ProxyPrincipal::Device,
+            NonceLifetime::Persistent,
+            None,
+        );
         persist_proxy_nonces_with_store(&store, &snapshot);
 
         let persisted = store.load_coord_mcp_nonces();
@@ -3151,11 +3206,41 @@ mod tests {
             "/tmp/coord-mcp-persist-off-wd",
             ProxyPrincipal::Device,
             NonceLifetime::Persistent,
+            None,
         );
         assert!(
             proxy_nonce_is_valid(&nonce),
             "minting must register the nonce in-memory regardless of persistence"
         );
+    }
+
+    /// B3-under-F2/F3 regression: a device-principal terminal spawned under an
+    /// EXPLICIT non-pin tenant (the F2 picker / F3 `--tenant` choice, threaded
+    /// from `terminal_create`) must freeze THAT tenant on its coord-mcp nonce, so
+    /// the proxy injects the session's OWN tenant credential — not the
+    /// `machine.json` active pin. Without the threaded `spawn_tenant`, the nonce
+    /// froze `resolve_active_tenant_id()` (the pin) while `stamp_session_tenant`
+    /// recorded the spawn input — the exact coord/JWT-vs-coord-mcp split-brain B3
+    /// closes, reintroduced through the F2/F3 terminal path. `Some(chosen)`
+    /// short-circuits the `.or_else(resolve_active_tenant_id)` fallback, so this
+    /// is deterministic regardless of the host's machine.json.
+    #[test]
+    fn nonce_freezes_explicit_spawn_tenant_over_active_pin() {
+        let workdir = "/tmp/coord-mcp-explicit-spawn-tenant-wd";
+        let chosen = Uuid::new_v4();
+        let (nonce, _snapshot) = mint_and_register_nonce(
+            workdir,
+            ProxyPrincipal::Device,
+            NonceLifetime::Persistent,
+            Some(chosen),
+        );
+        assert_eq!(
+            proxy_session_tenant_for_nonce(&nonce),
+            Some(chosen),
+            "the explicit spawn tenant must win over the active pin on the nonce",
+        );
+        // Drop the in-memory entry so this test never leaks into a sibling.
+        proxy_nonces().lock().unwrap().remove(&nonce);
     }
 
     /// Phase 3c — the pure reconcile predicate: rewrite only when a proxy port
@@ -3471,9 +3556,9 @@ mod tests {
     fn remint_graces_evicted_device_nonce_but_never_agent() {
         // Device: mint A, then re-mint B for the SAME workdir → A graced, B live.
         let wd = format!("D:/grace-wt-{}", uuid::Uuid::now_v7());
-        let a = register_proxy_nonce(&wd);
+        let a = register_proxy_nonce(&wd, None);
         assert!(proxy_nonce_is_valid(&a));
-        let b = register_proxy_nonce(&wd);
+        let b = register_proxy_nonce(&wd, None);
         assert_ne!(a, b);
         assert!(proxy_nonce_is_valid(&b), "the fresh device nonce is live");
         assert!(

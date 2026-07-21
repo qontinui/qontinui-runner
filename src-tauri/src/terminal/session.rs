@@ -412,6 +412,12 @@ impl TerminalSession {
         interceptor: Arc<OutputInterceptor>,
         command: Option<Vec<String>>,
         extra_env: Option<Vec<(String, String)>>,
+        // The tenant the operator EXPLICITLY picked for THIS spawn (F2 picker /
+        // F3 `--tenant`), threaded from `terminal_create`. Frozen onto the
+        // session's coord-mcp nonce by the identity seam so the proxy acts as the
+        // session's OWN tenant, not the device active pin. `None` (every legacy
+        // caller / gate-continuation) → the active pin, unchanged.
+        session_tenant: Option<uuid::Uuid>,
     ) -> Result<Self, String> {
         let pty_system = native_pty_system();
 
@@ -531,6 +537,7 @@ impl TerminalSession {
             &title,
             &page_id,
             effective_claude_config_dir.clone(),
+            session_tenant,
         );
 
         // ---- Install-interception PATH-shim seam (plan §4 Phase 1) ----------
@@ -1195,6 +1202,10 @@ impl TerminalSession {
         // authoritative record so an autonomous boot-resume runs under the
         // CORRECT account. `None` = default account (no CLAUDE_CONFIG_DIR).
         config_dir: Option<String>,
+        // The tenant the operator picked for THIS spawn (F2/F3). Frozen onto the
+        // coord-mcp nonce below so the proxy acts as the session's own tenant.
+        // `None` → the device active pin (legacy / gate-continuation behavior).
+        session_tenant: Option<uuid::Uuid>,
     ) {
         use crate::install_effects_producer::intercept::shim_materializer;
         use tauri::Manager;
@@ -1275,7 +1286,9 @@ impl TerminalSession {
                 terminal_id = %terminal_id,
                 "coord-mcp: cwd already declares coord-mcp — skipping --mcp-config injection"
             );
-        } else if let Some(cfg_path) = crate::coord_mcp::provision_coord_mcp_config_file(cwd) {
+        } else if let Some(cfg_path) =
+            crate::coord_mcp::provision_coord_mcp_config_file(cwd, session_tenant)
+        {
             cmd.env(
                 crate::coord_mcp::MCP_CONFIG_ENV,
                 cfg_path.to_string_lossy().as_ref(),

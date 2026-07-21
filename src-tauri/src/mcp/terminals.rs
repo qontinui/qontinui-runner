@@ -182,6 +182,9 @@ pub async fn create_terminal_handler(
         app_handle,
         None,
         extra_env,
+        // MCP terminal-create route carries no tenant selector — device active
+        // pin (unchanged). F2/F3 tenant choice is a frontend-only surface today.
+        None,
     ) {
         Ok(info) => {
             if let Some(ctx) = isolated_ctx {

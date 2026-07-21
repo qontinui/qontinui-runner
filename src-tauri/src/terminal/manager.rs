@@ -51,6 +51,11 @@ impl TerminalManager {
         app_handle: AppHandle,
         command: Option<Vec<String>>,
         extra_env: Option<Vec<(String, String)>>,
+        // The tenant the operator EXPLICITLY picked for THIS spawn (F2 picker /
+        // F3 `--tenant`). Threaded to the identity seam so the session's coord-mcp
+        // proxy acts as that tenant, not the device active pin. `None` (every
+        // legacy caller / gate-continuation) keeps the active-pin behavior.
+        session_tenant: Option<uuid::Uuid>,
     ) -> Result<TerminalInfo, String> {
         let id = uuid::Uuid::new_v4().to_string();
         let title = title.unwrap_or_else(|| format!("Terminal {}", self.count() + 1));
@@ -96,6 +101,7 @@ impl TerminalManager {
             self.interceptor.clone(),
             command,
             extra_env,
+            session_tenant,
         )?;
 
         let info = session.info();

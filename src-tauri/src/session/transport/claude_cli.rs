@@ -80,6 +80,10 @@ impl Transport for ClaudeCliTransport {
                         self.app_handle.clone(),
                         None,
                         None,
+                        // Thread the intent's tenant so this interactive Claude
+                        // session's coord-mcp acts as the session's tenant, not
+                        // the device active pin.
+                        intent.tenant_id,
                     )
                     .map_err(TransportError::Runtime)?;
 

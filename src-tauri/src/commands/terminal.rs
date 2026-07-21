@@ -152,6 +152,10 @@ pub async fn terminal_create(
         app_handle,
         command,
         extra_env,
+        // F2/F3 — the tenant the operator picked for this tab, frozen onto the
+        // coord-mcp nonce so the session's proxy acts as that tenant (matches
+        // the value `stamp_session_tenant` records on the coord row below).
+        spawn_tenant_id,
     )?;
 
     // Park the isolated edit context on the terminal session so its
@@ -1344,6 +1348,9 @@ pub(crate) fn create_terminal_session_backend(
         app_handle,
         command,
         extra_env,
+        // Backend / gate-continuation spawn — runs under the device active pin,
+        // never an explicit F2/F3 tenant. `None` → the active pin (unchanged).
+        None,
     )?;
 
     // Park the pre-acquired isolated edit context on the session so its

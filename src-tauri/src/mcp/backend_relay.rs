@@ -2453,6 +2453,9 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
             api_state.app_handle.clone(),
             None,
             extra_env,
+            // The relay is a DEVICE-scoped surface (per-session tenants never
+            // route through the relay's WS identity) → device active pin.
+            None,
         ) {
             Ok(info) => {
                 if let Some(ctx) = isolated_ctx {

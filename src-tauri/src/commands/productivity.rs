@@ -1109,6 +1109,7 @@ pub async fn launch_coordinator_session(
         app_handle.clone(),
         None,
         extra_env,
+        None, // worker spawn — device active pin, no explicit F2/F3 tenant
     )?;
 
     if let Some(ctx) = isolated_ctx {
@@ -1273,6 +1274,7 @@ pub async fn spawn_worker_session(
         app_handle.clone(),
         None,
         extra_env,
+        None, // worker spawn — device active pin, no explicit F2/F3 tenant
     )?;
 
     // Phase 2 — park the isolated edit context on the TerminalSession
