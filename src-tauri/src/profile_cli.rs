@@ -81,19 +81,28 @@ pub fn run_env(cmd: EnvCmd) -> u8 {
     }
 }
 
-/// The operator-facing note printed when this machine has no usable local
-/// identity file. Keyed off the EXPLICIT presence signal
+/// The operator-facing note printed when this machine has no usable coord
+/// identity to send with the enroll. Keyed off the EXPLICIT presence signal
 /// (`LocalMachineIdentity::machine_json_present`) — never off an enroll wire
 /// field, which is `None` on every enroll by design.
+///
+/// Both silent-failure shapes get a note, because both end in the same place:
+/// an enroll that succeeds without linking the devenv↔coord twin bridge. The
+/// Settings panel (`DevenvEnrollSettings.tsx`) renders the same three states.
 fn missing_machine_json_note(identity: &enroll::LocalMachineIdentity) -> Option<&'static str> {
-    if identity.machine_json_present {
-        return None;
+    match (identity.machine_json_present, identity.coord_device_id) {
+        (true, Some(_)) => None,
+        (true, None) => Some(
+            "note: ~/.qontinui/machine.json is readable but its device_id is not a UUID — \
+             enrolling with a null coord_device_id, so the coord device link will be \
+             skipped (re-run `qontinui_profile device init` to repair it)",
+        ),
+        (false, _) => Some(
+            "note: no readable ~/.qontinui/machine.json — enrolling with null \
+             hostname/coord_device_id (run `qontinui_profile device init` first for a \
+             stable identity)",
+        ),
     }
-    Some(
-        "note: no readable ~/.qontinui/machine.json — enrolling with null \
-         hostname/coord_device_id (run `qontinui_profile device init` first for a \
-         stable identity)",
-    )
 }
 
 fn cmd_env_enroll(code: &str, backend_arg: Option<&str>, environment_arg: Option<&str>) -> u8 {
@@ -222,6 +231,13 @@ fn cmd_env_show() -> u8 {
         .map(|k| !k.is_empty())
         .unwrap_or(false);
 
+    // The same local-identity read an enroll would do, so `env show` reports the
+    // coord twin-bridge linkage the NEXT enroll will send — readable without
+    // having to attempt one. Mirrors the `devenv_enroll_status` Tauri command.
+    let identity = enroll::local_machine_identity();
+    let machine_json_present = identity.machine_json_present;
+    let coord_device_id = identity.coord_device_id.map(|d| d.to_string());
+
     let out = match cfg {
         Some(c) => json!({
             "enrolled": c.is_enrolled() && key_stored,
@@ -230,11 +246,15 @@ fn cmd_env_show() -> u8 {
             "environment_id": c.environment_id,
             "enrolled_at": c.enrolled_at,
             "machine_key_stored": key_stored,
+            "machine_json_present": machine_json_present,
+            "coord_device_id": coord_device_id,
             "config_path": EnvAgentConfig::path().map(|p| p.display().to_string()),
         }),
         None => json!({
             "enrolled": false,
             "machine_key_stored": key_stored,
+            "machine_json_present": machine_json_present,
+            "coord_device_id": coord_device_id,
             "config_path": EnvAgentConfig::path().map(|p| p.display().to_string()),
             "note": "no env-agent.json — run `qontinui-runner env enroll --code <code>`",
         }),
@@ -860,14 +880,21 @@ mod tests {
         };
         assert!(missing_machine_json_note(&present).is_none());
 
-        // Present but with an unparseable (non-UUID) device_id → still silent:
-        // the file IS readable.
+        // Present but with an unparseable (non-UUID) device_id → its OWN note:
+        // the file is readable, so "no readable machine.json" would be a lie,
+        // but the coord device link is still silently skipped.
         let present_no_uuid = enroll::LocalMachineIdentity {
             machine_json_present: true,
             hostname: None,
             coord_device_id: None,
         };
-        assert!(missing_machine_json_note(&present_no_uuid).is_none());
+        let note = missing_machine_json_note(&present_no_uuid)
+            .expect("a non-UUID device_id must not enroll silently");
+        assert!(note.contains("is not a UUID"), "{note}");
+        assert!(
+            !note.contains("no readable"),
+            "must not claim the file is unreadable: {note}"
+        );
 
         // Genuinely absent → the note still fires.
         let absent = enroll::LocalMachineIdentity::default();

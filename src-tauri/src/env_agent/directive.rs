@@ -37,8 +37,9 @@ const KEEPALIVE_INTERVAL_SECS: u64 = 20;
 
 /// Wire shape of the enroll directive coord publishes. The web backend mints the
 /// machine + code, then coord publishes THIS payload to the target device's
-/// channel. Only `enrollment_code` is required; the rest fall back to the
-/// profile-resolved backend + the local `machine.json` identity.
+/// channel. Only `enrollment_code` is required; `backend` falls back to the
+/// profile-resolved base, and the hostname / coord device identity come from the
+/// local `machine.json`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct EnrollDirective {
     /// The one-time enrollment code minted by the web dashboard.
@@ -46,8 +47,11 @@ pub struct EnrollDirective {
     /// Web backend base URL. Optional — falls back to the profile-resolved base.
     #[serde(default)]
     pub backend: Option<String>,
-    /// Server-minted devenv `machine_id` to enroll AS. Optional — falls back to
-    /// the local `machine.json` identity when absent.
+    /// Server-minted devenv `machine_id` (`devenv_machines.id`) to enroll AS.
+    /// Optional — when absent the enroll asserts NO machine_id and the backend
+    /// identifies the machine from the enrollment code. There is deliberately no
+    /// local fallback: `machine.json` holds coord's device_id, a different
+    /// identity space (see [`enroll::EnrollParams::machine_id`]).
     #[serde(default)]
     pub machine_id: Option<String>,
     /// Environment binding echoed from the dispatch (diagnostic; the enroll

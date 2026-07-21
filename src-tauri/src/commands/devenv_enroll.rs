@@ -27,6 +27,17 @@ struct EnrollStatus {
     /// Whether the runner's install dir is on the user PATH, i.e. whether the
     /// `qontinui-runner env …` terminal command resolves (Phase 1a follow-up).
     cli_on_path: bool,
+    /// Whether `~/.qontinui/machine.json` is present and readable. The CLI prints
+    /// a note when it is not; this is the same signal for the no-terminal path,
+    /// so the UI can say the coord twin bridge won't be linked BEFORE the
+    /// operator enrolls. Read from `LocalMachineIdentity::machine_json_present` —
+    /// never inferred from an enroll wire field, which is `None` by design.
+    machine_json_present: bool,
+    /// Coord's device identity that an enroll would send as `coord_device_id`
+    /// (the devenv↔coord twin-bridge linkage). `None` when `machine.json` is
+    /// absent or its `device_id` is not a UUID — enroll still succeeds, the twin
+    /// bridge just goes unlinked.
+    coord_device_id: Option<String>,
 }
 
 /// Enroll this machine into a devenv environment via a one-time code.
@@ -89,6 +100,11 @@ pub fn devenv_enroll_status() -> Result<CommandResponse, String> {
     // Best-effort: a lookup failure just reports "not on PATH" (the button is a
     // no-op-safe re-run anyway).
     let cli_on_path = qontinui_runner_lib::profile_cli::cli_dir_on_user_path().unwrap_or(false);
+    // Same local-identity read an enroll would do, so the panel reports what the
+    // NEXT enroll will actually send rather than what a past one did.
+    let identity = enroll::local_machine_identity();
+    let machine_json_present = identity.machine_json_present;
+    let coord_device_id = identity.coord_device_id.map(|d| d.to_string());
 
     let status = match cfg {
         Some(c) => EnrollStatus {
@@ -99,6 +115,8 @@ pub fn devenv_enroll_status() -> Result<CommandResponse, String> {
             enrolled_at: c.enrolled_at,
             has_key,
             cli_on_path,
+            machine_json_present,
+            coord_device_id,
         },
         None => EnrollStatus {
             enrolled: false,
@@ -108,6 +126,8 @@ pub fn devenv_enroll_status() -> Result<CommandResponse, String> {
             enrolled_at: None,
             has_key,
             cli_on_path,
+            machine_json_present,
+            coord_device_id,
         },
     };
 

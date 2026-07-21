@@ -8,7 +8,7 @@
 //!
 //! The enroll flow mirrors the backend contract in
 //! `qontinui-web` `app/api/v1/endpoints/devenv_agent.py`: POST
-//! `{enrollment_code, machine_id?, hostname?}` to
+//! `{enrollment_code, machine_id?, hostname?, coord_device_id?}` to
 //! `{backend}/api/v1/devenv/agent/enroll`; on success the response carries the
 //! machine key ONCE (stored immediately in `SecureStorage`) plus the
 //! `environment_id` (ALWAYS sourced from the response, never hardcoded). Nothing
@@ -128,8 +128,9 @@ pub fn run_enroll(params: EnrollParams) -> Result<EnrollOutcome, String> {
         let body_text = resp
             .text()
             .unwrap_or_else(|_| "<unable to read response body>".to_string());
+        let hint = enroll_failure_hint(status.as_u16(), &body_text, body.machine_id.as_deref());
         return Err(format!(
-            "enroll failed — POST {url} -> HTTP {status}: {body_text}"
+            "enroll failed — POST {url} -> HTTP {status}: {body_text}{hint}"
         ));
     }
 
@@ -172,6 +173,42 @@ pub fn run_enroll(params: EnrollParams) -> Result<EnrollOutcome, String> {
         environment_id,
         backend_url: backend,
     })
+}
+
+/// Extra operator-facing guidance appended to a failed enroll's error, or `""`
+/// when the raw response already says everything useful.
+///
+/// The one case worth explaining is `409 machine_id_mismatch`: the backend only
+/// raises it when the request ASSERTED a `machine_id` that differs from the one
+/// the enrollment code resolves to (`devenv_agent.py::enroll_agent`). A
+/// locally-initiated enroll never asserts one (see [`EnrollParams::machine_id`]),
+/// so when this fires the id came from a server-issued enroll directive — i.e.
+/// the directive is stale or aimed at another machine, which is not something
+/// re-running the enroll will fix.
+///
+/// Keyed off the structured `detail.code` (via the shared FastAPI error reader),
+/// never a substring scan of the body — an unrelated 409 that merely mentions
+/// the token must not draw a hint.
+fn enroll_failure_hint(status: u16, body_text: &str, asserted_machine_id: Option<&str>) -> String {
+    if status != 409
+        || super::pull::extract_error_code(body_text).as_deref() != Some("machine_id_mismatch")
+    {
+        return String::new();
+    }
+    // The `None` arm is unreachable against the real backend (it only raises
+    // this when we asserted an id), so say so rather than inventing guidance.
+    match asserted_machine_id {
+        Some(id) => format!(
+            "\nhint: this enroll asserted machine_id={id}, which came from a server-issued \
+             enroll directive — the enrollment code resolves to a DIFFERENT devenv machine. \
+             The directive is stale or aimed at another machine; re-dispatch it from the \
+             dashboard rather than retrying."
+        ),
+        None => "\nhint: this enroll asserted no machine_id, so the backend compared against a \
+             machine_id it never received — that contradicts its own contract. Please report \
+             it with the response body above."
+            .to_string(),
+    }
 }
 
 /// Resolve the web backend base URL for the enroll POST. Order:
@@ -269,6 +306,50 @@ mod tests {
             resolve_backend_base(Some("https://qontinui.io/")).unwrap(),
             "https://qontinui.io"
         );
+    }
+
+    /// The 409 hint must fire ONLY on the mismatch the directive path can still
+    /// produce, and must name the asserted id so the operator can see it came
+    /// from a directive rather than from local state. Fixtures use the REAL
+    /// backend error shape (`devenv_agent.py` raises
+    /// `detail: {code, message}`), so the test still holds if detection ever
+    /// becomes shape-sensitive.
+    #[test]
+    fn enroll_failure_hint_explains_only_machine_id_mismatch() {
+        const MISMATCH: &str = r#"{"detail":{"code":"machine_id_mismatch","message":"machine_id does not match the enrollment code."}}"#;
+
+        let hint = enroll_failure_hint(409, MISMATCH, Some("11111111-2222-3333-4444-555555555555"));
+        assert!(
+            hint.contains("11111111-2222-3333-4444-555555555555"),
+            "{hint}"
+        );
+        assert!(hint.contains("enroll directive"), "{hint}");
+
+        // A 409 we did not assert an id for contradicts the backend's own
+        // contract — different guidance.
+        let unasserted = enroll_failure_hint(409, MISMATCH, None);
+        assert!(
+            unasserted.contains("asserted no machine_id"),
+            "{unasserted}"
+        );
+
+        // Every other failure is left to speak for itself — including the
+        // endpoint's OTHER error code, and a body that merely MENTIONS the
+        // token outside `detail.code`.
+        assert!(enroll_failure_hint(
+            404,
+            r#"{"detail":{"code":"enrollment_code_invalid","message":"nope"}}"#,
+            None
+        )
+        .is_empty());
+        assert!(enroll_failure_hint(
+            409,
+            r#"{"detail":{"code":"other","message":"not a machine_id_mismatch"}}"#,
+            None
+        )
+        .is_empty());
+        assert!(enroll_failure_hint(409, "<html>machine_id_mismatch</html>", None).is_empty());
+        assert!(enroll_failure_hint(500, "boom", Some("m-1")).is_empty());
     }
 
     #[test]

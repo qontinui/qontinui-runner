@@ -366,7 +366,7 @@ async fn get_canonical(
 
 /// Pull `detail.code` out of a FastAPI error body, if present. Best-effort — a
 /// body that doesn't match simply yields `None` and the raw body is shown.
-fn extract_error_code(body: &str) -> Option<String> {
+pub(super) fn extract_error_code(body: &str) -> Option<String> {
     serde_json::from_str::<Value>(body)
         .ok()?
         .get("detail")?

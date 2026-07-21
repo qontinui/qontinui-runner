@@ -11,7 +11,16 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { KeyRound, Check, Loader2, Server, Terminal } from "lucide-react";
+import {
+  KeyRound,
+  Check,
+  Loader2,
+  Server,
+  Terminal,
+  Fingerprint,
+  AlertTriangle,
+  RefreshCw,
+} from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import type { LogFunction } from "./types";
 
@@ -30,6 +39,10 @@ interface EnrollStatus {
   has_key: boolean;
   /** Whether `qontinui-runner env …` resolves in a terminal (install dir on PATH). */
   cli_on_path: boolean;
+  /** Whether `~/.qontinui/machine.json` is present and readable. */
+  machine_json_present: boolean;
+  /** Coord device identity the next enroll will send as `coord_device_id`. */
+  coord_device_id: string | null;
 }
 
 interface EnrollOutcome {
@@ -40,6 +53,34 @@ interface EnrollOutcome {
 
 interface DevenvEnrollSettingsProps {
   onLog: LogFunction;
+}
+
+/**
+ * Re-reads the local identity after the operator runs the repair command the
+ * warning above points at. Without it the warning is stale until the panel
+ * remounts, and the operator's next click is Enroll — the very action the
+ * warning exists to precede.
+ */
+function RecheckIdentityButton({ onRecheck }: { onRecheck: () => Promise<void> }) {
+  const [checking, setChecking] = useState(false);
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        setChecking(true);
+        void onRecheck().finally(() => setChecking(false));
+      }}
+      disabled={checking}
+      className="inline-flex items-center gap-2 rounded-md border border-border bg-muted px-3 py-1.5 text-xs font-medium hover:bg-muted/70 disabled:opacity-50"
+    >
+      {checking ? (
+        <Loader2 className="size-3.5 animate-spin" />
+      ) : (
+        <RefreshCw className="size-3.5" />
+      )}
+      {checking ? "Checking…" : "Re-check"}
+    </button>
+  );
 }
 
 export function DevenvEnrollSettings({ onLog }: DevenvEnrollSettingsProps) {
@@ -147,6 +188,60 @@ export function DevenvEnrollSettings({ onLog }: DevenvEnrollSettingsProps) {
           </p>
         )}
       </div>
+
+      {/* Local identity — the same signal the CLI prints as a note before
+          enrolling. Shown in BOTH states: it describes what the NEXT enroll will
+          send, so it has to be visible before the operator clicks Enroll. */}
+      {status && (
+        <div className="space-y-1 text-xs">
+          <div className="flex items-center gap-2 font-medium">
+            <Fingerprint className="size-4" />
+            Local identity
+          </div>
+          {!status.machine_json_present ? (
+            <div className="space-y-2">
+              <p className="flex items-start gap-2 text-amber-600 dark:text-amber-500">
+                <AlertTriangle className="mt-px size-4 shrink-0" />
+                <span>
+                  No readable{" "}
+                  <code className="font-mono">~/.qontinui/machine.json</code> —
+                  enrolling still works, but with a null hostname and no coord
+                  device link. Run{" "}
+                  <code className="font-mono">qontinui_profile device init</code>{" "}
+                  first for a stable identity.
+                </span>
+              </p>
+              <RecheckIdentityButton onRecheck={refreshStatus} />
+            </div>
+          ) : status.coord_device_id ? (
+            <p className="flex items-start gap-2 text-muted-foreground">
+              <Check className="mt-px size-4 shrink-0 text-green-600 dark:text-green-500" />
+              <span>
+                Enroll will link coord device{" "}
+                <code className="font-mono break-all">
+                  {status.coord_device_id}
+                </code>
+                .
+              </span>
+            </p>
+          ) : (
+            <div className="space-y-2">
+              <p className="flex items-start gap-2 text-amber-600 dark:text-amber-500">
+                <AlertTriangle className="mt-px size-4 shrink-0" />
+                <span>
+                  <code className="font-mono">~/.qontinui/machine.json</code> is
+                  readable but its{" "}
+                  <code className="font-mono">device_id</code> is not a UUID —
+                  the coord device link will be skipped. Re-run{" "}
+                  <code className="font-mono">qontinui_profile device init</code>{" "}
+                  to repair it.
+                </span>
+              </p>
+              <RecheckIdentityButton onRecheck={refreshStatus} />
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Enroll form */}
       <div className="space-y-3">
