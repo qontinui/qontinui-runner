@@ -486,7 +486,9 @@ export function useTerminalManager(pageId: string = "default", windowLabel: stri
           // EXPLICITLY (the caller resolves picker-choice ?? active pin) so
           // the stamped tenant is exactly what the picker showed, with no
           // read-then-stamp race against a concurrent tenant switch. `null`
-          // (unpaired device) keeps Rust's device-default stamping.
+          // means the caller's `resolveTenantForSpawn` found no pin to send
+          // (single-tenant OR unpaired device) — Rust then applies its own
+          // device-default stamping, exactly as before F2.
           tenantId: tenantId ?? null,
           // Phase 2 (pop-out windows): tag the pane with its owning window so
           // its coord-session identity doesn't collide with a same-(title,cwd)

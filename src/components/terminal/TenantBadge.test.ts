@@ -9,7 +9,7 @@
 import { describe, expect, it } from "vitest";
 
 import { tenantBadgeLabel } from "./TenantBadge";
-import { resolveSpawnTenant, shortTenantId } from "./SpawnTenantPicker";
+import { pickSpawnTenant, resolveSpawnTenant, shortTenantId } from "./SpawnTenantPicker";
 
 const A = "6b1f4b0e-1111-4000-8000-000000000001";
 const B = "91ffaa20-2222-4000-8000-000000000002";
@@ -83,5 +83,36 @@ describe("resolveSpawnTenant", () => {
 
   it("returns undefined on an unpaired device so the caller omits tenant_id", () => {
     expect(resolveSpawnTenant({ active: null, candidates: [] })).toBeUndefined();
+  });
+});
+
+describe("pickSpawnTenant (every spawn path records the acting tenant)", () => {
+  it("resolves a button/component spawn to the active pin on a multi-tenant device", () => {
+    // The button / launch-menu / Ctrl+Shift+T paths pass no picker selection
+    // (`spawnTenantId` null), but a paired multi-tenant device HAS an active
+    // pin. The spawn (and therefore `tab.tenantId`) must bind to it — not
+    // undefined — so `TenantBadge` renders on these paths, matching the tenant
+    // Rust stamps onto `Intent.tenant_id`. This is the F1 defect this fix closes.
+    expect(pickSpawnTenant({ spawnTenantId: null, activeTenantId: A })).toBe(A);
+  });
+
+  it("prefers the picker's published selection over the active pin", () => {
+    expect(pickSpawnTenant({ spawnTenantId: B, activeTenantId: A })).toBe(B);
+  });
+
+  it("prefers an explicit per-invocation tenant (the /spawn-ai --tenant flag) over all else", () => {
+    expect(pickSpawnTenant({ explicit: B, spawnTenantId: A, activeTenantId: A })).toBe(B);
+  });
+
+  it("ignores a blank / whitespace explicit override and falls through", () => {
+    expect(pickSpawnTenant({ explicit: "   ", spawnTenantId: null, activeTenantId: A })).toBe(A);
+  });
+
+  it("stays undefined on a single-tenant / unpaired device (byte-identical to pre-F2)", () => {
+    // Nothing to send → the caller omits `tenant_id` → Rust device-default
+    // stamping, exactly as before. `TenantBadge` stays hidden (showSwitcher is
+    // also false in the single-tenant case), so no clutter and no wire change.
+    expect(pickSpawnTenant({ spawnTenantId: null, activeTenantId: null })).toBeUndefined();
+    expect(pickSpawnTenant({})).toBeUndefined();
   });
 });

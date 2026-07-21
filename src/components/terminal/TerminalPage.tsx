@@ -33,6 +33,7 @@ import { ConductorStatusStrip } from "./ConductorStatusStrip";
 import { UnzonedChip } from "./UnzonedChip";
 import { pickLayout } from "./useZoneLayout";
 import { buildCreatePlainTerminalAction } from "./createPlainTerminalAction";
+import { pickSpawnTenant } from "./SpawnTenantPicker";
 import { ResultCardProvider, ResultCardMount, useResultCard } from "./result-card";
 
 import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
@@ -134,8 +135,12 @@ function TerminalPageInner({
         id: "create-terminal",
         label: "Create Terminal",
         description: "Spawn a new PTY-backed terminal tab and assign it to the next free zone.",
+        // Thread the acting tenant (picker choice ?? active pin) so `tab.tenantId`
+        // matches what Rust stamps onto `Intent.tenant_id`; the badge then renders
+        // on this spawn path too. Deferred read (see the `resolveTenantForSpawn`
+        // note below) — the handler runs long after that const is initialized.
         handler: async () => {
-          await createTerminal();
+          await createTerminal(undefined, undefined, resolveTenantForSpawn());
         },
       },
       // Discoverable, named plain-terminal launcher on the now-primary
@@ -146,7 +151,9 @@ function TerminalPageInner({
       // from a fresh page. The inner arrow defers the `createAndAssignTerminal`
       // read to invocation time (it's declared below, same as the
       // `terminal-launch-menu` handlers that close over later consts).
-      buildCreatePlainTerminalAction((title) => createAndAssignTerminal(title)),
+      buildCreatePlainTerminalAction((title) =>
+        createAndAssignTerminal(title, undefined, resolveTenantForSpawn()),
+      ),
       {
         id: "list-terminals",
         label: "List Terminals",
@@ -866,7 +873,11 @@ function TerminalPageInner({
     dispatch,
     swapSource: uiState.swapSource,
     selectedZones: uiState.selectedZones,
-    createAndAssignTerminal,
+    // Ctrl+Shift+T is a new interactive spawn, so it records the acting tenant
+    // like every other spawn path. Deferred read of `resolveTenantForSpawn`
+    // (declared below) — the keydown handler only runs after render completes.
+    createAndAssignTerminal: () =>
+      createAndAssignTerminal(undefined, undefined, resolveTenantForSpawn()),
     closeTerminal,
     setActiveId,
     zoneLayout,
@@ -903,11 +914,10 @@ function TerminalPageInner({
   // tenant (the `/spawn-ai --tenant` flag) wins; otherwise the picker's
   // current selection; otherwise the device's active pin. `undefined` leaves
   // `tenant_id` off the wire and Rust stamps its own default (pre-F2
-  // behavior), which is what an unpaired device gets.
-  const resolveTenantForSpawn = (explicit?: string): string | undefined => {
-    const chosen = explicit?.trim() || spawnTenantId || activeTenantId;
-    return chosen ?? undefined;
-  };
+  // behavior), which is what a single-tenant/unpaired device gets. Delegates
+  // to the pure `pickSpawnTenant` so the precedence contract is unit-testable.
+  const resolveTenantForSpawn = (explicit?: string): string | undefined =>
+    pickSpawnTenant({ explicit, spawnTenantId, activeTenantId });
 
   const handleQuickLaunch = async (count: number, autoCommand?: string): Promise<string[]> => {
     const totalTabs = tabs.length + count;
@@ -1285,7 +1295,11 @@ function TerminalPageInner({
               the only honest surface for hidden sessions is this panel's
               Unassigned list; the UnzonedChip near the StatusStrip opens it. */}
           {uiState.showControlPanel && (
-            <ZoneControlPanel onCreateTerminal={() => createAndAssignTerminal()} />
+            <ZoneControlPanel
+              onCreateTerminal={() =>
+                createAndAssignTerminal(undefined, undefined, resolveTenantForSpawn())
+              }
+            />
           )}
 
           <TerminalRightPanel />
@@ -1339,7 +1353,11 @@ function TerminalPageInner({
                 const neededCount = profile.sessions.length;
                 const toCreate = Math.max(0, neededCount - existingTabCount);
                 for (let i = 0; i < toCreate; i++) {
-                  await createAndAssignTerminal();
+                  // These are brand-new blank terminals spawned NOW to fill the
+                  // profile's zones (not restored sessions carrying a stored
+                  // tenant), so they record the current acting tenant like any
+                  // other new spawn.
+                  await createAndAssignTerminal(undefined, undefined, resolveTenantForSpawn());
                 }
                 if (toCreate === 0) {
                   const assignedTabs = new Set<string>();

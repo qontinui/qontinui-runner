@@ -63,6 +63,37 @@ export function resolveSpawnTenant(args: {
   return active ?? undefined;
 }
 
+/**
+ * Page-level resolution of the tenant a spawn binds to — used by EVERY spawn
+ * path on the terminal page (console `/spawn`/`/spawn-ai --tenant`, the New
+ * Session button, the launch-menu `create-*` actions, the profile-load
+ * auto-fill, and Ctrl+Shift+T).
+ *
+ * Precedence: an explicit per-invocation tenant (the `/spawn-ai --tenant`
+ * flag) wins; else the picker's published selection (`spawnTenantId`, itself
+ * already the {@link resolveSpawnTenant} result); else the device's active
+ * pin. Returns `undefined` when nothing is known, so the caller omits
+ * `tenant_id` and Rust applies its own device-default stamping — byte-identical
+ * to pre-F2 behaviour on a single-tenant or unpaired device.
+ *
+ * Threading this through every spawn path (not just the console handlers) is
+ * what makes `TerminalTab.tenantId` equal what Rust stamps onto
+ * `Intent.tenant_id`, so `TenantBadge` renders on all new spawns, not only the
+ * console ones.
+ *
+ * Pure + exported so the precedence contract is unit-testable without
+ * rendering the page (the runner's vitest config is `environment: "node"`).
+ */
+export function pickSpawnTenant(args: {
+  explicit?: string;
+  spawnTenantId?: string | null;
+  activeTenantId?: string | null;
+}): string | undefined {
+  const { explicit, spawnTenantId, activeTenantId } = args;
+  const chosen = explicit?.trim() || spawnTenantId || activeTenantId;
+  return chosen ?? undefined;
+}
+
 /** Short display form for a tenant id (uuids share a long tail). */
 export function shortTenantId(tenantId: string): string {
   return tenantId.length > 8 ? tenantId.slice(0, 8) : tenantId;

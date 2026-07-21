@@ -70,6 +70,14 @@ export function TenantBadge({ tenantId, className }: TenantBadgeProps) {
 
   return (
     <span
+      // UI-Bridge-discoverable identity. `data-ui-bridge-id` is the runner's
+      // DOM-scan discovery attribute (same mechanism the sibling
+      // `SpawnTenantPicker` <select> uses, `terminal.spawn-tenant-picker`), so
+      // a snapshot / find-by-text sees this badge when it renders — it is a
+      // non-interactive <span> and would otherwise be invisible to the bridge.
+      // `data-testid` mirrors the neighbouring display badges (`ai-status-badge`).
+      data-ui-bridge-id="terminal.tenant-badge"
+      data-testid="tenant-badge"
       data-tenant-id={tenantId}
       className={`flex items-center gap-0.5 shrink-0 text-[8px] text-[#7aa2f7] bg-[#7aa2f7]/15 px-1 py-0 rounded font-mono ${
         className ?? ""
