@@ -1176,15 +1176,18 @@ const GENERIC_PREFIXES: &[&str] = &[
 /// every `list_sessions` payload.
 const MAX_DISPLAY_NAME_CHARS: usize = 50;
 
-/// Quoted record-kind names, used as a pre-filter before the per-line JSON
-/// parse. Matching the quoted KIND (not a bare `-title"` fragment) keeps prose
-/// that merely mentions the word from forcing a parse of every such line.
-const TITLE_KIND_MARKERS: [&str; 2] = ["\"custom-title\"", "\"ai-title\""];
+/// Single cheap substring shared by every title record (`"custom-title"` /
+/// `"ai-title"` both end `-title"`). Used only as a fast pre-filter; a match
+/// still has to survive the JSON parse and the authoritative `type` check, so
+/// the odd prose line that happens to contain it costs one rejected parse, not
+/// a wrong title. One `contains` = one buffer scan (see `may_carry_title_record`).
+const TITLE_RECORD_MARKER: &str = "-title\"";
 
-/// True when a chunk of text could contain a title record. Cheap substring
-/// test; a true result still has to survive the JSON parse and the `type` check.
+/// True when a chunk of text could contain a title record. A single-pass
+/// substring test; correctness comes from the downstream parse + `type` check,
+/// so this only has to be cheap and never a false NEGATIVE.
 fn may_carry_title_record(text: &str) -> bool {
-    TITLE_KIND_MARKERS.iter().any(|m| text.contains(m))
+    text.contains(TITLE_RECORD_MARKER)
 }
 
 /// Minimum characters that must precede a space before the word-boundary
@@ -1220,32 +1223,36 @@ fn truncate_display_name(text: &str) -> String {
 /// Normalize a raw title into something safe to render on one line, or `None`
 /// when nothing renderable survives.
 ///
-/// A `/rename` argument is arbitrary operator text: it can carry ANSI escapes
-/// (pasted from a terminal), markup, embedded newlines, or enough length to
-/// break the card layout. Applies the same scrubbing every heuristic-derived
-/// name gets — so titled and untitled sessions in one list look consistent.
+/// A title is LITERAL operator/Claude text (a `/rename` argument or an
+/// ai-title), not markup or a prompt — so this does the minimum that keeps it
+/// renderable and NOTHING that rewrites its content. Specifically it does NOT
+/// strip `<…>` (a title may legitimately contain `use Vec<String>` or `x < y`)
+/// and does NOT strip leading `#` (a title may be `#42 hotfix`); doing either
+/// silently mangles the name the operator deliberately chose. That markdown/tag
+/// scrubbing is correct for `generate_display_name`, whose input is a first
+/// user MESSAGE, but wrong here.
 ///
-/// Returns `None` when the result is empty (e.g. a title made only of escape
-/// sequences), so the caller falls through to the next source instead of
-/// rendering a blank, unidentifiable card.
+/// Kept: strip ANSI (pasted terminal escapes are noise), flatten every control
+/// char and whitespace run to single spaces (a title is one line), and bound
+/// the length. Returns `None` when nothing renderable survives (e.g. a title of
+/// only escape sequences), so the caller falls through to the next source
+/// rather than render a blank, unidentifiable card.
 fn sanitize_title(raw: &str) -> Option<String> {
     let stripped = super::strip_ansi(raw);
-    // Defense in depth: `strip_ansi` terminates OSC only on BEL, so an
-    // ST-terminated (`ESC \`) sequence can leave stray control bytes behind.
-    // Map every remaining control char to a space rather than deleting it, so
-    // words either side stay separated.
-    let decontrolled: String = stripped
+    // `strip_ansi` terminates OSC only on BEL, so an ST-terminated (`ESC \`)
+    // sequence can leave stray control bytes; treat every control char as a
+    // separator so words either side stay apart, then collapse whitespace runs.
+    let flat = stripped
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    let no_tags = strip_xml_tags(&decontrolled);
-    // Flatten newlines/tabs/runs — a title is a single-line label.
-    let flat = no_tags.split_whitespace().collect::<Vec<_>>().join(" ");
-    let flat = flat.trim().trim_start_matches('#').trim();
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     if flat.is_empty() {
         return None;
     }
-    Some(truncate_display_name(flat))
+    Some(truncate_display_name(&flat))
 }
 
 /// Extract the session's own Claude Code title, if it has one.
@@ -1359,10 +1366,12 @@ fn generate_display_name(first_preview: &Option<String>, last_modified: &str) ->
                 .unwrap_or(after_prefix);
 
             // Shared with the title path so both label sources obey one
-            // ceiling — and so neither can byte-slice a multi-byte character
-            // (the previous `&clean[..50]` here panicked on CJK/emoji input,
-            // taking down the whole session listing).
-            return truncate_display_name(first_line.trim_end_matches("..."));
+            // ceiling char-safely — the previous `&clean[..50]` byte-slice here
+            // panicked on CJK/emoji input, taking down the whole session
+            // listing. `truncate_display_name` returns a short line verbatim, so
+            // a user's own trailing "..." is preserved and a dots-only line
+            // ("......") stays non-empty instead of collapsing to a blank card.
+            return truncate_display_name(first_line);
         }
     }
 
@@ -2114,12 +2123,47 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_title_strips_markup_like_the_heuristic_path() {
+    fn test_sanitize_title_preserves_literal_angle_brackets() {
+        // A title is literal text — `<…>` is content, not markup. Stripping it
+        // (as the message heuristic does) silently truncates real names.
         assert_eq!(
-            sanitize_title("<b>fix login</b>").as_deref(),
-            Some("fix login")
+            sanitize_title("use Vec<String>").as_deref(),
+            Some("use Vec<String>")
         );
-        assert_eq!(sanitize_title("## Plan").as_deref(), Some("Plan"));
+        assert_eq!(
+            sanitize_title("Fix a<b sort bug").as_deref(),
+            Some("Fix a<b sort bug")
+        );
+        assert_eq!(sanitize_title("if x < y").as_deref(), Some("if x < y"));
+    }
+
+    #[test]
+    fn test_sanitize_title_preserves_leading_hash() {
+        // `#42` is a deliberate issue reference, not a markdown heading marker.
+        assert_eq!(sanitize_title("#42 hotfix").as_deref(), Some("#42 hotfix"));
+        assert_eq!(
+            sanitize_title("##1 blocker").as_deref(),
+            Some("##1 blocker")
+        );
+    }
+
+    #[test]
+    fn test_generate_display_name_dots_only_line_is_not_blank() {
+        // A first meaningful line of only dots must not collapse to an empty,
+        // unidentifiable card.
+        let name = generate_display_name(&Some("......".to_string()), "2025-03-07T14:30:00Z");
+        assert!(!name.is_empty());
+    }
+
+    #[test]
+    fn test_generate_display_name_preserves_user_trailing_ellipsis() {
+        // A short preview the user actually ended with "..." keeps it — the
+        // ellipsis is a real content cue, not our truncation marker.
+        let name = generate_display_name(
+            &Some("Refactor payment module...".to_string()),
+            "2025-03-07T14:30:00Z",
+        );
+        assert_eq!(name, "Refactor payment module...");
     }
 
     #[test]
