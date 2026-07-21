@@ -73,7 +73,7 @@
 //! unexpected IO error is treated AS building (skip, retry next tick).
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use tracing::{debug, info, warn};
@@ -90,6 +90,17 @@ const DEFAULT_RECLAIM_INTERVAL_SECS: u64 = 300;
 /// actively building and skipped. Override via
 /// `QONTINUI_WORKTREE_RECLAIM_ACTIVITY_WINDOW_SECS`.
 const DEFAULT_ACTIVITY_WINDOW_SECS: u64 = 600;
+
+/// Default cadence of the low-frequency local `git worktree prune` pass
+/// (Phase 3 registration hygiene) — daily. Override via
+/// `QONTINUI_WORKTREE_PRUNE_INTERVAL_SECS`.
+const DEFAULT_PRUNE_INTERVAL_SECS: u64 = 86_400;
+
+/// Default age ceiling for the coord-absent local backstop sweep (Phase 4)
+/// — 14 days. A session-worktree dir must be OLDER than this (by mtime)
+/// before the backstop may even consider it. Override via
+/// `QONTINUI_WORKTREE_BACKSTOP_MAX_AGE_SECS`.
+const DEFAULT_BACKSTOP_MAX_AGE_SECS: u64 = 14 * 86_400;
 
 // ---------------------------------------------------------------------------
 // Wire types — coord serializes these.
@@ -706,7 +717,25 @@ fn execute_pull(pull: &ReclaimPull) {
             canonical.as_deref(),
             root_exists,
         );
-        let _ = execute_steps(&instr.worktree_path, &steps);
+        let removed = execute_steps(&instr.worktree_path, &steps).is_ok()
+            && steps
+                .iter()
+                .any(|s| matches!(s, ReclaimStep::RemoveWorktree(_)));
+        // Phase 3 registration hygiene: after a SUCCESSFUL removal, prune
+        // the parent repo's `.git/worktrees/` registration. Best-effort —
+        // a prune failure warns inside `prune_parent_repo`, never fails
+        // the removal result.
+        if removed {
+            if let Some(c) = canonical.as_deref() {
+                prune_parent_repo(c);
+            } else {
+                debug!(
+                    "worktree_reclaim: removed {} but no canonical path for repo {} — \
+                     registration prune deferred to the daily pass",
+                    instr.worktree_path, instr.repo
+                );
+            }
+        }
     }
 }
 
@@ -743,6 +772,372 @@ pub(super) fn execute_steps(worktree_path: &str, steps: &[ReclaimStep]) -> Resul
     match first_err {
         Some(e) => Err(e),
         None => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 — registration hygiene (`git worktree prune`).
+//
+// `git worktree remove` prunes its own registration, but the `remove_dir_all`
+// fallback and every out-of-band deletion (operator cleanup, another machine,
+// the Phase 4 backstop below) leave a stale entry in the parent repo's
+// `.git/worktrees/` forever — 1,064 had piled up in qontinui-coord by
+// 2026-07-19 because nothing ever ran `git worktree prune`. Two surfaces fix
+// that: a best-effort prune after every successful reclaim removal, and a
+// low-frequency (daily) prune pass over every canonical checkout.
+//
+// Prune is registration-only: `git worktree prune` deletes ONLY
+// `.git/worktrees/<id>` entries whose worktree dir is gone — it never
+// creates or deletes a working directory, so it can never resurrect a husk
+// (the husk-guard invariant: reclaim never creates filesystem paths).
+// ---------------------------------------------------------------------------
+
+/// Parse a seconds value from a raw env string; `None` / unparseable →
+/// `default`. Pure (env reading lifted to callers) so tests never mutate
+/// the process-global environment.
+fn parse_secs_env(raw: Option<&str>, default: u64) -> u64 {
+    raw.and_then(|s| s.trim().parse().ok()).unwrap_or(default)
+}
+
+/// Cadence of the daily local prune + backstop maintenance pass.
+fn prune_interval_secs() -> u64 {
+    parse_secs_env(
+        std::env::var("QONTINUI_WORKTREE_PRUNE_INTERVAL_SECS")
+            .ok()
+            .as_deref(),
+        DEFAULT_PRUNE_INTERVAL_SECS,
+    )
+}
+
+/// Age ceiling for the Phase 4 backstop sweep.
+fn backstop_max_age_secs() -> u64 {
+    parse_secs_env(
+        std::env::var("QONTINUI_WORKTREE_BACKSTOP_MAX_AGE_SECS")
+            .ok()
+            .as_deref(),
+        DEFAULT_BACKSTOP_MAX_AGE_SECS,
+    )
+}
+
+/// The exact git argv (after the `git` binary) for a registration prune of
+/// `repo_root`. Pure — unit tests pin the invocation shape.
+fn prune_command_args(repo_root: &Path) -> Vec<String> {
+    vec![
+        "-C".to_string(),
+        repo_root.to_string_lossy().to_string(),
+        "worktree".to_string(),
+        "prune".to_string(),
+    ]
+}
+
+/// Best-effort `git worktree prune` in a parent repo's canonical checkout.
+/// NEVER fails the caller: a missing dir / non-repo / git failure logs a
+/// warning and returns. Creates nothing, deletes no working directory —
+/// registration metadata only.
+pub(super) fn prune_parent_repo(repo_root: &Path) {
+    if !repo_root.is_dir() {
+        debug!(
+            "worktree_reclaim: prune skipped — {} is not a directory",
+            repo_root.display()
+        );
+        return;
+    }
+    let args = prune_command_args(repo_root);
+    match crate::process_helpers::no_window("git").args(&args).output() {
+        Ok(o) if o.status.success() => {
+            debug!(
+                "worktree_reclaim: git worktree prune ok in {}",
+                repo_root.display()
+            );
+        }
+        Ok(o) => {
+            warn!(
+                "worktree_reclaim: git worktree prune in {} failed: {}",
+                repo_root.display(),
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+        }
+        Err(e) => {
+            warn!(
+                "worktree_reclaim: spawn git worktree prune in {}: {e}",
+                repo_root.display()
+            );
+        }
+    }
+}
+
+/// Enumerate every canonical repo checkout under the workspace root —
+/// reuses the census's discovery contract exactly (`qontinui_root()` for the
+/// root, [`super::census::is_canonical_repo_dir`] for the name filter, plus
+/// a `.git` presence check) so there is no second repo-discovery notion to
+/// drift from.
+fn enumerate_canonical_checkouts() -> Vec<PathBuf> {
+    let Some(root) = super::census::qontinui_root() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if super::census::is_canonical_repo_dir(name) && path.join(".git").exists() {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// The daily prune pass: `git worktree prune` in every canonical checkout.
+/// Covers registrations orphaned by manual deletions that never went
+/// through [`remove_worktree`].
+fn prune_all_canonical_checkouts() {
+    let repos = enumerate_canonical_checkouts();
+    if repos.is_empty() {
+        debug!("worktree_reclaim: prune pass — no canonical checkouts resolved");
+        return;
+    }
+    info!(
+        "worktree_reclaim: daily prune pass over {} canonical checkout(s)",
+        repos.len()
+    );
+    for repo in repos {
+        prune_parent_repo(&repo);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 — coord-absent local backstop sweep (LAST RESORT).
+//
+// 2,873 leaked session-worktree dirs (~60 GB) filled the disk on 2026-07-19:
+// coord's reclaim was unarmed + blind to the `<root>/<session-uuid>/<repo>`
+// path shape, the leaked dirs had no coord ledger rows, and the coord census
+// has a 24 h retention — so nothing anywhere would EVER delete them. This
+// sweep is the machine-local defense-in-depth for exactly that state: it
+// deletes a session-worktree dir only when BOTH
+//   (a) its mtime age exceeds a generous ceiling (default 14 days), AND
+//   (b) coord has been unreachable-or-unarmed for this poller's ENTIRE
+//       session (a monotonic boolean that flips permanently to "coord was
+//       live" on the first successful pull with any arming flag on).
+// (b) guarantees the backstop can never race a coord-issued instruction:
+// the moment coord's lifecycle is live, the backstop is suppressed for the
+// rest of the process lifetime. Dirty trees are never touched, and deletion
+// goes through the same INV-W4 plan machinery (junction-unlink-first via
+// [`execute_steps`]) as coord-issued removals.
+// ---------------------------------------------------------------------------
+
+/// Pure eligibility for one backstop deletion. `true` only when the dir's
+/// age STRICTLY exceeds the ceiling, coord was never seen live+armed this
+/// session, and the tree is clean. This is the function the unit tests pin.
+pub(super) fn backstop_eligible(
+    age_secs: u64,
+    ceiling_secs: u64,
+    coord_ever_live: bool,
+    is_dirty: bool,
+) -> bool {
+    !coord_ever_live && !is_dirty && age_secs > ceiling_secs
+}
+
+/// Tri-state dirtiness verdict for the backstop (stricter than
+/// [`worktree_is_dirty`], which maps every failure to "not dirty" — fine for
+/// a coord-vetted instruction, NOT fine for an autonomous local delete).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackstopDirty {
+    /// `git status --porcelain` succeeded and was empty, OR the dir has no
+    /// `.git` at all (plain leaked dir — nothing to be dirty).
+    Clean,
+    /// `git status --porcelain` succeeded and was non-empty — WIP, never
+    /// delete.
+    Dirty,
+    /// A `.git` file/dir is present but `git status` failed (corrupt or
+    /// unreadable repo) — we can't prove it's clean, so skip and log.
+    CorruptSkip,
+}
+
+/// Execution-time dirtiness check for one backstop candidate.
+fn backstop_dirty_verdict(path: &Path) -> BackstopDirty {
+    let has_git = path.join(".git").exists();
+    let Some(path_str) = path.to_str() else {
+        // Un-stringable path — treat like corrupt: skip.
+        return BackstopDirty::CorruptSkip;
+    };
+    match crate::process_helpers::no_window("git")
+        .args(["-C", path_str, "status", "--porcelain"])
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            if o.stdout.iter().all(|b| b.is_ascii_whitespace()) {
+                BackstopDirty::Clean
+            } else {
+                BackstopDirty::Dirty
+            }
+        }
+        // Status failed: only a dir with NO `.git` may be treated as clean;
+        // a corrupt-but-present `.git` is skipped.
+        _ if !has_git => BackstopDirty::Clean,
+        _ => BackstopDirty::CorruptSkip,
+    }
+}
+
+/// mtime age of `path` in whole seconds. `None` when the metadata / mtime
+/// is unreadable or the mtime is in the future (clock skew) — callers skip
+/// (conservative: an unmeasurable age is never "old enough").
+fn dir_age_secs(path: &Path) -> Option<u64> {
+    let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
+    mtime.elapsed().ok().map(|d| d.as_secs())
+}
+
+/// The session-worktree root (`<workspace-parent>/qontinui-worktrees`, or
+/// the env override) under which `<session-uuid>/<repo>` dirs materialize.
+/// Resolved through [`super::canonical_paths::agent_worktree_root`] so the
+/// sweep honors the same `QONTINUI_WORKTREE_ROOT` / `COORD_WORKTREE_ROOT`
+/// override as materialization; only the canonical's PARENT feeds the
+/// default, so any direct child of the workspace root anchors it.
+fn session_worktree_root() -> Option<PathBuf> {
+    let root = super::census::qontinui_root()?;
+    Some(super::canonical_paths::agent_worktree_root(
+        &root.join("qontinui-runner"),
+    ))
+}
+
+/// One backstop sweep over `<session_root>/<session-uuid>/<repo>` dirs.
+/// `coord_ever_live` is the poller's monotonic liveness boolean — `true`
+/// suppresses the entire sweep (last-resort contract). Best-effort: every
+/// failure logs and moves on; the sweep never propagates an error.
+fn backstop_sweep(coord_ever_live: bool) {
+    if coord_ever_live {
+        debug!("worktree_backstop: coord seen live+armed this session — sweep suppressed");
+        return;
+    }
+    let ceiling = backstop_max_age_secs();
+    let Some(root) = session_worktree_root() else {
+        debug!("worktree_backstop: no session-worktree root resolved — skipping");
+        return;
+    };
+    let sessions = match std::fs::read_dir(&root) {
+        Ok(r) => r,
+        Err(_) => return, // root absent → nothing leaked
+    };
+    for session in sessions.flatten() {
+        let session_dir = session.path();
+        if !session_dir.is_dir() {
+            continue;
+        }
+        // Only session-UUID dirs are governed — anything else under the
+        // root (operator scratch, unrelated tooling) is out of scope.
+        let is_session = session_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| Uuid::parse_str(n).is_ok());
+        if !is_session {
+            debug!(
+                "worktree_backstop: {} is not a session-uuid dir — out of scope",
+                session_dir.display()
+            );
+            continue;
+        }
+        let repos = match std::fs::read_dir(&session_dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for repo_entry in repos.flatten() {
+            let repo_dir = repo_entry.path();
+            if !repo_dir.is_dir() {
+                continue;
+            }
+            backstop_consider_one(&repo_dir, ceiling, coord_ever_live);
+        }
+        // Hygiene: a session dir left empty by the sweep (or by earlier
+        // partial cleanup) is removed non-recursively — fails harmlessly
+        // when anything remains inside.
+        let _ = std::fs::remove_dir(&session_dir);
+    }
+}
+
+/// Evaluate + (maybe) delete ONE session-worktree repo dir. Split out of
+/// [`backstop_sweep`] so the per-dir guard ordering reads linearly.
+fn backstop_consider_one(repo_dir: &Path, ceiling: u64, coord_ever_live: bool) {
+    // Age first — unmeasurable age is never old enough.
+    let Some(age) = dir_age_secs(repo_dir) else {
+        debug!(
+            "worktree_backstop: {} mtime unreadable — skipping",
+            repo_dir.display()
+        );
+        return;
+    };
+    // Dirtiness (WIP is sacred; corrupt-but-present .git is skipped).
+    let dirty = match backstop_dirty_verdict(repo_dir) {
+        BackstopDirty::Clean => false,
+        BackstopDirty::Dirty => true,
+        BackstopDirty::CorruptSkip => {
+            warn!(
+                "worktree_backstop: {} has a .git but `git status` failed (corrupt?) — skipping",
+                repo_dir.display()
+            );
+            return;
+        }
+    };
+    if !backstop_eligible(age, ceiling, coord_ever_live, dirty) {
+        return;
+    }
+    // G6 — never touch a tree that is currently building (belt-and-braces:
+    // a >14-day-old mtime makes this near-impossible, but the probe is
+    // cheap and the reclaim executor's contract is uniform).
+    if probe_building(repo_dir) {
+        info!(
+            "worktree_backstop: {} building — skipping this pass",
+            repo_dir.display()
+        );
+        return;
+    }
+    // INV-W4: unlink every top-level junction (plus the Tauri-layout
+    // `src-tauri/target`) BEFORE the recursive removal, via the same step
+    // machinery as coord-issued removals ([`execute_steps`] aborts the plan
+    // on a failed unlink so the removal can never recurse through a live
+    // reparse point).
+    let mut steps: Vec<ReclaimStep> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(repo_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if is_junction(&p) {
+                steps.push(ReclaimStep::UnlinkJunction(p));
+            }
+        }
+    }
+    let st_target = repo_dir.join("src-tauri").join("target");
+    if is_junction(&st_target) {
+        steps.push(ReclaimStep::UnlinkJunction(st_target));
+    }
+    steps.push(ReclaimStep::RemoveWorktree(repo_dir.to_path_buf()));
+
+    let wt_str = repo_dir.to_string_lossy().to_string();
+    match execute_steps(&wt_str, &steps) {
+        Ok(()) => {
+            warn!(
+                "worktree_backstop: DELETED {} (age={}d > ceiling {}d; coord absent/unarmed \
+                 for entire poller session — last-resort local backstop)",
+                repo_dir.display(),
+                age / 86_400,
+                ceiling / 86_400
+            );
+            // Phase 3 hygiene: prune the parent repo's registration.
+            if let Some(repo_name) = repo_dir.file_name().and_then(|n| n.to_str()) {
+                if let Ok(canonical) = super::canonical_paths::default_canonical_path(repo_name) {
+                    prune_parent_repo(&canonical);
+                }
+            }
+        }
+        Err(e) => {
+            warn!(
+                "worktree_backstop: failed to delete {}: {e}",
+                repo_dir.display()
+            );
+        }
     }
 }
 
@@ -806,12 +1201,16 @@ pub(super) async fn fetch_pull() -> Result<Option<(Uuid, ReclaimPull)>, String> 
     Ok(Some((device_id, pull)))
 }
 
-/// One reclaim cycle: pull + execute. Returns `Ok(())` on a clean skip or
-/// a successful pull; `Err` only on a transport / non-2xx failure.
-pub async fn tick_once() -> Result<(), String> {
+/// One reclaim cycle: pull + execute. Returns `Ok(live_armed)` on a clean
+/// skip or a successful pull — the bool is `true` iff coord responded
+/// successfully AND at least one arming flag was on (the signal that flips
+/// the poller's monotonic `coord_ever_live`, permanently suppressing the
+/// Phase 4 backstop). `Err` only on a transport / non-2xx failure.
+pub async fn tick_once() -> Result<bool, String> {
     let Some((_device_id, pull)) = fetch_pull().await? else {
-        return Ok(());
+        return Ok(false);
     };
+    let live_armed = pull.rejunction_armed || pull.remove_armed;
 
     // execute_pull runs synchronous git/cmd subprocesses and filesystem
     // removals — potentially long (junction unlinks + worktree deletes).
@@ -821,7 +1220,7 @@ pub async fn tick_once() -> Result<(), String> {
     tokio::task::spawn_blocking(move || execute_pull(&pull))
         .await
         .map_err(|e| format!("reclaim execution panicked: {e}"))?;
-    Ok(())
+    Ok(live_armed)
 }
 
 /// Spawn the periodic reclaim poller. Interval from
@@ -860,10 +1259,47 @@ pub fn spawn_reclaim() {
         }
         let mut tick = tokio::time::interval(Duration::from_secs(secs));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Phase 4: monotonic coord-liveness. Flips to `true` on the FIRST
+        // successful pull with any arming flag on, and never back — from
+        // that moment the local backstop sweep is suppressed for the rest
+        // of the process lifetime (coord's lifecycle owns reclaim).
+        let mut coord_ever_live = false;
+        // Phase 3/4: the daily maintenance pass (registration prune +
+        // backstop sweep). The FIRST pass is deliberately deferred one full
+        // interval after boot: a runner that boots during a coord outage
+        // must not mass-delete on its first tick, and with a 14-day ceiling
+        // a one-day deferral is immaterial.
+        let mut last_maintenance = Instant::now();
         loop {
             tick.tick().await;
-            if let Err(e) = tick_once().await {
-                warn!("worktree_reclaim: {e}");
+            match tick_once().await {
+                Ok(true) => {
+                    if !coord_ever_live {
+                        info!(
+                            "worktree_reclaim: coord live+armed — local backstop permanently \
+                             suppressed for this poller session"
+                        );
+                    }
+                    coord_ever_live = true;
+                }
+                Ok(false) => {}
+                Err(e) => warn!("worktree_reclaim: {e}"),
+            }
+
+            let interval = Duration::from_secs(prune_interval_secs());
+            if last_maintenance.elapsed() >= interval {
+                last_maintenance = Instant::now();
+                let ever_live = coord_ever_live;
+                // Blocking pool: the pass runs git subprocesses + dir walks.
+                if let Err(e) = tokio::task::spawn_blocking(move || {
+                    prune_all_canonical_checkouts();
+                    backstop_sweep(ever_live);
+                })
+                .await
+                {
+                    warn!("worktree_reclaim: maintenance pass panicked: {e}");
+                }
             }
         }
     });
@@ -1309,5 +1745,135 @@ mod tests {
         std::fs::create_dir_all(&release).unwrap();
         std::fs::write(release.join(".cargo-lock"), b"").unwrap();
         assert!(!worktree_is_building(dir.path(), Duration::from_secs(0)));
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 3 — registration hygiene (`git worktree prune`).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn prune_invocation_shape_is_registration_only() {
+        // The exact argv pins the invocation: `git -C <repo> worktree prune`
+        // — a registration-metadata operation with no path-creating or
+        // recursive-delete flags.
+        let args = prune_command_args(Path::new("D:/qontinui-root/qontinui-runner"));
+        assert_eq!(
+            args,
+            vec![
+                "-C".to_string(),
+                "D:/qontinui-root/qontinui-runner".to_string(),
+                "worktree".to_string(),
+                "prune".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn prune_on_missing_dir_is_a_noop_that_creates_nothing() {
+        // Husk-guard regression class: pruning must NEVER resurrect (or
+        // create) a directory. A missing repo root stays missing.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gone-repo");
+        prune_parent_repo(&missing);
+        assert!(!missing.exists(), "prune must not create the repo dir");
+    }
+
+    #[test]
+    fn prune_on_non_repo_dir_creates_no_entries() {
+        // Best-effort contract: a non-git dir warns (git fails) but the
+        // dir's contents are untouched and nothing new appears — a pruned
+        // registration can never re-materialize a worktree dir.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("keep.txt"), b"data").unwrap();
+        prune_parent_repo(dir.path());
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("keep.txt")]);
+    }
+
+    #[test]
+    fn secs_env_parses_and_defaults() {
+        // Good value → parsed; bad/missing → default.
+        assert_eq!(parse_secs_env(Some("120"), 86_400), 120);
+        assert_eq!(parse_secs_env(Some(" 120 "), 86_400), 120);
+        assert_eq!(parse_secs_env(Some("not-a-number"), 86_400), 86_400);
+        assert_eq!(parse_secs_env(Some(""), 86_400), 86_400);
+        assert_eq!(parse_secs_env(Some("-5"), 86_400), 86_400);
+        assert_eq!(parse_secs_env(None, 86_400), 86_400);
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 4 — coord-absent local backstop sweep.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn backstop_ceiling_boundary() {
+        let ceiling = DEFAULT_BACKSTOP_MAX_AGE_SECS;
+        // Just-under and exactly-at the ceiling → NOT eligible (strictly
+        // greater required).
+        assert!(!backstop_eligible(ceiling - 1, ceiling, false, false));
+        assert!(!backstop_eligible(ceiling, ceiling, false, false));
+        // Just-over → eligible.
+        assert!(backstop_eligible(ceiling + 1, ceiling, false, false));
+    }
+
+    #[test]
+    fn backstop_suppressed_once_coord_seen_live() {
+        // The monotonic boolean: coord seen live+armed ONCE suppresses the
+        // backstop for the whole session, regardless of age.
+        let ceiling = DEFAULT_BACKSTOP_MAX_AGE_SECS;
+        assert!(!backstop_eligible(ceiling * 10, ceiling, true, false));
+    }
+
+    #[test]
+    fn backstop_never_deletes_dirty_trees() {
+        let ceiling = DEFAULT_BACKSTOP_MAX_AGE_SECS;
+        assert!(!backstop_eligible(ceiling * 10, ceiling, false, true));
+        // And dirty + coord-live together is doubly ineligible.
+        assert!(!backstop_eligible(ceiling * 10, ceiling, true, true));
+    }
+
+    #[test]
+    fn backstop_dirty_verdict_no_git_is_clean() {
+        // A plain leaked dir with no `.git` at all: `git status` fails, but
+        // there is nothing to be dirty → Clean (deletable).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("leftover.txt"), b"x").unwrap();
+        assert_eq!(backstop_dirty_verdict(dir.path()), BackstopDirty::Clean);
+    }
+
+    #[test]
+    fn backstop_dirty_verdict_corrupt_git_skips() {
+        // A `.git` dir is PRESENT but empty/corrupt → `git status` fails →
+        // CorruptSkip (we can't prove it's clean, so never delete).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        assert_eq!(
+            backstop_dirty_verdict(dir.path()),
+            BackstopDirty::CorruptSkip
+        );
+    }
+
+    #[test]
+    fn backstop_env_override_bad_value_falls_back_to_default() {
+        // The env plumbing shares parse_secs_env; pin the two defaults.
+        assert_eq!(
+            parse_secs_env(Some("garbage"), DEFAULT_BACKSTOP_MAX_AGE_SECS),
+            14 * 86_400
+        );
+        assert_eq!(
+            parse_secs_env(None, DEFAULT_PRUNE_INTERVAL_SECS),
+            86_400
+        );
+    }
+
+    #[test]
+    fn backstop_sweep_suppressed_when_coord_ever_live() {
+        // With coord seen live, the sweep is a pure no-op — safe to call
+        // directly in tests (it must return before touching any real root).
+        backstop_sweep(true);
     }
 }
