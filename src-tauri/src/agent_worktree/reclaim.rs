@@ -843,7 +843,10 @@ pub(super) fn prune_parent_repo(repo_root: &Path) {
         return;
     }
     let args = prune_command_args(repo_root);
-    match crate::process_helpers::no_window("git").args(&args).output() {
+    match crate::process_helpers::no_window("git")
+        .args(&args)
+        .output()
+    {
         Ok(o) if o.status.success() => {
             debug!(
                 "worktree_reclaim: git worktree prune ok in {}",
@@ -1864,10 +1867,7 @@ mod tests {
             parse_secs_env(Some("garbage"), DEFAULT_BACKSTOP_MAX_AGE_SECS),
             14 * 86_400
         );
-        assert_eq!(
-            parse_secs_env(None, DEFAULT_PRUNE_INTERVAL_SECS),
-            86_400
-        );
+        assert_eq!(parse_secs_env(None, DEFAULT_PRUNE_INTERVAL_SECS), 86_400);
     }
 
     #[test]
