@@ -14,6 +14,15 @@ export interface TranscriptSession {
   has_plans: boolean;
   display_name: string;
   /**
+   * The real `--resume` name for this session: the label set via Claude's
+   * `/rename` (a `custom-title` transcript record — last one wins), else the
+   * auto-generated `summary`. Distinct from `display_name` (a first-user-message
+   * preview). Absent when the transcript carries neither record — consumers
+   * fall back to `display_name`. Backed by the Rust `TranscriptSession`'s
+   * `resume_name` field (`extract_resume_name_from_path`).
+   */
+  resume_name?: string | null;
+  /**
    * Optional `liveStatus` override populated only by the runner's
    * debug-gated `/ui-bridge/test/inject-session` path
    * (`mcp::test_fixtures` in qontinui-runner). Real on-disk transcripts
