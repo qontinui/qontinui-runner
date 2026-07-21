@@ -1292,6 +1292,89 @@ pub(crate) fn probe_and_breadcrumb_proxy(workdir: &str, port: u16) {
     });
 }
 
+/// Restrict `path` so only the owning user can read it.
+///
+/// Every file this module writes carries a coord proxy **nonce** — a
+/// replayable credential that authenticates as this device (or agent) against
+/// coord. They were written with default permissions, i.e. world-readable, and
+/// they are long-lived: a config minted 2026-07-13 was still valid and readable
+/// by any local process on 2026-07-21. Any process running as any local user
+/// could read one and act with this principal's authority.
+///
+/// **Best-effort by design — a failure here is logged, never fatal.** Losing
+/// coord-mcp delivery is a strictly worse outcome than a permissive file, and
+/// hard-failing would break every session spawn on any filesystem where the
+/// call misbehaves (network shares, exotic ACL states). The credential is no
+/// worse off than before the call.
+///
+/// `is_dir` additionally makes the restriction inheritable, so files created
+/// inside later are covered. Pass `false` for a file whose PARENT must stay
+/// accessible — notably `<repo>/.mcp.json`, whose parent is a repo working-tree
+/// root that other tooling and the operator must keep using.
+fn restrict_to_owner(path: &Path, is_dir: bool) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if is_dir { 0o700 } else { 0o600 };
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
+            warn!(
+                "coord_mcp: could not restrict {} to {mode:o}: {e} — \
+                 the file remains readable by other local users",
+                path.display()
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        // No std API sets a Windows DACL (`set_permissions` only toggles the
+        // read-only attribute), and the `windows` crate route needs a
+        // hand-built DACL. `icacls` is a built-in, is what an operator would
+        // run by hand, and keeps this reviewable — so no new dependency.
+        //
+        // /inheritance:r drops inherited ACEs (otherwise the permissive parent
+        // ACL keeps granting access); /grant:r replaces rather than adds.
+        let Some(user) = std::env::var("USERNAME").ok().filter(|u| !u.is_empty()) else {
+            warn!(
+                "coord_mcp: USERNAME unset — cannot restrict {}; \
+                 it remains readable by other local users",
+                path.display()
+            );
+            return;
+        };
+        let grant = if is_dir {
+            format!("{user}:(OI)(CI)(F)")
+        } else {
+            format!("{user}:(F)")
+        };
+        match std::process::Command::new("icacls")
+            .arg(path)
+            .arg("/inheritance:r")
+            .arg("/grant:r")
+            .arg(&grant)
+            .output()
+        {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => warn!(
+                "coord_mcp: icacls could not restrict {}: {} — \
+                 it remains readable by other local users",
+                path.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            Err(e) => warn!(
+                "coord_mcp: could not run icacls for {}: {e} — \
+                 it remains readable by other local users",
+                path.display()
+            ),
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (path, is_dir);
+    }
+}
+
 fn write_mcp_json(primary_wt: &str, mcp_config: &serde_json::Value) {
     let mcp_path = Path::new(primary_wt).join(".mcp.json");
     match std::fs::write(
@@ -1299,6 +1382,9 @@ fn write_mcp_json(primary_wt: &str, mcp_config: &serde_json::Value) {
         serde_json::to_string_pretty(mcp_config).unwrap_or_default(),
     ) {
         Ok(()) => {
+            // File only — the parent is a repo working-tree root that other
+            // tooling and the operator must keep using.
+            restrict_to_owner(&mcp_path, false);
             info!("coord_mcp: wrote .mcp.json for coord-mcp in {}", primary_wt);
         }
         Err(e) => {
@@ -1635,12 +1721,16 @@ pub(crate) fn provision_coord_mcp_config_file(workdir: &str) -> Option<std::path
         );
         return None;
     }
+    // Restrict the directory BEFORE writing, so the credential is never even
+    // briefly world-readable inside a permissive parent.
+    restrict_to_owner(&dir, true);
     let file = dir.join(mcp_config_file_name(workdir));
     match std::fs::write(
         &file,
         serde_json::to_string_pretty(&mcp_config).unwrap_or_default(),
     ) {
         Ok(()) => {
+            restrict_to_owner(&file, false);
             info!(
                 "coord_mcp: wrote --mcp-config file {} for workdir {workdir}",
                 file.display()
@@ -2351,6 +2441,56 @@ mod tests {
             "no bound port ⇒ the mint route refuses to mint (fail-closed, shared with the seam)"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every config this module writes carries a replayable proxy nonce, so it
+    /// must not be world-readable. Regression for the 2026-07-21 finding: a
+    /// config minted 2026-07-13 was still `-rw-r--r--` and still valid, so any
+    /// local process could read it and act as this device.
+    ///
+    /// The `unix` arm asserts the mode exactly. On Windows the DACL is set via
+    /// `icacls`, whose result is not readable through `std::fs::Permissions` —
+    /// so there the regression that actually matters is **self-lockout**: after
+    /// restricting, we must still be able to read our own credential back.
+    #[test]
+    fn restrict_to_owner_makes_a_credential_file_owner_only() {
+        let dir = std::env::temp_dir().join(format!("coord-mcp-acl-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("coord-mcp-test.json");
+        std::fs::write(&file, r#"{"nonce":"secret"}"#).unwrap();
+
+        restrict_to_owner(&file, false);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "credential file must be owner-only, got {mode:o}"
+            );
+        }
+
+        // Both platforms: the owner must not lock themselves out — a restriction
+        // that breaks our own read would break every session spawn.
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            r#"{"nonce":"secret"}"#,
+            "restricting must not cost the owner their own read"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Best-effort contract: restricting a path that does not exist must not
+    /// panic or propagate — the callers treat hardening as advisory and keep
+    /// delivering coord-mcp regardless.
+    #[test]
+    fn restrict_to_owner_is_best_effort_on_a_missing_path() {
+        let missing =
+            std::env::temp_dir().join(format!("coord-mcp-absent-{}", uuid::Uuid::now_v7()));
+        restrict_to_owner(&missing, false);
+        restrict_to_owner(&missing, true);
     }
 
     /// Phase 3a fail-closed: with no Tauri runtime / managed AppState in a unit
