@@ -205,6 +205,13 @@ export interface UnifiedSession {
 
   // Transcript metadata
   displayName: string;
+  /**
+   * The operator's real `/rename` name (or Claude's auto `summary`) when the
+   * transcript carries one; `null` otherwise. Preferred over `displayName` (a
+   * first-message preview) as the card headline, matching the Previous-Sessions
+   * surface and `claude --resume`.
+   */
+  resumeName: string | null;
   firstMessagePreview: string | null;
   messageCount: number;
   lastModified: string;
@@ -420,8 +427,7 @@ export function computeStatusCounts(sessions: readonly StatusCountsInput[]): Sta
   // Total = the live managed set: working + idle + needs-input + error +
   // completed. Equivalently the count of sessions that survived the
   // dormant/orphan filter above. Reconciles with the per-bucket pills.
-  const sessionCount =
-    workingCount + idleCount + needsInputLive + errorCount + completedCount;
+  const sessionCount = workingCount + idleCount + needsInputLive + errorCount + completedCount;
   return {
     sessionCount,
     workingCount,
@@ -763,6 +769,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
             projectPath: s.project_path,
             projectLabel: extractProjectLabel(s.project_path),
             displayName: s.display_name,
+            resumeName: s.resume_name ?? null,
             firstMessagePreview: s.first_message_preview,
             messageCount: s.message_count,
             lastModified: s.last_modified,
@@ -836,6 +843,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
           projectPath: s.project_path,
           projectLabel: extractProjectLabel(s.project_path),
           displayName: s.display_name,
+          resumeName: s.resume_name ?? null,
           firstMessagePreview: s.first_message_preview,
           messageCount: s.message_count,
           lastModified: s.last_modified,
@@ -889,6 +897,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
       filtered = filtered.filter(
         (s) =>
           s.displayName.toLowerCase().includes(q) ||
+          (s.resumeName?.toLowerCase().includes(q) ?? false) ||
           s.projectLabel.toLowerCase().includes(q) ||
           s.sessionId.toLowerCase().includes(q) ||
           (s.firstMessagePreview?.toLowerCase().includes(q) ?? false) ||
@@ -1090,9 +1099,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     const toResume = allSessions.filter(
       (s) => selectedIds.has(s.sessionId) && !isInjectedSession(s),
     );
-    const skipped = allSessions.filter(
-      (s) => selectedIds.has(s.sessionId) && isInjectedSession(s),
-    );
+    const skipped = allSessions.filter((s) => selectedIds.has(s.sessionId) && isInjectedSession(s));
     for (const s of skipped) {
       console.warn(
         `[test-fixtures] ignoring resume on synthetic tab ${s.zoneTabId ?? s.sessionId}`,
