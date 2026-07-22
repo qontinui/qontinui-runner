@@ -39,6 +39,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 import { instanceStorage } from "@/lib/instance-storage";
 
 import { useTerminalSession } from "./contexts/TerminalSessionContext";
+import { SessionManagerToggle } from "./SessionManagerToggle";
 import { SpawnTenantPicker } from "./SpawnTenantPicker";
 
 import {
@@ -556,6 +557,11 @@ export function CommandBar() {
           focused ? "bg-[#13141f]/95 border-[#7aa2f7]/40" : "bg-[#13141f]/80 border-[#2a2d3d]"
         }`}
       >
+        {/* Session Manager sidebar toggle — the only always-visible strip of
+            terminal-page chrome, so this is where the panel's visible (and
+            UI-Bridge addressable) affordance lives. Ctrl+Shift+B and
+            `/sessions` remain; this is additive. */}
+        <SessionManagerToggle />
         {/* F2 — tenant for the next spawn, immediately left of the console
             the operator types `/spawn-ai` into. Self-hides on single-tenant
             devices. */}

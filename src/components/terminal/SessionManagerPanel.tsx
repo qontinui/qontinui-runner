@@ -156,9 +156,24 @@ export function SessionManagerPanel({
 
   return (
     <div className="w-[340px] h-full flex flex-col border-r border-[#2a2d3d] bg-[#13141f] shrink-0">
-      {/* Live | Previous view toggle */}
+      {/*
+        Live | Previous view toggle.
+
+        Both buttons carry an author-controlled `data-ui-bridge-id`: the SDK's
+        auto-derived ids would slugify from the visible text (`button-live` /
+        `button-previous`), which is neither namespaced nor stable across the
+        page. With these stamps a driver can switch the panel deterministically
+        — `POST /ui-bridge/control/element/terminal.session-manager-view-previous/action
+        {"action":"click"}` — which is the only way to reach the
+        `past-sessions-view` surface, since the panel always mounts on "live".
+
+        This row sits ABOVE the `view === "previous" ? … : <>…</>` conditional
+        so it renders in both views; see `SessionManagerPanel.test.ts` for the
+        arm invariant that guards the panels below.
+      */}
       <div className="flex items-center gap-1 px-2 py-1.5 border-b border-[#2a2d3d]">
         <button
+          data-ui-bridge-id="terminal.session-manager-view-live"
           onClick={() => setView("live")}
           className={`flex-1 flex items-center justify-center gap-1 px-2 py-1 rounded text-[10px] font-medium transition-colors ${
             view === "live"
@@ -171,13 +186,14 @@ export function SessionManagerPanel({
           Live
         </button>
         <button
+          data-ui-bridge-id="terminal.session-manager-view-previous"
           onClick={() => setView("previous")}
           className={`flex-1 flex items-center justify-center gap-1 px-2 py-1 rounded text-[10px] font-medium transition-colors ${
             view === "previous"
               ? "bg-[#7aa2f7]/15 text-[#7aa2f7]"
               : "text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d]"
           }`}
-          title="Every session previously on this runner — resume by name"
+          title="Previous sessions — every session previously on this runner; resume by name"
         >
           <History className="w-3 h-3" />
           Previous

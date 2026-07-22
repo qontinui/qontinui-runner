@@ -11,6 +11,58 @@ import { usePastSessions, type PastSession } from "./usePastSessions";
  */
 const COHORT_RENDER_CAP = 30;
 
+/**
+ * UI-Bridge addressability for this view — two DIFFERENT attributes doing two
+ * DIFFERENT jobs. Do not swap them.
+ *
+ * **`data-page-element`** (the `PAST_SESSIONS_*_ELEMENT` constants below) is
+ * NOT an SDK concept — it is a plain CSS selector consumed by
+ * `POST /ui-bridge/control/page/read-value
+ * {"selector":"[data-page-element=past-sessions-view]"}`, the codebase's
+ * established recipe for a SCOPED REGION READ (same convention as
+ * `command-bar`, `status-strip`, `terminal-session-roster`). Reading the
+ * panel used to mean scraping `document.body.innerText` and slicing around a
+ * substring, which also swept in unrelated terminal-grid text.
+ *
+ * **`data-ui-bridge-id`** (the `pastSession*Id` helpers below) pins a CONTROL
+ * id for `POST /ui-bridge/control/element/<id>/action`. The SDK derives ids
+ * from visible text with per-parent ordinal disambiguation, so N cards each
+ * rendering "Copy command" / "Resume" collide on ordinals — and cohorts are
+ * sorted newest-first by `lastSeenAt`, so those ordinals SHIFT on every
+ * refresh. A hand-written stamp wins over auto-derivation and is echoed
+ * verbatim as `uiBridgeId` in `GET /ui-bridge/control/snapshot`, making each
+ * action addressable by its own session/cohort key instead of by position.
+ */
+export const PAST_SESSIONS_VIEW_ELEMENT = "past-sessions-view";
+/** @see {@link PAST_SESSIONS_VIEW_ELEMENT} */
+export const PAST_SESSIONS_COHORT_ELEMENT = "past-sessions-cohort";
+/** @see {@link PAST_SESSIONS_VIEW_ELEMENT} */
+export const PAST_SESSION_CARD_ELEMENT = "past-session-card";
+
+/** Stable control id for the "Refresh previous sessions" button. */
+export const PAST_SESSIONS_REFRESH_ID = "terminal.past-sessions-refresh";
+/** Stable control id for the error-state "Retry" button. */
+export const PAST_SESSIONS_RETRY_ID = "terminal.past-sessions-retry";
+
+/** Stable control id for one card's "Copy command" button. */
+export function pastSessionCopyId(claudeSessionId: string): string {
+  return `terminal.past-session-copy-${claudeSessionId}`;
+}
+
+/** Stable control id for one card's "Resume" button. */
+export function pastSessionResumeId(claudeSessionId: string): string {
+  return `terminal.past-session-resume-${claudeSessionId}`;
+}
+
+/**
+ * Stable control id for a cohort's "Show N more" / "Collapse" button. The same
+ * button carries both states, so one id covers both — and the id is keyed on
+ * the cohort rather than on the label, which changes as the count changes.
+ */
+export function pastSessionsCohortToggleId(cohortId: number): string {
+  return `terminal.past-sessions-cohort-toggle-${cohortId}`;
+}
+
 interface PastSessionsViewProps {
   /**
    * Resume a past session by id — wired to the real terminal resume path in
@@ -22,7 +74,7 @@ interface PastSessionsViewProps {
 }
 
 /** A cohort: sessions sharing a `cohortId`, plus its derived header fields. */
-interface Cohort {
+export interface Cohort {
   cohortId: number;
   sessions: PastSession[];
   /** Earliest `lastSeenAt` in the cohort (the group's timestamp). */
@@ -31,8 +83,13 @@ interface Cohort {
   latest: number;
 }
 
-/** Group past sessions by `cohortId`, newest cohort first. */
-function groupByCohort(sessions: PastSession[]): Cohort[] {
+/**
+ * Group past sessions by `cohortId`, newest cohort first.
+ *
+ * Exported for tests: the newest-first sort is exactly why per-card control
+ * ids must be session-keyed rather than ordinal-derived.
+ */
+export function groupByCohort(sessions: PastSession[]): Cohort[] {
   const map = new Map<number, PastSession[]>();
   for (const s of sessions) {
     const list = map.get(s.cohortId);
@@ -119,13 +176,19 @@ function PastSessionCard({
   const closed = session.state === "closed";
 
   return (
-    <div className="group relative border-l-2 border-l-transparent hover:bg-[#1a1b26] px-3 py-2">
+    <div
+      data-page-element={PAST_SESSION_CARD_ELEMENT}
+      data-session-id={session.claudeSessionId}
+      className="group relative border-l-2 border-l-transparent hover:bg-[#1a1b26] px-3 py-2"
+    >
       {/* Row 1: name + account badge */}
       <div className="flex items-center gap-1.5 mb-0.5">
         <span
           className="w-2 h-2 rounded-full shrink-0"
           style={{ backgroundColor: closed ? "#565f89" : "#9ece6a" }}
-          title={closed ? `closed${session.closeReason ? ` — ${session.closeReason}` : ""}` : "open"}
+          title={
+            closed ? `closed${session.closeReason ? ` — ${session.closeReason}` : ""}` : "open"
+          }
         />
         <span
           className="text-xs text-[#c0caf5] font-medium truncate flex-1"
@@ -181,6 +244,7 @@ function PastSessionCard({
       {/* Row 5: actions */}
       <div className="mt-1.5 ml-3.5 flex items-center gap-1.5">
         <button
+          data-ui-bridge-id={pastSessionCopyId(session.claudeSessionId)}
           onClick={handleCopy}
           className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium bg-[#7aa2f7]/15 text-[#7aa2f7] hover:bg-[#7aa2f7]/25 transition-colors"
           title="Copy the resume command to the clipboard"
@@ -189,6 +253,7 @@ function PastSessionCard({
           {copied ? "Copied!" : "Copy command"}
         </button>
         <button
+          data-ui-bridge-id={pastSessionResumeId(session.claudeSessionId)}
           onClick={handleResume}
           disabled={!resumable}
           className={`flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium transition-colors ${
@@ -231,7 +296,7 @@ export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps)
   }, []);
 
   return (
-    <div className="flex-1 flex flex-col min-h-0">
+    <div data-page-element={PAST_SESSIONS_VIEW_ELEMENT} className="flex-1 flex flex-col min-h-0">
       {/* Sub-header: count + refresh */}
       <div className="flex items-center gap-2 px-3 py-1.5 border-b border-[#2a2d3d]">
         <Layers className="w-3 h-3 text-[#565f89]" />
@@ -241,6 +306,7 @@ export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps)
         </span>
         <div className="flex-1" />
         <button
+          data-ui-bridge-id={PAST_SESSIONS_REFRESH_ID}
           onClick={refresh}
           disabled={loading}
           className="p-0.5 rounded text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d] transition-colors disabled:opacity-50"
@@ -262,8 +328,10 @@ export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps)
             <AlertTriangle className="w-4 h-4 mx-auto mb-2" />
             {error}
             <button
+              data-ui-bridge-id={PAST_SESSIONS_RETRY_ID}
               onClick={refresh}
               className="mt-2 block mx-auto px-2 py-0.5 rounded text-[10px] bg-[#f7768e]/15 text-[#f7768e] hover:bg-[#f7768e]/25 transition-colors"
+              title="Retry loading previous sessions"
             >
               Retry
             </button>
@@ -280,13 +348,19 @@ export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps)
               : cohort.sessions.slice(0, COHORT_RENDER_CAP);
             const hidden = cohort.sessions.length - visible.length;
             return (
-              <div key={cohort.cohortId}>
+              <div
+                key={cohort.cohortId}
+                data-page-element={PAST_SESSIONS_COHORT_ELEMENT}
+                data-cohort-id={cohort.cohortId}
+              >
                 {/* Cohort header: "12 sessions · Jul 19, 12:19 AM" */}
                 <div className="flex items-center gap-2 px-3 pt-3 pb-1">
                   <div className="flex-1 h-px bg-[#2a2d3d]" />
                   <span className="text-[10px] font-medium text-[#565f89] whitespace-nowrap">
                     {cohort.sessions.length} session{cohort.sessions.length !== 1 ? "s" : ""}
-                    <span className="ml-1 text-[#414868]">&middot; {formatWhen(cohort.earliest)}</span>
+                    <span className="ml-1 text-[#414868]">
+                      &middot; {formatWhen(cohort.earliest)}
+                    </span>
                   </span>
                   <div className="flex-1 h-px bg-[#2a2d3d]" />
                 </div>
@@ -299,18 +373,25 @@ export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps)
                   />
                 ))}
 
+                {/* One logical control, two labels — so both arms carry the
+                    SAME cohort-keyed id (the auto-derived one would be minted
+                    from "Show N more" and change with the count). */}
                 {hidden > 0 && (
                   <button
+                    data-ui-bridge-id={pastSessionsCohortToggleId(cohort.cohortId)}
                     onClick={() => toggleExpand(cohort.cohortId)}
                     className="w-full px-3 py-1.5 text-[10px] text-[#7aa2f7] hover:bg-[#1a1b26] transition-colors text-center"
+                    title="Show the rest of this cohort's sessions"
                   >
                     Show {hidden} more
                   </button>
                 )}
                 {isExpanded && cohort.sessions.length > COHORT_RENDER_CAP && (
                   <button
+                    data-ui-bridge-id={pastSessionsCohortToggleId(cohort.cohortId)}
                     onClick={() => toggleExpand(cohort.cohortId)}
                     className="w-full px-3 py-1.5 text-[10px] text-[#565f89] hover:bg-[#1a1b26] transition-colors text-center"
+                    title="Collapse this cohort back to its first sessions"
                   >
                     Collapse
                   </button>
