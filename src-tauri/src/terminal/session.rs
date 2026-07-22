@@ -92,14 +92,60 @@ fn tee_into_scrollback(
 }
 
 /// Flow-control watermarks (bytes), mirroring VS Code's `FlowControlConstants`
-/// (High=100000, Low=5000 chars). The reader pauses once the unacked gap
-/// (`bytes_sent − bytes_acked`) exceeds [`FLOW_HIGH_WATERMARK`] and resumes
-/// only once it drops back below [`FLOW_LOW_WATERMARK`] — hysteresis so we
-/// don't thrash pause/resume one byte at a time. The frontend acks
-/// render-completed bytes in ~5000-byte units (see `flowControl.ts`), so the
-/// Low watermark matches one ack quantum.
+/// (High=100000, Low=5000 chars). EMISSION to the webview pauses once the
+/// unacked gap (`bytes_sent − bytes_acked`) exceeds [`FLOW_HIGH_WATERMARK`]
+/// and resumes only once it drops back below [`FLOW_LOW_WATERMARK`] —
+/// hysteresis so we don't thrash pause/resume one byte at a time. The
+/// frontend acks render-completed bytes in ~5000-byte units (see
+/// `flowControl.ts`), so the Low watermark matches one ack quantum.
+///
+/// CRITICAL INVARIANT: backpressure gates the `terminal-output` webview
+/// emission ONLY — it must NEVER pause the PTY read itself. The original
+/// implementation paused the reader loop, which stopped feeding the VT grid
+/// and, once the kernel PTY buffer filled, hard-blocked the child process on
+/// stdout. Any session without a mounted `TerminalInstance` (every terminal
+/// on a non-selected terminal page — nothing acks for those) froze ~100KB
+/// into its next output burst, and the frozen grid also blinded the
+/// `auto_response` grid-scan rules that would have advanced it. The reader
+/// now always reads and always feeds interceptor + scrollback + grid; when
+/// the webview falls behind (or is absent) only the event stream is dropped,
+/// and the frontend recovers via the offset-gap resync in
+/// `TerminalInstance.tsx` (scrollback-ring replay, which also resets the
+/// counters via [`TerminalSession::reset_flow_control`]).
 const FLOW_HIGH_WATERMARK: u64 = 100_000;
 const FLOW_LOW_WATERMARK: u64 = 5_000;
+
+/// Hysteresis state machine deciding whether a chunk is emitted to the
+/// webview given the current unacked gap. Pure and single-threaded (lives on
+/// the reader thread) so the policy is unit-testable in isolation.
+///
+/// - Not paused: emits until `gap > FLOW_HIGH_WATERMARK`, then pauses.
+/// - Paused: stays paused until `gap <= FLOW_LOW_WATERMARK` (acks caught up
+///   or [`TerminalSession::reset_flow_control`] zeroed the gap), then emits
+///   again.
+struct EmissionGate {
+    paused: bool,
+}
+
+impl EmissionGate {
+    fn new() -> Self {
+        Self { paused: false }
+    }
+
+    /// Returns true when the chunk should be emitted to the webview. Skipped
+    /// chunks are NOT counted into `bytes_sent`, so the gap freezes at its
+    /// pause-time value until acks (or a flow-control reset) shrink it.
+    fn should_emit(&mut self, gap: u64) -> bool {
+        if self.paused {
+            if gap <= FLOW_LOW_WATERMARK {
+                self.paused = false;
+            }
+        } else if gap > FLOW_HIGH_WATERMARK {
+            self.paused = true;
+        }
+        !self.paused
+    }
+}
 
 /// Byte cap for a held DEC-2026 (synchronized-output) frame: flush the
 /// accumulated frame once it reaches this size even if `?2026l` hasn't
@@ -325,6 +371,15 @@ pub struct TerminalSession {
     /// Bytes received by the frontend (for flow control).
     bytes_sent: Arc<AtomicU64>,
     bytes_acked: Arc<AtomicU64>,
+    /// True when the reader skipped at least one webview emission while the
+    /// [`EmissionGate`] was paused and no resume-marker has been sent yet.
+    /// Read + cleared by [`Self::ack`]: once acks bring the gap back under
+    /// the LOW watermark, a zero-length marker event stamped at the current
+    /// produced offset is emitted so the frontend's offset-gap detection
+    /// triggers a scrollback-ring resync — without it, a burst that ENDS
+    /// while emission is paused would leave the pane stale forever (no
+    /// further chunk arrives to reveal the gap).
+    emission_skipped: Arc<AtomicBool>,
     /// Ring buffer of recent raw PTY output for reconnection.
     scrollback_buffer: Arc<Mutex<VecDeque<u8>>>,
     /// Monotonic counter of all bytes ever produced by the PTY.
@@ -589,6 +644,7 @@ impl TerminalSession {
         let exit_code: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
         let bytes_sent = Arc::new(AtomicU64::new(0));
         let bytes_acked = Arc::new(AtomicU64::new(0));
+        let emission_skipped = Arc::new(AtomicBool::new(false));
         let scrollback_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(SCROLLBACK_CAPACITY)));
         let total_bytes_produced = Arc::new(AtomicU64::new(0));
         let grid = Arc::new(Mutex::new(Grid::new(cols, rows)));
@@ -619,6 +675,7 @@ impl TerminalSession {
         let reader_alive = is_alive.clone();
         let reader_bytes_sent = bytes_sent.clone();
         let reader_bytes_acked = bytes_acked.clone();
+        let reader_emission_skipped = emission_skipped.clone();
         let reader_scrollback = scrollback_buffer.clone();
         let reader_total_bytes = total_bytes_produced.clone();
         let reader_output_tx = output_tx.clone();
@@ -643,20 +700,56 @@ impl TerminalSession {
                 // immediately with no holding. Only frames that span multiple
                 // reads are held.
                 let mut coalescer = SyncFrameCoalescer::new();
-                // Flow-control hysteresis state: once the unacked gap crosses
-                // the High watermark we stay paused until it falls back under
-                // Low (see FLOW_HIGH_WATERMARK / FLOW_LOW_WATERMARK).
-                let mut paused = false;
+                // Flow-control hysteresis state (see EmissionGate): once the
+                // unacked gap crosses the High watermark, webview EMISSION
+                // pauses until the gap falls back under Low. The PTY read
+                // itself is NEVER paused — pausing reads hard-blocked child
+                // processes on stdout for every terminal without a mounted
+                // pane (deselected terminal pages) and froze the VT grid the
+                // auto-response rules scan. RefCell because `emit_chunk` must
+                // stay `Fn` (it is shared with the coalescer by `&`-borrow);
+                // the reader thread is the sole accessor.
+                let emission_gate = std::cell::RefCell::new(EmissionGate::new());
 
-                // Emit one `terminal-output` event for `payload` stamped at
-                // absolute `offset`, mirror it to SSE + the backend relay, and
-                // advance the flow-control "sent" counter by the emitted length
-                // (so backpressure tracks bytes actually delivered to the
-                // frontend, not bytes still held in the coalescer).
-                let emit_chunk = |payload: &[u8], offset: u64| {
+                // Emit one `terminal-output` chunk stamped at absolute
+                // `offset`: mirror it to SSE + the backend relay
+                // unconditionally, then — when `gated`, only while the
+                // webview's unacked gap is under the flow-control watermarks
+                // — deliver it to the webview and advance the "sent" counter
+                // by the emitted length (so backpressure tracks bytes
+                // actually delivered to the webview, not bytes still held in
+                // the coalescer and not bytes dropped while emission is
+                // paused). Skipped chunks set `emission_skipped` (drives the
+                // resume-marker in [`TerminalSession::ack`]) and leave an
+                // offset discontinuity in the event stream; the frontend
+                // detects it and resyncs from the scrollback ring. The exit
+                // flush passes `gated: false` — the dying terminal's final
+                // frame is bounded (≤ SYNC_FLUSH_BYTE_CAP) and there may be
+                // no future chunk to reveal a gap after it.
+                let emit_impl = |payload: &[u8], offset: u64, gated: bool| {
                     let encoded = STANDARD.encode(payload);
                     // Broadcast to HTTP/SSE subscribers (ignore if no receivers)
                     let _ = reader_output_tx.send(encoded.clone());
+                    // Broadcast to backend relay for remote mobile access
+                    crate::event_system::broadcast_ws_notification(
+                        &reader_app,
+                        "terminal-output",
+                        &serde_json::json!({
+                            "terminal_id": &reader_id,
+                            "data": &encoded,
+                        }),
+                    );
+
+                    // Webview delivery is the only backpressure-gated leg.
+                    if gated {
+                        let sent = reader_bytes_sent.load(Ordering::Relaxed);
+                        let acked = reader_bytes_acked.load(Ordering::Relaxed);
+                        let gap = sent.saturating_sub(acked);
+                        if !emission_gate.borrow_mut().should_emit(gap) {
+                            reader_emission_skipped.store(true, Ordering::Relaxed);
+                            return;
+                        }
+                    }
                     let event = TerminalOutputWire {
                         terminal_id: &reader_id,
                         data: &encoded,
@@ -669,44 +762,13 @@ impl TerminalSession {
                             "Failed to emit terminal output event"
                         );
                     }
-                    // Broadcast to backend relay for remote mobile access
-                    crate::event_system::broadcast_ws_notification(
-                        &reader_app,
-                        "terminal-output",
-                        &serde_json::json!({
-                            "terminal_id": &reader_id,
-                            "data": &event.data,
-                        }),
-                    );
                     reader_bytes_sent.fetch_add(payload.len() as u64, Ordering::Relaxed);
                 };
+                let emit_chunk = |payload: &[u8], offset: u64| emit_impl(payload, offset, true);
 
                 loop {
                     if !reader_alive.load(Ordering::Relaxed) {
                         break;
-                    }
-
-                    // Flow control (Phase 3): char-count watermarks with
-                    // hysteresis, mirroring VS Code. The gap is measured
-                    // against EMITTED bytes (a held frame in the coalescer
-                    // hasn't been sent yet), so a held frame doesn't trip
-                    // backpressure on its own. Pause once the unacked gap
-                    // exceeds High; resume only once it drops below Low — so a
-                    // burst that overruns xterm's input buffer is throttled at
-                    // the producer until the renderer's acks catch up.
-                    let sent = reader_bytes_sent.load(Ordering::Relaxed);
-                    let acked = reader_bytes_acked.load(Ordering::Relaxed);
-                    let gap = sent.saturating_sub(acked);
-                    if paused {
-                        if gap > FLOW_LOW_WATERMARK {
-                            thread::sleep(std::time::Duration::from_millis(10));
-                            continue;
-                        }
-                        paused = false;
-                    } else if gap > FLOW_HIGH_WATERMARK {
-                        paused = true;
-                        thread::sleep(std::time::Duration::from_millis(10));
-                        continue;
                     }
 
                     // Time-cap a held sync block: if the block has been open ≥
@@ -797,8 +859,13 @@ impl TerminalSession {
                 }
                 // Flush any frame still held in a never-closed sync block so
                 // the last frame isn't lost when the reader exits (EOF / read
-                // error on child exit).
-                coalescer.flush_remaining(&emit_chunk);
+                // error on child exit). Ungated: after exit no further chunk
+                // can reveal an emission gap, so the final frame must reach
+                // the webview even when the gate is paused (bounded by
+                // SYNC_FLUSH_BYTE_CAP).
+                coalescer.flush_remaining(|payload: &[u8], offset: u64| {
+                    emit_impl(payload, offset, false)
+                });
                 debug!(terminal_id = %reader_id, "Reader thread exiting");
             })
             .map_err(|e| format!("Failed to spawn reader thread: {}", e))?;
@@ -950,6 +1017,7 @@ impl TerminalSession {
             waiter_join: Mutex::new(Some(waiter_handle)),
             bytes_sent,
             bytes_acked,
+            emission_skipped,
             scrollback_buffer,
             total_bytes_produced,
             created_at,
@@ -1526,8 +1594,37 @@ impl TerminalSession {
     }
 
     /// Acknowledge bytes received by the frontend (flow control).
+    ///
+    /// Resume-marker: when webview emission was skipped while the gate was
+    /// paused (`emission_skipped`) and this ack brings the gap back under
+    /// the LOW watermark, a burst that already ENDED would otherwise leave
+    /// the pane stale forever — the gate has reopened but no further chunk
+    /// arrives to reveal the gap. Emit a zero-length `terminal-output`
+    /// marker stamped at the current produced offset; the frontend's
+    /// offset-gap detection treats it like any other jump and resyncs from
+    /// the scrollback ring.
     pub fn ack(&self, bytes: u64) {
         self.bytes_acked.fetch_add(bytes, Ordering::Relaxed);
+        let sent = self.bytes_sent.load(Ordering::Relaxed);
+        let acked = self.bytes_acked.load(Ordering::Relaxed);
+        if sent.saturating_sub(acked) <= FLOW_LOW_WATERMARK
+            && self.emission_skipped.swap(false, Ordering::Relaxed)
+        {
+            if let Some(app) = &self.app_handle {
+                let event = TerminalOutputWire {
+                    terminal_id: &self.id,
+                    data: "",
+                    offset: self.total_bytes_produced.load(Ordering::Relaxed),
+                };
+                if let Err(e) = app.emit("terminal-output", &event) {
+                    warn!(
+                        terminal_id = %self.id,
+                        error = %e,
+                        "Failed to emit flow-control resume marker"
+                    );
+                }
+            }
+        }
     }
 
     /// Get terminal info for the frontend.
@@ -1615,9 +1712,20 @@ impl TerminalSession {
     }
 
     /// Reset flow control counters so a reconnecting frontend doesn't hit backpressure.
+    ///
+    /// Over-ack tolerance: render callbacks for writes issued BEFORE this
+    /// reset may still ack afterwards, briefly pushing `bytes_acked` above
+    /// `bytes_sent`. The gate computes the gap with `saturating_sub`, so the
+    /// skew reads as gap 0 — a bounded, one-shot blind margin (at most the
+    /// pre-reset in-flight bytes) before backpressure re-engages. This is
+    /// intentional; do not "fix" the saturating_sub.
     pub fn reset_flow_control(&self) {
         let sent = self.bytes_sent.load(Ordering::Relaxed);
         self.bytes_acked.store(sent, Ordering::Relaxed);
+        // A reset supersedes any pending resume-marker: the resetting
+        // consumer refetches the ring, which already covers the skipped
+        // bytes.
+        self.emission_skipped.store(false, Ordering::Relaxed);
     }
 
     /// Subscribe to the terminal output broadcast channel.
@@ -1869,6 +1977,7 @@ mod tests {
             waiter_join: Mutex::new(None),
             bytes_sent: Arc::new(AtomicU64::new(0)),
             bytes_acked: Arc::new(AtomicU64::new(0)),
+            emission_skipped: Arc::new(AtomicBool::new(false)),
             scrollback_buffer: Arc::new(Mutex::new(VecDeque::new())),
             total_bytes_produced: Arc::new(AtomicU64::new(0)),
             created_at: 0,
@@ -2390,5 +2499,44 @@ mod tests {
             buf_a, buf_b,
             "two terminals returned byte-identical scrollback buffers"
         );
+    }
+
+    // ── EmissionGate hysteresis (webview emission backpressure) ──────────
+    //
+    // Regression guard for the deselected-page hard-freeze: flow control
+    // must gate webview EMISSION only, via this hysteresis policy — the
+    // reader loop itself contains no pause path anymore. These tests pin
+    // the policy's exact transition points.
+
+    #[test]
+    fn emission_gate_emits_below_high_watermark() {
+        let mut gate = EmissionGate::new();
+        assert!(gate.should_emit(0));
+        assert!(gate.should_emit(FLOW_LOW_WATERMARK));
+        assert!(gate.should_emit(FLOW_HIGH_WATERMARK)); // exactly High: still emits
+    }
+
+    #[test]
+    fn emission_gate_pauses_above_high_and_holds_until_low() {
+        let mut gate = EmissionGate::new();
+        assert!(!gate.should_emit(FLOW_HIGH_WATERMARK + 1)); // crosses High: pause
+        // Anywhere above Low stays paused — including values far below High.
+        assert!(!gate.should_emit(FLOW_HIGH_WATERMARK));
+        assert!(!gate.should_emit(FLOW_LOW_WATERMARK + 1));
+        // At (or below) Low the gate reopens on the same call.
+        assert!(gate.should_emit(FLOW_LOW_WATERMARK));
+    }
+
+    #[test]
+    fn emission_gate_reset_to_zero_reopens_immediately() {
+        // reset_flow_control() sets acked = sent, i.e. gap == 0: the next
+        // chunk must emit — this is the "pane mounted / buffer fetched"
+        // recovery path.
+        let mut gate = EmissionGate::new();
+        assert!(!gate.should_emit(FLOW_HIGH_WATERMARK * 3));
+        assert!(gate.should_emit(0));
+        // And it stays open afterwards until High is crossed again.
+        assert!(gate.should_emit(FLOW_HIGH_WATERMARK));
+        assert!(!gate.should_emit(FLOW_HIGH_WATERMARK + 1));
     }
 }

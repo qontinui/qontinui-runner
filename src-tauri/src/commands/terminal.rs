@@ -614,6 +614,33 @@ pub fn terminal_ack(
     })
 }
 
+/// Reset a terminal's flow-control counters (acked = sent).
+///
+/// Called by `TerminalInstance` on UNMOUNT: the disposing pane strands its
+/// render-acks (its final coalesced write's completion callback never
+/// fires), and if the emission gate is already paused at that moment the
+/// tab would enter an emission blackout — the per-page tap receives
+/// nothing, so it can never proxy-ack the tab back open. The unmounting
+/// pane's backlog is being discarded with the xterm buffer anyway, so
+/// resetting is both safe and required to hand consumption over to the tap.
+#[tauri::command]
+pub fn terminal_flow_reset(
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+    terminal_id: String,
+) -> Result<CommandResponse, String> {
+    let session = terminal_manager
+        .get(&terminal_id)
+        .ok_or_else(|| format!("Terminal not found: {}", terminal_id))?;
+
+    session.reset_flow_control();
+
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: None,
+    })
+}
+
 /// Get the LIVE scrollback ring buffer for a terminal session.
 ///
 /// Returns the raw PTY byte history (base64) plus its absolute offset range
@@ -632,11 +659,15 @@ pub fn terminal_get_scrollback(
         .get(&terminal_id)
         .ok_or_else(|| format!("Terminal not found: {}", terminal_id))?;
 
+    // Reset backpressure BEFORE snapshotting the ring: emission resumes at
+    // the reset, so every chunk skipped up to this instant is either inside
+    // the snapshot (tee'd before it) or delivered live after it — no chunk
+    // can fall between snapshot and reset and open a hole exactly at
+    // `endOffset`. Chunks that are both in the snapshot AND delivered live
+    // are deduped by the frontend's `replayedThrough` trim.
+    session.reset_flow_control();
     let (data, start_offset) = session.get_scrollback_buffer();
     let end_offset = start_offset + data.len() as u64;
-    // Reconnecting frontends fetch the full ring; reset backpressure the same
-    // way the WS/HTTP buffer path does so the reader thread doesn't stall.
-    session.reset_flow_control();
     let encoded = STANDARD.encode(&data);
 
     Ok(CommandResponse {
@@ -1736,6 +1767,7 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
             terminal_close,
             terminal_list,
             terminal_ack,
+            terminal_flow_reset,
             terminal_save_scrollback,
             terminal_get_saved_scrollback,
             terminal_cleanup_scrollback,
