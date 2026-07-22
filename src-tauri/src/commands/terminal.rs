@@ -411,7 +411,7 @@ pub async fn terminal_close(
 /// NOT carry a Claude session id), returns `sessionIdsByTerminal`: a
 /// `{ terminal_id -> { claudeSessionId, configDir } }` map derived from the
 /// durable [`SessionLifecycleStore`]'s `terminal_id -> claude_session_id`
-/// index ([`SessionLifecycleStore::find_open_by_terminal`]).
+/// index ([`SessionLifecycleStore::find_confirmed_open_by_terminal`]).
 ///
 /// This is what lets the frontend attach `claudeSessionId` to a RECONNECTED
 /// tab. The per-session PR dropdown (and anything else session-scoped) gates
@@ -420,6 +420,16 @@ pub async fn terminal_close(
 /// its id and the dropdown never mounted for it. Best-effort + additive: if
 /// the store isn't managed the map is simply empty, and the `TerminalInfo`
 /// schema (`deny_unknown_fields`) is untouched.
+///
+/// The map is gated to CONFIRMED records only (see
+/// [`SessionLifecycleStore::find_confirmed_open_by_terminal`]). The spawn-time
+/// identity seam records an authoritative-but-provisional `open` row for EVERY
+/// terminal — including plain shells that never run a provider, and non-pinned
+/// launches whose minted uuid is not the id the process actually runs under —
+/// so surfacing unconfirmed ids would bind phantom / never-used ids onto tabs
+/// and could permanently mis-bind them (the transcript-poll capture stops once
+/// a tab carries any id). Only confirmed rows are real, correctly-identified
+/// sessions worth lighting up session-scoped UI for.
 #[tauri::command]
 pub fn terminal_list(
     app: tauri::AppHandle,
@@ -430,7 +440,7 @@ pub fn terminal_list(
     let mut session_ids_by_terminal = serde_json::Map::new();
     if let Some(store) = app.try_state::<Arc<SessionLifecycleStore>>() {
         for info in &terminals {
-            if let Some(rec) = store.find_open_by_terminal(&info.id) {
+            if let Some(rec) = store.find_confirmed_open_by_terminal(&info.id) {
                 session_ids_by_terminal.insert(
                     info.id.clone(),
                     serde_json::json!({

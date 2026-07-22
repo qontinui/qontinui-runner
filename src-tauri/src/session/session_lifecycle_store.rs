@@ -823,6 +823,36 @@ impl SessionLifecycleStore {
         }
     }
 
+    /// Like [`Self::find_open_by_terminal`], but only returns a CONFIRMED
+    /// record — one whose `confirmed_at` is set (a provider SessionStart hook
+    /// fired, or a start-anchored `observed`/`reconciled` bind proved a real
+    /// session exists here).
+    ///
+    /// This is what `terminal_list`'s `sessionIdsByTerminal` map uses to
+    /// re-attach `claudeSessionId` to reconnected/other tabs. The confirmed
+    /// gate is load-bearing: the spawn-time identity seam (`apply_identity_seam`)
+    /// mints a fresh session id and records an AUTHORITATIVE-but-PROVISIONAL
+    /// `open` row for EVERY terminal — including a plain interactive shell that
+    /// never runs a provider (a phantom), and a non-pinned launch whose minted
+    /// uuid is NOT the id the process actually runs under. Surfacing an
+    /// unconfirmed id would bind a phantom / foreign / never-used id onto the
+    /// tab: the per-session PR dropdown would poll coord for a non-existent
+    /// session every minute, session-scoped UI-bridge selectors would key off a
+    /// dead id, and — because the transcript-poll capture stops as soon as a tab
+    /// carries ANY id (`useTabSessionIdCapture`) — the tab could be PERMANENTLY
+    /// mis-bound to the seam's uuid instead of the real run id. Gating on
+    /// `confirmed_at` mirrors the reconcile phantom gate
+    /// ([`crate::session::reconcile::is_phantom_record`]) and the restore
+    /// classifier, so only a real, correctly-identified session lights up
+    /// session-scoped UI.
+    pub fn find_confirmed_open_by_terminal(
+        &self,
+        terminal_id: &str,
+    ) -> Option<TerminalSessionRecord> {
+        self.find_open_by_terminal(terminal_id)
+            .filter(|r| r.confirmed_at.is_some())
+    }
+
     /// Clone of the record for `claude_session_id`, open or closed.
     pub fn get(&self, claude_session_id: &str) -> Option<TerminalSessionRecord> {
         match self.map.lock() {
@@ -1498,6 +1528,56 @@ mod tests {
 
         assert!(
             store.find_open_by_terminal("term-unknown").is_none(),
+            "an unknown terminal id resolves to None"
+        );
+    }
+
+    /// `find_confirmed_open_by_terminal` — the gate `terminal_list`'s
+    /// `sessionIdsByTerminal` uses — returns a record ONLY once it is confirmed.
+    /// The spawn-time identity seam records an authoritative-but-PROVISIONAL
+    /// `open` row for every terminal (plain shells included, and non-pinned
+    /// launches whose minted uuid is never the run id); surfacing those would
+    /// bind phantom / wrong ids onto tabs. Provisional ⇒ `None`, confirmed ⇒
+    /// `Some`, while the unfiltered `find_open_by_terminal` still resolves both.
+    #[test]
+    fn find_confirmed_open_by_terminal_excludes_provisional_phantoms() {
+        let dir = tempdir().unwrap();
+        let store =
+            SessionLifecycleStore::open(&dir.path().join("terminal-sessions.json")).unwrap();
+
+        // A provisional (unconfirmed) row — the phantom-shell / minted-uuid shape.
+        let mut phantom = rec("phantom-sess");
+        phantom.terminal_id = "term-phantom".to_string();
+        phantom.confirmed_at = None;
+        store.record_open(phantom);
+
+        assert!(
+            store
+                .find_confirmed_open_by_terminal("term-phantom")
+                .is_none(),
+            "an unconfirmed (provisional) record is NOT surfaced to session-scoped UI"
+        );
+        assert!(
+            store.find_open_by_terminal("term-phantom").is_some(),
+            "the unfiltered lookup still resolves the provisional record"
+        );
+
+        // A confirmed row — a real session with a fired hook / start-anchored bind.
+        let mut real = rec("real-sess");
+        real.terminal_id = "term-real".to_string();
+        real.confirmed_at = Some(1_700_000_000_000);
+        store.record_open(real);
+
+        let found = store
+            .find_confirmed_open_by_terminal("term-real")
+            .expect("a confirmed record resolves by its terminal id");
+        assert_eq!(found.claude_session_id, "real-sess");
+        assert_eq!(found.config_dir.as_deref(), Some("C:/cfg"));
+
+        assert!(
+            store
+                .find_confirmed_open_by_terminal("term-unknown")
+                .is_none(),
             "an unknown terminal id resolves to None"
         );
     }
