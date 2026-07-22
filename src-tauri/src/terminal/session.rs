@@ -1080,36 +1080,142 @@ impl TerminalSession {
         cmd.env(Self::PATH_ENV_KEY, value);
     }
 
-    /// Extract an explicit `--session-id <id>` (or `--session-id=<id>`) from a
-    /// built PTY child command's argv, if present. Used by the identity seam to
-    /// adopt the id a runner-launched direct-command spawn actually carries as
-    /// its authoritative pin — so the recorded id equals the id the session runs
-    /// under (no phantom). Returns `None` for the interactive-shell path, whose
-    /// argv is the shell program and carries no `--session-id`.
+    /// Extract the explicit session id a built PTY child command's argv NAMES,
+    /// if any. Recognizes every flag that carries a CONCRETE id:
+    ///
+    /// - `--session-id <id>` / `--session-id=<id>`
+    /// - `--resume <id>`     / `--resume=<id>`
+    /// - `-r <id>`           (claude's short `--resume`; head-gated, below)
+    ///
+    /// Used by the identity seam to adopt the id a runner-launched
+    /// direct-command spawn actually carries as its authoritative pin — so the
+    /// recorded id equals the id the session runs under (no phantom). Returns
+    /// `None` for the interactive-shell path, whose argv is the shell program
+    /// and names no id.
+    ///
+    /// The resume forms are NOT optional extras: the account-migration respawn
+    /// ([`crate::terminal::account_migration`]) composes its argv through
+    /// [`crate::claude_session::launch_spec::render_argv`], which renders
+    /// `--resume <id>` and DROPS `--session-id`. Without them this function
+    /// returned `None` for that whole class and the seam minted a fresh uuid no
+    /// process ever ran under — an authoritative row unconfirmable by
+    /// construction.
+    ///
+    /// `--continue` / `-c` name NO id (the CLI picks the most recent session on
+    /// its own), so they deliberately do not match: there is nothing to adopt,
+    /// and inventing an id would recreate the very phantom this exists to
+    /// prevent. Mint-a-fresh-uuid stays the correct fallback there.
+    ///
+    /// PRECEDENCE — when argv somehow carries BOTH a session-id and a resume
+    /// flag, the RESUME id wins, because that is the id the launched process
+    /// will actually run under. This mirrors `launch_spec::render_argv` step 3
+    /// ("Session — … resume takes precedence over session-id",
+    /// `claude_session/launch_spec.rs:225-235`), which emits `--resume` and
+    /// omits `--session-id` when both are specified. Getting this backwards
+    /// would re-introduce the phantom for that argv shape.
     fn explicit_session_id_from(cmd: &CommandBuilder) -> Option<String> {
         let argv = cmd.get_argv();
-        let mut it = argv.iter();
+        // The ambiguous SHORT form only when the child IS claude — see
+        // `argv_head_is_claude`.
+        let allow_short_r = Self::argv_head_is_claude(argv);
+
+        let mut session_id: Option<String> = None;
+        let mut resume_id: Option<String> = None;
+
+        let mut it = argv.iter().peekable();
         while let Some(arg) = it.next() {
             let s = arg.to_string_lossy();
-            if let Some(rest) = s.strip_prefix("--session-id") {
-                // Attached form: `--session-id=<id>`.
-                if let Some(id) = rest.strip_prefix('=') {
-                    if !id.is_empty() {
-                        return Some(id.to_string());
-                    }
-                }
-                // Space-separated form: `--session-id <id>`.
-                if rest.is_empty() {
-                    if let Some(next) = it.next() {
-                        let id = next.to_string_lossy();
-                        if !id.is_empty() {
-                            return Some(id.to_string());
-                        }
-                    }
+            // `(is_resume, id)` for the flags that NAME an id; everything else
+            // (including `--continue` / `-c`) falls through unmatched.
+            let matched = if let Some(rest) = s.strip_prefix("--session-id") {
+                Self::flag_id_value(rest, &mut it).map(|v| (false, v))
+            } else if let Some(rest) = s.strip_prefix("--resume") {
+                Self::flag_id_value(rest, &mut it).map(|v| (true, v))
+            } else if s.as_ref() == "-r" && allow_short_r {
+                Self::flag_id_value("", &mut it).map(|v| (true, v))
+            } else {
+                None
+            };
+            if let Some((is_resume, id)) = matched {
+                let slot = if is_resume {
+                    &mut resume_id
+                } else {
+                    &mut session_id
+                };
+                if slot.is_none() {
+                    *slot = Some(id); // first occurrence of each class wins
                 }
             }
         }
-        None
+
+        // resume beats session-id (launch_spec.rs:225-235).
+        resume_id.or(session_id)
+    }
+
+    /// The id a `--flag`-prefixed argv token names: the attached `=<id>` form,
+    /// else the NEXT argv token. `None` when the token was only a glued prefix
+    /// match (`--session-idX`, `--resumeX`), when no value follows, or when the
+    /// following token does not look like an id.
+    ///
+    /// The next token is PEEKED and consumed only on acceptance, so a rejected
+    /// lookahead (`--resume --session-id <id>`) stays visible to the scan.
+    fn flag_id_value<'a, I>(rest: &str, it: &mut std::iter::Peekable<I>) -> Option<String>
+    where
+        I: Iterator<Item = &'a std::ffi::OsString>,
+    {
+        if let Some(attached) = rest.strip_prefix('=') {
+            return Self::accept_id_value(attached);
+        }
+        if rest.is_empty() {
+            let id = Self::accept_id_value(it.peek()?.to_string_lossy().as_ref())?;
+            it.next(); // consume only once accepted
+            return Some(id);
+        }
+        None // glued prefix match — not this flag
+    }
+
+    /// Accept a captured token as an explicit session id: non-empty, and not
+    /// itself a flag. The flag guard is what keeps `--resume --verbose` from
+    /// capturing `--verbose`, and `--resume` as the final arg from capturing
+    /// nothing.
+    ///
+    /// Deliberately NOT a strict UUID gate: this argv is BUILT BY the runner's
+    /// own direct-command callers, whose ids are passed through verbatim, and
+    /// the pin must equal whatever the child actually runs under — uuid-shaped
+    /// or not. (The UUID gate belongs on the untrusted side, where
+    /// `process_capture::process_tree::parse_session_id_from_cmdline` scrapes a
+    /// foreign process's command line.)
+    fn accept_id_value(raw: &str) -> Option<String> {
+        let t = raw.trim();
+        if t.is_empty() || t.starts_with('-') {
+            return None;
+        }
+        Some(t.to_string())
+    }
+
+    /// True when argv's head names the claude CLI image (basename compare,
+    /// tolerant of a path and a `.exe`/`.cmd`/`.bat` suffix).
+    ///
+    /// Gates the SHORT `-r` form only. `--session-id` / `--resume` are
+    /// unambiguous long flags, but `-r` is an extremely common unrelated short
+    /// flag (`cp -r`, `grep -r`, `ls -r`) and this seam builds a command for
+    /// ARBITRARY direct spawns — an ungated `-r` could pin a path as a session
+    /// id. This mirrors the identity shim, which reaches its own
+    /// `--session-id | --resume | -r | …` equivalence class
+    /// (`bin/qontinui_shim.rs::user_chose_session`) only after
+    /// `detect_identity_tool` has confirmed argv0 is claude/gemini.
+    fn argv_head_is_claude(argv: &[std::ffi::OsString]) -> bool {
+        let Some(head) = argv.first() else {
+            return false;
+        };
+        let lower = head.to_string_lossy().to_ascii_lowercase();
+        let base = lower.rsplit(['/', '\\']).next().unwrap_or(lower.as_str());
+        let stem = base
+            .strip_suffix(".exe")
+            .or_else(|| base.strip_suffix(".cmd"))
+            .or_else(|| base.strip_suffix(".bat"))
+            .unwrap_or(base);
+        stem == "claude"
     }
 
     /// Install-interception env-seam (plan §4 Phase 1). Behind the master flag
@@ -1201,9 +1307,11 @@ impl TerminalSession {
 
         // 1. Pinned session id — the runner KNOWS it up front.
         //
-        // If the caller supplied an explicit `--session-id <id>` in the PTY
-        // child command (the gate-continuation / runner-launched direct-command
-        // path builds `[claude, --session-id, <id>, …]`), ADOPT that id as the
+        // If the PTY child command's argv NAMES a session id — `--session-id
+        // <id>` (the gate-continuation / runner-launched direct-command path
+        // builds `[claude, --session-id, <id>, …]`) or `--resume <id>` / `-r
+        // <id>` (the account-migration respawn path builds `[claude, …,
+        // --resume, <id>]` and carries NO `--session-id`) — ADOPT that id as the
         // authoritative pin instead of minting a fresh one. Otherwise the seam
         // would record a fresh uuid the session never runs under (the identity
         // shim's don't-double-pin passes the explicit id straight through), and
@@ -2114,6 +2222,135 @@ mod tests {
         // falls back to Uuid::new_v4).
         let cmd = TerminalSession::build_command_from(None);
         assert_eq!(TerminalSession::explicit_session_id_from(&cmd), None);
+    }
+
+    /// Build a claude argv for the explicit-id tests.
+    fn claude_argv(args: &[&str]) -> CommandBuilder {
+        let mut parts = vec!["claude".to_string()];
+        parts.extend(args.iter().map(|a| a.to_string()));
+        TerminalSession::build_command_from(Some(parts))
+    }
+
+    #[test]
+    fn explicit_session_id_from_resume_space_separated() {
+        // The account-migration respawn path renders `--resume <id>` and drops
+        // `--session-id` entirely (launch_spec::render_argv step 3). Before this
+        // was recognized the seam minted a phantom uuid no process ever ran under.
+        let cmd = claude_argv(&[
+            "--permission-mode",
+            "bypassPermissions",
+            "--resume",
+            "abc-123",
+        ]);
+        assert_eq!(
+            TerminalSession::explicit_session_id_from(&cmd),
+            Some("abc-123".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_session_id_from_resume_attached_form() {
+        let cmd = claude_argv(&["--resume=xyz-789"]);
+        assert_eq!(
+            TerminalSession::explicit_session_id_from(&cmd),
+            Some("xyz-789".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_session_id_from_short_r_flag() {
+        let cmd = claude_argv(&["-r", "abc-123"]);
+        assert_eq!(
+            TerminalSession::explicit_session_id_from(&cmd),
+            Some("abc-123".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_session_id_from_short_r_ignored_for_non_claude_head() {
+        // `-r` is a common unrelated short flag; only a claude child may claim it
+        // (mirrors the shim's detect_identity_tool head gate).
+        let cmd = TerminalSession::build_command_from(Some(vec![
+            "cp".to_string(),
+            "-r".to_string(),
+            "src".to_string(),
+            "dst".to_string(),
+        ]));
+        assert_eq!(TerminalSession::explicit_session_id_from(&cmd), None);
+    }
+
+    #[test]
+    fn explicit_session_id_from_none_for_continue_flags_that_name_no_id() {
+        // `--continue` / `-c` name NO id — the seam must fall back to minting one
+        // rather than invent an id the process will not run under.
+        let cmd = claude_argv(&["--continue"]);
+        assert_eq!(TerminalSession::explicit_session_id_from(&cmd), None);
+        let cmd = claude_argv(&["-c"]);
+        assert_eq!(TerminalSession::explicit_session_id_from(&cmd), None);
+    }
+
+    #[test]
+    fn explicit_session_id_from_never_captures_a_following_flag() {
+        let cmd = claude_argv(&["--resume", "--verbose"]);
+        assert_eq!(TerminalSession::explicit_session_id_from(&cmd), None);
+        // …and the rejected lookahead is still scanned as a flag in its own right.
+        let cmd = claude_argv(&["--resume", "--session-id", "abc-123"]);
+        assert_eq!(
+            TerminalSession::explicit_session_id_from(&cmd),
+            Some("abc-123".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_session_id_from_none_when_resume_is_the_final_arg() {
+        let cmd = claude_argv(&["--resume"]);
+        assert_eq!(TerminalSession::explicit_session_id_from(&cmd), None);
+        let cmd = claude_argv(&["-r"]);
+        assert_eq!(TerminalSession::explicit_session_id_from(&cmd), None);
+    }
+
+    #[test]
+    fn explicit_session_id_from_prefers_resume_over_session_id_when_both_present() {
+        // launch_spec::render_argv step 3: "resume takes precedence over
+        // session-id" — so the resume id is the one claude actually runs under.
+        let cmd = claude_argv(&["--session-id", "aaa-111", "--resume", "bbb-222"]);
+        assert_eq!(
+            TerminalSession::explicit_session_id_from(&cmd),
+            Some("bbb-222".to_string())
+        );
+        // Argv order must not change the answer.
+        let cmd = claude_argv(&["--resume", "bbb-222", "--session-id", "aaa-111"]);
+        assert_eq!(
+            TerminalSession::explicit_session_id_from(&cmd),
+            Some("bbb-222".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_session_id_from_ignores_glued_false_prefixes() {
+        let cmd = claude_argv(&["--session-idX", "abc-123"]);
+        assert_eq!(TerminalSession::explicit_session_id_from(&cmd), None);
+        let cmd = claude_argv(&["--resumeX", "abc-123"]);
+        assert_eq!(TerminalSession::explicit_session_id_from(&cmd), None);
+    }
+
+    #[test]
+    fn apply_identity_seam_helpers_never_mutate_argv() {
+        // The seam is env-only by contract: adopting an id must never inject or
+        // rewrite argv. Guard the read path used by the seam.
+        let before = claude_argv(&["--resume", "abc-123"]);
+        let argv_before: Vec<String> = before
+            .get_argv()
+            .iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let _ = TerminalSession::explicit_session_id_from(&before);
+        let argv_after: Vec<String> = before
+            .get_argv()
+            .iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(argv_before, argv_after);
     }
 
     #[test]
