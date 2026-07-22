@@ -612,11 +612,35 @@ fn init_global() -> Option<TenantMemorySync> {
     Some(TenantMemorySync::new(Arc::new(outbox), machine_id))
 }
 
-/// Resolve the web backend base URL the memory API lives behind. Reuses the
-/// shared resolver (`QONTINUI_WEB_BASE` env → web base derived from the
-/// active profile's `coord_url`) that pairing + env-agent enroll already
-/// use. `None` when neither is available (unconfigured dev box).
+/// Resolve the web backend base URL the memory API lives behind.
+///
+/// Order: `QONTINUI_WEB_BASE` env (temp-runner / test override) → the
+/// operator-configured `web_integration.backend_url` from settings → the
+/// coord-derived fallback. `None` only when all three are absent.
+///
+/// The `web_integration.backend_url` step is load-bearing on the PRIMARY: it
+/// is the SAME base the runner's WS relay + `/api/v1/*` calls already use
+/// (e.g. `https://api.qontinui.io`). Without it, resolution fell straight
+/// through to `resolve_backend_base`'s coord-derivation, whose
+/// `derive_web_base_from_coord` strips a trailing `:port` and so mangles a
+/// PORTLESS production coord URL — `https://coord.qontinui.io` → `"https"`.
+/// That left the primary (which sets no `QONTINUI_WEB_BASE`) unable to reach
+/// the backend to upload memory records OR drain the synthesis/embedding job
+/// queues; only temp runners with an explicit `QONTINUI_WEB_BASE` ever worked.
 pub(crate) fn resolve_web_base() -> Option<String> {
+    if let Ok(v) = std::env::var("QONTINUI_WEB_BASE") {
+        let t = v.trim();
+        if !t.is_empty() {
+            return Some(t.trim_end_matches('/').to_string());
+        }
+    }
+    let wi = crate::settings::load_settings().web_integration;
+    if wi.enabled {
+        let b = wi.backend_url.trim();
+        if !b.is_empty() {
+            return Some(b.trim_end_matches('/').to_string());
+        }
+    }
     qontinui_runner_lib::env_agent::enroll::resolve_backend_base(None).ok()
 }
 
