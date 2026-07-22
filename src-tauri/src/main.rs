@@ -2173,6 +2173,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::watchers::list_watchers,
             commands::watchers::set_watcher_enabled,
             commands::watchers::update_watcher,
+            commands::web_integration::get_settings_health,
             commands::web_integration::get_web_integration_status,
             commands::web_integration::redeem_pair_code,
             commands::web_integration::save_web_integration_settings,
@@ -3758,13 +3759,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
             if server_mode {
                 // Server mode forces Restate on; persist so the block below picks it up.
-                let mut s = crate::settings::load_settings();
-                if !s.restate.enabled {
-                    s.restate.enabled = true;
-                    if let Err(e) = crate::settings::save_settings(&s) {
-                        warn!("Failed to persist restate.enabled=true for server mode: {}", e);
-                    } else {
-                        info!("Server mode: forced restate.enabled=true");
+                if !crate::settings::load_settings().restate.enabled {
+                    match crate::settings::update_settings(|s| s.restate.enabled = true) {
+                        Ok(()) => info!("Server mode: forced restate.enabled=true"),
+                        Err(e) => warn!(
+                            "Failed to persist restate.enabled=true for server mode: {}",
+                            e
+                        ),
                     }
                 }
             }

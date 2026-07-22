@@ -90,7 +90,7 @@ const RELAY_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 ///
 /// Kept as a pure function (no I/O, no global state) so the Phase 9
 /// tier-matrix calibration suite can exercise it deterministically. The
-/// I/O-bound wrapper `should_relay_idle` reads from `AuthManager` and
+/// I/O-bound wrapper `relay_gate` reads from `AuthManager` and
 /// calls into this inner predicate.
 pub(crate) fn should_relay_idle_with(
     tier: crate::settings::RunnerTier,
@@ -106,6 +106,24 @@ pub(crate) fn should_relay_idle_with(
     !has_device_jwt
 }
 
+/// What [`relay_gate`] decided, and why.
+///
+/// NO-DOWNGRADE (M1): a credential-store READ ERROR used to collapse into
+/// `has_device_jwt = false`, which idles the relay indefinitely — the runner
+/// silently disappears from qontinui-web / mobile and does NOT self-heal until
+/// something kicks it. A read error means the credential state is UNKNOWN, so
+/// the correct posture is "retry soon", not "gate unmet".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RelayGate {
+    /// Gates satisfied — connect.
+    Connect,
+    /// Gates definitively unmet (tier/toggle/no token). Idle until kicked.
+    Idle,
+    /// The credential store could not be read, so we do not know whether a
+    /// device JWT exists. Back off and retry rather than idling forever.
+    Unknown(String),
+}
+
 /// Live idle predicate consumed by `relay_loop`. Reads the device-JWT
 /// slot from `AuthManager` (filesystem I/O on `~/.qontinui`) and delegates
 /// to the pure inner [`should_relay_idle_with`]. Tests must use the inner
@@ -115,11 +133,27 @@ pub(crate) fn should_relay_idle_with(
 /// deliberately reads the legacy `access_token` slot (the DEFAULT
 /// binding's JWT) and stays on the unparameterized seam by construction;
 /// per-session tenants never route through the relay's WS identity.
-pub(crate) fn should_relay_idle(settings: &crate::settings::Settings) -> bool {
-    let has_device_jwt = match crate::auth::AuthManager::new().get_access_token() {
-        Ok(t) => !t.trim().is_empty(),
-        Err(e) => {
-            tracing::debug!(error = %e, "relay idle check: get_access_token failed");
+pub(crate) fn relay_gate(settings: &crate::settings::Settings) -> RelayGate {
+    use crate::secure_storage::StoredTokenRead;
+    let has_device_jwt = match crate::auth::AuthManager::new().probe_access_token() {
+        StoredTokenRead::Present(_) => true,
+        StoredTokenRead::Absent => false,
+        StoredTokenRead::Unreadable(e) => {
+            // Only an UNKNOWN credential state matters when the other two gates
+            // are otherwise satisfied — a Tier 0/1 runner with web integration
+            // off has no business retrying regardless of the credential store.
+            if settings.tier == crate::settings::RunnerTier::QontinuiAccount
+                && settings.web_integration.enabled
+            {
+                tracing::warn!(
+                    error = %e,
+                    "backend_relay: credential store unreadable — device-JWT presence is \
+                     UNKNOWN, not absent. Backing off and retrying instead of idling \
+                     (idling here silently removes the runner from qontinui-web/mobile)."
+                );
+                return RelayGate::Unknown(e);
+            }
+            tracing::debug!(error = %e, "relay idle check: credential store unreadable");
             false
         }
     };
@@ -135,15 +169,17 @@ pub(crate) fn should_relay_idle(settings: &crate::settings::Settings) -> bool {
             has_device_jwt,
             "backend_relay: idling (gate unmet)"
         );
+        RelayGate::Idle
+    } else {
+        RelayGate::Connect
     }
-    idle
 }
 
 /// Diagnostic snapshot of the relay's idle-gating inputs + live connection
 /// state, served at `GET /web-integration/status` on the runner's local API.
 ///
 /// Sourced from exactly the same places the relay loop reads when deciding
-/// whether to idle ([`should_relay_idle`]): `settings.tier`,
+/// whether to idle ([`relay_gate`]): `settings.tier`,
 /// `settings.web_integration.enabled`, the AuthManager device-JWT slot, and
 /// the live `ServerModeState` (WS connection + last connection error). This
 /// lets an operator see *why* the runner never appears to the mobile app /
@@ -158,7 +194,22 @@ pub struct WebIntegrationStatus {
     pub web_integration_enabled: bool,
     /// Whether AuthManager's `access_token` slot holds a non-empty
     /// device-JWT (gate 3). The actual token is never exposed.
+    ///
+    /// **Only meaningful when `credential_read_error` is `None`.** A `false`
+    /// here with a populated `credential_read_error` means UNKNOWN, not
+    /// "unpaired" — see [`credential_read_error`](Self::credential_read_error).
     pub has_device_jwt: bool,
+    /// NO-DOWNGRADE (M2): the error from reading the credential store, if the
+    /// read failed. Previously the `Err` was discarded entirely and the status
+    /// reported `has_device_jwt: false`, which misdiagnosed the M1 relay stall
+    /// as "this runner was never paired".
+    pub credential_read_error: Option<String>,
+    /// Provenance of the settings this snapshot was built from
+    /// (`loaded` / `fresh_install` / `unreadable`). When `unreadable`, `tier`
+    /// and `web_integration_enabled` are placeholders, NOT the user's values.
+    pub settings_provenance: &'static str,
+    /// The settings-read fault, if settings.json could not be read.
+    pub settings_error: Option<String>,
     /// Whether the relay currently holds an open, post-handshake WS
     /// connection. False whenever the relay is idling or reconnecting.
     pub ws_connected: bool,
@@ -171,11 +222,14 @@ pub struct WebIntegrationStatus {
 /// relay state the idle gate reads. Pure-ish (only reads): used by both the
 /// HTTP handler and any future caller that wants the gating snapshot.
 pub(crate) async fn web_integration_status(api_state: &Arc<ApiState>) -> WebIntegrationStatus {
-    let settings = crate::settings::load_settings();
-    let has_device_jwt = match crate::auth::AuthManager::new().get_access_token() {
-        Ok(t) => !t.trim().is_empty(),
-        Err(_) => false,
-    };
+    use crate::secure_storage::StoredTokenRead;
+    let loaded = crate::settings::load_settings_full();
+    let (has_device_jwt, credential_read_error) =
+        match crate::auth::AuthManager::new().probe_access_token() {
+            StoredTokenRead::Present(_) => (true, None),
+            StoredTokenRead::Absent => (false, None),
+            StoredTokenRead::Unreadable(e) => (false, Some(e)),
+        };
 
     let (ws_connected, last_error) = match api_state.app_state.current_server_mode().await {
         Some(sm) => (sm.is_ws_connected(), sm.registration_error().await),
@@ -183,9 +237,12 @@ pub(crate) async fn web_integration_status(api_state: &Arc<ApiState>) -> WebInte
     };
 
     WebIntegrationStatus {
-        tier: settings.tier,
-        web_integration_enabled: settings.web_integration.enabled,
+        tier: loaded.settings.tier,
+        web_integration_enabled: loaded.settings.web_integration.enabled,
         has_device_jwt,
+        credential_read_error,
+        settings_provenance: loaded.provenance.as_str(),
+        settings_error: loaded.error.clone(),
         ws_connected,
         last_error,
     }
@@ -475,20 +532,46 @@ async fn relay_loop(
         // that's the canonical WS bearer. See
         // `plans/2026-05-21-runner-unified-devices-migration.md` Phase 3.
         // The predicate is split into a pure inner (`should_relay_idle_with`)
-        // and the I/O-bound wrapper (`should_relay_idle`) so the Phase 9
-        // calibration suite can exercise the gate without touching disk.
-        if should_relay_idle(&settings) {
-            // Wait for a kick or shutdown before re-checking — there's
-            // nothing to do until settings change.
-            tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    info!("Backend relay shutting down (was idle awaiting config)");
+        // and the I/O-bound wrapper (`relay_gate`) so the Phase 9 calibration
+        // suite can exercise the gate without touching disk.
+        match relay_gate(&settings) {
+            RelayGate::Connect => {}
+            RelayGate::Idle => {
+                // Wait for a kick or shutdown before re-checking — there's
+                // nothing to do until settings change.
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        info!("Backend relay shutting down (was idle awaiting config)");
+                        return;
+                    }
+                    _ = kick_rx.changed() => {
+                        info!("Backend relay kicked — re-reading config");
+                        continue;
+                    }
+                }
+            }
+            RelayGate::Unknown(reason) => {
+                // NO-DOWNGRADE (M1): the credential store is unreadable, so we
+                // do NOT know whether a device JWT exists. Idling here would
+                // remove the runner from qontinui-web/mobile until something
+                // kicks it. Back off and retry so the relay self-heals as soon
+                // as the store becomes readable again.
+                warn!(
+                    "Backend relay: credential state UNKNOWN ({reason}) — retrying in {}ms \
+                     instead of idling",
+                    backoff_ms
+                );
+                sleep_with_kick(
+                    Duration::from_millis(backoff_ms),
+                    &mut shutdown_rx,
+                    &mut kick_rx,
+                )
+                .await;
+                if *shutdown_rx.borrow() {
                     return;
                 }
-                _ = kick_rx.changed() => {
-                    info!("Backend relay kicked — re-reading config");
-                    continue;
-                }
+                backoff_ms = (backoff_ms * 2).min(max_backoff_ms);
+                continue;
             }
         }
 
@@ -510,7 +593,7 @@ async fn relay_loop(
 
         // Pull the device-JWT from AuthManager's access_token slot —
         // populated by `pair::persist_pairing` and kept fresh by
-        // `mcp::device_jwt_refresher`. The upstream `should_relay_idle`
+        // `mcp::device_jwt_refresher`. The upstream `relay_gate`
         // gate already verified the slot is non-empty, but a TOCTOU race
         // with `clear_tokens` (sign-out) or an in-flight rotation could
         // leave us empty here; in that case, kick the refresher and
@@ -680,7 +763,7 @@ async fn relay_loop(
                 // when the connection dies on its own, so a `kick_cloud_relay()`
                 // from `set_runner_tier(local)` would NOT idle a live relay —
                 // `ws_connected` would stay true long after tier dropped to
-                // Local. Re-looping re-evaluates `should_relay_idle`.
+                // Local. Re-looping re-evaluates `relay_gate`.
                 let mut kick_clone = kick_rx.clone();
 
                 // Shared "last inbound frame at" epoch-ms, updated by the

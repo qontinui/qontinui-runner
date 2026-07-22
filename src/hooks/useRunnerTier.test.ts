@@ -30,7 +30,7 @@
 
 import { describe, it, expect } from "vitest";
 
-import { useRunnerTier, type RunnerTier } from "./useRunnerTier";
+import { useRunnerTier, type RunnerTier, type UseRunnerTierResult } from "./useRunnerTier";
 
 describe("useRunnerTier (Phase 9 contract tripwires)", () => {
   // Tripwire: a rename of the hook surfaces as a test-file compile error.
@@ -66,5 +66,26 @@ describe("useRunnerTier (Phase 9 contract tripwires)", () => {
     // same order as `commands::auth::get_runner_tier` returns them.
     const all: RunnerTier[] = ["local", "local_provider", "qontinui_account"];
     expect(all).toHaveLength(3);
+  });
+
+  // NO-DOWNGRADE tripwire. `tier` alone cannot express "we could not read the
+  // tier": its type is the three-tier union, so a read failure used to be
+  // indistinguishable from a genuine Tier 0 user, which silently removed every
+  // cloud feature. The hook must therefore keep exposing `tierKnown` + `error`
+  // so consumers can render UNKNOWN instead of the lesser capability. Deleting
+  // either field breaks this test rather than silently regressing the UI.
+  it("exposes an explicit unknown channel (tierKnown + error), not just `tier`", () => {
+    const shape: UseRunnerTierResult = {
+      tier: "qontinui_account",
+      tierKnown: false,
+      loading: false,
+      error: "settings.json could not be read",
+      refresh: async () => {},
+    };
+    // `tier` says qontinui_account, but `tierKnown` is false — the pair must
+    // remain independently representable.
+    expect(shape.tierKnown).toBe(false);
+    expect(shape.error).toBeTruthy();
+    expect(shape.tier).toBe("qontinui_account");
   });
 });

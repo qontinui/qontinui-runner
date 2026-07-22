@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { Monitor, KeyRound, Cloud } from "lucide-react";
+import { Monitor, KeyRound, Cloud, AlertTriangle } from "lucide-react";
 import { useState } from "react";
 
 interface TierStepProps {
@@ -39,15 +39,23 @@ const TIER_CARDS: {
 
 export function TierStep({ onNext }: TierStepProps) {
   const [busy, setBusy] = useState<TierChoice | null>(null);
+  // NO-DOWNGRADE (M6): a failed `set_runner_tier` used to be swallowed with
+  // `console.error`. The user clicked "Sign in to Qontinui (Tier 2)", nothing
+  // happened, no error appeared, and the UI funnelled them into the
+  // "start in local-only mode" link right below — a silent downgrade driven
+  // by an unreported error. Surface it inline with a retry instead.
+  const [error, setError] = useState<{ tier: TierChoice; message: string } | null>(null);
 
   const select = async (tier: TierChoice) => {
     setBusy(tier);
+    setError(null);
     try {
       await invoke("set_runner_tier", { tier });
       window.dispatchEvent(new CustomEvent("runner-tier-changed"));
       onNext();
     } catch (err) {
       console.error("[TierStep] set_runner_tier failed:", err);
+      setError({ tier, message: err instanceof Error ? err.message : String(err) });
       setBusy(null);
     }
   };
@@ -80,6 +88,31 @@ export function TierStep({ onNext }: TierStepProps) {
           </button>
         ))}
       </div>
+      {error && (
+        <div
+          id="tier-step-error"
+          role="alert"
+          className="flex items-start gap-2 p-3 rounded-md bg-destructive/10 border border-destructive/30"
+        >
+          <AlertTriangle className="w-4 h-4 text-destructive shrink-0 mt-0.5" />
+          <div className="text-xs flex-1 min-w-0 space-y-1.5">
+            <div className="font-medium text-destructive">
+              Could not save your choice — your tier was NOT changed
+            </div>
+            <div className="text-muted-foreground break-words">{error.message}</div>
+            <div className="text-muted-foreground">
+              Do not fall back to local-only mode because of this error; retry instead.
+            </div>
+            <button
+              onClick={() => void select(error.tier)}
+              disabled={busy !== null}
+              className="text-primary hover:underline disabled:opacity-50"
+            >
+              Retry
+            </button>
+          </div>
+        </div>
+      )}
       <button
         onClick={() => select("local")}
         disabled={busy !== null}

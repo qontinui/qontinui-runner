@@ -61,6 +61,17 @@ interface WebIntegrationStatus {
   registrationError: string | null;
   /** Whether the unified runner WebSocket is currently connected. */
   wsConnected: boolean;
+  /**
+   * NO-DOWNGRADE: non-null when `settings.json` could not be read or parsed.
+   * Every other field above is then a PLACEHOLDER, not the user's saved
+   * configuration — the runner deliberately refuses to write settings in this
+   * state rather than silently overwriting the file with defaults.
+   */
+  settingsFault?: {
+    path: string;
+    error: string;
+    detectedAtUnix: number;
+  } | null;
 }
 
 /** Shape of `test_web_integration_connection` response on success. */
@@ -218,19 +229,31 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
   // Independent of the web-integration form: reads/writes the runner-global
   // `cloud_sync_enabled` settings.json flag via its own command pair, and
   // saves immediately on toggle (no shared Save button involvement).
-  const [cloudSyncEnabled, setCloudSyncEnabled] = useState(false);
+  //
+  // NO-DOWNGRADE: `null` means UNKNOWN (the load has not resolved, or it
+  // FAILED). It must never be rendered as "off" — misrepresenting an enabled
+  // capability as disabled is exactly the silent downgrade this audit is
+  // about, and the load failure used to be swallowed with `console.error`
+  // while every other load in this file routes through `onLog`.
+  const [cloudSyncEnabled, setCloudSyncEnabled] = useState<boolean | null>(null);
   const [cloudSyncSaving, setCloudSyncSaving] = useState(false);
+  const [cloudSyncError, setCloudSyncError] = useState<string | null>(null);
 
   // --- Session metadata sync consent (plan 2026-07-10-split-cloud-sync-
   // consent) --------------------------------------------------------------
   // Gate 2, split off from the toggle above: reads/writes the runner-global
   // `session_metadata_sync_enabled` settings.json flag via its own
   // independent command pair, and saves immediately on toggle (no shared
-  // Save button involvement). Starts `false` client-side until the load
-  // effect below resolves the real (default `true`) backing value, matching
-  // the loading convention already used for `cloudSyncEnabled` above.
-  const [sessionMetadataSyncEnabled, setSessionMetadataSyncEnabled] = useState(false);
+  // Save button involvement).
+  //
+  // NO-DOWNGRADE: this flag defaults to `true` SERVER-side, so starting it at
+  // `false` client-side actively misrepresented an enabled capability as
+  // disabled whenever the load was slow or failed. `null` = UNKNOWN.
+  const [sessionMetadataSyncEnabled, setSessionMetadataSyncEnabled] = useState<boolean | null>(
+    null,
+  );
   const [sessionMetadataSyncSaving, setSessionMetadataSyncSaving] = useState(false);
+  const [sessionMetadataSyncError, setSessionMetadataSyncError] = useState<string | null>(null);
 
   // --- Tick to keep "last heartbeat <relative> ago" alive --------------------
   const [, setTick] = useState(0);
@@ -290,20 +313,33 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
       try {
         const result =
           await invoke<CloudSyncTauriResult<CloudSyncSettingsData>>("get_cloud_sync_settings");
-        if (!cancelled && result?.success && result.data) {
+        if (cancelled) return;
+        if (result?.success && result.data) {
           setCloudSyncEnabled(result.data.cloud_sync_enabled);
+          setCloudSyncError(null);
+        } else {
+          // A non-success result is still a failure to READ — leave the state
+          // UNKNOWN rather than rendering the toggle as off.
+          const msg = "backend reported failure";
+          setCloudSyncError(msg);
+          onLog("error", `Failed to load AI content sync setting: ${msg}`);
         }
       } catch (err) {
+        if (cancelled) return;
         console.error("Failed to load cloud sync settings:", err);
+        setCloudSyncError(String(err));
+        onLog("error", `Failed to load AI content sync setting: ${err}`);
       }
     };
     void loadCloudSync();
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [onLog]);
 
   const handleToggleCloudSync = useCallback(async () => {
+    // Guard: never let a click on an UNKNOWN toggle write a guessed value.
+    if (cloudSyncEnabled === null) return;
     const newValue = !cloudSyncEnabled;
     setCloudSyncEnabled(newValue);
     setCloudSyncSaving(true);
@@ -334,20 +370,31 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
         const result = await invoke<CloudSyncTauriResult<SessionMetadataSyncSettingsData>>(
           "get_session_metadata_sync_settings",
         );
-        if (!cancelled && result?.success && result.data) {
+        if (cancelled) return;
+        if (result?.success && result.data) {
           setSessionMetadataSyncEnabled(result.data.session_metadata_sync_enabled);
+          setSessionMetadataSyncError(null);
+        } else {
+          const msg = "backend reported failure";
+          setSessionMetadataSyncError(msg);
+          onLog("error", `Failed to load session metadata sync setting: ${msg}`);
         }
       } catch (err) {
+        if (cancelled) return;
         console.error("Failed to load session metadata sync settings:", err);
+        setSessionMetadataSyncError(String(err));
+        onLog("error", `Failed to load session metadata sync setting: ${err}`);
       }
     };
     void loadSessionMetadataSync();
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [onLog]);
 
   const handleToggleSessionMetadataSync = useCallback(async () => {
+    // Guard: never let a click on an UNKNOWN toggle write a guessed value.
+    if (sessionMetadataSyncEnabled === null) return;
     const newValue = !sessionMetadataSyncEnabled;
     setSessionMetadataSyncEnabled(newValue);
     setSessionMetadataSyncSaving(true);
@@ -789,6 +836,30 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
         icon={<Globe className="w-6 h-6" />}
       />
 
+      {/* NO-DOWNGRADE (C1): settings.json is unreadable. Say so loudly — every
+          value on this page is a placeholder, the runner is refusing to write
+          settings, and nothing about the user's account/tier has changed. */}
+      {status?.settingsFault && (
+        <div
+          id="banner-settings-unreadable"
+          className="flex items-start gap-2 p-3 rounded-md bg-destructive/10 border border-destructive/30"
+        >
+          <AlertTriangle className="w-4 h-4 text-destructive shrink-0 mt-0.5" />
+          <div className="text-xs flex-1 min-w-0 space-y-1">
+            <div className="font-medium text-destructive">Settings file unreadable</div>
+            <div className="text-muted-foreground break-all">
+              {status.settingsFault.path} — {truncate(status.settingsFault.error, 200)}
+            </div>
+            <div className="text-muted-foreground">
+              The values shown below are placeholders, not your saved configuration. Your account,
+              tier and tokens are unchanged; the runner is deliberately refusing to save settings
+              until this file can be read, so it cannot overwrite it with defaults. Fix or move the
+              file and restart.
+            </div>
+          </div>
+        </div>
+      )}
+
       {renderStatusBanner()}
 
       {/* Master toggle */}
@@ -936,24 +1007,44 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
               be resumed on this machine.
             </div>
           </div>
-          <button
-            type="button"
-            id="button-toggle-session-metadata-sync"
-            onClick={handleToggleSessionMetadataSync}
-            disabled={sessionMetadataSyncSaving}
-            className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:opacity-50 ${
-              sessionMetadataSyncEnabled ? "bg-primary" : "bg-muted"
-            }`}
-            aria-pressed={sessionMetadataSyncEnabled}
-            aria-label="Toggle session metadata sync"
-          >
+          {sessionMetadataSyncEnabled === null ? (
+            // NO-DOWNGRADE: the real value is unknown. Render that explicitly
+            // instead of an "off" toggle, and do not let the user act on a
+            // guess.
             <span
-              className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
-                sessionMetadataSyncEnabled ? "translate-x-4" : "translate-x-1"
+              id="label-session-metadata-sync-unknown"
+              className="shrink-0 text-[10px] text-amber-500 flex items-center gap-1"
+              title={sessionMetadataSyncError ?? "loading"}
+            >
+              <AlertTriangle className="w-3 h-3" />
+              {sessionMetadataSyncError ? "unknown" : "loading…"}
+            </span>
+          ) : (
+            <button
+              type="button"
+              id="button-toggle-session-metadata-sync"
+              onClick={handleToggleSessionMetadataSync}
+              disabled={sessionMetadataSyncSaving}
+              className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:opacity-50 ${
+                sessionMetadataSyncEnabled ? "bg-primary" : "bg-muted"
               }`}
-            />
-          </button>
+              aria-pressed={sessionMetadataSyncEnabled}
+              aria-label="Toggle session metadata sync"
+            >
+              <span
+                className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                  sessionMetadataSyncEnabled ? "translate-x-4" : "translate-x-1"
+                }`}
+              />
+            </button>
+          )}
         </label>
+        {sessionMetadataSyncError && (
+          <p className="text-[10px] text-destructive px-3">
+            Could not read this setting ({truncate(sessionMetadataSyncError, 100)}). It has NOT been
+            turned off — the runner is still using whatever you last saved.
+          </p>
+        )}
       </div>
 
       {/* AI content sync — independent consent toggle (gate 1 of the
@@ -972,24 +1063,41 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
               defense-in-depth, not a security boundary.
             </div>
           </div>
-          <button
-            type="button"
-            id="button-toggle-cloud-session-sync"
-            onClick={handleToggleCloudSync}
-            disabled={cloudSyncSaving}
-            className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:opacity-50 ${
-              cloudSyncEnabled ? "bg-primary" : "bg-muted"
-            }`}
-            aria-pressed={cloudSyncEnabled}
-            aria-label="Toggle AI content sync"
-          >
+          {cloudSyncEnabled === null ? (
             <span
-              className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
-                cloudSyncEnabled ? "translate-x-4" : "translate-x-1"
+              id="label-cloud-session-sync-unknown"
+              className="shrink-0 text-[10px] text-amber-500 flex items-center gap-1"
+              title={cloudSyncError ?? "loading"}
+            >
+              <AlertTriangle className="w-3 h-3" />
+              {cloudSyncError ? "unknown" : "loading…"}
+            </span>
+          ) : (
+            <button
+              type="button"
+              id="button-toggle-cloud-session-sync"
+              onClick={handleToggleCloudSync}
+              disabled={cloudSyncSaving}
+              className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:opacity-50 ${
+                cloudSyncEnabled ? "bg-primary" : "bg-muted"
               }`}
-            />
-          </button>
+              aria-pressed={cloudSyncEnabled}
+              aria-label="Toggle AI content sync"
+            >
+              <span
+                className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                  cloudSyncEnabled ? "translate-x-4" : "translate-x-1"
+                }`}
+              />
+            </button>
+          )}
         </label>
+        {cloudSyncError && (
+          <p className="text-[10px] text-destructive px-3">
+            Could not read this setting ({truncate(cloudSyncError, 100)}). It has NOT been turned
+            off — the runner is still using whatever you last saved.
+          </p>
+        )}
       </div>
 
       {/* ADVANCED — overrides + legacy token, tucked away but reachable. */}

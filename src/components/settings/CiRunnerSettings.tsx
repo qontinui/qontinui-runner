@@ -18,6 +18,15 @@ import type { LogFunction } from "./types";
 type CiRunnerState = "idle" | "busy" | "offline";
 
 /**
+ * NO-DOWNGRADE (L3): what we DISPLAY. `status?.runner_status ?? "offline"`
+ * reported a supervisor outage as "Offline" — a definitive verdict about the
+ * CI runner derived from a failure to reach the thing that would know. A
+ * supervisor we cannot reach means UNKNOWN, and both actions are disabled in
+ * that state rather than acting on a guess.
+ */
+type CiRunnerDisplayState = CiRunnerState | "unknown";
+
+/**
  * Shape actually returned by the supervisor's `GET /ci-runner/status` — FLAT:
  * `{ runner_status, labels, service_names, installed }`.
  *
@@ -111,16 +120,18 @@ function ToggleSwitch({
   );
 }
 
-function StatusBadge({ status }: { status: CiRunnerState }) {
+function StatusBadge({ status }: { status: CiRunnerDisplayState }) {
   const colors: Record<string, string> = {
     idle: "text-green-400",
     busy: "text-yellow-400",
     offline: "text-zinc-400",
+    unknown: "text-amber-400",
   };
   const labels: Record<string, string> = {
     idle: "Idle",
     busy: "Busy",
     offline: "Offline",
+    unknown: "Unknown",
   };
   return (
     <span className={`inline-flex items-center gap-1.5 text-xs font-medium ${colors[status]}`}>
@@ -137,6 +148,9 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
   const [error, setError] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
   const [actionSuccess, setActionSuccess] = useState<string | null>(null);
+  // NO-DOWNGRADE: true whenever the most recent poll failed. The previously
+  // fetched `status` is then STALE and must not be rendered as fact.
+  const [statusUnknown, setStatusUnknown] = useState(true);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const fetchStatus = useCallback(async () => {
@@ -151,13 +165,17 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
       }
       const data: CiRunnerStatus = await resp.json();
       setStatus(data);
+      setStatusUnknown(false);
       setError(null);
       setChecking(false);
     } catch (err) {
-      // A timeout means the supervisor is reachable but slow, not down.
-      // Surface a soft "checking…" state and preserve the last known status
-      // rather than flashing a hard "Failed to reach supervisor" banner that
-      // the next 10 s poll would immediately clear.
+      // Either failure mode leaves the previously-fetched `status` STALE, so
+      // mark it unknown (NO-DOWNGRADE) — it must not be rendered as current
+      // fact. A timeout additionally means the supervisor is reachable but
+      // slow, not down: surface a soft "checking…" state and keep the last
+      // status for display rather than flashing a hard "Failed to reach
+      // supervisor" banner that the next poll would immediately clear.
+      setStatusUnknown(true);
       if (err instanceof DOMException && err.name === "AbortError") {
         setChecking(true);
       } else {
@@ -309,10 +327,14 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
     );
   }
 
-  // Every read is defaulted: a supervisor that is down, older, or returns a
-  // partial body must degrade to "offline", never throw during render.
+  // Every read is defaulted so a supervisor that is down, older, or returns a
+  // partial body never throws during render. But "defaulted" must not mean
+  // "asserted": when the supervisor is unreachable the state is UNKNOWN, not
+  // offline, and the actions are disabled rather than acting on a guess.
   const installed = status?.installed ?? false;
-  const runnerStatus: CiRunnerState = status?.runner_status ?? "offline";
+  const runnerStatus: CiRunnerDisplayState = statusUnknown
+    ? "unknown"
+    : (status?.runner_status ?? "offline");
   const labels = status?.labels ?? [];
 
   return (
@@ -359,7 +381,7 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
             </div>
           </div>
           <div className="flex items-center gap-3">
-            {installed && <StatusBadge status={runnerStatus} />}
+            {(installed || statusUnknown) && <StatusBadge status={runnerStatus} />}
             <ToggleSwitch
               checked={installed}
               onChange={(checked) => {
@@ -369,7 +391,7 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
                   void handleDisable();
                 }
               }}
-              disabled={actionLoading}
+              disabled={actionLoading || statusUnknown}
             />
           </div>
         </div>

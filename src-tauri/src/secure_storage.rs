@@ -204,6 +204,19 @@ enum WriteMode {
     Fresh,
 }
 
+/// Outcome of reading a credential slot out of the encrypted store.
+///
+/// NO-DOWNGRADE: `Absent` ("definitively nothing stored") and `Unreadable`
+/// ("the store exists but we could not decrypt/parse it") are DIFFERENT facts.
+/// Flattening them into a single "no token" is what let a locked or corrupt
+/// store present as an unpaired / signed-out runner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredTokenRead {
+    Present(String),
+    Absent,
+    Unreadable(String),
+}
+
 /// Secure file-based storage manager.
 ///
 /// Provides encrypted storage for authentication tokens using AES-256-GCM.
@@ -670,6 +683,25 @@ impl SecureStorage {
     /// `AuthManager::get_access_token`.
     pub fn store_file_exists(&self) -> bool {
         self.storage_path.exists()
+    }
+
+    /// Tri-state read of the device-JWT (`access_token`) slot.
+    ///
+    /// [`Self::get_access_token`] returns `Err` for BOTH "nothing was ever
+    /// stored" and "the store is present but undecryptable", which is exactly
+    /// the collapse of "unknown" into "denied" that made an unreadable store
+    /// render as "this runner was never paired". This read keeps them apart.
+    pub fn read_access_token(&self) -> StoredTokenRead {
+        if !self.store_file_exists() {
+            return StoredTokenRead::Absent;
+        }
+        match self.load_tokens() {
+            Ok(tokens) => match tokens.access_token.filter(|t| !t.trim().is_empty()) {
+                Some(t) => StoredTokenRead::Present(t),
+                None => StoredTokenRead::Absent,
+            },
+            Err(e) => StoredTokenRead::Unreadable(e.to_string()),
+        }
     }
 
     /// Checks if tokens exist in storage.

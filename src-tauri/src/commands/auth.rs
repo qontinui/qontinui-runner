@@ -74,10 +74,26 @@ pub(crate) fn require_tier_2_for(tier: settings::RunnerTier) -> Result<(), AppEr
 }
 
 /// Returns Err with a structured "Tier 0/1 — no auth" message when the
-/// runner is not in Tier 2. All cloud-reaching auth commands gate on this.
+/// runner is definitively not in Tier 2. All cloud-reaching auth commands
+/// gate on this.
+///
+/// NO-DOWNGRADE (C4): a settings-read failure used to fail closed here with
+/// the Tier 0/1 message, telling a Tier 2 user to "Sign in via Settings →
+/// Account" — the wrong remediation for a corrupt settings.json, and it also
+/// blocked `logout` / `sign_out_full`, so the user could not even get out.
+/// An unresolvable tier is now a distinct [`AppError::ConfigError`]: it names
+/// the real fault and, unlike `AuthError`, does not render a sign-in CTA.
 fn require_tier_2() -> Result<(), AppError> {
-    let s = settings::load_settings();
-    require_tier_2_for(s.tier)
+    match settings::resolve_tier() {
+        settings::TierResolution::Known(tier) => require_tier_2_for(tier),
+        settings::TierResolution::Unknown { reason } => {
+            error!("require_tier_2: runner tier is UNKNOWN — {reason}");
+            Err(AppError::ConfigError(format!(
+                "Runner tier could not be determined, so this command was not run \
+                 (your account state is unchanged). {reason}"
+            )))
+        }
+    }
 }
 
 /// User information returned after login
@@ -314,13 +330,31 @@ async fn check_auth_status_impl() -> Result<AuthStatus, AppError> {
     // Tier 0/1 — never reach the backend, never touch the keychain.
     // Defense in depth: Phase 1 frontend doesn't call this in Tier 0/1, but
     // any caller that does must get an unambiguous "not authenticated".
-    if settings::load_settings().tier != settings::RunnerTier::QontinuiAccount {
-        return Ok(AuthStatus {
-            authenticated: false,
-            user: None,
-            device_id: None,
-            store_unreadable: false,
-        });
+    //
+    // NO-DOWNGRADE (C5): an UNKNOWN tier must NOT be answered with
+    // `Ok(authenticated: false)`. A successful command carrying a downgraded
+    // verdict is settled as far as the frontend is concerned — the hardened
+    // AuthProvider retry chain will not retry it — so a transient
+    // settings-read failure became an automatic logout that survived every
+    // frontend safeguard. Returning `Err` keeps it in the retryable class and
+    // renders the real reason instead of the LoginScreen.
+    match settings::resolve_tier() {
+        settings::TierResolution::Known(settings::RunnerTier::QontinuiAccount) => {}
+        settings::TierResolution::Known(_) => {
+            return Ok(AuthStatus {
+                authenticated: false,
+                user: None,
+                device_id: None,
+                store_unreadable: false,
+            });
+        }
+        settings::TierResolution::Unknown { reason } => {
+            error!("check_auth_status: runner tier is UNKNOWN — {reason}");
+            return Err(AppError::ConfigError(format!(
+                "Could not determine the runner tier, so the sign-in state is unknown \
+                 (you have NOT been signed out). {reason}"
+            )));
+        }
     }
 
     let auth_manager = AuthManager::new();
@@ -576,16 +610,22 @@ pub fn get_api_port(health: tauri::State<'_, HealthCompartment>) -> u16 {
 
 /// Returns the current runner tier. Frontend gates its auth-touching effects
 /// on this — see `AuthProvider.tsx`.
+///
+/// NO-DOWNGRADE: when settings.json cannot be read the tier is UNKNOWN, and
+/// this returns `Err` rather than the string `"local"`. Answering `"local"`
+/// made cloud features silently vanish on a transient read error; an `Err`
+/// keeps `useRunnerTier` in its retryable/unknown state instead.
 #[tauri::command]
 pub fn get_runner_tier() -> Result<String, String> {
-    let s = settings::load_settings();
-    // String form so the React side doesn't need a TS enum mirror.
-    Ok(match s.tier {
-        settings::RunnerTier::Local => "local",
-        settings::RunnerTier::LocalProvider => "local_provider",
-        settings::RunnerTier::QontinuiAccount => "qontinui_account",
+    let resolved = settings::resolve_tier();
+    match &resolved {
+        // String form so the React side doesn't need a TS enum mirror.
+        settings::TierResolution::Known(_) => Ok(resolved.as_str().to_string()),
+        settings::TierResolution::Unknown { reason } => {
+            error!("get_runner_tier: tier is UNKNOWN — {reason}");
+            Err(reason.clone())
+        }
     }
-    .to_string())
 }
 
 /// Sets the current runner tier and persists. Used by the SetupWizard's
@@ -598,15 +638,18 @@ pub fn set_runner_tier(tier: String) -> Result<(), String> {
         "qontinui_account" => settings::RunnerTier::QontinuiAccount,
         other => return Err(format!("invalid tier: {}", other)),
     };
-    let mut s = settings::load_settings();
-    s.tier = parsed;
-    s.tier_initialized = true;
     if crate::instance::is_secondary() {
         warn!(
             "set_runner_tier: secondary runner — applying in-memory only, skipping save_settings"
         );
     } else {
-        settings::save_settings(&s).map_err(|e| e.to_string())?;
+        // Provenance-checked write: refuses (loudly) rather than clobbering an
+        // unreadable settings.json with an all-defaults file that happens to
+        // carry the new tier.
+        settings::update_settings(|s| {
+            s.tier = parsed;
+            s.tier_initialized = true;
+        })?;
     }
     // Kick both the relay (so it picks up the new tier without a runner
     // restart) and the device-JWT refresher (Phase 2 of unified-devices
@@ -843,19 +886,21 @@ async fn finalize_signed_in(
 
     // 6. Promote to Tier 2 + stage backend, then kick the relay/refresher.
     {
-        let mut s = settings::load_settings();
-        if s.web_integration.backend_url.trim() != base {
-            s.web_integration.backend_url = base.clone();
-        }
-        s.web_integration.enabled = true;
-        s.qontinui_user_id = Some(login.sub.clone());
-        s.tier = settings::RunnerTier::QontinuiAccount;
-        s.tier_initialized = true;
         if crate::instance::is_secondary() {
             warn!("finalize_signed_in: secondary runner — applying in-memory only, skipping save_settings");
         } else {
-            settings::save_settings(&s).map_err(|e| {
-                error!("finalize_signed_in: step 6 (save_settings tier promotion) failed AFTER a successful pair: {e}");
+            let base_for_write = base.clone();
+            let sub = login.sub.clone();
+            settings::update_settings(move |s| {
+                if s.web_integration.backend_url.trim() != base_for_write {
+                    s.web_integration.backend_url = base_for_write;
+                }
+                s.web_integration.enabled = true;
+                s.qontinui_user_id = Some(sub);
+                s.tier = settings::RunnerTier::QontinuiAccount;
+                s.tier_initialized = true;
+            }).map_err(|e| {
+                error!("finalize_signed_in: step 6 (update_settings tier promotion) failed AFTER a successful pair: {e}");
                 AppError::Raw(format!("persist tier promotion: {e}"))
             })?;
         }
@@ -1018,20 +1063,21 @@ pub async fn qontinui_sign_out() -> Result<(), String> {
         );
     }
 
-    let mut s = settings::load_settings();
-    s.web_integration.runner_token = String::new();
-    s.qontinui_user_id = None;
-    // Keep tier == QontinuiAccount so the App gate renders LoginScreen for
-    // this Tier-2-unauthenticated state instead of falling through to the
-    // synthesized local-guest app shell.
-    s.tier = settings::RunnerTier::QontinuiAccount;
-    s.tier_initialized = true;
     if crate::instance::is_secondary() {
         warn!(
             "qontinui_sign_out: secondary runner — applying in-memory only, skipping save_settings"
         );
     } else {
-        settings::save_settings(&s).map_err(|e| {
+        settings::update_settings(|s| {
+            s.web_integration.runner_token = String::new();
+            s.qontinui_user_id = None;
+            // Keep tier == QontinuiAccount so the App gate renders LoginScreen
+            // for this Tier-2-unauthenticated state instead of falling through
+            // to the synthesized local-guest app shell.
+            s.tier = settings::RunnerTier::QontinuiAccount;
+            s.tier_initialized = true;
+        })
+        .map_err(|e| {
             let msg = format!("failed to persist sign-out: {}", e);
             error!("qontinui_sign_out: {}", msg);
             msg
@@ -1051,10 +1097,25 @@ pub async fn qontinui_sign_out() -> Result<(), String> {
 /// The frontend uses this from `WebIntegrationAuthBanner` to decide
 /// whether to surface a "re-pair this runner" CTA after upgrade
 /// (Phase 4 of the unified-devices migration).
+///
+/// NO-DOWNGRADE (M3): a credential-store READ ERROR is not "unpaired". It used
+/// to be flattened by `unwrap_or_default()`, so a locked/corrupt store rendered
+/// a "pair this runner first" CTA at a runner that IS paired. A read error is
+/// now `Err` (unknown), leaving `false` to mean "definitively no JWT".
 #[tauri::command]
 pub fn device_jwt_present() -> Result<bool, String> {
-    let token = AuthManager::new().get_access_token().unwrap_or_default();
-    Ok(crate::auth::looks_like_jwt(&token))
+    use crate::secure_storage::StoredTokenRead;
+    match AuthManager::new().probe_access_token() {
+        StoredTokenRead::Present(token) => Ok(crate::auth::looks_like_jwt(&token)),
+        StoredTokenRead::Absent => Ok(false),
+        StoredTokenRead::Unreadable(e) => {
+            error!("device_jwt_present: credential store unreadable — pairing state is UNKNOWN, not unpaired: {e}");
+            Err(format!(
+                "Could not read the credential store, so this runner's pairing state is \
+                 unknown (it has NOT been unpaired): {e}"
+            ))
+        }
+    }
 }
 
 /// Returns the runner's coord **device-JWT** (the token stored in
@@ -1070,13 +1131,25 @@ pub fn device_jwt_present() -> Result<bool, String> {
 /// Unlike [`get_access_token_for_websocket`], this neither requires tier-2 nor
 /// errors when unpaired: it is a credential *probe*, so a missing token is a
 /// normal `Ok(None)`, not an error.
+///
+/// NO-DOWNGRADE (M3): a store READ ERROR is distinct from "unpaired". It used
+/// to be flattened by `unwrap_or_default()` into `Ok(None)`, which the FE
+/// renders as "pair this runner first" — wrong remediation, and it disabled
+/// the CI-runner controls on a paired runner. A read error is now `Err`, so
+/// `Ok(None)` keeps its single meaning: definitively no device JWT.
 #[tauri::command]
 pub fn get_coord_device_token() -> Result<Option<String>, String> {
-    let token = AuthManager::new().get_access_token().unwrap_or_default();
-    if crate::auth::looks_like_jwt(&token) {
-        Ok(Some(token))
-    } else {
-        Ok(None)
+    use crate::secure_storage::StoredTokenRead;
+    match AuthManager::new().probe_access_token() {
+        StoredTokenRead::Present(token) if crate::auth::looks_like_jwt(&token) => Ok(Some(token)),
+        StoredTokenRead::Present(_) | StoredTokenRead::Absent => Ok(None),
+        StoredTokenRead::Unreadable(e) => {
+            error!("get_coord_device_token: credential store unreadable — pairing state is UNKNOWN, not unpaired: {e}");
+            Err(format!(
+                "Could not read the credential store, so this runner's device token is \
+                 unknown (it has NOT been unpaired): {e}"
+            ))
+        }
     }
 }
 

@@ -121,13 +121,24 @@ pub struct GetWebIntegrationStatusResponse {
     /// Whether the unified runner WebSocket is currently connected
     /// (post-handshake). Updated by `crate::mcp::backend_relay`.
     pub ws_connected: bool,
+    /// NO-DOWNGRADE: the settings-read fault, when settings.json could not be
+    /// read or parsed. Non-null means every other field in this response is a
+    /// PLACEHOLDER, not the user's saved configuration — the UI must say so
+    /// rather than rendering a runner that looks disabled/signed-out.
+    pub settings_fault: Option<crate::settings::SettingsFault>,
 }
 
 #[tauri::command]
 pub async fn get_web_integration_status(
     integration: State<'_, IntegrationCompartment>,
 ) -> Result<GetWebIntegrationStatusResponse, String> {
-    let persisted = settings::load_settings().web_integration.clone();
+    let loaded = settings::load_settings_full();
+    let persisted = loaded.settings.web_integration.clone();
+    let settings_fault = if loaded.is_authoritative() {
+        None
+    } else {
+        crate::settings::settings_fault()
+    };
     let sm_state_opt = integration.server_mode().read().await.clone();
 
     let (runner_id, last_heartbeat_at, registration_error, ws_connected) = match sm_state_opt {
@@ -148,6 +159,54 @@ pub async fn get_web_integration_status(
         last_heartbeat_at,
         registration_error,
         ws_connected,
+        settings_fault,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// get_settings_health
+// ---------------------------------------------------------------------------
+
+/// Response for [`get_settings_health`].
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsHealthResponse {
+    /// `"loaded" | "fresh_install" | "unreadable"`.
+    pub provenance: String,
+    /// `true` when the values the runner is operating on are the user's real
+    /// persisted state. When `false`, the runner is deliberately refusing to
+    /// write settings and every capability read is reporting UNKNOWN rather
+    /// than the lesser capability.
+    pub authoritative: bool,
+    /// Populated iff `!authoritative` — path + error + when it was seen.
+    pub fault: Option<crate::settings::SettingsFault>,
+    /// Ready-to-render one-line explanation, or `None` when healthy.
+    pub message: Option<String>,
+}
+
+/// Report whether `settings.json` is readable.
+///
+/// The user-visible half of C1: a settings-read failure no longer silently
+/// demotes the runner, so something has to SAY so. Poll this (or read
+/// `settingsFault` on [`get_web_integration_status`]) to surface a "settings
+/// unreadable" banner.
+#[tauri::command]
+pub fn get_settings_health() -> Result<SettingsHealthResponse, String> {
+    let loaded = settings::load_settings_full();
+    let authoritative = loaded.is_authoritative();
+    Ok(SettingsHealthResponse {
+        provenance: loaded.provenance.as_str().to_string(),
+        authoritative,
+        fault: if authoritative {
+            None
+        } else {
+            crate::settings::settings_fault()
+        },
+        message: if authoritative {
+            None
+        } else {
+            Some(loaded.unreadable_message())
+        },
     })
 }
 
@@ -177,11 +236,13 @@ pub async fn apply_web_integration_settings<R: Runtime>(
         return Ok(());
     }
 
-    // Persist normalized values to settings.json.
+    // Persist normalized values to settings.json. Provenance-checked: refuses
+    // rather than rewriting an unreadable settings.json from defaults (which
+    // would drop tier / saved projects / every other field as a side effect of
+    // saving one panel).
     {
-        let mut full = settings::load_settings();
-        full.web_integration = normalized.clone();
-        settings::save_settings(&full).map_err(|e| {
+        let to_persist = normalized.clone();
+        settings::update_settings(move |full| full.web_integration = to_persist).map_err(|e| {
             String::from(AppError::ConfigError(format!(
                 "failed to save settings: {}",
                 e
@@ -619,13 +680,13 @@ pub async fn redeem_pair_code(
     // caller that doesn't run the FE path still ends up online. Idempotent —
     // a no-op when already at Tier 2.
     {
-        let mut s = settings::load_settings();
-        if s.tier != settings::RunnerTier::QontinuiAccount {
-            s.tier = settings::RunnerTier::QontinuiAccount;
-            s.tier_initialized = true;
+        if settings::load_settings().tier != settings::RunnerTier::QontinuiAccount {
             if crate::instance::is_secondary() {
                 warn!("redeem_pair_code: secondary runner — applying tier in-memory only, skipping save_settings");
-            } else if let Err(e) = settings::save_settings(&s) {
+            } else if let Err(e) = settings::update_settings(|s| {
+                s.tier = settings::RunnerTier::QontinuiAccount;
+                s.tier_initialized = true;
+            }) {
                 warn!("redeem_pair_code: tier promotion persist failed (continuing): {e}");
             } else {
                 info!("redeem_pair_code: promoted runner to Tier QontinuiAccount");
@@ -666,6 +727,7 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
     PluginBuilder::new("qontinui_web_integration")
         .invoke_handler(tauri::generate_handler![
             get_web_integration_status,
+            get_settings_health,
             save_web_integration_settings,
             test_web_integration_connection,
             redeem_pair_code,
