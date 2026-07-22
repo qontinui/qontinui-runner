@@ -3808,8 +3808,9 @@ pub async fn ui_bridge_type_into_handler(
 /// `get_console_errors` and `get_idle_status` IPC calls. Fan-out runs in
 /// parallel so the wall time is approximately the slowest single IPC, not
 /// the sum of three. Each ancillary call falls back gracefully — a missing
-/// console-errors response just leaves `hasErrors=false`; missing idle
-/// status leaves `idleSignals=null`.
+/// console-errors response falls back to the Rust-side `AppState.ui_error`
+/// crash state (so a dead React tree reports `hasErrors: true` rather than
+/// reading as a clean page); missing idle status leaves `idleSignals=null`.
 pub async fn ui_bridge_get_state_summary_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
@@ -3902,11 +3903,18 @@ pub async fn ui_bridge_get_state_summary_handler(
             }
         }
         Err(e) => {
+            // The console-errors buffer lives inside the React tree, so this
+            // leg fails exactly when the tree is down — the case where
+            // `hasErrors=false` is most misleading. Fall back to the Rust-side
+            // crash state (`AppState.ui_error`, populated by the top-level
+            // `ErrorBoundary`), which survives a dead tree. A crashed tree then
+            // reports `hasErrors: true` instead of reading as a clean page.
+            let has_ui_error = state.app_state.ui_error.get().await.is_some();
             warn!(
-                "UI Bridge API: state-summary console-errors fetch failed ({}); defaulting hasErrors=false",
-                e
+                "UI Bridge API: state-summary console-errors fetch failed ({}); falling back to Rust-side ui_error state (hasErrors={})",
+                e, has_ui_error
             );
-            false
+            has_ui_error
         }
     };
 

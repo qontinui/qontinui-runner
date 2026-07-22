@@ -120,10 +120,155 @@ pub(crate) fn multi_window_dispatch_enabled() -> bool {
         .unwrap_or(true)
 }
 
+// ============================================================================
+// Frontend readiness classification (shared by every diagnostics surface)
+// ============================================================================
+
+/// Hint emitted when the React tree threw and the top-level `ErrorBoundary`
+/// is showing its fallback.
+///
+/// Shared by `gather_readiness_diagnostics` and
+/// `super::errors::ui_bridge_diagnostics_handler` so the two ladders can never
+/// drift on the one branch that distinguishes "crashed" from "responsive".
+pub(super) const TREE_CRASHED_HINT: &str = "React tree threw and the error boundary is showing its fallback — the SDK may still pong; snapshot will be empty. See uiError.";
+
+/// Distinct frontend-liveness states, ordered by diagnostic priority.
+///
+/// Both diagnostics surfaces (`GET /ui-bridge/diagnostics` and
+/// `GET /ui-bridge/diagnostics/readiness`) classify with
+/// [`classify_frontend_state`] and then map the state to their own wording, so
+/// the *ladder* is shared even though the two response bodies phrase their
+/// hints differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FrontendState {
+    /// The Tauri main WebView window doesn't exist at all.
+    WindowMissing,
+    /// No pong yet, but the process is <3s old — probably still booting.
+    Booting,
+    /// No pong ever and console errors were recorded — crashed during mount.
+    CrashedDuringMount,
+    /// No pong ever and the window isn't visible — WebView may not have rendered.
+    WindowNotVisible,
+    /// No pong ever, no other corroborating signal.
+    NeverPonged,
+    /// The React tree threw and the error boundary reported it to Rust.
+    ///
+    /// This branch sits **above** [`FrontendState::Stale`] and
+    /// [`FrontendState::Responsive`] deliberately: the SDK's pong loop can
+    /// survive under the error boundary's fallback, so a crashed tree
+    /// otherwise reports as responsive forever.
+    TreeCrashed,
+    /// Ponged at some point, but not in the last 30s.
+    Stale,
+    /// Ponged recently and no crash reported.
+    Responsive,
+}
+
+impl FrontendState {
+    /// Whether the frontend should be reported as ready.
+    ///
+    /// `last_pong > 0` is a latch — it flips true on the first pong and is
+    /// never reset — so on its own it cannot represent a tree that mounted and
+    /// *then* died. [`FrontendState::TreeCrashed`] forces it back to false; a
+    /// mounted-but-crashed tree is not ready.
+    pub(super) fn is_ready(self, last_pong: u64) -> bool {
+        last_pong > 0 && self != FrontendState::TreeCrashed
+    }
+}
+
+/// Inputs to [`classify_frontend_state`]. Grouped into a struct so the
+/// call sites can't transpose same-typed positional arguments.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FrontendStateInputs {
+    pub window_exists: bool,
+    pub window_visible: bool,
+    pub last_pong: u64,
+    pub last_pong_age_ms: u64,
+    pub console_error_count: u64,
+    pub process_uptime_ms: u64,
+    pub has_ui_error: bool,
+}
+
+/// Classify the frontend's liveness from the Rust-side signals only.
+///
+/// Pure and IPC-free by construction: every input is read from `ApiState` or
+/// the Tauri window handle, so this answers correctly even while the React
+/// tree is down (which is exactly when it matters).
+pub(super) fn classify_frontend_state(i: FrontendStateInputs) -> FrontendState {
+    if !i.window_exists {
+        FrontendState::WindowMissing
+    } else if i.last_pong == 0 && i.process_uptime_ms < 3000 {
+        FrontendState::Booting
+    } else if i.last_pong == 0 && i.console_error_count > 0 {
+        FrontendState::CrashedDuringMount
+    } else if i.last_pong == 0 && !i.window_visible {
+        FrontendState::WindowNotVisible
+    } else if i.last_pong == 0 {
+        FrontendState::NeverPonged
+    } else if i.has_ui_error {
+        FrontendState::TreeCrashed
+    } else if i.last_pong_age_ms > 30000 {
+        FrontendState::Stale
+    } else {
+        FrontendState::Responsive
+    }
+}
+
+/// The Rust-side crash signals both diagnostics surfaces join in, so a
+/// UI-Bridge driver never has to leave the UI-Bridge routes to find out *why*
+/// the page went dark. Produced by [`gather_ui_error_signals`].
+pub(super) struct UiErrorSignals {
+    /// Whether a React `ErrorBoundary` report is outstanding. Tracked
+    /// separately from `json` so a (theoretical) serialization failure can
+    /// never silently downgrade a crashed tree to "healthy".
+    pub present: bool,
+    /// The serialized `UiError`, or `Value::Null` when the tree is healthy.
+    pub json: serde_json::Value,
+    /// `"healthy" | "degraded" | "errored"` — the same value `/health` and
+    /// every heartbeat publish, via [`crate::ui_error::compute_derived_status`].
+    pub derived_status: &'static str,
+}
+
+/// Read the Rust-side crash signals: the React `ErrorBoundary` report held on
+/// `AppState` plus the `derived_status` the `/health` endpoint and every
+/// heartbeat already compute from it.
+pub(super) async fn gather_ui_error_signals(state: &Arc<ApiState>) -> UiErrorSignals {
+    let ui_error = state.app_state.ui_error.get().await;
+    let recent_crash = state.app_state.crash_dumps.get().await;
+    let derived_status = crate::ui_error::compute_derived_status(
+        ui_error.is_some(),
+        recent_crash.is_some(),
+        crate::mcp_api::embedding_reachable_cached(),
+    );
+    let json = match &ui_error {
+        Some(err) => serde_json::to_value(err).unwrap_or(serde_json::Value::Null),
+        None => serde_json::Value::Null,
+    };
+    UiErrorSignals {
+        present: ui_error.is_some(),
+        json,
+        derived_status,
+    }
+}
+
+/// Result of [`gather_readiness_diagnostics`].
+///
+/// Carries the readiness verdict alongside the JSON body so callers that need
+/// to branch on it (`ui_bridge_readiness_handler`'s 200-vs-503 decision) read
+/// a typed field rather than re-deriving the ladder or string-indexing into
+/// the body — either of which would let the two answers drift apart.
+pub(super) struct ReadinessDiagnostics {
+    /// The `{error, diagnostics: {…}}` body returned to clients.
+    pub body: serde_json::Value,
+    /// Whether the frontend counts as connected — false for a crashed tree
+    /// even while its pong loop is alive.
+    pub sdk_connected: bool,
+}
+
 /// Gather structured readiness diagnostics when the frontend readiness gate
 /// times out. Returns a JSON object with all available diagnostic fields so
 /// agents can diagnose why the WebView never became ready.
-pub(super) async fn gather_readiness_diagnostics(state: &Arc<ApiState>) -> serde_json::Value {
+pub(super) async fn gather_readiness_diagnostics(state: &Arc<ApiState>) -> ReadinessDiagnostics {
     use tauri::Manager;
 
     let last_pong = state
@@ -160,28 +305,53 @@ pub(super) async fn gather_readiness_diagnostics(state: &Arc<ApiState>) -> serde
         .as_ref()
         .and_then(|w| w.is_visible().ok())
         .unwrap_or(false);
-    let sdk_connected = last_pong > 0;
     let webview_url = main_window
         .as_ref()
         .and_then(|w| w.url().ok())
         .map(|u| u.to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
+    // Join the Rust-side crash state in. This survives a dead React tree,
+    // which is precisely when the IPC-backed surfaces stop answering.
+    let ui_error = gather_ui_error_signals(state).await;
+
+    let frontend_state = classify_frontend_state(FrontendStateInputs {
+        window_exists,
+        window_visible,
+        last_pong,
+        last_pong_age_ms,
+        console_error_count,
+        process_uptime_ms,
+        has_ui_error: ui_error.present,
+    });
+    // `sdk_connected` was `last_pong > 0` — a latch that can never flip back.
+    // A crashed tree is not connected even while its pong loop survives.
+    let sdk_connected = frontend_state.is_ready(last_pong);
+
     // Build a human-readable hint based on the diagnostic state
-    let hint = if !window_exists {
-        "Main WebView window does not exist — window creation may have failed."
-    } else if last_pong == 0 && process_uptime_ms < 3000 {
-        "Process just started (<3s uptime). Frontend may still be loading — consider retrying."
-    } else if last_pong == 0 && console_error_count > 0 {
-        "Frontend never sent initial pong and console errors were recorded. Check the runner devtools console — frontend likely crashed during mount."
-    } else if last_pong == 0 && !window_visible {
-        "Frontend never sent initial pong and main window is not visible — WebView may not have rendered."
-    } else if last_pong == 0 {
-        "Frontend never sent initial pong. Check if the WebView loaded successfully."
-    } else if last_pong_age_ms > 30000 {
-        "Frontend was responsive but stopped responding over 30s ago. It may have crashed or frozen."
-    } else {
-        "Frontend was responsive recently but the readiness gate was not notified. Possible race condition."
+    let hint = match frontend_state {
+        FrontendState::WindowMissing => {
+            "Main WebView window does not exist — window creation may have failed."
+        }
+        FrontendState::Booting => {
+            "Process just started (<3s uptime). Frontend may still be loading — consider retrying."
+        }
+        FrontendState::CrashedDuringMount => {
+            "Frontend never sent initial pong and console errors were recorded. Check the runner devtools console — frontend likely crashed during mount."
+        }
+        FrontendState::WindowNotVisible => {
+            "Frontend never sent initial pong and main window is not visible — WebView may not have rendered."
+        }
+        FrontendState::NeverPonged => {
+            "Frontend never sent initial pong. Check if the WebView loaded successfully."
+        }
+        FrontendState::TreeCrashed => TREE_CRASHED_HINT,
+        FrontendState::Stale => {
+            "Frontend was responsive but stopped responding over 30s ago. It may have crashed or frozen."
+        }
+        FrontendState::Responsive => {
+            "Frontend was responsive recently but the readiness gate was not notified. Possible race condition."
+        }
     };
 
     // Try to read window.__BOOT_ERRORS from the webview (set by index.html's
@@ -200,25 +370,31 @@ pub(super) async fn gather_readiness_diagnostics(state: &Arc<ApiState>) -> serde
     };
     let _ = boot_errors; // reserved for future use when Tauri eval returns values
 
-    serde_json::json!({
-        "error": "frontend_not_ready",
-        "diagnostics": {
-            "last_pong_age_ms": last_pong_age_ms,
-            "window_visible": window_visible,
-            "webview_url": webview_url,
-            "sdk_connected": sdk_connected,
-            "uptime_ms": process_uptime_ms,
-            "hint": hint,
-            "lastPongMs": last_pong,
-            "consoleErrorCount": console_error_count,
-            "circuitBreakerState": format!("{:?}", cb_state),
-            "circuitBreakerFailures": cb_failures,
-            "pendingRequestCount": pending_count,
-            "semaphoreAvailablePermits": available_permits,
-            "tauriMainWindowExists": window_exists,
-            "bootErrorsNote": "Call GET /ui-bridge/control/page/evaluate with expression 'JSON.stringify(window.__BOOT_ERRORS)' to retrieve boot-time JS errors"
-        }
-    })
+    ReadinessDiagnostics {
+        sdk_connected,
+        body: serde_json::json!({
+            "error": "frontend_not_ready",
+            "diagnostics": {
+                "last_pong_age_ms": last_pong_age_ms,
+                "window_visible": window_visible,
+                "webview_url": webview_url,
+                "sdk_connected": sdk_connected,
+                "uptime_ms": process_uptime_ms,
+                "hint": hint,
+                "lastPongMs": last_pong,
+                "consoleErrorCount": console_error_count,
+                // Rust-side crash state — null when the React tree is healthy.
+                "uiError": ui_error.json,
+                "derivedStatus": ui_error.derived_status,
+                "circuitBreakerState": format!("{:?}", cb_state),
+                "circuitBreakerFailures": cb_failures,
+                "pendingRequestCount": pending_count,
+                "semaphoreAvailablePermits": available_permits,
+                "tauriMainWindowExists": window_exists,
+                "bootErrorsNote": "Call GET /ui-bridge/control/page/evaluate with expression 'JSON.stringify(window.__BOOT_ERRORS)' to retrieve boot-time JS errors"
+            }
+        }),
+    }
 }
 
 /// Send a UI Bridge request and wait for the response synchronously.
@@ -274,7 +450,7 @@ pub async fn ui_bridge_request_sync_in_window(
             {
                 // Gather structured diagnostics instead of returning a bare string
                 let diag = gather_readiness_diagnostics(state).await;
-                return Err(serde_json::to_string(&diag).unwrap_or_else(|_| {
+                return Err(serde_json::to_string(&diag.body).unwrap_or_else(|_| {
                     "UI Bridge: Frontend did not become ready within 10s (diagnostics serialization failed)".to_string()
                 }));
             }
@@ -644,6 +820,161 @@ pub(crate) fn wrap_ipc_result(
 // ============================================================================
 // Tests
 // ============================================================================
+
+#[cfg(test)]
+mod frontend_state_tests {
+    //! Readiness-ladder regression tests.
+    //!
+    //! The defect these lock down: `ready`/`sdk_connected` used to be
+    //! `last_pong > 0`, a latch that flips true on the frontend's first pong
+    //! and is never reset. A React tree that crashed *after* mounting kept its
+    //! SDK pong loop alive under the error boundary's fallback, so every
+    //! diagnostics surface reported "Frontend is responsive" while
+    //! `GET /control/snapshot` returned nothing.
+    use super::{classify_frontend_state, FrontendState, FrontendStateInputs, TREE_CRASHED_HINT};
+
+    /// A healthy, recently-ponging frontend. Individual tests mutate one field.
+    fn healthy() -> FrontendStateInputs {
+        FrontendStateInputs {
+            window_exists: true,
+            window_visible: true,
+            last_pong: 1_700_000_000_000,
+            last_pong_age_ms: 500,
+            console_error_count: 0,
+            process_uptime_ms: 120_000,
+            has_ui_error: false,
+        }
+    }
+
+    #[test]
+    fn healthy_frontend_is_responsive_and_ready() {
+        let i = healthy();
+        let state = classify_frontend_state(i);
+        assert_eq!(state, FrontendState::Responsive);
+        assert!(state.is_ready(i.last_pong));
+    }
+
+    #[test]
+    fn ui_error_with_recent_pong_reports_crashed_and_not_ready() {
+        // THE regression: a fresh pong (500ms old) must NOT mask the crash.
+        let i = FrontendStateInputs {
+            has_ui_error: true,
+            ..healthy()
+        };
+        let state = classify_frontend_state(i);
+        assert_eq!(
+            state,
+            FrontendState::TreeCrashed,
+            "a present ui_error must win over a recent pong"
+        );
+        assert!(
+            !state.is_ready(i.last_pong),
+            "a mounted-but-crashed tree is not ready even while it still pongs"
+        );
+    }
+
+    #[test]
+    fn crashed_hint_names_the_error_boundary_and_points_at_ui_error() {
+        // The hint is the payload of this whole change — assert its content,
+        // not just that a branch fired.
+        assert!(TREE_CRASHED_HINT.contains("error boundary"));
+        assert!(TREE_CRASHED_HINT.contains("uiError"));
+    }
+
+    #[test]
+    fn ui_error_outranks_the_30s_stale_branch() {
+        let i = FrontendStateInputs {
+            has_ui_error: true,
+            last_pong_age_ms: 90_000,
+            ..healthy()
+        };
+        assert_eq!(classify_frontend_state(i), FrontendState::TreeCrashed);
+        assert!(!classify_frontend_state(i).is_ready(i.last_pong));
+    }
+
+    #[test]
+    fn stale_pong_without_ui_error_still_reports_stale_and_ready() {
+        // Pre-existing behavior preserved: `ready` tracks the pong latch on
+        // every non-crashed path, so only the crash branch changes verdict.
+        let i = FrontendStateInputs {
+            last_pong_age_ms: 90_000,
+            ..healthy()
+        };
+        let state = classify_frontend_state(i);
+        assert_eq!(state, FrontendState::Stale);
+        assert!(state.is_ready(i.last_pong));
+    }
+
+    #[test]
+    fn never_ponged_branches_outrank_ui_error() {
+        // A crash during mount is better described by the boot-time branches,
+        // which carry the console-error / window-visibility corroboration.
+        let base = FrontendStateInputs {
+            last_pong: 0,
+            last_pong_age_ms: 0,
+            has_ui_error: true,
+            ..healthy()
+        };
+
+        assert_eq!(
+            classify_frontend_state(FrontendStateInputs {
+                process_uptime_ms: 1_000,
+                ..base
+            }),
+            FrontendState::Booting
+        );
+        assert_eq!(
+            classify_frontend_state(FrontendStateInputs {
+                console_error_count: 3,
+                ..base
+            }),
+            FrontendState::CrashedDuringMount
+        );
+        assert_eq!(
+            classify_frontend_state(FrontendStateInputs {
+                window_visible: false,
+                ..base
+            }),
+            FrontendState::WindowNotVisible
+        );
+        assert_eq!(classify_frontend_state(base), FrontendState::NeverPonged);
+
+        // None of them are ready — last_pong is 0.
+        assert!(!classify_frontend_state(base).is_ready(base.last_pong));
+    }
+
+    #[test]
+    fn missing_window_outranks_everything() {
+        let i = FrontendStateInputs {
+            window_exists: false,
+            has_ui_error: true,
+            ..healthy()
+        };
+        assert_eq!(classify_frontend_state(i), FrontendState::WindowMissing);
+        // Unchanged from before this fix: with a live pong latch, a missing
+        // window handle alone does not flip `ready`.
+        assert!(classify_frontend_state(i).is_ready(i.last_pong));
+    }
+
+    #[test]
+    fn is_ready_is_false_whenever_no_pong_was_ever_received() {
+        for state in [
+            FrontendState::WindowMissing,
+            FrontendState::Booting,
+            FrontendState::CrashedDuringMount,
+            FrontendState::WindowNotVisible,
+            FrontendState::NeverPonged,
+            FrontendState::TreeCrashed,
+            FrontendState::Stale,
+            FrontendState::Responsive,
+        ] {
+            assert!(
+                !state.is_ready(0),
+                "{state:?} must not be ready with no pong"
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod wrap_ipc_result_tests {
