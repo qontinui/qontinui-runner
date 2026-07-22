@@ -20,7 +20,10 @@ use tracing::{info, warn};
 
 use crate::mcp::types::{ApiResponse, ApiState};
 
-use super::request::{gather_readiness_diagnostics, ui_bridge_request_sync, wrap_ipc_result};
+use super::request::{
+    classify_frontend_state, gather_readiness_diagnostics, gather_ui_error_signals,
+    ui_bridge_request_sync, wrap_ipc_result, FrontendState, FrontendStateInputs, TREE_CRASHED_HINT,
+};
 
 // ============================================================================
 // Query / request types for the error-session / baseline endpoints
@@ -228,21 +231,43 @@ pub async fn ui_bridge_diagnostics_handler(
         .map(|u| u.to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
-    let ready = last_pong > 0;
-    let readiness_hint = if !window_exists {
-        "Main WebView window does not exist — window creation may have failed"
-    } else if !ready && process_uptime_ms < 3000 {
-        "Process just started — frontend may still be loading"
-    } else if !ready && console_error_count > 0 {
-        "Frontend never sent pong and console errors recorded — likely crashed during mount"
-    } else if !ready && !window_visible {
-        "Frontend never sent pong and main window not visible — WebView may not have rendered"
-    } else if !ready {
-        "Frontend never sent initial pong — WebView may not have loaded"
-    } else if last_pong_age_ms > 30000 {
-        "Frontend stopped responding over 30s ago — may have crashed or frozen"
-    } else {
-        "Frontend is responsive"
+    // Join the Rust-side crash state in. `/health` and every heartbeat have
+    // always carried it; the UI-Bridge routes never did, so a driver looking
+    // at UI-Bridge routes could not see the throw the runner was holding.
+    let ui_error = gather_ui_error_signals(&state).await;
+
+    let frontend_state = classify_frontend_state(FrontendStateInputs {
+        window_exists,
+        window_visible,
+        last_pong,
+        last_pong_age_ms,
+        console_error_count,
+        process_uptime_ms,
+        has_ui_error: ui_error.present,
+    });
+    // `last_pong > 0` alone is a latch that never flips back, so it reported a
+    // crashed-but-still-ponging tree as ready. `is_ready` forces false on the
+    // crashed path.
+    let ready = frontend_state.is_ready(last_pong);
+    let readiness_hint = match frontend_state {
+        FrontendState::WindowMissing => {
+            "Main WebView window does not exist — window creation may have failed"
+        }
+        FrontendState::Booting => "Process just started — frontend may still be loading",
+        FrontendState::CrashedDuringMount => {
+            "Frontend never sent pong and console errors recorded — likely crashed during mount"
+        }
+        FrontendState::WindowNotVisible => {
+            "Frontend never sent pong and main window not visible — WebView may not have rendered"
+        }
+        FrontendState::NeverPonged => {
+            "Frontend never sent initial pong — WebView may not have loaded"
+        }
+        FrontendState::TreeCrashed => TREE_CRASHED_HINT,
+        FrontendState::Stale => {
+            "Frontend stopped responding over 30s ago — may have crashed or frozen"
+        }
+        FrontendState::Responsive => "Frontend is responsive",
     };
 
     Ok(Json(ApiResponse::success(serde_json::json!({
@@ -268,6 +293,10 @@ pub async fn ui_bridge_diagnostics_handler(
         },
         "pendingRequestCount": pending_count,
         "processUptimeMs": process_uptime_ms,
+        // Rust-side crash state — null / "healthy" when the React tree is fine.
+        // Mirrors the fields `/health` and the heartbeat already publish.
+        "uiError": ui_error.json,
+        "derivedStatus": ui_error.derived_status,
         "readiness": {
             "ready": ready,
             "hint": readiness_hint
@@ -285,7 +314,12 @@ pub async fn ui_bridge_readiness_handler(
         .ui_bridge_last_pong
         .load(std::sync::atomic::Ordering::Relaxed);
 
-    if last_pong > 0 {
+    // Reuse the verdict `gather_readiness_diagnostics` already computed rather
+    // than re-deriving `last_pong > 0` here. That expression is a latch: it
+    // reported 200 "ready" for a React tree that had crashed under the error
+    // boundary while its pong loop kept running. 503 is the correct answer on
+    // that path, and the 503 body carries `uiError` + the crash hint.
+    if diag.sdk_connected {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -306,7 +340,7 @@ pub async fn ui_bridge_readiness_handler(
         // attach a native screenshot + boot errors so agents can diagnose the
         // webview state without needing a separate call.
         let uptime_ms = state.started_at.elapsed().as_millis() as u64;
-        let mut result = diag;
+        let mut result = diag.body;
         if uptime_ms >= 30_000 {
             if let Some((screenshot, width, height)) =
                 super::capture_runner_window_base64(&state).await
