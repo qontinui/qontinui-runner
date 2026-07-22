@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Service identifier for the storage
 const SERVICE_NAME: &str = "com.qontinui.runner";
@@ -129,6 +129,44 @@ struct StoredTokens {
     /// per-tenant slots are refreshed independently by the per-slot pass.
     #[serde(default)]
     device_machine_key: Option<String>,
+    /// Whether the operator has explicitly logged out of the INTERACTIVE
+    /// session while leaving the autonomy credentials in place.
+    ///
+    /// This exists because "signed in?" is otherwise derived purely from
+    /// credential PRESENCE (see `AuthManager::has_local_signed_in_session`),
+    /// and the autonomy-preserving logout
+    /// ([`Self::clear_interactive_session`]) deliberately keeps the Cognito
+    /// session so the device-JWT refresher can re-mint. Without this flag that
+    /// logout would not stick: the next status re-check would see the retained
+    /// `oauth_refresh_token` and flip the UI straight back to signed-in.
+    ///
+    /// Set by both logout paths. Cleared ONLY by an EXPLICIT interactive
+    /// credential acquisition, of which there are exactly three:
+    ///
+    ///   1. `commands::auth::finalize_signed_in` — Cognito Hosted-UI PKCE and
+    ///      password sign-in (both converge there),
+    ///   2. `commands::web_integration::redeem_pair_code` — pair-code redeem
+    ///      from Settings (also allowlisted over the UI-Bridge HTTP surface),
+    ///   3. `qontinui_profile device pair` — the CLI pairing subcommand.
+    ///
+    /// Each of those clears it AFTER the pairing has actually been persisted,
+    /// so a sign-in that fails partway cannot un-logout the operator.
+    ///
+    /// Notably NOT cleared by [`Self::store_tokens`], [`Self::store_oauth_tokens`]
+    /// or `pair::persist_pairing`: the background device-JWT refresher writes
+    /// those slots on every refresh cycle (`mcp::device_jwt_refresher`), so
+    /// clearing it there would silently un-logout the operator minutes after
+    /// they logged out — the exact invariant this marker exists to protect.
+    ///
+    /// DOWNGRADE HAZARD: this key is unknown to any runner build that predates
+    /// it. An old binary reading a new `.enc` drops the key on its next write
+    /// (serde has no `flatten`-capture here), so downgrading a logged-out
+    /// install silently un-logs-out the operator. Re-running the logout on the
+    /// old build is not possible (it has no marker); the recovery is to upgrade
+    /// again and log out, or use the full sign-out which wipes the credentials
+    /// themselves.
+    #[serde(default)]
+    interactive_signed_out: bool,
 }
 
 /// Secure file-based storage manager.
@@ -332,6 +370,10 @@ impl SecureStorage {
         // NOT touch these, so autonomy survives a default logout.
         tokens.device_machine_key = None;
         tokens.agent_machine_key = None;
+        // Belt-and-braces: with every credential gone the presence check
+        // already reports signed-out, but keep the flag consistent so a
+        // partially-failed wipe can't leave the UI showing signed-in.
+        tokens.interactive_signed_out = true;
         self.save_tokens(&tokens)?;
         info!("Tokens cleared from secure file storage");
         Ok(())
@@ -354,11 +396,67 @@ impl SecureStorage {
         // oauth_* slots, device_id, and the long-lived autonomy machine keys
         // (device_machine_key / agent_machine_key) are intentionally preserved
         // so the refresher can re-mint a device JWT after a default logout.
+        //
+        // Because those credentials survive, the presence-based signed-in check
+        // would otherwise report the operator as still signed in on the next
+        // status re-check. Mark the interactive session as deliberately ended so
+        // the logout sticks while autonomy keeps running.
+        tokens.interactive_signed_out = true;
         self.save_tokens(&tokens)?;
         info!(
             "Device-JWT pair cleared from secure file storage (Cognito session preserved for \
              autonomous refresh)"
         );
+        Ok(())
+    }
+
+    /// Whether the operator explicitly ended the interactive session.
+    ///
+    /// FAIL-CLOSED on an unreadable-but-PRESENT store. `load_tokens()` returns
+    /// `Ok(default)` when the file is absent (first run — genuinely never
+    /// logged out, so `false` is correct), and `Err` only when a file that DOES
+    /// exist cannot be read/decrypted/parsed. That second case must report
+    /// `true`, because the marker is not the only thing an unreadable `.enc`
+    /// hides: `AuthManager::get_access_token` falls back to the OS KEYCHAIN,
+    /// which the device-JWT refresher re-populates right after the
+    /// autonomy-preserving logout. Reporting `false` there would let the
+    /// presence check read that keychain token and silently sign the operator
+    /// back in — resurrecting a session they explicitly ended. The `.enc` key
+    /// derives from hostname + USERNAME, so "present but undecryptable" is a
+    /// real, already-handled scenario (see the `store_present` warn! in
+    /// `AuthManager::get_access_token`), not a hypothetical.
+    ///
+    /// The cost of failing closed is a sign-in prompt on a corrupted store,
+    /// which is recoverable; the cost of failing open is an unrevocable logout.
+    pub fn is_interactive_signed_out(&self) -> bool {
+        match self.load_tokens() {
+            Ok(t) => t.interactive_signed_out,
+            Err(e) => {
+                if self.store_file_exists() {
+                    warn!(
+                        "Secure storage present but unreadable ({e}) — treating the interactive \
+                         session as SIGNED OUT (fail-closed) so a keychain-backed credential \
+                         cannot resurrect an ended session. Sign in again to repair the store."
+                    );
+                    true
+                } else {
+                    // No store file at all: nothing was ever logged out.
+                    debug!("No secure-storage file ({e}) — no interactive sign-out recorded");
+                    false
+                }
+            }
+        }
+    }
+
+    /// Clears the interactive sign-out marker. Called ONLY by the three
+    /// explicit interactive credential-acquisition paths (Cognito sign-in,
+    /// pair-code redeem, CLI `device pair`) once the acquisition has actually
+    /// been persisted — see the `interactive_signed_out` field docs.
+    pub fn clear_interactive_signed_out(&self) -> Result<()> {
+        let mut tokens = self.load_tokens().unwrap_or_default();
+        tokens.interactive_signed_out = false;
+        self.save_tokens(&tokens)?;
+        debug!("Interactive sign-out marker cleared (user signed back in)");
         Ok(())
     }
 
@@ -749,6 +847,112 @@ mod tests {
         assert_eq!(storage.get_oauth_expires_at(), None);
     }
 
+    /// The interactive sign-out marker is what makes the autonomy-preserving
+    /// logout STICK. Because `clear_interactive_session` deliberately keeps the
+    /// Cognito session, the presence-based "signed in?" check would otherwise
+    /// see the retained `oauth_refresh_token` and flip the UI back to
+    /// signed-in on the next status re-check.
+    #[test]
+    fn test_interactive_signed_out_marker_lifecycle() {
+        let storage = create_test_storage("test_interactive_signed_out_marker");
+
+        // A fresh store has never been logged out. An unreadable/absent store
+        // must never invent a logout the operator did not ask for.
+        assert!(
+            !storage.is_interactive_signed_out(),
+            "a fresh store must not report a sign-out"
+        );
+
+        storage.store_tokens("device.jwt", "").unwrap();
+        storage
+            .store_oauth_tokens("cog.access", "cog.id", "cog.refresh", 1_700_000_000)
+            .unwrap();
+        assert!(
+            !storage.is_interactive_signed_out(),
+            "storing credentials must not set the sign-out marker"
+        );
+
+        // Autonomy-preserving logout: marker set, Cognito session preserved.
+        storage.clear_interactive_session().unwrap();
+        assert!(
+            storage.is_interactive_signed_out(),
+            "clear_interactive_session must mark the interactive session ended"
+        );
+        assert_eq!(
+            storage.get_oauth_refresh_token().unwrap(),
+            "cog.refresh",
+            "the autonomy credential must survive the logout that sets the marker"
+        );
+
+        // THE LOAD-BEARING CASE: the background device-JWT refresher writes the
+        // oauth_* slots on every Cognito refresh cycle. If that write cleared
+        // the marker, the refresher would silently un-logout the operator
+        // minutes after they logged out. Only an interactive sign-in may clear
+        // it (`finalize_signed_in` calls `clear_interactive_signed_out`).
+        storage
+            .store_oauth_tokens("cog.access2", "cog.id2", "cog.refresh2", 1_700_000_001)
+            .unwrap();
+        assert!(
+            storage.is_interactive_signed_out(),
+            "a refresher oauth write MUST NOT clear the interactive sign-out marker"
+        );
+
+        // Signing back in is the only thing that ends the logout.
+        storage.clear_interactive_signed_out().unwrap();
+        assert!(
+            !storage.is_interactive_signed_out(),
+            "an interactive sign-in must clear the marker"
+        );
+
+        // The full stop-autonomy wipe also marks the session signed out, so a
+        // partially-failed wipe cannot leave the UI showing signed-in.
+        storage.clear_tokens().unwrap();
+        assert!(
+            storage.is_interactive_signed_out(),
+            "clear_tokens must also mark the interactive session ended"
+        );
+    }
+
+    /// An unreadable-but-PRESENT store must FAIL CLOSED: report signed-out.
+    ///
+    /// The failure mode this guards: after the autonomy-preserving logout the
+    /// device-JWT refresher immediately re-mints and writes the device JWT to
+    /// BOTH the `.enc` and the OS keychain. If the `.enc` then becomes
+    /// undecryptable (its key derives from hostname + USERNAME, so this is a
+    /// real, already-handled scenario), `AuthManager::get_access_token` still
+    /// serves the keychain copy. A marker read that returned `false` on that
+    /// error would therefore resurrect a session the operator explicitly ended.
+    #[test]
+    fn test_unreadable_store_reports_signed_out_fail_closed() {
+        let storage = create_test_storage("test_unreadable_store_fail_closed");
+
+        // No file at all → genuinely never logged out.
+        assert!(
+            !storage.store_file_exists(),
+            "fresh test storage must have no file"
+        );
+        assert!(
+            !storage.is_interactive_signed_out(),
+            "an ABSENT store is a first run, not a logout"
+        );
+
+        // Seed a real store, then corrupt it in place (garbage that cannot be
+        // AES-GCM decrypted) — the "present but undecryptable" case.
+        storage.store_tokens("device.jwt", "").unwrap();
+        assert!(storage.store_file_exists());
+        fs::write(&storage.storage_path, b"not-a-valid-aes-gcm-ciphertext").unwrap();
+        assert!(
+            storage.load_tokens().is_err(),
+            "the corrupted store must fail to load (test precondition)"
+        );
+
+        assert!(
+            storage.is_interactive_signed_out(),
+            "a PRESENT but unreadable store must fail CLOSED (report signed out) so a \
+             keychain-backed credential cannot resurrect an ended session"
+        );
+    }
+
     /// A pre-Phase-5 `StoredTokens` JSON (only the original three keys) must
     /// still deserialize — the new oauth_* fields carry `#[serde(default)]`.
     #[test]
@@ -758,6 +962,13 @@ mod tests {
         assert_eq!(parsed.access_token.as_deref(), Some("a"));
         assert!(parsed.oauth_access_token.is_none());
         assert!(parsed.oauth_expires_at.is_none());
+        // A store written before the marker existed must decode as NOT
+        // signed-out — an upgrade may never invent a logout for an operator
+        // whose install predates the flag.
+        assert!(
+            !parsed.interactive_signed_out,
+            "a legacy store must default to NOT interactively signed out"
+        );
     }
 
     #[test]

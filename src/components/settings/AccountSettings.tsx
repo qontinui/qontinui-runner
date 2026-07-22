@@ -10,11 +10,22 @@
  *     `runner-tier-changed` and the `web-integration-changed` event so the
  *     view flips to the signed-in state immediately.
  *
- *   - Tier 2: shows the signed-in account (when available) and a "Sign
- *     out" button. Signing out clears the runner token but KEEPS the
- *     runner at Tier 2 (unauthenticated), so the app returns to the
- *     LoginScreen to sign in again / switch accounts — it does NOT drop
- *     to local-guest (that is a separate first-run SetupWizard choice).
+ *   - Tier 2: shows the signed-in account (when available) and the two
+ *     logout paths. Both KEEP the runner at Tier 2 (unauthenticated), so
+ *     the app returns to the LoginScreen to sign in again / switch
+ *     accounts — neither drops to local-guest (that is a separate
+ *     first-run SetupWizard choice):
+ *
+ *       * "Log out & keep autonomous sessions running" (`logout`) clears
+ *         only the interactive device-JWT session and preserves the
+ *         Cognito session, so background terminal sessions keep running.
+ *       * "Sign out & stop autonomous sessions" (`qontinui_sign_out` +
+ *         `sign_out_full`) wipes every credential, so the device-JWT
+ *         refresher can no longer self-recover and autonomy stops.
+ *
+ *     Neither happens on its own: the runner has no idle timer and no
+ *     token-expiry logout — a stale device JWT is a refresher concern,
+ *     never a sign-out.
  *
  * The component is intentionally lean — token/runner_id/heartbeat
  * diagnostics live in the existing `WebIntegrationSettings` panel. This
@@ -61,9 +72,10 @@ interface DoctorReport {
 
 export function AccountSettings({ onLog }: AccountSettingsProps) {
   const { tier, loading: tierLoading, refresh: refreshTier } = useRunnerTier();
-  const { authStatus, signOutFull } = useAuth();
+  const { authStatus, signOutFull, logout } = useAuth();
   const [flowError, setFlowError] = useState<string | null>(null);
   const [signingOut, setSigningOut] = useState(false);
+  const [loggingOut, setLoggingOut] = useState(false);
 
   // --- Cognito Hosted-UI sign-in (RFC 8252 PKCE) ----------------------------
   // Backend URL the Cognito-bound device JWT is minted against. The legacy
@@ -187,6 +199,47 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
     }
   }, [onLog, refreshTier, signOutFull]);
 
+  /**
+   * Autonomy-preserving logout — the counterpart to {@link handleSignOut}.
+   *
+   * The Rust `logout` command clears ONLY the interactive device-JWT session
+   * and keeps the Cognito session, then immediately kicks the device-JWT
+   * refresher so the background daemons never see a missing-token window. The
+   * runner's autonomous terminal sessions keep running; only the operator's
+   * interactive session ends.
+   *
+   * That retained Cognito session is also why `logout` sets a persisted
+   * interactive-sign-out marker Rust-side: "signed in?" is otherwise derived
+   * from credential PRESENCE, so without the marker the next status re-check
+   * would see the kept refresh token and flip the UI straight back to
+   * signed-in. It is cleared only by an explicit interactive credential
+   * acquisition — a Cognito sign-in, a pair-code redeem, or the CLI
+   * `qontinui_profile device pair`.
+   */
+  const handleLogout = useCallback(async () => {
+    setLoggingOut(true);
+    setFlowError(null);
+    try {
+      // Logged BEFORE the await, deliberately. `logout()` flips `authStatus` to
+      // unauthenticated, which makes the App gate swap the whole shell for the
+      // LoginScreen — unmounting this panel AND the log view along with it. A
+      // confirmation logged afterwards is appended to a log the operator can no
+      // longer see, and this is the one message that most needs to land: that
+      // their autonomous sessions did NOT stop. Phrased as the intent so it is
+      // not a lie if the call below fails; the catch appends the failure.
+      onLog("info", "Logging out — autonomous terminal sessions keep running");
+      await logout();
+      window.dispatchEvent(new CustomEvent("runner-tier-changed"));
+      await refreshTier();
+    } catch (err) {
+      const msg = typeof err === "string" ? err : String(err);
+      setFlowError(msg);
+      onLog("error", `Logout failed: ${msg}`);
+    } finally {
+      setLoggingOut(false);
+    }
+  }, [logout, onLog, refreshTier]);
+
   if (tierLoading) {
     return (
       <div className="p-4">
@@ -223,8 +276,8 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
               Coord Doctor
             </div>
             <div className="text-xs text-muted-foreground mt-0.5">
-              Diagnose whether this runner can reach coord and set gates — runs 7
-              ordered checks and names the first thing to fix.
+              Diagnose whether this runner can reach coord and set gates — runs 7 ordered checks and
+              names the first thing to fix.
             </div>
           </div>
           <button
@@ -266,13 +319,9 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
                   )}
                   <div className="min-w-0">
                     <div className="font-mono text-foreground">{c.name}</div>
-                    <div className="text-muted-foreground break-words">
-                      {c.detail}
-                    </div>
+                    <div className="text-muted-foreground break-words">{c.detail}</div>
                     {!c.ok && (
-                      <div className="mt-0.5 text-amber-300/90 break-words">
-                        Fix: {c.fix}
-                      </div>
+                      <div className="mt-0.5 text-amber-300/90 break-words">Fix: {c.fix}</div>
                     )}
                   </div>
                 </li>
@@ -296,6 +345,8 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
           name={authStatus?.user?.name ?? null}
           signingOut={signingOut}
           onSignOut={handleSignOut}
+          loggingOut={loggingOut}
+          onLogout={handleLogout}
         />
       ) : (
         <SignedOutPanel
@@ -319,9 +370,19 @@ interface SignedInPanelProps {
   name: string | null;
   signingOut: boolean;
   onSignOut: () => void;
+  loggingOut: boolean;
+  onLogout: () => void;
 }
 
-function SignedInPanel({ email, userId, name, signingOut, onSignOut }: SignedInPanelProps) {
+function SignedInPanel({
+  email,
+  userId,
+  name,
+  signingOut,
+  onSignOut,
+  loggingOut,
+  onLogout,
+}: SignedInPanelProps) {
   // `check_auth_status` returns `user: null` for opaque runner tokens
   // (no JWT to decode `sub` from). Surface the qontinui_user_id placeholder
   // instead so the panel still shows "you're signed in".
@@ -349,24 +410,41 @@ function SignedInPanel({ email, userId, name, signingOut, onSignOut }: SignedInP
 
       <button
         type="button"
-        onClick={onSignOut}
-        disabled={signingOut}
-        className="inline-flex items-center gap-2 rounded bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+        onClick={onLogout}
+        disabled={loggingOut || signingOut}
+        className="inline-flex items-center gap-2 rounded border border-border bg-card px-4 py-2 text-sm font-medium text-foreground hover:bg-accent disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
       >
-        {signingOut ? <Loader2 className="w-4 h-4 animate-spin" /> : <LogOut className="w-4 h-4" />}
-        Sign out &amp; stop autonomous sessions
+        {loggingOut ? <Loader2 className="w-4 h-4 animate-spin" /> : <LogOut className="w-4 h-4" />}
+        Log out &amp; keep autonomous sessions running
       </button>
       <p className="text-xs text-muted-foreground">
-        This fully signs out: it clears your account session and returns you to the sign-in screen,
-        where you can sign in again or switch accounts. It also <strong>stops this runner&apos;s
-        autonomous terminal sessions</strong> — they cannot keep running without your account
-        session.
+        Ends your interactive session and returns you to the sign-in screen, but{" "}
+        <strong>leaves this runner&apos;s autonomous terminal sessions running</strong> — the
+        account session is kept so the runner keeps refreshing its device credential in the
+        background. You stay logged out until you sign in again.
       </p>
-      <p className="text-xs text-muted-foreground">
-        To stop using the app while keeping autonomous terminal sessions running, just close this
-        window instead of signing out — the runner keeps refreshing its device credential in the
-        background.
-      </p>
+
+      <div className="pt-1">
+        <button
+          type="button"
+          onClick={onSignOut}
+          disabled={signingOut || loggingOut}
+          className="inline-flex items-center gap-2 rounded bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+        >
+          {signingOut ? (
+            <Loader2 className="w-4 h-4 animate-spin" />
+          ) : (
+            <LogOut className="w-4 h-4" />
+          )}
+          Sign out &amp; stop autonomous sessions
+        </button>
+        <p className="mt-3 text-xs text-muted-foreground">
+          This fully signs out: it clears your account session and returns you to the sign-in
+          screen, where you can sign in again or switch accounts. It also{" "}
+          <strong>stops this runner&apos;s autonomous terminal sessions</strong> — they cannot keep
+          running without your account session.
+        </p>
+      </div>
     </div>
   );
 }
@@ -396,8 +474,8 @@ function SignedOutPanel({
         <div>
           <div className="text-sm font-medium">Sign in with Qontinui</div>
           <div className="text-xs text-muted-foreground">
-            Opens your browser to sign in with your Qontinui account, then binds this runner to
-            you. Promotes the runner to Tier 2.
+            Opens your browser to sign in with your Qontinui account, then binds this runner to you.
+            Promotes the runner to Tier 2.
           </div>
         </div>
 

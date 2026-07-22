@@ -386,6 +386,91 @@ impl AuthManager {
         Ok(())
     }
 
+    /// Whether the operator explicitly ended the interactive session via a
+    /// logout. See `SecureStorage::is_interactive_signed_out` for why this is
+    /// tracked separately from credential presence.
+    pub fn is_interactive_signed_out(&self) -> bool {
+        self.secure_storage.is_interactive_signed_out()
+    }
+
+    /// Clears the interactive sign-out marker.
+    ///
+    /// Call this from an EXPLICIT interactive credential acquisition ONLY, and
+    /// only once that acquisition has actually been persisted. There are
+    /// exactly three such call sites — Cognito sign-in
+    /// (`commands::auth::finalize_signed_in`), pair-code redeem
+    /// (`commands::web_integration::redeem_pair_code`) and the CLI
+    /// `qontinui_profile device pair`. Never call it from a credential WRITER
+    /// (`store_tokens` / `store_oauth_tokens` / `pair::persist_pairing`): the
+    /// background device-JWT refresher goes through those, and clearing there
+    /// would silently un-logout the operator on its next cycle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot be written.
+    pub fn clear_interactive_signed_out(&self) -> Result<()> {
+        self.secure_storage.clear_interactive_signed_out()
+    }
+
+    /// `true` iff the runner holds a *local* signed-in session: a paired coord
+    /// device-token JWT (the credential the WS relay presents) and/or a stored
+    /// Cognito session.
+    ///
+    /// Credential PRESENCE, deliberately not credential FRESHNESS. A stale or
+    /// even expired device JWT is a refresher problem, never a logout: the
+    /// supervised device-JWT refresher re-mints from the Cognito session, and
+    /// coord re-verifies on every WS handshake. Gating on freshness here used to
+    /// sign the operator out automatically — [`Self::device_jwt_needs_refresh`]
+    /// flips to `true` a full [`REFRESH_BEFORE_EXPIRY_SECS`] (80 min) BEFORE the
+    /// JWT actually expires, so an install with no stored Cognito refresh token
+    /// (legacy pair-code pairing) was reported unauthenticated 80 minutes early
+    /// and dropped to the LoginScreen.
+    ///
+    /// Also deliberately NOT a `/api/v1/auth/users/me` round-trip: the web
+    /// backend's `users/me` can return 401/403 for a federated Cognito identity
+    /// even though the runner is fully signed in and device-paired, which made a
+    /// completed sign-in render the LoginScreen forever.
+    pub fn has_local_signed_in_session(&self) -> bool {
+        let has_device_jwt = self
+            .get_access_token()
+            .map(|t| !t.trim().is_empty())
+            .unwrap_or(false);
+
+        // A stored Cognito session (refresh token present) also means the user
+        // signed in — even if the device JWT is momentarily stale and awaiting
+        // the refresher's next pair cycle.
+        let has_cognito_session = self
+            .get_oauth_refresh_token()
+            .map(|t| !t.trim().is_empty())
+            .unwrap_or(false);
+
+        has_device_jwt || has_cognito_session
+    }
+
+    /// The authoritative "is the operator signed in?" verdict, and the exact
+    /// predicate `check_auth_status` reports as `authenticated`.
+    ///
+    /// An explicit logout WINS over credential presence: the
+    /// autonomy-preserving `logout` deliberately keeps the Cognito session (so
+    /// background sessions keep running) and immediately re-mints a device JWT,
+    /// so without the marker check [`Self::has_local_signed_in_session`] would
+    /// report the operator as still signed in and the logout would not stick.
+    ///
+    /// Conversely, nothing else may report signed-out: no idle timer, no
+    /// token-expiry check, no failed backend round-trip. Sign-out is an explicit
+    /// user act only.
+    pub fn is_interactively_signed_in(&self) -> bool {
+        if self.is_interactive_signed_out() {
+            info!("Interactive session was explicitly signed out — reporting unauthenticated");
+            return false;
+        }
+        if !self.has_local_signed_in_session() {
+            info!("No local signed-in session — user not authenticated");
+            return false;
+        }
+        true
+    }
+
     /// Clears tokens from keychain (legacy).
     fn clear_tokens_from_keychain(&self) -> Result<()> {
         if !keychain_enabled() {
@@ -1077,6 +1162,159 @@ mod tests {
         );
 
         let _ = fs::remove_file(&storage_path);
+    }
+}
+
+/// Tests for the "is the operator signed in?" verdict — the predicate
+/// `check_auth_status` reports as `authenticated`, and the whole point of the
+/// no-auto-logout work: nothing but an EXPLICIT user act may report signed-out.
+#[cfg(test)]
+mod signed_in_verdict_tests {
+    use super::*;
+    use base64::Engine;
+    use std::env;
+    use std::fs;
+
+    fn create_test_auth_manager(test_name: &str) -> AuthManager {
+        let temp_dir = env::temp_dir().join("qontinui_test_auth_verdict");
+        let storage_path = temp_dir.join(format!("{}.enc", test_name));
+        let _ = fs::remove_file(&storage_path);
+        let storage = SecureStorage::with_path(storage_path).unwrap();
+        AuthManager::with_storage(storage)
+    }
+
+    /// Syntactically-valid (unsigned) JWT with the given `exp`.
+    fn jwt_with_exp(exp: i64) -> String {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!(r#"{{"exp":{exp}}}"#).as_bytes());
+        format!("{header}.{payload}.sig")
+    }
+
+    /// PRESENCE, not freshness. An expired device JWT is a refresher problem,
+    /// never a logout — the old freshness gate (`device_jwt_needs_refresh() ==
+    /// Ok(false)`) reported an install with no Cognito refresh token as
+    /// unauthenticated a full 80 minutes before the JWT actually expired, and
+    /// dropped the operator to the LoginScreen.
+    #[test]
+    fn presence_not_freshness_decides_local_session() {
+        let mgr = create_test_auth_manager("presence_not_freshness");
+        assert!(
+            !mgr.has_local_signed_in_session(),
+            "no credentials at all must read as no local session"
+        );
+
+        // An EXPIRED device JWT and no Cognito session (legacy pair-code
+        // install) is still a signed-in runner.
+        let expired = jwt_with_exp(chrono::Utc::now().timestamp() - 10_000);
+        mgr.store_tokens(&expired, "").unwrap();
+        assert!(
+            mgr.device_jwt_needs_refresh().unwrap(),
+            "test precondition: this JWT is stale by the refresher's measure"
+        );
+        assert!(
+            mgr.has_local_signed_in_session(),
+            "a stale/expired device JWT must NOT read as signed out"
+        );
+
+        // A blank slot is not a credential.
+        mgr.store_tokens("   ", "").unwrap();
+        assert!(
+            !mgr.has_local_signed_in_session(),
+            "a whitespace-only device JWT must not count as a session"
+        );
+
+        // A Cognito session alone (device JWT momentarily absent, e.g. right
+        // after a logout kicked the refresher) also means signed in.
+        mgr.store_oauth_tokens("cog.access", "cog.id", "cog.refresh", 1_700_000_000)
+            .unwrap();
+        assert!(
+            mgr.has_local_signed_in_session(),
+            "a stored Cognito session alone must read as signed in"
+        );
+    }
+
+    /// THE invariant `check_auth_status` short-circuits on. The
+    /// autonomy-preserving logout keeps the Cognito session AND immediately
+    /// re-mints a device JWT, so credential presence alone would report the
+    /// operator as still signed in — only the persisted marker makes the logout
+    /// stick, and only an explicit sign-in may clear it.
+    #[test]
+    fn explicit_logout_beats_credential_presence_until_sign_in() {
+        let mgr = create_test_auth_manager("logout_beats_presence");
+
+        mgr.store_tokens("device.jwt", "").unwrap();
+        mgr.store_oauth_tokens("cog.access", "cog.id", "cog.refresh", 1_700_000_000)
+            .unwrap();
+        assert!(
+            mgr.is_interactively_signed_in(),
+            "credentials present and no logout ⇒ signed in"
+        );
+
+        // Autonomy-preserving logout.
+        mgr.clear_interactive_session().unwrap();
+        assert!(
+            !mgr.is_interactively_signed_in(),
+            "an explicit logout must report signed OUT"
+        );
+        assert!(
+            mgr.has_local_signed_in_session(),
+            "…while the autonomy credentials deliberately survive it"
+        );
+
+        // The refresher re-mints a device JWT seconds later (this is exactly
+        // what `logout_impl`'s kick causes). It must NOT un-logout the operator.
+        mgr.store_tokens("device.jwt.reminted", "").unwrap();
+        assert!(
+            !mgr.is_interactively_signed_in(),
+            "a background device-JWT re-mint MUST NOT resurrect the session"
+        );
+        // Same for the refresher's Cognito refresh cycle.
+        mgr.store_oauth_tokens("cog.access2", "cog.id2", "cog.refresh2", 1_700_000_001)
+            .unwrap();
+        assert!(
+            !mgr.is_interactively_signed_in(),
+            "a background Cognito refresh MUST NOT resurrect the session"
+        );
+
+        // The ONLY un-lockout path — an explicit interactive credential
+        // acquisition (Cognito sign-in / pair-code redeem / CLI `device pair`)
+        // clears the marker. A regression here is a TOTAL lockout: the operator
+        // can sign in successfully and still be held at the LoginScreen.
+        mgr.clear_interactive_signed_out().unwrap();
+        assert!(
+            mgr.is_interactively_signed_in(),
+            "signing back in must end the logout"
+        );
+    }
+
+    /// The full stop-autonomy sign-out reports signed out on BOTH counts, and
+    /// re-pairing afterwards restores the session.
+    #[test]
+    fn full_sign_out_reports_signed_out_and_pairing_restores() {
+        let mgr = create_test_auth_manager("full_sign_out_then_pair");
+        mgr.store_tokens("device.jwt", "").unwrap();
+        mgr.store_oauth_tokens("cog.access", "cog.id", "cog.refresh", 1_700_000_000)
+            .unwrap();
+
+        mgr.clear_all_credentials().unwrap();
+        assert!(!mgr.has_local_signed_in_session());
+        assert!(!mgr.is_interactively_signed_in());
+
+        // CRITICAL-1 shape: pairing (pair-code redeem / CLI `device pair`)
+        // writes a device JWT and then clears the marker. Writing the credential
+        // WITHOUT clearing the marker leaves the operator dead-ended at the
+        // LoginScreen with a perfectly valid, relay-online pairing.
+        mgr.store_tokens("device.jwt.from.pair.code", "").unwrap();
+        assert!(
+            !mgr.is_interactively_signed_in(),
+            "test precondition: the credential alone does not clear the marker"
+        );
+        mgr.clear_interactive_signed_out().unwrap();
+        assert!(
+            mgr.is_interactively_signed_in(),
+            "a pair-code redeem that clears the marker must restore the session"
+        );
     }
 }
 

@@ -926,6 +926,23 @@ fn cmd_device_pair(
                 );
                 return ExitCode::from(2);
             }
+            // Running `device pair` IS an explicit interactive credential
+            // acquisition, so it ends any interactive logout — same rule as a
+            // Cognito sign-in or a pair-code redeem in the UI. Without this the
+            // operator would pair successfully (device JWT valid, relay online)
+            // and still be held at the runner's LoginScreen by the persisted
+            // sign-out marker. Cleared only AFTER `persist_pairing` succeeded,
+            // and deliberately NOT inside `persist_pairing` itself — the
+            // background device-JWT refresher writes those same credential slots
+            // and must never un-logout the operator.
+            if let Err(e) =
+                qontinui_runner_lib::auth::AuthManager::new().clear_interactive_signed_out()
+            {
+                eprintln!(
+                    "warning: pairing persisted but the interactive sign-out marker could not be \
+                     cleared ({e}); the runner UI may still show the sign-in screen"
+                );
+            }
             println!(
                 "device paired: user_id={} (device-token JWT saved to auth_tokens.enc)",
                 resp.user_id

@@ -33,6 +33,22 @@ export type RunnerTier = "local" | "local_provider" | "qontinui_account";
 export interface AuthContextValue {
   authStatus: AuthStatus | null;
   loading: boolean;
+  /**
+   * `true` while the FIRST auth probe has not yet produced a verdict and the
+   * bounded retry chain is still running.
+   *
+   * Consumers that gate on `!authStatus?.authenticated` MUST also honour this,
+   * or they render a sign-in prompt at a user who is in fact signed in: a null
+   * `authStatus` is indistinguishable from a real sign-out at the gate, and
+   * `loading` cannot carry this state (a 3s failsafe forces it back to `false`
+   * so a wedged IPC channel can never hang the app). While this is `true` the
+   * correct UI is the "checking authentication" shell, never `LoginScreen`.
+   *
+   * Always terminates: the chain is bounded (attempts x probe timeout), and
+   * after it gives up a slow background re-probe keeps trying without holding
+   * the UI hostage.
+   */
+  authResolving: boolean;
   error: string | null;
   /**
    * Always `false` under Cognito-only auth — the legacy dev email/password
