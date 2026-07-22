@@ -55,6 +55,23 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
 
+    # GHA-backed sccache caches workspace-crate compilation units that
+    # Swatinem/rust-cache prunes by design (workspace members always rebuild
+    # from source). Plan 2026-07-22-runner-ci-sccache-workspace-crate-caching
+    # Phase 1 — a measurement: revert if the Windows-leg median win < 8 min.
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      CARGO_INCREMENTAL: "0"
+      # Block src-tauri/.cargo/config.toml's S3 [env] default. sccache's
+      # backend selection prefers S3 over GHA when SCCACHE_BUCKET is set
+      # (config.rs into_fallback: s3 -> redis -> memcached -> gcs -> gha),
+      # and this repo has no AWS credentials, so an S3 capture would fail
+      # every rustc invocation. cargo's `force = false` [env] default only
+      # applies when the var is NOT already present in the environment; a
+      # set-but-empty var blocks it, and sccache filters empty strings.
+      SCCACHE_BUCKET: ""
+
     steps:
       - uses: actions/checkout@v5
 
@@ -199,6 +216,14 @@ jobs:
       # frameworks which are always available. No additional brew packages needed.
       # Note: AX integration tests require accessibility permissions at runtime,
       # which CI environments typically do not grant. Compilation is unaffected.
+
+      # Complementary to rust-cache below: rust-cache restores third-party
+      # dependency artifacts, sccache caches workspace-crate codegen that
+      # rust-cache prunes at save time. The job-level RUSTC_WRAPPER is safe
+      # even though this step comes after `Setup Rust`: the only earlier
+      # cargo invocation is `cargo fmt -- --check` (rustfmt, not rustc).
+      - name: Install sccache (GHA cache backend)
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
 
       # Swatinem/rust-cache replaces the previous actions/cache stanza, which
       # was broken two ways and never cached a single build artifact:
@@ -435,6 +460,15 @@ jobs:
           QONTINUI_ALLOW_NO_DB: "1"
         run: powershell -File scripts/contract-smoke.ps1 -DirectExe target/debug/qontinui-runner.exe -Profile ci -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts
         shell: bash
+
+      # Hit rate + cache location visibility for the Phase 1 exit criterion —
+      # the `Cache location` line MUST read GHA (ghac), not S3; S3 means the
+      # SCCACHE_BUCKET-blocking job env above regressed and rustc calls are
+      # about to fail on missing AWS credentials.
+      - name: sccache stats
+        if: always()
+        shell: bash
+        run: sccache --show-stats
 
   # Gating frontend unit-test lane (vitest).
   #
