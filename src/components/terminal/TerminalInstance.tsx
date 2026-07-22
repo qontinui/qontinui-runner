@@ -14,7 +14,13 @@ import { consumeInputChunk } from "./consumeInputChunk";
 import { preparePasteData } from "./preparePaste";
 import { wheelToLineDelta, DEFAULT_CELL_HEIGHT_PX } from "./wheelScroll";
 import { matchScrollShortcut } from "./scrollKeys";
-import { trimReplayedChunk, type OffsetChunk } from "./scrollbackReplay";
+import {
+  trimReplayedChunk,
+  isEmissionGap,
+  resyncSliceStart,
+  drainHeldChunks,
+  type OffsetChunk,
+} from "./scrollbackReplay";
 import { RenderAckAccumulator, ACK_FLOOR_INTERVAL_MS } from "./flowControl";
 import { useWindowAssignments } from "./contexts/WindowAssignmentsContext";
 
@@ -380,6 +386,21 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
       // boundary are already in the buffer via the ring and must not be
       // written again.
       let replayedThrough = 0;
+      // Emission-gap resync state. The Rust reader gates WEBVIEW EMISSION
+      // (never the PTY read) on flow-control backpressure, so when this
+      // renderer falls behind — or the pane mounts onto a terminal whose
+      // emission was paused — the live stream carries an offset jump. We
+      // detect it via `nextExpectedOffset` (exclusive end of the last
+      // observed chunk), hold post-gap chunks in `resyncPending`, refetch
+      // the scrollback ring (which also resets the backend's flow-control
+      // counters, resuming emission), write the missed slice, then drain the
+      // held chunks trimmed against the advanced replay boundary.
+      // `writtenThrough` tracks the exclusive end of bytes actually written
+      // (ring replays + live chunks) — the resync slice boundary.
+      let nextExpectedOffset: number | null = null;
+      let writtenThrough = 0;
+      let resyncInFlight = false;
+      let resyncPending: OffsetChunk[] = [];
       // Phase 3 — render-based flow control. Tracks bytes the backend has
       // actually RENDERED (its `write` completion callback fired), not bytes
       // merely received off the wire, and decides when to ack the Rust reader
@@ -500,6 +521,88 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         }
       };
 
+      /**
+       * Mid-session recovery for a webview-emission gap (flow-control drop).
+       * Each pass fetches the scrollback ring — which also resets the
+       * backend's flow-control counters, resuming emission — writes the
+       * slice the renderer missed, then drains held chunks only up to the
+       * first REMAINING hole (`drainHeldChunks`): post-hole chunks stay held
+       * so the next pass's (advanced) ring window can cover the hole first —
+       * writing them early would splice the hole out permanently. Bounded
+       * retries; on exhaustion or fetch failure the leftovers are written
+       * spliced rather than stranded (full-frame TUI redraws self-heal, and
+       * the next remount's ring replay reconciles scrollback).
+       */
+      const resyncFromRing = async () => {
+        if (resyncInFlight) return;
+        resyncInFlight = true;
+        try {
+          for (let attempt = 0; attempt < 5; attempt++) {
+            const ring = await invoke<{
+              success: boolean;
+              data: { data: string; startOffset: number; endOffset: number } | null;
+            }>("terminal_get_scrollback", { terminalId });
+            const b = backendRef.current;
+            if (disposed || !b || !ring.success || !ring.data) return;
+            const rawRing = atob(ring.data.data);
+            const ringBytes = new Uint8Array(rawRing.length);
+            for (let i = 0; i < rawRing.length; i++) {
+              ringBytes[i] = rawRing.charCodeAt(i);
+            }
+            const from = resyncSliceStart(
+              { startOffset: ring.data.startOffset, endOffset: ring.data.endOffset },
+              writtenThrough,
+            );
+            const slice = ringBytes.subarray(from);
+            if (slice.length > 0) {
+              // Direct write (not the coalesce queue): any pre-gap staged
+              // chunks flushed in an earlier microtask, and the held
+              // post-gap chunks drain AFTER this, so stream order holds.
+              b.write(slice);
+            }
+            replayedThrough = Math.max(replayedThrough, ring.data.endOffset);
+            writtenThrough = Math.max(writtenThrough, ring.data.endOffset);
+            nextExpectedOffset = Math.max(nextExpectedOffset ?? 0, ring.data.endOffset);
+
+            const drained = drainHeldChunks(resyncPending, writtenThrough, replayedThrough);
+            resyncPending = drained.reheld;
+            writtenThrough = drained.writtenThrough;
+            for (const w of drained.writable) {
+              coalesceQueue.push(w);
+              coalesceLen += w.length;
+            }
+            if (drained.writable.length > 0) scheduleFlush();
+            if (drained.reheld.length === 0) return;
+            console.warn(
+              `[Terminal ${terminalId}] emission gap persisted across resync (attempt ${attempt + 1}); retrying`,
+            );
+          }
+          console.warn(
+            `[Terminal ${terminalId}] emission-gap resync exhausted retries; accepting spliced output`,
+          );
+        } catch (e) {
+          console.warn(`[Terminal ${terminalId}] emission-gap resync failed:`, e);
+        } finally {
+          // Never strand held chunks: on success the loop drained them all;
+          // on retry exhaustion or fetch failure, write what remains even
+          // though a hole may precede it (spliced beats frozen).
+          const rest = resyncPending;
+          resyncPending = [];
+          for (const c of rest) {
+            const slice = trimReplayedChunk(c, replayedThrough);
+            if (slice && slice.length > 0) {
+              coalesceQueue.push(slice);
+              coalesceLen += slice.length;
+              scheduleFlush();
+            }
+            if (c.offset !== undefined) {
+              writtenThrough = Math.max(writtenThrough, c.offset + c.bytes.length);
+            }
+          }
+          resyncInFlight = false;
+        }
+      };
+
       const buildOutputListener = () =>
         listen<TerminalOutputPayload>("terminal-output", (event) => {
           if (event.payload.terminalId !== terminalId) return;
@@ -508,15 +611,36 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
           for (let i = 0; i < raw.length; i++) {
             bytes[i] = raw.charCodeAt(i);
           }
+          const offset = event.payload.offset;
+
+          // Emission-gap detection: the backend gates webview emission (not
+          // the PTY read) under backpressure, so a dropped chunk surfaces as
+          // the next delivered chunk starting beyond the end of the last one.
+          // Only meaningful once the backend is ready — pre-ready holes are
+          // covered wholesale by the mount ring replay.
+          const gapDetected = backendReady && isEmissionGap(nextExpectedOffset, offset);
+          if (offset !== undefined) {
+            nextExpectedOffset = Math.max(nextExpectedOffset ?? 0, offset + bytes.length);
+          }
 
           if (!backendReady) {
             // Backend not yet created — buffer the bytes; they'll be drained
             // (and the idle timer primed) once the backend init completes.
-            pendingBytes.push({ bytes, offset: event.payload.offset });
+            pendingBytes.push({ bytes, offset });
             return;
           }
 
           if (!backendRef.current) return;
+
+          if (gapDetected || resyncInFlight) {
+            // Hold post-gap chunks until the ring slice covering the hole is
+            // written so bytes land in stream order; the resync drain trims
+            // each held chunk against the advanced replay boundary.
+            resyncPending.push({ bytes, offset });
+            bytesReceivedRef.current += bytes.length;
+            if (gapDetected) void resyncFromRing();
+            return;
+          }
           // A chunk emitted before the ring snapshot can still be DELIVERED
           // after the replay (event delivery and invoke responses are not
           // mutually ordered) — trim it to its unreplayed suffix so the
@@ -529,18 +653,19 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
           // `handleOutput` independently of this instance's mount state (Phase 2
           // of the flow-grid virtualization plan). This listener is now purely
           // the xterm write/render path.
-          const unreplayed = trimReplayedChunk(
-            { bytes, offset: event.payload.offset },
-            replayedThrough,
-          );
-          if (unreplayed) {
+          const unreplayed = trimReplayedChunk({ bytes, offset }, replayedThrough);
+          if (unreplayed && unreplayed.length > 0) {
             // Phase 4: stage the unreplayed suffix and flush once per microtask
             // into a single coalesced backend.write() (offset-dedup already
             // applied above, before coalescing). The render-ack accounts the
-            // coalesced length when its completion callback fires.
+            // coalesced length when its completion callback fires. Length
+            // guard: zero-length resume-marker events carry only an offset.
             coalesceQueue.push(unreplayed);
             coalesceLen += unreplayed.length;
             scheduleFlush();
+          }
+          if (offset !== undefined) {
+            writtenThrough = Math.max(writtenThrough, offset + bytes.length);
           }
           bytesReceivedRef.current += bytes.length;
         });
@@ -974,6 +1099,7 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
             }
             backend.write(ringBytes);
             replayedThrough = ring.data.endOffset;
+            writtenThrough = Math.max(writtenThrough, ring.data.endOffset);
           }
         } catch (e) {
           // Best-effort: a failed replay degrades to the pre-fix behavior
@@ -991,6 +1117,9 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
             } catch (e) {
               console.error(`[Terminal ${terminalId}] drain write error:`, e);
             }
+          }
+          if (buffered.offset !== undefined) {
+            writtenThrough = Math.max(writtenThrough, buffered.offset + buffered.bytes.length);
           }
           bytesReceivedRef.current += buffered.bytes.length;
         }
@@ -1202,6 +1331,14 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         uiBridge?.registry?.unregisterElement(`terminal-input-${terminalId}`);
         outputUnsub?.();
         exitUnsub?.();
+        // Hand consumption over to the per-page tap: this pane's render-acks
+        // strand on dispose (the final write's completion callback never
+        // fires), and if the emission gate is paused right now the tab would
+        // enter a permanent emission blackout — the tap only proxy-acks
+        // bytes it RECEIVES, so it could never reopen the gate on its own.
+        // Resetting is safe: the unrendered backlog is being discarded with
+        // the xterm buffer anyway.
+        invoke("terminal_flow_reset", { terminalId }).catch(() => {});
         try {
           backendRef.current?.dispose();
         } catch {

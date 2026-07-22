@@ -497,17 +497,49 @@ const PageSessionScope = memo(function PageSessionScope({
     let rafHandle: ReturnType<typeof requestAnimationFrame> | null = null;
     let unlisten: UnlistenFn | null = null;
     let disposed = false;
+    // Proxy-ack accumulator for tabs with NO mounted TerminalInstance
+    // (virtualized-offscreen or non-active page). The backend gates webview
+    // emission on acked bytes (see session.rs EmissionGate); without a
+    // mounted pane nobody render-acks, emission for the tab would stop at
+    // the high watermark, and THIS tap — the consumer that keeps session-
+    // state tracking mount-independent — would go blind. The tap is a real
+    // consumer, so it acks the bytes it consumed, but ONLY while no
+    // instance is mounted for the tab (a mounted instance's render-based
+    // acks must not be double-counted). Acks batch per rAF flush so the
+    // invoke rate is one call per tab per frame at most.
+    const pendingAcks = new Map<string, number>();
+
+    // rAF suspends in occluded/minimized windows (WebView2), which would
+    // starve the proxy-acks below — the gap would cross the high watermark
+    // and emission (and with it this tap's state-tracking feed) would pause
+    // until window restore. Pair every rAF schedule with a setTimeout floor
+    // so the flush fires even without paint ticks; whichever fires first
+    // cancels the other.
+    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+    const ACK_FLUSH_FLOOR_MS = 200;
 
     const flush = () => {
-      rafHandle = null;
+      if (rafHandle !== null) {
+        cancelAnimationFrame(rafHandle);
+        rafHandle = null;
+      }
+      if (timeoutHandle !== null) {
+        clearTimeout(timeoutHandle);
+        timeoutHandle = null;
+      }
       const fn = handleOutputRef.current;
       for (const [tabId, text] of coalescer.drain()) {
         fn(tabId, text);
       }
+      for (const [tabId, bytesAcked] of pendingAcks) {
+        invoke("terminal_ack", { terminalId: tabId, bytesAcked }).catch(() => {});
+      }
+      pendingAcks.clear();
     };
     const scheduleFlush = () => {
-      if (rafHandle !== null) return;
+      if (rafHandle !== null || timeoutHandle !== null) return;
       rafHandle = requestAnimationFrame(flush);
+      timeoutHandle = setTimeout(flush, ACK_FLUSH_FLOOR_MS);
     };
 
     (async () => {
@@ -516,7 +548,14 @@ const PageSessionScope = memo(function PageSessionScope({
         // Drop events for tabs this scope doesn't own (another page/window) or
         // doesn't know about — exactly one scope owns any given terminalId.
         if (!tabIdSetRef.current.has(tid)) return;
-        coalescer.push(tid, base64ToBytes(event.payload.data));
+        const bytes = base64ToBytes(event.payload.data);
+        coalescer.push(tid, bytes);
+        // `.current` on the per-tab ref is non-null exactly while a
+        // TerminalInstance is mounted for the tab (set by its
+        // useImperativeHandle, cleared on unmount).
+        if (bytes.length > 0 && !terminalRefs.current.get(tid)?.current) {
+          pendingAcks.set(tid, (pendingAcks.get(tid) ?? 0) + bytes.length);
+        }
         scheduleFlush();
       });
       if (disposed) {
@@ -529,6 +568,7 @@ const PageSessionScope = memo(function PageSessionScope({
     return () => {
       disposed = true;
       if (rafHandle !== null) cancelAnimationFrame(rafHandle);
+      if (timeoutHandle !== null) clearTimeout(timeoutHandle);
       // Do NOT flush on teardown: the scope only unmounts when its whole page is
       // removed, so its tracker + tabs are going away too — a trailing sub-frame
       // update would target unmounted state. Just release the listener.
