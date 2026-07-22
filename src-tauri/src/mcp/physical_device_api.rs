@@ -15,6 +15,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{info, warn};
 
+use crate::mcp::adb_helper::{self, AdbDeviceInfo};
 use crate::mcp::physical_device::{
     ActiveTransport, PhysicalDevice, PhysicalDeviceInfo, PhysicalDeviceRegistry,
 };
@@ -31,10 +32,13 @@ use crate::mcp::types::{ApiResponse, ApiState};
 struct DeviceListResponse {
     devices: Vec<PhysicalDevice>,
     count: usize,
-    /// Operator remediation hint, present only when no devices are paired.
-    /// A release AAB is not auto-reachable until a transport is set up, so
-    /// `count: 0` is the common "nothing to test" state — surface the fix
-    /// inline instead of leaving callers to guess.
+    /// Operator remediation hint. Surfaces the most specific actionable cause:
+    /// an adb device stuck in the `unauthorized` state (un-accepted "Allow USB
+    /// debugging" RSA prompt) takes precedence, since it explains why `adb
+    /// forward`/pairing silently fail; otherwise, when no devices are paired,
+    /// the transport-setup hint. A release AAB is not auto-reachable until a
+    /// transport is set up, so `count: 0` is the common "nothing to test"
+    /// state — surface the fix inline instead of leaving callers to guess.
     #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<String>,
 }
@@ -118,6 +122,36 @@ struct ConnectDeviceResponse {
 }
 
 // ============================================================================
+// Helpers
+// ============================================================================
+
+/// Build the "Allow USB debugging" RSA-prompt remediation hint if any adb
+/// device is stuck in the `unauthorized` state.
+///
+/// A USB device that hasn't accepted the RSA authorization prompt shows up in
+/// `adb devices` as `<serial>\tunauthorized`. In that state `adb forward` and
+/// pairing silently fail, so the generic "run adb forward" hint is misleading —
+/// this names the real cause and the fix. Returns `None` when no device is
+/// unauthorized.
+fn unauthorized_devices_hint(devices: &[AdbDeviceInfo]) -> Option<String> {
+    let serials: Vec<&str> = devices
+        .iter()
+        .filter(|d| d.state == "unauthorized")
+        .map(|d| d.serial.as_str())
+        .collect();
+    if serials.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "ADB device(s) {} are UNAUTHORIZED — accept the \"Allow USB debugging\" \
+         RSA prompt on the phone (or revoke + re-enable USB debugging in \
+         Developer Options, then reconnect), then retry. Until the device is \
+         authorized, `adb forward` and pairing cannot succeed.",
+        serials.join(", ")
+    ))
+}
+
+// ============================================================================
 // Handlers
 // ============================================================================
 
@@ -127,7 +161,16 @@ async fn list_devices(
 ) -> Result<Json<ApiResponse<DeviceListResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     let devices = state.physical_device_registry.list_all().await;
     let count = devices.len();
-    let hint = if count == 0 {
+    // An adb device stuck in `unauthorized` (un-accepted "Allow USB debugging"
+    // RSA prompt) is the real cause behind an otherwise-opaque USB failure:
+    // `adb forward` and pairing silently fail, and the generic "run adb
+    // forward" hint below would mislead. Detect it first and surface the
+    // actual remedy. Empty on any adb error, so this never masks the paired
+    // devices already found.
+    let unauthorized_hint = unauthorized_devices_hint(&adb_helper::list_devices().await);
+    let hint = if unauthorized_hint.is_some() {
+        unauthorized_hint
+    } else if count == 0 {
         Some(
             "No devices paired. Set up a transport, then re-query: \
              (USB) `adb forward tcp:8087 tcp:8087` and hit \
@@ -544,4 +587,49 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/ui-bridge/devices/pair/confirm", post(confirm_pairing))
         .route("/ui-bridge/devices/{id}/pairing", delete(revoke_pairing))
         .route("/ui-bridge/devices/register-lan", post(register_lan_device))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{unauthorized_devices_hint, AdbDeviceInfo};
+
+    fn dev(serial: &str, state: &str) -> AdbDeviceInfo {
+        AdbDeviceInfo {
+            serial: serial.to_string(),
+            state: state.to_string(),
+            model: None,
+        }
+    }
+
+    #[test]
+    fn unauthorized_line_produces_rsa_hint() {
+        // Mirrors an `adb devices` line: `R3CN30ABCDEF\tunauthorized`.
+        let devices = vec![dev("R3CN30ABCDEF", "unauthorized")];
+        let hint = unauthorized_devices_hint(&devices).expect("hint present");
+        assert!(hint.contains("UNAUTHORIZED"));
+        assert!(hint.contains("RSA prompt"));
+        assert!(hint.contains("R3CN30ABCDEF"));
+    }
+
+    #[test]
+    fn multiple_unauthorized_serials_listed() {
+        let devices = vec![
+            dev("AAA111", "unauthorized"),
+            dev("BBB222", "device"),
+            dev("CCC333", "unauthorized"),
+        ];
+        let hint = unauthorized_devices_hint(&devices).expect("hint present");
+        assert!(hint.contains("AAA111"));
+        assert!(hint.contains("CCC333"));
+        // Authorized device is not named in the unauthorized hint.
+        assert!(!hint.contains("BBB222"));
+    }
+
+    #[test]
+    fn no_unauthorized_yields_none() {
+        // Authorized + offline devices must not trigger the RSA hint.
+        let devices = vec![dev("AAA111", "device"), dev("BBB222", "offline")];
+        assert!(unauthorized_devices_hint(&devices).is_none());
+        assert!(unauthorized_devices_hint(&[]).is_none());
+    }
 }
