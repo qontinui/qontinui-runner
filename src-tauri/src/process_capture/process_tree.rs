@@ -151,22 +151,58 @@ pub fn claude_anchor_in_subtree(root_pid: u32, snapshot: &ProcessSnapshot) -> Op
         })
 }
 
-/// Extract the `--session-id` value from a process command line, returning it
-/// ONLY when it is UUID-shaped (8-4-4-4-12 hex, case-insensitive). Handles the
-/// three spellings the provider CLI accepts:
-///   - `--session-id <uuid>`  (space-separated)
-///   - `--session-id=<uuid>`  (equals)
-///   - `--session-id "<uuid>"` / `--session-id='<uuid>'` (quoted)
+/// Extract the session id a process command line NAMES, returning it ONLY when
+/// it is UUID-shaped (8-4-4-4-12 hex, case-insensitive). Handles every flag
+/// that carries a concrete id, in each spelling the provider CLI accepts:
+///   - `--session-id <uuid>` / `--session-id=<uuid>` / `--session-id "<uuid>"`
+///   - `--resume <uuid>`     / `--resume=<uuid>`     / `--resume "<uuid>"`
+///   - `-r <uuid>`  (claude's short `--resume`)
+///
+/// The resume forms matter because a resumed session's argv carries ONLY
+/// `--resume` — `claude_session::launch_spec::render_argv` drops `--session-id`
+/// when a resume id is present. Reading them here is the SAME class of evidence
+/// as reading `--session-id`: this is the live anchor process's own argv, which
+/// names the id that process is demonstrably running under, so the resulting
+/// bind stays [`crate::session::reconcile::BindOrigin::Authoritative`] and still
+/// confirms only against a transcript for that exact id.
+///
+/// `--continue` / `-c` name no id and are deliberately not matched.
+///
+/// PRECEDENCE: `--resume` beats `--session-id`, mirroring
+/// `launch_spec::render_argv` step 3 ("resume takes precedence over
+/// session-id", `claude_session/launch_spec.rs:225-235`) — the resume id is the
+/// one the process actually runs under.
+///
 /// The UUID-shape gate is the safety net: a stray token that merely follows the
 /// flag text (or a `--session-idX` false prefix) can never be mistaken for a
-/// real id. `None` when the flag is absent or its value isn't UUID-shaped.
+/// real id. `None` when no such flag is present or no value is UUID-shaped.
 pub fn parse_session_id_from_cmdline(cmdline: &str) -> Option<String> {
-    const NEEDLE: &str = "--session-id";
+    // resume first — see PRECEDENCE above.
+    find_flag_uuid(cmdline, "--resume", false)
+        .or_else(|| find_flag_uuid(cmdline, "-r", true))
+        .or_else(|| find_flag_uuid(cmdline, "--session-id", false))
+}
+
+/// Scan `cmdline` for `<needle>=<uuid>` / `<needle> <uuid>` (quotes tolerated)
+/// and return the first UUID-shaped value.
+///
+/// `require_token_start` additionally demands the needle sit at a token
+/// boundary (start of line, or after whitespace/quote). Required for the short
+/// `-r`, which as a bare substring also occurs inside `--resume` and inside
+/// ordinary paths (`C:\foo-r bar`); the long flags keep their historical
+/// substring scan so their behavior is byte-identical to before.
+fn find_flag_uuid(cmdline: &str, needle: &str, require_token_start: bool) -> Option<String> {
     let mut search_from = 0usize;
-    while let Some(rel) = cmdline[search_from..].find(NEEDLE) {
+    while let Some(rel) = cmdline[search_from..].find(needle) {
         let idx = search_from + rel;
-        let after = &cmdline[idx + NEEDLE.len()..];
-        search_from = idx + NEEDLE.len();
+        let after = &cmdline[idx + needle.len()..];
+        search_from = idx + needle.len();
+        if require_token_start {
+            let prev = cmdline[..idx].chars().next_back();
+            if !prev.is_none_or(|c| c.is_whitespace() || c == '"' || c == '\'') {
+                continue;
+            }
+        }
         // Accept `=value` or ` value`; reject a glued `--session-idX` prefix.
         let value_part = if let Some(eq) = after.strip_prefix('=') {
             eq
@@ -956,8 +992,88 @@ mod tests {
             parse_session_id_from_cmdline("claude --session-id not-a-uuid"),
             None
         );
-        // Reject: flag absent.
+        // Reject: `--resume` IS recognized now, but its value is not UUID-shaped
+        // (and no other id-naming flag is present) → still None.
         assert_eq!(parse_session_id_from_cmdline("claude --resume abc"), None);
+    }
+
+    #[test]
+    fn parse_session_id_reads_resume_space_equals_and_quoted_forms() {
+        // A resumed session's argv carries ONLY `--resume` (render_argv drops
+        // `--session-id`), so the anchor's own cmdline must still name its id.
+        let id = "1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d";
+        assert_eq!(
+            parse_session_id_from_cmdline(&format!("claude --resume {id}")),
+            Some(id.to_string())
+        );
+        assert_eq!(
+            parse_session_id_from_cmdline(&format!("claude --resume={id}")),
+            Some(id.to_string())
+        );
+        assert_eq!(
+            parse_session_id_from_cmdline(&format!("claude --resume \"{id}\" -p")),
+            Some(id.to_string())
+        );
+    }
+
+    #[test]
+    fn parse_session_id_reads_short_r_only_at_a_token_boundary() {
+        let id = "1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d";
+        assert_eq!(
+            parse_session_id_from_cmdline(&format!("claude -r {id}")),
+            Some(id.to_string())
+        );
+        // `-r` at the very start of the line is still a token start.
+        assert_eq!(
+            parse_session_id_from_cmdline(&format!("-r {id}")),
+            Some(id.to_string())
+        );
+        // Glued mid-token `-r` (a path) must NOT capture the following token.
+        assert_eq!(
+            parse_session_id_from_cmdline(&format!("C:/tools/foo-r {id}")),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_session_id_ignores_continue_flags_that_name_no_id() {
+        // `--continue` / `-c` pick "the most recent session" — they name no id,
+        // so there is nothing to read and nothing may be invented.
+        assert_eq!(parse_session_id_from_cmdline("claude --continue"), None);
+        assert_eq!(parse_session_id_from_cmdline("claude -c"), None);
+    }
+
+    #[test]
+    fn parse_session_id_never_captures_a_following_flag_or_missing_value() {
+        assert_eq!(
+            parse_session_id_from_cmdline("claude --resume --verbose"),
+            None
+        );
+        assert_eq!(parse_session_id_from_cmdline("claude --resume"), None);
+        assert_eq!(parse_session_id_from_cmdline("claude -r"), None);
+        // Glued false prefix.
+        let id = "1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d";
+        assert_eq!(
+            parse_session_id_from_cmdline(&format!("claude --resumeX {id}")),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_session_id_prefers_resume_over_session_id_when_both_present() {
+        // Matches launch_spec::render_argv step 3 ("resume takes precedence
+        // over session-id") — the resume id is the one the process runs under.
+        let sid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let rid = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        assert_eq!(
+            parse_session_id_from_cmdline(&format!("claude --session-id {sid} --resume {rid}")),
+            Some(rid.to_string())
+        );
+        // Order in the cmdline must not change the answer.
+        assert_eq!(
+            parse_session_id_from_cmdline(&format!("claude --resume {rid} --session-id {sid}")),
+            Some(rid.to_string())
+        );
     }
 
     #[cfg(windows)]

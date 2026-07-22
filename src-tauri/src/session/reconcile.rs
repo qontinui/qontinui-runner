@@ -221,7 +221,9 @@ pub fn decide_bind_for_live_pty(
         }
     }
 
-    // RUNG 2 — the typed `--session-id` IS the identity. No correlation guess:
+    // RUNG 2 — the id the anchor's own argv NAMES (`--session-id`, `--resume`,
+    // `-r` — see `process_tree::parse_session_id_from_cmdline`) IS the identity:
+    // the live process is demonstrably running under it. No correlation guess:
     // bind it authoritative. It's confirmed only if a real transcript for that
     // exact id is already on disk; otherwise it's provisional (the transcript
     // will appear a tick or two later and a hook / the next tick confirms it).
