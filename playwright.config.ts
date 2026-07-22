@@ -6,12 +6,13 @@
 // references Playwright. All four signals are misleading:
 //
 // - `testDir: "./playwright-user-scripts"` resolves to a RUNTIME directory
-//   created by the Rust backend inside the runner's data dir
-//   (src-tauri/src/playwright/executor.rs:177,529). The runner writes
-//   user-generated Playwright test files there and executes them against the
-//   users' own applications — a shipped product feature. The directory is
-//   intentionally absent from the source tree.
-// - `@playwright/test` is a RUNTIME dependency: executor.rs:165-169 resolves
+//   created by the Rust backend next to the runner's `node_modules` (exe
+//   ancestor walk-up, src-tauri/src/playwright/executor.rs:177,529). The
+//   runner writes user-generated Playwright test files there and executes
+//   them against the users' own applications — a shipped product feature.
+//   The directory is gitignored (`playwright-user-scripts/`); in a dev build
+//   it materializes inside the checkout root at runtime.
+// - `@playwright/test` is a RUNTIME dependency: executor.rs:153-173 resolves
 //   it out of node_modules and hard-errors without it;
 //   scripts/headless-launcher.js:42 requires it for the MCP headless-browser
 //   path; orchestrator/verification.rs:232 generates `npx playwright test`
