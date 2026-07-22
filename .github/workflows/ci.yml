@@ -71,6 +71,15 @@ jobs:
       # applies when the var is NOT already present in the environment; a
       # set-but-empty var blocks it, and sccache filters empty strings.
       SCCACHE_BUCKET: ""
+      # Pin the server port job-wide to the same value src-tauri/.cargo/
+      # config.toml's [env] default gives cargo-spawned clients (4230).
+      # Without this, non-cargo sccache invocations (the `sccache stats`
+      # step, the sccache-action post-run) talk to a fresh default-port
+      # server and report zero compile requests while the real 4230
+      # server did all the work — observed on the first Phase 1 run
+      # (stats read 0/0 while ~1k sccache/* GHA cache entries were
+      # written during the compile window).
+      SCCACHE_SERVER_PORT: "4230"
 
     steps:
       - uses: actions/checkout@v5
