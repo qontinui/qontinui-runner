@@ -1623,19 +1623,119 @@ mod tier_tests {
     /// persist. `should_persist_migration` encodes that decision.
     #[test]
     fn secondary_runner_must_not_persist_migration() {
+        let ok = SettingsProvenance::Loaded;
         // Secondary with a pending migration: persist is suppressed.
         assert!(
-            !should_persist_migration(true, /* is_secondary = */ true),
+            !should_persist_migration(true, /* is_secondary = */ true, ok),
             "a secondary runner must never persist a migration to the shared settings.json"
         );
         // Primary with a pending migration: persist proceeds.
         assert!(
-            should_persist_migration(true, /* is_secondary = */ false),
+            should_persist_migration(true, /* is_secondary = */ false, ok),
             "the primary runner must persist its tier/local_user_id migration"
         );
         // Nothing to persist: never persist, regardless of runner kind.
-        assert!(!should_persist_migration(false, false));
-        assert!(!should_persist_migration(false, true));
+        assert!(!should_persist_migration(false, false, ok));
+        assert!(!should_persist_migration(false, true, ok));
+    }
+
+    // ------------------------------------------------------------------
+    // C1/C2/C3 — settings provenance
+    // ------------------------------------------------------------------
+
+    /// THE headline invariant: a `Settings` that was defaulted only because
+    /// the real file was unreadable must NEVER be written back to disk. Doing
+    /// so atomically replaced a corrupt-but-recoverable settings.json with an
+    /// all-defaults one (tier=Local, empty runner_token, setup_completed=false)
+    /// and logged it as a successful migration.
+    #[test]
+    fn unreadable_settings_are_never_persisted() {
+        assert!(
+            !should_persist_migration(true, false, SettingsProvenance::Unreadable),
+            "a defaulted-because-unreadable struct must never be persisted, \
+             even by the primary runner with a pending migration"
+        );
+        assert!(
+            !should_persist_migration(true, true, SettingsProvenance::Unreadable),
+            "…and certainly not by a secondary"
+        );
+    }
+
+    /// A genuine first run (no file yet) is authoritative: defaults ARE the
+    /// user's state, so the tier/local_user_id migration may persist and seed
+    /// the file. Regression guard against over-correcting C2 into "never
+    /// persist anything", which would leave `local_user_id` unminted forever.
+    #[test]
+    fn fresh_install_still_persists_its_migration() {
+        assert!(
+            should_persist_migration(true, false, SettingsProvenance::FreshInstall),
+            "a genuine first run must still seed settings.json"
+        );
+    }
+
+    #[test]
+    fn provenance_authoritativeness_matrix() {
+        assert!(SettingsProvenance::Loaded.is_authoritative());
+        assert!(SettingsProvenance::FreshInstall.is_authoritative());
+        assert!(
+            !SettingsProvenance::Unreadable.is_authoritative(),
+            "unreadable means UNKNOWN — it must never be treated as real state"
+        );
+    }
+
+    /// An unreadable load must not be reported as a definitive tier. Callers
+    /// that gate capability on the tier have to be able to tell "the user is
+    /// Local" from "we do not know the user's tier".
+    #[test]
+    fn tier_resolution_distinguishes_unknown_from_local() {
+        let local = TierResolution::Known(RunnerTier::Local);
+        let unknown = TierResolution::Unknown {
+            reason: "boom".to_string(),
+        };
+        assert_ne!(local, unknown);
+        assert_eq!(local.known(), Some(RunnerTier::Local));
+        assert_eq!(unknown.known(), None, "unknown must not collapse to Local");
+        assert_eq!(local.as_str(), "local");
+        assert_eq!(unknown.as_str(), "unknown");
+        assert_eq!(
+            TierResolution::Known(RunnerTier::QontinuiAccount).as_str(),
+            "qontinui_account"
+        );
+    }
+
+    /// The unreadable message must name the file + the real remediation, and
+    /// must NOT tell the user to sign in (which is the wrong CTA and the
+    /// misleading behavior C4 called out).
+    #[test]
+    fn unreadable_message_does_not_suggest_signing_in() {
+        let loaded = LoadedSettings {
+            settings: Settings::default(),
+            provenance: SettingsProvenance::Unreadable,
+            error: Some("parse failed: expected value at line 1".to_string()),
+        };
+        let msg = loaded.unreadable_message();
+        assert!(msg.contains("settings.json could not be read"), "{msg}");
+        assert!(msg.contains("parse failed"), "{msg}");
+        assert!(msg.contains("Nothing was changed"), "{msg}");
+        assert!(
+            !msg.to_lowercase().contains("sign in"),
+            "must not render a sign-in CTA for a file-read fault: {msg}"
+        );
+    }
+
+    /// `read_settings_from_disk` decides provenance from the file; this locks
+    /// in the classification of the three shapes without touching the real
+    /// user settings file (the classifier is exercised through its inputs).
+    #[test]
+    fn parse_failure_classifies_as_unreadable_not_fresh() {
+        // A truncated/corrupt document must not deserialize — if it ever did,
+        // the Unreadable branch could never be reached and C1 would regress.
+        assert!(
+            serde_json::from_str::<Settings>("{\"tier\": \"qontinui_acc").is_err(),
+            "a truncated settings.json must fail to parse"
+        );
+        // …while an empty object is a legitimate (authoritative) document.
+        assert!(serde_json::from_str::<Settings>("{}").is_ok());
     }
 }
 
@@ -2385,46 +2485,221 @@ fn get_settings_path() -> Result<PathBuf, String> {
     Ok(get_config_dir()?.join(SETTINGS_FILE))
 }
 
-/// Load settings from file
-pub fn load_settings() -> Settings {
-    let mut settings = match get_settings_path() {
-        Ok(path) => {
-            if path.exists() {
-                match fs::read_to_string(&path) {
-                    Ok(contents) => match serde_json::from_str::<Settings>(&contents) {
-                        Ok(mut s) => {
-                            // Gate-2 split migration: carry a pre-split explicit
-                            // `cloud_sync_enabled` decision forward onto the new
-                            // `session_metadata_sync_enabled` flag when the new
-                            // key is absent. Only runs against a real,
-                            // successfully-parsed settings file — a genuinely
-                            // fresh install never reaches this branch and
-                            // already gets the field's own serde default
-                            // (`true`) from the parse above.
-                            if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&contents) {
-                                migrate_metadata_sync_flag(&raw, &mut s);
-                            }
-                            s
-                        }
-                        Err(e) => {
-                            error!("Failed to parse settings file: {}", e);
-                            Settings::default()
-                        }
-                    },
-                    Err(e) => {
-                        error!("Failed to read settings file: {}", e);
-                        Settings::default()
-                    }
-                }
-            } else {
-                Settings::default()
+// ============================================================================
+// Settings provenance — "unknown" must never collapse into "denied"
+// ============================================================================
+//
+// `load_settings()` used to return `Settings::default()` on EVERY failure
+// (path resolution, read error, parse error) with only an `error!` log. Since
+// `RunnerTier` defaults to `Local`, a transient Windows sharing violation or a
+// truncated settings.json silently demoted a Tier 2 install to a local guest,
+// blanked `web_integration.runner_token`, turned off `cloud_sync_enabled`, and
+// reset `setup_completed` — re-showing the first-run SetupWizard. Worse, the
+// defaulted struct was then PERSISTED by the tier migration, making the
+// demotion permanent, and any unrelated `load → mutate one field → save` did
+// the same on the next checkbox toggle.
+//
+// The fix is to make the failure legible: every load now carries a
+// [`SettingsProvenance`] saying whether the returned `Settings` reflect real
+// on-disk user state. Nothing that writes identity-bearing state may act on a
+// non-authoritative load.
+
+/// Where an in-memory [`Settings`] value came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingsProvenance {
+    /// A `settings.json` existed and parsed successfully. The values are the
+    /// user's real, persisted state.
+    Loaded,
+    /// No `settings.json` existed — a genuine first run. Defaults ARE the
+    /// user's state (there is nothing to lose), so this is authoritative.
+    FreshInstall,
+    /// A `settings.json` (or its directory) existed but could not be read or
+    /// parsed. The accompanying `Settings` is a DEFAULT placeholder: its
+    /// identity-bearing fields (`tier`, `web_integration.runner_token`,
+    /// `setup_completed`, `qontinui_user_id`, sync toggles) are **not** the
+    /// user's values and must never be persisted, nor used to deny a
+    /// capability.
+    Unreadable,
+}
+
+impl SettingsProvenance {
+    /// `true` when the accompanying `Settings` reflects real user state and may
+    /// safely be written back to disk / used to gate capability.
+    pub fn is_authoritative(self) -> bool {
+        matches!(self, Self::Loaded | Self::FreshInstall)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Loaded => "loaded",
+            Self::FreshInstall => "fresh_install",
+            Self::Unreadable => "unreadable",
+        }
+    }
+}
+
+/// A settings load together with the provenance of its values.
+///
+/// Deliberately NOT `Clone`/`Debug`: `Settings` is neither, and a whole-settings
+/// clone is exactly the pattern this type exists to discourage.
+pub struct LoadedSettings {
+    pub settings: Settings,
+    pub provenance: SettingsProvenance,
+    /// Human-readable reason the load was non-authoritative
+    /// (`None` for `Loaded` / `FreshInstall`).
+    pub error: Option<String>,
+}
+
+impl LoadedSettings {
+    pub fn is_authoritative(&self) -> bool {
+        self.provenance.is_authoritative()
+    }
+
+    /// The canonical user-facing message for an unreadable settings file.
+    /// Deliberately names the remediation (fix/move the file) rather than
+    /// implying the user is signed out or on a lower tier.
+    pub fn unreadable_message(&self) -> String {
+        format!(
+            "settings.json could not be read ({}) — the runner cannot determine your \
+             saved configuration. Nothing was changed. Fix or move {} and retry.",
+            self.error.as_deref().unwrap_or("unknown error"),
+            settings_path_for_display(),
+        )
+    }
+}
+
+fn settings_path_for_display() -> String {
+    get_settings_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| SETTINGS_FILE.to_string())
+}
+
+/// A recorded settings-read fault, exposed so the UI can surface a loud
+/// "settings unreadable" banner instead of silently rendering a demoted app.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsFault {
+    pub path: String,
+    pub error: String,
+    /// Unix seconds when the fault was last observed.
+    pub detected_at_unix: u64,
+}
+
+/// Process-global last-known settings-read fault. `None` once a load succeeds
+/// again, so the surface self-heals when the file becomes readable.
+static SETTINGS_FAULT: std::sync::RwLock<Option<SettingsFault>> = std::sync::RwLock::new(None);
+
+fn record_settings_fault(fault: Option<SettingsFault>) {
+    // `load_settings()` runs on hot paths (the relay loop re-reads every
+    // iteration), and the overwhelmingly common case is "healthy, still
+    // healthy". Take the cheap read lock first and skip the write entirely
+    // when there is nothing to clear.
+    if fault.is_none() {
+        if let Ok(guard) = SETTINGS_FAULT.read() {
+            if guard.is_none() {
+                return;
             }
         }
-        Err(e) => {
-            error!("Failed to get settings path: {}", e);
-            Settings::default()
+    }
+    if let Ok(mut guard) = SETTINGS_FAULT.write() {
+        *guard = fault;
+    }
+}
+
+/// The most recent settings-read fault, or `None` when the last load was
+/// authoritative. Read by the `get_settings_health` command and the
+/// `/web-integration/status` diagnostic.
+pub fn settings_fault() -> Option<SettingsFault> {
+    SETTINGS_FAULT.read().ok().and_then(|g| g.clone())
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Read + parse the persisted settings document, WITHOUT any env overlays,
+/// roster overlay, or tier migration. This is the raw on-disk truth plus its
+/// provenance — the base every read-modify-write must start from.
+fn read_settings_from_disk() -> LoadedSettings {
+    let unreadable = |error: String| {
+        error!("Settings unreadable — refusing to synthesize defaults: {error}");
+        record_settings_fault(Some(SettingsFault {
+            path: settings_path_for_display(),
+            error: error.clone(),
+            detected_at_unix: now_unix(),
+        }));
+        LoadedSettings {
+            settings: Settings::default(),
+            provenance: SettingsProvenance::Unreadable,
+            error: Some(error),
         }
     };
+
+    let path = match get_settings_path() {
+        Ok(p) => p,
+        Err(e) => return unreadable(format!("cannot resolve settings path: {e}")),
+    };
+
+    if !path.exists() {
+        record_settings_fault(None);
+        return LoadedSettings {
+            settings: Settings::default(),
+            provenance: SettingsProvenance::FreshInstall,
+            error: None,
+        };
+    }
+
+    let contents = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => return unreadable(format!("read failed: {e}")),
+    };
+
+    match serde_json::from_str::<Settings>(&contents) {
+        Ok(mut s) => {
+            // Gate-2 split migration: carry a pre-split explicit
+            // `cloud_sync_enabled` decision forward onto the new
+            // `session_metadata_sync_enabled` flag when the new key is absent.
+            // Only runs against a real, successfully-parsed settings file — a
+            // genuinely fresh install never reaches this branch and already
+            // gets the field's own serde default (`true`) from the parse above.
+            if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&contents) {
+                migrate_metadata_sync_flag(&raw, &mut s);
+            }
+            record_settings_fault(None);
+            LoadedSettings {
+                settings: s,
+                provenance: SettingsProvenance::Loaded,
+                error: None,
+            }
+        }
+        Err(e) => unreadable(format!("parse failed: {e}")),
+    }
+}
+
+/// Load settings from file.
+///
+/// Convenience wrapper over [`load_settings_full`] for the many read-only
+/// callers that only want values and cannot act on provenance. **Any caller
+/// that writes settings back, or that turns a settings value into a
+/// capability/authentication verdict, must use [`load_settings_full`] (or
+/// [`update_settings`] / [`resolve_tier`]) instead** — see the provenance
+/// module docs above.
+pub fn load_settings() -> Settings {
+    load_settings_full().settings
+}
+
+/// Load settings from file, reporting whether the values are the user's real
+/// persisted state ([`SettingsProvenance`]).
+pub fn load_settings_full() -> LoadedSettings {
+    let LoadedSettings {
+        mut settings,
+        provenance,
+        error,
+    } = read_settings_from_disk();
 
     // Supervisor-injected Restate port/URL overrides (Phase 2 plumbing).
     // These apply only to the in-memory settings for the current process;
@@ -2520,13 +2795,32 @@ pub fn load_settings() -> Settings {
     // migration in-memory only — correct for this process's lifetime, never
     // written to a settings file. This mirrors the in-memory-only
     // `QONTINUI_RUNNER_TIER` overlay just below.
+    //
+    // C2 GUARD: a `Settings::default()` synthesized because the real file was
+    // unreadable has `tier_initialized == false` and an empty `runner_token`,
+    // so `migrate_tier_in_place` would stamp `tier = Local, tier_initialized =
+    // true` and request a persist — atomically overwriting the corrupt (but
+    // possibly recoverable) file with an all-defaults one and logging it as a
+    // success. That is silent data destruction, and it makes the demotion
+    // permanent across restarts. A non-authoritative load therefore skips the
+    // migration ENTIRELY: no in-memory tier stamp, no local_user_id mint, no
+    // persist.
     let mut needs_persist = false;
-    if migrate_tier_in_place(&mut settings) {
-        needs_persist = true;
-    }
-    if settings.local_user_id.trim().is_empty() {
-        settings.local_user_id = uuid::Uuid::new_v4().to_string();
-        needs_persist = true;
+    if provenance.is_authoritative() {
+        if migrate_tier_in_place(&mut settings) {
+            needs_persist = true;
+        }
+        if settings.local_user_id.trim().is_empty() {
+            settings.local_user_id = uuid::Uuid::new_v4().to_string();
+            needs_persist = true;
+        }
+    } else {
+        error!(
+            "Settings load was non-authoritative ({}) — skipping the tier/local_user_id \
+             migration and its persist so the existing settings.json is not overwritten \
+             with defaults",
+            provenance.as_str()
+        );
     }
     let is_secondary = crate::instance::is_secondary();
     if needs_persist && is_secondary {
@@ -2538,7 +2832,7 @@ pub fn load_settings() -> Settings {
             settings.tier
         );
     }
-    if should_persist_migration(needs_persist, is_secondary) {
+    if should_persist_migration(needs_persist, is_secondary, provenance) {
         if let Err(e) = save_settings(&settings) {
             error!("Failed to persist tier/local_user_id migration: {}", e);
         } else {
@@ -2582,7 +2876,99 @@ pub fn load_settings() -> Settings {
         }
     }
 
-    settings
+    LoadedSettings {
+        settings,
+        provenance,
+        error,
+    }
+}
+
+// ============================================================================
+// Provenance-checked write path (C3)
+// ============================================================================
+
+/// Read-modify-write a single settings field WITHOUT the whole-file clobber
+/// that `load_settings() → mutate one field → save_settings()` invites.
+///
+/// Two guarantees over the old pattern:
+///
+/// 1. **Hard-errors on a non-authoritative base.** If the settings file could
+///    not be read or parsed, the mutation is refused with the reason instead of
+///    persisting an all-defaults struct — which used to sign the runner out of
+///    Tier 2 as a side effect of toggling an unrelated checkbox, and report
+///    success while doing it.
+/// 2. **Mutates the PERSISTED document, not the env-overlaid view.**
+///    `load_settings()` layers in-memory-only overlays (`QONTINUI_RUNNER_TIER`,
+///    `QONTINUI_RUNNER_TOKEN`, Restate ports, the machine-global Claude
+///    roster). Saving that view wrote those overlays into the file — e.g. a
+///    secondary launched with `QONTINUI_RUNNER_TIER=local` persisted
+///    `tier = Local` over the primary's Tier 2 the first time it saved any
+///    unrelated setting. Starting from the raw on-disk document keeps every
+///    "in-memory only; never persisted" comment true.
+///
+/// The closure sees the on-disk document. Callers that need the *effective*
+/// (overlaid) values to compute the new one should read them separately with
+/// [`load_settings`] before calling.
+pub fn update_settings<F>(mutate: F) -> Result<(), String>
+where
+    F: FnOnce(&mut Settings),
+{
+    let loaded = read_settings_from_disk();
+    if !loaded.is_authoritative() {
+        let msg = loaded.unreadable_message();
+        error!("update_settings refused: {msg}");
+        return Err(msg);
+    }
+    let mut settings = loaded.settings;
+    mutate(&mut settings);
+    save_settings(&settings)
+}
+
+/// Tri-state runner tier: a settings-read failure means the tier is UNKNOWN,
+/// not `Local`. Capability gates must render "we could not determine your
+/// tier" rather than the lesser capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TierResolution {
+    Known(RunnerTier),
+    Unknown { reason: String },
+}
+
+impl TierResolution {
+    /// The tier if known, else `None`. Never guesses.
+    ///
+    /// Part of the tri-state contract even though the current in-tree callers
+    /// all `match` exhaustively — a caller that only needs "the tier, if we
+    /// actually know it" must have a way to ask that does not fabricate one.
+    #[allow(dead_code)]
+    pub fn known(&self) -> Option<RunnerTier> {
+        match self {
+            Self::Known(t) => Some(*t),
+            Self::Unknown { .. } => None,
+        }
+    }
+
+    /// `"local" | "local_provider" | "qontinui_account" | "unknown"`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Known(RunnerTier::Local) => "local",
+            Self::Known(RunnerTier::LocalProvider) => "local_provider",
+            Self::Known(RunnerTier::QontinuiAccount) => "qontinui_account",
+            Self::Unknown { .. } => "unknown",
+        }
+    }
+}
+
+/// Resolve the runner tier, distinguishing "definitively Tier 0/1" from
+/// "we could not read settings.json, so the tier is unknown".
+pub fn resolve_tier() -> TierResolution {
+    let loaded = load_settings_full();
+    if loaded.is_authoritative() {
+        TierResolution::Known(loaded.settings.tier)
+    } else {
+        TierResolution::Unknown {
+            reason: loaded.unreadable_message(),
+        }
+    }
 }
 
 /// Parse a `QONTINUI_RUNNER_TIER` env-var value and apply it as an in-memory
@@ -2632,18 +3018,28 @@ pub(crate) fn migrate_tier_in_place(settings: &mut Settings) -> bool {
 /// Decide whether a pending tier/local_user_id migration may be persisted to
 /// the SHARED settings.json.
 ///
-/// Returns `true` only when there is something to persist (`needs_persist`)
-/// AND the runner is the primary (`!is_secondary`). A secondary (temp or
-/// named — any supervisor-launched runner with `QONTINUI_INSTANCE_NAME`) must
-/// never write the shared file, because `migrate_tier_in_place` infers
-/// `tier=Local` for it (no `runner_token`), which would silently demote the
-/// primary's persisted Tier 2 state on disk. See the FOOTGUN GUARD comment in
-/// `load_settings`.
+/// Returns `true` only when ALL THREE hold:
+///
+/// - there is something to persist (`needs_persist`);
+/// - the runner is the primary (`!is_secondary`) — a secondary (temp or named,
+///   i.e. any supervisor-launched runner with `QONTINUI_INSTANCE_NAME`) must
+///   never write the shared file, because `migrate_tier_in_place` infers
+///   `tier=Local` for it (no `runner_token`), which would silently demote the
+///   primary's persisted Tier 2 state on disk (see the FOOTGUN GUARD comment
+///   in `load_settings_full`);
+/// - the base load was **authoritative** (`provenance.is_authoritative()`) — a
+///   struct defaulted because the file was unreadable is not the user's state,
+///   and writing it destroys the real (possibly recoverable) file. This is the
+///   single most important invariant in this module.
 ///
 /// Pure helper (no env / no IO) so the guard can be unit-tested without
 /// mutating process env or touching the real settings file.
-pub(crate) fn should_persist_migration(needs_persist: bool, is_secondary: bool) -> bool {
-    needs_persist && !is_secondary
+pub(crate) fn should_persist_migration(
+    needs_persist: bool,
+    is_secondary: bool,
+    provenance: SettingsProvenance,
+) -> bool {
+    needs_persist && !is_secondary && provenance.is_authoritative()
 }
 
 /// Gate-2 split migration (plan `2026-07-10-split-cloud-sync-consent`):
@@ -2688,9 +3084,7 @@ pub fn get_container_settings() -> crate::container::container_config::Container
 pub fn save_container_settings(
     config: crate::container::container_config::ContainerConfig,
 ) -> Result<(), String> {
-    let mut settings = load_settings();
-    settings.container = config;
-    save_settings(&settings)
+    update_settings(|settings| settings.container = config)
 }
 
 pub fn get_security_settings() -> crate::security::engine::SecuritySettings {
@@ -2701,9 +3095,7 @@ pub fn get_security_settings() -> crate::security::engine::SecuritySettings {
 pub fn save_security_settings(
     config: crate::security::engine::SecuritySettings,
 ) -> Result<(), String> {
-    let mut settings = load_settings();
-    settings.security = config;
-    save_settings(&settings)
+    update_settings(|settings| settings.security = config)
 }
 
 /// Save the last loaded config path
@@ -3142,9 +3534,7 @@ pub fn get_saved_projects() -> Vec<SavedProject> {
 /// user commits their project selection, and by the `saved_projects`
 /// Tauri-command module.
 pub fn save_saved_projects(projects: Vec<SavedProject>) -> Result<(), String> {
-    let mut settings = load_settings();
-    settings.saved_projects = projects;
-    save_settings(&settings)
+    update_settings(|settings| settings.saved_projects = projects)
 }
 
 // ============================================================================
@@ -3172,9 +3562,7 @@ pub fn get_cloud_sync_enabled() -> bool {
 
 /// Persist the cloud session sync consent flag.
 pub fn save_cloud_sync_enabled(enabled: bool) -> Result<(), String> {
-    let mut settings = load_settings();
-    settings.cloud_sync_enabled = enabled;
-    save_settings(&settings)
+    update_settings(|settings| settings.cloud_sync_enabled = enabled)
 }
 
 /// Get the session metadata sync consent flag (gate 2). Default true.
@@ -3184,9 +3572,7 @@ pub fn get_session_metadata_sync_enabled() -> bool {
 
 /// Persist the session metadata sync consent flag.
 pub fn save_session_metadata_sync_enabled(enabled: bool) -> Result<(), String> {
-    let mut settings = load_settings();
-    settings.session_metadata_sync_enabled = enabled;
-    save_settings(&settings)
+    update_settings(|settings| settings.session_metadata_sync_enabled = enabled)
 }
 
 // ============================================================================
@@ -3200,9 +3586,7 @@ pub fn get_lock_yield_policy_settings() -> LockYieldPolicySettings {
 
 /// Save the lock-yield policy settings.
 pub fn save_lock_yield_policy_settings(policy: LockYieldPolicySettings) -> Result<(), String> {
-    let mut settings = load_settings();
-    settings.lock_yield_policy = policy;
-    save_settings(&settings)
+    update_settings(|settings| settings.lock_yield_policy = policy)
 }
 
 #[cfg(test)]

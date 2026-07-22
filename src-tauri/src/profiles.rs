@@ -270,17 +270,25 @@ pub enum CoordBaseSource {
     TierDefault,
     /// Nothing configured and no hosted tier — the dev-localhost guess.
     DevLocalhostFallback,
+    /// Nothing configured AND settings.json was unreadable, so the tier is
+    /// unknown. The production default applied rather than the dev-localhost
+    /// guess — see [`apply_tier_policy`]. Distinct from [`Self::TierDefault`]
+    /// so the doctor / 502 bodies can say "we guessed prod because we could
+    /// not read your tier", not "your tier is qontinui_account".
+    UnknownTierProdDefault,
 }
 
 impl CoordBaseSource {
     /// Stable wire string: `"env" | "profile" | "tier_default" |
-    /// "dev_localhost_fallback"`. Used verbatim in proxy error JSON.
+    /// "dev_localhost_fallback" | "unknown_tier_prod_default"`. Used verbatim
+    /// in proxy error JSON.
     pub fn as_str(self) -> &'static str {
         match self {
             CoordBaseSource::Env => "env",
             CoordBaseSource::Profile => "profile",
             CoordBaseSource::TierDefault => "tier_default",
             CoordBaseSource::DevLocalhostFallback => "dev_localhost_fallback",
+            CoordBaseSource::UnknownTierProdDefault => "unknown_tier_prod_default",
         }
     }
 }
@@ -390,17 +398,83 @@ pub fn settings_json_path() -> Option<PathBuf> {
     Some(dir.join("settings.json"))
 }
 
+/// Outcome of reading `settings.json::tier` — a tri-state, because "we could
+/// not read the file" is NOT the same fact as "the runner is Tier 0/1".
+///
+/// The old `Option<String>` reader discarded BOTH the read error and the parse
+/// error with `.ok()?`, so a transient file lock or a truncated settings.json
+/// looked identical to a genuinely local runner. Downstream
+/// ([`apply_tier_policy`]) that meant a hosted production runner silently
+/// dialed dev-localhost for coord — disabling gates, work units, fleet
+/// coordination and the merge train, with no error anywhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TierRead {
+    /// settings.json parsed and carries this tier value.
+    Known(String),
+    /// settings.json parsed but has no usable `tier` (and no `runner_token` to
+    /// infer one from) — a genuinely tier-less install.
+    Absent,
+    /// settings.json could not be read or parsed. The tier is UNKNOWN.
+    Unknown(String),
+}
+
+impl TierRead {
+    /// The tier string when it is actually known. `None` for both `Absent`
+    /// and `Unknown` — callers that care about the difference must match.
+    pub fn known(&self) -> Option<&str> {
+        match self {
+            Self::Known(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+}
+
 /// The persisted runner tier as the serde snake_case string
-/// (`"local"` | `"local_provider"` | `"qontinui_account"`), or `None` when the
-/// settings file is absent/unreadable (which `Settings::default()` would treat
-/// as `Local`).
-pub fn read_runner_tier() -> Option<String> {
-    let path = settings_json_path()?;
-    let bytes = std::fs::read(path).ok()?;
-    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    json.get("tier")
+/// (`"local"` | `"local_provider"` | `"qontinui_account"`).
+///
+/// Reads the JSON directly rather than importing `Settings` because the
+/// `Settings` struct is a main-binary module (not in lib.rs). Errors are
+/// PRESERVED as [`TierRead::Unknown`] — see the type docs for why.
+///
+/// When the document parses but has no `tier` key (a pre-tier settings.json,
+/// before `migrate_tier_in_place` has run once), the tier is inferred from a
+/// non-empty `web_integration.runner_token` exactly as that migration does —
+/// otherwise a hosted install would read as `Absent` during the one boot
+/// before the migration persists.
+pub fn read_runner_tier() -> TierRead {
+    let Some(path) = settings_json_path() else {
+        return TierRead::Unknown("cannot resolve settings.json path".to_string());
+    };
+    if !path.exists() {
+        return TierRead::Absent;
+    }
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            return TierRead::Unknown(format!("read {} failed: {e}", path.display()));
+        }
+    };
+    let json: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(j) => j,
+        Err(e) => {
+            return TierRead::Unknown(format!("parse {} failed: {e}", path.display()));
+        }
+    };
+    if let Some(t) = json.get("tier").and_then(|v| v.as_str()) {
+        return TierRead::Known(t.to_string());
+    }
+    // Pre-tier document: mirror `settings::migrate_tier_in_place`'s inference.
+    let has_runner_token = json
+        .get("web_integration")
+        .and_then(|w| w.get("runner_token"))
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if has_runner_token {
+        TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
+    } else {
+        TierRead::Absent
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -414,12 +488,19 @@ pub fn read_runner_tier() -> Option<String> {
 /// - `Configured` passes through with its recorded source.
 /// - `Unset` + tier `"qontinui_account"` ⇒ [`CoordBase::TierDefault`] on
 ///   [`PROD_COORD_BASE`] (a hosted runner must never dial dev-localhost).
-/// - `Unset` + any other tier (incl. absent/unreadable settings.json) ⇒ the
-///   existing dev-localhost guess.
+/// - `Unset` + [`TierRead::Unknown`] (settings.json unreadable) ⇒ ALSO
+///   [`CoordBase::TierDefault`] on [`PROD_COORD_BASE`], with source
+///   [`CoordBaseSource::UnknownTierProdDefault`]. An unreadable tier is
+///   "unknown", not "local": guessing dev-localhost silently severs a hosted
+///   runner from coord (no gates, no work units, no merge train) with nothing
+///   in the logs. Guessing production instead fails LOUDLY (auth/DNS error) on
+///   a genuine dev box, which is the recoverable direction.
+/// - `Unset` + [`TierRead::Absent`] / any other known tier ⇒ the existing
+///   dev-localhost guess.
 fn apply_tier_policy(
     resolved: CoordBase,
     configured_source: Option<CoordBaseSource>,
-    tier: Option<&str>,
+    tier: &TierRead,
 ) -> (CoordBase, CoordBaseSource) {
     match resolved {
         CoordBase::Configured(base) => (
@@ -433,19 +514,20 @@ fn apply_tier_policy(
             CoordBase::DevLocalhost(base),
             CoordBaseSource::DevLocalhostFallback,
         ),
-        CoordBase::Unset => {
-            if tier == Some(QONTINUI_ACCOUNT_TIER) {
-                (
-                    CoordBase::TierDefault(PROD_COORD_BASE.to_string()),
-                    CoordBaseSource::TierDefault,
-                )
-            } else {
-                (
-                    CoordBase::DevLocalhost(DEV_LOCALHOST_COORD_BASE.to_string()),
-                    CoordBaseSource::DevLocalhostFallback,
-                )
-            }
-        }
+        CoordBase::Unset => match tier {
+            TierRead::Known(t) if t == QONTINUI_ACCOUNT_TIER => (
+                CoordBase::TierDefault(PROD_COORD_BASE.to_string()),
+                CoordBaseSource::TierDefault,
+            ),
+            TierRead::Unknown(_) => (
+                CoordBase::TierDefault(PROD_COORD_BASE.to_string()),
+                CoordBaseSource::UnknownTierProdDefault,
+            ),
+            _ => (
+                CoordBase::DevLocalhost(DEV_LOCALHOST_COORD_BASE.to_string()),
+                CoordBaseSource::DevLocalhostFallback,
+            ),
+        },
     }
 }
 
@@ -454,6 +536,9 @@ static DEV_LOCALHOST_WARN_ONCE: std::sync::Once = std::sync::Once::new();
 
 /// Process-global one-shot INFO guard for the tier-default production base.
 static TIER_DEFAULT_INFO_ONCE: std::sync::Once = std::sync::Once::new();
+
+/// Process-global one-shot WARN guard for the unknown-tier production default.
+static UNKNOWN_TIER_WARN_ONCE: std::sync::Once = std::sync::Once::new();
 
 /// Resolve the coord base, applying the tier-aware fallback policy, keeping
 /// the enum shape so Option-family callers can map each variant explicitly
@@ -469,9 +554,9 @@ pub fn coord_base_policy() -> (CoordBase, CoordBaseSource) {
     // when a base is configured.
     let tier = match resolved {
         CoordBase::Unset => read_runner_tier(),
-        _ => None,
+        _ => TierRead::Absent,
     };
-    let (base, source) = apply_tier_policy(resolved, configured_source, tier.as_deref());
+    let (base, source) = apply_tier_policy(resolved, configured_source, &tier);
     match source {
         CoordBaseSource::TierDefault => {
             TIER_DEFAULT_INFO_ONCE.call_once(|| {
@@ -481,6 +566,24 @@ pub fn coord_base_policy() -> (CoordBase, CoordBaseSource) {
                     "no coord configured (COORD_HTTP_URL unset, profile has no coord_url) — \
                      runner tier is qontinui_account, defaulting to the production \
                      coordinator"
+                );
+            });
+        }
+        CoordBaseSource::UnknownTierProdDefault => {
+            let reason = match &tier {
+                TierRead::Unknown(e) => e.clone(),
+                _ => "unknown".to_string(),
+            };
+            UNKNOWN_TIER_WARN_ONCE.call_once(|| {
+                warn!(
+                    coord_base = PROD_COORD_BASE,
+                    coord_base_source = source.as_str(),
+                    reason = %reason,
+                    "no coord configured AND settings.json could not be read, so the runner \
+                     tier is UNKNOWN — defaulting to the PRODUCTION coordinator rather than \
+                     silently dialing dev-localhost (a hosted runner pointed at localhost \
+                     loses gates, work units and the merge train with no error). Fix \
+                     settings.json, or set COORD_HTTP_URL explicitly."
                 );
             });
         }
@@ -881,7 +984,7 @@ mod tests {
         let (base, source) = apply_tier_policy(
             CoordBase::Configured("https://c.example".into()),
             Some(CoordBaseSource::Env),
-            Some(QONTINUI_ACCOUNT_TIER),
+            &TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string()),
         );
         assert_eq!(base, CoordBase::Configured("https://c.example".into()));
         assert_eq!(source, CoordBaseSource::Env);
@@ -890,17 +993,18 @@ mod tests {
     #[test]
     fn policy_configured_profile_passes_through_with_profile_source() {
         // Tier must be irrelevant when a base is configured — exercise all
-        // tiers against the profile arm.
+        // tiers (including the unreadable one) against the profile arm.
         for tier in [
-            Some("local"),
-            Some("local_provider"),
-            Some(QONTINUI_ACCOUNT_TIER),
-            None,
+            TierRead::Known("local".into()),
+            TierRead::Known("local_provider".into()),
+            TierRead::Known(QONTINUI_ACCOUNT_TIER.into()),
+            TierRead::Absent,
+            TierRead::Unknown("io error".into()),
         ] {
             let (base, source) = apply_tier_policy(
                 CoordBase::Configured("https://p.example".into()),
                 Some(CoordBaseSource::Profile),
-                tier,
+                &tier,
             );
             assert_eq!(base, CoordBase::Configured("https://p.example".into()));
             assert_eq!(source, CoordBaseSource::Profile, "tier {tier:?}");
@@ -909,7 +1013,11 @@ mod tests {
 
     #[test]
     fn policy_unset_hosted_tier_yields_prod_tier_default() {
-        let (base, source) = apply_tier_policy(CoordBase::Unset, None, Some(QONTINUI_ACCOUNT_TIER));
+        let (base, source) = apply_tier_policy(
+            CoordBase::Unset,
+            None,
+            &TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string()),
+        );
         assert_eq!(base, CoordBase::TierDefault(PROD_COORD_BASE.to_string()));
         assert_eq!(source, CoordBaseSource::TierDefault);
         assert_eq!(source.as_str(), "tier_default");
@@ -917,15 +1025,17 @@ mod tests {
 
     #[test]
     fn policy_unset_non_hosted_tiers_keep_dev_localhost_guess() {
-        // "local", "local_provider", absent/unreadable settings.json (None),
-        // and even an unknown future tier string all keep the dev guess.
+        // "local", "local_provider", a genuinely tier-less settings.json, and
+        // even an unknown future tier string all keep the dev guess. NOTE:
+        // `TierRead::Unknown` is deliberately NOT in this list — see
+        // `policy_unset_unreadable_tier_prefers_production`.
         for tier in [
-            Some("local"),
-            Some("local_provider"),
-            Some("something_new"),
-            None,
+            TierRead::Known("local".into()),
+            TierRead::Known("local_provider".into()),
+            TierRead::Known("something_new".into()),
+            TierRead::Absent,
         ] {
-            let (base, source) = apply_tier_policy(CoordBase::Unset, None, tier);
+            let (base, source) = apply_tier_policy(CoordBase::Unset, None, &tier);
             assert_eq!(
                 base,
                 CoordBase::DevLocalhost(DEV_LOCALHOST_COORD_BASE.to_string()),
@@ -938,6 +1048,37 @@ mod tests {
             );
             assert_eq!(source.as_str(), "dev_localhost_fallback");
         }
+    }
+
+    /// H4: an UNREADABLE settings.json means the tier is unknown, and a hosted
+    /// runner must never be silently dropped onto dev-localhost coord (which
+    /// costs it gates, work units, fleet coordination and the merge train with
+    /// no error anywhere). Prefer production — that direction fails loudly on
+    /// a genuine dev box instead of failing silently on a hosted one.
+    #[test]
+    fn policy_unset_unreadable_tier_prefers_production() {
+        let (base, source) = apply_tier_policy(
+            CoordBase::Unset,
+            None,
+            &TierRead::Unknown("sharing violation".into()),
+        );
+        assert_eq!(
+            base,
+            CoordBase::TierDefault(PROD_COORD_BASE.to_string()),
+            "an unknown tier must not resolve to dev-localhost"
+        );
+        assert_eq!(source, CoordBaseSource::UnknownTierProdDefault);
+        assert_eq!(source.as_str(), "unknown_tier_prod_default");
+    }
+
+    /// `TierRead::Unknown` must stay distinguishable from every known tier and
+    /// from `Absent` — the whole point of the tri-state.
+    #[test]
+    fn tier_read_unknown_is_not_a_known_tier() {
+        assert_eq!(TierRead::Known("local".into()).known(), Some("local"));
+        assert_eq!(TierRead::Absent.known(), None);
+        assert_eq!(TierRead::Unknown("boom".into()).known(), None);
+        assert_ne!(TierRead::Absent, TierRead::Unknown("boom".into()));
     }
 
     #[test]

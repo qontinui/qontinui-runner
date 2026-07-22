@@ -103,12 +103,12 @@ async fn save_general_settings(
     Json(payload): Json<GeneralSettingsPayload>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
     let result = tokio::task::spawn_blocking(move || {
-        let mut s = settings::load_settings();
-        s.auto_load_last_config = payload.auto_load_last_config;
-        s.include_summary_step_by_default = payload.include_summary_step_by_default;
-        s.preflight_check_enabled = payload.preflight_check_enabled;
-        s.session_auto_fix_on_failure = payload.session_auto_fix_on_failure;
-        settings::save_settings(&s)
+        settings::update_settings(|s| {
+            s.auto_load_last_config = payload.auto_load_last_config;
+            s.include_summary_step_by_default = payload.include_summary_step_by_default;
+            s.preflight_check_enabled = payload.preflight_check_enabled;
+            s.session_auto_fix_on_failure = payload.session_auto_fix_on_failure;
+        })
     })
     .await
     .map_err(|e| {
@@ -164,9 +164,7 @@ async fn save_app_mode(
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
     let mode = payload.mode.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let mut s = settings::load_settings();
-        s.app_mode = payload.mode;
-        settings::save_settings(&s)
+        settings::update_settings(|s| s.app_mode = payload.mode)
     })
     .await
     .map_err(|e| {

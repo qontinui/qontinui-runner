@@ -280,6 +280,33 @@ impl AuthManager {
         }
     }
 
+    /// Tri-state probe of the device-JWT (`access_token`) slot.
+    ///
+    /// NO-DOWNGRADE: [`Self::get_access_token`] returns `Err` both when nothing
+    /// was ever stored (genuinely unpaired) and when the store is present but
+    /// undecryptable (state UNKNOWN). Callers that turn "no token" into a
+    /// capability denial — the relay idle gate, the `device_jwt_present` /
+    /// `get_coord_device_token` probes, the coord doctor — must be able to tell
+    /// those apart, otherwise a corrupt store renders as "pair this runner
+    /// first" at a runner that IS paired, and silently removes it from the
+    /// fleet.
+    ///
+    /// Order matters: the full chain (secure store → keychain) is tried FIRST,
+    /// so a legacy keychain-only install still reports `Present`. Only when the
+    /// whole chain fails do we inspect the store to classify the failure.
+    pub fn probe_access_token(&self) -> crate::secure_storage::StoredTokenRead {
+        use crate::secure_storage::StoredTokenRead;
+        if let Ok(token) = self.get_access_token() {
+            if !token.trim().is_empty() {
+                return StoredTokenRead::Present(token);
+            }
+            return StoredTokenRead::Absent;
+        }
+        // The chain failed. `Absent` only if the store is genuinely empty /
+        // missing; a present-but-unreadable store is UNKNOWN.
+        self.secure_storage.read_access_token()
+    }
+
     /// Retrieves access token from keychain (legacy).
     fn get_access_token_from_keychain(&self) -> Result<String> {
         if !keychain_enabled() {

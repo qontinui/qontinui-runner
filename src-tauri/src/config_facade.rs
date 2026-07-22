@@ -29,8 +29,8 @@ use tracing::info;
 use std::collections::HashMap;
 
 use crate::settings::{
-    load_settings, save_settings, AccessibilitySettings, AiSettings, AuthSource,
-    CloudRelaySettings, DebugSettings, ExecutionVariablesSettings, GlobalLogSource,
+    load_settings, load_settings_full, update_settings, AccessibilitySettings, AiSettings,
+    AuthSource, CloudRelaySettings, DebugSettings, ExecutionVariablesSettings, GlobalLogSource,
     GlobalLogSourceSettings, LogSourceAiSelectionMode, LogSourceCategory, MobileSettings,
     PathSettings, PlaywrightSettings, RunnerInstanceConfig, SelfHealingSettings, Settings,
     SpawnPlacement, TunnelSettings, VariableSource, WorldStateVerifierSettings,
@@ -293,10 +293,7 @@ pub fn get_setting<T: SettingsField>() -> T {
 /// ```
 pub fn save_setting<T: SettingsField>(value: T) -> Result<(), String> {
     info!("Saving {} settings", T::field_name());
-    let mut settings = load_settings();
-    T::set_in(&mut settings, value);
-    save_settings(&settings)?;
-    Ok(())
+    update_settings(|settings| T::set_in(settings, value))
 }
 
 /// Generic update for any settings field using a closure.
@@ -316,12 +313,11 @@ where
     F: FnOnce(&mut T),
 {
     info!("Updating {} settings", T::field_name());
-    let mut settings = load_settings();
-    let mut value = T::get_from(&settings).clone();
-    f(&mut value);
-    T::set_in(&mut settings, value);
-    save_settings(&settings)?;
-    Ok(())
+    update_settings(|settings| {
+        let mut value = T::get_from(settings).clone();
+        f(&mut value);
+        T::set_in(settings, value);
+    })
 }
 
 // ============================================================================
@@ -456,11 +452,21 @@ pub mod keychain_keys {
 /// * `Ok(())` - Migration successful (or nothing to migrate)
 /// * `Err(String)` - Error during migration
 pub fn migrate_api_keys_to_keychain() -> Result<(), String> {
-    use crate::settings::{load_settings, save_settings};
-    use tracing::{info, warn};
+    use tracing::warn;
 
     info!("Checking for API keys to migrate to keychain...");
-    let mut settings = load_settings();
+    // Provenance-checked: a defaulted-because-unreadable struct has no
+    // plaintext key to migrate anyway, and acting on it would only risk a
+    // whole-file clobber via the save below.
+    let loaded = load_settings_full();
+    if !loaded.is_authoritative() {
+        warn!(
+            "Skipping API-key keychain migration — {}",
+            loaded.unreadable_message()
+        );
+        return Ok(());
+    }
+    let settings = loaded.settings;
     let mut migrated_any = false;
 
     // Note: The current AiSettings doesn't store API keys in plaintext,
@@ -473,7 +479,6 @@ pub fn migrate_api_keys_to_keychain() -> Result<(), String> {
             match playwright_keychain().store(keychain_keys::PLAYWRIGHT_PASSWORD, password) {
                 Ok(()) => {
                     info!("Migrated Playwright test password to keychain");
-                    settings.playwright.test_password = None;
                     migrated_any = true;
                 }
                 Err(e) => {
@@ -485,7 +490,7 @@ pub fn migrate_api_keys_to_keychain() -> Result<(), String> {
 
     // Save settings if we migrated anything (to clear plaintext values)
     if migrated_any {
-        save_settings(&settings)
+        update_settings(|s| s.playwright.test_password = None)
             .map_err(|e| format!("Failed to save settings after migration: {}", e))?;
         info!("API key migration complete");
     } else {
@@ -511,9 +516,7 @@ pub fn get_last_config_path() -> Option<String> {
 /// Save the last loaded config path.
 pub fn save_last_config_path(path: &str) -> Result<(), String> {
     info!("Saving last config path: {}", path);
-    let mut settings = load_settings();
-    settings.last_config_path = Some(path.to_string());
-    save_settings(&settings)
+    update_settings(|settings| settings.last_config_path = Some(path.to_string()))
 }
 
 /// Get the last used workflow ID.
@@ -524,9 +527,7 @@ pub fn get_last_workflow_id() -> Option<String> {
 /// Save the last used workflow ID.
 pub fn save_last_workflow_id(workflow_id: &str) -> Result<(), String> {
     info!("Saving last workflow ID: {}", workflow_id);
-    let mut settings = load_settings();
-    settings.last_workflow_id = Some(workflow_id.to_string());
-    save_settings(&settings)
+    update_settings(|settings| settings.last_workflow_id = Some(workflow_id.to_string()))
 }
 
 /// Get the last used monitor index.
@@ -537,9 +538,7 @@ pub fn get_last_monitor_index() -> Option<i32> {
 /// Save the last used monitor index.
 pub fn save_last_monitor_index(monitor_index: i32) -> Result<(), String> {
     info!("Saving last monitor index: {}", monitor_index);
-    let mut settings = load_settings();
-    settings.last_monitor_index = Some(monitor_index);
-    save_settings(&settings)
+    update_settings(|settings| settings.last_monitor_index = Some(monitor_index))
 }
 
 /// Get the last used monitor indices (multi-monitor support).
@@ -554,13 +553,13 @@ pub fn get_last_monitor_indices() -> Option<Vec<i32>> {
 /// Save the last used monitor indices (multi-monitor support).
 pub fn save_last_monitor_indices(monitor_indices: Vec<i32>) -> Result<(), String> {
     info!("Saving last monitor indices: {:?}", monitor_indices);
-    let mut settings = load_settings();
-    settings.last_monitor_indices = Some(monitor_indices.clone());
-    // Also update legacy single monitor for backward compatibility
-    if let Some(first) = monitor_indices.first() {
-        settings.last_monitor_index = Some(*first);
-    }
-    save_settings(&settings)
+    update_settings(|settings| {
+        // Also update legacy single monitor for backward compatibility
+        if let Some(first) = monitor_indices.first() {
+            settings.last_monitor_index = Some(*first);
+        }
+        settings.last_monitor_indices = Some(monitor_indices);
+    })
 }
 
 /// Get the auto-load last config setting.
@@ -571,9 +570,7 @@ pub fn get_auto_load_last_config() -> bool {
 /// Save the auto-load last config setting.
 pub fn save_auto_load_last_config(enabled: bool) -> Result<(), String> {
     info!("Saving auto-load last config setting: {}", enabled);
-    let mut settings = load_settings();
-    settings.auto_load_last_config = enabled;
-    save_settings(&settings)
+    update_settings(|settings| settings.auto_load_last_config = enabled)
 }
 
 /// Get the auto-continue AI workflow setting.
@@ -584,9 +581,7 @@ pub fn get_auto_continue_ai_workflow() -> bool {
 /// Save the auto-continue AI workflow setting.
 pub fn save_auto_continue_ai_workflow(enabled: bool) -> Result<(), String> {
     info!("Saving auto-continue AI workflow setting: {}", enabled);
-    let mut settings = load_settings();
-    settings.auto_continue_ai_workflow = enabled;
-    save_settings(&settings)
+    update_settings(|settings| settings.auto_continue_ai_workflow = enabled)
 }
 
 /// Get the session auto-fix on failure setting.
@@ -599,9 +594,7 @@ pub fn get_session_auto_fix_on_failure() -> bool {
 #[allow(dead_code)]
 pub fn save_session_auto_fix_on_failure(enabled: bool) -> Result<(), String> {
     info!("Saving session auto-fix on failure setting: {}", enabled);
-    let mut settings = load_settings();
-    settings.session_auto_fix_on_failure = enabled;
-    save_settings(&settings)
+    update_settings(|settings| settings.session_auto_fix_on_failure = enabled)
 }
 
 /// Get the include summary step by default setting.
@@ -615,21 +608,34 @@ pub fn save_include_summary_step_by_default(enabled: bool) -> Result<(), String>
         "Saving include summary step by default setting: {}",
         enabled
     );
-    let mut settings = load_settings();
-    settings.include_summary_step_by_default = enabled;
-    save_settings(&settings)
+    update_settings(|settings| settings.include_summary_step_by_default = enabled)
 }
 
 /// Check if setup wizard has been completed.
+///
+/// NO-DOWNGRADE: an unreadable settings.json used to answer `false` here (the
+/// `Settings::default()` value), which re-ran the first-run SetupWizard on an
+/// established install — a capability reduction caused by a read error. When
+/// the load is non-authoritative we answer `true` instead: "we do not know"
+/// must never be resolved into "start over". The genuine first run
+/// (`FreshInstall`, no file on disk) still answers `false` and shows the
+/// wizard.
 pub fn get_setup_completed() -> bool {
-    load_settings().setup_completed
+    let loaded = load_settings_full();
+    if !loaded.is_authoritative() {
+        tracing::error!(
+            "setup_completed is UNKNOWN ({}) — assuming setup IS complete so an \
+             established install is not sent back through the first-run wizard",
+            loaded.unreadable_message()
+        );
+        return true;
+    }
+    loaded.settings.setup_completed
 }
 
 /// Mark setup wizard as completed.
 pub fn save_setup_completed(completed: bool) -> Result<(), String> {
-    let mut settings = load_settings();
-    settings.setup_completed = completed;
-    save_settings(&settings)
+    update_settings(|settings| settings.setup_completed = completed)
 }
 
 /// Get the interactive sessions enabled setting.
@@ -640,9 +646,7 @@ pub fn get_interactive_sessions_enabled() -> bool {
 /// Save the interactive sessions enabled setting.
 pub fn save_interactive_sessions_enabled(enabled: bool) -> Result<(), String> {
     info!("Saving interactive sessions enabled setting: {}", enabled);
-    let mut settings = load_settings();
-    settings.ai.interactive_sessions_enabled = enabled;
-    save_settings(&settings)
+    update_settings(|settings| settings.ai.interactive_sessions_enabled = enabled)
 }
 
 /// Get the user-configured custom UI Bridge discovery ports.
@@ -660,9 +664,7 @@ pub fn save_discovery_ports(ports: Vec<u16>) -> Result<(), String> {
     cleaned.sort_unstable();
     cleaned.dedup();
     info!("Saving {} custom discovery port(s)", cleaned.len());
-    let mut settings = load_settings();
-    settings.discovery_ports = cleaned;
-    save_settings(&settings)
+    update_settings(|settings| settings.discovery_ports = cleaned)
 }
 
 /// Get the configured Claude Code config directories.
@@ -727,9 +729,7 @@ pub fn get_dev_logs_dir_override() -> Option<String> {
 /// Save the dev_logs_dir override.
 pub fn save_dev_logs_dir(dev_logs_dir: Option<String>) -> Result<(), String> {
     info!("Saving dev_logs_dir: {:?}", dev_logs_dir);
-    let mut settings = load_settings();
-    settings.paths.dev_logs_dir = dev_logs_dir;
-    save_settings(&settings)
+    update_settings(|settings| settings.paths.dev_logs_dir = dev_logs_dir)
 }
 
 // ============================================================================
@@ -942,24 +942,22 @@ pub fn get_managed_process_configs() -> Vec<crate::process_capture::ProcessConfi
 pub fn save_managed_process_config(
     config: crate::process_capture::ProcessConfig,
 ) -> Result<(), String> {
-    let mut settings = load_settings();
-    if let Some(existing) = settings
-        .managed_processes
-        .iter_mut()
-        .find(|p| p.id == config.id)
-    {
-        *existing = config;
-    } else {
-        settings.managed_processes.push(config);
-    }
-    save_settings(&settings)
+    update_settings(|settings| {
+        if let Some(existing) = settings
+            .managed_processes
+            .iter_mut()
+            .find(|p| p.id == config.id)
+        {
+            *existing = config;
+        } else {
+            settings.managed_processes.push(config);
+        }
+    })
 }
 
 /// Delete a managed process config by ID.
 pub fn delete_managed_process_config(id: &str) -> Result<(), String> {
-    let mut settings = load_settings();
-    settings.managed_processes.retain(|p| p.id != id);
-    save_settings(&settings)
+    update_settings(|settings| settings.managed_processes.retain(|p| p.id != id))
 }
 
 /// Replace the entire managed-process list in one atomic save.
@@ -970,9 +968,7 @@ pub fn delete_managed_process_config(id: &str) -> Result<(), String> {
 pub fn replace_managed_process_configs(
     configs: Vec<crate::process_capture::ProcessConfig>,
 ) -> Result<(), String> {
-    let mut settings = load_settings();
-    settings.managed_processes = configs;
-    save_settings(&settings)
+    update_settings(|settings| settings.managed_processes = configs)
 }
 
 // ============================================================================
@@ -1062,30 +1058,30 @@ pub fn get_runner_instances() -> Vec<RunnerInstanceConfig> {
 
 /// Save or update a runner instance configuration.
 pub fn save_runner_instance(config: RunnerInstanceConfig) -> Result<(), String> {
-    let mut settings = load_settings();
-    if let Some(existing) = settings
-        .runner_instances
-        .iter_mut()
-        .find(|i| i.id == config.id)
-    {
-        existing.name = config.name;
-        existing.port = config.port;
-    } else {
-        settings.runner_instances.push(config);
-    }
-    save_settings(&settings)?;
+    let mut persisted: Vec<RunnerInstanceConfig> = Vec::new();
+    update_settings(|settings| {
+        if let Some(existing) = settings
+            .runner_instances
+            .iter_mut()
+            .find(|i| i.id == config.id)
+        {
+            existing.name = config.name;
+            existing.port = config.port;
+        } else {
+            settings.runner_instances.push(config);
+        }
+        persisted = settings.runner_instances.clone();
+    })?;
     // After every save, re-check the full set for duplicates — catches the
     // moment when a user (or the auto-suggest port logic, if it ever drifts)
     // introduces a collision with an existing slot.
-    warn_on_duplicate_ports(&settings.runner_instances);
+    warn_on_duplicate_ports(&persisted);
     Ok(())
 }
 
 /// Delete a runner instance configuration by ID.
 pub fn delete_runner_instance(id: &str) -> Result<(), String> {
-    let mut settings = load_settings();
-    settings.runner_instances.retain(|i| i.id != id);
-    save_settings(&settings)
+    update_settings(|settings| settings.runner_instances.retain(|i| i.id != id))
 }
 
 // ============================================================================
@@ -1102,9 +1098,7 @@ pub fn get_temp_spawn_placements() -> Vec<SpawnPlacement> {
 /// Replace the temp-runner spawn placement list with the supplied list.
 /// Returns the persisted list on success.
 pub fn save_temp_spawn_placements(placements: Vec<SpawnPlacement>) -> Result<(), String> {
-    let mut settings = load_settings();
-    settings.temp_spawn_placements = placements;
-    save_settings(&settings)
+    update_settings(|settings| settings.temp_spawn_placements = placements)
 }
 
 // ============================================================================

@@ -1,8 +1,8 @@
 //! `coord doctor` — one-command runner self-check for coord access + gate
 //! registration (plan 2026-06-13 Phase 4).
 //!
-//! Runs SEVEN ordered checks, STOPS at the first red, and reports that link +
-//! its fix. Green on all seven ⇒ "this runner can set gates." The output is
+//! Runs EIGHT ordered checks, STOPS at the first red, and reports that link +
+//! its fix. Green on all eight ⇒ "this runner can set gates." The output is
 //! copy-pasteable and **identical across machines**, so MSI / spaceship / a
 //! fresh box all self-diagnose the same way.
 //!
@@ -145,7 +145,7 @@ pub fn run_checks(checks: Vec<Check<'_>>) -> DoctorReport {
 }
 
 // ===========================================================================
-// Real wiring — the 7 checks, reusing existing predicates / on-disk state.
+// Real wiring — the 8 checks, reusing existing predicates / on-disk state.
 // ===========================================================================
 
 /// Runtime-only facts the lib can't observe on its own. Injected so the Tauri
@@ -164,13 +164,15 @@ pub struct DoctorInputs {
     pub claude_config_dir: Option<String>,
 }
 
-/// Run the full 7-check self-check and return the structured report.
+/// Run the full 8-check self-check and return the structured report.
 ///
 /// Each check reuses the canonical state:
 /// 1. Claude account — `.credentials.json` validity (same paths + expiry logic
 ///    as `ai_provider::oauth_refresh::default_location_has_valid_credentials`).
-/// 2. Tier — `settings.json::tier == "qontinui_account"`
-///    (`settings::load_settings().tier == RunnerTier::QontinuiAccount`).
+/// 2. Tier — `settings.json::tier == "qontinui_account"`, tri-state so an
+///    unreadable settings.json reports as UNKNOWN rather than `local`.
+/// 2b. Credential store readable — a store read ERROR is reported as itself,
+///    ahead of every bearer-consuming check it would otherwise misdiagnose.
 /// 3. Paired + signed in — `paired_user.json`
 ///    (`pair::read_paired_user_id_from_disk`) + a bearer in the access-token
 ///    slot (`auth::AuthManager::get_access_token`).
@@ -204,19 +206,54 @@ pub fn diagnose(inputs: &DoctorInputs) -> DoctorReport {
             }
         }),
         Check::new("tier", "set runner tier to Qontinui account", || {
-            let tier = read_runner_tier();
-            if tier.as_deref() == Some(crate::profiles::QONTINUI_ACCOUNT_TIER) {
-                (true, "runner tier is Qontinui account".into())
-            } else {
-                (
+            match read_runner_tier() {
+                crate::profiles::TierRead::Known(t)
+                    if t == crate::profiles::QONTINUI_ACCOUNT_TIER =>
+                {
+                    (true, "runner tier is Qontinui account".into())
+                }
+                crate::profiles::TierRead::Known(t) => {
+                    (false, format!("runner tier is {t} (not qontinui_account)"))
+                }
+                crate::profiles::TierRead::Absent => (
                     false,
-                    format!(
-                        "runner tier is {} (not qontinui_account)",
-                        tier.as_deref().unwrap_or("local")
-                    ),
-                )
+                    "settings.json has no tier (and no runner_token to infer one from)".into(),
+                ),
+                // NO-DOWNGRADE: do not report "runner tier is local" when the
+                // real fault is that settings.json could not be read — that
+                // sends the operator to the wrong remediation.
+                crate::profiles::TierRead::Unknown(e) => (
+                    false,
+                    format!("runner tier is UNKNOWN — settings.json unreadable ({e})"),
+                ),
             }
         }),
+        // M4 / NO-DOWNGRADE: the credential-store read is its own check, placed
+        // AHEAD of every check that consumes a bearer. Previously each consumer
+        // did `get_access_token().ok().unwrap_or_default()` (or `.ok()`),
+        // feeding an empty bearer downstream — so an unreadable store was
+        // misdiagnosed as "not signed in" / "machine.json missing
+        // active_tenant_id" / "bearer is not a device JWT". Since `run_checks`
+        // stops at the first red, an unreadable store now reports itself
+        // instead of blaming the next check in line.
+        {
+            let auth_ref = crate::auth::AuthManager::new();
+            Check::new(
+                "credential_store_readable",
+                "credential store unreadable — check file permissions / OS keychain access",
+                move || match auth_ref.probe_access_token() {
+                    crate::secure_storage::StoredTokenRead::Unreadable(e) => (
+                        false,
+                        format!(
+                            "credential store could not be read ({e}) — every check \
+                             below would misreport as 'not signed in' / 'no tenant'. \
+                             The runner has NOT been signed out."
+                        ),
+                    ),
+                    _ => (true, "credential store is readable".into()),
+                },
+            )
+        },
         {
             let auth_ref = crate::auth::AuthManager::new();
             Check::new("paired_signed_in", "sign in / re-pair", move || {
@@ -245,7 +282,18 @@ pub fn diagnose(inputs: &DoctorInputs) -> DoctorReport {
                 "tenant_resolvable",
                 "machine.json missing active_tenant_id",
                 move || {
-                    let bearer = auth_ref.get_access_token().ok().unwrap_or_default();
+                    let bearer = match auth_ref.get_access_token() {
+                        Ok(b) => b,
+                        Err(e) => {
+                            return (
+                                false,
+                                format!(
+                                    "credential store unreadable ({e}) — the tenant is UNKNOWN, \
+                                     not missing; this is not a tenant misconfiguration"
+                                ),
+                            )
+                        }
+                    };
                     match resolve_tenant_for_doctor(&bearer) {
                         Some((tid, src)) => (true, format!("tenant {tid} resolved from {src}")),
                         None => (
@@ -499,11 +547,11 @@ fn macos_keychain_has_claude_credentials() -> bool {
 // this thin delegate keeps the doctor's call sites unchanged.
 // ---------------------------------------------------------------------------
 
-/// The persisted runner tier as the serde snake_case string
-/// (`"local"` | `"local_provider"` | `"qontinui_account"`), or `None` when the
-/// settings file is absent/unreadable. Delegates to
-/// [`crate::profiles::read_runner_tier`].
-fn read_runner_tier() -> Option<String> {
+/// The persisted runner tier as a tri-state — `Known` / `Absent` / `Unknown`.
+/// Delegates to [`crate::profiles::read_runner_tier`]; the doctor must report
+/// "could not read settings.json" rather than the misleading "runner tier is
+/// local".
+fn read_runner_tier() -> crate::profiles::TierRead {
     crate::profiles::read_runner_tier()
 }
 
@@ -648,7 +696,20 @@ fn mcp_json_check(bound_port: Option<u16>, auth: &crate::auth::AuthManager) -> (
     }
 
     // Bearer must decode sub_type == device (mirrors proxy_request_gate).
-    let bearer = auth.get_access_token().ok().unwrap_or_default();
+    // NO-DOWNGRADE (M4): a store READ ERROR is not "the bearer is not a device
+    // JWT" — say which one it is.
+    let bearer = match auth.get_access_token() {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                false,
+                format!(
+                    "{}: credential store unreadable ({e}) — the bearer is UNKNOWN, not invalid",
+                    path.display()
+                ),
+            )
+        }
+    };
     match jwt_sub_type(&bearer).as_deref() {
         Some("device") => (
             true,
