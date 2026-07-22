@@ -590,6 +590,28 @@ pub async fn redeem_pair_code(
 
     persist_pairing(&resp, tenant_id).map_err(|e| format!("persist pairing: {}", e))?;
 
+    // Redeeming a pair code IS an explicit interactive credential acquisition —
+    // the operator typed a code that a signed-in web session minted — so it ends
+    // any interactive logout, exactly like a Cognito sign-in does.
+    //
+    // Without this, an operator who used the autonomy-preserving logout and then
+    // re-paired by code was dead-ended: the device JWT is valid, the runner is
+    // Tier 2 with the relay online and autonomy running, but `check_auth_status`
+    // still short-circuits on the persisted marker and reports
+    // `authenticated:false` forever — so the App gate renders LoginScreen, with
+    // the very Settings pane where a pair code is entered unreachable behind it.
+    // (This command is allowlisted over the UI-Bridge HTTP surface for
+    // agent-driven pairing, so it is a live path, not a theoretical one.)
+    //
+    // Placed AFTER `persist_pairing` on purpose: a redeem that failed to persist
+    // must not un-logout the operator. Placed HERE rather than inside
+    // `persist_pairing` also on purpose: the background device-JWT refresher
+    // writes the same credential slots, and clearing on that path would silently
+    // un-logout the operator on the next refresh cycle.
+    if let Err(e) = crate::auth::AuthManager::new().clear_interactive_signed_out() {
+        warn!("redeem_pair_code: could not clear the interactive sign-out marker: {e}");
+    }
+
     // Promote to Tier 2 (qontinui_account) now that a device JWT is in
     // hand. Redeeming a pair code IS a cloud-account bind, so the runner
     // must leave Tier Local for the WS relay to come online. Defensive:

@@ -84,6 +84,11 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [loading, setLoading] = useState(true);
+  // "The first probe has not produced a verdict yet." Distinct from `loading`
+  // on purpose — see the failsafe effect below, which forces `loading` false
+  // after 3s and would otherwise expose the LoginScreen for most of the retry
+  // chain. Consumed by the App gate via the context.
+  const [authResolving, setAuthResolving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // True while the Tier-2 probe has not yet produced a DEFINITIVE verdict —
   // i.e. every attempt so far timed out or threw. Distinct from `loading`
@@ -192,9 +197,11 @@ export function AuthProvider({ children }: AuthProviderProps) {
     try {
       await checkAuthStatus();
     } catch (err) {
-      // Don't destroy the session on a transient status-check failure; the
-      // backend's `check_auth_status` only reports `authenticated:false` on a
-      // definitive 401/403, which surfaces through the next render.
+      // Don't destroy the session on a transient status-check failure.
+      // `checkAuthStatus` already absorbs its own errors without touching
+      // `authStatus`, so this is belt-and-braces: the backend reports
+      // `authenticated:false` only when the credential slots are empty or the
+      // operator explicitly logged out, and that surfaces on the next render.
       log.warn(`refreshAuth() #${callNum} - status re-check failed (keeping state):`, err);
     }
   }, [checkAuthStatus]);
@@ -287,14 +294,82 @@ export function AuthProvider({ children }: AuthProviderProps) {
     if (!isTier2) return;
     log.debug("useEffect[checkAuthStatus] - checking auth status on mount");
     let cancelled = false;
-    void (async () => {
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+
+    // The first probe is the one case a failure cannot simply be absorbed:
+    // there is no prior status to keep, and a null `authStatus` renders the
+    // LoginScreen exactly as a real sign-out would. Retry with backoff so a
+    // slow boot (IPC still wiring up, cold network on the Cognito refresh)
+    // resolves into the actual verdict instead of a spurious sign-in prompt.
+    //
+    // `authResolving` — NOT `loading` — is what keeps the App on the "checking
+    // authentication" shell for the duration. `loading` cannot carry it: the
+    // failsafe effect below forces `loading` false 3s after every transition
+    // (deliberately, so a wedged IPC can't hang the app), which would leave the
+    // LoginScreen showing for ~55 of the chain's ~67 worst-case seconds — a
+    // LONGER spurious sign-out prompt than before the retries existed.
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- must be set before the first probe's await, or the App gate renders LoginScreen for a frame
+    setAuthResolving(true);
+    const attempt = async (n: number) => {
       if (cancelled) return;
-      await checkAuthStatus();
-    })();
+      const status = await checkAuthStatus();
+      // A non-null result is a definitive verdict — including a legitimate
+      // `authenticated:false` from an explicit sign-out. Only a thrown/timed-out
+      // probe (null) is worth retrying.
+      if (cancelled) return;
+      if (status !== null) {
+        setAuthResolving(false);
+        return;
+      }
+      if (n + 1 >= AUTH_PROBE_MAX_ATTEMPTS) {
+        log.warn(
+          `Auth probe failed ${n + 1}x - giving up on the fast chain; ` +
+            `showing the sign-in screen and re-probing every ${AUTH_PROBE_RECOVERY_INTERVAL_MS}ms`,
+        );
+        // Release the loading shell: from here the operator must be able to act
+        // (the probe may be failing for a reason only they can fix). The
+        // background recovery effect keeps trying so a merely slow network
+        // resolves itself without them touching anything.
+        setAuthResolving(false);
+        return;
+      }
+      const delay = AUTH_PROBE_RETRY_BASE_MS * 2 ** n;
+      log.warn(`Auth probe attempt ${n + 1} failed - retrying in ${delay}ms`);
+      setLoading(true);
+      retryTimer = setTimeout(() => void attempt(n + 1), delay);
+    };
+    void attempt(0);
+
     return () => {
       cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      setAuthResolving(false);
     };
   }, [checkAuthStatus, isTier2, tierLoading]);
+
+  /**
+   * Background recovery for an UNRESOLVED first probe.
+   *
+   * `authStatus === null` after the bounded chain gave up means we never got a
+   * verdict — the operator may well be signed in, but the App gate is showing
+   * them `LoginScreen`. Nothing else re-probes: the 14-minute re-check below is
+   * gated on `authStatus?.authenticated`, and `runner-tier-changed` only fires
+   * on a user action. So keep probing slowly until a verdict lands.
+   *
+   * Deliberately NOT armed for a definitive `authenticated:false` — that is a
+   * real sign-out, and re-probing it would be a pointless timer.
+   */
+  useEffect(() => {
+    if (tierLoading || !isTier2) return;
+    if (authStatus !== null) return;
+    if (authResolving) return; // the fast chain owns the probe
+    log.debug("Auth unresolved - arming slow background re-probe");
+    const intervalId = setInterval(() => {
+      log.debug("Slow auth re-probe firing");
+      void checkAuthStatus();
+    }, AUTH_PROBE_RECOVERY_INTERVAL_MS);
+    return () => clearInterval(intervalId);
+  }, [tierLoading, isTier2, authStatus, authResolving, checkAuthStatus]);
 
   /**
    * Re-check auth status when the runner tier changes underneath us.
@@ -340,8 +415,15 @@ export function AuthProvider({ children }: AuthProviderProps) {
   }, [tierLoading, isTier2, authStatus]);
 
   /**
-   * Failsafe timeout for loading state. If loading is still true after 3
-   * seconds, force it to false so the app doesn't hang on "Loading...".
+   * Failsafe timeout for loading state. If `loading` is still true after 3
+   * seconds, force it to false so a wedged IPC channel can never hang the app
+   * on "Loading..." forever. Re-arms on every `loading` transition.
+   *
+   * This intentionally does NOT know about the first-probe retry chain, and it
+   * must not: the chain's own bound is `authResolving`, which the App gate
+   * honours separately. Keeping the two apart is what lets the retry chain stay
+   * in the loading SHELL (via `authResolving`) without weakening the guarantee
+   * that a stuck `loading` flag always clears.
    */
   useEffect(() => {
     if (!loading) return;
@@ -382,6 +464,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const contextValue: AuthContextValue = {
     authStatus,
     loading,
+    authResolving,
     error,
     // Retained for API stability: dev email/password auto-login is removed, so
     // there is never a pending auto-login. Consumers (App, PromptHomePage) gate

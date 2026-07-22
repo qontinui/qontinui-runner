@@ -70,6 +70,7 @@ import ImageDetailModal from "./components/ImageDetailModal";
 import { LoginScreen } from "./components/LoginScreen";
 import { SetupWizard } from "./components/setup-wizard";
 import { registerOpenableView } from "./lib/openable-views";
+import { resolveAuthGate } from "./lib/authGate";
 import { LogSourcePicker } from "./components/LogSourcePicker";
 import { Sidebar } from "./components/navigation";
 import { TerminalPage } from "./components/terminal";
@@ -489,13 +490,30 @@ function AppContent() {
     setActiveTab("run-recap");
   }, [lastRun, execution, setActiveTab]);
 
-  // `authProbeUnresolved` keeps us on the loading screen while the Tier-2
-  // probe is still retrying. Without it, an indeterminate probe falls through
-  // to the `!authenticated` gate below and shows LoginScreen at a runner that
-  // is signed in — the false-logout that hit pop-out terminal windows.
-  const isAuthLoading = auth.loading || auth.devAutoLoginPending || auth.authProbeUnresolved;
-  const isInitializing = isAuthLoading || !isApiReady;
-  if (isInitializing) {
+  // Root-surface selection lives in `resolveAuthGate` (pure + unit-tested) so
+  // the one failure mode that is invisible in review — rendering `LoginScreen`
+  // at a user who is in fact signed in — is locked down by a test rather than
+  // by a comment. The load-bearing indeterminacy input is the UNION of two
+  // provider signals, either of which means "no trustworthy verdict yet, NOT
+  // a sign-out": `auth.authResolving` (a probe is in flight) and
+  // `auth.authProbeUnresolved` (the Tier-2 probe has produced no verdict yet
+  // and is retrying on backoff — the false-logout that hit pop-out terminal
+  // windows). `auth.loading` cannot stand in for either (AuthProvider's
+  // failsafe forces that flag false so a wedged IPC can't hang the app).
+  const isTier2 = auth.tier === "qontinui_account";
+  const authIndeterminate = auth.authResolving || auth.authProbeUnresolved;
+  const isAuthLoading = auth.loading || auth.devAutoLoginPending || authIndeterminate;
+  const gate = resolveAuthGate({
+    authLoading: auth.loading,
+    authResolving: authIndeterminate,
+    devAutoLoginPending: auth.devAutoLoginPending,
+    apiReady: isApiReady,
+    setupCompleted,
+    isTier2,
+    authenticated: auth.authStatus?.authenticated === true,
+  });
+
+  if (gate === "loading") {
     const loadingMessage = auth.devAutoLoginPending
       ? "Signing in..."
       : isAuthLoading
@@ -516,15 +534,18 @@ function AppContent() {
   // dispatches `runner-tier-changed` after writing the tier; the
   // useRunnerTier hook in AuthProvider re-reads, and the appropriate
   // gate fires below.
-  if (setupCompleted === false) {
+  if (gate === "wizard") {
     return <SetupWizard onComplete={() => setSetupCompleted(true)} />;
   }
 
-  // LoginScreen is Tier 2 only. Tier 0/1 get a synthesized local-guest
-  // auth from AuthProvider, so `auth.authStatus?.authenticated` is true
-  // and we fall through to the main app.
-  const isTier2 = auth.tier === "qontinui_account";
-  if (isTier2 && !auth.authStatus?.authenticated) {
+  // LoginScreen is Tier 2 only. Tier 0/1 get a synthesized local-guest auth
+  // from AuthProvider, so they never reach this branch.
+  //
+  // Reaching it means the auth verdict is settled, so a falsy `authenticated`
+  // is either a real sign-out/never-signed-in or a probe that exhausted its
+  // retries — in which case AuthProvider keeps re-probing in the background and
+  // this screen flips on its own if the runner turns out to be signed in.
+  if (gate === "login") {
     return <LoginScreen />;
   }
 

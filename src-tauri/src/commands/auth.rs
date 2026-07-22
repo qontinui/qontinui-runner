@@ -281,14 +281,20 @@ async fn check_auth_status_impl() -> Result<AuthStatus, AppError> {
     let auth_manager = AuthManager::new();
     let device_id = auth_manager.get_device_id().ok();
 
-    // Authoritative signal: does the runner hold a valid local signed-in
-    // session? This is true immediately after a successful `cognito_sign_in`
-    // (device paired + Cognito tokens stored) AND on a fresh boot that restored
-    // those credentials from disk. If there's no local session, the runner has
-    // genuinely never signed in (or was logged out) — report unauthenticated so
-    // the frontend shows LoginScreen.
-    if !has_local_signed_in_session(&auth_manager) {
-        info!("No local signed-in session — user not authenticated");
+    // Authoritative signal: `AuthManager::is_interactively_signed_in` — the
+    // operator has not explicitly logged out AND the runner holds local
+    // credentials. True immediately after a successful `cognito_sign_in` (device
+    // paired + Cognito tokens stored) AND on a fresh boot that restored those
+    // credentials from disk. Anything else means the runner has genuinely never
+    // signed in, or was explicitly logged out — report unauthenticated so the
+    // frontend shows LoginScreen. (Both cases log their reason inside the
+    // helper.)
+    //
+    // `device_id: None` here matches the tier short-circuit above; the device
+    // may well still be paired and running autonomy after an
+    // autonomy-preserving logout, but an unauthenticated status reports no
+    // device by convention.
+    if !auth_manager.is_interactively_signed_in() {
         return Ok(AuthStatus {
             authenticated: false,
             user: None,
@@ -746,6 +752,24 @@ async fn finalize_signed_in(
         AppError::Raw(format!("persist pairing: {e}"))
     })?;
 
+    // 5b. The sign-in has now GENUINELY succeeded (Cognito tokens stored, device
+    //     bound, device JWT persisted), so end any interactive logout. Deliberate
+    //     ordering: doing this right after step 2 (`store_oauth_tokens`) meant a
+    //     sign-in that then failed at step 3/4/5 left the marker cleared with an
+    //     `oauth_refresh_token` on disk — so the next `check_auth_status`
+    //     reported `authenticated:true` and the app entered the shell on a FAILED
+    //     sign-in. Everything after this point (tier promotion, coord_url, relay
+    //     kicks) is either non-fatal or purely local, so clearing here cannot
+    //     resurrect that class of bug.
+    //
+    //     Equally deliberate: this is NOT done inside `store_oauth_tokens` /
+    //     `store_tokens` / `persist_pairing`. The background device-JWT refresher
+    //     writes those same slots on every cycle, so clearing there would
+    //     silently un-logout the operator.
+    if let Err(e) = auth_manager.clear_interactive_signed_out() {
+        warn!("finalize_signed_in: could not clear the interactive sign-out marker: {e}");
+    }
+
     let tenant_id_str = if tenant_id.is_nil() {
         None
     } else {
@@ -915,8 +939,9 @@ pub async fn qontinui_sign_out() -> Result<(), String> {
     // the gating checks all run off the `tier` field + cleared token below.
     //
     // This is the explicit "switch accounts → LoginScreen" path, so it must be
-    // the FULL wipe: `has_local_signed_in_session` treats a preserved Cognito
-    // session as still-authenticated, so an interactive-only clear would keep
+    // the FULL wipe: `AuthManager::has_local_signed_in_session` treats a
+    // preserved Cognito session as still-authenticated, so an
+    // interactive-only clear would keep
     // the App gate out of the LoginScreen. Clearing the Cognito session also
     // (correctly) stops the old account's autonomous sessions before a new
     // account signs in.
