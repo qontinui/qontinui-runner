@@ -181,9 +181,9 @@ const fn default_probe_safe() -> bool {
 pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     ProxyableCommand {
         name: "get_web_integration_status",
-        description: "Return the persisted web-integration settings plus live registration state (runner id, last heartbeat, last registration error).",
+        description: "Return the persisted web-integration settings plus live registration state (runner id, last heartbeat, last registration error). `settingsFault` is non-null when settings.json could not be read — every other field is then a placeholder, not the user's saved configuration.",
         args_schema: "{}",
-        response_schema: "{ \"enabled\": boolean, \"backendUrl\": string, \"runnerTokenMasked\": string, \"runnerId\": string | null, \"lastHeartbeatAt\": string | null, \"registrationError\": string | null }",
+        response_schema: "{ \"enabled\": boolean, \"backendUrl\": string, \"webBaseUrl\": string, \"runnerTokenMasked\": string, \"runnerId\": string | null, \"lastHeartbeatAt\": string | null, \"registrationError\": string | null, \"wsConnected\": boolean, \"settingsFault\": { \"path\": string, \"error\": string, \"detectedAtUnix\": number } | null }",
         probe_with_empty_args: true,
         observe_projection: None,
     },
