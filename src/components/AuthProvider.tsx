@@ -51,6 +51,22 @@ const AUTH_PROBE_TIMEOUT_MS = 15000;
 // to a Tier-2 operator until auth resolves, so we never stop retrying.
 const AUTH_PROBE_RETRY_BACKOFF_MS = [1000, 2000, 4000, 8000, 15000] as const;
 
+// Bounded retry for the FIRST auth probe only (the fast chain in the mount
+// effect). Delays are AUTH_PROBE_RETRY_BASE_MS * 2^n → 1s, 2s, 4s across 4
+// total attempts. Worst case ~67s (4 x 15s probes + 7s of backoff) — spent in
+// the "checking authentication" shell, NOT on the LoginScreen (see
+// `authResolving`). Complements the catch-level backoff above: the chain
+// bounds the initial loading shell; the catch keeps re-probing after it.
+const AUTH_PROBE_MAX_ATTEMPTS = 4;
+const AUTH_PROBE_RETRY_BASE_MS = 1000;
+
+// After the bounded chain gives up, keep re-probing on a slow background
+// interval. Without this, a signed-in operator whose network was slow for a
+// minute at boot is parked on the LoginScreen until they act: the 14-minute
+// re-check below is gated on `authStatus?.authenticated` so it never arms, and
+// the `runner-tier-changed` listener only fires on a user action.
+const AUTH_PROBE_RECOVERY_INTERVAL_MS = 60000;
+
 const log = createLogger("Auth");
 
 // Store context in window to survive HMR reloads
