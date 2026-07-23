@@ -172,6 +172,25 @@ impl AuthManager {
         Ok(())
     }
 
+    /// Explicit-acquisition variant of [`Self::store_tokens`]: overwrites a
+    /// present-but-unreadable file store from blank rather than refusing. Called
+    /// only on the explicit pairing path (`pair::persist_pairing`) — never from
+    /// the background device-JWT refresher, which uses [`Self::store_tokens`].
+    /// See `SecureStorage::WriteMode` for why the distinction matters.
+    pub fn store_tokens_fresh(&self, access_token: &str, refresh_token: &str) -> Result<()> {
+        self.secure_storage
+            .store_tokens_fresh(access_token, refresh_token)
+            .context("Failed to store tokens in secure storage")?;
+
+        // Keychain backup, best effort — identical to store_tokens.
+        if let Err(e) = self.store_tokens_in_keychain(access_token, refresh_token) {
+            debug!("Could not store tokens in keychain (backup): {}", e);
+        }
+
+        info!("Tokens stored successfully in secure storage (fresh/overwrite)");
+        Ok(())
+    }
+
     /// Stores tokens in the OS keychain (legacy/backup).
     fn store_tokens_in_keychain(&self, access_token: &str, refresh_token: &str) -> Result<()> {
         if !keychain_enabled() {
@@ -398,6 +417,17 @@ impl AuthManager {
     /// tracked separately from credential presence.
     pub fn is_interactive_signed_out(&self) -> bool {
         self.secure_storage.is_interactive_signed_out()
+    }
+
+    /// `true` iff the credential store file EXISTS on disk but cannot be
+    /// read/decrypted/parsed — the "corrupt / wrong-machine key" case (a machine
+    /// rename / disk move / re-image makes the hostname+username-derived AES key
+    /// no longer match). Surfaced on the auth status so the LoginScreen can offer
+    /// a "reset your credential store" affordance instead of a bare, unexplained
+    /// sign-in prompt (`commands::auth::check_auth_status` /
+    /// `reset_credential_store`).
+    pub fn is_store_present_but_unreadable(&self) -> bool {
+        self.secure_storage.is_present_but_unreadable()
     }
 
     /// Clears the interactive sign-out marker.
@@ -682,6 +712,26 @@ impl AuthManager {
         Ok(())
     }
 
+    /// Explicit-acquisition variant of [`Self::store_oauth_tokens`]: overwrites
+    /// a present-but-unreadable file store from blank rather than refusing.
+    /// Called only by `finalize_signed_in` step 2 (the first write of an
+    /// interactive Cognito sign-in), so it heals an undecryptable `.enc` the
+    /// operator is deliberately re-authenticating over. The background
+    /// refresher's Cognito write uses [`Self::store_oauth_tokens`].
+    pub fn store_oauth_tokens_fresh(
+        &self,
+        access_token: &str,
+        id_token: &str,
+        refresh_token: &str,
+        expires_at: i64,
+    ) -> Result<()> {
+        self.secure_storage
+            .store_oauth_tokens_fresh(access_token, id_token, refresh_token, expires_at)
+            .context("Failed to store Cognito tokens in secure storage")?;
+        info!("Cognito tokens stored successfully in secure storage (fresh/overwrite)");
+        Ok(())
+    }
+
     /// Retrieve the Cognito access token.
     pub fn get_oauth_access_token(&self) -> Result<String> {
         self.secure_storage.get_oauth_access_token()
@@ -744,6 +794,18 @@ impl AuthManager {
     pub fn store_tenant_device_jwt(&self, tenant_id: &Uuid, jwt: &str) -> Result<()> {
         self.secure_storage
             .store_tenant_device_jwt(tenant_id, jwt)
+            .context("Failed to store per-tenant device JWT in secure storage")
+    }
+
+    /// Explicit-acquisition variant of [`Self::store_tenant_device_jwt`]:
+    /// overwrites a present-but-unreadable file store from blank rather than
+    /// refusing. The FIRST write of the explicit pairing path
+    /// (`pair::persist_pairing`), so on an undecryptable `.enc` it heals the
+    /// store for the rest of that pairing sequence. The background refresher's
+    /// per-tenant write uses [`Self::store_tenant_device_jwt`].
+    pub fn store_tenant_device_jwt_fresh(&self, tenant_id: &Uuid, jwt: &str) -> Result<()> {
+        self.secure_storage
+            .store_tenant_device_jwt_fresh(tenant_id, jwt)
             .context("Failed to store per-tenant device JWT in secure storage")
     }
 

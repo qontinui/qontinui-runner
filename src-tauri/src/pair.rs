@@ -1337,6 +1337,17 @@ pub fn pair_via_browser(
 /// - The legacy `user_id`/`tenant_id` file fields are written as mirrors
 ///   of the default binding so pre-8a readers (incl. the
 ///   `qontinui_profile` bin's local struct) stay compatible.
+///
+/// EXPLICIT-ONLY. Every caller is an interactive credential acquisition
+/// (`finalize_signed_in`, `redeem_pair_code`, CLI `device pair`) — the
+/// background device-JWT refresher writes these slots directly, never through
+/// here. Because of that, the credential writes below use the `*_fresh`
+/// (overwrite-a-present-but-unreadable-store) methods: the operator is
+/// deliberately re-establishing credentials, so an undecryptable `.enc` (from a
+/// hostname change / disk move) is healed rather than dead-ending them at the
+/// LoginScreen. This must NOT be called from any background context — doing so
+/// would let a background write blank an unreadable store. See
+/// `SecureStorage::WriteMode`.
 pub fn persist_pairing(resp: &PairCompleteResponse, tenant_id: uuid::Uuid) -> Result<(), String> {
     use crate::auth::AuthManager;
     let mgr = AuthManager::new();
@@ -1345,8 +1356,11 @@ pub fn persist_pairing(resp: &PairCompleteResponse, tenant_id: uuid::Uuid) -> Re
     if let Some(did) = &resp.device_id {
         // Best-effort: record device_id alongside the auth tokens so the
         // runner GUI can identify itself without reading machine.json.
+        // `_fresh` for consistency with the explicit-acquisition posture above
+        // (persist_pairing is explicit-only) — though step 1 has already healed
+        // any unreadable store, so this merges.
         if let Ok(storage) = crate::secure_storage::SecureStorage::new() {
-            if let Err(e) = storage.store_device_id(did) {
+            if let Err(e) = storage.store_device_id_fresh(did) {
                 tracing::debug!("store_device_id non-fatal: {e}");
             }
         }
@@ -1361,7 +1375,7 @@ pub fn persist_pairing(resp: &PairCompleteResponse, tenant_id: uuid::Uuid) -> Re
         .filter(|k| !k.trim().is_empty())
     {
         if let Ok(storage) = crate::secure_storage::SecureStorage::new() {
-            if let Err(e) = storage.store_device_machine_key(dmk) {
+            if let Err(e) = storage.store_device_machine_key_fresh(dmk) {
                 tracing::debug!("store_device_machine_key non-fatal: {e}");
             }
         }
@@ -1378,7 +1392,15 @@ pub(crate) fn persist_pairing_with(
     tenant_id: uuid::Uuid,
 ) -> Result<(), String> {
     // 1. The paired tenant's slot ALWAYS gets the fresh JWT.
-    mgr.store_tenant_device_jwt(&tenant_id, &resp.token)
+    //
+    // `_fresh` (overwrite a present-but-unreadable store) because `persist_pairing`
+    // is only ever reached from an EXPLICIT credential acquisition — Cognito
+    // sign-in, pair-code redeem, or the CLI `device pair` — never the background
+    // refresher (which writes these slots through the plain, refuse-on-unreadable
+    // methods). This is the FIRST write of the sequence, so on an undecryptable
+    // `.enc` it heals the store and every write below then merges over the
+    // now-readable store. See `SecureStorage::WriteMode`.
+    mgr.store_tenant_device_jwt_fresh(&tenant_id, &resp.token)
         .map_err(|e| format!("store_tenant_device_jwt failed: {e}"))?;
 
     // 2. Load + migrate the existing file (missing → fresh; unparseable
@@ -1432,9 +1454,11 @@ pub(crate) fn persist_pairing_with(
         })
         .unwrap_or(tenant_id);
 
-    // 5. Legacy access_token slot = the DEFAULT binding's JWT (D4).
+    // 5. Legacy access_token slot = the DEFAULT binding's JWT (D4). `_fresh`
+    //    for the same reason as step 1 (explicit acquisition may overwrite an
+    //    unreadable store); by here step 1 has already healed it, so this merges.
     if default_tenant == tenant_id {
-        mgr.store_tokens(&resp.token, "")
+        mgr.store_tokens_fresh(&resp.token, "")
             .map_err(|e| format!("AuthManager::store_tokens failed: {e}"))?;
     }
 
@@ -1913,6 +1937,36 @@ mod tests {
             Some("jwt.a.1")
         );
         assert_eq!(mgr.get_access_token().unwrap(), "jwt.a.1");
+    }
+
+    /// REGRESSION (this branch's finalize/pair path over a corrupt store):
+    /// `persist_pairing_with` must succeed over a present-but-UNREADABLE store,
+    /// because it is only ever reached from an explicit credential acquisition.
+    /// Its writers use the `*_fresh` (overwrite-unreadable) variants — the FIRST
+    /// (`store_tenant_device_jwt_fresh`) heals the dead `.enc`, and the rest
+    /// merge over the now-readable store. Before the fix, every write refused and
+    /// the operator was dead-ended at the LoginScreen with no in-app way back.
+    #[test]
+    fn persist_over_an_unreadable_store_heals_and_writes_both_slots() {
+        let dir = temp_dir_for("persist_over_unreadable");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+
+        // Corrupt the token store in place — present, but undecryptable.
+        let enc = dir.join("tokens.enc");
+        std::fs::write(&enc, b"not-a-valid-aes-gcm-ciphertext").unwrap();
+
+        persist_pairing_with(&mgr, &path, &pair_resp("jwt.a.1"), ta())
+            .expect("explicit pairing must heal and write over an unreadable store");
+
+        // Both credential slots hold the fresh JWT after the heal.
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&ta()).unwrap().as_deref(),
+            Some("jwt.a.1")
+        );
+        assert_eq!(mgr.get_access_token().unwrap(), "jwt.a.1");
+        // The paired-user file was written.
+        assert_eq!(read_file(&path).default_tenant_id.as_deref(), Some(T_A));
     }
 
     /// Additive pair for a SECOND tenant: appended, default NOT stolen,

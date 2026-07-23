@@ -20,6 +20,16 @@ export interface AuthStatus {
   authenticated: boolean;
   user: User | null;
   device_info: DeviceInfo | null;
+  /**
+   * `true` when the credential store file exists on disk but cannot be
+   * decrypted/parsed — the "corrupt / wrong-machine key" case (a machine
+   * rename, disk move, or re-image invalidates the hostname+username-derived
+   * AES key). The Rust read side fails closed to the LoginScreen; this flag
+   * lets the screen explain WHY and offer a reset (`reset_credential_store`)
+   * instead of a bare, unexplained sign-in prompt. Absent/`false` for a
+   * readable or genuinely-missing store and for Tier 0/1.
+   */
+  store_unreadable?: boolean;
 }
 
 /**

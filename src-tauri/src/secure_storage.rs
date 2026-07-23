@@ -169,6 +169,41 @@ struct StoredTokens {
     interactive_signed_out: bool,
 }
 
+/// Write posture for a read-modify-write over a possibly-unreadable store.
+///
+/// Every credential writer here is read-modify-write: load the whole struct,
+/// change one slot, save it back. When the store is present-but-UNREADABLE the
+/// two postures diverge:
+///
+/// - [`WriteMode::Merge`] REFUSES (`Err`). The posture for every BACKGROUND
+///   writer (the device-JWT refresher's per-slot / oauth / legacy passes): a
+///   blank rewrite there would silently destroy sibling credential slots
+///   (including the Cognito `oauth_refresh_token` that keeps autonomy alive)
+///   while reporting success.
+/// - [`WriteMode::Fresh`] starts from a blank [`StoredTokens`] instead of
+///   refusing. Reserved for the EXPLICIT, user/agent-initiated
+///   credential-acquisition writes (Cognito sign-in, pair-code redeem, CLI
+///   `device pair`). There the operator is deliberately re-establishing
+///   credentials and the old encrypted bytes are already cryptographically
+///   dead on this machine — the AES key derives from hostname + username, so a
+///   machine rename / disk move / re-image produces an undecryptable `.enc`
+///   that ONLY a fresh sign-in can heal. Refusing there dead-ended the operator
+///   at the LoginScreen with no in-app way back. A BACKGROUND refresh must never
+///   use this.
+///
+/// The two only differ on the present-but-unreadable path; on a readable store
+/// (or a genuinely absent one) `Fresh` behaves identically to `Merge`, so an
+/// explicit-path write never discards slots it could have preserved — it only
+/// discards bytes that were already unreadable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WriteMode {
+    /// Refuse over a present-but-unreadable store (background writers).
+    Merge,
+    /// Overwrite a present-but-unreadable store from blank (explicit
+    /// credential acquisition only).
+    Fresh,
+}
+
 /// Secure file-based storage manager.
 ///
 /// Provides encrypted storage for authentication tokens using AES-256-GCM.
@@ -196,7 +231,11 @@ impl SecureStorage {
         let storage_path = data_dir.join(STORAGE_FILE);
         debug!("SecureStorage initialized at: {:?}", storage_path);
 
-        Ok(Self { storage_path })
+        let storage = Self { storage_path };
+        // Best-effort boot sweep of crash-orphaned atomic-write temp files
+        // (older than 5 min so we never race a live writer). Never fatal.
+        storage.sweep_stale_temp_files(std::time::Duration::from_secs(5 * 60));
+        Ok(storage)
     }
 
     /// Creates a SecureStorage instance with a custom storage path.
@@ -346,7 +385,7 @@ impl SecureStorage {
     }
 
     /// Loads the current store for a read-modify-write, REFUSING to fabricate a
-    /// blank one over a present-but-unreadable file.
+    /// blank one over a present-but-unreadable file ([`WriteMode::Merge`]).
     ///
     /// Every writer here is read-modify-write: it loads the whole struct,
     /// changes one slot, and saves it back. `load_tokens().unwrap_or_default()`
@@ -360,25 +399,70 @@ impl SecureStorage {
     /// Mirrors the posture `AuthManager::get_access_token` already takes: a
     /// malformed-but-present store is never overwritten, so the corruption is
     /// surfaced (and left intact for forensics) rather than masked.
+    ///
+    /// The EXPLICIT credential-acquisition writers instead call
+    /// [`Self::load_tokens_for_write_mode`] with [`WriteMode::Fresh`], which
+    /// starts from blank rather than refusing — see that method and `WriteMode`.
     fn load_tokens_for_write(&self) -> Result<StoredTokens> {
+        self.load_tokens_for_write_mode(WriteMode::Merge)
+    }
+
+    /// [`Self::load_tokens_for_write`] with an explicit posture.
+    ///
+    /// On a present-but-unreadable store, [`WriteMode::Merge`] refuses (`Err`)
+    /// and [`WriteMode::Fresh`] returns a blank [`StoredTokens`] so the explicit
+    /// caller can rewrite the (cryptographically-dead) store from scratch. On a
+    /// readable or genuinely-absent store the two are identical.
+    fn load_tokens_for_write_mode(&self, mode: WriteMode) -> Result<StoredTokens> {
         match self.load_tokens() {
             Ok(tokens) => Ok(tokens),
-            Err(e) if self.store_file_exists() => Err(anyhow::anyhow!(
-                "secure storage at {} is present but unreadable ({e}); refusing to overwrite it \
-                 — a blank rewrite would destroy every other credential slot (including the \
-                 Cognito refresh token that keeps autonomous sessions running). Delete the file \
-                 to re-pair from scratch.",
-                self.storage_path.display()
-            )),
+            Err(e) if self.store_file_exists() => match mode {
+                WriteMode::Merge => Err(anyhow::anyhow!(
+                    "secure storage at {} is present but unreadable ({e}); refusing to overwrite \
+                     it — a blank rewrite would destroy every other credential slot (including \
+                     the Cognito refresh token that keeps autonomous sessions running). An \
+                     explicit sign-in / pairing may overwrite it; a background refresh may not.",
+                    self.storage_path.display()
+                )),
+                WriteMode::Fresh => {
+                    warn!(
+                        "secure storage at {} is present but unreadable ({e}); an EXPLICIT \
+                         credential-acquisition write is rebuilding it from a blank store. The \
+                         prior encrypted bytes were undecryptable on this machine (the AES key \
+                         derives from hostname + username, so a machine rename / disk move \
+                         produces exactly this) and are discarded — a background refresh would \
+                         have refused here instead.",
+                        self.storage_path.display()
+                    );
+                    Ok(StoredTokens::default())
+                }
+            },
             // File genuinely absent (raced away between the two checks): a
             // fresh store is the correct starting point.
             Err(_) => Ok(StoredTokens::default()),
         }
     }
 
-    /// Stores both access and refresh tokens.
+    /// Stores both access and refresh tokens. Background/default posture:
+    /// refuses over a present-but-unreadable store ([`WriteMode::Merge`]).
     pub fn store_tokens(&self, access_token: &str, refresh_token: &str) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write()?;
+        self.store_tokens_mode(access_token, refresh_token, WriteMode::Merge)
+    }
+
+    /// Explicit-acquisition variant of [`Self::store_tokens`]: overwrites a
+    /// present-but-unreadable store from blank rather than refusing. Only the
+    /// explicit pairing path (`pair::persist_pairing`) calls this.
+    pub fn store_tokens_fresh(&self, access_token: &str, refresh_token: &str) -> Result<()> {
+        self.store_tokens_mode(access_token, refresh_token, WriteMode::Fresh)
+    }
+
+    fn store_tokens_mode(
+        &self,
+        access_token: &str,
+        refresh_token: &str,
+        mode: WriteMode,
+    ) -> Result<()> {
+        let mut tokens = self.load_tokens_for_write_mode(mode)?;
         tokens.access_token = Some(access_token.to_string());
         tokens.refresh_token = Some(refresh_token.to_string());
         self.save_tokens(&tokens)?;
@@ -494,16 +578,27 @@ impl SecureStorage {
     /// real, already-handled scenario (see the `store_present` warn! in
     /// `AuthManager::get_access_token`), not a hypothetical.
     ///
-    /// The cost of failing closed is a sign-in prompt on a corrupted store,
-    /// which is recoverable; the cost of failing open is an unrevocable logout.
+    /// Why failing closed is SAFE here (and not the automatic logout this whole
+    /// change removes): the read is PURE. Reporting signed-out tears down no
+    /// live session — the autonomous daemons keep running off the device JWT the
+    /// refresher already holds (in memory and in the OS keychain), so nothing is
+    /// revoked. The token is NOT necessarily dead: in the hostname-change case
+    /// the keychain copy is still perfectly usable (the keychain is keyed per
+    /// OS-user, not by the `.enc`'s hostname-derived key). That is precisely why
+    /// we must NOT fail open — trusting that still-usable keychain token in this
+    /// read would silently resurrect a session the operator explicitly ended,
+    /// indistinguishable from genuine corruption. The only cost of failing
+    /// closed is a re-sign-in prompt, which is recoverable; the cost of failing
+    /// open is an unrevocable, invisible un-logout.
     ///
-    /// THIS POSTURE DEPENDS ON [`Self::save_tokens`] BEING ATOMIC. Failing
-    /// closed is only sound because an unreadable store means genuine
-    /// corruption. Under the old plain `fs::write` (truncate-then-write) a
-    /// reader racing the device-JWT refresher's ~5-minute rewrite could observe
-    /// a zero-length file, and this branch would have manufactured exactly the
-    /// automatic logout the marker exists to prevent. If `save_tokens` ever
-    /// stops being atomic, this must stop failing closed.
+    /// Failing closed treats an unreadable store as a REAL signal, which is only
+    /// justified because [`Self::save_tokens`] is ATOMIC (temp file → rename):
+    /// a partial/torn write is impossible, so an unreadable store is durable
+    /// corruption, never a transient artifact of a reader racing the refresher's
+    /// ~5-minute rewrite. Under the old plain `fs::write` (truncate-then-write)
+    /// that race could momentarily expose a zero-length file and this branch
+    /// would have manufactured a spurious logout. If `save_tokens` ever stops
+    /// being atomic, this must stop failing closed.
     pub fn is_interactive_signed_out(&self) -> bool {
         match self.load_tokens() {
             Ok(t) => t.interactive_signed_out,
@@ -536,9 +631,21 @@ impl SecureStorage {
         Ok(())
     }
 
-    /// Stores the device ID.
+    /// Stores the device ID. Background/default posture: refuses over a
+    /// present-but-unreadable store.
     pub fn store_device_id(&self, device_id: &str) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write()?;
+        self.store_device_id_mode(device_id, WriteMode::Merge)
+    }
+
+    /// Explicit-acquisition variant of [`Self::store_device_id`]: overwrites a
+    /// present-but-unreadable store from blank rather than refusing. Called on
+    /// the explicit pairing path (`pair::persist_pairing`).
+    pub fn store_device_id_fresh(&self, device_id: &str) -> Result<()> {
+        self.store_device_id_mode(device_id, WriteMode::Fresh)
+    }
+
+    fn store_device_id_mode(&self, device_id: &str, mode: WriteMode) -> Result<()> {
+        let mut tokens = self.load_tokens_for_write_mode(mode)?;
         tokens.device_id = Some(device_id.to_string());
         self.save_tokens(&tokens)?;
         info!("Device ID stored in secure file storage: {}", device_id);
@@ -585,7 +692,46 @@ impl SecureStorage {
         refresh_token: &str,
         expires_at: i64,
     ) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write()?;
+        self.store_oauth_tokens_mode(
+            access_token,
+            id_token,
+            refresh_token,
+            expires_at,
+            WriteMode::Merge,
+        )
+    }
+
+    /// Explicit-acquisition variant of [`Self::store_oauth_tokens`]: overwrites
+    /// a present-but-unreadable store from blank rather than refusing. Called
+    /// only by `finalize_signed_in` step 2 (the first write of an interactive
+    /// Cognito sign-in), so it can heal an undecryptable `.enc` the operator is
+    /// deliberately re-authenticating over. The background refresher's Cognito
+    /// write uses the plain (Merge) method.
+    pub fn store_oauth_tokens_fresh(
+        &self,
+        access_token: &str,
+        id_token: &str,
+        refresh_token: &str,
+        expires_at: i64,
+    ) -> Result<()> {
+        self.store_oauth_tokens_mode(
+            access_token,
+            id_token,
+            refresh_token,
+            expires_at,
+            WriteMode::Fresh,
+        )
+    }
+
+    fn store_oauth_tokens_mode(
+        &self,
+        access_token: &str,
+        id_token: &str,
+        refresh_token: &str,
+        expires_at: i64,
+        mode: WriteMode,
+    ) -> Result<()> {
+        let mut tokens = self.load_tokens_for_write_mode(mode)?;
         tokens.oauth_access_token = Some(access_token.to_string());
         tokens.oauth_id_token = Some(id_token.to_string());
         tokens.oauth_refresh_token = Some(refresh_token.to_string());
@@ -711,9 +857,29 @@ impl SecureStorage {
     }
 
     /// Store (or overwrite) the device JWT for one tenant binding. Leaves the
-    /// legacy `access_token` slot and every other slot untouched.
+    /// legacy `access_token` slot and every other slot untouched. Background/
+    /// default posture: refuses over a present-but-unreadable store.
     pub fn store_tenant_device_jwt(&self, tenant_id: &uuid::Uuid, jwt: &str) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write()?;
+        self.store_tenant_device_jwt_mode(tenant_id, jwt, WriteMode::Merge)
+    }
+
+    /// Explicit-acquisition variant of [`Self::store_tenant_device_jwt`]:
+    /// overwrites a present-but-unreadable store from blank rather than
+    /// refusing. This is the FIRST write of `pair::persist_pairing`, so on an
+    /// undecryptable `.enc` it heals the store and every subsequent write in the
+    /// same explicit pairing sequence then merges over the now-readable store.
+    /// The background refresher's per-tenant write uses the plain (Merge) method.
+    pub fn store_tenant_device_jwt_fresh(&self, tenant_id: &uuid::Uuid, jwt: &str) -> Result<()> {
+        self.store_tenant_device_jwt_mode(tenant_id, jwt, WriteMode::Fresh)
+    }
+
+    fn store_tenant_device_jwt_mode(
+        &self,
+        tenant_id: &uuid::Uuid,
+        jwt: &str,
+        mode: WriteMode,
+    ) -> Result<()> {
+        let mut tokens = self.load_tokens_for_write_mode(mode)?;
         tokens
             .tenant_device_jwts
             .insert(Self::tenant_device_jwt_key(tenant_id), jwt.to_string());
@@ -765,7 +931,19 @@ impl SecureStorage {
     /// any prior key. Leaves all other slots untouched. Mirror of
     /// [`Self::store_agent_machine_key`].
     pub fn store_device_machine_key(&self, key: &str) -> Result<()> {
-        let mut tokens = self.load_tokens_for_write()?;
+        self.store_device_machine_key_mode(key, WriteMode::Merge)
+    }
+
+    /// Explicit-acquisition variant of [`Self::store_device_machine_key`]:
+    /// overwrites a present-but-unreadable store from blank rather than
+    /// refusing. Called (best-effort) on the explicit pairing path
+    /// (`pair::persist_pairing`) when the web response auto-minted a `dmk_`.
+    pub fn store_device_machine_key_fresh(&self, key: &str) -> Result<()> {
+        self.store_device_machine_key_mode(key, WriteMode::Fresh)
+    }
+
+    fn store_device_machine_key_mode(&self, key: &str, mode: WriteMode) -> Result<()> {
+        let mut tokens = self.load_tokens_for_write_mode(mode)?;
         tokens.device_machine_key = Some(key.to_string());
         self.save_tokens(&tokens)?;
         info!("device machine key stored in secure file storage");
@@ -793,13 +971,67 @@ impl SecureStorage {
     }
 
     /// Deletes the storage file entirely.
-    #[allow(dead_code)]
+    ///
+    /// The reset affordance behind the "your credential store is corrupt" banner
+    /// (`commands::auth::reset_credential_store`): when the `.enc` is
+    /// present-but-unreadable, deleting it turns the next launch back into a
+    /// clean first-run (absent store ⇒ no interactive-sign-out marker, sign-in
+    /// writes succeed) so the operator can sign in again from the LoginScreen.
     pub fn delete_storage(&self) -> Result<()> {
         if self.storage_path.exists() {
             fs::remove_file(&self.storage_path).context("Failed to delete storage file")?;
             info!("Secure storage file deleted");
         }
         Ok(())
+    }
+
+    /// Best-effort sweep of crash-orphaned `auth_tokens.enc.tmp.<...>` temp
+    /// files left next to the store. [`Self::save_tokens`] writes to a temp file
+    /// then renames it over the store; a crash or power loss between create and
+    /// rename can strand a partial temp. It is harmless (readers only ever open
+    /// the real store path) but accumulates, so we unlink temps older than
+    /// `min_age` on startup. Never fatal — every IO error is swallowed so a
+    /// sweep failure can't block runner boot.
+    fn sweep_stale_temp_files(&self, min_age: std::time::Duration) {
+        let Some(dir) = self.storage_path.parent() else {
+            return;
+        };
+        // Derive the prefix from the ACTUAL store file name (not the
+        // `STORAGE_FILE` constant): `atomic_write` names temps
+        // `<store-file-name>.tmp.<...>`, and the store file name is
+        // customizable via `with_path` (tests) even though production uses
+        // `STORAGE_FILE`.
+        let Some(store_name) = self.storage_path.file_name().and_then(|n| n.to_str()) else {
+            return;
+        };
+        let prefix = format!("{store_name}.tmp.");
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        let now = std::time::SystemTime::now();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            // Only unlink temps that are demonstrably old — never race a
+            // concurrent writer's in-flight temp (same process or a sibling
+            // runner). A temp with an unreadable mtime is left alone.
+            let old_enough = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .is_some_and(|age| age >= min_age);
+            if old_enough {
+                let path = entry.path();
+                match fs::remove_file(&path) {
+                    Ok(()) => info!("Swept stale secure-storage temp file: {}", path.display()),
+                    Err(e) => debug!("Could not sweep temp file {}: {e}", path.display()),
+                }
+            }
+        }
     }
 }
 
@@ -1165,6 +1397,128 @@ mod tests {
             "the full wipe still records the sign-out"
         );
         assert!(storage.get_oauth_refresh_token().is_err());
+    }
+
+    /// The EXPLICIT credential-acquisition writers (`*_fresh`) must OVERWRITE a
+    /// present-but-unreadable store instead of refusing — the regression this
+    /// branch's finalize/pair path hit: with an undecryptable `.enc` (hostname
+    /// change / disk move), every re-auth write refused and the operator could
+    /// never sign back in from the LoginScreen. Their Merge siblings still
+    /// refuse (proven above); this asserts the Fresh variants heal.
+    #[test]
+    fn test_fresh_writers_overwrite_an_unreadable_store() {
+        let storage = create_test_storage("test_fresh_writers_overwrite_unreadable");
+        storage.store_tokens("old.jwt", "").unwrap();
+
+        // Corrupt it in place — present but undecryptable.
+        fs::write(&storage.storage_path, b"not-a-valid-aes-gcm-ciphertext").unwrap();
+        assert!(storage.load_tokens().is_err(), "test precondition");
+
+        // The Merge variant still refuses (background posture unchanged).
+        assert!(
+            storage.store_oauth_tokens("a", "b", "c", 1).is_err(),
+            "the background (Merge) oauth write must still refuse over an unreadable store"
+        );
+
+        // A Cognito sign-in heals with the Fresh oauth write, then merges the
+        // pairing writes over the now-readable store — the finalize_signed_in
+        // sequence.
+        storage
+            .store_oauth_tokens_fresh("cog.a", "cog.i", "cog.r", 1_700_000_000)
+            .expect("store_oauth_tokens_fresh must overwrite an unreadable store");
+        let tenant = uuid::Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+        storage
+            .store_tenant_device_jwt_fresh(&tenant, "jwt.tenant")
+            .expect("store_tenant_device_jwt_fresh must succeed");
+        storage
+            .store_tokens_fresh("device.jwt", "")
+            .expect("store_tokens_fresh must succeed");
+        storage
+            .store_device_id_fresh("dev-1")
+            .expect("store_device_id_fresh must succeed");
+        storage
+            .store_device_machine_key_fresh("dmk_1")
+            .expect("store_device_machine_key_fresh must succeed");
+
+        // Every slot written across the healed sequence survives — the Fresh
+        // writes discarded ONLY the dead bytes, then merged on the readable store.
+        assert_eq!(storage.get_oauth_refresh_token().unwrap(), "cog.r");
+        assert_eq!(storage.get_access_token().unwrap(), "device.jwt");
+        assert_eq!(
+            storage.get_tenant_device_jwt(&tenant).unwrap().as_deref(),
+            Some("jwt.tenant")
+        );
+        assert_eq!(storage.get_device_id().unwrap(), "dev-1");
+        assert_eq!(
+            storage.get_device_machine_key().unwrap().as_deref(),
+            Some("dmk_1")
+        );
+        assert!(
+            !storage.is_present_but_unreadable(),
+            "the store must be readable after the explicit heal"
+        );
+    }
+
+    /// On a READABLE store, a Fresh write must behave exactly like a Merge write
+    /// — it preserves every sibling slot, discarding nothing. (Fresh only
+    /// diverges on the present-but-unreadable path.)
+    #[test]
+    fn test_fresh_writer_preserves_siblings_on_a_readable_store() {
+        let storage = create_test_storage("test_fresh_preserves_readable");
+        storage.store_tokens("device.jwt", "").unwrap();
+        storage
+            .store_oauth_tokens("cog.a", "cog.i", "cog.r", 1_700_000_000)
+            .unwrap();
+
+        // A Fresh write over a perfectly readable store must not blank oauth.
+        storage.store_tokens_fresh("device.jwt.v2", "").unwrap();
+        assert_eq!(storage.get_access_token().unwrap(), "device.jwt.v2");
+        assert_eq!(
+            storage.get_oauth_refresh_token().unwrap(),
+            "cog.r",
+            "a Fresh write over a readable store must preserve sibling slots"
+        );
+    }
+
+    /// The boot sweep unlinks crash-orphaned `*.enc.tmp.<...>` files older than
+    /// the age threshold, but leaves the real store and any recent temp alone.
+    #[test]
+    fn test_sweep_stale_temp_files() {
+        let storage = create_test_storage("test_sweep_temps");
+        storage.store_tokens("device.jwt", "").unwrap();
+        let dir = storage.storage_path.parent().unwrap();
+        let stem = storage
+            .storage_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        // Two temps matching the real store's `.tmp.` prefix.
+        let a = dir.join(format!("{stem}.tmp.111"));
+        let b = dir.join(format!("{stem}.tmp.222"));
+        fs::write(&a, b"orphaned").unwrap();
+        fs::write(&b, b"in-flight").unwrap();
+
+        // A generous threshold spares fresh temps (never race a live writer).
+        storage.sweep_stale_temp_files(std::time::Duration::from_secs(3600));
+        assert!(a.exists(), "a temp younger than the threshold must survive");
+        assert!(b.exists());
+
+        // Let them age past a small threshold (a real elapse, not a 0-second
+        // threshold — filesystem mtime resolution can round an mtime slightly
+        // ahead of a just-captured `now`, which would spuriously spare a
+        // 0-second sweep). Then both qualify and are swept; the real store,
+        // which never matches the `.tmp.` prefix, must remain.
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        storage.sweep_stale_temp_files(std::time::Duration::from_millis(20));
+        assert!(!a.exists(), "a temp older than the threshold must be swept");
+        assert!(!b.exists());
+        assert!(
+            storage.storage_path.exists(),
+            "the real store must never be swept"
+        );
+        assert_eq!(storage.get_access_token().unwrap(), "device.jwt");
     }
 
     /// A pre-Phase-5 `StoredTokens` JSON (only the original three keys) must

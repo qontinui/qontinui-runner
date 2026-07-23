@@ -94,6 +94,15 @@ pub struct AuthStatus {
     pub authenticated: bool,
     pub user: Option<UserInfo>,
     pub device_id: Option<String>,
+    /// `true` when the credential store file EXISTS but cannot be
+    /// decrypted/parsed — the "corrupt / wrong-machine key" case (a machine
+    /// rename / disk move / re-image invalidates the hostname+username-derived
+    /// AES key). The read side fails closed to the LoginScreen; this flag lets
+    /// the frontend explain WHY and offer a reset (`reset_credential_store`)
+    /// rather than showing a bare, unexplained sign-in prompt. Always `false`
+    /// for Tier 0/1 and for a readable/absent store.
+    #[serde(default)]
+    pub store_unreadable: bool,
 }
 
 /// Device information for registration
@@ -211,6 +220,41 @@ async fn sign_out_full_impl() -> Result<(), AppError> {
     Ok(())
 }
 
+/// Deletes a corrupt/undecryptable credential store so the operator can sign in
+/// again. The reset affordance behind the LoginScreen "your credential store is
+/// corrupt" banner (`AuthStatus::store_unreadable`).
+///
+/// When the `.enc` is present-but-unreadable (a machine rename / disk move /
+/// re-image invalidates the hostname+username-derived AES key), the read side
+/// fails closed and the operator lands on the LoginScreen. Deleting the file
+/// turns the next launch into a clean first-run: absent store ⇒ no
+/// interactive-sign-out marker, and the next sign-in writes succeed. If a valid
+/// device token still lives in the OS keychain (which is keyed per OS-user, not
+/// by the dead `.enc` key), `get_access_token`'s migration path re-seeds a fresh
+/// `.enc` with the correct current-machine key — a transparent self-heal.
+///
+/// # Errors
+///
+/// Returns an error string if the file exists but cannot be removed.
+#[tauri::command]
+pub async fn reset_credential_store() -> Result<(), String> {
+    info!("reset_credential_store: deleting the credential store to allow a fresh sign-in");
+    let storage = crate::secure_storage::SecureStorage::new().map_err(|e| {
+        let msg = format!("could not open secure storage: {e}");
+        error!("reset_credential_store: {msg}");
+        msg
+    })?;
+    storage.delete_storage().map_err(|e| {
+        let msg = format!("could not delete credential store: {e}");
+        error!("reset_credential_store: {msg}");
+        msg
+    })?;
+    info!(
+        "reset_credential_store: credential store deleted — LoginScreen sign-in will start fresh"
+    );
+    Ok(())
+}
+
 /// Checks the current authentication status.
 ///
 /// This command:
@@ -275,11 +319,18 @@ async fn check_auth_status_impl() -> Result<AuthStatus, AppError> {
             authenticated: false,
             user: None,
             device_id: None,
+            store_unreadable: false,
         });
     }
 
     let auth_manager = AuthManager::new();
     let device_id = auth_manager.get_device_id().ok();
+
+    // Surface a present-but-undecryptable store so the LoginScreen can offer a
+    // reset instead of a bare sign-in prompt. This is the same condition the
+    // read side fails closed on (`is_interactively_signed_in` → false below), so
+    // the operator would otherwise land on an unexplained LoginScreen.
+    let store_unreadable = auth_manager.is_store_present_but_unreadable();
 
     // Authoritative signal: `AuthManager::is_interactively_signed_in` — the
     // operator has not explicitly logged out AND the runner holds local
@@ -299,6 +350,7 @@ async fn check_auth_status_impl() -> Result<AuthStatus, AppError> {
             authenticated: false,
             user: None,
             device_id: None,
+            store_unreadable,
         });
     }
 
@@ -346,6 +398,9 @@ async fn check_auth_status_impl() -> Result<AuthStatus, AppError> {
         authenticated: true,
         user,
         device_id,
+        // A signed-in status means the store read succeeded, so it is readable
+        // by construction; carry the computed value for completeness.
+        store_unreadable,
     })
 }
 
@@ -690,16 +745,26 @@ async fn finalize_signed_in(
     };
 
     // 2. Persist the Cognito user tokens in the distinct oauth slots.
+    //
+    // `store_oauth_tokens_FRESH`, not the plain writer: this is the FIRST write
+    // of an EXPLICIT, operator-initiated sign-in, so it is allowed to overwrite
+    // a present-but-unreadable `.enc` (the old encrypted bytes are already
+    // cryptographically dead on this machine — the AES key derives from
+    // hostname+username, so a rename / disk move produces exactly that). The
+    // plain (refuse-on-unreadable) writer dead-ended re-auth: every sign-in
+    // write refused and the operator could never leave the LoginScreen. The
+    // background refresher keeps using the refusing writer. Healing here also
+    // makes the subsequent pairing writes (step 5) see a readable store.
     let auth_manager = AuthManager::new();
     auth_manager
-        .store_oauth_tokens(
+        .store_oauth_tokens_fresh(
             &login.access_token,
             &login.id_token,
             &login.refresh_token,
             login.expires_at,
         )
         .map_err(|e| {
-            error!("finalize_signed_in: step 2 (store_oauth_tokens) failed: {e}");
+            error!("finalize_signed_in: step 2 (store_oauth_tokens_fresh) failed: {e}");
             AppError::Raw(format!("persist Cognito tokens: {e}"))
         })?;
 
@@ -1046,6 +1111,7 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             cognito_sign_in_password,
             qontinui_sign_out,
             sign_out_full,
+            reset_credential_store,
             device_jwt_present,
             get_coord_device_token,
             kick_device_jwt_refresher_cmd,
