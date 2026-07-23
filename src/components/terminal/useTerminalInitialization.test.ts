@@ -153,7 +153,12 @@ describe("reportTreeReset (tree-reset observability)", () => {
       }
       return Promise.resolve({ success: true, message: null, data: null });
     });
-    await reportTreeReset({ mountNumber: 2, authenticated: true, pageIds: ["default", "p2"] });
+    await reportTreeReset({
+      mountNumber: 2,
+      authenticated: true,
+      pageIds: ["default", "p2"],
+      clientTs: 1_700_000_000_000,
+    });
     expect(mockInvoke).toHaveBeenCalledWith(
       "terminal_report_tree_reset",
       expect.objectContaining({
@@ -161,6 +166,10 @@ describe("reportTreeReset (tree-reset observability)", () => {
         authenticated: true,
         pageIds: ["default", "p2"],
         openRecordCount: 2,
+        // Same-document proof: rows sharing a timeOrigin belong to one
+        // webview document — the remount-vs-fresh-load discriminator.
+        timeOrigin: expect.any(Number),
+        clientTs: 1_700_000_000_000,
       }),
     );
   });

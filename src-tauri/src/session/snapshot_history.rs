@@ -589,13 +589,28 @@ pub fn read_all_snapshot_sessions(path: &Path) -> Vec<SnapshotSession> {
 /// Frontend-collected payload of one terminal-tree reset report. Every field
 /// is best-effort at the reporting site, so all but the mount counter are
 /// optional/defaulted — a partial report is still worth a row.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TreeResetReport {
-    /// 1-based mount counter from the frontend mount effect. Mount #1 (a
+    /// 1-based mount counter, MODULE-scoped in the frontend so it survives
+    /// fiber destruction and resets only on a real document load. Mount #1 (a
     /// normal boot) is recorded too — consumers filter on this to isolate
-    /// genuine REmounts (`> 1`).
+    /// genuine REmounts (`> 1`). Dev-only StrictMode double-mounts write a
+    /// spurious `2` on boot; exe-mode runners don't run StrictMode, so a
+    /// `> 1` row in prod is a tree reset.
     pub mount_number: u32,
+    /// `performance.timeOrigin` of the reporting document — rows sharing a
+    /// value provably belong to ONE webview document, so a second row with
+    /// the same `time_origin` is a tree reset by construction (the
+    /// remount-vs-fresh-load discriminator `navigation_type` alone cannot
+    /// provide: it is document-scoped and never changes on an in-app remount).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_origin: Option<f64>,
+    /// `Date.now()` captured in the mount effect itself, BEFORE the awaited
+    /// open-record fetch — orders the row against restore logs even when the
+    /// server stamp (`ts`) lands hundreds of ms later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_ts: Option<i64>,
     /// `authStatus?.authenticated` at reset time (`None` = auth state unknown).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authenticated: Option<bool>,
@@ -665,7 +680,11 @@ fn record_tree_reset_at(path: &Path, now_ms: i64, report: TreeResetReport) {
             .create(true)
             .append(true)
             .open(path)?;
-        writeln!(f, "{line}")
+        // Single write_all syscall (not writeln!'s two) — O_APPEND makes the
+        // one syscall atomic, so concurrent reports during a remount storm
+        // cannot interleave into torn rows in the very file that must stay
+        // trustworthy during that storm.
+        f.write_all(format!("{line}\n").as_bytes())
     })();
     if let Err(e) = write {
         warn!(
@@ -1058,6 +1077,8 @@ mod tests {
             navigation_type: Some("navigate".to_string()),
             page_ids: vec!["default".to_string(), "page-2".to_string()],
             open_record_count: Some(7),
+            time_origin: Some(1_699_999_990_000.5),
+            client_ts: Some(1_699_999_999_900),
         };
         record_tree_reset_at(&path, 1_700_000_000_000, report.clone());
         record_tree_reset_at(
@@ -1083,6 +1104,8 @@ mod tests {
             "navigationType",
             "pageIds",
             "openRecordCount",
+            "timeOrigin",
+            "clientTs",
         ] {
             assert!(lines[0].contains(field), "row carries {field}");
         }
@@ -1104,10 +1127,18 @@ mod tests {
                 navigation_type: None,
                 page_ids: vec![],
                 open_record_count: None,
+                time_origin: None,
+                client_ts: None,
             },
         );
         let raw = std::fs::read_to_string(&path).unwrap();
-        for absent in ["authenticated", "navigationType", "openRecordCount"] {
+        for absent in [
+            "authenticated",
+            "navigationType",
+            "openRecordCount",
+            "timeOrigin",
+            "clientTs",
+        ] {
             assert!(!raw.contains(absent), "uncollected {absent} is omitted");
         }
         let rec: TreeResetRecord = serde_json::from_str(raw.trim()).unwrap();
@@ -1133,6 +1164,8 @@ mod tests {
                 navigation_type: None,
                 page_ids: vec![],
                 open_record_count: None,
+                time_origin: None,
+                client_ts: None,
             },
         ); // must not panic
     }
