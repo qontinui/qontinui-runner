@@ -365,6 +365,13 @@ impl AuthManager {
     /// the keychain clear here is exactly the same `clear_tokens_from_keychain`
     /// helper and never touches a Cognito entry.
     ///
+    /// Over an unreadable store the file-side clear now REFUSES (it could not
+    /// honour "preserve the Cognito session" — a blank rewrite would silently
+    /// escalate this into a full sign-out). That is warned, not propagated, and
+    /// the logout still sticks: the keychain pair is cleared regardless, and
+    /// `SecureStorage::is_interactive_signed_out` fails closed on an unreadable
+    /// store, so the status check reports signed-out anyway.
+    ///
     /// # Errors
     ///
     /// Returns an error if clearing fails.
@@ -430,7 +437,29 @@ impl AuthManager {
     /// backend's `users/me` can return 401/403 for a federated Cognito identity
     /// even though the runner is fully signed in and device-paired, which made a
     /// completed sign-in render the LoginScreen forever.
+    /// "Could not read the store" is UNKNOWN, not "no credential" — the two must
+    /// not be collapsed. They are handled explicitly and up front here, because
+    /// the `.unwrap_or(false)` below would otherwise answer for a case it cannot
+    /// see: with the `.enc` unreadable, [`Self::get_access_token`] falls back to
+    /// the OS KEYCHAIN and can return a token the store knows nothing about, so
+    /// the collapse could just as easily produce a false YES as a false NO. An
+    /// unreadable store is resolved the same way
+    /// [`SecureStorage::is_interactive_signed_out`] resolves it — fail closed,
+    /// one consistent verdict — rather than by whichever slot happened to
+    /// answer first.
     pub fn has_local_signed_in_session(&self) -> bool {
+        if self.secure_storage.is_present_but_unreadable() {
+            warn!(
+                "Secure storage present but unreadable — cannot prove a local session either \
+                 way. Reporting NO local session (fail-closed, consistent with the interactive \
+                 sign-out marker) instead of trusting the keychain fallback. Sign in again to \
+                 repair the store."
+            );
+            return false;
+        }
+
+        // Past this point the store is readable, so an `Err` means the slot is
+        // genuinely empty — a real NO, not an unknown.
         let has_device_jwt = self
             .get_access_token()
             .map(|t| !t.trim().is_empty())
