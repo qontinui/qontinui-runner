@@ -234,6 +234,40 @@ jobs:
       - name: Install sccache (GHA cache backend)
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
 
+      # Graceful degradation for the sccache wiring above. The GHA cache
+      # backend is infra outside this repo's control, and its failure was
+      # fatal to a fully-green candidate on run 30025467814 ("Server startup
+      # failed: cache storage failed to read => ... dns error" reaching the
+      # actions-cache blob host). Probe the exact failing operation now:
+      # `sccache --show-stats` auto-starts the server, which performs the
+      # cache-storage pre-check. If it fails, fall back to an uncached build:
+      #   - RUSTC_WRAPPER= (empty): cargo documents an empty wrapper as
+      #     "unset", and a set-but-empty var still blocks src-tauri/
+      #     .cargo/config.toml's [env] default, same trick as SCCACHE_BUCKET
+      #     above. GITHUB_ENV writes land in the runner's global env map, so
+      #     they override the job-level `env:` value for all later steps.
+      #   - SCCACHE_GHA_ENABLED=false: any later non-cargo sccache
+      #     invocation (the sccache-action post-run calls --show-stats and
+      #     setFailed()s on error) starts a harmless local-disk server
+      #     instead of re-dying against the unreachable backend.
+      # When the backend is healthy this step changes nothing: it just
+      # starts the port-4230 server that cargo's clients would have started
+      # on first rustc invocation. Phase 1 measurement semantics are intact.
+      - name: Probe sccache backend (fall back to uncached build on failure)
+        id: sccache_probe
+        shell: bash
+        run: |
+          if sccache --show-stats; then
+            echo "fallback=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "fallback=true" >> "$GITHUB_OUTPUT"
+            echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+            echo "SCCACHE_GHA_ENABLED=false" >> "$GITHUB_ENV"
+            msg="sccache unavailable (cache backend unreachable) — building without compile cache"
+            echo "::warning::$msg"
+            echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       # Swatinem/rust-cache replaces the previous actions/cache stanza, which
       # was broken two ways and never cached a single build artifact:
       #   1. It cached `src-tauri/target/` — but the cargo workspace root is
@@ -473,11 +507,18 @@ jobs:
       # Hit rate + cache location visibility for the Phase 1 exit criterion —
       # the `Cache location` line MUST read GHA (ghac), not S3; S3 means the
       # SCCACHE_BUCKET-blocking job env above regressed and rustc calls are
-      # about to fail on missing AWS credentials.
+      # about to fail on missing AWS credentials. When the backend probe
+      # fell back to an uncached build, real stats don't exist — print an
+      # explicit note instead of a misleading idle local-disk server's zeros.
       - name: sccache stats
         if: always()
         shell: bash
-        run: sccache --show-stats
+        run: |
+          if [ "${{ steps.sccache_probe.outputs.fallback }}" = "true" ]; then
+            echo "sccache unavailable this run (cache backend unreachable) — build ran without compile cache; no Phase 1 stats."
+          else
+            sccache --show-stats
+          fi
 
   # Gating frontend unit-test lane (vitest).
   #
