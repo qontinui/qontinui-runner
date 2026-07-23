@@ -8,7 +8,12 @@
 //! not the worktree), and read the volume's free space. This module
 //! periodically collects that census and POSTs it to coord's
 //! `POST /coord/worktree-census/{device_id}` (anonymous, device-keyed — same
-//! machine-wide posture as `/coord/trees/upsert`).
+//! machine-wide posture as `/coord/trees/upsert`) in bounded CHUNKS as the
+//! walk progresses (every `QONTINUI_CENSUS_CHUNK_ROWS` rows or
+//! `QONTINUI_CENSUS_CHUNK_SECS` seconds, whichever first) — on a large
+//! population a walk takes HOURS, and a single end-of-walk POST left coord
+//! with no recent rows (and thus zero actionable reclaim instructions) for
+//! the entire walk. Volume reports ride ONLY the final chunk of a walk.
 //!
 //! ## Mirrors the machine-wide pollers, not the per-agent ones
 //!
@@ -66,6 +71,47 @@ use super::canonical_paths::default_canonical_path;
 /// 30s fleet heartbeat. Override via `QONTINUI_WORKTREE_CENSUS_INTERVAL_SECS`.
 const DEFAULT_CENSUS_INTERVAL_SECS: u64 = 300;
 
+/// Default chunk-flush row bound. The walk emits a chunk after this many
+/// rows OR after [`DEFAULT_CENSUS_CHUNK_SECS`] seconds, whichever comes
+/// first, so coord always holds recent rows for recently-walked paths even
+/// while a multi-hour walk is still in flight. Override via
+/// `QONTINUI_CENSUS_CHUNK_ROWS`.
+const DEFAULT_CENSUS_CHUNK_ROWS: usize = 500;
+
+/// Default chunk-flush time bound (seconds). Override via
+/// `QONTINUI_CENSUS_CHUNK_SECS`.
+const DEFAULT_CENSUS_CHUNK_SECS: u64 = 60;
+
+/// Default per-chunk POST timeout (seconds). Chunks are bounded (~500 rows)
+/// so coord's server-side persist stays well inside this; the old whole-walk
+/// POST could exceed its 15s timeout on a 5901-row body. Override via
+/// `QONTINUI_CENSUS_POST_TIMEOUT_SECS`.
+const DEFAULT_CENSUS_POST_TIMEOUT_SECS: u64 = 30;
+
+fn census_chunk_rows() -> usize {
+    std::env::var("QONTINUI_CENSUS_CHUNK_ROWS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_CENSUS_CHUNK_ROWS)
+        .max(1)
+}
+
+fn census_chunk_secs() -> u64 {
+    std::env::var("QONTINUI_CENSUS_CHUNK_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_CENSUS_CHUNK_SECS)
+        .max(1)
+}
+
+fn census_post_timeout_secs() -> u64 {
+    std::env::var("QONTINUI_CENSUS_POST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_CENSUS_POST_TIMEOUT_SECS)
+        .max(1)
+}
+
 // ---------------------------------------------------------------------------
 // Census-before-reclaim boot ordering (the stale-census husk-guard, R3).
 //
@@ -88,7 +134,10 @@ fn first_census_notify() -> &'static tokio::sync::Notify {
     FIRST_CENSUS_NOTIFY.get_or_init(tokio::sync::Notify::new)
 }
 
-/// Record that a census POST landed (called from [`tick_once`] on 2xx).
+/// Record that a census POST landed (called from [`ChunkPoster::post`] on the
+/// first 2xx chunk POST of a walk). Chunked emission releases this gate as
+/// soon as coord holds SOME rows — the reclaim poller's boot gate only needs
+/// "coord has a recent census", not a completed walk.
 fn mark_first_census_posted() {
     FIRST_CENSUS_POSTED.store(true, std::sync::atomic::Ordering::Release);
     first_census_notify().notify_waiters();
@@ -117,24 +166,37 @@ pub(super) async fn wait_first_census_posted(timeout: Duration) -> bool {
 // ---------------------------------------------------------------------------
 // The shared census SNAPSHOT (the on-demand survey's data source).
 //
-// `build_census` is a MULTI-MINUTE walk on a real machine: ~400 worktrees
-// under `D:/qontinui-root`, each costing ~7 `git` subprocess spawns for the
-// worktree plus 3 for its canonical checkout (~2s/row measured), plus a
-// recursive file walk of every non-junctioned `node_modules`/`target`. Running
-// it INLINE per HTTP request made `GET /agent-worktrees/reclaimable` hang for
-// the whole walk — a UI panel's primary fetch must never do that.
+// The census walk ([`build_census_chunked`]) is a MULTI-HOUR walk on a real
+// machine: thousands of worktrees under `D:/qontinui-root`, each costing ~7
+// `git` subprocess spawns for the worktree plus 3 for its canonical checkout
+// (~2s/row measured), plus a recursive file walk of every non-junctioned
+// `node_modules`/`target`. Running it INLINE per HTTP request made
+// `GET /agent-worktrees/reclaimable` hang for the whole walk — a UI panel's
+// primary fetch must never do that.
 //
-// So the periodic task publishes its result here and the on-demand survey
-// READS this snapshot. A snapshot is only ever used for DISPLAY: the survey
-// always reports how old it is (`census_age_secs`), and the removal path
-// re-evaluates every runner guard against LIVE disk before deleting anything
-// (see `on_demand::execute_targets`) — a stale census can never authorize a
+// So the walk publishes here and the on-demand survey READS this snapshot.
+// Chunked emission keeps the snapshot PROGRESSIVE: every chunk is upsert-
+// merged by `(repo, path)` as the walk advances, and the completed walk then
+// REPLACES the whole snapshot (which is what drops rows for paths that
+// vanished — chunk merges between completions only ever add/update). A
+// snapshot is only ever used for DISPLAY: the survey always reports how old
+// it is (`census_age_secs`), and the removal path re-evaluates every runner
+// guard against LIVE disk before deleting anything (see
+// `on_demand::execute_targets`) — a stale census can never authorize a
 // deletion.
 // ---------------------------------------------------------------------------
 
-/// The most recent completed census walk, with the wall-clock time it was
-/// taken and how long it took to build. Cheap to clone (the payload is behind
-/// an `Arc`) so readers never hold the lock across `await`.
+/// The most recent census state. Cheap to clone (the payload is behind an
+/// `Arc`) so readers never hold the lock across `await`.
+///
+/// * `taken_at` — wall-clock time of the NEWEST data merged in: the newest
+///   chunk while a walk is in flight, the walk-completion instant otherwise.
+///   `census_age_secs` in the survey therefore reflects how recently ANY rows
+///   were refreshed, which is the honest freshness signal under chunked
+///   emission (individual rows can be older; the removal path re-checks live
+///   disk regardless).
+/// * `build_ms` — duration of the last COMPLETED walk; `0` when only chunk
+///   merges have landed so far this boot (no walk has completed yet).
 #[derive(Debug, Clone)]
 pub(super) struct CensusSnapshot {
     pub(super) req: Arc<WorktreeCensusReq>,
@@ -186,19 +248,115 @@ pub(super) fn census_builds_started() -> u64 {
     CENSUS_BUILDS_STARTED.load(Ordering::Acquire)
 }
 
-/// Publish a completed walk and wake every waiter.
-fn publish_census(req: WorktreeCensusReq, build_ms: u64) -> Arc<WorktreeCensusReq> {
+/// Replace the snapshot in `cell` with a COMPLETED walk result. This is the
+/// only operation that can DROP rows (paths that vanished since the previous
+/// walk) — chunk merges only ever add/update. Cell-parametrized so tests can
+/// exercise the replace semantics on a local cell without racing the global.
+fn publish_census_to_cell(
+    cell: &RwLock<Option<CensusSnapshot>>,
+    req: WorktreeCensusReq,
+    build_ms: u64,
+) -> Arc<WorktreeCensusReq> {
     let arc = Arc::new(req);
     let snapshot = CensusSnapshot {
         req: Arc::clone(&arc),
         taken_at: chrono::Utc::now(),
         build_ms,
     };
-    if let Ok(mut g) = latest_census_cell().write() {
+    if let Ok(mut g) = cell.write() {
         *g = Some(snapshot);
     }
+    arc
+}
+
+/// Publish a completed walk and wake every waiter.
+fn publish_census(req: WorktreeCensusReq, build_ms: u64) -> Arc<WorktreeCensusReq> {
+    let arc = publish_census_to_cell(latest_census_cell(), req, build_ms);
     snapshot_notify().notify_waiters();
     arc
+}
+
+/// Build the snapshot that results from upsert-merging `chunk_rows` into
+/// `prev`, keyed on `(repo, path)`:
+///
+/// * a row whose `(repo, path)` already exists is REPLACED in place;
+/// * a new `(repo, path)` is appended;
+/// * rows of `prev` not mentioned by the chunk are KEPT (vanished paths are
+///   only dropped by the complete-walk replace, [`publish_census_to_cell`]);
+/// * `volumes` and `build_ms` carry over from `prev` (volumes are refreshed
+///   only by a completed walk; `build_ms` stays the last completed walk's
+///   duration, `0` before the first completion);
+/// * `taken_at` becomes `now` — the newest merged chunk defines snapshot
+///   freshness (see [`CensusSnapshot`]).
+fn merged_snapshot(
+    prev: Option<&CensusSnapshot>,
+    chunk_rows: &[WorktreeCensus],
+    device_id: Uuid,
+    tenant_id: Option<Uuid>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> CensusSnapshot {
+    let (mut worktrees, volumes, build_ms) = match prev {
+        Some(p) => (p.req.worktrees.clone(), p.req.volumes.clone(), p.build_ms),
+        None => (Vec::new(), Vec::new(), 0),
+    };
+    for row in chunk_rows {
+        match worktrees
+            .iter_mut()
+            .find(|w| w.repo == row.repo && w.path == row.path)
+        {
+            Some(existing) => *existing = row.clone(),
+            None => worktrees.push(row.clone()),
+        }
+    }
+    CensusSnapshot {
+        req: Arc::new(WorktreeCensusReq {
+            device_id,
+            tenant_id,
+            volumes,
+            worktrees,
+        }),
+        taken_at: now,
+        build_ms,
+    }
+}
+
+/// Upsert-merge one chunk into `cell` (see [`merged_snapshot`]). No-op on an
+/// empty chunk. Cell-parametrized for the same test-isolation reason as
+/// [`publish_census_to_cell`].
+fn merge_chunk_into_cell(
+    cell: &RwLock<Option<CensusSnapshot>>,
+    chunk_rows: &[WorktreeCensus],
+    device_id: Uuid,
+    tenant_id: Option<Uuid>,
+) {
+    if chunk_rows.is_empty() {
+        return;
+    }
+    if let Ok(mut g) = cell.write() {
+        let snap = merged_snapshot(
+            g.as_ref(),
+            chunk_rows,
+            device_id,
+            tenant_id,
+            chrono::Utc::now(),
+        );
+        *g = Some(snap);
+    }
+}
+
+/// Merge one chunk into the shared snapshot and wake survey waiters, so the
+/// on-demand survey improves continuously while a walk is in flight instead
+/// of being all-or-nothing.
+fn merge_chunk_into_latest(
+    chunk_rows: &[WorktreeCensus],
+    device_id: Uuid,
+    tenant_id: Option<Uuid>,
+) {
+    if chunk_rows.is_empty() {
+        return;
+    }
+    merge_chunk_into_cell(latest_census_cell(), chunk_rows, device_id, tenant_id);
+    snapshot_notify().notify_waiters();
 }
 
 /// Test-only publisher so the survey's cache path is exercisable without a
@@ -206,6 +364,210 @@ fn publish_census(req: WorktreeCensusReq, build_ms: u64) -> Arc<WorktreeCensusRe
 #[cfg(test)]
 pub(super) fn publish_census_for_test(req: WorktreeCensusReq) {
     publish_census(req, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Chunked emission — the walk hands out bounded chunks as it progresses.
+//
+// The walk is a synchronous multi-hour function on the blocking pool; chunks
+// travel over a tokio unbounded mpsc channel (the sync side's `send` never
+// blocks and needs no runtime), and the async side of `build_and_publish`
+// drains the channel concurrently with the walk: each chunk is upsert-merged
+// into `LATEST_CENSUS` and POSTed to coord. Failed POSTs are dropped, not
+// retried — the next walk re-observes every path, and per-row freshness on
+// the coord side means a dropped chunk only leaves that slice unactionable
+// until the next pass. The channel is bounded in practice by the walk's total
+// row count (rows are small; the walk itself is the rate limiter).
+// ---------------------------------------------------------------------------
+
+/// One bounded slice of a census walk.
+struct CensusChunk {
+    rows: Vec<WorktreeCensus>,
+    /// `Some` ONLY on the final chunk of a walk. Volumes are deliberately
+    /// withheld from intermediate chunks: coord's `worktree_volume` table has
+    /// no retention prune, so per-chunk volume rows would bloat it (~12k rows
+    /// already).
+    volumes: Option<Vec<VolumeReport>>,
+}
+
+/// Accumulates rows and flushes a chunk after `max_rows` rows OR `max_age`
+/// since the oldest buffered row, whichever comes first. Pure bookkeeping —
+/// the injected `now` makes the time bound unit-testable.
+struct Chunker {
+    max_rows: usize,
+    max_age: Duration,
+    buf: Vec<WorktreeCensus>,
+    oldest_buffered_at: Option<Instant>,
+}
+
+impl Chunker {
+    fn new(max_rows: usize, max_age: Duration) -> Self {
+        Self {
+            max_rows: max_rows.max(1),
+            max_age,
+            buf: Vec::new(),
+            oldest_buffered_at: None,
+        }
+    }
+
+    /// Push one row; returns a full chunk when a bound is hit.
+    fn push_at(&mut self, row: WorktreeCensus, now: Instant) -> Option<Vec<WorktreeCensus>> {
+        if self.buf.is_empty() {
+            self.oldest_buffered_at = Some(now);
+        }
+        self.buf.push(row);
+        let age_hit = self
+            .oldest_buffered_at
+            .is_some_and(|t| now.duration_since(t) >= self.max_age);
+        if self.buf.len() >= self.max_rows || age_hit {
+            self.oldest_buffered_at = None;
+            Some(std::mem::take(&mut self.buf))
+        } else {
+            None
+        }
+    }
+
+    fn push(&mut self, row: WorktreeCensus) -> Option<Vec<WorktreeCensus>> {
+        self.push_at(row, Instant::now())
+    }
+
+    /// Drain whatever is buffered (the final, possibly-empty partial chunk).
+    fn take_remainder(&mut self) -> Vec<WorktreeCensus> {
+        self.oldest_buffered_at = None;
+        std::mem::take(&mut self.buf)
+    }
+}
+
+/// Sync-side emitter the walk drives: rows in, [`CensusChunk`]s out on the
+/// channel. Send failures (receiver dropped) are ignored — the walk finishes
+/// and its complete result is still returned to the caller.
+struct ChunkEmitter {
+    chunker: Chunker,
+    tx: tokio::sync::mpsc::UnboundedSender<CensusChunk>,
+}
+
+impl ChunkEmitter {
+    fn new(chunker: Chunker, tx: tokio::sync::mpsc::UnboundedSender<CensusChunk>) -> Self {
+        Self { chunker, tx }
+    }
+
+    fn on_row(&mut self, row: WorktreeCensus) {
+        if let Some(rows) = self.chunker.push(row) {
+            let _ = self.tx.send(CensusChunk {
+                rows,
+                volumes: None,
+            });
+        }
+    }
+
+    /// Emit the final chunk: the buffered remainder plus the walk's volume
+    /// reports (the ONLY chunk that carries volumes).
+    fn finish(mut self, volumes: Vec<VolumeReport>) {
+        let rows = self.chunker.take_remainder();
+        let _ = self.tx.send(CensusChunk {
+            rows,
+            volumes: Some(volumes),
+        });
+    }
+}
+
+/// Async-side chunk POSTer. Built once per walk; `dest` is `None` when no
+/// coord base is configured (chunks then only feed the local snapshot).
+struct ChunkPoster {
+    dest: Option<(reqwest::Client, String)>,
+    device_id: Uuid,
+    tenant_id: Option<Uuid>,
+    posted: u32,
+    failed: u32,
+}
+
+impl ChunkPoster {
+    fn new(device_id: Uuid, tenant_id: Option<Uuid>) -> Self {
+        let dest = match coord_http_base() {
+            None => {
+                debug!(
+                    "worktree_census: no coord_url configured — census chunks will not be POSTed"
+                );
+                None
+            }
+            Some(base) => {
+                let url = format!(
+                    "{}/coord/worktree-census/{}",
+                    base.trim_end_matches('/'),
+                    device_id
+                );
+                match reqwest::Client::builder()
+                    .timeout(Duration::from_secs(census_post_timeout_secs()))
+                    .build()
+                {
+                    Ok(client) => Some((client, url)),
+                    Err(e) => {
+                        warn!(
+                            "worktree_census: build census http client: {e} — chunk POSTs disabled for this walk"
+                        );
+                        None
+                    }
+                }
+            }
+        };
+        Self {
+            dest,
+            device_id,
+            tenant_id,
+            posted: 0,
+            failed: 0,
+        }
+    }
+
+    /// POST one chunk to coord. Best-effort: failures are counted, warned,
+    /// and DROPPED (never retried, never buffered) — the walk continues and
+    /// the next walk re-observes the slice.
+    async fn post(&mut self, chunk: CensusChunk) {
+        // An intermediate chunk is only ever emitted full, but guard anyway.
+        // The FINAL chunk (volumes: Some) is always POSTed even when empty —
+        // an empty walk still tells coord "this device censused" and releases
+        // the R3 boot gate, matching the pre-chunking behavior.
+        if chunk.volumes.is_none() && chunk.rows.is_empty() {
+            return;
+        }
+        let volumes = chunk.volumes.unwrap_or_default();
+        let Some((client, url)) = &self.dest else {
+            return;
+        };
+        let body = WorktreeCensusReq {
+            device_id: self.device_id,
+            tenant_id: self.tenant_id,
+            volumes,
+            worktrees: chunk.rows,
+        };
+        match client.post(url).json(&body).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                self.posted += 1;
+                // R3 boot ordering: the first successful chunk POST of this
+                // boot releases the reclaim poller's census-before-reclaim
+                // gate — coord holds rows from that moment on.
+                mark_first_census_posted();
+                debug!(
+                    "worktree_census: chunk posted ({} rows, {} volumes)",
+                    body.worktrees.len(),
+                    body.volumes.len()
+                );
+            }
+            Ok(resp) => {
+                self.failed += 1;
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                let excerpt: String = text.chars().take(200).collect();
+                warn!(
+                    "worktree_census: coord returned {status} for chunk POST {url}: {excerpt} — dropping chunk, walk continues"
+                );
+            }
+            Err(e) => {
+                self.failed += 1;
+                warn!("worktree_census: chunk POST {url}: {e} — dropping chunk, walk continues");
+            }
+        }
+    }
 }
 
 /// What one call to [`build_and_publish`] did.
@@ -219,10 +581,15 @@ pub(super) enum BuildOutcome {
     Skipped,
 }
 
-/// Run the census walk once (on the blocking pool) and publish the snapshot.
+/// Run the census walk once (on the blocking pool), stream its chunks to
+/// `LATEST_CENSUS` + coord as they are produced, and publish the complete
+/// snapshot at the end.
 ///
 /// This is the ONLY place a walk is started, so the "at most one walk at a
-/// time" invariant holds for the periodic tick and the explicit refresh alike.
+/// time" invariant holds for the periodic tick and the explicit refresh
+/// alike. Both walk triggers therefore POST chunks: a refresh-triggered walk
+/// feeding coord matters on huge populations, where a walk can outlast many
+/// periodic intervals (the periodic tick just sees `AlreadyRunning`).
 pub(super) async fn build_and_publish() -> Result<BuildOutcome, String> {
     if CENSUS_BUILD_ACTIVE
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -231,29 +598,54 @@ pub(super) async fn build_and_publish() -> Result<BuildOutcome, String> {
         debug!("worktree_census: a census walk is already in flight — not starting a second");
         return Ok(BuildOutcome::AlreadyRunning);
     }
+    // Resolve identity + root up front (cheap file reads) so a skip releases
+    // the guard immediately and never spawns a walk.
+    let Some(device_id) = load_device_id() else {
+        CENSUS_BUILD_ACTIVE.store(false, Ordering::Release);
+        debug!(
+            "worktree_census: ~/.qontinui/machine.json missing or device_id unparseable — skipping"
+        );
+        return Ok(BuildOutcome::Skipped);
+    };
+    let Some(root) = qontinui_root() else {
+        CENSUS_BUILD_ACTIVE.store(false, Ordering::Release);
+        debug!("worktree_census: no qontinui-root dir resolved — skipping");
+        return Ok(BuildOutcome::Skipped);
+    };
+    let tenant_id = resolve_tenant_id();
+
     CENSUS_BUILDS_STARTED.fetch_add(1, Ordering::AcqRel);
     let started = Instant::now();
-    // build_census stats real files under every worktree's node_modules/
-    // target and shells out to git — a synchronous multi-MINUTE disk walk.
-    // Run it on the blocking pool so the shared fleet-publishers runtime's
-    // async worker isn't pinned for the duration (the starvation class
-    // PR #391 isolated the heartbeat from).
-    let built = tokio::task::spawn_blocking(build_census).await;
+    // The walk stats real files under every worktree's node_modules/target
+    // and shells out to git — a synchronous multi-HOUR disk walk on large
+    // populations. Run it on the blocking pool so the shared
+    // fleet-publishers runtime's async worker isn't pinned for the duration
+    // (the starvation class PR #391 isolated the heartbeat from), and drain
+    // its chunks here concurrently.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CensusChunk>();
+    let walker =
+        tokio::task::spawn_blocking(move || build_census_chunked(&root, device_id, tenant_id, tx));
+
+    let mut poster = ChunkPoster::new(device_id, tenant_id);
+    // Ends when the walker drops `tx` (completion or panic).
+    while let Some(chunk) = rx.recv().await {
+        merge_chunk_into_latest(&chunk.rows, device_id, tenant_id);
+        poster.post(chunk).await;
+    }
+
+    let built = walker.await;
     CENSUS_BUILD_ACTIVE.store(false, Ordering::Release);
     let build_ms = started.elapsed().as_millis() as u64;
     let req = built.map_err(|e| format!("census walk panicked: {e}"))?;
-    match req {
-        Some(r) => {
-            info!(
-                "worktree_census: census walk completed in {}ms ({} worktrees, {} volumes)",
-                build_ms,
-                r.worktrees.len(),
-                r.volumes.len()
-            );
-            Ok(BuildOutcome::Built(publish_census(r, build_ms)))
-        }
-        None => Ok(BuildOutcome::Skipped),
-    }
+    info!(
+        "worktree_census: census walk completed in {}ms ({} worktrees, {} volumes; {} chunk POSTs ok, {} failed)",
+        build_ms,
+        req.worktrees.len(),
+        req.volumes.len(),
+        poster.posted,
+        poster.failed
+    );
+    Ok(BuildOutcome::Built(publish_census(req, build_ms)))
 }
 
 /// Kick a census walk in the BACKGROUND (the `?refresh=1` path). Returns
@@ -974,9 +1366,11 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
     }
 }
 
-/// Enumerate every worktree under `root`, dedup by canonical path, and
-/// build a census row for each.
-fn enumerate_worktrees(root: &Path) -> Vec<WorktreeCensus> {
+/// Enumerate every worktree under `root`, dedup by canonical path, build a
+/// census row for each, and hand each row to `on_row` as soon as it is
+/// captured (the chunked-emission feed — a row costs ~2s of git spawns, so
+/// push-per-row is what lets chunks flow DURING the walk).
+fn enumerate_worktrees_with(root: &Path, on_row: &mut dyn FnMut(WorktreeCensus)) {
     // Discover the governed repos: every top-level `qontinui-*` dir with
     // a `.git` (matches fleet::tree_publisher's notion of a governed
     // repo, but here it's the canonical checkout we anchor the worktree
@@ -1005,7 +1399,6 @@ fn enumerate_worktrees(root: &Path) -> Vec<WorktreeCensus> {
     }
 
     let mut seen: HashSet<String> = HashSet::new();
-    let mut rows: Vec<WorktreeCensus> = Vec::new();
 
     for (repo, canonical) in &repo_roots {
         // Also try the canonical-path resolver so a repo whose dir name
@@ -1028,49 +1421,57 @@ fn enumerate_worktrees(root: &Path) -> Vec<WorktreeCensus> {
             if !seen.insert(key) {
                 continue;
             }
-            rows.push(capture_worktree(repo, &wt));
+            on_row(capture_worktree(repo, &wt));
         }
     }
-
-    rows
 }
 
 // ---------------------------------------------------------------------------
-// Tick + spawn.
+// The walk + spawn.
 // ---------------------------------------------------------------------------
 
-/// Build the census body. Public so an integration test can drive the
-/// collection without the spawn machinery (mirrors
-/// `dirty_poller::tick_once`). Returns `None` when identity / root is
-/// unresolvable (the tick cleanly skips).
-pub fn build_census() -> Option<WorktreeCensusReq> {
-    let device_id = match load_device_id() {
-        Some(id) => id,
-        None => {
-            debug!(
-                "worktree_census: ~/.qontinui/machine.json missing or device_id unparseable — skipping"
-            );
-            return None;
-        }
-    };
-    let root = match qontinui_root() {
-        Some(r) => r,
-        None => {
-            debug!("worktree_census: no qontinui-root dir resolved — skipping");
-            return None;
-        }
-    };
+/// The census walk, chunked: enumerate every worktree under `root`, streaming
+/// each row through a [`ChunkEmitter`] onto `tx` (a chunk every
+/// `QONTINUI_CENSUS_CHUNK_ROWS` rows or `QONTINUI_CENSUS_CHUNK_SECS` seconds,
+/// whichever first), then compute the volume reports and emit them on the
+/// FINAL chunk only. Returns the complete census body for the walk-completion
+/// snapshot replace.
+///
+/// Synchronous — always run on the blocking pool ([`build_and_publish`] is
+/// the only caller and the only place a walk starts).
+fn build_census_chunked(
+    root: &Path,
+    device_id: Uuid,
+    tenant_id: Option<Uuid>,
+    tx: tokio::sync::mpsc::UnboundedSender<CensusChunk>,
+) -> WorktreeCensusReq {
+    let mut emitter = ChunkEmitter::new(
+        Chunker::new(
+            census_chunk_rows(),
+            Duration::from_secs(census_chunk_secs()),
+        ),
+        tx,
+    );
+    let mut worktrees: Vec<WorktreeCensus> = Vec::new();
+    enumerate_worktrees_with(root, &mut |row| {
+        worktrees.push(row.clone());
+        emitter.on_row(row);
+    });
 
-    let worktrees = enumerate_worktrees(&root);
     let paths: Vec<PathBuf> = worktrees.iter().map(|w| PathBuf::from(&w.path)).collect();
     let volumes = collect_volumes(&paths);
+    // Low-free-space alarm — a LEADING signal so low disk surfaces here rather
+    // than as phantom cargo build failures (`os error 112`). Runs on every
+    // completed walk regardless of coord reachability. Read-only.
+    warn_on_low_disk(&volumes);
+    emitter.finish(volumes.clone());
 
-    Some(WorktreeCensusReq {
+    WorktreeCensusReq {
         device_id,
-        tenant_id: resolve_tenant_id(),
+        tenant_id,
         volumes,
         worktrees,
-    })
+    }
 }
 
 /// Env override (bytes) for the low-disk WARN floor. Default ~100 GB.
@@ -1119,62 +1520,6 @@ fn warn_on_low_disk(volumes: &[VolumeReport]) {
     }
 }
 
-/// One census cycle: collect + POST. Returns `Ok(())` on a clean skip or
-/// a successful POST; `Err` only on a built-payload transport / non-2xx
-/// failure (the caller logs + retries next tick).
-pub async fn tick_once() -> Result<(), String> {
-    // One walk at a time, published to the shared snapshot BEFORE the POST so
-    // the on-demand survey benefits even when coord is unreachable.
-    let req = match build_and_publish().await? {
-        BuildOutcome::Built(r) => r,
-        BuildOutcome::AlreadyRunning | BuildOutcome::Skipped => return Ok(()),
-    };
-    // Low-free-space alarm — a LEADING signal so low disk surfaces here rather
-    // than as phantom cargo build failures (dep-crate compile errors with no
-    // src/ diagnostics, sccache write errors, `os error 112`). Runs every tick
-    // regardless of coord reachability, before the POST. Read-only.
-    warn_on_low_disk(&req.volumes);
-    let base = match coord_http_base() {
-        Some(b) => b,
-        None => {
-            debug!("worktree_census: no coord_url configured — skipping POST");
-            return Ok(());
-        }
-    };
-
-    let url = format!(
-        "{}/coord/worktree-census/{}",
-        base.trim_end_matches('/'),
-        req.device_id
-    );
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("build census http client: {e}"))?;
-    let resp = client
-        .post(&url)
-        .json(req.as_ref())
-        .send()
-        .await
-        .map_err(|e| format!("POST {url}: {e}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        let excerpt: String = body.chars().take(200).collect();
-        return Err(format!("coord returned {status} for POST {url}: {excerpt}"));
-    }
-    // R3 boot ordering: the first successful POST of this boot releases the
-    // reclaim poller's census-before-reclaim gate.
-    mark_first_census_posted();
-    debug!(
-        "worktree_census: posted device_id={} worktrees={} volumes={}",
-        req.device_id,
-        req.worktrees.len(),
-        req.volumes.len()
-    );
-    Ok(())
-}
-
 /// Spawn the periodic census task on the ambient tokio runtime.
 ///
 /// Interval read from `QONTINUI_WORKTREE_CENSUS_INTERVAL_SECS` (default
@@ -1182,6 +1527,12 @@ pub async fn tick_once() -> Result<(), String> {
 /// `fleet::spawn_heartbeat` / `fleet::spawn_tree_publisher` — a system
 /// suspend skips catch-up rather than blasting back-to-back ticks.
 /// Failures `warn!` and retry on the next tick; the loop never panics.
+///
+/// Each tick runs [`build_and_publish`], which streams the census to coord in
+/// bounded chunks DURING the walk — there is no separate whole-walk POST any
+/// more (that single 3.3MB end-of-walk POST is what left coord's census table
+/// empty for the whole multi-hour walk, and its server-side persist blew the
+/// old 15s client timeout).
 pub fn spawn_census() {
     let secs: u64 = std::env::var("QONTINUI_WORKTREE_CENSUS_INTERVAL_SECS")
         .ok()
@@ -1199,8 +1550,13 @@ pub fn spawn_census() {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            if let Err(e) = tick_once().await {
-                warn!("worktree_census: {e}");
+            match build_and_publish().await {
+                Ok(BuildOutcome::Built(req)) => debug!(
+                    "worktree_census: periodic walk published {} rows",
+                    req.worktrees.len()
+                ),
+                Ok(BuildOutcome::AlreadyRunning | BuildOutcome::Skipped) => {}
+                Err(e) => warn!("worktree_census: {e}"),
             }
         }
     });
@@ -1492,6 +1848,237 @@ mod tests {
         // origin/main...HEAD: 0 behind, 1 ahead → "on:topic;0\t1".
         assert!(div.starts_with("on:topic;"), "got: {div}");
         assert!(div.contains('1'), "should report the 1 ahead commit: {div}");
+    }
+
+    // -----------------------------------------------------------------
+    // Chunked-emission tests. All operate on LOCAL state (a Chunker, a
+    // channel, a local RwLock cell) — never on the global LATEST_CENSUS,
+    // which concurrent tests in other modules also publish to.
+    // -----------------------------------------------------------------
+
+    /// Minimal census row for chunk tests.
+    fn row(repo: &str, path: &str, bytes: u64) -> WorktreeCensus {
+        WorktreeCensus {
+            repo: repo.to_string(),
+            path: path.to_string(),
+            branch: None,
+            head_sha: None,
+            head_age_secs: None,
+            is_dirty: false,
+            nm_present: false,
+            nm_is_junction: false,
+            nm_bytes: 0,
+            target_present: false,
+            target_is_junction: false,
+            target_bytes: 0,
+            last_access_mtime: None,
+            attributable_bytes: bytes,
+            landed_in_main: None,
+            building: None,
+            canonical_current_branch: None,
+            canonical_is_dirty: None,
+            canonical_base_divergence: None,
+        }
+    }
+
+    #[test]
+    fn chunker_flushes_on_row_boundary() {
+        let mut c = Chunker::new(3, Duration::from_secs(3600));
+        let mut flushed = Vec::new();
+        for i in 0..7 {
+            if let Some(chunk) = c.push(row("r", &format!("p{i}"), 0)) {
+                flushed.push(chunk);
+            }
+        }
+        assert_eq!(flushed.len(), 2, "3-row bound over 7 rows → two flushes");
+        assert_eq!(flushed[0].len(), 3);
+        assert_eq!(flushed[1].len(), 3);
+        assert_eq!(flushed[0][0].path, "p0");
+        assert_eq!(flushed[1][0].path, "p3");
+        let rem = c.take_remainder();
+        assert_eq!(rem.len(), 1, "the 7th row stays buffered until finish");
+        assert_eq!(rem[0].path, "p6");
+        assert!(c.take_remainder().is_empty(), "remainder drains the buffer");
+    }
+
+    #[test]
+    fn chunker_flushes_on_time_boundary_whichever_first() {
+        // Row bound is huge; only the 60s age bound can flush.
+        let mut c = Chunker::new(1000, Duration::from_secs(60));
+        let t0 = Instant::now();
+        assert!(c.push_at(row("r", "a", 0), t0).is_none());
+        assert!(
+            c.push_at(row("r", "b", 0), t0 + Duration::from_secs(30))
+                .is_none(),
+            "age below the bound must not flush"
+        );
+        let chunk = c
+            .push_at(row("r", "c", 0), t0 + Duration::from_secs(61))
+            .expect("61s since the oldest buffered row must flush");
+        assert_eq!(chunk.len(), 3, "the time flush carries the whole buffer");
+        // The next row starts a fresh window anchored at ITS push time.
+        assert!(
+            c.push_at(row("r", "d", 0), t0 + Duration::from_secs(90))
+                .is_none(),
+            "new window: 0s old, row bound not hit"
+        );
+        assert_eq!(c.take_remainder().len(), 1);
+    }
+
+    #[test]
+    fn chunk_emitter_sends_volumes_only_on_final_chunk() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CensusChunk>();
+        let mut emitter = ChunkEmitter::new(Chunker::new(2, Duration::from_secs(3600)), tx);
+        for i in 0..5 {
+            emitter.on_row(row("r", &format!("p{i}"), 0));
+        }
+        emitter.finish(vec![VolumeReport {
+            volume: "D:".to_string(),
+            total_bytes: 100,
+            free_bytes: 40,
+        }]);
+
+        let mut chunks = Vec::new();
+        while let Ok(c) = rx.try_recv() {
+            chunks.push(c);
+        }
+        assert_eq!(chunks.len(), 3, "2+2 full chunks plus the final remainder");
+        assert!(
+            chunks[..2].iter().all(|c| c.volumes.is_none()),
+            "intermediate chunks must NEVER carry volumes (coord's \
+             worktree_volume table has no retention prune)"
+        );
+        let last = chunks.last().unwrap();
+        assert_eq!(last.rows.len(), 1, "the 5th row rides the final chunk");
+        assert_eq!(
+            last.volumes.as_ref().map(|v| v.len()),
+            Some(1),
+            "the final chunk carries the walk's volume reports"
+        );
+    }
+
+    #[test]
+    fn merged_snapshot_upserts_by_repo_and_path() {
+        let device = Uuid::nil();
+        let prev = CensusSnapshot {
+            req: Arc::new(WorktreeCensusReq {
+                device_id: device,
+                tenant_id: None,
+                volumes: vec![VolumeReport {
+                    volume: "D:".to_string(),
+                    total_bytes: 100,
+                    free_bytes: 50,
+                }],
+                worktrees: vec![
+                    row("qontinui-runner", "D:/x/a", 10),
+                    row("qontinui-runner", "D:/x/b", 20),
+                    // Same PATH, different repo — must be a distinct key.
+                    row("qontinui-coord", "D:/x/a", 30),
+                ],
+            }),
+            taken_at: chrono::Utc::now() - chrono::Duration::hours(2),
+            build_ms: 12_345,
+        };
+
+        let now = chrono::Utc::now();
+        let chunk = vec![
+            row("qontinui-runner", "D:/x/a", 99), // update
+            row("qontinui-runner", "D:/x/c", 7),  // insert
+        ];
+        let merged = merged_snapshot(Some(&prev), &chunk, device, None, now);
+
+        assert_eq!(merged.req.worktrees.len(), 4, "1 update + 1 insert over 3");
+        let by_key = |repo: &str, path: &str| {
+            merged
+                .req
+                .worktrees
+                .iter()
+                .find(|w| w.repo == repo && w.path == path)
+                .map(|w| w.attributable_bytes)
+        };
+        assert_eq!(by_key("qontinui-runner", "D:/x/a"), Some(99), "updated");
+        assert_eq!(by_key("qontinui-runner", "D:/x/b"), Some(20), "kept");
+        assert_eq!(
+            by_key("qontinui-coord", "D:/x/a"),
+            Some(30),
+            "same path in another repo untouched — the key is (repo, path)"
+        );
+        assert_eq!(by_key("qontinui-runner", "D:/x/c"), Some(7), "inserted");
+        assert_eq!(merged.taken_at, now, "taken_at = time of the newest chunk");
+        assert_eq!(
+            merged.build_ms, 12_345,
+            "build_ms stays the last COMPLETED walk's duration"
+        );
+        assert_eq!(
+            merged.req.volumes, prev.req.volumes,
+            "chunk merges never touch volumes"
+        );
+    }
+
+    #[test]
+    fn merged_snapshot_cold_start_has_chunk_rows_and_zero_build_ms() {
+        let now = chrono::Utc::now();
+        let chunk = vec![row("qontinui-runner", "D:/x/a", 1)];
+        let merged = merged_snapshot(None, &chunk, Uuid::nil(), None, now);
+        assert_eq!(merged.req.worktrees.len(), 1);
+        assert!(merged.req.volumes.is_empty());
+        assert_eq!(merged.build_ms, 0, "no walk has completed yet");
+        assert_eq!(merged.taken_at, now);
+    }
+
+    #[test]
+    fn chunk_merge_then_complete_walk_replace_drops_vanished_paths() {
+        // Local cell — the exact production functions, no global state.
+        let cell: RwLock<Option<CensusSnapshot>> = RwLock::new(None);
+
+        // Two chunks of an in-flight walk accumulate…
+        merge_chunk_into_cell(
+            &cell,
+            &[row("qontinui-runner", "D:/x/a", 1)],
+            Uuid::nil(),
+            None,
+        );
+        merge_chunk_into_cell(
+            &cell,
+            &[
+                row("qontinui-runner", "D:/x/a", 2), // fresher re-observation
+                row("qontinui-runner", "D:/x/b", 3),
+            ],
+            Uuid::nil(),
+            None,
+        );
+        {
+            let g = cell.read().unwrap();
+            let snap = g.as_ref().expect("merges created a snapshot");
+            assert_eq!(snap.req.worktrees.len(), 2);
+            assert_eq!(snap.req.worktrees[0].attributable_bytes, 2, "upserted");
+        }
+
+        // Empty chunk (a final chunk can have no remainder) is a no-op.
+        merge_chunk_into_cell(&cell, &[], Uuid::nil(), None);
+        assert_eq!(
+            cell.read().unwrap().as_ref().unwrap().req.worktrees.len(),
+            2
+        );
+
+        // …then the COMPLETED walk replaces the snapshot wholesale: path b
+        // vanished from disk mid-walk and is dropped by the replace (chunk
+        // merges alone could never remove it).
+        publish_census_to_cell(
+            &cell,
+            WorktreeCensusReq {
+                device_id: Uuid::nil(),
+                tenant_id: None,
+                volumes: Vec::new(),
+                worktrees: vec![row("qontinui-runner", "D:/x/a", 5)],
+            },
+            777,
+        );
+        let g = cell.read().unwrap();
+        let snap = g.as_ref().unwrap();
+        assert_eq!(snap.req.worktrees.len(), 1, "vanished path b dropped");
+        assert_eq!(snap.req.worktrees[0].path, "D:/x/a");
+        assert_eq!(snap.build_ms, 777, "replace records the walk duration");
     }
 
     #[test]
