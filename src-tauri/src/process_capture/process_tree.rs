@@ -46,6 +46,14 @@ pub struct ProcessSnapshot {
     pub parent_map: HashMap<u32, Vec<u32>>,
     pub creation_times: HashMap<u32, i64>,
     pub names: HashMap<u32, String>,
+    /// `exe_paths[pid] -> full executable path` (WMI `ExecutablePath` on
+    /// Windows, `/proc/<pid>/exe` on Unix), when resolvable. Powers the
+    /// qontinui-shim exclusion in [`is_countable_claude`]: the path-identity
+    /// shim is ALSO named `claude.exe`, and the one fact that distinguishes it
+    /// from a real claude is the directory it lives in. Fail-open: a pid
+    /// absent here (access denied, protected process) is treated as a real
+    /// image — never as a shim.
+    pub exe_paths: HashMap<u32, String>,
 }
 
 /// Skew tolerance (millis) for the PID-reuse creation-time vs the reference
@@ -97,12 +105,12 @@ pub fn claude_present_in_inclusive_subtree(
             return false;
         }
     }
-    if is_claude_image(snapshot.names.get(&root_pid)) {
+    if is_countable_claude(root_pid, snapshot) {
         return true;
     }
     bfs_descendants_from(root_pid, &snapshot.parent_map, &snapshot.creation_times)
         .iter()
-        .any(|d| is_claude_image(snapshot.names.get(&d.pid)))
+        .any(|d| is_countable_claude(d.pid, snapshot))
 }
 
 /// Every claude-image PID in the **inclusive** subtree rooted at `root_pid`
@@ -115,13 +123,13 @@ pub fn claude_present_in_inclusive_subtree(
 /// need the guard pair it with `claude_present_in_inclusive_subtree`.
 pub fn claude_pids_in_inclusive_subtree(root_pid: u32, snapshot: &ProcessSnapshot) -> Vec<u32> {
     let mut out = Vec::new();
-    if is_claude_image(snapshot.names.get(&root_pid)) {
+    if is_countable_claude(root_pid, snapshot) {
         out.push(root_pid);
     }
     out.extend(
         bfs_descendants_from(root_pid, &snapshot.parent_map, &snapshot.creation_times)
             .iter()
-            .filter(|d| is_claude_image(snapshot.names.get(&d.pid)))
+            .filter(|d| is_countable_claude(d.pid, snapshot))
             .map(|d| d.pid),
     );
     out
@@ -252,6 +260,90 @@ fn is_claude_image(name: Option<&String>) -> bool {
         .to_ascii_lowercase();
     let stem = base.strip_suffix(".exe").unwrap_or(&base);
     stem == "claude"
+}
+
+/// A pid counts as a live claude iff its image name matches `claude*` AND its
+/// executable does NOT live in one of qontinui's own shim directories. The
+/// path-identity shim (the `qontinui-shim` stub materialized as `claude.exe`)
+/// is indistinguishable from a real claude by basename — it exists precisely
+/// to shadow the name — so counting by [`is_claude_image`] alone double-counts
+/// every shim-launched session (measured live 2026-07: 36 of 156 claude-named
+/// processes were the shim). The one fact that defines the shim is where it
+/// lives on disk, so the exclusion keys on the exe's directory (never on
+/// tree-shape heuristics like parent-is-also-claude, which miscount legitimate
+/// nested claude launches). Fail-open: a pid with no resolved exe path counts
+/// as real.
+fn is_countable_claude(pid: u32, snapshot: &ProcessSnapshot) -> bool {
+    if !is_claude_image(snapshot.names.get(&pid)) {
+        return false;
+    }
+    match snapshot.exe_paths.get(&pid) {
+        Some(exe_path) => !is_shim_dir_exe_path(exe_path, persistent_identity_shim_dir()),
+        None => true,
+    }
+}
+
+/// The persistent identity-shim dir (`~/.qontinui/runner/identity-shim`) as a
+/// normalized-string, resolved once per process. Single source of truth is
+/// [`qontinui_runner_lib::profile_cli::identity_shim_dir`] — the same function
+/// the shim materializer installs into, so the exclusion can never drift from
+/// the install location. `None` when the home dir is unresolvable.
+fn persistent_identity_shim_dir() -> Option<&'static str> {
+    static DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        qontinui_runner_lib::profile_cli::identity_shim_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+    })
+    .as_deref()
+}
+
+/// True iff `exe_path` points into one of qontinui's own claude-shim
+/// directories:
+///
+/// - a per-terminal identity dir (`qontinui-identity-<terminal_id>`) or
+///   install-intercept dir (`qontinui-shim-<terminal_id>`), matched by the
+///   containing dir's basename prefix (the dirs are materialized under the
+///   system temp dir by `install_effects_producer::intercept::shim_materializer`,
+///   whose prefix constants are reused here), or
+/// - the persistent identity dir (`persistent_identity_dir`, in prod
+///   `profile_cli::identity_shim_dir()` = `~/.qontinui/runner/identity-shim`),
+///   matched by the full containing dir (separator- and case-normalized —
+///   Windows paths are case-insensitive).
+///
+/// Pure over its inputs; parsed with manual `/`+`\` splitting (not
+/// `std::path`) so Windows-style snapshot paths behave identically on every
+/// host, mirroring [`is_claude_image`].
+pub fn is_shim_dir_exe_path(exe_path: &str, persistent_identity_dir: Option<&str>) -> bool {
+    use crate::install_effects_producer::intercept::shim_materializer::{
+        IDENTITY_DIR_PREFIX, SHIM_DIR_PREFIX,
+    };
+    let trimmed = exe_path.trim_end_matches(['/', '\\']);
+    // Split off the file name; what remains is the containing directory.
+    let Some(sep_idx) = trimmed.rfind(['/', '\\']) else {
+        return false; // bare name — no directory to key on
+    };
+    let dir = &trimmed[..sep_idx];
+    let dir_base = dir.rsplit(['/', '\\']).next().unwrap_or(dir);
+    if dir_base.starts_with(IDENTITY_DIR_PREFIX) || dir_base.starts_with(SHIM_DIR_PREFIX) {
+        return true;
+    }
+    if let Some(stable) = persistent_identity_dir {
+        if normalize_dir(dir) == normalize_dir(stable) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Normalize a directory path for equality: unify separators to `/`, trim any
+/// trailing separator, lowercase (Windows filesystems are case-insensitive;
+/// the false-positive window this opens on case-sensitive Unix is an
+/// exact-string collision with `~/.qontinui/runner/identity-shim` — ours by
+/// construction).
+fn normalize_dir(p: &str) -> String {
+    p.replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
 }
 
 /// Discover every descendant of `root_pid` (NOT including the root itself).
@@ -421,7 +513,7 @@ fn collect_descendants_from_snapshot(
 async fn snapshot_process_table() -> ProcessSnapshot {
     // ConvertTo-Json on a single row drops the array; force an array with @().
     const SCRIPT: &str = "$ErrorActionPreference='SilentlyContinue'; \
-        @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate,Name) | \
+        @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate,Name,ExecutablePath) | \
         ConvertTo-Json -Compress -Depth 3";
 
     let output = match tokio::task::spawn_blocking(|| {
@@ -465,6 +557,10 @@ struct WmiProcessRow {
     creation_date: Option<serde_json::Value>,
     #[serde(rename = "Name", default)]
     name: Option<String>,
+    /// Full exe path; `null` for protected/system processes (fail-open —
+    /// absent means "not a shim", see [`ProcessSnapshot::exe_paths`]).
+    #[serde(rename = "ExecutablePath", default)]
+    executable_path: Option<String>,
 }
 
 #[cfg(windows)]
@@ -492,6 +588,9 @@ fn parse_powershell_snapshot(json: &str) -> ProcessSnapshot {
         snap.creation_times.insert(row.process_id, secs);
         if let Some(name) = row.name {
             snap.names.insert(row.process_id, name);
+        }
+        if let Some(path) = row.executable_path.filter(|p| !p.trim().is_empty()) {
+            snap.exe_paths.insert(row.process_id, path);
         }
     }
     snap
@@ -705,6 +804,13 @@ fn snapshot_process_table_sync() -> ProcessSnapshot {
             });
         if let Some(name) = name {
             snap.names.insert(pid, name);
+        }
+        // Full exe path for the qontinui-shim exclusion. Best-effort: the
+        // readlink fails for other users' processes (permission) — fail-open
+        // absent, mirroring the Windows `ExecutablePath: null` case.
+        if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) {
+            snap.exe_paths
+                .insert(pid, exe.to_string_lossy().into_owned());
         }
     }
     snap
@@ -937,6 +1043,95 @@ mod tests {
         assert!(claude_present_in_inclusive_subtree(
             500,
             &snap,
+            REFERENCE_FRESH
+        ));
+    }
+
+    /// The pure shim-dir predicate: per-terminal identity/install-intercept
+    /// dirs match by basename prefix; the persistent identity dir matches by
+    /// normalized full-dir equality; ordinary claude installs never match.
+    #[test]
+    fn shim_dir_exe_path_detection() {
+        // Per-terminal identity dir (Windows temp path, backslashes).
+        assert!(is_shim_dir_exe_path(
+            r"C:\Users\x\AppData\Local\Temp\qontinui-identity-term-1\claude.exe",
+            None
+        ));
+        // Per-terminal install-intercept dir (forward slashes).
+        assert!(is_shim_dir_exe_path(
+            "/tmp/qontinui-shim-term-1/cargo",
+            None
+        ));
+        // Persistent identity dir: separator + case normalized.
+        let stable = r"C:\Users\x\.qontinui\runner\identity-shim";
+        assert!(is_shim_dir_exe_path(
+            r"C:\Users\x\.qontinui\RUNNER\identity-shim\claude.exe",
+            Some(stable)
+        ));
+        assert!(is_shim_dir_exe_path(
+            "C:/Users/x/.qontinui/runner/identity-shim/claude.exe",
+            Some(stable)
+        ));
+        // A real claude at an ordinary path is NOT a shim.
+        assert!(!is_shim_dir_exe_path(
+            r"C:\Users\x\AppData\Local\Programs\claude\claude.exe",
+            Some(stable)
+        ));
+        // A dir merely CONTAINING the stable dir as an ancestor is not it.
+        assert!(!is_shim_dir_exe_path(
+            r"C:\Users\x\.qontinui\runner\identity-shim-backup\claude.exe",
+            Some(stable)
+        ));
+        // Bare name — no directory to key on.
+        assert!(!is_shim_dir_exe_path("claude.exe", Some(stable)));
+    }
+
+    /// A qontinui path-identity shim (image `claude.exe`, exe path inside a
+    /// shim dir) must NOT count as a live claude — while a real `claude.exe`
+    /// at a non-shim path (and one with NO resolved path — fail-open) still
+    /// does, in both the enumeration and the presence signal.
+    #[test]
+    fn shim_claude_is_not_counted_as_live_claude() {
+        // Shell 600 → shim 601 → real claude 602; sibling claude 603 with no
+        // resolved exe path (access denied — must fail open to "real").
+        let mut snap = snap_with(
+            &[(600, &[601, 603]), (601, &[602])],
+            &[(600, 1_000), (601, 1_000), (602, 1_000), (603, 1_000)],
+            &[
+                (600, "powershell.exe"),
+                (601, "claude.exe"),
+                (602, "claude.exe"),
+                (603, "claude.exe"),
+            ],
+        );
+        snap.exe_paths.insert(
+            601,
+            r"C:\Users\x\AppData\Local\Temp\qontinui-identity-t1\claude.exe".to_string(),
+        );
+        snap.exe_paths.insert(
+            602,
+            r"C:\Users\x\AppData\Local\Programs\claude\claude.exe".to_string(),
+        );
+
+        let mut pids = claude_pids_in_inclusive_subtree(600, &snap);
+        pids.sort();
+        assert_eq!(pids, vec![602, 603], "shim 601 excluded; real + unknown-path kept");
+        assert!(claude_present_in_inclusive_subtree(600, &snap, REFERENCE_FRESH));
+
+        // Subtree holding ONLY the shim (real claude gone): claude-absent.
+        let mut shim_only = snap_with(
+            &[(700, &[701])],
+            &[(700, 1_000), (701, 1_000)],
+            &[(700, "pwsh.exe"), (701, "claude.exe")],
+        );
+        shim_only.exe_paths.insert(
+            701,
+            "/tmp/qontinui-identity-t2/claude".to_string(),
+        );
+        assert!(claude_pids_in_inclusive_subtree(700, &shim_only).is_empty());
+        assert!(!claude_present_in_inclusive_subtree(
+            700,
+            &shim_only,
             REFERENCE_FRESH
         ));
     }
@@ -1198,8 +1393,8 @@ mod tests {
     #[test]
     fn parse_powershell_snapshot_captures_name() {
         let json = r#"[
-            {"ProcessId":10,"ParentProcessId":0,"CreationDate":"/Date(1715911000000)/","Name":"powershell.exe"},
-            {"ProcessId":11,"ParentProcessId":10,"CreationDate":"/Date(1715911000000)/","Name":"claude.exe"}
+            {"ProcessId":10,"ParentProcessId":0,"CreationDate":"/Date(1715911000000)/","Name":"powershell.exe","ExecutablePath":null},
+            {"ProcessId":11,"ParentProcessId":10,"CreationDate":"/Date(1715911000000)/","Name":"claude.exe","ExecutablePath":"C:\\Users\\x\\AppData\\Local\\Programs\\claude\\claude.exe"}
         ]"#;
         let snap = parse_powershell_snapshot(json);
         assert_eq!(
@@ -1207,6 +1402,12 @@ mod tests {
             Some("powershell.exe")
         );
         assert_eq!(snap.names.get(&11).map(|s| s.as_str()), Some("claude.exe"));
+        // ExecutablePath: null is absent (fail-open); a real path is captured.
+        assert!(!snap.exe_paths.contains_key(&10));
+        assert_eq!(
+            snap.exe_paths.get(&11).map(|s| s.as_str()),
+            Some(r"C:\Users\x\AppData\Local\Programs\claude\claude.exe")
+        );
         // End-to-end: the inclusive-subtree helper sees claude under the shell.
         // reference == the shell's creation in millis so the reuse guard is a
         // no-op (creation does not predate the reference).

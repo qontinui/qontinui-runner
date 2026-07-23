@@ -235,9 +235,14 @@ pub fn health_json() -> serde_json::Value {
 ///   live PTY.
 /// - A record is **accounted** when its terminal's subtree has a live claude
 ///   (per `claude_present_in_inclusive_subtree`, including its PID-reuse
-///   guard against `opened_at`); those claude PIDs are subtracted from the
-///   live set. Everything left over is **live-but-untracked**; every open
-///   record that is not accounted is **tracked-open-but-dead**.
+///   guard against `primary_boot_unix_millis` — the runner primary's OWN boot
+///   time, NEVER a per-record `opened_at`: a later record can legitimately
+///   reuse an already-running terminal, whose PID then predates that record's
+///   `opened_at` by design, and an `opened_at`-keyed guard falsely flips such
+///   live idle sessions to tracked-dead — see the guard fn's doc comment);
+///   those claude PIDs are subtracted from the live set. Everything left over
+///   is **live-but-untracked**; every open record that is not accounted is
+///   **tracked-open-but-dead**.
 /// - `exempt_root_pids` are the legitimate headless planes (agent-runtime
 ///   children + AI-session/task-run children — see module docs): each root's
 ///   inclusive-subtree claude PIDs are pre-accounted so a normal agent run
@@ -248,6 +253,7 @@ pub fn evaluate(
     open_records: &[TerminalSessionRecord],
     terminal_pids: &HashMap<String, u32>,
     exempt_root_pids: &HashSet<u32>,
+    primary_boot_unix_millis: i64,
     now_ms: i64,
 ) -> TrackingHealthReport {
     let live_claude: Vec<u32> = claude_pids_in_inclusive_subtree(runner_pid, snapshot);
@@ -261,7 +267,8 @@ pub fn evaluate(
     for rec in open_records {
         let alive = match terminal_pids.get(&rec.terminal_id) {
             Some(&pid) => {
-                let present = claude_present_in_inclusive_subtree(pid, snapshot, rec.opened_at);
+                let present =
+                    claude_present_in_inclusive_subtree(pid, snapshot, primary_boot_unix_millis);
                 if present {
                     accounted.extend(claude_pids_in_inclusive_subtree(pid, snapshot));
                 }
@@ -309,6 +316,7 @@ async fn run_once(
     terminal_manager: &Arc<TerminalManager>,
     store: &Arc<SessionLifecycleStore>,
     session_manager: &Arc<crate::claude_session::SessionManager>,
+    primary_boot_unix_millis: i64,
 ) {
     let snap = crate::process_capture::process_tree::snapshot_process_table_public().await;
     if snap.parent_map.is_empty() {
@@ -340,6 +348,7 @@ async fn run_once(
         &open,
         &terminal_pids,
         &exempt,
+        primary_boot_unix_millis,
         chrono::Utc::now().timestamp_millis(),
     );
 
@@ -378,9 +387,21 @@ pub async fn run_periodic(
     store: Arc<SessionLifecycleStore>,
     session_manager: Arc<crate::claude_session::SessionManager>,
 ) {
+    // Reference instant for the PID-reuse guard: this primary's own boot time
+    // (captured once, at task spawn — effectively boot time), NOT a per-record
+    // `opened_at`. Same idiom as the liveness poll in main.rs; see the doc
+    // comment on `claude_present_in_inclusive_subtree` for the incident
+    // writeup (2026-07-03).
+    let primary_boot_unix_millis = chrono::Utc::now().timestamp_millis();
     tokio::time::sleep(INITIAL_DELAY).await;
     loop {
-        run_once(&terminal_manager, &store, &session_manager).await;
+        run_once(
+            &terminal_manager,
+            &store,
+            &session_manager,
+            primary_boot_unix_millis,
+        )
+        .await;
         tokio::time::sleep(CHECK_INTERVAL).await;
     }
 }
@@ -475,6 +496,7 @@ mod tests {
             &terminal_pids,
             &HashSet::new(),
             now_ms,
+            now_ms,
         );
 
         assert_eq!(report.live_claude_total, 2);
@@ -510,6 +532,7 @@ mod tests {
             &store.open_records(),
             &terminal_pids,
             &HashSet::new(),
+            now_ms,
             now_ms,
         );
 
@@ -554,6 +577,7 @@ mod tests {
             &terminal_pids,
             &HashSet::new(),
             now_ms,
+            now_ms,
         );
 
         assert!(report.is_clean(), "unexpected drift: {report:?}");
@@ -586,12 +610,91 @@ mod tests {
             &HashMap::new(),
             &exempt,
             now_ms,
+            now_ms,
         );
 
         // 40 and its subtree member 41 are exempt; only 50 remains.
         let untracked: Vec<u32> = report.live_untracked.iter().map(|p| p.pid).collect();
         assert_eq!(untracked, vec![50]);
         assert!(report.tracked_dead.is_empty());
+    }
+
+    /// P3 regression (defect 1): a session whose claude process PREDATES its
+    /// record's `opened_at` — a later record opened against an already-running
+    /// terminal (reconnect into an existing pane) — must NOT be classified
+    /// tracked-dead. The PID-reuse reference is the runner primary's own boot
+    /// time; keyed on `opened_at` (the old bug) the guard falsely read the
+    /// older PID as recycled and flipped the live idle session to trackedDead
+    /// (measured live: all 9 trackedDead were this artifact).
+    #[test]
+    fn claude_predating_opened_at_is_not_tracked_dead() {
+        // Boot at 1_000s (1_000_000ms). Shell 5 + claude 10 created at boot
+        // (1_000s). The record against t-5 was opened MUCH later (2_000_000ms).
+        let primary_boot_ms = 1_000_000;
+        let now_ms = 3_000_000;
+        let snap = snap_with(
+            &[(1, &[5]), (5, &[10])],
+            &[(5, 1_000), (10, 1_000)],
+            &[(5, "powershell.exe"), (10, "claude.exe")],
+        );
+        let (store, _dir) = store_with(&[record("sess-reconnect", "t-5", 2_000_000)]);
+        let terminal_pids: HashMap<String, u32> = [("t-5".to_string(), 5)].into_iter().collect();
+
+        let report = evaluate(
+            &snap,
+            1,
+            &store.open_records(),
+            &terminal_pids,
+            &HashSet::new(),
+            primary_boot_ms,
+            now_ms,
+        );
+
+        assert!(
+            report.tracked_dead.is_empty(),
+            "live session falsely tracked-dead: {report:?}"
+        );
+        assert!(report.live_untracked.is_empty());
+        assert!(report.is_clean());
+    }
+
+    /// P3 regression (defect 2): a qontinui path-identity shim — image name
+    /// `claude.exe`, exe path inside a shim dir — must NOT count toward
+    /// `live_claude_total` nor surface as live-untracked, while a real
+    /// `claude.exe` at a non-shim path still does.
+    #[test]
+    fn shim_process_is_not_counted_as_live_claude() {
+        let now_s = chrono::Utc::now().timestamp();
+        let now_ms = now_s * 1000;
+        // Runner (1) → shim claude 20 (shim dir) and real stray claude 30.
+        let mut snap = snap_with(
+            &[(1, &[20, 30])],
+            &[(20, now_s), (30, now_s)],
+            &[(20, "claude.exe"), (30, "claude.exe")],
+        );
+        snap.exe_paths.insert(
+            20,
+            r"C:\Users\x\AppData\Local\Temp\qontinui-identity-t9\claude.exe".to_string(),
+        );
+        snap.exe_paths.insert(
+            30,
+            r"C:\Users\x\AppData\Local\Programs\claude\claude.exe".to_string(),
+        );
+        let (store, _dir) = store_with(&[]);
+
+        let report = evaluate(
+            &snap,
+            1,
+            &store.open_records(),
+            &HashMap::new(),
+            &HashSet::new(),
+            now_ms,
+            now_ms,
+        );
+
+        assert_eq!(report.live_claude_total, 1, "shim excluded from the count");
+        let untracked: Vec<u32> = report.live_untracked.iter().map(|p| p.pid).collect();
+        assert_eq!(untracked, vec![30], "only the REAL claude reports drift");
     }
 
     #[test]
