@@ -1356,8 +1356,10 @@ async fn coord_claims_by_resource_handler(
 
 /// The ONLY coord WRITE routes the nonce-gated device-JWT forwarder may reach:
 /// the two gate writes (plan 2026-06-15-coord-mcp-live-token-write-forwarder,
-/// Phase 1) plus the work-unit registry writes (device-session coord surface
-/// hardening follow-up). The write sibling of [`ClaimsReadTarget`].
+/// Phase 1), the claim-anchored gate register (plan
+/// 2026-07-21-gate-cascade-step3-proxy-rebase, Phase 1b), plus the work-unit
+/// registry writes (device-session coord surface hardening follow-up). The
+/// write sibling of [`ClaimsReadTarget`].
 ///
 /// Every work-unit variant maps to coord's device-JWT `work_units_agent_authed`
 /// sub-router (layered with `require_jwt`, which accepts the device bearer):
@@ -1390,6 +1392,11 @@ enum CoordWriteTarget {
     RegisterPlanGate { slug: String },
     /// `POST {coord}/coord/gates/{gate_id}/attest`
     AttestGate { gate_id: String },
+    /// `POST {coord}/coord/gates/register-agent` — coord's device-authed
+    /// claim-anchored register route (the REST twin of MCP
+    /// `coord_register_gate`). The claim anchor (`claim_kind` +
+    /// `resource_key`) travels in the JSON body; no dynamic path segment.
+    RegisterGate,
     /// `POST {coord}/coord/work-units/upsert` (slug travels in the JSON body;
     /// no dynamic path segment)
     WorkUnitUpsert,
@@ -1428,7 +1435,7 @@ impl CoordWriteTarget {
     /// rejected before any coord URL is built — a bad path can never be smuggled).
     fn validate(&self) -> Result<(), (u16, &'static str, String)> {
         match self {
-            CoordWriteTarget::WorkUnitUpsert => Ok(()),
+            CoordWriteTarget::RegisterGate | CoordWriteTarget::WorkUnitUpsert => Ok(()),
             CoordWriteTarget::RegisterPlanGate { slug }
             | CoordWriteTarget::WorkUnitTransition { slug }
             | CoordWriteTarget::WorkUnitRegisterGate { slug }
@@ -1474,6 +1481,9 @@ fn write_upstream_url(base: &str, target: &CoordWriteTarget) -> String {
         CoordWriteTarget::AttestGate { gate_id } => {
             format!("{base}/coord/gates/{gate_id}/attest")
         }
+        CoordWriteTarget::RegisterGate => {
+            format!("{base}/coord/gates/register-agent")
+        }
         CoordWriteTarget::WorkUnitUpsert => {
             format!("{base}/coord/work-units/upsert")
         }
@@ -1490,12 +1500,15 @@ fn write_upstream_url(base: &str, target: &CoordWriteTarget) -> String {
 }
 
 /// `POST /coord-mcp/gates/register-plan/{slug}` +
+/// `POST /coord-mcp/gates/register` +
 /// `POST /coord-mcp/gates/{gate_id}/attest` +
 /// `POST /coord-mcp/work-units/{upsert | {slug}/transition |
 /// {slug}/register-gate | {slug}/deps}` — the nonce-gated device-JWT WRITE
 /// forwarder for device-provisioned sessions (plan
 /// 2026-06-15-coord-mcp-live-token-write-forwarder, Phase 1; work-unit surface
-/// added by the device-session coord surface hardening follow-up).
+/// added by the device-session coord surface hardening follow-up;
+/// claim-anchored gate register added by plan
+/// 2026-07-21-gate-cascade-step3-proxy-rebase, Phase 1b).
 ///
 /// Why: a device session's `.mcp.json` carries no bearer anymore (live-token
 /// proxy, runner #546) — only the per-session loopback nonce. The plan-ready,
@@ -1719,6 +1732,14 @@ async fn coord_register_plan_gate_handler(
     body: axum::body::Bytes,
 ) -> axum::response::Response {
     coord_write_proxy_handler(CoordWriteTarget::RegisterPlanGate { slug }, headers, body).await
+}
+
+/// `POST /coord-mcp/gates/register` — see [`coord_write_proxy_handler`].
+async fn coord_register_gate_handler(
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    coord_write_proxy_handler(CoordWriteTarget::RegisterGate, headers, body).await
 }
 
 /// `POST /coord-mcp/gates/{gate_id}/attest` — see [`coord_write_proxy_handler`].
@@ -3763,6 +3784,15 @@ pub fn create_router(
             "/coord-mcp/gates/register-plan/{slug}",
             post(coord_register_plan_gate_handler),
         )
+        // Claim-anchored register (plan 2026-07-21-gate-cascade-step3-proxy-rebase
+        // Phase 1b): forwards to coord's device-authed
+        // `POST /coord/gates/register-agent` — the REST twin of MCP
+        // `coord_register_gate`. Claim anchor travels in the body; no dynamic
+        // segment.
+        .route(
+            "/coord-mcp/gates/register",
+            post(coord_register_gate_handler),
+        )
         .route(
             "/coord-mcp/gates/{gate_id}/attest",
             post(coord_attest_gate_handler),
@@ -4544,7 +4574,7 @@ mod coord_claims_proxy_tests {
 #[cfg(test)]
 mod coord_write_proxy_tests {
     use super::{
-        coord_attest_gate_handler, coord_register_plan_gate_handler,
+        coord_attest_gate_handler, coord_register_gate_handler, coord_register_plan_gate_handler,
         coord_work_unit_register_gate_handler, coord_work_unit_set_deps_handler,
         coord_work_unit_transition_handler, coord_work_unit_upsert_handler,
         forward_coord_write_post, gate_id_is_valid, slug_is_valid, write_upstream_url,
@@ -4556,6 +4586,7 @@ mod coord_write_proxy_tests {
     // Concrete route templates (axum 0.8 `{param}` form) registered in the real router.
     const WRITE_ROUTES: &[&str] = &[
         "/coord-mcp/gates/register-plan/{slug}",
+        "/coord-mcp/gates/register",
         "/coord-mcp/gates/{gate_id}/attest",
         "/coord-mcp/work-units/upsert",
         "/coord-mcp/work-units/{slug}/transition",
@@ -4565,6 +4596,7 @@ mod coord_write_proxy_tests {
     // Concrete request paths used to hit those routes in tests.
     const WRITE_REQUEST_PATHS: &[&str] = &[
         "/coord-mcp/gates/register-plan/2026-06-15-some-plan",
+        "/coord-mcp/gates/register",
         "/coord-mcp/gates/123e4567-e89b-12d3-a456-426614174000/attest",
         "/coord-mcp/work-units/upsert",
         "/coord-mcp/work-units/2026-07-03-some-unit/transition",
@@ -4575,11 +4607,12 @@ mod coord_write_proxy_tests {
     fn write_router() -> Router {
         Router::new()
             .route(WRITE_ROUTES[0], post(coord_register_plan_gate_handler))
-            .route(WRITE_ROUTES[1], post(coord_attest_gate_handler))
-            .route(WRITE_ROUTES[2], post(coord_work_unit_upsert_handler))
-            .route(WRITE_ROUTES[3], post(coord_work_unit_transition_handler))
-            .route(WRITE_ROUTES[4], post(coord_work_unit_register_gate_handler))
-            .route(WRITE_ROUTES[5], post(coord_work_unit_set_deps_handler))
+            .route(WRITE_ROUTES[1], post(coord_register_gate_handler))
+            .route(WRITE_ROUTES[2], post(coord_attest_gate_handler))
+            .route(WRITE_ROUTES[3], post(coord_work_unit_upsert_handler))
+            .route(WRITE_ROUTES[4], post(coord_work_unit_transition_handler))
+            .route(WRITE_ROUTES[5], post(coord_work_unit_register_gate_handler))
+            .route(WRITE_ROUTES[6], post(coord_work_unit_set_deps_handler))
     }
 
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {
@@ -4640,6 +4673,12 @@ mod coord_write_proxy_tests {
                 },
             ),
             "https://coord.example.test/coord/gates/123e4567-e89b-12d3-a456-426614174000/attest"
+        );
+        // Claim-anchored register (plan 2026-07-21-gate-cascade-step3-proxy-rebase
+        // Phase 1b): fixed route, no dynamic segment.
+        assert_eq!(
+            write_upstream_url("https://coord.example.test", &CoordWriteTarget::RegisterGate),
+            "https://coord.example.test/coord/gates/register-agent"
         );
         // Work-unit registry forward-list (device-session coord surface
         // hardening follow-up).
@@ -4709,8 +4748,10 @@ mod coord_write_proxy_tests {
         assert_eq!(err.0, 400);
         assert_eq!(err.1, "COORD_WRITE_PROXY_BAD_TARGET");
 
-        // Work-unit targets: upsert carries no segment (always valid); every
-        // slug-carrying variant runs the same charset validation.
+        // Segment-free targets are always valid: the claim-anchored gate
+        // register and the work-unit upsert both carry their payload in the
+        // JSON body — no dynamic segment, no traversal surface.
+        assert!(CoordWriteTarget::RegisterGate.validate().is_ok());
         assert!(CoordWriteTarget::WorkUnitUpsert.validate().is_ok());
         for target in [
             CoordWriteTarget::WorkUnitTransition {
