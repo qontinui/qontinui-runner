@@ -22,6 +22,8 @@ import {
   classifyRestoreAction,
   recordBelongsToRestore,
   reportTreeReset,
+  decideReconnectOutcome,
+  decideColdResume,
 } from "./useTerminalInitialization";
 import type { TerminalSessionRecord } from "./types";
 import type { SessionOpenArgs } from "./sessionRecordArgs";
@@ -291,6 +293,52 @@ describe("claimInitForPage (once-per-pageId guard)", () => {
     expect(claimInitForPage(seen, "page-a")).toBe(false);
     // ...and B is likewise already converged.
     expect(claimInitForPage(seen, "page-b")).toBe(false);
+  });
+});
+
+// P1 restore idempotence, defect (a): `reconnectToExistingSessions` returns
+// `null` ONLY for an INDETERMINATE read (invoke failed / unsuccessful /
+// malformed response) — never for "definitely nothing" (that's `[]`).
+// Coercing null to [] sent every open record down the cold `claude --resume`
+// path while its previous terminal generation was still alive, orphaning a
+// PTY generation per restore pass. null must ABORT the restore.
+describe("decideReconnectOutcome (P1 null → abort-restore)", () => {
+  it("aborts restore when the reconnect result is indeterminate (null)", () => {
+    expect(decideReconnectOutcome(null)).toEqual({ kind: "abort-restore" });
+  });
+
+  it("proceeds on an EMPTY list — a definitive cold start is not an abort", () => {
+    expect(decideReconnectOutcome([])).toEqual({
+      kind: "proceed",
+      reconnectedTabIds: [],
+    });
+  });
+
+  it("proceeds with the reconnected ids when some PTYs survived", () => {
+    expect(decideReconnectOutcome(["t-1", "t-2"])).toEqual({
+      kind: "proceed",
+      reconnectedTabIds: ["t-1", "t-2"],
+    });
+  });
+});
+
+// P1 restore idempotence, defect (b): even after a successful reconnect, a
+// record's session can be alive under a process the reconnect did not return.
+// The cold auto-resume path must consult the live-session registry and NEVER
+// respawn an id that is already hosted — and must fail CLOSED (skip) when the
+// registry could not be read.
+describe("decideColdResume (P1 liveness gate before cold respawn)", () => {
+  it("respawns only when the id is definitively not live", () => {
+    expect(decideColdResume(new Set(["other"]), "sess-1")).toBe("respawn");
+    expect(decideColdResume(new Set(), "sess-1")).toBe("respawn");
+  });
+
+  it("skips (rebind-not-respawn) when a live process already hosts the id", () => {
+    expect(decideColdResume(new Set(["sess-1"]), "sess-1")).toBe("skip-alive");
+  });
+
+  it("fails CLOSED when the registry read failed — unknown liveness never respawns", () => {
+    expect(decideColdResume(null, "sess-1")).toBe("skip-unknown");
   });
 });
 
