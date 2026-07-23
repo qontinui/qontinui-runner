@@ -5,6 +5,7 @@ import { createLogger } from "@/lib/logger";
 import {
   TAB_LIST,
   ACTIVE_TAB_STORAGE_KEY,
+  DEFAULT_TAB_ID,
   isValidTabId,
   type MainTabId,
 } from "@/components/app/tab-types";
@@ -946,7 +947,7 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
 
         case "tabs_list": {
           try {
-            const activeTab = instanceStorage.getItem(ACTIVE_TAB_STORAGE_KEY) ?? "prompt-home";
+            const activeTab = instanceStorage.getItem(ACTIVE_TAB_STORAGE_KEY) ?? DEFAULT_TAB_ID;
             await sendResponse({
               requestId,
               type,
@@ -1012,7 +1013,7 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               });
               return true;
             }
-            const previousTab = instanceStorage.getItem(ACTIVE_TAB_STORAGE_KEY) ?? "prompt-home";
+            const previousTab = instanceStorage.getItem(ACTIVE_TAB_STORAGE_KEY) ?? DEFAULT_TAB_ID;
             // Fire the same event the runner's `useAppNavigation` hook already
             // listens for. This is the exact code path a user click traverses
             // (via the sidebar's `setActiveTab(tab)` -> `ui-bridge-set-tab`),
@@ -1274,7 +1275,7 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
           // a static `primaryActions` list — we just supply the dynamic
           // pieces here (current tab, tab list, components, intents).
           try {
-            const activeTab = instanceStorage.getItem(ACTIVE_TAB_STORAGE_KEY) ?? "prompt-home";
+            const activeTab = instanceStorage.getItem(ACTIVE_TAB_STORAGE_KEY) ?? DEFAULT_TAB_ID;
 
             const tabs = TAB_LIST.map((entry) => ({
               id: entry.id,

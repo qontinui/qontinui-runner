@@ -3,7 +3,7 @@ import type { BridgeSnapshot } from "@qontinui/ui-bridge";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 import { getUIBridgeGlobal } from "./utils";
 import { createLogger } from "@/lib/logger";
-import { ACTIVE_TAB_STORAGE_KEY } from "@/components/app/tab-types";
+import { ACTIVE_TAB_STORAGE_KEY, DEFAULT_TAB_ID } from "@/components/app/tab-types";
 import { instanceStorage } from "@/lib/instance-storage";
 
 const logger = createLogger("UIBridgeDiscoveryEvents");
@@ -203,10 +203,10 @@ export function useDiscoveryEvents(
             // snapshot. The runner's tab system stores its active tab in
             // instanceStorage under `ACTIVE_TAB_STORAGE_KEY` (the same key
             // the `tabs_list` IPC handler reads), so this matches whatever
-            // `tab_activate` last set. Falls back to "prompt-home" — the
+            // `tab_activate` last set. Falls back to `DEFAULT_TAB_ID` — the
             // initial tab the runner shell selects on first launch — when
             // nothing is persisted yet.
-            getActiveTab: () => instanceStorage.getItem(ACTIVE_TAB_STORAGE_KEY) ?? "prompt-home",
+            getActiveTab: () => instanceStorage.getItem(ACTIVE_TAB_STORAGE_KEY) ?? DEFAULT_TAB_ID,
           });
           logger.debug(`get_snapshot: snapshot created (${snapshot.elements.length} elements)`);
 

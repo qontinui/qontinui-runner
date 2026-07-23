@@ -98,7 +98,7 @@ import { autoPopulateCtr, getGlobalCtr } from "@qontinui/ui-bridge/ctr";
 import { getGlobalRegistry } from "@qontinui/ui-bridge";
 
 import { instanceStorage } from "@/lib/instance-storage";
-import { ACTIVE_TAB_STORAGE_KEY, TAB_LIST } from "@/components/app/tab-types";
+import { ACTIVE_TAB_STORAGE_KEY, DEFAULT_TAB_ID, TAB_LIST } from "@/components/app/tab-types";
 import { toTabCanonical } from "@/hooks/ui-bridge-events/utils";
 import { acquireSingletonListener } from "@/hooks/ui-bridge-events/singleton-listener";
 
@@ -874,7 +874,7 @@ function CtrAutoPopulator() {
  *
  * Reads the active tab from `instanceStorage` fresh on each snapshot —
  * do NOT capture `activeTabId` outside the closure. Fallback matches
- * the `tabs_list` IPC handler ("prompt-home" — the first tab the runner
+ * the `tabs_list` IPC handler (`DEFAULT_TAB_ID` — the first tab the runner
  * shell selects on launch).
  */
 function RunnerTabsEnricher() {
@@ -882,7 +882,7 @@ function RunnerTabsEnricher() {
     const registry = getGlobalRegistry();
     if (!registry) return;
     const dispose = registry.registerSnapshotEnricher("runner-tabs", () => {
-      const activeTabId = instanceStorage.getItem(ACTIVE_TAB_STORAGE_KEY) ?? "prompt-home";
+      const activeTabId = instanceStorage.getItem(ACTIVE_TAB_STORAGE_KEY) ?? DEFAULT_TAB_ID;
       const availableTabs = TAB_LIST.map((entry) => ({
         id: entry.id,
         label: entry.label,

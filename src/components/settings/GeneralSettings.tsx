@@ -1,8 +1,12 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Settings as SettingsIcon, FileText } from "lucide-react";
+import { Settings as SettingsIcon, FileText, Layers } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
-import { useAdvancedAutomation } from "@/contexts/AdvancedAutomationContext";
+import {
+  DISCLOSURE_LABELS,
+  useFeatureDisclosure,
+  type FeatureDisclosure,
+} from "@/contexts/FeatureDisclosureContext";
 import type { AppSettings, LogFunction } from "./types";
 
 interface TauriResult<T> {
@@ -39,10 +43,13 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
   // login, so scheduled tasks fire even if the user closed the runner.
   const [autostartEnabled, setAutostartEnabled] = useState<boolean>(false);
 
-  // "Show advanced automation features" — persisted in localStorage via the
-  // AdvancedAutomationContext and consumed reactively by the Sidebar, which
-  // calls setShowHiddenItems() to reveal the workflow-authoring nav items.
-  const { showAdvancedAutomation, setShowAdvancedAutomation } = useAdvancedAutomation();
+  // The two optional feature sets. Persisted in localStorage by
+  // FeatureDisclosureContext and consumed reactively by the Sidebar (which
+  // calls setShowHiddenItems() for "advanced" and gates the AI Dev / Visual
+  // switcher on "visual") and by the Settings sub-nav.
+  const { isEnabled, setEnabled } = useFeatureDisclosure();
+  const showAdvancedAutomation = isEnabled("advanced");
+  const showVisualAutomation = isEnabled("visual");
 
   const loadAppSettings = async () => {
     try {
@@ -146,10 +153,10 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
     }
   };
 
-  const handleToggleShowAdvancedAutomation = () => {
-    const newValue = !showAdvancedAutomation;
-    setShowAdvancedAutomation(newValue);
-    onLog("success", `Advanced automation features ${newValue ? "shown" : "hidden"}`);
+  const handleToggleDisclosure = (disclosure: FeatureDisclosure, current: boolean) => {
+    const newValue = !current;
+    setEnabled(disclosure, newValue);
+    onLog("success", `${DISCLOSURE_LABELS[disclosure]} ${newValue ? "shown" : "hidden"}`);
   };
 
   const handleToggleIncludeSummaryStep = async () => {
@@ -239,11 +246,19 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
         </div>
       </div>
 
-      {/* Workflow Builder Settings */}
+      {/*
+        Optional feature sets. The runner ships two large paradigms alongside
+        its Terminal-first default — the verification-agentic loop workflow and
+        visual GUI automation — and each is revealed here. Turning one on adds
+        its pages to the sidebar AND its panels to this Settings sub-nav; both
+        default off so a session-driven user is not asked to navigate machinery
+        they never use. Nothing is uninstalled either way: every route, tab and
+        settings panel stays reachable by deep-link regardless.
+      */}
       <div className="space-y-4 rounded-lg bg-card/50 p-4">
         <h4 className="font-medium text-sm flex items-center gap-2">
-          <FileText className="w-4 h-4" />
-          Workflow Builder
+          <Layers className="w-4 h-4" />
+          Optional Feature Sets
         </h4>
 
         <div className="space-y-2">
@@ -251,13 +266,16 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
             <div className="space-y-1">
               <div className="text-sm font-medium">Show advanced automation features</div>
               <div className="text-xs text-muted-foreground">
-                Reveals the workflow-authoring tools (Workflow Builder, DAG Editor, Orchestration
-                loop, Step Builders) in the sidebar. The Terminal is the primary way to run AI work;
-                these are advanced surfaces for building reusable, gated, scheduled workflows.
+                Reveals the verification-agentic loop workflow: the Home prompt page, the Active
+                execution dashboard, the Workflow Builder, DAG Editor, Orchestration loop, Step
+                Builders and Specs — plus their settings panels (Advanced AI, Playwright, Execution
+                Variables, Discovery). The Terminal is the primary way to run AI work; these are
+                surfaces for building reusable, gated, scheduled workflows.
               </div>
             </div>
             <button
-              onClick={handleToggleShowAdvancedAutomation}
+              onClick={() => handleToggleDisclosure("advanced", showAdvancedAutomation)}
+              aria-pressed={showAdvancedAutomation}
               className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
                 showAdvancedAutomation ? "bg-primary" : "bg-muted"
               }`}
@@ -272,6 +290,57 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
 
           <label className="flex items-center justify-between cursor-pointer p-3 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
             <div className="space-y-1">
+              <div className="text-sm font-medium">Show visual GUI automation</div>
+              <div className="text-xs text-muted-foreground">
+                Adds the AI Dev / Visual switcher to the top of the sidebar. Switching to Visual
+                swaps the menu to the image-matching, state-machine and device-control surfaces
+                (Dashboard, Execute, Visual GUI) and reveals their settings panels (Self-Healing,
+                Mobile, image-match debugging).
+              </div>
+            </div>
+            <button
+              onClick={() => handleToggleDisclosure("visual", showVisualAutomation)}
+              aria-pressed={showVisualAutomation}
+              className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                showVisualAutomation ? "bg-primary" : "bg-muted"
+              }`}
+            >
+              <span
+                className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                  showVisualAutomation ? "translate-x-4" : "translate-x-1"
+                }`}
+              />
+            </button>
+          </label>
+        </div>
+      </div>
+
+      {/*
+        Workflow Builder defaults — only meaningful once the loop workflow is
+        revealed, so the section follows its disclosure rather than describing a
+        builder the user cannot open.
+
+        Unlike the image-match debug section in AdvancedSettings, this one needs
+        no "…or the setting is on" escape hatch — but for a narrower reason than
+        it looks: `include_summary_step_by_default` currently has NO reader. It
+        appears only in its own getter/setter chain (`settings.rs`,
+        `config_facade.rs`, `commands/config.rs`) and the MCP settings
+        passthrough; nothing in workflow generation or the step builders
+        consults it. So the value cannot strand anything, because it does not
+        do anything yet. If a consumer is ever wired up — the Terminal's
+        "save as workflow" flow is the obvious candidate, and it deliberately
+        opens the builder WITHOUT this disclosure — revisit this gate and apply
+        the union rule the way AdvancedSettings does.
+      */}
+      {showAdvancedAutomation && (
+        <div className="space-y-4 rounded-lg bg-card/50 p-4">
+          <h4 className="font-medium text-sm flex items-center gap-2">
+            <FileText className="w-4 h-4" />
+            Workflow Builder
+          </h4>
+
+          <label className="flex items-center justify-between cursor-pointer p-3 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
+            <div className="space-y-1">
               <div className="text-sm font-medium">Include AI Summary in New Workflows</div>
               <div className="text-xs text-muted-foreground">
                 Automatically add an AI Summary step to the completion phase of new workflows
@@ -279,6 +348,7 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
             </div>
             <button
               onClick={handleToggleIncludeSummaryStep}
+              aria-pressed={includeSummaryStep}
               className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
                 includeSummaryStep ? "bg-primary" : "bg-muted"
               }`}
@@ -290,16 +360,16 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
               />
             </button>
           </label>
-        </div>
 
-        <div className="p-3 bg-primary/5 rounded-lg">
-          <div className="text-xs text-muted-foreground">
-            <strong className="text-foreground">Tip:</strong> The AI Summary step generates a
-            comprehensive summary of your workflow execution, including what was accomplished and
-            any issues encountered. It runs at the end of the completion phase.
+          <div className="p-3 bg-primary/5 rounded-lg">
+            <div className="text-xs text-muted-foreground">
+              <strong className="text-foreground">Tip:</strong> The AI Summary step generates a
+              comprehensive summary of your workflow execution, including what was accomplished and
+              any issues encountered. It runs at the end of the completion phase.
+            </div>
           </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

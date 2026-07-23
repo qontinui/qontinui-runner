@@ -5,7 +5,7 @@
  * Active operations (capture, storage cleanup) have been moved to dedicated tabs.
  */
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import { useUIComponent } from "@qontinui/ui-bridge";
 import { instanceStorage } from "@/lib/instance-storage";
 import { GeneralSettings } from "./GeneralSettings";
@@ -39,9 +39,11 @@ import {
   migrateSettingsSubTab,
   SETTINGS_SUB_TAB_TO_MAIN_TAB,
   SETTINGS_TABS,
+  settingsTabsFor,
   VALID_SETTINGS_TABS,
   type SettingsTab,
 } from "./settings-tabs";
+import { useFeatureDisclosure } from "@/contexts/FeatureDisclosureContext";
 
 interface SettingsProps {
   /** Default tab to open. If provided, overrides instanceStorage persistence. */
@@ -55,6 +57,12 @@ const STORAGE_KEY = "qontinui-settings-active-tab";
 const VALID_TABS = VALID_SETTINGS_TABS;
 
 export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps) {
+  // Which optional feature sets the user has revealed. Drives the sub-nav only:
+  // every panel below stays routable by id whatever this returns, so a
+  // deep-link to a gated panel renders it (with the sub-nav still usable)
+  // rather than bouncing the caller somewhere else.
+  const { isEnabled } = useFeatureDisclosure();
+
   const [activeTab, setActiveTabRaw] = useState<SettingsTab>(() => {
     if (defaultTab && (VALID_TABS as readonly string[]).includes(defaultTab)) {
       return defaultTab as SettingsTab;
@@ -101,6 +109,11 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
   useEffect(() => {
     instanceStorage.setItem(STORAGE_KEY, activeTab);
   }, [activeTab]);
+
+  // Sub-nav buttons: the disclosure-visible set UNION the active tab. The rule
+  // lives in `settings-tabs.ts` so the sidebar's Settings flyout applies the
+  // identical one — see `settingsTabsFor`.
+  const subNavTabs = useMemo(() => settingsTabsFor(isEnabled, activeTab), [isEnabled, activeTab]);
 
   // UI Bridge: Component-level actions for AI control
   useUIComponent({
@@ -152,8 +165,17 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
       {
         id: "list-tabs",
         label: "List available settings tabs",
-        description: "Return the id + label of every settings sub-tab.",
-        handler: () => SETTINGS_TABS.map((t) => ({ id: t.id, label: t.label })),
+        description:
+          "Return the id + label of every settings sub-tab, plus whether it is " +
+          "currently shown in the sub-nav. Gated tabs remain switchable by id.",
+        handler: () =>
+          SETTINGS_TABS.map((t) => ({
+            id: t.id,
+            label: t.label,
+            // Presentation gating only — `switch-tab` accepts every id here.
+            visibleInSubNav: !t.requires || t.requires.some(isEnabled),
+            requiresDisclosure: t.requires ?? null,
+          })),
       },
     ],
   });
@@ -232,12 +254,15 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
         Clicking a button calls our wrapping `setActiveTab` which both flips
         local state AND fires `ui-bridge-set-tab` so the runner's main
         activeTab (the one surfaced at GET /control/tabs) tracks the sub-tab.
+
+        Renders `subNavTabs`, not the whole registry: the loop-workflow and
+        visual-GUI panels only appear once their feature disclosure is on.
       */}
       <nav
         aria-label="Settings sub-tabs"
         className="flex flex-wrap gap-1 border-b border-zinc-700 pb-2"
       >
-        {SETTINGS_TABS.map((tab) => {
+        {subNavTabs.map((tab) => {
           const isActive = activeTab === tab.id;
           return (
             <button

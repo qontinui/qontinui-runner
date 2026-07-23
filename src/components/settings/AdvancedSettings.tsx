@@ -13,6 +13,7 @@ import {
 import { instanceStorage } from "@/lib/instance-storage";
 import { SectionHeader } from "./SectionHeader";
 import { getStatusColors } from "@/design-system";
+import { useFeatureDisclosure } from "@/contexts/FeatureDisclosureContext";
 import type { DebugSettings, LogFunction } from "./types";
 
 interface DeviceInfo {
@@ -33,11 +34,23 @@ interface AdvancedSettingsProps {
 }
 
 export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsProps) {
+  const { isEnabled } = useFeatureDisclosure();
+  const showVisualAutomation = isEnabled("visual");
   const [settings, setSettings] = useState<DebugSettings>({
     enable_image_debug: false,
     top_matches_count: 5,
   });
   const [loading, setLoading] = useState(true);
+  /**
+   * Did we actually learn the backend's debug settings?
+   *
+   * `settings` initialises to `enable_image_debug: false`, so a FAILED load
+   * leaves it indistinguishable from a genuine "off". That matters because the
+   * image-match section below renders on `enable_image_debug` being true — a
+   * failed load would hide the only switch that turns a live debug capture off.
+   * Unknown is not OFF.
+   */
+  const [debugSettingsKnown, setDebugSettingsKnown] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -72,6 +85,7 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
           top_matches_count: result.data.top_matches_count || 5,
         };
         setSettings(loadedSettings);
+        setDebugSettingsKnown(true);
         onLog("debug", "Debug settings loaded");
       } else {
         onLog("warning", "Using default debug settings");
@@ -187,7 +201,7 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
     <div className="space-y-6">
       <SectionHeader
         title="Advanced"
-        description="Developer and debugging options for troubleshooting automation issues. These settings provide detailed diagnostics for image matching."
+        description="Developer and debugging options: device information, terminal backend, and large-session resume behavior."
         icon={<Wrench className="w-6 h-6" />}
       />
 
@@ -207,8 +221,32 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
         </div>
       )}
 
+      {/*
+        Image-match diagnostics are a VISUAL GUI AUTOMATION concern — top match
+        candidates, confidence scores and the Image Recognition Debug tab all
+        belong to the template-matching engine. The rest of this panel (device
+        info, terminal backend, session resume) is core, so only this section
+        follows the "visual" disclosure rather than the whole Debug page.
+
+        `|| settings.enable_image_debug` is the same "visible UNION active" rule
+        the nav surfaces use, applied to a SETTING rather than a page. Hiding a
+        page is harmless because an unvisited page does nothing; hiding a
+        control whose value is ON is not — image debug keeps capturing top-match
+        candidates on every recognition attempt, and the only switch that turns
+        it off would have just disappeared. So the section stays while the
+        setting is engaged, whatever the disclosure says.
+
+        `|| !debugSettingsKnown` matters for the same reason: `settings`
+        initialises to `enable_image_debug: false` and is filled by an async
+        Tauri call. A load that FAILS leaves that default in place, which is
+        indistinguishable from a real "off" — so the rule would hide the
+        off-switch precisely when we cannot prove the capture is stopped.
+        Unknown is not OFF. (The `loading` early-return above means this is
+        about a failed or empty load, not the in-flight window.)
+      */}
+      {(showVisualAutomation || !debugSettingsKnown || settings.enable_image_debug) && (
       <div className="space-y-4 rounded-lg bg-card/50 p-4">
-        <h4 className="font-medium text-sm">Debug</h4>
+        <h4 className="font-medium text-sm">Image Match Debug</h4>
 
         <div className="space-y-2">
           <label className="flex items-center justify-between cursor-pointer p-3 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
@@ -294,6 +332,7 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
           </button>
         </div>
       </div>
+      )}
 
       {/* Device Information Section */}
       <div className="space-y-4 rounded-lg bg-card/50 p-4">

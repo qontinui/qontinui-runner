@@ -1,5 +1,5 @@
 {
-  "description": "General settings tab within the runner Settings panel. Displays application-level preferences for startup behavior and workflow builder defaults. Contains two sections: 'Application' (Auto-load Last Configuration on Startup, Launch on System Startup) and 'Workflow Builder' (Include AI Summary in New Workflows). All three settings are boolean toggle switches that persist via Tauri IPC commands. Toggling uses optimistic UI updates with rollback on failure. The Launch on System Startup toggle is backed by the OS autostart mechanism (Windows Registry Run key, macOS LaunchAgent, Linux .desktop) and reconciles against the actual OS state after each toggle.\n\n# GeneralSettings\n\n_(notes)_",
+  "description": "General settings tab within the runner Settings panel. Displays application-level preferences for startup behavior plus the runner's two optional feature disclosures. Contains 'Application' (Auto-load Last Configuration on Startup, Launch on System Startup) and 'Optional Feature Sets' (Show advanced automation features, Show visual GUI automation), and — only while the advanced disclosure is on — 'Workflow Builder' (Include AI Summary in New Workflows). All settings are boolean toggle switches. The startup and workflow toggles persist via Tauri IPC with optimistic updates and rollback on failure; the two disclosure toggles persist to localStorage and are read reactively by the Sidebar and the Settings sub-nav. The Launch on System Startup toggle is backed by the OS autostart mechanism (Windows Registry Run key, macOS LaunchAgent, Linux .desktop) and reconciles against the actual OS state after each toggle.\n\n# GeneralSettings\n\n_(notes)_",
   "groups": [
     {
       "assertions": [
@@ -57,7 +57,7 @@
         }
       ],
       "category": "element-presence",
-      "description": "The General settings tab renders a SectionHeader with title 'General' and a description, followed by two card sections: 'Application' and 'Workflow Builder'. There are no sub-tabs or nested navigation within this tab.",
+      "description": "The General settings tab renders a SectionHeader with title 'General' and a description, followed by the 'Application' and 'Optional Feature Sets' cards. A third card, 'Workflow Builder', renders only when the advanced disclosure is enabled. There are no sub-tabs or nested navigation within this tab.",
       "id": "gen-page-structure",
       "name": "Page Structure",
       "source": "migrated"
@@ -144,8 +144,68 @@
         {
           "assertionType": "exists",
           "category": "element-presence",
-          "description": "Required element 0 for state Workflow Builder Section",
+          "description": "Required element for state Optional Feature Sets",
           "enabled": true,
+          "id": "gen-feature-disclosure-elem-0",
+          "reviewed": true,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Optional Feature Sets"
+            },
+            "label": "Required element for Optional Feature Sets",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element for state Optional Feature Sets",
+          "enabled": true,
+          "id": "gen-feature-disclosure-elem-1",
+          "reviewed": true,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Show advanced automation features"
+            },
+            "label": "Required element for Optional Feature Sets",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element for state Optional Feature Sets",
+          "enabled": true,
+          "id": "gen-feature-disclosure-elem-2",
+          "reviewed": true,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Show visual GUI automation"
+            },
+            "label": "Required element for Optional Feature Sets",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The 'Optional Feature Sets' card carries the two disclosure toggles that decide how much of the runner is on screen: 'Show advanced automation features' (the verification-agentic loop workflow — Home prompt, Active dashboard, builders, and their settings panels) and 'Show visual GUI automation' (adds the AI Dev / Visual switcher to the sidebar and reveals the image-matching and device panels). Both default OFF and are always rendered.",
+      "id": "gen-feature-disclosure-section",
+      "name": "Optional Feature Sets Section",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Workflow Builder Section",
+          "enabled": false,
           "id": "gen-workflow-builder-section-elem-0",
           "reviewed": false,
           "severity": "critical",
@@ -162,7 +222,7 @@
           "assertionType": "exists",
           "category": "element-presence",
           "description": "Required element 1 for state Workflow Builder Section",
-          "enabled": true,
+          "enabled": false,
           "id": "gen-workflow-builder-section-elem-1",
           "reviewed": false,
           "severity": "critical",
@@ -179,7 +239,7 @@
           "assertionType": "exists",
           "category": "element-presence",
           "description": "Required element 2 for state Workflow Builder Section",
-          "enabled": true,
+          "enabled": false,
           "id": "gen-workflow-builder-section-elem-2",
           "reviewed": false,
           "severity": "critical",
@@ -194,7 +254,7 @@
         }
       ],
       "category": "element-presence",
-      "description": "The 'Workflow Builder' card contains one toggle row: 'Include AI Summary in New Workflows'. A FileText icon appears next to the section heading. A tip banner explains that the AI Summary step runs at the end of the completion phase.",
+      "description": "The 'Workflow Builder' card contains the 'Include AI Summary in New Workflows' toggle and an explanatory tip. It follows the advanced disclosure so it never describes a builder the user cannot open.",
       "id": "gen-workflow-builder-section",
       "name": "Workflow Builder Section",
       "source": "migrated"
@@ -351,7 +411,7 @@
           "assertionType": "exists",
           "category": "element-presence",
           "description": "Required element 0 for state Include AI Summary Toggle Behavior",
-          "enabled": true,
+          "enabled": false,
           "id": "gen-summary-step-behavior-elem-0",
           "reviewed": false,
           "severity": "critical",
@@ -368,7 +428,7 @@
           "assertionType": "exists",
           "category": "element-presence",
           "description": "Required element 1 for state Include AI Summary Toggle Behavior",
-          "enabled": true,
+          "enabled": false,
           "id": "gen-summary-step-behavior-elem-1",
           "reviewed": false,
           "severity": "critical",
@@ -385,7 +445,7 @@
           "assertionType": "exists",
           "category": "element-presence",
           "description": "Required element 2 for state Include AI Summary Toggle Behavior",
-          "enabled": true,
+          "enabled": false,
           "id": "gen-summary-step-behavior-elem-2",
           "reviewed": false,
           "severity": "critical",

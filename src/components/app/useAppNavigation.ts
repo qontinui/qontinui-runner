@@ -8,11 +8,13 @@ import type { MainTabId } from "./tab-types";
 import type { ProductivityView } from "@/components/productivity/types";
 import {
   ACTIVE_TAB_STORAGE_KEY,
-  migrateTabId,
   resolveExternalTabId,
   setActiveTabAndPersist,
   SIDEBAR_COLLAPSED_KEY,
 } from "./tab-types";
+import { resolveLandingTab } from "./landing-tab";
+import { useFeatureDisclosure } from "@/contexts/FeatureDisclosureContext";
+import { useProductMode } from "@/contexts/ProductModeContext";
 import { useNavigation } from "./NavigationContext";
 
 export const PAGE_TO_TAB: Record<string, MainTabId> = {
@@ -123,20 +125,88 @@ export function useAppNavigation(): UseAppNavigationReturn {
   const isApiReady = useApiReady();
   const { registerNavigate } = useNavigation();
 
-  const [activeTab, setActiveTab] = useState<MainTabId>(() => {
-    // Phase 1 (pop-out terminal windows): a window opened with the
-    // `?view=terminal` boot hint renders the Terminal page directly and
-    // ignores the shared persisted active-tab (which is the main window's).
+  const { isEnabled } = useFeatureDisclosure();
+  // The EFFECTIVE mode (already pinned to "ai" while the visual disclosure is
+  // off). The landing decision must model the sidebar that will actually
+  // render, so it takes the same value `Sidebar` filters with.
+  const { mode: productMode } = useProductMode();
+
+  /**
+   * True for a window opened with the `?view=terminal` boot hint (Phase 1,
+   * pop-out terminal windows). Such a window renders the Terminal directly and
+   * ignores the shared persisted active-tab, which belongs to the main window.
+   *
+   * Resolved ONCE into state rather than re-parsed at each use: it guards both
+   * the initial tab and the API-port reconciliation below, and the two must
+   * agree — re-deriving it in two places is how the pop-out contract would get
+   * half-honoured.
+   */
+  const [isTerminalPopout] = useState(() => {
     try {
-      if (new URLSearchParams(window.location.search).get("view") === "terminal") {
-        return "terminal";
-      }
+      return new URLSearchParams(window.location.search).get("view") === "terminal";
     } catch {
-      /* non-DOM / parse failure — fall through to the persisted tab */
+      // non-DOM / parse failure — treat as a normal window
+      return false;
     }
-    const stored = instanceStorage.getItem("qontinui-main-active-tab");
-    return migrateTabId(stored);
   });
+
+  const [activeTab, setActiveTab] = useState<MainTabId>(() => {
+    if (isTerminalPopout) return "terminal";
+    const stored = instanceStorage.getItem(ACTIVE_TAB_STORAGE_KEY);
+    // Not `migrateTabId`: a persisted tab that still EXISTS but is currently
+    // behind a feature disclosure is not somewhere to open on. See
+    // `resolveLandingTab`.
+    return resolveLandingTab(stored, {
+      advanced: isEnabled("advanced"),
+      visual: isEnabled("visual"),
+      productMode,
+    });
+  });
+
+  /**
+   * Has anything deliberately set the tab since mount?
+   *
+   * The API-port reconciliation below needs to know "did the user navigate
+   * yet?", and it used to infer that from `activeTab === DEFAULT_TAB_ID`. That
+   * inference was safe only while the default was a page nobody lands on
+   * deliberately. With `terminal` as the default it is false in both directions:
+   * a `?view=terminal` pop-out starts there by contract, and Terminal is now the
+   * single most likely first click — either would be silently overwritten by the
+   * main window's persisted tab. Track the fact instead of inferring it.
+   */
+  const hasNavigatedRef = useRef(false);
+
+  /**
+   * The ONE setter every deliberate navigation goes through — the sidebar, the
+   * UI Bridge listeners, the Tauri events, and `TabContent`'s own
+   * `setActiveTab` prop (this is what the hook returns). Wrapping the setter
+   * rather than calling a `markNavigated()` at each of the ten call sites means
+   * a future navigation path cannot forget to mark itself and silently become
+   * clobberable by the reconciliation above.
+   */
+  const activeTabRef = useRef(activeTab);
+  const setActiveTabTracked = useCallback((tab: MainTabId) => {
+    // A set to the tab we are ALREADY on is not a navigation. `Settings.tsx`
+    // mirrors its `defaultTab` prop back through `ui-bridge-set-tab` on mount,
+    // which lands here — so without this guard, merely RENDERING a settings
+    // panel arms the ref and tells the reconciliation below that the user has
+    // navigated. On a temp runner that means it never adopts its own
+    // port-namespaced tab. The ref must mean "the user navigated", not
+    // "something dispatched a tab event".
+    if (tab === activeTabRef.current) {
+      setActiveTab(tab);
+      return;
+    }
+    activeTabRef.current = tab;
+    hasNavigatedRef.current = true;
+    setActiveTab(tab);
+  }, []);
+
+  // Keep the mirror honest for sets that bypass the wrapper (the reconciliation
+  // below, and the initial state).
+  useEffect(() => {
+    activeTabRef.current = activeTab;
+  }, [activeTab]);
 
   // Feed the active tab into the UI Bridge navigation tracker as the canonical
   // route signal. The runner doesn't use react-router or history.pushState, so
@@ -174,14 +244,14 @@ export function useAppNavigation(): UseAppNavigationReturn {
   // One-shot reconciliation: when the API port finalises (it can resolve
   // *after* this hook mounts on temp/spawned runners), the initial mount-time
   // read of `instanceStorage` may have hit the wrong namespace and defaulted
-  // to "prompt-home". Once `isApiReady` flips true and the port is settled,
+  // to DEFAULT_TAB_ID. Once `isApiReady` flips true and the port is settled,
   // re-read storage ONCE to pick up the correct value.
   //
   // Critically this must NOT clobber a deliberate live state change. If the
   // user (or a Tauri event, or a UI Bridge command) has already navigated
-  // away from "prompt-home" before isApiReady fires, that live state wins —
-  // we only reconcile when our in-memory state is still the default
-  // ("prompt-home") and storage now has a different (real) persisted value.
+  // away from the landing tab before isApiReady fires, that live state wins —
+  // we only reconcile when our in-memory state is still the default and
+  // storage now has a different (real) persisted value.
   // Without this guard, isApiReady flipping (e.g. after a transient health
   // probe failure) would yank the user back to whatever's stored.
   const hasReconciledApiPortRef = useRef(false);
@@ -190,18 +260,19 @@ export function useAppNavigation(): UseAppNavigationReturn {
     if (getApiPort() === 9876) return;
     if (hasReconciledApiPortRef.current) return;
     hasReconciledApiPortRef.current = true;
+    // A pop-out terminal window has no business adopting the main window's tab.
+    if (isTerminalPopout) return;
+    // A deliberate navigation in the gap between mount and isApiReady=true wins.
+    if (hasNavigatedRef.current) return;
     const stored = instanceStorage.getItem(ACTIVE_TAB_STORAGE_KEY);
-    const correct = migrateTabId(stored);
-    // Only adopt the storage value if our current state is still the mount
-    // default AND storage actually contains a real (non-null) value. This
-    // prevents wiping a deliberate navigation that happened in the gap
-    // between mount and isApiReady=true.
-    setActiveTab((current) => {
-      if (current !== "prompt-home") return current;
-      if (stored === null) return current;
-      return correct;
+    if (stored === null) return;
+    const correct = resolveLandingTab(stored, {
+      advanced: isEnabled("advanced"),
+      visual: isEnabled("visual"),
+      productMode,
     });
-  }, [isApiReady]);
+    setActiveTab(correct);
+  }, [isApiReady, isEnabled, isTerminalPopout, productMode]);
 
   // When a `productivity-*` alias is requested, the main tab is `productivity`
   // but the sub-view (plans/coordinator/knowledge) needs to be surfaced to the
@@ -262,18 +333,18 @@ export function useAppNavigation(): UseAppNavigationReturn {
     registerNavigate((page: string) => {
       const tabId = PAGE_TO_TAB[page];
       if (tabId) {
-        setActiveTabAndPersist(setActiveTab, instanceStorage, tabId);
+        setActiveTabAndPersist(setActiveTabTracked, instanceStorage, tabId);
         dispatchProductivitySubView(page);
       }
     });
-  }, [registerNavigate, dispatchProductivitySubView]);
+  }, [registerNavigate, dispatchProductivitySubView, setActiveTabTracked]);
 
   useEffect(() => {
     const handler = (e: WindowEventMap["ui-bridge-navigate"]) => {
       const { page } = e.detail;
       const tabId = PAGE_TO_TAB[page];
       if (tabId) {
-        setActiveTabAndPersist(setActiveTab, instanceStorage, tabId);
+        setActiveTabAndPersist(setActiveTabTracked, instanceStorage, tabId);
         dispatchProductivitySubView(page);
       }
     };
@@ -290,7 +361,7 @@ export function useAppNavigation(): UseAppNavigationReturn {
         );
         return;
       }
-      setActiveTabAndPersist(setActiveTab, instanceStorage, tabId);
+      setActiveTabAndPersist(setActiveTabTracked, instanceStorage, tabId);
     };
     window.addEventListener("ui-bridge-navigate", handler);
     window.addEventListener("ui-bridge-set-tab", directHandler as EventListener);
@@ -298,7 +369,7 @@ export function useAppNavigation(): UseAppNavigationReturn {
       window.removeEventListener("ui-bridge-navigate", handler);
       window.removeEventListener("ui-bridge-set-tab", directHandler as EventListener);
     };
-  }, [dispatchProductivitySubView]);
+  }, [dispatchProductivitySubView, setActiveTabTracked]);
 
   // Tauri-native listener for the `ui-bridge:activate-tab` event emitted by
   // `POST /ui-bridge/control/activate-tab/{tab_id}`. This is intentionally
@@ -325,7 +396,7 @@ export function useAppNavigation(): UseAppNavigationReturn {
           );
           return;
         }
-        setActiveTabAndPersist(setActiveTab, instanceStorage, tabId);
+        setActiveTabAndPersist(setActiveTabTracked, instanceStorage, tabId);
       });
     };
 
@@ -334,7 +405,7 @@ export function useAppNavigation(): UseAppNavigationReturn {
     return () => {
       if (unlisten) unlisten();
     };
-  }, []);
+  }, [setActiveTabTracked]);
 
   useEffect(() => {
     let unlisten: (() => void) | null = null;
@@ -349,7 +420,7 @@ export function useAppNavigation(): UseAppNavigationReturn {
         const { page } = event.payload;
         const tabId = PAGE_TO_TAB[page];
         if (tabId) {
-          setActiveTabAndPersist(setActiveTab, instanceStorage, tabId);
+          setActiveTabAndPersist(setActiveTabTracked, instanceStorage, tabId);
           if (page === "state-machine") {
             setTimeout(() => window.dispatchEvent(new Event("sm-show-exploration")), 200);
           }
@@ -367,7 +438,7 @@ export function useAppNavigation(): UseAppNavigationReturn {
         unlisten();
       }
     };
-  }, [dispatchProductivitySubView]);
+  }, [dispatchProductivitySubView, setActiveTabTracked]);
 
   useEffect(() => {
     const handleNavigateToErrorMonitor = (
@@ -375,20 +446,20 @@ export function useAppNavigation(): UseAppNavigationReturn {
     ) => {
       const { taskRunId, taskRunName } = e.detail ?? {};
       setErrorMonitorScope({ taskRunId, taskRunName });
-      setActiveTabAndPersist(setActiveTab, instanceStorage, "error-monitor");
+      setActiveTabAndPersist(setActiveTabTracked, instanceStorage, "error-monitor");
     };
     window.addEventListener("navigate-to-error-monitor", handleNavigateToErrorMonitor);
     return () =>
       window.removeEventListener("navigate-to-error-monitor", handleNavigateToErrorMonitor);
-  }, []);
+  }, [setActiveTabTracked]);
 
   useEffect(() => {
     const handleNavigateToActive = () => {
-      setActiveTabAndPersist(setActiveTab, instanceStorage, "active");
+      setActiveTabAndPersist(setActiveTabTracked, instanceStorage, "active");
     };
     window.addEventListener("navigate-to-active", handleNavigateToActive);
     return () => window.removeEventListener("navigate-to-active", handleNavigateToActive);
-  }, []);
+  }, [setActiveTabTracked]);
 
   useEffect(() => {
     let unlisten: (() => void) | null = null;
@@ -482,7 +553,7 @@ export function useAppNavigation(): UseAppNavigationReturn {
         const path = raw.split(/[?#]/)[0];
         const tabId = PAGE_TO_TAB[path];
         if (tabId) {
-          setActiveTabAndPersist(setActiveTab, instanceStorage, tabId);
+          setActiveTabAndPersist(setActiveTabTracked, instanceStorage, tabId);
           dispatchProductivitySubView(path);
           return;
         }
@@ -495,7 +566,7 @@ export function useAppNavigation(): UseAppNavigationReturn {
           console.warn(`[useAppNavigation] navigateHandler: no tab for path "${url}" — ignoring`);
           return;
         }
-        setActiveTabAndPersist(setActiveTab, instanceStorage, direct);
+        setActiveTabAndPersist(setActiveTabTracked, instanceStorage, direct);
       };
     }
     return () => {
@@ -506,11 +577,11 @@ export function useAppNavigation(): UseAppNavigationReturn {
         delete g2.navigateHandler;
       }
     };
-  }, [setActiveTab, dispatchProductivitySubView]);
+  }, [setActiveTabTracked, dispatchProductivitySubView]);
 
   return {
     activeTab,
-    setActiveTab,
+    setActiveTab: setActiveTabTracked,
     sidebarCollapsed,
     handleSidebarCollapsedChange,
     terminalSessionCount,

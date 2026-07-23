@@ -3,7 +3,7 @@ import ReactDOM from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { setDevelopmentMode } from "@qontinui/navigation";
 import { ProductModeProvider } from "./contexts/ProductModeContext";
-import { AdvancedAutomationProvider } from "./contexts/AdvancedAutomationContext";
+import { FeatureDisclosureProvider } from "./contexts/FeatureDisclosureContext";
 import App from "./App";
 import ErrorBoundary from "./ErrorBoundary";
 import { setScriptEmitter, TauriScriptEmitter } from "./lib/step-output-handlers/script-emitter";
@@ -52,11 +52,17 @@ if (!rootElement) {
   const tree = (
     <QueryClientProvider client={queryClient}>
       <ErrorBoundary>
-        <ProductModeProvider>
-          <AdvancedAutomationProvider>
+        {/*
+          FeatureDisclosureProvider wraps ProductModeProvider, not the other
+          way round: the effective product mode is DERIVED from the "visual"
+          disclosure (mode is pinned to "ai" while it is off), so the
+          disclosure state has to be in scope when the mode is computed.
+        */}
+        <FeatureDisclosureProvider>
+          <ProductModeProvider>
             <App />
-          </AdvancedAutomationProvider>
-        </ProductModeProvider>
+          </ProductModeProvider>
+        </FeatureDisclosureProvider>
       </ErrorBoundary>
     </QueryClientProvider>
   );
