@@ -479,13 +479,15 @@ struct Assembled {
 ///
 /// ## Why this reads a CACHED census
 ///
-/// [`census::build_census`] is a multi-minute walk (~400 worktrees under the
-/// workspace root, ~10 `git` spawns per row plus recursive sizing of every
-/// non-junctioned `node_modules`/`target`). Running it inline per request made
-/// this endpoint hang for the whole walk. It now reads the snapshot the
-/// periodic census task publishes, and REPORTS ITS AGE — never presenting a
-/// stale snapshot as live. Removal still re-checks live disk
-/// ([`execute_targets`]), so a stale snapshot can never authorize a deletion.
+/// The census walk ([`census::build_and_publish`]) can take hours (thousands
+/// of worktrees under the workspace root, ~10 `git` spawns per row plus
+/// recursive sizing of every non-junctioned `node_modules`/`target`). Running
+/// it inline per request made this endpoint hang for the whole walk. It now
+/// reads the snapshot the census task publishes — upsert-merged per chunk
+/// while a walk is in flight, replaced on walk completion — and REPORTS ITS
+/// AGE, never presenting a stale snapshot as live. Removal still re-checks
+/// live disk ([`execute_targets`]), so a stale snapshot can never authorize a
+/// deletion.
 ///
 /// ## Always answers
 ///
