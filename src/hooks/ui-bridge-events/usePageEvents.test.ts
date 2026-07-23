@@ -27,6 +27,21 @@ describe("checkEvaluateBlocklist", () => {
     });
   });
 
+  describe("history.go reload synonyms are blocked, navigation is not", () => {
+    it.each(["history.go(0)", "history.go()", "history.go( 0 )"])(
+      "rejects %s",
+      (expr) => {
+        expect(checkEvaluateBlocklist(expr, false)).not.toBeNull();
+      },
+    );
+    it.each(["history.go(-1)", "history.go(1)", "history.back()"])(
+      "allows %s",
+      (expr) => {
+        expect(checkEvaluateBlocklist(expr, false)).toBeNull();
+      },
+    );
+  });
+
   describe("location reads still pass", () => {
     it.each([
       "location.pathname",

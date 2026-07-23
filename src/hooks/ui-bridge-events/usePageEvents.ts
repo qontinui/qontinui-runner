@@ -93,6 +93,7 @@ const structuralPatterns = [
   /\bwindow\.location\.(assign|replace|reload)\b/, // redirect / reload
   /\bwindow\.location\s*=/, // redirect via assignment
   /\blocation\.(assign|replace|reload)\b/, // bare redirect / reload
+  /\bhistory\.go\s*\(\s*0?\s*\)/, // history.go(0) / go() — reload synonyms; go(±n) stays allowed
   /\blocation\s*=\s*["'`]/, // redirect via bare assignment
   /\bcrypto\.subtle\b/, // key material access
 ];
@@ -466,7 +467,8 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
           try {
             // SECURITY: gate the expression through the module-level
             // blocklist (see `checkEvaluateBlocklist` above for the
-            // patterns and per-entry rationale).
+            // patterns and per-entry rationale). `=== true` is deliberate:
+            // only a literal boolean from the wire relaxes network blocks.
             const matched = checkEvaluateBlocklist(expression, allowNetworkRequests === true);
             if (matched) {
               throw new Error(
