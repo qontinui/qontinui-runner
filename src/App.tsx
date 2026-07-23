@@ -546,7 +546,7 @@ function AppContent() {
   // retries — in which case AuthProvider keeps re-probing in the background and
   // this screen flips on its own if the runner turns out to be signed in.
   if (gate === "login") {
-    return <LoginScreen />;
+    return <LoginScreen storeUnreadable={auth.authStatus?.store_unreadable === true} />;
   }
 
   const lastRunId = lastRun?.id;

@@ -13,7 +13,7 @@
 
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { LogIn, AlertCircle, Loader2 } from "lucide-react";
+import { LogIn, AlertCircle, Loader2, RotateCcw } from "lucide-react";
 import { createLogger } from "@/lib/logger";
 
 const log = createLogger("LoginScreen");
@@ -37,9 +37,18 @@ type CognitoSignInResponse = {
  */
 type CognitoProvider = "Google" | "MicrosoftEntra" | "GitHub";
 
-export function LoginScreen() {
+/**
+ * @param storeUnreadable - `true` when the runner's on-disk credential store is
+ *   present but undecryptable (a machine rename / disk move / re-image
+ *   invalidated its hostname+username-derived key). The Rust read side fails
+ *   closed to this screen; the banner explains why and offers a one-click reset
+ *   (`reset_credential_store`) so a fresh sign-in can write cleanly.
+ */
+export function LoginScreen({ storeUnreadable = false }: { storeUnreadable?: boolean }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  // Reset-credential-store affordance (only shown when `storeUnreadable`).
+  const [resetting, setResetting] = useState(false);
   // Inline email/password (direct Cognito InitiateAuth — no browser).
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -47,9 +56,7 @@ export function LoginScreen() {
   // Which Hosted-UI sign-in is in flight: a federated provider, "qontinui"
   // (the native chooser/email screen), or null. Disables the other buttons and
   // shows a per-button spinner.
-  const [pending, setPending] = useState<CognitoProvider | "qontinui" | null>(
-    null
-  );
+  const [pending, setPending] = useState<CognitoProvider | "qontinui" | null>(null);
 
   /**
    * Start a Hosted-UI Cognito sign-in. `provider` jumps straight into a
@@ -57,9 +64,7 @@ export function LoginScreen() {
    * "Sign in with Qontinui" chooser/email path (param omitted server-side).
    */
   const handleSignIn = async (provider?: CognitoProvider) => {
-    log.debug(
-      `handleSignIn(${provider ?? "qontinui"}) called — starting Cognito PKCE sign-in`
-    );
+    log.debug(`handleSignIn(${provider ?? "qontinui"}) called — starting Cognito PKCE sign-in`);
     setLoading(true);
     setPending(provider ?? "qontinui");
     setError("");
@@ -105,6 +110,29 @@ export function LoginScreen() {
     }
   };
 
+  /**
+   * Delete the corrupt on-disk credential store, then re-probe auth. The Rust
+   * `reset_credential_store` command removes the undecryptable `.enc`; dispatching
+   * `runner-tier-changed` makes AuthProvider re-run `check_auth_status` so the
+   * banner clears (and, if a valid keychain token self-heals a fresh store, the
+   * screen leaves without a manual sign-in).
+   */
+  const handleResetStore = async () => {
+    log.debug("handleResetStore() called — deleting corrupt credential store");
+    setResetting(true);
+    setError("");
+    try {
+      await invoke("reset_credential_store");
+      log.debug("Credential store reset — re-probing auth");
+      window.dispatchEvent(new CustomEvent("runner-tier-changed"));
+    } catch (err) {
+      log.error("Reset credential store failed:", err);
+      setError(typeof err === "string" ? err : String(err));
+    } finally {
+      setResetting(false);
+    }
+  };
+
   return (
     <div className="min-h-screen bg-background grid-dots flex items-center justify-center p-6">
       <div className="w-full max-w-md space-y-8">
@@ -121,9 +149,58 @@ export function LoginScreen() {
 
         {/* Sign-in Card */}
         <div className="card p-8 space-y-6 glow-cyan">
+          {/* Corrupt-credential-store banner. Shown when the on-disk store is
+              present but undecryptable (e.g. this machine was renamed / the
+              install was moved). The read side fails closed to this screen, so
+              without this the operator sees an unexplained sign-in prompt AND —
+              before the paired-with fix — could not complete a sign-in at all.
+              Resetting deletes the dead store so a fresh sign-in writes cleanly. */}
+          {storeUnreadable && (
+            <div
+              id="credential-store-corrupt"
+              data-testid="credential-store-corrupt"
+              role="alert"
+              aria-live="assertive"
+              className="space-y-3 p-3 bg-amber-500/10 border border-amber-500/50 rounded-lg animate-slideDown"
+            >
+              <div className="flex items-start gap-2">
+                <AlertCircle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
+                <div className="space-y-1">
+                  <p className="text-sm font-semibold text-foreground">
+                    Your credential store is corrupt
+                  </p>
+                  <p className="text-sm text-muted-foreground">
+                    The saved credentials on this machine can no longer be read — this usually
+                    happens after the computer was renamed or the install was moved. Reset the store
+                    to sign in again.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => void handleResetStore()}
+                disabled={resetting || loading || pwLoading}
+                data-testid="reset-credential-store"
+                className="w-full btn-secondary py-2.5 text-sm font-semibold flex items-center justify-center gap-2"
+              >
+                {resetting ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    <span>Resetting…</span>
+                  </>
+                ) : (
+                  <>
+                    <RotateCcw className="w-4 h-4" />
+                    <span>Reset credential store</span>
+                  </>
+                )}
+              </button>
+            </div>
+          )}
+
           <p className="text-sm text-muted-foreground text-center">
-            Sign in with your Qontinui account. A secure browser window opens to
-            complete authentication, then returns you here.
+            Sign in with your Qontinui account. A secure browser window opens to complete
+            authentication, then returns you here.
           </p>
 
           {/* Error Message */}
@@ -241,10 +318,7 @@ export function LoginScreen() {
             }}
           >
             <div className="space-y-1">
-              <label
-                htmlFor="email"
-                className="block text-sm font-medium text-foreground"
-              >
+              <label htmlFor="email" className="block text-sm font-medium text-foreground">
                 Email
               </label>
               <input
@@ -260,10 +334,7 @@ export function LoginScreen() {
               />
             </div>
             <div className="space-y-1">
-              <label
-                htmlFor="password"
-                className="block text-sm font-medium text-foreground"
-              >
+              <label htmlFor="password" className="block text-sm font-medium text-foreground">
                 Password
               </label>
               <input
@@ -328,12 +399,7 @@ export function LoginScreen() {
 /** Google "G" brand mark (multi-color), used on the social sign-in button. */
 function GoogleIcon({ className }: { className?: string }) {
   return (
-    <svg
-      className={className}
-      viewBox="0 0 24 24"
-      aria-hidden="true"
-      focusable="false"
-    >
+    <svg className={className} viewBox="0 0 24 24" aria-hidden="true" focusable="false">
       <path
         fill="#4285F4"
         d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.27-4.74 3.27-8.1Z"
@@ -357,12 +423,7 @@ function GoogleIcon({ className }: { className?: string }) {
 /** Microsoft four-square brand mark, used on the social sign-in button. */
 function MicrosoftIcon({ className }: { className?: string }) {
   return (
-    <svg
-      className={className}
-      viewBox="0 0 24 24"
-      aria-hidden="true"
-      focusable="false"
-    >
+    <svg className={className} viewBox="0 0 24 24" aria-hidden="true" focusable="false">
       <path fill="#F25022" d="M2 2h9.5v9.5H2z" />
       <path fill="#7FBA00" d="M12.5 2H22v9.5h-9.5z" />
       <path fill="#00A4EF" d="M2 12.5h9.5V22H2z" />

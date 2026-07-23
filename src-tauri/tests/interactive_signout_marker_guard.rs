@@ -51,8 +51,27 @@ use std::path::{Path, PathBuf};
 /// background refresher can never clear the marker through it.
 const PERSIST_PAIRING_DEFINITION: &str = "pair.rs";
 
-/// Modules that must NEVER clear the marker (background credential writers).
-const MUST_NOT_CLEAR: &[&str] = &["pair.rs", "mcp/device_jwt_refresher.rs"];
+/// The ONLY production files allowed to reference `clear_interactive_signed_out`
+/// — an ALLOWLIST, not a blocklist. Two are the definition sites (the
+/// `SecureStorage` method and its `AuthManager` wrapper); the other three are
+/// the explicit, user/agent-initiated pairing call sites. Any OTHER production
+/// file that clears the marker is a regression.
+///
+/// This is inverted from the old static blocklist (`["pair.rs",
+/// "mcp/device_jwt_refresher.rs"]`) on purpose: a blocklist only catches the two
+/// modules someone thought to name, so a NEW background-refresher helper in a
+/// fresh module could clear the marker undetected. A subset-of-allowlist check
+/// fails closed — any new caller must be added here (and justified) before it
+/// compiles green.
+const CLEAR_ALLOWLIST: &[&str] = &[
+    // Definition sites (plumbing, not a background-reachable clear).
+    "secure_storage.rs",
+    "auth.rs",
+    // Explicit, user/agent-initiated credential acquisition (the only callers).
+    "commands/auth.rs",
+    "commands/web_integration.rs",
+    "bin/qontinui_profile.rs",
+];
 
 const CLEAR_CALL: &str = "clear_interactive_signed_out";
 const PERSIST_CALL: &str = "persist_pairing(";
@@ -97,31 +116,46 @@ fn every_pairing_path_clears_the_interactive_signout_marker() {
 }
 
 #[test]
-fn background_credential_writers_never_clear_the_marker() {
+fn only_allowlisted_sites_clear_the_interactive_signout_marker() {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut offenders: Vec<String> = Vec::new();
-    for rel in MUST_NOT_CLEAR {
-        let path = src.join(rel);
+
+    // The allowlist must not rot: every named file must still exist.
+    for rel in CLEAR_ALLOWLIST {
         assert!(
-            path.exists(),
-            "guarded file src/{rel} no longer exists — update MUST_NOT_CLEAR"
+            src.join(rel).exists(),
+            "allowlisted file src/{rel} no longer exists — update CLEAR_ALLOWLIST"
         );
-        let text = read(&path);
+    }
+    let allow: std::collections::BTreeSet<&str> = CLEAR_ALLOWLIST.iter().copied().collect();
+
+    let mut files = Vec::new();
+    collect_rs(&src, &mut files);
+    files.sort();
+
+    let mut offenders: Vec<String> = Vec::new();
+    for file in &files {
+        let rel = rel_path(&src, file);
+        let text = read(file);
         if production_lines(&text)
             .iter()
             .any(|l| l.contains(CLEAR_CALL))
+            && !allow.contains(rel.as_str())
         {
-            offenders.push((*rel).to_string());
+            offenders.push(rel);
         }
     }
 
     assert!(
         offenders.is_empty(),
-        "\nThese modules are reached by the BACKGROUND device-JWT refresher, which\n\
-         rewrites the credential slots on every cycle. Clearing the interactive\n\
-         sign-out marker there silently un-logs-out the operator minutes after they\n\
-         logged out — the exact auto-logout behaviour the marker exists to prevent.\n\
-         Clear it at the explicit, user-initiated pairing call site instead.\n\n\
+        "\nThese files clear the interactive sign-out marker but are NOT on the\n\
+         allowlist. Clearing the marker anywhere the BACKGROUND device-JWT refresher\n\
+         can reach silently un-logs-out the operator minutes after they logged out —\n\
+         the exact auto-logout behaviour the marker exists to prevent. The marker may\n\
+         be cleared ONLY at an explicit, user/agent-initiated credential acquisition\n\
+         (Cognito sign-in, pair-code redeem, CLI `device pair`).\n\n\
+         If this is a genuinely explicit new call site, add it to CLEAR_ALLOWLIST in\n\
+         this test WITH a justifying comment. If it is a background writer, remove the\n\
+         clear.\n\n\
          Offending files:\n{}\n",
         offenders
             .iter()
@@ -158,9 +192,16 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Lines that are production code: not inside a `#[cfg(test)]` region (tracked
-/// by brace depth, same approach as `coord_schema_authorship.rs`) and not a
-/// comment.
-fn production_lines(text: &str) -> Vec<&str> {
+/// by brace depth, same approach as `coord_schema_authorship.rs`) and with
+/// comments stripped.
+///
+/// Comment stripping matters because both directions match with `.contains()`:
+/// a trailing `// … persist_pairing( …` or `// … clear_interactive_signed_out`
+/// would otherwise false-satisfy the check (a comment mentioning the call reads
+/// as making the call). Full-line comments (`//`-leading and `*`-leading
+/// block-comment continuations) are dropped entirely; inline `/* … */` and
+/// trailing `//` comments are stripped from otherwise-code lines.
+fn production_lines(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut depth: i32 = 0;
     let mut pending_cfg_test = false;
@@ -169,16 +210,21 @@ fn production_lines(text: &str) -> Vec<&str> {
 
     for raw in text.lines() {
         let trimmed = raw.trim_start();
-        let is_comment = trimmed.starts_with("//") || trimmed.starts_with('*');
+        // Whole-line comment: a `//` line/doc comment, or a `*`-leading
+        // continuation line of a `/* … */` block comment (incl. the closing
+        // `*/`).
+        let is_comment_line = trimmed.starts_with("//") || trimmed.starts_with('*');
 
-        if !is_comment && trimmed.starts_with("#[cfg(test)]") {
+        if !is_comment_line && trimmed.starts_with("#[cfg(test)]") {
             pending_cfg_test = true;
         }
 
-        if !cfg_test_active && !is_comment {
-            out.push(raw);
+        if !cfg_test_active && !is_comment_line {
+            out.push(strip_inline_comments(raw));
         }
 
+        // Brace accounting stays on the raw line (unchanged from before), so
+        // `#[cfg(test)]` region detection is not perturbed by comment stripping.
         let opens = raw.matches('{').count() as i32;
         let closes = raw.matches('}').count() as i32;
         if pending_cfg_test && opens > 0 {
@@ -192,4 +238,26 @@ fn production_lines(text: &str) -> Vec<&str> {
         }
     }
     out
+}
+
+/// Remove single-line `/* … */` block comments and a trailing `// …` line
+/// comment from a code line. Naive (does not account for `//` or `/*` inside
+/// string literals) — sufficient for this file-level heuristic guard, and the
+/// two matched tokens (`persist_pairing(`, `clear_interactive_signed_out`) never
+/// appear inside a string literal in this codebase.
+fn strip_inline_comments(line: &str) -> String {
+    let mut s = line.to_string();
+    // Strip single-line block comments first, so a `/* // */`-style construct
+    // doesn't leave a spurious `//` behind.
+    while let (Some(a), Some(b)) = (s.find("/*"), s.find("*/")) {
+        if b >= a + 2 {
+            s.replace_range(a..b + 2, " ");
+        } else {
+            break;
+        }
+    }
+    if let Some(idx) = s.find("//") {
+        s.truncate(idx);
+    }
+    s
 }
