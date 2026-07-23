@@ -556,6 +556,14 @@ async fn health(
         // populated only when unauthenticated (incl. the gh-not-installed
         // case). /health never blocks on the probe.
         "prCredential": pr_credential_health(),
+        // Session-fabric Phase 0: how each proxied coord call resolved the
+        // caller's own coord agent_session_id, since this process booted.
+        // coord sees only "header present / absent" — this is the ONLY place
+        // the break point in `nonce → workdir → task_run_id → session_id` is
+        // knowable, so read it here before concluding the arm is off.
+        // `no_task_run` climbing is EXPECTED for interactive/sniffed sessions
+        // (they carry no worktree), not a defect.
+        "selfId": self_id_health_snapshot(),
         "ai": {
             "configured": ai_configured,
             "running": ai_running,
@@ -686,24 +694,129 @@ async fn drain_handler(
 /// the body + non-hop-by-hop request headers, return coord's status + headers
 /// + body bytes verbatim. Generic header passthrough keeps us correct if coord
 /// ever adds SSE negotiation headers, but no streaming machinery is built.
+/// Which link of the caller-self resolution chain produced the answer
+/// (session-fabric Phase 0). Every variant except [`SelfIdOutcome::Injected`]
+/// means coord will fall back to its fuzzy `recent_session_for_device` guess —
+/// and, crucially, coord CANNOT tell them apart: from its side every one of
+/// them looks identical (`coord_self_id_header_total{state="absent"}`). The
+/// runner is the only place the break point is knowable, so it is counted here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelfIdOutcome {
+    /// The header was sent.
+    Injected,
+    /// An agent-spawn session — out of scope by design; those carry their own
+    /// scoped identity.
+    NonDevicePrincipal,
+    /// No `X-Coord-Mcp-Proxy-Key` on the request.
+    NoNonce,
+    /// The nonce is not in the live binding map.
+    NoWorkdir,
+    /// The workdir matched no worktree-carrying session. THE EXPECTED OUTCOME
+    /// FOR INTERACTIVE/SNIFFED SESSIONS: `task_run_id_for_workdir` skips every
+    /// session whose `worktree()` is `None`, so a terminal the operator opened
+    /// by hand can never resolve. Seeing this climb is not a bug report.
+    NoTaskRun,
+    /// The session has no coord `agent_session_id` yet — the registrar has not
+    /// registered it. Transient for a freshly-spawned session.
+    NoSession,
+}
+
+impl SelfIdOutcome {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Injected => "injected",
+            Self::NonDevicePrincipal => "non_device_principal",
+            Self::NoNonce => "no_nonce",
+            Self::NoWorkdir => "no_workdir",
+            Self::NoTaskRun => "no_task_run",
+            Self::NoSession => "no_session",
+        }
+    }
+
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Injected,
+        Self::NonDevicePrincipal,
+        Self::NoNonce,
+        Self::NoWorkdir,
+        Self::NoTaskRun,
+        Self::NoSession,
+    ];
+}
+
+/// Per-outcome counters, in declaration order of [`SelfIdOutcome::ALL`].
+fn self_id_counters() -> &'static [std::sync::atomic::AtomicU64; 6] {
+    static COUNTERS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; 6]> =
+        std::sync::OnceLock::new();
+    COUNTERS.get_or_init(Default::default)
+}
+
+fn record_self_id_outcome(outcome: SelfIdOutcome) {
+    let idx = SelfIdOutcome::ALL
+        .iter()
+        .position(|o| *o == outcome)
+        .unwrap_or(0);
+    self_id_counters()[idx].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Snapshot of the self-id chain counters for `GET /health`.
+pub(crate) fn self_id_health_snapshot() -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    for (i, outcome) in SelfIdOutcome::ALL.iter().enumerate() {
+        obj.insert(
+            outcome.label().to_string(),
+            serde_json::json!(self_id_counters()[i].load(Ordering::Relaxed)),
+        );
+    }
+    serde_json::Value::Object(obj)
+}
+
 /// Resolve the calling terminal's coord `agent_session_id` for the caller-self
 /// header (session-fabric Phase 0). Bridges the only thing the proxy knows —
 /// the per-session nonce — back to a coord session id:
 /// `nonce → workdir → task_run_id → coord agent_session_id`. Every link is
-/// best-effort; a break anywhere returns `None` (the caller then omits the
-/// header and coord keeps its fuzzy fallback — today's behavior). Pure lookups,
-/// no I/O beyond the in-memory maps + a `canonicalize` in the workdir match.
-fn resolve_caller_session_id(state: &Arc<ApiState>, nonce: Option<&str>) -> Option<uuid::Uuid> {
-    let nonce = nonce?;
-    let workdir = crate::coord_mcp::workdir_for_nonce(nonce)?;
-    let session_manager = state
+/// best-effort; a break anywhere yields `None` (the caller then omits the
+/// header and coord keeps its fuzzy fallback), and the break point is reported
+/// as a [`SelfIdOutcome`] so the chain is diagnosable from `GET /health`
+/// instead of by reading the runner's process memory.
+///
+/// Not memoized. The one expensive hop — `task_run_id_for_workdir`'s
+/// per-session `canonicalize` — no longer holds the session-manager lock across
+/// its syscalls (it snapshots under the lock and canonicalizes lock-free), so
+/// running the chain per call costs a handful of lock-free stats before a
+/// network round-trip to coord — cheap enough to not warrant a cache. A memo
+/// keyed on the nonce would ALSO be unsound: a persistent DEVICE nonce is built
+/// to outlive its session, so a cached `nonce → session_id` would misattribute
+/// a *new* session that reused the same on-disk nonce + workdir. Recomputing
+/// every call reads the live session set and is always correct.
+fn resolve_caller_session_id(
+    state: &Arc<ApiState>,
+    nonce: Option<&str>,
+) -> (Option<uuid::Uuid>, SelfIdOutcome) {
+    let Some(nonce) = nonce else {
+        return (None, SelfIdOutcome::NoNonce);
+    };
+    let Some(workdir) = crate::coord_mcp::workdir_for_nonce(nonce) else {
+        return (None, SelfIdOutcome::NoWorkdir);
+    };
+    let Some(session_manager) = state
         .app_handle
-        .try_state::<Arc<crate::claude_session::SessionManager>>()?;
-    let task_run_id = session_manager.task_run_id_for_workdir(&workdir)?;
-    let registrar = state
+        .try_state::<Arc<crate::claude_session::SessionManager>>()
+    else {
+        return (None, SelfIdOutcome::NoTaskRun);
+    };
+    let Some(task_run_id) = session_manager.task_run_id_for_workdir(&workdir) else {
+        return (None, SelfIdOutcome::NoTaskRun);
+    };
+    let Some(registrar) = state
         .app_handle
-        .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()?;
-    registrar.session_id_for(&task_run_id)
+        .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()
+    else {
+        return (None, SelfIdOutcome::NoSession);
+    };
+    match registrar.session_id_for(&task_run_id) {
+        Some(sid) => (Some(sid), SelfIdOutcome::Injected),
+        None => (None, SelfIdOutcome::NoSession),
+    }
 }
 
 async fn coord_mcp_proxy_handler(
@@ -852,19 +965,32 @@ async fn coord_mcp_proxy_handler(
 
     // Session-fabric Phase 0: resolve the calling terminal's OWN coord
     // agent_session_id so coord self-identifies the caller deterministically
-    // instead of guessing the device's most-recent session. Flag-gated
-    // (COORD_SESSION_SELF_ID=observe); DEVICE principal only — agent-spawn
-    // sessions carry their own scoped identity and are out of scope here.
-    // Best-effort: any missing link (unknown workdir / un-promoted session /
-    // unregistered coord session) yields None ⇒ the header is omitted and coord
-    // falls back to its fuzzy pick (today's behavior).
-    let caller_session_id: Option<uuid::Uuid> = if crate::coord_mcp::session_self_id_enabled()
-        && matches!(&principal, crate::coord_mcp::ProxyPrincipal::Device)
-    {
-        resolve_caller_session_id(&state, nonce.as_deref())
-    } else {
-        None
-    };
+    // instead of guessing the device's most-recent session. DEVICE principal
+    // only — agent-spawn sessions carry their own scoped identity and are out
+    // of scope here. Best-effort: any missing link yields None ⇒ the header is
+    // omitted and coord falls back to its fuzzy pick.
+    //
+    // DELIBERATELY UNGATED on the runner side. This used to also require
+    // `COORD_SESSION_SELF_ID=observe` in the RUNNER's process env, which made
+    // the feature un-armable in practice: a runner snapshots its environment at
+    // launch, fleet policy forbids restarting an active runner, and so the flag
+    // could be correct on disk and absent in-process indefinitely — which is
+    // exactly what kept Phase 0 inert from the day it shipped until it was
+    // measured on 2026-07-22. coord's own `COORD_SESSION_SELF_ID` is now the
+    // single arm: it decides whether to HONOR the header, and it is IaC, so a
+    // flip needs a deploy rather than a runner restart. Sending unconditionally
+    // is safe because the header is advisory — coord trusts it only after
+    // `session_on_device` proves device binding (fail-closed), the JWT remains
+    // the authorization boundary, and the strip of any CLIENT-supplied copy
+    // below is likewise unconditional, so no client can spoof a sibling
+    // session's identity.
+    let (caller_session_id, self_id_outcome) =
+        if matches!(&principal, crate::coord_mcp::ProxyPrincipal::Device) {
+            resolve_caller_session_id(&state, nonce.as_deref())
+        } else {
+            (None, SelfIdOutcome::NonDevicePrincipal)
+        };
+    record_self_id_outcome(self_id_outcome);
 
     // Shared client: connect fast-fail, generous overall timeout (coord MCP
     // tool calls can legitimately run long).
@@ -4282,6 +4408,55 @@ pub async fn start_server(
 /// the `forward_claims_get` seam against a local mock coord with a synthetic
 /// bearer — covering live-bearer injection, verbatim query forwarding, and
 /// verbatim status+body passthrough including non-200 upstream verdicts.
+#[cfg(test)]
+mod self_id_chain_tests {
+    use super::{self_id_health_snapshot, SelfIdOutcome};
+
+    #[test]
+    fn every_outcome_has_a_distinct_label() {
+        let labels: Vec<&str> = SelfIdOutcome::ALL.iter().map(|o| o.label()).collect();
+        let mut sorted = labels.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            labels.len(),
+            "duplicate self-id outcome label — the /health series would collide: {labels:?}"
+        );
+        assert_eq!(SelfIdOutcome::ALL.len(), 6);
+    }
+
+    #[test]
+    fn health_snapshot_renders_every_series() {
+        // A missing series reads as "this break never happens", which is the
+        // ambiguity the whole counter family exists to remove — so every
+        // outcome must be present even at zero.
+        let snap = self_id_health_snapshot();
+        let obj = snap.as_object().expect("selfId snapshot must be an object");
+        for outcome in SelfIdOutcome::ALL {
+            assert!(
+                obj.contains_key(outcome.label()),
+                "GET /health selfId is missing the `{}` series",
+                outcome.label()
+            );
+        }
+        assert_eq!(obj.len(), SelfIdOutcome::ALL.len());
+    }
+
+    #[test]
+    fn injected_is_the_only_success_outcome() {
+        // coord cannot distinguish these: from its side every non-Injected
+        // outcome is an identical `absent`. Guards against a future variant
+        // being added as a second "success" without the header actually going.
+        let successes: Vec<&str> = SelfIdOutcome::ALL
+            .iter()
+            .filter(|o| matches!(o, SelfIdOutcome::Injected))
+            .map(|o| o.label())
+            .collect();
+        assert_eq!(successes, vec!["injected"]);
+    }
+}
+
 #[cfg(test)]
 mod coord_claims_proxy_tests {
     use super::{

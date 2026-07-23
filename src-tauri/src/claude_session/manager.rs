@@ -157,6 +157,9 @@ impl SessionManager {
         removed
     }
 
+    // (helper `worktree_path_matches` lives at module scope below so it is
+    // unit-testable without constructing a `ClaudeSession`.)
+
     /// Resolve the `task_run_id` of the active `ClaudeSession` whose isolated
     /// worktree checkout is `workdir` (session-fabric Phase 0 self-identification).
     ///
@@ -172,17 +175,27 @@ impl SessionManager {
     /// active sessions (bounded by the operator's live terminal count).
     pub fn task_run_id_for_workdir(&self, workdir: &str) -> Option<String> {
         let target_canon = std::fs::canonicalize(workdir).ok();
-        let guard = self.sessions.lock().ok()?;
-        for (task_run_id, session) in guard.iter() {
-            let Some(wt) = session.worktree() else {
-                continue;
-            };
-            let matches = wt.path.to_string_lossy() == workdir
-                || target_canon
-                    .as_deref()
-                    .is_some_and(|tc| std::fs::canonicalize(&wt.path).ok().as_deref() == Some(tc));
-            if matches {
-                return Some(task_run_id.clone());
+        // Snapshot (task_run_id, worktree path) pairs under the lock, then do
+        // the filesystem `canonicalize` comparisons AFTER releasing it. This
+        // runs on every proxied coord_* call (session-fabric Phase 0 caller
+        // self-identification), and holding `sessions` across O(live sessions)
+        // `canonicalize` syscalls would serialize all session management behind
+        // proxy traffic. The snapshot is cheap (clone of a String + PathBuf per
+        // worktree-carrying session); the syscalls happen lock-free.
+        let candidates: Vec<(String, std::path::PathBuf)> = {
+            let guard = self.sessions.lock().ok()?;
+            guard
+                .iter()
+                .filter_map(|(task_run_id, session)| {
+                    session
+                        .worktree()
+                        .map(|wt| (task_run_id.clone(), wt.path.clone()))
+                })
+                .collect()
+        };
+        for (task_run_id, path) in candidates {
+            if worktree_path_matches(&path, workdir, target_canon.as_deref()) {
+                return Some(task_run_id);
             }
         }
         None
@@ -458,6 +471,27 @@ impl SessionManager {
     }
 }
 
+/// Does a session's worktree `path` identify `workdir`? A fast literal-string
+/// compare first (the common case — the proxy provisions the nonce into the
+/// exact stored path), then a canonical-path fallback for symlink/8.3/case
+/// differences. `target_canon` is `canonicalize(workdir)` computed once by the
+/// caller so it is not repeated per session. Pure and lock-free by design so
+/// `task_run_id_for_workdir` can run it outside the `sessions` lock and so it
+/// is unit-testable without a live `ClaudeSession`.
+fn worktree_path_matches(
+    path: &std::path::Path,
+    workdir: &str,
+    target_canon: Option<&std::path::Path>,
+) -> bool {
+    if path.to_string_lossy() == workdir {
+        return true;
+    }
+    match target_canon {
+        Some(tc) => std::fs::canonicalize(path).ok().as_deref() == Some(tc),
+        None => false,
+    }
+}
+
 impl Default for SessionManager {
     fn default() -> Self {
         Self::new()
@@ -553,5 +587,53 @@ mod tests {
         mgr.register_worker(w).expect("register");
         assert!(mgr.find_worker_by_terminal_id("unrelated-term").is_none());
         assert!(mgr.find_worker_by_terminal_id("").is_none());
+    }
+
+    #[test]
+    fn worktree_path_matches_on_exact_string_without_touching_fs() {
+        // The common path: the stored worktree path is byte-identical to the
+        // workdir the proxy provisioned. Must match on the string alone, so a
+        // `None` target_canon (canonicalize failed / not computed) is
+        // irrelevant — no filesystem access is required for a hit.
+        let p = std::path::Path::new("D:/qontinui-root/agent-worktrees/abc/qontinui-runner");
+        assert!(worktree_path_matches(
+            p,
+            "D:/qontinui-root/agent-worktrees/abc/qontinui-runner",
+            None
+        ));
+    }
+
+    #[test]
+    fn worktree_path_matches_rejects_a_different_path() {
+        // Distinct paths, and no canonical target to fall back on ⇒ no match.
+        // This is the worktree-less / wrong-session case that must resolve to
+        // None so coord keeps its fuzzy fallback rather than misattributing.
+        let p = std::path::Path::new("D:/qontinui-root/agent-worktrees/abc/qontinui-runner");
+        assert!(!worktree_path_matches(
+            p,
+            "D:/qontinui-root/agent-worktrees/XYZ/qontinui-runner",
+            None
+        ));
+    }
+
+    #[test]
+    fn worktree_path_matches_canonical_fallback_on_a_real_dir() {
+        // When the strings differ, an equal *canonical* form still matches.
+        // Use the temp dir (a real path) reached two ways: itself, and itself
+        // + "/." — different strings, identical canonicalization.
+        let base = std::env::temp_dir();
+        let dotted = base.join(".");
+        let target_canon = std::fs::canonicalize(&base).ok();
+        assert!(
+            target_canon.is_some(),
+            "temp dir must canonicalize for this test to be meaningful"
+        );
+        // `dotted` as the stored session path, `base` as the query workdir:
+        // strings differ (trailing "/."), canonical forms match.
+        assert!(worktree_path_matches(
+            &dotted,
+            &base.to_string_lossy(),
+            target_canon.as_deref()
+        ));
     }
 }
