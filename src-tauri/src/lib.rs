@@ -27,6 +27,15 @@ pub mod runner_breadcrumb;
 pub mod schema_export;
 pub mod tauri_event_payloads;
 
+// Temp-file-then-rename writer. Declared in BOTH the lib and the runner bin
+// (same file, like `process_helpers` / `coord_doctor`) because
+// `secure_storage` — which compiles into both crates — needs it: the encrypted
+// token store MUST be written atomically, or a reader racing the device-JWT
+// refresher's ~5-minute rewrite sees a truncated file and reports the store
+// corrupt (which, with the fail-closed sign-out marker, reads as a logout the
+// operator never performed).
+pub mod fs_atomic;
+
 // Exposed for the `qontinui_profile device pair` CLI (and any other binary
 // that needs the encrypted token store outside the Tauri runtime). Both
 // modules are Tauri-free.

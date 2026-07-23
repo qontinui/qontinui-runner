@@ -303,21 +303,82 @@ impl SecureStorage {
         Ok(tokens)
     }
 
-    /// Saves tokens to encrypted storage.
+    /// Saves tokens to encrypted storage — ATOMICALLY (temp file + rename).
+    ///
+    /// This must never be a plain `fs::write`. That is truncate-then-write, so
+    /// a reader racing a writer can observe a zero-length or half-written file;
+    /// `decrypt` then bails with "Invalid encrypted data: too short" and the
+    /// caller sees a corrupt store that never existed. The device-JWT refresher
+    /// rewrites this file roughly every 5 minutes, so that race is not
+    /// theoretical, and a crash or power loss mid-write makes it DURABLE.
+    ///
+    /// That matters more since [`Self::is_interactive_signed_out`] fails CLOSED
+    /// on an unreadable-but-present store: a torn write would be read as "the
+    /// operator logged out" and bounce them to the LoginScreen — a brand-new
+    /// automatic logout manufactured by the guard against automatic logouts.
+    /// The fail-closed posture is only sound because this write is atomic.
+    ///
+    /// `atomic_write` is the same helper `settings.rs` and `claude_accounts.rs`
+    /// use (temp file → fsync → rename; `MoveFileExW` with
+    /// `MOVEFILE_REPLACE_EXISTING` on Windows, so the swap is atomic on NTFS
+    /// just like POSIX rename).
     fn save_tokens(&self, tokens: &StoredTokens) -> Result<()> {
         let json = serde_json::to_vec(tokens).context("Failed to serialize tokens")?;
 
         let encrypted = self.encrypt(&json)?;
 
-        fs::write(&self.storage_path, encrypted).context("Failed to write storage file")?;
+        crate::fs_atomic::atomic_write(&self.storage_path, &encrypted)
+            .context("Failed to write storage file")?;
 
         debug!("Saved tokens to secure storage");
         Ok(())
     }
 
+    /// `true` iff the store file EXISTS but cannot be read/decrypted/parsed.
+    ///
+    /// The discriminator between "first run" (absent → a blank store is the
+    /// correct starting point) and "corrupt / wrong-machine key" (present but
+    /// unreadable → every slot is unknown, and pretending it is blank destroys
+    /// credentials). [`Self::load_tokens`] returns `Ok(default)` for the
+    /// former and `Err` only for the latter.
+    pub fn is_present_but_unreadable(&self) -> bool {
+        self.store_file_exists() && self.load_tokens().is_err()
+    }
+
+    /// Loads the current store for a read-modify-write, REFUSING to fabricate a
+    /// blank one over a present-but-unreadable file.
+    ///
+    /// Every writer here is read-modify-write: it loads the whole struct,
+    /// changes one slot, and saves it back. `load_tokens().unwrap_or_default()`
+    /// therefore turned any transient or permanent read failure into a silent
+    /// wipe of EVERY OTHER SLOT — including `oauth_refresh_token`, the only
+    /// credential the device-JWT refresher can self-recover from — while
+    /// returning `Ok(())`. The worst shape was `clear_interactive_signed_out`
+    /// on a successful sign-in destroying all credentials and reporting
+    /// success.
+    ///
+    /// Mirrors the posture `AuthManager::get_access_token` already takes: a
+    /// malformed-but-present store is never overwritten, so the corruption is
+    /// surfaced (and left intact for forensics) rather than masked.
+    fn load_tokens_for_write(&self) -> Result<StoredTokens> {
+        match self.load_tokens() {
+            Ok(tokens) => Ok(tokens),
+            Err(e) if self.store_file_exists() => Err(anyhow::anyhow!(
+                "secure storage at {} is present but unreadable ({e}); refusing to overwrite it \
+                 — a blank rewrite would destroy every other credential slot (including the \
+                 Cognito refresh token that keeps autonomous sessions running). Delete the file \
+                 to re-pair from scratch.",
+                self.storage_path.display()
+            )),
+            // File genuinely absent (raced away between the two checks): a
+            // fresh store is the correct starting point.
+            Err(_) => Ok(StoredTokens::default()),
+        }
+    }
+
     /// Stores both access and refresh tokens.
     pub fn store_tokens(&self, access_token: &str, refresh_token: &str) -> Result<()> {
-        let mut tokens = self.load_tokens().unwrap_or_default();
+        let mut tokens = self.load_tokens_for_write()?;
         tokens.access_token = Some(access_token.to_string());
         tokens.refresh_token = Some(refresh_token.to_string());
         self.save_tokens(&tokens)?;
@@ -351,6 +412,13 @@ impl SecureStorage {
     /// device JWT and will park until an interactive re-login. Use
     /// [`Self::clear_interactive_session`] for a default logout that should
     /// keep autonomy alive.
+    ///
+    /// The ONE writer that deliberately keeps `unwrap_or_default()` instead of
+    /// [`Self::load_tokens_for_write`]: destroying every credential slot IS the
+    /// operation, so an unreadable store must not block it. `device_id` is the
+    /// only thing lost relative to a readable run, and it is a regenerable local
+    /// identifier, not a credential. (Every other writer refuses, because for
+    /// them a blank rewrite is silent credential loss, not the point.)
     pub fn clear_tokens(&self) -> Result<()> {
         let mut tokens = self.load_tokens().unwrap_or_default();
         tokens.access_token = None;
@@ -390,7 +458,7 @@ impl SecureStorage {
     /// runner's autonomous terminal sessions running. Contrast with
     /// [`Self::clear_tokens`], which wipes everything.
     pub fn clear_interactive_session(&self) -> Result<()> {
-        let mut tokens = self.load_tokens().unwrap_or_default();
+        let mut tokens = self.load_tokens_for_write()?;
         tokens.access_token = None;
         tokens.refresh_token = None;
         // oauth_* slots, device_id, and the long-lived autonomy machine keys
@@ -428,6 +496,14 @@ impl SecureStorage {
     ///
     /// The cost of failing closed is a sign-in prompt on a corrupted store,
     /// which is recoverable; the cost of failing open is an unrevocable logout.
+    ///
+    /// THIS POSTURE DEPENDS ON [`Self::save_tokens`] BEING ATOMIC. Failing
+    /// closed is only sound because an unreadable store means genuine
+    /// corruption. Under the old plain `fs::write` (truncate-then-write) a
+    /// reader racing the device-JWT refresher's ~5-minute rewrite could observe
+    /// a zero-length file, and this branch would have manufactured exactly the
+    /// automatic logout the marker exists to prevent. If `save_tokens` ever
+    /// stops being atomic, this must stop failing closed.
     pub fn is_interactive_signed_out(&self) -> bool {
         match self.load_tokens() {
             Ok(t) => t.interactive_signed_out,
@@ -453,7 +529,7 @@ impl SecureStorage {
     /// pair-code redeem, CLI `device pair`) once the acquisition has actually
     /// been persisted — see the `interactive_signed_out` field docs.
     pub fn clear_interactive_signed_out(&self) -> Result<()> {
-        let mut tokens = self.load_tokens().unwrap_or_default();
+        let mut tokens = self.load_tokens_for_write()?;
         tokens.interactive_signed_out = false;
         self.save_tokens(&tokens)?;
         debug!("Interactive sign-out marker cleared (user signed back in)");
@@ -462,7 +538,7 @@ impl SecureStorage {
 
     /// Stores the device ID.
     pub fn store_device_id(&self, device_id: &str) -> Result<()> {
-        let mut tokens = self.load_tokens().unwrap_or_default();
+        let mut tokens = self.load_tokens_for_write()?;
         tokens.device_id = Some(device_id.to_string());
         self.save_tokens(&tokens)?;
         info!("Device ID stored in secure file storage: {}", device_id);
@@ -509,7 +585,7 @@ impl SecureStorage {
         refresh_token: &str,
         expires_at: i64,
     ) -> Result<()> {
-        let mut tokens = self.load_tokens().unwrap_or_default();
+        let mut tokens = self.load_tokens_for_write()?;
         tokens.oauth_access_token = Some(access_token.to_string());
         tokens.oauth_id_token = Some(id_token.to_string());
         tokens.oauth_refresh_token = Some(refresh_token.to_string());
@@ -552,7 +628,7 @@ impl SecureStorage {
     /// Clears only the Cognito (oauth) token slots, leaving the device-JWT
     /// slot intact. Used on Cognito sign-out.
     pub fn clear_oauth_tokens(&self) -> Result<()> {
-        let mut tokens = self.load_tokens().unwrap_or_default();
+        let mut tokens = self.load_tokens_for_write()?;
         tokens.oauth_access_token = None;
         tokens.oauth_id_token = None;
         tokens.oauth_refresh_token = None;
@@ -572,7 +648,7 @@ impl SecureStorage {
         &self,
         nonces: &std::collections::HashMap<String, String>,
     ) -> Result<()> {
-        let mut tokens = self.load_tokens().unwrap_or_default();
+        let mut tokens = self.load_tokens_for_write()?;
         tokens.coord_mcp_nonces = nonces.clone();
         self.save_tokens(&tokens)?;
         Ok(())
@@ -592,7 +668,7 @@ impl SecureStorage {
     /// (`mk_<token>`). Minted ONCE by the enroll endpoint; overwrites any
     /// prior key. Leaves all other slots untouched.
     pub fn store_agent_machine_key(&self, key: &str) -> Result<()> {
-        let mut tokens = self.load_tokens().unwrap_or_default();
+        let mut tokens = self.load_tokens_for_write()?;
         tokens.agent_machine_key = Some(key.to_string());
         self.save_tokens(&tokens)?;
         info!("env-agent machine key stored in secure file storage");
@@ -610,7 +686,7 @@ impl SecureStorage {
     /// Clear the dev-environment capture agent's per-machine API key, leaving
     /// all other slots intact. Used when re-enrolling or unenrolling.
     pub fn clear_agent_machine_key(&self) -> Result<()> {
-        let mut tokens = self.load_tokens().unwrap_or_default();
+        let mut tokens = self.load_tokens_for_write()?;
         tokens.agent_machine_key = None;
         self.save_tokens(&tokens)?;
         info!("env-agent machine key cleared from secure file storage");
@@ -637,7 +713,7 @@ impl SecureStorage {
     /// Store (or overwrite) the device JWT for one tenant binding. Leaves the
     /// legacy `access_token` slot and every other slot untouched.
     pub fn store_tenant_device_jwt(&self, tenant_id: &uuid::Uuid, jwt: &str) -> Result<()> {
-        let mut tokens = self.load_tokens().unwrap_or_default();
+        let mut tokens = self.load_tokens_for_write()?;
         tokens
             .tenant_device_jwts
             .insert(Self::tenant_device_jwt_key(tenant_id), jwt.to_string());
@@ -660,7 +736,7 @@ impl SecureStorage {
     /// Remove one tenant's device-JWT slot, leaving all other slots (incl.
     /// the legacy `access_token`) intact. Idempotent.
     pub fn clear_tenant_device_jwt(&self, tenant_id: &uuid::Uuid) -> Result<()> {
-        let mut tokens = self.load_tokens().unwrap_or_default();
+        let mut tokens = self.load_tokens_for_write()?;
         tokens
             .tenant_device_jwts
             .remove(&Self::tenant_device_jwt_key(tenant_id));
@@ -689,7 +765,7 @@ impl SecureStorage {
     /// any prior key. Leaves all other slots untouched. Mirror of
     /// [`Self::store_agent_machine_key`].
     pub fn store_device_machine_key(&self, key: &str) -> Result<()> {
-        let mut tokens = self.load_tokens().unwrap_or_default();
+        let mut tokens = self.load_tokens_for_write()?;
         tokens.device_machine_key = Some(key.to_string());
         self.save_tokens(&tokens)?;
         info!("device machine key stored in secure file storage");
@@ -709,7 +785,7 @@ impl SecureStorage {
     /// Used on revocation / re-issue. Mirror of
     /// [`Self::clear_agent_machine_key`].
     pub fn clear_device_machine_key(&self) -> Result<()> {
-        let mut tokens = self.load_tokens().unwrap_or_default();
+        let mut tokens = self.load_tokens_for_write()?;
         tokens.device_machine_key = None;
         self.save_tokens(&tokens)?;
         info!("device machine key cleared from secure file storage");
@@ -951,6 +1027,144 @@ mod tests {
             "a PRESENT but unreadable store must fail CLOSED (report signed out) so a \
              keychain-backed credential cannot resurrect an ended session"
         );
+    }
+
+    /// A write must never expose a truncated store to a concurrent reader.
+    ///
+    /// `save_tokens` used a plain `fs::write` (truncate-then-write). The
+    /// device-JWT refresher rewrites this file about every 5 minutes, and
+    /// `is_interactive_signed_out` FAILS CLOSED on an unreadable-but-present
+    /// store — so one torn read would bounce the operator to the LoginScreen:
+    /// an automatic logout manufactured by the guard against automatic logouts.
+    ///
+    /// The reader here asserts the invariant directly: at no instant may the
+    /// store be present-and-unreadable while a writer is hammering it.
+    #[test]
+    fn test_save_tokens_is_atomic_under_a_concurrent_reader() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let storage = Arc::new(create_test_storage("test_save_tokens_atomic"));
+        // Seed so the file exists for the whole run — a missing file is a
+        // legitimate state and would not prove anything.
+        storage.store_tokens("device.jwt.seed", "").unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer_storage = Arc::clone(&storage);
+        let writer_stop = Arc::clone(&stop);
+        let writer = std::thread::spawn(move || {
+            for i in 0..100 {
+                writer_storage
+                    .store_tokens(&format!("device.jwt.{i}"), "")
+                    .expect("write must succeed");
+            }
+            writer_stop.store(true, Ordering::SeqCst);
+        });
+
+        // At least one read happens even if the writer wins the race to finish.
+        let mut reads = 0usize;
+        loop {
+            assert!(
+                !storage.is_present_but_unreadable(),
+                "a concurrent reader observed a TORN store — save_tokens is not atomic. \
+                 This is the failure that turns a routine refresher write into a spurious \
+                 logout (is_interactive_signed_out fails closed on an unreadable store)."
+            );
+            reads += 1;
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+        writer.join().expect("writer thread panicked");
+        assert!(reads > 0, "the reader never ran");
+
+        // And the store is intact afterwards.
+        assert_eq!(storage.get_access_token().unwrap(), "device.jwt.99");
+    }
+
+    /// The atomic write leaves no `.tmp.<nanos>` debris next to the store.
+    #[test]
+    fn test_save_tokens_leaves_no_temp_file_behind() {
+        let storage = create_test_storage("test_save_tokens_no_temp_debris");
+        storage.store_tokens("device.jwt", "").unwrap();
+        storage.store_tokens("device.jwt.2", "").unwrap();
+
+        let dir = storage.storage_path.parent().unwrap();
+        let stem = storage.storage_path.file_name().unwrap().to_string_lossy();
+        let debris: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(&format!("{stem}.tmp.")))
+            .collect();
+        assert!(debris.is_empty(), "temp files left behind: {debris:?}");
+    }
+
+    /// A read-modify-write over a present-but-unreadable store must FAIL, not
+    /// silently rewrite a blank store.
+    ///
+    /// Every writer is read-modify-write, so `load_tokens().unwrap_or_default()`
+    /// turned an unreadable store into a wipe of EVERY OTHER SLOT — including
+    /// `oauth_refresh_token`, the only credential the refresher can self-recover
+    /// from — while returning `Ok(())`. The worst shape: signing in calls
+    /// `clear_interactive_signed_out`, which would destroy all credentials and
+    /// report success.
+    #[test]
+    fn test_writers_refuse_to_blank_an_unreadable_store() {
+        let storage = create_test_storage("test_writers_refuse_unreadable");
+        storage.store_tokens("device.jwt", "").unwrap();
+        storage
+            .store_oauth_tokens("cog.access", "cog.id", "cog.refresh", 1_700_000_000)
+            .unwrap();
+
+        let corrupt = b"not-a-valid-aes-gcm-ciphertext".to_vec();
+        fs::write(&storage.storage_path, &corrupt).unwrap();
+
+        for (name, result) in [
+            ("store_tokens", storage.store_tokens("new.jwt", "")),
+            (
+                "store_oauth_tokens",
+                storage.store_oauth_tokens("a", "b", "c", 1),
+            ),
+            ("store_device_id", storage.store_device_id("dev-1")),
+            (
+                "clear_interactive_signed_out",
+                storage.clear_interactive_signed_out(),
+            ),
+            (
+                "clear_interactive_session",
+                storage.clear_interactive_session(),
+            ),
+            (
+                "store_agent_machine_key",
+                storage.store_agent_machine_key("mk_x"),
+            ),
+        ] {
+            assert!(
+                result.is_err(),
+                "{name} must REFUSE to write over a present-but-unreadable store \
+                 (a blank rewrite silently destroys every other credential slot)"
+            );
+        }
+
+        // The corrupt bytes are left byte-identical — the corruption is
+        // surfaced, not masked (same posture as AuthManager::get_access_token).
+        assert_eq!(
+            fs::read(&storage.storage_path).unwrap(),
+            corrupt,
+            "a refused write must leave the store untouched"
+        );
+
+        // …with ONE deliberate exception: the full wipe. Destroying every slot
+        // IS the operation there, so an unreadable store must not block it.
+        storage
+            .clear_tokens()
+            .expect("clear_tokens must still succeed");
+        assert!(
+            storage.is_interactive_signed_out(),
+            "the full wipe still records the sign-out"
+        );
+        assert!(storage.get_oauth_refresh_token().is_err());
     }
 
     /// A pre-Phase-5 `StoredTokens` JSON (only the original three keys) must
