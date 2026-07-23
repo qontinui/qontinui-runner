@@ -313,7 +313,7 @@ fn persistent_identity_shim_dir() -> Option<&'static str> {
 /// Pure over its inputs; parsed with manual `/`+`\` splitting (not
 /// `std::path`) so Windows-style snapshot paths behave identically on every
 /// host, mirroring [`is_claude_image`].
-pub fn is_shim_dir_exe_path(exe_path: &str, persistent_identity_dir: Option<&str>) -> bool {
+fn is_shim_dir_exe_path(exe_path: &str, persistent_identity_dir: Option<&str>) -> bool {
     use crate::install_effects_producer::intercept::shim_materializer::{
         IDENTITY_DIR_PREFIX, SHIM_DIR_PREFIX,
     };
@@ -324,7 +324,11 @@ pub fn is_shim_dir_exe_path(exe_path: &str, persistent_identity_dir: Option<&str
     };
     let dir = &trimmed[..sep_idx];
     let dir_base = dir.rsplit(['/', '\\']).next().unwrap_or(dir);
-    if dir_base.starts_with(IDENTITY_DIR_PREFIX) || dir_base.starts_with(SHIM_DIR_PREFIX) {
+    // Case-folded like `normalize_dir` below: WMI can report case-mangled
+    // paths, and a miss here fails open to counting the shim as real.
+    let dir_base_lower = dir_base.to_ascii_lowercase();
+    if dir_base_lower.starts_with(IDENTITY_DIR_PREFIX) || dir_base_lower.starts_with(SHIM_DIR_PREFIX)
+    {
         return true;
     }
     if let Some(stable) = persistent_identity_dir {
