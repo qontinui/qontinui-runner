@@ -71,6 +71,7 @@ import { TierUnavailableScreen } from "./components/TierUnavailableScreen";
 import { SetupWizard } from "./components/setup-wizard";
 import { registerOpenableView } from "./lib/openable-views";
 import { resolveAuthGate } from "./lib/authGate";
+import { resolveAuthGatePresentation } from "./lib/authGatePresentation";
 import { LogSourcePicker } from "./components/LogSourcePicker";
 import { Sidebar } from "./components/navigation";
 import { TerminalPage } from "./components/terminal";
@@ -528,51 +529,47 @@ function AppContent() {
     tierUnknown: auth.tierUnknown,
   });
 
-  if (gate === "loading") {
-    const loadingMessage = auth.devAutoLoginPending
-      ? "Signing in..."
-      : isAuthLoading
-        ? "Checking authentication..."
-        : "Starting API server...";
-    return (
-      <div className="min-h-screen bg-background grid-dots flex items-center justify-center">
-        <div className="card p-8 text-center space-y-4">
-          <div className="inline-block w-12 h-12 border-4 border-primary border-t-transparent rounded-full animate-spin" />
-          <p className="text-muted-foreground">{loadingMessage}</p>
-        </div>
-      </div>
-    );
-  }
+  // P2 (auth-gate overlay): HOW each gate surface renders. `"loading"` and
+  // `"login"` are OVERLAYS above the permanently-mounted app tree — never
+  // early returns — so no auth state change (real sign-out, transient probe
+  // blip, or any future trigger) can unmount `<TerminalPage>`. Terminal PTYs,
+  // scrollback, and the restore guard (`didInitPages`, a useRef inside
+  // `useTerminalInitialization`) survive every gate flip by construction —
+  // the old early returns were what let restore respawn `claude --resume`
+  // over still-alive sessions after a blip.
+  const presentation = resolveAuthGatePresentation(gate);
 
-  // NO-DOWNGRADE hold: the runner tier could not be determined (settings.json
-  // unreadable, read retries exhausted). We must NOT synthesize a local-guest
-  // shell (silently strips cloud features from a Tier-2 runner) NOR show
-  // LoginScreen (reads as a sign-out). Hold and explain instead; AuthProvider's
-  // useRunnerTier re-reads on `runner-tier-changed` (the Retry button), so this
-  // screen leaves on its own once settings.json is readable again.
-  if (gate === "tier-unknown") {
-    return <TierUnavailableScreen error={auth.tierError} />;
-  }
-
-  // Runner-tier-decoupling Phase 1 — wizard runs FIRST so Tier 0/1 setup
-  // can happen without ever hitting the login screen. The SetupWizard
-  // dispatches `runner-tier-changed` after writing the tier; the
-  // useRunnerTier hook in AuthProvider re-reads, and the appropriate
-  // gate fires below.
-  if (gate === "wizard") {
+  // The two surfaces that still REPLACE the tree rather than overlay it (see
+  // authGatePresentation.ts for why each one has nothing worth keeping
+  // mounted underneath):
+  //
+  //   - `tier-unknown` — NO-DOWNGRADE hold. The runner tier could not be
+  //     determined (settings.json unreadable, read retries exhausted). We must
+  //     NOT synthesize a local-guest shell (silently strips cloud features
+  //     from a Tier-2 runner) NOR show LoginScreen (reads as a sign-out), and
+  //     we must not leave a tier-derived tree mounted underneath either. Hold
+  //     and explain; AuthProvider's useRunnerTier re-reads on
+  //     `runner-tier-changed` (the Retry button), so the screen leaves on its
+  //     own once settings.json is readable again.
+  //   - `wizard` — Runner-tier-decoupling Phase 1: the wizard runs FIRST (of
+  //     the tier-derived gates) so Tier 0/1 setup can happen without ever
+  //     hitting the login screen. It renders pre-setup, when no terminal tree
+  //     exists yet. The SetupWizard dispatches `runner-tier-changed` after
+  //     writing the tier; useRunnerTier re-reads and the appropriate gate
+  //     fires below.
+  if (presentation.mode === "early-return") {
+    if (presentation.surface === "tier-unknown") {
+      return <TierUnavailableScreen error={auth.tierError} />;
+    }
     return <SetupWizard onComplete={() => setSetupCompleted(true)} />;
   }
 
-  // LoginScreen is Tier 2 only. Tier 0/1 get a synthesized local-guest auth
-  // from AuthProvider, so they never reach this branch.
-  //
-  // Reaching it means the auth verdict is settled, so a falsy `authenticated`
-  // is either a real sign-out/never-signed-in or a probe that exhausted its
-  // retries — in which case AuthProvider keeps re-probing in the background and
-  // this screen flips on its own if the runner turns out to be signed in.
-  if (gate === "login") {
-    return <LoginScreen storeUnreadable={auth.authStatus?.store_unreadable === true} />;
-  }
+  const authOverlay = presentation.mode === "overlay" ? presentation.surface : null;
+  const loadingMessage = auth.devAutoLoginPending
+    ? "Signing in..."
+    : isAuthLoading
+      ? "Checking authentication..."
+      : "Starting API server...";
 
   const lastRunId = lastRun?.id;
 
@@ -585,111 +582,127 @@ function AppContent() {
         enableMutationObserver={true}
         mutationDebounceMs={500}
       >
-        <RunnerPageContext activeTab={activeTab} />
-        <UIBridgeHooks
-          activeTab={activeTab}
-          sidebarCollapsed={sidebarCollapsed}
-          isActionModalOpen={modalState.isActionModalOpen}
-          isImageModalOpen={modalState.isImageModalOpen}
-          showLogSourcePicker={showLogSourcePicker}
-          executionActive={execution.executionActive}
-        />
         {/*
+          P2 (auth-gate overlay): the whole app tree lives inside this
+          `display: contents` wrapper (no layout box of its own) so it can be
+          made `inert` while an auth overlay is up. `inert` removes the entire
+          subtree from hit-testing, focus/tab order, and the accessibility
+          tree — combined with the opaque overlay below, the tree is visually
+          AND interactively unreachable while auth is unresolved or signed
+          out, yet stays mounted so terminal PTYs and the restore guard
+          survive every auth flip.
+        */}
+        <div className="contents" inert={authOverlay !== null}>
+          <RunnerPageContext activeTab={activeTab} />
+          <UIBridgeHooks
+            activeTab={activeTab}
+            sidebarCollapsed={sidebarCollapsed}
+            isActionModalOpen={modalState.isActionModalOpen}
+            isImageModalOpen={modalState.isImageModalOpen}
+            showLogSourcePicker={showLogSourcePicker}
+            executionActive={execution.executionActive}
+          />
+          {/*
           Top-of-app banner that surfaces "this runner needs to be authorized
           with qontinui-web" for fresh installs. Mounted inside UIBridgeProvider
           (via App > UIBridgeProvider > AppContent) so its useUIElement
-          registrations land on the live registry. Mounted after the
-          auth/setup gates above so we don't show it on the login or
-          first-run wizard screens.
+          registrations land on the live registry. Since P2 (auth-gate
+          overlay) it mounts with the tree even while auth is unresolved or
+          signed out — its fixed z-9999 banners stay hidden on those surfaces
+          because the opaque z-20000 auth overlay covers them and the tree is
+          inert. The wizard remains an early return, so it still never renders
+          on the first-run wizard screen. Its mount effects are local Tauri
+          IPC reads only (`get_web_integration_status`, `device_jwt_present`),
+          safe pre-auth.
         */}
-        <WebIntegrationAuthBanner />
-        <div className="h-screen w-screen bg-background grid-dots flex flex-col overflow-hidden min-w-[1200px] min-h-[700px]">
-          <StatusIndicator
-            pythonStatus={execution.pythonStatus}
-            executionActive={execution.executionActive}
-            backgroundActivities={backgroundActivities}
-          />
-
-          <div className="flex flex-1 overflow-hidden">
-            <Sidebar
-              activeTab={activeTab}
-              onTabChange={setActiveTab}
-              collapsed={sidebarCollapsed}
-              onCollapsedChange={handleSidebarCollapsedChange}
+          <WebIntegrationAuthBanner />
+          <div className="h-screen w-screen bg-background grid-dots flex flex-col overflow-hidden min-w-[1200px] min-h-[700px]">
+            <StatusIndicator
+              pythonStatus={execution.pythonStatus}
+              executionActive={execution.executionActive}
+              backgroundActivities={backgroundActivities}
             />
 
-            <main className="flex-1 overflow-hidden relative">
-              <TabContent
+            <div className="flex flex-1 overflow-hidden">
+              <Sidebar
                 activeTab={activeTab}
-                setActiveTab={setActiveTab}
-                addLog={addLog}
-                addAiOutputLog={addAiOutputLog}
-                logs={logs}
-                imageLogs={imageLogs}
-                aiOutputLogs={aiOutputLogs}
-                clearGeneralLogs={clearGeneralLogs}
-                clearImageLogs={clearImageLogs}
-                clearAiOutputLogs={clearAiOutputLogs}
-                logCount={logCount}
-                imageLogCount={imageLogCount}
-                filteredLogs={filteredLogs}
-                logLevel={logLevel}
-                setLogLevel={setLogLevel}
-                uiState={uiState}
-                modalState={modalState}
-                actionLogViewData={actionLogViewData}
-                actionLogLoading={actionLogLoading}
-                actionLogError={actionLogError}
-                refreshActionLog={refreshActionLog}
-                activeLogSubTab={activeLogSubTab}
-                setActiveLogSubTab={setActiveLogSubTab}
-                editWorkflowId={editWorkflowId}
-                setEditWorkflowId={setEditWorkflowId}
-                globalLogSourceSettings={globalLogSources.settings}
-                projectSelection={projectSelection}
-                projectLogs={projectLogs}
-                lastRun={lastRun}
-                lastRunWorkflowId={lastRunWorkflowId}
-                lastRunWorkflowName={lastRunWorkflowName}
-                isRunningLastWorkflow={isRunningLastWorkflow}
-                handleRunLastWorkflow={handleRunLastWorkflow}
-                handleGoToRecap={handleGoToRecap}
-                handleCopyLogs={handleCopyLogs}
-                clearActionLogs={clearActionLogs}
-                clearAllLogs={clearAllLogs}
-                errorMonitorScope={errorMonitorScope}
-                clearErrorMonitorScope={clearErrorMonitorScope}
+                onTabChange={setActiveTab}
+                collapsed={sidebarCollapsed}
+                onCollapsedChange={handleSidebarCollapsedChange}
               />
-              <div
-                className={`absolute inset-0 flex flex-col ${activeTab === "terminal" ? "" : "hidden"}`}
-              >
-                <TerminalPageTabBar
-                  pages={terminalPages.visiblePages}
-                  activePageId={terminalPages.activePageId}
-                  onSelectPage={terminalPages.setActivePageId}
-                  onAddPage={terminalPages.addPage}
-                  onRemovePage={terminalPages.removePage}
-                  onRenamePage={terminalPages.renamePage}
-                  onReorganize={() => setShowReorganize(true)}
-                  isPinned={terminalPages.isPinned}
-                  onPopOut={() => {
-                    // Open a new pop-out OS window (same process) that hosts its
-                    // own terminal tabs — the visible counterpart to the
-                    // `open-terminal-window` UI Bridge action. New terminals
-                    // created in that window belong to it (window_assignments).
-                    void invoke("open_terminal_window", { placement: null }).catch((err) =>
-                      console.error("Failed to open pop-out window:", err),
-                    );
-                  }}
-                  onPopOutPage={(pageId) => {
-                    // Detach the whole page (all its terminals + zone layout)
-                    // into its own bound pop-out window.
-                    void popOutPage(pageId).catch((err) =>
-                      console.error("Failed to pop out page:", err),
-                    );
-                  }}
+
+              <main className="flex-1 overflow-hidden relative">
+                <TabContent
+                  activeTab={activeTab}
+                  setActiveTab={setActiveTab}
+                  addLog={addLog}
+                  addAiOutputLog={addAiOutputLog}
+                  logs={logs}
+                  imageLogs={imageLogs}
+                  aiOutputLogs={aiOutputLogs}
+                  clearGeneralLogs={clearGeneralLogs}
+                  clearImageLogs={clearImageLogs}
+                  clearAiOutputLogs={clearAiOutputLogs}
+                  logCount={logCount}
+                  imageLogCount={imageLogCount}
+                  filteredLogs={filteredLogs}
+                  logLevel={logLevel}
+                  setLogLevel={setLogLevel}
+                  uiState={uiState}
+                  modalState={modalState}
+                  actionLogViewData={actionLogViewData}
+                  actionLogLoading={actionLogLoading}
+                  actionLogError={actionLogError}
+                  refreshActionLog={refreshActionLog}
+                  activeLogSubTab={activeLogSubTab}
+                  setActiveLogSubTab={setActiveLogSubTab}
+                  editWorkflowId={editWorkflowId}
+                  setEditWorkflowId={setEditWorkflowId}
+                  globalLogSourceSettings={globalLogSources.settings}
+                  projectSelection={projectSelection}
+                  projectLogs={projectLogs}
+                  lastRun={lastRun}
+                  lastRunWorkflowId={lastRunWorkflowId}
+                  lastRunWorkflowName={lastRunWorkflowName}
+                  isRunningLastWorkflow={isRunningLastWorkflow}
+                  handleRunLastWorkflow={handleRunLastWorkflow}
+                  handleGoToRecap={handleGoToRecap}
+                  handleCopyLogs={handleCopyLogs}
+                  clearActionLogs={clearActionLogs}
+                  clearAllLogs={clearAllLogs}
+                  errorMonitorScope={errorMonitorScope}
+                  clearErrorMonitorScope={clearErrorMonitorScope}
                 />
-                {/*
+                <div
+                  className={`absolute inset-0 flex flex-col ${activeTab === "terminal" ? "" : "hidden"}`}
+                >
+                  <TerminalPageTabBar
+                    pages={terminalPages.visiblePages}
+                    activePageId={terminalPages.activePageId}
+                    onSelectPage={terminalPages.setActivePageId}
+                    onAddPage={terminalPages.addPage}
+                    onRemovePage={terminalPages.removePage}
+                    onRenamePage={terminalPages.renamePage}
+                    onReorganize={() => setShowReorganize(true)}
+                    isPinned={terminalPages.isPinned}
+                    onPopOut={() => {
+                      // Open a new pop-out OS window (same process) that hosts its
+                      // own terminal tabs — the visible counterpart to the
+                      // `open-terminal-window` UI Bridge action. New terminals
+                      // created in that window belong to it (window_assignments).
+                      void invoke("open_terminal_window", { placement: null }).catch((err) =>
+                        console.error("Failed to open pop-out window:", err),
+                      );
+                    }}
+                    onPopOutPage={(pageId) => {
+                      // Detach the whole page (all its terminals + zone layout)
+                      // into its own bound pop-out window.
+                      void popOutPage(pageId).catch((err) =>
+                        console.error("Failed to pop out page:", err),
+                      );
+                    }}
+                  />
+                  {/*
                   Phase 4 — startup session-recovery banner. Subscribes to the
                   one-shot `session-recovery-summary` event emitted after
                   auto-reattach; renders a prominent (crash) or quiet (planned)
@@ -698,19 +711,19 @@ function AppContent() {
                   report. Composes with the session-visibility surfaces rather
                   than owning any session state.
                 */}
-                <SessionRecoveryBanner />
-                {showReorganize && (
-                  <ReorganizeDialog
-                    pages={terminalPages.pages}
-                    onClose={() => setShowReorganize(false)}
-                    onApply={async (plan) => {
-                      await handleReorganize(plan);
-                      setShowReorganize(false);
-                    }}
-                  />
-                )}
-                <div className="flex-1 min-h-0">
-                  {/*
+                  <SessionRecoveryBanner />
+                  {showReorganize && (
+                    <ReorganizeDialog
+                      pages={terminalPages.pages}
+                      onClose={() => setShowReorganize(false)}
+                      onApply={async (plan) => {
+                        await handleReorganize(plan);
+                        setShowReorganize(false);
+                      }}
+                    />
+                  )}
+                  <div className="flex-1 min-h-0">
+                    {/*
                     Phase 3 (mount-hydration lift): the terminal session state
                     provider is lifted ABOVE TerminalPage and made page-scoped
                     INSIDE the provider (one always-mounted PageSessionScope per
@@ -727,107 +740,147 @@ function AppContent() {
                     TerminalPage (== session.pageId) so the page's render logic
                     is untouched; the `key={activePageId}` remount is gone.
                   */}
-                  <WindowAssignmentsProvider>
-                    <TerminalSessionProvider
-                      pages={terminalPages.pages}
-                      activePageId={terminalPages.activePageId}
-                      onNavigateToBuilder={navigateToBuilder}
-                      onNavigateToActive={navigateToActive}
-                    >
-                      <TerminalPageProvider value={terminalPages.activePageId}>
-                        <TerminalPage
-                          onNavigateToBuilder={navigateToBuilder}
-                          onNavigateToActive={navigateToActive}
-                          onSessionCountChange={setTerminalSessionCount}
-                        />
-                      </TerminalPageProvider>
-                    </TerminalSessionProvider>
-                  </WindowAssignmentsProvider>
+                    <WindowAssignmentsProvider>
+                      <TerminalSessionProvider
+                        pages={terminalPages.pages}
+                        activePageId={terminalPages.activePageId}
+                        onNavigateToBuilder={navigateToBuilder}
+                        onNavigateToActive={navigateToActive}
+                      >
+                        <TerminalPageProvider value={terminalPages.activePageId}>
+                          <TerminalPage
+                            onNavigateToBuilder={navigateToBuilder}
+                            onNavigateToActive={navigateToActive}
+                            onSessionCountChange={setTerminalSessionCount}
+                          />
+                        </TerminalPageProvider>
+                      </TerminalSessionProvider>
+                    </WindowAssignmentsProvider>
+                  </div>
                 </div>
-              </div>
-            </main>
-          </div>
-
-          <ActionDetailModal
-            action={modalState.selectedAction}
-            isOpen={modalState.isActionModalOpen}
-            onClose={modalState.closeActionModal}
-          />
-
-          <ImageDetailModal
-            entry={modalState.selectedImageEntry}
-            isOpen={modalState.isImageModalOpen}
-            onClose={modalState.closeImageModal}
-          />
-
-          {projectLogs.config && (
-            <LogSourcePicker
-              isOpen={showLogSourcePicker}
-              onClose={() => setShowLogSourcePicker(false)}
-              selectedSourceIds={projectLogs.config.selectedSourceIds}
-              globalProfileId={projectLogs.config.globalProfileId}
-              onSave={(sourceIds, profileId) => {
-                if (profileId) {
-                  projectLogs.setGlobalProfile(profileId);
-                } else {
-                  projectLogs.setSelectedSources(sourceIds);
-                }
-                setShowLogSourcePicker(false);
-              }}
-            />
-          )}
-
-          <AppToasts
-            runLastWorkflowError={runLastWorkflowError}
-            onDismissRunError={() => setRunLastWorkflowError(null)}
-            staleTaskMessage={staleTaskMessage}
-            onDismissStaleTask={() => setStaleTaskMessage(null)}
-          />
-
-          {/* Canary rollback alerts */}
-          {canaryAlerts.map((alert, idx) => (
-            <div
-              key={alert.id}
-              className="fixed p-4 rounded-lg shadow-lg border max-w-md z-toast bg-card border-destructive/50"
-              style={{ bottom: `${1 + (idx + 1) * 5}rem`, right: "1rem" }}
-            >
-              <div className="flex items-start gap-3">
-                <div className="flex-1 min-w-0">
-                  <h4 className="font-medium text-sm text-destructive">Canary Rollback</h4>
-                  <p className="text-sm text-muted-foreground mt-1">{alert.message}</p>
-                  <p className="text-xs text-muted-foreground mt-0.5">
-                    Canary {alert.canary_id.slice(0, 12)}...
-                    {alert.p_value != null && ` | p={${alert.p_value.toFixed(4)}}`}
-                  </p>
-                </div>
-                <button
-                  onClick={() => dismissCanaryAlert(alert.id)}
-                  className="text-muted-foreground hover:text-foreground shrink-0"
-                >
-                  &times;
-                </button>
-              </div>
+              </main>
             </div>
-          ))}
 
-          <ApprovalDialog />
-          <ToastContainer toasts={toasts} onDismiss={dismissToast} />
-          {/* Surfaces incoming cross-machine session handoffs as toasts.
+            <ActionDetailModal
+              action={modalState.selectedAction}
+              isOpen={modalState.isActionModalOpen}
+              onClose={modalState.closeActionModal}
+            />
+
+            <ImageDetailModal
+              entry={modalState.selectedImageEntry}
+              isOpen={modalState.isImageModalOpen}
+              onClose={modalState.closeImageModal}
+            />
+
+            {projectLogs.config && (
+              <LogSourcePicker
+                isOpen={showLogSourcePicker}
+                onClose={() => setShowLogSourcePicker(false)}
+                selectedSourceIds={projectLogs.config.selectedSourceIds}
+                globalProfileId={projectLogs.config.globalProfileId}
+                onSave={(sourceIds, profileId) => {
+                  if (profileId) {
+                    projectLogs.setGlobalProfile(profileId);
+                  } else {
+                    projectLogs.setSelectedSources(sourceIds);
+                  }
+                  setShowLogSourcePicker(false);
+                }}
+              />
+            )}
+
+            <AppToasts
+              runLastWorkflowError={runLastWorkflowError}
+              onDismissRunError={() => setRunLastWorkflowError(null)}
+              staleTaskMessage={staleTaskMessage}
+              onDismissStaleTask={() => setStaleTaskMessage(null)}
+            />
+
+            {/* Canary rollback alerts */}
+            {canaryAlerts.map((alert, idx) => (
+              <div
+                key={alert.id}
+                className="fixed p-4 rounded-lg shadow-lg border max-w-md z-toast bg-card border-destructive/50"
+                style={{ bottom: `${1 + (idx + 1) * 5}rem`, right: "1rem" }}
+              >
+                <div className="flex items-start gap-3">
+                  <div className="flex-1 min-w-0">
+                    <h4 className="font-medium text-sm text-destructive">Canary Rollback</h4>
+                    <p className="text-sm text-muted-foreground mt-1">{alert.message}</p>
+                    <p className="text-xs text-muted-foreground mt-0.5">
+                      Canary {alert.canary_id.slice(0, 12)}...
+                      {alert.p_value != null && ` | p={${alert.p_value.toFixed(4)}}`}
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => dismissCanaryAlert(alert.id)}
+                    className="text-muted-foreground hover:text-foreground shrink-0"
+                  >
+                    &times;
+                  </button>
+                </div>
+              </div>
+            ))}
+
+            <ApprovalDialog />
+            <ToastContainer toasts={toasts} onDismiss={dismissToast} />
+            {/* Surfaces incoming cross-machine session handoffs as toasts.
               Listens for `session-event` with kind=handoff_request — PR #258. */}
-          <IncomingHandoffToastBridge />
-          <PerformanceOverlay position="bottom-right" />
-          <GiantSCCFixture />
-          <CommandPalette />
-          <GlobalKnowledgeBrowser />
-          {/*
+            <IncomingHandoffToastBridge />
+            <PerformanceOverlay position="bottom-right" />
+            <GiantSCCFixture />
+            <CommandPalette />
+            <GlobalKnowledgeBrowser />
+            {/*
             Plan 2026-05-18-agent-spawn-coordination Phase 3 — spawn-time
             claim-conflict modal + post-acquire stolen-claim banner.
             Both listen for runner-side Tauri events; they render nothing
             until those events fire.
           */}
-          <ConflictModal />
-          <StolenBanner />
+            <ConflictModal />
+            <StolenBanner />
+          </div>
         </div>
+        {/*
+          P2 (auth-gate overlay): the gate surfaces render ABOVE the mounted
+          tree instead of replacing it. Requirements the structure guarantees:
+
+          - OPAQUE: `bg-background` is a solid color (`--background` is an
+            opaque triplet), and the container is `fixed inset-0`, so no
+            terminal content can show through while a surface is up.
+          - INTERACTIVELY SEALED: the fixed container intercepts all pointer
+            events, and the app tree behind it is `inert` (see the wrapper
+            above), so nothing underneath is clickable or focusable.
+          - ABOVE EVERYTHING: z-[20000] clears every z-index in the app — the
+            highest elsewhere are the tutorial scale (10001–10002) and the
+            fixed 9999 banners (e.g. WebIntegrationAuthBanner, which mounts
+            with the tree now but stays covered on the loading/login surfaces,
+            preserving its "never shown while signed out" behavior).
+        */}
+        {authOverlay === "loading" && (
+          <div className="fixed inset-0 z-[20000] bg-background grid-dots flex items-center justify-center">
+            <div className="card p-8 text-center space-y-4">
+              <div className="inline-block w-12 h-12 border-4 border-primary border-t-transparent rounded-full animate-spin" />
+              <p className="text-muted-foreground">{loadingMessage}</p>
+            </div>
+          </div>
+        )}
+        {/*
+          LoginScreen is Tier 2 only. Tier 0/1 get a synthesized local-guest
+          auth from AuthProvider, so they never reach this surface. Reaching it
+          means the auth verdict is settled, so a falsy `authenticated` is
+          either a real sign-out/never-signed-in or a probe that exhausted its
+          retries — in which case AuthProvider keeps re-probing in the
+          background and this overlay clears on its own if the runner turns
+          out to be signed in. Its root is `min-h-screen bg-background`, so it
+          fills the fixed container edge-to-edge with an opaque surface.
+        */}
+        {authOverlay === "login" && (
+          <div className="fixed inset-0 z-[20000] overflow-auto bg-background">
+            <LoginScreen storeUnreadable={auth.authStatus?.store_unreadable === true} />
+          </div>
+        )}
       </RenderLogWrapper>
     </ProfilerWrapper>
   );
