@@ -1073,6 +1073,52 @@ pub fn build_census() -> Option<WorktreeCensusReq> {
     })
 }
 
+/// Env override (bytes) for the low-disk WARN floor. Default ~100 GB.
+pub const LOW_DISK_WARN_BYTES_ENV: &str = "COORD_LOW_DISK_WARN_BYTES";
+/// Env override (bytes) for the critical-disk ERROR floor. Default ~25 GB.
+pub const LOW_DISK_CRIT_BYTES_ENV: &str = "COORD_LOW_DISK_CRIT_BYTES";
+const DEFAULT_LOW_DISK_WARN_BYTES: u64 = 100 * 1024 * 1024 * 1024;
+const DEFAULT_LOW_DISK_CRIT_BYTES: u64 = 25 * 1024 * 1024 * 1024;
+
+fn env_bytes(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Emit a `warn!`/`error!` per volume whose free space is under the floor. A
+/// leading signal for the disk-full condition that otherwise only manifests as
+/// phantom cargo build failures. Read-only; best-effort logging only.
+fn warn_on_low_disk(volumes: &[VolumeReport]) {
+    let warn_floor = env_bytes(LOW_DISK_WARN_BYTES_ENV, DEFAULT_LOW_DISK_WARN_BYTES);
+    let crit_floor = env_bytes(LOW_DISK_CRIT_BYTES_ENV, DEFAULT_LOW_DISK_CRIT_BYTES);
+    const GB: f64 = 1_073_741_824.0;
+    for v in volumes {
+        let free_gb = v.free_bytes as f64 / GB;
+        let pct = if v.total_bytes > 0 {
+            v.free_bytes as f64 / v.total_bytes as f64 * 100.0
+        } else {
+            100.0
+        };
+        if v.free_bytes < crit_floor {
+            tracing::error!(
+                "worktree_census: CRITICAL low disk on {} — {:.1} GB free ({:.1}%). \
+                 Builds will manufacture phantom failures (os error 112). Arm \
+                 COORD_ORPHAN_TARGET_REAP_ENABLED and/or reclaim target dirs.",
+                v.volume,
+                free_gb,
+                pct
+            );
+        } else if v.free_bytes < warn_floor {
+            warn!(
+                "worktree_census: low disk on {} — {:.1} GB free ({:.1}%).",
+                v.volume, free_gb, pct
+            );
+        }
+    }
+}
+
 /// One census cycle: collect + POST. Returns `Ok(())` on a clean skip or
 /// a successful POST; `Err` only on a built-payload transport / non-2xx
 /// failure (the caller logs + retries next tick).
@@ -1083,6 +1129,11 @@ pub async fn tick_once() -> Result<(), String> {
         BuildOutcome::Built(r) => r,
         BuildOutcome::AlreadyRunning | BuildOutcome::Skipped => return Ok(()),
     };
+    // Low-free-space alarm — a LEADING signal so low disk surfaces here rather
+    // than as phantom cargo build failures (dep-crate compile errors with no
+    // src/ diagnostics, sccache write errors, `os error 112`). Runs every tick
+    // regardless of coord reachability, before the POST. Read-only.
+    warn_on_low_disk(&req.volumes);
     let base = match coord_http_base() {
         Some(b) => b,
         None => {

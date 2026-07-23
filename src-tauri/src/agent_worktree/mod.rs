@@ -65,6 +65,7 @@ pub mod fs_observer;
 pub mod isolated_edit;
 pub mod maintenance_executor;
 pub mod on_demand;
+pub mod orphan_target_reaper;
 pub mod reclaim;
 pub mod session_env;
 
