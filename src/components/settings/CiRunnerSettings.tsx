@@ -49,6 +49,12 @@ interface CiRunnerSettingsProps {
 
 const SUPERVISOR_BASE = "http://localhost:9875";
 const POLL_INTERVAL_MS = 10_000;
+// Upper bound on a single status fetch. The supervisor now serves
+// `/ci-runner/status` from its cached probe state in <100 ms, but if it is
+// briefly slow (e.g. a cold WSL probe on the first tick after boot) we abort
+// and surface a soft "Checking supervisor…" state rather than letting the
+// fetch hang or the browser abort it into a hard "Failed to fetch" banner.
+const STATUS_FETCH_TIMEOUT_MS = 8_000;
 
 // Shown when the runner is unpaired (no coord device-JWT). Enabling/disabling
 // the CI runner mints a GitHub Actions registration token via coord, which now
@@ -129,21 +135,39 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
   const [loading, setLoading] = useState(true);
   const [actionLoading, setActionLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [checking, setChecking] = useState(false);
   const [actionSuccess, setActionSuccess] = useState<string | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const fetchStatus = useCallback(async () => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), STATUS_FETCH_TIMEOUT_MS);
     try {
-      const resp = await fetch(`${SUPERVISOR_BASE}/ci-runner/status`);
+      const resp = await fetch(`${SUPERVISOR_BASE}/ci-runner/status`, {
+        signal: controller.signal,
+      });
       if (!resp.ok) {
         throw new Error(`HTTP ${resp.status}`);
       }
       const data: CiRunnerStatus = await resp.json();
       setStatus(data);
       setError(null);
+      setChecking(false);
     } catch (err) {
-      setError(`Failed to reach supervisor: ${err instanceof Error ? err.message : String(err)}`);
+      // A timeout means the supervisor is reachable but slow, not down.
+      // Surface a soft "checking…" state and preserve the last known status
+      // rather than flashing a hard "Failed to reach supervisor" banner that
+      // the next 10 s poll would immediately clear.
+      if (err instanceof DOMException && err.name === "AbortError") {
+        setChecking(true);
+      } else {
+        setError(
+          `Failed to reach supervisor: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        setChecking(false);
+      }
     } finally {
+      clearTimeout(timeoutId);
       setLoading(false);
     }
   }, []);
@@ -303,6 +327,15 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
         <div className={`p-3 ${getAccentColors("red").bg} rounded-lg flex items-start gap-2`}>
           <X className={`w-4 h-4 ${getAccentColors("red").text} shrink-0 mt-0.5`} />
           <span className={`${getAccentColors("red").text} text-xs`}>{error}</span>
+        </div>
+      )}
+
+      {checking && !error && (
+        <div className={`p-3 ${getAccentColors("amber").bg} rounded-lg flex items-start gap-2`}>
+          <CircleDot className={`w-4 h-4 ${getAccentColors("amber").text} shrink-0 mt-0.5`} />
+          <span className={`${getAccentColors("amber").text} text-xs`}>
+            Checking supervisor…
+          </span>
         </div>
       )}
 
