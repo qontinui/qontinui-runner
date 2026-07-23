@@ -35,7 +35,6 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
-import type { TerminalInfo } from "@qontinui/shared-types/tauri-events";
 
 import { instanceStorage } from "@/lib/instance-storage";
 import { writeClipboard } from "@/lib/clipboard";
@@ -51,7 +50,7 @@ import { compareByUsageHeadroom } from "../../settings/types";
 import type { ResultCardSpec, ResultCardSection } from "../result-card";
 import { buildMetricsCardSpec, buildHistoryCardSpec } from "../result-card";
 import type { CommandResponse } from "../types";
-import type { TerminalPageConfig } from "../useTerminalPages";
+import { extractSessions, type PastSession } from "../usePastSessions";
 import type { CommandAction, CommandResult, ResolverContext } from "./types";
 import { useCommandAction } from "./useCommandAction";
 import { useOrchestrateCommand } from "./orchestrateCommand";
@@ -272,26 +271,6 @@ export function resolveTenantArg(
     return { error: `tenant "${value}" is ambiguous (matches ${prefixed.length} bindings)` };
   }
   return { error: `no tenant binding matches "${value}"` };
-}
-
-/**
- * Read the persisted page-id → page-name map so `/copy-names` can label each
- * group with the page's display name. Pages live under the same
- * `instanceStorage` key `useTerminalPages` uses (`qontinui-terminal-pages`).
- * Best-effort: an empty/broken store just yields an empty map and the handler
- * falls back to the raw page id.
- */
-function readPageNames(): Map<string, string> {
-  const map = new Map<string, string>();
-  try {
-    const pages = instanceStorage.getJSON<TerminalPageConfig[]>("qontinui-terminal-pages", []);
-    for (const p of pages) {
-      if (p && typeof p.id === "string" && typeof p.name === "string") map.set(p.id, p.name);
-    }
-  } catch {
-    /* ignore — fall back to raw ids */
-  }
-  return map;
 }
 
 export function useTerminalCommands(ctx: TerminalCommandsContext): void {
@@ -1172,70 +1151,106 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     },
   });
 
-  // 36. /copy-names — copy every session name (all tabs, all pages) to clipboard
-  // Written for crash-recovery: the operator keeps a written list of session
-  // names so sessions can be restored by hand if the app exits. This gathers
-  // them in one keystroke.
+  // 36. /copy-names — copy the open sessions' RESUME names + resume commands
   //
-  // Cross-page note: useTerminalSession() is scoped to the ACTIVE page only,
-  // so we can't read other pages' tabs from a context. The Rust backend owns
-  // every PTY across every page, so `terminal_list` is the authoritative,
-  // complete source (and its titles survive a React remount — exactly the
-  // crash-recovery property we want). Titles = TerminalInfo.title.
+  // Written for the rebuild loop: write the open sessions down, rebuild the
+  // primary runner, resume them. That loop needs the name Claude Code shows in
+  // its `/resume` picker plus the `clX --resume <id>` command — NOT the tab
+  // title, which is what this command originally copied.
+  //
+  // Why not `terminal_list`: `TerminalInfo.title` is the PTY/OSC *tab* title
+  // and carries no session identity. Measured on the primary runner
+  // 2026-07-23: of 255 live terminals, 122 were titled just `"claude"` and 24
+  // were `powershell.exe`; joining the tab titles against the real resume
+  // names agreed on 0 of 21 joinable rows, and the non-generic titles
+  // (`qontinui-runner-1d`, …) are working-dir-derived and NOT unique — 11
+  // different sessions shared one. The list was unusable for resuming.
+  //
+  // `terminal_session_list_history` is the authoritative source: it merges the
+  // durable lifecycle registry, the snapshot history, and the on-disk
+  // transcripts, and derives `resumeName` from the transcript's last
+  // `/rename` custom-title (falling back to auto-summary → first-message
+  // preview → registry title). It is cross-page by construction, so the
+  // active-page-only React context is still not a limitation.
   useCommandAction({
     id: "terminal.copy-names",
     slash: "/copy-names",
     aliases: ["/copy-sessions", "/session-names"],
-    label: "Copy all session names",
+    label: "Copy open sessions + resume commands",
     description:
-      "Copy the names of every terminal session across ALL pages to the clipboard, " +
-      "one per line and grouped by page. Handy to save before a restart so sessions " +
-      "can be restored manually.",
+      "Copy every OPEN session's `/resume` name and its ready-to-run " +
+      "`clX --resume <id>` command to the clipboard, grouped by account. " +
+      "Save this before a restart so the sessions can be resumed afterwards.",
     paramSchema: SCHEMA.empty,
     patterns: [/^copy[- ]names$/i, /^copy[- ]sessions$/i, /^session[- ]names$/i],
     handler: async (): Promise<CommandResult<{ count: number }>> => {
-      let terminals: TerminalInfo[] = [];
+      let all: PastSession[] = [];
       try {
-        const res = await invoke<CommandResponse>("terminal_list");
-        if (res.success && res.data) {
-          terminals = (res.data as { terminals: TerminalInfo[] }).terminals ?? [];
-        }
+        const res = await invoke<CommandResponse>("terminal_session_list_history", {
+          opts: { includeShells: false },
+        });
+        // Normalize at the boundary via the same helper the Previous Sessions
+        // panel uses: the command wraps its payload as `{sessions:[…]}`, and a
+        // shape surprise must degrade to an empty list rather than crash the
+        // grouping below.
+        if (res.success) all = extractSessions(res.data);
       } catch {
-        return fail("list-failed", "could not read the terminal list from the backend");
+        return fail("list-failed", "could not read the session history from the backend");
       }
-      if (terminals.length === 0) return fail("no-sessions", "no terminal sessions found");
 
-      // Group by page, creation-ordered within each page (matches tab order).
-      const pageNames = readPageNames();
-      const byPage = new Map<string, TerminalInfo[]>();
-      for (const t of [...terminals].sort((a, b) => a.createdAt - b.createdAt)) {
-        const pid = t.pageId || "default";
-        const list = byPage.get(pid) ?? [];
-        list.push(t);
-        byPage.set(pid, list);
+      // Open sessions are the ones worth writing down — a closed session is
+      // already gone. Newest-first so the most recent work is at the top.
+      const sessions = all
+        .filter((s) => s.state === "open")
+        .sort((a, b) => b.lastSeenAt - a.lastSeenAt);
+      const closedCount = all.length - sessions.length;
+      if (sessions.length === 0) {
+        return fail(
+          "no-sessions",
+          all.length === 0
+            ? "no sessions found in the registry"
+            : `no OPEN sessions (${all.length} closed) — nothing to resume`,
+        );
       }
-      const multiPage = byPage.size > 1;
+
+      // Group by account: resume commands are per-wrapper (clg/clh/clp/…), so
+      // grouping keeps each block directly runnable as a unit.
+      const byAccount = new Map<string, PastSession[]>();
+      for (const s of sessions) {
+        const label = s.account?.label || "unknown";
+        const list = byAccount.get(label) ?? [];
+        list.push(s);
+        byAccount.set(label, list);
+      }
 
       const lines: string[] = [];
       const sections: ResultCardSection[] = [];
-      for (const [pid, list] of byPage) {
-        const pageName = pageNames.get(pid) ?? (pid === "default" ? "Terminal" : pid);
-        if (multiPage) lines.push(`# ${pageName}`);
+      for (const [label, list] of byAccount) {
+        lines.push(`# ${label} (${list.length})`);
         sections.push({
-          heading: multiPage ? pageName : undefined,
-          rows: list.map((t, i) => ({ label: String(i + 1), value: t.title })),
+          heading: `${label} (${list.length})`,
+          // A session whose transcript is already pruned cannot actually be
+          // resumed — surface that rather than handing over a command that
+          // will fail.
+          rows: list.map((s) => ({
+            label: s.resumeName,
+            value: s.transcriptExists ? s.resumeCommand : `${s.resumeCommand}  (no transcript)`,
+          })),
         });
-        for (const t of list) lines.push(t.title);
-        if (multiPage) lines.push("");
+        for (const s of list) {
+          lines.push(s.resumeName);
+          lines.push(`  ${s.resumeCommand}${s.transcriptExists ? "" : "  # no transcript"}`);
+        }
+        lines.push("");
       }
       const text = lines.join("\n").trimEnd();
 
       const copied = await writeClipboard(text);
-      const n = terminals.length;
+      const n = sessions.length;
       ctx.showCard({
-        title: `${n} session name${n === 1 ? "" : "s"} ${copied ? "copied" : "gathered"}`,
+        title: `${n} open session${n === 1 ? "" : "s"} ${copied ? "copied" : "gathered"}`,
         subtitle: copied
-          ? "All session names are on your clipboard."
+          ? `Resume names + commands are on your clipboard${closedCount > 0 ? ` (${closedCount} closed session${closedCount === 1 ? "" : "s"} omitted)` : ""}.`
           : "Clipboard write failed — copy them from below.",
         sections,
         footer: {
