@@ -11,15 +11,40 @@ resolver = "2"
 debug = 0
 split-debuginfo = "packed"
 
-# 2026-07-03: the primary (debug build) hard-aborted with 0xc0000409 — a Rust
-# std debug-assertion UB check ("Alignment::new_unchecked requires a power of
-# two") fired inside AWS-LC's jitter-entropy path
-# (aws_lc_..._jent_entropy_switch_notime_impl) across an FFI/nounwind boundary,
-# turning a rare, timing-dependent bogus alignment value into a process abort.
-# Release builds never compile this check in; disabling debug-assertions for
-# these two crates ONLY restores release-parity there while keeping assertions
-# everywhere else. Escalation path if the same panic recurs from another dep:
-# widen to [profile.dev.package."*"].
+# 2026-07-03: added because the primary (debug build) hard-aborted with
+# 0xc0000409 — a std debug-assertion UB check ("Alignment::new_unchecked
+# requires a power of two") on a `tokio-rt-worker`, with a backtrace through
+# `aws_lc_..._jent_entropy_switch_notime_impl`. Kept, but read the correction:
+#
+# ATTRIBUTION CORRECTED 2026-07-22. The aws-lc frame that named this crate is an
+# ARTIFACT. `debug = 0` above strips line tables, so the `backtrace` crate falls
+# back to the PE export table and resolves every Rust frame to the nearest
+# exported C symbol — and that symbol appears in 100% of crash reports on this
+# build, including deliberate unrelated panics. So the backtrace never actually
+# implicated AWS-LC; it could not implicate anything. The panic PAYLOAD (the
+# alignment precondition) was real, but its attribution to this crate was not.
+#
+# What is established since:
+#   - The suppression shipped and the 0xc0000409 aborts CONTINUED (2026-07-15,
+#     07-19 x2, 07-20, 07-21), so it did not fix the crash family it was added
+#     for. Those all report `alloc/src/rc.rs:3743` — a racing non-atomic `Rc`
+#     refcount, root-caused and fixed by the `[patch.crates-io] tao` override at
+#     the bottom of this file. A corrupted refcount causing a premature free is
+#     a plausible source of the bogus alignment value too, but that is a
+#     hypothesis, not a proof.
+#   - The alignment panic has not recurred. NOTE it cannot be re-checked against
+#     the crash corpus: `crash_20260703_115845.txt` has since been rotated out of
+#     `.dev-logs`, so absence there is not evidence.
+#
+# DELIBERATELY NOT REMOVED in the same change as the tao fix, so that fix stays
+# the single variable — if crashes continue, the cause stays attributable.
+# Revisit once the tao patch has soaked: if the alignment panic never returns,
+# delete these two entries and restore the UB tripwire.
+#
+# The old escalation path recorded here — "if the panic recurs from another dep,
+# widen to [profile.dev.package.\"*\"]" — is REVOKED. Do not apply it. It would
+# have blinded the whole dependency tree to exactly the `rc.rs` UB check that
+# finally identified this bug, while real memory corruption kept propagating.
 [profile.dev.package.aws-lc-rs]
 debug-assertions = false
 [profile.dev.package.aws-lc-sys]
@@ -56,3 +81,39 @@ debug = 0
 opt-level = 2
 codegen-units = 256
 lto = false
+
+# ---------------------------------------------------------------------------
+# tao: make `EventLoopRunnerShared`'s refcount atomic.
+#
+# tao's `EventLoopRunnerShared` is a NON-atomic `Rc<EventLoopRunner>`, but it is
+# reachable from `tauri_runtime_wry::DispatcherMainThreadContext`, which is
+# `unsafe impl Send + Sync`. So every `AppHandle::clone()` / `Webview::clone()`
+# on a background thread races that refcount against the main thread. The
+# corruption surfaces as three different Windows exceptions -- all the same bug:
+#
+#   0xc000001d  count wrapped past usize::MAX -> `inc_strong`'s overflow abort()
+#               compiles to a `ud2` (ILLEGAL_INSTRUCTION)
+#   0xc0000409  count read 0 -> `alloc/src/rc.rs` `hint::assert_unchecked` UB
+#               check -> non-unwinding __fastfail
+#   0xc0000374  premature free -> STATUS_HEAP_CORRUPTION
+#
+# This killed the primary runner ~16x between 2026-07-10 and 2026-07-21, at one
+# fault offset, always on a `tokio-rt-worker` thread. Root-caused by disassembly
+# at the fault RIP (`add rax,1 / mov [rcx],rax / ... / ud2` -- a NON-atomic
+# increment, i.e. `Rc`, not `Arc`) plus a byte-signature match identifying the
+# caller as `tao::EventLoopWindowTarget::clone`.
+#
+# Upstream, open and unfixed in every released version:
+#   https://github.com/tauri-apps/tauri/issues/15408
+#
+# The vendored copy is byte-identical to the crates.io 0.35.0 source except for
+# a 2-line semantic change (`Rc` -> `Arc` on that one alias and its constructor);
+# `vendor/tao-0.35.0/QONTINUI-PATCH.md` records the delta. Only the REFCOUNT
+# becomes atomic -- the pointee is still only ever dereferenced on the main
+# thread, so this adds no new soundness assumption, it only removes a data race.
+#
+# `tests/tao_arc_patch_active.rs` fails the build if this patch ever stops
+# applying (e.g. a tauri bump moves the tree to a tao version this doesn't
+# match) -- without that guard the crash would silently return.
+[patch.crates-io]
+tao = { path = "vendor/tao-0.35.0" }
