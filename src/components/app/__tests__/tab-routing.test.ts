@@ -23,7 +23,13 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { TAB_LIST, isValidTabId, migrateTabId, resolveExternalTabId } from "../tab-types";
+import {
+  DEFAULT_TAB_ID,
+  TAB_LIST,
+  isValidTabId,
+  migrateTabId,
+  resolveExternalTabId,
+} from "../tab-types";
 import type { MainTabId } from "../tab-types";
 import {
   SETTINGS_TABS,
@@ -78,10 +84,38 @@ describe("R1: every MainTabId has a renderer", () => {
       "monitor-discoveries",
     ]) {
       expect(isValidTabId(dead)).toBe(false);
-      // …but a value persisted by an older build still lands on a real page.
-      expect(migrateTabId(dead)).not.toBe("prompt-home");
+      // …but a value persisted by an older build still lands on a real page —
+      // its own migration target, not the generic fallback.
+      expect(migrateTabId(dead)).not.toBe(DEFAULT_TAB_ID);
       expect(isValidTabId(migrateTabId(dead))).toBe(true);
     }
+  });
+});
+
+describe("the landing tab", () => {
+  it("is the Terminal", () => {
+    // The runner is Terminal-first: the Home prompt page composes a
+    // verification-agentic loop workflow and now lives behind the "advanced"
+    // disclosure, so a cold start must not land there.
+    expect(DEFAULT_TAB_ID).toBe("terminal");
+    expect(isValidTabId(DEFAULT_TAB_ID)).toBe(true);
+  });
+
+  it("is what an absent or unreadable persisted tab resolves to", () => {
+    expect(migrateTabId(null)).toBe(DEFAULT_TAB_ID);
+    expect(migrateTabId("a-tab-that-never-existed")).toBe(DEFAULT_TAB_ID);
+  });
+
+  it("does not swallow a legacy alias that migrates TO the landing tab", () => {
+    // The regression this locks: Sidebar.selectTab used to infer "unknown id"
+    // from `migrateTabId` returning the fallback. `run-plan` is a real legacy
+    // alias whose target IS the landing tab, so that inference would classify
+    // a legitimate click as unknown and silently drop it. `resolveExternalTabId`
+    // — which the sidebar now uses — distinguishes the two by returning null
+    // only for genuinely unknown ids.
+    expect(migrateTabId("run-plan")).toBe(DEFAULT_TAB_ID);
+    expect(resolveExternalTabId("run-plan")).toBe(DEFAULT_TAB_ID);
+    expect(resolveExternalTabId("a-tab-that-never-existed")).toBeNull();
   });
 });
 

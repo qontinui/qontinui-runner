@@ -210,6 +210,23 @@ const VALID_TAB_IDS: MainTabId[] = [
 export const SIDEBAR_COLLAPSED_KEY = "qontinui-sidebar-collapsed";
 
 /**
+ * The tab the runner opens on when nothing else decides it: a cold start with
+ * no persisted `activeTab`, or a persisted value that no longer names a page.
+ *
+ * Terminal, not the Home prompt. The Terminal is the runner's primary surface —
+ * most sessions are Claude Code / shell sessions run from it — while the Home
+ * prompt page composes a verification-agentic LOOP WORKFLOW and now lives
+ * behind the "Show advanced automation features" disclosure. Landing a fresh
+ * install on a page its own sidebar no longer lists would be the worst of both.
+ *
+ * Every fallback in the app routes through this constant rather than
+ * hard-coding a tab id, so the landing page is one edit — the previous spread
+ * of literal `?? "prompt-home"` defaults across App.tsx, the UI Bridge event
+ * hooks and the sidebar is exactly how a default drifts out of sync.
+ */
+export const DEFAULT_TAB_ID: MainTabId = "terminal";
+
+/**
  * Human-readable labels for every `MainTabId`. Authoritative source for the
  * UI Bridge `GET /control/tabs` endpoint and any other consumer that needs
  * to present a tab by a display name rather than its raw id.
@@ -525,10 +542,15 @@ export function resolveExternalTabId(candidate: string | null | undefined): Main
 /**
  * Resolve the PERSISTED active-tab value read back from instanceStorage.
  * Alias-first (see `resolveExternalTabId`), and always yields a tab — an
- * unreadable/unknown stored value falls back to `prompt-home`.
+ * unreadable/unknown stored value falls back to `DEFAULT_TAB_ID`.
+ *
+ * Callers that need to DISTINGUISH "unknown id" from "resolved to the default"
+ * must use `resolveExternalTabId` (which returns null for unknown) rather than
+ * comparing this function's result against the default: several real ids
+ * legitimately resolve to it.
  */
 export function migrateTabId(stored: string | null): MainTabId {
-  if (!stored) return "prompt-home";
+  if (!stored) return DEFAULT_TAB_ID;
 
   if (stored in LEGACY_TAB_MIGRATIONS) {
     return LEGACY_TAB_MIGRATIONS[stored];
@@ -538,5 +560,5 @@ export function migrateTabId(stored: string | null): MainTabId {
     return stored;
   }
 
-  return "prompt-home";
+  return DEFAULT_TAB_ID;
 }

@@ -68,12 +68,23 @@ function getExpectedSpecId(navId: string, platform: "runner" | "web"): string {
 export function getKnownPages(): KnownPage[] {
   const allItems = getAllItems();
   const pages: KnownPage[] = [];
+  // A nav id can legitimately appear TWICE in the registry — `run-findings` is
+  // both a top-level REVIEW item and a child of Runs, pointing at the same
+  // `/runs/findings` page. `getAllItems()` flattens groups and CHILDREN_MAP
+  // without deduping, so without this the catalog lists that page twice per
+  // app and the Specs page shows a phantom "missing spec" for the copy whose
+  // row the reader happens to look at second.
+  const seen = new Set<string>();
 
   for (const item of allItems) {
     // Skip parent containers — they are not pages themselves
     if (item.hasChildren) {
       continue;
     }
+    if (seen.has(item.id)) {
+      continue;
+    }
+    seen.add(item.id);
 
     const group = getItemGroup(item.id);
     const groupLabel = group?.label ?? "UNKNOWN";

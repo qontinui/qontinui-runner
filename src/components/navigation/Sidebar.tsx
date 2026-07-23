@@ -24,7 +24,7 @@ import {
   KeyboardEvent,
 } from "react";
 import { instanceStorage } from "@/lib/instance-storage";
-import { isValidTabId, migrateTabId, type MainTabId } from "@/components/app/tab-types";
+import { resolveExternalTabId, type MainTabId } from "@/components/app/tab-types";
 import {
   Play,
   Bot,
@@ -108,6 +108,13 @@ import {
   type IconName,
   getRunnerNavigation,
   getChildrenForPlatform,
+  getChildrenItems,
+  findItemById,
+  getItemGroup,
+  getProductMode,
+  getShowHiddenItems,
+  isItemAvailable,
+  NAVIGATION_GROUPS,
   setProductMode,
   setShowHiddenItems,
   STORAGE_KEYS,
@@ -120,7 +127,11 @@ import {
   useNavigationItem,
 } from "@qontinui/navigation";
 import { useProductMode, type ProductMode } from "@/contexts/ProductModeContext";
-import { useAdvancedAutomation } from "@/contexts/AdvancedAutomationContext";
+import {
+  useFeatureDisclosure,
+  type FeatureDisclosure,
+} from "@/contexts/FeatureDisclosureContext";
+import { isSettingsNavItemVisible } from "@/components/settings/settings-tabs";
 
 // ============================================================================
 // Icon Mapping
@@ -270,14 +281,116 @@ function transformGroup(group: SharedNavigationGroup): ResolvedNavigationGroup {
   };
 }
 
-function getChildItems(parentId: string): ResolvedNavigationItem[] {
-  const children = getChildrenForPlatform(parentId, "runner");
-  return children.map(transformItem);
+/**
+ * Children of a parent nav item (the flyout contents), already filtered for the
+ * runner platform by the shared package.
+ *
+ * `isDisclosureEnabled` additionally drops the settings panels whose feature
+ * disclosure is off, so the Settings flyout lists exactly what the Settings
+ * page's own sub-nav lists. Without it the two disagree: the flyout would offer
+ * "Playwright", and clicking it would open a Settings page whose sub-nav has no
+ * such button. The requirement itself lives in `settings-tabs.ts` — see
+ * `isSettingsNavItemVisible` for why it is not on the nav package's items.
+ *
+ * `activeTab` is threaded in for the SAME reason the Settings sub-nav takes it:
+ * the rule is "visible UNION active". A gated panel that is currently open must
+ * keep its entry here too, or the flyout hides the very page on screen and the
+ * user cannot navigate back to it.
+ */
+function getChildItems(
+  parentId: string,
+  isDisclosureEnabled: (disclosure: FeatureDisclosure) => boolean,
+  activeTab: string,
+): ResolvedNavigationItem[] {
+  const visible = getChildrenForPlatform(parentId, "runner").filter((child) =>
+    isSettingsNavItemVisible(child.id, isDisclosureEnabled, activeTab),
+  );
+  if (visible.some((child) => child.id === activeTab)) return visible.map(transformItem);
+
+  // The active child is currently demoted (a gated settings panel, or a
+  // loop-only Runs tab like Image Recognition). Restore it — in its canonical
+  // position, not appended — so the flyout still lists the page on screen.
+  const all = getChildrenItems(parentId);
+  if (!all.some((child) => child.id === activeTab)) return visible.map(transformItem);
+  const visibleIds = new Set(visible.map((child) => child.id));
+  return all
+    .filter((child) => visibleIds.has(child.id) || child.id === activeTab)
+    .map(transformItem);
 }
 
-function buildNavigationGroups(): ResolvedNavigationGroup[] {
-  const sharedGroups = getRunnerNavigation();
-  return sharedGroups.map(transformGroup);
+/**
+ * The sidebar's groups, with the SAME "visible UNION active" rule the flyout and
+ * the Settings sub-nav apply.
+ *
+ * Without the union term, navigating to a demoted page — a UI Bridge
+ * `activate-tab prompt-home`, a deep-link, or simply turning a disclosure off
+ * while sitting on one of its pages — renders that page with nothing marked
+ * active in the sidebar and no entry to return to. The page is reachable but
+ * invisible, which is indistinguishable from a broken nav.
+ *
+ * Restoring is deliberately a LIVE-only behaviour: `resolveLandingTab` bounces a
+ * demoted tab at cold start instead, because nobody asked to open there.
+ */
+function buildNavigationGroups(activeTab: string): ResolvedNavigationGroup[] {
+  const groups = getRunnerNavigation().map(transformGroup);
+  const shownAtTopLevel = groups.some((group) =>
+    group.items.some((item) => item.id === activeTab),
+  );
+  if (shownAtTopLevel) return groups;
+
+  const activeItem = findItemById(activeTab);
+  const homeGroup = getItemGroup(activeTab);
+  // Not a top-level nav item (a flyout child, or a page with no sidebar entry
+  // at all) — nothing to restore here.
+  if (!activeItem || !homeGroup || !homeGroup.items.some((i) => i.id === activeTab)) {
+    return groups;
+  }
+
+  // The union rule covers the DISCLOSURES only. `hiddenInProd` and `platforms`
+  // are different statements: "must not exist in a production build" and "is
+  // not this app's page" — neither is something the user can opt into, so
+  // neither may be unioned in. Without this check, driving a production runner
+  // to `event-history` (dev-only AND advanced, and the sole CONFIGURE item)
+  // would revive a whole dev-only group into the production sidebar.
+  //
+  // Re-runs the registry's own gate with the disclosure filters forced OPEN, so
+  // exactly the two dimensions we mean to bypass are bypassed.
+  const prevShowHidden = getShowHiddenItems();
+  const prevMode = getProductMode();
+  let allowedIgnoringDisclosures: boolean;
+  try {
+    setShowHiddenItems(true);
+    setProductMode(null);
+    allowedIgnoringDisclosures = isItemAvailable(activeItem, "runner");
+  } finally {
+    setShowHiddenItems(prevShowHidden);
+    setProductMode(prevMode);
+  }
+  if (!allowedIgnoringDisclosures) return groups;
+
+  const restored = transformItem(activeItem);
+  const existing = groups.find((group) => group.id === homeGroup.id);
+  if (existing) {
+    // Canonical position within the group.
+    const order = homeGroup.items.map((i) => i.id);
+    const items = [...existing.items, restored].sort(
+      (a, b) => order.indexOf(a.id) - order.indexOf(b.id),
+    );
+    return groups.map((group) => (group.id === existing.id ? { ...group, items } : group));
+  }
+
+  // The whole group was dropped (every item demoted). Re-add it carrying only
+  // the active item, in its canonical position among the groups.
+  const groupOrder = NAVIGATION_GROUPS.map((g) => g.id);
+  const revived: ResolvedNavigationGroup = {
+    id: homeGroup.id,
+    label: homeGroup.label,
+    items: [restored],
+    defaultExpanded: true,
+  };
+  const next = [...groups, revived];
+  next.sort((a, b) => groupOrder.indexOf(a.id) - groupOrder.indexOf(b.id));
+  return next;
 }
 
 // ============================================================================
@@ -537,6 +650,8 @@ interface NavGroupProps {
   onKeyDown: (e: KeyboardEvent, itemId: string) => void;
   getTabIndex: (itemId: string) => number;
   openFlyoutId: string | null;
+  /** Disclosure predicate, threaded through so child lookups match the sidebar. */
+  isDisclosureEnabled: (disclosure: FeatureDisclosure) => boolean;
 }
 
 function NavGroup({
@@ -549,6 +664,7 @@ function NavGroup({
   onKeyDown,
   getTabIndex,
   openFlyoutId,
+  isDisclosureEnabled,
 }: NavGroupProps) {
   const ChevronIcon = isExpanded ? ChevronDown : ChevronRight;
 
@@ -557,7 +673,9 @@ function NavGroup({
       <div className="space-y-1">
         {group.items.map((item) => {
           const isParentActive =
-            item.hasChildren && getChildItems(item.id).some((child) => child.id === activeTab);
+            item.hasChildren && getChildItems(item.id, isDisclosureEnabled, activeTab).some(
+              (child) => child.id === activeTab,
+            );
 
           return (
             <NavItem
@@ -583,7 +701,9 @@ function NavGroup({
       <div className="space-y-0.5">
         {group.items.map((item) => {
           const isParentActive =
-            item.hasChildren && getChildItems(item.id).some((child) => child.id === activeTab);
+            item.hasChildren && getChildItems(item.id, isDisclosureEnabled, activeTab).some(
+              (child) => child.id === activeTab,
+            );
           const isFlyoutOpen = openFlyoutId === item.id;
 
           return (
@@ -631,7 +751,9 @@ function NavGroup({
       >
         {group.items.map((item) => {
           const isParentActive =
-            item.hasChildren && getChildItems(item.id).some((child) => child.id === activeTab);
+            item.hasChildren && getChildItems(item.id, isDisclosureEnabled, activeTab).some(
+              (child) => child.id === activeTab,
+            );
           const isFlyoutOpen = openFlyoutId === item.id;
 
           return (
@@ -856,12 +978,16 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
     });
   });
 
-  // Product mode filtering
-  const { mode: productMode, setMode: setProductModeState } = useProductMode();
+  // Product mode filtering. `productMode` is already pinned to "ai" by
+  // ProductModeContext while the "visual" disclosure is off, and
+  // `canSwitchMode` says whether the AI Dev / Visual switcher is offered at all.
+  const { mode: productMode, setMode: setProductModeState, canSwitchMode } = useProductMode();
 
-  // "Show advanced automation features" — reveals the workflow-authoring nav
-  // items flagged `hidden: true` in @qontinui/navigation when enabled.
-  const { showAdvancedAutomation } = useAdvancedAutomation();
+  // "Show advanced automation features" — reveals the loop-workflow and
+  // workflow-authoring nav items flagged `hidden` for the runner platform in
+  // @qontinui/navigation when enabled.
+  const { isEnabled } = useFeatureDisclosure();
+  const showAdvancedAutomation = isEnabled("advanced");
 
   // Sync product mode + hidden-item visibility to shared navigation package and
   // rebuild groups. Both must run before buildNavigationGroups() so the freshly
@@ -869,8 +995,8 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
   const navigationGroups = useMemo(() => {
     setProductMode(productMode);
     setShowHiddenItems(showAdvancedAutomation);
-    return buildNavigationGroups();
-  }, [productMode, showAdvancedAutomation]);
+    return buildNavigationGroups(activeTab);
+  }, [productMode, showAdvancedAutomation, activeTab]);
 
   // Flyout state
   const [openFlyout, setOpenFlyout] = useState<{
@@ -902,7 +1028,8 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
       g.items.some(
         (item) =>
           item.id === activeTab ||
-          (item.hasChildren && getChildItems(item.id).some((child) => child.id === activeTab)),
+          (item.hasChildren &&
+            getChildItems(item.id, isEnabled, activeTab).some((child) => child.id === activeTab)),
       ),
     );
     if (activeGroup && !isGroupExpanded(currentState, activeGroup.id)) {
@@ -914,7 +1041,7 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
       });
       dispatch(navigationActions.expandGroup(activeGroup.id));
     }
-  }, [activeTab, collapsed, navigationGroups]);
+  }, [activeTab, collapsed, navigationGroups, isEnabled]);
 
   const toggleGroup = useCallback(
     (groupId: string) => {
@@ -934,14 +1061,17 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
     [navState, navigationGroups],
   );
 
-  const openFlyoutSidebar = useCallback((item: ResolvedNavigationItem) => {
-    const children = getChildItems(item.id);
-    setOpenFlyout({
-      id: item.id,
-      label: item.label,
-      items: children,
-    });
-  }, []);
+  const openFlyoutSidebar = useCallback(
+    (item: ResolvedNavigationItem) => {
+      const children = getChildItems(item.id, isEnabled, activeTab);
+      setOpenFlyout({
+        id: item.id,
+        label: item.label,
+        items: children,
+      });
+    },
+    [isEnabled, activeTab],
+  );
 
   const closeFlyout = useCallback(() => {
     setOpenFlyout(null);
@@ -954,31 +1084,31 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
    * REJECTED AND LOGGED rather than cast through and silently blanked
    * (the `"memory"` bug: an id in no union member reached `TabContent`, hit its
    * `default: return null`, and rendered an empty page with no diagnostic).
+   *
+   * Resolution goes through `resolveExternalTabId`, which returns `null` for an
+   * unknown id. The earlier version inferred "unknown" from `migrateTabId`
+   * returning the fallback tab — a trick that only worked while no real
+   * migration targeted the fallback. It stopped being true the moment the
+   * landing tab became `terminal` (`run-plan` migrates to exactly that), and it
+   * would have started silently swallowing a legitimate legacy click.
    */
   const selectTab = useCallback(
     (rawId: string) => {
-      if (isValidTabId(rawId)) {
-        onTabChange(rawId);
-        return;
-      }
-
-      // Legacy alias? `migrateTabId` maps known-old ids onto current ones and
-      // falls back to "prompt-home" for ids it does not recognise. No real
-      // migration targets "prompt-home", so that fallback == "unknown id".
-      const migrated = migrateTabId(rawId);
-      if (migrated !== "prompt-home") {
-        console.warn(
-          `[Sidebar] navigation item id "${rawId}" is a legacy alias; migrated to "${migrated}".`,
+      const resolved = resolveExternalTabId(rawId);
+      if (!resolved) {
+        console.error(
+          `[Sidebar] navigation item id "${rawId}" is not a known tab (MainTabId) and has no ` +
+            `migration. Ignoring the click instead of navigating to a page that cannot render. ` +
+            `Fix the id in @qontinui/navigation or add it to MainTabId + TabContent.`,
         );
-        onTabChange(migrated);
         return;
       }
-
-      console.error(
-        `[Sidebar] navigation item id "${rawId}" is not a known tab (MainTabId) and has no ` +
-          `migration. Ignoring the click instead of navigating to a page that cannot render. ` +
-          `Fix the id in @qontinui/navigation or add it to MainTabId + TabContent.`,
-      );
+      if (resolved !== rawId) {
+        console.warn(
+          `[Sidebar] navigation item id "${rawId}" is a legacy alias; migrated to "${resolved}".`,
+        );
+      }
+      onTabChange(resolved);
     },
     [onTabChange],
   );
@@ -991,7 +1121,7 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
         } else {
           openFlyoutSidebar(item);
           if (item.selectsFirstChild) {
-            const children = getChildItems(item.id);
+            const children = getChildItems(item.id, isEnabled, activeTab);
             if (children.length > 0) {
               selectTab(children[0].id);
             }
@@ -1011,7 +1141,7 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
         closeFlyout();
       }
     },
-    [openFlyout, closeFlyout, openFlyoutSidebar, selectTab],
+    [openFlyout, closeFlyout, openFlyoutSidebar, selectTab, isEnabled, activeTab],
   );
 
   const flattenedItems = useMemo(
@@ -1120,14 +1250,23 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
         style={{ width: collapsed ? SIDEBAR_WIDTH_COLLAPSED : SIDEBAR_WIDTH_EXPANDED }}
         aria-label="Main navigation"
       >
-        {/* Product Mode Switcher */}
-        <div className="px-2 pt-2 pb-0">
-          <ProductModeSwitcher
-            mode={productMode}
-            onModeChange={setProductModeState}
-            collapsed={collapsed}
-          />
-        </div>
+        {/*
+          Product Mode Switcher — rendered ONLY once the user has opted into
+          visual GUI automation (Settings → General → "Show visual GUI
+          automation"). Visual automation is an optional paradigm alongside the
+          Terminal-first default, so its entry point is disclosure-gated the
+          same way the advanced/loop-workflow surfaces are, rather than
+          permanently occupying the top of every user's sidebar.
+        */}
+        {canSwitchMode && (
+          <div className="px-2 pt-2 pb-0">
+            <ProductModeSwitcher
+              mode={productMode}
+              onModeChange={setProductModeState}
+              collapsed={collapsed}
+            />
+          </div>
+        )}
 
         {/* Navigation Groups */}
         <div className="flex-1 overflow-y-auto py-2 px-2 space-y-4">
@@ -1143,6 +1282,7 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
               onKeyDown={handleKeyDown}
               getTabIndex={getTabIndex}
               openFlyoutId={openFlyout?.id ?? null}
+              isDisclosureEnabled={isEnabled}
             />
           ))}
         </div>
