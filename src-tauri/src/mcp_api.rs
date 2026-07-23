@@ -4677,7 +4677,10 @@ mod coord_write_proxy_tests {
         // Claim-anchored register (plan 2026-07-21-gate-cascade-step3-proxy-rebase
         // Phase 1b): fixed route, no dynamic segment.
         assert_eq!(
-            write_upstream_url("https://coord.example.test", &CoordWriteTarget::RegisterGate),
+            write_upstream_url(
+                "https://coord.example.test",
+                &CoordWriteTarget::RegisterGate
+            ),
             "https://coord.example.test/coord/gates/register-agent"
         );
         // Work-unit registry forward-list (device-session coord surface
