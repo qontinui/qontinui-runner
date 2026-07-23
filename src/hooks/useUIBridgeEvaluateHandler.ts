@@ -98,10 +98,13 @@ interface EvaluateResponsePayload {
 
 /**
  * Structural code-injection blocks — always enforced. Mirrors the
- * structural set in `usePageEvents.ts::page_evaluate`. See that file for
- * per-entry rationale. Deliberately allows: localStorage/sessionStorage
- * (tab navigation), location.reload (page refresh after config changes),
- * globalThis/Reflect/Proxy (deep inspection).
+ * structural set in `usePageEvents.ts::checkEvaluateBlocklist`. See that
+ * file for per-entry rationale. Deliberately allows:
+ * localStorage/sessionStorage (tab navigation), globalThis/Reflect/Proxy
+ * (deep inspection). `location.reload` is blocked for the same reason the
+ * `page_refresh` handler refuses to reload: a full page reload tears down
+ * all React state (auth, execution, the terminal tree), orphaning every
+ * live PTY session.
  */
 const STRUCTURAL_PATTERNS: RegExp[] = [
   /\bimport\s*\(/,
@@ -112,9 +115,9 @@ const STRUCTURAL_PATTERNS: RegExp[] = [
   /\bnew\s+Function\b/,
   /\bdocument\.cookie\b/,
   /\bwindow\.open\b/,
-  /\bwindow\.location\.(assign|replace)\b/,
+  /\bwindow\.location\.(assign|replace|reload)\b/,
   /\bwindow\.location\s*=/,
-  /\blocation\.(assign|replace)\b/,
+  /\blocation\.(assign|replace|reload)\b/,
   /\blocation\s*=\s*["'`]/,
   /\bcrypto\.subtle\b/,
 ];
