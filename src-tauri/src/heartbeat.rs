@@ -180,10 +180,15 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
             // Read the /health-driven embedding probe cache. `None` (probe
             // hasn't run yet) collapses to "healthy" so a pre-probe heartbeat
             // doesn't flap to "degraded" on boot.
+            // `pg_reachable = None`: the heartbeat loop does not run a DB
+            // round-trip (the bounded PG liveness probe lives only in the
+            // `/health` handler), so it passes unknown rather than probing on
+            // every tick.
             let base_status = crate::ui_error::compute_derived_status(
                 ui_error_snapshot.is_some(),
                 recent_crash_snapshot.is_some(),
                 crate::mcp_api::embedding_reachable_cached(),
+                None,
             );
 
             // Phase 5 — provisioning completeness gate. A runner is

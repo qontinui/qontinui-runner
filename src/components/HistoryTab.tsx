@@ -18,6 +18,7 @@
 import { useState, useEffect, useMemo, useCallback, type CSSProperties } from "react";
 import { instanceStorage } from "@/lib/instance-storage";
 import { invoke } from "@tauri-apps/api/core";
+import { withTimeout } from "@/lib/withTimeout";
 import {
   History,
   CheckCircle,
@@ -40,6 +41,15 @@ import { createLogger } from "@/lib/logger";
 const logger = createLogger("HistoryTab");
 import { FixedVirtualList } from "./ui";
 import { PatternIndicator } from "./history/PatternIndicator";
+
+/**
+ * Client-side ceiling for the data-loading Tauri invokes (iter4 B-2). Without
+ * it, a backend that hangs (e.g. the PG pool stall this remediation also fixes
+ * server-side, B-1) left `loading` stuck `true` forever with no error ever
+ * surfaced. `withTimeout` rejects past this window so the `finally` clears
+ * `loading` and the error branch renders a retry affordance.
+ */
+const DATA_LOAD_TIMEOUT_MS = 10_000;
 
 /** Threshold for switching to virtual scrolling */
 const VIRTUAL_SCROLL_THRESHOLD = 100;
@@ -135,28 +145,38 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi, mode = "history" }
     instanceStorage.setJSON(STORAGE_KEY_FILTER, { type: filterType, status: filterStatus });
   }, [filterType, filterStatus]);
 
-  // Fetch GUI runs
+  // Fetch GUI runs. Throws on timeout or a backend error verdict so the
+  // caller's catch surfaces an error state (iter4 B-2): the invoke is bounded
+  // by `withTimeout`, and a `success: false` TieredInfoResponse (e.g. the
+  // "PG pool error" the server now returns instead of hanging, B-1) is
+  // promoted to a thrown error rather than silently swallowed.
   const fetchGuiRuns = useCallback(async () => {
-    try {
-      const result = await invoke<TieredInfoResponse<RunDetails[]>>("get_recent_runs", {
-        limit: 100,
-      });
-      if (result.success && result.data) {
-        setGuiRuns(result.data);
-      }
-    } catch (err) {
-      console.error("Failed to fetch GUI runs:", err);
+    const result = await withTimeout(
+      invoke<TieredInfoResponse<RunDetails[]>>("get_recent_runs", { limit: 100 }),
+      DATA_LOAD_TIMEOUT_MS,
+      "get_recent_runs",
+    );
+    if (result.success) {
+      setGuiRuns(result.data ?? []);
+    } else {
+      throw new Error(result.error || "Failed to load runs");
     }
   }, []);
 
-  // Fetch AI runs
+  // Fetch AI runs. Deliberately tolerant — the endpoint may not exist yet —
+  // but still bounded by `withTimeout` so a hung backend can't keep the
+  // combined loading state pinned forever (iter4 B-2).
   const fetchAiRuns = useCallback(async () => {
     try {
-      const result = await invoke<{
-        success: boolean;
-        data?: AiSessionRun[];
-        error?: string;
-      }>("get_ai_session_history", { limit: 100 });
+      const result = await withTimeout(
+        invoke<{
+          success: boolean;
+          data?: AiSessionRun[];
+          error?: string;
+        }>("get_ai_session_history", { limit: 100 }),
+        DATA_LOAD_TIMEOUT_MS,
+        "get_ai_session_history",
+      );
       if (result.success && result.data) {
         setAiRuns(result.data);
       }
@@ -294,11 +314,19 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi, mode = "history" }
     });
   };
 
-  // Handle refresh
+  // Handle refresh. Mirrors the initial fetch's error handling (iter4 B-2) so
+  // a failed/timed-out reload surfaces the error branch + retry instead of
+  // spinning the refresh icon indefinitely.
   const handleRefresh = async () => {
     setLoading(true);
-    await Promise.all([fetchGuiRuns(), fetchAiRuns()]);
-    setLoading(false);
+    setError(null);
+    try {
+      await Promise.all([fetchGuiRuns(), fetchAiRuns()]);
+    } catch (err) {
+      setError(String(err instanceof Error ? err.message : err));
+    } finally {
+      setLoading(false);
+    }
   };
 
   // Handle delete selected
@@ -410,29 +438,29 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi, mode = "history" }
         {/* Status filter — only meaningful for terminal-state history view.
             Active runs have no pass/fail yet, so we hide it in active mode. */}
         {mode === "history" && (
-        <div className="flex rounded-lg border border-border overflow-hidden">
-          {(["all", "success", "failed"] as FilterStatus[]).map((status) => (
-            <button
-              key={status}
-              onClick={() => setFilterStatus(status)}
-              className={`px-3 py-1.5 text-sm ${
-                filterStatus === status ? "bg-primary text-primary-foreground" : "hover:bg-muted"
-              }`}
-            >
-              {status === "all" && "All"}
-              {status === "success" && (
-                <span className="flex items-center gap-1">
-                  <CheckCircle className="w-3 h-3" /> Passed
-                </span>
-              )}
-              {status === "failed" && (
-                <span className="flex items-center gap-1">
-                  <XCircle className="w-3 h-3" /> Failed
-                </span>
-              )}
-            </button>
-          ))}
-        </div>
+          <div className="flex rounded-lg border border-border overflow-hidden">
+            {(["all", "success", "failed"] as FilterStatus[]).map((status) => (
+              <button
+                key={status}
+                onClick={() => setFilterStatus(status)}
+                className={`px-3 py-1.5 text-sm ${
+                  filterStatus === status ? "bg-primary text-primary-foreground" : "hover:bg-muted"
+                }`}
+              >
+                {status === "all" && "All"}
+                {status === "success" && (
+                  <span className="flex items-center gap-1">
+                    <CheckCircle className="w-3 h-3" /> Passed
+                  </span>
+                )}
+                {status === "failed" && (
+                  <span className="flex items-center gap-1">
+                    <XCircle className="w-3 h-3" /> Failed
+                  </span>
+                )}
+              </button>
+            ))}
+          </div>
         )}
 
         {/* Search */}
@@ -491,7 +519,21 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi, mode = "history" }
         {loading && filteredRuns.length === 0 ? (
           <div className="text-center py-8 text-muted-foreground">Loading...</div>
         ) : error ? (
-          <div className={`text-center py-8 ${getStatusColors("error").text}`}>{error}</div>
+          <div className="text-center py-8">
+            <AlertTriangle
+              className={`w-10 h-10 mx-auto mb-3 ${getStatusColors("error").text} opacity-80`}
+            />
+            <p className={getStatusColors("error").text}>{error}</p>
+            <button
+              type="button"
+              onClick={handleRefresh}
+              disabled={loading}
+              className="btn-secondary mt-4 inline-flex items-center gap-2"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`} />
+              Retry
+            </button>
+          </div>
         ) : filteredRuns.length === 0 ? (
           <div className="text-center py-8 text-muted-foreground">
             <History className="w-12 h-12 mx-auto mb-4 opacity-50" />

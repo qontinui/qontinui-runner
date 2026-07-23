@@ -235,10 +235,13 @@ pub(super) struct UiErrorSignals {
 pub(super) async fn gather_ui_error_signals(state: &Arc<ApiState>) -> UiErrorSignals {
     let ui_error = state.app_state.ui_error.get().await;
     let recent_crash = state.app_state.crash_dumps.get().await;
+    // `pg_reachable = None`: this signal gatherer does not run a DB round-trip;
+    // the bounded PG liveness probe lives only in the `/health` handler (B-5).
     let derived_status = crate::ui_error::compute_derived_status(
         ui_error.is_some(),
         recent_crash.is_some(),
         crate::mcp_api::embedding_reachable_cached(),
+        None,
     );
     let json = match &ui_error {
         Some(err) => serde_json::to_value(err).unwrap_or(serde_json::Value::Null),

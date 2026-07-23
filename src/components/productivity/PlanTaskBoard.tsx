@@ -57,6 +57,7 @@ import {
   UpstreamReportsPreview,
 } from "./CompletionReportSections";
 import type { PlanRow, PlanStatus, TaskDetail, TaskRow, TaskStatus } from "./types";
+import { withTimeout } from "@/lib/withTimeout";
 
 /** localStorage key prefix for the per-plan reflection panel open/closed state. */
 const REFLECTION_OPEN_KEY = (planId: string) => `productivity.reflection-open.${planId}`;
@@ -622,14 +623,13 @@ function SessionActions({ sessionId }: SessionActionsProps) {
           role="alertdialog"
           aria-labelledby="productivity-rewind-confirm-heading"
         >
-          <p
-            id="productivity-rewind-confirm-heading"
-            className="font-medium text-amber-200"
-          >
+          <p id="productivity-rewind-confirm-heading" className="font-medium text-amber-200">
             Rewind session {sessionId.slice(0, 8)}…?
           </p>
           <p className="text-amber-300/90">
-            This restores files from the pre-edit snapshots, kills the worker, and (by default) spawns a replacement with failure context. Destructive — files modified by this session will be reverted.
+            This restores files from the pre-edit snapshots, kills the worker, and (by default)
+            spawns a replacement with failure context. Destructive — files modified by this session
+            will be reverted.
           </p>
           <div className="flex gap-2">
             <button
@@ -657,9 +657,7 @@ function SessionActions({ sessionId }: SessionActionsProps) {
         </div>
       )}
 
-      {(state.kind === "summarized" ||
-        state.kind === "rewound" ||
-        state.kind === "error") && (
+      {(state.kind === "summarized" || state.kind === "rewound" || state.kind === "error") && (
         <SessionActionResult state={state} onDismiss={() => setState({ kind: "idle" })} />
       )}
     </section>
@@ -747,10 +745,7 @@ function SessionActionResult({ state, onDismiss }: SessionActionResultProps) {
   if (body == null) return null;
 
   return (
-    <div
-      className={`mt-2 p-2 rounded border text-[11px] ${bgClass}`}
-      data-ui-bridge-id={testId}
-    >
+    <div className={`mt-2 p-2 rounded border text-[11px] ${bgClass}`} data-ui-bridge-id={testId}>
       {body}
       <button
         onClick={onDismiss}
@@ -785,10 +780,7 @@ function TaskDetailPanel({ detail, loading, error, onReloadDetail }: TaskDetailP
       data-ui-bridge-id="productivity.task-detail"
     >
       <div className="px-3 py-2 border-b border-border">
-        <h2
-          id="productivity-task-detail-heading"
-          className="text-sm font-semibold text-foreground"
-        >
+        <h2 id="productivity-task-detail-heading" className="text-sm font-semibold text-foreground">
           Task Detail
         </h2>
       </div>
@@ -971,7 +963,14 @@ export function PlanTaskBoard() {
     setPlansLoading(true);
     setPlansError(null);
     try {
-      const rows = await listPlansFiltered(showArchived);
+      // iter4 B-2: bound the invoke so a hung backend surfaces the existing
+      // error branch (+ the header Refresh acts as retry) instead of pinning
+      // "Loading plans…" forever.
+      const rows = await withTimeout(
+        listPlansFiltered(showArchived),
+        10_000,
+        "list_plans_filtered",
+      );
       setPlans(rows);
       // If the previously selected plan vanished or none was selected yet,
       // pick the first row by default.

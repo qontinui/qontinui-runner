@@ -169,17 +169,25 @@ fn matches_existing(existing: &UiError, message: &str, digest: Option<&str>) -> 
 /// * `embedding_reachable` — `None` until the first probe has run (treated as
 ///   unknown, not degraded — avoids false positives during boot). `Some(true)`
 ///   = healthy. `Some(false)` = degraded.
+/// * `pg_reachable` — bounded PG liveness (a `SELECT 1` with the deadpool
+///   `get()` timeout). `None` when not probed (e.g. the heartbeat sinks that
+///   don't run a DB round-trip, or a runner with no PG configured) — treated
+///   as unknown, not degraded. `Some(false)` = the data layer is unreachable →
+///   degraded, so `/health` stops reporting "healthy" while every PG-backed
+///   panel is dead (iter4 B-5).
 ///
 /// All three heartbeat sinks (`/health`, operations heartbeat, web-backend
-/// heartbeat) call this so their `derived_status` stays in lockstep.
+/// heartbeat) call this so their `derived_status` stays in lockstep. Only the
+/// `/health` handler passes a probed `pg_reachable`; the others pass `None`.
 pub fn compute_derived_status(
     has_ui_error: bool,
     has_recent_crash: bool,
     embedding_reachable: Option<bool>,
+    pg_reachable: Option<bool>,
 ) -> &'static str {
     if has_ui_error || has_recent_crash {
         "errored"
-    } else if matches!(embedding_reachable, Some(false)) {
+    } else if matches!(embedding_reachable, Some(false)) || matches!(pg_reachable, Some(false)) {
         "degraded"
     } else {
         "healthy"
@@ -321,28 +329,60 @@ mod tests {
 
     #[test]
     fn derived_status_errored_wins_over_everything() {
-        assert_eq!(compute_derived_status(true, false, Some(true)), "errored");
-        assert_eq!(compute_derived_status(true, true, Some(false)), "errored");
-        assert_eq!(compute_derived_status(false, true, Some(true)), "errored");
+        assert_eq!(
+            compute_derived_status(true, false, Some(true), Some(true)),
+            "errored"
+        );
+        assert_eq!(
+            compute_derived_status(true, true, Some(false), Some(false)),
+            "errored"
+        );
+        assert_eq!(
+            compute_derived_status(false, true, Some(true), Some(true)),
+            "errored"
+        );
     }
 
     #[test]
     fn derived_status_degraded_when_embedding_unreachable() {
         assert_eq!(
-            compute_derived_status(false, false, Some(false)),
+            compute_derived_status(false, false, Some(false), Some(true)),
+            "degraded"
+        );
+    }
+
+    #[test]
+    fn derived_status_degraded_when_pg_unreachable() {
+        // iter4 B-5: PG down while everything else is fine → degraded, so
+        // /health can no longer report "healthy" over a dead data layer.
+        assert_eq!(
+            compute_derived_status(false, false, Some(true), Some(false)),
             "degraded"
         );
     }
 
     #[test]
     fn derived_status_healthy_when_embedding_reachable() {
-        assert_eq!(compute_derived_status(false, false, Some(true)), "healthy");
+        assert_eq!(
+            compute_derived_status(false, false, Some(true), Some(true)),
+            "healthy"
+        );
     }
 
     #[test]
     fn derived_status_unknown_embedding_is_healthy_not_degraded() {
         // Boot-time: probe hasn't run yet. Avoid false-positive degraded.
-        assert_eq!(compute_derived_status(false, false, None), "healthy");
+        assert_eq!(compute_derived_status(false, false, None, None), "healthy");
+    }
+
+    #[test]
+    fn derived_status_unknown_pg_is_healthy_not_degraded() {
+        // No PG probe (heartbeat sinks, or no PG configured) must not
+        // false-positive to degraded.
+        assert_eq!(
+            compute_derived_status(false, false, Some(true), None),
+            "healthy"
+        );
     }
 
     /// Wire-contract snapshot: serialized `UiError` must carry the exact
