@@ -1177,6 +1177,8 @@ pub fn terminal_report_tree_reset(
     navigation_type: Option<String>,
     page_ids: Option<Vec<String>>,
     open_record_count: Option<u32>,
+    time_origin: Option<f64>,
+    client_ts: Option<i64>,
 ) -> Result<CommandResponse, String> {
     let page_ids = page_ids.unwrap_or_default();
     info!(
@@ -1185,6 +1187,7 @@ pub fn terminal_report_tree_reset(
         navigation_type = navigation_type.as_deref().unwrap_or("unknown"),
         page_ids = ?page_ids,
         open_record_count = ?open_record_count,
+        time_origin = ?time_origin,
         "terminal tree reset reported: terminal page tree mounted (mount #{mount_number})"
     );
     // Port-scoped like the session-snapshots file, so multiple runner
@@ -1199,6 +1202,8 @@ pub fn terminal_report_tree_reset(
             navigation_type,
             page_ids,
             open_record_count,
+            time_origin,
+            client_ts,
         },
     );
     Ok(CommandResponse {

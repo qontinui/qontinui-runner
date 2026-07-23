@@ -267,6 +267,7 @@ export async function reportTreeReset(params: {
   mountNumber: number;
   authenticated?: boolean;
   pageIds: string[];
+  clientTs?: number;
 }): Promise<void> {
   try {
     let navigationType: string | undefined;
@@ -292,11 +293,30 @@ export async function reportTreeReset(params: {
       navigationType,
       pageIds: params.pageIds,
       openRecordCount,
+      // Same-document proof: rows sharing a timeOrigin belong to ONE webview
+      // document, so a second row with the same timeOrigin is a tree reset by
+      // construction (navigationType alone is document-scoped and cannot
+      // distinguish an in-app remount from the original load).
+      timeOrigin: performance.timeOrigin,
+      clientTs: params.clientTs,
     });
   } catch (err) {
     console.warn("[TerminalPage] tree-reset report failed:", err);
   }
 }
+
+/**
+ * Document-scoped mount counter for the tree-reset report. Deliberately MODULE
+ * state, not a `useRef`: a genuine tree reset destroys the fiber (and any ref
+ * with it), so a ref-scoped counter reports every real remount as mount #1 —
+ * indistinguishable from a fresh boot. Module state survives React remounts
+ * within the same JS realm and resets only on a real document load, which is
+ * exactly the remount-vs-fresh-load line the diagnostic must draw. (Dev-only
+ * StrictMode double-mount writes a spurious mount #2 row on boot; exe-mode
+ * runners don't run StrictMode, so a `mountNumber > 1` row in prod IS a tree
+ * reset.)
+ */
+let documentMountCount = 0;
 
 /**
  * Pure guard for the once-per-pageId init backstop (Phase 3 mount-hydration
@@ -517,12 +537,18 @@ export function useTerminalInitialization({
       );
     }
     // P0 tree-reset observability: durably report EVERY mount (mount #1 is a
-    // data point too — consumers filter on mountNumber). Fire-and-forget; the
+    // data point too — consumers filter on mountNumber). Uses the module-scope
+    // counter, NOT mountCountRef: the ref dies with the fiber on a genuine
+    // remount and would report every reset as mount #1. Fire-and-forget; the
     // report must never affect the initialization flow.
+    documentMountCount += 1;
     reportTreeReset({
-      mountNumber: mountNum,
+      mountNumber: documentMountCount,
       authenticated,
       pageIds: loadKnownPageIds(),
+      // Stamped at mount, before the awaited open-record fetch inside
+      // reportTreeReset, so the row orders correctly against restore logs.
+      clientTs: Date.now(),
     }).catch(() => {
       // reportTreeReset already swallows internally; this is belt-and-braces.
     });
