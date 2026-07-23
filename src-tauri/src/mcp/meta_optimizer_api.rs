@@ -23,6 +23,7 @@ use crate::meta_optimizer::types::{
     LearningOutcomeSummaryL0, MetaOptimizerRun, PromptVariant, Recommendation,
     ReflectionFixDetailL1, ReflectionFixSummaryL0,
 };
+use crate::str_utils::truncate_str;
 
 // ---------------------------------------------------------------------------
 // Query parameter structs
@@ -433,11 +434,7 @@ pub async fn get_optimizer_context_handler(
 
                         if let Some(applied) = &rec.applied_at {
                             // Show date only (trim to first 10 chars)
-                            let date = if applied.len() >= 10 {
-                                &applied[..10]
-                            } else {
-                                applied
-                            };
+                            let date = truncate_str(applied, 10);
                             let _ = write!(out, "\n   Applied: {}", date);
                         }
                         let _ = writeln!(out);
@@ -488,11 +485,7 @@ pub async fn get_optimizer_context_handler(
 
                 if let Some((b_sr, b_dur, b_date)) = &baseline {
                     let _ = writeln!(out, "## Progress vs Baseline");
-                    let date = if b_date.len() >= 10 {
-                        &b_date[..10]
-                    } else {
-                        b_date
-                    };
+                    let date = truncate_str(b_date, 10);
                     let _ = writeln!(
                         out,
                         "- Baseline (captured {}): {:.1}% success, {:.1}s avg duration",

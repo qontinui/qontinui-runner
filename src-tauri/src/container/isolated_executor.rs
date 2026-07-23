@@ -2,6 +2,7 @@ use tracing::{info, warn};
 
 use super::container_config::ContainerConfig;
 use super::docker_client::{ContainerResult, DockerManager};
+use crate::str_utils::truncate_str;
 
 pub struct IsolatedExecutor {
     docker: std::sync::Arc<DockerManager>,
@@ -53,7 +54,7 @@ impl IsolatedExecutor {
 
         info!(
             "Executing in container: {} (profile={}, extra_env={})",
-            &command[..command.len().min(100)],
+            truncate_str(command, 100),
             security_policy
                 .map(|p| p.profile_name.as_str())
                 .unwrap_or("none"),

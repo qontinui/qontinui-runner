@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 
 use crate::error_monitor::types::{ErrorSeverity, ErrorStatus, StoredErrorEvent};
+use crate::str_utils::truncate_str;
 
 /// A curated collection of errors ready for debug agent analysis.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -295,7 +296,8 @@ impl DebugContextCurator {
             }
 
             // Similar message (simple substring match)
-            if error.message.len() > 10 && other.message.contains(&error.message[..10]) {
+            if error.message.len() > 10 && other.message.contains(truncate_str(&error.message, 10))
+            {
                 related.push(other.id);
             }
         }

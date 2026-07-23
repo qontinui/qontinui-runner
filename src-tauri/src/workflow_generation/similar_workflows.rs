@@ -9,6 +9,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::database::pg::PgDb;
+use crate::str_utils::truncate_str_ellipsis;
 
 /// A similar workflow found by vector search.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,11 +57,7 @@ pub fn format_similar_workflows(similar: &[SimilarWorkflow]) -> String {
             w.completion_step_count,
         ));
         if !w.description.is_empty() {
-            let desc_preview = if w.description.len() > 200 {
-                format!("{}...", &w.description[..200])
-            } else {
-                w.description.clone()
-            };
+            let desc_preview = truncate_str_ellipsis(&w.description, 200);
             output.push_str(&format!("- **Description**: {}\n", desc_preview));
         }
         output.push('\n');

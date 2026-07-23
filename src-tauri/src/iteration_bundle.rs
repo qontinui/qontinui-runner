@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::info;
 
-use crate::str_utils::truncate_str;
+use crate::str_utils::{truncate_str, truncate_str_ellipsis};
 
 use crate::step_executor::{ExecutionResult, ExecutionStepConfig, LogSourceConfig};
 
@@ -1233,11 +1233,7 @@ impl IterationBundle {
             };
 
             // Truncate long URLs
-            let url_display = if capture.url.len() > 50 {
-                format!("{}...", &capture.url[..47])
-            } else {
-                capture.url.clone()
-            };
+            let url_display = truncate_str_ellipsis(&capture.url, 47);
 
             md.push_str(&format!(
                 "| {} | {} | {} | {} | `{}` |\n",

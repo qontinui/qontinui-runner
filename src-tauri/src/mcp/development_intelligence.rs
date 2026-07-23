@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::mcp::types::ApiState;
+use crate::str_utils::truncate_str;
 
 // ============================================================================
 // Request / Response types
@@ -788,7 +789,7 @@ pub async fn feature_health(
                     status = "abandoned".to_string();
                     signals.push(format!(
                         "No git commits touching this component since {}",
-                        &last_code_change[..10],
+                        truncate_str(&last_code_change, 10),
                     ));
                     signals.push("No test files reference this component".to_string());
                 } else if code_age > 60.0 {

@@ -78,6 +78,7 @@ use crate::mcp::awas::{
 
 use crate::mcp::shared::get_workspace_paths_internal;
 use crate::mcp::types::ApiState;
+use crate::str_utils::truncate_str;
 
 // Cached embedding-service probe state. Module-scope so heartbeats can read
 // the reachability bit without running the full async probe path — the
@@ -2565,7 +2566,7 @@ pub fn create_router(
             } else {
                 warn!(
                     "UI Bridge: Failed to parse response payload: {}",
-                    &payload_str[..payload_str.len().min(200)]
+                    truncate_str(&payload_str, 200)
                 );
             }
         });
@@ -2606,7 +2607,7 @@ pub fn create_router(
             let Some(parsed) = parsed else {
                 warn!(
                     "UI Bridge invoke: failed to parse invoke-response payload: {}",
-                    &payload_str[..payload_str.len().min(200)]
+                    truncate_str(&payload_str, 200)
                 );
                 return;
             };
@@ -2618,7 +2619,7 @@ pub fn create_router(
             let Some(request_id) = request_id else {
                 warn!(
                     "UI Bridge invoke: invoke-response missing request_id: {}",
-                    &payload_str[..payload_str.len().min(200)]
+                    truncate_str(&payload_str, 200)
                 );
                 return;
             };
@@ -2693,7 +2694,7 @@ pub fn create_router(
             let Some(parsed) = parsed else {
                 warn!(
                     "UI Bridge evaluate: failed to parse evaluate-response payload: {}",
-                    &payload_str[..payload_str.len().min(200)]
+                    truncate_str(&payload_str, 200)
                 );
                 return;
             };
@@ -2705,7 +2706,7 @@ pub fn create_router(
             let Some(request_id) = request_id else {
                 warn!(
                     "UI Bridge evaluate: evaluate-response missing request_id: {}",
-                    &payload_str[..payload_str.len().min(200)]
+                    truncate_str(&payload_str, 200)
                 );
                 return;
             };
@@ -2783,7 +2784,7 @@ pub fn create_router(
                 let Some(parsed) = parsed else {
                     warn!(
                         "scenarios/current: failed to parse projection response payload: {}",
-                        &payload_str[..payload_str.len().min(200)]
+                        truncate_str(&payload_str, 200)
                     );
                     return;
                 };
@@ -2795,7 +2796,7 @@ pub fn create_router(
                 let Some(request_id) = request_id else {
                     warn!(
                         "scenarios/current: projection response missing request_id: {}",
-                        &payload_str[..payload_str.len().min(200)]
+                        truncate_str(&payload_str, 200)
                     );
                     return;
                 };

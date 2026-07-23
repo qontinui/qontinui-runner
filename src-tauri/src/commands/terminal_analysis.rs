@@ -15,6 +15,7 @@ use crate::commands::compartments::HealthCompartment;
 use crate::commands::CommandResponse;
 use crate::doctor::DoctorHandle;
 use crate::error::AppError;
+use crate::str_utils::truncate_str;
 use std::path::PathBuf;
 use std::time::SystemTime;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
@@ -89,7 +90,7 @@ fn run_analysis(
         warn!(
             "Failed to parse AI analysis JSON: {}\nRaw output: {}",
             e,
-            &stripped[..stripped.len().min(200)]
+            truncate_str(stripped, 200)
         );
         String::from(AppError::ParseError(format!(
             "Failed to parse AI response as JSON: {}",

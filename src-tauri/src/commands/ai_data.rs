@@ -616,10 +616,9 @@ pub struct TextLogsSummary {
 /// Supports format: "2026-01-06 18:22:53" at the start of the line
 fn parse_log_timestamp(line: &str) -> Option<DateTime<Utc>> {
     // Format: "2026-01-06 18:22:53 [info ..."
-    if line.len() < 19 {
-        return None;
-    }
-    let timestamp_str = &line[..19];
+    // `get` rather than `&line[..19]`: a short line, or a multi-byte char
+    // straddling byte 19, yields None instead of panicking.
+    let timestamp_str = line.get(..19)?;
     NaiveDateTime::parse_from_str(timestamp_str, "%Y-%m-%d %H:%M:%S")
         .ok()
         .map(|dt| DateTime::from_naive_utc_and_offset(dt, Utc))

@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{error, info, warn};
 
+use crate::str_utils::truncate_str;
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -197,7 +199,7 @@ pub fn create_worktree(
         .take(40)
         .collect();
 
-    let short_id = &execution_id[..execution_id.len().min(8)];
+    let short_id = truncate_str(execution_id, 8);
     let branch_name = format!("worktree/{}-{}", sanitized_name, short_id);
 
     // Create worktree directory
@@ -247,7 +249,7 @@ pub fn create_worktree(
         branch_name,
         worktree_path.display(),
         source_branch,
-        &source_commit[..8]
+        truncate_str(&source_commit, 8)
     );
 
     let output = run_git_command(
@@ -863,7 +865,7 @@ After resolving all conflicts, stage the files with `git add` and run `git commi
     let truncated_diff = if full_diff.len() > 50000 {
         format!(
             "{}...\n[diff truncated, {} more chars]",
-            &full_diff[..50000],
+            truncate_str(&full_diff, 50000),
             full_diff.len() - 50000
         )
     } else {

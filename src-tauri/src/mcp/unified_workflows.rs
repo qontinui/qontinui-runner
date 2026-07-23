@@ -15,6 +15,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::database::CreateTaskRunInput;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use crate::str_utils::truncate_str;
 use crate::unified_workflows::UnifiedWorkflowExt;
 use crate::workflow_generation;
 
@@ -831,7 +832,7 @@ pub async fn generate_unified_workflow_handler(
 > {
     info!(
         "Generating unified workflow from description: {}...",
-        &request.description[..request.description.len().min(50)]
+        truncate_str(&request.description, 50)
     );
 
     // Inject observation memory into inline_context (async, before blocking spawn)
@@ -918,7 +919,7 @@ pub async fn generate_unified_workflow_async_handler(
 
     info!(
         "Generating unified workflow async from description: {}...",
-        &request.description[..request.description.len().min(50)]
+        truncate_str(&request.description, 50)
     );
 
     // Resolve contexts (same pattern as generator.rs)

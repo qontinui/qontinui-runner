@@ -13,7 +13,7 @@ use tracing::{info, warn};
 use crate::display::RawEvent;
 use crate::executor::file_logger::FileLogger;
 use crate::orchestrator::context_propagation::ExpressionEvaluator;
-use crate::str_utils::truncate_str;
+use crate::str_utils::{truncate_str, truncate_str_ellipsis};
 
 use super::executor::StepExecutor;
 use super::executor_types::*;
@@ -363,11 +363,7 @@ impl StepExecutor {
                     err.line_number,
                     err.error_type,
                     // Truncate long lines
-                    if err.message.len() > 200 {
-                        format!("{}...", &err.message[..200])
-                    } else {
-                        err.message.clone()
-                    }
+                    truncate_str_ellipsis(&err.message, 200)
                 ));
             }
             if error_count > display_limit {
@@ -498,7 +494,7 @@ impl StepExecutor {
             if sanitized != command {
                 info!(
                     "Legacy executor: jq→python replacement applied: {}",
-                    &sanitized[..sanitized.len().min(100)]
+                    truncate_str(&sanitized, 100)
                 );
             }
             sanitized
@@ -1830,7 +1826,10 @@ impl StepExecutor {
                 files_checked: result.files_checked,
                 error_message: result.error.clone(),
                 output: if result.output.len() > 2000 {
-                    Some(format!("{}... (truncated)", &result.output[..2000]))
+                    Some(format!(
+                        "{}... (truncated)",
+                        truncate_str(&result.output, 2000)
+                    ))
                 } else if !result.output.is_empty() {
                     Some(result.output.clone())
                 } else {

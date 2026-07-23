@@ -19,6 +19,7 @@ use crate::ai_provider;
 use crate::ai_router::TaskContext;
 use crate::database::pg::PgDb;
 use crate::memory::importance;
+use crate::str_utils::{truncate_str, truncate_str_ellipsis};
 
 // =============================================================================
 // Types
@@ -435,7 +436,7 @@ fn parse_consolidation_response(response: &str) -> Result<ConsolidationResult, S
         format!(
             "Failed to parse consolidation response: {}. Response: {}",
             e,
-            &cleaned[..cleaned.len().min(200)]
+            truncate_str(cleaned, 200)
         )
     })
 }
@@ -751,11 +752,7 @@ async fn try_llm_inductive(
     let count = observations.len();
     let mut obs_lines = String::new();
     for obs in observations.iter().take(10) {
-        let preview = if obs.content.len() > 200 {
-            format!("{}...", &obs.content[..200])
-        } else {
-            obs.content.clone()
-        };
+        let preview = truncate_str_ellipsis(&obs.content, 200);
         obs_lines.push_str(&format!("- {}: {}\n", obs.title, preview));
     }
     if count > 10 {
@@ -803,7 +800,7 @@ async fn try_llm_inductive(
         format!(
             "Failed to parse inductive JSON: {} — raw: {}",
             e,
-            &json_str[..json_str.len().min(200)]
+            truncate_str(json_str, 200)
         )
     })?;
 
@@ -820,11 +817,7 @@ async fn try_llm_abductive(
     let count = cluster.len();
     let mut issue_lines = String::new();
     for obs in cluster.iter().take(10) {
-        let preview = if obs.content.len() > 200 {
-            format!("{}...", &obs.content[..200])
-        } else {
-            obs.content.clone()
-        };
+        let preview = truncate_str_ellipsis(&obs.content, 200);
         issue_lines.push_str(&format!("- {}: {}\n", obs.title, preview));
     }
     if count > 10 {
@@ -872,7 +865,7 @@ async fn try_llm_abductive(
         format!(
             "Failed to parse abductive JSON: {} — raw: {}",
             e,
-            &json_str[..json_str.len().min(200)]
+            truncate_str(json_str, 200)
         )
     })?;
 
@@ -1334,10 +1327,7 @@ pub async fn run_dreamer(
                     // Create observation for high-confidence abductive hypotheses
                     if trace.confidence > 0.7 {
                         let obs_input = crate::database::types::CreateObservationInput {
-                            title: format!(
-                                "Hypothesis: {}",
-                                &trace.conclusion[..trace.conclusion.len().min(80)]
-                            ),
+                            title: format!("Hypothesis: {}", truncate_str(&trace.conclusion, 80)),
                             content: trace.conclusion.clone(),
                             observation_type: "hypothesis".to_string(),
                             scope: "project".to_string(),

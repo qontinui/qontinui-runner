@@ -8,6 +8,7 @@ use tracing::{info, warn};
 
 use super::org_chart::OrgChartSeed;
 use super::types::DecomposerConfig;
+use crate::str_utils::truncate_str;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SubTaskStatus {
@@ -375,7 +376,7 @@ fn extract_json_from_response(response: &str) -> Result<String, String> {
 
     Err(format!(
         "Could not extract valid JSON from response: {}...",
-        &response[..response.len().min(200)]
+        truncate_str(&response, 200)
     ))
 }
 

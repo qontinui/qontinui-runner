@@ -65,6 +65,7 @@ use tracing::{debug, info, warn};
 use super::types::AiResponse;
 use crate::config_facade::ai_keychain;
 use crate::settings::{self, AiProvider};
+use crate::str_utils::truncate_str;
 
 // =============================================================================
 // Error type
@@ -189,7 +190,7 @@ pub trait OneshotLlmExt: OneshotLlm {
                 if s.len() <= 200 {
                     s
                 } else {
-                    format!("{}…", &s[..200])
+                    format!("{}…", truncate_str(&s, 200))
                 }
             };
             // Counter bump for the post-call typed-deserialize failure path.
@@ -344,7 +345,7 @@ fn parse_payload(output: &str) -> Result<Value, OneshotError> {
         let preview = if output.len() <= 200 {
             output.to_string()
         } else {
-            format!("{}…", &output[..200])
+            format!("{}…", truncate_str(output, 200))
         };
         record_call_err("schema_parse");
         OneshotError::SchemaParse(format!("response is not valid JSON: {} | {}", e, preview))

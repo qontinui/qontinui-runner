@@ -95,6 +95,7 @@ use super::types::*;
 use crate::ai_router::TaskContext;
 use crate::commands::AppState;
 use crate::state_explorer::{ExplorationConfig, ExplorationStatus, ExplorationTask};
+use crate::str_utils::truncate_str;
 
 /// Result of resolving a Playwright script ID from the database.
 enum ResolvedScript {
@@ -989,7 +990,7 @@ impl AiVerifier {
             criterion
                 .evaluation_prompt
                 .as_deref()
-                .map(|s| &s[..s.len().min(50)])
+                .map(|s| truncate_str(s, 50))
         );
 
         // Build isolated context

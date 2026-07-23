@@ -371,7 +371,13 @@ pub fn emit_finding_recorded(
         } else {
             format!(
                 "{}, ... (+{} more)",
-                finding.related_files[..2].join(", "),
+                finding
+                    .related_files
+                    .iter()
+                    .take(2)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 finding.related_files.len() - 2
             )
         };
@@ -637,7 +643,12 @@ pub fn emit_overrides_summary(
     } else {
         format!(
             "{}, ... (+{} more)",
-            criteria_ids[..2].join(", "),
+            criteria_ids
+                .iter()
+                .take(2)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
             criteria_ids.len() - 2
         )
     };

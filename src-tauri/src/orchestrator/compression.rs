@@ -18,6 +18,7 @@ use tracing::{debug, info, warn};
 
 use crate::database::pg::PgDb;
 use crate::database::StoredTaskKnowledge;
+use crate::str_utils::truncate_str_ellipsis;
 
 // ============================================================================
 // Configuration
@@ -458,11 +459,7 @@ impl CompressionService {
             let key = entry.content.chars().take(50).collect::<String>();
             if seen_patterns.insert(key) {
                 // Truncate long entries
-                let content = if entry.content.len() > 200 {
-                    format!("{}...", &entry.content[..200])
-                } else {
-                    entry.content.clone()
-                };
+                let content = truncate_str_ellipsis(&entry.content, 200);
                 summary_parts.push(format!("- {}", content));
             }
         }

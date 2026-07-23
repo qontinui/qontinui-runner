@@ -20,6 +20,7 @@ use std::sync::OnceLock;
 use tracing::warn;
 
 use crate::step_executor::ExecutionStepConfig;
+use crate::str_utils::truncate_str;
 
 /// Maximum number of injected steps per agentic phase.
 const MAX_INJECTED_STEPS: usize = 20;
@@ -153,7 +154,7 @@ impl InjectedStepParser {
                 warn!(
                     "INJECT_STEP: Failed to parse JSON: {} (content: {})",
                     e,
-                    &trimmed[..trimmed.len().min(200)]
+                    truncate_str(trimmed, 200)
                 );
                 None
             }

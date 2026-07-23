@@ -49,6 +49,7 @@ use super::types::{
     UIBridgeDiscoveryRequest, UiBridgeError,
 };
 use super::{ipc_handler_path_get, ipc_handler_post};
+use crate::str_utils::truncate_str_ellipsis;
 
 /// Phase 3.2b (plan 2026-05-03) — bidirectional simple-glob match between
 /// a query value and a single `reveals` entry. Mirrors the canonical SDK
@@ -1845,11 +1846,7 @@ pub async fn ui_bridge_execute_action_handler(
                 // Truncate result to 1KB to respect memory budgets
                 let res = json_resp.data.as_ref().map(|d| {
                     let s = d.to_string();
-                    if s.len() > 1024 {
-                        format!("{}...", &s[..1024])
-                    } else {
-                        s
-                    }
+                    truncate_str_ellipsis(&s, 1024)
                 });
                 (s, err, res)
             }

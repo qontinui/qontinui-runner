@@ -888,7 +888,7 @@ mod tests {
         assert!(
             msg.contains("\"heldLocks\""),
             "user message must include heldLocks key: {}",
-            &msg[..msg.len().min(500)]
+            crate::str_utils::truncate_str(&msg, 500)
         );
         assert!(
             msg.contains("\"src/foo.rs\""),

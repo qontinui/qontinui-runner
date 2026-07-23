@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use super::compartments::HealthCompartment;
 use super::CommandResponse;
+use crate::str_utils::truncate_str;
 
 // Migrated to HealthCompartment (Workstream C).
 // Only find_log_sources_with_ai consumes AppState (doctor_handle); all other
@@ -1354,7 +1355,7 @@ pub async fn find_log_sources_with_ai(
             warn!(
                 "Failed to parse AI response as JSON: {}. Response was: {}",
                 e,
-                &json_str[..json_str.len().min(500)]
+                truncate_str(&json_str, 500)
             );
             Ok(CommandResponse {
                 success: false,

@@ -6,6 +6,7 @@
 use super::{parse_optional_workflow_id, parse_workflow_id, PgDb};
 use crate::database::cross_run_ops::CrossRunPattern;
 use crate::database::graph_ops::{PipelineEvent, WorkflowVersion};
+use crate::str_utils::truncate_str_ellipsis;
 
 impl PgDb {
     // ========================================================================
@@ -664,15 +665,6 @@ impl PgDb {
         let query_lower = query.to_lowercase();
         let mut results = Vec::new();
 
-        fn truncate_str(s: &str, max_len: usize) -> String {
-            if s.len() <= max_len {
-                s.to_string()
-            } else {
-                let truncated: String = s.chars().take(max_len).collect();
-                format!("{}...", truncated)
-            }
-        }
-
         // 1. Search task_run_findings
         if let Ok(rows) = conn
             .query(
@@ -703,7 +695,7 @@ impl PgDb {
                         "[{}][{}] {}",
                         category,
                         severity,
-                        truncate_str(&description, 120)
+                        truncate_str_ellipsis(&description, 120)
                     ),
                     relevance_score: score,
                     source_table: "task_run_findings".to_string(),
@@ -741,7 +733,7 @@ impl PgDb {
                         "[{}][{}] {}",
                         scope,
                         status,
-                        truncate_str(&fix_description, 120)
+                        truncate_str_ellipsis(&fix_description, 120)
                     ),
                     relevance_score: score,
                     source_table: "reflection_fixes".to_string(),
@@ -778,7 +770,7 @@ impl PgDb {
                         "[{}][conf:{}] {}",
                         category,
                         confidence,
-                        truncate_str(&content, 120)
+                        truncate_str_ellipsis(&content, 120)
                     ),
                     relevance_score: score,
                     source_table: "task_knowledge".to_string(),
@@ -815,7 +807,12 @@ impl PgDb {
                     entity_type: "error".to_string(),
                     entity_id: id.to_string(),
                     title: error_type.unwrap_or_else(|| format!("{} error", source)),
-                    snippet: format!("[{}][{}] {}", source, severity, truncate_str(&message, 120)),
+                    snippet: format!(
+                        "[{}][{}] {}",
+                        source,
+                        severity,
+                        truncate_str_ellipsis(&message, 120)
+                    ),
                     relevance_score: score,
                     source_table: "error_events".to_string(),
                 });
@@ -854,7 +851,7 @@ impl PgDb {
                         agent,
                         severity,
                         status,
-                        truncate_str(&content, 120)
+                        truncate_str_ellipsis(&content, 120)
                     ),
                     relevance_score: score,
                     source_table: "generation_rules".to_string(),
@@ -887,7 +884,11 @@ impl PgDb {
                     entity_type: "workflow".to_string(),
                     entity_id: id,
                     title: name,
-                    snippet: format!("[{}] {}", category, truncate_str(&description, 120)),
+                    snippet: format!(
+                        "[{}] {}",
+                        category,
+                        truncate_str_ellipsis(&description, 120)
+                    ),
                     relevance_score: score,
                     source_table: "unified_workflows".to_string(),
                 });
@@ -930,7 +931,7 @@ impl PgDb {
                         element_type.as_deref().unwrap_or("unknown"),
                         text_content
                             .as_deref()
-                            .map(|t| truncate_str(t, 120))
+                            .map(|t| truncate_str_ellipsis(t, 120))
                             .unwrap_or_default()
                     ),
                     relevance_score: score,

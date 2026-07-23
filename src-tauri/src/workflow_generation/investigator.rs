@@ -12,6 +12,7 @@
 use crate::ai_provider::AiResponse;
 use crate::ai_router::TaskContext;
 use crate::doctor::DoctorHandle;
+use crate::str_utils::truncate_str;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
@@ -103,7 +104,7 @@ pub fn run_investigation(
     );
     debug!(
         "Enriched description preview: {}",
-        &output[..output.len().min(200)]
+        truncate_str(&output, 200)
     );
 
     InvestigationResult {

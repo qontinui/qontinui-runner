@@ -32,6 +32,7 @@ use super::types::{
     get_parent_task_id, step_execution_to_record, AgenticOutcome, LoopConfig, LoopResult,
     PhaseResult, SweepResult,
 };
+use crate::str_utils::truncate_str;
 
 /// The main loop controller for unified workflows.
 ///
@@ -3016,7 +3017,7 @@ impl LoopController {
                 group.failure_type,
                 success,
                 if group_passed { "PASSED" } else { "FAILED" },
-                &output[..output.len().min(2000)],
+                truncate_str(&output, 2000),
             ));
         }
 

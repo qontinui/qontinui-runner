@@ -13,6 +13,7 @@
 
 use crate::ai_provider::middleware::{AiMiddleware, MiddlewareContext};
 use crate::ai_provider::AiResponse;
+use crate::str_utils::truncate_str;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -253,7 +254,7 @@ impl AiMiddleware for BudgetEnforcementMiddleware {
                 "IMPORTANT: The token budget for this task run is exhausted. \
                  Summarize your progress so far and produce your final output immediately. \
                  Do not start new work.\n\n{}",
-                &prompt[..prompt.len().min(2000)]
+                truncate_str(prompt, 2000)
             ));
         }
 
