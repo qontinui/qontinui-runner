@@ -76,7 +76,7 @@ describe("handleEvaluateRequest", () => {
     expect((payload as { error: string }).error).toMatch(/prohibited pattern/);
   });
 
-  it.each(["location.reload()", "window.location.reload()"])(
+  it.each(["location.reload()", "window.location.reload()", "history.go(0)"])(
     "rejects %s (reload does via evaluate what page_refresh refuses)",
     async (expression) => {
       const deps = makeDeps();

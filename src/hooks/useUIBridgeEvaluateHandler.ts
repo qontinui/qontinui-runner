@@ -118,6 +118,7 @@ const STRUCTURAL_PATTERNS: RegExp[] = [
   /\bwindow\.location\.(assign|replace|reload)\b/,
   /\bwindow\.location\s*=/,
   /\blocation\.(assign|replace|reload)\b/,
+  /\bhistory\.go\s*\(\s*0?\s*\)/,
   /\blocation\s*=\s*["'`]/,
   /\bcrypto\.subtle\b/,
 ];
