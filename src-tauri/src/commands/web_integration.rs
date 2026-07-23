@@ -114,6 +114,17 @@ fn normalize_for_compare(s: &WebIntegrationSettings) -> WebIntegrationSettings {
 pub struct GetWebIntegrationStatusResponse {
     pub enabled: bool,
     pub backend_url: String,
+    /// The persisted web-frontend origin override, or `""` when unset (the
+    /// backend then derives it from `backend_url`).
+    ///
+    /// NO-DOWNGRADE: this field was DECLARED by the TypeScript
+    /// `WebIntegrationStatus` interface but never sent by Rust, so
+    /// `applyStatusToForm` always seeded the Advanced "web base URL" input
+    /// with `""`. Saving the panel for any unrelated reason (toggling
+    /// Enabled, pasting a token) then posted `webBaseUrl: undefined` and
+    /// silently WIPED a configured override — a capability reduction caused
+    /// by a value that was never read back. Sending it closes the loop.
+    pub web_base_url: String,
     pub runner_token_masked: String,
     pub runner_id: Option<String>,
     pub last_heartbeat_at: Option<String>,
@@ -154,6 +165,7 @@ pub async fn get_web_integration_status(
     Ok(GetWebIntegrationStatusResponse {
         enabled: persisted.enabled,
         backend_url: persisted.backend_url,
+        web_base_url: persisted.web_base_url.unwrap_or_default(),
         runner_token_masked: mask_runner_token(&persisted.runner_token),
         runner_id,
         last_heartbeat_at,
@@ -801,6 +813,41 @@ mod ipc_wire_contract_tests {
         }"#;
         let args: SaveArgs = serde_json::from_str(payload).expect("must deserialize");
         assert_eq!(args.web_base_url.as_deref(), Some("http://localhost:3001"));
+    }
+
+    /// NO-DOWNGRADE round-trip guard for the READ side.
+    ///
+    /// The save wire contract above was tested; the STATUS response was not.
+    /// `WebIntegrationStatus` in `WebIntegrationSettings.tsx` declares
+    /// `webBaseUrl`, but the Rust response struct never carried it — so the
+    /// Advanced "web base URL" input was seeded with `""` on every load, and
+    /// the next unrelated Save posted `webBaseUrl: undefined`, silently
+    /// wiping a configured override. Every field the frontend seeds its form
+    /// from must be present in the response, or saving becomes lossy.
+    #[test]
+    fn status_response_carries_every_field_the_form_seeds_from() {
+        let json = serde_json::to_value(super::GetWebIntegrationStatusResponse {
+            enabled: true,
+            backend_url: "http://localhost:8000".into(),
+            web_base_url: "http://localhost:3001".into(),
+            runner_token_masked: "qontinui_runner_…abcd".into(),
+            runner_id: None,
+            last_heartbeat_at: None,
+            registration_error: None,
+            ws_connected: false,
+            settings_fault: None,
+        })
+        .expect("status response must serialize");
+
+        // Exactly the keys `applyStatusToForm` / `isDirty` read.
+        for key in ["enabled", "backendUrl", "webBaseUrl", "runnerTokenMasked"] {
+            assert!(
+                json.get(key).is_some(),
+                "status response is missing `{key}` — the form seeds from it, so an \
+                 absent field silently blanks the user's saved value on the next save"
+            );
+        }
+        assert_eq!(json["webBaseUrl"], "http://localhost:3001");
     }
 
     #[test]
