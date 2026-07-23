@@ -34,8 +34,10 @@
 //! injection in the binary) resolves it identically.
 
 use super::parser::{parse_work_unit, slug_from_filename, ParsedWorkUnit, PlanConvention};
-use super::push::{push_work_unit, PushOutcomeKind, SetDepsOutcome, WorkUnitSink};
-use std::collections::HashMap;
+use super::push::{
+    push_archive_metadata, push_work_unit, PushOutcomeKind, SetDepsOutcome, WorkUnitSink,
+};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -65,6 +67,9 @@ pub struct AdapterMetrics {
     /// here does NOT fail the reconcile — the unit's upsert already succeeded
     /// and edges are additive.
     pub deps_errors_total: AtomicU64,
+    /// Total `metadata.archive_path` stamps written by the archive scan
+    /// (counter). Metadata-only — never a status transition (D4).
+    pub archive_stamped_total: AtomicU64,
 }
 
 /// A point-in-time read of [`AdapterMetrics`].
@@ -78,6 +83,7 @@ pub struct MetricsSnapshot {
     pub deps_set_total: u64,
     pub deps_skipped_unmigrated_total: u64,
     pub deps_errors_total: u64,
+    pub archive_stamped_total: u64,
 }
 
 impl AdapterMetrics {
@@ -93,6 +99,7 @@ impl AdapterMetrics {
                 .deps_skipped_unmigrated_total
                 .load(Ordering::Relaxed),
             deps_errors_total: self.deps_errors_total.load(Ordering::Relaxed),
+            archive_stamped_total: self.archive_stamped_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -241,14 +248,108 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
     summary
 }
 
+/// Outcome of one metadata-only archive scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ArchiveSummary {
+    /// Archived plans scanned this cycle.
+    pub scanned: u64,
+    /// `metadata.archive_path` stamps written (metadata-only upserts).
+    pub stamped: u64,
+    /// Per-unit archive-upsert errors.
+    pub errors: u64,
+}
+
+/// Metadata-only reconcile of the **archive** directory (D4). For every plan
+/// found in the archive dir, stamp `metadata.archive_path` provenance via
+/// [`push_archive_metadata`] — **never** a status transition. Pure of IO beyond
+/// the sink, so it is unit-tested with a fake sink.
+///
+/// The archive scan carries no client-side edge-trigger memory: an archived
+/// plan is terminal, its `archive_path` is stable, and the upsert is idempotent,
+/// so re-stamping each cycle is harmless (and re-asserts provenance a coord
+/// restart might have missed). It records nothing into `last_applied`, so it can
+/// never influence the active-dir transition path.
+pub async fn reconcile_archive_once<S: WorkUnitSink + ?Sized>(
+    archived_units: &[ParsedWorkUnit],
+    sink: &S,
+    metrics: &AdapterMetrics,
+) -> ArchiveSummary {
+    let mut summary = ArchiveSummary {
+        scanned: archived_units.len() as u64,
+        ..Default::default()
+    };
+    for u in archived_units {
+        match push_archive_metadata(sink, u).await {
+            Ok(()) => {
+                summary.stamped += 1;
+                metrics
+                    .archive_stamped_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                summary.errors += 1;
+                metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    slug = %u.slug,
+                    error = %format!("{e:#}"),
+                    "plan adapter: archive metadata stamp failed"
+                );
+            }
+        }
+    }
+    summary
+}
+
+/// Pure disappeared-slug detection (D4). A slug we have previously applied
+/// (present in `known`) that is now absent from BOTH the active scan
+/// (`active_slugs`) and the archive scan (`archive_slugs`), and has not already
+/// been warned about (`warned`), is "disappeared": the plan file left the
+/// active dir without landing in the archive. Returns those newly-disappeared
+/// slugs and records them in `warned` so each is surfaced **once per process**.
+///
+/// The caller only *warns* on the result — the work unit is left untouched.
+/// Terminal state is owned by coord's derive engine; the adapter must never
+/// push `shipped`/`archived` to fill the gap (a second-writer race).
+pub fn newly_disappeared_slugs(
+    known: &HashMap<String, String>,
+    active_slugs: &HashSet<String>,
+    archive_slugs: &HashSet<String>,
+    warned: &mut HashSet<String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for slug in known.keys() {
+        if !active_slugs.contains(slug) && !archive_slugs.contains(slug) && !warned.contains(slug) {
+            warned.insert(slug.clone());
+            out.push(slug.clone());
+        }
+    }
+    out
+}
+
 /// The periodic reconcile loop. Runs until the task is dropped.
-async fn run_loop<S: WorkUnitSink + ?Sized>(dir: PathBuf, sink: &S, interval_secs: u64) {
+///
+/// Each cycle: reconcile the active dir (edge-triggered status transitions),
+/// then — when an archive dir is configured — metadata-only stamp every archived
+/// plan's `archive_path` (never a transition, D4), then warn once about any slug
+/// that vanished from both dirs.
+async fn run_loop<S: WorkUnitSink + ?Sized>(
+    dir: PathBuf,
+    archive_dir: Option<PathBuf>,
+    sink: &S,
+    interval_secs: u64,
+) {
     let conv = PlanConvention::operator_default();
     let metrics = adapter_metrics();
     let mut last_applied: HashMap<String, String> = HashMap::new();
     let mut last_deps: HashMap<String, Vec<String>> = HashMap::new();
+    let mut warned_disappeared: HashSet<String> = HashSet::new();
     let mut tick = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
-    tracing::info!(dir = %dir.display(), interval_secs, "plan adapter: reconcile loop started");
+    tracing::info!(
+        dir = %dir.display(),
+        archive_dir = archive_dir.as_ref().map(|d| d.display().to_string()),
+        interval_secs,
+        "plan adapter: reconcile loop started"
+    );
     loop {
         tick.tick().await;
         let units = read_plan_dir(&dir, &conv);
@@ -265,6 +366,39 @@ async fn run_loop<S: WorkUnitSink + ?Sized>(dir: PathBuf, sink: &S, interval_sec
             deps_errors = summary.deps_errors,
             "plan adapter: reconcile cycle complete"
         );
+
+        // Archive scan (metadata-only) + disappeared-slug detection. When no
+        // archive dir is configured, `read_plan_dir` on `None` is skipped and
+        // the archive slug set is empty — a slug that vanishes from the active
+        // dir with no archive configured is still surfaced as disappeared.
+        let archived = match &archive_dir {
+            Some(a) => read_plan_dir(a, &conv),
+            None => Vec::new(),
+        };
+        if !archived.is_empty() {
+            let asum = reconcile_archive_once(&archived, sink, metrics).await;
+            tracing::info!(
+                scanned = asum.scanned,
+                stamped = asum.stamped,
+                errors = asum.errors,
+                "plan adapter: archive scan complete (metadata-only)"
+            );
+        }
+        let active_slugs: HashSet<String> = units.iter().map(|u| u.slug.clone()).collect();
+        let archive_slugs: HashSet<String> = archived.iter().map(|u| u.slug.clone()).collect();
+        for slug in newly_disappeared_slugs(
+            &last_applied,
+            &active_slugs,
+            &archive_slugs,
+            &mut warned_disappeared,
+        ) {
+            tracing::warn!(
+                slug = %slug,
+                "plan adapter: work-unit slug disappeared from the active dir and is absent \
+                 from the archive dir; leaving the unit untouched (terminal state is owned by \
+                 coord's derive engine — the adapter never pushes shipped/archived)"
+            );
+        }
     }
 }
 
@@ -308,6 +442,16 @@ pub fn resolve_plans_dir(configured: Option<String>) -> Option<String> {
     resolve_plans_dir_with_source(configured).map(|(dir, _)| dir)
 }
 
+/// Resolve the plans **archive** directory (D4). Unlike the active dir, the
+/// archive has **no env override** — it has no legacy env var to stay
+/// compatible with, and it is deliberately not derivable from the active dir
+/// (it commonly lives in a different repo). A blank setting counts as unset, so
+/// an archive dir configured to `""` disables the archive scan rather than
+/// scanning a directory named `""`.
+pub fn resolve_plans_archive_dir(configured: Option<String>) -> Option<String> {
+    configured.filter(|s| !s.trim().is_empty())
+}
+
 /// Spawn the reconcile loop iff the adapter is configured for this runner: a
 /// plans directory resolvable via [`resolve_plans_dir`] (the runner's
 /// `PathSettings::plans_dir`, or the [`PLAN_ADAPTER_DIR_ENV`] override) AND a
@@ -315,10 +459,14 @@ pub fn resolve_plans_dir(configured: Option<String>) -> Option<String> {
 /// markdown-plan tier off never scans. Interval overridable via
 /// `QONTINUI_PLAN_ADAPTER_INTERVAL_SECS` (default 60s).
 ///
-/// `configured_plans_dir` is the caller-supplied `PathSettings::plans_dir`
-/// (the settings store lives in the runner binary, not this lib crate).
+/// `configured_plans_dir` / `configured_archive_dir` are the caller-supplied
+/// `PathSettings::plans_dir` / `PathSettings::plans_archive_dir` (the settings
+/// store lives in the runner binary, not this lib crate). The archive dir is
+/// optional and gates only the metadata-only archive scan (D4) — the adapter
+/// still starts, and still reconciles the active dir, when it is unset.
 pub fn spawn_if_configured(
     configured_plans_dir: Option<String>,
+    configured_archive_dir: Option<String>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let (dir, source) = resolve_plans_dir_with_source(configured_plans_dir)?;
     if source == PlansDirSource::Env {
@@ -328,6 +476,7 @@ pub fn spawn_if_configured(
             "plan adapter: plans dir taken from env override (settings value ignored)"
         );
     }
+    let archive_dir = resolve_plans_archive_dir(configured_archive_dir).map(PathBuf::from);
     let sink = match super::push::HttpWorkUnitSink::from_profile() {
         Some(s) => s,
         None => {
@@ -343,7 +492,7 @@ pub fn spawn_if_configured(
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(60);
     Some(tokio::spawn(async move {
-        run_loop(PathBuf::from(dir), &sink, interval_secs).await;
+        run_loop(PathBuf::from(dir), archive_dir, &sink, interval_secs).await;
     }))
 }
 
@@ -450,6 +599,9 @@ mod tests {
         last_actor: Option<String>,
         deps_behavior: DepsBehavior,
         deps_calls: Mutex<Vec<(String, Vec<String>)>>,
+        /// Every upsert body seen, so the archive scan can be asserted to write
+        /// `metadata.archive_path` with no status.
+        upserts: Mutex<Vec<UpsertBody>>,
     }
     #[async_trait::async_trait]
     impl WorkUnitSink for FakeSink {
@@ -466,6 +618,7 @@ mod tests {
                     .unwrap()
                     .insert(body.slug.clone(), s.clone());
             }
+            self.upserts.lock().unwrap().push(body.clone());
             Ok(())
         }
         async fn transition(&self, slug: &str, body: &TransitionBody) -> Result<()> {
@@ -736,5 +889,135 @@ mod tests {
         let snap = m.snapshot();
         assert_eq!(snap.scanned, 5);
         assert_eq!(snap.transitions_total, 2);
+    }
+
+    // ---- Phase 4: metadata-only archive scan (D4) ----
+
+    /// Write `body` to `<dir>/<slug>.md` and return the full path string.
+    fn write_plan(dir: &Path, slug: &str, body: &str) -> String {
+        let path = dir.join(format!("{slug}.md"));
+        std::fs::write(&path, body).unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    /// The load-bearing D4 test: an archive scan of real `*.md` files — one
+    /// whose `> **Status:` says the coord-derived `shipped`, one whose status is
+    /// the non-vocabulary `archived` (which coord silently classifies `Free` and
+    /// would ACCEPT) — produces ZERO status transitions, only a
+    /// `metadata.archive_path` stamp per slug pointing at the archived file.
+    #[tokio::test]
+    async fn archive_scan_stamps_path_and_never_transitions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shipped_path = write_plan(
+            tmp.path(),
+            "2026-01-01-shipped-plan",
+            "# Shipped Plan\n\n> **Status:** shipped 2026-01-01.\n",
+        );
+        let archived_path = write_plan(
+            tmp.path(),
+            "2026-01-02-archived-plan",
+            "# Archived Plan\n\n> **Status:** archived\n",
+        );
+
+        // Reuse the production scan path — its missing-dir-yields-empty-vec
+        // behavior is exactly the right unset semantics.
+        let conv = PlanConvention::operator_default();
+        let scanned = read_plan_dir(tmp.path(), &conv);
+        assert_eq!(scanned.len(), 2);
+
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let summary = reconcile_archive_once(&scanned, &sink, &metrics).await;
+
+        // ZERO transitions from ANY archive-scanned entry — the only D4 guard,
+        // since coord will not reject either `shipped` or `archived` here.
+        assert_eq!(
+            *sink.transitions.lock().unwrap(),
+            0,
+            "archive scan must NEVER emit a status transition"
+        );
+        assert_eq!(summary.stamped, 2);
+        assert_eq!(summary.errors, 0);
+        assert_eq!(metrics.snapshot().archive_stamped_total, 2);
+        assert_eq!(metrics.snapshot().transitions_total, 0);
+
+        // Exactly one metadata-only upsert per slug: no status, archive_path set
+        // to the archived file's path.
+        let ups = sink.upserts.lock().unwrap();
+        assert_eq!(ups.len(), 2);
+        for up in ups.iter() {
+            assert!(up.status.is_none(), "archive upsert carries no status");
+        }
+        let by_slug: HashMap<&str, &UpsertBody> =
+            ups.iter().map(|u| (u.slug.as_str(), u)).collect();
+        assert_eq!(
+            by_slug["2026-01-01-shipped-plan"]
+                .metadata
+                .as_ref()
+                .unwrap()["archive_path"],
+            serde_json::json!(shipped_path)
+        );
+        assert_eq!(
+            by_slug["2026-01-02-archived-plan"]
+                .metadata
+                .as_ref()
+                .unwrap()["archive_path"],
+            serde_json::json!(archived_path)
+        );
+    }
+
+    /// A missing/unset archive dir yields an empty scan (no writes) — the same
+    /// unset semantics as the active dir.
+    #[tokio::test]
+    async fn archive_scan_of_missing_dir_is_empty_noop() {
+        let conv = PlanConvention::operator_default();
+        let scanned = read_plan_dir(Path::new("/definitely/not/a/dir/xyz"), &conv);
+        assert!(scanned.is_empty());
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let summary = reconcile_archive_once(&scanned, &sink, &metrics).await;
+        assert_eq!(summary.scanned, 0);
+        assert_eq!(summary.stamped, 0);
+        assert!(sink.upserts.lock().unwrap().is_empty());
+        assert_eq!(*sink.transitions.lock().unwrap(), 0);
+    }
+
+    /// Disappeared-slug rule (D4): a slug we applied that is gone from the active
+    /// dir AND absent from the archive dir is surfaced ONCE per process, and the
+    /// detection never transitions (it only warns — no sink call at all).
+    #[test]
+    fn disappeared_slug_warns_once_and_never_transitions() {
+        let mut known: HashMap<String, String> = HashMap::new();
+        known.insert("a".to_string(), "in_progress".to_string());
+        known.insert("b".to_string(), "vetted".to_string());
+        known.insert("c".to_string(), "shipped".to_string());
+
+        // `a` still active, `b` moved to archive, `c` vanished from both.
+        let active: HashSet<String> = ["a".to_string()].into_iter().collect();
+        let archive: HashSet<String> = ["b".to_string()].into_iter().collect();
+        let mut warned: HashSet<String> = HashSet::new();
+
+        let first = newly_disappeared_slugs(&known, &active, &archive, &mut warned);
+        assert_eq!(first, vec!["c".to_string()], "only c disappeared");
+
+        // Warn-once: a second identical scan yields nothing new.
+        let second = newly_disappeared_slugs(&known, &active, &archive, &mut warned);
+        assert!(
+            second.is_empty(),
+            "a disappeared slug is warned at most once per process"
+        );
+    }
+
+    /// A slug archived (not vanished) is NOT flagged disappeared — the archive
+    /// set suppresses it.
+    #[test]
+    fn archived_slug_is_not_disappeared() {
+        let mut known: HashMap<String, String> = HashMap::new();
+        known.insert("done".to_string(), "shipped".to_string());
+        let active: HashSet<String> = HashSet::new();
+        let archive: HashSet<String> = ["done".to_string()].into_iter().collect();
+        let mut warned: HashSet<String> = HashSet::new();
+        assert!(newly_disappeared_slugs(&known, &active, &archive, &mut warned).is_empty());
+        assert!(warned.is_empty());
     }
 }

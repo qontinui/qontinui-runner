@@ -47,6 +47,7 @@ pub use parser::{
 };
 pub use push::{push_work_unit, HttpWorkUnitSink, PushOutcome, WorkUnitSink};
 pub use trigger::{
-    adapter_metrics, resolve_plans_dir, resolve_plans_dir_with_source, spawn_if_configured,
+    adapter_metrics, newly_disappeared_slugs, reconcile_archive_once, resolve_plans_archive_dir,
+    resolve_plans_dir, resolve_plans_dir_with_source, spawn_if_configured, ArchiveSummary,
     MetricsSnapshot, PlansDirSource, ReconcileSummary, PLAN_ADAPTER_DIR_ENV,
 };
