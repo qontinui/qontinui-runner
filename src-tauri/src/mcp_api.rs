@@ -170,6 +170,39 @@ async fn embedding_service_health() -> serde_json::Value {
     })
 }
 
+/// Bounded PG liveness probe for `/health` (iter4 B-5). Runs a `SELECT 1`
+/// through the global deadpool pool with a hard 2s ceiling *on top of* the
+/// pool's own bounded `get()` timeout (B-1), so the health handler can never
+/// hang on a wedged data layer even in a pathological pool state.
+///
+/// Returns:
+/// * `None` — no PG configured (the global `PgDb` was never set). Do not
+///   downgrade a runner that legitimately runs without PG.
+/// * `Some(true)` — a connection was checked out and `SELECT 1` succeeded
+///   within the window.
+/// * `Some(false)` — the pool errored (unreachable / exhausted, incl. the
+///   degraded-boot pool with no live backend), or the probe exceeded 2s.
+///
+/// Unlike the embedding probe this is intentionally NOT cached: it is a single
+/// sub-millisecond round-trip on a healthy DB, and when the DB is down the 2s
+/// ceiling bounds the cost — surfacing the outage on the very next `/health`
+/// poll is the whole point (the B-5 observability gap the plan calls out).
+async fn pg_liveness_probe() -> Option<bool> {
+    let pg = crate::database::pg::PgDb::try_global()?;
+    let probe = async move {
+        let conn = pg.pool().get().await.map_err(|e| e.to_string())?;
+        conn.simple_query("SELECT 1")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok::<(), String>(())
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(2), probe).await {
+        Ok(Ok(())) => Some(true),
+        Ok(Err(_)) => Some(false),
+        Err(_) => Some(false),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PR-credential probe (plan qontinui-pr-credential-provisioning, Phase 0)
 // ---------------------------------------------------------------------------
@@ -517,10 +550,18 @@ async fn health(
     // who care about the distinction should branch on `ui_error` /
     // `recent_crash` / `embeddingService.reachable` presence instead of
     // re-parsing the compound status string.
+    // iter4 B-5: bounded PG liveness. `/health` previously reported "healthy"
+    // in 3ms while every PG-backed panel hung forever (B-1). Fold a hard-capped
+    // `SELECT 1` into the aggregation so a wedged/unreachable data layer
+    // downgrades the runner to `degraded`. `None` (no PG configured) does NOT
+    // downgrade. Depends on B-1's pool timeout — plus a 2s ceiling here — so
+    // the probe itself can never hang the handler.
+    let pg_reachable = pg_liveness_probe().await;
     let derived_status = crate::ui_error::compute_derived_status(
         ui_error_snapshot.is_some(),
         recent_crash_snapshot.is_some(),
         embedding_reachable_cached(),
+        pg_reachable,
     );
 
     // One-way readiness flag flipped by the first successful UI Bridge IPC
@@ -550,6 +591,12 @@ async fn health(
         "consoleErrorCount": console_errors,
         "aiProviderCircuitBreakers": ai_provider_states,
         "embeddingService": embedding_health,
+        // iter4 B-5: PG data-layer liveness (bounded `SELECT 1`). `reachable`
+        // is null when unprobed/unconfigured, true/false otherwise. Drives the
+        // `degraded` downgrade above so `/health` mirrors the data layer.
+        "database": {
+            "reachable": pg_reachable,
+        },
         // PR-credential surface (plan qontinui-pr-credential-provisioning,
         // Phase 0): cached `gh auth status` verdict. `state: "pending"` +
         // null fields until the first detached probe resolves; `hint` is

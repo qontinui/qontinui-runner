@@ -187,9 +187,10 @@ impl PgDb {
     /// Build the deadpool connection pool WITHOUT verifying connectivity or
     /// running the self-provision DDL. Shared by `new` (which then probes and
     /// self-provisions) and `new_degraded` (which does neither). The builder
-    /// does no I/O and registers no timers (we deliberately avoid
-    /// `.recycle_timeout` — see the comment below), so it is safe to call from
-    /// a synchronous context outside a Tokio runtime.
+    /// does no I/O — it only records config (including the bounded
+    /// `create`/`wait`/`recycle` timeouts and the `Tokio1` runtime; timers are
+    /// registered lazily at `get()` time, never at build time) — so it is safe
+    /// to call from a synchronous context outside a Tokio runtime.
     fn build_pool(database_url: &str) -> Result<deadpool_postgres::Pool, String> {
         let pg_config: tokio_postgres::Config = database_url
             .parse()
@@ -207,18 +208,39 @@ impl PgDb {
         // backends doesn't leave 16 zombie sessions blocking advisory locks
         // for the next runner.
         //
-        // Do NOT add `.recycle_timeout(Some(_))` here — `Pool::builder`'s
-        // timeout setters require a tokio runtime to be entered for their
-        // timer machinery (deadpool 0.12 panics with "Timeouts require a
-        // runtime" otherwise). The PG bootstrap is called from a synchronous
-        // `rt.block_on(PgDb::new(...))` in `main.rs`, which builds its own
-        // single-threaded runtime for the bootstrap. That runtime IS active
-        // during the await inside `block_on`, but the `Pool::builder` chain
-        // runs synchronously before the first `.await`, so the timer
-        // registration races with runtime entry and panics.
-        // See: src/main.rs:285 for the calling context.
+        // BOUNDED TIMEOUTS (iter4 B-1 fix). Previously this builder set NO
+        // timeouts, so every `pool.get().await` blocked FOREVER when a usable
+        // connection could not be obtained (exhausted pool, or a checked-out
+        // connection whose driver task stopped being polled). That turned
+        // every PG-backed Tauri command / HTTP handler into an infinite
+        // "Loading…" spinner with no error ever surfaced.
+        //
+        // How deadpool 0.12 actually gates timeouts (verified against the
+        // vendored source, NOT the old comment's claim of a panic):
+        // `PoolBuilder::build()` returns `Err(BuildError::NoRuntimeSpecified)`
+        // — it does NOT panic — *only* when a timeout is configured AND no
+        // `Runtime` was set. The timer itself is registered lazily at
+        // `get()` time via the configured `Runtime`, on the caller's async
+        // task. So the safe, panic-free recipe is: set the timeouts AND
+        // declare `.runtime(Runtime::Tokio1)`. `Runtime::Tokio1` is a plain
+        // enum variant — constructing it needs no active runtime — so this is
+        // equally safe on the synchronous `new_degraded` bootstrap path
+        // (`main.rs` `rt.block_on`) where `build_pool` runs before the first
+        // `.await`. Every actual `get()` is awaited inside a Tokio runtime, so
+        // the timer registration always has a runtime available.
+        //
+        // 5s bounds the three phases: waiting for a free slot (`wait`),
+        // establishing a new connection (`create`), and the recycle/health
+        // check on checkout (`recycle`). On expiry `get()` returns an `Err`
+        // that callers map to `Err("PG pool error: …")` → the UI shows an
+        // error state instead of spinning.
+        let timeout = Some(std::time::Duration::from_secs(5));
         deadpool_postgres::Pool::builder(mgr)
             .max_size(8)
+            .runtime(deadpool_postgres::Runtime::Tokio1)
+            .create_timeout(timeout)
+            .wait_timeout(timeout)
+            .recycle_timeout(timeout)
             .post_create(deadpool_postgres::Hook::async_fn(|conn, _| {
                 Box::pin(async move {
                     conn.simple_query("SET search_path TO project, public")

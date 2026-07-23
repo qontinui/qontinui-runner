@@ -1063,10 +1063,14 @@ async fn run_heartbeat_sender<S>(
         // can derive its `derived_status` from this.
         let ui_error_snapshot = api_state.app_state.ui_error.get().await;
         let recent_crash_snapshot = api_state.app_state.crash_dumps.get().await;
+        // `pg_reachable = None`: the web-backend heartbeat relay does not run
+        // a DB round-trip; the bounded PG liveness probe lives only in the
+        // `/health` handler.
         let derived_status = crate::ui_error::compute_derived_status(
             ui_error_snapshot.is_some(),
             recent_crash_snapshot.is_some(),
             crate::mcp_api::embedding_reachable_cached(),
+            None,
         )
         .to_string();
 
