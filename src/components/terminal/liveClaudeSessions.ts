@@ -14,6 +14,9 @@
  *
  * Keys are camelCase, matching the Rust command's serde output exactly.
  */
+import { invoke } from "@tauri-apps/api/core";
+import type { CommandResponse } from "./types";
+
 export interface LiveClaudeSessionAccount {
   /** Account label, e.g. `"paktis"`. */
   label: string;
@@ -185,6 +188,41 @@ export function sharedSessionIds(
     if (list.length < 2) byId.delete(id);
   }
   return byId;
+}
+
+/**
+ * Read the set of session ids that some LIVE Claude Code process is already
+ * hosting, via `terminal_claude_session_list_live` (each entry is PID-verified
+ * against the live process table on the Rust side —
+ * `session::claude_session_registry::read_live_sessions`).
+ *
+ * The restore path consults this BEFORE typing `claude --resume <id>` for a
+ * cold-restored record: an id in this set is already alive, and resuming it
+ * again forks the session — a second live process on the same transcript
+ * (measured 2026-07-23: 22 of 80 live ids had >1 live process).
+ *
+ * Returns `null` when the registry could not be read (invoke failed,
+ * unsuccessful response, or missing payload). Callers MUST treat `null` as
+ * indeterminate and FAIL CLOSED toward not-respawning — never as "nothing
+ * alive". A missing tab is recoverable; a duplicate live session corrupts the
+ * transcript.
+ */
+export async function fetchLiveClaudeSessionIds(): Promise<ReadonlySet<string> | null> {
+  let resp: CommandResponse;
+  try {
+    resp = await invoke<CommandResponse>("terminal_claude_session_list_live");
+  } catch (err) {
+    console.warn("[liveClaudeSessions] terminal_claude_session_list_live failed:", err);
+    return null;
+  }
+  // `data` is always present on a successful response; its absence means we
+  // did not understand the payload — indeterminate, not empty.
+  if (!resp?.success || resp.data == null) return null;
+  const ids = new Set<string>();
+  for (const s of extractLiveSessions(resp.data)) {
+    if (s && typeof s.sessionId === "string" && s.sessionId) ids.add(s.sessionId);
+  }
+  return ids;
 }
 
 /** Group sessions by account label, preserving input order within a group. */

@@ -1,8 +1,14 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+const mockInvoke = vi.fn();
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: (...args: unknown[]) => mockInvoke(...args),
+}));
 
 import {
   DERIVED_NAME_SOURCE,
   extractLiveSessions,
+  fetchLiveClaudeSessionIds,
   groupByAccount,
   isOperatorNamed,
   registryNamesBySessionId,
@@ -198,6 +204,63 @@ describe("sharedSessionIds", () => {
 
   it("is empty for no sessions", () => {
     expect(sharedSessionIds([]).size).toBe(0);
+  });
+});
+
+describe("fetchLiveClaudeSessionIds (P1 restore-idempotence liveness source)", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+  });
+
+  it("returns the deduped set of live session ids", async () => {
+    mockInvoke.mockResolvedValueOnce({
+      success: true,
+      message: null,
+      data: {
+        sessions: [
+          // Two live processes on ONE id — the exact duplication symptom;
+          // the set collapses them.
+          mk({ sessionId: "dup", pid: 10 }),
+          mk({ sessionId: "dup", pid: 11 }),
+          mk({ sessionId: "solo", pid: 12 }),
+        ],
+      },
+    });
+    const ids = await fetchLiveClaudeSessionIds();
+    expect(mockInvoke).toHaveBeenCalledWith("terminal_claude_session_list_live");
+    expect(ids).not.toBeNull();
+    expect([...ids!].sort()).toEqual(["dup", "solo"]);
+  });
+
+  it("returns an EMPTY set (not null) when no process is live", async () => {
+    // Empty-and-known must stay distinguishable from unreadable: an empty set
+    // allows respawns, null forbids them.
+    mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: { sessions: [] } });
+    const ids = await fetchLiveClaudeSessionIds();
+    expect(ids).not.toBeNull();
+    expect(ids!.size).toBe(0);
+  });
+
+  it("returns null (indeterminate → fail closed) when the invoke rejects", async () => {
+    mockInvoke.mockRejectedValueOnce(new Error("ipc down"));
+    expect(await fetchLiveClaudeSessionIds()).toBeNull();
+  });
+
+  it("returns null on an unsuccessful or payload-less response", async () => {
+    mockInvoke.mockResolvedValueOnce({ success: false, message: "boom", data: null });
+    expect(await fetchLiveClaudeSessionIds()).toBeNull();
+    mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: null });
+    expect(await fetchLiveClaudeSessionIds()).toBeNull();
+  });
+
+  it("ignores rows without a usable sessionId instead of throwing", async () => {
+    mockInvoke.mockResolvedValueOnce({
+      success: true,
+      message: null,
+      data: { sessions: [mk({ sessionId: "ok" }), { pid: 1 }, null, mk({ sessionId: "" })] },
+    });
+    const ids = await fetchLiveClaudeSessionIds();
+    expect([...ids!]).toEqual(["ok"]);
   });
 });
 

@@ -433,7 +433,20 @@ export function useTerminalManager(pageId: string = "default", windowLabel: stri
 
   /**
    * Reconnect to existing Rust PTY sessions that survived a React remount.
-   * Returns the ordered list of reconnected tab IDs, or null if no sessions found.
+   *
+   * Return contract (P1 restore idempotence — the restore path aborts on
+   * `null`, so the two cases must never be conflated):
+   * - `string[]` (possibly EMPTY) — the backend terminal list was read
+   *   successfully; the array is the definitive ordered set of reconnected
+   *   tab ids for this page. `[]` means "definitely nothing to reconnect"
+   *   (e.g. a cold start), and the caller may safely cold-restore records.
+   * - `null` — INDETERMINATE: the list could not be read (invoke failed or
+   *   the response was unsuccessful/malformed). Callers must NOT treat this
+   *   as "nothing alive": cold-respawning `claude --resume` for records
+   *   whose previous terminal generation is still alive forks the live
+   *   sessions (measured 2026-07-23: 22 of 80 live session ids had >1 live
+   *   process). `useTerminalInitialization` aborts restore on `null` and
+   *   retries on the next activation.
    */
   const reconnectToExistingSessions = useCallback(async (): Promise<string[] | null> => {
     try {
@@ -441,7 +454,10 @@ export function useTerminalManager(pageId: string = "default", windowLabel: stri
       if (!result.success || !result.data) return null;
 
       const terminals = (result.data as { terminals: TerminalInfo[] }).terminals;
-      if (!terminals || terminals.length === 0) return null;
+      // Malformed payload (no `terminals` key) is indeterminate — never
+      // claim "definitely empty" off a shape we didn't understand.
+      if (!terminals) return null;
+      if (terminals.length === 0) return [];
 
       // `TerminalInfo` carries no Claude session id, so a reconnected tab
       // would otherwise come back with `claudeSessionId: undefined` and any
@@ -465,7 +481,9 @@ export function useTerminalManager(pageId: string = "default", windowLabel: stri
         invoke("terminal_close", { terminalId: t.id }).catch(() => {});
       }
 
-      if (alive.length === 0) return null;
+      // List read fine, nothing alive on this page — a DEFINITIVE empty
+      // result (cold start), not an indeterminate one.
+      if (alive.length === 0) return [];
 
       logger.info(`Reconnecting to ${alive.length} existing PTY session(s)`);
 

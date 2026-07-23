@@ -18,6 +18,7 @@ import type { SaveSessionLayoutParams } from "./useSessionPersistence";
 import type { SessionOpenArgs } from "./sessionRecordArgs";
 import { rememberSessionId } from "./lastKnownSessionIds";
 import { loadKnownPageIds } from "./useTerminalPages";
+import { fetchLiveClaudeSessionIds } from "./liveClaudeSessions";
 
 /**
  * Fetch the durable RESTORABLE session records for `pageId` from the backend
@@ -337,6 +338,69 @@ export function claimInitForPage(seen: Set<string>, pageId: string): boolean {
   return true;
 }
 
+/**
+ * Decide what the restore path does with the `reconnectToExistingSessions`
+ * result (P1 restore idempotence, defect (a)).
+ *
+ * The reconnect returns `null` ONLY when the live-terminal list could not be
+ * read (invoke failed / unsuccessful / malformed response) — an INDETERMINATE
+ * outcome, distinct from `[]` ("definitely nothing to reconnect", the normal
+ * cold start). The old call site coerced `null` to `[]`, which sent EVERY
+ * open record down the cold `claude --resume` respawn path while its previous
+ * terminal generation was still alive — each restore pass orphaned another
+ * generation (measured: one page leaked ~330 orphan PTYs across ~7 passes).
+ *
+ * On `"abort-restore"` the caller leaves the page exactly as-is — nothing
+ * spawned, no record touched — and releases the once-per-pageId init guard so
+ * the next activation of the page retries the whole restore.
+ *
+ * Pure + exported so the null → abort branch is directly unit-testable
+ * without booting React.
+ */
+export type ReconnectDecision =
+  { kind: "abort-restore" } | { kind: "proceed"; reconnectedTabIds: readonly string[] };
+
+export function decideReconnectOutcome(
+  reconnectedTabIds: readonly string[] | null,
+): ReconnectDecision {
+  return reconnectedTabIds === null
+    ? { kind: "abort-restore" }
+    : { kind: "proceed", reconnectedTabIds };
+}
+
+/**
+ * Decide whether a cold-restored `auto-resume` record may actually respawn
+ * `claude --resume <id>` (P1 restore idempotence, defect (b)).
+ *
+ * Even after a successful reconnect, a record's session can be alive under a
+ * process the reconnect did not return — an orphaned previous terminal
+ * generation, a PTY on another page, or a process outside the runner
+ * entirely. Respawning it forks the live session: two processes on one
+ * transcript.
+ *
+ * - `"respawn"` — the id is definitively not hosted by any live process; the
+ *   normal cold-restore path may proceed.
+ * - `"skip-alive"` — some live Claude process already hosts this id: NEVER
+ *   respawn. The runner owns no reconnectable PTY for that process, so there
+ *   is no tab to rebind it to either — the record is left untouched (it stays
+ *   restorable/manually resumable); the reconnected-PTY branch remains the
+ *   only rebind mechanism.
+ * - `"skip-unknown"` — the live registry could not be read (`liveSessionIds
+ *   === null`): FAIL CLOSED toward not-respawning. A missing tab is
+ *   recoverable; a duplicate live session corrupts the transcript.
+ *
+ * Pure + exported for direct unit tests.
+ */
+export type ColdResumeDecision = "respawn" | "skip-alive" | "skip-unknown";
+
+export function decideColdResume(
+  liveSessionIds: ReadonlySet<string> | null,
+  claudeSessionId: string,
+): ColdResumeDecision {
+  if (liveSessionIds === null) return "skip-unknown";
+  return liveSessionIds.has(claudeSessionId) ? "skip-alive" : "respawn";
+}
+
 /** Validate session IDs before interpolating into shell commands. */
 const SESSION_ID_RE = /^[a-zA-Z0-9_-]+$/;
 function isValidSessionId(id: string): boolean {
@@ -628,12 +692,42 @@ export function useTerminalInitialization({
       // it issues the resume commands); the `finally` below only opens the gate
       // when NO drain was scheduled, so the flag always flips exactly once.
       let drainScheduled = false;
+      // True when the reconnect result was INDETERMINATE (`null`) and restore
+      // was aborted: the once-per-pageId guard is released so the next
+      // activation retries, and the auto-save gate is left CLOSED so the
+      // retried restore still runs with saves suppressed (an open gate would
+      // let the debounced save clobber the cosmetic snapshot mid-retry).
+      let restoreAborted = false;
       try {
         // 1) Reconnect to live PTYs that survived a React remount. These tabs
         //    are plain (no claudeSessionId on the wire) but their ids are the
         //    SAME stable terminal ids the registry recorded under `terminalId`.
-        const reconnectedTabIds = await reconnectToExistingSessions();
-        const reconnectedSet = new Set(reconnectedTabIds ?? []);
+        //
+        //    P1 defect (a): `null` means the live-terminal list could not be
+        //    read — NOT "nothing reconnected". Coercing it to [] used to send
+        //    every open record down the cold `claude --resume` path while its
+        //    previous terminal generation was still alive, orphaning a PTY
+        //    generation per pass. Abort instead: leave the page as-is and let
+        //    the next activation retry. (Same null-awareness as the plan-tab
+        //    cold-start check in step 4 below.)
+        const reconnectDecision = decideReconnectOutcome(await reconnectToExistingSessions());
+        if (reconnectDecision.kind === "abort-restore") {
+          restoreAborted = true;
+          // Release the guard so the retry can run — this abort must not
+          // consume the pageId.
+          didInitPages.current.delete(initPageId);
+          console.warn(
+            `[TerminalPage] reconnect indeterminate for page "${initPageId}" — aborting restore ` +
+              `(nothing spawned, records untouched); the next activation retries. Cold-respawning ` +
+              `here could fork sessions whose processes are still alive.`,
+          );
+          // Render the page as-is (rather than a permanent loading spinner);
+          // nothing was spawned or consumed.
+          setInitialized(true);
+          return;
+        }
+        const { reconnectedTabIds } = reconnectDecision;
+        const reconnectedSet = new Set(reconnectedTabIds);
 
         // 2) The durable backend session registry is the SOURCE OF TRUTH for
         //    which Claude sessions exist and their zones. The localStorage
@@ -645,6 +739,19 @@ export function useTerminalInitialization({
           knownPageIds: loadKnownPageIds(),
           adoptOrphans,
         });
+
+        // P1 defect (b): before ANY cold `claude --resume`, read which session
+        // ids are ALREADY hosted by a live Claude process (Claude Code's own
+        // per-process registry, PID-verified on the Rust side). Only fetched
+        // when some record would actually reach the cold auto-resume path.
+        // `null` = registry unreadable = every such respawn fails CLOSED
+        // (see `decideColdResume`).
+        const needsLiveness = openRecords.some(
+          (r) => !reconnectedSet.has(r.terminalId) && classifyRestoreAction(r) === "auto-resume",
+        );
+        const liveSessionIds: ReadonlySet<string> | null = needsLiveness
+          ? await fetchLiveClaudeSessionIds()
+          : new Set<string>();
 
         // Cosmetic snapshot — never the resumable Claude set / zone binding.
         const saved = sessionPersistence.hasSavedLayout()
@@ -715,6 +822,29 @@ export function useTerminalInitialization({
             });
             rememberSessionId(tabId, rec.claudeSessionId, safeConfigDir);
             continue;
+          }
+
+          // P1 defect (b): an `auto-resume` record whose session is ALREADY
+          // hosted by a live process must never be cold-respawned — typing
+          // `claude --resume <id>` would fork the live session. There is no
+          // reconnectable PTY for it either (the reconnect above didn't
+          // return one), so there is nothing to rebind: skip the record
+          // entirely, leaving it untouched in the registry (still restorable
+          // on a later pass / manually resumable). When liveness is UNKNOWN
+          // (registry read failed), fail CLOSED toward not-respawning — a
+          // missing tab is recoverable; a duplicate live session corrupts
+          // the transcript.
+          if (restoreAction === "auto-resume") {
+            const resumeDecision = decideColdResume(liveSessionIds, rec.claudeSessionId);
+            if (resumeDecision !== "respawn") {
+              console.warn(
+                `[TerminalPage] skipping cold respawn for session ${rec.claudeSessionId}: ` +
+                  (resumeDecision === "skip-alive"
+                    ? "a live Claude process already hosts this id (respawning would fork it)"
+                    : "live-session registry unreadable — failing closed toward not-respawning"),
+              );
+              continue;
+            }
           }
 
           // b) Cold restart (no live pty): recreate the tab, bind its recorded
@@ -845,8 +975,10 @@ export function useTerminalInitialization({
         //    registry record) — recreate them so the markdown viewers survive a
         //    cold restart. Skip on a React remount: live plan tabs are gone with
         //    the unmounted tree but their snapshot entry still re-creates them
-        //    only when we cold-started (no reconnected pty tabs).
-        if (saved && !reconnectedTabIds) {
+        //    only when we cold-started (no reconnected pty tabs). Cold start is
+        //    now signalled by an EMPTY reconnect list — the `null` case aborted
+        //    the whole restore above (P1 defect (a)).
+        if (saved && reconnectedTabIds.length === 0) {
           for (const session of saved.sessions) {
             if (session.type !== "plan" || !session.planFilePath) continue;
             const tabId = createPlanTab(session.planFilePath);
@@ -950,7 +1082,13 @@ export function useTerminalInitialization({
         // saved sessions, nothing to restore, or restore threw — open it now
         // so brand-new sessions still persist. Never leave it permanently
         // closed (that would silently disable persistence).
-        if (!drainScheduled) {
+        //
+        // Exception (P1 abort-restore): when the reconnect was indeterminate
+        // the whole restore was aborted for a retry on the next activation —
+        // the gate must stay CLOSED so the retried restore still runs with
+        // auto-save suppressed. Not permanent: the retry flips it via this
+        // same finally / its drain timer.
+        if (!drainScheduled && !restoreAborted) {
           restoreCompletePages.current.add(initPageId);
         }
         // ALWAYS leave the loading state, even if restore threw. `initialized`
