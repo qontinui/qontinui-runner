@@ -7,6 +7,28 @@ Execute an approved implementation plan end-to-end in a single session, without 
 ## Arguments
 - `$ARGUMENTS` - Optional: specific notes or constraints for this implementation run
 
+## Plan directories
+
+Every plan path below resolves from two environment variables. The qontinui runner
+injects them into agent sessions from its `paths.plans_dir` / `paths.plans_archive_dir`
+settings; a session launched outside the runner will not have them.
+
+- **`$QONTINUI_PLANS_DIR`** — the directory plans live in. **If it is unset, ask the
+  user once where plans live, or fall back to `<workspace-root>/plans`** (a `plans/`
+  directory beside the repos this session is working in). Never assume an absolute path
+  from another machine, and never write a plan somewhere you had to guess.
+- **`$QONTINUI_PLANS_ARCHIVE_DIR`** — optional, and normally unset. Unset (or equal to
+  `$QONTINUI_PLANS_DIR`) means **shipped plans stay where they are**, stamped in place —
+  the recommended layout, and what Step 6 assumes. Set to a different directory, it names
+  where Step 6 moves a stamped plan.
+- **Suite directories** — a multi-plan suite lives in its own directory *beside*
+  `$QONTINUI_PLANS_DIR` (`$QONTINUI_PLANS_DIR/../<plan-dir>/`), optionally carrying an
+  `00-index.md`.
+
+**Neither directory has to be inside a git repo.** Wherever this skill commits or pushes
+a plan edit it first checks `git -C "<dir>" rev-parse --is-inside-work-tree`; when that
+fails, the edit on disk is the whole ritual. Nothing here requires a second repo.
+
 ## Instructions
 
 This skill orchestrates the full implementation workflow. **Phases run as subagents to save context.** The main conversation tracks progress and coordinates — heavy work happens in agents.
@@ -97,8 +119,8 @@ available, shell out to the helper instead of re-implementing the parse
 inline:
 
 ```bash
-python D:/qontinui-root/qontinui-stack/scripts/resolve-plan-deps.py \
-    D:/qontinui-root/plans/<this-plan>.md --json
+python <workspace-root>/qontinui-stack/scripts/resolve-plan-deps.py \
+    "$QONTINUI_PLANS_DIR/<this-plan>.md" --json
 ```
 
 It emits `{plan_stem, depends_on[{stem, status, location, summary}],
@@ -117,10 +139,11 @@ to Step 0.5. **This is the common case.**
 
 For each dep stem, resolve to a plan file:
 
-1. Try `D:/qontinui-root/plans/<stem>.md` first (in-progress location).
-2. If that doesn't exist, try `D:/qontinui-root/qontinui-dev-notes/plans/<stem>.md`
-   (shipped archive).
-3. If neither exists, the dep is **missing** — abort (see below).
+1. Try `$QONTINUI_PLANS_DIR/<stem>.md`.
+2. If that doesn't exist, check the suite dirs beside it (`$QONTINUI_PLANS_DIR/../<plan-dir>/`).
+3. If `$QONTINUI_PLANS_ARCHIVE_DIR` is set and differs from `$QONTINUI_PLANS_DIR`,
+   also try `$QONTINUI_PLANS_ARCHIVE_DIR/<stem>.md` — a dep may already be archived.
+4. If still unresolved, the dep is **missing** — abort (see below).
 
 Use `Read` (a failure is the not-found signal) or `Glob` against the
 absolute path. Once located, read the dep file's status blockquote and
@@ -136,14 +159,16 @@ After resolving every dep, apply these rules:
 - **Any dep in `DRAFT` / `VETTED` / `IN PROGRESS` / `NOT STARTED` / `PARTIAL`**
   → surface a conflict via `AskUserQuestion` (see below). Do NOT stamp
   IN PROGRESS until the operator resolves.
-- **Any dep file is missing** (neither directory has `<stem>.md`)
+- **Any dep file is missing** (no searched directory has `<stem>.md`)
   → **abort the skill** with an actionable error before stamping anything.
-  Example error text:
+  Example error text (print the directories you actually resolved, not the
+  variable names):
   ```
   Cannot start implementation: plan declares Depends-On: <stem>, but no
   matching plan file exists at:
-    D:/qontinui-root/plans/<stem>.md
-    D:/qontinui-root/qontinui-dev-notes/plans/<stem>.md
+    $QONTINUI_PLANS_DIR/<stem>.md
+    $QONTINUI_PLANS_DIR/../<plan-dir>/NN-<stem>.md
+    $QONTINUI_PLANS_ARCHIVE_DIR/<stem>.md   (if configured)
 
   Fix the Depends-On stem in the plan's status block (typo? renamed
   upstream?) or remove the entry if the dep no longer applies, then
@@ -258,17 +283,20 @@ Rules:
 - If the existing block is already `IN PROGRESS`, refresh the date and append your session marker — multiple agents may pick up the same plan; keep the trail.
 - If the existing block is `SHIPPED` / `SUPERSEDED` / `OBSOLETE`, STOP — implementing a shipped plan is almost certainly a mistake. Confirm with the user before proceeding.
 
-**Transition the work-unit registry directly when you stamp.** IN PROGRESS /
-SHIPPED stamps drive `unit_status` gates, which watch the work unit's `status` in
-coord's directly-writable work-unit registry. There is no longer a plan-ingest
-worker mirroring `qontinui-dev-notes/plans/` into the registry, so set the status
+**Transition the work-unit registry directly when you stamp IN PROGRESS.** The
+IN PROGRESS stamp drives `unit_status` gates, which watch the work unit's `status`
+in coord's directly-writable work-unit registry. There is no longer a plan-ingest
+worker mirroring the plan directory into the registry, so set the status
 with an explicit `POST $COORD_HTTP_URL/coord/work-units/<plan-stem>/transition`
-`{to_status, by_actor}` (or an upsert carrying a new `status`) — a direct
-transition is durable, not reverted by an ingest tick. The plan `.md` stamp +
-commit/push + archive STAY (the operator-private artifact workflow), but the coord
-status transition is now this explicit call, not a side effect of the file push.
-(claude-config is NOT a coord sole-authority repo — its PRs land via normal GitHub
-flow.)
+`{to_status:"in_progress", by_actor}` (or an upsert carrying a new `status`) — a
+direct transition is durable, not reverted by an ingest tick. **`shipped` is the
+exception — do NOT transition to it by hand (see Step 6):** it is a DERIVED status
+coord computes from the work unit's landing predicate, so a direct
+`to_status:"shipped"` POST is rejected with `status_is_derived`. The plan `.md`
+stamp (in place — Step 6) + any commit/push STAY (the operator-private artifact workflow), but
+the coord `in_progress` transition is this explicit call, not a side effect of the
+file push. (claude-config is NOT a coord sole-authority repo — its PRs land via
+normal GitHub flow.)
 
 #### Single-stamp invariant — applies to Step 0.5 and Step 6
 
@@ -313,7 +341,7 @@ without claims. This skill MUST remain usable in non-coord environments.
 
 For each phase you are about to launch:
 
-1. **Plan-stem.** From the plan path (e.g. `D:/qontinui-root/plans/2026-05-18-agent-spawn-coordination.md`),
+1. **Plan-stem.** From the plan path (e.g. `$QONTINUI_PLANS_DIR/2026-05-18-agent-spawn-coordination.md`),
    take the filename without `.md` — `2026-05-18-agent-spawn-coordination`.
 2. **Resource key.** `plan:<plan-stem>:phase:<phase-number>` —
    e.g. `plan:2026-05-18-agent-spawn-coordination:phase:3`.
@@ -668,7 +696,7 @@ that's the right semantic for a single-machine fan-out.
 
 #### Final UPSERT — clear on completion (Step 6)
 
-When Step 6 (SHIPPED stamp + archive) completes successfully, POST one
+When Step 6 (SHIPPED stamp, in place) completes successfully, POST one
 final upsert that clears `current_task` so the dashboard tile stops
 showing this plan as in-flight:
 
@@ -1149,21 +1177,21 @@ Use `/clean-commit` or commit manually. Do NOT include AI attribution.
 **Cooperative abort-report (commit-action effect signatures §6.2).** If a
 `git commit` is REJECTED by a pre-commit hook (non-zero exit), forward the
 reason to coord before fixing + retrying:
-`bash D:/qontinui-root/.claude/scripts/report-commit-abort.sh "<captured hook output>"`
+`bash <workspace-root>/.claude/scripts/report-commit-abort.sh "<captured hook output>"`
 — best-effort, fail-open; it never edits git or blocks. `/clean-commit` Phase 4
-does this automatically; do the same on a manual commit. Never `--no-verify` to
-bypass the hook — that defeats both the hook and the supervision signal.
-
-**Opening a PR:** open the PR with `qontinui-pr create` (preferred — it goes
-through the runner's coord-brokered loopback proxy and works without a personal
-GitHub login on this machine). `gh pr create` also works where a personal
-`gh auth login` exists.
+does this automatically; do the same on a manual commit. On machines with the
+commit-abort wrapper installed
+(operator-local installer `qontinui-dev-notes/scripts/install-commit-abort-hook.sh`, plan
+`2026-06-06-commit-abort-wrapper`) the rejected hook auto-reports when gated
+on — the manual call is the fallback for unwrapped machines and stays harmless
+everywhere (same match keys, best-effort oplog). Never `--no-verify` to bypass
+the hook — that defeats both the hook and the supervision signal.
 
 ### Step 5: UI Bridge Improvement Plan (if manual testing was performed)
 
 If manual testing was performed in Step 2, create a plan (using EnterPlanMode) for UI Bridge improvements based on friction encountered during testing. This plan is for a future session — do not implement it now.
 
-### Step 6: Mark the plan done and archive it
+### Step 6: Mark the plan done (stamp where it lives)
 
 Once Steps 1–5 land cleanly:
 
@@ -1174,23 +1202,88 @@ Once Steps 1–5 land cleanly:
    ```
    Keep it short — 3–6 lines. List the canonical commit SHAs (one per repo touched). If there's a follow-up plan with open items, name it.
 
-2. **Move the plan from in-progress to the completed archive.** Workspace convention:
-   - In-progress: `D:/qontinui-root/plans/` (workspace root, not git-tracked).
-   - Completed: `qontinui-dev-notes/plans/` (git-tracked archive).
+2. **Stamp the plan where it lives.** The stamp — not the file's location — is what
+   marks a plan done.
 
-   Use a plain `mv plans/<name>.md qontinui-dev-notes/plans/<name>.md`. The plan's followup file (if any) stays in whichever location matches its own state — completed plans go to dev-notes, plans with open items stay at the workspace root.
+   - **`$QONTINUI_PLANS_DIR/<name>.md`** → leave it there, stamped, and commit the
+     stamp (item 3).
+   - **`$QONTINUI_PLANS_DIR/../<plan-dir>/NN-<name>.md`** (suite dir) → leave it
+     there, stamped; **if that directory has an `00-index.md`**, flip the plan's
+     row from `DRAFT` to `SHIPPED <YYYY-MM-DD>` and bump the top-level status
+     header if the whole suite is now closed. Commit both (item 3).
 
-3. **Commit the archived plan in dev-notes.** Single commit with message like `plans: archive <plan-name> as shipped (<commit-sha-summary>)`. Push — this is the operator-private artifact archive. **Separately, transition the coord work-unit registry** so `unit_status` gates clear: `POST $COORD_HTTP_URL/coord/work-units/<plan-stem>/transition {to_status:"shipped", by_actor:"<this session>"}` (the work-unit registry is directly writable; there is no longer an ingest worker mirroring dev-notes, so the file push no longer transitions the registry for you).
+   **With `$QONTINUI_PLANS_ARCHIVE_DIR` unset — the default — never `mv`/`git mv` a
+   plan, and never invent an `archive/` or `done/` subfolder.** Shipped and
+   unshipped plans sit side by side in one directory, distinguished only by their
+   stamps. Relocating by hand splits "where the plan was authored" from "where it
+   now lives" — churn this project avoids, and the cause of the incident below.
 
-4. **If the plan was already authored inside `qontinui-dev-notes/plans/`** (e.g. it was vetted there from the start), skip the move; just edit the status block in place and commit.
+   **Only when `$QONTINUI_PLANS_ARCHIVE_DIR` is set and differs from
+   `$QONTINUI_PLANS_DIR`** does a stamped plan move; that setting is the user
+   opting in to a two-directory layout. The move happens **after** the stamp is
+   committed — see item 3, which owns both halves in the right order.
+   **If you are not certain the archive dir is meant as a destination** — older
+   tooling used the same variable as a read-only second *lookup* path — do NOT move.
+   Stamp in place and say so in your report. An unmoved plan is trivially archived
+   later; a wrongly-moved one costs a search.
 
-5. **Clear coord activity status (per Step 0.6.5).** Fire the final
+   > **Why the in-place default is spelled out** (operator incident, 2026-07-21).
+   > This step once mandated a `mv` out of an untracked working directory into a
+   > git-tracked one. A later cleanup commit deleted five plans; three had already
+   > been removed from the untracked source by that `mv`, so those records existed
+   > nowhere on disk until they were recovered by hand. The general rule that
+   > prevents a repeat: **a plan only ever moves into a location at least as
+   > durable as the one it left, and the move never precedes the stamp+commit.**
+   > When the plan directory is a git repo, a deleted plan is always recoverable:
+   > ```bash
+   > cd "$QONTINUI_PLANS_DIR"
+   > # newest deletion first — a plan may have been deleted and re-added
+   > # more than once, so take the top SHA:
+   > git log --diff-filter=D --oneline -1 -- <name>.md   # -> <del-commit>
+   > git checkout <del-commit>^ -- <name>.md             # atomic restore
+   > ```
+   > For a suite-dir plan, swap the path for `../<plan-dir>/NN-<name>.md`.
+
+3. **Commit the stamp — if, and only if, the plan directory is inside a git repo.**
+   ```bash
+   PLAN_DIR="$(dirname "<plan path>")"
+   if git -C "$PLAN_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+     # one commit; add the 00-index.md flip if the plan sits in a suite dir with one.
+     # Name the paths explicitly — a shared checkout's index may hold a peer's files.
+     git -C "$PLAN_DIR" commit -m "docs(plans): mark <plan> SHIPPED — <summary>" -- <paths>
+     git -C "$PLAN_DIR" push
+   fi
+   ```
+   If that check fails, the plan directory is a plain folder: the stamped file on
+   disk **is** the record, there is nothing to commit or push, and you must not
+   create a repo to hold it. (Closeout push authority covers docs/plans diffs
+   wherever a repo does exist.)
+
+   **Then — and only then — archive, if the user configured an archive dir** (item 2).
+   A suite-dir plan keeps its suite directory name under the archive root:
+   ```bash
+   mkdir -p "$QONTINUI_PLANS_ARCHIVE_DIR"
+   mv "<plan path>" "$QONTINUI_PLANS_ARCHIVE_DIR/<name>.md"
+   ```
+   Re-run the same git conditional on **both** directories afterwards: commit the
+   removal where the plan came from, and commit the addition where it landed. Either
+   side that is not a git repo simply has nothing to commit.
+
+   **Do NOT POST a `shipped` work-unit transition:**
+   unlike `in_progress` (Step 0.5), `shipped` is a DERIVED status — coord
+   computes it from the work unit's landing predicate, so a direct
+   `to_status:"shipped"` POST is rejected with `status_is_derived`. Coord flips
+   the unit to `shipped` itself once the landing gate clears; your job is only
+   to ensure that gate exists/clears (Step 6.5 — a `pr_merged` or `commit_live`
+   gate anchored to the plan's work unit), not to set the status by hand.
+
+4. **Clear coord activity status (per Step 0.6.5).** Fire the final
    clearing `POST /coord/status` documented in Step 0.6.5 with
    `current_task: null` so the dashboard tile stops showing this plan
    as in-flight. Failure is non-fatal — `prune_stale()` TTLs the row
    within an hour.
 
-This step is mandatory. Plans without a status stamp lose context within weeks; plans left in the in-progress dir after they ship clutter triage and confuse future agents into thinking work is still pending.
+This step is mandatory. Plans without a status stamp lose context within weeks — and the stamp, not the file's location, is what tells a future agent whether work is still pending. A stamped plan sitting next to unstamped ones is the intended end state, not clutter.
 
 ### Step 6.5: Offer to register a coord gate for any deferred/blocked phase
 
@@ -1228,7 +1321,7 @@ supersedes unit_ready for the dependency-gated case".)
   `deploy_healthy`, `claim_terminal`, `operator_approval`, `ci_green`,
   `ref_exists`, `metric_threshold`, `time_elapsed`, `unit_ready`,
   `migration_at_head`, `infra_drift_clear`, `file_exists`, `sql_count`,
-  `unit_status`, `gate_cleared`; optional
+  `unit_status`, `gate_cleared`, `commit_live`; optional
   `continuation_prompt` e.g. `run /implement-phase <stem> "Phase N"` for
   auto-resume). **HTTP fallback** when MCP is unavailable — for a plan-anchored gate
   it is now TWO device-authed calls on coord's `require_jwt` sub-router
@@ -1248,7 +1341,11 @@ supersedes unit_ready for the dependency-gated case".)
   session that completes the work can attest the gate itself; set `operator` for
   business/judgment/strategy or on-page-human-verification gates. Default is
   `operator` if omitted; the sensitive-work rule always forces `operator`.
-- **Predicate choice:** wait-on-PR → `pr_merged`; wait-on-deploy →
+- **Predicate choice:** wait-on-PR (non-coord repo) → `pr_merged`; work landing
+  on a **coord-orchestrated repo** → `commit_live` `{repo, commit_sha}` with a
+  **post-land main SHA** (NEVER a pre-land branch-head SHA — rebase-land rewrites
+  SHAs so the gate rots open, gate `c14d103c` 2026-07-11; or anchor `file_exists`/
+  `unit_status` instead); wait-on-deploy →
   `deploy_healthy`; wait-on-CI → `ci_green`; burn-in / wait-N-days →
   `time_elapsed`; metric condition → `metric_threshold` (explicit `labels` — e.g.
   `coord_ci_runner_count` MUST filter `{status:"idle"}`); a vetted plan that is

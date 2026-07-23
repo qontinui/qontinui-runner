@@ -20,7 +20,27 @@ These four are the **engineering priorities** — they decide *what* gets built.
 
 ## Arguments
 
-- `$ARGUMENTS` — Path to the plan file (e.g. `C:/tmp/some-plan.md` or relative). If omitted, look for the most recently modified `*plan*.md` file under `C:/tmp` and the working tree root, and ask the user to confirm before editing.
+- `$ARGUMENTS` — Path to the plan file (absolute or relative). If omitted, look for the most recently modified `*.md` under `$QONTINUI_PLANS_DIR` (see below) and the working tree root, and ask the user to confirm before editing.
+
+## Plan directories
+
+Plan paths resolve from two environment variables. The qontinui runner injects them
+into agent sessions from its `paths.plans_dir` / `paths.plans_archive_dir` settings;
+a session launched outside the runner will not have them.
+
+- **`$QONTINUI_PLANS_DIR`** — the directory plans live in. **If it is unset, ask the
+  user once where plans live, or fall back to `<workspace-root>/plans`** (a `plans/`
+  directory beside the repos this session is working in). Never assume an absolute
+  path from another machine.
+- **`$QONTINUI_PLANS_ARCHIVE_DIR`** — optional, normally unset. When set and different
+  from `$QONTINUI_PLANS_DIR`, it holds plans that have already been archived; look
+  there only when resolving a stem that is not in the active directory.
+- **Suite directories** — a multi-plan suite lives in its own directory *beside*
+  `$QONTINUI_PLANS_DIR` (`$QONTINUI_PLANS_DIR/../<plan-dir>/`).
+
+Neither directory has to be inside a git repo. Where this skill commits a plan edit it
+first checks `git -C "<dir>" rev-parse --is-inside-work-tree`; if that fails, the edit
+on disk is the whole ritual.
 
 ## Decision policy (binding)
 
@@ -255,13 +275,13 @@ these three skills aligned):
 
 For each dep stem, resolve to a plan file using the lookup chain:
 
-1. Try `D:/qontinui-root/plans/<stem>.md` first (in-progress location).
-2. If that doesn't exist, try `D:/qontinui-root/qontinui-dev-notes/plans/<stem>.md`
-   (shipped archive).
-3. If neither exists, the dep is **missing** — flag it as a vet defect.
+1. Try `$QONTINUI_PLANS_DIR/<stem>.md`.
+2. If that doesn't exist, check the suite dirs beside it (`$QONTINUI_PLANS_DIR/../<plan-dir>/`).
+3. If `$QONTINUI_PLANS_ARCHIVE_DIR` is set and differs from `$QONTINUI_PLANS_DIR`,
+   also try `$QONTINUI_PLANS_ARCHIVE_DIR/<stem>.md`.
+4. If still unresolved, the dep is **missing** — flag it as a vet defect.
 
-Use `Read` (a failure is the not-found signal) or `Glob` to check both
-locations. A missing dep is a `Wrong` or `Stale` defect per Step 3's
+Use `Read` (a failure is the not-found signal) or `Glob` to check. A missing dep is a `Wrong` or `Stale` defect per Step 3's
 categories — it means the plan references upstream work that either was
 renamed, never written, or already archived under a different stem.
 
@@ -364,6 +384,19 @@ instead of leaving the plan to rot until someone clicks. This **replaces** the o
 `unit_ready`, NOT `operator_approval` (`operator_approval` is for genuine human
 decisions only — see the predicate guidance in `_gate-registration`).
 
+> **Under `/vet-imp`, register `unit_ready` NOTIFY-ONLY (omit `continuation_spawn`).**
+> When this vet runs as the first half of the `/vet-imp` chain, `/implement-plan`
+> executes IN THIS SAME SESSION immediately after the VETTED stamp. Attaching a
+> dispatching `continuation_spawn` to the `unit_ready` gate would make coord ALSO
+> queue a fresh runner-terminal session to run `/implement-plan` — a duplicate,
+> parallel implementation of the same plan (the exact concurrent-WIP clobber the
+> coordination layer exists to prevent). So under `/vet-imp`: still upsert the work
+> unit, mark it `vetted`, and register the `unit_ready` gate for registry/dashboard
+> visibility (it auto-clears by predicate), but WITHOUT `continuation_spawn`. The
+> in-session `/implement-plan` is the dispatch. Only register the continuation when
+> vetting STANDALONE (no implementation follows this session), where the dispatch
+> into a visible session is the whole point.
+
 Register exactly once per VETTED stamp (refresh, don't duplicate):
 
 > **Agent sessions: use the device-authed work-unit door.** A vetting agent holds
@@ -440,8 +473,8 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
      {
        "target_device_id": "<device_id from step 2>",
        "presentation": "terminal",
-       "initial_prompt": "run /implement-plan plans/<plan stem>.md",
-       "continuation_prompt": "run /implement-plan plans/<plan stem>.md",
+       "initial_prompt": "run /implement-plan <absolute path to the plan file>",
+       "continuation_prompt": "run /implement-plan <absolute path to the plan file>",
        "repos": ["<the plan's repo slug(s) — see below>"]
      }
      ```
@@ -449,11 +482,14 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
      the target device running the `claude` CLI with the prompt as argv — the
      operator sees it and can interrupt (that is the point of a visible
      continuation, per the visible-gate-continuations plan).
+     **Expand the plan path before you register it** — write the resolved absolute
+     path, not the literal `$QONTINUI_PLANS_DIR`. The continuation runs later, in a
+     shell on the target device, whose environment you cannot count on matching yours.
      **Populate `repos` with the plan's declared repo(s)** (from the plan's
      `**Repo(s):**` line, or the repos the plan touches) — do NOT leave it `[]`.
      An empty `repos` makes `acquire_continuation_workdir` skip worktree
-     allocation and drop the continuation's terminal cwd onto the SHARED ROOT
-     (`D:/qontinui-root`) uncoordinated — the exact concurrent-WIP clobber the
+     allocation and drop the continuation's terminal cwd onto the shared
+     workspace root, uncoordinated — the exact concurrent-WIP clobber the
      coordination layer exists to prevent. With `repos` set, the runner
      provisions an isolated `.agent-worktrees/<id>/<repo>` worktree (the first
      repo) as the cwd, so the session edits a per-session worktree under a
@@ -476,7 +512,7 @@ re-create the work-queue-as-decision antipattern.)
 the coord work-unit registry so the `unit_ready` predicate can see it:
 `POST $COORD_HTTP_URL/coord/work-units/<plan stem>/transition {to_status:"vetted", by_actor:"<this session>"}`
 (or the step-1 upsert carrying `status:"vetted"`). The registry is directly
-writable — there is no longer a plan-ingest worker mirroring `qontinui-dev-notes/plans/`,
+writable — there is no longer a plan-ingest worker mirroring the plan directory,
 so this explicit transition is what marks the unit vetted (the plan `.md` VETTED
 stamp + its commit/push remain the operator-private artifact record). (claude-config
 is NOT a coord sole-authority repo — its PRs land via normal GitHub flow.)
@@ -506,7 +542,7 @@ leave it in the report.
   `deploy_healthy`, `claim_terminal`, `operator_approval`, `ci_green`,
   `ref_exists`, `metric_threshold`, `time_elapsed`, `unit_ready`,
   `migration_at_head`, `infra_drift_clear`, `file_exists`, `sql_count`,
-  `unit_status`, `gate_cleared`; optional
+  `unit_status`, `gate_cleared`, `commit_live`; optional
   `continuation_prompt`). **HTTP fallback** when MCP is unavailable — for a
   plan-anchored gate it is now TWO device-authed calls on coord's `require_jwt`
   sub-router (device/agent/service JWT all work): (1)
@@ -525,7 +561,11 @@ leave it in the report.
   session that completes the work can attest the gate itself; set `operator` for
   business/judgment/strategy or on-page-human-verification gates. Default is
   `operator` if omitted; the sensitive-work rule always forces `operator`.
-- **Predicate choice:** wait-on-PR → `pr_merged`; wait-on-deploy →
+- **Predicate choice:** wait-on-PR (non-coord repo) → `pr_merged`; work landing
+  on a **coord-orchestrated repo** → `commit_live` `{repo, commit_sha}` with a
+  **post-land main SHA** (NEVER a pre-land branch-head SHA — rebase-land rewrites
+  SHAs so the gate rots open, gate `c14d103c` 2026-07-11; or anchor `file_exists`/
+  `unit_status` instead); wait-on-deploy →
   `deploy_healthy`; wait-on-CI → `ci_green`; burn-in → `time_elapsed`; metric →
   `metric_threshold` (explicit `labels` — e.g. `coord_ci_runner_count` MUST filter
   `{status:"idle"}`); a vetted plan that is ready, dispatchable work → `unit_ready`
