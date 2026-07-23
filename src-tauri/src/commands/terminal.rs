@@ -1116,6 +1116,56 @@ pub fn terminal_session_list_history(
     })
 }
 
+/// Report a mount of the terminal page tree (P0 tree-reset observability).
+///
+/// The terminal tree gets remounted by top-level state flips, after which the
+/// restore respawns `claude --resume` for still-alive sessions — and until now
+/// the only trace was a webview `console.warn` nothing captured. The frontend
+/// mount effect calls this on EVERY mount (mount #1 included — consumers
+/// filter on `mount_number > 1` for genuine remounts), fire-and-forget.
+///
+/// Pure observability: one `tracing::info!` line + one durable JSONL row via
+/// [`crate::session::snapshot_history::record_tree_reset`]. NO behavior
+/// change — always succeeds, even when the durable append fails (best-effort
+/// by that module's design).
+#[tauri::command]
+pub fn terminal_report_tree_reset(
+    mount_number: u32,
+    authenticated: Option<bool>,
+    navigation_type: Option<String>,
+    page_ids: Option<Vec<String>>,
+    open_record_count: Option<u32>,
+) -> Result<CommandResponse, String> {
+    let page_ids = page_ids.unwrap_or_default();
+    info!(
+        mount_number,
+        authenticated = ?authenticated,
+        navigation_type = navigation_type.as_deref().unwrap_or("unknown"),
+        page_ids = ?page_ids,
+        open_record_count = ?open_record_count,
+        "terminal tree reset reported: terminal page tree mounted (mount #{mount_number})"
+    );
+    // Port-scoped like the session-snapshots file, so multiple runner
+    // instances never interleave rows.
+    let port = crate::mcp::types::get_mcp_api_port();
+    let path = crate::session::snapshot_history::tree_reset_path_for_port(port);
+    crate::session::snapshot_history::record_tree_reset(
+        &path,
+        crate::session::snapshot_history::TreeResetReport {
+            mount_number,
+            authenticated,
+            navigation_type,
+            page_ids,
+            open_record_count,
+        },
+    );
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: None,
+    })
+}
+
 /// Manually migrate a Claude terminal session to a different configured
 /// account: copy its transcript into the target account's project dir, close
 /// the old pane, and respawn `claude --resume` under the target account (see
@@ -1751,6 +1801,7 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
             terminal_session_mark_restore_pending,
             terminal_session_clear_restore_pending,
             terminal_session_rebind_terminal,
+            terminal_report_tree_reset,
         ])
         .build()
 }

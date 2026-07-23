@@ -2030,6 +2030,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal::terminal_grid_text,
             commands::terminal::terminal_list,
             commands::terminal::terminal_migrate_session_account,
+            commands::terminal::terminal_report_tree_reset,
             commands::terminal::terminal_resize,
             commands::terminal::terminal_save_scrollback,
             commands::terminal::terminal_session_clear_restore_pending,
