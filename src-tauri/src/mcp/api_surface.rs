@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::mcp::types::{ApiResponse, ApiState};
+use crate::str_utils::truncate_str_ellipsis;
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -685,11 +686,7 @@ fn scan_clorinde_queries(src_tauri: &Path) -> Vec<ClorindeQuery> {
                                 sql.push_str(lines[j].trim());
                             }
                         }
-                        let sql_preview = if sql.len() > 200 {
-                            format!("{}...", &sql[..200])
-                        } else {
-                            sql.clone()
-                        };
+                        let sql_preview = truncate_str_ellipsis(&sql, 200);
 
                         // Extract table from SQL (FROM/INTO/UPDATE tablename)
                         let table = extract_table_from_sql(&sql);

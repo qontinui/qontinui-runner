@@ -9,6 +9,7 @@
 use crate::ai_provider::AiResponse;
 use crate::ai_router::TaskContext;
 use crate::doctor::DoctorHandle;
+use crate::str_utils::truncate_str;
 use crate::workflow_generation::generator::extract_json_from_response;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -171,7 +172,7 @@ pub fn analyze_complexity(
             warn!("Failed to parse complexity analysis output as JSON: {}", e);
             debug!(
                 "Complexity analysis raw output: {}",
-                &output[..output.len().min(500)]
+                truncate_str(&output, 500)
             );
             ComplexityAnalysis {
                 score: 0.0,

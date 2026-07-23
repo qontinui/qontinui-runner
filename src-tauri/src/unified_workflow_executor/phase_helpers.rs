@@ -21,6 +21,7 @@ use crate::commands::execution_reporting::LLMMetrics;
 use crate::findings::{FindingCategoryExt, FindingParser, FindingSeverityExt, ParsedFinding};
 use crate::mcp::types::MCP_API_PORT;
 use crate::step_executor::ExecutionStepConfig;
+use crate::str_utils::truncate_str;
 
 // =============================================================================
 // Token Usage Tracking
@@ -1128,7 +1129,7 @@ pub(super) async fn execute_prompt_response_mode(
                 "AI misinterpreted its task and asked for permission instead of producing the expected output. \
                  This typically happens when the task description is phrased as an imperative instruction. \
                  The AI should be generating content, not executing actions. Output: {}",
-                &output_text[..output_text.len().min(200)]
+                truncate_str(&output_text, 200)
             ));
         }
     }
@@ -1296,11 +1297,7 @@ pub(super) fn compute_embedding_sync(text: &str) -> Result<Vec<f32>, String> {
         embedding: Vec<f32>,
     }
 
-    let truncated = if text.len() > 2000 {
-        text[..2000].to_string()
-    } else {
-        text.to_string()
-    };
+    let truncated = truncate_str(text, 2000).to_string();
 
     // Spawn a dedicated OS thread so this blocking HTTP call doesn't stall a
     // tokio worker, and use Tauri's process-wide runtime for the async work.

@@ -13,6 +13,7 @@
 
 use super::middleware::{AiMiddleware, MiddlewareContext};
 use super::types::AiResponse;
+use crate::str_utils::truncate_str;
 use regex::Regex;
 use std::sync::LazyLock;
 use tracing::debug;
@@ -363,7 +364,7 @@ fn deduplicate_sections(text: &str) -> String {
                 result_paragraphs.push(para.to_string());
             } else {
                 // Subsequent — replace with marker
-                let preview = &para[..para.len().min(50)];
+                let preview = truncate_str(para, 50);
                 result_paragraphs.push(format!("[repeated: {}...]", preview));
             }
         } else {

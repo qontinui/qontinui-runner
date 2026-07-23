@@ -24,6 +24,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::step_executor::{StepExecutionResult, VerificationPhaseResult};
+use crate::str_utils::{truncate_str, truncate_str_ellipsis};
 
 // =============================================================================
 // Types
@@ -217,7 +218,7 @@ pub fn parse_triage_response(response: &str) -> Result<TriageResult, String> {
         format!(
             "Failed to parse triage response as JSON: {}. Response: {}",
             e,
-            &response[..response.len().min(500)]
+            truncate_str(response, 500)
         )
     })
 }
@@ -446,22 +447,14 @@ pub fn extract_group_failure_context(
                     if let Some(ref stdout) = details.stdout {
                         let s: &str = stdout.as_ref();
                         if !s.is_empty() {
-                            let truncated = if s.len() > 1500 {
-                                format!("{}...\n[truncated]", &s[..1500])
-                            } else {
-                                s.to_string()
-                            };
+                            let truncated = truncate_str_ellipsis(s, 1500);
                             context.push_str(&format!("**Output:**\n```\n{}\n```\n", truncated));
                         }
                     }
                     if let Some(ref stderr) = details.stderr {
                         let s: &str = stderr.as_ref();
                         if !s.is_empty() {
-                            let truncated = if s.len() > 1000 {
-                                format!("{}...\n[truncated]", &s[..1000])
-                            } else {
-                                s.to_string()
-                            };
+                            let truncated = truncate_str_ellipsis(s, 1000);
                             context.push_str(&format!("**Stderr:**\n```\n{}\n```\n", truncated));
                         }
                     }

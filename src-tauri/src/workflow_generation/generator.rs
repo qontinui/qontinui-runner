@@ -26,6 +26,7 @@ use crate::context;
 use crate::database::pg::PgDb;
 use crate::doctor::DoctorHandle;
 use crate::skills::SkillRegistry;
+use crate::str_utils::truncate_str;
 use crate::unified_workflows::UnifiedWorkflow;
 use crate::workflow_generation::dependency_analysis;
 use crate::workflow_generation::evaluation;
@@ -594,7 +595,7 @@ pub fn generate_workflow(
 ) -> (GenerateWorkflowResponse, PipelineArtifact) {
     info!(
         "Generating workflow from description: {}",
-        &request.description[..request.description.len().min(100)]
+        truncate_str(&request.description, 100)
     );
 
     let pipeline_start = Instant::now();
@@ -874,7 +875,7 @@ pub fn generate_workflow(
                 session_id: None,
                 session_name: Some(format!(
                     "Generate: {}",
-                    &request.description[..request.description.len().min(60)]
+                    truncate_str(&request.description, 60)
                 )),
                 phase: Some("investigation".to_string()),
                 phase_iteration: None,
@@ -1044,7 +1045,7 @@ pub fn generate_workflow(
                 session_id: None,
                 session_name: Some(format!(
                     "Generate: {}",
-                    &request.description[..request.description.len().min(60)]
+                    truncate_str(&request.description, 60)
                 )),
                 phase: Some("specification".to_string()),
                 phase_iteration: None,
@@ -2659,7 +2660,7 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
         })
         .map_err(|e| {
             error!("Failed to parse builder agent JSON: {}", e);
-            warn!("Response text: {}", &json_text[..json_text.len().min(500)]);
+            warn!("Response text: {}", truncate_str(&json_text, 500));
             Box::new(GenerateWorkflowResponse {
                 workflow: None,
                 validation_errors: vec![],

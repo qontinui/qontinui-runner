@@ -4,21 +4,7 @@ use serde::Serialize;
 use tracing::trace;
 
 use super::types::ClaudeOutputMessage;
-
-/// Truncate a string to at most `max_bytes` bytes, ensuring the cut is on a valid
-/// UTF-8 char boundary. Returns the full string if it's already within the limit.
-pub fn truncate_str(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    // Find the largest byte index <= max_bytes that is a valid char boundary.
-    // Start at max_bytes and walk backward until we find a char boundary.
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
+use crate::str_utils::truncate_str;
 
 /// Decode a single NDJSON line into a ClaudeOutputMessage.
 pub fn decode_message(line: &str) -> Result<ClaudeOutputMessage, String> {

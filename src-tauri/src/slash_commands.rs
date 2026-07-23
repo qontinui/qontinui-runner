@@ -4,6 +4,7 @@
 //! parses each into a workflow, and syncs with the database (create/update/delete).
 
 use crate::database::pg::parse_workflow_id;
+use crate::str_utils::truncate_str;
 use crate::unified_workflows::CreateUnifiedWorkflowRequest;
 use regex::Regex;
 use serde::Serialize;
@@ -165,7 +166,7 @@ fn extract_description(content: &str) -> String {
 
     let desc = desc_lines.join(" ");
     if desc.len() > 200 {
-        format!("{}...", &desc[..197])
+        format!("{}...", truncate_str(&desc, 197))
     } else {
         desc
     }

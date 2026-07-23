@@ -10,6 +10,7 @@ use tracing::warn;
 
 use crate::database::pg::PgDb;
 use crate::reflection::graph_engine::KnowledgeGraph;
+use crate::str_utils::truncate_str_ellipsis;
 
 // =============================================================================
 // Types
@@ -258,7 +259,7 @@ async fn retrieve_observations(pg: &PgDb, query: &str, limit: i64) -> Vec<Memory
                 id: r.id.to_string(),
                 source: MemorySource::Observation,
                 title: r.title,
-                snippet: truncate_str(&r.content_preview, 500),
+                snippet: truncate_str_ellipsis(&r.content_preview, 500),
                 source_score: score,
                 fused_score: 0.0,
                 timestamp: ts,
@@ -289,7 +290,7 @@ async fn retrieve_observations(pg: &PgDb, query: &str, limit: i64) -> Vec<Memory
                 id: model.id.to_string(),
                 source: MemorySource::Observation,
                 title: format!("[Mental Model] {}", model.title),
-                snippet: truncate_str(&model.content, 500),
+                snippet: truncate_str_ellipsis(&model.content, 500),
                 source_score: (model.importance * 1.2).min(1.0), // 20% boost for mental models
                 fused_score: 0.0,
                 timestamp: Some(model.updated_at),
@@ -330,8 +331,8 @@ async fn retrieve_timeline(pg: &PgDb, query: &str, limit: i64) -> Vec<MemoryResu
                         source: MemorySource::ActivityTimeline,
                         title: r
                             .window_title
-                            .unwrap_or_else(|| truncate_str(&r.text_preview, 80)),
-                        snippet: truncate_str(&r.text_preview, 500),
+                            .unwrap_or_else(|| truncate_str_ellipsis(&r.text_preview, 80)),
+                        snippet: truncate_str_ellipsis(&r.text_preview, 500),
                         source_score: score as f64,
                         fused_score: 0.0,
                         timestamp: ts,
@@ -371,7 +372,7 @@ async fn retrieve_knowledge(pg: &PgDb, query: &str, limit: i64) -> Vec<MemoryRes
                         id,
                         source: MemorySource::TaskKnowledge,
                         title: format!("{} knowledge", category),
-                        snippet: truncate_str(&content, 500),
+                        snippet: truncate_str_ellipsis(&content, 500),
                         source_score: score,
                         fused_score: 0.0,
                         timestamp: ts,
@@ -412,7 +413,7 @@ async fn retrieve_pg_unified(
                     id: r.entity_id,
                     source,
                     title: r.title,
-                    snippet: truncate_str(&r.snippet, 500),
+                    snippet: truncate_str_ellipsis(&r.snippet, 500),
                     source_score: r.relevance_score,
                     fused_score: 0.0,
                     timestamp: None,
@@ -468,7 +469,7 @@ async fn retrieve_embeddings(pg: &PgDb, query: &str, limit: usize) -> Vec<Memory
                     id: sr.item.id,
                     source: MemorySource::TaskKnowledge,
                     title: format!("{} knowledge", sr.item.category),
-                    snippet: truncate_str(&sr.item.content, 500),
+                    snippet: truncate_str_ellipsis(&sr.item.content, 500),
                     source_score: sr.hybrid_score as f64,
                     fused_score: 0.0,
                     timestamp: chrono::DateTime::parse_from_rfc3339(&sr.item.created_at)
@@ -510,8 +511,8 @@ async fn retrieve_embeddings(pg: &PgDb, query: &str, limit: usize) -> Vec<Memory
                 all_results.push(MemoryResult {
                     id,
                     source: MemorySource::Error,
-                    title: format!("[{}] {}", severity, truncate_str(message, 80)),
-                    snippet: truncate_str(message, 500),
+                    title: format!("[{}] {}", severity, truncate_str_ellipsis(message, 80)),
+                    snippet: truncate_str_ellipsis(message, 500),
                     source_score: score * 0.7, // Discount text-only results vs embedding
                     fused_score: 0.0,
                     timestamp: chrono::DateTime::parse_from_rfc3339(last_seen)
@@ -550,7 +551,10 @@ fn retrieve_graph(graph: &KnowledgeGraph, query: &str, limit: usize) -> Vec<Memo
                 id: node.entity_id.clone(),
                 source: MemorySource::GraphNode,
                 title: node.label.clone(),
-                snippet: truncate_str(&format!("[{}] {}", node.kind.as_str(), node.label), 500),
+                snippet: truncate_str_ellipsis(
+                    &format!("[{}] {}", node.kind.as_str(), node.label),
+                    500,
+                ),
                 source_score: score,
                 fused_score: 0.0,
                 timestamp: node
@@ -724,7 +728,7 @@ pub(crate) async fn retrieve_tenant_memory_at(
                 id,
                 source: MemorySource::TenantMemory,
                 title: title.to_string(),
-                snippet: truncate_str(content, 500),
+                snippet: truncate_str_ellipsis(content, 500),
                 source_score: rrf / max_rrf,
                 fused_score: 0.0,
                 timestamp: h
@@ -1297,19 +1301,6 @@ async fn synthesize_results(
 }
 
 // =============================================================================
-// Helpers
-// =============================================================================
-
-fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max_len).collect();
-        format!("{}...", truncated)
-    }
-}
-
-// =============================================================================
 // Tests
 // =============================================================================
 
@@ -1447,15 +1438,6 @@ mod tests {
         let sources = MemorySource::parse_list("timeline,knowledge");
         assert!(sources.contains(&MemorySource::ActivityTimeline));
         assert!(sources.contains(&MemorySource::TaskKnowledge));
-    }
-
-    #[test]
-    fn test_truncate_str() {
-        assert_eq!(truncate_str("hello", 10), "hello");
-        let long = "a".repeat(600);
-        let result = truncate_str(&long, 500);
-        assert!(result.ends_with("..."));
-        assert_eq!(result.chars().count(), 503); // 500 + "..."
     }
 
     #[test]

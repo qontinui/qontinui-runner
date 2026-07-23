@@ -13,6 +13,7 @@ use crate::database::pg::PgDb;
 use crate::database::types::{CreateEntityProfileInput, ObservationSearchResult};
 use crate::reflection::graph_engine::KnowledgeGraph;
 use crate::reflection::graph_types::GraphNodeKind;
+use crate::str_utils::truncate_str;
 
 /// Parsed LLM profile response.
 #[derive(Debug, Deserialize)]
@@ -460,7 +461,7 @@ async fn generate_profile_via_llm(
         format!(
             "Failed to parse LLM profile JSON: {}. Response: {}",
             e,
-            &cleaned[..cleaned.len().min(200)]
+            truncate_str(cleaned, 200)
         )
     })?;
 

@@ -3,6 +3,7 @@
 //! Reads Claude Code's on-disk session transcripts (structured JSONL with message
 //! types, text blocks, plan content) without any dependency on Claude Code itself.
 
+use crate::str_utils::truncate_str;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -1352,7 +1353,7 @@ fn generate_display_name(first_preview: &Option<String>, last_modified: &str) ->
                 return first_line.to_string();
             }
             // Find a word boundary near 50 chars
-            let truncated = &clean[..clean.len().min(50)];
+            let truncated = truncate_str(&clean, 50);
             if let Some(last_space) = truncated.rfind(' ') {
                 if last_space > 20 {
                     return format!("{}...", &clean[..last_space]);

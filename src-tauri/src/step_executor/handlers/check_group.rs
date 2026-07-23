@@ -10,6 +10,7 @@ use tracing::info;
 use super::{HandlerContext, StepHandler, StepHandlerResult};
 use crate::check_executor::{execute_check, CheckDefinition, CheckTool, CheckType};
 use crate::step_executor::{CheckIssueDetail, ExecutionStepConfig, IndividualCheckResult};
+use crate::str_utils::truncate_str;
 
 /// Handler for check_group steps.
 pub struct CheckGroupHandler;
@@ -161,7 +162,10 @@ impl StepHandler for CheckGroupHandler {
                 files_checked: result.files_checked,
                 error_message: result.error.clone(),
                 output: if result.output.len() > 2000 {
-                    Some(format!("{}... (truncated)", &result.output[..2000]))
+                    Some(format!(
+                        "{}... (truncated)",
+                        truncate_str(&result.output, 2000)
+                    ))
                 } else if !result.output.is_empty() {
                     Some(result.output.clone())
                 } else {

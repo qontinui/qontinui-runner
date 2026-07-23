@@ -17,6 +17,7 @@ use super::compression::{CompressionResult, TokenCount};
 use super::hooks::{HookResult, HookTrigger};
 use super::retry::RetryState;
 use crate::ai_router::{ComplexityAssessment, TaskComplexity};
+use crate::str_utils::truncate_str_ellipsis;
 
 // ============================================================================
 // Event Types
@@ -221,7 +222,7 @@ impl StatusEventEmitter {
                 confidence: assessment.confidence,
                 factors: assessment.factors.clone(),
                 selected_model: assessment.selected_model.clone(),
-                prompt_preview: prompt_preview.map(|s| truncate_string(s, 100)),
+                prompt_preview: prompt_preview.map(|s| truncate_str_ellipsis(s, 100)),
                 file_count,
                 criteria_count,
             },
@@ -249,7 +250,7 @@ impl StatusEventEmitter {
         // Get the latest attempt from error history
         let latest_attempt = state.error_history.last().map(|a| RetryAttemptPayload {
             attempt_number: a.attempt_number,
-            error: truncate_string(&a.error, 500),
+            error: truncate_str_ellipsis(&a.error, 500),
             attempt_timestamp: a.timestamp.clone(),
             delay_ms: a.delay_ms,
             feedback_injected: a.feedback_injected,
@@ -258,7 +259,10 @@ impl StatusEventEmitter {
         // Build the full state payload
         let state_payload = RetryStatePayload {
             attempt: state.attempt,
-            last_error: state.last_error.as_ref().map(|e| truncate_string(e, 500)),
+            last_error: state
+                .last_error
+                .as_ref()
+                .map(|e| truncate_str_ellipsis(e, 500)),
             last_attempt_at: state.last_attempt_at.clone(),
             total_delay_ms: state.total_delay_ms,
             error_history: state
@@ -266,7 +270,7 @@ impl StatusEventEmitter {
                 .iter()
                 .map(|a| RetryAttemptPayload {
                     attempt_number: a.attempt_number,
-                    error: truncate_string(&a.error, 200),
+                    error: truncate_str_ellipsis(&a.error, 200),
                     attempt_timestamp: a.timestamp.clone(),
                     delay_ms: a.delay_ms,
                     feedback_injected: a.feedback_injected,
@@ -280,7 +284,7 @@ impl StatusEventEmitter {
             error: state
                 .last_error
                 .as_ref()
-                .map(|e| truncate_string(e, 500))
+                .map(|e| truncate_str_ellipsis(e, 500))
                 .unwrap_or_default(),
             attempt_timestamp: state
                 .last_attempt_at
@@ -401,8 +405,11 @@ impl StatusEventEmitter {
                 hook_name: result.hook_name.clone(),
                 trigger: trigger_str.clone(),
                 success: result.success,
-                output: result.output.clone().map(|s| truncate_string(&s, 500)),
-                error: result.error.clone().map(|s| truncate_string(&s, 500)),
+                output: result
+                    .output
+                    .clone()
+                    .map(|s| truncate_str_ellipsis(&s, 500)),
+                error: result.error.clone().map(|s| truncate_str_ellipsis(&s, 500)),
                 duration_ms: result.duration_ms,
                 timestamp: chrono::Utc::now().to_rfc3339(),
             },
@@ -485,19 +492,6 @@ fn trigger_to_string(trigger: HookTrigger) -> String {
     }
 }
 
-/// Truncate a string to a maximum length
-fn truncate_string(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        let mut end = max_len;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}...", &s[..end])
-    }
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -505,12 +499,6 @@ fn truncate_string(s: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_truncate_string() {
-        assert_eq!(truncate_string("short", 10), "short");
-        assert_eq!(truncate_string("this is longer", 10), "this is lo...");
-    }
 
     #[test]
     fn test_trigger_to_string() {

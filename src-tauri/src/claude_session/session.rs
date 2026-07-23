@@ -643,7 +643,7 @@ impl ClaudeSession {
                     match result {
                         Ok(line) => {
                             line_count += 1;
-                            let preview = crate::claude_protocol::codec::truncate_str(&line, 150);
+                            let preview = crate::str_utils::truncate_str(&line, 150);
                             info!("[STDOUT_READER] Line #{}: {}", line_count, preview);
 
                             // Update activity

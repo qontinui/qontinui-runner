@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use super::{AgenticMetric, MetricResult};
+use crate::str_utils::truncate_str;
 
 /// Input data for LLM-as-judge evaluation.
 ///
@@ -116,7 +117,7 @@ fn parse_judge_response(response: &str, model_used: &str) -> Vec<MetricResult> {
             warn!(
                 "Failed to parse LLM judge response: {}. Raw: {}",
                 e,
-                &response[..response.len().min(200)]
+                truncate_str(&response, 200)
             );
             return fallback_scores(model_used, "Failed to parse LLM response");
         }

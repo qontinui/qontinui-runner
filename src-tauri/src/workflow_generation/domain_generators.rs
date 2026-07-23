@@ -17,6 +17,7 @@ use super::template_library::StepTemplate;
 use crate::ai_provider::AiResponse;
 use crate::ai_router::TaskContext;
 use crate::doctor::DoctorHandle;
+use crate::str_utils::truncate_str;
 
 // ============================================================================
 // Context & result types
@@ -134,21 +135,13 @@ pub trait DomainGenerator: Send + Sync {
         if !context.discovery_context.is_empty() {
             prompt.push_str("## Discovery Context\n\n");
             // Truncate to avoid blowing token budget
-            let disc = if context.discovery_context.len() > 4000 {
-                &context.discovery_context[..4000]
-            } else {
-                &context.discovery_context
-            };
+            let disc = truncate_str(&context.discovery_context, 4000);
             prompt.push_str(disc);
             prompt.push_str("\n\n");
         }
         if !context.resolved_contexts.is_empty() {
             prompt.push_str("## Resolved Investigation Context\n\n");
-            let res = if context.resolved_contexts.len() > 4000 {
-                &context.resolved_contexts[..4000]
-            } else {
-                &context.resolved_contexts
-            };
+            let res = truncate_str(&context.resolved_contexts, 4000);
             prompt.push_str(res);
             prompt.push_str("\n\n");
         }
@@ -301,7 +294,7 @@ pub trait DomainGenerator: Send + Sync {
                     "Domain {} JSON parse failed: {} — raw: {}",
                     domain,
                     e,
-                    &json_text[..json_text.len().min(200)]
+                    truncate_str(&json_text, 200)
                 );
                 DomainGenerationResult {
                     domain,

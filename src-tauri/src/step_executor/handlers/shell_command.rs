@@ -89,7 +89,7 @@ impl StepHandler for ShellCommandHandler {
             if sanitized != command {
                 info!(
                     "Runtime jq→python replacement applied: {}",
-                    &sanitized[..sanitized.len().min(100)]
+                    truncate_str(&sanitized, 100)
                 );
             }
             sanitized
@@ -106,7 +106,7 @@ impl StepHandler for ShellCommandHandler {
             if sanitized != command {
                 info!(
                     "Runtime \\r fix applied before xargs: {}",
-                    &sanitized[..sanitized.len().min(100)]
+                    truncate_str(&sanitized, 100)
                 );
             }
             sanitized

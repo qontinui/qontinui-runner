@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use super::{AgenticMetric, MetricResult};
+use crate::str_utils::truncate_str;
 
 /// A captured retrieval event for post-hoc RAG evaluation.
 ///
@@ -86,11 +87,11 @@ fn build_rag_judge_prompt(input: &RagJudgeInput) -> String {
                 result.similarity,
                 result.hybrid_score,
                 result.title,
-                &result.content_preview[..result.content_preview.len().min(150)],
+                truncate_str(&result.content_preview, 150),
             ));
         }
         if let Some(ref ctx) = event.formatted_context {
-            let preview = &ctx[..ctx.len().min(500)];
+            let preview = truncate_str(ctx, 500);
             retrieval_section.push_str(&format!("Formatted context (preview): {}\n", preview));
         }
     }
@@ -98,7 +99,7 @@ fn build_rag_judge_prompt(input: &RagJudgeInput) -> String {
     let output_section = input
         .generated_output
         .as_deref()
-        .map(|o| &o[..o.len().min(1000)])
+        .map(|o| truncate_str(o, 1000))
         .unwrap_or("(no generated output available)");
 
     format!(
@@ -137,7 +138,7 @@ fn parse_rag_judge_response(response: &str, model_used: &str) -> Vec<MetricResul
             warn!(
                 "Failed to parse RAG judge response: {}. Raw: {}",
                 e,
-                &response[..response.len().min(200)]
+                truncate_str(&response, 200)
             );
             return rag_fallback_scores(model_used, "Failed to parse LLM response");
         }
@@ -278,7 +279,7 @@ pub fn capture_retrieval_event<T>(
                     title,
                     similarity: r.similarity,
                     hybrid_score: r.hybrid_score,
-                    content_preview: preview[..preview.len().min(200)].to_string(),
+                    content_preview: truncate_str(&preview, 200).to_string(),
                 }
             })
             .collect(),

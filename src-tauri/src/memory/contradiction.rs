@@ -15,6 +15,7 @@ use crate::ai_provider;
 use crate::ai_router::TaskContext;
 use crate::database::pg::PgDb;
 use crate::database::types::{ContradictionCandidate, ContradictionStats};
+use crate::str_utils::truncate_str;
 
 /// Internal scoring result for auto-resolution.
 struct ResolutionScore {
@@ -250,7 +251,7 @@ async fn llm_resolve(
         format!(
             "Failed to parse LLM JSON response: {} — raw output: {}",
             e,
-            &output[..output.len().min(200)]
+            truncate_str(&output, 200)
         )
     })?;
 

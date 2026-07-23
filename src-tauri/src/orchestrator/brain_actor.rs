@@ -21,6 +21,7 @@
 
 use crate::orchestrator::agent_roles::ModelTier;
 use crate::orchestrator::structured_output::StructuredSignal;
+use crate::str_utils::truncate_str;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
@@ -248,11 +249,7 @@ impl BrainActorOrchestrator {
                     self.force_brain_reinvocation = true;
                 }
                 StructuredSignal::RecordStore { key, value } => {
-                    debug!(
-                        "Storing record: {} = {}",
-                        key,
-                        &value[..value.len().min(100)]
-                    );
+                    debug!("Storing record: {} = {}", key, truncate_str(value, 100));
                     self.record_store.insert(key.clone(), value.clone());
                 }
                 _ => {} // Other signals handled by the main loop

@@ -10,6 +10,7 @@
 use crate::ai_provider::AiResponse;
 use crate::ai_router::TaskContext;
 use crate::doctor::DoctorHandle;
+use crate::str_utils::truncate_str;
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 use tracing::{debug, info, warn};
@@ -226,7 +227,7 @@ pub fn run_specification_agent(
                 "Specification agent produced {} criteria in {}ms (goal: {})",
                 criteria.criteria.len(),
                 duration_ms,
-                &criteria.goal_summary[..criteria.goal_summary.len().min(80)]
+                truncate_str(&criteria.goal_summary, 80)
             );
             debug!(
                 "Criteria IDs: {:?}",
@@ -254,10 +255,7 @@ pub fn run_specification_agent(
         }
         Err(e) => {
             warn!("Failed to parse specification output as JSON: {}", e);
-            debug!(
-                "Specification raw output: {}",
-                &output[..output.len().min(500)]
-            );
+            debug!("Specification raw output: {}", truncate_str(&output, 500));
             SpecificationResult {
                 criteria: empty_criteria(),
                 success: false,

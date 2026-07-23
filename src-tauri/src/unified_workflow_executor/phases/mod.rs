@@ -27,6 +27,7 @@
 use tracing::{debug, info};
 
 use crate::findings::{FindingCategoryExt, FindingStatusExt};
+use crate::str_utils::truncate_str_ellipsis;
 
 // Token tracking, UI Bridge, environment readiness, response mode, and token
 // estimation extracted to phase_helpers module.
@@ -187,7 +188,7 @@ async fn build_compressed_iteration_history(
                     category_str, status_str, finding.title
                 ));
                 if !finding.description.is_empty() {
-                    let desc = truncate_str(&finding.description, 200);
+                    let desc = truncate_str_ellipsis(&finding.description, 200);
                     findings_lines.push(format!("  {}", desc));
                 }
             }
@@ -200,7 +201,7 @@ async fn build_compressed_iteration_history(
             } else if budget_remaining > 100 {
                 // Truncate to fit within 80% of remaining budget
                 let max_chars = (budget_remaining * 4 * 80) / 100;
-                sections.push(truncate_str(&section, max_chars));
+                sections.push(truncate_str_ellipsis(&section, max_chars));
                 budget_remaining = budget_remaining.saturating_sub(max_chars / 4);
                 sections_included += 1;
                 sections_truncated += 1;
@@ -290,7 +291,7 @@ async fn build_compressed_iteration_history(
             .iter()
             .filter(|o| o.iteration == recent_iter)
         {
-            recent_lines.push(truncate_str(&obs.content, 4000));
+            recent_lines.push(truncate_str_ellipsis(&obs.content, 4000));
         }
 
         if recent_lines.len() > 2 {
@@ -302,7 +303,7 @@ async fn build_compressed_iteration_history(
                 sections_included += 1;
             } else if budget_remaining > 200 {
                 let max_chars = (budget_remaining * 4 * 80) / 100;
-                sections.push(truncate_str(&section, max_chars));
+                sections.push(truncate_str_ellipsis(&section, max_chars));
                 budget_remaining = budget_remaining.saturating_sub(max_chars / 4);
                 sections_included += 1;
                 sections_truncated += 1;
@@ -406,7 +407,10 @@ async fn build_compressed_iteration_history(
 
             // Extract fix description from solutions for this iteration
             if let Some(solution) = all_solutions.iter().find(|s| s.iteration == iter) {
-                iter_parts.push(format!("  Tried: {}", truncate_str(&solution.content, 120)));
+                iter_parts.push(format!(
+                    "  Tried: {}",
+                    truncate_str_ellipsis(&solution.content, 120)
+                ));
             }
 
             // Extract git diff stat from observations for this iteration
@@ -421,7 +425,8 @@ async fn build_compressed_iteration_history(
                 // Enforce per-iteration char budget
                 let joined = iter_parts.join("\n");
                 if joined.len() > max_per_old_iteration_chars {
-                    compressed_lines.push(truncate_str(&joined, max_per_old_iteration_chars));
+                    compressed_lines
+                        .push(truncate_str_ellipsis(&joined, max_per_old_iteration_chars));
                 } else {
                     compressed_lines.push(joined);
                 }
@@ -503,10 +508,13 @@ async fn build_compressed_iteration_history(
                             entry.category.to_uppercase(),
                             entry.iteration,
                             entry.confidence,
-                            truncate_str(&entry.content, 300),
+                            truncate_str_ellipsis(&entry.content, 300),
                         ));
                         if let Some(ref evidence) = entry.evidence {
-                            lines.push(format!("  Evidence: {}", truncate_str(evidence, 150)));
+                            lines.push(format!(
+                                "  Evidence: {}",
+                                truncate_str_ellipsis(evidence, 150)
+                            ));
                         }
                     }
                     let section = lines.join("\n");
@@ -527,7 +535,7 @@ async fn build_compressed_iteration_history(
                         lines.push(format!(
                             "- [iter {}] {}",
                             entry.iteration,
-                            truncate_str(&entry.content, 300),
+                            truncate_str_ellipsis(&entry.content, 300),
                         ));
                     }
                     let section = lines.join("\n");
@@ -567,7 +575,7 @@ async fn build_compressed_iteration_history(
                             "- **[{}, relevance: {:.2}]** {}",
                             entry.category.to_uppercase(),
                             entry.relevance_score,
-                            truncate_str(&entry.content, 300),
+                            truncate_str_ellipsis(&entry.content, 300),
                         ));
                     }
                     let section = lines.join("\n");
@@ -602,7 +610,7 @@ async fn build_compressed_iteration_history(
                                 "- **[{}]** ({}): {}",
                                 entry.category.to_uppercase(),
                                 entry.confidence,
-                                truncate_str(&entry.content, 300),
+                                truncate_str_ellipsis(&entry.content, 300),
                             ));
                         }
                         let section = lines.join("\n");
@@ -635,7 +643,7 @@ async fn build_compressed_iteration_history(
                         lines.push(format!(
                             "From '{}': {}",
                             source_wf_name,
-                            truncate_str(knowledge_text, 400),
+                            truncate_str_ellipsis(knowledge_text, 400),
                         ));
                         lines.push(String::new());
                     }
@@ -672,7 +680,11 @@ async fn build_compressed_iteration_history(
                             "project_recurring_issue" => "Known Issue",
                             _ => category.as_str(),
                         };
-                        lines.push(format!("**[{}]** {}", label, truncate_str(content, 400),));
+                        lines.push(format!(
+                            "**[{}]** {}",
+                            label,
+                            truncate_str_ellipsis(content, 400),
+                        ));
                         lines.push(String::new());
                     }
                     let section = lines.join("\n");
@@ -721,7 +733,7 @@ async fn build_compressed_iteration_history(
                                 "- **[Predicted Fix, confidence: {:.0}%]** Based on {} previous successful application(s): {}",
                                 predicted.confidence * 100.0,
                                 predicted.reuse_count,
-                                truncate_str(&predicted.fix_description, 300),
+                                truncate_str_ellipsis(&predicted.fix_description, 300),
                             ));
                             prediction_count += 1;
 
@@ -859,7 +871,7 @@ async fn build_compressed_iteration_history(
                     "- **[{}]** (applies to: {}) {}",
                     fix_type,
                     ctx_str,
-                    truncate_str(description, 300),
+                    truncate_str_ellipsis(description, 300),
                 ));
                 lines.push(String::new());
             }
@@ -890,7 +902,7 @@ async fn build_compressed_iteration_history(
                 if capped_tokens <= budget_remaining {
                     let capped_section = if tokens > 600 {
                         let max_chars = 600 * 4;
-                        truncate_str(&section, max_chars)
+                        truncate_str_ellipsis(&section, max_chars)
                     } else {
                         section
                     };
@@ -1462,21 +1474,4 @@ fn preread_previously_edited_files(
     }
 
     result
-}
-
-/// Truncate a string to max_len characters, appending "..." if truncated.
-fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.len() > max_len {
-        // Find the last char boundary at or before max_len to avoid
-        // panicking on multi-byte UTF-8 characters.
-        let end = s
-            .char_indices()
-            .take_while(|(i, _)| *i <= max_len)
-            .last()
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        format!("{}...", &s[..end])
-    } else {
-        s.to_string()
-    }
 }

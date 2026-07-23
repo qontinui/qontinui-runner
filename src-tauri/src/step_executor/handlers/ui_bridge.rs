@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use super::{ExecutionStepConfig, HandlerContext, StepHandler, StepHandlerResult};
+use crate::str_utils::truncate_str;
 
 // ---------------------------------------------------------------------------
 // Pure helper functions (#1 — foundation for typed parsing and compare logic)
@@ -1381,7 +1382,7 @@ impl UiBridgeHandler {
         } else {
             format!(
                 "\n\nCurrent UI Bridge snapshot (if available):\n{}",
-                &snapshot_text[..snapshot_text.len().min(2000)]
+                truncate_str(&snapshot_text, 2000)
             )
         };
 
@@ -2078,7 +2079,7 @@ impl UiBridgeHandler {
                 warn!(
                     "Failed to parse comparison result as typed struct: {}. Raw: {}",
                     e,
-                    &comparison_json[..comparison_json.len().min(500)]
+                    truncate_str(&comparison_json, 500)
                 );
                 return StepHandlerResult::failure(format!(
                     "Failed to parse comparison result: {}",

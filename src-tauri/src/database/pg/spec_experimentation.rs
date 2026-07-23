@@ -4,6 +4,7 @@
 //! and spec_versions tables.
 
 use super::{parse_workflow_id, PgDb};
+use crate::str_utils::{truncate_str, truncate_str_ellipsis};
 use tracing::{debug, info};
 
 /// Lightweight compliance result row.
@@ -1859,11 +1860,7 @@ impl PgDb {
 
             let id = uuid::Uuid::new_v4().to_string();
             let now = chrono::Utc::now().to_rfc3339();
-            let title = if fix.fix_description.len() > 100 {
-                format!("{}...", &fix.fix_description[..97])
-            } else {
-                fix.fix_description.clone()
-            };
+            let title = truncate_str_ellipsis(&fix.fix_description, 97);
 
             let result = conn
                 .execute(
@@ -1905,7 +1902,7 @@ impl PgDb {
     ) -> Result<Vec<(String, String, Option<String>)>, String> {
         let conn = self.pool.get().await.map_err(|e| format!("PG pool: {e}"))?;
 
-        let search = format!("%{}%", &query_text[..query_text.len().min(100)]);
+        let search = format!("%{}%", truncate_str(query_text, 100));
 
         let rows = conn
             .query(
