@@ -65,6 +65,7 @@ pub mod fs_observer;
 pub mod isolated_edit;
 pub mod maintenance_executor;
 pub mod on_demand;
+pub mod orphan_target_reaper;
 pub mod reclaim;
 
 /// Env var that controls the worktree-per-session spawn path. **Default ON**

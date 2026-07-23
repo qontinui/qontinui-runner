@@ -878,6 +878,24 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // Same machine-wide, anonymous, device-keyed identity as
                 // the reclaim poller (census::{load_device_id,coord_http_base}).
                 agent_worktree::maintenance_executor::spawn_maintenance();
+                // Ξ_Orphan cargo-target reaper — machine-wide local disk
+                // hygiene for the reclaim blind spot. The worktree census/
+                // reclaim only ever measures/removes the canonical
+                // `<worktree>/target` (`src-tauri/target`) + `node_modules`
+                // INSIDE enumerated worktrees; but agents deliberately build
+                // into OUT-OF-TREE target roots (`target-wt-<slug>`,
+                // `_cargo-targets/<slug>`, `cargo-target-coord`, …) via
+                // cargo-guard's target-agent routing and CARGO_TARGET_DIR to
+                // dodge build-lock contention. Those match no worktree pattern,
+                // so the reaper never sees them — they filled D: to 1.3% free
+                // (2026-07-23, ~1.35 TB recovered by hand). This poller reaps
+                // that population: out-of-tree cargo target roots (CACHEDIR.TAG)
+                // that are not building (no held .cargo-lock, deepest artifact
+                // mtime past the grace) and not reparse points, junction-safe.
+                // DRY-RUN by default (logs "would reap"); armed via
+                // COORD_ORPHAN_TARGET_REAP_ENABLED. Default 900s cadence
+                // (QONTINUI_ORPHAN_TARGET_INTERVAL_SECS). No coord round-trip.
+                agent_worktree::orphan_target_reaper::spawn_orphan_reaper();
                 // Ξ_FS backstop (Phase 5) — a defense-in-depth DETECTOR for
                 // edits that leaked OUTSIDE any session worktree. Periodically
                 // scans the SHARED canonical checkouts; alarms (POST
