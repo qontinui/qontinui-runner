@@ -46,8 +46,17 @@ describe("resolveAuthGatePresentation", () => {
   });
 
   it("never early-returns for a gate that has a live tree underneath (exhaustive)", () => {
+    // Record<AuthGate, true> forces this list to grow with the type — a new
+    // AuthGate variant is a compile error here, not a silently untested gate.
+    const allGates: Record<AuthGate, true> = {
+      loading: true,
+      wizard: true,
+      login: true,
+      "tier-unknown": true,
+      app: true,
+    };
+    const gates = Object.keys(allGates) as AuthGate[];
     const earlyReturnGates = new Set<AuthGate>(["wizard", "tier-unknown"]);
-    const gates: AuthGate[] = ["loading", "wizard", "login", "tier-unknown", "app"];
     for (const gate of gates) {
       const presentation = resolveAuthGatePresentation(gate);
       if (earlyReturnGates.has(gate)) {

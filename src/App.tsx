@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ApolloProvider } from "@apollo/client/react";
 
@@ -71,6 +71,7 @@ import { TierUnavailableScreen } from "./components/TierUnavailableScreen";
 import { SetupWizard } from "./components/setup-wizard";
 import { registerOpenableView } from "./lib/openable-views";
 import { resolveAuthGate } from "./lib/authGate";
+import { setAuthOverlay, useAuthOverlay } from "./lib/authOverlayStore";
 import { resolveAuthGatePresentation } from "./lib/authGatePresentation";
 import { LogSourcePicker } from "./components/LogSourcePicker";
 import { Sidebar } from "./components/navigation";
@@ -538,6 +539,30 @@ function AppContent() {
   // the old early returns were what let restore respawn `claude --resume`
   // over still-alive sessions after a blip.
   const presentation = resolveAuthGatePresentation(gate);
+  const authOverlay = presentation.mode === "overlay" ? presentation.surface : null;
+
+  // Publish the overlay state for sibling trees rendered OUTSIDE AppContent
+  // (AppWithTutorials' fixed-position siblings, BuildRefreshBanner) so they
+  // go `inert` in lockstep with the main tree — otherwise Tab from the
+  // LoginScreen walks into their invisible controls.
+  useEffect(() => {
+    setAuthOverlay(authOverlay);
+    return () => setAuthOverlay(null);
+  }, [authOverlay]);
+
+  // An open Radix modal sets document.body's pointer-events to "none" and
+  // traps focus inside its own (now invisible, z<20000) content — both defeat
+  // the overlay seal. Radix dismissable layers listen for Escape at the
+  // document, so dispatching one closes the open layer stack (releasing both
+  // the body style and the focus trap); then pull focus into the overlay.
+  // Residual: a layer that opts out of Escape-dismiss keeps its focus trap —
+  // the overlay still wins hit-testing via its explicit pointer-events-auto.
+  const overlayRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (authOverlay === null) return;
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    overlayRef.current?.focus();
+  }, [authOverlay]);
 
   // The two surfaces that still REPLACE the tree rather than overlay it (see
   // authGatePresentation.ts for why each one has nothing worth keeping
@@ -563,8 +588,6 @@ function AppContent() {
     }
     return <SetupWizard onComplete={() => setSetupCompleted(true)} />;
   }
-
-  const authOverlay = presentation.mode === "overlay" ? presentation.surface : null;
   const loadingMessage = auth.devAutoLoginPending
     ? "Signing in..."
     : isAuthLoading
@@ -859,7 +882,11 @@ function AppContent() {
             preserving its "never shown while signed out" behavior).
         */}
         {authOverlay === "loading" && (
-          <div className="fixed inset-0 z-[20000] bg-background grid-dots flex items-center justify-center">
+          <div
+            ref={overlayRef}
+            tabIndex={-1}
+            className="fixed inset-0 z-[20000] pointer-events-auto bg-background grid-dots flex items-center justify-center"
+          >
             <div className="card p-8 text-center space-y-4">
               <div className="inline-block w-12 h-12 border-4 border-primary border-t-transparent rounded-full animate-spin" />
               <p className="text-muted-foreground">{loadingMessage}</p>
@@ -877,12 +904,31 @@ function AppContent() {
           fills the fixed container edge-to-edge with an opaque surface.
         */}
         {authOverlay === "login" && (
-          <div className="fixed inset-0 z-[20000] overflow-auto bg-background">
+          <div
+            ref={overlayRef}
+            tabIndex={-1}
+            className="fixed inset-0 z-[20000] pointer-events-auto overflow-auto bg-background"
+          >
             <LoginScreen storeUnreadable={auth.authStatus?.store_unreadable === true} />
           </div>
         )}
       </RenderLogWrapper>
     </ProfilerWrapper>
+  );
+}
+
+/**
+ * Wraps fixed-position UI that renders OUTSIDE AppContent's inert wrapper in
+ * the same inert-while-auth-overlay guard (P2 auth-gate overlay), subscribed
+ * via the module-level overlay store since these trees sit beside/above the
+ * component that computes the gate. `display: contents` adds no layout box.
+ */
+function AuthOverlayInertBoundary({ children }: { children: ReactNode }) {
+  const overlay = useAuthOverlay();
+  return (
+    <div className="contents" inert={overlay !== null}>
+      {children}
+    </div>
   );
 }
 
@@ -912,18 +958,29 @@ function AppWithTutorials() {
         */}
         <Now1HzProvider>
           <AppContent />
-          <ContextualTutorial />
-          <DemoVisualOverlay />
-          <PromptAutomationOverlay />
           {/*
-            Persistent global pill that surfaces in-progress background tasks
-            (currently the long-running UI Bridge integration generation
-            triggered from the home prompt). Mounted inside
-            PromptExecutionProvider but outside <AppContent>'s tab content so
-            it stays visible across tab switches. See BackgroundTaskPill.tsx
-            for the detection rule and dismiss flow.
+            P2 (auth-gate overlay): these fixed-position siblings render
+            OUTSIDE AppContent's inert wrapper, so they take the same inert
+            guard via the overlay store — without it they stay in the tab
+            order (invisible but Enter-activatable) while an auth overlay is
+            up. This also intentionally hides BuildRefreshBanner-class fixed
+            UI behind the login surface; the operator handles updates after
+            signing in.
           */}
-          <BackgroundTaskPill />
+          <AuthOverlayInertBoundary>
+            <ContextualTutorial />
+            <DemoVisualOverlay />
+            <PromptAutomationOverlay />
+            {/*
+              Persistent global pill that surfaces in-progress background tasks
+              (currently the long-running UI Bridge integration generation
+              triggered from the home prompt). Mounted inside
+              PromptExecutionProvider but outside <AppContent>'s tab content so
+              it stays visible across tab switches. See BackgroundTaskPill.tsx
+              for the detection rule and dismiss flow.
+            */}
+            <BackgroundTaskPill />
+          </AuthOverlayInertBoundary>
         </Now1HzProvider>
       </PromptExecutionProvider>
     </TutorialProvider>
@@ -1091,7 +1148,9 @@ export default function App() {
         `<meta name="build-id">` baked into the embedded index.html — i.e.
         the runner exe was swapped while this webview stayed open.
       */}
-      <BuildRefreshBanner />
+      <AuthOverlayInertBoundary>
+        <BuildRefreshBanner />
+      </AuthOverlayInertBoundary>
       {/* Launch-time auto-update check: prompts + installs a newer signed
           release on startup. Renders nothing; fail-open. */}
       <AutoUpdateChecker />
