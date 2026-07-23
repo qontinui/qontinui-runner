@@ -2520,7 +2520,7 @@ mod tests {
     fn emission_gate_pauses_above_high_and_holds_until_low() {
         let mut gate = EmissionGate::new();
         assert!(!gate.should_emit(FLOW_HIGH_WATERMARK + 1)); // crosses High: pause
-        // Anywhere above Low stays paused — including values far below High.
+                                                             // Anywhere above Low stays paused — including values far below High.
         assert!(!gate.should_emit(FLOW_HIGH_WATERMARK));
         assert!(!gate.should_emit(FLOW_LOW_WATERMARK + 1));
         // At (or below) Low the gate reopens on the same call.
