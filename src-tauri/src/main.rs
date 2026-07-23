@@ -2823,6 +2823,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                         let open = poll_lifecycle_store.open_records();
                         let live = poll_tm.list();
+                        // Terminal ids live RIGHT NOW — prune() keeps every
+                        // record whose terminal still lives, so retention
+                        // clocks only start once the terminal itself is gone
+                        // (P4: prune retention vs terminal liveness).
+                        let live_terminal_ids: std::collections::HashSet<String> =
+                            live.iter().map(|i| i.id.clone()).collect();
 
                         // Transcript-anchored reconcile steady-state guard
                         // (Phase 2 / G1). The reconcile pass disk-scans every
@@ -2850,8 +2856,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             // WITHOUT taking the per-tick process snapshot.
                             consecutive_dead.clear();
                             consecutive_no_match.clear();
-                            poll_lifecycle_store
-                                .prune(chrono::Utc::now().timestamp_millis());
+                            poll_lifecycle_store.prune(
+                                chrono::Utc::now().timestamp_millis(),
+                                &live_terminal_ids,
+                            );
                             continue;
                         }
                         if open.is_empty() {
@@ -3116,7 +3124,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             &snap,
                         );
 
-                        poll_lifecycle_store.prune(chrono::Utc::now().timestamp_millis());
+                        poll_lifecycle_store.prune(
+                            chrono::Utc::now().timestamp_millis(),
+                            &live_terminal_ids,
+                        );
                     }
                 });
 
