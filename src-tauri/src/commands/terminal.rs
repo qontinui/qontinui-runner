@@ -925,6 +925,32 @@ pub fn terminal_session_record_open(
     })
 }
 
+/// Re-point an open session record at the terminal that now hosts it.
+///
+/// Called by the cold-restore path for every recreated tab whose record is NOT
+/// on the verified-resume track (`terminal-only` / `quarantine`). Those records
+/// otherwise keep pointing at the dead pre-restart terminal id forever, so each
+/// restore pass fails to recognise the tab it already made and cold-creates a
+/// duplicate — an unbounded PTY leak proportional to (stale records × restarts).
+///
+/// Deliberately NOT `terminal_session_record_open`: that refreshes
+/// `last_seen_at` and would make ghost rows immortal. See
+/// [`SessionLifecycleStore::rebind_terminal`].
+#[tauri::command]
+pub fn terminal_session_rebind_terminal(
+    store: tauri::State<'_, Arc<SessionLifecycleStore>>,
+    claude_session_id: String,
+    terminal_id: String,
+    zone_index: i32,
+) -> Result<CommandResponse, String> {
+    store.rebind_terminal(&claude_session_id, &terminal_id, zone_index);
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: None,
+    })
+}
+
 /// Mark a session restore-pending in the lifecycle registry: the boot-restore
 /// drain is about to type `claude --resume` into a freshly-created plain shell
 /// and the handshake is not yet verified. While the marker is set the
@@ -1724,6 +1750,7 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
             terminal_session_list_history,
             terminal_session_mark_restore_pending,
             terminal_session_clear_restore_pending,
+            terminal_session_rebind_terminal,
         ])
         .build()
 }

@@ -653,6 +653,52 @@ impl SessionLifecycleStore {
         self.snapshot_change(&snapshot);
     }
 
+    /// Re-point an OPEN record at the terminal that now hosts it, without
+    /// touching any liveness or provenance field.
+    ///
+    /// A cold restore recreates the PTY under a fresh ephemeral terminal id, so
+    /// the record's `terminal_id` goes stale the moment the old process is
+    /// gone. Only the VERIFIED-resume path used to re-assert it (via
+    /// `record_open`), which left every `terminal-only` / `quarantine` record
+    /// permanently pointing at a dead id — so the next restore pass could not
+    /// recognise its own work and cold-created ANOTHER terminal for the same
+    /// record, every pass, forever. (Observed 2026-07-22: 48 stale records on
+    /// one page had leaked ~330 orphan PTYs across ~7 restore passes.)
+    ///
+    /// `record_open` is the wrong tool for that rebind: it refreshes
+    /// `last_seen_at`, which is exactly what made ghost rows immortal. This
+    /// updates the binding ONLY — `last_seen_at`, `state`, `origin`,
+    /// `confirmed_at` and `restore_pending_at` are all left untouched, so a
+    /// stale row still ages out of the restorable set on schedule.
+    ///
+    /// No-op (no write, no flush) when the session is absent, not `open`, or
+    /// already bound to `terminal_id`.
+    pub fn rebind_terminal(&self, claude_session_id: &str, terminal_id: &str, zone_index: i32) {
+        let snapshot = {
+            let mut m = match self.map.lock() {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = %e, "session_lifecycle_store: lock poisoned on rebind_terminal");
+                    return;
+                }
+            };
+            let Some(rec) = m.get_mut(claude_session_id) else {
+                return; // unknown session — nothing to rebind
+            };
+            if rec.state != "open" {
+                return; // closed/exited records are not restore targets
+            }
+            if rec.terminal_id == terminal_id && rec.zone_index == zone_index {
+                return; // already current — no write, no flush
+            }
+            rec.terminal_id = terminal_id.to_string();
+            rec.zone_index = zone_index;
+            m.clone()
+        };
+        self.persist(&snapshot);
+        self.snapshot_change(&snapshot);
+    }
+
     /// Mark a present session as restore-pending (a boot-restore is about to
     /// type / has typed `claude --resume` and the handshake is not yet
     /// verified). While the marker is set the liveness poll skips the record
@@ -3566,5 +3612,76 @@ mod tests {
                 "empty-term-2".to_string(),
             ]
         );
+    }
+
+    /// `rebind_terminal` re-points an open record at the terminal that now
+    /// hosts it WITHOUT refreshing `last_seen_at` — the whole reason it exists
+    /// rather than a `record_open` re-assert. A stale row must keep aging out
+    /// on schedule even after a cold restore rebinds it, or ghost rows become
+    /// immortal (the hazard that gated the re-assert to verified resumes and
+    /// so let the orphan-PTY leak run unbounded).
+    #[test]
+    fn rebind_terminal_updates_binding_without_refreshing_liveness() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        store.record_open(rec("s1"));
+        let before = store.get("s1").unwrap();
+        assert_eq!(before.terminal_id, "term-abc");
+
+        // Age `last_seen_at` so a refresh would be unmistakable.
+        let aged = before.last_seen_at - 600_000;
+        {
+            let raw = std::fs::read(&path).unwrap();
+            let mut m: HashMap<String, TerminalSessionRecord> =
+                serde_json::from_slice(&raw).unwrap();
+            m.get_mut("s1").unwrap().last_seen_at = aged;
+            std::fs::write(&path, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+        }
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        store.rebind_terminal("s1", "term-fresh", 5);
+
+        let after = store.get("s1").unwrap();
+        assert_eq!(after.terminal_id, "term-fresh", "binding must move");
+        assert_eq!(after.zone_index, 5, "zone must move with the binding");
+        assert_eq!(
+            after.last_seen_at, aged,
+            "rebind must NOT refresh last_seen_at (ghost rows would become immortal)"
+        );
+        assert_eq!(after.state, "open");
+        assert_eq!(
+            after.confirmed_at, before.confirmed_at,
+            "rebind must not touch provenance"
+        );
+
+        // Survives a reload — the rebind is persisted, not in-memory only.
+        let reloaded = SessionLifecycleStore::open(&path).unwrap();
+        assert_eq!(reloaded.get("s1").unwrap().terminal_id, "term-fresh");
+    }
+
+    /// A rebind is a no-op on a record that is absent or no longer `open` —
+    /// a closed row is not a restore target and must not be silently revived.
+    #[test]
+    fn rebind_terminal_is_a_noop_for_absent_or_closed_records() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        // Absent — must not panic or create a row.
+        store.rebind_terminal("ghost", "term-fresh", 1);
+        assert!(store.get("ghost").is_none());
+
+        store.record_open(rec("s2"));
+        store.record_close("s2", "user-closed");
+        store.rebind_terminal("s2", "term-fresh", 1);
+
+        let after = store.get("s2").unwrap();
+        assert_eq!(
+            after.terminal_id, "term-abc",
+            "a closed record must not be rebound"
+        );
+        assert_eq!(after.state, "closed");
     }
 }
