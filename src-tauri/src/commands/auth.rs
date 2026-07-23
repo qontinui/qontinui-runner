@@ -258,6 +258,12 @@ fn has_local_signed_in_session(auth_manager: &AuthManager) -> bool {
     has_valid_device_jwt || has_cognito_session
 }
 
+/// Wall-clock cap on the best-effort profile enrichment inside
+/// [`check_auth_status_impl`]. The authenticated/unauthenticated verdict is
+/// decided from local credentials alone, so exceeding this budget costs only
+/// the `user` field — never the verdict.
+const ENRICHMENT_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
 async fn check_auth_status_impl() -> Result<AuthStatus, AppError> {
     info!("Checking authentication status");
 
@@ -295,9 +301,34 @@ async fn check_auth_status_impl() -> Result<AuthStatus, AppError> {
     // even a 401/403 — the federated-identity `users/me` gap) does NOT
     // downgrade `authenticated`: a valid local device pairing is proof the
     // runner is signed in. We only use the response to populate `user`.
-    let user = match web_backend_user_bearer(&auth_manager).await {
-        Ok(access_token) => fetch_user_info(&access_token).await,
-        Err(_) => None,
+    //
+    // The enrichment is two NETWORK legs — `ensure_fresh_cognito_bearer` (a
+    // Cognito `refresh_token` grant when the stored token is stale) and the
+    // `users/me` GET (its own 5s client timeout) — so left unbounded it can
+    // hold this command open well past any caller's patience. That matters
+    // because the verdict above is already decided from the LOCAL keychain:
+    // a caller that gives up waiting has no way to tell "slow enrichment"
+    // from "not signed in" and renders the sign-in screen at a runner that
+    // is fully authenticated (observed on pop-out terminal windows, whose
+    // fresh webview probes auth while the app is still booting).
+    // Cap the whole enrichment so the verdict is never held hostage to it.
+    let user = match tokio::time::timeout(ENRICHMENT_BUDGET, async {
+        match web_backend_user_bearer(&auth_manager).await {
+            Ok(access_token) => fetch_user_info(&access_token).await,
+            Err(_) => None,
+        }
+    })
+    .await
+    {
+        Ok(user) => user,
+        Err(_) => {
+            warn!(
+                "check_auth_status: user enrichment exceeded {:?} — returning authenticated \
+                 status without profile",
+                ENRICHMENT_BUDGET
+            );
+            None
+        }
     };
 
     info!(

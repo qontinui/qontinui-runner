@@ -489,7 +489,11 @@ function AppContent() {
     setActiveTab("run-recap");
   }, [lastRun, execution, setActiveTab]);
 
-  const isAuthLoading = auth.loading || auth.devAutoLoginPending;
+  // `authProbeUnresolved` keeps us on the loading screen while the Tier-2
+  // probe is still retrying. Without it, an indeterminate probe falls through
+  // to the `!authenticated` gate below and shows LoginScreen at a runner that
+  // is signed in — the false-logout that hit pop-out terminal windows.
+  const isAuthLoading = auth.loading || auth.devAutoLoginPending || auth.authProbeUnresolved;
   const isInitializing = isAuthLoading || !isApiReady;
   if (isInitializing) {
     const loadingMessage = auth.devAutoLoginPending

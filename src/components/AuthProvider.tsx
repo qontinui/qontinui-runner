@@ -35,9 +35,21 @@ import { withTimeout } from "@/lib/withTimeout";
 
 // Defensive timeout for the initial-mount Tauri-invoke calls in AuthProvider.
 // If the IPC channel is mid-setup on the first webview render and the
-// invoke Promise never settles, the effect chain stays stuck. A 5s cap unsticks
+// invoke Promise never settles, the effect chain stays stuck. This cap unsticks
 // the chain so the existing catch handlers run their normal cleanup.
-const AUTH_PROBE_TIMEOUT_MS = 5000;
+//
+// It MUST exceed the Rust side's own worst case. `check_auth_status` decides
+// the verdict from the local keychain, then best-effort-enriches the profile
+// over the network under its own `ENRICHMENT_BUDGET` (commands/auth.rs). This
+// cap sits comfortably above that budget so a slow-but-successful probe is
+// never cut short — the old 5s value was equal to a single one of the
+// enrichment's network legs, so ordinary backend latency tripped it.
+const AUTH_PROBE_TIMEOUT_MS = 15000;
+
+// Backoff schedule for re-probing after an INDETERMINATE result (timeout /
+// IPC error). Capped and repeated at the last value — the runner is useless
+// to a Tier-2 operator until auth resolves, so we never stop retrying.
+const AUTH_PROBE_RETRY_BACKOFF_MS = [1000, 2000, 4000, 8000, 15000] as const;
 
 const log = createLogger("Auth");
 
@@ -73,8 +85,15 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // True while the Tier-2 probe has not yet produced a DEFINITIVE verdict —
+  // i.e. every attempt so far timed out or threw. Distinct from `loading`
+  // (which the 3s failsafe below force-clears): consumers gate the sign-in
+  // screen on this so an indeterminate probe never reads as "signed out".
+  const [probeUnresolved, setProbeUnresolved] = useState(true);
   const mountCountRef = useRef(0);
   const refreshCallCountRef = useRef(0);
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const retryAttemptRef = useRef(0);
 
   // Log mount/unmount
   useEffect(() => {
@@ -87,7 +106,24 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
   /**
    * Check authentication status. Called on mount and periodically (Tier 2).
+   *
+   * A probe that TIMES OUT or throws is INDETERMINATE — it says nothing about
+   * whether the runner is signed in. It used to be recorded as
+   * `authenticated: false`, which is how a transient IPC/backend stall turned
+   * into a sign-out: `check_auth_status` reaches the network to enrich the
+   * user profile, the invoke overran the cap, and the App gate
+   * (`isTier2 && !authenticated → LoginScreen`) put a fully-signed-in runner
+   * on the sign-in screen. Nothing recovered it either — the periodic
+   * re-check timer below only arms when already authenticated — so the window
+   * stayed there until the operator signed in by hand. A brand-new webview
+   * (every pop-out terminal window) probes auth while the app is still
+   * booting, which is exactly when the stall is likeliest.
+   *
+   * So: only a RESOLVED response mutates `authStatus`. An indeterminate one
+   * leaves the previous state alone and schedules a backoff retry.
    */
+  const checkAuthStatusRef = useRef<(() => Promise<AuthStatus | null>) | null>(null);
+
   const checkAuthStatus = useCallback(async () => {
     log.debug("checkAuthStatus() called");
     try {
@@ -98,21 +134,49 @@ export function AuthProvider({ children }: AuthProviderProps) {
         "check_auth_status",
       );
       log.debug("checkAuthStatus() result:", status);
+      if (retryTimerRef.current !== null) {
+        clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
+      }
+      retryAttemptRef.current = 0;
       setAuthStatus(status);
+      setProbeUnresolved(false);
       return status;
     } catch (err) {
-      log.error("Failed to check auth status:", err);
+      // Indeterminate — keep whatever we knew before and try again shortly.
+      log.error("Auth status probe failed (indeterminate — will retry):", err);
       setError(err as string);
-      setAuthStatus({
-        authenticated: false,
-        user: null,
-        device_info: null,
-      });
+      const attempt = retryAttemptRef.current;
+      retryAttemptRef.current = attempt + 1;
+      const delay =
+        AUTH_PROBE_RETRY_BACKOFF_MS[
+          Math.min(attempt, AUTH_PROBE_RETRY_BACKOFF_MS.length - 1)
+        ];
+      if (retryTimerRef.current !== null) clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = setTimeout(() => {
+        retryTimerRef.current = null;
+        void checkAuthStatusRef.current?.();
+      }, delay);
+      log.debug(`Auth status re-probe scheduled in ${delay}ms (attempt #${attempt + 1})`);
       return null;
     } finally {
       setLoading(false);
     }
   }, []);
+
+  // `checkAuthStatus` is stable ([] deps); publish it for the retry timer,
+  // which cannot close over the callback it is defined inside.
+  useEffect(() => {
+    checkAuthStatusRef.current = checkAuthStatus;
+  }, [checkAuthStatus]);
+
+  // Never leave a retry armed past unmount (pop-out window closed mid-backoff).
+  useEffect(
+    () => () => {
+      if (retryTimerRef.current !== null) clearTimeout(retryTimerRef.current);
+    },
+    [],
+  );
 
   /**
    * Re-validate authentication. Under Cognito-only auth there is no separate
@@ -164,6 +228,9 @@ export function AuthProvider({ children }: AuthProviderProps) {
         device_info: null,
       });
     } finally {
+      // An OPERATOR-requested sign-out is a definitive verdict — unlike a
+      // failed probe, it must reach the sign-in screen.
+      setProbeUnresolved(false);
       setLoading(false);
     }
   }, []);
@@ -202,6 +269,8 @@ export function AuthProvider({ children }: AuthProviderProps) {
         device_info: null,
       });
     } finally {
+      // Operator-requested — definitive, same as `logout`.
+      setProbeUnresolved(false);
       setLoading(false);
     }
   }, []);
@@ -263,6 +332,8 @@ export function AuthProvider({ children }: AuthProviderProps) {
           user: { id: "local-guest", email: "", name: null },
           device_info: null,
         });
+        // Tier 0/1 never probes, so the probe is trivially resolved.
+        setProbeUnresolved(false);
         setLoading(false);
       });
     }
@@ -316,6 +387,9 @@ export function AuthProvider({ children }: AuthProviderProps) {
     // there is never a pending auto-login. Consumers (App, PromptHomePage) gate
     // on this; keeping it constant-false preserves their logic.
     devAutoLoginPending: false,
+    // Tier 2 only: no definitive verdict yet. Consumers must NOT read this as
+    // "signed out" — see `checkAuthStatus`.
+    authProbeUnresolved: isTier2 && probeUnresolved,
     tier,
     logout,
     signOutFull,

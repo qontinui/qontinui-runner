@@ -640,6 +640,36 @@ export function useTerminalInitialization({
           });
           rememberSessionId(tabId, rec.claudeSessionId, safeConfigDir);
 
+          // Re-point the record at the tab we JUST created for it.
+          //
+          // Only the auto-resume track re-asserts `terminalId` (deferred to
+          // `runVerifiedResume` via `recordOpen`, on a VERIFIED handshake).
+          // Every `terminal-only` / `quarantine` record therefore kept pointing
+          // at the dead pre-restart terminal id — so the NEXT restore pass
+          // couldn't see the tab it had already made for that record, took the
+          // cold path again, and spawned another PTY. Each pass leaked one
+          // orphan shell per stale record, unbounded (observed 2026-07-22: 48
+          // stale records on one page → ~330 orphan PTYs over ~7 passes,
+          // 621 live shells under the runner process).
+          //
+          // `rebind` updates the binding ONLY — it never refreshes
+          // `lastSeenAt`, so this cannot resurrect a ghost row the way a
+          // `record_open` re-assert would (the reason the re-assert was gated
+          // to verified resumes in the first place). Fire-and-forget: a failed
+          // rebind costs us the dedupe on the next pass, nothing more.
+          if (restoreAction !== "auto-resume") {
+            invoke("terminal_session_rebind_terminal", {
+              claudeSessionId: rec.claudeSessionId,
+              terminalId: tabId,
+              zoneIndex: rec.zoneIndex,
+            }).catch((err) => {
+              console.warn(
+                `[TerminalPage] rebind failed for ${rec.claudeSessionId} → ${tabId}:`,
+                err,
+              );
+            });
+          }
+
           // Restore-pending marker only protects rows whose resume the drain
           // will actually attempt (auto-resume) or that await an operator retry
           // (quarantine). A `terminal-only` phantom has no resume to verify, so
@@ -794,7 +824,10 @@ export function useTerminalInitialization({
         // comes from the registry, so a failed/never-firing resume no longer
         // risks losing sessions — the registry record persists regardless.
         // No default terminal — start empty so users can launch AI sessions via the Launch Menu.
-        setInitialized(true);
+      } catch (err) {
+        // Restore is best-effort. Whatever bound before the throw stays bound;
+        // the page renders in whatever state it reached (see the `finally`).
+        console.error(`[TerminalPage] restore failed for page ${initPageId}:`, err);
       } finally {
         // Always open the auto-save gate. If a drain timer was scheduled it
         // owns the flip (after resume commands are issued); otherwise — no
@@ -804,6 +837,15 @@ export function useTerminalInitialization({
         if (!drainScheduled) {
           restoreCompletePages.current.add(initPageId);
         }
+        // ALWAYS leave the loading state, even if restore threw. `initialized`
+        // gates the whole page behind a "Loading terminals..." spinner, and the
+        // once-per-pageId guard above has already consumed `initPageId` — so a
+        // throw anywhere in the block above used to strand the page on that
+        // spinner for the lifetime of the window, with no retry and no visible
+        // error. Flipping it here degrades a failed restore to "a page with
+        // fewer tabs than expected" (recoverable, and the console carries the
+        // cause) instead of a permanently blank window.
+        setInitialized(true);
       }
     })();
   }, [

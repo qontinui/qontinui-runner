@@ -41,6 +41,18 @@ export interface AuthContextValue {
    */
   devAutoLoginPending: boolean;
   /**
+   * Tier 2 only: the `check_auth_status` probe has not yet returned a
+   * DEFINITIVE verdict — every attempt so far timed out or threw, and a
+   * backoff retry is armed.
+   *
+   * Consumers must treat this as UNKNOWN, never as "signed out". Gating the
+   * sign-in screen on `!authenticated` alone put fully-signed-in runners on
+   * `LoginScreen` whenever the probe stalled (most visibly in freshly-opened
+   * pop-out terminal windows, which probe while the app is still booting).
+   * Always `false` in Tier 0/1, which never probes.
+   */
+  authProbeUnresolved: boolean;
+  /**
    * Current runner tier. Surfaced so consumers can gate UI without calling
    * `useRunnerTier()` redundantly. Only "qontinui_account" requires a Qontinui
    * (Cognito) sign-in; "local" and "local_provider" run with a synthesized
