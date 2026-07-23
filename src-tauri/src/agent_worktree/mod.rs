@@ -66,6 +66,7 @@ pub mod isolated_edit;
 pub mod maintenance_executor;
 pub mod on_demand;
 pub mod reclaim;
+pub mod session_env;
 
 /// Env var that controls the worktree-per-session spawn path. **Default ON**
 /// (Phase 2b); set to a falsy value (`0`/`false`/`no`) to opt a machine out.

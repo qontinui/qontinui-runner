@@ -19,9 +19,19 @@
 //!
 //! ## Opt-in
 //!
-//! [`spawn_if_configured`] is gated on `QONTINUI_PLAN_ADAPTER_DIR` — the
-//! markdown-plan convention is operator-private, so a fleet runner without
-//! that env set no-ops entirely (it never scans, never pushes).
+//! [`spawn_if_configured`] is gated on a **configured plans directory**: the
+//! runner's `PathSettings::plans_dir` setting, overridable per-machine by the
+//! `QONTINUI_PLAN_ADAPTER_DIR` env var ([`PLAN_ADAPTER_DIR_ENV`]). The
+//! markdown-plan carrier is the optional top coordination tier, so a runner
+//! with neither configured no-ops entirely (it never scans, never pushes) —
+//! claims/intent and coord-native work-units are unaffected.
+//!
+//! The settings value is passed IN rather than read here: this module lives in
+//! the lib crate and the settings store lives in the runner binary's module
+//! tree, so the binary resolves `PathSettings` and hands the value to
+//! [`spawn_if_configured`]. [`resolve_plans_dir`] owns the precedence so every
+//! surface that needs the active plans dir (the adapter here, the session-env
+//! injection in the binary) resolves it identically.
 
 use super::parser::{parse_work_unit, slug_from_filename, ParsedWorkUnit, PlanConvention};
 use super::push::{push_work_unit, PushOutcomeKind, SetDepsOutcome, WorkUnitSink};
@@ -258,20 +268,72 @@ async fn run_loop<S: WorkUnitSink + ?Sized>(dir: PathBuf, sink: &S, interval_sec
     }
 }
 
-/// Spawn the reconcile loop iff the adapter is configured for this runner:
-/// `QONTINUI_PLAN_ADAPTER_DIR` set (the operator's plans dir) AND a coord base
-/// resolvable. Returns `None` (no-op) otherwise — a fleet runner without the
-/// operator's plan convention never scans. Interval overridable via
-/// `QONTINUI_PLAN_ADAPTER_INTERVAL_SECS` (default 60s).
-pub fn spawn_if_configured() -> Option<tokio::task::JoinHandle<()>> {
-    let dir = std::env::var("QONTINUI_PLAN_ADAPTER_DIR")
+/// Per-machine override for the active plans directory. Wins over the
+/// runner's `PathSettings::plans_dir` setting when set to a non-empty value.
+pub const PLAN_ADAPTER_DIR_ENV: &str = "QONTINUI_PLAN_ADAPTER_DIR";
+
+/// Where a resolved active plans directory came from — so the caller can log
+/// the env override at `info` without duplicating the precedence logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlansDirSource {
+    /// [`PLAN_ADAPTER_DIR_ENV`] was set (per-machine override).
+    Env,
+    /// The runner's `PathSettings::plans_dir` setting.
+    Settings,
+}
+
+/// Resolve the active plans directory, reporting which source won.
+///
+/// Precedence: [`PLAN_ADAPTER_DIR_ENV`] → `configured` (the runner's
+/// `PathSettings::plans_dir`) → `None` (markdown-plan tier off). Empty strings
+/// count as unset at every layer, so an accidentally-blank env var falls
+/// through to the setting rather than disabling it.
+pub fn resolve_plans_dir_with_source(
+    configured: Option<String>,
+) -> Option<(String, PlansDirSource)> {
+    if let Some(dir) = std::env::var(PLAN_ADAPTER_DIR_ENV)
         .ok()
-        .filter(|s| !s.is_empty())?;
+        .filter(|s| !s.trim().is_empty())
+    {
+        return Some((dir, PlansDirSource::Env));
+    }
+    configured
+        .filter(|s| !s.trim().is_empty())
+        .map(|dir| (dir, PlansDirSource::Settings))
+}
+
+/// [`resolve_plans_dir_with_source`] without the provenance — the active plans
+/// directory, or `None` when the markdown-plan tier is off.
+pub fn resolve_plans_dir(configured: Option<String>) -> Option<String> {
+    resolve_plans_dir_with_source(configured).map(|(dir, _)| dir)
+}
+
+/// Spawn the reconcile loop iff the adapter is configured for this runner: a
+/// plans directory resolvable via [`resolve_plans_dir`] (the runner's
+/// `PathSettings::plans_dir`, or the [`PLAN_ADAPTER_DIR_ENV`] override) AND a
+/// coord base resolvable. Returns `None` (no-op) otherwise — a runner with the
+/// markdown-plan tier off never scans. Interval overridable via
+/// `QONTINUI_PLAN_ADAPTER_INTERVAL_SECS` (default 60s).
+///
+/// `configured_plans_dir` is the caller-supplied `PathSettings::plans_dir`
+/// (the settings store lives in the runner binary, not this lib crate).
+pub fn spawn_if_configured(
+    configured_plans_dir: Option<String>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let (dir, source) = resolve_plans_dir_with_source(configured_plans_dir)?;
+    if source == PlansDirSource::Env {
+        tracing::info!(
+            dir = %dir,
+            env_var = PLAN_ADAPTER_DIR_ENV,
+            "plan adapter: plans dir taken from env override (settings value ignored)"
+        );
+    }
     let sink = match super::push::HttpWorkUnitSink::from_profile() {
         Some(s) => s,
         None => {
             tracing::warn!(
-                "plan adapter: QONTINUI_PLAN_ADAPTER_DIR set but no coord base configured; not starting"
+                dir = %dir,
+                "plan adapter: plans dir configured but no coord base configured; not starting"
             );
             return None;
         }
@@ -292,6 +354,67 @@ mod tests {
     use super::*;
     use anyhow::Result;
     use std::sync::Mutex;
+
+    // ---- active-plans-dir resolution (settings + env override) ----
+
+    /// Serialized against every other env-touching test in this binary, and
+    /// restoring `QONTINUI_PLAN_ADAPTER_DIR` on the way out — the operator's
+    /// machines have it `setx`-persisted, so a leaked removal would change
+    /// what sibling tests observe.
+    fn with_plan_dir_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _guard = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_ADAPTER_DIR_ENV]);
+        match value {
+            Some(v) => std::env::set_var(PLAN_ADAPTER_DIR_ENV, v),
+            None => std::env::remove_var(PLAN_ADAPTER_DIR_ENV),
+        }
+        f()
+    }
+
+    #[test]
+    fn env_override_wins_over_the_setting() {
+        let resolved = with_plan_dir_env(Some("/env/plans"), || {
+            resolve_plans_dir_with_source(Some("/settings/plans".to_string()))
+        });
+        assert_eq!(
+            resolved,
+            Some(("/env/plans".to_string(), PlansDirSource::Env))
+        );
+    }
+
+    #[test]
+    fn setting_is_used_when_no_env_override() {
+        let resolved = with_plan_dir_env(None, || {
+            resolve_plans_dir_with_source(Some("/settings/plans".to_string()))
+        });
+        assert_eq!(
+            resolved,
+            Some(("/settings/plans".to_string(), PlansDirSource::Settings))
+        );
+    }
+
+    /// Neither source configured ⇒ the markdown-plan tier is off. This is the
+    /// no-op the adapter's opt-in contract rests on.
+    #[test]
+    fn nothing_configured_resolves_to_none() {
+        assert_eq!(with_plan_dir_env(None, || resolve_plans_dir(None)), None);
+    }
+
+    /// A blank env var must not silently disable a configured setting.
+    #[test]
+    fn blank_env_falls_through_to_the_setting() {
+        let resolved = with_plan_dir_env(Some("   "), || {
+            resolve_plans_dir(Some("/settings/plans".to_string()))
+        });
+        assert_eq!(resolved.as_deref(), Some("/settings/plans"));
+    }
+
+    /// A blank setting is unset, not a directory named "".
+    #[test]
+    fn blank_setting_resolves_to_none() {
+        let resolved = with_plan_dir_env(None, || resolve_plans_dir(Some("  ".to_string())));
+        assert_eq!(resolved, None);
+    }
 
     fn unit(slug: &str, status: &str) -> ParsedWorkUnit {
         unit_with_deps(slug, status, vec![])

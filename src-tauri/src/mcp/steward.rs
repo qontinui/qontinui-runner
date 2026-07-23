@@ -282,7 +282,11 @@ pub async fn steward_start_handler(
         None, // rows — default
         app_handle,
         None, // command override — interactive shell, we type the command in
-        None, // extra_env
+        // The shared session-env contribution. No isolated edit context here
+        // (the steward runs in the shared checkout), so `QONTINUI_SESSION_WORKTREES`
+        // is omitted exactly as before — but the steward is an agent session and
+        // must still learn where the plans live. See `agent_worktree::session_env`.
+        crate::agent_worktree::session_env::session_extra_env(None),
     ) {
         Ok(info) => {
             info!("HTTP: Created merge-train-steward terminal: {}", info.id);

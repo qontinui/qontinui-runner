@@ -962,11 +962,102 @@ pub struct PathSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dev_logs_dir: Option<String>,
 
+    /// Directory holding the **active** markdown plans this runner mirrors into
+    /// coord work-units, and that agent sessions are pointed at via
+    /// `QONTINUI_PLANS_DIR`.
+    ///
+    /// Default (when None): **unset — the markdown-plan tier is OFF**. There is
+    /// no fallback path: a runner without this configured never scans for
+    /// plans, never pushes work-units, and launches sessions without
+    /// `QONTINUI_PLANS_DIR`. The coordination tiers below it (claims/intent,
+    /// coord-native work-units) are unaffected.
+    ///
+    /// The `QONTINUI_PLAN_ADAPTER_DIR` environment variable overrides this
+    /// setting when set (per-machine escape hatch).
+    ///
+    /// Override example: `D:\qontinui-root\plans`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plans_dir: Option<String>,
+
+    /// An additional location plans may be read from or archived into, per the
+    /// user's own convention — exported to agent sessions as
+    /// `QONTINUI_PLANS_ARCHIVE_DIR`. The runner only carries the value; which
+    /// of those two roles it plays is the consuming skill's business.
+    ///
+    /// Default (when None): **unset — sessions are told nothing about an
+    /// archive**. Archiving is a file *location*, never a lifecycle status.
+    /// The value is not derivable from `plans_dir` (the archive commonly lives
+    /// in a different repo), so there is deliberately no fallback.
+    ///
+    /// Override example: `D:\qontinui-root\qontinui-dev-notes\plans`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plans_archive_dir: Option<String>,
+
     /// When true, enforce workspace-scoped working directory resolution globally.
     /// Steps cannot resolve paths outside the workspace root.
     /// Default: false (permissive). Individual workflows can override via `strict_cwd`.
     #[serde(default)]
     pub strict_mode: bool,
+}
+
+#[cfg(test)]
+mod path_settings_tests {
+    use super::*;
+
+    /// Both plan directories default to unset (markdown-plan tier off) and
+    /// must not appear in the serialized form when unset — an emitted `null`
+    /// or `""` would be indistinguishable from "configured to nothing" for the
+    /// session-env injection, which keys off absence.
+    #[test]
+    fn plan_dirs_default_unset_and_do_not_serialize() {
+        let defaults = PathSettings::default();
+        assert_eq!(defaults.plans_dir, None);
+        assert_eq!(defaults.plans_archive_dir, None);
+
+        let json = serde_json::to_value(&defaults).expect("PathSettings must serialize");
+        let obj = json.as_object().expect("serializes as an object");
+        assert!(
+            !obj.contains_key("plans_dir"),
+            "unset plans_dir must be absent, got {json}"
+        );
+        assert!(
+            !obj.contains_key("plans_archive_dir"),
+            "unset plans_archive_dir must be absent, got {json}"
+        );
+    }
+
+    /// Round-trip with both fields set: they serialize and come back verbatim.
+    #[test]
+    fn plan_dirs_round_trip_when_set() {
+        let settings = PathSettings {
+            dev_logs_dir: Some("/w/.dev-logs".to_string()),
+            plans_dir: Some("/w/plans".to_string()),
+            plans_archive_dir: Some("/w/dev-notes/plans".to_string()),
+            strict_mode: false,
+        };
+
+        let json = serde_json::to_string(&settings).expect("must serialize");
+        let parsed: PathSettings = serde_json::from_str(&json).expect("must deserialize");
+
+        assert_eq!(parsed.plans_dir.as_deref(), Some("/w/plans"));
+        assert_eq!(
+            parsed.plans_archive_dir.as_deref(),
+            Some("/w/dev-notes/plans")
+        );
+        assert_eq!(parsed.dev_logs_dir.as_deref(), Some("/w/.dev-logs"));
+    }
+
+    /// Settings persisted before the fields existed must still load — the
+    /// `#[serde(default)]` path, i.e. every runner upgrading into this change.
+    #[test]
+    fn legacy_json_without_plan_dirs_deserializes() {
+        let parsed: PathSettings =
+            serde_json::from_str(r#"{"dev_logs_dir":"/w/.dev-logs","strict_mode":true}"#)
+                .expect("legacy PathSettings JSON must still deserialize");
+        assert_eq!(parsed.plans_dir, None);
+        assert_eq!(parsed.plans_archive_dir, None);
+        assert!(parsed.strict_mode);
+    }
 }
 
 // ============================================================================
