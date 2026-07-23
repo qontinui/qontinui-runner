@@ -201,7 +201,13 @@ mod tests {
 
     #[test]
     fn parses_the_operator_ground_truth_row() {
-        let s = parse_registry_file(SAMPLE, Path::new("C:\\claude\\.claude-paktis")).unwrap();
+        // Forward slashes deliberately: `Path::file_name` treats `\` as an
+        // ordinary character on Linux, so a Windows-style `C:\claude\...`
+        // literal yields the WHOLE string as the file name there, the
+        // `.claude-` prefix never matches, and the account silently degrades
+        // to `unknown`/`claude`. Forward slashes parse identically on both
+        // platforms, so this asserts the real mapping in CI as well as locally.
+        let s = parse_registry_file(SAMPLE, Path::new("C:/claude/.claude-paktis")).unwrap();
         assert_eq!(s.name, "per-agent coord-mcp proxy");
         assert_eq!(s.session_id, "b770ae37-1ffa-4888-a5d1-89d058307adf");
         assert_eq!(s.pid, 2804);
