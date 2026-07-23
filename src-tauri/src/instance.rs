@@ -30,6 +30,37 @@ pub fn is_secondary() -> bool {
     instance_name().is_some()
 }
 
+/// True iff this runner is the canonical instance — the one allowed to own
+/// SHARED, machine-wide state that is not path-isolated per instance.
+///
+/// The umbrella-root `.mcp.json` (`D:/qontinui-root/.mcp.json`) is exactly that
+/// kind of state: every Claude session opened at the workspace root reads it,
+/// and it is the sole path to coord-mcp (and therefore to the policy system) for
+/// those sessions. A secondary that writes its own ephemeral port + nonce there
+/// and then exits leaves the file naming a corpse, with nothing to heal it until
+/// the primary next boots — which, for a protected primary, can be days.
+///
+/// **Deliberately `resolve_data_subdir`-based, not [`is_secondary`].**
+/// `is_secondary()` keys on `QONTINUI_INSTANCE_NAME` alone, so a secondary the
+/// supervisor spawned without that env var reads as PRIMARY and would be handed
+/// the shared root config — the exact fail-open this guard exists to prevent.
+/// `resolve_data_subdir` additionally detects a secondary by `primary_port` or
+/// a non-default API port, so a nameless secondary fails CLOSED (quarantined,
+/// hence `false` here). Same isolation boundary [`scope_path`] already enforces
+/// for on-disk state, applied to the one shared file it never covered.
+///
+/// Unlike [`data_subdir`] this does NOT emit the nameless-secondary `error!` —
+/// it is consulted on write-decision paths that can run many times per session,
+/// and `data_subdir` already logs that supervisor bug loudly on the boot path.
+pub fn owns_shared_root_state() -> bool {
+    resolve_data_subdir(
+        instance_name().as_deref(),
+        primary_port(),
+        crate::mcp::types::get_mcp_api_port(),
+    )
+    .is_none()
+}
+
 /// Classify this runner from the env it was launched with.
 ///
 /// Asymmetry note: `QONTINUI_INSTANCE_NAME` is set for both temp and named

@@ -3252,10 +3252,25 @@ pub fn create_router(
             // Change 2 observability: one structured summary of restore vs
             // self-heal so a future silent rotation (restored=0 → root Rewrite) is
             // greppable. A root `Rewrite` after `restored == 0` is the smell.
+            //
+            // The summary NAMES THE INSTANCE: `SkippedSecondary` is expected and
+            // routine on a temp/named runner, but an operator debugging a stale
+            // root `.mcp.json` needs to see *which* instance last declined to fix
+            // it — otherwise the skip reads as the repair silently not running.
+            // A NAMELESS secondary must not be labelled "primary" here — that is
+            // the exact fail-open `owns_shared_root_state` exists to catch, and
+            // mislabelling it in the log would hide it from the operator too.
+            let reconcile_instance = crate::instance::instance_name().unwrap_or_else(|| {
+                if crate::instance::owns_shared_root_state() {
+                    "primary".to_string()
+                } else {
+                    "unnamed-secondary".to_string()
+                }
+            });
             info!(
                 "coord_mcp boot reconcile: restored {restored} persisted nonce(s), \
                  rewrote {session_rewritten} session config(s), root self-heal = {root_action:?} \
-                 (bound port :{reconcile_bound_port})"
+                 (instance {reconcile_instance}, bound port :{reconcile_bound_port})"
             );
             if matches!(root_action, crate::coord_mcp::RootReconcileAction::Rewrite)
                 && restored == 0

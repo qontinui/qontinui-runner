@@ -1585,11 +1585,85 @@ fn jwt_unverified_claim(token: &str, claim: &str) -> Option<String> {
     json.get(claim).and_then(|v| v.as_str()).map(String::from)
 }
 
+/// Compare two directory paths for identity, tolerating the shapes the runner
+/// actually sees: mixed `/` and `\` separators, a trailing separator, and
+/// Windows' case-insensitive filesystem. Prefers `canonicalize` (resolves `..`,
+/// symlinks, junctions and 8.3 short names) and falls back to a normalized
+/// string compare when either path does not exist — a fallback the unit tests
+/// depend on, since they compare synthetic paths.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    if let (Ok(x), Ok(y)) = (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        return x == y;
+    }
+    fn normalize(p: &Path) -> String {
+        let s = p.to_string_lossy().replace('\\', "/");
+        let s = s.trim_end_matches('/');
+        if cfg!(windows) {
+            s.to_lowercase()
+        } else {
+            s.to_string()
+        }
+    }
+    normalize(a) == normalize(b)
+}
+
+/// Pure core of the shared-root write guard: may a runner with this
+/// `owns_shared_root_state` classification write `<workdir>/.mcp.json`?
+///
+/// Only ONE directory is protected — the umbrella root itself. A secondary keeps
+/// full authority over every other workdir (its own session cwds, worktrees and
+/// per-repo checkouts), because those configs are what make in-session recovery
+/// possible at all: when root is hijacked, probing the siblings for a live one is
+/// the recovery. Blanket-refusing a secondary would destroy that asset.
+fn shared_root_write_allowed_at(
+    workdir: &str,
+    root_dir: Option<&Path>,
+    owns_shared_root_state: bool,
+) -> bool {
+    if owns_shared_root_state {
+        return true;
+    }
+    match root_dir {
+        Some(root) => !same_dir(Path::new(workdir), root),
+        // No resolvable umbrella root → there is no shared root config to
+        // protect, so nothing to refuse.
+        None => true,
+    }
+}
+
 /// True iff writing our coord-mcp `.mcp.json` into `workdir` would not clobber a
 /// user's own config: the file is absent/unreadable, OR it parses as a config
 /// whose `mcpServers` is solely our `coord-mcp` entry (a prior provisioning we
 /// own and may refresh). A foreign or unparseable file returns false (leave it).
+///
+/// **Shared-root guard (plan 2026-07-20-ephemeral-runner-hijacks-root-mcp-json).**
+/// Before any of that, a SECONDARY instance is refused outright when `workdir` is
+/// the umbrella root: the shared root `.mcp.json` is the primary's to own. This
+/// lands here — at the chokepoint every writer funnels through — rather than only
+/// at the boot self-heal, because
+/// `acquire_for_terminal` → [`provision_coord_mcp_for_session`] is a SECOND,
+/// independent writer that reaches the root file without ever calling
+/// [`reconcile_root_config`]: an operator tab opened at `D:/qontinui-root` on a
+/// temp runner rewrites root to the temp port with no boot reconcile involved.
+/// Guarding only the self-heal would leave that hole wide open.
 fn coord_mcp_safe_to_write(workdir: &str) -> bool {
+    if !shared_root_write_allowed_at(
+        workdir,
+        qontinui_root_dir().as_deref(),
+        crate::instance::owns_shared_root_state(),
+    ) {
+        warn!(
+            "coord_mcp: REFUSING to write {workdir}/.mcp.json — this runner is a \
+             SECONDARY instance (name={:?}, port={}) and the umbrella-root \
+             .mcp.json is the PRIMARY's shared state. Writing our ephemeral port \
+             + nonce there would strand every root-opened session on a dead \
+             endpoint once this runner exits.",
+            crate::instance::instance_name(),
+            crate::mcp::types::get_mcp_api_port(),
+        );
+        return false;
+    }
+
     let path = Path::new(workdir).join(".mcp.json");
     let existing = match std::fs::read_to_string(&path) {
         Ok(s) => s,
@@ -1850,7 +1924,18 @@ pub(crate) enum RootReconcileAction {
     /// Mint a fresh nonce and rewrite the file to the current bound port.
     /// Produced when the port moved (a live client must reconnect regardless, so
     /// preserving the old nonce buys nothing) OR no nonce is readable from disk.
+    ///
+    /// NOTE the doc-comment reasoning above — *"a live client must reconnect
+    /// regardless"* — is sound for the instance's OWN config and wrong for the
+    /// SHARED root one, which is why root self-heal is gated on
+    /// [`crate::instance::owns_shared_root_state`] and can yield
+    /// [`RootReconcileAction::SkippedSecondary`] instead.
     Rewrite,
+    /// This runner is a SECONDARY instance, so it did not evaluate — let alone
+    /// write — the shared root config at all. Distinct from `Leave` (which means
+    /// "looked, and there was nothing to do") so the boot summary can tell an
+    /// operator *why* a stale root config was not repaired.
+    SkippedSecondary,
 }
 
 /// Pure resolver for [`RootReconcileAction`] — decoupled from file I/O so the
@@ -1999,10 +2084,64 @@ fn root_config_is_stale(root_dir: &Path, bound_port: u16) -> bool {
 /// 2026-07-07 Change 1 secondary gap: a boot with zero open sessions must still
 /// repair a stale-port root config, which the old session-gated wiring skipped).
 /// Returns the [`RootReconcileAction`] actually taken (`Leave` when there is no
-/// resolvable root dir) so the boot task can log the restore-vs-heal outcome.
+/// resolvable root dir, `SkippedSecondary` on a non-canonical instance) so the
+/// boot task can log the restore-vs-heal outcome.
+///
+/// **Instance-gated (plan 2026-07-20-ephemeral-runner-hijacks-root-mcp-json).**
+/// "Unconditional" was the right fix for the original bug (a boot with zero open
+/// sessions used to skip root repair entirely) but it was never gated on WHICH
+/// instance is booting, and the action is chosen purely by port comparison — so
+/// any ephemeral runner on `:9877` saw `9876 != 9877`, took the `Rewrite` arm,
+/// and claimed the shared root config for a process about to exit. The heal stays
+/// unconditional with respect to session presence; it is now conditional on being
+/// the instance that OWNS that file.
 pub(crate) fn reconcile_root_config(bound_port: u16) -> RootReconcileAction {
-    match qontinui_root_dir() {
-        Some(root_dir) => reconcile_root_config_at(&root_dir, bound_port),
+    reconcile_root_config_gated(
+        qontinui_root_dir().as_deref(),
+        bound_port,
+        crate::instance::owns_shared_root_state(),
+    )
+}
+
+/// Env-free, instance-gated core of [`reconcile_root_config`] — split out so the
+/// guard is unit-testable against an explicit temp dir and an injected
+/// classification, without mutating process-global env (which races the parallel
+/// test harness).
+///
+/// The instance check runs FIRST, ahead of the root-dir match, so a secondary
+/// reports [`RootReconcileAction::SkippedSecondary`] uniformly — including when
+/// no root dir resolves. Ordering the two the other way would report `Leave` for
+/// that case and lose the "a secondary declined" signal precisely where an
+/// operator is already confused about why nothing was repaired. The shared root
+/// config is not merely left unwritten but never opened.
+///
+/// Prevention, not restoration: the tempting alternative — let the secondary
+/// overwrite root and restore it on exit — is rejected, because a SIGKILL, panic
+/// or runtime teardown skips exit hooks, converting a deterministic bug into an
+/// intermittent one. A file that is never wrongly written needs no restoration.
+///
+/// Accepted consequence: when no primary is running, nobody heals a stale root
+/// config. That is correct — a root config naming a dead PRIMARY self-corrects
+/// the moment the primary boots, whereas one naming a dead EPHEMERAL runner is
+/// indistinguishable from a live config until the request fails.
+fn reconcile_root_config_gated(
+    root_dir: Option<&Path>,
+    bound_port: u16,
+    owns_shared_root_state: bool,
+) -> RootReconcileAction {
+    if !owns_shared_root_state {
+        info!(
+            "coord_mcp: root self-heal SKIPPED — this runner is a SECONDARY \
+             instance (name={:?}, port={}); the shared root .mcp.json at {:?} \
+             belongs to the primary and is left untouched",
+            crate::instance::instance_name(),
+            crate::mcp::types::get_mcp_api_port(),
+            root_dir,
+        );
+        return RootReconcileAction::SkippedSecondary;
+    }
+    match root_dir {
+        Some(dir) => reconcile_root_config_at(dir, bound_port),
         None => RootReconcileAction::Leave,
     }
 }
@@ -2059,6 +2198,13 @@ fn reconcile_root_config_at(root_dir: &Path, bound_port: u16) -> RootReconcileAc
             );
             RootReconcileAction::Rewrite
         }
+        // Unreachable in practice: the pure resolver ([`root_reconcile_action`])
+        // only ever yields Leave/AdoptNonce/Rewrite — `SkippedSecondary` is
+        // produced solely by the instance gate in [`reconcile_root_config_gated`],
+        // which returns BEFORE calling this function. Handle it as identity rather
+        // than `unreachable!` so a future resolver change degrades to a no-op skip
+        // instead of a panic on the boot path.
+        RootReconcileAction::SkippedSecondary => RootReconcileAction::SkippedSecondary,
     }
 }
 
@@ -3530,6 +3676,188 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dead);
         let _ = std::fs::remove_dir_all(&empty);
         let _ = std::fs::remove_dir_all(&agent);
+    }
+
+    /// THE REGRESSION, stated as a test — WRITER PATH 1 (boot self-heal).
+    ///
+    /// Plan 2026-07-20-ephemeral-runner-hijacks-root-mcp-json: an ephemeral
+    /// runner boots on `:9877`, the unconditional root self-heal compares
+    /// `9876 != 9877`, takes the `Rewrite` arm and claims the SHARED root
+    /// `.mcp.json` for a process about to exit — leaving every root-opened
+    /// Claude session on the machine with a dead coord-mcp endpoint (and hence
+    /// no policy system) until the protected primary next boots, which can be
+    /// days. Observed four times in the field (`:9881`, `:9877` ×3).
+    ///
+    /// Asserts on the FILE BYTES, not only the returned enum: the defect is a
+    /// file write, so an action-only assertion would pass while the file was
+    /// still clobbered.
+    #[test]
+    fn secondary_instance_never_self_heals_the_shared_root_config() {
+        let root = std::env::temp_dir().join(format!("coord-mcp-sec-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        // A HEALTHY root config naming the primary's port — precisely what a
+        // temp runner on a different port used to overwrite.
+        let healthy = r#"{"mcpServers":{"coord-mcp":{"type":"http","url":"http://127.0.0.1:9876/coord-mcp","headers":{"X-Coord-Mcp-Proxy-Key":"primary-owned-nonce"}}}}"#;
+        std::fs::write(root.join(".mcp.json"), healthy).unwrap();
+
+        // The SECONDARY on :9877 — the reproduction. Must not touch the file.
+        assert_eq!(
+            reconcile_root_config_gated(Some(&root), 9877, false),
+            RootReconcileAction::SkippedSecondary,
+            "a secondary must SKIP root self-heal, not evaluate it"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".mcp.json")).unwrap(),
+            healthy,
+            "the shared root .mcp.json must be BYTE-IDENTICAL after a secondary's boot reconcile"
+        );
+
+        // Belt-and-braces: the skip is not an artifact of the config being
+        // healthy. A root config that IS stale for the secondary's port (the
+        // `Rewrite` trigger) is still left alone.
+        assert_eq!(
+            root_reconcile_action(Some(9876), Some("primary-owned-nonce"), false, 9877),
+            RootReconcileAction::Rewrite,
+            "precondition: ungated, this input would have REWRITTEN the root config"
+        );
+        assert_eq!(
+            reconcile_root_config_gated(Some(&root), 9877, false),
+            RootReconcileAction::SkippedSecondary
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".mcp.json")).unwrap(),
+            healthy,
+            "even a would-be-Rewrite input must leave the shared root config untouched"
+        );
+
+        // The PRIMARY's shipped repair must be unchanged — the guard narrows who
+        // may heal, never what healing does.
+        assert_eq!(
+            reconcile_root_config_gated(Some(&root), 9876, true),
+            RootReconcileAction::AdoptNonce,
+            "the primary still adopts an unregistered same-port nonce"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".mcp.json")).unwrap(),
+            healthy,
+            "adopt stays byte-identical for the primary too"
+        );
+        assert_eq!(
+            reconcile_root_config_gated(Some(&root), 9881, true),
+            RootReconcileAction::Rewrite,
+            "the primary on a MOVED port still rewrites (shipped repair preserved)"
+        );
+        assert_eq!(read_proxy_port(&root.to_string_lossy()), Some(9881));
+
+        // A secondary reports SkippedSecondary UNIFORMLY, including when no root
+        // dir resolves. Reporting `Leave` there would lose the "a secondary
+        // declined" signal exactly where an operator is already puzzled about why
+        // nothing was repaired — so the instance check must precede the root-dir
+        // match, not follow it.
+        assert_eq!(
+            reconcile_root_config_gated(None, 9877, false),
+            RootReconcileAction::SkippedSecondary,
+            "a secondary skips regardless of whether a root dir resolves"
+        );
+        // The primary with no resolvable root dir still reports Leave (unchanged).
+        assert_eq!(
+            reconcile_root_config_gated(None, 9876, true),
+            RootReconcileAction::Leave,
+            "no root dir to heal is Leave for the primary — shipped behaviour"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// THE REGRESSION, stated as a test — WRITER PATH 2 (the
+    /// `coord_mcp_safe_to_write` chokepoint).
+    ///
+    /// `acquire_for_terminal` → `provision_coord_mcp_for_session` is a SECOND,
+    /// independent writer: an operator tab opened at `D:/qontinui-root` on a temp
+    /// runner rewrites the shared root config to the temp port without ever
+    /// calling `reconcile_root_config`. Guarding only the boot self-heal would
+    /// leave that hole open, so the guard also lands at the chokepoint every
+    /// writer funnels through.
+    ///
+    /// Also pins the SCOPE of the refusal: a secondary keeps full authority over
+    /// every OTHER workdir. That is not incidental — the per-repo sibling configs
+    /// surviving a root hijack are what make in-session recovery possible (probe
+    /// the siblings for one that still answers, copy it over root).
+    #[test]
+    fn shared_root_write_guard_refuses_only_the_root_dir_and_only_for_secondaries() {
+        let root = Path::new("D:/qontinui-root");
+        let sibling = "D:/qontinui-root/qontinui-runner";
+        let worktree = "D:/qontinui-root/wt-something";
+
+        // PRIMARY (owns shared root state) — unchanged everywhere, root included.
+        for wd in ["D:/qontinui-root", sibling, worktree] {
+            assert!(
+                shared_root_write_allowed_at(wd, Some(root), true),
+                "the primary must keep writing {wd}"
+            );
+        }
+
+        // SECONDARY — refused at root ONLY.
+        assert!(
+            !shared_root_write_allowed_at("D:/qontinui-root", Some(root), false),
+            "a secondary must never claim the shared root config"
+        );
+        assert!(
+            shared_root_write_allowed_at(sibling, Some(root), false),
+            "a secondary still provisions per-repo sibling configs (the recovery asset)"
+        );
+        assert!(
+            shared_root_write_allowed_at(worktree, Some(root), false),
+            "a secondary still provisions its own isolated worktree sessions"
+        );
+
+        // Path-shape robustness — the refusal must not be defeatable by a
+        // trailing separator, backslashes, or (on Windows) a case difference.
+        for variant in [
+            "D:/qontinui-root/",
+            "D:\\qontinui-root",
+            "D:\\qontinui-root\\",
+        ] {
+            assert!(
+                !shared_root_write_allowed_at(variant, Some(root), false),
+                "{variant} is the shared root and must be refused"
+            );
+        }
+        #[cfg(windows)]
+        assert!(
+            !shared_root_write_allowed_at("d:/QONTINUI-ROOT", Some(root), false),
+            "Windows paths are case-insensitive — the guard must be too"
+        );
+
+        // A path that merely SHARES A PREFIX with the root is not the root.
+        assert!(
+            shared_root_write_allowed_at("D:/qontinui-root-other", Some(root), false),
+            "prefix-sharing must not be mistaken for path identity"
+        );
+
+        // No resolvable umbrella root → nothing to protect, nothing refused.
+        assert!(shared_root_write_allowed_at(
+            "D:/qontinui-root",
+            None,
+            false
+        ));
+    }
+
+    /// The chokepoint guard composes with the pre-existing non-clobber guard
+    /// rather than replacing it: `coord_mcp_safe_to_write` still answers `true`
+    /// for an ordinary workdir in the (primary) test process, so wiring the new
+    /// refusal in front of it did not change the shipped behaviour for the case
+    /// that matters — a secondary provisioning its own session cwd.
+    #[test]
+    fn safe_to_write_still_permits_an_ordinary_workdir() {
+        let dir = std::env::temp_dir().join(format!("coord-mcp-ok-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wd = dir.to_string_lossy().to_string();
+        assert!(
+            coord_mcp_safe_to_write(&wd),
+            "an absent .mcp.json in a non-root workdir stays writable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Plan 2026-07-07 Change 1 — the pure `root_reconcile_action` resolver over
