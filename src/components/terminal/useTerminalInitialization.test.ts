@@ -21,6 +21,7 @@ import {
   runVerifiedResume,
   classifyRestoreAction,
   recordBelongsToRestore,
+  reportTreeReset,
 } from "./useTerminalInitialization";
 import type { TerminalSessionRecord } from "./types";
 import type { SessionOpenArgs } from "./sessionRecordArgs";
@@ -133,6 +134,67 @@ describe("fetchOpenRecords", () => {
   });
 });
 
+// P0 tree-reset observability: the mount effect fires a durable
+// terminal_report_tree_reset on EVERY mount, fire-and-forget — the report must
+// never be able to affect the initialization flow.
+describe("reportTreeReset (tree-reset observability)", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+  });
+
+  it("reports the mount with the collected payload (open-record count included)", async () => {
+    mockInvoke.mockImplementation((cmd: unknown) => {
+      if (cmd === "terminal_session_list_open") {
+        return Promise.resolve({
+          success: true,
+          message: null,
+          data: { sessions: [rec({ claudeSessionId: "A" }), rec({ claudeSessionId: "B" })] },
+        });
+      }
+      return Promise.resolve({ success: true, message: null, data: null });
+    });
+    await reportTreeReset({ mountNumber: 2, authenticated: true, pageIds: ["default", "p2"] });
+    expect(mockInvoke).toHaveBeenCalledWith(
+      "terminal_report_tree_reset",
+      expect.objectContaining({
+        mountNumber: 2,
+        authenticated: true,
+        pageIds: ["default", "p2"],
+        openRecordCount: 2,
+      }),
+    );
+  });
+
+  it("mount #1 is reported too (consumers filter on mountNumber)", async () => {
+    mockInvoke.mockResolvedValue({ success: true, message: null, data: null });
+    await reportTreeReset({ mountNumber: 1, pageIds: [] });
+    expect(mockInvoke).toHaveBeenCalledWith(
+      "terminal_report_tree_reset",
+      expect.objectContaining({ mountNumber: 1, authenticated: undefined }),
+    );
+  });
+
+  it("still reports when the open-record count fetch fails (partial payload)", async () => {
+    mockInvoke.mockImplementation((cmd: unknown) =>
+      cmd === "terminal_session_list_open"
+        ? Promise.reject(new Error("ipc down"))
+        : Promise.resolve({ success: true, message: null, data: null }),
+    );
+    await reportTreeReset({ mountNumber: 3, pageIds: ["default"] });
+    expect(mockInvoke).toHaveBeenCalledWith(
+      "terminal_report_tree_reset",
+      expect.objectContaining({ mountNumber: 3, openRecordCount: undefined }),
+    );
+  });
+
+  it("swallows a rejected report — never throws into the mount effect", async () => {
+    mockInvoke.mockRejectedValue(new Error("ipc down"));
+    await expect(
+      reportTreeReset({ mountNumber: 2, pageIds: ["default"] }),
+    ).resolves.toBeUndefined();
+  });
+});
+
 // Orphan-page adoption (2026-07-13 session-loss incident): a record whose
 // pageId names no live page must be adopted by the first restoring page —
 // but ONLY when it classifies auto-resume. Everything else keeps today's
@@ -151,9 +213,9 @@ describe("recordBelongsToRestore (orphan-page adoption)", () => {
   });
 
   it("record on ANOTHER live page is never taken (that page owns it)", () => {
-    expect(
-      recordBelongsToRestore(confirmed("page-b"), "page-a", ["page-a", "page-b"], true),
-    ).toBe(false);
+    expect(recordBelongsToRestore(confirmed("page-b"), "page-a", ["page-a", "page-b"], true)).toBe(
+      false,
+    );
   });
 
   it("orphan (page not in layout) + auto-resume class ⇒ adopted when this page is the adopter", () => {
@@ -169,9 +231,9 @@ describe("recordBelongsToRestore (orphan-page adoption)", () => {
   it("orphan on the FRESH-INSTALL default page is not an orphan (default is a live page)", () => {
     // knownPageIds includes "default" ⇒ default-page records belong to the
     // default page's own restore run, never adopted elsewhere.
-    expect(recordBelongsToRestore(confirmed("default"), "page-a", ["default", "page-a"], true)).toBe(
-      false,
-    );
+    expect(
+      recordBelongsToRestore(confirmed("default"), "page-a", ["default", "page-a"], true),
+    ).toBe(false);
     expect(recordBelongsToRestore(confirmed("default"), "default", ["default"], true)).toBe(true);
   });
 
@@ -234,10 +296,7 @@ describe("runVerifiedResume", () => {
   /** A refs map whose handle accepts writes (the default writeWhenReady path). */
   const refsWithHandle = (writes: string[]) =>
     new Map([
-      [
-        "tab-1",
-        { current: { writeToTerminal: (text: string) => void writes.push(text) } },
-      ],
+      ["tab-1", { current: { writeToTerminal: (text: string) => void writes.push(text) } }],
     ]) as never;
 
   beforeEach(() => {

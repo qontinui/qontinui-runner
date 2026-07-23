@@ -575,6 +575,107 @@ pub fn read_all_snapshot_sessions(path: &Path) -> Vec<SnapshotSession> {
     latest.into_values().map(|(_, s)| s).collect()
 }
 
+// ── Terminal tree-reset reports (P0 tree-reset observability) ────────────────
+//
+// A remount of the terminal page tree (top-level state flip → restore respawns
+// `claude --resume`) used to be visible only as a webview console.warn that
+// nothing captured. The `terminal_report_tree_reset` command appends one durable
+// row per mount here. Kept in its OWN JSONL file (never spliced into the
+// session-snapshots file above): a tree-reset row is not a layout snapshot, and
+// writing it through `SnapshotHistory` would disturb that file's change-dedupe
+// key and heartbeat clock — a behavior change this observability-only surface
+// must not make.
+
+/// Frontend-collected payload of one terminal-tree reset report. Every field
+/// is best-effort at the reporting site, so all but the mount counter are
+/// optional/defaulted — a partial report is still worth a row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TreeResetReport {
+    /// 1-based mount counter from the frontend mount effect. Mount #1 (a
+    /// normal boot) is recorded too — consumers filter on this to isolate
+    /// genuine REmounts (`> 1`).
+    pub mount_number: u32,
+    /// `authStatus?.authenticated` at reset time (`None` = auth state unknown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticated: Option<bool>,
+    /// `PerformanceNavigationTiming.type` (`"navigate"` / `"reload"` / …) —
+    /// the reload-vs-in-app-remount discriminator, the row's key field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub navigation_type: Option<String>,
+    /// The terminal page ids about to re-initialize.
+    #[serde(default)]
+    pub page_ids: Vec<String>,
+    /// How many open records the restore is about to consider
+    /// (`terminal_session_list_open` count at reset time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_record_count: Option<u32>,
+}
+
+/// One durable tree-reset row — timestamp stamps plus the report payload,
+/// one JSON line per row (same shape conventions as [`SnapshotRecord`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TreeResetRecord {
+    /// Unix epoch millis the report was recorded.
+    pub ts: i64,
+    /// RFC 3339 UTC rendering of `ts` (the file is a human-read artifact).
+    pub at: String,
+    #[serde(flatten)]
+    pub report: TreeResetReport,
+}
+
+/// Resolve the tree-reset history path for a runner lifecycle `port`,
+/// mirroring [`snapshot_path_for_port`]'s port-scoped naming
+/// (`tree-resets.jsonl` for the primary 9876, else `tree-resets-<port>.jsonl`).
+pub fn tree_reset_path_for_port(port: u16) -> PathBuf {
+    let file = if port == 9876 {
+        "tree-resets.jsonl".to_string()
+    } else {
+        format!("tree-resets-{}.jsonl", port)
+    };
+    crate::session::claude_hook::session_restore_dir().join(file)
+}
+
+/// Append one tree-reset row to `path`, stamping the timestamps now.
+/// Best-effort like every append in this module: a failure is logged, never
+/// propagated — the report must never affect the initialization flow.
+pub fn record_tree_reset(path: &Path, report: TreeResetReport) {
+    record_tree_reset_at(path, Utc::now().timestamp_millis(), report);
+}
+
+fn record_tree_reset_at(path: &Path, now_ms: i64, report: TreeResetReport) {
+    let record = TreeResetRecord {
+        ts: now_ms,
+        at: rfc3339(now_ms),
+        report,
+    };
+    let line = match serde_json::to_string(&record) {
+        Ok(l) => l,
+        Err(e) => {
+            warn!(error = %e, "tree_reset: serialize failed — report dropped");
+            return;
+        }
+    };
+    let write = (|| -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        writeln!(f, "{line}")
+    })();
+    if let Err(e) = write {
+        warn!(
+            error = %e,
+            path = %path.display(),
+            "tree_reset: append failed — report dropped"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -942,5 +1043,99 @@ mod tests {
         assert!(!is_restorable_identity(true, false));
         assert!(!is_restorable_identity(false, true));
         assert!(!is_restorable_identity(false, false));
+    }
+
+    // ── Tree-reset report rows (P0 tree-reset observability) ─────────────────
+
+    /// Each report appends one camelCase JSONL row (creating parent dirs)
+    /// that round-trips through serde with the flattened payload intact.
+    #[test]
+    fn tree_reset_appends_one_row_that_round_trips() {
+        let dir = tempdir().unwrap();
+        // Parent dir does not exist yet — the append must create it.
+        let path = dir.path().join("session-restore").join("tree-resets.jsonl");
+        let report = TreeResetReport {
+            mount_number: 2,
+            authenticated: Some(true),
+            navigation_type: Some("navigate".to_string()),
+            page_ids: vec!["default".to_string(), "page-2".to_string()],
+            open_record_count: Some(7),
+        };
+        record_tree_reset_at(&path, 1_700_000_000_000, report.clone());
+        record_tree_reset_at(
+            &path,
+            1_700_000_001_000,
+            TreeResetReport {
+                mount_number: 3,
+                ..report.clone()
+            },
+        );
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 2, "one row per report, append-only");
+        let rec: TreeResetRecord = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(rec.ts, 1_700_000_000_000);
+        assert!(rec.at.starts_with("2023-"), "human-readable timestamp");
+        assert_eq!(rec.report, report, "flattened payload round-trips");
+        // Wire shape: camelCase, payload flattened onto the row (no nesting).
+        for field in [
+            "mountNumber",
+            "authenticated",
+            "navigationType",
+            "pageIds",
+            "openRecordCount",
+        ] {
+            assert!(lines[0].contains(field), "row carries {field}");
+        }
+        assert!(!lines[0].contains("report"), "payload is flattened");
+    }
+
+    /// Optional fields the frontend could not collect are OMITTED (not
+    /// `null`/`false`), and a minimal report still parses back.
+    #[test]
+    fn tree_reset_omits_uncollected_optional_fields() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tree-resets.jsonl");
+        record_tree_reset_at(
+            &path,
+            1_700_000_000_000,
+            TreeResetReport {
+                mount_number: 1,
+                authenticated: None,
+                navigation_type: None,
+                page_ids: vec![],
+                open_record_count: None,
+            },
+        );
+        let raw = std::fs::read_to_string(&path).unwrap();
+        for absent in ["authenticated", "navigationType", "openRecordCount"] {
+            assert!(!raw.contains(absent), "uncollected {absent} is omitted");
+        }
+        let rec: TreeResetRecord = serde_json::from_str(raw.trim()).unwrap();
+        assert_eq!(rec.report.mount_number, 1);
+        assert_eq!(rec.report.authenticated, None);
+    }
+
+    /// A write failure is swallowed (logged), never panics/propagates — the
+    /// report must not be able to affect initialization.
+    #[test]
+    fn tree_reset_append_failure_is_swallowed() {
+        let dir = tempdir().unwrap();
+        // The target path's parent is a FILE, so create_dir_all/open must fail.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "x").unwrap();
+        let path = blocker.join("tree-resets.jsonl");
+        record_tree_reset_at(
+            &path,
+            1_700_000_000_000,
+            TreeResetReport {
+                mount_number: 1,
+                authenticated: None,
+                navigation_type: None,
+                page_ids: vec![],
+                open_record_count: None,
+            },
+        ); // must not panic
     }
 }

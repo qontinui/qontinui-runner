@@ -53,12 +53,7 @@ export async function fetchOpenRecords(
   for (const rec of sessions) {
     if (!rec || typeof rec.claudeSessionId !== "string") continue;
     if (
-      !recordBelongsToRestore(
-        rec,
-        pageId,
-        opts?.knownPageIds ?? [],
-        opts?.adoptOrphans ?? false,
-      )
+      !recordBelongsToRestore(rec, pageId, opts?.knownPageIds ?? [], opts?.adoptOrphans ?? false)
     ) {
       continue;
     }
@@ -251,6 +246,59 @@ export async function runVerifiedResume(params: {
 }
 
 /**
+ * Report a mount of the terminal page tree to the backend
+ * (`terminal_report_tree_reset`) so a tree reset is durably observable — P0
+ * tree-reset observability. Until now the only trace of a remount (top-level
+ * state flip → restore respawns `claude --resume`) was a webview
+ * `console.warn` nothing captured.
+ *
+ * Collects the payload best-effort:
+ * - `navigationType` — `PerformanceNavigationTiming.type`, the
+ *   reload-vs-in-app-remount discriminator (a fresh "reload"/"navigate" entry
+ *   means a full webview load; a remount without one is an in-app tree reset);
+ * - `openRecordCount` — size of the restorable set the restore is about to
+ *   consider, via the same read-only `terminal_session_list_open` query the
+ *   restore itself uses.
+ *
+ * Fire-and-forget and observability-only: never throws, never blocks or
+ * affects initialization. Exported for unit tests.
+ */
+export async function reportTreeReset(params: {
+  mountNumber: number;
+  authenticated?: boolean;
+  pageIds: string[];
+}): Promise<void> {
+  try {
+    let navigationType: string | undefined;
+    try {
+      const nav = performance.getEntriesByType("navigation")[0] as
+        | PerformanceNavigationTiming
+        | undefined;
+      navigationType = nav?.type;
+    } catch {
+      // No navigation timing surface (tests) — report without it.
+    }
+    let openRecordCount: number | undefined;
+    try {
+      const resp = await invoke<CommandResponse>("terminal_session_list_open");
+      const sessions = (resp?.data as { sessions?: unknown[] } | undefined)?.sessions;
+      if (Array.isArray(sessions)) openRecordCount = sessions.length;
+    } catch {
+      // Count unavailable — a partial report is still worth a row.
+    }
+    await invoke("terminal_report_tree_reset", {
+      mountNumber: params.mountNumber,
+      authenticated: params.authenticated,
+      navigationType,
+      pageIds: params.pageIds,
+      openRecordCount,
+    });
+  } catch (err) {
+    console.warn("[TerminalPage] tree-reset report failed:", err);
+  }
+}
+
+/**
  * Pure guard for the once-per-pageId init backstop (Phase 3 mount-hydration
  * lift). With the session provider lifted above the page, the single
  * `useTerminalInitialization` instance persists across terminal-page switches,
@@ -364,6 +412,12 @@ function sanitizeConfigDir(dir: string | undefined): string | undefined {
 interface UseTerminalInitializationParams {
   /** Which terminal page this restore runs for ("default" when unset). */
   pageId: string;
+  /**
+   * `authStatus?.authenticated` at reset time, forwarded into the tree-reset
+   * report (`undefined` = auth state unknown/not yet resolved). Optional so
+   * non-App harnesses need not thread auth through.
+   */
+  authenticated?: boolean;
   tabs: TerminalTab[];
   terminalRefs: React.MutableRefObject<Map<string, React.RefObject<TerminalInstanceHandle | null>>>;
   reconnectToExistingSessions: () => Promise<string[] | null>;
@@ -432,6 +486,7 @@ interface UseTerminalInitializationParams {
 
 export function useTerminalInitialization({
   pageId,
+  authenticated,
   tabs,
   terminalRefs,
   reconnectToExistingSessions,
@@ -461,6 +516,19 @@ export function useTerminalInitialization({
           `parent app tree unmounted (e.g., auth state change).`,
       );
     }
+    // P0 tree-reset observability: durably report EVERY mount (mount #1 is a
+    // data point too — consumers filter on mountNumber). Fire-and-forget; the
+    // report must never affect the initialization flow.
+    reportTreeReset({
+      mountNumber: mountNum,
+      authenticated,
+      pageIds: loadKnownPageIds(),
+    }).catch(() => {
+      // reportTreeReset already swallows internally; this is belt-and-braces.
+    });
+    // Mount-time report only: re-running on `authenticated` flips would skew
+    // the mount counter semantics.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Init / restore guards are keyed by pageId, NOT per hook mount. The single

@@ -9,6 +9,7 @@ import type { PastSession } from "./usePastSessions";
 import { ZoneGrid } from "./ZoneGrid";
 import { useTerminalWindowActions } from "./useTerminalWindowActions";
 import { useTenant } from "@/contexts/TenantContext";
+import { useAuth } from "../AuthProvider";
 import { ZoneLayoutPicker } from "./ZoneLayoutPicker";
 import { DocFinderModal } from "./DocFinderModal";
 import { PromptModal } from "./PromptModal";
@@ -102,6 +103,9 @@ function TerminalPageInner({
   // F2 — the tenant the next spawn binds to (`SpawnTenantPicker` writes it)
   // and the device's persisted pin as the fallback.
   const { spawnTenantId, activeTenantId, candidates: tenantCandidates } = useTenant();
+  // Auth state at reset time, forwarded into the tree-reset report (P0
+  // tree-reset observability) — the tree's usual killer IS an auth flip.
+  const { authStatus } = useAuth();
   // Phase 4 — single context replaces the prior 4-way split. Field set
   // is identical (the new context spreads the same returns).
   const session = useTerminalSession();
@@ -789,6 +793,7 @@ function TerminalPageInner({
 
   useTerminalInitialization({
     pageId,
+    authenticated: authStatus?.authenticated,
     tabs,
     terminalRefs,
     reconnectToExistingSessions,
