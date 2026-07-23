@@ -923,9 +923,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // never scans. The setting is read here because the settings
                 // store lives in this binary, not the lib crate. See
                 // `plan_workunit_adapter::trigger`.
-                qontinui_runner_lib::plan_workunit_adapter::trigger::spawn_if_configured(
-                    config_facade::get_setting::<settings::PathSettings>().plans_dir,
-                );
+                {
+                    let paths = config_facade::get_setting::<settings::PathSettings>();
+                    qontinui_runner_lib::plan_workunit_adapter::trigger::spawn_if_configured(
+                        paths.plans_dir,
+                        paths.plans_archive_dir,
+                    );
+                }
                 // Park this thread's runtime forever so the spawned
                 // interval task keeps ticking for the runner's lifetime.
                 std::future::pending::<()>().await;

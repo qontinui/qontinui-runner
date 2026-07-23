@@ -281,6 +281,36 @@ pub async fn push_work_unit<S: WorkUnitSink + ?Sized>(
     })
 }
 
+/// Stamp `metadata.archive_path` for a plan found in the archive directory —
+/// a **metadata-only** upsert (`status: None`, no transition, ever).
+///
+/// This is the D4 guard expressed in code: the archive scan is a metadata-only
+/// writer. It records where a plan was archived to (`u.source_path`, the
+/// archived file's filesystem path) as provenance and does **nothing else**. In
+/// particular it never emits a status transition — not even when the archived
+/// file's `> **Status:` line parses to `shipped` (coord-derived, not settable)
+/// or the non-vocabulary `archived` (which coord would silently classify `Free`
+/// and *accept*). Terminal state is owned by coord's derive engine; a second
+/// writer racing it is exactly what this metadata-only path avoids.
+///
+/// A plan normally lives in exactly one directory (active *or* archive), so this
+/// does not contend with the full-metadata upsert the active-dir reconcile
+/// writes for the same slug.
+pub async fn push_archive_metadata<S: WorkUnitSink + ?Sized>(
+    sink: &S,
+    u: &ParsedWorkUnit,
+) -> Result<()> {
+    sink.upsert(&UpsertBody {
+        slug: u.slug.clone(),
+        title: u.title.clone(),
+        // NEVER a status write from the archive scan (D4).
+        status: None,
+        metadata: Some(serde_json::json!({ "archive_path": u.source_path })),
+        by_actor: Some(ADAPTER_ACTOR.to_string()),
+    })
+    .await
+}
+
 /// Production [`WorkUnitSink`]: HTTP against coord with the device-JWT bearer.
 pub struct HttpWorkUnitSink {
     base: String,
@@ -453,6 +483,52 @@ mod tests {
             source_path: format!("plans/{slug}.md"),
             content: String::new(),
         }
+    }
+
+    /// Regression guard (Phase 4): the archive scan must not weaken the
+    /// second-writer deference. `is_real_agent_actor` classifies exactly the
+    /// adapter's own actor and the empty actor as "not a real owner"; anything
+    /// else is a real agent owner the proxy defers to.
+    #[test]
+    fn is_real_agent_actor_deference_unchanged() {
+        assert!(!is_real_agent_actor(ADAPTER_ACTOR));
+        assert!(!is_real_agent_actor(""));
+        assert!(is_real_agent_actor("device:d:agent:a"));
+        assert!(is_real_agent_actor("some-other-system-actor"));
+    }
+
+    #[tokio::test]
+    async fn push_archive_metadata_stamps_path_and_never_transitions() {
+        let sink = FakeSink::default();
+        // A shipped archived plan: the archive scan must NOT transition it —
+        // it only stamps provenance.
+        let u = unit("2026-01-01-done", "shipped");
+        push_archive_metadata(&sink, &u).await.unwrap();
+
+        let ups = sink.upserts.lock().unwrap();
+        assert_eq!(ups.len(), 1, "exactly one metadata-only upsert");
+        assert!(ups[0].status.is_none(), "archive upsert carries NO status");
+        assert_eq!(
+            ups[0].metadata.as_ref().unwrap()["archive_path"],
+            serde_json::json!(u.source_path),
+            "archive_path stamped to the archived file path"
+        );
+        assert!(
+            sink.transitions.lock().unwrap().is_empty(),
+            "archive scan NEVER transitions"
+        );
+    }
+
+    /// The non-vocabulary `archived` status classifies `Free` on coord and is
+    /// silently accepted — so the client-side no-transition guard is the only
+    /// thing stopping a second write. Assert it holds for `archived` too.
+    #[tokio::test]
+    async fn push_archive_metadata_no_transition_even_for_archived_status() {
+        let sink = FakeSink::default();
+        let u = unit("2026-01-02-old", "archived");
+        push_archive_metadata(&sink, &u).await.unwrap();
+        assert!(sink.transitions.lock().unwrap().is_empty());
+        assert!(sink.upserts.lock().unwrap()[0].status.is_none());
     }
 
     #[test]
