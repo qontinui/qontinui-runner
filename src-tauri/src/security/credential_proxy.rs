@@ -7,6 +7,7 @@
 //!
 //! This ensures that real API keys never enter the container's memory space.
 
+use crate::str_utils::truncate_str;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -137,7 +138,7 @@ impl CredentialProxy {
                     None => {
                         warn!(
                             "Credential proxy: failed to resolve credential for placeholder {}",
-                            &placeholder[..placeholder.len().min(20)]
+                            truncate_str(placeholder, 20)
                         );
                         return None;
                     }
