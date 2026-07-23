@@ -60,6 +60,71 @@ function isPageEventType(type: string): type is PageEventTypes {
   return PAGE_EVENT_TYPES.has(type as PageEventTypes);
 }
 
+// SECURITY: `page_evaluate` blocklist. Block dangerous patterns while
+// allowing diagnostic expressions. Evaluation uses new Function(), which
+// does not have access to local scope.
+//
+// Note: `window.location` read access (pathname, host, port, href,
+// origin, protocol, search, hash, hostname) is allowed for test
+// probes. Only mutating methods (assign/replace/reload) and
+// assignment to window.location are blocked.
+// Block patterns that enable code injection, data exfiltration,
+// or persistent state corruption. Deliberately ALLOW:
+//   - localStorage / sessionStorage (needed for tab navigation)
+//   - globalThis / Reflect / Proxy (useful for deep inspection)
+// The remaining blocklist targets patterns with no legitimate
+// agent-testing use case.
+// Structural patterns — always enforced. Code injection, prototype
+// pollution, cookie exfiltration, redirects, reloads, crypto key access.
+//
+// `location.reload` is blocked for the same reason the `page_refresh`
+// handler below refuses to reload: a full page reload tears down all
+// React state (auth, execution, the terminal tree), orphaning every
+// live PTY session.
+const structuralPatterns = [
+  /\bimport\s*\(/, // dynamic import — can load arbitrary modules
+  /\brequire\s*\(/, // require — same
+  /\b__proto__\b/, // prototype pollution
+  /\bconstructor\s*\[/, // constructor bracket access
+  /\beval\s*\(/, // nested eval — full code execution
+  /\bnew\s+Function\b/, // Function constructor — same
+  /\bdocument\.cookie\b/, // cookie theft
+  /\bwindow\.open\b/, // popup/phishing
+  /\bwindow\.location\.(assign|replace|reload)\b/, // redirect / reload
+  /\bwindow\.location\s*=/, // redirect via assignment
+  /\blocation\.(assign|replace|reload)\b/, // bare redirect / reload
+  /\blocation\s*=\s*["'`]/, // redirect via bare assignment
+  /\bcrypto\.subtle\b/, // key material access
+];
+// Network patterns — disabled only when the caller explicitly
+// sets `allowNetworkRequests: true`. Default is to block them
+// as data-exfiltration / persistent-channel risks.
+const networkPatterns = [
+  /\bfetch\s*\(/, // network requests — data exfiltration
+  /\bXMLHttpRequest\b/, // network requests — same
+  /\bnavigator\.sendBeacon\b/, // data exfiltration beacon
+  /\bWebSocket\b/, // persistent network channel
+];
+
+/**
+ * Pure gate for `page_evaluate` expressions. Returns the first prohibited
+ * pattern the expression matches, or `null` when the expression is allowed.
+ * Exported for unit tests.
+ *
+ * NOTE: mirrored by `rejectIfDangerous` in `useUIBridgeEvaluateHandler.ts`
+ * (the tagged `/control/page/evaluate` flow) — any change here MUST be
+ * mirrored there.
+ */
+export function checkEvaluateBlocklist(
+  expression: string,
+  allowNetworkRequests: boolean,
+): RegExp | null {
+  const dangerousPatterns = allowNetworkRequests
+    ? structuralPatterns
+    : [...structuralPatterns, ...networkPatterns];
+  return dangerousPatterns.find((p) => p.test(expression)) ?? null;
+}
+
 /**
  * Handles: page_refresh, page_navigate, page_go_back, page_go_forward, query_selector, page_evaluate
  */
@@ -399,54 +464,13 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
             return true;
           }
           try {
-            // SECURITY: Block dangerous patterns while allowing diagnostic expressions.
-            // Uses new Function() which does not have access to local scope.
-            //
-            // Note: `window.location` read access (pathname, host, port, href,
-            // origin, protocol, search, hash, hostname) is allowed for test
-            // probes. Only mutating methods (assign/replace/reload) and
-            // assignment to window.location are blocked.
-            // Block patterns that enable code injection, data exfiltration,
-            // or persistent state corruption. Deliberately ALLOW:
-            //   - localStorage / sessionStorage (needed for tab navigation)
-            //   - location.reload (needed for page refresh after config changes)
-            //   - globalThis / Reflect / Proxy (useful for deep inspection)
-            // The remaining blocklist targets patterns with no legitimate
-            // agent-testing use case.
-            // Structural patterns — always enforced. Code injection, prototype
-            // pollution, cookie exfiltration, redirects, crypto key access.
-            const structuralPatterns = [
-              /\bimport\s*\(/, // dynamic import — can load arbitrary modules
-              /\brequire\s*\(/, // require — same
-              /\b__proto__\b/, // prototype pollution
-              /\bconstructor\s*\[/, // constructor bracket access
-              /\beval\s*\(/, // nested eval — full code execution
-              /\bnew\s+Function\b/, // Function constructor — same
-              /\bdocument\.cookie\b/, // cookie theft
-              /\bwindow\.open\b/, // popup/phishing
-              /\bwindow\.location\.(assign|replace)\b/, // redirect (reload allowed)
-              /\bwindow\.location\s*=/, // redirect via assignment
-              /\blocation\.(assign|replace)\b/, // bare redirect (reload allowed)
-              /\blocation\s*=\s*["'`]/, // redirect via bare assignment
-              /\bcrypto\.subtle\b/, // key material access
-            ];
-            // Network patterns — disabled only when the caller explicitly
-            // sets `allowNetworkRequests: true`. Default is to block them
-            // as data-exfiltration / persistent-channel risks.
-            const networkPatterns = [
-              /\bfetch\s*\(/, // network requests — data exfiltration
-              /\bXMLHttpRequest\b/, // network requests — same
-              /\bnavigator\.sendBeacon\b/, // data exfiltration beacon
-              /\bWebSocket\b/, // persistent network channel
-            ];
-            const dangerousPatterns = allowNetworkRequests
-              ? structuralPatterns
-              : [...structuralPatterns, ...networkPatterns];
-            const isDangerous = dangerousPatterns.some((p) => p.test(expression));
-            if (isDangerous) {
-              const matched = dangerousPatterns.find((p) => p.test(expression));
+            // SECURITY: gate the expression through the module-level
+            // blocklist (see `checkEvaluateBlocklist` above for the
+            // patterns and per-entry rationale).
+            const matched = checkEvaluateBlocklist(expression, allowNetworkRequests === true);
+            if (matched) {
               throw new Error(
-                `Expression rejected: contains prohibited pattern${matched ? ` (${matched.source})` : ""}`,
+                `Expression rejected: contains prohibited pattern (${matched.source})`,
               );
             }
             // Default: wrap as `return <expr>` so simple expressions like

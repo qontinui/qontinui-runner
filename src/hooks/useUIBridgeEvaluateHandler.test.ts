@@ -76,6 +76,41 @@ describe("handleEvaluateRequest", () => {
     expect((payload as { error: string }).error).toMatch(/prohibited pattern/);
   });
 
+  it.each(["location.reload()", "window.location.reload()"])(
+    "rejects %s (reload does via evaluate what page_refresh refuses)",
+    async (expression) => {
+      const deps = makeDeps();
+      const handled = await handleEvaluateRequest(
+        { request_id: `reload:${expression}`, expression },
+        deps,
+      );
+      expect(handled).toBe(true);
+      const [, payload] = deps.emit.mock.calls[0];
+      expect(payload).toMatchObject({ ok: false });
+      expect((payload as { error: string }).error).toMatch(/prohibited pattern/);
+    },
+  );
+
+  it("still allows location READS like location.pathname", async () => {
+    const deps = makeDeps();
+    // node env has no `location`; provide one for the evaluated expression.
+    (globalThis as Record<string, unknown>).location = { pathname: "/probe" };
+    try {
+      const handled = await handleEvaluateRequest(
+        { request_id: "read", expression: "location.pathname" },
+        deps,
+      );
+      expect(handled).toBe(true);
+      expect(deps.emit).toHaveBeenCalledWith("ui-bridge:evaluate-response", {
+        request_id: "read",
+        ok: true,
+        result: { success: true, result: { value: "/probe" } },
+      });
+    } finally {
+      delete (globalThis as Record<string, unknown>).location;
+    }
+  });
+
   it("emits the discriminated {value,type} shape when unwrap=true", async () => {
     const deps = makeDeps();
     await handleEvaluateRequest({ request_id: "u1", expression: "42", unwrap: true }, deps);
