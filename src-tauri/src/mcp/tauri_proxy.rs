@@ -223,16 +223,11 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 )
                 .await;
 
-            // Phase 2c — carry `QONTINUI_SESSION_WORKTREES` (all materialized
-            // sibling worktrees) onto the PTY, derived before the ctx is parked.
-            let extra_env = isolated_ctx.as_ref().and_then(|ctx| {
-                ctx.session_worktrees_env_value().map(|v| {
-                    vec![(
-                        crate::agent_worktree::isolated_edit::SESSION_WORKTREES_ENV.to_string(),
-                        v,
-                    )]
-                })
-            });
+            // The shared session-env contribution (`QONTINUI_SESSION_WORKTREES`
+            // + the configured plan directories) onto the PTY, derived before
+            // the ctx is parked. See `agent_worktree::session_env`.
+            let extra_env =
+                crate::agent_worktree::session_env::session_extra_env(isolated_ctx.as_ref());
 
             match tm.create(
                 a.title,

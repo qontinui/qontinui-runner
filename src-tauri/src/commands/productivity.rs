@@ -1081,19 +1081,13 @@ pub async fn launch_coordinator_session(
         .await;
     let repo_path = effective_repo_path.unwrap_or(primary_repo_path);
 
-    // Phase 2c — `QONTINUI_SESSION_WORKTREES` (agent-agnostic, all sibling
-    // worktrees) onto the PTY + `--add-dir <sibling>` appended to the claude
-    // command (convenience for claude). Derived from the live context before
-    // it is parked on the session. Single-repo coordinator → no siblings, so
-    // both are no-ops (env carries just the cwd repo, no `--add-dir`).
-    let extra_env = isolated_ctx.as_ref().and_then(|ctx| {
-        ctx.session_worktrees_env_value().map(|v| {
-            vec![(
-                crate::agent_worktree::isolated_edit::SESSION_WORKTREES_ENV.to_string(),
-                v,
-            )]
-        })
-    });
+    // The shared session-env contribution (`QONTINUI_SESSION_WORKTREES` + the
+    // configured plan directories) onto the PTY + `--add-dir <sibling>`
+    // appended to the claude command (convenience for claude). Derived from
+    // the live context before it is parked on the session. Single-repo
+    // coordinator → no siblings, so `--add-dir` is a no-op and the worktrees
+    // var carries just the cwd repo. See `agent_worktree::session_env`.
+    let extra_env = crate::agent_worktree::session_env::session_extra_env(isolated_ctx.as_ref());
     let add_dir_args = isolated_ctx
         .as_ref()
         .map(|ctx| ctx.claude_add_dir_args())
@@ -1235,19 +1229,13 @@ pub async fn spawn_worker_session(
     // (byte-identical to the historical bare string when unconfigured).
     let initial_command = claude_autonomous_launch_head();
 
-    // Phase 2c — `QONTINUI_SESSION_WORKTREES` (agent-agnostic, all sibling
-    // worktrees) onto the PTY + `--add-dir <sibling>` appended to the claude
-    // command (convenience for claude). Derived from the live context before
-    // it is parked on the session. Single-repo worker → no siblings, so both
-    // are no-ops (env carries just the cwd repo, no `--add-dir`).
-    let extra_env = isolated_ctx.as_ref().and_then(|ctx| {
-        ctx.session_worktrees_env_value().map(|v| {
-            vec![(
-                crate::agent_worktree::isolated_edit::SESSION_WORKTREES_ENV.to_string(),
-                v,
-            )]
-        })
-    });
+    // The shared session-env contribution (`QONTINUI_SESSION_WORKTREES` + the
+    // configured plan directories) onto the PTY + `--add-dir <sibling>`
+    // appended to the claude command (convenience for claude). Derived from
+    // the live context before it is parked on the session. Single-repo worker
+    // → no siblings, so `--add-dir` is a no-op and the worktrees var carries
+    // just the cwd repo. See `agent_worktree::session_env`.
+    let extra_env = crate::agent_worktree::session_env::session_extra_env(isolated_ctx.as_ref());
     let add_dir_args = isolated_ctx
         .as_ref()
         .map(|ctx| ctx.claude_add_dir_args())

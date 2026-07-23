@@ -916,11 +916,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // plan-decoupling program) — periodic reconcile scan of the
                 // operator's plans/ dir, pushing each plan's parsed work-unit
                 // to coord's /coord/work-units API (edge-triggered, idempotent,
-                // loud conflict surfacing). Opt-in + operator-private: no-ops
-                // unless QONTINUI_PLAN_ADAPTER_DIR is set AND a coord base is
-                // configured, so a plain fleet runner never scans. See
+                // loud conflict surfacing). Opt-in: no-ops unless a plans dir
+                // is configured (the `paths.plans_dir` setting, or the
+                // QONTINUI_PLAN_ADAPTER_DIR env override) AND a coord base is
+                // configured, so a runner with the markdown-plan tier off
+                // never scans. The setting is read here because the settings
+                // store lives in this binary, not the lib crate. See
                 // `plan_workunit_adapter::trigger`.
-                qontinui_runner_lib::plan_workunit_adapter::trigger::spawn_if_configured();
+                qontinui_runner_lib::plan_workunit_adapter::trigger::spawn_if_configured(
+                    config_facade::get_setting::<settings::PathSettings>().plans_dir,
+                );
                 // Park this thread's runtime forever so the spawned
                 // interval task keeps ticking for the runner's lifetime.
                 std::future::pending::<()>().await;

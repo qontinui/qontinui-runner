@@ -46,4 +46,7 @@ pub use parser::{
     parse_work_unit, slug_from_filename, ParsedPhase, ParsedWorkUnit, PlanConvention,
 };
 pub use push::{push_work_unit, HttpWorkUnitSink, PushOutcome, WorkUnitSink};
-pub use trigger::{adapter_metrics, spawn_if_configured, MetricsSnapshot, ReconcileSummary};
+pub use trigger::{
+    adapter_metrics, resolve_plans_dir, resolve_plans_dir_with_source, spawn_if_configured,
+    MetricsSnapshot, PlansDirSource, ReconcileSummary, PLAN_ADAPTER_DIR_ENV,
+};

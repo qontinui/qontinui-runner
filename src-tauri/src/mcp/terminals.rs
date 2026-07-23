@@ -161,17 +161,11 @@ pub async fn create_terminal_handler(
     )
     .await;
 
-    // Phase 2c — carry `QONTINUI_SESSION_WORKTREES` (all materialized sibling
-    // worktrees) onto the PTY, derived from the live context before it is
-    // parked on the session. `None` (no ctx / single-or-zero worktree) → no env.
-    let extra_env = isolated_ctx.as_ref().and_then(|ctx| {
-        ctx.session_worktrees_env_value().map(|v| {
-            vec![(
-                crate::agent_worktree::isolated_edit::SESSION_WORKTREES_ENV.to_string(),
-                v,
-            )]
-        })
-    });
+    // The shared session-env contribution (`QONTINUI_SESSION_WORKTREES` + the
+    // configured plan directories), derived from the live context before it is
+    // parked on the session; each var is omitted when it does not resolve.
+    // See `agent_worktree::session_env`.
+    let extra_env = crate::agent_worktree::session_env::session_extra_env(isolated_ctx.as_ref());
 
     match terminal_manager.create(
         request.title,
