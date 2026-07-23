@@ -57,6 +57,7 @@
 //! has fully absorbed the old surface.
 
 pub mod claude_hook;
+pub mod claude_session_registry;
 pub mod coord_sync;
 pub mod dual_write;
 pub mod handoff;

@@ -94,7 +94,7 @@ export interface UsePastSessionsResult {
  * `[]` for anything unexpected: consumers iterate this value during render, so
  * a non-array here would throw and take the whole panel down with it.
  */
-export function extractSessions(data: unknown): PastSession[] {
+function extractSessions(data: unknown): PastSession[] {
   if (Array.isArray(data)) return data as PastSession[];
   if (data && typeof data === "object") {
     const inner = (data as { sessions?: unknown }).sessions;

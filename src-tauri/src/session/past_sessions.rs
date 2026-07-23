@@ -136,7 +136,7 @@ pub struct PastSessionsOpts {
 /// `qontinui→clq`, `tiohorst→clt`); an unrecognized `.claude-<x>` keeps `<x>`
 /// as the label with the generic `claude` wrapper, and a config dir with no
 /// `.claude-<x>` suffix (or none at all) is `unknown`/`claude`.
-fn account_from_config_dir(config_dir: Option<&str>) -> PastSessionAccount {
+pub(crate) fn account_from_config_dir(config_dir: Option<&str>) -> PastSessionAccount {
     let acct = |label: &str, wrapper: &str| PastSessionAccount {
         label: label.to_string(),
         wrapper: wrapper.to_string(),
