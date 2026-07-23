@@ -1313,7 +1313,14 @@ impl SessionLifecycleStore {
     /// The same gate covers the open-stale path: a not-seen-in-7d row whose
     /// terminal is still alive is a liveness-tracking gap to surface, not
     /// garbage to silently delete. Retention clocks start mattering only once
-    /// the terminal itself is gone. Atomic-writes only if something changed.
+    /// the terminal itself is gone.
+    ///
+    /// The "recorded then closed" proof needs only the NEWEST closed row per
+    /// live terminal, so only that row is exempt from retention; older closed
+    /// rows under the same live terminal age out normally. Without this bound
+    /// a long-lived terminal hosting many sequential claude runs would retain
+    /// (and rewrite) every closed row for the primary's whole uptime.
+    /// Atomic-writes only if something changed.
     pub fn prune(&self, now: i64, live_terminal_ids: &HashSet<String>) {
         let snapshot = {
             let mut m = match self.map.lock() {
@@ -1323,16 +1330,42 @@ impl SessionLifecycleStore {
                     return;
                 }
             };
+            // Newest closed_at per live terminal — the one closed row per
+            // terminal the liveness gate keeps unconditionally.
+            let mut newest_closed: HashMap<&str, i64> = HashMap::new();
+            for rec in m.values() {
+                if rec.state == "closed" && live_terminal_ids.contains(&rec.terminal_id) {
+                    if let Some(closed_at) = rec.closed_at {
+                        let e = newest_closed.entry(rec.terminal_id.as_str()).or_insert(closed_at);
+                        *e = (*e).max(closed_at);
+                    }
+                }
+            }
+            let newest_closed: HashMap<String, i64> = newest_closed
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect();
             let before = m.len();
             m.retain(|_, rec| {
-                // A record whose terminal is STILL LIVE is never pruned —
-                // it must outlive its terminal, whatever its state or age.
-                if live_terminal_ids.contains(&rec.terminal_id) {
+                let terminal_live = live_terminal_ids.contains(&rec.terminal_id);
+                // A non-closed record whose terminal is STILL LIVE is never
+                // pruned — it must outlive its terminal, whatever its age.
+                if terminal_live && rec.state != "closed" {
                     return true;
                 }
                 if rec.state == "closed" {
                     match rec.closed_at {
-                        Some(closed_at) => now - closed_at <= CLOSED_RETENTION_MS,
+                        Some(closed_at) => {
+                            // Live terminal: its newest closed row is the
+                            // recorded-then-closed proof — exempt from
+                            // retention. Older siblings age out normally.
+                            if terminal_live
+                                && newest_closed.get(&rec.terminal_id) == Some(&closed_at)
+                            {
+                                return true;
+                            }
+                            now - closed_at <= CLOSED_RETENTION_MS
+                        }
                         // Closed without a timestamp — keep (shouldn't happen).
                         None => true,
                     }
@@ -2955,14 +2988,18 @@ mod tests {
 
         let mut closed_live = rec("closed-live-term");
         closed_live.terminal_id = "term-live".to_string();
+        let mut closed_live_older = rec("closed-live-term-older");
+        closed_live_older.terminal_id = "term-live".to_string();
         let mut closed_gone = rec("closed-gone-term");
         closed_gone.terminal_id = "term-gone".to_string();
         let mut open_live = rec("open-live-term");
         open_live.terminal_id = "term-live".to_string();
         store.record_open(closed_live);
+        store.record_open(closed_live_older);
         store.record_open(closed_gone);
         store.record_open(open_live);
         store.record_close("closed-live-term", "pty-exit");
+        store.record_close("closed-live-term-older", "pty-exit");
         store.record_close("closed-gone-term", "pty-exit");
 
         let now = Utc::now().timestamp_millis();
@@ -2973,6 +3010,10 @@ mod tests {
                 serde_json::from_slice(&raw).unwrap();
             m.get_mut("closed-live-term").unwrap().closed_at =
                 Some(now - CLOSED_RETENTION_MS - 1_000);
+            // An OLDER closed sibling under the same live terminal — only the
+            // newest closed row per live terminal is retention-exempt.
+            m.get_mut("closed-live-term-older").unwrap().closed_at =
+                Some(now - CLOSED_RETENTION_MS - 2_000);
             m.get_mut("closed-gone-term").unwrap().closed_at =
                 Some(now - CLOSED_RETENTION_MS - 1_000);
             m.get_mut("open-live-term").unwrap().last_seen_at = now - OPEN_STALE_MS - 1_000;
@@ -2987,7 +3028,11 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert!(
             m.contains_key("closed-live-term"),
-            "closed row survives while its terminal lives"
+            "newest closed row survives while its terminal lives"
+        );
+        assert!(
+            !m.contains_key("closed-live-term-older"),
+            "older closed sibling under the same live terminal ages out"
         );
         assert!(
             !m.contains_key("closed-gone-term"),
