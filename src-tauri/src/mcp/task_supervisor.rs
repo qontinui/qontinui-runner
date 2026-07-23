@@ -24,7 +24,7 @@
 use std::time::Duration;
 
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Base backoff before the first respawn after a death.
 const INITIAL_RESPAWN_BACKOFF: Duration = Duration::from_secs(1);
@@ -62,6 +62,43 @@ where
         INITIAL_RESPAWN_BACKOFF,
         MAX_RESPAWN_BACKOFF,
         HEALTHY_RUN,
+        make_run,
+    ))
+}
+
+/// [`spawn_supervised`] for PROCESS-LIFETIME loops that have no shutdown
+/// signal (the agent-runtime delivery tasks: the coord WS spawn-request
+/// subscriber and the continuation backstop poll). Same supervision engine
+/// ([`supervise_loop`]), but:
+///
+/// - no `shutdown_rx` — the loop is supposed to run until process exit, so
+///   the supervisor holds a watch channel that is never signalled (its sender
+///   is intentionally leaked);
+/// - the backoff windows are the caller's, since these coord-facing loops
+///   want a slower ladder than the local relay/refresher defaults.
+pub(crate) fn spawn_supervised_forever<F, Fut>(
+    name: &'static str,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+    healthy_run: Duration,
+    make_run: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // Never signalled AND never dropped: a dropped sender would complete
+    // `shutdown_rx.changed()` with an error during the backoff select, which
+    // the supervisor treats as a shutdown. Leak it so the channel stays open
+    // for the process lifetime (one leaked sender per supervised task).
+    std::mem::forget(shutdown_tx);
+    tokio::spawn(supervise_loop(
+        name,
+        shutdown_rx,
+        initial_backoff,
+        max_backoff,
+        healthy_run,
         make_run,
     ))
 }
@@ -110,11 +147,20 @@ async fn supervise_loop<F, Fut>(
                 "{name} loop returned without a shutdown signal after {:.1}s — respawning",
                 started.elapsed().as_secs_f64()
             ),
-            Err(_panic) => warn!(
-                "{name} loop PANICKED after {:.1}s — respawning (it would otherwise stay dead \
-                 until a runner restart)",
-                started.elapsed().as_secs_f64()
-            ),
+            Err(panic_payload) => {
+                // Surface the payload — a bare "panicked" line made these
+                // deaths near-undiagnosable from logs alone.
+                let msg = panic_payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                error!(
+                    "{name} loop PANICKED after {:.1}s: {msg} — respawning (it would \
+                     otherwise stay dead until a runner restart)",
+                    started.elapsed().as_secs_f64()
+                );
+            }
         }
 
         // A loop that ran healthy for a while before dying resets the backoff;
@@ -284,6 +330,48 @@ mod tests {
         );
         assert_eq!(last_seen.load(Ordering::SeqCst), 7);
         assert_eq!(runs.load(Ordering::SeqCst), 3);
+    }
+
+    /// The forever variant (no shutdown channel) respawns a panicking loop —
+    /// the agent-runtime delivery-task wiring. It has no clean exit by design,
+    /// so the test observes enough respawns then aborts the supervisor.
+    #[tokio::test]
+    async fn forever_variant_respawns_after_panic() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let (done_tx, done_rx) = watch::channel(false);
+        let runs2 = runs.clone();
+
+        let supervisor = spawn_supervised_forever(
+            "test-forever",
+            FAST_INITIAL,
+            FAST_MAX,
+            FAST_HEALTHY,
+            move || {
+                let runs = runs2.clone();
+                let done_tx = done_tx.clone();
+                async move {
+                    let n = runs.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n >= 3 {
+                        let _ = done_tx.send(true);
+                        // Park: from here on the loop is "healthy forever".
+                        std::future::pending::<()>().await;
+                    }
+                    panic!("boom #{n} (test panic — expected in output)");
+                }
+            },
+        );
+
+        let mut done = done_rx;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !*done.borrow_and_update() {
+                done.changed().await.expect("done channel closed");
+            }
+        })
+        .await
+        .expect("forever supervisor should have respawned the loop to run #3");
+
+        assert!(runs.load(Ordering::SeqCst) >= 3, "initial run + 2 respawns");
+        supervisor.abort();
     }
 
     /// A shutdown signalled while the loop is dying repeatedly is observed and

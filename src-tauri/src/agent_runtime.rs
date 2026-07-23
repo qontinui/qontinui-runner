@@ -613,11 +613,54 @@ pub fn spawn_runtime() {
     // exit-hook trigger never fired, a slot freed between WS connects.
     // Spawned independently of the WS pump so it survives subscription flaps.
     spawn_continuation_backstop_poll(device_id);
-    tokio::spawn(async move {
+    // Supervised (panic net): a panic anywhere inside the WS pump used to kill
+    // this bare task silently and permanently disable push delivery for the
+    // process lifetime. The supervisor restarts it with backoff instead.
+    spawn_supervised_delivery("spawn-request-subscriber", move || async move {
         if let Err(e) = subscribe_to_spawn_requests(device_id).await {
             error!("agent_runtime: subscriber exited with error: {e:#}");
         }
     });
+}
+
+/// Initial (and reset) restart backoff for a supervised delivery task.
+const SUPERVISED_BACKOFF_BASE: Duration = Duration::from_secs(5);
+
+/// Capped maximum restart backoff for a supervised delivery task.
+const SUPERVISED_BACKOFF_CAP: Duration = Duration::from_secs(300);
+
+/// A supervised delivery task that ran at least this long before dying counts
+/// as a HEALTHY run: its next restart resets the backoff to
+/// [`SUPERVISED_BACKOFF_BASE`] instead of continuing the doubling ladder.
+const SUPERVISED_HEALTHY_RUN: Duration = Duration::from_secs(600);
+
+/// Spawn a long-lived delivery task under a restart supervisor (panic net).
+///
+/// Both continuation-delivery tasks (the WS subscriber and the periodic
+/// backstop poll) used to be bare `tokio::spawn`s with dropped `JoinHandle`s:
+/// a single panic anywhere in their bodies killed the task SILENTLY and
+/// PERMANENTLY — no more push frames / no more backstop polls for the process
+/// lifetime, with nothing in the logs but the default panic print. This is an
+/// OUTER panic net only — each task's internal reconnect / interval loop is
+/// unchanged.
+///
+/// Thin wiring over the crate's ONE supervision idiom
+/// ([`crate::mcp::task_supervisor`]) in its process-lifetime (no shutdown
+/// signal) form, with the delivery ladder: base 5s, doubling, cap 300s, reset
+/// after a 10-min healthy run — slower than the local relay/refresher
+/// defaults because every restart here re-hits coord.
+fn spawn_supervised_delivery<F, Fut>(name: &'static str, make_run: F)
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let _handle = crate::mcp::task_supervisor::spawn_supervised_forever(
+        name,
+        SUPERVISED_BACKOFF_BASE,
+        SUPERVISED_BACKOFF_CAP,
+        SUPERVISED_HEALTHY_RUN,
+        make_run,
+    );
 }
 
 /// The base (and reset) reconnect back-off, in milliseconds.
@@ -855,7 +898,10 @@ async fn handle_message(txt: &str, device_id: uuid::Uuid) -> anyhow::Result<()> 
                 }
             } else if envelope_is_gate_continuation(&value) {
                 match parse_gate_continuation_payload(&value) {
-                    Some(payload) => dispatch_gate_continuation(payload, device_id),
+                    Some(payload) => {
+                        // Outcome counts matter only on the poll path.
+                        let _ = dispatch_gate_continuation(payload, device_id);
+                    }
                     None => warn!(
                         "agent_runtime: gate-continuation envelope on {channel} had no \
                          parseable payload/body"
@@ -1173,6 +1219,38 @@ fn decide_spawn(status: u16, body: &str) -> SpawnDecision {
     }
 }
 
+/// One-shot marker so a recovered lock poisoning is reported loudly exactly
+/// once per process (recoveries after the first would be pure log noise —
+/// every subsequent acquisition of a poisoned mutex re-observes the poison).
+static LOCK_POISON_REPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Lock a continuation-runtime `std::sync::Mutex`, RECOVERING from poisoning
+/// instead of propagating the panic.
+///
+/// These registries (`dispatched_gate_ids`, `dispatched_dispatch_ids`,
+/// `continuation_sessions`, the deferred-stamp rate-limit map) hold plain
+/// collections whose contents are valid even if a holder panicked mid-update —
+/// recovery is always safe. A bare `.lock().unwrap()` here turned ONE panic
+/// while holding the lock into a cascading panic at EVERY later delivery (a
+/// permanently-dead continuation consumer); with this helper the poisoning is
+/// loud (one `error!`) instead of lethal.
+fn lock_recover<'a, T>(
+    mutex: &'a std::sync::Mutex<T>,
+    what: &'static str,
+) -> std::sync::MutexGuard<'a, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        if !LOCK_POISON_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            error!(
+                "agent_runtime: recovered a POISONED {what} lock — a prior holder \
+                 panicked mid-update; continuing with the recovered state \
+                 (reported once per process)"
+            );
+        }
+        poisoned.into_inner()
+    })
+}
+
 /// Process-wide set of gate_ids whose continuation we have ALREADY dispatched.
 ///
 /// At-least-once delivery means a single continuation can arrive via BOTH the WS
@@ -1194,7 +1272,22 @@ fn dispatched_gate_ids() -> &'static std::sync::Mutex<std::collections::HashSet<
 /// claimed (caller must skip — a duplicate delivery). Insert-and-test under one
 /// lock so two concurrent deliveries can't both win.
 fn claim_gate_dispatch(gate_id: uuid::Uuid) -> bool {
-    dispatched_gate_ids().lock().unwrap().insert(gate_id)
+    lock_recover(dispatched_gate_ids(), "dispatched_gate_ids").insert(gate_id)
+}
+
+/// Release an in-process gate-dispatch claim ([`claim_gate_dispatch`]).
+///
+/// **The load-bearing half of the delivery-stall fix.** The dedupe set's ONLY
+/// purpose is the WS+poll double-delivery race: an id must stay claimed only
+/// while a dispatch is IN-FLIGHT or after the continuation was actually
+/// CONSUMED on coord (the consume claim POSTed). Every LOCAL skip that leaves
+/// the row pending on coord (AtCap, DuplicateAnchor, device-mismatch, an `Err`
+/// before/around the consume claim) must release, or the skip is permanent for
+/// the process lifetime: the backstop poll re-lists the row every tick and the
+/// dispatcher drops it at the dedupe check forever — the exact mechanism that
+/// stranded 51 continuations pending-with-null-outcomes over 2 days.
+fn release_gate_dispatch(gate_id: uuid::Uuid) {
+    lock_recover(dispatched_gate_ids(), "dispatched_gate_ids").remove(&gate_id);
 }
 
 /// Process-wide set of work-unit `dispatch_id`s whose continuation we have
@@ -1217,10 +1310,30 @@ fn dispatched_dispatch_ids() -> &'static std::sync::Mutex<std::collections::Hash
 /// claimed (a duplicate delivery — caller must skip). Insert-and-test under one
 /// lock, exactly like [`claim_gate_dispatch`].
 fn claim_dispatch_dispatch(dispatch_id: uuid::Uuid) -> bool {
-    dispatched_dispatch_ids()
-        .lock()
-        .unwrap()
-        .insert(dispatch_id)
+    lock_recover(dispatched_dispatch_ids(), "dispatched_dispatch_ids").insert(dispatch_id)
+}
+
+/// Release an in-process unit-dispatch claim ([`claim_dispatch_dispatch`]) —
+/// the sibling of [`release_gate_dispatch`] for the work-unit path. Load
+/// bearing for the unit contract's at-least-once promise: a failed spawn is
+/// deliberately left un-consumed so coord re-lists it, but WITHOUT this
+/// release the re-listed row would be dropped at the in-process dedupe check
+/// forever (the same permanent-deferral defect as the gate path).
+fn release_dispatch_dispatch(dispatch_id: uuid::Uuid) {
+    lock_recover(dispatched_dispatch_ids(), "dispatched_dispatch_ids").remove(&dispatch_id);
+}
+
+/// Release whichever in-process dedupe claim the dispatcher took for this
+/// continuation, per its [`ConsumeTarget`]. Called from every LOCAL-skip exit
+/// of [`run_gate_continuation_inner`] that leaves the row pending on coord
+/// (see [`release_gate_dispatch`] for the invariant). [`ConsumeTarget::None`]
+/// (legacy, no id) never claimed, so there is nothing to release.
+fn release_local_dispatch_claim(consume_target: ConsumeTarget) {
+    match consume_target {
+        ConsumeTarget::Gate(gate_id) => release_gate_dispatch(gate_id),
+        ConsumeTarget::Dispatch(dispatch_id) => release_dispatch_dispatch(dispatch_id),
+        ConsumeTarget::None => {}
+    }
 }
 
 // =============================================================================
@@ -1300,14 +1413,30 @@ fn continuation_addressed_to_self(
 }
 
 /// Drop registry entries whose terminal is no longer live, using `is_live`
-/// (`terminal_id -> bool`). Called under the registry lock by the guard below
-/// so the count and the anchor_key scan only ever see currently-running
-/// sessions. Returns the retained entries' count.
-fn prune_dead_continuations(
-    map: &mut std::collections::HashMap<String, ContinuationSession>,
-    is_live: &dyn Fn(&str) -> bool,
-) {
-    map.retain(|tid, _| is_live(tid));
+/// (`terminal_id -> bool`).
+///
+/// **Never runs `is_live` under the registry lock.** `is_live` reaches into
+/// Tauri-managed state (`live_terminal_predicate` → `try_state` →
+/// `TerminalManager::is_alive()`) — the highest-probability
+/// panic-while-holding-the-lock site. Instead: snapshot the terminal ids under
+/// the lock, RELEASE, evaluate liveness on the snapshot, then re-acquire and
+/// remove the dead ids. An entry registered between snapshot and re-acquire is
+/// simply not liveness-tested this round (it is freshly spawned, i.e. live);
+/// an entry removed concurrently makes the removal a no-op.
+fn prune_dead_continuations(is_live: &dyn Fn(&str) -> bool) {
+    let ids: Vec<String> = lock_recover(continuation_sessions(), "continuation_sessions")
+        .keys()
+        .cloned()
+        .collect();
+    // Lock released — evaluate liveness on the snapshot only.
+    let dead: Vec<String> = ids.into_iter().filter(|tid| !is_live(tid)).collect();
+    if dead.is_empty() {
+        return;
+    }
+    let mut map = lock_recover(continuation_sessions(), "continuation_sessions");
+    for tid in &dead {
+        map.remove(tid);
+    }
 }
 
 /// Outcome of the pre-spawn continuation guard (P3 + P4).
@@ -1333,8 +1462,10 @@ fn evaluate_continuation_guard(
     anchor_key: Option<&str>,
     is_live: &dyn Fn(&str) -> bool,
 ) -> ContinuationGuard {
-    let mut map = continuation_sessions().lock().unwrap();
-    prune_dead_continuations(&mut map, is_live);
+    // Prune runs `is_live` OUTSIDE the registry lock (see its doc); the P3/P4
+    // scan below then runs under a freshly-acquired lock.
+    prune_dead_continuations(is_live);
+    let map = lock_recover(continuation_sessions(), "continuation_sessions");
 
     // P3: a LIVE session already exists for this anchor_key → dedup.
     if let Some(anchor) = anchor_key {
@@ -1359,7 +1490,7 @@ fn evaluate_continuation_guard(
 /// `create_terminal_session_backend` succeeds). The entry is reaped lazily by
 /// [`prune_dead_continuations`] the next time the guard runs.
 fn register_continuation_session(terminal_id: String, anchor_key: Option<String>) {
-    continuation_sessions().lock().unwrap().insert(
+    lock_recover(continuation_sessions(), "continuation_sessions").insert(
         terminal_id.clone(),
         ContinuationSession {
             terminal_id,
@@ -1494,23 +1625,32 @@ fn continuation_backstop_poll_secs() -> u64 {
 /// Spawned once per process from [`spawn_runtime`]. Independent of the WS pump
 /// so it keeps draining even while the subscription is flapping.
 fn spawn_continuation_backstop_poll(device_id: uuid::Uuid) {
-    tokio::spawn(async move {
-        let secs = continuation_backstop_poll_secs();
-        let mut interval = tokio::time::interval(Duration::from_secs(secs));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Skip the immediate first tick — the WS-connect catch-up poll
-        // (`poll_pending_continuations` on connect) covers startup.
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            debug!(
-                "agent_runtime: backstop poll firing (every {secs}s, always armed) \
-                 for device_id={device_id}"
-            );
-            poll_pending_continuations(device_id).await;
-            poll_pending_unit_dispatches(device_id).await;
-        }
+    // Supervised (panic net): a panic inside one tick used to kill this bare
+    // task silently — no more backstop polls for the process lifetime. See
+    // [`spawn_supervised_delivery`]; the interval loop itself is unchanged.
+    spawn_supervised_delivery("continuation-backstop-poll", move || {
+        continuation_backstop_poll_loop(device_id)
     });
+}
+
+/// The backstop poll's interval loop body (runs forever; restarted by the
+/// supervisor if it ever panics or returns).
+async fn continuation_backstop_poll_loop(device_id: uuid::Uuid) {
+    let secs = continuation_backstop_poll_secs();
+    let mut interval = tokio::time::interval(Duration::from_secs(secs));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Skip the immediate first tick — the WS-connect catch-up poll
+    // (`poll_pending_continuations` on connect) covers startup.
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        debug!(
+            "agent_runtime: backstop poll firing (every {secs}s, always armed) \
+             for device_id={device_id}"
+        );
+        poll_pending_continuations(device_id).await;
+        poll_pending_unit_dispatches(device_id).await;
+    }
 }
 
 /// Liveness predicate for the continuation guard, backed by the process-global
@@ -1633,7 +1773,14 @@ enum ConsumeTarget {
 ///
 /// Absent `gate_id` (legacy coord) → no dedupe-by-id, no claim, no outcome:
 /// dispatch exactly once via [`spawn_gate_continuation_task`] (unchanged).
-fn dispatch_gate_continuation(payload: GateContinuationPayload, device_id: uuid::Uuid) {
+///
+/// Returns the synchronous fast-path outcome so the poll path can aggregate
+/// honest per-run counts for the coord self-report
+/// ([`post_continuation_poll_report`]); the WS fast-path ignores it.
+fn dispatch_gate_continuation(
+    payload: GateContinuationPayload,
+    device_id: uuid::Uuid,
+) -> DispatchOutcome {
     // Instance-targeting self-gate (primary-only by default). A continuation
     // spawns on EXACTLY the instance it is addressed to; an absent
     // `target_instance_name` addresses the PRIMARY (`instance_name() == None`).
@@ -1656,7 +1803,7 @@ fn dispatch_gate_continuation(payload: GateContinuationPayload, device_id: uuid:
             crate::instance::instance_name(),
             payload.target_instance_name,
         );
-        return;
+        return DispatchOutcome::NotAddressedToSelf;
     }
     if let Some(gate_id) = payload.gate_id {
         // Synchronous fast-path: drop an in-process duplicate before any I/O.
@@ -1665,7 +1812,7 @@ fn dispatch_gate_continuation(payload: GateContinuationPayload, device_id: uuid:
                 "agent_runtime: gate-continuation gate_id={gate_id} already dispatched; \
                  skipping duplicate"
             );
-            return;
+            return DispatchOutcome::AlreadyDispatched;
         }
         // One task owns the whole claim → spawn → outcome handshake. The #469
         // local guards run FIRST inside `run_gate_continuation_inner`, then the
@@ -1676,8 +1823,13 @@ fn dispatch_gate_continuation(payload: GateContinuationPayload, device_id: uuid:
                 run_gate_continuation_inner(payload, device_id, ConsumeTarget::Gate(gate_id)).await
             {
                 error!("agent_runtime: run_gate_continuation (gate_id={gate_id}) failed: {e:#}");
+                // An errored run is no longer in-flight and posted no successful
+                // consume outcome path we can rely on — release the in-process
+                // claim so a re-listed row can retry (see release_gate_dispatch).
+                release_gate_dispatch(gate_id);
             }
         });
+        DispatchOutcome::Dispatched
     } else if let Some(dispatch_id) = payload.dispatch_id {
         // Work-unit DAG dispatch: reuses the `gate_continuation` spawn frame but
         // is keyed on `dispatch_id` (no gate_id). Applies on BOTH the live WS
@@ -1690,7 +1842,7 @@ fn dispatch_gate_continuation(payload: GateContinuationPayload, device_id: uuid:
                 "agent_runtime: unit-dispatch dispatch_id={dispatch_id} already dispatched; \
                  skipping duplicate"
             );
-            return;
+            return DispatchOutcome::AlreadyDispatched;
         }
         // One task owns spawn → consume-ack. Unlike the gate path there is NO
         // claim-before-spawn: the scheduler's `metadata.dispatched_at` CAS is the
@@ -1709,13 +1861,33 @@ fn dispatch_gate_continuation(payload: GateContinuationPayload, device_id: uuid:
                 error!(
                     "agent_runtime: run_gate_continuation (dispatch_id={dispatch_id}) failed: {e:#}"
                 );
+                // A failed spawn is deliberately left un-consumed so coord
+                // re-lists it — the re-listed row must not be dropped at the
+                // in-process dedupe forever (see release_dispatch_dispatch).
+                release_dispatch_dispatch(dispatch_id);
             }
         });
+        DispatchOutcome::Dispatched
     } else {
         // Legacy coord: neither gate_id nor dispatch_id → no dedupe-by-id and no
         // claim/outcome. Dispatch once with no coord handshake (unchanged).
         spawn_gate_continuation_task(payload, device_id);
+        DispatchOutcome::Dispatched
     }
+}
+
+/// Synchronous fast-path outcome of [`dispatch_gate_continuation`] — what the
+/// dispatcher decided BEFORE any I/O. Consumed by the poll path to build the
+/// per-run self-report counts; the WS fast-path ignores it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispatchOutcome {
+    /// A run task was spawned (or the legacy no-id dispatch fired): the id (if
+    /// any) was NEWLY claimed by this delivery.
+    Dispatched,
+    /// Dropped at the in-process dedupe — this id is in-flight or consumed.
+    AlreadyDispatched,
+    /// Not addressed to this instance (the addressed instance spawns it).
+    NotAddressedToSelf,
 }
 
 /// Poll coord for gate-continuation dispatches that landed while this runner was
@@ -1769,18 +1941,117 @@ async fn poll_pending_continuations(device_id: uuid::Uuid) {
     };
     if body.pending.is_empty() {
         debug!("agent_runtime: pending-continuations poll: none pending for device_id={device_id}");
+        // Still self-report: a zero-listed report every tick is the liveness
+        // evidence coord uses to tell "poll running, queue empty" apart from
+        // "poll dead" (the failure mode this plan exists for).
+        post_continuation_poll_report(device_id, PollRunCounts::default()).await;
         return;
     }
     info!(
         "agent_runtime: pending-continuations poll: {} pending for device_id={device_id} — replaying",
         body.pending.len()
     );
+    let mut counts = PollRunCounts {
+        listed_n: body.pending.len(),
+        ..Default::default()
+    };
     for row in body.pending {
         // The row's gate_id is authoritative; stamp it onto the payload so the
         // shared seam dedupes + acks even if coord omitted it inside `payload`.
         let mut payload = row.payload;
         payload.gate_id = Some(row.gate_id);
-        dispatch_gate_continuation(payload, device_id);
+        match dispatch_gate_continuation(payload, device_id) {
+            DispatchOutcome::Dispatched => counts.dispatched_n += 1,
+            DispatchOutcome::AlreadyDispatched => counts.already_dispatched += 1,
+            DispatchOutcome::NotAddressedToSelf => counts.not_addressed_to_self += 1,
+        }
+    }
+    post_continuation_poll_report(device_id, counts).await;
+}
+
+/// Aggregate counts from one [`poll_pending_continuations`] run, feeding the
+/// coord self-report. `listed_n` = rows fetched; `dispatched_n` = ids NEWLY
+/// claimed this run; the two skip counters are the dedupe-drops and the
+/// not-addressed-to-this-instance drops (skipped = listed − dispatched).
+#[derive(Debug, Default, Clone, Copy)]
+struct PollRunCounts {
+    listed_n: usize,
+    dispatched_n: usize,
+    already_dispatched: usize,
+    not_addressed_to_self: usize,
+}
+
+/// Wire body for `POST /coord/agents/continuation-poll-report`.
+#[derive(Debug, Serialize)]
+struct ContinuationPollReportBody {
+    device_id: uuid::Uuid,
+    listed_n: usize,
+    dispatched_n: usize,
+    skipped_n: usize,
+    skip_reasons: std::collections::BTreeMap<&'static str, usize>,
+}
+
+impl ContinuationPollReportBody {
+    fn new(device_id: uuid::Uuid, counts: PollRunCounts) -> Self {
+        let mut skip_reasons = std::collections::BTreeMap::new();
+        if counts.already_dispatched > 0 {
+            skip_reasons.insert("already_dispatched", counts.already_dispatched);
+        }
+        if counts.not_addressed_to_self > 0 {
+            skip_reasons.insert("not_addressed_to_self", counts.not_addressed_to_self);
+        }
+        Self {
+            device_id,
+            listed_n: counts.listed_n,
+            dispatched_n: counts.dispatched_n,
+            skipped_n: counts.listed_n.saturating_sub(counts.dispatched_n),
+            skip_reasons,
+        }
+    }
+}
+
+/// POST the per-run poll self-report to coord
+/// (`POST /coord/agents/continuation-poll-report`). Pure observability: lets
+/// coord tell a live-but-empty poll apart from a dead poll loop, and surfaces
+/// a runner that lists rows every tick but dispatches none (the permanent
+/// dedupe-drop stall this plan fixes). **Best-effort, never affects
+/// delivery**: a 404 (coord's route not deployed yet — parallel phase) is
+/// `debug!`; any other non-2xx or transport error is one `warn!`.
+async fn post_continuation_poll_report(device_id: uuid::Uuid, counts: PollRunCounts) {
+    let Some(base) = coord_http_base() else {
+        return;
+    };
+    let url = format!("{base}/coord/agents/continuation-poll-report");
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("agent_runtime: poll-report client build failed (continuing): {e:#}");
+            return;
+        }
+    };
+    let body = ContinuationPollReportBody::new(device_id, counts);
+    match client.post(&url).json(&body).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            debug!(
+                "agent_runtime: poll self-report posted (listed={} dispatched={} skipped={})",
+                body.listed_n, body.dispatched_n, body.skipped_n
+            );
+        }
+        Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+            debug!(
+                "agent_runtime: poll-report POST 404 (endpoint not deployed yet; continuing)"
+            );
+        }
+        Ok(resp) => {
+            warn!(
+                "agent_runtime: poll-report POST returned {} (continuing)",
+                resp.status()
+            );
+        }
+        Err(e) => warn!("agent_runtime: poll-report POST failed (continuing): {e:#}"),
     }
 }
 
@@ -1889,7 +2160,8 @@ async fn poll_pending_unit_dispatches(device_id: uuid::Uuid) {
         // coord omitted it inside `payload`.
         let mut payload = row.payload;
         payload.dispatch_id = Some(row.dispatch_id);
-        dispatch_gate_continuation(payload, device_id);
+        // Outcome counts are aggregated only on the gate-continuations poll.
+        let _ = dispatch_gate_continuation(payload, device_id);
     }
 }
 
@@ -1980,6 +2252,100 @@ async fn post_continuation_outcome(
         }
         Err(e) => warn!(
             "agent_runtime: continuation-outcome POST gate_id={gate_id} failed (continuing): {e:#}"
+        ),
+    }
+}
+
+/// Minimum interval between deferred-stamp posts for the SAME gate id. The
+/// backstop re-lists a deferred row every ~300s; without this limit a 2-day
+/// AtCap stall would post ~576 stamps per gate.
+const CONTINUATION_DEFERRED_STAMP_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Per-gate last-posted times for the deferred stamp (in-process rate limit).
+fn deferred_stamp_last_post(
+) -> &'static std::sync::Mutex<std::collections::HashMap<uuid::Uuid, std::time::Instant>> {
+    static LAST: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<uuid::Uuid, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    LAST.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Decide-and-record: should a deferred stamp be posted for `gate_id` at
+/// `now`? `true` at most once per [`CONTINUATION_DEFERRED_STAMP_INTERVAL`] per
+/// gate (and records `now` as the last post when it says `true`). Takes `now`
+/// as a parameter so the rate-limit window is unit-testable.
+fn should_post_deferred_stamp(gate_id: uuid::Uuid, now: std::time::Instant) -> bool {
+    let mut map = lock_recover(deferred_stamp_last_post(), "deferred_stamp_last_post");
+    if let Some(last) = map.get(&gate_id) {
+        if now.saturating_duration_since(*last) < CONTINUATION_DEFERRED_STAMP_INTERVAL {
+            return false;
+        }
+    }
+    // Opportunistic bound: entries older than the window can never suppress
+    // again — drop them once the map is large so it can't grow unboundedly.
+    if map.len() > 1024 {
+        map.retain(|_, t| now.saturating_duration_since(*t) < CONTINUATION_DEFERRED_STAMP_INTERVAL);
+    }
+    map.insert(gate_id, now);
+    true
+}
+
+/// Wire body for `POST /coord/gates/{gate_id}/continuation-deferred`.
+#[derive(Debug, Clone, Serialize)]
+struct ContinuationDeferredBody {
+    device_id: uuid::Uuid,
+    reason: String,
+}
+
+/// POST the NON-CONSUMING deferred stamp for a locally-skipped continuation
+/// (`POST /coord/gates/{gate_id}/continuation-deferred`, body
+/// `{device_id, reason}` with reason `at_cap:<cap>` /
+/// `duplicate_anchor:<terminal_id>`).
+///
+/// This replaces the AtCap arm's old `report_spawn_failed` lifecycle post,
+/// which polluted the agent-lifecycle channel with fake spawn failures for
+/// rows that were merely deferred. The stamp leaves the gate's continuation
+/// lifecycle untouched (still pending, still re-deliverable) — it only gives
+/// coord an honest, queryable "a runner saw this and deferred it" signal.
+/// Rate-limited per gate via [`should_post_deferred_stamp`] (once per hour).
+/// **Best-effort**: the route may 404 until coord's parallel phase deploys —
+/// ANY non-2xx or transport error is `debug!` and we move on.
+async fn post_continuation_deferred(gate_id: uuid::Uuid, device_id: uuid::Uuid, reason: String) {
+    let Some(base) = coord_http_base() else {
+        return;
+    };
+    let url = format!("{base}/coord/gates/{gate_id}/continuation-deferred");
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            debug!(
+                "agent_runtime: continuation-deferred client build failed \
+                 gate_id={gate_id} (continuing): {e:#}"
+            );
+            return;
+        }
+    };
+    let body = ContinuationDeferredBody { device_id, reason };
+    match client.post(&url).json(&body).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            debug!(
+                "agent_runtime: continuation-deferred posted gate_id={gate_id} reason={}",
+                body.reason
+            );
+        }
+        Ok(resp) => {
+            debug!(
+                "agent_runtime: continuation-deferred POST gate_id={gate_id} returned {} \
+                 (route may not be deployed yet; continuing)",
+                resp.status()
+            );
+        }
+        Err(e) => debug!(
+            "agent_runtime: continuation-deferred POST gate_id={gate_id} failed \
+             (continuing): {e:#}"
         ),
     }
 }
@@ -2111,6 +2477,9 @@ async fn run_gate_continuation_inner(
             "agent_runtime: gate-continuation target_device_id={} != local {device_id}; ignoring",
             payload.target_device_id
         );
+        // Local skip, row left pending on coord → release the in-process claim
+        // (invariant: claimed only while in-flight or after the consume claim).
+        release_local_dispatch_claim(consume_target);
         return Ok(());
     }
 
@@ -2139,10 +2508,24 @@ async fn run_gate_continuation_inner(
             // the anchor_key dedup is a LOCAL guard that fires BEFORE step 2's
             // claim, so we must not burn a coord-side claim on a dispatch the
             // local guard rejected. The ALREADY-LIVE continuation (the one that
-            // won the anchor) owns its own claim+outcome; this re-cleared/dup
-            // gate_id is simply dropped, and the in-process dedupe absorbs any
-            // re-delivery. The deduped gate stays pending on coord (harmless —
-            // its work is the live session) until cancelled or it expires.
+            // won the anchor) owns its own claim+outcome; the deduped gate stays
+            // pending on coord (its work IS the live session) until cancelled or
+            // it expires. Instead, stamp it `continuation-deferred` (non-
+            // consuming, rate-limited hourly) so coord can see WHY it is
+            // pending, and RELEASE the in-process claim — once the anchor's live
+            // session exits, a re-delivery of this same gate_id must be able to
+            // dispatch (before the release, the dedupe set dropped it forever).
+            if let ConsumeTarget::Gate(gate_id) = consume_target {
+                if should_post_deferred_stamp(gate_id, std::time::Instant::now()) {
+                    post_continuation_deferred(
+                        gate_id,
+                        device_id,
+                        format!("duplicate_anchor:{existing_terminal_id}"),
+                    )
+                    .await;
+                }
+            }
+            release_local_dispatch_claim(consume_target);
             return Ok(());
         }
         ContinuationGuard::AtCap(cap) => {
@@ -2150,14 +2533,6 @@ async fn run_gate_continuation_inner(
             // backstop poll (`spawn_continuation_backstop_poll`, always armed)
             // re-fetches it within one interval even if the capacity-freed
             // exit-hook trigger is missed — no per-process arming flag needed.
-            //
-            // The `deferred:` prefix (Resolved Q3) distinguishes a capacity DEFER
-            // (the continuation is intact + pending on coord, re-deliverable once a
-            // slot frees) from a hard spawn failure, so a coord-side consumer can
-            // tell them apart on the agent-LIFECYCLE channel. NOTE: this is the
-            // agent `report_spawn_failed` lifecycle post, NOT the #484 continuation-
-            // outcome channel — the AtCap arm deliberately posts NO continuation
-            // claim/outcome (see below).
             let reason = format!(
                 "deferred: continuation cap ({cap}) reached — re-delivered when a slot frees"
             );
@@ -2165,19 +2540,29 @@ async fn run_gate_continuation_inner(
                 "agent_runtime: gate-continuation refused: {reason} (anchor_key={:?})",
                 payload.anchor_key
             );
-            // No coord "operator must resume" alert path is runner-wirable
-            // (`/coord/alerts` is read-only); `spawn-failed` is the honest,
-            // already-wired fallback. A fresh correlation id (no worktree/agent
-            // was acquired) carries the lifecycle post.
-            //
             // Deliberately NO continuation claim/outcome here (contract item 4):
             // the local cap rejected BEFORE the claim, so we must NOT burn a
             // coord-side claim on a dispatch the cap refused. The continuation
             // stays pending (uncancelled, unconsumed) on coord so it can be
             // re-delivered once a cap slot frees, OR cancelled by the operator /
-            // takeover path. The `spawn-failed` agent post above is the operator
-            // signal; the gate's continuation lifecycle is intentionally untouched.
-            report_spawn_failed(uuid::Uuid::now_v7(), &reason, None, 0, None).await;
+            // takeover path.
+            //
+            // The old `report_spawn_failed` lifecycle post is GONE: it polluted
+            // the agent-lifecycle channel with fake spawn failures for rows that
+            // were merely deferred. The honest signal is the NON-CONSUMING
+            // `continuation-deferred` stamp (rate-limited hourly per gate; the
+            // route may 404 until coord's parallel phase deploys — best-effort).
+            if let ConsumeTarget::Gate(gate_id) = consume_target {
+                if should_post_deferred_stamp(gate_id, std::time::Instant::now()) {
+                    post_continuation_deferred(gate_id, device_id, format!("at_cap:{cap}")).await;
+                }
+            }
+            // CRITICAL (the delivery-stall root fix): release the in-process
+            // dedupe claim. The dispatcher claimed this id BEFORE the guard ran;
+            // without the release an AtCap "deferral" was PERMANENT — the
+            // backstop re-listed the row every tick and the dedupe check dropped
+            // it forever (51 continuations stranded over 2 days).
+            release_local_dispatch_claim(consume_target);
             return Ok(());
         }
     }
@@ -2195,6 +2580,10 @@ async fn run_gate_continuation_inner(
                      (gate_id={gate_id})",
                     reason.as_deref().unwrap_or("(no reason given)")
                 );
+                // Deliberately NOT released: coord answered the consume claim
+                // with 409 cancelled, so the row is TERMINAL there (never
+                // re-listed). Keeping the id claimed cheaply absorbs any
+                // in-flight duplicate delivery of the same cancelled gate.
                 return Ok(());
             }
             SpawnDecision::SpawnDespiteClaimError { cause } => {
@@ -5240,6 +5629,184 @@ mod tests {
             "the SAME uuid as a dispatch_id still wins — separate set"
         );
     }
+
+    /// THE delivery-stall regression: claim → release → claim must succeed
+    /// again. Before `release_gate_dispatch` existed, nothing ever removed an
+    /// id from the dedupe set, so a locally-skipped (AtCap/DuplicateAnchor)
+    /// continuation was dropped at the dedupe check on EVERY subsequent
+    /// re-delivery for the process lifetime.
+    #[test]
+    fn release_gate_dispatch_allows_reclaim() {
+        let gate = uuid::Uuid::now_v7();
+        assert!(claim_gate_dispatch(gate), "first claim wins");
+        assert!(!claim_gate_dispatch(gate), "duplicate is deduped");
+        release_gate_dispatch(gate);
+        assert!(
+            claim_gate_dispatch(gate),
+            "after release, a re-delivery of the SAME gate_id claims again"
+        );
+        assert!(
+            !claim_gate_dispatch(gate),
+            "…and the re-claim dedupes duplicates as usual"
+        );
+        // Releasing an id that was never claimed is a harmless no-op.
+        release_gate_dispatch(uuid::Uuid::now_v7());
+    }
+
+    /// The work-unit sibling: a failed unit spawn is left un-consumed so coord
+    /// re-lists it — the re-listed row must be claimable again after release.
+    #[test]
+    fn release_dispatch_dispatch_allows_reclaim() {
+        let d = uuid::Uuid::now_v7();
+        assert!(claim_dispatch_dispatch(d), "first claim wins");
+        assert!(!claim_dispatch_dispatch(d), "duplicate is deduped");
+        release_dispatch_dispatch(d);
+        assert!(
+            claim_dispatch_dispatch(d),
+            "after release, the re-listed dispatch_id claims again"
+        );
+    }
+
+    /// [`release_local_dispatch_claim`] routes to the right set per target
+    /// (and is a no-op for the legacy no-id target).
+    #[test]
+    fn release_local_dispatch_claim_routes_per_target() {
+        let g = uuid::Uuid::now_v7();
+        let d = uuid::Uuid::now_v7();
+        assert!(claim_gate_dispatch(g));
+        assert!(claim_dispatch_dispatch(d));
+        release_local_dispatch_claim(ConsumeTarget::Gate(g));
+        release_local_dispatch_claim(ConsumeTarget::Dispatch(d));
+        release_local_dispatch_claim(ConsumeTarget::None); // no-op, must not panic
+        assert!(claim_gate_dispatch(g), "gate id was released");
+        assert!(claim_dispatch_dispatch(d), "dispatch id was released");
+    }
+
+    /// End-to-end sequencing of the incident fix at the unit level: a gate id
+    /// claimed by the dispatcher, then rejected AtCap by the guard, is
+    /// RELEASED — so when a slot frees, the next delivery of the SAME gate id
+    /// passes both the dedupe claim and the guard. (Before the fix, step 4's
+    /// claim returned false forever: the primary's 9 boot-drained slots +
+    /// `QONTINUI_CONTINUATION_SESSION_CAP=9` stranded 51 continuations.)
+    #[test]
+    fn atcap_release_lets_same_gate_redispatch_after_slot_frees() {
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "1");
+        let gate = uuid::Uuid::now_v7();
+
+        // Delivery 1: dispatcher claims the id, guard says AtCap (cap full).
+        register_continuation_session("busy-slot".into(), Some("other-anchor".into()));
+        let live_all = |_id: &str| true;
+        assert!(claim_gate_dispatch(gate), "delivery 1 claims the id");
+        assert_eq!(
+            evaluate_continuation_guard(Some("new-anchor"), &live_all),
+            ContinuationGuard::AtCap(1)
+        );
+        // …the AtCap arm releases the in-process claim (the critical fix).
+        release_gate_dispatch(gate);
+
+        // A slot frees (the busy session exits) and the backstop re-lists the
+        // row: the SAME gate id must now claim AND pass the guard.
+        let busy_dead = |id: &str| id != "busy-slot";
+        assert!(
+            claim_gate_dispatch(gate),
+            "re-delivery after the release claims the id again"
+        );
+        assert_eq!(
+            evaluate_continuation_guard(Some("new-anchor"), &busy_dead),
+            ContinuationGuard::Proceed,
+            "freed slot → the deferred continuation finally dispatches"
+        );
+
+        release_gate_dispatch(gate);
+        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
+        clear_continuation_registry();
+    }
+
+    /// The deferred stamp is rate-limited to once per gate per hour, per gate
+    /// id (independent gates don't suppress each other).
+    #[test]
+    fn deferred_stamp_rate_limits_per_gate_per_hour() {
+        let gate_a = uuid::Uuid::now_v7();
+        let gate_b = uuid::Uuid::now_v7();
+        let t0 = std::time::Instant::now();
+
+        assert!(
+            should_post_deferred_stamp(gate_a, t0),
+            "first stamp for a gate posts"
+        );
+        assert!(
+            !should_post_deferred_stamp(gate_a, t0),
+            "an immediate second stamp for the SAME gate is suppressed"
+        );
+        assert!(
+            !should_post_deferred_stamp(
+                gate_a,
+                t0 + CONTINUATION_DEFERRED_STAMP_INTERVAL - Duration::from_secs(1)
+            ),
+            "still suppressed just inside the window"
+        );
+        assert!(
+            should_post_deferred_stamp(gate_a, t0 + CONTINUATION_DEFERRED_STAMP_INTERVAL),
+            "posts again once the window has elapsed"
+        );
+        assert!(
+            should_post_deferred_stamp(gate_b, t0),
+            "a different gate is independent"
+        );
+    }
+
+    /// The poll self-report body serializes to the locked wire shape:
+    /// `{device_id, listed_n, dispatched_n, skipped_n, skip_reasons:{…}}` with
+    /// `skipped_n = listed − dispatched` and only non-zero skip reasons keyed.
+    #[test]
+    fn continuation_poll_report_body_wire_shape() {
+        let dev = uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let body = ContinuationPollReportBody::new(
+            dev,
+            PollRunCounts {
+                listed_n: 5,
+                dispatched_n: 2,
+                already_dispatched: 2,
+                not_addressed_to_self: 1,
+            },
+        );
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "device_id": "11111111-1111-1111-1111-111111111111",
+                "listed_n": 5,
+                "dispatched_n": 2,
+                "skipped_n": 3,
+                "skip_reasons": {
+                    "already_dispatched": 2,
+                    "not_addressed_to_self": 1,
+                },
+            })
+        );
+
+        // Zero-skip run: skip_reasons is an EMPTY object, not omitted.
+        let clean = ContinuationPollReportBody::new(
+            dev,
+            PollRunCounts {
+                listed_n: 1,
+                dispatched_n: 1,
+                already_dispatched: 0,
+                not_addressed_to_self: 0,
+            },
+        );
+        let v = serde_json::to_value(&clean).unwrap();
+        assert_eq!(v["skipped_n"], 0);
+        assert_eq!(v["skip_reasons"], serde_json::json!({}));
+    }
+
+    // NOTE: the delivery-task panic net is `spawn_supervised_delivery` — thin
+    // wiring over `crate::mcp::task_supervisor::spawn_supervised_forever`,
+    // whose respawn-after-panic behavior is covered by that module's own tests
+    // (`forever_variant_respawns_after_panic` et al.).
 
     /// Coord's `GET /coord/agents/pending-unit-dispatches` response parses into
     /// [`PendingUnitDispatchesResponse`]: each row's `payload` is the spawn-frame
