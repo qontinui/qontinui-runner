@@ -1035,8 +1035,22 @@ impl SessionLifecycleStore {
     }
 
     /// Drop `closed` records closed > 24h ago and `open` records not seen
-    /// for > 7d. Atomic-writes only if something changed.
-    pub fn prune(&self, now: i64) {
+    /// for > 7d — EXCEPT any record whose terminal is still live.
+    ///
+    /// `live_terminal_ids` is the caller's current live-terminal view (the
+    /// liveness poll's own `TerminalManager::list()` for this tick — the same
+    /// source `classify` runs against, so prune and close-detection can never
+    /// disagree about what "live" means). A closed row whose terminal still
+    /// lives is the registry's only proof that terminal was ever recorded:
+    /// deleting it on wall-clock retention while the terminal survives
+    /// converts a "recorded then closed" terminal into an apparent "never
+    /// recorded" one (measured live 2026-07: 234 of 255 live terminals looked
+    /// never-recorded because their closed rows had been retention-pruned).
+    /// The same gate covers the open-stale path: a not-seen-in-7d row whose
+    /// terminal is still alive is a liveness-tracking gap to surface, not
+    /// garbage to silently delete. Retention clocks start mattering only once
+    /// the terminal itself is gone. Atomic-writes only if something changed.
+    pub fn prune(&self, now: i64, live_terminal_ids: &HashSet<String>) {
         let snapshot = {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
@@ -1047,6 +1061,11 @@ impl SessionLifecycleStore {
             };
             let before = m.len();
             m.retain(|_, rec| {
+                // A record whose terminal is STILL LIVE is never pruned —
+                // it must outlive its terminal, whatever its state or age.
+                if live_terminal_ids.contains(&rec.terminal_id) {
+                    return true;
+                }
                 if rec.state == "closed" {
                     match rec.closed_at {
                         Some(closed_at) => now - closed_at <= CLOSED_RETENTION_MS,
@@ -2410,7 +2429,10 @@ mod tests {
 
         // Prune destroys the registry row (far-future now) but the history
         // keeps every appended line: the audit outlives `prune`.
-        store.prune(Utc::now().timestamp_millis() + CLOSED_RETENTION_MS + 1_000);
+        store.prune(
+            Utc::now().timestamp_millis() + CLOSED_RETENTION_MS + 1_000,
+            &HashSet::new(),
+        );
         assert!(store.get("sess-1").is_none(), "registry row pruned");
         assert_eq!(lines(&history_path).len(), 2, "history retained past prune");
     }
@@ -2467,9 +2489,10 @@ mod tests {
             std::fs::write(&path, bytes).unwrap();
         }
 
-        // Reopen so the store loads the aged timestamps, then prune.
+        // Reopen so the store loads the aged timestamps, then prune. No
+        // terminal is live, so retention alone decides.
         let store = SessionLifecycleStore::open(&path).unwrap();
-        store.prune(now);
+        store.prune(now, &HashSet::new());
 
         let store = SessionLifecycleStore::open(&path).unwrap();
         let raw = std::fs::read(&path).unwrap();
@@ -2485,6 +2508,73 @@ mod tests {
             .map(|r| r.claude_session_id)
             .collect();
         assert_eq!(open_ids, vec!["fresh-open".to_string()]);
+    }
+
+    /// P4: prune retention vs terminal liveness. A closed row whose terminal
+    /// is STILL LIVE survives the prune past `CLOSED_RETENTION_MS` (deleting
+    /// it would make a recorded-then-closed terminal look never-recorded);
+    /// the same-aged closed row whose terminal is gone is pruned. The
+    /// open-stale (7d not-seen) path is gated identically.
+    #[test]
+    fn prune_keeps_rows_whose_terminal_is_still_live() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        let mut closed_live = rec("closed-live-term");
+        closed_live.terminal_id = "term-live".to_string();
+        let mut closed_gone = rec("closed-gone-term");
+        closed_gone.terminal_id = "term-gone".to_string();
+        let mut open_live = rec("open-live-term");
+        open_live.terminal_id = "term-live".to_string();
+        store.record_open(closed_live);
+        store.record_open(closed_gone);
+        store.record_open(open_live);
+        store.record_close("closed-live-term", "pty-exit");
+        store.record_close("closed-gone-term", "pty-exit");
+
+        let now = Utc::now().timestamp_millis();
+        // Age both closed rows past retention and the open row past stale.
+        {
+            let raw = std::fs::read(&path).unwrap();
+            let mut m: HashMap<String, TerminalSessionRecord> =
+                serde_json::from_slice(&raw).unwrap();
+            m.get_mut("closed-live-term").unwrap().closed_at =
+                Some(now - CLOSED_RETENTION_MS - 1_000);
+            m.get_mut("closed-gone-term").unwrap().closed_at =
+                Some(now - CLOSED_RETENTION_MS - 1_000);
+            m.get_mut("open-live-term").unwrap().last_seen_at = now - OPEN_STALE_MS - 1_000;
+            std::fs::write(&path, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+        }
+
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        let live: HashSet<String> = ["term-live".to_string()].into_iter().collect();
+        store.prune(now, &live);
+
+        let m: HashMap<String, TerminalSessionRecord> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            m.contains_key("closed-live-term"),
+            "closed row survives while its terminal lives"
+        );
+        assert!(
+            !m.contains_key("closed-gone-term"),
+            "terminal gone → pruned after retention"
+        );
+        assert!(
+            m.contains_key("open-live-term"),
+            "stale-open row with a live terminal survives"
+        );
+
+        // Once the terminal is gone too, the same aged rows are pruned.
+        store.prune(now, &HashSet::new());
+        let m: HashMap<String, TerminalSessionRecord> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            !m.contains_key("closed-live-term"),
+            "pruned once its terminal is gone"
+        );
+        assert!(!m.contains_key("open-live-term"));
     }
 
     #[test]
