@@ -837,14 +837,6 @@ pub(crate) fn evict_proxy_nonces_for_workdir(workdir: &str) {
 /// session (session-fabric Phase 0). MUST match coord's `CALLER_SESSION_HEADER`.
 pub(crate) const CALLER_SESSION_HEADER: &str = "x-coord-caller-session";
 
-/// `true` when deterministic caller self-identification is enabled
-/// (`COORD_SESSION_SELF_ID=observe`). Off/unset/any-other value ⇒ the proxy
-/// injects nothing and coord keeps its fuzzy fallback — byte-for-byte today's
-/// behavior. Mirrors coord's own gate so both halves arm from one env var.
-pub(crate) fn session_self_id_enabled() -> bool {
-    std::env::var("COORD_SESSION_SELF_ID").as_deref() == Ok("observe")
-}
-
 /// The session WORKDIR a registered proxy nonce was provisioned into (the
 /// terminal's cwd / isolated worktree path). `None` for an empty, unregistered,
 /// or no-longer-valid nonce ([`live_binding`]). Backs session-fabric Phase 0
