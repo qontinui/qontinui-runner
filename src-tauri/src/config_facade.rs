@@ -841,10 +841,21 @@ pub fn seed_default_log_sources_if_empty() {
         GlobalLogSource {
             id: uuid::Uuid::new_v4().to_string(),
             name: "Runner".to_string(),
-            description: "Qontinui runner Vite + Rust logs".to_string(),
+            description: "Qontinui runner's own tracing sink (auth/Cognito, \
+                device-JWT/relay, backend-URL resolution, executor). Daily-rolled; \
+                the reader resolves the newest dated file automatically."
+                .to_string(),
             category: LogSourceCategory::Runner,
             source_type: "file".to_string(),
-            path: format!("{}/runner-tauri.log", dev_logs.replace('\\', "/")),
+            // The runner writes its tracing to `<dev_logs>/qontinui-runner.log.<date>`
+            // (see crate::logging). Point at the stable basename — read_single_source
+            // resolves the newest dated rotation. NOT `runner-tauri.log`, which is the
+            // supervisor's captured stdout, not the runner's own tracing.
+            path: format!(
+                "{}/{}",
+                dev_logs.replace('\\', "/"),
+                crate::paths::RUNNER_LOG_SINK_PREFIX
+            ),
             pattern: None,
             tail_lines: 100,
             enabled: true,
@@ -853,7 +864,9 @@ pub fn seed_default_log_sources_if_empty() {
                 "rust".to_string(),
                 "tauri".to_string(),
                 "runner".to_string(),
-                "vite".to_string(),
+                "cognito".to_string(),
+                "relay".to_string(),
+                "auth".to_string(),
             ],
             format: "plaintext".to_string(),
             parser: "rust".to_string(),
