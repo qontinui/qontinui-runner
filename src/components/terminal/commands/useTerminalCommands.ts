@@ -122,6 +122,12 @@ export interface TerminalCommandsContext {
    */
   openDocFinder: () => void;
   /**
+   * Open the prompt-library modal (`/prompt`). Same lifted-state pattern
+   * as `openDocFinder`: `TerminalPage` holds the `showPrompt` state so
+   * the modal mount and this registry action share one source of truth.
+   */
+  openPromptModal: () => void;
+  /**
    * Pop a result card. Threaded in from `TerminalPageInner` (which holds
    * the `ResultCardProvider`'s `showCard`). Used by `/metrics` and
    * `/history` to present the ZoneStatusBar popover bodies as a card.
@@ -1119,6 +1125,27 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     patterns: [/^docs?$/i, /^doc-finder$/i],
     handler: async (): Promise<CommandResult> => {
       ctx.openDocFinder();
+      return ok();
+    },
+  });
+
+  // 33b. /prompt — open the prompt-library modal (coord-backed, versioned
+  // prompt templates; plan 2026-07-24-terminal-prompt-library-command).
+  // Individual prompts also self-register as dynamic `/<slug>` actions via
+  // `usePromptLibraryCommands`.
+  useCommandAction({
+    id: "terminal.prompt",
+    slash: "/prompt",
+    aliases: ["/prompts"],
+    label: "Open prompt library",
+    description:
+      "Browse the curated prompt library (authored and versioned on the web). " +
+      "Pick a prompt, fill its parameters, then start a new AI session with it, " +
+      "insert it into an open session, or copy it.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^prompts?$/i, /^prompt[- ]library$/i],
+    handler: async (): Promise<CommandResult> => {
+      ctx.openPromptModal();
       return ok();
     },
   });
