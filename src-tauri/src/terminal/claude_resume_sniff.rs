@@ -98,13 +98,19 @@ fn is_session_uuid(s: &str) -> bool {
         })
 }
 
-/// Apply the two effects of a recognized typed resume line: (1) `record_open`
+/// Apply the three effects of a recognized typed resume line: (1) `record_open`
 /// the session in the lifecycle store — a NEW writer arm beside the existing
 /// frontend-command / continuation-poller writers (structural dedup by
-/// session id means a frontend re-record simply refreshes this row); (2) for
-/// the bypass form, invoke `emit_bypass` (production emits
-/// `terminal-bypass-permissions`). Split out from
-/// [`spawn_register_typed_resume`] so the pair is testable without a Tauri app.
+/// session id means a frontend re-record simply refreshes this row); (2)
+/// invoke `register_coord` (production routes the sniffed session through
+/// [`crate::claude_session::coord_register::AiCoordRegistrar::register_sniffed_session`]
+/// — session-identity fabric Phase 3) — AFTER the record_open, so the
+/// registrar's handle hook can read the record's `terminal_id`, and ONLY when
+/// the store recorded (a session the runner can't durably track shouldn't get
+/// a coord identity the runner can't resolve later); (3) for the bypass form,
+/// invoke `emit_bypass` (production emits `terminal-bypass-permissions`).
+/// Split out from [`spawn_register_typed_resume`] so the trio is testable
+/// without a Tauri app.
 pub(crate) fn apply_typed_resume_effects(
     store: Option<&SessionLifecycleStore>,
     parsed: &TypedClaudeResume,
@@ -112,6 +118,7 @@ pub(crate) fn apply_typed_resume_effects(
     working_dir: &str,
     page_id: &str,
     title: &str,
+    register_coord: impl FnOnce(),
     emit_bypass: impl FnOnce(),
 ) {
     match store {
@@ -148,6 +155,7 @@ pub(crate) fn apply_typed_resume_effects(
                 bypass = parsed.bypass_permissions,
                 "typed claude resume sniff: session durably recorded"
             );
+            register_coord();
         }
         None => warn!(
             terminal_id = %terminal_id,
@@ -179,6 +187,26 @@ pub fn spawn_register_typed_resume(
             .map(|s| s.inner().clone());
         let emit_handle = app_handle.clone();
         let emit_terminal_id = terminal_id.clone();
+        // Session-identity fabric Phase 3 — register the sniffed session with
+        // coord through the SAME AiCoordRegistrar the pinned plane uses (R6
+        // dedupe on claude_session_id absorbs re-sniffs; the Phase-1 handle
+        // hook then mints/rebinds the fsh_ handle with task_run_id: None).
+        // Best-effort: an unmanaged registrar (tests, early boot) is a no-op.
+        let register_handle = app_handle.clone();
+        let register_csid = parsed.claude_session_id.clone();
+        let register_title = title.clone();
+        let register_coord = move || {
+            let Some(registrar) = register_handle
+                .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()
+            else {
+                debug!(
+                    claude_session = %register_csid,
+                    "typed claude resume sniff: AiCoordRegistrar not managed — skipping coord registration"
+                );
+                return;
+            };
+            registrar.register_sniffed_session(&register_csid, &register_title, None);
+        };
         apply_typed_resume_effects(
             store.as_deref(),
             &parsed,
@@ -186,6 +214,7 @@ pub fn spawn_register_typed_resume(
             &working_dir,
             &page_id,
             &title,
+            register_coord,
             move || {
                 if let Err(e) = emit_handle.emit(
                     "terminal-bypass-permissions",
@@ -272,9 +301,9 @@ mod tests {
     }
 
     #[test]
-    fn apply_effects_records_open_and_emits_bypass() {
-        // A typed bypass resume line must produce BOTH a record_open effect
-        // and a bypass-event effect.
+    fn apply_effects_records_open_registers_coord_and_emits_bypass() {
+        // A typed bypass resume line must produce all three effects: a
+        // record_open, a coord-registration invocation, and a bypass event.
         let dir = tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
         let parsed = parse(&format!(
@@ -282,6 +311,7 @@ mod tests {
         ))
         .unwrap();
 
+        let coord_registered = Cell::new(false);
         let bypass_emitted = Cell::new(false);
         apply_typed_resume_effects(
             Some(&store),
@@ -290,6 +320,7 @@ mod tests {
             "C:/repo",
             "default",
             "Terminal 1",
+            || coord_registered.set(true),
             || bypass_emitted.set(true),
         );
 
@@ -300,15 +331,20 @@ mod tests {
         assert_eq!(open[0].working_dir.as_deref(), Some("C:/repo"));
         assert_eq!(open[0].page_id, "default");
         assert_eq!(open[0].state, "open");
+        assert!(
+            coord_registered.get(),
+            "coord registration effect must fire when the store recorded"
+        );
         assert!(bypass_emitted.get(), "bypass event effect must fire");
     }
 
     #[test]
-    fn apply_effects_independence_of_the_two_arms() {
-        // No bypass flag → record lands, no event.
+    fn apply_effects_independence_of_the_arms() {
+        // No bypass flag → record lands + coord registration fires, no event.
         let dir = tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
         let parsed = parse(&format!("claude --resume {UUID}")).unwrap();
+        let coord_registered = Cell::new(false);
         let bypass_emitted = Cell::new(false);
         apply_typed_resume_effects(
             Some(&store),
@@ -317,16 +353,21 @@ mod tests {
             "C:/repo",
             "default",
             "Terminal 1",
+            || coord_registered.set(true),
             || bypass_emitted.set(true),
         );
         assert_eq!(store.open_records().len(), 1);
+        assert!(coord_registered.get());
         assert!(!bypass_emitted.get(), "no bypass flag → no event");
 
-        // Store missing (best-effort warn + skip) → bypass mark still fires.
+        // Store missing (best-effort warn + skip) → coord registration must
+        // NOT fire (a session the runner can't durably track shouldn't get a
+        // coord identity), but the bypass mark still fires.
         let parsed = parse(&format!(
             "claude --resume {UUID} --dangerously-skip-permissions"
         ))
         .unwrap();
+        let coord_registered = Cell::new(false);
         let bypass_emitted = Cell::new(false);
         apply_typed_resume_effects(
             None,
@@ -335,7 +376,12 @@ mod tests {
             "C:/repo",
             "default",
             "Terminal 1",
+            || coord_registered.set(true),
             || bypass_emitted.set(true),
+        );
+        assert!(
+            !coord_registered.get(),
+            "no store record → no coord registration"
         );
         assert!(bypass_emitted.get());
     }

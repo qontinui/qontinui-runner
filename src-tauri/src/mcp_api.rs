@@ -562,8 +562,10 @@ async fn health(
         // coord sees only "header present / absent" — this is the ONLY place
         // the break point in `nonce → workdir → task_run_id → session_id` is
         // knowable, so read it here before concluding the arm is off.
-        // `no_task_run` climbing is EXPECTED for interactive/sniffed sessions
-        // (they carry no worktree), not a defect.
+        // Interactive/sniffed sessions resolve via the Phase-3 lifecycle
+        // fallback (`injected_via_lifecycle`); `no_task_run` now means BOTH
+        // chains missed (plain shell, or a session that never sniffed/
+        // registered).
         "selfId": self_id_health_snapshot(),
         "ai": {
             "configured": ai_configured,
@@ -703,8 +705,16 @@ async fn drain_handler(
 /// runner is the only place the break point is knowable, so it is counted here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SelfIdOutcome {
-    /// The header was sent.
+    /// The header was sent, resolved via the primary chain
+    /// (`nonce → workdir → task_run_id → agent_session_id`).
     Injected,
+    /// The header was sent, resolved via the interactive/sniffed-session
+    /// fallback (`nonce → workdir → lifecycle-store record → registrar`)
+    /// after the primary chain missed at the task-run link — session-identity
+    /// fabric Phase 3. A SECOND success arm: coord sees an identical header
+    /// either way, but the /health split keeps the resolving chain
+    /// diagnosable per-plane.
+    InjectedViaLifecycle,
     /// An agent-spawn session — out of scope by design; those carry their own
     /// scoped identity.
     NonDevicePrincipal,
@@ -712,13 +722,17 @@ pub(crate) enum SelfIdOutcome {
     NoNonce,
     /// The nonce is not in the live binding map.
     NoWorkdir,
-    /// The workdir matched no worktree-carrying session. THE EXPECTED OUTCOME
-    /// FOR INTERACTIVE/SNIFFED SESSIONS: `task_run_id_for_workdir` skips every
-    /// session whose `worktree()` is `None`, so a terminal the operator opened
-    /// by hand can never resolve. Seeing this climb is not a bug report.
+    /// The workdir matched no worktree-carrying session AND the
+    /// interactive/sniffed lifecycle fallback also missed (no registered open
+    /// lifecycle record for the workdir). Before Phase 3 this was the
+    /// expected steady-state outcome for every interactive session; now it
+    /// means the terminal's session was never sniffed/registered (plain
+    /// shell, pre-Phase-3 session, or registration still in flight).
     NoTaskRun,
-    /// The session has no coord `agent_session_id` yet — the registrar has not
-    /// registered it. Transient for a freshly-spawned session.
+    /// The primary chain resolved a `task_run_id` but the registrar holds no
+    /// coord `agent_session_id` for it. Transient for a freshly-spawned
+    /// session. (No lifecycle fallback here — the fallback would key on the
+    /// same id and miss identically.)
     NoSession,
 }
 
@@ -726,6 +740,7 @@ impl SelfIdOutcome {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Injected => "injected",
+            Self::InjectedViaLifecycle => "injected_via_lifecycle",
             Self::NonDevicePrincipal => "non_device_principal",
             Self::NoNonce => "no_nonce",
             Self::NoWorkdir => "no_workdir",
@@ -734,8 +749,9 @@ impl SelfIdOutcome {
         }
     }
 
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::Injected,
+        Self::InjectedViaLifecycle,
         Self::NonDevicePrincipal,
         Self::NoNonce,
         Self::NoWorkdir,
@@ -745,8 +761,8 @@ impl SelfIdOutcome {
 }
 
 /// Per-outcome counters, in declaration order of [`SelfIdOutcome::ALL`].
-fn self_id_counters() -> &'static [std::sync::atomic::AtomicU64; 6] {
-    static COUNTERS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; 6]> =
+fn self_id_counters() -> &'static [std::sync::atomic::AtomicU64; 7] {
+    static COUNTERS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; 7]> =
         std::sync::OnceLock::new();
     COUNTERS.get_or_init(Default::default)
 }
@@ -774,8 +790,10 @@ pub(crate) fn self_id_health_snapshot() -> serde_json::Value {
 /// Resolve the calling terminal's coord `agent_session_id` for the caller-self
 /// header (session-fabric Phase 0). Bridges the only thing the proxy knows —
 /// the per-session nonce — back to a coord session id:
-/// `nonce → workdir → task_run_id → coord agent_session_id`. Every link is
-/// best-effort; a break anywhere yields `None` (the caller then omits the
+/// `nonce → workdir → task_run_id → coord agent_session_id`, falling back for
+/// interactive/sniffed sessions (fabric Phase 3) to
+/// `nonce → workdir → lifecycle record → coord agent_session_id`. Every link
+/// is best-effort; a break anywhere yields `None` (the caller then omits the
 /// header and coord keeps its fuzzy fallback), and the break point is reported
 /// as a [`SelfIdOutcome`] so the chain is diagnosable from `GET /health`
 /// instead of by reading the runner's process memory.
@@ -799,24 +817,115 @@ fn resolve_caller_session_id(
     let Some(workdir) = crate::coord_mcp::workdir_for_nonce(nonce) else {
         return (None, SelfIdOutcome::NoWorkdir);
     };
-    let Some(session_manager) = state
+    let task_run_id = state
         .app_handle
         .try_state::<Arc<crate::claude_session::SessionManager>>()
-    else {
-        return (None, SelfIdOutcome::NoTaskRun);
-    };
-    let Some(task_run_id) = session_manager.task_run_id_for_workdir(&workdir) else {
-        return (None, SelfIdOutcome::NoTaskRun);
-    };
-    let Some(registrar) = state
+        .and_then(|sm| sm.task_run_id_for_workdir(&workdir));
+    match task_run_id {
+        // Primary chain hit — semantics unchanged from Phase 0/#841.
+        Some(task_run_id) => {
+            let Some(registrar) = state
+                .app_handle
+                .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()
+            else {
+                return (None, SelfIdOutcome::NoSession);
+            };
+            match registrar.session_id_for(&task_run_id) {
+                Some(sid) => (Some(sid), SelfIdOutcome::Injected),
+                None => (None, SelfIdOutcome::NoSession),
+            }
+        }
+        // Session-identity fabric Phase 3 — interactive/sniffed fallback.
+        // The workdir named no worktree-carrying SessionManager session (the
+        // interactive plane never has one), so resolve through the durable
+        // lifecycle store instead: workdir → open record (claude_session_id)
+        // → the registrar's agent_session_id for that sniffed registration.
+        None => match resolve_caller_via_lifecycle(state, &workdir) {
+            Some(sid) => (Some(sid), SelfIdOutcome::InjectedViaLifecycle),
+            None => (None, SelfIdOutcome::NoTaskRun),
+        },
+    }
+}
+
+/// Phase-3 fallback leg: resolve the caller's coord `agent_session_id` from
+/// the lifecycle store when the SessionManager worktree chain misses.
+///
+/// Lock discipline mirrors the #841 pattern: `open_records()` clones the
+/// record set under the store's lock (a snapshot), and every path comparison /
+/// registrar lookup runs lock-free afterwards. Cost per call: one
+/// `canonicalize` of the target workdir, a string compare per open record
+/// (with a canonicalize fallback only for records whose string form differs),
+/// and an R4 map lookup per workdir-matching record — bounded by the
+/// operator's open-terminal count, and only ever run after the primary chain
+/// already missed. Fails to `None` silently (header simply absent, as today).
+fn resolve_caller_via_lifecycle(state: &Arc<ApiState>, workdir: &str) -> Option<uuid::Uuid> {
+    let store = state
         .app_handle
-        .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()
-    else {
-        return (None, SelfIdOutcome::NoSession);
-    };
-    match registrar.session_id_for(&task_run_id) {
-        Some(sid) => (Some(sid), SelfIdOutcome::Injected),
-        None => (None, SelfIdOutcome::NoSession),
+        .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()?;
+    let registrar = state
+        .app_handle
+        .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()?;
+    let records = store.open_records(); // snapshot under the store lock
+    let target_canon = std::fs::canonicalize(workdir).ok();
+    select_lifecycle_caller(&records, workdir, target_canon.as_deref(), |csid| {
+        registrar.session_id_for(csid)
+    })
+}
+
+/// Pure candidate selection for the lifecycle fallback (unit-testable without
+/// a Tauri app). Among OPEN lifecycle records whose `working_dir` matches the
+/// proxy-provisioned `workdir` AND whose `claude_session_id` the registrar
+/// resolved (i.e. the session actually registered — this filters out phantom
+/// spawn-time shell records, which never register), picks the most recently
+/// seen (`last_seen_at`, ties broken by `claude_session_id` for determinism).
+///
+/// Several interactive sessions CAN share one workdir (unlike worktrees,
+/// which are per-session); when they do, the workdir-scoped most-recent pick
+/// is strictly narrower than coord's device-wide fuzzy fallback — and the
+/// header remains advisory (coord verifies device binding fail-closed before
+/// trusting it; the JWT stays the authorization boundary).
+fn select_lifecycle_caller(
+    records: &[crate::session::session_lifecycle_store::TerminalSessionRecord],
+    workdir: &str,
+    target_canon: Option<&std::path::Path>,
+    resolve: impl Fn(&str) -> Option<uuid::Uuid>,
+) -> Option<uuid::Uuid> {
+    let mut best: Option<(i64, &str, uuid::Uuid)> = None;
+    for rec in records {
+        let Some(dir) = rec.working_dir.as_deref() else {
+            continue;
+        };
+        if !lifecycle_workdir_matches(dir, workdir, target_canon) {
+            continue;
+        }
+        let Some(sid) = resolve(&rec.claude_session_id) else {
+            continue;
+        };
+        let candidate = (rec.last_seen_at, rec.claude_session_id.as_str(), sid);
+        best = match best {
+            Some(cur) if (cur.0, cur.1) >= (candidate.0, candidate.1) => Some(cur),
+            _ => Some(candidate),
+        };
+    }
+    best.map(|(_, _, sid)| sid)
+}
+
+/// Whether a lifecycle record's `working_dir` names the proxy workdir. Exact
+/// string equality first (the common case: both strings originate from the
+/// same terminal-create working_dir); a `canonicalize` of the record path
+/// only as a fallback, mirroring `worktree_path_matches` in the primary
+/// chain.
+fn lifecycle_workdir_matches(
+    record_dir: &str,
+    workdir: &str,
+    target_canon: Option<&std::path::Path>,
+) -> bool {
+    if record_dir == workdir {
+        return true;
+    }
+    match target_canon {
+        Some(tc) => std::fs::canonicalize(record_dir).ok().as_deref() == Some(tc),
+        None => false,
     }
 }
 
@@ -4426,7 +4535,8 @@ pub async fn start_server(
 /// verbatim status+body passthrough including non-200 upstream verdicts.
 #[cfg(test)]
 mod self_id_chain_tests {
-    use super::{self_id_health_snapshot, SelfIdOutcome};
+    use super::{select_lifecycle_caller, self_id_health_snapshot, SelfIdOutcome};
+    use crate::session::session_lifecycle_store::TerminalSessionRecord;
 
     #[test]
     fn every_outcome_has_a_distinct_label() {
@@ -4439,7 +4549,7 @@ mod self_id_chain_tests {
             labels.len(),
             "duplicate self-id outcome label — the /health series would collide: {labels:?}"
         );
-        assert_eq!(SelfIdOutcome::ALL.len(), 6);
+        assert_eq!(SelfIdOutcome::ALL.len(), 7);
     }
 
     #[test]
@@ -4460,16 +4570,131 @@ mod self_id_chain_tests {
     }
 
     #[test]
-    fn injected_is_the_only_success_outcome() {
-        // coord cannot distinguish these: from its side every non-Injected
-        // outcome is an identical `absent`. Guards against a future variant
-        // being added as a second "success" without the header actually going.
+    fn the_two_injected_arms_are_the_only_success_outcomes() {
+        // coord cannot distinguish the failure arms: from its side every
+        // non-injected outcome is an identical `absent`. Guards against a
+        // future variant being added as another "success" without the header
+        // actually going. Phase 3 added `injected_via_lifecycle` as the
+        // second (interactive-plane) success arm.
         let successes: Vec<&str> = SelfIdOutcome::ALL
             .iter()
-            .filter(|o| matches!(o, SelfIdOutcome::Injected))
+            .filter(|o| {
+                matches!(
+                    o,
+                    SelfIdOutcome::Injected | SelfIdOutcome::InjectedViaLifecycle
+                )
+            })
             .map(|o| o.label())
             .collect();
-        assert_eq!(successes, vec!["injected"]);
+        assert_eq!(successes, vec!["injected", "injected_via_lifecycle"]);
+    }
+
+    /// Minimal open-record builder for the pure-selection tests.
+    fn rec(csid: &str, working_dir: Option<&str>, last_seen_at: i64) -> TerminalSessionRecord {
+        TerminalSessionRecord {
+            claude_session_id: csid.to_string(),
+            config_dir: None,
+            working_dir: working_dir.map(str::to_string),
+            page_id: "default".to_string(),
+            zone_index: 0,
+            title: None,
+            terminal_id: format!("term-{csid}"),
+            opened_at: 0,
+            last_seen_at,
+            state: "open".to_string(),
+            closed_at: None,
+            close_reason: None,
+            provider: crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
+            origin: None,
+            restore_pending_at: None,
+            confirmed_at: None,
+            handle: None,
+        }
+    }
+
+    #[test]
+    fn lifecycle_selection_picks_the_matching_registered_record() {
+        let sid = uuid::Uuid::new_v4();
+        let records = vec![
+            rec("other-dir", Some("D:/elsewhere"), 50),
+            rec("match", Some("D:/repo"), 10),
+        ];
+        let got = select_lifecycle_caller(&records, "D:/repo", None, |csid| {
+            (csid == "match").then_some(sid)
+        });
+        assert_eq!(got, Some(sid));
+    }
+
+    #[test]
+    fn lifecycle_selection_skips_unregistered_records() {
+        // A workdir-matching record whose session never registered (phantom
+        // spawn-time shell record, pre-Phase-3 session) must not resolve —
+        // the resolver closure is the registration filter.
+        let records = vec![rec("phantom", Some("D:/repo"), 99)];
+        let got = select_lifecycle_caller(&records, "D:/repo", None, |_| None);
+        assert_eq!(got, None, "unregistered record must not inject");
+    }
+
+    #[test]
+    fn lifecycle_selection_prefers_most_recently_seen_on_shared_workdir() {
+        // Interactive sessions can share a workdir; the workdir-scoped
+        // most-recent pick is the deterministic tie-break.
+        let old_sid = uuid::Uuid::new_v4();
+        let new_sid = uuid::Uuid::new_v4();
+        let records = vec![
+            rec("older", Some("D:/repo"), 100),
+            rec("newer", Some("D:/repo"), 200),
+        ];
+        let got = select_lifecycle_caller(&records, "D:/repo", None, |csid| match csid {
+            "older" => Some(old_sid),
+            "newer" => Some(new_sid),
+            _ => None,
+        });
+        assert_eq!(got, Some(new_sid));
+
+        // If the newer record is unregistered, the older registered one wins.
+        let got = select_lifecycle_caller(&records, "D:/repo", None, |csid| {
+            (csid == "older").then_some(old_sid)
+        });
+        assert_eq!(got, Some(old_sid));
+    }
+
+    #[test]
+    fn lifecycle_selection_equal_timestamps_break_deterministically() {
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        let records = vec![
+            rec("aaaa", Some("D:/repo"), 100),
+            rec("bbbb", Some("D:/repo"), 100),
+        ];
+        let resolve = |csid: &str| match csid {
+            "aaaa" => Some(a),
+            "bbbb" => Some(b),
+            _ => None,
+        };
+        let got1 = select_lifecycle_caller(&records, "D:/repo", None, resolve);
+        // Reversed input order must yield the same pick (lexicographically
+        // greatest claude_session_id on a timestamp tie).
+        let reversed: Vec<_> = records.iter().rev().cloned().collect();
+        let got2 = select_lifecycle_caller(&reversed, "D:/repo", None, resolve);
+        assert_eq!(got1, got2, "selection must be input-order independent");
+        assert_eq!(got1, Some(b));
+    }
+
+    #[test]
+    fn lifecycle_selection_misses_cleanly() {
+        // No records / no workdir match / recordless working_dir → None
+        // (header simply absent, as today).
+        let sid = uuid::Uuid::new_v4();
+        assert_eq!(
+            select_lifecycle_caller(&[], "D:/repo", None, |_| Some(sid)),
+            None
+        );
+        let records = vec![rec("x", None, 10), rec("y", Some("D:/other"), 10)];
+        assert_eq!(
+            select_lifecycle_caller(&records, "D:/repo", None, |_| Some(sid)),
+            None
+        );
     }
 }
 
