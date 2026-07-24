@@ -11,6 +11,11 @@ import { useTerminalWindowActions } from "./useTerminalWindowActions";
 import { useTenant } from "@/contexts/TenantContext";
 import { ZoneLayoutPicker } from "./ZoneLayoutPicker";
 import { DocFinderModal } from "./DocFinderModal";
+import { PromptModal } from "./PromptModal";
+import { usePromptLibrary } from "./usePromptLibrary";
+import { usePromptLibraryCommands } from "./commands/usePromptLibraryCommands";
+import { writeToTerminalById } from "./writeToTerminalById";
+import { compareByUsageHeadroom } from "../settings/types";
 import { ZoneMinimap } from "./ZoneMinimap";
 import { ZoneProfilePicker } from "./ZoneProfilePicker";
 import {
@@ -452,6 +457,10 @@ function TerminalPageInner({
   // the contention toast, matching its visual language.
   const [dismissedBanners, setDismissedBanners] = useState<Set<string>>(new Set());
   const [showDocFinder, setShowDocFinder] = useState(false);
+  // Prompt-library modal (`/prompt`). `promptFocusSlug` preselects one
+  // prompt when a dynamic `/<slug>` command with parameters opens it.
+  const [showPrompt, setShowPrompt] = useState(false);
+  const [promptFocusSlug, setPromptFocusSlug] = useState<string | null>(null);
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- intentional sync: drop stale dismissals whenever fileLockStates changes so the banner re-shows on a fresh waiter wave (count 0 → 1 after a "Hold" click). The same React-rules exception pattern is used at lib/runner-api.ts:61 / :79 for the port-listener sync.
     setDismissedBanners((prev) => {
@@ -1041,6 +1050,37 @@ function TerminalPageInner({
         )
       : sessionManager.accountUsage;
 
+  // Prompt library (plan 2026-07-24-terminal-prompt-library-command).
+  // Fetched once per page mount (the Rust command holds a 45s TTL + ETag
+  // cache); `/prompt` opens the modal, and each fetched prompt registers a
+  // dynamic `/<slug>` action below.
+  const promptLibrary = usePromptLibrary();
+
+  const openPromptModal = (focusSlug?: string) => {
+    setPromptFocusSlug(focusSlug ?? null);
+    setShowPrompt(true);
+  };
+
+  // Spawn a fresh AI session with the rendered prompt auto-typed. Account
+  // resolution mirrors `/spawn-ai best`: the configured account with the
+  // most usage headroom.
+  const spawnWithPromptText = async (text: string): Promise<void> => {
+    const configDir = [...spawnAccounts].sort(compareByUsageHeadroom)[0]?.config_dir;
+    if (!configDir) {
+      workflowGen.setNotification({
+        message: "No Claude account configured — add one in the session manager first",
+        type: "error",
+      });
+      return;
+    }
+    await handleLaunchAiSession(1, configDir, text);
+  };
+
+  // Prefill (NO trailing \r — the operator reviews before submitting).
+  const insertPromptText = (tabId: string, text: string): void => {
+    writeToTerminalById(terminalRefs.current, tabId, text);
+  };
+
   useTerminalCommands({
     spawnPlain: handleQuickLaunch,
     spawnAi: handleLaunchAiSession,
@@ -1049,7 +1089,21 @@ function TerminalPageInner({
     sortZones: handleSortZones,
     exportAll: handleExportOutput,
     openDocFinder: () => setShowDocFinder(true),
+    openPromptModal: () => openPromptModal(),
     showCard,
+  });
+
+  // Dynamic `/<slug>` actions — one per fetched prompt; collision-checked
+  // against the built-ins and disposed on library refresh/unmount.
+  usePromptLibraryCommands({
+    prompts: promptLibrary.prompts,
+    openPromptModal,
+    spawnWithText: spawnWithPromptText,
+    insertIntoFocused: (text) => {
+      if (!activeId) return false;
+      writeToTerminalById(terminalRefs.current, activeId, text);
+      return true;
+    },
   });
 
   if (!initialized) {
@@ -1105,6 +1159,21 @@ function TerminalPageInner({
               setShowDocFinder(false);
             }}
             onClose={() => setShowDocFinder(false)}
+          />
+        )}
+        {showPrompt && (
+          <PromptModal
+            prompts={promptLibrary.prompts}
+            auth={promptLibrary.auth}
+            reason={promptLibrary.reason}
+            loading={promptLibrary.loading}
+            onRefresh={promptLibrary.refresh}
+            initialSlug={promptFocusSlug}
+            sessions={tabs.map((t) => ({ id: t.id, title: t.title }))}
+            focusedSessionId={activeId}
+            onSpawn={spawnWithPromptText}
+            onInsert={insertPromptText}
+            onClose={() => setShowPrompt(false)}
           />
         )}
         <TerminalNotification

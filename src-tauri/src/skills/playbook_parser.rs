@@ -197,7 +197,10 @@ pub fn parse_playbook_content(
 ///
 /// Expects the content to start with `---\n`, followed by YAML, followed by
 /// `---\n`, followed by the markdown body.
-fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
+///
+/// `pub(crate)`: also used by `crate::prompt_library` to parse coord-served
+/// prompt-template documents (same markdown-with-frontmatter format).
+pub(crate) fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
     let content = content.trim_start();
 
     if !content.starts_with("---") {

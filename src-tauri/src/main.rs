@@ -138,6 +138,7 @@ mod pm_detect;
 mod process_capture;
 mod process_helpers;
 mod productivity;
+mod prompt_library;
 mod prompt_snippets;
 mod prompts;
 mod rag;
@@ -1842,6 +1843,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::productivity::get_coordinator_leader,
             commands::productivity::get_escalations,
             commands::productivity::get_fleet_health,
+            prompt_library::list_prompt_templates,
             commands::productivity::get_coord_http_base,
             commands::productivity::spawn_from_plan,
             commands::productivity::get_plan_recommendations,
