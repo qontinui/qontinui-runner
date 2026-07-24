@@ -893,6 +893,33 @@ struct HeartbeatPayload {
     /// Omitted entirely when the setting is disabled.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     ci_runner_labels: Vec<String>,
+    /// The git SHA this binary was BUILT from — the compile-time constant
+    /// `env!("QONTINUI_GIT_SHA")` (12-char short SHA, baked by `build.rs`).
+    /// Feeds coord's `coord.devices.served_git_sha` so the fleet can observe
+    /// what code each runner is actually serving (plan
+    /// `2026-07-20-coord-runner-served-sha-observability-and-gate`). `None`
+    /// (and thus omitted) when the embedded value is the `build.rs`
+    /// `"unknown"` fallback — a source-tarball build with no git must not
+    /// send a junk SHA. Additive + backward-safe: coord's device-register
+    /// request struct has no `deny_unknown_fields`, so a pre-migration coord
+    /// silently ignores this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_sha: Option<&'static str>,
+    /// origin/main's current SHA as last resolved by the periodic build-drift
+    /// check (`build_drift::latest().main_sha`). Feeds coord's
+    /// `coord.devices.served_main_sha`. `None` (omitted) before the first
+    /// drift check completes, or on a repo-less / offline install where
+    /// origin/main is unresolvable. Same additive/backward-safe contract as
+    /// `git_sha`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    main_sha: Option<String>,
+    /// How many commits this binary is behind origin/main
+    /// (`build_drift::latest().commits_behind`). Feeds coord's
+    /// `coord.devices.served_commits_behind`. `None` (omitted) until the
+    /// drift check has a concrete count (needs both objects locally). Same
+    /// additive/backward-safe contract as `git_sha`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commits_behind: Option<u64>,
 }
 
 /// Suppress serializing the field when it's the default. Keeps the
@@ -972,6 +999,25 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
         (Vec::new(), Vec::new())
     };
 
+    // Served-code observability (plan 2026-07-20-coord-runner-served-sha-
+    // observability-and-gate). The embedded build SHA is always present as a
+    // compile-time constant; only the `build.rs` `"unknown"` fallback (a
+    // source-tarball build with no git) collapses to None → omitted. The
+    // drift verdict feeds origin/main's SHA + commits-behind; it's `None`
+    // overall until the first periodic check completes, yielding None for
+    // both derived fields.
+    let git_sha = {
+        let s = env!("QONTINUI_GIT_SHA");
+        if s == "unknown" {
+            None
+        } else {
+            Some(s)
+        }
+    };
+    let drift = crate::build_drift::latest();
+    let main_sha = drift.as_ref().and_then(|d| d.main_sha.clone());
+    let commits_behind = drift.as_ref().and_then(|d| d.commits_behind);
+
     let payload = HeartbeatPayload {
         device_id,
         hostname: device.hostname.clone(),
@@ -983,6 +1029,9 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
         last_capture_fallback_at,
         capabilities,
         ci_runner_labels,
+        git_sha,
+        main_sha,
+        commits_behind,
     };
     let url = format!("{base}/coord/devices/register");
 
@@ -3731,6 +3780,9 @@ mod tests {
             last_capture_fallback_at: None,
             capabilities: Vec::new(),
             ci_runner_labels: Vec::new(),
+            git_sha: None,
+            main_sha: None,
+            commits_behind: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert!(
@@ -3752,6 +3804,9 @@ mod tests {
             last_capture_fallback_at: None,
             capabilities: Vec::new(),
             ci_runner_labels: Vec::new(),
+            git_sha: None,
+            main_sha: None,
+            commits_behind: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -3779,6 +3834,9 @@ mod tests {
             last_capture_fallback_at: None,
             capabilities: Vec::new(),
             ci_runner_labels: Vec::new(),
+            git_sha: None,
+            main_sha: None,
+            commits_behind: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -3804,6 +3862,9 @@ mod tests {
             last_capture_fallback_at: None,
             capabilities: Vec::new(),
             ci_runner_labels: Vec::new(),
+            git_sha: None,
+            main_sha: None,
+            commits_behind: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -3835,6 +3896,9 @@ mod tests {
             last_capture_fallback_at: Some(at),
             capabilities: Vec::new(),
             ci_runner_labels: Vec::new(),
+            git_sha: None,
+            main_sha: None,
+            commits_behind: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -3867,6 +3931,9 @@ mod tests {
             last_capture_fallback_at: None,
             capabilities: Vec::new(),
             ci_runner_labels: Vec::new(),
+            git_sha: None,
+            main_sha: None,
+            commits_behind: None,
         };
         let body0 = serde_json::to_value(&p0).unwrap();
         assert!(
@@ -3989,6 +4056,9 @@ mod tests {
             last_capture_fallback_at: None,
             capabilities: Vec::new(),
             ci_runner_labels: Vec::new(),
+            git_sha: None,
+            main_sha: None,
+            commits_behind: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -4004,6 +4074,95 @@ mod tests {
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect();
         assert_eq!(ids, vec![a.to_string(), b.to_string()]);
+    }
+
+    /// Served-code observability (plan 2026-07-20-coord-runner-served-sha-
+    /// observability-and-gate). When present, `git_sha` / `main_sha` /
+    /// `commits_behind` ride the heartbeat wire so coord can straight-write
+    /// `coord.devices.served_git_sha` / `served_main_sha` /
+    /// `served_commits_behind`. A `"unknown"`-fallback build sends NO
+    /// `git_sha` (the None/skip path), so a repo-less source-tarball build
+    /// never poisons the column with a junk SHA.
+    #[test]
+    fn heartbeat_payload_serializes_served_sha_and_drift() {
+        let p = HeartbeatPayload {
+            device_id: uuid::Uuid::nil(),
+            hostname: "test".into(),
+            claude_code_available: false,
+            tenant_id: uuid::Uuid::nil(),
+            tenant_ids: vec![uuid::Uuid::nil()],
+            capture_preview_count: 0,
+            monitor_crop_count: 0,
+            last_capture_fallback_at: None,
+            capabilities: Vec::new(),
+            ci_runner_labels: Vec::new(),
+            git_sha: Some("dc7aa9c5aaaa"),
+            main_sha: Some("dc7aa9c5aaaabbbbccccddddeeeeffff00001111".into()),
+            commits_behind: Some(4),
+        };
+        let body = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            body.get("git_sha").and_then(|v| v.as_str()),
+            Some("dc7aa9c5aaaa"),
+            "git_sha must ride the heartbeat wire when present"
+        );
+        assert_eq!(
+            body.get("main_sha").and_then(|v| v.as_str()),
+            Some("dc7aa9c5aaaabbbbccccddddeeeeffff00001111"),
+            "main_sha must ride the heartbeat wire when present"
+        );
+        assert_eq!(
+            body.get("commits_behind").and_then(|v| v.as_u64()),
+            Some(4),
+            "commits_behind must ride the heartbeat wire when present"
+        );
+    }
+
+    /// The `"unknown"` build.rs fallback resolves to `git_sha: None` at the
+    /// construction site, which `skip_serializing_if = "Option::is_none"`
+    /// omits — a source-tarball build with no git must send NO `git_sha`
+    /// key (never the literal string `"unknown"`). Same omission holds for
+    /// the drift fields before the first periodic check.
+    #[test]
+    fn heartbeat_payload_omits_unknown_served_sha_and_absent_drift() {
+        // Mirror the production resolution: env!("QONTINUI_GIT_SHA") ==
+        // "unknown" collapses to None before construction.
+        let git_sha = {
+            let s = "unknown";
+            if s == "unknown" {
+                None
+            } else {
+                Some(s)
+            }
+        };
+        let p = HeartbeatPayload {
+            device_id: uuid::Uuid::nil(),
+            hostname: "test".into(),
+            claude_code_available: false,
+            tenant_id: uuid::Uuid::nil(),
+            tenant_ids: vec![uuid::Uuid::nil()],
+            capture_preview_count: 0,
+            monitor_crop_count: 0,
+            last_capture_fallback_at: None,
+            capabilities: Vec::new(),
+            ci_runner_labels: Vec::new(),
+            git_sha,
+            main_sha: None,
+            commits_behind: None,
+        };
+        let body = serde_json::to_value(&p).unwrap();
+        assert!(
+            body.get("git_sha").is_none(),
+            "an 'unknown' embedded SHA must be omitted from the wire, got {body}"
+        );
+        assert!(
+            body.get("main_sha").is_none(),
+            "absent main_sha (no drift check yet) must be omitted, got {body}"
+        );
+        assert!(
+            body.get("commits_behind").is_none(),
+            "absent commits_behind (no drift check yet) must be omitted, got {body}"
+        );
     }
 
     // ---- behind_default_count (stale-primary-checkout guard, Phase 1c) ----
@@ -4157,6 +4316,9 @@ mod tests {
             last_capture_fallback_at: None,
             capabilities,
             ci_runner_labels,
+            git_sha: None,
+            main_sha: None,
+            commits_behind: None,
         }
     }
 
