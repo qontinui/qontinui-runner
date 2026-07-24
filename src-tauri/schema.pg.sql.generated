@@ -1269,7 +1269,9 @@ CREATE TABLE coord.agent_worktrees (
     reclaim_candidate_at timestamp with time zone,
     trigger_signal text,
     work_unit_id uuid,
-    CONSTRAINT agent_worktrees_status_chk CHECK ((status = ANY (ARRAY['allocated'::text, 'active'::text, 'merging'::text, 'merged'::text, 'abandoned'::text])))
+    retention text DEFAULT 'auto'::text NOT NULL,
+    CONSTRAINT agent_worktrees_status_chk CHECK ((status = ANY (ARRAY['allocated'::text, 'active'::text, 'merging'::text, 'merged'::text, 'abandoned'::text]))),
+    CONSTRAINT coord_agent_worktrees_retention_check CHECK ((retention = ANY (ARRAY['auto'::text, 'pinned'::text])))
 );
 
 
@@ -2398,6 +2400,10 @@ CREATE TABLE coord.devices (
     renderer_memory_bytes bigint DEFAULT 0 NOT NULL,
     renderer_reload_total bigint DEFAULT 0 NOT NULL,
     renderer_reload_storming boolean DEFAULT false NOT NULL,
+    served_git_sha text,
+    served_git_sha_at timestamp with time zone,
+    served_main_sha text,
+    served_commits_behind integer,
     CONSTRAINT devices_role_chk CHECK (((role IS NULL) OR (role = ANY (ARRAY['agent'::text, 'build'::text, 'cache'::text, 'coord'::text])))),
     CONSTRAINT devices_state_chk CHECK ((state = ANY (ARRAY['healthy'::text, 'degraded'::text, 'partitioned'::text, 'abandoned'::text])))
 );
@@ -3310,6 +3316,29 @@ CREATE TABLE coord.memory_federation_reports (
 
 
 --
+-- Name: memory_jobs; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.memory_jobs (
+    job_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    target_ids uuid[] NOT NULL,
+    input_texts jsonb NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    claimed_by text,
+    claimed_at timestamp with time zone,
+    finished_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    result jsonb,
+    attempt integer DEFAULT 0 NOT NULL,
+    input_hash text NOT NULL,
+    kind text NOT NULL,
+    CONSTRAINT memory_jobs_kind_check CHECK ((kind = ANY (ARRAY['synthesis'::text, 'embedding'::text]))),
+    CONSTRAINT memory_jobs_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'claimed'::text, 'done'::text, 'failed'::text])))
+);
+
+
+--
 -- Name: memory_links; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -3372,27 +3401,6 @@ CREATE TABLE coord.memory_records (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT memory_records_kind_check CHECK ((kind = ANY (ARRAY['observation'::text, 'fact'::text, 'mental_model'::text, 'episode'::text, 'feedback'::text, 'reference'::text, 'rule'::text, 'library'::text]))),
     CONSTRAINT memory_records_scope_check CHECK ((scope = ANY (ARRAY['tenant'::text, 'runner'::text, 'agent'::text, 'session'::text])))
-);
-
-
---
--- Name: memory_synthesis_jobs; Type: TABLE; Schema: coord; Owner: -
---
-
-CREATE TABLE coord.memory_synthesis_jobs (
-    job_id uuid DEFAULT gen_random_uuid() NOT NULL,
-    tenant_id uuid NOT NULL,
-    member_ids uuid[] NOT NULL,
-    member_texts jsonb NOT NULL,
-    status text DEFAULT 'pending'::text NOT NULL,
-    claimed_by text,
-    claimed_at timestamp with time zone,
-    finished_at timestamp with time zone,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    result_text text,
-    attempt integer DEFAULT 0 NOT NULL,
-    member_set_hash text NOT NULL,
-    CONSTRAINT memory_synthesis_jobs_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'claimed'::text, 'done'::text, 'failed'::text])))
 );
 
 
@@ -3504,6 +3512,7 @@ CREATE TABLE coord.merge_proposals (
     merge_class text,
     requeue_count integer DEFAULT 0 NOT NULL,
     land_route text,
+    failure_class text,
     CONSTRAINT merge_proposals_status_chk CHECK ((status = ANY (ARRAY['queued'::text, 'dry-rebasing'::text, 'awaiting-ci'::text, 'landing'::text, 'blocked-by-overlap'::text, 'conflict'::text, 'merged'::text, 'cancelled'::text, 'shadow-landed'::text, 'speculative-ci'::text])))
 );
 
@@ -4664,6 +4673,40 @@ CREATE TABLE coord.session_file_snapshots (
 
 
 --
+-- Name: session_handle_lineage; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.session_handle_lineage (
+    handle text NOT NULL,
+    agent_session_id uuid NOT NULL,
+    bound_at timestamp with time zone
+);
+
+
+--
+-- Name: session_handles; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.session_handles (
+    handle text NOT NULL,
+    claude_session_id text NOT NULL,
+    tenant_id uuid NOT NULL,
+    device_id uuid NOT NULL,
+    task_run_id uuid,
+    promptable boolean DEFAULT false NOT NULL,
+    accept_tenant_peer_prompts boolean DEFAULT false NOT NULL,
+    name text,
+    current_agent_session_id uuid,
+    current_terminal_id text,
+    machine_id uuid,
+    status text,
+    first_bound_at timestamp with time zone,
+    last_heartbeat_at timestamp with time zone,
+    closed_at timestamp with time zone
+);
+
+
+--
 -- Name: session_messages; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -4848,7 +4891,6 @@ CREATE TABLE coord.tenant_merge_settings (
     min_green_dwell_secs integer,
     confidence_threshold real,
     auto_merge_enabled boolean,
-    dry_run boolean,
     rulebook_overrides jsonb,
     escalate_paths text[],
     audit_confidence_shadow_floor real,
@@ -4861,6 +4903,7 @@ CREATE TABLE coord.tenant_merge_settings (
     blast_radius_gate_enabled boolean,
     layering_gate_enabled boolean,
     auto_fix_red_main boolean,
+    auto_fix_red_main_flaky boolean,
     CONSTRAINT ck_tms_credibility_weighted_pass_min_range CHECK (((credibility_weighted_pass_min IS NULL) OR ((credibility_weighted_pass_min >= (0)::double precision) AND (credibility_weighted_pass_min <= (1)::double precision)))),
     CONSTRAINT tenant_merge_settings_rollout_state_check CHECK (((rollout_state IS NULL) OR (rollout_state = ANY (ARRAY['dry_run'::text, 'shadow'::text, 'live'::text]))))
 );
@@ -4895,7 +4938,6 @@ CREATE TABLE coord.tenant_repo_profiles (
     confidence_threshold_override real,
     escalate_paths_extra text[] DEFAULT '{}'::text[] NOT NULL,
     auto_merge_label_budget integer,
-    dry_run_override boolean,
     profile_version integer DEFAULT 1 NOT NULL,
     profile_source text DEFAULT 'manual'::text NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
@@ -4905,6 +4947,7 @@ CREATE TABLE coord.tenant_repo_profiles (
     layering_gate_enabled_override boolean,
     config_yaml_overrides jsonb,
     auto_fix_red_main boolean,
+    auto_fix_red_main_flaky boolean,
     CONSTRAINT ck_trp_credibility_weighted_pass_min_override_range CHECK (((credibility_weighted_pass_min_override IS NULL) OR ((credibility_weighted_pass_min_override >= (0)::double precision) AND (credibility_weighted_pass_min_override <= (1)::double precision)))),
     CONSTRAINT tenant_repo_profiles_rollout_state_check CHECK (((rollout_state IS NULL) OR (rollout_state = ANY (ARRAY['dry_run'::text, 'shadow'::text, 'live'::text])))),
     CONSTRAINT tenant_repo_profiles_source_check CHECK ((profile_source = ANY (ARRAY['audit'::text, 'user_edit'::text, 'drift_accept'::text, 'manual'::text, 'preset'::text])))
@@ -5336,6 +5379,39 @@ CREATE SEQUENCE coord.worktree_census_id_seq
 --
 
 ALTER SEQUENCE coord.worktree_census_id_seq OWNED BY coord.worktree_census.id;
+
+
+--
+-- Name: worktree_reclaim_events; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.worktree_reclaim_events (
+    id bigint NOT NULL,
+    device_id uuid NOT NULL,
+    repo text NOT NULL,
+    path text NOT NULL,
+    action text NOT NULL,
+    observed_missing_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: worktree_reclaim_events_id_seq; Type: SEQUENCE; Schema: coord; Owner: -
+--
+
+CREATE SEQUENCE coord.worktree_reclaim_events_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: worktree_reclaim_events_id_seq; Type: SEQUENCE OWNED BY; Schema: coord; Owner: -
+--
+
+ALTER SEQUENCE coord.worktree_reclaim_events_id_seq OWNED BY coord.worktree_reclaim_events.id;
 
 
 --
@@ -14657,6 +14733,13 @@ ALTER TABLE ONLY coord.worktree_census ALTER COLUMN id SET DEFAULT nextval('coor
 
 
 --
+-- Name: worktree_reclaim_events id; Type: DEFAULT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.worktree_reclaim_events ALTER COLUMN id SET DEFAULT nextval('coord.worktree_reclaim_events_id_seq'::regclass);
+
+
+--
 -- Name: worktree_volume id; Type: DEFAULT; Schema: coord; Owner: -
 --
 
@@ -15887,6 +15970,14 @@ ALTER TABLE ONLY coord.memory_federation_reports
 
 
 --
+-- Name: memory_jobs memory_jobs_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.memory_jobs
+    ADD CONSTRAINT memory_jobs_pkey PRIMARY KEY (job_id);
+
+
+--
 -- Name: memory_links memory_links_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -15908,14 +15999,6 @@ ALTER TABLE ONLY coord.memory_observations
 
 ALTER TABLE ONLY coord.memory_records
     ADD CONSTRAINT memory_records_pkey PRIMARY KEY (memory_id);
-
-
---
--- Name: memory_synthesis_jobs memory_synthesis_jobs_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
---
-
-ALTER TABLE ONLY coord.memory_synthesis_jobs
-    ADD CONSTRAINT memory_synthesis_jobs_pkey PRIMARY KEY (job_id);
 
 
 --
@@ -16399,6 +16482,30 @@ ALTER TABLE ONLY coord.session_file_snapshots
 
 
 --
+-- Name: session_handle_lineage session_handle_lineage_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.session_handle_lineage
+    ADD CONSTRAINT session_handle_lineage_pkey PRIMARY KEY (handle, agent_session_id);
+
+
+--
+-- Name: session_handles session_handles_claude_session_id_key; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.session_handles
+    ADD CONSTRAINT session_handles_claude_session_id_key UNIQUE (claude_session_id);
+
+
+--
+-- Name: session_handles session_handles_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.session_handles
+    ADD CONSTRAINT session_handles_pkey PRIMARY KEY (handle);
+
+
+--
 -- Name: session_messages session_messages_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -16708,6 +16815,14 @@ ALTER TABLE ONLY coord.worker_heartbeats
 
 ALTER TABLE ONLY coord.worktree_census
     ADD CONSTRAINT worktree_census_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: worktree_reclaim_events worktree_reclaim_events_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.worktree_reclaim_events
+    ADD CONSTRAINT worktree_reclaim_events_pkey PRIMARY KEY (id);
 
 
 --
@@ -20343,6 +20458,13 @@ CREATE INDEX idx_agent_worktrees_overlap_paths_gin ON coord.agent_worktrees USIN
 
 
 --
+-- Name: idx_agent_worktrees_retention_pinned; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_agent_worktrees_retention_pinned ON coord.agent_worktrees USING btree (retention) WHERE (retention = 'pinned'::text);
+
+
+--
 -- Name: idx_agent_worktrees_status; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -20609,10 +20731,10 @@ CREATE INDEX idx_config_observations_observed_at ON coord.config_observations US
 
 
 --
--- Name: idx_config_observations_surface_kind_key; Type: INDEX; Schema: coord; Owner: -
+-- Name: idx_config_observations_surface_kind_key_observed; Type: INDEX; Schema: coord; Owner: -
 --
 
-CREATE INDEX idx_config_observations_surface_kind_key ON coord.config_observations USING btree (surface, kind, key);
+CREATE INDEX idx_config_observations_surface_kind_key_observed ON coord.config_observations USING btree (surface, kind, key, observed_at DESC);
 
 
 --
@@ -21155,6 +21277,13 @@ CREATE INDEX idx_memories_tenant_id ON coord.memories USING btree (tenant_id) WH
 
 
 --
+-- Name: idx_memory_jobs_pending; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_memory_jobs_pending ON coord.memory_jobs USING btree (tenant_id, kind, created_at) WHERE (status = 'pending'::text);
+
+
+--
 -- Name: idx_memory_links_tenant_source; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -21197,17 +21326,17 @@ CREATE INDEX idx_memory_records_tenant_kind_created ON coord.memory_records USIN
 
 
 --
+-- Name: idx_memory_records_tenant_model_scorable; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_memory_records_tenant_model_scorable ON coord.memory_records USING btree (tenant_id, embedding_model) WHERE ((is_tombstone = false) AND (embedding IS NOT NULL));
+
+
+--
 -- Name: idx_memory_records_tenant_scope; Type: INDEX; Schema: coord; Owner: -
 --
 
 CREATE INDEX idx_memory_records_tenant_scope ON coord.memory_records USING btree (tenant_id, scope, scope_ref);
-
-
---
--- Name: idx_memory_synthesis_jobs_pending; Type: INDEX; Schema: coord; Owner: -
---
-
-CREATE INDEX idx_memory_synthesis_jobs_pending ON coord.memory_synthesis_jobs USING btree (tenant_id, created_at) WHERE (status = 'pending'::text);
 
 
 --
@@ -21554,6 +21683,13 @@ CREATE INDEX idx_pr_events_tenant_id ON coord.pr_events USING btree (tenant_id) 
 
 
 --
+-- Name: idx_pr_events_tenant_reason_created; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_pr_events_tenant_reason_created ON coord.pr_events USING btree (tenant_id, ((payload ->> 'block_reason_code'::text)), created_at DESC) WHERE (event_kind = 'predicate_eval'::text);
+
+
+--
 -- Name: idx_pr_files_repo_pr; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -21635,6 +21771,13 @@ CREATE INDEX idx_release_observations_observed_at ON coord.release_observations 
 --
 
 CREATE INDEX idx_release_observations_tenant_id ON coord.release_observations USING btree (tenant_id) WHERE (tenant_id IS NOT NULL);
+
+
+--
+-- Name: idx_release_observations_tenant_surface_target_observed; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_release_observations_tenant_surface_target_observed ON coord.release_observations USING btree (tenant_id, surface, target, observed_at DESC);
 
 
 --
@@ -21792,10 +21935,17 @@ CREATE INDEX idx_ri_status ON coord.runner_instances USING btree (status);
 
 
 --
--- Name: idx_route_serving_observations_host_path; Type: INDEX; Schema: coord; Owner: -
+-- Name: idx_route_serving_observations_drift_status; Type: INDEX; Schema: coord; Owner: -
 --
 
-CREATE INDEX idx_route_serving_observations_host_path ON coord.route_serving_observations USING btree (host, route_path);
+CREATE INDEX idx_route_serving_observations_drift_status ON coord.route_serving_observations USING btree (drift_class, actual_status);
+
+
+--
+-- Name: idx_route_serving_observations_host_path_observed; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_route_serving_observations_host_path_observed ON coord.route_serving_observations USING btree (host, route_path, observed_at DESC);
 
 
 --
@@ -21824,6 +21974,20 @@ CREATE INDEX idx_scheduler_ticks_tick_at ON coord.scheduler_ticks USING btree (t
 --
 
 CREATE INDEX idx_schema_drift_events_event_at ON coord.schema_drift_events USING btree (event_at DESC);
+
+
+--
+-- Name: idx_session_handle_lineage_agent_session; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_session_handle_lineage_agent_session ON coord.session_handle_lineage USING btree (agent_session_id);
+
+
+--
+-- Name: idx_session_handles_device_live; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_session_handles_device_live ON coord.session_handles USING btree (device_id) WHERE (status = 'live'::text);
 
 
 --
@@ -22226,6 +22390,13 @@ CREATE INDEX idx_worktree_census_repo_path ON coord.worktree_census USING btree 
 
 
 --
+-- Name: idx_worktree_reclaim_events_device_observed_missing_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_worktree_reclaim_events_device_observed_missing_at ON coord.worktree_reclaim_events USING btree (device_id, observed_missing_at DESC);
+
+
+--
 -- Name: idx_worktree_volume_device_observed_at; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -22478,6 +22649,13 @@ CREATE UNIQUE INDEX uq_fleet_runtime_policy_scope ON coord.fleet_runtime_policy 
 
 
 --
+-- Name: uq_memory_jobs_live_input; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_memory_jobs_live_input ON coord.memory_jobs USING btree (tenant_id, kind, input_hash) WHERE (status = ANY (ARRAY['pending'::text, 'claimed'::text, 'done'::text]));
+
+
+--
 -- Name: uq_memory_links_edge; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -22489,13 +22667,6 @@ CREATE UNIQUE INDEX uq_memory_links_edge ON coord.memory_links USING btree (tena
 --
 
 CREATE UNIQUE INDEX uq_memory_records_tenant_content_hash_live ON coord.memory_records USING btree (tenant_id, content_hash) WHERE ((is_tombstone = false) AND (superseded_by IS NULL) AND (valid_until IS NULL));
-
-
---
--- Name: uq_memory_synthesis_jobs_live_member_set; Type: INDEX; Schema: coord; Owner: -
---
-
-CREATE UNIQUE INDEX uq_memory_synthesis_jobs_live_member_set ON coord.memory_synthesis_jobs USING btree (tenant_id, member_set_hash) WHERE (status = ANY (ARRAY['pending'::text, 'claimed'::text, 'done'::text]));
 
 
 --
@@ -22545,6 +22716,13 @@ CREATE UNIQUE INDEX uq_prompt_documents_tenant_kind_name ON coord.prompt_documen
 --
 
 CREATE UNIQUE INDEX uq_restack_verifications_signature ON coord.restack_verifications USING btree (signature_id);
+
+
+--
+-- Name: uq_session_handles_tenant_name; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_session_handles_tenant_name ON coord.session_handles USING btree (tenant_id, name) WHERE (closed_at IS NULL);
 
 
 --
@@ -29436,6 +29614,14 @@ ALTER TABLE ONLY coord.memory_federation_reports
 
 
 --
+-- Name: memory_jobs memory_jobs_tenant_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.memory_jobs
+    ADD CONSTRAINT memory_jobs_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES coord.tenants(tenant_id) ON DELETE CASCADE;
+
+
+--
 -- Name: memory_links memory_links_source_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -29473,14 +29659,6 @@ ALTER TABLE ONLY coord.memory_records
 
 ALTER TABLE ONLY coord.memory_records
     ADD CONSTRAINT memory_records_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES coord.tenants(tenant_id) ON DELETE RESTRICT;
-
-
---
--- Name: memory_synthesis_jobs memory_synthesis_jobs_tenant_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
---
-
-ALTER TABLE ONLY coord.memory_synthesis_jobs
-    ADD CONSTRAINT memory_synthesis_jobs_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES coord.tenants(tenant_id) ON DELETE CASCADE;
 
 
 --
@@ -29681,6 +29859,22 @@ ALTER TABLE ONLY coord.device_connections
 
 ALTER TABLE ONLY coord.session_events
     ADD CONSTRAINT session_events_session_id_fkey FOREIGN KEY (session_id) REFERENCES coord.sessions(id) ON DELETE CASCADE;
+
+
+--
+-- Name: session_handle_lineage session_handle_lineage_handle_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.session_handle_lineage
+    ADD CONSTRAINT session_handle_lineage_handle_fkey FOREIGN KEY (handle) REFERENCES coord.session_handles(handle);
+
+
+--
+-- Name: session_handles session_handles_device_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.session_handles
+    ADD CONSTRAINT session_handles_device_id_fkey FOREIGN KEY (device_id) REFERENCES coord.devices(device_id);
 
 
 --
