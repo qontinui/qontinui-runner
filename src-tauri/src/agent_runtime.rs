@@ -2067,9 +2067,7 @@ async fn post_continuation_poll_report(device_id: uuid::Uuid, counts: PollRunCou
             );
         }
         Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
-            debug!(
-                "agent_runtime: poll-report POST 404 (endpoint not deployed yet; continuing)"
-            );
+            debug!("agent_runtime: poll-report POST 404 (endpoint not deployed yet; continuing)");
         }
         Ok(resp) => {
             warn!(
