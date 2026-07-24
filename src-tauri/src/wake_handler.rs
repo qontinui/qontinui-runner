@@ -61,8 +61,17 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
+    // Dedupe identical URLs within a single burst: cold-start can deliver the
+    // same queued URL more than once, and for `github-connected` two spawns of
+    // the same URL would race — one claims, the loser emits a spurious failure
+    // event that can clobber the shown success (review L1). The OAuth code is
+    // still spent exactly once regardless; this just avoids the racing UI event.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for url_str in urls {
         let url_str = url_str.as_ref();
+        if !seen.insert(url_str.to_string()) {
+            continue;
+        }
         match Url::parse(url_str) {
             Ok(url) => {
                 if url.scheme() != SCHEME {
