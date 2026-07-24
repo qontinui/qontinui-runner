@@ -172,7 +172,7 @@ fn register_blocking(req: &HandleRegisterRequest) -> Option<String> {
                 info!(
                     claude_session_id = %req.claude_session_id,
                     status = %resp.status(),
-                    "session_handle: coord register route unavailable (best-effort — retried on next registration)"
+                    "session_handle: coord register route unavailable (best-effort — retried on next FRESH registration, typically next runner restart)"
                 );
             }
             None
@@ -182,7 +182,7 @@ fn register_blocking(req: &HandleRegisterRequest) -> Option<String> {
                 debug!(
                     claude_session_id = %req.claude_session_id,
                     error = %e,
-                    "session_handle: coord register call failed (best-effort — retried on next registration)"
+                    "session_handle: coord register call failed (best-effort — retried on next FRESH registration, typically next runner restart)"
                 );
             }
             None
