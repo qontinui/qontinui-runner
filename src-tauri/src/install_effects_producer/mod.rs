@@ -1423,6 +1423,7 @@ mod tests {
             origin: Some("authoritative".to_string()),
             restore_pending_at: None,
             confirmed_at: confirmed.then_some(3),
+            handle: None,
         }
     }
 
@@ -1615,6 +1616,7 @@ mod tests {
             origin: Some(ORIGIN_OBSERVED.to_string()),
             restore_pending_at: None,
             confirmed_at: None,
+            handle: None,
         });
 
         // The confirming hook fires with bash-flavored context.

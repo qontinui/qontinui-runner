@@ -947,6 +947,7 @@ pub fn terminal_session_record_open(
         origin,
         restore_pending_at: None,
         confirmed_at: None,
+        handle: None,
     };
     store.record_open(record);
     Ok(CommandResponse {
@@ -1652,6 +1653,7 @@ async fn poll_and_record_session<F>(
                 ),
                 restore_pending_at: None,
                 confirmed_at: None,
+                handle: None,
             };
             store.record_open(record);
             info!(
@@ -1709,6 +1711,7 @@ pub(crate) fn record_pinned_session_open(
         origin: Some(crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string()),
         restore_pending_at: None,
         confirmed_at: None,
+        handle: None,
     });
     info!(
         terminal_id = %terminal_id,

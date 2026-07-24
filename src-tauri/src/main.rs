@@ -2637,6 +2637,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     },
                 );
+                // Session-identity fabric Phase 1 — let the AI-session
+                // registrar persist the coord-minted `fsh_` session handle
+                // next to `claude_session_id` in this durable store, so a
+                // restart re-presents the SAME handle on restore-rebind.
+                ai_coord_registrar.attach_lifecycle_store(lifecycle_store.clone());
                 // Append-only session-snapshot HISTORY (session-restore
                 // shim-fix plan, Phase 4): a durable JSONL audit of the full
                 // session set, written on every layout-meaningful registry

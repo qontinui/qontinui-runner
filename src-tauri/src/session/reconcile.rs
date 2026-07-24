@@ -351,6 +351,7 @@ fn bind_record(
         origin: Some(origin.to_string()),
         restore_pending_at: None,
         confirmed_at: confirmed.then(|| chrono::Utc::now().timestamp_millis()),
+        handle: None,
     }
 }
 
@@ -1072,6 +1073,7 @@ fn disk_only_record(t: &crate::terminal::transcript::RecentTranscript) -> Termin
         origin: Some(ORIGIN_RECONCILED.to_string()),
         restore_pending_at: None,
         confirmed_at: None,
+        handle: None,
     }
 }
 
@@ -1260,6 +1262,7 @@ mod tests {
             origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
             confirmed_at: Some(1),
+            handle: None,
         }
     }
 
@@ -1645,6 +1648,7 @@ mod tests {
             origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
             confirmed_at: None,
+            handle: None,
         };
         store.record_open(phantom);
 
@@ -1797,6 +1801,7 @@ mod tests {
             origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
             confirmed_at: None,
+            handle: None,
         });
 
         let live = vec![pty("live-term", Some(4242), "C:/repo")];

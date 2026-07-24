@@ -58,7 +58,7 @@
 //! affected — every coord write here is best-effort and swallows errors.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -119,6 +119,13 @@ struct Inner {
     /// hold (`task_run_id`).
     forward: Mutex<HashMap<Uuid, String>>,
     reverse: Mutex<HashMap<String, Uuid>>,
+    /// Session-identity fabric Phase 1 — lifecycle store the registrar
+    /// persists the coord-minted `fsh_` session handle into (next to the
+    /// record's `claude_session_id`). Attached once at startup
+    /// ([`AiCoordRegistrar::attach_lifecycle_store`]); unattached (tests,
+    /// ephemeral registrars) → the handle mint/rebind is skipped entirely,
+    /// which also keeps unit tests network-silent.
+    lifecycle_store: OnceLock<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>,
 }
 
 impl AiCoordRegistrar {
@@ -131,7 +138,22 @@ impl AiCoordRegistrar {
                 machine_id,
                 forward: Mutex::new(HashMap::new()),
                 reverse: Mutex::new(HashMap::new()),
+                lifecycle_store: OnceLock::new(),
             }),
+        }
+    }
+
+    /// Attach the durable lifecycle store (once, at startup) so
+    /// [`Self::register_session`] can acquire the coord-minted `fsh_` session
+    /// handle and persist it next to the record's `claude_session_id`
+    /// (session-identity fabric Phase 1). Without it the handle mint/rebind
+    /// is skipped entirely (tests, ephemeral registrars).
+    pub fn attach_lifecycle_store(
+        &self,
+        store: Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>,
+    ) {
+        if self.inner.lifecycle_store.set(store).is_err() {
+            warn!("ai_coord_register: lifecycle store already attached — ignoring");
         }
     }
 
@@ -206,6 +228,9 @@ impl AiCoordRegistrar {
                 "AI session".to_string()
             }
         };
+        // Captured before `purpose` moves into the intent JSON — forwarded as
+        // the fabric handle's human `name` alias below.
+        let name_alias = super::session_handle::name_alias(&purpose);
         let mut intent = json!({ "purpose": purpose });
         if let Some(r) = repo.as_ref() {
             intent["repo"] = json!(r);
@@ -247,6 +272,39 @@ impl AiCoordRegistrar {
             "ai_coord_register: registered AI session {} as coord session {} (kind=agentic)",
             task_run_id, session_id
         );
+
+        // Session-identity fabric Phase 1 — acquire/rebind the stable `fsh_`
+        // session handle for this session, best-effort on a detached thread
+        // (NEVER fails registration or startup; coord may not serve the route
+        // yet). The runner pins the CLI session id to `task_run_id` for every
+        // registrar-managed session (each call site passes
+        // `CliSessionContext { cli_session_id: task_run_id, .. }`), so
+        // `claude_session_id == task_run_id` here — the durable anchor the
+        // registry mints/rebinds on. Running on every FRESH registration also
+        // covers restore for free: a restarted runner re-registers each
+        // resumed session (the R4 dedup index is in-memory, lost on restart),
+        // and the server-side rebind keyed on `claude_session_id` refreshes
+        // `current_agent_session_id` on the existing handle row. Gated on an
+        // ATTACHED lifecycle store (main.rs attaches at boot) — which also
+        // keeps unit-test registrars (never attached) network-silent.
+        if let Some(store) = self.inner.lifecycle_store.get().cloned() {
+            let terminal_id = store
+                .get(task_run_id)
+                .map(|r| r.terminal_id)
+                .filter(|t| !t.trim().is_empty());
+            super::session_handle::spawn_register(
+                store,
+                super::session_handle::HandleRegisterRequest {
+                    claude_session_id: task_run_id.to_string(),
+                    agent_session_id: session_id,
+                    task_run_id: Some(task_run_id.to_string()),
+                    terminal_id,
+                    name: name_alias,
+                    machine_id: Some(self.inner.machine_id),
+                },
+            );
+        }
+
         Some(session_id)
     }
 
@@ -761,8 +819,9 @@ fn requeue_front(queue: &mut std::collections::VecDeque<LogEntry>, batch: Vec<Lo
 /// Resolve the coord HTTP base (env `COORD_HTTP_URL` → active profile
 /// `coord_url`). `None` when nothing is configured — the emitter then keeps
 /// buffering (capped) rather than dropping, matching the other resolvers'
-/// no-localhost-fallback posture.
-fn coord_http_base() -> Option<String> {
+/// no-localhost-fallback posture. `pub(crate)` so the session-handle
+/// registrar ([`super::session_handle`]) shares the same resolution.
+pub(crate) fn coord_http_base() -> Option<String> {
     match qontinui_runner_lib::profiles::resolve_coord_base() {
         qontinui_runner_lib::profiles::CoordBase::Configured(base) => {
             Some(base.trim_end_matches('/').to_string())

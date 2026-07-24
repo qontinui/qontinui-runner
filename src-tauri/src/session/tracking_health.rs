@@ -429,6 +429,7 @@ mod tests {
             origin: None,
             restore_pending_at: None,
             confirmed_at: None,
+            handle: None,
         }
     }
 

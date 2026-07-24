@@ -356,6 +356,7 @@ pub async fn dispatch_subtask(
                 ),
                 restore_pending_at: None,
                 confirmed_at: None,
+                handle: None,
             },
         );
         info!(
