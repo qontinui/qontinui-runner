@@ -1908,6 +1908,9 @@ async fn poll_pending_continuations(device_id: uuid::Uuid) {
         return;
     };
     let url = format!("{base}/coord/agents/pending-continuations?device_id={device_id}");
+    // Every fetch-failure exit below still self-reports (all-zeros +
+    // `skip_reasons.fetch_failed`): coord must be able to tell "poll loop
+    // alive but the pull route failing" apart from "poll loop dead".
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
@@ -1915,6 +1918,7 @@ async fn poll_pending_continuations(device_id: uuid::Uuid) {
         Ok(c) => c,
         Err(e) => {
             warn!("agent_runtime: pending-continuations client build failed: {e:#}");
+            post_continuation_poll_report(device_id, PollRunCounts::fetch_failure()).await;
             return;
         }
     };
@@ -1922,6 +1926,7 @@ async fn poll_pending_continuations(device_id: uuid::Uuid) {
         Ok(r) => r,
         Err(e) => {
             warn!("agent_runtime: pending-continuations GET failed (continuing): {e:#}");
+            post_continuation_poll_report(device_id, PollRunCounts::fetch_failure()).await;
             return;
         }
     };
@@ -1930,12 +1935,14 @@ async fn poll_pending_continuations(device_id: uuid::Uuid) {
             "agent_runtime: pending-continuations GET returned {} (continuing)",
             resp.status()
         );
+        post_continuation_poll_report(device_id, PollRunCounts::fetch_failure()).await;
         return;
     }
     let body: PendingContinuationsResponse = match resp.json().await {
         Ok(b) => b,
         Err(e) => {
             warn!("agent_runtime: pending-continuations parse failed (continuing): {e:#}");
+            post_continuation_poll_report(device_id, PollRunCounts::fetch_failure()).await;
             return;
         }
     };
@@ -1973,12 +1980,28 @@ async fn poll_pending_continuations(device_id: uuid::Uuid) {
 /// coord self-report. `listed_n` = rows fetched; `dispatched_n` = ids NEWLY
 /// claimed this run; the two skip counters are the dedupe-drops and the
 /// not-addressed-to-this-instance drops (skipped = listed − dispatched).
+/// `fetch_failed` marks a run whose pending-list pull itself failed (client
+/// build / GET / non-2xx / parse) — reported so coord can tell "poll loop
+/// alive but the pull route failing" apart from "poll loop dead" (the exact
+/// ambiguity the self-report exists to kill).
 #[derive(Debug, Default, Clone, Copy)]
 struct PollRunCounts {
     listed_n: usize,
     dispatched_n: usize,
     already_dispatched: usize,
     not_addressed_to_self: usize,
+    fetch_failed: bool,
+}
+
+impl PollRunCounts {
+    /// The counts for a run whose pending-list pull failed before any row was
+    /// listed: all zeros + the `fetch_failed` skip reason.
+    fn fetch_failure() -> Self {
+        Self {
+            fetch_failed: true,
+            ..Default::default()
+        }
+    }
 }
 
 /// Wire body for `POST /coord/agents/continuation-poll-report`.
@@ -1999,6 +2022,9 @@ impl ContinuationPollReportBody {
         }
         if counts.not_addressed_to_self > 0 {
             skip_reasons.insert("not_addressed_to_self", counts.not_addressed_to_self);
+        }
+        if counts.fetch_failed {
+            skip_reasons.insert("fetch_failed", 1);
         }
         Self {
             device_id,
@@ -5771,6 +5797,7 @@ mod tests {
                 dispatched_n: 2,
                 already_dispatched: 2,
                 not_addressed_to_self: 1,
+                fetch_failed: false,
             },
         );
         let v = serde_json::to_value(&body).unwrap();
@@ -5794,13 +5821,28 @@ mod tests {
             PollRunCounts {
                 listed_n: 1,
                 dispatched_n: 1,
-                already_dispatched: 0,
-                not_addressed_to_self: 0,
+                ..Default::default()
             },
         );
         let v = serde_json::to_value(&clean).unwrap();
         assert_eq!(v["skipped_n"], 0);
         assert_eq!(v["skip_reasons"], serde_json::json!({}));
+
+        // A pending-list fetch failure self-reports as all-zeros +
+        // skip_reasons.fetch_failed = 1, so coord can tell a failing pull
+        // route apart from a dead poll loop.
+        let failed = ContinuationPollReportBody::new(dev, PollRunCounts::fetch_failure());
+        let v = serde_json::to_value(&failed).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "device_id": "11111111-1111-1111-1111-111111111111",
+                "listed_n": 0,
+                "dispatched_n": 0,
+                "skipped_n": 0,
+                "skip_reasons": { "fetch_failed": 1 },
+            })
+        );
     }
 
     // NOTE: the delivery-task panic net is `spawn_supervised_delivery` — thin
