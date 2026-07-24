@@ -516,43 +516,6 @@ fn detect_os_version() -> Option<String> {
     System::long_os_version().or_else(System::os_version)
 }
 
-/// Path to the paired-user JSON written by `device pair` and read by `device
-/// init` to attach a `user_id` to the register payload. Living under the
-/// Tauri app's local data directory (alongside `auth_tokens.enc`) keeps the
-/// CLI bin and the GUI runner reading the same file.
-fn paired_user_path() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|d| d.join("com.qontinui.runner").join("paired_user.json"))
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PairedUserFile {
-    user_id: String,
-    /// Mirror of `qontinui_runner_lib::pair::PairedUserFile::tenant_id`.
-    /// `#[serde(default)]` keeps legacy files (user_id-only) parsing.
-    /// The CLI bootstrap (`register_with_coord`) forwards this to coord
-    /// on `POST /coord/devices/register`; absent → JWT-claim fallback.
-    #[serde(default)]
-    tenant_id: Option<String>,
-}
-
-fn load_paired_user_id() -> Option<String> {
-    let path = paired_user_path()?;
-    let bytes = std::fs::read(&path).ok()?;
-    let parsed: PairedUserFile = serde_json::from_slice(&bytes).ok()?;
-    Some(parsed.user_id)
-}
-
-/// Load `(user_id, tenant_id_opt)` from `paired_user.json`. Returns
-/// `None` if the file doesn't exist or isn't parseable. Phase 2 of the
-/// default-tenant-propagation plan — the CLI bootstrap needs both
-/// fields to satisfy coord's `tenant_id_required` gate.
-fn load_paired_user() -> Option<(String, Option<String>)> {
-    let path = paired_user_path()?;
-    let bytes = std::fs::read(&path).ok()?;
-    let parsed: PairedUserFile = serde_json::from_slice(&bytes).ok()?;
-    Some((parsed.user_id, parsed.tenant_id))
-}
-
 fn cmd_device_path() -> ExitCode {
     match device_file_path() {
         Some(p) => {
@@ -642,11 +605,12 @@ fn cmd_device_init(name_arg: Option<&str>) -> ExitCode {
     // machine.json is the canonical record; coord.devices is a derived view
     // (qontinui-coord re-syncs from machine.json on next /coord/status POST).
     let display_name = file.name.clone().unwrap_or_else(|| file.hostname.clone());
-    let paired = load_paired_user();
-    let (paired_user_id, paired_tenant_id) = match paired {
-        Some((uid, tid)) => (Some(uid), tid),
-        None => (None, None),
-    };
+    // Read pairing state through the lib's env-honoring, v2-aware readers
+    // (they resolve `QONTINUI_SECURE_STORAGE_DIR` first, then
+    // `data_local_dir()/com.qontinui.runner/` — the same chain the write
+    // path `persist_pairing` uses). Both are `None` when unpaired.
+    let paired_user_id = qontinui_runner_lib::pair::read_paired_user_id_from_disk();
+    let paired_tenant_id = qontinui_runner_lib::pair::read_paired_tenant_id_from_disk();
     // Resolve tenant_id for the register payload (coord rejects with
     // 400 `tenant_id_required` otherwise). Order: paired_user.json
     // → cached device-token JWT claim → hard error. Matches the
@@ -756,13 +720,15 @@ fn cmd_device_show() -> ExitCode {
 // On success we persist:
 //
 // - The device-token JWT via the runner's existing `AuthManager` /
-//   `SecureStorage` (AES-256-GCM at `{data_local_dir}/com.qontinui.runner/
-//   auth_tokens.enc`). The same file may already hold a pre-Phase-3
-//   `qontinui_runner_<random>` bearer; this overwrites it with the JWT (see
-//   the comment in `secure_storage.rs` documenting the format change).
+//   `SecureStorage` (AES-256-GCM in `auth_tokens.enc`, under
+//   `QONTINUI_SECURE_STORAGE_DIR` when that env var is set and non-empty,
+//   else `{data_local_dir}/com.qontinui.runner/`). The same file may already
+//   hold a pre-Phase-3 `qontinui_runner_<random>` bearer; this overwrites it
+//   with the JWT (see the comment in `secure_storage.rs` documenting the
+//   format change).
 //
-// - The paired user_id to `paired_user.json` (under the same data_local_dir),
-//   so the next `device init` carries it on the register payload.
+// - The paired user_id to `paired_user.json` (same env-var-first directory
+//   chain), so the next `device init` carries it on the register payload.
 
 enum PairMode {
     Browser,
@@ -974,9 +940,10 @@ fn cmd_device_pair(
 ///   `vision`, `accessibility-bridge`) get pushed by Phase 6 work.
 /// - `name`: user-supplied display name; defaults to hostname.
 /// - `user_id`: optional UUID, present only if the device has been paired
-///   (the file `{data_local_dir}/com.qontinui.runner/paired_user.json`
-///   exists from a prior `device pair` run). When absent, coord treats this
-///   as a "system device" register.
+///   (`paired_user.json` exists from a prior `device pair` run — under
+///   `QONTINUI_SECURE_STORAGE_DIR` when set and non-empty, else
+///   `{data_local_dir}/com.qontinui.runner/`). When absent, coord treats
+///   this as a "system device" register.
 fn register_with_coord(
     device_id: &str,
     hostname: &str,
