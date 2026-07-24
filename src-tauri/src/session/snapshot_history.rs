@@ -791,6 +791,7 @@ mod tests {
             origin: Some("authoritative".to_string()),
             restore_pending_at: None,
             confirmed_at: Some(500),
+            handle: None,
         };
         let s = SnapshotSession::from(&rec);
         assert_eq!(s.claude_session_id, "sess-1");
@@ -841,6 +842,7 @@ mod tests {
             origin: Some("authoritative".to_string()),
             restore_pending_at: None,
             confirmed_at: confirmed.then_some(500),
+            handle: None,
         }
     }
 

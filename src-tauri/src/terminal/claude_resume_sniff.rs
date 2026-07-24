@@ -140,6 +140,7 @@ pub(crate) fn apply_typed_resume_effects(
                 ),
                 restore_pending_at: None,
                 confirmed_at: None,
+                handle: None,
             });
             info!(
                 terminal_id = %terminal_id,

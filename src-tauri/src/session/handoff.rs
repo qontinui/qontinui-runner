@@ -895,6 +895,7 @@ fn registry_record_from_restore_payload(
         origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
         restore_pending_at: None,
         confirmed_at,
+        handle: None,
     }
 }
 

@@ -301,6 +301,7 @@ mod tests {
             origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
             confirmed_at: Some(3),
+            handle: None,
         }
     }
 

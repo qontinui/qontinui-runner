@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::session::restore_record_emitter::RestoreRecordEmitter;
 use crate::session::snapshot_history::{SnapshotHistory, SnapshotSession, TranscriptProbe};
@@ -266,6 +266,20 @@ pub struct TerminalSessionRecord {
     /// additive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirmed_at: Option<i64>,
+    /// Coord-minted stable fleet session handle (`fsh_…`) for this session
+    /// (session-identity fabric Phase 1, plan
+    /// `2026-07-05-session-identity-messaging-restore-fabric.md` §4). Persisted
+    /// next to `claude_session_id` so a restart re-presents the SAME handle on
+    /// restore-rebind instead of re-minting. The registry is
+    /// SERVER-authoritative — rebind is keyed on the durable
+    /// `claude_session_id`, so a divergent local value is overwritten (server
+    /// wins; see [`SessionLifecycleStore::set_handle`]).
+    ///
+    /// `#[serde(default)]`: every pre-fabric on-disk record deserializes as
+    /// `None` (no handle acquired yet) — purely additive; legacy rows load
+    /// cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
 }
 
 /// Durable map of `claude_session_id -> TerminalSessionRecord`. Cheap to
@@ -487,6 +501,15 @@ impl SessionLifecycleStore {
             // present, else preserve the existing one.
             if rec.confirmed_at.is_some() {
                 entry.confirmed_at = rec.confirmed_at;
+            }
+            // The fleet session handle is STICKY like `config_dir`: handle
+            // acquisition is a separate best-effort write
+            // ([`Self::set_handle`]) and virtually no `record_open` caller
+            // knows the handle — a re-record without one (zone-move backstop,
+            // boot re-assert, provider hook) must never clear it. Take the
+            // incoming value only when present.
+            if rec.handle.is_some() {
+                entry.handle = rec.handle;
             }
             entry.state = "open".to_string();
             entry.closed_at = None;
@@ -777,6 +800,52 @@ impl SessionLifecycleStore {
         // honest restore tier (terminal_only → full for a Full-tier
         // provider), which is a material wire-field change.
         self.mirror_restore_record(&confirmed);
+    }
+
+    /// Persist the coord-minted stable fleet session handle (`fsh_…`) onto the
+    /// record for `claude_session_id` (session-identity fabric Phase 1).
+    ///
+    /// SERVER WINS: coord's `coord.session_handles` registry rebinds on the
+    /// durable `claude_session_id` (UNIQUE anchor), so when the local value
+    /// diverges from what the server returned, the local file drifted —
+    /// overwrite it and warn. Writes ONLY on change; a matching handle is a
+    /// no-op, and an ABSENT record (e.g. an AI subprocess session that has no
+    /// terminal-grid row) is a debug-logged no-op — this method never creates
+    /// records (a handle-only row would be a phantom restore candidate).
+    pub fn set_handle(&self, claude_session_id: &str, handle: &str) {
+        let snapshot = {
+            let mut m = match self.map.lock() {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = %e, "session_lifecycle_store: lock poisoned on set_handle");
+                    return;
+                }
+            };
+            let Some(rec) = m.get_mut(claude_session_id) else {
+                debug!(
+                    claude_session_id,
+                    handle,
+                    "session_lifecycle_store: no record for session — handle not persisted locally (registry is server-authoritative)"
+                );
+                return;
+            };
+            match rec.handle.as_deref() {
+                Some(existing) if existing == handle => return, // unchanged — no write
+                Some(existing) => warn!(
+                    claude_session_id,
+                    local = existing,
+                    server = handle,
+                    "session_lifecycle_store: local session handle diverged from coord registry — server wins"
+                ),
+                None => info!(
+                    claude_session_id,
+                    handle, "session_lifecycle_store: bound fleet session handle"
+                ),
+            }
+            rec.handle = Some(handle.to_string());
+            m.clone()
+        };
+        self.persist(&snapshot);
     }
 
     /// Re-key a record from `old_id` to `new_id`: remove the entry stored under
@@ -1548,6 +1617,7 @@ mod tests {
             origin: None,
             restore_pending_at: None,
             confirmed_at: None,
+            handle: None,
         }
     }
 
@@ -1684,6 +1754,83 @@ mod tests {
         assert!(
             s2.get("old").unwrap().confirmed_at.is_none(),
             "pre-Phase-2 record loads provisional"
+        );
+    }
+
+    /// Session-identity fabric Phase 1 — the `fsh_` handle round-trips through
+    /// disk, is STICKY across a handle-less re-record, only writes on change,
+    /// the server wins on divergence, `set_handle` never creates records, and
+    /// a LEGACY on-disk row without the field loads cleanly as `None`.
+    #[test]
+    fn handle_persists_sticky_and_legacy_rows_load_without_it() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        store.record_open(rec("sess-h"));
+        assert!(
+            store.get("sess-h").unwrap().handle.is_none(),
+            "no handle until acquired"
+        );
+
+        // Acquire → persisted.
+        store.set_handle("sess-h", "fsh_abc");
+        assert_eq!(
+            store.get("sess-h").unwrap().handle.as_deref(),
+            Some("fsh_abc")
+        );
+
+        // A handle-less re-record (zone-move backstop / boot re-assert /
+        // provider hook) must NOT clear it — sticky like config_dir.
+        store.record_open(rec("sess-h"));
+        assert_eq!(
+            store.get("sess-h").unwrap().handle.as_deref(),
+            Some("fsh_abc"),
+            "handle-less re-record preserves the handle"
+        );
+
+        // Same value re-set is a no-op; a DIVERGENT server value overwrites
+        // (server wins — rebind is keyed on claude_session_id server-side).
+        store.set_handle("sess-h", "fsh_abc");
+        store.set_handle("sess-h", "fsh_new");
+        assert_eq!(
+            store.get("sess-h").unwrap().handle.as_deref(),
+            Some("fsh_new")
+        );
+
+        // set_handle on an absent id never creates a record (a handle-only
+        // row would be a phantom restore candidate).
+        store.set_handle("ghost", "fsh_ghost");
+        assert!(store.get("ghost").is_none());
+
+        // Durable across reload, and a record_open CARRYING a handle sets it.
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        assert_eq!(
+            store.get("sess-h").unwrap().handle.as_deref(),
+            Some("fsh_new"),
+            "handle survives a reload"
+        );
+        let mut r = rec("sess-h2");
+        r.handle = Some("fsh_h2".to_string());
+        store.record_open(r);
+        assert_eq!(
+            store.get("sess-h2").unwrap().handle.as_deref(),
+            Some("fsh_h2")
+        );
+
+        // A legacy on-disk row without the `handle` key loads cleanly as None
+        // (serde default — the fabric field is purely additive).
+        let json = r#"{"old": {
+            "claudeSessionId":"old","configDir":null,"workingDir":"C:/repo",
+            "pageId":"default","zoneIndex":1,"title":"Old","terminalId":"t",
+            "openedAt":1,"lastSeenAt":2,"state":"open","closedAt":null,"closeReason":null
+        }}"#;
+        let p2 = dir.path().join("legacy-handle.json");
+        std::fs::write(&p2, json).unwrap();
+        let s2 = SessionLifecycleStore::open(&p2).unwrap();
+        assert!(
+            s2.get("old").unwrap().handle.is_none(),
+            "legacy row without the field loads with no handle"
         );
     }
 
@@ -3139,6 +3286,7 @@ mod tests {
             origin: None,
             restore_pending_at: None,
             confirmed_at: None,
+            handle: None,
         }
     }
 
