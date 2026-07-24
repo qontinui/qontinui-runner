@@ -75,6 +75,8 @@ import { useZoneLayout } from "../useZoneLayout";
 import { type TerminalInstanceHandle } from "../TerminalInstance";
 import { type ZoneSessionInfo } from "../ZoneProfilePicker";
 import { writeWhenReady } from "../writeWhenReady";
+import { fetchLiveClaudeSessionIds } from "../liveClaudeSessions";
+import { decideColdResume } from "../useTerminalInitialization";
 
 import { useSessionStateTracking } from "../useSessionStateTracking";
 import { useUnreadTracking } from "../useUnreadTracking";
@@ -278,10 +280,7 @@ const PageSessionScope = memo(function PageSessionScope({
   const tabIds = useMemo(() => tabs.map((t) => t.id), [tabs]);
   // Live-tab set so the zone layout can exclude exited tombstones from the
   // hidden-but-LIVE "N more" count (and surface them separately).
-  const liveTabIds = useMemo(
-    () => new Set(tabs.filter((t) => t.isAlive).map((t) => t.id)),
-    [tabs],
-  );
+  const liveTabIds = useMemo(() => new Set(tabs.filter((t) => t.isAlive).map((t) => t.id)), [tabs]);
   const zoneLayout = useZoneLayout(tabIds, pageId, myWindowLabel, liveTabIds);
 
   // Page-namespaced zone labels / notes / pins / tags. Moved into the scope
@@ -340,11 +339,48 @@ const PageSessionScope = memo(function PageSessionScope({
     };
 
     // Process only sessions whose zone now has an assignment; leave the
-    // rest in the ref for the next assignments tick.
+    // rest in the ref for the next assignments tick. The partition (and the
+    // ref update) stays SYNCHRONOUS so a re-fire of this effect while the
+    // async liveness gate below is in flight can never double-type a resume.
     const remaining: ZoneSessionInfo[] = [];
+    const toResume: Array<{ s: ZoneSessionInfo; tabId: string }> = [];
     for (const s of sessions) {
       const tabId = zoneLayout.assignments[s.zoneIndex];
       if (tabId && SESSION_ID_RE.test(s.claudeSessionId)) {
+        toResume.push({ s, tabId });
+      } else {
+        remaining.push(s);
+      }
+    }
+    pendingProfileSessionsRef.current = remaining.length > 0 ? remaining : null;
+    if (toResume.length === 0) return;
+
+    void (async () => {
+      // P1 restore idempotence: a zone profile can name sessions that are
+      // ALREADY alive elsewhere (another page, another window, a process
+      // outside the runner) — typing `--resume <id>` for one forks it: two
+      // live processes on one transcript. Gate every typed resume on the same
+      // liveness oracle the cold-restore drain uses (fetchLiveClaudeSessionIds
+      // + decideColdResume). One fetch covers the batch — unlike the drain's
+      // ~500 ms-spaced typing, this loop types back-to-back within
+      // milliseconds, so the read IS "immediately before typing" for all of
+      // them. `null` (registry unreadable) fails CLOSED: skip the whole
+      // batch. Skipped sessions are dropped, not re-parked — the profile's
+      // layout/tabs are untouched, and the operator can still resume any of
+      // them by hand (single-id operator-clicked resume paths stay ungated
+      // by design: the click is the intent).
+      const liveIds = await fetchLiveClaudeSessionIds();
+      for (const { s, tabId } of toResume) {
+        const decision = decideColdResume(liveIds, s.claudeSessionId);
+        if (decision !== "respawn") {
+          console.warn(
+            `[TerminalSession] profile resume SKIPPED for session ${s.claudeSessionId}: ` +
+              (decision === "skip-alive"
+                ? "a live Claude process already hosts this id (typing --resume would fork it)"
+                : "live-session registry unreadable — failing closed toward not-respawning"),
+          );
+          continue;
+        }
         updateTab(tabId, {
           claudeSessionId: s.claudeSessionId,
           claudeConfigDir: s.claudeConfigDir,
@@ -373,11 +409,8 @@ const PageSessionScope = memo(function PageSessionScope({
               ),
           },
         );
-      } else {
-        remaining.push(s);
       }
-    }
-    pendingProfileSessionsRef.current = remaining.length > 0 ? remaining : null;
+    })();
   }, [zoneLayout.assignments, updateTab, tabs, pageId]);
 
   // Transcripts are read up here (rather than in the AiFeatures block below)
@@ -704,8 +737,7 @@ const PageSessionScope = memo(function PageSessionScope({
         }>("analyze_session_summary", { input: text });
         if (result.success && result.data) {
           const data = result.data as
-            | Array<{ type?: string; content?: string }>
-            | { panels?: Array<{ content?: string }> };
+            Array<{ type?: string; content?: string }> | { panels?: Array<{ content?: string }> };
           let summaryContent: string | null = null;
 
           if (Array.isArray(data)) {
