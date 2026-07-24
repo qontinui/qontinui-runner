@@ -332,12 +332,22 @@ pub fn ensure_device_initialized_at(path: &std::path::Path) {
 
 /// Path to the paired-user JSON written by `device pair` and read by
 /// `device init` to attach a `user_id` to the register payload. Lives
-/// under the Tauri app's local data directory (alongside
-/// `auth_tokens.enc`) so the CLI bin and the GUI runner read the same
-/// file.
+/// alongside `auth_tokens.enc`: under `QONTINUI_SECURE_STORAGE_DIR` when
+/// that env var is set and non-empty, else the Tauri app's local data
+/// directory (`data_local_dir()/com.qontinui.runner/`) — so the CLI bin
+/// and the GUI runner read the same file.
 pub(crate) fn paired_user_path() -> Option<PathBuf> {
-    let base = std::env::var("QONTINUI_SECURE_STORAGE_DIR")
-        .ok()
+    paired_user_path_with(std::env::var("QONTINUI_SECURE_STORAGE_DIR").ok())
+}
+
+/// Env-free core of [`paired_user_path`] so unit tests can pin the
+/// resolution order hermetically (no process-global `set_var` — see the
+/// `launch_env.rs` header for why that races). `override_dir` is the raw
+/// `QONTINUI_SECURE_STORAGE_DIR` value; `None` (unset) and `Some("")`
+/// (set-but-empty) both fall back to
+/// `data_local_dir()/com.qontinui.runner/`.
+fn paired_user_path_with(override_dir: Option<String>) -> Option<PathBuf> {
+    let base = override_dir
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .or_else(|| dirs::data_local_dir().map(|d| d.join("com.qontinui.runner")))?;
@@ -2363,6 +2373,35 @@ mod tests {
 
         let after = std::fs::read(&path).unwrap();
         assert_eq!(before, after, "unparseable file left untouched");
+    }
+
+    /// The expected no-override fallback:
+    /// `data_local_dir()/com.qontinui.runner/paired_user.json`.
+    fn fallback_paired_user_path() -> Option<PathBuf> {
+        dirs::data_local_dir().map(|d| d.join("com.qontinui.runner").join("paired_user.json"))
+    }
+
+    #[test]
+    fn paired_user_path_with_honors_override_dir() {
+        let dir = std::env::temp_dir().join("qontinui-ssd-override-test");
+        let got = paired_user_path_with(Some(dir.to_string_lossy().into_owned()))
+            .expect("override dir must resolve");
+        assert_eq!(got, dir.join("paired_user.json"));
+    }
+
+    #[test]
+    fn paired_user_path_with_empty_override_falls_back_to_data_local_dir() {
+        // Set-but-empty env var is treated as unset (the existing
+        // `.filter(|s| !s.is_empty())` semantics).
+        assert_eq!(
+            paired_user_path_with(Some(String::new())),
+            fallback_paired_user_path()
+        );
+    }
+
+    #[test]
+    fn paired_user_path_with_none_falls_back_to_data_local_dir() {
+        assert_eq!(paired_user_path_with(None), fallback_paired_user_path());
     }
 }
 
