@@ -61,20 +61,37 @@ export interface LiveClaudeSession {
 }
 
 /**
- * Normalize the command's `data` payload into a `LiveClaudeSession[]`.
+ * STRICT payload extraction: the command's `data` must be a bare array or an
+ * object whose `sessions` key is an array — anything else returns `null`
+ * ("shape not understood"), never `[]`.
  *
- * The command wraps its payload as `{ sessions: [...] }`; a bare array is
- * accepted too. Anything else degrades to `[]` — callers iterate this during
- * render, so a shape surprise must never throw. (Same contract, and the same
- * hard-won reason, as `usePastSessions.extractSessions`.)
+ * The liveness oracle (`fetchLiveClaudeSessionIds`) depends on this polarity:
+ * a misshapen payload (e.g. `{}` after a Rust-side rename) that degraded to
+ * `[]` would read as "definitively no live sessions" and let the restore path
+ * respawn — fork — every session. Display callers who want the tolerant
+ * degrade use [`extractLiveSessions`].
  */
-export function extractLiveSessions(data: unknown): LiveClaudeSession[] {
+export function extractLiveSessionsStrict(data: unknown): LiveClaudeSession[] | null {
   if (Array.isArray(data)) return data as LiveClaudeSession[];
   if (data && typeof data === "object") {
     const inner = (data as { sessions?: unknown }).sessions;
     if (Array.isArray(inner)) return inner as LiveClaudeSession[];
   }
-  return [];
+  return null;
+}
+
+/**
+ * Normalize the command's `data` payload into a `LiveClaudeSession[]`.
+ *
+ * The command wraps its payload as `{ sessions: [...] }`; a bare array is
+ * accepted too. Anything else degrades to `[]` — callers iterate this during
+ * render, so a shape surprise must never throw. (Same contract, and the same
+ * hard-won reason, as `usePastSessions.extractSessions`.) DISPLAY-only:
+ * liveness decisions must use [`extractLiveSessionsStrict`], where an
+ * unrecognized shape is indeterminate, not empty.
+ */
+export function extractLiveSessions(data: unknown): LiveClaudeSession[] {
+  return extractLiveSessionsStrict(data) ?? [];
 }
 
 /**
@@ -218,8 +235,19 @@ export async function fetchLiveClaudeSessionIds(): Promise<ReadonlySet<string> |
   // `data` is always present on a successful response; its absence means we
   // did not understand the payload — indeterminate, not empty.
   if (!resp?.success || resp.data == null) return null;
+  // Strict shape check: a payload that is neither an array nor `{sessions:
+  // [...]}` (renamed key, `{}`, version skew) is INDETERMINATE — flowing it
+  // through the tolerant extractor would yield [] = "definitively empty" and
+  // green-light respawning everything.
+  const sessions = extractLiveSessionsStrict(resp.data);
+  if (sessions === null) {
+    console.warn(
+      "[liveClaudeSessions] terminal_claude_session_list_live returned an unrecognized payload shape — treating liveness as indeterminate",
+    );
+    return null;
+  }
   const ids = new Set<string>();
-  for (const s of extractLiveSessions(resp.data)) {
+  for (const s of sessions) {
     if (s && typeof s.sessionId === "string" && s.sessionId) ids.add(s.sessionId);
   }
   return ids;

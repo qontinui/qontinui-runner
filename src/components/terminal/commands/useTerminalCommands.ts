@@ -1235,6 +1235,11 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
         return fail("no-sessions", "no live Claude Code sessions found");
       }
 
+      // The Rust reader keeps nameless rows (old CLI builds) because they
+      // still prove liveness for the restore oracle — for DISPLAY, substitute
+      // a placeholder so the label/heading is never blank.
+      const displayName = (s: LiveClaudeSession) => s.name || "(unnamed)";
+
       // Group by account: resume commands are per-wrapper (clg/clh/clp/…), so
       // each block stays directly runnable as a unit.
       const byAccount = groupByAccount(sessions);
@@ -1249,10 +1254,10 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
         lines.push(`# ${label} (${list.length})`);
         sections.push({
           heading: `${label} (${list.length})`,
-          rows: list.map((s) => ({ label: s.name, value: s.resumeCommand })),
+          rows: list.map((s) => ({ label: displayName(s), value: s.resumeCommand })),
         });
         for (const s of list) {
-          lines.push(`# ${s.name}   [${s.status}]`);
+          lines.push(`# ${displayName(s)}   [${s.status}]`);
           lines.push(s.resumeCommand);
         }
         lines.push("");
@@ -1261,13 +1266,13 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
         lines.push(`# ${shared.size} session id(s) are shared by several live processes —`);
         lines.push("# resuming one of these ids will NOT bring back every window:");
         for (const [id, list] of shared) {
-          lines.push(`#   ${id}: ${list.map((s) => s.name).join(", ")}`);
+          lines.push(`#   ${id}: ${list.map(displayName).join(", ")}`);
         }
         sections.push({
           heading: `Shared session ids (${shared.size})`,
           rows: [...shared].map(([id, list]) => ({
             label: id,
-            value: list.map((s) => `${s.name} [pid ${s.pid}]`).join(", "),
+            value: list.map((s) => `${displayName(s)} [pid ${s.pid}]`).join(", "),
           })),
         });
       }

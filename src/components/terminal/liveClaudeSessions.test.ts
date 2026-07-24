@@ -8,6 +8,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 import {
   DERIVED_NAME_SOURCE,
   extractLiveSessions,
+  extractLiveSessionsStrict,
   fetchLiveClaudeSessionIds,
   groupByAccount,
   isOperatorNamed,
@@ -184,6 +185,26 @@ describe("registryNamesBySessionId", () => {
   });
 });
 
+describe("extractLiveSessionsStrict (liveness polarity)", () => {
+  it("accepts the {sessions:[…]} envelope and a bare array", () => {
+    expect(extractLiveSessionsStrict({ sessions: [mk()] })).toHaveLength(1);
+    expect(extractLiveSessionsStrict([mk()])).toHaveLength(1);
+    expect(extractLiveSessionsStrict({ sessions: [] })).toEqual([]);
+    expect(extractLiveSessionsStrict([])).toEqual([]);
+  });
+
+  it("maps any other shape to null (indeterminate), never []", () => {
+    // A shape surprise flowing through the tolerant extractor becomes [] =
+    // "definitively no live sessions" → the restore path forks everything.
+    expect(extractLiveSessionsStrict(null)).toBeNull();
+    expect(extractLiveSessionsStrict(undefined)).toBeNull();
+    expect(extractLiveSessionsStrict("nope")).toBeNull();
+    expect(extractLiveSessionsStrict({})).toBeNull();
+    expect(extractLiveSessionsStrict({ session: [mk()] })).toBeNull(); // renamed key
+    expect(extractLiveSessionsStrict({ sessions: "not-an-array" })).toBeNull();
+  });
+});
+
 describe("sharedSessionIds", () => {
   it("reports ids held by more than one live process", () => {
     // The restore-duplication symptom: one session id, several live processes,
@@ -250,6 +271,21 @@ describe("fetchLiveClaudeSessionIds (P1 restore-idempotence liveness source)", (
     mockInvoke.mockResolvedValueOnce({ success: false, message: "boom", data: null });
     expect(await fetchLiveClaudeSessionIds()).toBeNull();
     mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: null });
+    expect(await fetchLiveClaudeSessionIds()).toBeNull();
+  });
+
+  it("returns null (indeterminate) on a misshapen payload — never an empty set", async () => {
+    // `data: {}` (no sessions key), a renamed key, and a non-array `sessions`
+    // must all fail CLOSED: [] would green-light respawning every session.
+    mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: {} });
+    expect(await fetchLiveClaudeSessionIds()).toBeNull();
+    mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: { session: [mk()] } });
+    expect(await fetchLiveClaudeSessionIds()).toBeNull();
+    mockInvoke.mockResolvedValueOnce({
+      success: true,
+      message: null,
+      data: { sessions: "not-an-array" },
+    });
     expect(await fetchLiveClaudeSessionIds()).toBeNull();
   });
 
