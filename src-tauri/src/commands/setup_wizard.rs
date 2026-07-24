@@ -224,12 +224,184 @@ pub async fn github_list_repos() -> Result<Value, String> {
 /// Derived from the configured API base (`derive_web_base_url`) so a dev/staging
 /// build pointing at a non-prod backend opens the matching web origin instead of
 /// hard-coding `qontinui.io`.
+///
+/// P2 (seamless runner-native claim): the URL carries a runner-minted `state`
+/// nonce. When the web flow was runner-initiated it round-trips this nonce
+/// through the GitHub install/authorize redirect and deep-links back
+/// (`qontinui://github-connected?code=…&installation_id=…&state=…`) so the
+/// RUNNER performs the claim with its own Cognito bearer — binding to the
+/// runner's tenant deterministically, independent of which account happens to
+/// be logged into the browser. The browser-session claim remains the fallback
+/// when the deep link never arrives (cross-device install, older web build).
 #[tauri::command]
 pub fn github_connect_url() -> String {
+    let state = mint_connect_state();
     format!(
-        "{}/connect-runner-github",
-        crate::api_config::derive_web_base_url(&crate::api_config::get_api_base_url())
+        "{}/connect-runner-github?state={}",
+        crate::api_config::derive_web_base_url(&crate::api_config::get_api_base_url()),
+        state
     )
+}
+
+// ---- P2: runner-native claim on the `github-connected` deep-link ----------
+//
+// Threat model (plan §5, security classification): the `qontinui://` custom
+// scheme is an unauthenticated local channel — any locally-installed app could
+// register the same scheme, and any web page can attempt to launch a crafted
+// deep link. The `state` nonce is the proof that a `github-connected` URL
+// belongs to a connect flow THIS runner started: runner-minted (256-bit,
+// OS-CSPRNG via `rand::rng()`), single-use (consumed on first match),
+// time-bounded (TTL below), held only in process memory. A deep link with a
+// missing/expired/mismatched nonce is rejected before any network call, so a
+// crafted link can never make the runner claim an attacker-chosen org. The
+// coord claim's admin-of-install gate is the server-side backstop.
+
+/// How long a minted connect `state` nonce stays redeemable. Generous enough
+/// for a human to log in + install the GitHub App; short enough that a stale
+/// pending flow can't be redeemed much later.
+const CONNECT_STATE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Single pending-flow slot `(nonce, minted_at)`. Clicking Connect again
+/// replaces any previous pending flow (last click wins — matches the UI, where
+/// only one connect flow is ever visible).
+static PENDING_CONNECT_STATE: std::sync::Mutex<Option<(String, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+
+/// Mint + arm a fresh connect nonce (256-bit hex from the OS CSPRNG).
+fn mint_connect_state() -> String {
+    use rand::RngCore;
+    let mut buf = [0u8; 32];
+    rand::rng().fill_bytes(&mut buf);
+    let nonce = hex::encode(buf);
+    *PENDING_CONNECT_STATE
+        .lock()
+        .expect("connect-state mutex poisoned") = Some((nonce.clone(), std::time::Instant::now()));
+    nonce
+}
+
+/// Validate a deep-link `state` against the pending flow and consume it.
+///
+/// Single-use: consumed only on a MATCH — a mismatching presentation must not
+/// clear the slot, or any crafted deep link could cancel a legitimate pending
+/// flow (denial of service). Brute-forcing the match is infeasible (256-bit
+/// nonce; the OS-launch channel also makes timing measurement impractical, so
+/// a constant-time compare buys nothing here). An expired slot is cleared on
+/// sight so it can't linger.
+fn take_connect_state_if_valid(presented: &str) -> Result<(), String> {
+    let mut slot = PENDING_CONNECT_STATE
+        .lock()
+        .expect("connect-state mutex poisoned");
+    match slot.as_ref() {
+        None => Err("no pending GitHub connect flow — click Connect GitHub in the runner first"
+            .to_string()),
+        Some((nonce, minted_at)) => {
+            if minted_at.elapsed() > CONNECT_STATE_TTL {
+                *slot = None;
+                Err("the GitHub connect flow expired — click Connect GitHub again".to_string())
+            } else if nonce != presented {
+                Err("state nonce does not match the pending connect flow".to_string())
+            } else {
+                *slot = None;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Which GitHub account the claim targets. Fresh installs return an
+/// `installation_id` on the Setup-URL redirect; the already-installed-org path
+/// (`login/oauth/authorize`) returns only the org login — the web proxy
+/// accepts either.
+pub enum GithubClaimTarget {
+    InstallationId(u64),
+    AccountLogin(String),
+}
+
+/// Complete a runner-initiated GitHub App connect: validate + consume the
+/// `state` nonce, then claim the installation through the existing web proxy
+/// (`POST /api/v1/operations/pr-merge/onboarding/claim`) with the runner's own
+/// Cognito bearer, `bind_only: true` (D2 decision — the clone flow must never
+/// surprise a partner org with bootstrap PRs).
+///
+/// Returns the human-readable outcome message. Never logs `code` or the nonce.
+pub async fn claim_github_connection(
+    code: String,
+    target: GithubClaimTarget,
+    state: String,
+) -> Result<String, String> {
+    take_connect_state_if_valid(&state)?;
+
+    let Some(bearer) = cognito_bearer().await else {
+        return Err(
+            "Sign in to your Qontinui account in the runner to finish connecting GitHub."
+                .to_string(),
+        );
+    };
+
+    let url = format!(
+        "{}/api/v1/operations/pr-merge/onboarding/claim",
+        crate::api_config::get_api_base_url()
+    );
+    let mut body = serde_json::json!({
+        "code": code,
+        "bind_only": true,
+    });
+    let target_label = match &target {
+        GithubClaimTarget::InstallationId(id) => {
+            body["installation_id"] = serde_json::json!(id);
+            format!("installation_id={}", id)
+        }
+        GithubClaimTarget::AccountLogin(login) => {
+            body["account_login"] = serde_json::json!(login);
+            format!("account_login={}", login)
+        }
+    };
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .bearer_auth(&bearer)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to reach Qontinui backend: {}", e))?;
+
+    let status = resp.status();
+    let (host, path) = crate::outbound_trace::split_url(&url);
+    crate::outbound_trace::record(
+        "claim_github_connection",
+        crate::outbound_trace::OutboundTrace {
+            method: "POST".to_string(),
+            host,
+            path,
+            status: status.as_u16(),
+            bearer_kind: "access".to_string(),
+            // Request/response bodies carry an OAuth code + claim outcome —
+            // record the status only.
+            response_shape: None,
+        },
+    );
+
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    if status.is_success() {
+        info!("Runner-native GitHub claim succeeded ({})", target_label);
+        Ok("GitHub connected — your repositories are now available.".to_string())
+    } else {
+        let msg = body
+            .get("detail")
+            .and_then(|d| {
+                d.as_str().map(str::to_string).or_else(|| {
+                    d.get("message")
+                        .and_then(|m| m.as_str())
+                        .map(str::to_string)
+                })
+            })
+            .unwrap_or_else(|| format!("claim failed with status {}", status));
+        warn!(
+            "Runner-native GitHub claim failed ({}, status={}): {}",
+            target_label, status, msg
+        );
+        Err(msg)
+    }
 }
 
 /// Clone a GitHub repository into a local destination folder, reusing the user's
@@ -1190,4 +1362,55 @@ pub fn save_dev_services_from_setup(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Whole nonce lifecycle in ONE test fn: the pending-flow slot is a global,
+    /// so parallel test fns would race it (see the fleet note on global-state
+    /// test flake). Sequential assertions inside one fn keep it deterministic.
+    #[test]
+    fn connect_state_nonce_lifecycle() {
+        // No pending flow → reject.
+        assert!(take_connect_state_if_valid("anything").is_err());
+
+        // Minted nonce is 256-bit hex and lands in the connect URL shape.
+        let nonce = mint_connect_state();
+        assert_eq!(nonce.len(), 64);
+        assert!(nonce.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // A mismatching presentation is rejected AND must not consume the
+        // pending flow (a crafted deep link must not cancel a real one).
+        assert!(take_connect_state_if_valid("wrong-nonce").is_err());
+        assert!(take_connect_state_if_valid(&nonce).is_ok());
+
+        // Single-use: the same nonce cannot be redeemed twice.
+        assert!(take_connect_state_if_valid(&nonce).is_err());
+
+        // A re-mint replaces the previous pending flow (last click wins).
+        let first = mint_connect_state();
+        let second = mint_connect_state();
+        assert_ne!(first, second);
+        assert!(take_connect_state_if_valid(&first).is_err());
+        assert!(take_connect_state_if_valid(&second).is_ok());
+
+        // Expired slot → rejected and cleared. (Backdate the minted_at; skip
+        // silently if the platform clock can't represent the subtraction.)
+        let expired_at = std::time::Instant::now()
+            .checked_sub(CONNECT_STATE_TTL + std::time::Duration::from_secs(1));
+        if let Some(minted_at) = expired_at {
+            let stale = mint_connect_state();
+            PENDING_CONNECT_STATE
+                .lock()
+                .unwrap()
+                .replace((stale.clone(), minted_at));
+            let err = take_connect_state_if_valid(&stale).unwrap_err();
+            assert!(err.contains("expired"), "unexpected error: {err}");
+            // Cleared on sight — a second presentation now sees no pending flow.
+            let err2 = take_connect_state_if_valid(&stale).unwrap_err();
+            assert!(err2.contains("no pending"), "unexpected error: {err2}");
+        }
+    }
 }
