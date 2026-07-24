@@ -721,9 +721,9 @@ export function useTerminalInitialization({
               `(nothing spawned, records untouched); the next activation retries. Cold-respawning ` +
               `here could fork sessions whose processes are still alive.`,
           );
-          // Render the page as-is (rather than a permanent loading spinner);
-          // nothing was spawned or consumed.
-          setInitialized(true);
+          // Nothing was spawned or consumed. The `finally` below flips
+          // `initialized`, so the page renders as-is rather than hanging on a
+          // permanent loading spinner.
           return;
         }
         const { reconnectedTabIds } = reconnectDecision;
@@ -742,16 +742,19 @@ export function useTerminalInitialization({
 
         // P1 defect (b): before ANY cold `claude --resume`, read which session
         // ids are ALREADY hosted by a live Claude process (Claude Code's own
-        // per-process registry, PID-verified on the Rust side). Only fetched
-        // when some record would actually reach the cold auto-resume path.
-        // `null` = registry unreadable = every such respawn fails CLOSED
-        // (see `decideColdResume`).
-        const needsLiveness = openRecords.some(
-          (r) => !reconnectedSet.has(r.terminalId) && classifyRestoreAction(r) === "auto-resume",
-        );
-        const liveSessionIds: ReadonlySet<string> | null = needsLiveness
-          ? await fetchLiveClaudeSessionIds()
-          : new Set<string>();
+        // per-process registry, PID-verified on the Rust side). Fetched LAZILY
+        // (memoized) the first time a record actually reaches the cold
+        // auto-resume path, so the fetch condition can never drift from the
+        // loop's real gate. `undefined` = not fetched yet; `null` = fetched
+        // and INDETERMINATE (registry unreadable) = every such respawn fails
+        // CLOSED (see `decideColdResume`).
+        let liveSessionIdsCache: ReadonlySet<string> | null | undefined;
+        const getLiveSessionIds = async (): Promise<ReadonlySet<string> | null> => {
+          if (liveSessionIdsCache === undefined) {
+            liveSessionIdsCache = await fetchLiveClaudeSessionIds();
+          }
+          return liveSessionIdsCache;
+        };
 
         // Cosmetic snapshot — never the resumable Claude set / zone binding.
         const saved = sessionPersistence.hasSavedLayout()
@@ -829,13 +832,16 @@ export function useTerminalInitialization({
           // `claude --resume <id>` would fork the live session. There is no
           // reconnectable PTY for it either (the reconnect above didn't
           // return one), so there is nothing to rebind: skip the record
-          // entirely, leaving it untouched in the registry (still restorable
-          // on a later pass / manually resumable). When liveness is UNKNOWN
-          // (registry read failed), fail CLOSED toward not-respawning — a
-          // missing tab is recoverable; a duplicate live session corrupts
+          // entirely, leaving it untouched in the registry. It stays
+          // AUTO-restorable only briefly — the lifecycle poll retires
+          // unmatched records CloseNoTerminal after 3×45 s (~2¼ min),
+          // dropping them from the restorable set — but it remains MANUALLY
+          // resumable (`claude --resume <id>`) indefinitely. When liveness is
+          // UNKNOWN (registry read failed), fail CLOSED toward not-respawning
+          // — a missing tab is recoverable; a duplicate live session corrupts
           // the transcript.
           if (restoreAction === "auto-resume") {
-            const resumeDecision = decideColdResume(liveSessionIds, rec.claudeSessionId);
+            const resumeDecision = decideColdResume(await getLiveSessionIds(), rec.claudeSessionId);
             if (resumeDecision !== "respawn") {
               console.warn(
                 `[TerminalPage] skipping cold respawn for session ${rec.claudeSessionId}: ` +
@@ -1034,6 +1040,37 @@ export function useTerminalInitialization({
                   isValidSessionId(restore.claudeSessionId)
                 ) {
                   await new Promise((r) => setTimeout(r, 500));
+                  // P1 defect (b), drain-time re-check: the classify-time
+                  // liveness snapshot is up to ~25 s stale by the time the
+                  // drain reaches a tab on a large page — an id that became
+                  // live in that window (another page's restore, an operator
+                  // resume, an external process) would be forked by typing
+                  // `--resume` now. Re-read the registry immediately before
+                  // typing EACH resume (drains are already spaced ~500 ms, so
+                  // one IPC read per resume is cheap), with the same
+                  // fail-closed polarity as classify time: `null` =
+                  // indeterminate = skip. A skipped record gets the same
+                  // treatment as classify-time skip-alive — left untouched in
+                  // the registry (no resume typed, no `record_open` re-assert;
+                  // the restore-pending marker self-heals via the liveness
+                  // poll) — only the tab's "resuming" affordance is cleared so
+                  // it doesn't spin forever. (Wiring is not unit-testable
+                  // here: the drain is an inline timer closure over React
+                  // refs; the decision itself is `decideColdResume`, whose
+                  // polarity — including null → skip-unknown — is covered by
+                  // its pure tests.)
+                  const liveNow = await fetchLiveClaudeSessionIds();
+                  const drainDecision = decideColdResume(liveNow, restore.claudeSessionId);
+                  if (drainDecision !== "respawn") {
+                    console.warn(
+                      `[TerminalPage] drain-time skip for session ${restore.claudeSessionId}: ` +
+                        (drainDecision === "skip-alive"
+                          ? "a live Claude process now hosts this id (typing --resume would fork it)"
+                          : "live-session registry unreadable at drain time — failing closed toward not-respawning"),
+                    );
+                    updateTab(restore.tabId, { isReconnecting: false });
+                    continue;
+                  }
                   // Type the resume and VERIFY the handshake (retry once on
                   // failure). Fire-and-forget per tab so one slow/failed
                   // verification (up to ~30s) doesn't serialize the drain;

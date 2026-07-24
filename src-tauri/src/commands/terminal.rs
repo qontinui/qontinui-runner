@@ -1265,8 +1265,15 @@ pub async fn terminal_claude_session_list_live() -> Result<CommandResponse, Stri
     let config_dirs = crate::terminal::transcript::find_claude_config_dirs();
     // Re-check liveness: a crashed process cannot remove its own registry file,
     // so PID presence is the guard against reporting a dead session as open.
+    //
+    // FAIL CLOSED on an empty snapshot: the runner itself is always a live
+    // process, so an empty table can only be a failed read. Erroring here maps
+    // to `null` (indeterminate) in the frontend liveness oracle
+    // (`fetchLiveClaudeSessionIds`) → skip-unknown; returning success + `[]`
+    // instead would read as "definitively no live sessions" and let the
+    // restore path respawn — fork — every session.
     let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
-    let live_pids: std::collections::HashSet<u32> = snapshot.names.keys().copied().collect();
+    let live_pids = crate::session::claude_session_registry::live_pids_from_snapshot(&snapshot)?;
     let sessions =
         crate::session::claude_session_registry::read_live_sessions(&config_dirs, &live_pids);
     Ok(CommandResponse {
