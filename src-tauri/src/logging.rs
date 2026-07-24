@@ -124,12 +124,22 @@ pub struct LoggingConfig {
 
 impl Default for LoggingConfig {
     fn default() -> Self {
-        // Scoped per-runner for secondary instances so concurrent runners
-        // don't interleave log lines in the same daily-rolling file.
-        let base = dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("qontinui-runner");
-        let log_dir = crate::instance::scope_path(&base).join("logs");
+        // Write the runner's tracing sink into the SAME dev-logs tree as every
+        // other dev log (backend/frontend/supervisor). `get_dev_logs_dir()`
+        // honors the `paths.dev_logs_dir` settings override (so on a dev box
+        // this resolves to e.g. `D:/qontinui-root/.dev-logs/`, where CLAUDE.md
+        // and the operator look) and already applies `instance::scope_path`,
+        // so secondary runners still get their own `instance-<id>/` subdir and
+        // never interleave into one daily-rolling file. On an installed runner
+        // with no override it falls back to `<app_data>/qontinui-runner/dev-logs`.
+        //
+        // Previously this was a hardcoded `<app_data>/qontinui-runner/logs`
+        // that ignored the override, stranding the sink in a directory tree
+        // divorced from every other log — the root cause of the 2026-07-21
+        // "runner tracing is unlogged" misdiagnosis (the tracing was written,
+        // just nowhere anyone looked). See
+        // plans/2026-07-21-runner-tracing-observability-tailable-log-sink.md.
+        let log_dir = crate::paths::get_dev_logs_dir();
 
         Self {
             level: Level::INFO,
@@ -192,7 +202,17 @@ pub fn init_logging(config: LoggingConfig) -> anyhow::Result<LoggingInitResult> 
     let mut file_guard = None;
 
     if config.log_to_file {
-        let file_appender = rolling::daily(config.log_dir, "qontinui-runner.log");
+        // Daily rotation with a bounded retention window. Without
+        // `max_log_files` the sink grew unbounded — the primary's log dir had
+        // accreted 126 MB across 117 daily files (~35 MB/day) by 2026-07-24.
+        // 14 keeps a fortnight of history, which comfortably covers any
+        // interactive-flow post-mortem, and caps disk at ~2 weeks of volume.
+        let file_appender = rolling::Builder::new()
+            .rotation(rolling::Rotation::DAILY)
+            .filename_prefix("qontinui-runner.log")
+            .max_log_files(14)
+            .build(&config.log_dir)
+            .map_err(|e| anyhow::anyhow!("failed to build rolling log appender: {e}"))?;
         let (non_blocking_file, guard) = non_blocking(file_appender);
         file_guard = Some(guard);
 

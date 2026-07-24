@@ -406,9 +406,33 @@ pub fn pkce_login(identity_provider: Option<&str>) -> Result<CognitoLoginResult,
     }
 
     let code = captured?;
+    // Breadcrumb: the loopback callback fired and yielded an auth code. Logs
+    // length only, never the code itself — this is the "callback received on
+    // 127.0.0.1:53682" link the 2026-07-21 sign-in debug had to infer.
+    tracing::info!(
+        "Cognito callback received on 127.0.0.1:{COGNITO_CALLBACK_PORT} (authorization code len={})",
+        code.len()
+    );
 
-    // Exchange the authorization code for tokens.
-    let token_resp = exchange_code(&code, &code_verifier)?;
+    // Exchange the authorization code for tokens. Breadcrumb both outcomes —
+    // token presence/expiry on success, the classified error on failure — so a
+    // failed sign-in localizes to this exact step. Never logs token values.
+    let token_resp = match exchange_code(&code, &code_verifier) {
+        Ok(resp) => {
+            tracing::info!(
+                "Cognito code-for-token exchange OK (id_token len={}, access_token len={}, refresh_token={}, expires_in={}s)",
+                resp.id_token.len(),
+                resp.access_token.len(),
+                resp.refresh_token.is_some(),
+                resp.expires_in
+            );
+            resp
+        }
+        Err(e) => {
+            tracing::warn!("Cognito code-for-token exchange FAILED: {e}");
+            return Err(e);
+        }
+    };
     let expires_at = chrono::Utc::now().timestamp() + token_resp.expires_in;
     let refresh_token = token_resp.refresh_token.ok_or_else(|| {
         "Cognito token response omitted refresh_token — the runner client must be configured \

@@ -559,7 +559,27 @@ fn read_log_sources_by_profile_impl(
 
 /// Helper to read a single source
 fn read_single_source(source: &GlobalLogSource) -> LogSourceContent {
-    let path = PathBuf::from(&source.path);
+    let mut path = PathBuf::from(&source.path);
+
+    // Rotation-aware fallback. A daily-rolling sink (e.g. the runner's own
+    // `qontinui-runner.log`) never writes the undated basename — the live file
+    // is `<basename>.<YYYY-MM-DD>`. When the configured literal path is absent,
+    // resolve the newest matching dated sibling so a source pointed at the
+    // stable basename still reads the current rotation instead of reporting
+    // "File does not exist".
+    if !path.exists() {
+        if let (Some(dir), Some(prefix)) =
+            (path.parent(), path.file_name().and_then(|n| n.to_str()))
+        {
+            if let Some(newest) = crate::paths::resolve_newest_rolling_file(dir, prefix) {
+                path = newest;
+            }
+        }
+    }
+
+    // Report the file actually read (may be the resolved dated rotation),
+    // not the configured basename, so callers can `tail -f` the right file.
+    let resolved_path = path.to_string_lossy().to_string();
 
     if !path.exists() {
         return LogSourceContent {
@@ -567,7 +587,7 @@ fn read_single_source(source: &GlobalLogSource) -> LogSourceContent {
             source_name: source.name.clone(),
             lines: Vec::new(),
             total_lines: 0,
-            file_path: source.path.clone(),
+            file_path: resolved_path,
             last_modified: None,
             error: Some("File does not exist".to_string()),
         };
@@ -587,7 +607,7 @@ fn read_single_source(source: &GlobalLogSource) -> LogSourceContent {
             source_name: source.name.clone(),
             lines,
             total_lines,
-            file_path: source.path.clone(),
+            file_path: resolved_path,
             last_modified,
             error: None,
         },
@@ -596,7 +616,7 @@ fn read_single_source(source: &GlobalLogSource) -> LogSourceContent {
             source_name: source.name.clone(),
             lines: Vec::new(),
             total_lines: 0,
-            file_path: source.path.clone(),
+            file_path: resolved_path,
             last_modified,
             error: Some(e),
         },

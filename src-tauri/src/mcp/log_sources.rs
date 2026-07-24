@@ -50,6 +50,35 @@ async fn get_settings(
     Ok(Json(ApiResponse::success(result)))
 }
 
+/// GET /log-sources/runner-log-sink - Resolve the runner's own tracing sink.
+///
+/// The one-step discoverability answer to "where is the runner writing its
+/// tracing right now?" — returns the sink directory and the newest current
+/// dated file, so an agent debugging a live interactive flow can `tail -f` it
+/// without guessing the platform-specific dev-logs layout.
+async fn get_runner_log_sink(
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let (dir, current) = tokio::task::spawn_blocking(crate::paths::resolve_runner_log_sink)
+        .await
+        .map_err(|e| {
+            error!("Failed to resolve runner log sink: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!(
+                    "Failed to resolve runner log sink: {}",
+                    e
+                ))),
+            )
+        })?;
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "dir": dir.to_string_lossy(),
+        "current_file": current.as_ref().map(|p| p.to_string_lossy().to_string()),
+        "prefix": crate::paths::RUNNER_LOG_SINK_PREFIX,
+        "exists": current.is_some(),
+    }))))
+}
+
 /// PUT /log-sources/settings - Save all global log source settings
 async fn save_settings(
     Json(request): Json<GlobalLogSourceSettings>,
@@ -167,6 +196,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/log-sources/settings",
             get(get_settings).put(save_settings),
         )
+        .route("/log-sources/runner-log-sink", get(get_runner_log_sink))
         .route("/log-sources/ai-mode", put(set_ai_mode))
         .route("/log-sources/default-profile", put(set_default_profile))
         .route("/log-sources/migrate", post(migrate_from_projects))

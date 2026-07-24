@@ -69,6 +69,54 @@ fn get_default_dev_logs_dir() -> PathBuf {
         .join("dev-logs")
 }
 
+/// Basename prefix of the runner's own rolling tracing sink. The daily
+/// appender in [`crate::logging`] writes `<prefix>.<YYYY-MM-DD>` files under
+/// [`get_dev_logs_dir`].
+pub const RUNNER_LOG_SINK_PREFIX: &str = "qontinui-runner.log";
+
+/// Resolve the newest rolling-log file for `prefix` in `dir`.
+///
+/// `tracing_appender`'s daily rotation writes date-suffixed files
+/// (`qontinui-runner.log.2026-07-24`), never a stable undated name, so any
+/// consumer that wants "the current log" must pick the newest matching
+/// sibling rather than opening a fixed path. Matches the exact `prefix` and
+/// the `prefix.<date>` rotation form (`prefix.` followed by a digit) — but
+/// NOT arbitrary siblings like `prefix.bak` or `prefix.old`, so a caller
+/// falling back through here can't silently latch onto an unrelated backup.
+/// Returns the most recently modified match, or `None` if none exists.
+pub fn resolve_newest_rolling_file(dir: &Path, prefix: &str) -> Option<PathBuf> {
+    let rotation_prefix = format!("{prefix}.");
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.path().is_file())
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .map(|n| {
+                    n == prefix
+                        || n.strip_prefix(&rotation_prefix)
+                            .and_then(|suffix| suffix.chars().next())
+                            .is_some_and(|c| c.is_ascii_digit())
+                })
+                .unwrap_or(false)
+        })
+        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+        .map(|e| e.path())
+}
+
+/// Resolve the runner tracing sink: its directory and the newest current file.
+///
+/// The single "where is the runner's own tracing?" answer — the discoverability
+/// surface that was missing during the 2026-07-21 stuck-sign-in debug. Returns
+/// `(dir, Some(current_file))` when a dated log exists, `(dir, None)` when the
+/// directory is empty (e.g. a just-started runner mid first-rotation).
+pub fn resolve_runner_log_sink() -> (PathBuf, Option<PathBuf>) {
+    let dir = get_dev_logs_dir();
+    let current = resolve_newest_rolling_file(&dir, RUNNER_LOG_SINK_PREFIX);
+    (dir, current)
+}
+
 /// Ensure a directory exists, creating it if necessary.
 fn ensure_dir_exists(path: &PathBuf) {
     if !path.exists() {
@@ -442,6 +490,62 @@ mod tests {
         assert!(get_screenshots_dir().starts_with(&base));
         assert!(get_state_explorer_dir().starts_with(&base));
         assert!(get_api_images_dir().starts_with(&base));
+    }
+
+    #[test]
+    fn test_resolve_newest_rolling_file() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path();
+        let prefix = "qontinui-runner.log";
+
+        // Empty directory → None.
+        assert!(resolve_newest_rolling_file(p, prefix).is_none());
+
+        let write = |name: &str| {
+            let path = p.join(name);
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "x").unwrap();
+            path
+        };
+
+        // Dated rotations (the tracing_appender daily form) match; the newest
+        // by mtime wins. Create oldest→newest with sleeps so mtimes differ.
+        write("qontinui-runner.log.2026-07-22");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write("qontinui-runner.log.2026-07-23");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let newest = write("qontinui-runner.log.2026-07-24");
+
+        // Sibling logs that are NOT this prefix, and non-date suffixes, must be
+        // ignored — the fallback must never latch onto an unrelated backup.
+        write("runner-tauri.log");
+        write("qontinui-runner.log.bak");
+        write("qontinui-runner.log.old");
+
+        let got = resolve_newest_rolling_file(p, prefix).expect("a match");
+        assert_eq!(got, newest, "newest dated rotation should win");
+
+        // The exact undated basename also matches when present.
+        let dir2 = tempfile::tempdir().expect("tempdir2");
+        let exact = {
+            let path = dir2.path().join(prefix);
+            std::fs::File::create(&path).unwrap();
+            path
+        };
+        assert_eq!(
+            resolve_newest_rolling_file(dir2.path(), prefix).expect("exact"),
+            exact
+        );
+
+        // A directory with only a `.bak` sibling (no dated rotation, no exact)
+        // yields None — proving `.bak`/`.old` are excluded.
+        let dir3 = tempfile::tempdir().expect("tempdir3");
+        std::fs::File::create(dir3.path().join("qontinui-runner.log.bak")).unwrap();
+        assert!(
+            resolve_newest_rolling_file(dir3.path(), prefix).is_none(),
+            ".bak sibling must not be treated as a rotation"
+        );
     }
 
     #[test]
