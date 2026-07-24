@@ -273,9 +273,12 @@ fn mint_connect_state() -> String {
     let mut buf = [0u8; 32];
     rand::rng().fill_bytes(&mut buf);
     let nonce = hex::encode(buf);
+    // Recover from a poisoned lock rather than propagate the panic: the
+    // critical sections here are panic-free today, but a poison must never
+    // permanently brick the connect feature (review L2).
     *PENDING_CONNECT_STATE
         .lock()
-        .expect("connect-state mutex poisoned") = Some((nonce.clone(), std::time::Instant::now()));
+        .unwrap_or_else(|e| e.into_inner()) = Some((nonce.clone(), std::time::Instant::now()));
     nonce
 }
 
@@ -290,9 +293,16 @@ fn mint_connect_state() -> String {
 fn take_connect_state_if_valid(presented: &str) -> Result<(), String> {
     let mut slot = PENDING_CONNECT_STATE
         .lock()
-        .expect("connect-state mutex poisoned");
+        .unwrap_or_else(|e| e.into_inner());
     match slot.as_ref() {
-        None => Err("no pending GitHub connect flow — click Connect GitHub in the runner first"
+        // The pending flow is process-memory only, so "no pending flow" also
+        // covers the two benign-but-common cases in a multi-runner setup
+        // (review M1/M2): the runner restarted mid-flow, or the OS delivered
+        // the deep link to a DIFFERENT runner window than the one that started
+        // it. The web "Complete in this browser instead" fallback recovers all
+        // three — the message points there rather than implying an error.
+        None => Err("no pending GitHub connect flow in this runner window — start it \
+                     from Connect GitHub here, or use \"Complete in this browser instead\""
             .to_string()),
         Some((nonce, minted_at)) => {
             if minted_at.elapsed() > CONNECT_STATE_TTL {
