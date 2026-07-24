@@ -132,6 +132,13 @@ struct Inner {
     /// ephemeral registrars) → the handle mint/rebind is skipped entirely,
     /// which also keeps unit tests network-silent.
     lifecycle_store: OnceLock<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>,
+    /// Test-only observability for the Phase-1 handle hook: counts every
+    /// DECISION to fire it ([`AiCoordRegistrar::spawn_handle_register`]),
+    /// incremented BEFORE the attached-store gate — so unit tests (which
+    /// never attach a store and therefore stay network-silent) can still
+    /// assert the fire/no-fire decision (review W3).
+    #[cfg(test)]
+    handle_hook_fires: std::sync::atomic::AtomicU64,
 }
 
 impl AiCoordRegistrar {
@@ -145,6 +152,8 @@ impl AiCoordRegistrar {
                 forward: Mutex::new(HashMap::new()),
                 reverse: Mutex::new(HashMap::new()),
                 lifecycle_store: OnceLock::new(),
+                #[cfg(test)]
+                handle_hook_fires: std::sync::atomic::AtomicU64::new(0),
             }),
         }
     }
@@ -235,13 +244,21 @@ impl AiCoordRegistrar {
     /// Dedupe is the same R6 index, keyed on `claude_session_id` — the
     /// pinned plane's `task_run_id` IS its `claude_session_id`, so the two
     /// planes share one keyspace and a session registered by either path
-    /// no-ops in the other. A restore storm of N sniffed sessions therefore
-    /// writes at most one `Started` outbox row per distinct session per
-    /// process lifetime, and the rows drain through the existing serialized
-    /// `CoordSync` drain loop — zero direct HTTP from the sniff path.
+    /// no-ops in the other. The check-and-reserve is ATOMIC (one reverse-map
+    /// lock acquisition, review W1), so even a restore storm racing N
+    /// concurrent registrations of one session serializes to exactly one
+    /// `Started` outbox row per distinct session per process lifetime
+    /// (barring an outbox write failure, which rolls the reservation back
+    /// for retry). Rows drain through the existing serialized `CoordSync`
+    /// drain loop — zero direct HTTP from the sniff path.
     ///
     /// The Phase-1 handle hook at the end of registration fires as usual,
-    /// minting/rebinding the `fsh_` handle with `task_run_id: None`.
+    /// minting/rebinding the `fsh_` handle with `task_run_id: None`. On an
+    /// R6 hit it STILL fires (rebind is idempotent and re-points the
+    /// handle's terminal_id at the new pane — review W3); the coord row's
+    /// KIND, however, stays whatever the first registration wrote — a
+    /// hand-resumed pinned session keeps `agentic` (kind transition needs
+    /// coord-side support that doesn't exist; documented residual).
     pub fn register_sniffed_session(
         &self,
         claude_session_id: &str,
@@ -270,16 +287,68 @@ impl AiCoordRegistrar {
             return None;
         }
 
-        // R6 — already registered? Return the existing coord id, write nothing.
-        if let Some(existing) = self.session_id_for(claude_session_id) {
-            debug!(
-                "ai_coord_register: {} already registered as coord session {} — no-op",
-                claude_session_id, existing
-            );
+        let session_id = crate::session::uuid_v7();
+
+        // R6 — check-AND-reserve atomically under ONE reverse-map lock
+        // acquisition (review W1). `spawn_register_typed_resume` dispatches a
+        // detached task per submitted PTY line, so a restore storm can race N
+        // registrations of the SAME claude_session_id; a check-then-act gap
+        // here would let several racers each write a Started row and orphan
+        // the losers' coord rows (their reverse-map entries overwritten,
+        // never closable). Reserving the freshly-minted id in the same
+        // critical section guarantees exactly one winner proceeds to the
+        // outbox write; losers observe the reservation and no-op with the
+        // winner's id. The reservation is rolled back below if the outbox
+        // write fails, so a later retry can re-register.
+        let dedupe_hit = {
+            let Ok(mut rev) = self.inner.reverse.lock() else {
+                warn!(
+                    "ai_coord_register: reverse-index lock poisoned — skipping {}",
+                    claude_session_id
+                );
+                return None;
+            };
+            match rev.get(claude_session_id) {
+                Some(existing) => Some(*existing),
+                None => {
+                    rev.insert(claude_session_id.to_string(), session_id);
+                    None
+                }
+            }
+        };
+        if let Some(existing) = dedupe_hit {
+            if task_run_id.is_none() {
+                // Sniffed-plane R6 hit (review W3): the operator re-typed a
+                // resume line for an already-registered session — most often
+                // a hand-resume of a PINNED session (`claude --resume
+                // <task_run_id>`), which keeps the coord row's original kind
+                // (`agentic`; a coord-side kind transition needs server
+                // support that doesn't exist — documented residual). Fire
+                // the handle hook anyway: the server-side rebind is
+                // idempotent and refreshes the handle's terminal_id to the
+                // NEW pane (the sniff's record_open ran before this call).
+                // Info (not debug): this is a plane-crossing event worth
+                // seeing in the log.
+                info!(
+                    "ai_coord_register: sniffed re-register of {} (already coord session {}) — \
+                     no new row; refiring handle rebind for the new terminal",
+                    claude_session_id, existing
+                );
+                self.spawn_handle_register(
+                    claude_session_id,
+                    existing,
+                    None,
+                    super::session_handle::name_alias(purpose),
+                );
+            } else {
+                debug!(
+                    "ai_coord_register: {} already registered as coord session {} — no-op",
+                    claude_session_id, existing
+                );
+            }
             return Some(existing);
         }
 
-        let session_id = crate::session::uuid_v7();
         let now = chrono::Utc::now();
         // Intent shape mirrors `coord.sessions.intent` (JSONB) — purpose is
         // required (min 3 chars coord-side); fall back to a stable default so a
@@ -340,13 +409,21 @@ impl AiCoordRegistrar {
                 "ai_coord_register: outbox Started write failed for {} (best-effort): {}",
                 claude_session_id, e
             );
+            // Roll back the W1 reservation (only if it is still ours — a
+            // concurrent close_session can't have replaced it, but guard
+            // anyway) so a later retry can re-register.
+            if let Ok(mut rev) = self.inner.reverse.lock() {
+                if rev.get(claude_session_id) == Some(&session_id) {
+                    rev.remove(claude_session_id);
+                }
+            }
             return None;
         }
 
-        // Record the R4 index only after the durable outbox write succeeds.
-        if let (Ok(mut fwd), Ok(mut rev)) = (self.inner.forward.lock(), self.inner.reverse.lock()) {
+        // Finalize the R4 index: the reverse entry was reserved atomically
+        // above; add the forward entry now that the outbox write is durable.
+        if let Ok(mut fwd) = self.inner.forward.lock() {
             fwd.insert(session_id, claude_session_id.to_string());
-            rev.insert(claude_session_id.to_string(), session_id);
         }
 
         info!(
@@ -357,20 +434,41 @@ impl AiCoordRegistrar {
         );
 
         // Session-identity fabric Phase 1 — acquire/rebind the stable `fsh_`
-        // session handle for this session, best-effort on a detached thread
-        // (NEVER fails registration or startup; coord may not serve the route
-        // yet). `claude_session_id` is the durable anchor the registry
-        // mints/rebinds on — for the pinned plane it equals `task_run_id`
-        // (each call site passes `CliSessionContext { cli_session_id:
-        // task_run_id, .. }`); for the sniffed plane it is the id lifted from
-        // the typed `--resume`/`--session-id` flag and `task_run_id` rides as
-        // `None`. Running on every FRESH registration also covers restore for
-        // free: a restarted runner re-registers each resumed session (the R4
-        // dedup index is in-memory, lost on restart), and the server-side
-        // rebind keyed on `claude_session_id` refreshes
-        // `current_agent_session_id` on the existing handle row. Gated on an
-        // ATTACHED lifecycle store (main.rs attaches at boot) — which also
-        // keeps unit-test registrars (never attached) network-silent.
+        // session handle for this session. `claude_session_id` is the durable
+        // anchor the registry mints/rebinds on — for the pinned plane it
+        // equals `task_run_id` (each call site passes `CliSessionContext {
+        // cli_session_id: task_run_id, .. }`); for the sniffed plane it is
+        // the id lifted from the typed `--resume`/`--session-id` flag and
+        // `task_run_id` rides as `None`. Running on every FRESH registration
+        // also covers restore for free: a restarted runner re-registers each
+        // resumed session (the R4 dedup index is in-memory, lost on restart),
+        // and the server-side rebind keyed on `claude_session_id` refreshes
+        // `current_agent_session_id` on the existing handle row.
+        self.spawn_handle_register(claude_session_id, session_id, task_run_id, name_alias);
+
+        Some(session_id)
+    }
+
+    /// Fire the Phase-1 `fsh_` handle mint/rebind for
+    /// `claude_session_id ↔ session_id`, best-effort on a detached thread
+    /// (NEVER fails the caller; coord may not serve the route yet). Gated on
+    /// an ATTACHED lifecycle store (main.rs attaches at boot) — which also
+    /// keeps unit-test registrars (never attached) network-silent. Shared by
+    /// the fresh-registration path and the sniffed-plane R6-hit rebind
+    /// (review W3).
+    fn spawn_handle_register(
+        &self,
+        claude_session_id: &str,
+        session_id: Uuid,
+        task_run_id: Option<&str>,
+        name: Option<String>,
+    ) {
+        // Counted BEFORE the store gate so network-silent unit tests can
+        // observe the fire decision (see `Inner::handle_hook_fires`).
+        #[cfg(test)]
+        self.inner
+            .handle_hook_fires
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(store) = self.inner.lifecycle_store.get().cloned() {
             let terminal_id = store
                 .get(claude_session_id)
@@ -383,13 +481,20 @@ impl AiCoordRegistrar {
                     agent_session_id: session_id,
                     task_run_id: task_run_id.map(str::to_string),
                     terminal_id,
-                    name: name_alias,
+                    name,
                     machine_id: Some(self.inner.machine_id),
                 },
             );
         }
+    }
 
-        Some(session_id)
+    /// Test-only: how many times the Phase-1 handle hook fired (decision
+    /// count, pre-store-gate — see `Inner::handle_hook_fires`).
+    #[cfg(test)]
+    fn handle_hook_fire_count(&self) -> u64 {
+        self.inner
+            .handle_hook_fires
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Commit ↔ session lineage push-report (plan
@@ -1064,6 +1169,164 @@ mod tests {
         assert!(reg.inner.outbox.pending().unwrap().is_empty());
         assert!(reg.session_id_for(&csid).is_none());
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+    }
+
+    #[test]
+    fn concurrent_sniffed_registers_serialize_to_one_started_row() {
+        // Review W1: `spawn_register_typed_resume` dispatches a detached task
+        // per typed line, so a restore storm can race N registrations of ONE
+        // claude_session_id. The atomic check-and-reserve must serialize
+        // them: whatever the interleaving, exactly one Started row is
+        // written and every racer returns the same coord id.
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let csid = Uuid::new_v4().to_string();
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let ids: Vec<Option<Uuid>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let reg = reg.clone();
+                    let csid = csid.clone();
+                    let barrier = barrier.clone();
+                    s.spawn(move || {
+                        barrier.wait();
+                        reg.register_sniffed_session(&csid, "Terminal 1", None)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        let first = ids[0].expect("racer 0 must resolve a coord id");
+        assert!(
+            ids.iter().all(|i| *i == Some(first)),
+            "every racer must observe the same coord id: {ids:?}"
+        );
+        let started = reg
+            .inner
+            .outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event_kind == SessionEventKind::Started.as_str())
+            .count();
+        assert_eq!(started, 1, "exactly one Started row despite the race");
+        assert_eq!(reg.session_id_for(&csid), Some(first));
+        assert_eq!(reg.task_run_id_for(&first).as_deref(), Some(csid.as_str()));
+    }
+
+    #[test]
+    fn handle_hook_fires_on_fresh_register_and_sniffed_r6_hit_only() {
+        // Review W3: a sniffed R6 hit (hand-resume of an already-registered
+        // session) must REFIRE the handle hook so the server-side rebind
+        // re-points the handle's terminal_id at the new pane; a pinned R6
+        // hit must NOT (unchanged pinned semantics). Counter increments
+        // pre-store-gate, so this stays network-silent (no store attached).
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let id = Uuid::new_v4().to_string();
+
+        // Fresh pinned registration fires the hook once.
+        reg.register_session(&id, "purpose", None).unwrap();
+        assert_eq!(reg.handle_hook_fire_count(), 1);
+
+        // Pinned re-register (R6 hit) does NOT refire.
+        reg.register_session(&id, "purpose", None).unwrap();
+        assert_eq!(reg.handle_hook_fire_count(), 1);
+
+        // Sniffed R6 hit on the SAME session (operator hand-resumed the
+        // pinned session) REFIRES the rebind.
+        reg.register_sniffed_session(&id, "Terminal 2", None)
+            .unwrap();
+        assert_eq!(reg.handle_hook_fire_count(), 2);
+
+        // Fresh sniffed registration of a different session fires once more.
+        let other = Uuid::new_v4().to_string();
+        reg.register_sniffed_session(&other, "Terminal 3", None)
+            .unwrap();
+        assert_eq!(reg.handle_hook_fire_count(), 3);
+
+        // Sniffed re-sniff hit also refires (rebind is idempotent).
+        reg.register_sniffed_session(&other, "Terminal 3", None)
+            .unwrap();
+        assert_eq!(reg.handle_hook_fire_count(), 4);
+    }
+
+    #[test]
+    fn store_close_observer_closes_sniffed_coord_row() {
+        // Review W2 end-to-end (minus Tauri): wire a lifecycle store's close
+        // observer to close_session the way main.rs does, register a sniffed
+        // session, then record_close the record — the coord row must get a
+        // Closed outbox row and the index must evict.
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::session::session_lifecycle_store::SessionLifecycleStore::open(
+                store_dir.path().join("terminal-sessions.json"),
+            )
+            .unwrap(),
+        );
+        {
+            // main.rs wires this through a Weak to avoid the Arc cycle; the
+            // test uses a plain clone (registrar is cheap-to-clone shared
+            // state, and the test scope owns both ends).
+            let reg_for_obs = reg.clone();
+            store.attach_close_observer(move |csid| reg_for_obs.close_session(csid));
+        }
+
+        let csid = Uuid::new_v4().to_string();
+        store.record_open(
+            crate::session::session_lifecycle_store::TerminalSessionRecord {
+                claude_session_id: csid.clone(),
+                config_dir: None,
+                working_dir: Some("C:/repo".to_string()),
+                page_id: "default".to_string(),
+                zone_index: 0,
+                title: Some("Terminal 1".to_string()),
+                terminal_id: "term-1".to_string(),
+                opened_at: 0,
+                last_seen_at: 0,
+                state: "open".to_string(),
+                closed_at: None,
+                close_reason: None,
+                provider: crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
+                origin: None,
+                restore_pending_at: None,
+                confirmed_at: None,
+                handle: None,
+            },
+        );
+        let coord_id = reg
+            .register_sniffed_session(&csid, "Terminal 1", None)
+            .unwrap();
+
+        store.record_close(&csid, "poll-dead");
+
+        // Index evicted + a Closed row enqueued for the coord id.
+        assert!(reg.session_id_for(&csid).is_none());
+        let closed =
+            reg.inner.outbox.pending().unwrap().into_iter().any(|r| {
+                r.event_kind == SessionEventKind::Closed.as_str() && r.session_id == coord_id
+            });
+        assert!(closed, "record_close must propagate to a coord Closed row");
+
+        // A repeat close is a no-op (observer only fires on a REAL
+        // transition): still exactly one Closed row.
+        store.record_close(&csid, "poll-dead");
+        let closed_count = reg
+            .inner
+            .outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event_kind == SessionEventKind::Closed.as_str())
+            .count();
+        assert_eq!(closed_count, 1);
     }
 
     #[test]

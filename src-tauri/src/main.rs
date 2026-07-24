@@ -2650,6 +2650,22 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // next to `claude_session_id` in this durable store, so a
                 // restart re-presents the SAME handle on restore-rebind.
                 ai_coord_registrar.attach_lifecycle_store(lifecycle_store.clone());
+                // Fabric Phase 3 (review W2) — when a terminal-session record
+                // flips closed (operator close, poll-dead, no-terminal,
+                // account migration), close the matching coord session row so
+                // sniffed registrations don't accrue as never-closing
+                // coord.sessions rows. Weak, not Arc: the registrar already
+                // holds this store for the handle hook, and a strong closure
+                // capture would create a permanent Arc cycle. A csid the
+                // registrar never registered no-ops inside close_session.
+                {
+                    let reg = std::sync::Arc::downgrade(&ai_coord_registrar);
+                    lifecycle_store.attach_close_observer(move |csid| {
+                        if let Some(r) = reg.upgrade() {
+                            r.close_session(csid);
+                        }
+                    });
+                }
                 // Append-only session-snapshot HISTORY (session-restore
                 // shim-fix plan, Phase 4): a durable JSONL audit of the full
                 // session set, written on every layout-meaningful registry

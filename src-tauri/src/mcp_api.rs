@@ -923,14 +923,18 @@ fn resolve_caller_via_lifecycle(state: &Arc<ApiState>, workdir: &str) -> Option<
 /// a Tauri app). Among OPEN lifecycle records whose `working_dir` matches the
 /// proxy-provisioned `workdir` AND whose `claude_session_id` the registrar
 /// resolved (i.e. the session actually registered — this filters out phantom
-/// spawn-time shell records, which never register), picks the most recently
-/// seen (`last_seen_at`, ties broken by `claude_session_id` for determinism).
+/// spawn-time shell records, which never register), picks the greatest
+/// `last_seen_at` (ties broken by `claude_session_id`).
 ///
-/// Several interactive sessions CAN share one workdir (unlike worktrees,
-/// which are per-session); when they do, the workdir-scoped most-recent pick
-/// is strictly narrower than coord's device-wide fuzzy fallback — and the
-/// header remains advisory (coord verifies device binding fail-closed before
-/// trusting it; the JWT stays the authorization boundary).
+/// That pick is a DETERMINISTIC tie-break, not a caller-activity signal:
+/// `last_seen_at` is refreshed by the liveness poll for every live session,
+/// so its ordering among concurrently-live sessions sharing one workdir is
+/// effectively arbitrary (poll-order), and the chosen record may not be the
+/// session actually making this call. It is still workdir-scoped — strictly
+/// narrower than coord's device-wide fuzzy fallback — and the header remains
+/// advisory (coord verifies device binding fail-closed before trusting it;
+/// the JWT stays the authorization boundary). The single-open-session
+/// workdir, the common case, is exact.
 fn select_lifecycle_caller(
     records: &[crate::session::session_lifecycle_store::TerminalSessionRecord],
     workdir: &str,

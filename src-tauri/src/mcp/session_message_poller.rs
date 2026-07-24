@@ -554,9 +554,12 @@ enum ResolvedTarget {
 ///    WorkerSession (PTY) via `SessionManager::find_worker_by_terminal_id`.
 /// 2. A direct SDK `SessionManager::get(to_session)` — covers a session whose
 ///    runner `task_run_id` IS what coord addressed (SDK sessions).
-/// 3. The `AiCoordRegistrar` forward index (coord UUIDv7 → runner
-///    `task_run_id`), if `to_session` parses as a coord session UUID — covers
-///    agentic SDK sessions registered via the registrar.
+/// 3. The `AiCoordRegistrar` forward index (coord UUIDv7 → the registered
+///    `claude_session_id`, which is the runner `task_run_id` for the pinned
+///    plane), if `to_session` parses as a coord session UUID — covers agentic
+///    SDK sessions, PTY workers, and (fabric Phase 3) sniffed interactive
+///    sessions, whose index value resolves through the lifecycle store like
+///    arm (1).
 ///
 /// SDK matches win over PTY (the SDK queue is clobber-safe), so we probe (2)/(3)
 /// before falling back to the PTY terminal from (1).
@@ -586,6 +589,24 @@ fn resolve_target(
                         task_run_id,
                         terminal_id: worker.terminal_id().to_string(),
                     });
+                }
+                // Sniffed interactive session (fabric Phase 3, review N2):
+                // the registrar index value IS the claude_session_id (no
+                // SessionManager entry exists for a typed `--resume`
+                // session), so resolve it through the lifecycle store
+                // exactly like arm (1) — coord-id addressing then reaches
+                // the same PTY that csid addressing already could.
+                if let Some(rec) = lifecycle_store.get(&task_run_id) {
+                    if rec.state == "open" {
+                        if let Some(worker) =
+                            session_manager.find_worker_by_terminal_id(&rec.terminal_id)
+                        {
+                            return Some(ResolvedTarget::Pty {
+                                task_run_id: worker.task_run_id().to_string(),
+                                terminal_id: rec.terminal_id.clone(),
+                            });
+                        }
+                    }
                 }
             }
         }

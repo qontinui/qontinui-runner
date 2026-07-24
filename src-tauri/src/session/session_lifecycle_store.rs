@@ -321,6 +321,26 @@ pub struct SessionLifecycleStore {
     /// transcript is still restored as a terminal, just never `--resume`d.
     /// Unattached → every read is `None` ("not probed"), never `false`.
     transcript_probe: OnceLock<Arc<dyn TranscriptProbe>>,
+    /// Optional close observer (session-identity fabric Phase 3, review W2):
+    /// invoked with the `claude_session_id` AFTER a record actually flips
+    /// open→closed (never on a repeat/absent close). main.rs attaches a
+    /// closure that calls `AiCoordRegistrar::close_session` (through a Weak,
+    /// avoiding the Arc cycle with the registrar's attached store), so
+    /// sniffed-registered sessions don't accrue as never-closing
+    /// `coord.sessions` rows when their terminal dies. A csid the registrar
+    /// never registered no-ops inside `close_session` (index miss).
+    /// Unattached (tests, ephemeral fallbacks) → no-op.
+    close_observer: OnceLock<CloseObserver>,
+}
+
+/// Boxed close-observer callback (see `SessionLifecycleStore::close_observer`).
+/// Newtype so the store can keep `#[derive(Debug)]`.
+struct CloseObserver(Box<dyn Fn(&str) + Send + Sync>);
+
+impl std::fmt::Debug for CloseObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CloseObserver")
+    }
 }
 
 impl SessionLifecycleStore {
@@ -337,7 +357,19 @@ impl SessionLifecycleStore {
             snapshot_history: OnceLock::new(),
             restore_emitter: OnceLock::new(),
             transcript_probe: OnceLock::new(),
+            close_observer: OnceLock::new(),
         })
+    }
+
+    /// Attach the close observer (once, at startup) — invoked with the
+    /// `claude_session_id` after every real open→closed transition
+    /// ([`Self::record_close`]). See the field doc for the production wiring
+    /// (coord session-row closure, fabric Phase 3 / review W2). Without it
+    /// every close is local-only, the pre-Phase-3 behavior.
+    pub fn attach_close_observer(&self, f: impl Fn(&str) + Send + Sync + 'static) {
+        if self.close_observer.set(CloseObserver(Box::new(f))).is_err() {
+            warn!("session_lifecycle_store: close observer already attached — ignoring");
+        }
     }
 
     /// Attach the append-only snapshot-history sink (once, at startup).
@@ -698,6 +730,13 @@ impl SessionLifecycleStore {
         };
         self.persist(&snapshot);
         self.snapshot_change(&snapshot);
+        // Fabric Phase 3 (review W2): notify AFTER the durable local write,
+        // outside the map lock, and only on a REAL open→closed transition
+        // (the early return above skips repeat/absent closes). Best-effort:
+        // the production observer enqueues a coord `Closed` outbox row.
+        if let Some(obs) = self.close_observer.get() {
+            (obs.0)(claude_session_id);
+        }
     }
 
     /// Bump `last_seen_at` on a present session. No-op (no write) if absent.
@@ -2589,6 +2628,46 @@ mod tests {
         // Reload and confirm the closed record persisted with its reason.
         let store = SessionLifecycleStore::open(&path).unwrap();
         assert!(store.open_records().is_empty());
+    }
+
+    #[test]
+    fn close_observer_fires_only_on_real_open_to_closed_transitions() {
+        // Fabric Phase 3 (review W2): the observer must see every REAL
+        // open→closed flip exactly once — never an absent-id close, never a
+        // repeat close. Unattached stores (every other test) stay no-op.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+
+        let fired = std::sync::Arc::new(AtomicUsize::new(0));
+        let last: std::sync::Arc<std::sync::Mutex<String>> = Default::default();
+        {
+            let fired = fired.clone();
+            let last = last.clone();
+            store.attach_close_observer(move |csid| {
+                fired.fetch_add(1, Ordering::SeqCst);
+                *last.lock().unwrap() = csid.to_string();
+            });
+        }
+
+        // Absent id → no fire.
+        store.record_close("ghost", "x");
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
+
+        // Real transition → fires once with the csid.
+        store.record_open(rec("sess-1"));
+        store.record_close("sess-1", "poll-dead");
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        assert_eq!(last.lock().unwrap().as_str(), "sess-1");
+
+        // Repeat close → no refire.
+        store.record_close("sess-1", "again");
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+
+        // Reopen + close again → a second REAL transition fires again.
+        store.record_open(rec("sess-1"));
+        store.record_close("sess-1", "poll-dead");
+        assert_eq!(fired.load(Ordering::SeqCst), 2);
     }
 
     #[test]
