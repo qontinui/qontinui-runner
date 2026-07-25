@@ -286,38 +286,6 @@ pub async fn check_auth_status() -> Result<AuthStatus, String> {
     check_auth_status_impl().await.map_err(String::from)
 }
 
-/// `true` iff the runner holds a valid *local* signed-in session: a paired
-/// coord device-token JWT (the credential the WS relay presents) and/or a
-/// stored Cognito session. This is the authoritative "is the runner signed
-/// in?" signal — it is what a successful [`cognito_sign_in`] produces
-/// (`store_oauth_tokens` + `persist_pairing` → device JWT in the access_token
-/// slot) and what survives a process restart on disk.
-///
-/// Why this is the source of truth (and NOT a `/api/v1/auth/users/me`
-/// round-trip): the web backend's `users/me` endpoint can return 401/403 for a
-/// federated Cognito identity even though the runner is fully signed in and
-/// device-paired (the pair-cli bind returned 201 with the SAME access token).
-/// Gating "authenticated" on that call made a completed sign-in render the
-/// LoginScreen forever. The runner is signed in when it has local credentials,
-/// regardless of whether `users/me` happens to accept the Cognito access token.
-fn has_local_signed_in_session(auth_manager: &AuthManager) -> bool {
-    // A paired device has a (non-expired) coord device-token JWT in the
-    // access_token slot — written by `persist_pairing` after a successful
-    // pair-cli bind. `device_jwt_needs_refresh() == Ok(false)` means a real,
-    // unexpired JWT is present.
-    let has_valid_device_jwt = matches!(auth_manager.device_jwt_needs_refresh(), Ok(false));
-
-    // A stored Cognito session (refresh token present) also means the user
-    // signed in — even if the device JWT is momentarily stale and awaiting the
-    // refresher's next pair cycle.
-    let has_cognito_session = auth_manager
-        .get_oauth_refresh_token()
-        .map(|t| !t.trim().is_empty())
-        .unwrap_or(false);
-
-    has_valid_device_jwt || has_cognito_session
-}
-
 /// Wall-clock cap on the best-effort profile enrichment inside
 /// [`check_auth_status_impl`]. The authenticated/unauthenticated verdict is
 /// decided from local credentials alone, so exceeding this budget costs only
