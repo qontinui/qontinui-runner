@@ -1158,7 +1158,6 @@ pub fn terminal_session_list_history(
     })
 }
 
-<<<<<<< HEAD
 /// Report a mount of the terminal page tree (P0 tree-reset observability).
 ///
 /// The terminal tree gets remounted by top-level state flips, after which the
@@ -1211,38 +1210,6 @@ pub fn terminal_report_tree_reset(
         success: true,
         message: None,
         data: None,
-=======
-/// List the LIVE Claude Code sessions with the names the operator actually
-/// sees — read from Claude Code's own per-process registry
-/// (`<config_dir>/sessions/<pid>.json`), not from our transcript scraping.
-///
-/// This is the correct source for "write the open sessions down before I
-/// rebuild the runner": `name` is verbatim what the session window and
-/// `/resume` show, and each row carries a ready `cd … && clX --resume <id>`.
-///
-/// Distinct from [`terminal_session_list_history`], which is the *historical*
-/// view (open + closed + snapshot-only) with a transcript-derived
-/// `resume_name`. Measured 2026-07-23, that derivation covered 33 of 80 live
-/// sessions and matched the real window name on only 11 of those 33 — see
-/// `session::claude_session_registry` for the numbers.
-///
-/// Returns one row per live PROCESS. Several live processes may report the
-/// same `sessionId` (22 of 80 did), each with its own name; collapsing that is
-/// the caller's decision.
-#[tauri::command]
-pub async fn terminal_claude_session_list_live() -> Result<CommandResponse, String> {
-    let config_dirs = crate::terminal::transcript::find_claude_config_dirs();
-    // Re-check liveness: a crashed process cannot remove its own registry file,
-    // so PID presence is the guard against reporting a dead session as open.
-    let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
-    let live_pids: std::collections::HashSet<u32> = snapshot.names.keys().copied().collect();
-    let sessions =
-        crate::session::claude_session_registry::read_live_sessions(&config_dirs, &live_pids);
-    Ok(CommandResponse {
-        success: true,
-        message: None,
-        data: Some(serde_json::json!({ "sessions": sessions })),
->>>>>>> 88e72393 (fix(runner): /copy-names reads Claude Code's own session registry)
     })
 }
 

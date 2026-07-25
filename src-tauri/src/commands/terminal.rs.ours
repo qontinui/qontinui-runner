@@ -403,7 +403,7 @@ pub async fn terminal_close(
 /// NOT carry a Claude session id), returns `sessionIdsByTerminal`: a
 /// `{ terminal_id -> { claudeSessionId, configDir } }` map derived from the
 /// durable [`SessionLifecycleStore`]'s `terminal_id -> claude_session_id`
-/// index ([`SessionLifecycleStore::find_confirmed_open_by_terminal`]).
+/// index ([`SessionLifecycleStore::find_open_by_terminal`]).
 ///
 /// This is what lets the frontend attach `claudeSessionId` to a RECONNECTED
 /// tab. The per-session PR dropdown (and anything else session-scoped) gates
@@ -412,16 +412,6 @@ pub async fn terminal_close(
 /// its id and the dropdown never mounted for it. Best-effort + additive: if
 /// the store isn't managed the map is simply empty, and the `TerminalInfo`
 /// schema (`deny_unknown_fields`) is untouched.
-///
-/// The map is gated to CONFIRMED records only (see
-/// [`SessionLifecycleStore::find_confirmed_open_by_terminal`]). The spawn-time
-/// identity seam records an authoritative-but-provisional `open` row for EVERY
-/// terminal — including plain shells that never run a provider, and non-pinned
-/// launches whose minted uuid is not the id the process actually runs under —
-/// so surfacing unconfirmed ids would bind phantom / never-used ids onto tabs
-/// and could permanently mis-bind them (the transcript-poll capture stops once
-/// a tab carries any id). Only confirmed rows are real, correctly-identified
-/// sessions worth lighting up session-scoped UI for.
 #[tauri::command]
 pub fn terminal_list(
     app: tauri::AppHandle,
@@ -432,7 +422,7 @@ pub fn terminal_list(
     let mut session_ids_by_terminal = serde_json::Map::new();
     if let Some(store) = app.try_state::<Arc<SessionLifecycleStore>>() {
         for info in &terminals {
-            if let Some(rec) = store.find_confirmed_open_by_terminal(&info.id) {
+            if let Some(rec) = store.find_open_by_terminal(&info.id) {
                 session_ids_by_terminal.insert(
                     info.id.clone(),
                     serde_json::json!({
@@ -624,33 +614,6 @@ pub fn terminal_ack(
     })
 }
 
-/// Reset a terminal's flow-control counters (acked = sent).
-///
-/// Called by `TerminalInstance` on UNMOUNT: the disposing pane strands its
-/// render-acks (its final coalesced write's completion callback never
-/// fires), and if the emission gate is already paused at that moment the
-/// tab would enter an emission blackout — the per-page tap receives
-/// nothing, so it can never proxy-ack the tab back open. The unmounting
-/// pane's backlog is being discarded with the xterm buffer anyway, so
-/// resetting is both safe and required to hand consumption over to the tap.
-#[tauri::command]
-pub fn terminal_flow_reset(
-    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
-    terminal_id: String,
-) -> Result<CommandResponse, String> {
-    let session = terminal_manager
-        .get(&terminal_id)
-        .ok_or_else(|| format!("Terminal not found: {}", terminal_id))?;
-
-    session.reset_flow_control();
-
-    Ok(CommandResponse {
-        success: true,
-        message: None,
-        data: None,
-    })
-}
-
 /// Get the LIVE scrollback ring buffer for a terminal session.
 ///
 /// Returns the raw PTY byte history (base64) plus its absolute offset range
@@ -669,15 +632,11 @@ pub fn terminal_get_scrollback(
         .get(&terminal_id)
         .ok_or_else(|| format!("Terminal not found: {}", terminal_id))?;
 
-    // Reset backpressure BEFORE snapshotting the ring: emission resumes at
-    // the reset, so every chunk skipped up to this instant is either inside
-    // the snapshot (tee'd before it) or delivered live after it — no chunk
-    // can fall between snapshot and reset and open a hole exactly at
-    // `endOffset`. Chunks that are both in the snapshot AND delivered live
-    // are deduped by the frontend's `replayedThrough` trim.
-    session.reset_flow_control();
     let (data, start_offset) = session.get_scrollback_buffer();
     let end_offset = start_offset + data.len() as u64;
+    // Reconnecting frontends fetch the full ring; reset backpressure the same
+    // way the WS/HTTP buffer path does so the reader thread doesn't stall.
+    session.reset_flow_control();
     let encoded = STANDARD.encode(&data);
 
     Ok(CommandResponse {
@@ -957,35 +916,8 @@ pub fn terminal_session_record_open(
         origin,
         restore_pending_at: None,
         confirmed_at: None,
-        handle: None,
     };
     store.record_open(record);
-    Ok(CommandResponse {
-        success: true,
-        message: None,
-        data: None,
-    })
-}
-
-/// Re-point an open session record at the terminal that now hosts it.
-///
-/// Called by the cold-restore path for every recreated tab whose record is NOT
-/// on the verified-resume track (`terminal-only` / `quarantine`). Those records
-/// otherwise keep pointing at the dead pre-restart terminal id forever, so each
-/// restore pass fails to recognise the tab it already made and cold-creates a
-/// duplicate — an unbounded PTY leak proportional to (stale records × restarts).
-///
-/// Deliberately NOT `terminal_session_record_open`: that refreshes
-/// `last_seen_at` and would make ghost rows immortal. See
-/// [`SessionLifecycleStore::rebind_terminal`].
-#[tauri::command]
-pub fn terminal_session_rebind_terminal(
-    store: tauri::State<'_, Arc<SessionLifecycleStore>>,
-    claude_session_id: String,
-    terminal_id: String,
-    zone_index: i32,
-) -> Result<CommandResponse, String> {
-    store.rebind_terminal(&claude_session_id, &terminal_id, zone_index);
     Ok(CommandResponse {
         success: true,
         message: None,
@@ -1158,60 +1090,6 @@ pub fn terminal_session_list_history(
     })
 }
 
-<<<<<<< HEAD
-/// Report a mount of the terminal page tree (P0 tree-reset observability).
-///
-/// The terminal tree gets remounted by top-level state flips, after which the
-/// restore respawns `claude --resume` for still-alive sessions — and until now
-/// the only trace was a webview `console.warn` nothing captured. The frontend
-/// mount effect calls this on EVERY mount (mount #1 included — consumers
-/// filter on `mount_number > 1` for genuine remounts), fire-and-forget.
-///
-/// Pure observability: one `tracing::info!` line + one durable JSONL row via
-/// [`crate::session::snapshot_history::record_tree_reset`]. NO behavior
-/// change — always succeeds, even when the durable append fails (best-effort
-/// by that module's design).
-#[tauri::command]
-pub fn terminal_report_tree_reset(
-    mount_number: u32,
-    authenticated: Option<bool>,
-    navigation_type: Option<String>,
-    page_ids: Option<Vec<String>>,
-    open_record_count: Option<u32>,
-    time_origin: Option<f64>,
-    client_ts: Option<i64>,
-) -> Result<CommandResponse, String> {
-    let page_ids = page_ids.unwrap_or_default();
-    info!(
-        mount_number,
-        authenticated = ?authenticated,
-        navigation_type = navigation_type.as_deref().unwrap_or("unknown"),
-        page_ids = ?page_ids,
-        open_record_count = ?open_record_count,
-        time_origin = ?time_origin,
-        "terminal tree reset reported: terminal page tree mounted (mount #{mount_number})"
-    );
-    // Port-scoped like the session-snapshots file, so multiple runner
-    // instances never interleave rows.
-    let port = crate::mcp::types::get_mcp_api_port();
-    let path = crate::session::snapshot_history::tree_reset_path_for_port(port);
-    crate::session::snapshot_history::record_tree_reset(
-        &path,
-        crate::session::snapshot_history::TreeResetReport {
-            mount_number,
-            authenticated,
-            navigation_type,
-            page_ids,
-            open_record_count,
-            time_origin,
-            client_ts,
-        },
-    );
-    Ok(CommandResponse {
-        success: true,
-        message: None,
-        data: None,
-=======
 /// List the LIVE Claude Code sessions with the names the operator actually
 /// sees — read from Claude Code's own per-process registry
 /// (`<config_dir>/sessions/<pid>.json`), not from our transcript scraping.
@@ -1242,7 +1120,6 @@ pub async fn terminal_claude_session_list_live() -> Result<CommandResponse, Stri
         success: true,
         message: None,
         data: Some(serde_json::json!({ "sessions": sessions })),
->>>>>>> 88e72393 (fix(runner): /copy-names reads Claude Code's own session registry)
     })
 }
 
@@ -1751,7 +1628,6 @@ async fn poll_and_record_session<F>(
                 ),
                 restore_pending_at: None,
                 confirmed_at: None,
-                handle: None,
             };
             store.record_open(record);
             info!(
@@ -1809,7 +1685,6 @@ pub(crate) fn record_pinned_session_open(
         origin: Some(crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string()),
         restore_pending_at: None,
         confirmed_at: None,
-        handle: None,
     });
     info!(
         terminal_id = %terminal_id,
@@ -1868,7 +1743,6 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
             terminal_close,
             terminal_list,
             terminal_ack,
-            terminal_flow_reset,
             terminal_save_scrollback,
             terminal_get_saved_scrollback,
             terminal_cleanup_scrollback,
@@ -1883,8 +1757,6 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
             terminal_session_list_history,
             terminal_session_mark_restore_pending,
             terminal_session_clear_restore_pending,
-            terminal_session_rebind_terminal,
-            terminal_report_tree_reset,
         ])
         .build()
 }
