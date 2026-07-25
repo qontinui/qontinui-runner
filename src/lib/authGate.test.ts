@@ -10,6 +10,7 @@ const signedIn: AuthGateInput = {
   setupCompleted: true,
   isTier2: true,
   authenticated: true,
+  tierUnknown: false,
 };
 
 describe("resolveAuthGate", () => {
@@ -86,6 +87,56 @@ describe("resolveAuthGate", () => {
     // Tier 0/1 get a synthesized local-guest auth, but even a falsy value must
     // not divert them to a sign-in screen they have no account for.
     expect(resolveAuthGate({ ...signedIn, isTier2: false, authenticated: false })).toBe("app");
+  });
+
+  // NO-DOWNGRADE: an unreadable settings.json leaves the tier UNKNOWN. The gate
+  // must HOLD on a dedicated screen — never the local-guest app shell (which
+  // would silently strip cloud features from a Tier-2 runner) and never
+  // LoginScreen (which reads as a sign-out).
+  describe("tier-unknown (settings.json unreadable)", () => {
+    it("holds on the tier-unknown screen when the tier could not be determined", () => {
+      expect(resolveAuthGate({ ...signedIn, tierUnknown: true })).toBe("tier-unknown");
+    });
+
+    it("does NOT fall through to the app shell when the tier is unknown", () => {
+      // The exact silent downgrade: an unknown-tier runner with a placeholder
+      // (non-Tier-2) tier must not render as a local-guest app.
+      expect(
+        resolveAuthGate({
+          ...signedIn,
+          tierUnknown: true,
+          isTier2: false,
+          authenticated: false,
+        }),
+      ).toBe("tier-unknown");
+    });
+
+    it("does NOT show LoginScreen when the tier is unknown, even for a Tier-2 look", () => {
+      expect(resolveAuthGate({ ...signedIn, tierUnknown: true, authenticated: false })).toBe(
+        "tier-unknown",
+      );
+    });
+
+    it("holds even when setup looks incomplete (never guess a surface from an unknown tier)", () => {
+      expect(resolveAuthGate({ ...signedIn, tierUnknown: true, setupCompleted: false })).toBe(
+        "tier-unknown",
+      );
+    });
+
+    it("still shows the loading shell before the tier settles (unknown never wins over loading)", () => {
+      // `tierUnknown` is only ever true after the read retries are exhausted;
+      // while auth/tier work is in flight the loading shell must win.
+      expect(resolveAuthGate({ ...signedIn, tierUnknown: true, authLoading: true })).toBe(
+        "loading",
+      );
+      expect(resolveAuthGate({ ...signedIn, tierUnknown: true, apiReady: false })).toBe("loading");
+    });
+
+    it("leaves the tier-unknown screen once the tier resolves", () => {
+      // The LEAVE path: a re-read lands a known tier → tierUnknown clears → the
+      // normal gate resumes (app for a settled signed-in runner).
+      expect(resolveAuthGate({ ...signedIn, tierUnknown: false })).toBe("app");
+    });
   });
 
   it("treats a still-unread setup flag as not-yet-wizard", () => {

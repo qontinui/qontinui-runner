@@ -7,6 +7,7 @@
 import {
   Wifi,
   WifiOff,
+  Loader2,
   Monitor,
   Globe,
   Globe2,
@@ -109,11 +110,16 @@ export function BottomBar({
   taskStartTime = null,
 }: BottomBarProps) {
   const elapsedSec = useSharedElapsedTime(taskStartTime ?? null);
-  const { isConnected, latencyMs } = useRunnerConnectionStatus();
+  const { isConnected, latencyMs, isUnknown: connUnknown } = useRunnerConnectionStatus();
   const { lastFetchedAt } = useSharedStepDataRaw();
   const dataAgeSec = useSharedElapsedTime(lastFetchedAt);
   const isStale = dataAgeSec > 10;
-  const connColors = getStatusColors(isConnected ? "success" : "error");
+  // NO-DOWNGRADE (L1): a genuinely UNKNOWN connection state (the fallback health
+  // poll has failed but not yet hit the consecutive-failure threshold) must read
+  // as "checking…", NEVER as "Disconnected". Only a settled verdict flips the
+  // indicator red; while unknown we hold an amber/neutral "checking" badge so a
+  // single dropped health request never tells the operator the runner is down.
+  const connColors = getStatusColors(connUnknown ? "warning" : isConnected ? "success" : "error");
 
   // Get activity display info
   const activityInfo = activeActivity ? ACTIVITY_DISPLAY_CONFIG[activeActivity] : null;
@@ -198,12 +204,20 @@ export function BottomBar({
           data-content-label="connection status"
           className={cn(connColors.bg, connColors.text, "border", connColors.border)}
         >
-          {isConnected ? (
+          {connUnknown ? (
+            <Loader2 className="mr-1.5 h-3 w-3 animate-spin" />
+          ) : isConnected ? (
             <Wifi className="mr-1.5 h-3 w-3" />
           ) : (
             <WifiOff className="mr-1.5 h-3 w-3" />
           )}
-          {isConnected ? (latencyMs !== null ? `${latencyMs}ms` : "Connected") : "Disconnected"}
+          {connUnknown
+            ? "Checking…"
+            : isConnected
+              ? latencyMs !== null
+                ? `${latencyMs}ms`
+                : "Connected"
+              : "Disconnected"}
         </Badge>
       </div>
     </div>
