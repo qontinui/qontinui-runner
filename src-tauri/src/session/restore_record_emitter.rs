@@ -159,7 +159,11 @@ impl RestoreRecordEmitter {
     /// (`session_metadata_sync_enabled`) is checked first — when off, this
     /// returns before any allocation or I/O and nothing leaves the machine.
     /// Never fails the caller: all errors are logged and swallowed.
-    pub fn emit(&self, rec: &TerminalSessionRecord) {
+    ///
+    /// `transcript_exists` is the caller's transcript probe result for this
+    /// record (`None` ⇒ could not determine); it must match what the local
+    /// restore path sees, or the mirrored tier and local behavior diverge.
+    pub fn emit(&self, rec: &TerminalSessionRecord, transcript_exists: Option<bool>) {
         if !(self.gate)() {
             return;
         }
@@ -182,7 +186,7 @@ impl RestoreRecordEmitter {
             return;
         };
 
-        let payload = restore_record_payload(rec, self.machine_id);
+        let payload = restore_record_payload(rec, self.machine_id, transcript_exists);
 
         // Debounce: only re-emit when the material wire fields (or the
         // coord session they attach to) actually changed. The lock spans
@@ -227,15 +231,29 @@ impl std::fmt::Debug for RestoreRecordEmitter {
 
 /// Build the binding wire payload for one registry record. Pure — the tier
 /// decision mirrors the frontend `classifyRestoreAction` gate exactly:
-/// `"full"` requires authoritative origin AND confirmation AND a
-/// [`RestoreTier::Full`] provider; everything else degrades honestly to
-/// `"terminal_only"` with a null authoritative id.
+/// `"full"` requires authoritative origin AND confirmation AND a transcript
+/// that was not probed-absent AND a [`RestoreTier::Full`] provider; everything
+/// else degrades honestly to `"terminal_only"` with a null authoritative id.
+///
+/// `transcript_exists` is the record's transcript probe result: `Some(false)`
+/// only when the probe positively determined there is NO transcript, `None`
+/// when it could not determine (see
+/// [`crate::session::session_lifecycle_store::SessionLifecycleStore::probe_transcript_exists`]).
+/// It belongs in this predicate because the mirrored tier is a PROMISE to the
+/// remote consumer — `handoff` materializes `origin: authoritative` +
+/// `confirmed_at` from `tier == full` alone — so mirroring `"full"` for an id
+/// this machine now refuses to `--resume` would hand a peer a resume that can
+/// only fail. Unknown never downgrades, matching the local gate.
 ///
 /// `launch_command` is adapter-derived and carries NO env vars or tokens:
 /// the deterministic resume argv for `"full"` (account isolation rides env
 /// at spawn time, never the recorded command), the provider's bare program
 /// for `"terminal_only"` (a fresh conversation needs no id).
-pub fn restore_record_payload(rec: &TerminalSessionRecord, machine_id: Uuid) -> JsonValue {
+pub fn restore_record_payload(
+    rec: &TerminalSessionRecord,
+    machine_id: Uuid,
+    transcript_exists: Option<bool>,
+) -> JsonValue {
     let adapter = adapter_for(&rec.provider);
     // `observed` sits with `authoritative` here, mirroring
     // `classifyRestoreAction`: a confirmed observed bind is process-anchored to
@@ -245,6 +263,7 @@ pub fn restore_record_payload(rec: &TerminalSessionRecord, machine_id: Uuid) -> 
         rec.origin.as_deref(),
         Some(ORIGIN_AUTHORITATIVE) | Some(ORIGIN_OBSERVED)
     ) && rec.confirmed_at.is_some()
+        && transcript_exists != Some(false)
         && adapter.restore_tier() == RestoreTier::Full;
 
     let (tier, authoritative_session_id, launch_command) = if full {
@@ -328,7 +347,7 @@ mod tests {
     fn emits_full_tier_payload_with_binding_shape() {
         let sid = Uuid::new_v4();
         let (em, outbox, _dir) = emitter(sid, true);
-        em.emit(&rec("sess-1", "term-linked"));
+        em.emit(&rec("sess-1", "term-linked"), None);
 
         let pending = outbox.pending().unwrap();
         assert_eq!(pending.len(), 1);
@@ -353,14 +372,14 @@ mod tests {
     fn debounces_unchanged_records_and_reemits_on_material_change() {
         let (em, outbox, _dir) = emitter(Uuid::new_v4(), true);
         let r = rec("sess-1", "term-linked");
-        em.emit(&r);
-        em.emit(&r); // identical refresh — debounced
+        em.emit(&r, None);
+        em.emit(&r, None); // identical refresh — debounced
         assert_eq!(outbox.pending().unwrap().len(), 1, "no duplicate emission");
 
         // A material change (cwd) re-emits.
         let mut moved = r.clone();
         moved.working_dir = Some("C:/other".to_string());
-        em.emit(&moved);
+        em.emit(&moved, None);
         let pending = outbox.pending().unwrap();
         assert_eq!(pending.len(), 2, "material change re-emits");
         assert_eq!(pending[1].payload["cwd"], "C:/other");
@@ -368,7 +387,7 @@ mod tests {
         // A non-material change (title) does NOT re-emit.
         let mut renamed = moved.clone();
         renamed.title = Some("renamed".to_string());
-        em.emit(&renamed);
+        em.emit(&renamed, None);
         assert_eq!(
             outbox.pending().unwrap().len(),
             2,
@@ -379,7 +398,7 @@ mod tests {
     #[test]
     fn gate_off_writes_nothing() {
         let (em, outbox, _dir) = emitter(Uuid::new_v4(), false);
-        em.emit(&rec("sess-1", "term-linked"));
+        em.emit(&rec("sess-1", "term-linked"), None);
         assert!(
             outbox.pending().unwrap().is_empty(),
             "gate off ⇒ no outbox entry, nothing leaves the machine"
@@ -389,8 +408,8 @@ mod tests {
     #[test]
     fn unlinked_terminal_writes_nothing() {
         let (em, outbox, _dir) = emitter(Uuid::new_v4(), true);
-        em.emit(&rec("sess-1", "term-unlinked"));
-        em.emit(&rec("sess-1", "term-unlinked")); // skip line dedups; still nothing
+        em.emit(&rec("sess-1", "term-unlinked"), None);
+        em.emit(&rec("sess-1", "term-unlinked"), None); // skip line dedups; still nothing
         assert!(outbox.pending().unwrap().is_empty());
     }
 
@@ -401,11 +420,11 @@ mod tests {
         let (em, outbox, _dir) = emitter(Uuid::new_v4(), true);
         let mut provisional = rec("sess-1", "term-linked");
         provisional.confirmed_at = None;
-        em.emit(&provisional);
+        em.emit(&provisional, None);
 
         let mut confirmed = provisional.clone();
         confirmed.confirmed_at = Some(9);
-        em.emit(&confirmed);
+        em.emit(&confirmed, None);
 
         let pending = outbox.pending().unwrap();
         assert_eq!(pending.len(), 2);
@@ -420,7 +439,7 @@ mod tests {
         let machine = Uuid::new_v4();
 
         // Authoritative + confirmed + full-tier provider ⇒ full.
-        let full = restore_record_payload(&rec("sess-1", "t"), machine);
+        let full = restore_record_payload(&rec("sess-1", "t"), machine, None);
         assert_eq!(full["restore_tier"], TIER_FULL);
         assert_eq!(full["authoritative_session_id"], "sess-1");
         assert_eq!(full["machine_id"], machine.to_string());
@@ -429,7 +448,7 @@ mod tests {
         // terminal_only, null id — mirrors classifyRestoreAction.
         let mut provisional = rec("sess-1", "t");
         provisional.confirmed_at = None;
-        let p = restore_record_payload(&provisional, machine);
+        let p = restore_record_payload(&provisional, machine, None);
         assert_eq!(p["restore_tier"], TIER_TERMINAL_ONLY);
         assert!(p["authoritative_session_id"].is_null());
         assert_eq!(p["launch_command"], "claude");
@@ -438,7 +457,7 @@ mod tests {
         // full — mirrors classifyRestoreAction's observed branch.
         let mut observed = rec("sess-1", "t");
         observed.origin = Some(ORIGIN_OBSERVED.to_string());
-        let o = restore_record_payload(&observed, machine);
+        let o = restore_record_payload(&observed, machine, None);
         assert_eq!(o["restore_tier"], TIER_FULL);
         assert_eq!(o["authoritative_session_id"], "sess-1");
 
@@ -446,7 +465,7 @@ mod tests {
         let mut observed_prov = rec("sess-1", "t");
         observed_prov.origin = Some(ORIGIN_OBSERVED.to_string());
         observed_prov.confirmed_at = None;
-        let op = restore_record_payload(&observed_prov, machine);
+        let op = restore_record_payload(&observed_prov, machine, None);
         assert_eq!(op["restore_tier"], TIER_TERMINAL_ONLY);
 
         // Reconciled origin (backstop guess, may name a foreign session) ⇒
@@ -454,14 +473,44 @@ mod tests {
         let mut reconciled = rec("sess-1", "t");
         reconciled.origin =
             Some(crate::session::session_lifecycle_store::ORIGIN_RECONCILED.to_string());
-        let r = restore_record_payload(&reconciled, machine);
+        let r = restore_record_payload(&reconciled, machine, None);
         assert_eq!(r["restore_tier"], TIER_TERMINAL_ONLY);
         assert!(r["authoritative_session_id"].is_null());
 
         // Absent origin (pre-field record — read as reconciled) ⇒ same.
         let mut unfielded = rec("sess-1", "t");
         unfielded.origin = None;
-        let u = restore_record_payload(&unfielded, machine);
+        let u = restore_record_payload(&unfielded, machine, None);
         assert_eq!(u["restore_tier"], TIER_TERMINAL_ONLY);
+    }
+
+    /// The mirrored tier must not promise a resume this machine would refuse.
+    /// A confirmed authoritative record whose transcript was probed ABSENT is
+    /// mirrored `terminal_only` with a null id — otherwise the peer consumer
+    /// (`handoff` rebuilds `origin: authoritative` + `confirmed_at` from
+    /// `tier == full`) inherits a `--resume` that can only fail. UNKNOWN
+    /// (`None`) must not downgrade, matching `classifyRestoreAction`.
+    #[test]
+    fn payload_full_also_requires_a_transcript_that_was_not_probed_absent() {
+        let machine = Uuid::new_v4();
+        let confirmed_authoritative = rec("sess-1", "t");
+
+        let absent = restore_record_payload(&confirmed_authoritative, machine, Some(false));
+        assert_eq!(
+            absent["restore_tier"], TIER_TERMINAL_ONLY,
+            "probed-absent transcript must not be mirrored as a full resume"
+        );
+        assert!(absent["authoritative_session_id"].is_null());
+        assert_eq!(absent["launch_command"], "claude");
+
+        let present = restore_record_payload(&confirmed_authoritative, machine, Some(true));
+        assert_eq!(present["restore_tier"], TIER_FULL);
+        assert_eq!(present["authoritative_session_id"], "sess-1");
+
+        let unknown = restore_record_payload(&confirmed_authoritative, machine, None);
+        assert_eq!(
+            unknown["restore_tier"], TIER_FULL,
+            "UNKNOWN must not downgrade — it is not evidence of absence"
+        );
     }
 }

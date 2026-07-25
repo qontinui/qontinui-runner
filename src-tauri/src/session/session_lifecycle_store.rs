@@ -309,12 +309,17 @@ pub struct SessionLifecycleStore {
     /// registry write on the network (the drain loop does the pushing).
     /// Unattached (tests, ephemeral fallbacks) → no-op.
     restore_emitter: OnceLock<Arc<RestoreRecordEmitter>>,
-    /// Optional write-time transcript-existence probe, stamped onto every
-    /// snapshot-history entry ([`SnapshotSession::restorable`] /
-    /// `transcript_exists`). Read ONLY on the snapshot projection path — the
-    /// registry itself never consults it, so an attached probe cannot change
-    /// restore behavior, only describe it. Unattached → the fields are omitted
-    /// ("not probed"), never stamped `false`.
+    /// Optional transcript-existence probe. Read at two points: write time, to
+    /// stamp every snapshot-history entry ([`SnapshotSession::restorable`] /
+    /// `transcript_exists`), and list time, by callers going through
+    /// [`Self::probe_transcript_exists`].
+    ///
+    /// The registry's own SELECTION logic never consults it: `restorable_records`
+    /// and the reconcile paths are unchanged by an attached probe, so it cannot
+    /// add or remove restore candidates. What it does feed is the honest
+    /// restore TIER the frontend classifier picks — a candidate with no
+    /// transcript is still restored as a terminal, just never `--resume`d.
+    /// Unattached → every read is `None` ("not probed"), never `false`.
     transcript_probe: OnceLock<Arc<dyn TranscriptProbe>>,
 }
 
@@ -353,13 +358,79 @@ impl SessionLifecycleStore {
         }
     }
 
-    /// Attach the write-time transcript-existence probe (once, at startup) used
-    /// to stamp the restorability tuple onto snapshot-history entries. Without
-    /// it those fields are simply omitted — the store works standalone.
+    /// Attach the transcript-existence probe (once, at startup). It stamps the
+    /// restorability tuple onto snapshot-history entries AND answers
+    /// [`Self::probe_transcript_exists`] for the boot-restore projection. Without
+    /// it both read "not probed" — the store works standalone.
     pub fn attach_transcript_probe(&self, probe: Arc<dyn TranscriptProbe>) {
         if self.transcript_probe.set(probe).is_err() {
             warn!("session_lifecycle_store: transcript probe already attached — ignoring");
         }
+    }
+
+    /// Ask the attached transcript probe whether `session_id` has a provider
+    /// transcript on disk.
+    ///
+    /// `None` means NOT PROBED (no probe attached) and callers MUST treat it as
+    /// UNKNOWN — never as "absent".
+    ///
+    /// This is what lets the boot-restore projection tell an id whose
+    /// conversation exists from one whose does not. `confirmed_at` cannot: it
+    /// attests only that a provider session STARTED in the terminal (its
+    /// SessionStart hook fired), while the transcript is written once the session
+    /// carries messages — so a session launched and never used is confirmed
+    /// forever with no transcript, and `claude --resume <id>` on it fails with
+    /// "No conversation found" on every boot.
+    ///
+    /// Also `None` when `working_dir` is absent OR BLANK. A transcript path is
+    /// DERIVED from the project dir, so without one the probe has nothing to
+    /// stat — [`crate::session::reconcile::DiskTranscriptIndex`] answers a bare
+    /// `false` there, which is "could not determine", NOT "does not exist".
+    /// Gating on that raw `false` would downgrade a working-dir-less record to
+    /// terminal-only and silently lose a resumable conversation, so the
+    /// unanswerable case is mapped back to UNKNOWN here.
+    ///
+    /// Blank matters as much as absent because `""` is reachable: the
+    /// hook-confirm merge writes `prior.working_dir.clone().unwrap_or_default()`
+    /// (`install_effects_producer`), and unlike `config_dir` the registry does
+    /// not normalize an empty `working_dir` away. An empty project path encodes
+    /// to `""`, which stats a path that can never exist — a `false` that says
+    /// nothing about the session.
+    ///
+    /// ## Known residual false-negative paths
+    ///
+    /// A `Some(false)` here is "the probe looked and found nothing at the path it
+    /// derived", which is not quite "no transcript exists anywhere". Two ways to
+    /// derive the wrong path, both fail-CLOSED (demote to terminal-only) rather
+    /// than fail-open:
+    ///
+    /// 1. The transcript's location follows the PROVIDER PROCESS's cwd, while
+    ///    this record carries the PTY's spawn cwd. `cd` then launch, and they
+    ///    diverge permanently — the hook-confirm merge deliberately preserves
+    ///    `prior.working_dir` (see the 2026-07-13 stranding incident), so it
+    ///    never self-heals.
+    /// 2. [`crate::session::reconcile::DiskTranscriptIndex::discover`] snapshots
+    ///    the config-dir set ONCE at startup and ignores the record's own
+    ///    `config_dir`, so a transcript under an account dir added later is
+    ///    invisible. Contrast `past_sessions::resolve_transcript_path`, which
+    ///    tries the record's `config_dir` first and re-discovers per call.
+    ///
+    /// Both degrade a restore to terminal-only (right cwd, fresh conversation)
+    /// and neither loses data — the session stays resumable by hand from the
+    /// Past Sessions surface, which uses the better resolver. Answering by
+    /// SESSION ID across all project dirs (the walk exists:
+    /// `transcript::list_recent_sessions_all_projects`) would remove the class
+    /// outright and is the follow-up worth doing before anything DESTRUCTIVE
+    /// (e.g. pruning transcript-less rows) is gated on this.
+    pub fn probe_transcript_exists(
+        &self,
+        session_id: &str,
+        working_dir: Option<&str>,
+    ) -> Option<bool> {
+        let working_dir = working_dir.filter(|s| !s.trim().is_empty())?;
+        self.transcript_probe
+            .get()
+            .map(|p| p.transcript_exists(session_id, Some(working_dir)))
     }
 
     /// Project the registry into snapshot entries, stamping restorability from
@@ -380,12 +451,21 @@ impl SessionLifecycleStore {
     /// emitter, if any. Called AFTER the registry persist; best-effort by
     /// construction (the emitter gates, debounces, and swallows failures —
     /// it never fails the registry path).
+    ///
+    /// The transcript probe result is threaded through so the MIRRORED restore
+    /// tier matches what this machine's own restore path will do. Without it the
+    /// mirror advertises `restore_tier: "full"` (which `handoff` turns back into
+    /// `origin: authoritative` + `confirmed_at`) for exactly the ids the local
+    /// classifier now refuses to `--resume`.
     fn mirror_restore_record(&self, rec: &TerminalSessionRecord) {
         if rec.state != "open" {
             return;
         }
         if let Some(emitter) = self.restore_emitter.get() {
-            emitter.emit(rec);
+            emitter.emit(
+                rec,
+                self.probe_transcript_exists(&rec.claude_session_id, rec.working_dir.as_deref()),
+            );
         }
     }
 

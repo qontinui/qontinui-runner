@@ -18,9 +18,14 @@
  *      (which runs the normal verified resume). Presented as a match-to-confirm,
  *      never as a guaranteed restore.
  *   3. TERMINAL-ONLY / fresh conversation (`restoreTerminalOnly`) — the terminal
- *      + cwd were restored but the CONVERSATION was NOT (the provider's
- *      `restoreTier()` is `"terminal-only"`, so it can re-open the terminal but
- *      cannot `--resume` the chat by id). Informational + dismissible — the user
+ *      + cwd were restored but the CONVERSATION was NOT. Two causes land here,
+ *      so the copy states the OUTCOME and not a cause: the provider's
+ *      `restoreTier()` is `"terminal-only"` (it can re-open the terminal but
+ *      cannot `--resume` a chat by id), OR the session has no transcript on disk
+ *      (it started but never accumulated messages, so there is no conversation
+ *      to resume — see `classifyRestoreAction`'s transcript gate). Naming either
+ *      cause would be wrong for the other, and the banner aggregates terminals
+ *      so it cannot attribute per-tab. Informational + dismissible — the user
  *      must SEE the conversation is fresh and is never misled into thinking it
  *      came back. There is nothing to retry.
  *
@@ -178,9 +183,9 @@ export function ResumeFailedBanner({
                 : `${terminalOnly.length} terminals restored — fresh conversations`}
             </div>
             <div className="text-[10px] text-[#a9b1d6] leading-snug mt-0.5">
-              The terminal and working directory were restored, but this provider can&apos;t resume
-              the previous conversation by id — so it starts fresh. Nothing was lost from the
-              terminal; only the chat history did not carry over.
+              The terminal and working directory were restored, but the previous conversation could
+              not be resumed by id — so it starts fresh. Nothing was lost from the terminal; only
+              the chat history did not carry over.
             </div>
             <ul className="mt-1.5 space-y-1">
               {terminalOnly.map((t) => (
