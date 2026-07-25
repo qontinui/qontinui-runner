@@ -39,13 +39,10 @@
 //! drain loop reads, so registration reuses the entire existing drain → auth →
 //! retry → 409-idempotency machinery with no new HTTP code:
 //!
-//! - **R1/R2 register** → `Started` outbox row (`POST /sessions`) carrying a
-//!   nil `tenant_id` (coord resolves the real tenant from the device, exactly
-//!   like every other runner-originated session) plus, per plane:
-//!   `session_kind="agentic"` + `task_run_id` for pinned registrar-managed
-//!   sessions, or `session_kind="terminal_claude"` + `claude_code_session_id`
-//!   for sniffed interactive sessions (fabric Phase 3,
-//!   [`AiCoordRegistrar::register_sniffed_session`]).
+//! - **R1/R2 register** → `Started` outbox row (`POST /sessions`) carrying
+//!   `session_kind="agentic"`, `task_run_id`, and a nil `tenant_id` (coord
+//!   resolves the real tenant from the device, exactly like every other
+//!   runner-originated session).
 //! - **R3 heartbeat** → `Heartbeat` outbox row (`PATCH {heartbeat:true}`) on
 //!   operator interaction only.
 //! - **R5 close** → `Closed` outbox row (`DELETE /sessions/:id`) + index evict.
@@ -61,7 +58,7 @@
 //! affected — every coord write here is best-effort and swallows errors.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -115,23 +112,13 @@ pub struct AiCoordRegistrar {
 struct Inner {
     outbox: Arc<OutboxWriter>,
     machine_id: Uuid,
-    /// R4 index — coord `session_id` (UUIDv7) → the session's durable
-    /// `claude_session_id` (== `task_run_id` for the pinned plane; the typed
-    /// `--resume` id for the sniffed plane), plus the reverse map so
-    /// close/evict and caller-self resolution work without a scan. `forward`
-    /// is the inject resolver Phase 1 consumes (a sniffed id simply misses in
-    /// `SessionManager.get` — sniffed sessions have no inject transport);
-    /// `reverse` is the lifecycle/heartbeat/self-id path keyed by what
-    /// callers already hold.
+    /// R4 index — coord `session_id` (UUIDv7) → runner `task_run_id` (UUIDv4),
+    /// plus the reverse map so close-by-`task_run_id` can evict without a scan.
+    /// `forward` is the inject resolver Phase 1 consumes; `reverse` is the
+    /// lifecycle/heartbeat path keyed by what the AI-session commands already
+    /// hold (`task_run_id`).
     forward: Mutex<HashMap<Uuid, String>>,
     reverse: Mutex<HashMap<String, Uuid>>,
-    /// Session-identity fabric Phase 1 — lifecycle store the registrar
-    /// persists the coord-minted `fsh_` session handle into (next to the
-    /// record's `claude_session_id`). Attached once at startup
-    /// ([`AiCoordRegistrar::attach_lifecycle_store`]); unattached (tests,
-    /// ephemeral registrars) → the handle mint/rebind is skipped entirely,
-    /// which also keeps unit tests network-silent.
-    lifecycle_store: OnceLock<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>,
 }
 
 impl AiCoordRegistrar {
@@ -144,22 +131,7 @@ impl AiCoordRegistrar {
                 machine_id,
                 forward: Mutex::new(HashMap::new()),
                 reverse: Mutex::new(HashMap::new()),
-                lifecycle_store: OnceLock::new(),
             }),
-        }
-    }
-
-    /// Attach the durable lifecycle store (once, at startup) so
-    /// [`Self::register_session`] can acquire the coord-minted `fsh_` session
-    /// handle and persist it next to the record's `claude_session_id`
-    /// (session-identity fabric Phase 1). Without it the handle mint/rebind
-    /// is skipped entirely (tests, ephemeral registrars).
-    pub fn attach_lifecycle_store(
-        &self,
-        store: Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>,
-    ) {
-        if self.inner.lifecycle_store.set(store).is_err() {
-            warn!("ai_coord_register: lifecycle store already attached — ignoring");
         }
     }
 
@@ -198,83 +170,25 @@ impl AiCoordRegistrar {
     /// Best-effort: a disabled gate or an outbox write error returns `None`
     /// and never disturbs the live AI session. `purpose` surfaces in the
     /// dashboard Live Sessions panel; `repo` is the optional session repo.
-    ///
-    /// The runner pins every registrar-managed session's CLI session id to
-    /// its `task_run_id`, so the index key here IS the session's
-    /// `claude_session_id` — one keyspace shared with
-    /// [`Self::register_sniffed_session`] (see [`Self::register_inner`]).
     pub fn register_session(
         &self,
         task_run_id: &str,
         purpose: &str,
         repo: Option<String>,
     ) -> Option<Uuid> {
-        self.register_inner(task_run_id, Some(task_run_id), purpose, repo)
-    }
-
-    /// Session-identity fabric Phase 3 — register a SNIFFED interactive
-    /// session (a `claude --resume <id>` / `--session-id <id>` line the
-    /// operator typed into a plain terminal, lifted by
-    /// [`crate::terminal::claude_resume_sniff`]) with coord, through the SAME
-    /// machinery as [`Self::register_session`].
-    ///
-    /// Differences from the pinned plane, both derived from `task_run_id`
-    /// being absent (there is no runner `SessionManager` entry for a typed
-    /// session):
-    ///
-    /// - The `Started` payload carries NO `task_run_id`; instead it forwards
-    ///   the durable anchor as `claude_code_session_id` so coord can join the
-    ///   session row to commit history / transcripts.
-    /// - `kind` is `terminal_claude`, NOT `agentic`. **Load-bearing:** coord's
-    ///   `next_step.rs` auto-continuation targets only `agentic`/`workflow`
-    ///   stale sessions — registering an OPERATOR'S interactive pane as
-    ///   `agentic` would make coord eligible to autonomously "continue" it
-    ///   when idle. `terminal_claude` is the existing coord-side kind for
-    ///   exactly this plane and is never auto-continued.
-    ///
-    /// Dedupe is the same R6 index, keyed on `claude_session_id` — the
-    /// pinned plane's `task_run_id` IS its `claude_session_id`, so the two
-    /// planes share one keyspace and a session registered by either path
-    /// no-ops in the other. A restore storm of N sniffed sessions therefore
-    /// writes at most one `Started` outbox row per distinct session per
-    /// process lifetime, and the rows drain through the existing serialized
-    /// `CoordSync` drain loop — zero direct HTTP from the sniff path.
-    ///
-    /// The Phase-1 handle hook at the end of registration fires as usual,
-    /// minting/rebinding the `fsh_` handle with `task_run_id: None`.
-    pub fn register_sniffed_session(
-        &self,
-        claude_session_id: &str,
-        purpose: &str,
-        repo: Option<String>,
-    ) -> Option<Uuid> {
-        self.register_inner(claude_session_id, None, purpose, repo)
-    }
-
-    /// Shared register core for the pinned (`task_run_id = Some`) and sniffed
-    /// (`task_run_id = None`) planes. `claude_session_id` is the R6 dedupe /
-    /// R4 index key for BOTH — the durable anchor that always exists (plan
-    /// `2026-07-05-session-identity-messaging-restore-fabric.md` §2.5).
-    fn register_inner(
-        &self,
-        claude_session_id: &str,
-        task_run_id: Option<&str>,
-        purpose: &str,
-        repo: Option<String>,
-    ) -> Option<Uuid> {
         if !registration_enabled() {
             debug!(
                 "ai_coord_register: disabled via QONTINUI_SESSION_AUTOMATION_REGISTER — skipping {}",
-                claude_session_id
+                task_run_id
             );
             return None;
         }
 
         // R6 — already registered? Return the existing coord id, write nothing.
-        if let Some(existing) = self.session_id_for(claude_session_id) {
+        if let Some(existing) = self.session_id_for(task_run_id) {
             debug!(
                 "ai_coord_register: {} already registered as coord session {} — no-op",
-                claude_session_id, existing
+                task_run_id, existing
             );
             return Some(existing);
         }
@@ -292,9 +206,6 @@ impl AiCoordRegistrar {
                 "AI session".to_string()
             }
         };
-        // Captured before `purpose` moves into the intent JSON — forwarded as
-        // the fabric handle's human `name` alias below.
-        let name_alias = super::session_handle::name_alias(&purpose);
         let mut intent = json!({ "purpose": purpose });
         if let Some(r) = repo.as_ref() {
             intent["repo"] = json!(r);
@@ -303,32 +214,15 @@ impl AiCoordRegistrar {
         // The `Started` payload is the create-body shape `rebuild_create_body`
         // relabels for `POST /sessions`. `tenant_id` is omitted (nil) so coord
         // resolves the real tenant from the device registration — the same path
-        // every runner-originated session uses. Kind: `agentic` for the pinned
-        // plane, `terminal_claude` for sniffed interactive panes (see
-        // `register_sniffed_session` — coord must never auto-continue an
-        // operator's own terminal).
-        let kind = if task_run_id.is_some() {
-            SessionKind::Agentic
-        } else {
-            SessionKind::TerminalClaude
-        };
-        let mut payload = json!({
+        // every runner-originated session uses.
+        let payload = json!({
             "id": session_id,
-            "kind": kind.as_str(),
+            "kind": SessionKind::Agentic.as_str(),
             "intent": intent,
             "state": "active",
             "started_at": now,
+            "task_run_id": task_run_id,
         });
-        if let Some(trid) = task_run_id {
-            // Pinned plane: forward the SessionManager key so coord persists
-            // `coord.sessions.task_run_id` for inject-target resolution.
-            payload["task_run_id"] = json!(trid);
-        } else {
-            // Sniffed plane: no task run exists — forward the durable Claude
-            // session id instead (`rebuild_create_body` passes it through as
-            // a first-class field; coord tolerates its absence elsewhere).
-            payload["claude_code_session_id"] = json!(claude_session_id);
-        }
 
         if let Err(e) = self.inner.outbox.record(
             self.inner.machine_id,
@@ -338,78 +232,21 @@ impl AiCoordRegistrar {
         ) {
             warn!(
                 "ai_coord_register: outbox Started write failed for {} (best-effort): {}",
-                claude_session_id, e
+                task_run_id, e
             );
             return None;
         }
 
         // Record the R4 index only after the durable outbox write succeeds.
         if let (Ok(mut fwd), Ok(mut rev)) = (self.inner.forward.lock(), self.inner.reverse.lock()) {
-            fwd.insert(session_id, claude_session_id.to_string());
-            rev.insert(claude_session_id.to_string(), session_id);
+            fwd.insert(session_id, task_run_id.to_string());
+            rev.insert(task_run_id.to_string(), session_id);
         }
 
         info!(
-            "ai_coord_register: registered AI session {} as coord session {} (kind={})",
-            claude_session_id,
-            session_id,
-            kind.as_str()
+            "ai_coord_register: registered AI session {} as coord session {} (kind=agentic)",
+            task_run_id, session_id
         );
-
-        // Session-identity fabric Phase 1 — acquire/rebind the stable `fsh_`
-        // session handle for this session, best-effort on a detached thread
-        // (NEVER fails registration or startup; coord may not serve the route
-<<<<<<< HEAD
-        // yet). `claude_session_id` is the durable anchor the registry
-        // mints/rebinds on — for the pinned plane it equals `task_run_id`
-        // (each call site passes `CliSessionContext { cli_session_id:
-        // task_run_id, .. }`); for the sniffed plane it is the id lifted from
-        // the typed `--resume`/`--session-id` flag and `task_run_id` rides as
-        // `None`. Running on every FRESH registration also covers restore for
-        // free: a restarted runner re-registers each resumed session (the R4
-        // dedup index is in-memory, lost on restart), and the server-side
-        // rebind keyed on `claude_session_id` refreshes
-=======
-        // yet). The runner pins the CLI session id to `task_run_id` for every
-        // registrar-managed session (each call site passes
-        // `CliSessionContext { cli_session_id: task_run_id, .. }`), so
-        // `claude_session_id == task_run_id` here — the durable anchor the
-        // registry mints/rebinds on. Running on every FRESH registration also
-        // covers restore for free: a restarted runner re-registers each
-        // resumed session (the R4 dedup index is in-memory, lost on restart),
-        // and the server-side rebind keyed on `claude_session_id` refreshes
->>>>>>> 47c84d5b (feat: persist + rebind fsh_ session handle in lifecycle store (fabric Phase 1))
-        // `current_agent_session_id` on the existing handle row. Gated on an
-        // ATTACHED lifecycle store (main.rs attaches at boot) — which also
-        // keeps unit-test registrars (never attached) network-silent.
-        if let Some(store) = self.inner.lifecycle_store.get().cloned() {
-            let terminal_id = store
-<<<<<<< HEAD
-                .get(claude_session_id)
-=======
-                .get(task_run_id)
->>>>>>> 47c84d5b (feat: persist + rebind fsh_ session handle in lifecycle store (fabric Phase 1))
-                .map(|r| r.terminal_id)
-                .filter(|t| !t.trim().is_empty());
-            super::session_handle::spawn_register(
-                store,
-                super::session_handle::HandleRegisterRequest {
-<<<<<<< HEAD
-                    claude_session_id: claude_session_id.to_string(),
-                    agent_session_id: session_id,
-                    task_run_id: task_run_id.map(str::to_string),
-=======
-                    claude_session_id: task_run_id.to_string(),
-                    agent_session_id: session_id,
-                    task_run_id: Some(task_run_id.to_string()),
->>>>>>> 47c84d5b (feat: persist + rebind fsh_ session handle in lifecycle store (fabric Phase 1))
-                    terminal_id,
-                    name: name_alias,
-                    machine_id: Some(self.inner.machine_id),
-                },
-            );
-        }
-
         Some(session_id)
     }
 
@@ -924,9 +761,8 @@ fn requeue_front(queue: &mut std::collections::VecDeque<LogEntry>, batch: Vec<Lo
 /// Resolve the coord HTTP base (env `COORD_HTTP_URL` → active profile
 /// `coord_url`). `None` when nothing is configured — the emitter then keeps
 /// buffering (capped) rather than dropping, matching the other resolvers'
-/// no-localhost-fallback posture. `pub(crate)` so the session-handle
-/// registrar ([`super::session_handle`]) shares the same resolution.
-pub(crate) fn coord_http_base() -> Option<String> {
+/// no-localhost-fallback posture.
+fn coord_http_base() -> Option<String> {
     match qontinui_runner_lib::profiles::resolve_coord_base() {
         qontinui_runner_lib::profiles::CoordBase::Configured(base) => {
             Some(base.trim_end_matches('/').to_string())
@@ -993,118 +829,6 @@ mod tests {
             .filter(|r| r.event_kind == SessionEventKind::Started.as_str())
             .count();
         assert_eq!(started, 1);
-    }
-
-    #[test]
-    fn sniffed_register_writes_terminal_claude_row_without_task_run_id() {
-        let _env = env_lock();
-        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
-        let (reg, _dir) = registrar();
-        let csid = Uuid::new_v4().to_string();
-
-        let coord_id = reg
-            .register_sniffed_session(&csid, "Terminal 3", None)
-            .unwrap();
-
-        // Same R4 index, keyed on claude_session_id.
-        assert_eq!(
-            reg.task_run_id_for(&coord_id).as_deref(),
-            Some(csid.as_str())
-        );
-        assert_eq!(reg.session_id_for(&csid), Some(coord_id));
-
-        // Exactly one Started row: kind terminal_claude (NEVER agentic — coord
-        // auto-continues stale agentic sessions, and this is an operator
-        // pane), NO task_run_id, and the durable anchor forwarded as
-        // claude_code_session_id.
-        let pending = reg.inner.outbox.pending().unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].event_kind, SessionEventKind::Started.as_str());
-        assert_eq!(pending[0].payload["kind"], json!("terminal_claude"));
-        assert!(pending[0].payload.get("task_run_id").is_none());
-        assert_eq!(pending[0].payload["claude_code_session_id"], json!(csid));
-        assert_eq!(pending[0].payload["id"], json!(coord_id));
-    }
-
-    #[test]
-    fn sniffed_reregister_is_idempotent_no_duplicate_started_row() {
-        // R6 for the sniffed plane: a re-sniff of the same live session (the
-        // operator re-types the resume line, or a restore storm re-observes
-        // it) must not re-register — one Started row per session per process.
-        let _env = env_lock();
-        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
-        let (reg, _dir) = registrar();
-        let csid = Uuid::new_v4().to_string();
-
-        let first = reg
-            .register_sniffed_session(&csid, "Terminal 1", None)
-            .unwrap();
-        let second = reg
-            .register_sniffed_session(&csid, "Terminal 1", None)
-            .unwrap();
-        assert_eq!(first, second, "re-sniff returns the same coord id");
-
-        let started = reg
-            .inner
-            .outbox
-            .pending()
-            .unwrap()
-            .into_iter()
-            .filter(|r| r.event_kind == SessionEventKind::Started.as_str())
-            .count();
-        assert_eq!(started, 1);
-    }
-
-    #[test]
-    fn sniffed_and_pinned_planes_share_one_dedupe_keyspace() {
-        // The pinned plane's task_run_id IS its claude_session_id, so a
-        // session that registered as pinned must no-op when the sniff later
-        // observes the same id (and vice versa) — no duplicate coord row.
-        let _env = env_lock();
-        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
-        let (reg, _dir) = registrar();
-        let id = Uuid::new_v4().to_string();
-
-        let pinned = reg.register_session(&id, "purpose", None).unwrap();
-        let sniffed = reg
-            .register_sniffed_session(&id, "Terminal 2", None)
-            .unwrap();
-        assert_eq!(pinned, sniffed, "one coord identity across both planes");
-        assert_eq!(reg.inner.outbox.pending().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn sniffed_disabled_gate_registers_nothing() {
-        let _env = env_lock();
-        std::env::set_var("QONTINUI_SESSION_AUTOMATION_REGISTER", "0");
-        let (reg, _dir) = registrar();
-        let csid = Uuid::new_v4().to_string();
-        assert!(reg
-            .register_sniffed_session(&csid, "Terminal 1", None)
-            .is_none());
-        assert!(reg.inner.outbox.pending().unwrap().is_empty());
-        assert!(reg.session_id_for(&csid).is_none());
-        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
-    }
-
-    #[test]
-    fn sniffed_close_emits_closed_row_and_evicts_index() {
-        // close_session is keyed on the same claude_session_id keyspace, so
-        // a sniffed registration can be closed by the same path.
-        let _env = env_lock();
-        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
-        let (reg, _dir) = registrar();
-        let csid = Uuid::new_v4().to_string();
-        let coord_id = reg
-            .register_sniffed_session(&csid, "Terminal 1", None)
-            .unwrap();
-        reg.close_session(&csid);
-        assert!(reg.session_id_for(&csid).is_none());
-        let closed =
-            reg.inner.outbox.pending().unwrap().into_iter().any(|r| {
-                r.event_kind == SessionEventKind::Closed.as_str() && r.session_id == coord_id
-            });
-        assert!(closed);
     }
 
     #[test]

@@ -359,7 +359,6 @@ impl AiCoordRegistrar {
         // Session-identity fabric Phase 1 — acquire/rebind the stable `fsh_`
         // session handle for this session, best-effort on a detached thread
         // (NEVER fails registration or startup; coord may not serve the route
-<<<<<<< HEAD
         // yet). `claude_session_id` is the durable anchor the registry
         // mints/rebinds on — for the pinned plane it equals `task_run_id`
         // (each call site passes `CliSessionContext { cli_session_id:
@@ -369,40 +368,20 @@ impl AiCoordRegistrar {
         // free: a restarted runner re-registers each resumed session (the R4
         // dedup index is in-memory, lost on restart), and the server-side
         // rebind keyed on `claude_session_id` refreshes
-=======
-        // yet). The runner pins the CLI session id to `task_run_id` for every
-        // registrar-managed session (each call site passes
-        // `CliSessionContext { cli_session_id: task_run_id, .. }`), so
-        // `claude_session_id == task_run_id` here — the durable anchor the
-        // registry mints/rebinds on. Running on every FRESH registration also
-        // covers restore for free: a restarted runner re-registers each
-        // resumed session (the R4 dedup index is in-memory, lost on restart),
-        // and the server-side rebind keyed on `claude_session_id` refreshes
->>>>>>> 47c84d5b (feat: persist + rebind fsh_ session handle in lifecycle store (fabric Phase 1))
         // `current_agent_session_id` on the existing handle row. Gated on an
         // ATTACHED lifecycle store (main.rs attaches at boot) — which also
         // keeps unit-test registrars (never attached) network-silent.
         if let Some(store) = self.inner.lifecycle_store.get().cloned() {
             let terminal_id = store
-<<<<<<< HEAD
                 .get(claude_session_id)
-=======
-                .get(task_run_id)
->>>>>>> 47c84d5b (feat: persist + rebind fsh_ session handle in lifecycle store (fabric Phase 1))
                 .map(|r| r.terminal_id)
                 .filter(|t| !t.trim().is_empty());
             super::session_handle::spawn_register(
                 store,
                 super::session_handle::HandleRegisterRequest {
-<<<<<<< HEAD
                     claude_session_id: claude_session_id.to_string(),
                     agent_session_id: session_id,
                     task_run_id: task_run_id.map(str::to_string),
-=======
-                    claude_session_id: task_run_id.to_string(),
-                    agent_session_id: session_id,
-                    task_run_id: Some(task_run_id.to_string()),
->>>>>>> 47c84d5b (feat: persist + rebind fsh_ session handle in lifecycle store (fabric Phase 1))
                     terminal_id,
                     name: name_alias,
                     machine_id: Some(self.inner.machine_id),

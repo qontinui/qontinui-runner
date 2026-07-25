@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "base_sha": "86d12e555a88915479c4db38cba7f6996c3f9a16",
+  "ours_sha": "e1b84fc42d9e26da7f87195425e334245b3639d9",
+  "theirs_sha": "54cbb562aca0e3b38adcd1262753e9e5b4f31c00",
+  "entries": [
+    {
+      "path": "src-tauri/src/claude_session/coord_register.rs",
+      "base_oid": "c3985d127904e2ca76d893ab97618f33b84be561",
+      "ours_oid": "a42b2be54d832686546c1475208426364e27d5fe",
+      "theirs_oid": "38b55b73afe62701da4153d13fd171c15f217a96",
+      "base_path": "src-tauri/src/claude_session/coord_register.rs.base",
+      "ours_path": "src-tauri/src/claude_session/coord_register.rs.ours",
+      "theirs_path": "src-tauri/src/claude_session/coord_register.rs.theirs",
+      "hunks": [
+        "<<<<<<< HEAD\n        // yet). `claude_session_id` is the durable anchor the registry\n        // mints/rebinds on — for the pinned plane it equals `task_run_id`\n        // (each call site passes `CliSessionContext { cli_session_id:\n        // task_run_id, .. }`); for the sniffed plane it is the id lifted from\n        // the typed `--resume`/`--session-id` flag and `task_run_id` rides as\n        // `None`. Running on every FRESH registration also covers restore for\n        // free: a restarted runner re-registers each resumed session (the R4\n        // dedup index is in-memory, lost on restart), and the server-side\n        // rebind keyed on `claude_session_id` refreshes\n=======\n        // yet). The runner pins the CLI session id to `task_run_id` for every\n        // registrar-managed session (each call site passes\n        // `CliSessionContext { cli_session_id: task_run_id, .. }`), so\n        // `claude_session_id == task_run_id` here — the durable anchor the\n        // registry mints/rebinds on. Running on every FRESH registration also\n        // covers restore for free: a restarted runner re-registers each\n        // resumed session (the R4 dedup index is in-memory, lost on restart),\n        // and the server-side rebind keyed on `claude_session_id` refreshes\n>>>>>>> 47c84d5b (feat: persist + rebind fsh_ session handle in lifecycle store (fabric Phase 1))\n",
+        "<<<<<<< HEAD\n                .get(claude_session_id)\n=======\n                .get(task_run_id)\n>>>>>>> 47c84d5b (feat: persist + rebind fsh_ session handle in lifecycle store (fabric Phase 1))\n",
+        "<<<<<<< HEAD\n                    claude_session_id: claude_session_id.to_string(),\n                    agent_session_id: session_id,\n                    task_run_id: task_run_id.map(str::to_string),\n=======\n                    claude_session_id: task_run_id.to_string(),\n                    agent_session_id: session_id,\n                    task_run_id: Some(task_run_id.to_string()),\n>>>>>>> 47c84d5b (feat: persist + rebind fsh_ session handle in lifecycle store (fabric Phase 1))\n"
+      ]
+    },
+    {
+      "path": "src-tauri/src/claude_session/session_handle.rs",
+      "base_oid": null,
+      "ours_oid": "944f767480e75b8f890f0b5e5fa9df0b8c83323a",
+      "theirs_oid": "feea25eb1ebbffe8adb0393ab187321f30964c90",
+      "base_path": null,
+      "ours_path": "src-tauri/src/claude_session/session_handle.rs.ours",
+      "theirs_path": "src-tauri/src/claude_session/session_handle.rs.theirs",
+      "hunks": [
+        "<<<<<<< HEAD\n                    \"session_handle: coord register route unavailable (best-effort — retried on next FRESH registration, typically next runner restart)\"\n=======\n                    \"session_handle: coord register route unavailable (best-effort — retried on next registration)\"\n>>>>>>> 47c84d5b (feat: persist + rebind fsh_ session handle in lifecycle store (fabric Phase 1))\n",
+        "<<<<<<< HEAD\n                    \"session_handle: coord register call failed (best-effort — retried on next FRESH registration, typically next runner restart)\"\n=======\n                    \"session_handle: coord register call failed (best-effort — retried on next registration)\"\n>>>>>>> 47c84d5b (feat: persist + rebind fsh_ session handle in lifecycle store (fabric Phase 1))\n"
+      ]
+    }
+  ]
+}
