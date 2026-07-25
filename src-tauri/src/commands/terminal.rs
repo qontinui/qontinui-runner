@@ -1907,9 +1907,7 @@ mod tests {
             closed_at: None,
             close_reason: None,
             provider: crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
-            origin: Some(
-                crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string(),
-            ),
+            origin: Some(crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string()),
             restore_pending_at: None,
             confirmed_at: Some(3),
             handle: None,
