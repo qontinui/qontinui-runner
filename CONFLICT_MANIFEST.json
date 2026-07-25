@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "base_sha": "d2ede07fb413c97735d3fbd2ed2d7a935a93fb61",
+  "ours_sha": "605f1407cadc7cf2afa09893239e61cd6a1dbd65",
+  "theirs_sha": "10e6cee14b7503e390303c0ee511f0fe7d2b8c31",
+  "entries": [
+    {
+      "path": "src-tauri/src/session/session_lifecycle_store.rs",
+      "base_oid": "9bc74d6aa04de3078a8f2232ee15803624417511",
+      "ours_oid": "b6bb3d7886ca80b5b240f1df8d298d92e1ed791f",
+      "theirs_oid": "12cebcb90d87676ca5707a16d76949629a9a2239",
+      "base_path": "src-tauri/src/session/session_lifecycle_store.rs.base",
+      "ours_path": "src-tauri/src/session/session_lifecycle_store.rs.ours",
+      "theirs_path": "src-tauri/src/session/session_lifecycle_store.rs.theirs",
+      "hunks": [
+        "<<<<<<< HEAD\n        // A provisional (unconfirmed) row — the phantom-shell / minted-uuid shape.\n        let mut phantom = rec(\"phantom-sess\");\n        phantom.terminal_id = \"term-phantom\".to_string();\n=======\n        // A provisional (unconfirmed) row in the exact shape the spawn-time\n        // identity seam records for every terminal: authoritative origin,\n        // `confirmed_at: None` — the phantom-shell / minted-uuid case.\n        let mut phantom = rec(\"phantom-sess\");\n        phantom.terminal_id = \"term-phantom\".to_string();\n        phantom.origin = Some(ORIGIN_AUTHORITATIVE.to_string());\n>>>>>>> 605f1407 (fix(terminal): gate sessionIdsByTerminal to confirmed sessions only)\n"
+      ]
+    }
+  ]
+}

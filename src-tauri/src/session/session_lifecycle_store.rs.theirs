@@ -1661,18 +1661,9 @@ mod tests {
         let store =
             SessionLifecycleStore::open(&dir.path().join("terminal-sessions.json")).unwrap();
 
-<<<<<<< HEAD
         // A provisional (unconfirmed) row — the phantom-shell / minted-uuid shape.
         let mut phantom = rec("phantom-sess");
         phantom.terminal_id = "term-phantom".to_string();
-=======
-        // A provisional (unconfirmed) row in the exact shape the spawn-time
-        // identity seam records for every terminal: authoritative origin,
-        // `confirmed_at: None` — the phantom-shell / minted-uuid case.
-        let mut phantom = rec("phantom-sess");
-        phantom.terminal_id = "term-phantom".to_string();
-        phantom.origin = Some(ORIGIN_AUTHORITATIVE.to_string());
->>>>>>> 605f1407 (fix(terminal): gate sessionIdsByTerminal to confirmed sessions only)
         phantom.confirmed_at = None;
         store.record_open(phantom);
 
