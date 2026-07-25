@@ -73,4 +73,20 @@ export interface TerminalSessionRecord {
    * for cold-boot records the reconcile couldn't reach.
    */
   confirmedAt?: number;
+  /**
+   * Whether a provider transcript for `claudeSessionId` actually exists on
+   * disk, probed backend-side at list time (`terminal_session_list_open`).
+   * `undefined` ⇒ NOT PROBED (no transcript probe attached) — read as UNKNOWN,
+   * never as `false`.
+   *
+   * `confirmedAt` alone is NOT proof a conversation can be resumed: the
+   * provider's SessionStart hook fires when a session STARTS, but Claude Code
+   * only writes the transcript once the session carries messages. A session
+   * that was launched and never used is therefore `confirmedAt`-set with NO
+   * transcript, and `claude --resume <id>` on it fails with "No conversation
+   * found" on every subsequent boot (observed live 2026-07-24: four such rows,
+   * one still `state: "open"`). `classifyRestoreAction` gates auto-resume on
+   * this field for exactly that reason.
+   */
+  transcriptExists?: boolean;
 }

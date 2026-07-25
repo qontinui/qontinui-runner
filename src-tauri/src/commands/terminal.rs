@@ -1121,11 +1121,41 @@ pub fn terminal_session_list_open(
     }
     sessions.extend(disk_only);
 
+    // Stamp the derived `transcriptExists` bit onto every candidate so the
+    // frontend classifier can avoid typing `--resume` against an id with no
+    // conversation on disk. See `probe_transcript_exists` for why `confirmed_at`
+    // is not sufficient proof and which cases read UNKNOWN.
+    let rows: Vec<RestoreCandidate> = sessions
+        .into_iter()
+        .map(|rec| {
+            let transcript_exists =
+                store.probe_transcript_exists(&rec.claude_session_id, rec.working_dir.as_deref());
+            RestoreCandidate {
+                record: rec,
+                transcript_exists,
+            }
+        })
+        .collect();
+
     Ok(CommandResponse {
         success: true,
         message: None,
-        data: Some(serde_json::json!({ "sessions": sessions })),
+        data: Some(serde_json::json!({ "sessions": rows })),
     })
+}
+
+/// One row of [`terminal_session_list_open`]'s response: the registry record
+/// flattened, plus the DERIVED `transcriptExists` bit. Kept out of
+/// [`TerminalSessionRecord`] itself so the persisted registry stays free of
+/// derived state — the bit is recomputed from disk on every list.
+#[derive(serde::Serialize)]
+struct RestoreCandidate {
+    #[serde(flatten)]
+    record: TerminalSessionRecord,
+    /// `None` ⇒ not probed; serialized as absent so the frontend reads UNKNOWN
+    /// rather than "no transcript".
+    #[serde(rename = "transcriptExists", skip_serializing_if = "Option::is_none")]
+    transcript_exists: Option<bool>,
 }
 
 /// List EVERY previous Claude terminal session for display — the "previous
@@ -1861,6 +1891,131 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    fn restore_candidate_record(id: &str) -> TerminalSessionRecord {
+        TerminalSessionRecord {
+            claude_session_id: id.to_string(),
+            config_dir: None,
+            working_dir: Some("C:/repo".to_string()),
+            page_id: "default".to_string(),
+            zone_index: 0,
+            title: None,
+            terminal_id: "term-1".to_string(),
+            opened_at: 1,
+            last_seen_at: 2,
+            state: "open".to_string(),
+            closed_at: None,
+            close_reason: None,
+            provider: crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
+            origin: Some(
+                crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string(),
+            ),
+            restore_pending_at: None,
+            confirmed_at: Some(3),
+            handle: None,
+        }
+    }
+
+    /// `RestoreCandidate`'s wire shape: the record's own fields stay FLAT (the
+    /// frontend deserializes it as a `TerminalSessionRecord`), and the derived
+    /// `transcriptExists` bit rides alongside — present as a real boolean when
+    /// probed, and ABSENT (never `false`) when no probe is attached. The absent
+    /// case is load-bearing: the frontend classifier downgrades to
+    /// terminal-only on `false` only, so a `false` emitted for "not probed"
+    /// would silently disable auto-resume for every session.
+    #[test]
+    fn restore_candidate_flattens_record_and_omits_unprobed_transcript_bit() {
+        let probed_absent = serde_json::to_value(RestoreCandidate {
+            record: restore_candidate_record("sess-absent"),
+            transcript_exists: Some(false),
+        })
+        .expect("probed-absent candidate serializes");
+        assert_eq!(probed_absent["claudeSessionId"], "sess-absent");
+        assert_eq!(
+            probed_absent["transcriptExists"],
+            serde_json::Value::Bool(false),
+            "a probed-absent transcript must be reported as an explicit false"
+        );
+
+        let probed_present = serde_json::to_value(RestoreCandidate {
+            record: restore_candidate_record("sess-present"),
+            transcript_exists: Some(true),
+        })
+        .expect("probed-present candidate serializes");
+        assert_eq!(
+            probed_present["transcriptExists"],
+            serde_json::Value::Bool(true)
+        );
+
+        let unprobed = serde_json::to_value(RestoreCandidate {
+            record: restore_candidate_record("sess-unprobed"),
+            transcript_exists: None,
+        })
+        .expect("unprobed candidate serializes");
+        assert_eq!(
+            unprobed["claudeSessionId"], "sess-unprobed",
+            "flatten must keep the record's fields at the top level"
+        );
+        assert!(
+            unprobed.get("transcriptExists").is_none(),
+            "no probe attached must OMIT the field, never emit false: {unprobed}"
+        );
+    }
+
+    /// With NO probe attached every read is UNKNOWN, so a standalone store can
+    /// never manufacture a "no transcript" verdict.
+    #[test]
+    fn probe_transcript_exists_is_unknown_without_an_attached_probe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json"))
+            .expect("store opens");
+        assert_eq!(
+            store.probe_transcript_exists("sess-1", Some("C:/repo")),
+            None,
+            "unattached probe must read UNKNOWN, not absent"
+        );
+    }
+
+    /// The working-dir guard, exercised WITH a probe attached so the assertions
+    /// actually reach it. A probe that says `true` for everything isolates the
+    /// guard: a missing or blank working dir must still read UNKNOWN, because a
+    /// transcript path is derived from the project dir and
+    /// `DiskTranscriptIndex::transcript_exists` answers a bare `false` when it
+    /// has none — "could not determine", not "does not exist". Gating on that
+    /// raw value would demote a resumable session to terminal-only.
+    #[test]
+    fn probe_transcript_exists_needs_a_usable_working_dir_to_answer() {
+        #[derive(Debug)]
+        struct AlwaysPresent;
+        impl crate::session::snapshot_history::TranscriptProbe for AlwaysPresent {
+            fn transcript_exists(&self, _session_id: &str, _wd: Option<&str>) -> bool {
+                true
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json"))
+            .expect("store opens");
+        store.attach_transcript_probe(Arc::new(AlwaysPresent));
+
+        assert_eq!(
+            store.probe_transcript_exists("sess-1", Some("C:/repo")),
+            Some(true),
+            "an attached probe with a usable working dir must be consulted"
+        );
+        assert_eq!(
+            store.probe_transcript_exists("sess-1", None),
+            None,
+            "no working dir means the probe cannot answer — UNKNOWN, not absent"
+        );
+        for blank in ["", "   ", "\t"] {
+            assert_eq!(
+                store.probe_transcript_exists("sess-1", Some(blank)),
+                None,
+                "a blank working dir ({blank:?}) encodes to an impossible path — UNKNOWN"
+            );
+        }
+    }
 
     /// Phase 3 item 1 guardrail: a backend call arriving with
     /// `capture_hint: None` (through the optional-shape compatibility

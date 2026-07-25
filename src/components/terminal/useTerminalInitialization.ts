@@ -348,7 +348,8 @@ function isValidSessionId(id: string): boolean {
  * autonomous restore).
  *
  * - `"auto-resume"`: the record is `origin === "authoritative"` OR
- *   `origin === "observed"`, AND CONFIRMED (`confirmedAt` set) AND its
+ *   `origin === "observed"`, AND CONFIRMED (`confirmedAt` set), AND its
+ *   transcript was not probed-absent (`transcriptExists !== false`), AND its
  *   provider's `restoreTier()` is `"full"`. For `authoritative` the runner KNOWS
  *   the id (it pre-pinned `--session-id`) AND a provider's SessionStart hook (or
  *   the process-start-anchored reconcile backstop) observed a REAL provider
@@ -360,7 +361,7 @@ function isValidSessionId(id: string): boolean {
  *   authoritative and observed records.
  * - `"terminal-only"`: restore terminal+cwd+launch-command, but type NO resume
  *   and show NO operator-confirm banner — there is no conversation to bring
- *   back, and the UI is HONEST about it ("fresh conversation"). Two distinct
+ *   back, and the UI is HONEST about it ("fresh conversation"). Three distinct
  *   sources land here:
  *     1. an authoritative/observed-but-PROVISIONAL record — the spawn-time pin
  *        wrote a provisional record for EVERY terminal, including plain shells
@@ -375,6 +376,12 @@ function isValidSessionId(id: string): boolean {
  *        provider can re-open the terminal at the right cwd/launch-command but
  *        CANNOT deterministically resume the conversation by id. The terminal
  *        is restored; the UI notes the conversation is fresh.
+ *     3. a CONFIRMED record the backend probed as having NO transcript on disk
+ *        (`transcriptExists === false`) — the session STARTED (that is all
+ *        `confirmedAt` attests) but never accumulated messages, so the provider
+ *        never wrote a transcript and `--resume` can only fail. Distinct from
+ *        (1): the record is genuinely confirmed, so no reconcile prune covers
+ *        it, and it survives every boot until the row is closed.
  * - `"quarantine"`: a `"reconciled"` (or pre-field / any other) origin — a
  *   backstop-recovered id that can name a FOREIGN session. The tab is created so
  *   layout is preserved, but no resume is typed; the operator confirms via a
@@ -385,8 +392,10 @@ function isValidSessionId(id: string): boolean {
  *   typed, never quarantined (nothing actionable).
  *
  * The auto-resume GATE lives here on the frontend as
- * `(origin === "authoritative" || origin === "observed") && confirmed` (a record
- * is "confirmed" when its `confirmedAt` is set). The backend reconcile is the
+ * `(origin === "authoritative" || origin === "observed") && confirmed &&
+ * transcriptExists !== false` (a record is "confirmed" when its `confirmedAt` is
+ * set; `transcriptExists` is `undefined` when the backend attached no probe, and
+ * unknown must not downgrade). The backend reconcile is the
  * PRIMARY phantom defense (it prunes/flags provisional records for live PTYs
  * before this runs), but the classifier keeps the `confirmed` check so a phantom
  * the reconcile didn't see
@@ -396,7 +405,10 @@ function isValidSessionId(id: string): boolean {
 export type RestoreAction = "auto-resume" | "terminal-only" | "quarantine" | "skip-invalid";
 
 export function classifyRestoreAction(
-  rec: Pick<TerminalSessionRecord, "claudeSessionId" | "origin" | "confirmedAt" | "provider">,
+  rec: Pick<
+    TerminalSessionRecord,
+    "claudeSessionId" | "origin" | "confirmedAt" | "provider" | "transcriptExists"
+  >,
 ): RestoreAction {
   if (!isValidSessionId(rec.claudeSessionId)) return "skip-invalid";
   if (rec.origin === "authoritative" || rec.origin === "observed") {
@@ -407,6 +419,13 @@ export function classifyRestoreAction(
     // session exists as a confirmed authoritative one, so it takes the same
     // path.)
     if (rec.confirmedAt == null) return "terminal-only";
+    // CONFIRMED but probed as having NO transcript ⇒ no conversation to bring
+    // back, so typing `--resume` can only manufacture a "No conversation found"
+    // failure. Restore the terminal honestly instead — the same landing the
+    // provisional branch above takes. Strictly `=== false`: `undefined` is NOT
+    // PROBED, and unknown must never downgrade. See `TerminalSessionRecord.
+    // transcriptExists` for why `confirmedAt` is not proof of resumability.
+    if (rec.transcriptExists === false) return "terminal-only";
     // Confirmed authoritative/observed ⇒ auto-resume (no operator click) — but
     // ONLY when the provider can deterministically resume the FULL conversation
     // by id (`restoreTier() === "full"`). A `terminal-only`-tier provider can
@@ -726,10 +745,13 @@ export function useTerminalInitialization({
             resumeQuarantined: restoreAction === "quarantine",
             // Honest "fresh conversation" note (Phase 5) ONLY for a CONFIRMED
             // terminal-only restore — i.e. a real provider session existed here
-            // but its provider can't `--resume` the chat by id (terminal-only
-            // tier). An UNCONFIRMED terminal-only row is a phantom shell that
-            // never hosted a conversation, so restoring it as a plain terminal
-            // (no note) is the honest, clutter-free outcome.
+            // but its conversation could not be resumed by id: either the
+            // provider is terminal-only tier, or the session has no transcript
+            // on disk (the transcript gate above). The banner copy names the
+            // OUTCOME rather than either cause, since both land here. An
+            // UNCONFIRMED terminal-only row is a phantom shell that never hosted
+            // a conversation, so restoring it as a plain terminal (no note) is
+            // the honest, clutter-free outcome.
             restoreTerminalOnly: restoreAction === "terminal-only" && rec.confirmedAt != null,
           });
           rememberSessionId(tabId, rec.claudeSessionId, safeConfigDir);

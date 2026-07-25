@@ -93,18 +93,28 @@ const COMPACT_TRIGGER_RECORDS: usize = 4096;
 /// (amortizes the full-file rewrite; ~every 21h at heartbeat cadence).
 const COMPACT_CHECK_EVERY: usize = 256;
 
-/// Write-time existence probe for a session's on-disk transcript — the
-/// evidence that makes a recorded id actually `--resume`-able.
+/// Existence probe for a session's on-disk transcript — the evidence that makes
+/// a recorded id actually `--resume`-able.
 ///
 /// Injected (rather than called directly) so the store can stamp
 /// [`SnapshotSession::transcript_exists`] without this module taking a
 /// dependency on the disk layout, and so tests are deterministic.
 /// [`crate::session::reconcile::DiskTranscriptIndex`] is the real
-/// implementation.
+/// implementation. Read at write time (the snapshot stamp) and at list time
+/// (`SessionLifecycleStore::probe_transcript_exists`, which feeds the
+/// boot-restore tier).
 pub trait TranscriptProbe: std::fmt::Debug + Send + Sync {
-    /// Whether a transcript file exists for `session_id` (scoped by
-    /// `working_dir`, the transcript's project path — `None` when the record
-    /// carries no cwd, which the disk implementation treats as "cannot prove").
+    /// Whether a transcript file exists for `session_id`, scoped by
+    /// `working_dir` — the transcript's project path, from which the file path is
+    /// DERIVED.
+    ///
+    /// The `bool` return cannot express "could not determine", and the disk
+    /// implementation answers a bare `false` for a missing/blank `working_dir`.
+    /// Callers that GATE behavior on the answer must therefore not pass an
+    /// unusable `working_dir` — `SessionLifecycleStore::probe_transcript_exists`
+    /// is the guarded entry point that maps those cases to UNKNOWN. Widening this
+    /// return to `Option<bool>` so the distinction lives in one place is a
+    /// worthwhile follow-up.
     fn transcript_exists(&self, session_id: &str, working_dir: Option<&str>) -> bool;
 }
 
