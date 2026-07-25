@@ -301,6 +301,13 @@ jobs:
           cargo fmt -- --check
 
       - name: Clippy check
+        # UBUNTU ONLY. Windows clippy moved to the parallel `clippy-windows`
+        # job (below) so it no longer sits on the windows `test` critical path
+        # (~12 min saved there). cfg(windows) lint coverage is preserved in that
+        # job — see plan 2026-07-22-runner-ci-sccache-workspace-crate-caching.md
+        # Phase 2. This ubuntu leg stays the in-job blocking full-workspace
+        # clippy (clippy-tiers.yml is diff-scoped/advisory, not a substitute).
+        if: matrix.platform == 'ubuntu-22.04'
         # Plain `cargo clippy` (no `-D warnings`): lint levels come solely from
         # src-tauri/Cargo.toml [lints.clippy]. T1 correctness/suspicious groups
         # are `deny` there, so a correctness lint still exits non-zero and fails
@@ -478,6 +485,94 @@ jobs:
         if: always()
         shell: bash
         run: sccache --show-stats
+
+  # Windows clippy, split OUT of the matrix `test` job so it no longer sits on
+  # the windows `test` critical path (~12 min saved there — clippy was the 3rd
+  # full compile on that leg). It runs in PARALLEL with `test`, and since it
+  # only compiles-to-lint (no test run, no tauri build) it finishes well before
+  # the windows test leg, so it is off the critical path.
+  #
+  # WHY a separate job rather than just dropping windows clippy: this repo has
+  # substantial #[cfg(windows)] code (win32 session / terminal / junction
+  # paths) compiled — hence linted — only on a windows host. clippy-tiers.yml
+  # runs ubuntu-only, and plain `cargo test` does not evaluate [lints.clippy]
+  # levels (clippy-driver only), so neither substitutes for a windows clippy
+  # pass. See plan 2026-07-22-runner-ci-sccache-workspace-crate-caching.md
+  # Phase 2.
+  #
+  # The setup steps mirror the `test` job's windows prefix (checkout → siblings
+  # → pnpm/node → rust → pagefile → rust-cache → frontend build). Keep them in
+  # sync with that job. rust-cache here saves on `main` only (its own cache
+  # scope, distinct from the `test` job's) so candidate/PR runs don't add ~2.6
+  # GB saves against the 10 GB repo cache cap.
+  clippy-windows:
+    name: Clippy (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Rust path-dep on ../../qontinui-schemas/rust + the SDK↔runner manifest
+      # diff test read; same rationale as the `test` job's sibling checkout.
+      - name: Checkout sibling repos
+        run: |
+          cd "$GITHUB_WORKSPACE/.."
+          git clone --depth 1 https://github.com/qontinui/qontinui-schemas.git
+          git clone --depth 1 https://github.com/qontinui/qontinui-web.git
+          git clone --depth 1 https://github.com/qontinui/ui-bridge.git
+        shell: bash
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+          cache: "pnpm"
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt, clippy
+
+      - name: Configure pagefile (Windows — guard against link-time OOM)
+        uses: al-cheb/configure-pagefile-action@v1.4
+        with:
+          minimum-size: 32GB
+          maximum-size: 32GB
+          disk-root: "D:"
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          cache-on-failure: true
+          # Save from main only — this job's cache is a separate scope from the
+          # `test` job's, and candidate/PR saves would otherwise add another
+          # ~2.6 GB consumer to the 10 GB repo cache cap (the eviction problem
+          # runner PR #792 fixes for the `test` job's cache).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      # tauri::generate_context!() in src-tauri/src/lib.rs reads tauri.conf.json
+      # at compile time and panics if frontendDist (../dist) is missing; clippy
+      # compiles lib.rs, so the frontend must be built first.
+      - name: Build frontend
+        run: pnpm run build
+
+      - name: Clippy check
+        # Same invocation as the `test` job's ubuntu clippy — lint levels come
+        # from src-tauri/Cargo.toml [lints.clippy]; T1 groups are `deny` so a
+        # correctness lint fails this check.
+        run: |
+          cd src-tauri
+          cargo clippy
 
   # Gating frontend unit-test lane (vitest).
   #
