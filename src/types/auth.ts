@@ -83,8 +83,23 @@ export interface AuthContextValue {
    * `useRunnerTier()` redundantly. Only "qontinui_account" requires a Qontinui
    * (Cognito) sign-in; "local" and "local_provider" run with a synthesized
    * local-guest auth.
+   *
+   * ONLY meaningful when `tierUnknown` is false — otherwise `tier` is the "local"
+   * placeholder, NOT a verdict about the runner (see `tierUnknown`).
    */
   tier: RunnerTier;
+  /**
+   * The runner tier could NOT be determined — `get_runner_tier` failed
+   * (settings.json unreadable) and the read retries were exhausted. This is a
+   * THIRD tier state, distinct from any known tier: consumers must NEITHER treat
+   * the runner as Tier 2 NOR synthesize a local-guest shell — both are a silent
+   * downgrade of a runner whose real tier is simply unknown. The correct
+   * response is to HOLD and surface `tierError`. Always `false` while the tier is
+   * still loading or once it is known.
+   */
+  tierUnknown: boolean;
+  /** Why the tier could not be read, when `tierUnknown` is true; else `null`. */
+  tierError: string | null;
   /**
    * Default logout — clears only the interactive device-JWT session and keeps
    * the Cognito session, so the runner's autonomous terminal sessions keep

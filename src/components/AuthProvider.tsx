@@ -13,7 +13,10 @@
  *
  * This provider's job is now just to:
  *   - read auth status (`check_auth_status`) for Tier 2,
- *   - synthesize a local-guest auth for Tier 0/1,
+ *   - synthesize a local-guest auth for Tier 0/1 (only when the tier is KNOWN),
+ *   - HOLD — never downgrade — when the tier is UNKNOWN (settings.json
+ *     unreadable): surface `tierUnknown`/`tierError` so the App gate can render a
+ *     "cannot determine tier" screen instead of a local-guest shell,
  *   - periodically re-validate Tier-2 status,
  *   - expose `logout`.
  */
@@ -95,8 +98,20 @@ export function AuthProvider({ children }: AuthProviderProps) {
   // Tier 1 ("local_provider") DO NOT require a qontinui-account session; they
   // boot with a synthesized local-guest auth and never hit the auth backend.
   // Only Tier 2 ("qontinui_account") runs the Cognito status flow.
-  const { tier, loading: tierLoading } = useRunnerTier();
-  const isTier2 = tier === "qontinui_account";
+  const { tier, tierKnown, loading: tierLoading, error: tierError } = useRunnerTier();
+  // Three tier states, not two — "unknown" must never collapse into "denied".
+  // An unreadable settings.json means we do NOT know the tier, which is a
+  // different fact from knowing the tier is local. So:
+  //   - `isTier2` is a STRICT true: false unless the tier is KNOWN to be
+  //     qontinui_account (a placeholder tier read during a failed load must not
+  //     read as Tier 2 — and, symmetrically, must not read as local either).
+  //   - `tierUnknown` carries the third state so the App gate can HOLD instead
+  //     of silently rendering a Tier-2 runner as a local-guest shell (the
+  //     flagship no-silent-downgrade symptom). It is only ever true AFTER the
+  //     read retries are exhausted; while a read is still in flight `tierLoading`
+  //     is true and this is false.
+  const isTier2 = tierKnown && tier === "qontinui_account";
+  const tierUnknown = !tierLoading && !tierKnown;
 
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [loading, setLoading] = useState(true);
@@ -170,9 +185,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       const attempt = retryAttemptRef.current;
       retryAttemptRef.current = attempt + 1;
       const delay =
-        AUTH_PROBE_RETRY_BACKOFF_MS[
-          Math.min(attempt, AUTH_PROBE_RETRY_BACKOFF_MS.length - 1)
-        ];
+        AUTH_PROBE_RETRY_BACKOFF_MS[Math.min(attempt, AUTH_PROBE_RETRY_BACKOFF_MS.length - 1)];
       if (retryTimerRef.current !== null) clearTimeout(retryTimerRef.current);
       retryTimerRef.current = setTimeout(() => {
         retryTimerRef.current = null;
@@ -412,11 +425,24 @@ export function AuthProvider({ children }: AuthProviderProps) {
   }, [checkAuthStatus]);
 
   /**
-   * Synthesize a local-guest authStatus for Tier 0/1.
+   * Synthesize a local-guest authStatus for Tier 0/1 — but ONLY when the tier is
+   * actually KNOWN to be local/local_provider.
+   *
+   * NO-DOWNGRADE: the guard here is the actual fix for the flagship symptom. If
+   * the tier is UNKNOWN (settings.json unreadable), `isTier2` is false — but
+   * fabricating a local-guest identity in that case is exactly the silent
+   * downgrade this change removes: a real Tier-2 runner would render as a
+   * local-guest shell with every cloud feature gone and no error shown. So we
+   * require `tierKnown` before synthesizing, and bail on `tierUnknown`. In the
+   * unknown state we hold `authStatus` at null; the App gate renders the
+   * tier-unavailable screen, and this effect re-runs (its deps include
+   * `tierKnown`/`tierUnknown`) to synthesize normally once the tier resolves —
+   * e.g. settings.json becomes readable again and a re-read lands a real tier.
    */
   useEffect(() => {
     if (tierLoading) return;
-    if (!isTier2 && authStatus === null) {
+    if (tierUnknown) return;
+    if (tierKnown && !isTier2 && authStatus === null) {
       queueMicrotask(() => {
         setAuthStatus({
           authenticated: true,
@@ -428,7 +454,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
         setLoading(false);
       });
     }
-  }, [tierLoading, isTier2, authStatus]);
+  }, [tierLoading, tierUnknown, tierKnown, isTier2, authStatus]);
 
   /**
    * Failsafe timeout for loading state. If `loading` is still true after 3
@@ -479,7 +505,13 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
   const contextValue: AuthContextValue = {
     authStatus,
-    loading,
+    // The tier read is part of "still loading auth" — while `tierLoading` is
+    // true we do not yet know which tier the runner is, so nothing downstream
+    // (local-guest synthesis, the Tier-2 probe, the App gate) can decide yet.
+    // Folding it in here keeps the App's loading shell up for the duration of a
+    // (possibly retrying) tier read, so the app never flashes past it into a
+    // wrong surface. The internal `loading` state still owns the 3s failsafe.
+    loading: loading || tierLoading,
     authResolving,
     error,
     // Retained for API stability: dev email/password auto-login is removed, so
@@ -490,6 +522,12 @@ export function AuthProvider({ children }: AuthProviderProps) {
     // "signed out" — see `checkAuthStatus`.
     authProbeUnresolved: isTier2 && probeUnresolved,
     tier,
+    // The third tier state. When true, the tier could NOT be determined
+    // (settings.json unreadable, retries exhausted): consumers must neither
+    // treat the runner as Tier 2 nor as local-guest — they must HOLD and surface
+    // `tierError`. False while loading or once the tier is known.
+    tierUnknown,
+    tierError,
     logout,
     signOutFull,
     refreshAuth,

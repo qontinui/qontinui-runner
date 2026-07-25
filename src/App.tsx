@@ -68,6 +68,7 @@ import StatusIndicator from "./components/StatusIndicator";
 import ActionDetailModal from "./components/ActionDetailModal";
 import ImageDetailModal from "./components/ImageDetailModal";
 import { LoginScreen } from "./components/LoginScreen";
+import { TierUnavailableScreen } from "./components/TierUnavailableScreen";
 import { SetupWizard } from "./components/setup-wizard";
 import { registerOpenableView } from "./lib/openable-views";
 import { resolveAuthGate } from "./lib/authGate";
@@ -511,6 +512,11 @@ function AppContent() {
     setupCompleted,
     isTier2,
     authenticated: auth.authStatus?.authenticated === true,
+    // NO-DOWNGRADE: an unreadable settings.json leaves the tier UNKNOWN. The
+    // gate holds on TierUnavailableScreen rather than falling through to the
+    // local-guest app shell (which would silently strip cloud features from a
+    // Tier-2 runner) or LoginScreen (which would read as a sign-out).
+    tierUnknown: auth.tierUnknown,
   });
 
   if (gate === "loading") {
@@ -527,6 +533,16 @@ function AppContent() {
         </div>
       </div>
     );
+  }
+
+  // NO-DOWNGRADE hold: the runner tier could not be determined (settings.json
+  // unreadable, read retries exhausted). We must NOT synthesize a local-guest
+  // shell (silently strips cloud features from a Tier-2 runner) NOR show
+  // LoginScreen (reads as a sign-out). Hold and explain instead; AuthProvider's
+  // useRunnerTier re-reads on `runner-tier-changed` (the Retry button), so this
+  // screen leaves on its own once settings.json is readable again.
+  if (gate === "tier-unknown") {
+    return <TierUnavailableScreen error={auth.tierError} />;
   }
 
   // Runner-tier-decoupling Phase 1 — wizard runs FIRST so Tier 0/1 setup

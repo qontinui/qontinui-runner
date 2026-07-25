@@ -1,7 +1,7 @@
 /**
- * The runner's top-level auth gate: which of the four root surfaces does
- * `App` render — the loading shell, the setup wizard, the login screen, or the
- * app itself?
+ * The runner's top-level auth gate: which root surface does `App` render — the
+ * loading shell, the setup wizard, the login screen, the tier-unavailable hold
+ * screen, or the app itself?
  *
  * Extracted as a pure function because the gate has one failure mode that is
  * invisible in review and expensive in practice: **rendering `LoginScreen` at a
@@ -23,7 +23,7 @@
  * enforced — and tested.
  */
 
-export type AuthGate = "loading" | "wizard" | "login" | "app";
+export type AuthGate = "loading" | "wizard" | "login" | "tier-unknown" | "app";
 
 export interface AuthGateInput {
   /** `AuthProvider.loading` — in-flight auth work, force-cleared after 3s. */
@@ -40,6 +40,13 @@ export interface AuthGateInput {
   isTier2: boolean;
   /** `authStatus?.authenticated === true`. */
   authenticated: boolean;
+  /**
+   * The runner tier could not be determined (settings.json unreadable, read
+   * retries exhausted). The tier is neither Tier 2 nor a known local tier, so
+   * we must HOLD on a dedicated screen rather than pick any tier-derived
+   * surface. Never true while the tier is still loading (that is `authLoading`).
+   */
+  tierUnknown: boolean;
 }
 
 export function resolveAuthGate(input: AuthGateInput): AuthGate {
@@ -51,8 +58,19 @@ export function resolveAuthGate(input: AuthGateInput): AuthGate {
   if (!input.apiReady) {
     return "loading";
   }
-  // Wizard runs FIRST so Tier 0/1 setup can happen without ever hitting the
-  // login screen.
+  // NO-DOWNGRADE: we could not determine the runner tier (settings.json
+  // unreadable). Every gate below presumes a KNOWN tier — deciding
+  // wizard/login/app from an unknown tier is precisely the silent downgrade this
+  // screen exists to prevent (a Tier-2 runner would fall through to the
+  // local-guest app shell). HOLD here; the tier is re-read when settings becomes
+  // readable and this clears on its own. This never eats first-run: a fresh
+  // install has a KNOWN default tier (a missing settings file is not an
+  // unreadable one), so `tierUnknown` is false and the wizard still shows.
+  if (input.tierUnknown) {
+    return "tier-unknown";
+  }
+  // Wizard runs FIRST (of the tier-derived gates) so Tier 0/1 setup can happen
+  // without ever hitting the login screen.
   if (input.setupCompleted === false) {
     return "wizard";
   }
