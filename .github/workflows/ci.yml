@@ -230,6 +230,14 @@ jobs:
           # Candidate/PR runs often fail on steps after the Rust compiles
           # succeeded; still save so the next run on the ref stays warm.
           cache-on-failure: true
+          # Save ONLY from main. Observed 2026-07-17: every merge-candidate/*
+          # and PR run saved its own ~2.6 GB copy under a one-shot ref,
+          # blowing the repo's 10 GB cache cap and EVICTING main's cache —
+          # main runs then restored "No cache found." and went cold (1h39m
+          # vs 1h17m warm), defeating the cache fix entirely. Candidates and
+          # PRs still RESTORE main's cache (restore is unrestricted); their
+          # refs are one-shot, so a per-ref save buys nothing.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
