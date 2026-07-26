@@ -1,3 +1,0 @@
-# HelpTab
-
-_(notes)_

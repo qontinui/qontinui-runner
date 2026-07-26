@@ -1,3 +1,0 @@
-# ShellCommandsPage
-
-_(notes)_
