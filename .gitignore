@@ -152,3 +152,7 @@ target-rebuild/
 target-types-task/
 target-wt/
 *.log.err
+
+# MSYS/Cygwin crash dumps (bash.exe.stackdump, du.exe.stackdump, ...).
+# Build-environment noise on Windows dev boxes, never source.
+*.stackdump
