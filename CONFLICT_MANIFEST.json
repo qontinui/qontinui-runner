@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "base_sha": "f1c3ef23625d494db69236563b932d28b0c12b96",
+  "ours_sha": "091db62a7862d86feb289fd121e64cb6a0750353",
+  "theirs_sha": "48872497de14161ece7fb0e23ef1cf2efa9868c5",
+  "entries": [
+    {
+      "path": "src-tauri/src/process_capture/process_tree.rs",
+      "base_oid": "91116eab7f2e1c0b4114663064070c6b600e2def",
+      "ours_oid": "a80b171f19a9f194134f572ee267aaf8c1beb329",
+      "theirs_oid": "6c92993beaa29c4ab7045b761d69b9967e61cbcc",
+      "base_path": "src-tauri/src/process_capture/process_tree.rs.base",
+      "ours_path": "src-tauri/src/process_capture/process_tree.rs.ours",
+      "theirs_path": "src-tauri/src/process_capture/process_tree.rs.theirs",
+      "hunks": [
+        "<<<<<<< HEAD\nfn is_shim_dir_exe_path(exe_path: &str, persistent_identity_dir: Option<&str>) -> bool {\n=======\npub fn is_shim_dir_exe_path(exe_path: &str, persistent_identity_dir: Option<&str>) -> bool {\n>>>>>>> c49a2c4f (fix(runner): tracking_health — primary boot time as PID-reuse reference; exclude path-identity shim from live_claude)\n",
+        "<<<<<<< HEAD\n    // Case-folded like `normalize_dir` below: WMI can report case-mangled\n    // paths, and a miss here fails open to counting the shim as real.\n    let dir_base_lower = dir_base.to_ascii_lowercase();\n    if dir_base_lower.starts_with(IDENTITY_DIR_PREFIX)\n        || dir_base_lower.starts_with(SHIM_DIR_PREFIX)\n    {\n=======\n    if dir_base.starts_with(IDENTITY_DIR_PREFIX) || dir_base.starts_with(SHIM_DIR_PREFIX) {\n>>>>>>> c49a2c4f (fix(runner): tracking_health — primary boot time as PID-reuse reference; exclude path-identity shim from live_claude)\n",
+        "<<<<<<< HEAD\n        assert_eq!(\n            pids,\n            vec![602, 603],\n            \"shim 601 excluded; real + unknown-path kept\"\n        );\n        assert!(claude_present_in_inclusive_subtree(\n            600,\n            &snap,\n            REFERENCE_FRESH\n        ));\n=======\n        assert_eq!(pids, vec![602, 603], \"shim 601 excluded; real + unknown-path kept\");\n        assert!(claude_present_in_inclusive_subtree(600, &snap, REFERENCE_FRESH));\n>>>>>>> c49a2c4f (fix(runner): tracking_health — primary boot time as PID-reuse reference; exclude path-identity shim from live_claude)\n",
+        "<<<<<<< HEAD\n        shim_only\n            .exe_paths\n            .insert(701, \"/tmp/qontinui-identity-t2/claude\".to_string());\n=======\n        shim_only.exe_paths.insert(\n            701,\n            \"/tmp/qontinui-identity-t2/claude\".to_string(),\n        );\n>>>>>>> c49a2c4f (fix(runner): tracking_health — primary boot time as PID-reuse reference; exclude path-identity shim from live_claude)\n"
+      ]
+    }
+  ]
+}
