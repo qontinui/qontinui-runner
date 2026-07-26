@@ -102,16 +102,41 @@ jobs:
           sudo mkswap /swapfile
           sudo swapon /swapfile
 
+      # Swatinem/rust-cache, matching ci.yml. The `actions/cache` stanza this
+      # replaces was the same one ci.yml documents at its own cache step as
+      # "broken two ways and never cached a single build artifact":
+      #   1. It cached `src-tauri/target/`, but the cargo workspace root is the
+      #      REPO root (./Cargo.toml holds the [workspace] table → ./target), so
+      #      that path never existed. Observed on run 30211607823: the step
+      #      restored 112 MB — the cargo registry alone, zero build artifacts.
+      #   2. Exact-match key with no restore-keys, so any Cargo.lock change was
+      #      a total miss even for the registry portion.
+      # ci.yml was migrated off it; these two jobs were left behind.
+      #
+      # `shared-key` is load-bearing. rust-cache keys on `github.job` by
+      # default, so without it this nightly (the only job here that may save —
+      # `schedule` runs on main) and `clippy-diff` would sit in separate cache
+      # scopes and clippy-diff would restore nothing at all.
+      #
+      # `cache-targets: false` is deliberate, not an oversight. The repo's
+      # Actions cache sits at ~95% of the 10 GB cap, and the entries that gate
+      # the merge train are ci.yml's ~2.2 GB main-scoped rust caches — the ones
+      # PR #792's `save-if` exists to stop candidate/PR runs from evicting.
+      # Neither job in this workflow is a required check, so they must not buy
+      # their own speedup with the cap main's caches depend on. Revisit only if
+      # `gh api repos/qontinui/qontinui-runner/actions/cache/usage` shows real
+      # headroom.
       - name: Cache Rust dependencies
-        uses: actions/cache@v3
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            src-tauri/target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          # Workspace root is the repo root: ./Cargo.toml -> ./target
+          workspaces: ". -> target"
+          shared-key: clippy-tiers
+          cache-targets: false
+          # Same policy as ci.yml (PR #792): save from main only. This job runs
+          # on main via `schedule`, so it is what populates the cache; the
+          # clippy-diff PR runs restore it and never save.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
@@ -227,16 +252,19 @@ jobs:
           sudo mkswap /swapfile
           sudo swapon /swapfile
 
+      # Same migration as the nightly job above — see its comment for why the
+      # replaced `actions/cache` stanza cached nothing. `shared-key` puts this
+      # job in the nightly's cache scope so it RESTORES what the nightly saved
+      # from main; `save-if` then evaluates false on every `pull_request` run,
+      # so this job never adds a save against the 10 GB repo cache cap. That is
+      # PR #792's policy applied here: restore unrestricted, save from main only.
       - name: Cache Rust dependencies
-        uses: actions/cache@v3
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            src-tauri/target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          workspaces: ". -> target"
+          shared-key: clippy-tiers
+          cache-targets: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
