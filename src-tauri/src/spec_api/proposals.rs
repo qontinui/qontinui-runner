@@ -43,6 +43,12 @@ use crate::mcp::types::ApiState;
 use crate::spec_api::apps::AppErrorExt;
 use crate::spec_api::events;
 use crate::spec_api::responses::SpecError;
+// Converts an on-disk page id (`account-billing`) back to its pathname
+// (`/account/billing`). Owned by `spec_api::slug` alongside its inverse: the
+// copy that lived here recognised only `index` for the root page while the
+// slugger emits `root`, so `root` mapped to `/root` and this scan reported the
+// index page as un-spec'd.
+use crate::spec_api::slug::spec_id_to_pathname;
 use crate::spec_api::storage;
 use qontinui_types::spec_api_events::SpecApiEvent;
 
@@ -1041,33 +1047,6 @@ fn mint_proposal_id() -> String {
     format!("prop_{}", uuid::Uuid::now_v7())
 }
 
-/// Convert an on-disk page id (slug form, e.g. `account-billing`) back to
-/// its pathname (e.g. `/account/billing`). Inverse of `pathname_to_spec_id`
-/// owned by the sibling `workflow_generation::spec_authoring` module.
-///
-/// v1.0 slug shape: pathname segments joined with `-`, lowercased, leading
-/// slash dropped. Index pathnames (empty / `/`) map to `index`. Anything
-/// outside that shape returns `None`.
-fn spec_id_to_pathname(spec_id: &str) -> Option<String> {
-    if spec_id.is_empty() {
-        return None;
-    }
-    if spec_id == "index" {
-        return Some("/".to_string());
-    }
-    // Reject anything that wouldn't round-trip cleanly through the slug
-    // shape — e.g. uppercase, double-dashes (which would collapse on
-    // re-slug), leading/trailing dashes.
-    if spec_id.chars().any(|c| c.is_uppercase())
-        || spec_id.contains("--")
-        || spec_id.starts_with('-')
-        || spec_id.ends_with('-')
-    {
-        return None;
-    }
-    Some(format!("/{}", spec_id.replace('-', "/")))
-}
-
 /// Map a `RegisteredElement` (from `commands::spec_drift::DriftReport
 /// .missing_from_spec`) to a target `spec_id` within `app_id`'s spec
 /// corpus, using `elem.file` as the pathname-routing input.
@@ -1162,21 +1141,8 @@ mod tests {
         assert_eq!(id.len(), 5 + 36, "unexpected proposal id length: {}", id);
     }
 
-    #[test]
-    fn spec_id_to_pathname_simple() {
-        assert_eq!(
-            spec_id_to_pathname("account-billing").as_deref(),
-            Some("/account/billing")
-        );
-        assert_eq!(spec_id_to_pathname("home").as_deref(), Some("/home"));
-        assert_eq!(spec_id_to_pathname("index").as_deref(), Some("/"));
-        assert_eq!(spec_id_to_pathname(""), None);
-        // Reject non-roundtrippable shapes.
-        assert_eq!(spec_id_to_pathname("Account-Billing"), None);
-        assert_eq!(spec_id_to_pathname("-leading"), None);
-        assert_eq!(spec_id_to_pathname("trailing-"), None);
-        assert_eq!(spec_id_to_pathname("double--dash"), None);
-    }
+    // `spec_id_to_pathname` behaviour is owned and tested by
+    // `spec_api::slug`, together with its inverse.
 
     #[test]
     fn infer_target_spec_id_strips_src_pages() {
