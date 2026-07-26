@@ -225,28 +225,51 @@ A PR is ready to merge when every required workflow is green on the PR's HEAD co
 
 ### What "main is green" means here
 
-This repo has five workflows in `.github/workflows/`. They split into two tiers by trigger type:
+Workflows in `.github/workflows/` split into three tiers. The authoritative list of what actually blocks a merge is the `main-merge-gates` ruleset (see "Branch protection" below) — it pins **check-context names**, so this section and the ruleset must be kept in sync whenever a job is renamed, added, or split out.
 
-**Merge gates** (must be green on your PR before merge):
+**Merge gates** (the ruleset's required contexts — must be green on your PR before merge):
 
-- `ci.yml` — runs on PR + push to `main` and `develop` (`.github/workflows/ci.yml:3-7`). Two jobs:
-  - `test` matrix (`ci.yml:13-189`) on `ubuntu-22.04`, `macos-latest`, `windows-latest`: clones sibling repos (`qontinui-schemas`, `jspinak/qontinui-web`), `pnpm install` + `pnpm run lint` + `pnpm run build`, then `cargo fmt -- --check`, `cargo clippy -- -D warnings`, `cargo test`, and finally `pnpm run tauri build --debug --no-bundle`. Each platform leg must be either green **or** linked to a tracked open issue documenting an upstream-runner block (see "Platform escape valve" below). The escape valve is for hosted-runner pathologies you can't fix in the PR (e.g. rustc-LLVM crashing on the GitHub `windows-latest` image), not for "tests are flaky, ignore."
-  - `security` job (`ci.yml:191-228`) on `ubuntu-latest` only: `cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071` + `pnpm audit --audit-level=moderate`. Runs in parallel with the matrix; treated as part of the same `ci.yml` gate. Don't ignore it just because it's separate from the platform legs.
-- `forbid-runner-schema.yml` — runs on PR + push to `main` and `develop` (`.github/workflows/forbid-runner-schema.yml:21-25`). Cheap, fast, no excuse for letting it go red.
-- `schema-pg-sql-fresh.yml` — `pull_request: [main]` + `workflow_dispatch`, paths-filtered to `src-tauri/queries/**` and `src-tauri/schema.pg.sql.generated` (`.github/workflows/schema-pg-sql-fresh.yml:18-25`). Required when your PR touches those paths; otherwise it doesn't run and isn't a gate for that PR. Confirms the checked-in `schema.pg.sql.generated` matches a fresh `alembic upgrade head + pg_dump` against the current `qontinui-web` alembic chain. If it goes red, regenerate locally via `bash src-tauri/scripts/regenerate_schema_pg_sql.sh` and commit the result.
+- `ci.yml` — PR + push to `main`, `develop`, and the coord `merge-candidate/**` refs. Five jobs, six contexts (the `test` matrix reports one per platform):
+  - `test (ubuntu-22.04)` / `test (windows-latest)` — the matrix leg: clones the sibling repos (`qontinui-schemas`, `qontinui-web`, `ui-bridge`), `pnpm install` + lint + typecheck + vitest + `pnpm run build`, then `cargo fmt -- --check`, `cargo test`, `pnpm run tauri build --debug --no-bundle`, plus the Windows-only SDK↔runner contract smoke. `cargo clippy` runs on the **ubuntu leg only** — the Windows clippy pass moved to its own job (next bullet). macOS is currently disabled in the matrix. Each platform leg must be either green **or** linked to a tracked open issue documenting an upstream-runner block (see "Platform escape valve" below). The escape valve is for hosted-runner pathologies you can't fix in the PR (e.g. rustc-LLVM crashing on the GitHub `windows-latest` image), not for "tests are flaky, ignore."
+  - `Clippy (windows)` — the `clippy-windows` job, split out of the matrix so it runs in **parallel** with `test (windows-latest)` instead of sitting on its critical path (~12 min saved there). It is not redundant with the ubuntu clippy: this repo has substantial `#[cfg(windows)]` code that is only compiled — hence only linted — on a Windows host, `clippy-tiers.yml` is ubuntu-only and advisory, and plain `cargo test` does not evaluate `[lints.clippy]` levels. If this job is not required, Windows lint coverage exists but gates nothing.
+  - `Frontend unit tests (vitest)` — the standalone `frontend-tests` job. The matrix leg runs `pnpm test` too, but wedged behind ~40-70 min of cargo; this job gives the same signal in ~1-2 min.
+  - `seam-gate` — source-level assertion that the three `#[cfg(any(debug_assertions, feature = "test-fixtures"))]` anchors guarding the `/ui-bridge/test/*` injection seam are intact.
+  - `security` — `cargo audit --file Cargo.lock` (with the documented `--ignore`s) + `pnpm audit --audit-level=moderate`. Runs in parallel with the matrix; don't ignore it just because it's a separate context.
+- `forbid-runner-schema.yml` → `forbid-runner-schema`. Cheap, fast, no excuse for letting it go red.
+- `secret-scan.yml` → `Gitleaks Secret Detection`.
+- `schema-pg-sql-fresh.yml` → `schema-fresh`, and `clorinde-bindings-fresh.yml` → `clorinde-fresh`. Both are **always-run shim jobs** that reflect the verdict of a paths-filtered verify job, so the context reports on every PR (green as a no-op when your PR doesn't touch the watched paths) rather than going missing. `schema-fresh` confirms the checked-in `schema.pg.sql.generated` matches a fresh `alembic upgrade head + pg_dump` against the current `qontinui-web` alembic chain; if it goes red, regenerate locally via `bash src-tauri/scripts/regenerate_schema_pg_sql.sh` and commit the result.
 
-> **Note on `spec-pairing.yml`**: a previous draft of this section claimed `spec-pairing.yml` is a path-triggered gate in this repo. It isn't — `spec-pairing.yml` lives in `jspinak/qontinui-web`, not in `qontinui-runner`. Don't expect to see it in this repo's PR checks.
+> **Note on `spec-pairing.yml`**: a previous draft of this section claimed `spec-pairing.yml` is a path-triggered gate in this repo. It isn't — `spec-pairing.yml` lives in `qontinui-web`, not in `qontinui-runner`. Don't expect to see it in this repo's PR checks.
 
-**Not merge gates** (validated at release time, not PR time):
+**Runs on PRs but is NOT a merge gate** (advisory signal — read it, don't be blocked by it):
+
+- `ci-integrity.yml` → `Guard gating workflows from self-edits`. Goes **red by design** on any PR that edits one of the gating workflow files, so coord will not auto-land it and an operator reviews the diff. Do not "fix" this red and do not remove a file from its gating list.
+- `clippy-tiers.yml` → `Clippy nightly (unscoped, all-targets)` + `Clippy diff-scoped (advisory)`. Ubuntu-only, advisory by design; not a substitute for either blocking clippy context above.
+- `qontinui-types-drift.yml`, `reproducibility-gate.yml`, `atlas-exclude-fresh.yml`, `page-spec-paths.yml`, `frontend-coverage-producer.yml`.
+
+**Not PR-time at all** (validated at release time):
 
 - `release.yml` — `push: tags: ['v*']` + `workflow_dispatch`. Won't run on a PR. Verify when cutting a tag.
 - `build-python-executor.yml` — `workflow_dispatch` + `workflow_call` only. Called from `release.yml`. Verify when invoking manually or via release.
 
 If `release.yml` is red on `windows-latest`, that's a release-time problem, not a merge-time problem — but file an issue so it isn't a surprise on the next tag.
 
+### CI cache budget (10 GB, repo-wide)
+
+GitHub caps Actions cache at **10 GB per repository** and evicts least-recently-used entries once you cross it. This repo lives close to that cap: a single `Swatinem/rust-cache` entry is ~2.3 GB and there are three of them from `main` alone (ubuntu `test`, windows `test`, `clippy-windows`). Two consequences worth knowing before you touch CI:
+
+- **Only `main` saves.** Every rust-cache step sets `save-if: ${{ github.ref == 'refs/heads/main' }}`. Merge-candidate and PR refs are one-shot, so a per-ref save buys nothing and used to evict the `main` cache that everything else restores from (observed 2026-07-17: main went cold, 1h39m vs 1h17m warm). Restore is unrestricted — candidates and PRs still read main's cache. If you add a job with a cargo build, add the same `save-if`.
+- **A reverted cache-producing feature leaves its entries behind.** Removing the wiring from `ci.yml` does not evict what it already wrote; those keys keep occupying the cap and evicting the caches that still matter. When you revert something that wrote to the Actions cache, delete its keys too:
+  ```bash
+  gh api repos/qontinui/qontinui-runner/actions/cache/usage
+  gh api --paginate 'repos/qontinui/qontinui-runner/actions/caches?per_page=100' \
+    --jq '.actions_caches[] | [.id, .size_in_bytes, .ref, .key] | @tsv'
+  gh api -X DELETE repos/qontinui/qontinui-runner/actions/caches/<cache_id>
+  ```
+
 ### Platform escape valve
 
-`ci.yml` runs on three hosted GitHub runners, and a platform leg can sometimes fail for reasons you can't fix inside your PR — either a genuine upstream issue (a runner-image regression, a third-party action breaking change) or an in-progress project-side fight that's already being worked on a different branch. Strict-on-every-platform-no-matter-what would block all merges during those windows, which punishes contributors for problems being tracked elsewhere.
+`ci.yml`'s `test` matrix runs on hosted GitHub runners, and a platform leg can sometimes fail for reasons you can't fix inside your PR — either a genuine upstream issue (a runner-image regression, a third-party action breaking change) or an in-progress project-side fight that's already being worked on a different branch. Strict-on-every-platform-no-matter-what would block all merges during those windows, which punishes contributors for problems being tracked elsewhere.
 
 Concrete current example: rustc-LLVM has been OOMing during codegen of the `qontinui_runner` test bin. On Windows the OOM surfaces as `STATUS_ILLEGAL_INSTRUCTION 0xc000001d` (rustc's allocator aborts; the OS reports the abort, not a real CPU instruction-set fault). On Linux the same root cause shows up as the runner agent receiving SIGTERM / exit 143 (the Linux OOM-killer takes the runner down before rustc can report). The mitigation lives in `Cargo.toml` profile overrides (`[profile.test] debug = 0`), `CARGO_BUILD_JOBS` caps, and pagefile / swap expansion — see `Cargo.toml:5-9` for the in-tree comment naming this exact symptom. Don't pin `target-cpu` or chase image-vintage theories; verify the OOM hypothesis first by grepping the log for `out of memory` and `Allocation failed`.
 
@@ -309,14 +332,18 @@ There are usually several `ci/...` branches at any given time, some live and som
 
 The merge-gate set above is mechanically enforced by the `main-merge-gates` Repository Ruleset on `qontinui-runner` `main` (ruleset id `16044811`, [admin UI](https://github.com/qontinui/qontinui-runner/rules/16044811)). The rule blocks force-push, branch deletion, and any merge to `main` whose PR doesn't have these check contexts green:
 
-- `forbid-runner-schema`
-- `security`
 - `test (ubuntu-22.04)`
-- `test (macos-latest)`
 - `test (windows-latest)`
-- `schema-fresh` — required *when run*, i.e. only on PRs touching `src-tauri/queries/**` or `src-tauri/schema.pg.sql.generated`
+- `Clippy (windows)`
+- `Frontend unit tests (vitest)`
+- `seam-gate`
+- `security`
+- `forbid-runner-schema`
+- `clorinde-fresh`
+- `schema-fresh`
+- `Gitleaks Secret Detection`
 
-Required-when-run is the rulesets default: checks that didn't trigger on a PR don't show as `pending` and don't block merge. PRs also have to go through a pull request — direct push to `main` is blocked.
+Required-when-run is the rulesets default: checks that didn't trigger on a PR don't show as `pending` and don't block merge. `clorinde-fresh` and `schema-fresh` exploit that deliberately in the other direction — they are always-run shim jobs, so the context reports on every PR instead of going missing. The ruleset is **not strict** (`strict_required_status_checks_policy: false`), so a PR does not have to be up to date with `main` to merge; that is what lets coord's merge train validate a rebased candidate ref rather than forcing every PR to rebase. PRs also have to go through a pull request — direct push to `main` is blocked.
 
 The escape-valve case ("merge with a red leg if a tracked plan documents the block") is intentionally **not** encoded in the ruleset. GitHub can't natively express "green OR linked open issue," so that part of the policy still lives in PR-review discipline, plus admin override (below) for the mechanical case.
 
