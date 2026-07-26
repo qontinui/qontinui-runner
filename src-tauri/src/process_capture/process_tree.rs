@@ -327,7 +327,8 @@ fn is_shim_dir_exe_path(exe_path: &str, persistent_identity_dir: Option<&str>) -
     // Case-folded like `normalize_dir` below: WMI can report case-mangled
     // paths, and a miss here fails open to counting the shim as real.
     let dir_base_lower = dir_base.to_ascii_lowercase();
-    if dir_base_lower.starts_with(IDENTITY_DIR_PREFIX) || dir_base_lower.starts_with(SHIM_DIR_PREFIX)
+    if dir_base_lower.starts_with(IDENTITY_DIR_PREFIX)
+        || dir_base_lower.starts_with(SHIM_DIR_PREFIX)
     {
         return true;
     }
@@ -1119,8 +1120,16 @@ mod tests {
 
         let mut pids = claude_pids_in_inclusive_subtree(600, &snap);
         pids.sort();
-        assert_eq!(pids, vec![602, 603], "shim 601 excluded; real + unknown-path kept");
-        assert!(claude_present_in_inclusive_subtree(600, &snap, REFERENCE_FRESH));
+        assert_eq!(
+            pids,
+            vec![602, 603],
+            "shim 601 excluded; real + unknown-path kept"
+        );
+        assert!(claude_present_in_inclusive_subtree(
+            600,
+            &snap,
+            REFERENCE_FRESH
+        ));
 
         // Subtree holding ONLY the shim (real claude gone): claude-absent.
         let mut shim_only = snap_with(
@@ -1128,10 +1137,9 @@ mod tests {
             &[(700, 1_000), (701, 1_000)],
             &[(700, "pwsh.exe"), (701, "claude.exe")],
         );
-        shim_only.exe_paths.insert(
-            701,
-            "/tmp/qontinui-identity-t2/claude".to_string(),
-        );
+        shim_only
+            .exe_paths
+            .insert(701, "/tmp/qontinui-identity-t2/claude".to_string());
         assert!(claude_pids_in_inclusive_subtree(700, &shim_only).is_empty());
         assert!(!claude_present_in_inclusive_subtree(
             700,
