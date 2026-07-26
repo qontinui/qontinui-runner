@@ -1072,7 +1072,9 @@ impl SessionLifecycleStore {
             for rec in m.values() {
                 if rec.state == "closed" && live_terminal_ids.contains(&rec.terminal_id) {
                     if let Some(closed_at) = rec.closed_at {
-                        let e = newest_closed.entry(rec.terminal_id.as_str()).or_insert(closed_at);
+                        let e = newest_closed
+                            .entry(rec.terminal_id.as_str())
+                            .or_insert(closed_at);
                         *e = (*e).max(closed_at);
                     }
                 }
