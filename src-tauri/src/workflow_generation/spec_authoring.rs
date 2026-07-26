@@ -23,6 +23,7 @@ use crate::database::pg::PgDb;
 use crate::spec_api::types::{
     IrElementCriteria, IrPageSpec, IrProvenance, IrState, IrTransition, ProposalStatus,
 };
+use crate::state_discovery::derive::DEFAULT_WINDOW_DAYS as DERIVE_WINDOW_DAYS;
 
 // ---------------------------------------------------------------------------
 // Public surface
@@ -159,57 +160,33 @@ pub async fn author_candidate_with_executor(
 // Slug helper — shared with sibling `spec_api::proposals`
 // ---------------------------------------------------------------------------
 
-/// Deterministic slug from a URL pathname. Lowercased ASCII; non-alphanumeric
-/// runs collapse to a single `-`; leading/trailing `-` are trimmed. Empty
-/// input maps to `"root"` so we always emit a usable id.
-///
-/// ```
-/// // (doc-test gated behind cargo feature so it's only compiled under
-/// //  --features spec-authoring; covered by the unit tests below.)
-/// // assert_eq!(
-/// //     qontinui_runner_lib::workflow_generation::spec_authoring::pathname_to_spec_id("/account/billing"),
-/// //     "account-billing"
-/// // );
-/// ```
-pub(crate) fn pathname_to_spec_id(pathname: &str) -> String {
-    let mut out = String::with_capacity(pathname.len());
-    let mut last_was_hyphen = true; // suppress leading hyphens
-    for ch in pathname.chars() {
-        let mapped = if ch.is_ascii_alphanumeric() {
-            Some(ch.to_ascii_lowercase())
-        } else {
-            None
-        };
-        match mapped {
-            Some(c) => {
-                out.push(c);
-                last_was_hyphen = false;
-            }
-            None => {
-                if !last_was_hyphen {
-                    out.push('-');
-                    last_was_hyphen = true;
-                }
-            }
-        }
-    }
-    // Trim trailing hyphen (leading is suppressed by `last_was_hyphen` init).
-    while out.ends_with('-') {
-        out.pop();
-    }
-    if out.is_empty() {
-        "root".to_string()
-    } else {
-        out
-    }
-}
+/// Re-exported from [`crate::spec_api::slug`], which owns both directions of
+/// the pathname ↔ spec-id mapping so they cannot drift apart. It also has to
+/// live outside this module: `spec_authoring` is behind the `spec-authoring`
+/// feature, while `state_discovery::capture` needs the same slug on every
+/// build.
+pub(crate) use crate::spec_api::slug::pathname_to_spec_id;
 
 // ---------------------------------------------------------------------------
 // Step 3 — skeleton projection
 // ---------------------------------------------------------------------------
 
-/// Load the most recent (non-empty) `state_discovery_artifacts` row for the
-/// pathname-derived spec id and project it into a deterministic IR skeleton.
+/// Load the most recent (non-empty) **global** discovery artifact and project
+/// the states active on `pathname` into a deterministic IR skeleton.
+///
+/// # Why the artifact is global
+///
+/// Co-occurrence discovery groups elements that appear in exactly the same set
+/// of renders, so it needs the cross-view render pool: elements `{a,b,c}` seen
+/// on pages 1-4 form one state, `{d,e}` seen on pages 2-3 form another.
+/// Deriving per page would instead give every persistent element on that page
+/// an identical render-set, collapsing the page into a single mega-state and
+/// discarding exactly the shared-chrome structure the model wants to capture
+/// once rather than N times.
+///
+/// So `S` (the state set) is derived globally, and this function computes
+/// `S_Ξ ⊆ S` — the states active on one page — by intersecting each state's
+/// render-set with the observations labelled for that page.
 ///
 /// Determinism contract:
 /// - states ordered by id ascending
@@ -222,15 +199,25 @@ async fn load_and_project_skeleton(
     pathname: &str,
 ) -> Result<IrPageSpec, AuthoringError> {
     let candidate_id = pathname_to_spec_id(pathname);
-    let artifact = load_latest_artifact(pg_db, &candidate_id).await?;
+    let artifact = load_latest_global_artifact(pg_db, &candidate_id).await?;
 
     let clusters = extract_clusters(&artifact.body)?;
     if clusters.is_empty() {
         return Err(AuthoringError::EmptyArtifact);
     }
 
-    // Project each cluster, then sort states by id for determinism.
-    let mut states: Vec<IrState> = clusters
+    // Project S down to S_Ξ. A page with no labelled observations yields no
+    // active states — reported as EmptyArtifact rather than silently
+    // emitting every state in the application.
+    let page_renders = load_page_render_ids(pg_db, &candidate_id).await?;
+    let active = select_active_clusters(&clusters, &page_renders);
+
+    if active.is_empty() {
+        return Err(AuthoringError::EmptyArtifact);
+    }
+
+    // Project each active cluster, then sort states by id for determinism.
+    let mut states: Vec<IrState> = active
         .iter()
         .map(|c| project_cluster_to_state(app_id, c))
         .collect::<Vec<_>>();
@@ -241,7 +228,13 @@ async fn load_and_project_skeleton(
         id: candidate_id.clone(),
         name: format!("Auto-discovered: {pathname}"),
         description: Some(format!(
-            "Skeleton projected from {} observations over the last 90 days.",
+            "Skeleton projected from {} of {} globally discovered states, \
+             selected by intersecting each state's render-set with {} \
+             observations labelled for this page (global corpus: {} \
+             observations over the last 90 days).",
+            states.len(),
+            clusters.len(),
+            page_renders.len(),
             artifact.observation_count
         )),
         metadata: None,
@@ -269,9 +262,32 @@ struct LoadedArtifact {
     body: serde_json::Value,
 }
 
-async fn load_latest_artifact(
+/// Project the global state set `S` down to `S_Ξ` — the states active on one
+/// page.
+///
+/// A state is active on the page when its render-set contains at least one of
+/// the page's observations. Membership is deliberately "any", not "all": a
+/// state spanning pages 1-4 is active on each of them, which is the whole
+/// point of deriving globally. Order is preserved from the artifact so callers
+/// keep their own determinism contract.
+fn select_active_clusters<'a>(
+    clusters: &'a [Cluster],
+    page_renders: &std::collections::HashSet<String>,
+) -> Vec<&'a Cluster> {
+    clusters
+        .iter()
+        .filter(|c| c.render_ids.iter().any(|r| page_renders.contains(r)))
+        .collect()
+}
+
+/// Load the newest non-empty global artifact.
+///
+/// Global artifacts are the ones written with `spec_id IS NULL` — derivation
+/// runs over the whole observation corpus (see [`load_and_project_skeleton`]
+/// for why). `for_page` is used only to name the page in the not-found error.
+async fn load_latest_global_artifact(
     pg_db: &PgDb,
-    spec_id: &str,
+    for_page: &str,
 ) -> Result<LoadedArtifact, AuthoringError> {
     let conn = pg_db
         .pool()
@@ -283,11 +299,11 @@ async fn load_latest_artifact(
         .query(
             r#"SELECT id::text, artifact, observation_count
                FROM state_discovery_artifacts
-               WHERE spec_id = $1
+               WHERE spec_id IS NULL
                  AND observation_count > 0
                ORDER BY derived_at DESC
                LIMIT 1"#,
-            &[&spec_id],
+            &[],
         )
         .await
         .map_err(|e| AuthoringError::Database(format!("PG query: {}", e)))?;
@@ -296,7 +312,7 @@ async fn load_latest_artifact(
         .into_iter()
         .next()
         .ok_or_else(|| AuthoringError::NoDiscoveryArtifact {
-            pathname: spec_id.to_string(),
+            pathname: for_page.to_string(),
         })?;
     let artifact_id: String = row.get(0);
     let body: serde_json::Value = row.get(1);
@@ -309,8 +325,48 @@ async fn load_latest_artifact(
     })
 }
 
-/// One cluster of co-occurring elements, sourced from the
-/// `state_discovery_artifacts.artifact` JSON.
+/// Observation ids labelled for `page_label`, within the same 90-day window
+/// derivation uses.
+///
+/// These are the render ids that a state's `screenshotIds` must intersect for
+/// the state to count as active on this page. Observations captured before
+/// page labelling existed carry `spec_id IS NULL` and are correctly excluded —
+/// they contribute to the global clustering but cannot be attributed to a page.
+async fn load_page_render_ids(
+    pg_db: &PgDb,
+    page_label: &str,
+) -> Result<std::collections::HashSet<String>, AuthoringError> {
+    let conn = pg_db
+        .pool()
+        .get()
+        .await
+        .map_err(|e| AuthoringError::Database(format!("PG pool error: {}", e)))?;
+
+    let rows = conn
+        .query(
+            r#"SELECT id::text
+               FROM co_occurrence_observations
+               WHERE spec_id = $1
+                 AND invalidated_at IS NULL
+                 AND captured_at >= now() - ($2::int || ' days')::interval"#,
+            &[&page_label, &DERIVE_WINDOW_DAYS],
+        )
+        .await
+        .map_err(|e| {
+            AuthoringError::Database(format!("PG query co_occurrence_observations: {}", e))
+        })?;
+
+    Ok(rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
+}
+
+/// One discovered state from the global `state_discovery_artifacts.artifact`
+/// JSON — a cluster of elements that share a render-set signature.
+///
+/// Field names mirror the Python adapter's serialization
+/// (`UIBridgeStateDiscoveryResult.to_dict`), which emits camelCase
+/// `stateImageIds` / `screenshotIds`. An earlier revision read a
+/// `fingerprints` key that the adapter has never emitted; because the field
+/// was `#[serde(default)]`, every cluster silently parsed with zero elements.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Cluster {
     /// Cluster id (deterministic from the discovery side).
@@ -318,12 +374,16 @@ struct Cluster {
     /// Human-readable name. Falls back to `id` when absent.
     #[serde(default)]
     name: Option<String>,
-    /// Fingerprint strings. Each is mapped to one `IrElementCriteria`.
-    /// Format is opaque to spec_authoring — we look for `id:<...>`,
-    /// `aria:<...>`, `tag:<tag>:<text>`, `role:<...>` prefixes and otherwise
-    /// fall back to `text`.
-    #[serde(default)]
-    fingerprints: Vec<String>,
+    /// Element ids belonging to this state. The Python adapter prefixes them
+    /// with `reg:`; [`project_cluster_to_state`] strips that back to the bare
+    /// fingerprint capture wrote into `co_occurrence_observations`.
+    #[serde(rename = "stateImageIds", default)]
+    element_ids: Vec<String>,
+    /// Observation ids this state was seen in — the state's **render-set**,
+    /// i.e. the signature clustering grouped on. A state belongs to page `P`
+    /// iff this set intersects `P`'s observations.
+    #[serde(rename = "screenshotIds", default)]
+    render_ids: Vec<String>,
 }
 
 fn extract_clusters(body: &serde_json::Value) -> Result<Vec<Cluster>, AuthoringError> {
@@ -354,7 +414,13 @@ fn extract_clusters(body: &serde_json::Value) -> Result<Vec<Cluster>, AuthoringE
 /// treats it as the "candidate criteria" channel for the skeleton, and the
 /// AI verification step relocates them onto `assertions` as appropriate.
 fn project_cluster_to_state(app_id: &str, cluster: &Cluster) -> IrState {
-    let mut sorted = cluster.fingerprints.clone();
+    let mut sorted: Vec<String> = cluster
+        .element_ids
+        .iter()
+        // Undo the adapter's `reg:` prefix so the criteria carry the same
+        // fingerprint capture stored on the observation.
+        .map(|e| e.strip_prefix("reg:").unwrap_or(e).to_string())
+        .collect();
     sorted.sort();
     sorted.dedup();
 
@@ -915,19 +981,8 @@ mod tests {
     use crate::spec_api::hashing::canonical_hash;
     use crate::spec_api::types::{IrAssertion, IrAssertionTarget};
 
-    #[test]
-    fn pathname_to_spec_id_basic() {
-        assert_eq!(pathname_to_spec_id("/account/billing"), "account-billing");
-        assert_eq!(pathname_to_spec_id("/"), "root");
-        assert_eq!(pathname_to_spec_id(""), "root");
-        assert_eq!(pathname_to_spec_id("/Foo/Bar/"), "foo-bar");
-        assert_eq!(pathname_to_spec_id("/foo--bar//baz"), "foo-bar-baz");
-        assert_eq!(pathname_to_spec_id("/settings/general"), "settings-general");
-        // Idempotent on canonical form.
-        let once = pathname_to_spec_id("/Account/Billing/");
-        let twice = pathname_to_spec_id(&format!("/{}", once));
-        assert_eq!(once, twice);
-    }
+    // Slug behaviour is owned and tested by `spec_api::slug`, including the
+    // round-trip property this module depends on.
 
     fn artifact_json(states: Vec<serde_json::Value>) -> serde_json::Value {
         serde_json::json!({
@@ -937,12 +992,28 @@ mod tests {
         })
     }
 
-    fn cluster(id: &str, fingerprints: &[&str]) -> serde_json::Value {
+    /// Build a state in the shape the Python adapter actually emits
+    /// (`UIBridgeStateDiscoveryResult.to_dict`): camelCase `stateImageIds` /
+    /// `screenshotIds`, with element ids `reg:`-prefixed. Fixtures must mirror
+    /// the real serialization — an earlier fixture used a `fingerprints` key
+    /// the adapter has never emitted, so these tests passed while the
+    /// production path parsed every cluster as empty.
+    fn cluster(id: &str, elements: &[&str]) -> serde_json::Value {
+        cluster_seen_in(id, elements, &["render-default"])
+    }
+
+    fn cluster_seen_in(id: &str, elements: &[&str], renders: &[&str]) -> serde_json::Value {
+        let element_ids: Vec<String> = elements.iter().map(|e| format!("reg:{e}")).collect();
         serde_json::json!({
             "id": id,
             "name": format!("cluster-{}", id),
-            "fingerprints": fingerprints,
+            "stateImageIds": element_ids,
+            "screenshotIds": renders,
         })
+    }
+
+    fn render_set(ids: &[&str]) -> std::collections::HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
     }
 
     fn skeleton_from_artifact(body: &serde_json::Value, observation_count: i32) -> IrPageSpec {
@@ -1002,6 +1073,76 @@ mod tests {
         // We test that conversion logic via a focused match.
         let clusters = err.expect("parsed");
         assert!(clusters.is_empty(), "empty cluster list expected");
+    }
+
+    #[test]
+    fn real_adapter_shape_parses_with_elements_and_renders() {
+        // Regression: the previous `fingerprints` field never appeared in a
+        // real artifact, so `#[serde(default)]` yielded empty clusters and
+        // every projected state came out with no criteria.
+        let body = serde_json::json!({
+            "states": [{
+                "id": "fp_state_6c3eda5e919d",
+                "name": "c0045a4533ac7947 (16 elements)",
+                "confidence": 0.94,
+                "stateImageIds": ["reg:016e88557e9c2b1e", "reg:017db53ce3bc7ca3"],
+                "screenshotIds": ["0fe4e39c-1b98-49e7-a73d-7a5f572a636c"],
+            }],
+            "elements": [],
+            "elementToRenders": {},
+        });
+        let clusters = extract_clusters(&body).expect("clusters parse");
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].element_ids.len(), 2, "elements must survive");
+        assert_eq!(clusters[0].render_ids.len(), 1, "render-set must survive");
+
+        // And the `reg:` prefix is stripped back to the stored fingerprint.
+        let state = project_cluster_to_state("qontinui-runner", &clusters[0]);
+        let criteria = state.excluded_elements.expect("criteria present");
+        assert_eq!(criteria.len(), 2);
+    }
+
+    #[test]
+    fn selection_projects_s_to_s_active_per_page() {
+        // Operator's worked example: elements {a,b,c} appear on pages 1-4 and
+        // form one state; {d,e} appear on pages 2-3 and form another. Page 2
+        // therefore has BOTH states active simultaneously (S_Ξ ⊆ S).
+        let body = artifact_json(vec![
+            cluster_seen_in("abc", &["a", "b", "c"], &["p1", "p2", "p3", "p4"]),
+            cluster_seen_in("de", &["d", "e"], &["p2", "p3"]),
+        ]);
+        let clusters = extract_clusters(&body).expect("clusters parse");
+
+        let on_p1 = select_active_clusters(&clusters, &render_set(&["p1"]));
+        assert_eq!(
+            on_p1.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["abc"],
+            "page 1 sees only the state spanning pages 1-4"
+        );
+
+        let on_p2 = select_active_clusters(&clusters, &render_set(&["p2"]));
+        assert_eq!(
+            on_p2.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["abc", "de"],
+            "page 2 has both states active at once"
+        );
+
+        let on_p4 = select_active_clusters(&clusters, &render_set(&["p4"]));
+        assert_eq!(
+            on_p4.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["abc"],
+            "page 4 drops the state confined to pages 2-3"
+        );
+    }
+
+    #[test]
+    fn page_with_no_labelled_observations_selects_nothing() {
+        // The guard against the old behaviour: an unlabelled page must yield
+        // no states rather than every state in the application.
+        let body = artifact_json(vec![cluster_seen_in("abc", &["a"], &["p1"])]);
+        let clusters = extract_clusters(&body).expect("clusters parse");
+        assert!(select_active_clusters(&clusters, &render_set(&[])).is_empty());
+        assert!(select_active_clusters(&clusters, &render_set(&["p9"])).is_empty());
     }
 
     #[test]

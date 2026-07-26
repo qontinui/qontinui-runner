@@ -28,7 +28,11 @@ use crate::mcp::types::{api_error, ApiResponse, ApiState};
 /// Default lookback window for derivation, in days. 90 d matches the design
 /// doc's chosen decay window — observations older than this are treated as
 /// stale and excluded. Callers may override per-request.
-const DEFAULT_WINDOW_DAYS: i32 = 90;
+///
+/// `spec_authoring` reads the same constant when selecting a page's
+/// observations, so the window a state was discovered over and the window it
+/// is attributed to a page over cannot drift apart.
+pub(crate) const DEFAULT_WINDOW_DAYS: i32 = 90;
 
 /// Max time budget for the Python `discover_states_from_renders` call. The
 /// clustering is hierarchical agglomerative over up to O(fingerprints²), so

@@ -4,8 +4,23 @@ import type { MainTabId } from "./tab-types";
 
 export function RunnerPageContext({ activeTab }: { activeTab: MainTabId }) {
   const context = useMemo(() => {
+    // `meta.tabId` carries the view's stable identity. The runner is a desktop
+    // SPA that routes in React state, so `location.pathname` is `/` for every
+    // view — the tab id is the only thing telling them apart, and it is what
+    // co-occurrence capture labels observations with (see
+    // `state_discovery::capture::resolve_page_label`). Display names are not a
+    // substitute: they drift on rename, and every `settings-*` tab shares the
+    // single name "Settings" while the spec corpus has 12 distinct
+    // `settings-*` pages.
+    const meta = { tabId: activeTab };
+
     if (activeTab.startsWith("settings")) {
-      return { name: "Settings", section: "configure", breadcrumb: ["Configure", "Settings"] };
+      return {
+        name: "Settings",
+        section: "configure",
+        breadcrumb: ["Configure", "Settings"],
+        meta,
+      };
     }
 
     const map: Record<string, { name: string; section: string; breadcrumb: string[] }> = {
@@ -137,7 +152,8 @@ export function RunnerPageContext({ activeTab }: { activeTab: MainTabId }) {
       wrappers: { name: "Wrappers", section: "wrappers", breadcrumb: ["Wrappers"] },
     };
 
-    return map[activeTab] ?? { name: activeTab, section: "other", breadcrumb: [activeTab] };
+    const base = map[activeTab] ?? { name: activeTab, section: "other", breadcrumb: [activeTab] };
+    return { ...base, meta };
   }, [activeTab]);
 
   usePageContext(context);

@@ -11,6 +11,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::database::pg::PgDb;
+use crate::spec_api::slug::pathname_to_spec_id;
 
 use super::fingerprint::stable_element_fingerprint;
 
@@ -20,16 +21,58 @@ use super::fingerprint::stable_element_fingerprint;
 /// downsampling are the two levers we'll reach for first.
 const SAMPLE_RATE: u32 = 1;
 
+/// Resolve the page identity that labels this observation.
+///
+/// This is a **selection label, not a partition key.** Derivation stays global
+/// — co-occurrence clustering groups elements that appear in the same set of
+/// renders, so restricting the render pool to one page would collapse that
+/// page's persistent elements into a single mega-state and destroy the
+/// cross-view signal the algorithm exists to find. The label is what later
+/// lets authoring project the global state set `S` down to the states active
+/// on one page (`S_Ξ ⊆ S`).
+///
+/// Precedence:
+/// 1. `page.pageContext.meta.tabId` — a stable developer-supplied view id.
+///    Desktop SPAs route in React state, so the URL never moves; the tab id is
+///    the only thing distinguishing one view from another. (The runner's whole
+///    corpus sits at `http://tauri.localhost/`.)
+/// 2. `page.pageContext.name` — slugged. For apps that call `usePageContext`
+///    without a `meta.tabId`. Display labels drift on rename, so this ranks
+///    below the id.
+/// 3. `page.pathname` — slugged. Correct for real-URL apps (qontinui-web).
+///
+/// Returns `None` when none of the three yields a usable slug; the observation
+/// is then recorded unlabelled rather than dropped, since it still carries
+/// co-occurrence signal for the global derivation.
+fn resolve_page_label(snapshot: &serde_json::Value) -> Option<String> {
+    let page = snapshot.get("page")?;
+    let page_context = page.get("pageContext");
+
+    let from_tab_id = page_context
+        .and_then(|c| c.get("meta"))
+        .and_then(|m| m.get("tabId"))
+        .and_then(|v| v.as_str());
+    let from_name = page_context
+        .and_then(|c| c.get("name"))
+        .and_then(|v| v.as_str());
+    let from_pathname = page.get("pathname").and_then(|v| v.as_str());
+
+    let raw = from_tab_id.or(from_name).or(from_pathname)?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    Some(pathname_to_spec_id(raw))
+}
+
 /// Enqueue a single observation derived from a UI Bridge snapshot.
 ///
-/// Extracts a fingerprint per element, records minimal page metadata
-/// (pathname, url, viewport, element_count), and inserts one row into
-/// `co_occurrence_observations`. All errors downgrade to WARN logs — the
+/// Extracts a fingerprint per element, resolves the page label (see
+/// [`resolve_page_label`]), records minimal page metadata, and inserts one row
+/// into `co_occurrence_observations`. All errors downgrade to WARN logs — the
 /// snapshot path must never fail because of observation capture.
 pub async fn enqueue_observation(
     pg_db: Arc<PgDb>,
     snapshot: &serde_json::Value,
-    spec_id: Option<String>,
     runner_instance: String,
 ) {
     // Sample-rate gate. SAMPLE_RATE == 1 means every call goes through;
@@ -83,12 +126,18 @@ pub async fn enqueue_observation(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     let viewport = page.and_then(|p| p.get("viewport")).cloned();
+    // Keep the raw developer context alongside the derived label so a
+    // mislabelled corpus is diagnosable without replaying snapshots.
+    let page_context = page.and_then(|p| p.get("pageContext")).cloned();
+
+    let spec_id = resolve_page_label(snapshot);
 
     let snapshot_metadata = serde_json::json!({
         "pathname": pathname,
         "url": url,
         "viewport": viewport,
         "element_count": element_count,
+        "page_context": page_context,
     });
 
     let fingerprints_json = serde_json::Value::Array(
@@ -135,5 +184,79 @@ pub async fn enqueue_observation(
             "state_discovery::capture: failed to insert observation ({} elements): {}",
             element_count, e
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn tab_id_wins_over_name_and_pathname() {
+        let snap = json!({
+            "page": {
+                "pathname": "/",
+                "pageContext": {
+                    "name": "DAG Workflow Editor",
+                    "meta": { "tabId": "dag-workflow-editor" }
+                }
+            }
+        });
+        assert_eq!(
+            resolve_page_label(&snap).as_deref(),
+            Some("dag-workflow-editor")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_slugged_context_name() {
+        let snap = json!({
+            "page": { "pathname": "/", "pageContext": { "name": "Active Dashboard" } }
+        });
+        assert_eq!(
+            resolve_page_label(&snap).as_deref(),
+            Some("active-dashboard")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_pathname_for_real_url_apps() {
+        // qontinui-web (Next.js) has no pageContext but a meaningful pathname.
+        let snap = json!({ "page": { "pathname": "/account/billing" } });
+        assert_eq!(
+            resolve_page_label(&snap).as_deref(),
+            Some("account-billing")
+        );
+    }
+
+    #[test]
+    fn desktop_spa_root_pathname_is_the_degenerate_case() {
+        // The failure this whole change exists to fix: a Tauri SPA reports
+        // `/` for every one of its views, so pathname alone cannot tell them
+        // apart. Without a pageContext there is nothing better to key on.
+        let snap = json!({ "page": { "pathname": "/", "url": "http://tauri.localhost/" } });
+        assert_eq!(resolve_page_label(&snap).as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn missing_page_or_blank_label_yields_none() {
+        assert_eq!(resolve_page_label(&json!({})), None);
+        assert_eq!(resolve_page_label(&json!({ "page": {} })), None);
+        assert_eq!(
+            resolve_page_label(&json!({ "page": { "pathname": "   " } })),
+            None
+        );
+    }
+
+    #[test]
+    fn label_is_idempotent_under_reslugging() {
+        // The label is written to `spec_id` and later compared against spec
+        // ids on disk; re-slugging an already-canonical label must not move it.
+        let snap = json!({
+            "page": { "pageContext": { "meta": { "tabId": "config-log-sources" } } }
+        });
+        let once = resolve_page_label(&snap).unwrap();
+        assert_eq!(pathname_to_spec_id(&once), once);
     }
 }

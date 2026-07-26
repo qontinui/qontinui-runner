@@ -27,6 +27,7 @@ pub mod handlers;
 pub mod hashing;
 pub mod projection;
 pub mod responses;
+pub mod slug;
 pub mod spec_check;
 pub mod storage;
 pub mod thresholds;

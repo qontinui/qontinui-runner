@@ -2720,10 +2720,9 @@ pub async fn ui_bridge_get_snapshot_handler(
             // `state-definition-observation-pipeline.md` Step 2 for why
             // capture sits after the response body is assembled.
             //
-            // TODO: infer `spec_id` from snapshot/page context once the
-            // spec→page binding is available. For now capture is
-            // scope-agnostic and the derivation endpoint decides whether to
-            // filter by spec.
+            // The page label is resolved inside `enqueue_observation` from the
+            // snapshot's own `page.pageContext` / `page.pathname` — the caller
+            // has no scope knowledge the snapshot doesn't already carry.
             let pg_db_for_obs = state.app_state.pg_db.clone();
             let snapshot_for_obs = data.clone();
             let runner_instance = std::env::var("QONTINUI_RUNNER_ROLE")
@@ -2733,7 +2732,6 @@ pub async fn ui_bridge_get_snapshot_handler(
                 crate::state_discovery::enqueue_observation(
                     pg_db_for_obs,
                     &snapshot_for_obs,
-                    None,
                     runner_instance,
                 )
                 .await;
