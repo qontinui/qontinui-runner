@@ -1926,6 +1926,21 @@ CREATE TABLE coord.continuation_dispatches (
 
 
 --
+-- Name: continuation_poll_status; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.continuation_poll_status (
+    device_id uuid NOT NULL,
+    polled_at timestamp with time zone NOT NULL,
+    listed_n integer NOT NULL,
+    dispatched_n integer NOT NULL,
+    skipped_n integer NOT NULL,
+    skip_reasons jsonb DEFAULT '{}'::jsonb NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
 -- Name: coordinator_decisions; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -2721,6 +2736,11 @@ CREATE TABLE coord.gates (
     progress_computed_at timestamp with time zone,
     shadow_reap_signal text,
     shadow_reap_at timestamp with time zone,
+    continuation_expired_at timestamp with time zone,
+    continuation_expired_reason text,
+    continuation_deferred_at timestamp with time zone,
+    continuation_deferred_reason text,
+    continuation_deferred_count integer DEFAULT 0 NOT NULL,
     CONSTRAINT ck_gates_anchor CHECK ((((claim_kind IS NOT NULL) AND (resource_key IS NOT NULL) AND (work_unit_id IS NULL) AND (phase_name IS NULL)) OR ((claim_kind IS NULL) AND (resource_key IS NULL) AND (work_unit_id IS NOT NULL) AND (phase_name IS NOT NULL)))),
     CONSTRAINT coord_gates_clearance_audience_check CHECK ((clearance_audience = ANY (ARRAY['operator'::text, 'agent'::text]))),
     CONSTRAINT gates_verdict_check CHECK ((verdict = ANY (ARRAY['open'::text, 'cleared'::text, 'failed'::text, 'misconfigured'::text])))
@@ -4213,8 +4233,8 @@ CREATE TABLE coord.prompt_documents (
     updated_by text,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     attrs jsonb,
-    CONSTRAINT prompt_documents_format_check CHECK ((format = ANY (ARRAY['markdown'::text, 'rubric'::text]))),
-    CONSTRAINT prompt_documents_kind_check CHECK ((kind = ANY (ARRAY['policy'::text, 'response_prompt'::text, 'continuation_rules'::text, 'agent_playbook'::text])))
+    CONSTRAINT ck_prompt_documents_kind CHECK ((kind = ANY (ARRAY['policy'::text, 'response_prompt'::text, 'continuation_rules'::text, 'agent_playbook'::text, 'prompt_template'::text]))),
+    CONSTRAINT prompt_documents_format_check CHECK ((format = ANY (ARRAY['markdown'::text, 'rubric'::text])))
 );
 
 
@@ -4727,7 +4747,11 @@ CREATE TABLE coord.session_messages (
     delivered_at timestamp with time zone,
     read_at timestamp with time zone,
     acked_at timestamp with time zone,
-    ack_response text
+    ack_response text,
+    to_handle text,
+    from_handle text,
+    park_plan_slug text,
+    park_expires_at timestamp with time zone
 );
 
 
@@ -15562,6 +15586,14 @@ ALTER TABLE ONLY coord.continuation_dispatches
 
 
 --
+-- Name: continuation_poll_status continuation_poll_status_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.continuation_poll_status
+    ADD CONSTRAINT continuation_poll_status_pkey PRIMARY KEY (device_id);
+
+
+--
 -- Name: coordinator_decisions coordinator_decisions_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -22005,10 +22037,31 @@ CREATE INDEX idx_session_messages_inbox ON coord.session_messages USING btree (t
 
 
 --
+-- Name: idx_session_messages_park_copy; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_session_messages_park_copy ON coord.session_messages USING btree ((1)) WHERE (action ? 'park_source_id'::text);
+
+
+--
+-- Name: idx_session_messages_park_pending; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_session_messages_park_pending ON coord.session_messages USING btree (park_expires_at) WHERE (park_expires_at IS NOT NULL);
+
+
+--
 -- Name: idx_session_messages_tenant; Type: INDEX; Schema: coord; Owner: -
 --
 
 CREATE INDEX idx_session_messages_tenant ON coord.session_messages USING btree (tenant_id);
+
+
+--
+-- Name: idx_session_messages_to_handle; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_session_messages_to_handle ON coord.session_messages USING btree (to_handle) WHERE (acked_at IS NULL);
 
 
 --
