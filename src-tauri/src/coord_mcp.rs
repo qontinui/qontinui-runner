@@ -524,10 +524,34 @@ fn rotation_grace_cause() -> String {
 
 /// Test-only redirect for the rotation log (process-global): `None` (the
 /// default) silences file emission so the many nonce-minting unit tests never
-/// write into the developer's real dev-logs dir; the forensics test points it
-/// at a temp dir and filters lines by its own unique workdirs.
+/// write into the developer's real dev-logs dir.
 #[cfg(test)]
 static ROTATION_LOG_DIR_OVERRIDE: OnceLock<Mutex<Option<std::path::PathBuf>>> = OnceLock::new();
+
+/// Switch file emission on for the test binary and return the ONE directory
+/// every file-asserting forensics test shares. Idempotent by construction: the
+/// first caller creates the dir and installs the override, every later caller
+/// gets the same path back.
+///
+/// It must be shared, not per-test. The override is process-global while tests
+/// run concurrently in one process, so a test that installed its OWN dir would
+/// silently capture (and be captured by) any peer test's lines — whichever set
+/// the override last wins, and the loser reads an empty or missing file. One
+/// shared dir plus per-test filtering on unique workdirs is race-free instead.
+#[cfg(test)]
+fn rotation_log_test_dir() -> std::path::PathBuf {
+    let mut slot = ROTATION_LOG_DIR_OVERRIDE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("rotation log override poisoned");
+    if let Some(existing) = slot.as_ref() {
+        return existing.clone();
+    }
+    let dir = std::env::temp_dir().join(format!("coord-mcp-rot-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&dir).expect("create rotation forensics test dir");
+    *slot = Some(dir.clone());
+    dir
+}
 
 /// Where the rotation log lives: the same dev-logs dir every other JSONL
 /// stream resolves ([`crate::paths::get_dev_logs_dir`] — settings override
@@ -576,6 +600,123 @@ fn log_rotation_event(event: &str, workdir: &str, nonce: &str, cause: &str) {
         line.push('\n');
         let _ = f.write_all(line.as_bytes());
     }
+}
+
+/// Minimum interval between `reject` forensics lines carrying the SAME key
+/// prefix. Every other event is a discrete runner action (a mint, an eviction,
+/// a file write) that cannot repeat in a tight loop; a reject fires on the
+/// REQUEST path, so a client retrying against a dead key would otherwise append
+/// one line per attempt and grow the log without bound. One line per key per
+/// window attributes the incident just as well, and the suppressed repeats are
+/// counted rather than silently dropped.
+const REJECT_LOG_THROTTLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Per-key-prefix reject-emission state: when a line was last written for this
+/// prefix, and how many rejects have been suppressed since.
+struct RejectThrottle {
+    last_logged: std::time::Instant,
+    suppressed: u64,
+}
+
+static REJECT_THROTTLES: OnceLock<Mutex<HashMap<String, RejectThrottle>>> = OnceLock::new();
+
+/// Admit or suppress one reject for `prefix`. `Some(n)` ⇒ emit a line and
+/// report that `n` rejects were suppressed since the previous one; `None` ⇒
+/// stay silent, this prefix is inside its window.
+///
+/// A trailing suppressed count is lost if the rejects simply stop (nothing
+/// arrives to carry it out) — acceptable: the incident is already on record via
+/// the line that opened the window, and the alternative is a flush timer this
+/// best-effort path has no business owning.
+fn reject_throttle_admit(prefix: &str) -> Option<u64> {
+    let now = std::time::Instant::now();
+    let mut map = REJECT_THROTTLES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("reject throttle map poisoned");
+    // Opportunistic prune (the shape `grace_evicted_device_nonces` uses): a
+    // long-lived runner can see many distinct dead keys, and an entry quiet for
+    // well over a window has nothing left to throttle or report.
+    map.retain(|_, t| now.duration_since(t.last_logged) < REJECT_LOG_THROTTLE * 10);
+    // Early-return out of the `get_mut` borrow rather than matching it — the
+    // insert below cannot coexist with a live `Option<&mut _>` scrutinee.
+    if let Some(t) = map.get_mut(prefix) {
+        if now.duration_since(t.last_logged) < REJECT_LOG_THROTTLE {
+            t.suppressed += 1;
+            return None;
+        }
+        t.last_logged = now;
+        return Some(std::mem::take(&mut t.suppressed));
+    }
+    map.insert(
+        prefix.to_string(),
+        RejectThrottle {
+            last_logged: now,
+            suppressed: 0,
+        },
+    );
+    Some(0)
+}
+
+/// The workdir a nonce is currently bound to, read WITHOUT mutating the
+/// registry — unlike [`live_binding`], which lazily evicts an expired ephemeral
+/// as a side effect. The reject forensics line runs on the request path after
+/// the gate has already decided, so it must not change registry state.
+fn known_workdir_for_nonce(nonce: &str) -> Option<String> {
+    if nonce.is_empty() {
+        return None;
+    }
+    proxy_nonces()
+        .lock()
+        .expect("proxy nonce map poisoned")
+        .get(nonce)
+        .map(|b| b.workdir.clone())
+}
+
+/// Record a coord-mcp proxy request REJECTED at the auth gate — the consumer
+/// half of the rotation trail, and the line that makes the rest of it
+/// answerable.
+///
+/// `mint` / `evict` / `grace` / `adopt` / `write` record what the runner did TO
+/// a key. None of them records a key actually FAILING, so on their own they
+/// show that rotations happened without ever pinning one to the incident it
+/// caused — the U8 gap only half-closed. Join on `key_prefix`: an `evict` line
+/// and a later `reject` line carrying the same prefix are the same key, and the
+/// `evict` line supplies the workdir this one usually cannot (an unregistered
+/// or already-evicted key has no binding left to look up).
+///
+/// Throttled per key prefix ([`REJECT_LOG_THROTTLE`]) because this runs on the
+/// request path. Best-effort like every other forensics emission: it never
+/// fails and never delays the 401 it accompanies. Callers MUST NOT hold the
+/// nonce-registry lock.
+pub(crate) fn log_proxy_nonce_rejected(nonce: Option<&str>, cause: &str) {
+    let nonce = nonce.unwrap_or("");
+    let prefix = rotation_key_prefix(nonce);
+    let Some(suppressed) = reject_throttle_admit(&prefix) else {
+        return;
+    };
+    // A still-registered nonce (bearer/principal mismatch, agent slot gone) can
+    // name its own workdir; an unregistered or evicted one cannot — that is
+    // what the prefix join is for.
+    let workdir = known_workdir_for_nonce(nonce).unwrap_or_default();
+    let cause = if suppressed > 0 {
+        format!("{cause} [+{suppressed} identical rejects suppressed since the previous line]")
+    } else {
+        cause.to_string()
+    };
+    log_rotation_event("reject", &workdir, nonce, &cause);
+}
+
+/// [`log_proxy_nonce_rejected`] for an ASYNC caller. The emission opens and
+/// appends to a file, and the proxy handler runs on the async executor — the
+/// same reason the device-JWT read a few lines below it goes through
+/// `spawn_blocking`. Detached and fire-and-forget: a 401 must never wait on
+/// forensics, and a line lost to shutdown is the best-effort contract every
+/// other emission on this path already carries.
+pub(crate) fn spawn_log_proxy_nonce_rejected(nonce: Option<&str>, cause: impl Into<String>) {
+    let nonce = nonce.map(str::to_owned);
+    let cause = cause.into();
+    tokio::task::spawn_blocking(move || log_proxy_nonce_rejected(nonce.as_deref(), &cause));
 }
 
 /// Project the live nonce map down to the DEVICE-only `nonce → workdir` shape
@@ -4192,15 +4333,10 @@ mod tests {
     /// ever carries a full nonce — only the 8-char prefix.
     #[test]
     fn rotation_forensics_one_line_per_event_and_prefix_only() {
-        let dir = std::env::temp_dir().join(format!("coord-mcp-rot-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&dir).unwrap();
-        // The override is process-global and deliberately left set —
-        // concurrent tests may append lines for OTHER workdirs, so every
-        // assertion below filters by this test's unique workdirs.
-        *ROTATION_LOG_DIR_OVERRIDE
-            .get_or_init(|| Mutex::new(None))
-            .lock()
-            .unwrap() = Some(dir.clone());
+        // Shared across every file-asserting forensics test (see
+        // `rotation_log_test_dir`) — peer tests append lines for OTHER
+        // workdirs, so every assertion below filters by this test's own.
+        let dir = rotation_log_test_dir();
 
         let wd = format!("D:/rot-forensics-wt-{}", uuid::Uuid::now_v7());
         let a = register_proxy_nonce(&wd); // mint
@@ -4258,5 +4394,102 @@ mod tests {
                 "no line may contain a full 64-char-class nonce"
             );
         }
+    }
+
+    /// Follow-up to Phase 4: a REJECTED proxy request is the consumer half of
+    /// the trail. It must emit a `reject` line carrying the prefix (so it joins
+    /// to the `evict` line that killed the key), name the workdir when the
+    /// nonce is still bound, and leak no more key material than any other line.
+    #[test]
+    fn rotation_forensics_reject_line_joins_to_the_evicting_workdir() {
+        let dir = rotation_log_test_dir();
+
+        let wd = format!("D:/rot-reject-wt-{}", uuid::Uuid::now_v7());
+        let live = register_proxy_nonce(&wd);
+        // A key this runner never minted — the shape a client presents after
+        // its own was evicted and the registry moved on.
+        let stranger = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+
+        log_proxy_nonce_rejected(Some(&live), "bound but gated (401)");
+        log_proxy_nonce_rejected(Some(&stranger), "unregistered (401)");
+
+        let raw = std::fs::read_to_string(dir.join(ROTATION_LOG_FILE)).unwrap();
+        let rejects: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("valid JSON per line"))
+            .filter(|v| v["event"] == "reject")
+            .filter(|v| {
+                v["key_prefix"] == rotation_key_prefix(&live).as_str()
+                    || v["key_prefix"] == rotation_key_prefix(&stranger).as_str()
+            })
+            .collect();
+        assert_eq!(rejects.len(), 2, "one line per distinct rejected key");
+
+        let for_key = |n: &str| {
+            rejects
+                .iter()
+                .find(|v| v["key_prefix"] == rotation_key_prefix(n).as_str())
+                .expect("a reject line for this key")
+                .clone()
+        };
+        // A still-registered nonce names its workdir directly...
+        assert_eq!(for_key(&live)["workdir"], wd.as_str());
+        // ...an unknown one cannot, and is joined on `key_prefix` instead.
+        assert_eq!(for_key(&stranger)["workdir"], "");
+
+        for n in [live.as_str(), stranger.as_str()] {
+            assert!(
+                !raw.contains(n),
+                "a reject line leaked a full nonce — prefixes only"
+            );
+        }
+    }
+
+    /// The reject path runs on the REQUEST path, so a client looping against a
+    /// dead key must not append a line per attempt: one line per key per
+    /// window, with the suppressed repeats counted into the next one.
+    #[test]
+    fn reject_throttle_admits_once_per_window_and_counts_suppressed() {
+        let prefix = format!("thr{}", &uuid::Uuid::new_v4().simple().to_string()[..5]);
+
+        assert_eq!(
+            reject_throttle_admit(&prefix),
+            Some(0),
+            "the first reject for a prefix always emits, with nothing suppressed yet"
+        );
+        for _ in 0..5 {
+            assert_eq!(
+                reject_throttle_admit(&prefix),
+                None,
+                "repeats inside the window stay silent"
+            );
+        }
+
+        // Reopen the window by backdating the entry rather than sleeping for
+        // REJECT_LOG_THROTTLE — the throttle is a duration comparison, so this
+        // exercises the same branch without a minute of wall-clock.
+        {
+            let mut map = REJECT_THROTTLES
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap();
+            let t = map.get_mut(&prefix).expect("entry for this prefix");
+            t.last_logged =
+                std::time::Instant::now() - REJECT_LOG_THROTTLE - std::time::Duration::from_secs(1);
+        }
+        assert_eq!(
+            reject_throttle_admit(&prefix),
+            Some(5),
+            "the next emission after the window carries the suppressed count"
+        );
+        assert_eq!(
+            reject_throttle_admit(&prefix),
+            None,
+            "and it opened a fresh window"
+        );
     }
 }
