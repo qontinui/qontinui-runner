@@ -18,6 +18,14 @@
 //! both directions in one module makes the round-trip property testable, and
 //! `spec_authoring` is feature-gated while capture is not, so a shared
 //! ungated home is also a build requirement.
+//!
+//! `root` is the *only* spelling of the index page. An `index` alias was
+//! briefly accepted by `spec_id_to_pathname` for compatibility with an older
+//! on-disk convention, but it made the composition non-injective: both ids
+//! mapped to `/` while only `root` round-tripped, so an on-disk
+//! `specs/pages/index/` shadowed the `root` page that authoring would write.
+//! The alias was dropped (no corpus had ever authored an index page), and the
+//! round-trip is now total on every id `pathname_to_spec_id` can emit.
 
 /// Slugify a pathname into a spec id.
 ///
@@ -57,13 +65,12 @@ pub(crate) fn pathname_to_spec_id(pathname: &str) -> String {
     }
 }
 
-/// The spec id [`pathname_to_spec_id`] emits for the index pathname (`/`).
+/// The one spec id that denotes the index pathname (`/`) — what
+/// [`pathname_to_spec_id`] emits and the only spelling
+/// [`spec_id_to_pathname`] recognises. There is deliberately no alias: a
+/// second accepted spelling would make the round-trip non-injective (see the
+/// module doc).
 pub(crate) const INDEX_SPEC_ID: &str = "root";
-
-/// Spec ids that denote the index page. `root` is what
-/// [`pathname_to_spec_id`] emits; `index` is the older on-disk convention and
-/// is still accepted so an existing `specs/pages/index/` keeps resolving.
-const INDEX_ALIASES: [&str; 2] = [INDEX_SPEC_ID, "index"];
 
 /// Recover the pathname a spec id was slugged from.
 ///
@@ -78,7 +85,7 @@ pub(crate) fn spec_id_to_pathname(spec_id: &str) -> Option<String> {
     if spec_id.is_empty() {
         return None;
     }
-    if INDEX_ALIASES.contains(&spec_id) {
+    if spec_id == INDEX_SPEC_ID {
         return Some("/".to_string());
     }
     if spec_id.chars().any(|c| c.is_uppercase())
@@ -125,29 +132,77 @@ mod tests {
     }
 
     #[test]
-    fn both_index_spellings_resolve_to_root_pathname() {
+    fn root_is_the_only_index_spelling() {
         // The bug this module exists to close: `root` is what the slugger
-        // emits, `index` is the older on-disk name, and both must map back to
-        // `/` rather than `/root` and `/index`.
+        // emits for `/`, and it must map back to `/` rather than `/root`.
+        assert_eq!(spec_id_to_pathname(INDEX_SPEC_ID).as_deref(), Some("/"));
         assert_eq!(spec_id_to_pathname("root").as_deref(), Some("/"));
-        assert_eq!(spec_id_to_pathname("index").as_deref(), Some("/"));
+        // `index` is NOT an alias. Accepting it made the composition
+        // non-injective (`index` and `root` both mapped to `/` while only
+        // `root` round-tripped), so an on-disk `specs/pages/index/` shadowed
+        // the `root` page authoring writes. It now slugs like any other id.
+        assert_eq!(spec_id_to_pathname("index").as_deref(), Some("/index"));
+        assert_eq!(pathname_to_spec_id("/index"), "index");
     }
 
     #[test]
     fn index_round_trips() {
         let id = pathname_to_spec_id("/");
+        assert_eq!(id, INDEX_SPEC_ID);
         assert_eq!(spec_id_to_pathname(&id).as_deref(), Some("/"));
     }
 
     #[test]
-    fn round_trip_holds_for_canonical_ids() {
-        for path in ["/account/billing", "/settings/general", "/a/b/c", "/"] {
+    fn round_trip_is_total_pathname_to_id_to_pathname() {
+        // `spec_id_to_pathname ∘ pathname_to_spec_id == identity` on every
+        // canonical pathname — including the index case, which is exactly the
+        // asymmetry the `index` alias used to introduce.
+        for path in [
+            "/",
+            "/account/billing",
+            "/settings/general",
+            "/a/b/c",
+            "/home",
+            "/index",
+        ] {
             let id = pathname_to_spec_id(path);
-            let back = spec_id_to_pathname(&id).expect("canonical id round-trips");
+            assert_eq!(
+                spec_id_to_pathname(&id).as_deref(),
+                Some(path),
+                "round-trip must be the identity on {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_root_pathname_is_the_one_residual_collision() {
+        // `root` is a sentinel, so a real page served at `/root` slugs onto
+        // the index page's id and recovers as `/`. This is inherent to using
+        // an in-band sentinel and is the only pathname the round-trip above
+        // does not hold for — pinned here so it stays a known, single
+        // exception rather than drifting into a second silent alias.
+        assert_eq!(pathname_to_spec_id("/root"), INDEX_SPEC_ID);
+        assert_eq!(spec_id_to_pathname(INDEX_SPEC_ID).as_deref(), Some("/"));
+    }
+
+    #[test]
+    fn round_trip_is_total_id_to_pathname_to_id() {
+        // The other direction: every id `spec_id_to_pathname` accepts must
+        // re-slug to itself. `root` is included because it is no longer one of
+        // two ids sharing the `/` pathname.
+        for id in [
+            INDEX_SPEC_ID,
+            "index",
+            "account-billing",
+            "settings-general",
+            "a-b-c",
+            "home",
+        ] {
+            let back = spec_id_to_pathname(id).expect("canonical id round-trips");
             assert_eq!(
                 pathname_to_spec_id(&back),
                 id,
-                "re-slugging the recovered pathname must be stable for {path}"
+                "re-slugging the recovered pathname must be stable for {id}"
             );
         }
     }
