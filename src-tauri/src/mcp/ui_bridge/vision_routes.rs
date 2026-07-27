@@ -797,15 +797,28 @@ fn build_raw_pipeline(crop: Option<Region>) -> Pipeline {
 }
 
 // ============================================================================
-// Cache directory (for the GET-by-sha256 streaming handler)
+// Cache lookup (for the GET-by-sha256 streaming handler)
 // ============================================================================
 
-/// Path to the on-disk vision cache. Matches the root passed to
-/// `VisionCache::new` in `mcp_api::api_state_init`. Used only by
-/// `vision_cache_get_handler`, which streams files directly without
-/// going through the in-memory LRU index.
-fn cache_dir() -> PathBuf {
-    PathBuf::from("tmp_vision_cache")
+/// Find the cached image file `<sha>.<ext>` directly under `dir`, returning its
+/// path and extension. Cache entries are always flat files at the cache root, so
+/// a single `read_dir` + prefix match suffices.
+///
+/// `dir` MUST be the `VisionCache`'s own absolute root
+/// (`state.vision_cache.root()`). A previous version resolved a bare
+/// `"tmp_vision_cache"` against the process CWD — which is NOT the runner root
+/// (the Tauri exe is launched from elsewhere) — so every GET-by-sha 404'd with
+/// "cache empty" even though `VisionCache::put` had written the file under the
+/// absolute root `current_runner_path().join("tmp_vision_cache")`.
+fn find_cache_file(dir: &StdPath, sha: &str) -> std::io::Result<Option<(PathBuf, String)>> {
+    let prefix = format!("{}.", sha);
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(ext) = name.strip_prefix(&prefix) {
+            return Ok(Some((entry.path(), ext.to_string())));
+        }
+    }
+    Ok(None)
 }
 
 /// Render a cache entry's on-disk path as the host-agnostic relative form
@@ -816,7 +829,7 @@ fn cache_dir() -> PathBuf {
 /// regardless of CWD. The response `path` is diagnostic-only — every consumer
 /// fetches bytes by `sha256` via `/vision/raw` (`fetchVisionCacheBytes`), never
 /// by `path` — so we strip the absolute prefix and emit the relative path the
-/// doc comment and `cache_dir()` already promise. Cache entries are always flat
+/// response contract already promises. Cache entries are always flat
 /// files directly under the root, so the file name plus the fixed
 /// `tmp_vision_cache/` prefix is sufficient; the smoke gate's
 /// `^tmp_vision_cache[\\/]` regex accepts either slash flavour.
@@ -1846,6 +1859,7 @@ async fn capture_and_encode_png(
 
 /// `GET /ui-bridge/vision/cache/{sha256}` — stream a cached image.
 async fn vision_cache_get_handler(
+    State(state): State<Arc<ApiState>>,
     Path(sha): Path<String>,
 ) -> Result<Response, (StatusCode, Json<ApiResponse<()>>)> {
     if !sha.chars().all(|c| c.is_ascii_hexdigit()) || sha.len() != 64 {
@@ -1854,31 +1868,26 @@ async fn vision_cache_get_handler(
             Json(api_error("invalid sha256 (must be 64 hex chars)")),
         ));
     }
-    let dir = cache_dir();
+    // Serve from the SAME absolute root the writer (`VisionCache::put`) uses, via
+    // the shared cache's own accessor — never a CWD-relative guess (the process
+    // CWD is not the runner root, which is what 404'd every GET with "cache empty").
+    let dir = state.vision_cache.root();
     if !dir.exists() {
         return Err((StatusCode::NOT_FOUND, Json(api_error("cache empty"))));
     }
-    let entries = std::fs::read_dir(&dir).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("readdir: {}", e))),
-        )
-    })?;
-    let prefix = format!("{}.", sha);
-    let mut hit: Option<(PathBuf, String)> = None;
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if let Some(ext) = name.strip_prefix(&prefix) {
-            hit = Some((entry.path(), ext.to_string()));
-            break;
-        }
-    }
-    let (path, ext) = hit.ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(api_error(format!("no cache entry for {}", sha))),
-        )
-    })?;
+    let (path, ext) = find_cache_file(dir, &sha)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("readdir: {}", e))),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(api_error(format!("no cache entry for {}", sha))),
+            )
+        })?;
     let bytes = std::fs::read(&path).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2514,6 +2523,43 @@ mod tests {
             Some("MonitorCrop"),
             "captureBackend must serialize as camelCase when Some"
         );
+    }
+
+    /// Regression: the GET-by-sha handler must scan the SAME absolute root the
+    /// writer (`VisionCache::put`) uses (`VisionCache::root()`), not a
+    /// CWD-relative `"tmp_vision_cache"`. Before the fix, the reader resolved a
+    /// bare relative path against the process CWD (≠ runner root), so every
+    /// GET-by-sha 404'd with "cache empty" even though the file existed under the
+    /// absolute cache root. `find_cache_file` driven by `cache.root()` finds it.
+    #[test]
+    fn cache_file_found_under_vision_cache_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache = qontinui_vision_core::VisionCache::new(tmp.path(), 8 * 1024 * 1024)
+            .expect("create cache");
+        // The cache root is absolute — the property the reader now relies on to
+        // stay independent of the process CWD.
+        assert!(
+            cache.root().is_absolute(),
+            "VisionCache root must be absolute so the reader is CWD-independent"
+        );
+        let key = [0x11u8; 32];
+        let hit = cache.put(&key, b"fake-jpeg-bytes", "jpeg").expect("put");
+
+        // Driven by the cache's own root, the handler's lookup finds the file.
+        let found = find_cache_file(cache.root(), &hit.sha256_hex)
+            .expect("read_dir")
+            .expect("file written by put() must be found under root()");
+        assert_eq!(found.1, "jpeg", "extension round-trips");
+        assert_eq!(
+            std::fs::read(&found.0).expect("read cached file"),
+            b"fake-jpeg-bytes",
+            "bytes round-trip"
+        );
+
+        // An unknown sha misses cleanly (Ok(None), not an error) — the branch
+        // that yields the handler's "no cache entry" 404 rather than "cache empty".
+        let miss = find_cache_file(cache.root(), &"0".repeat(64)).expect("read_dir");
+        assert!(miss.is_none(), "unknown sha misses cleanly");
     }
 }
 
