@@ -2626,6 +2626,23 @@ ALTER SEQUENCE coord.fleet_runtime_policy_id_seq OWNED BY coord.fleet_runtime_po
 
 
 --
+-- Name: footprint_drift_events; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.footprint_drift_events (
+    event_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    agent_session_id uuid NOT NULL,
+    agent_id uuid,
+    tenant_id uuid,
+    repo text,
+    observed_path text NOT NULL,
+    declared_paths text[],
+    correlation_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
 -- Name: fs_observations; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -2741,9 +2758,15 @@ CREATE TABLE coord.gates (
     continuation_deferred_at timestamp with time zone,
     continuation_deferred_reason text,
     continuation_deferred_count integer DEFAULT 0 NOT NULL,
+    gate_class text,
+    registered_by_agent_id uuid,
+    cleared_by_device_id uuid,
+    cleared_by_agent_id uuid,
+    cleared_via text,
+    cleared_under_rule uuid,
     CONSTRAINT ck_gates_anchor CHECK ((((claim_kind IS NOT NULL) AND (resource_key IS NOT NULL) AND (work_unit_id IS NULL) AND (phase_name IS NULL)) OR ((claim_kind IS NULL) AND (resource_key IS NULL) AND (work_unit_id IS NOT NULL) AND (phase_name IS NOT NULL)))),
     CONSTRAINT coord_gates_clearance_audience_check CHECK ((clearance_audience = ANY (ARRAY['operator'::text, 'agent'::text]))),
-    CONSTRAINT gates_verdict_check CHECK ((verdict = ANY (ARRAY['open'::text, 'cleared'::text, 'failed'::text, 'misconfigured'::text])))
+    CONSTRAINT gates_verdict_check CHECK ((verdict = ANY (ARRAY['open'::text, 'cleared'::text, 'failed'::text, 'misconfigured'::text, 'withdrawn'::text])))
 );
 
 
@@ -3993,7 +4016,8 @@ CREATE TABLE coord.pr_check_runs (
     started_at timestamp with time zone,
     completed_at timestamp with time zone,
     details_url text,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    head_branch text
 );
 
 
@@ -4025,7 +4049,8 @@ CREATE VIEW coord.pr_check_runs_latest AS
     started_at,
     completed_at,
     details_url,
-    updated_at
+    updated_at,
+    head_branch
    FROM coord.pr_check_runs
   ORDER BY repo, head_sha, name, started_at DESC NULLS LAST, check_id DESC;
 
@@ -6909,6 +6934,31 @@ CREATE TABLE project.deferred_questions (
     reviewer_comment text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     reviewed_at timestamp with time zone
+);
+
+
+--
+-- Name: design_policies; Type: TABLE; Schema: project; Owner: -
+--
+
+CREATE TABLE project.design_policies (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    slug character varying(100) NOT NULL,
+    name character varying(255) NOT NULL,
+    principle text DEFAULT ''::text NOT NULL,
+    rationale text DEFAULT ''::text NOT NULL,
+    enforcement text DEFAULT ''::text NOT NULL,
+    category character varying(50) DEFAULT ''::character varying NOT NULL,
+    severity character varying(20) DEFAULT 'info'::character varying NOT NULL,
+    applies_to character varying(255) DEFAULT ''::character varying NOT NULL,
+    is_built_in boolean DEFAULT false NOT NULL,
+    sort_order integer DEFAULT 0 NOT NULL,
+    enabled boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    created_by character varying(255),
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_by character varying(255)
 );
 
 
@@ -15770,6 +15820,14 @@ ALTER TABLE ONLY coord.fleet_runtime_policy
 
 
 --
+-- Name: footprint_drift_events footprint_drift_events_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.footprint_drift_events
+    ADD CONSTRAINT footprint_drift_events_pkey PRIMARY KEY (event_id);
+
+
+--
 -- Name: fs_observations fs_observations_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -17407,6 +17465,14 @@ ALTER TABLE ONLY project.decisions
 
 ALTER TABLE ONLY project.deferred_questions
     ADD CONSTRAINT deferred_questions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: design_policies design_policies_pkey; Type: CONSTRAINT; Schema: project; Owner: -
+--
+
+ALTER TABLE ONLY project.design_policies
+    ADD CONSTRAINT design_policies_pkey PRIMARY KEY (id);
 
 
 --
@@ -19362,6 +19428,14 @@ ALTER TABLE ONLY project.action_frames
 
 
 --
+-- Name: design_policies uq_design_policy_tenant_slug; Type: CONSTRAINT; Schema: project; Owner: -
+--
+
+ALTER TABLE ONLY project.design_policies
+    ADD CONSTRAINT uq_design_policy_tenant_slug UNIQUE (tenant_id, slug);
+
+
+--
 -- Name: finding_category_configs uq_finding_category_user_slug; Type: CONSTRAINT; Schema: project; Owner: -
 --
 
@@ -20938,6 +21012,20 @@ CREATE INDEX idx_events_machine_created ON coord.events USING btree (device_id, 
 
 
 --
+-- Name: idx_fde_created; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_fde_created ON coord.footprint_drift_events USING btree (created_at);
+
+
+--
+-- Name: idx_fde_session; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_fde_session ON coord.footprint_drift_events USING btree (agent_session_id);
+
+
+--
 -- Name: idx_findings_resource_keys; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -21820,6 +21908,13 @@ CREATE INDEX idx_repo_branches_correlation_id ON coord.repo_branches USING btree
 
 
 --
+-- Name: idx_repo_branches_merged_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_repo_branches_merged_at ON coord.repo_branches USING btree (merged_at DESC) WHERE (merge_commit_sha IS NOT NULL);
+
+
+--
 -- Name: idx_repo_branches_pr_state; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -22625,6 +22720,13 @@ CREATE INDEX ix_policy_clauses_tenant ON coord.policy_clauses USING btree (tenan
 
 
 --
+-- Name: ix_pr_check_runs_repo_head_branch; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_pr_check_runs_repo_head_branch ON coord.pr_check_runs USING btree (repo, head_branch);
+
+
+--
 -- Name: ix_primary_trees_app_id; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -22705,7 +22807,7 @@ CREATE UNIQUE INDEX uq_fleet_runtime_policy_scope ON coord.fleet_runtime_policy 
 -- Name: uq_memory_jobs_live_input; Type: INDEX; Schema: coord; Owner: -
 --
 
-CREATE UNIQUE INDEX uq_memory_jobs_live_input ON coord.memory_jobs USING btree (tenant_id, kind, input_hash) WHERE (status = ANY (ARRAY['pending'::text, 'claimed'::text, 'done'::text]));
+CREATE UNIQUE INDEX uq_memory_jobs_live_input ON coord.memory_jobs USING btree (tenant_id, kind, input_hash) WHERE ((status = ANY (ARRAY['pending'::text, 'claimed'::text])) OR ((status = 'done'::text) AND (kind = 'synthesis'::text)));
 
 
 --
@@ -27844,6 +27946,13 @@ CREATE INDEX ix_project_comments_project_id ON project.project_comments USING bt
 --
 
 CREATE INDEX ix_project_comments_workflow_id ON project.project_comments USING btree (workflow_id);
+
+
+--
+-- Name: ix_project_design_policies_tenant_id; Type: INDEX; Schema: project; Owner: -
+--
+
+CREATE INDEX ix_project_design_policies_tenant_id ON project.design_policies USING btree (tenant_id);
 
 
 --
