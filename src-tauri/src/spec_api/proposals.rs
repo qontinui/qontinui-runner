@@ -43,12 +43,11 @@ use crate::mcp::types::ApiState;
 use crate::spec_api::apps::AppErrorExt;
 use crate::spec_api::events;
 use crate::spec_api::responses::SpecError;
-// Converts an on-disk page id (`account-billing`) back to its pathname
-// (`/account/billing`). Owned by `spec_api::slug` alongside its inverse: the
-// copy that lived here recognised only `index` for the root page while the
-// slugger emits `root`, so `root` mapped to `/root` and this scan reported the
-// index page as un-spec'd.
-use crate::spec_api::slug::spec_id_to_pathname;
+// The single spelling of the index page's spec id. Owned by `spec_api::slug`
+// alongside both directions of the pathname ↔ spec-id mapping: the copy that
+// lived here recognised only `index` for the root page while the slugger emits
+// `root`, so the two ids shadowed each other on disk.
+use crate::spec_api::slug::INDEX_SPEC_ID;
 use crate::spec_api::storage;
 use qontinui_types::spec_api_events::SpecApiEvent;
 
@@ -1084,8 +1083,11 @@ fn mint_proposal_id() -> String {
 /// Heuristic v1.0: strip the conventional source-tree prefix
 /// (`src/pages/...`, `src/app/...`, `app/...`), drop the file extension and
 /// the `index` leaf, lowercase, and slugify by joining the remaining
-/// segments with `-`. Files outside these prefixes return `None` (the
-/// caller drops them — patch routing is best-effort).
+/// segments with `-`. A bare `index` at the root becomes
+/// [`INDEX_SPEC_ID`] (`root`), matching what
+/// [`crate::spec_api::slug::pathname_to_spec_id`] emits for `/`. Files
+/// outside these prefixes return `None` (the caller drops them — patch
+/// routing is best-effort).
 ///
 /// Sibling-module symmetry: keeps the slug shape identical to the
 /// `pathname_to_spec_id` helper owned by `workflow_generation::spec_authoring`.
@@ -1129,11 +1131,12 @@ fn infer_target_spec_id(_app_id: &str, elem: &RegisteredElement) -> Option<Strin
     }
 
     // Drop trailing `index` (e.g. `account/billing/index.tsx` →
-    // `account/billing`). Index-at-root maps to "index".
+    // `account/billing`). Index-at-root maps to `INDEX_SPEC_ID` (`root`) —
+    // the one spelling `spec_api::slug` recognises for the `/` pathname.
     let trimmed: Vec<String> = if segments.last().map(|s| s.as_str()) == Some("index") {
         let n = segments.len();
         if n == 1 {
-            return Some("index".to_string());
+            return Some(INDEX_SPEC_ID.to_string());
         }
         segments.into_iter().take(n - 1).collect()
     } else {
@@ -1222,9 +1225,12 @@ mod tests {
             line: 12,
             suggested_assertion: String::new(),
         };
+        // Must be the slugger's spelling of `/` (`root`), not the literal
+        // `index` leaf — the two used to be accepted interchangeably and so
+        // shadowed each other under `specs/pages/`.
         assert_eq!(
             infer_target_spec_id("qontinui-runner", &elem).as_deref(),
-            Some("index")
+            Some(INDEX_SPEC_ID)
         );
     }
 
