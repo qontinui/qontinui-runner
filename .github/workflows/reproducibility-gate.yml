@@ -127,16 +127,40 @@ jobs:
       - name: Build frontend (creates dist/ for tauri::generate_context!)
         run: pnpm run build
 
+      # Swatinem/rust-cache, matching ci.yml and clippy-tiers.yml. The
+      # `actions/cache@v3` stanza this replaces had the same two defects
+      # ci.yml documents at its own cache step, plus a third that only
+      # matters here:
+      #   1. Exact-match key with no `restore-keys`, so ANY Cargo.lock
+      #      change was a total miss — including the registry portion it
+      #      was mostly there to preserve.
+      #   2. It saved `target/` — measured 2026-07-27 at 1.28 GB (Windows)
+      #      + 1.06 GB (Linux) = 2.34 GB, the largest cache consumer in the
+      #      repo after ci.yml's two merge-train rust caches. This job is
+      #      NOT a required check and runs once nightly, so it must not buy
+      #      its own speedup with the 10 GB repo cap that main's gating
+      #      caches depend on — the same call clippy-tiers.yml made, and
+      #      the cap was back at 9.36/10 GB when this was written.
+      #   3. Restoring a `target/` from a DIFFERENT run is actively wrong
+      #      for a reproducibility gate: stale artifacts are exactly the
+      #      state that can mask a nondeterminism a cold build would expose.
+      #      The two builds this job compares happen within a single run and
+      #      are unaffected.
+      # `cache-targets: false` therefore keeps the dependency/registry
+      # restore this job genuinely benefits from and drops the payload.
       - name: Cache Rust dependencies
-        uses: actions/cache@v3
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-repro-cargo-${{ hashFiles('**/Cargo.lock') }}
+          # Workspace root is the repo root: ./Cargo.toml -> ./target
+          workspaces: ". -> target"
+          shared-key: repro-gate
+          cache-targets: false
+          # Same policy as ci.yml (PR #792) and clippy-tiers.yml: save from
+          # main only. The `schedule` trigger always runs on main, so this is
+          # only load-bearing for a `workflow_dispatch` fired on a branch —
+          # kept uniform so the policy is auditable in one grep rather than
+          # per-workflow exceptions.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # qontinui-runner/Cargo.toml is the workspace root with src-tauri/
       # as a member, so cargo invoked from src-tauri/ resolves the
