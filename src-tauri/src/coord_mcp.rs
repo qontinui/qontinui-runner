@@ -480,6 +480,104 @@ fn graced_nonce_is_valid(nonce: &str) -> bool {
     }
 }
 
+// ============================================================================
+// Rotation forensics (plan 2026-07-27-coord-mcp-flake-remediation, Phase 4/R6)
+// ============================================================================
+
+/// Filename of the append-only rotation-forensics JSONL, written into the
+/// dev-logs dir alongside the other `*.jsonl` streams. One line per nonce
+/// mint / evict / grace / adopt and per `.mcp.json` write, so the NEXT
+/// "transport died mid-session" incident is attributable from disk instead of
+/// unlogged (the investigation's U8 gap: rotation events left zero trace).
+const ROTATION_LOG_FILE: &str = "coord-mcp-rotations.jsonl";
+
+/// How much of a nonce a forensics line may carry: the first 8 characters —
+/// enough to correlate a line with an `.mcp.json` sighting, useless to
+/// authenticate with (a full nonce is 64 chars of UUID hex).
+const ROTATION_KEY_PREFIX_LEN: usize = 8;
+
+/// The loggable prefix of `nonce` — NEVER the full key
+/// ([`ROTATION_KEY_PREFIX_LEN`]).
+fn rotation_key_prefix(nonce: &str) -> String {
+    nonce.chars().take(ROTATION_KEY_PREFIX_LEN).collect()
+}
+
+/// Build one rotation-forensics JSONL line. Pure over its inputs (bar the
+/// timestamp) so the shape — and the prefix-only guarantee — is unit-testable
+/// without touching the filesystem.
+fn rotation_log_line(event: &str, workdir: &str, nonce: &str, cause: &str) -> String {
+    serde_json::json!({
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "event": event,
+        "workdir": workdir,
+        "key_prefix": rotation_key_prefix(nonce),
+        "cause": cause,
+    })
+    .to_string()
+}
+
+/// Shared `cause` text for a "grace" forensics line, naming the active TTL so
+/// the log self-documents how long the evicted key stays acceptable.
+fn rotation_grace_cause() -> String {
+    format!("evicted device nonce graced {}s", NONCE_GRACE_TTL.as_secs())
+}
+
+/// Test-only redirect for the rotation log (process-global): `None` (the
+/// default) silences file emission so the many nonce-minting unit tests never
+/// write into the developer's real dev-logs dir; the forensics test points it
+/// at a temp dir and filters lines by its own unique workdirs.
+#[cfg(test)]
+static ROTATION_LOG_DIR_OVERRIDE: OnceLock<Mutex<Option<std::path::PathBuf>>> = OnceLock::new();
+
+/// Where the rotation log lives: the same dev-logs dir every other JSONL
+/// stream resolves ([`crate::paths::get_dev_logs_dir`] — settings override
+/// first, then the app-data default, instance-scoped for secondary runners).
+/// `None` ⇒ skip file emission.
+fn rotation_log_dir() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    {
+        ROTATION_LOG_DIR_OVERRIDE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("rotation log override poisoned")
+            .clone()
+    }
+    #[cfg(not(test))]
+    {
+        Some(crate::paths::get_dev_logs_dir())
+    }
+}
+
+/// Record one rotation event: a `tracing::info!` line (so the spawn-log ring
+/// sees it live) plus one appended JSONL line in the dev-logs dir (durable
+/// across restarts — the ring is not). Best-effort and infallible by design:
+/// forensics must never break provisioning, so an unresolvable dir or a failed
+/// open/write is skipped silently (append-only `OpenOptions` shape cloned from
+/// `tracing_layers.rs`'s spans stream). Callers MUST NOT hold the
+/// nonce-registry lock — this does file I/O.
+fn log_rotation_event(event: &str, workdir: &str, nonce: &str, cause: &str) {
+    let prefix = rotation_key_prefix(nonce);
+    info!("coord_mcp: rotation event={event} workdir={workdir} key_prefix={prefix} cause={cause}");
+    let Some(dir) = rotation_log_dir() else {
+        return;
+    };
+    use std::io::Write as _;
+    let path = dir.join(ROTATION_LOG_FILE);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        // ONE `write_all` per event, newline included: concurrent emitters
+        // (each opens its own append handle) must never interleave a line —
+        // `writeln!` would issue the payload and the newline as separate
+        // writes, which corrupts the JSONL under concurrency.
+        let mut line = rotation_log_line(event, workdir, nonce, cause);
+        line.push('\n');
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 /// Project the live nonce map down to the DEVICE-only `nonce → workdir` shape
 /// the encrypted store persists (OQ3): agent bindings are dropped so they never
 /// reach disk. The store contract is unchanged (`HashMap<String, String>`), so
@@ -750,7 +848,13 @@ fn mint_and_register_nonce(
     // so the registry mutex is never held across I/O. `None` on a
     // single-tenant install (→ legacy default slot at inject time).
     let session_tenant = crate::session::dual_write::resolve_active_tenant_id();
-    let snapshot = {
+    // Forensics cause resolved BEFORE `principal` is moved into the map.
+    let mint_cause = match (&principal, ephemeral) {
+        (ProxyPrincipal::Device, false) => "persistent device mint (runner-spawn/re-provision)",
+        (ProxyPrincipal::Device, true) => "ephemeral device mint (mint route)",
+        (ProxyPrincipal::Agent { .. }, _) => "agent mint",
+    };
+    let (snapshot, evicted_device, evicted_agent) = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
         // ONE pass does all pre-insert map maintenance (fused from three: an
         // expired-ephemeral sweep, a graceable collect, and a persistent-eviction
@@ -759,6 +863,7 @@ fn mint_and_register_nonce(
         // lock. Semantics are byte-for-byte the prior three passes — see this
         // fn's doc for the eviction rule.
         let mut evicted_graceable: Vec<String> = Vec::new();
+        let mut evicted_agent: Vec<String> = Vec::new();
         map.retain(|n, b| {
             // (1) Sweep EVERY expired ephemeral, whatever its workdir/class.
             // Because an ephemeral mint no longer evicts a prior same-workdir
@@ -786,6 +891,8 @@ fn mint_and_register_nonce(
             if !ephemeral && b.workdir == workdir && !b.lifetime.is_ephemeral() {
                 if b.principal == ProxyPrincipal::Device {
                     evicted_graceable.push(n.clone());
+                } else {
+                    evicted_agent.push(n.clone());
                 }
                 return false;
             }
@@ -801,8 +908,35 @@ fn mint_and_register_nonce(
             },
         );
         grace_evicted_device_nonces(&evicted_graceable);
-        map.clone()
+        (map.clone(), evicted_graceable, evicted_agent)
     };
+    // Rotation forensics (Phase 4/R6) — emitted AFTER the registry lock is
+    // released (file I/O must never run under it). The "grace" lines live here
+    // rather than inside `grace_evicted_device_nonces` for the same reason:
+    // both its callers invoke it under the registry lock, atomically with the
+    // eviction, and moving the grace insert outside the lock would open a
+    // window where an in-flight request finds its nonce neither live nor
+    // graced. (Expired-ephemeral sweep removals above are deliberately NOT
+    // logged: a TTL death is deterministic, not a rotation.)
+    let grace_cause = rotation_grace_cause();
+    for n in &evicted_device {
+        log_rotation_event(
+            "evict",
+            workdir,
+            n,
+            "superseded by same-workdir persistent re-mint",
+        );
+        log_rotation_event("grace", workdir, n, &grace_cause);
+    }
+    for n in &evicted_agent {
+        log_rotation_event(
+            "evict",
+            workdir,
+            n,
+            "superseded by same-workdir persistent re-mint (agent — fails closed, never graced)",
+        );
+    }
+    log_rotation_event("mint", workdir, &nonce, mint_cause);
     (nonce, snapshot)
 }
 
@@ -814,7 +948,7 @@ fn mint_and_register_nonce(
 /// Evicted device nonces ride the same grace TTL as a re-mint so an in-flight
 /// client fails closed only after the window; agent nonces drop immediately.
 pub(crate) fn evict_proxy_nonces_for_workdir(workdir: &str) {
-    let snapshot = {
+    let (snapshot, evicted_device, evicted_agent) = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
         let evicted_device: Vec<String> = map
             .iter()
@@ -824,10 +958,29 @@ pub(crate) fn evict_proxy_nonces_for_workdir(workdir: &str) {
         if evicted_device.is_empty() && !map.values().any(|b| b.workdir == workdir) {
             return; // nothing bound to this workdir — skip the persist write
         }
+        let evicted_agent: Vec<String> = map
+            .iter()
+            .filter(|(_, b)| b.workdir == workdir && b.principal != ProxyPrincipal::Device)
+            .map(|(n, _)| n.clone())
+            .collect();
         map.retain(|_, b| b.workdir != workdir);
         grace_evicted_device_nonces(&evicted_device);
-        map.clone()
+        (map.clone(), evicted_device, evicted_agent)
     };
+    // Rotation forensics — outside the lock (see `mint_and_register_nonce`).
+    let grace_cause = rotation_grace_cause();
+    for n in &evicted_device {
+        log_rotation_event("evict", workdir, n, "per-session workdir closed");
+        log_rotation_event("grace", workdir, n, &grace_cause);
+    }
+    for n in &evicted_agent {
+        log_rotation_event(
+            "evict",
+            workdir,
+            n,
+            "per-session workdir closed (agent — fails closed, never graced)",
+        );
+    }
     persist_proxy_nonces(&snapshot);
 }
 
@@ -1378,6 +1531,21 @@ fn write_mcp_json(primary_wt: &str, mcp_config: &serde_json::Value) {
             // tooling and the operator must keep using.
             restrict_to_owner(&mcp_path, false);
             info!("coord_mcp: wrote .mcp.json for coord-mcp in {}", primary_wt);
+            // Rotation forensics (Phase 4/R6): every write of this file is a
+            // client-visible rotation candidate — record which key it now
+            // carries. Extraction is infallible-by-shape (the single writer
+            // `coord_mcp_proxy_config_json` always sets the header); an
+            // unexpected shape logs an empty prefix rather than nothing.
+            let key = mcp_config
+                .pointer("/mcpServers/coord-mcp/headers/X-Coord-Mcp-Proxy-Key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            log_rotation_event(
+                "write",
+                primary_wt,
+                key,
+                ".mcp.json rewritten (proxy shape)",
+            );
         }
         Err(e) => {
             warn!(
@@ -1801,6 +1969,20 @@ pub(crate) fn provision_coord_mcp_config_file(workdir: &str) -> Option<std::path
                 "coord_mcp: wrote --mcp-config file {} for workdir {workdir}",
                 file.display()
             );
+            // Rotation forensics (Phase 4/R6): the app-data `--mcp-config`
+            // materialization carries a fresh key to identity-seam sessions
+            // exactly like an in-cwd `.mcp.json` write does — give it the
+            // same "write" line so those sessions get the full trail.
+            let key = mcp_config
+                .pointer("/mcpServers/coord-mcp/headers/X-Coord-Mcp-Proxy-Key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            log_rotation_event(
+                "write",
+                workdir,
+                key,
+                "app-data --mcp-config file materialized (proxy shape)",
+            );
             Some(file)
         }
         Err(e) => {
@@ -2009,13 +2191,20 @@ fn qontinui_root_dir() -> Option<std::path::PathBuf> {
 /// path is never reached for an agent config (a static-bearer shape has no proxy
 /// URL, so [`read_proxy_port`] returns `None` and the resolver leaves it).
 fn adopt_on_disk_nonce(workdir: &str, nonce: &str) {
-    let snapshot = {
+    let (snapshot, evicted) = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
         // Persistent class only — an adopted nonce came from a runner-written
         // `.mcp.json`, and must NOT evict a bare session's ephemeral nonce for
         // the same workdir (the class-scoping rationale in
         // `mint_and_register_nonce`).
-        map.retain(|_, b| !(b.workdir == workdir && !b.lifetime.is_ephemeral()));
+        let mut evicted: Vec<String> = Vec::new();
+        map.retain(|n, b| {
+            if b.workdir == workdir && !b.lifetime.is_ephemeral() {
+                evicted.push(n.clone());
+                return false;
+            }
+            true
+        });
         map.insert(
             nonce.to_string(),
             NonceBinding {
@@ -2030,8 +2219,23 @@ fn adopt_on_disk_nonce(workdir: &str, nonce: &str) {
                 session_tenant: None,
             },
         );
-        map.clone()
+        (map.clone(), evicted)
     };
+    // Rotation forensics — outside the lock (see `mint_and_register_nonce`).
+    for n in &evicted {
+        log_rotation_event(
+            "evict",
+            workdir,
+            n,
+            "superseded by on-disk nonce adoption (not graced)",
+        );
+    }
+    log_rotation_event(
+        "adopt",
+        workdir,
+        nonce,
+        "re-registered the on-disk `.mcp.json` nonce (no file rewrite)",
+    );
     persist_proxy_nonces(&snapshot);
 }
 
@@ -3981,5 +4185,78 @@ mod tests {
             !graced_nonces().lock().unwrap().contains_key(&nonce),
             "an expired grace entry must be lazily evicted on the failing check"
         );
+    }
+
+    /// Phase 4 (plan 2026-07-27-coord-mcp-flake-remediation, R6): every
+    /// rotation event appends exactly one JSONL forensics line, and no line
+    /// ever carries a full nonce — only the 8-char prefix.
+    #[test]
+    fn rotation_forensics_one_line_per_event_and_prefix_only() {
+        let dir = std::env::temp_dir().join(format!("coord-mcp-rot-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The override is process-global and deliberately left set —
+        // concurrent tests may append lines for OTHER workdirs, so every
+        // assertion below filters by this test's unique workdirs.
+        *ROTATION_LOG_DIR_OVERRIDE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap() = Some(dir.clone());
+
+        let wd = format!("D:/rot-forensics-wt-{}", uuid::Uuid::now_v7());
+        let a = register_proxy_nonce(&wd); // mint
+        let b = register_proxy_nonce(&wd); // mint + evict(a) + grace(a)
+        evict_proxy_nonces_for_workdir(&wd); // evict(b) + grace(b)
+        let adopted = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        adopt_on_disk_nonce(&wd, &adopted); // adopt (nothing left to evict)
+
+        // A real `.mcp.json` write into a temp workdir → one "write" line.
+        let wt = std::env::temp_dir().join(format!("coord-mcp-rot-wt-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&wt).unwrap();
+        let wt_str = wt.to_string_lossy().to_string();
+        write_mcp_json(&wt_str, &coord_mcp_proxy_config_json(9876, &adopted));
+
+        let raw = std::fs::read_to_string(dir.join(ROTATION_LOG_FILE)).unwrap();
+        let mine: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("valid JSON per line"))
+            .filter(|v| v["workdir"] == wd.as_str() || v["workdir"] == wt_str.as_str())
+            .collect();
+
+        let count = |event: &str| mine.iter().filter(|v| v["event"] == event).count();
+        assert_eq!(count("mint"), 2, "one line per mint");
+        assert_eq!(count("evict"), 2, "re-mint evicted `a`, close evicted `b`");
+        assert_eq!(count("grace"), 2, "each evicted device nonce graced once");
+        assert_eq!(count("adopt"), 1, "one line per adoption");
+        assert_eq!(count("write"), 1, "one line per .mcp.json write");
+        assert_eq!(mine.len(), 8, "no extra lines for these workdirs");
+
+        // Prefix-only guarantee: the key field is exactly the 8-char prefix,
+        // and no full 64-char-class nonce appears anywhere in the file.
+        let key_re = regex::Regex::new("^[0-9a-f]{8}$").unwrap();
+        for v in &mine {
+            let key = v["key_prefix"].as_str().expect("key_prefix is a string");
+            assert!(
+                key_re.is_match(key),
+                "key field must be the 8-char prefix only, got {key:?}"
+            );
+        }
+        for full in [a.as_str(), b.as_str(), adopted.as_str()] {
+            assert!(!raw.contains(full), "a forensics line leaked a full nonce");
+        }
+        // Length-class guard scoped to THIS test's lines (`mine`): a
+        // concurrent test whose workdir string embeds 64 hex chars must not
+        // nondeterministically fail this test. The `raw.contains` checks
+        // above remain the whole-file leak tripwire for real nonces.
+        let hex64 = regex::Regex::new("[0-9a-f]{64}").unwrap();
+        for v in &mine {
+            assert!(
+                !hex64.is_match(&v.to_string()),
+                "no line may contain a full 64-char-class nonce"
+            );
+        }
     }
 }
