@@ -1002,6 +1002,14 @@ async fn coord_mcp_proxy_handler(
         Some(p) => p,
         None => {
             warn!("coord-mcp proxy: missing or unrecognized X-Coord-Mcp-Proxy-Key");
+            // Rotation forensics: THE transport-death event. Everything the
+            // rotation log records up to here is what the runner did to a key;
+            // this is a client dying on one, and the `key_prefix` join is what
+            // ties it back to the mint/evict line that caused it.
+            crate::coord_mcp::spawn_log_proxy_nonce_rejected(
+                nonce.as_deref(),
+                "missing, unregistered, or expired proxy key (401)",
+            );
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({
@@ -1093,6 +1101,10 @@ async fn coord_mcp_proxy_handler(
                         "coord-mcp proxy: no live token slot for agent_id={agent_id} \
                          (torn-down or restarted agent) — failing closed"
                     );
+                    crate::coord_mcp::spawn_log_proxy_nonce_rejected(
+                        nonce.as_deref(),
+                        "no live agent token slot — torn-down or restarted agent (401)",
+                    );
                     return (
                         axum::http::StatusCode::UNAUTHORIZED,
                         Json(serde_json::json!({
@@ -1111,6 +1123,13 @@ async fn coord_mcp_proxy_handler(
         crate::coord_mcp::proxy_request_gate(nonce.as_deref(), bearer.as_deref(), &principal)
     {
         warn!("coord-mcp proxy: {msg}");
+        // The gate's own message is the cause — it never embeds key material
+        // (it reports the nonce as absent/unrecognized, or names the bearer's
+        // `sub_type`), so it is safe to carry into a forensics line verbatim.
+        crate::coord_mcp::spawn_log_proxy_nonce_rejected(
+            nonce.as_deref(),
+            format!("{msg} ({status})"),
+        );
         return (
             axum::http::StatusCode::from_u16(status)
                 .unwrap_or(axum::http::StatusCode::UNAUTHORIZED),
