@@ -9,6 +9,12 @@
 //!   matching slash-command body as the new session's first user message,
 //!   so the Coordinator can spawn an `auto-review` worker, a fresh
 //!   `coordinate` instance, etc., without a parallel HTTP route per role.
+//!   It also accepts a mutually-exclusive free-form `prompt` for work no role
+//!   covers — without it, an agent that had just written a task brief could
+//!   not hand it to a session, because the only alternatives were the five
+//!   fixed roles or a generic session that did not know what it was for.
+//!   (`POST /task-runs` takes a prompt but only inserts a row; it spawns
+//!   nothing, so it is not a substitute.)
 //! - `POST /sessions/<id>/message` — HTTP wrapper around the
 //!   `send_user_message` Tauri command at
 //!   `commands::ai_session::send_user_message`.
@@ -64,6 +70,22 @@ pub struct SpawnSessionRequest {
     /// when `role` is set.
     #[serde(default)]
     pub args: Option<String>,
+    /// Free-form first user message, for work no `role` covers.
+    ///
+    /// The role allow-list is deliberately closed — a role maps to a
+    /// `.claude/commands/<role>.md` body, so an unknown role is a typo, not an
+    /// instruction. But that left a real gap: an agent that had just WRITTEN a
+    /// task (an analysis brief, a prompt file, a hand-off summary) had no way
+    /// to hand it to a new session. Every spawn was either one of five fixed
+    /// roles or a generic "respond helpfully" session that did not know what it
+    /// was for, so the work had to be started by a human retyping it.
+    ///
+    /// Ignored when `role` is set: a role's slash command IS its prompt, and
+    /// silently concatenating the two would produce a session running a
+    /// half-command. Supply `args` to parameterise a role instead — the 400
+    /// below makes that explicit rather than letting the field vanish.
+    #[serde(default)]
+    pub prompt: Option<String>,
 }
 
 fn default_session_name() -> String {
@@ -80,6 +102,36 @@ pub struct SpawnSessionResponse {
     /// True when the role was recognised and the slash command was
     /// dispatched as the initial prompt; false for plain ad-hoc sessions.
     pub dispatched_slash_command: bool,
+}
+
+/// The new session's first user message.
+///
+/// Precedence, and why: a `role` wins because its slash command IS the prompt
+/// (the handler rejects role+prompt outright, so this arm is only reached for a
+/// role-only spawn). A free-form `prompt` is used verbatim so a spawning agent
+/// can hand over the actual task. The generic greeting is the last resort —
+/// reached only when the caller supplied neither, i.e. the pre-existing ad-hoc
+/// session. Whitespace-only inputs are treated as absent, so a caller that
+/// builds a prompt by string-joining and ends up with `"  "` gets the honest
+/// fallback instead of a session whose first message is blank.
+///
+/// Pure — no state, no I/O — so the precedence is testable without a running
+/// app, which is the whole reason it is not inline in the handler.
+fn initial_prompt_for(
+    slash_command: Option<&str>,
+    args: Option<&str>,
+    prompt: Option<&str>,
+) -> String {
+    match (slash_command, args) {
+        (Some(cmd), Some(args)) if !args.trim().is_empty() => format!("{} {}", cmd, args.trim()),
+        (Some(cmd), _) => cmd.to_string(),
+        (None, _) => match prompt.map(str::trim) {
+            Some(p) if !p.is_empty() => p.to_string(),
+            _ => "You are an AI assistant in a session initiated from the Coordinator. \
+                  Respond helpfully and conversationally."
+                .to_string(),
+        },
+    }
 }
 
 async fn spawn_session(
@@ -104,6 +156,20 @@ async fn spawn_session(
         },
         _ => None,
     };
+
+    // `role` and `prompt` are mutually exclusive. Rejecting the combination is
+    // the honest reading: a role's slash command IS the prompt, so honouring
+    // both would mean picking one and silently dropping the other — and the
+    // dropped one would be the caller's actual intent about half the time.
+    if slash_command.is_some() && req.prompt.as_deref().is_some_and(|p| !p.trim().is_empty()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "`prompt` cannot be combined with `role`: a role's slash command IS its first \
+             message. Use `args` to parameterise the role, or drop `role` to send a free-form \
+             prompt."
+                .to_string(),
+        ));
+    }
 
     let task_run_id = uuid::Uuid::new_v4().to_string();
 
@@ -132,13 +198,8 @@ async fn spawn_session(
     // .claude/commands/coordinate.md body at session start. For plain
     // spawns we fall back to a generic system prompt to match the existing
     // ad-hoc create_ai_session behaviour.
-    let initial_prompt = match (slash_command, req.args.as_deref()) {
-        (Some(cmd), Some(args)) if !args.trim().is_empty() => format!("{} {}", cmd, args.trim()),
-        (Some(cmd), _) => cmd.to_string(),
-        (None, _) => "You are an AI assistant in a session initiated from the Coordinator. \
-                      Respond helpfully and conversationally."
-            .to_string(),
-    };
+    let initial_prompt =
+        initial_prompt_for(slash_command, req.args.as_deref(), req.prompt.as_deref());
 
     let session_ctx = AiSessionContext::setup(&task_run_id, &req.task_name);
 
@@ -191,9 +252,17 @@ async fn spawn_session(
 
     match spawn_result {
         Ok(Ok(())) => {
+            // `prompt_chars` rather than the prompt itself: a free-form spawn
+            // prompt can be long and may carry task detail that does not belong
+            // in the runner log, but "was a prompt actually dispatched, and was
+            // it non-trivial" is exactly what you want when a spawned session
+            // turns out to be sitting idle.
             info!(
-                "Spawned session task_run_id={} role={:?} dispatched={}",
-                task_run_id, req.role, dispatched
+                "Spawned session task_run_id={} role={:?} dispatched={} prompt_chars={}",
+                task_run_id,
+                req.role,
+                dispatched,
+                req.prompt.as_deref().map(str::len).unwrap_or(0)
             );
             Ok(Json(SpawnSessionResponse {
                 task_run_id,
@@ -489,6 +558,58 @@ async fn continuation_verdict(
 // =============================================================================
 // Routes
 // =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GENERIC: &str = "You are an AI assistant in a session initiated from the Coordinator.";
+
+    #[test]
+    fn a_free_form_prompt_becomes_the_first_message_verbatim() {
+        // The gap this closes: before, an agent that had written a task brief
+        // had no way to hand it to a session — this arm did not exist and the
+        // spawn fell through to the generic greeting.
+        let p = initial_prompt_for(None, None, Some("Read plans/foo.md and produce a plan."));
+        assert_eq!(p, "Read plans/foo.md and produce a plan.");
+    }
+
+    #[test]
+    fn a_role_still_wins_and_args_still_parameterise_it() {
+        assert_eq!(
+            initial_prompt_for(Some("/coordinate"), None, None),
+            "/coordinate"
+        );
+        assert_eq!(
+            initial_prompt_for(Some("/implement-plan"), Some(" my-plan "), None),
+            "/implement-plan my-plan"
+        );
+    }
+
+    #[test]
+    fn neither_role_nor_prompt_keeps_the_pre_existing_generic_session() {
+        assert!(initial_prompt_for(None, None, None).starts_with(GENERIC));
+    }
+
+    #[test]
+    fn a_blank_prompt_falls_back_instead_of_dispatching_an_empty_message() {
+        // A caller that string-joins its way to "   " should get the honest
+        // fallback, not a session whose first message is whitespace.
+        assert!(initial_prompt_for(None, None, Some("   \n ")).starts_with(GENERIC));
+        assert!(initial_prompt_for(None, None, Some("")).starts_with(GENERIC));
+    }
+
+    #[test]
+    fn role_and_prompt_never_silently_concatenate() {
+        // The handler rejects this combination with a 400; this pins the
+        // precedence so that if that guard is ever removed the result is still
+        // a clean role dispatch rather than a mangled half-command.
+        assert_eq!(
+            initial_prompt_for(Some("/auto-review"), None, Some("do something else")),
+            "/auto-review"
+        );
+    }
+}
 
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
