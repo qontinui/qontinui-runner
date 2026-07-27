@@ -160,20 +160,21 @@ pub async fn post_scan(
         }
     };
 
-    let on_disk = storage::list_pages(&root, &app_id).unwrap_or_default();
-    let on_disk_pathnames: HashSet<String> = on_disk
-        .iter()
-        .filter_map(|id| spec_id_to_pathname(id))
+    // Compare page labels to spec ids directly. Both sides are now the same
+    // slug space (`storage::list_pages` returns spec ids; the scan groups by
+    // the `spec_id` label capture writes), so no pathname round-trip is
+    // needed — and none is possible: a label like `dag-workflow-editor` maps
+    // to the pathname `/dag/workflow/editor`, which exists nowhere.
+    let on_disk_labels: HashSet<String> = storage::list_pages(&root, &app_id)
+        .unwrap_or_default()
+        .into_iter()
         .collect();
 
     let mut queued: Vec<QueuedProposalSummary> = Vec::new();
     let scanned_pathnames = full_page_rows.len();
     for pathname in full_page_rows {
-        if on_disk_pathnames.contains(&pathname) {
-            debug!(
-                "post_scan: pathname {} already has a spec; skipping",
-                pathname
-            );
+        if on_disk_labels.contains(&pathname) {
+            debug!("post_scan: page {} already has a spec; skipping", pathname);
             continue;
         }
         let proposal_id = mint_proposal_id();
@@ -302,9 +303,16 @@ pub async fn post_scan(
         .into_response()
 }
 
-/// Run the verbatim SQL from `05-flywheel.md` § Step 7 against
-/// `co_occurrence_observations`. Returns pathnames sorted by observation
-/// count desc, capped at `limit`.
+/// Find pages with enough observations to be worth authoring a spec for.
+/// Returns page labels sorted by observation count desc, capped at `limit`.
+///
+/// Groups by the `spec_id` label `state_discovery::capture` writes, NOT by
+/// `snapshot_metadata->>'pathname'` as `05-flywheel.md` § Step 7 originally
+/// specified. The pathname is structurally `/` for every view of a desktop
+/// SPA, so grouping by it yielded exactly one candidate whose label resolved
+/// to `root` — a page capture never labels. Producer and consumer disagreed
+/// on the key, and every proposal died with no active states. Grouping by the
+/// same column the selection side reads keeps the two ends in one namespace.
 async fn query_eligible_pathnames(
     pg_db: &crate::database::pg::PgDb,
     lookback_days: i32,
@@ -320,13 +328,13 @@ async fn query_eligible_pathnames(
         .query(
             r#"
             SELECT
-                snapshot_metadata->>'pathname' AS pathname,
+                spec_id AS page_label,
                 COUNT(*) AS obs
             FROM co_occurrence_observations
             WHERE captured_at >= now() - ($1::int || ' days')::interval
               AND invalidated_at IS NULL
-              AND (snapshot_metadata->>'pathname') IS NOT NULL
-            GROUP BY pathname
+              AND spec_id IS NOT NULL
+            GROUP BY spec_id
             HAVING COUNT(*) >= $2
             ORDER BY obs DESC
             LIMIT $3
@@ -640,6 +648,8 @@ fn authoring_error_reason(
     match e {
         NoDiscoveryArtifact { .. } => "no-discovery-artifact",
         EmptyArtifact => "empty-artifact",
+        NoPageObservations { .. } => "no-page-observations",
+        NoActiveStates { .. } => "no-active-states",
         MalformedAiOutput(_) => "malformed-ai-output",
         AiDispatchFailed(_) => "ai-dispatch-failed",
         ExistingSpecMissing(_) => "existing-spec-missing",
@@ -656,6 +666,19 @@ fn authoring_error_detail(
             format!("no discovery artifact for pathname={}", pathname)
         }
         EmptyArtifact => "discovery artifact has zero states".to_string(),
+        NoPageObservations { page_label } => format!(
+            "no observations labelled for page '{}' — the page has not been \
+             visited in the window, or capture is not labelling it",
+            page_label
+        ),
+        NoActiveStates {
+            page_label,
+            total_states,
+        } => format!(
+            "none of the {} discovered states were fully present in any \
+             observation of page '{}'",
+            total_states, page_label
+        ),
         MalformedAiOutput(s) => format!("malformed AI output: {}", s),
         AiDispatchFailed(s) => format!("AI dispatch failed: {}", s),
         ExistingSpecMissing(s) => format!("existing spec missing: {}", s),

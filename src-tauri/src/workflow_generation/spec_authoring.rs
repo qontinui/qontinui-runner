@@ -13,7 +13,7 @@
 //! [`AuthoringOutcome`], [`AuthoringError`], and [`pathname_to_spec_id`]
 //! (shared with `spec_api::proposals`).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -68,9 +68,22 @@ pub enum AuthoringError {
     /// No discovery artifact exists for the pathname yet.
     #[error("no discovery artifact for pathname '{pathname}'")]
     NoDiscoveryArtifact { pathname: String },
-    /// Discovery artifact has zero states (under-observed page).
+    /// Discovery artifact has zero states (under-observed corpus).
     #[error("discovery artifact is empty")]
     EmptyArtifact,
+    /// The artifact has states, but no observation carries this page's label —
+    /// so nothing can be attributed to it. Distinct from [`Self::EmptyArtifact`]
+    /// because the fix is different: the page needs visiting (or capture needs
+    /// to be labelling it), not more derivation.
+    #[error("page '{page_label}' has no labelled observations")]
+    NoPageObservations { page_label: String },
+    /// The page has observations, but none of the discovered states was ever
+    /// fully present in one of them.
+    #[error("none of {total_states} discovered states are active on page '{page_label}'")]
+    NoActiveStates {
+        page_label: String,
+        total_states: usize,
+    },
     /// Meta-workflow returned but the result failed structural validation.
     #[error("malformed AI output: {0}")]
     MalformedAiOutput(String),
@@ -206,14 +219,35 @@ async fn load_and_project_skeleton(
         return Err(AuthoringError::EmptyArtifact);
     }
 
-    // Project S down to S_Ξ. A page with no labelled observations yields no
-    // active states — reported as EmptyArtifact rather than silently
-    // emitting every state in the application.
-    let page_renders = load_page_render_ids(pg_db, &candidate_id).await?;
-    let active = select_active_clusters(&clusters, &page_renders);
+    // A global artifact whose states carry no render-sets cannot be scoped to
+    // any page. Selecting from it would return nothing for every page and read
+    // as "this page is unobserved", so fail loudly on the artifact instead.
+    if clusters.iter().all(|c| c.render_ids.is_empty()) {
+        return Err(AuthoringError::MalformedAiOutput(format!(
+            "discovery artifact {} has states but no screenshotIds — page \
+             scoping is impossible; discovery ran without render-id passthrough",
+            artifact.artifact_id
+        )));
+    }
 
+    // Project S down to S_Ξ. The two empty cases are reported separately: a
+    // page nothing was ever labelled for needs visiting (or capture needs to
+    // be labelling it), whereas a page whose observations match no state needs
+    // more derivation. Collapsing both into EmptyArtifact is what made a
+    // producer/consumer key mismatch require a code read to diagnose.
+    let page_renders = load_page_render_ids(pg_db, &candidate_id).await?;
+    if page_renders.is_empty() {
+        return Err(AuthoringError::NoPageObservations {
+            page_label: candidate_id,
+        });
+    }
+
+    let active = select_active_clusters(&clusters, &page_renders);
     if active.is_empty() {
-        return Err(AuthoringError::EmptyArtifact);
+        return Err(AuthoringError::NoActiveStates {
+            page_label: candidate_id,
+            total_states: clusters.len(),
+        });
     }
 
     // Project each active cluster, then sort states by id for determinism.
@@ -256,7 +290,6 @@ async fn load_and_project_skeleton(
 /// the raw JSON `body` around so consumers can re-extract additional fields
 /// without re-querying.
 struct LoadedArtifact {
-    #[allow(dead_code)]
     artifact_id: String,
     observation_count: i32,
     body: serde_json::Value,
@@ -272,7 +305,7 @@ struct LoadedArtifact {
 /// keep their own determinism contract.
 fn select_active_clusters<'a>(
     clusters: &'a [Cluster],
-    page_renders: &std::collections::HashSet<String>,
+    page_renders: &HashSet<String>,
 ) -> Vec<&'a Cluster> {
     clusters
         .iter()
@@ -335,7 +368,7 @@ async fn load_latest_global_artifact(
 async fn load_page_render_ids(
     pg_db: &PgDb,
     page_label: &str,
-) -> Result<std::collections::HashSet<String>, AuthoringError> {
+) -> Result<HashSet<String>, AuthoringError> {
     let conn = pg_db
         .pool()
         .get()
@@ -473,7 +506,20 @@ fn fingerprint_to_criteria(fingerprint: &String) -> IrElementCriteria {
     } else if let Some(rest) = fingerprint.strip_prefix("role:") {
         out.role = Some(rest.to_string());
     } else {
-        out.text = Some(fingerprint.clone());
+        // Unprefixed fingerprints are opaque: `stable_element_fingerprint`
+        // returns a 16-char SHA-256 prefix over (role, name, tag, structure),
+        // which is one-way. Putting that hash in `text` would assert the
+        // element's visible text IS "016e88557e9c2b1e" — a criterion that can
+        // never match, handed to the AI fill-in step as if it were real
+        // content. Park it in an attribute that is honest about being a
+        // digest instead. Recovering matchable criteria requires the derive
+        // step to pass element attributes through to discovery rather than
+        // only `{"id": <hash>}`; until then the AI step gets a stable handle
+        // and no false signal.
+        out.attributes = Some(BTreeMap::from([(
+            "data-fingerprint".to_string(),
+            fingerprint.clone(),
+        )]));
     }
     out
 }
@@ -1012,7 +1058,7 @@ mod tests {
         })
     }
 
-    fn render_set(ids: &[&str]) -> std::collections::HashSet<String> {
+    fn render_set(ids: &[&str]) -> HashSet<String> {
         ids.iter().map(|s| s.to_string()).collect()
     }
 
@@ -1100,6 +1146,21 @@ mod tests {
         let state = project_cluster_to_state("qontinui-runner", &clusters[0]);
         let criteria = state.excluded_elements.expect("criteria present");
         assert_eq!(criteria.len(), 2);
+
+        // Assert content, not just count. Real fingerprints are opaque
+        // SHA-256 prefixes, so they must NOT be asserted as visible text —
+        // that would be a criterion no element can ever match.
+        let first = &criteria[0];
+        assert_eq!(first.text, None, "an opaque digest must not become text");
+        assert_eq!(
+            first
+                .attributes
+                .as_ref()
+                .and_then(|a| a.get("data-fingerprint"))
+                .map(String::as_str),
+            Some("016e88557e9c2b1e"),
+            "the digest is carried as an attribute that admits what it is"
+        );
     }
 
     #[test]
@@ -1182,6 +1243,19 @@ mod tests {
         // role last.
         let crit = fingerprint_to_criteria(&"role:dialog".to_string());
         assert_eq!(crit.role.as_deref(), Some("dialog"));
+
+        // Unprefixed is what production actually emits — an opaque digest, not
+        // a semantic prefix. It must not be asserted as visible text.
+        let crit = fingerprint_to_criteria(&"016e88557e9c2b1e".to_string());
+        assert_eq!(crit.text, None);
+        assert_eq!(crit.id, None);
+        assert_eq!(
+            crit.attributes
+                .as_ref()
+                .and_then(|a| a.get("data-fingerprint"))
+                .map(String::as_str),
+            Some("016e88557e9c2b1e")
+        );
     }
 
     // -----------------------------------------------------------------

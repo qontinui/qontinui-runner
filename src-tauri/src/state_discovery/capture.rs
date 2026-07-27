@@ -36,31 +36,39 @@ const SAMPLE_RATE: u32 = 1;
 ///    Desktop SPAs route in React state, so the URL never moves; the tab id is
 ///    the only thing distinguishing one view from another. (The runner's whole
 ///    corpus sits at `http://tauri.localhost/`.)
-/// 2. `page.pageContext.name` — slugged. For apps that call `usePageContext`
-///    without a `meta.tabId`. Display labels drift on rename, so this ranks
-///    below the id.
-/// 3. `page.pathname` — slugged. Correct for real-URL apps (qontinui-web).
+/// 2. top-level `activeTab` — the same identity, supplied by the SDK's own
+///    `getActiveTab` provider rather than by `usePageContext`. It is already
+///    present in every runner snapshot, so labelling works on runners built
+///    before `meta.tabId` existed instead of waiting for a rebuild.
+/// 3. `page.pageContext.name` — slugged. For apps that call `usePageContext`
+///    without a tab id. Display labels drift on rename and collapse all
+///    twelve `settings-*` views onto one name, so this ranks below both ids.
+/// 4. `page.pathname` — slugged. Correct for real-URL apps (qontinui-web).
 ///
-/// Returns `None` when none of the three yields a usable slug; the observation
-/// is then recorded unlabelled rather than dropped, since it still carries
-/// co-occurrence signal for the global derivation.
+/// Blank candidates are skipped rather than accepted, so an empty `tabId`
+/// falls through to the next source instead of shadowing it. Returns `None`
+/// when nothing yields a usable slug; the observation is then recorded
+/// unlabelled rather than dropped, since it still carries co-occurrence
+/// signal for the global derivation.
 fn resolve_page_label(snapshot: &serde_json::Value) -> Option<String> {
-    let page = snapshot.get("page")?;
-    let page_context = page.get("pageContext");
+    let page = snapshot.get("page");
+    let page_context = page.and_then(|p| p.get("pageContext"));
 
-    let from_tab_id = page_context
-        .and_then(|c| c.get("meta"))
-        .and_then(|m| m.get("tabId"))
-        .and_then(|v| v.as_str());
-    let from_name = page_context
-        .and_then(|c| c.get("name"))
-        .and_then(|v| v.as_str());
-    let from_pathname = page.get("pathname").and_then(|v| v.as_str());
+    let candidates = [
+        page_context
+            .and_then(|c| c.get("meta"))
+            .and_then(|m| m.get("tabId")),
+        snapshot.get("activeTab"),
+        page_context.and_then(|c| c.get("name")),
+        page.and_then(|p| p.get("pathname")),
+    ];
 
-    let raw = from_tab_id.or(from_name).or(from_pathname)?;
-    if raw.trim().is_empty() {
-        return None;
-    }
+    let raw = candidates
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .find(|s| !s.trim().is_empty())?;
+
     Some(pathname_to_spec_id(raw))
 }
 
@@ -207,6 +215,30 @@ mod tests {
             resolve_page_label(&snap).as_deref(),
             Some("dag-workflow-editor")
         );
+    }
+
+    #[test]
+    fn falls_back_to_top_level_active_tab() {
+        // Runners built before `meta.tabId` existed still emit the SDK's own
+        // top-level `activeTab`, so labelling must not depend on a rebuild.
+        let snap = json!({
+            "activeTab": "config-log-sources",
+            "page": { "pathname": "/", "pageContext": { "name": "Settings" } }
+        });
+        assert_eq!(
+            resolve_page_label(&snap).as_deref(),
+            Some("config-log-sources"),
+            "activeTab must outrank the display name, which collapses every settings-* view"
+        );
+    }
+
+    #[test]
+    fn blank_candidate_falls_through_instead_of_shadowing() {
+        let snap = json!({
+            "activeTab": "capture",
+            "page": { "pageContext": { "meta": { "tabId": "   " } } }
+        });
+        assert_eq!(resolve_page_label(&snap).as_deref(), Some("capture"));
     }
 
     #[test]
