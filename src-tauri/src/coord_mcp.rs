@@ -421,6 +421,17 @@ fn proxy_nonces() -> &'static Mutex<HashMap<String, NonceBinding>> {
     PROXY_NONCES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The AGENT arm of the grace-TTL split (plan
+/// 2026-07-27-coord-mcp-flake-remediation, Phase 5/R3): the pre-split 90s
+/// bound retained under its own name so the device-arm widening below can
+/// never silently leak into the agent class. Deliberately UNUSED by the grace
+/// path — agent nonces are never graced AT ALL (they hard-fail closed on
+/// re-mint/restart, the scope-elevation non-goal, OQ3) — it exists as the
+/// named ceiling any future agent-class grace must consciously adopt, and the
+/// grace tests pin it against [`DEVICE_EVICTED_NONCE_GRACE_TTL`].
+#[cfg_attr(not(test), allow(dead_code))] // documented ceiling; consumed only by the grace tests
+const AGENT_NONCE_GRACE_TTL: std::time::Duration = std::time::Duration::from_secs(90);
+
 /// Grace window (plan 2026-07-07-coord-mcp-nonce-survives-runner-restart,
 /// Change 3, defense in depth): a DEVICE nonce evicted by a same-workdir re-mint
 /// stays valid for this long so an in-flight MCP client that cached it rides
@@ -430,7 +441,25 @@ fn proxy_nonces() -> &'static Mutex<HashMap<String, NonceBinding>> {
 /// this window, and only for a device nonce the runner itself just superseded.
 /// AGENT nonces are NEVER graced: they must hard-fail closed on re-mint/restart
 /// (the scope-elevation non-goal, OQ3).
-const NONCE_GRACE_TTL: std::time::Duration = std::time::Duration::from_secs(90);
+///
+/// Widened 90s → 6h by plan 2026-07-27-coord-mcp-flake-remediation (Phase
+/// 5/R3): the persistent-nonce class is one-slot-per-workdir, so ANY peer
+/// session/terminal opened with the same cwd re-provisions `.mcp.json` and
+/// evicts the live peer's key — and since the MCP client never re-reads the
+/// file, 90s of grace meant time-to-transport-death ≈ time-to-first-peer
+/// -re-provision (the fleet-wide "Command failed with no output" flake, 11+
+/// sessions). 6h covers a working session's lifetime while staying bounded:
+/// the widened accept window is loopback-only, device-class, PERSISTENT-class
+/// only (ephemeral nonces never grace — grace would bypass the opt-out kill
+/// switch, which only [`live_binding`] enforces), and is entered from exactly
+/// two runner-initiated paths: a same-workdir re-mint superseding the key
+/// ([`mint_and_register_nonce`]) and the close-time eviction of a per-session
+/// workdir ([`evict_proxy_nonces_for_workdir`] — a straggling in-flight client
+/// of a just-closed session rides the same window). The one-slot eviction
+/// invariant is untouched (the old key still dies — deterministically, just
+/// later). Operator-tunable by editing this const.
+const DEVICE_EVICTED_NONCE_GRACE_TTL: std::time::Duration =
+    std::time::Duration::from_secs(6 * 60 * 60);
 
 /// A device nonce kept transiently valid after eviction, with its expiry.
 struct GracedNonce {
@@ -449,15 +478,15 @@ fn graced_nonces() -> &'static Mutex<HashMap<String, GracedNonce>> {
 }
 
 /// Move DEVICE nonces just evicted for `_workdir` into the grace registry with a
-/// [`NONCE_GRACE_TTL`] expiry, opportunistically pruning expired entries so the
-/// map stays bounded. Only device nonces are passed here (the caller filters);
-/// agent nonces are dropped outright to fail closed.
+/// [`DEVICE_EVICTED_NONCE_GRACE_TTL`] expiry, opportunistically pruning expired
+/// entries so the map stays bounded. Only device nonces are passed here (the
+/// caller filters); agent nonces are dropped outright to fail closed.
 fn grace_evicted_device_nonces(nonces: &[String]) {
     if nonces.is_empty() {
         return;
     }
     let now = std::time::Instant::now();
-    let expires_at = now + NONCE_GRACE_TTL;
+    let expires_at = now + DEVICE_EVICTED_NONCE_GRACE_TTL;
     let mut graced = graced_nonces().lock().expect("graced nonce map poisoned");
     graced.retain(|_, g| g.expires_at > now);
     for n in nonces {
@@ -519,7 +548,10 @@ fn rotation_log_line(event: &str, workdir: &str, nonce: &str, cause: &str) -> St
 /// Shared `cause` text for a "grace" forensics line, naming the active TTL so
 /// the log self-documents how long the evicted key stays acceptable.
 fn rotation_grace_cause() -> String {
-    format!("evicted device nonce graced {}s", NONCE_GRACE_TTL.as_secs())
+    format!(
+        "evicted device nonce graced {}s",
+        DEVICE_EVICTED_NONCE_GRACE_TTL.as_secs()
+    )
 }
 
 /// Test-only redirect for the rotation log (process-global): `None` (the
@@ -884,8 +916,9 @@ fn mint_and_register_nonce(
             // share a cwd, and an ephemeral eviction is not graced, so removing a
             // sibling ephemeral nonce would 401 the other session's
             // already-connected MCP client mid-session. The DEVICE nonces among
-            // the evicted set are collected to ride a short grace TTL (Change 3) —
-            // an in-flight client that cached one keeps validating until it
+            // the evicted set are collected to ride the device-evicted grace
+            // TTL (Change 3; widened by plan 2026-07-27 Phase 5/R3) — an
+            // in-flight client that cached one keeps validating until it
             // reconnects; agent nonces are NOT graced (they hard-fail closed on
             // re-mint), so they are dropped without being collected.
             if !ephemeral && b.workdir == workdir && !b.lifetime.is_ephemeral() {
@@ -945,19 +978,39 @@ fn mint_and_register_nonce(
 /// per-agent dirs, a per-session workdir is never reused, so the same-workdir
 /// eviction inside [`mint_and_register_nonce`] never fires for it — without
 /// this call its device nonce would stay valid (and persisted) forever.
-/// Evicted device nonces ride the same grace TTL as a re-mint so an in-flight
-/// client fails closed only after the window; agent nonces drop immediately.
+/// Evicted PERSISTENT device nonces ride the same grace TTL as a re-mint so an
+/// in-flight client fails closed only after the window; agent nonces drop
+/// immediately, and so do EPHEMERAL device nonces (plan 2026-07-27 Phase 5/R3
+/// hardening): grace checks only expiry, never the session-identity opt-out
+/// gate that [`live_binding`] enforces on ephemeral bindings, so gracing an
+/// ephemeral nonce would let it outlive the operator's kill switch for the
+/// whole grace window. Ephemeral nonces stay TTL-bounded on their own class
+/// rules instead — the same "grace is for runner-initiated re-provisions of
+/// the persistent class only" invariant `mint_and_register_nonce` documents.
 pub(crate) fn evict_proxy_nonces_for_workdir(workdir: &str) {
-    let (snapshot, evicted_device, evicted_agent) = {
+    let (snapshot, evicted_device, evicted_ephemeral, evicted_agent) = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
         let evicted_device: Vec<String> = map
             .iter()
-            .filter(|(_, b)| b.workdir == workdir && b.principal == ProxyPrincipal::Device)
+            .filter(|(_, b)| {
+                b.workdir == workdir
+                    && b.principal == ProxyPrincipal::Device
+                    && !b.lifetime.is_ephemeral()
+            })
             .map(|(n, _)| n.clone())
             .collect();
         if evicted_device.is_empty() && !map.values().any(|b| b.workdir == workdir) {
             return; // nothing bound to this workdir — skip the persist write
         }
+        let evicted_ephemeral: Vec<String> = map
+            .iter()
+            .filter(|(_, b)| {
+                b.workdir == workdir
+                    && b.principal == ProxyPrincipal::Device
+                    && b.lifetime.is_ephemeral()
+            })
+            .map(|(n, _)| n.clone())
+            .collect();
         let evicted_agent: Vec<String> = map
             .iter()
             .filter(|(_, b)| b.workdir == workdir && b.principal != ProxyPrincipal::Device)
@@ -965,13 +1018,26 @@ pub(crate) fn evict_proxy_nonces_for_workdir(workdir: &str) {
             .collect();
         map.retain(|_, b| b.workdir != workdir);
         grace_evicted_device_nonces(&evicted_device);
-        (map.clone(), evicted_device, evicted_agent)
+        (
+            map.clone(),
+            evicted_device,
+            evicted_ephemeral,
+            evicted_agent,
+        )
     };
     // Rotation forensics — outside the lock (see `mint_and_register_nonce`).
     let grace_cause = rotation_grace_cause();
     for n in &evicted_device {
         log_rotation_event("evict", workdir, n, "per-session workdir closed");
         log_rotation_event("grace", workdir, n, &grace_cause);
+    }
+    for n in &evicted_ephemeral {
+        log_rotation_event(
+            "evict",
+            workdir,
+            n,
+            "per-session workdir closed (ephemeral — never graced, kill switch stays enforceable)",
+        );
     }
     for n in &evicted_agent {
         log_rotation_event(
@@ -4168,8 +4234,14 @@ mod tests {
     /// an entry whose `expires_at` is not strictly in the future is treated as
     /// expired and lazily evicted. Deterministic because monotonic time only
     /// advances — an entry stamped `now()` is never `> now()` at the later check.
+    ///
+    /// Extended for the TTL split (plan 2026-07-27-coord-mcp-flake-remediation,
+    /// Phase 5/R3): the DEVICE arm graces for [`DEVICE_EVICTED_NONCE_GRACE_TTL`]
+    /// (6h, strictly wider than the retained 90s [`AGENT_NONCE_GRACE_TTL`]
+    /// bound), while an evicted AGENT nonce never even ENTERS the grace map.
     #[test]
     fn graced_nonce_expires_and_is_lazily_evicted() {
+        // Arm 1 — lazy expiry (unchanged by the split).
         let nonce = format!("expired-{}", uuid::Uuid::new_v4().simple());
         graced_nonces().lock().unwrap().insert(
             nonce.clone(),
@@ -4184,6 +4256,65 @@ mod tests {
         assert!(
             !graced_nonces().lock().unwrap().contains_key(&nonce),
             "an expired grace entry must be lazily evicted on the failing check"
+        );
+
+        // Arm 2 — the DEVICE arm carries the WIDENED TTL.
+        assert_eq!(AGENT_NONCE_GRACE_TTL, std::time::Duration::from_secs(90));
+        assert_eq!(
+            DEVICE_EVICTED_NONCE_GRACE_TTL,
+            std::time::Duration::from_secs(6 * 60 * 60)
+        );
+        assert!(
+            AGENT_NONCE_GRACE_TTL < DEVICE_EVICTED_NONCE_GRACE_TTL,
+            "the widening applies only to the device arm"
+        );
+        let wd = format!("D:/grace-ttl-wt-{}", uuid::Uuid::now_v7());
+        let before = std::time::Instant::now();
+        let a = register_proxy_nonce(&wd);
+        let _b = register_proxy_nonce(&wd); // evicts + graces `a`
+        let expires_at = graced_nonces()
+            .lock()
+            .unwrap()
+            .get(&a)
+            .expect("an evicted device nonce enters the grace map")
+            .expires_at;
+        // Timing-sound bracket: grace is stamped at t >= `before`, so a 6h TTL
+        // guarantees `expires_at >= before + 6h`; any applied TTL meaningfully
+        // below 6h fails the lower bound, any above 6h fails the upper.
+        assert!(
+            expires_at >= before + DEVICE_EVICTED_NONCE_GRACE_TTL,
+            "the device arm must apply the full widened TTL, not merely exceed 90s"
+        );
+        assert!(
+            expires_at <= std::time::Instant::now() + DEVICE_EVICTED_NONCE_GRACE_TTL,
+            "device grace stays bounded by DEVICE_EVICTED_NONCE_GRACE_TTL"
+        );
+
+        // Arm 3 — the AGENT arm: an evicted agent nonce must never even ENTER
+        // the grace map (stronger than "not valid": the accept-set widening
+        // structurally cannot reach the agent class).
+        let awd = format!("D:/grace-ttl-agent-wt-{}", uuid::Uuid::now_v7());
+        let agent_id = uuid::Uuid::new_v4();
+        let a2 = register_agent_proxy_nonce(&awd, agent_id);
+        let _b2 = register_agent_proxy_nonce(&awd, agent_id);
+        assert!(
+            !graced_nonces().lock().unwrap().contains_key(&a2),
+            "an evicted AGENT nonce must never enter the grace map"
+        );
+        assert!(
+            !proxy_nonce_is_valid(&a2),
+            "an evicted AGENT nonce hard-fails closed"
+        );
+
+        // Arm 4 — the EPHEMERAL arm: a close-time eviction must never grace an
+        // ephemeral device nonce (grace checks only expiry, so gracing one
+        // would bypass the session-identity kill switch for the whole window).
+        let ewd = format!("D:/grace-ttl-ephemeral-wt-{}", uuid::Uuid::now_v7());
+        let e = register_session_proxy_nonce(&ewd);
+        evict_proxy_nonces_for_workdir(&ewd);
+        assert!(
+            !graced_nonces().lock().unwrap().contains_key(&e),
+            "an evicted EPHEMERAL device nonce must never enter the grace map"
         );
     }
 
