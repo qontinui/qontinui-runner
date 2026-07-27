@@ -667,17 +667,18 @@ fn authoring_error_detail(
         }
         EmptyArtifact => "discovery artifact has zero states".to_string(),
         NoPageObservations { page_label } => format!(
-            "no observations labelled for page '{}' — the page has not been \
-             visited in the window, or capture is not labelling it",
+            "no observations labelled for page '{}' — the page has never been \
+             visited, or capture is not labelling it",
             page_label
         ),
         NoActiveStates {
             page_label,
             total_states,
         } => format!(
-            "none of the {} discovered states were fully present in any \
-             observation of page '{}'",
-            total_states, page_label
+            "page '{}' has observations, but none of them is in the newest \
+             discovery artifact's render-set, so none of its {} states can be \
+             shown active here — re-derive to pick the page's visits up",
+            page_label, total_states
         ),
         MalformedAiOutput(s) => format!("malformed AI output: {}", s),
         AiDispatchFailed(s) => format!("AI dispatch failed: {}", s),

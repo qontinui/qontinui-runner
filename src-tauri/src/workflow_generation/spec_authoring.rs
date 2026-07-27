@@ -18,12 +18,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::database::pg::PgDb;
 use crate::spec_api::types::{
     IrElementCriteria, IrPageSpec, IrProvenance, IrState, IrTransition, ProposalStatus,
 };
-use crate::state_discovery::derive::DEFAULT_WINDOW_DAYS as DERIVE_WINDOW_DAYS;
 
 // ---------------------------------------------------------------------------
 // Public surface
@@ -71,14 +71,16 @@ pub enum AuthoringError {
     /// Discovery artifact has zero states (under-observed corpus).
     #[error("discovery artifact is empty")]
     EmptyArtifact,
-    /// The artifact has states, but no observation carries this page's label —
-    /// so nothing can be attributed to it. Distinct from [`Self::EmptyArtifact`]
-    /// because the fix is different: the page needs visiting (or capture needs
-    /// to be labelling it), not more derivation.
+    /// No observation anywhere in the corpus carries this page's label, so
+    /// nothing can be attributed to it. Distinct from [`Self::EmptyArtifact`]
+    /// and from [`Self::NoActiveStates`] because the fix is different: the page
+    /// needs visiting (or capture needs to be labelling it), not derivation.
     #[error("page '{page_label}' has no labelled observations")]
     NoPageObservations { page_label: String },
-    /// The page has observations, but none of the discovered states was ever
-    /// fully present in one of them.
+    /// The page HAS labelled observations, but none of them is in the newest
+    /// artifact's render-set — every visit postdates that derivation, so no
+    /// discovered state can be shown active here. The fix is a re-derive, not
+    /// more visits.
     #[error("none of {total_states} discovered states are active on page '{page_label}'")]
     NoActiveStates {
         page_label: String,
@@ -230,25 +232,67 @@ async fn load_and_project_skeleton(
         )));
     }
 
-    // Project S down to S_Ξ. The two empty cases are reported separately: a
-    // page nothing was ever labelled for needs visiting (or capture needs to
-    // be labelling it), whereas a page whose observations match no state needs
-    // more derivation. Collapsing both into EmptyArtifact is what made a
-    // producer/consumer key mismatch require a code read to diagnose.
-    let page_renders = load_page_render_ids(pg_db, &candidate_id).await?;
+    // The artifact's own render-set is what bounds the page query. `S_Ξ` is an
+    // intersection, so it can never contain a render this artifact was not
+    // derived over — every other row the old query returned was materialised
+    // only to be discarded. Bounding by the artifact also removes the *second*
+    // time window that query carried (`captured_at >= now() - 90 days`), which
+    // could only ever disagree with the window the artifact was really derived
+    // over. See [`load_page_render_ids`] for the full argument.
+    let (artifact_renders, unparseable) = normalize_render_ids(&clusters);
+    if !unparseable.is_empty() {
+        tracing::warn!(
+            "spec_authoring: discovery artifact {} carries {} non-UUID screenshotId(s) \
+             (e.g. {:?}) — they name no observation row and are ignored",
+            artifact.artifact_id,
+            unparseable.len(),
+            unparseable.iter().take(3).collect::<Vec<_>>()
+        );
+    }
+    if artifact_renders.is_empty() {
+        return Err(AuthoringError::MalformedAiOutput(format!(
+            "discovery artifact {} has screenshotIds but none of them is a UUID — \
+             page scoping is impossible; discovery ran over a render log whose ids \
+             are not observation ids",
+            artifact.artifact_id
+        )));
+    }
+
+    // Project S down to S_Ξ.
+    let page_renders = load_page_render_ids(pg_db, &candidate_id, &artifact_renders).await?;
     if page_renders.is_empty() {
-        return Err(AuthoringError::NoPageObservations {
-            page_label: candidate_id,
+        // Two very different causes land here, and collapsing them is what
+        // made a producer/consumer key mismatch require a code read to
+        // diagnose. Since the query is now bounded by the artifact, an empty
+        // result no longer means "this page has no observations" — it means
+        // "no observation THIS ARTIFACT was derived from carries this page's
+        // label". So ask PG the one extra question that separates them. It
+        // runs only on the failure path, and `EXISTS` short-circuits on
+        // `idx_observations_spec`.
+        return Err(if page_has_observations(pg_db, &candidate_id).await? {
+            // The page has been observed, but every one of those observations
+            // postdates the newest artifact. Fix: re-derive, not more visits.
+            AuthoringError::NoActiveStates {
+                page_label: candidate_id,
+                total_states: clusters.len(),
+            }
+        } else {
+            // Nothing was ever labelled for this page. Fix: visit it, or make
+            // capture label it.
+            AuthoringError::NoPageObservations {
+                page_label: candidate_id,
+            }
         });
     }
 
+    // Non-empty by construction: `page_renders ⊆ artifact_renders`, and every
+    // id in `artifact_renders` came from some cluster's render-set, so any id
+    // that comes back selects at least the cluster it came from.
     let active = select_active_clusters(&clusters, &page_renders);
-    if active.is_empty() {
-        return Err(AuthoringError::NoActiveStates {
-            page_label: candidate_id,
-            total_states: clusters.len(),
-        });
-    }
+    debug_assert!(
+        !active.is_empty(),
+        "page_renders ⊆ artifact_renders, so a non-empty page_renders must select a cluster"
+    );
 
     // Project each active cluster, then sort states by id for determinism.
     let mut states: Vec<IrState> = active
@@ -263,12 +307,13 @@ async fn load_and_project_skeleton(
         name: format!("Auto-discovered: {pathname}"),
         description: Some(format!(
             "Skeleton projected from {} of {} globally discovered states, \
-             selected by intersecting each state's render-set with {} \
-             observations labelled for this page (global corpus: {} \
-             observations over the last 90 days).",
+             selected by intersecting each state's render-set with the {} of \
+             the artifact's {} resolvable renders that are labelled for this \
+             page (global corpus at derivation time: {} observations).",
             states.len(),
             clusters.len(),
             page_renders.len(),
+            artifact_renders.len(),
             artifact.observation_count
         )),
         metadata: None,
@@ -305,12 +350,61 @@ struct LoadedArtifact {
 /// keep their own determinism contract.
 fn select_active_clusters<'a>(
     clusters: &'a [Cluster],
-    page_renders: &HashSet<String>,
+    page_renders: &HashSet<Uuid>,
 ) -> Vec<&'a Cluster> {
     clusters
         .iter()
-        .filter(|c| c.render_ids.iter().any(|r| page_renders.contains(r)))
+        .filter(|c| {
+            c.render_ids
+                .iter()
+                .filter_map(|r| normalize_render_id(r))
+                .any(|id| page_renders.contains(&id))
+        })
         .collect()
+}
+
+/// Canonicalize one artifact render id into the `co_occurrence_observations.id`
+/// it names.
+///
+/// `screenshotIds` are passed through discovery verbatim from
+/// [`crate::state_discovery::derive`], which writes the observation's UUID as
+/// the render id. The Python adapter prefixes *element* ids with `reg:` and not
+/// render ids, but strip it defensively so a future adapter change degrades to
+/// a match rather than to a silent miss.
+///
+/// Returns `None` for ids that are not UUID-shaped. Those name no observation
+/// row at all — the adapter's positional `render_<i>` fallback and the pixel
+/// analyzers' `screenshot_000` are both of that shape — and binding one into a
+/// `uuid[]` parameter would fail the whole query rather than just missing.
+fn normalize_render_id(raw: &str) -> Option<Uuid> {
+    Uuid::parse_str(raw.strip_prefix("reg:").unwrap_or(raw)).ok()
+}
+
+/// Union every cluster's render-set, split into the ids that name an
+/// observation row and the ones that cannot.
+///
+/// This union is the bound on [`load_page_render_ids`]. Both halves are sorted
+/// and deduped, so the same artifact always produces the same bound parameter
+/// (and the same warning) — the determinism contract extends to the query.
+fn normalize_render_ids(clusters: &[Cluster]) -> (Vec<Uuid>, Vec<String>) {
+    let mut resolved: BTreeSet<Uuid> = BTreeSet::new();
+    let mut rejected: BTreeSet<String> = BTreeSet::new();
+    for cluster in clusters {
+        for raw in &cluster.render_ids {
+            match normalize_render_id(raw) {
+                Some(id) => {
+                    resolved.insert(id);
+                }
+                None => {
+                    rejected.insert(raw.clone());
+                }
+            }
+        }
+    }
+    (
+        resolved.into_iter().collect(),
+        rejected.into_iter().collect(),
+    )
 }
 
 /// Load the newest non-empty global artifact.
@@ -358,17 +452,60 @@ async fn load_latest_global_artifact(
     })
 }
 
-/// Observation ids labelled for `page_label`, within the same 90-day window
-/// derivation uses.
+/// The page-scoping query, hoisted to a `const` so a test can pin its shape.
+///
+/// The A4 defect was a `captured_at` predicate here, and it is invisible in any
+/// unit test that does not reach PG — so the regression guard is an assertion
+/// that this string bounds by `id`, not by time. See
+/// `page_query_is_bounded_by_artifact_ids_not_by_time`.
+const PAGE_RENDERS_SQL: &str = r#"SELECT id
+   FROM co_occurrence_observations
+   WHERE spec_id = $1
+     AND invalidated_at IS NULL
+     AND id = ANY($2::uuid[])"#;
+
+/// Observation ids labelled for `page_label`, **bounded by the artifact's own
+/// render-set** rather than by a time window.
 ///
 /// These are the render ids that a state's `screenshotIds` must intersect for
-/// the state to count as active on this page. Observations captured before
-/// page labelling existed carry `spec_id IS NULL` and are correctly excluded —
-/// they contribute to the global clustering but cannot be attributed to a page.
+/// the state to count as active on this page. `artifact_renders` is the union
+/// of those `screenshotIds` (see [`normalize_render_ids`]), so pushing it into
+/// the predicate makes PG return *exactly* the intersection: previously every
+/// observation labelled for the page in the trailing window came back, and
+/// everything outside the artifact's render-set was materialised into a
+/// `HashSet` only to be discarded by [`select_active_clusters`].
+///
+/// More importantly it removes the *second* time window. Windowing on
+/// `now() - 90 days` here while the artifact was derived at an arbitrary
+/// earlier `derived_at` over an arbitrary per-request `window_days` meant the
+/// two windows could only ever disagree: an artifact derived 60 days ago over
+/// a 90-day window references renders 0–150 days old, and the trailing filter
+/// dropped the 90–150-day slice of them — silently shrinking `S_Ξ`, and
+/// emptying it entirely for a page whose visits all fall in that slice, which
+/// reads as "this page is unobserved". Bounding by the artifact leaves no
+/// second window to drift: the set is defined by the artifact that produced
+/// the clusters, so it cannot disagree with itself.
+///
+/// The trade this makes is deliberate. The bind parameter grows with the
+/// artifact (≈ every clustered observation across all pages), so on a page
+/// that is a small share of traffic more ids go up than rows come back, and
+/// `spec_id = $1 AND id = ANY(...)` is an `idx_observations_spec` scan plus a
+/// `ScalarArrayOpExpr` filter rather than a pure index seek. Correctness by
+/// construction is worth that: the alternative (bind `derived_at` +
+/// `window_days` off the artifact row) keeps a time predicate here and so
+/// keeps the whole drift class alive, merely narrowing it.
+///
+/// Two filters are still load-bearing. Observations captured before page
+/// labelling existed carry `spec_id IS NULL` and are correctly excluded — they
+/// contribute to the global clustering but cannot be attributed to a page. And
+/// `invalidated_at IS NULL` must stay: an operator-invalidated observation has
+/// to stop counting even though an artifact derived before the invalidation
+/// still names it.
 async fn load_page_render_ids(
     pg_db: &PgDb,
     page_label: &str,
-) -> Result<HashSet<String>, AuthoringError> {
+    artifact_renders: &[Uuid],
+) -> Result<HashSet<Uuid>, AuthoringError> {
     let conn = pg_db
         .pool()
         .get()
@@ -376,20 +513,51 @@ async fn load_page_render_ids(
         .map_err(|e| AuthoringError::Database(format!("PG pool error: {}", e)))?;
 
     let rows = conn
-        .query(
-            r#"SELECT id::text
-               FROM co_occurrence_observations
-               WHERE spec_id = $1
-                 AND invalidated_at IS NULL
-                 AND captured_at >= now() - ($2::int || ' days')::interval"#,
-            &[&page_label, &DERIVE_WINDOW_DAYS],
+        .query(PAGE_RENDERS_SQL, &[&page_label, &artifact_renders])
+        .await
+        .map_err(|e| {
+            AuthoringError::Database(format!("PG query co_occurrence_observations: {}", e))
+        })?;
+
+    Ok(rows.into_iter().map(|r| r.get::<_, Uuid>(0)).collect())
+}
+
+/// Does this page have *any* non-invalidated observation, ignoring the
+/// artifact?
+///
+/// Only called when [`load_page_render_ids`] came back empty, to separate the
+/// two causes that produce that: a page nothing was ever labelled for (fix:
+/// visit it, or make capture label it) versus a page that has been observed
+/// only since the newest artifact was derived (fix: re-derive). Both used to
+/// be distinguishable from the render-id query alone, because that query was
+/// not bounded by the artifact; now they are not, so this asks directly.
+///
+/// Deliberately unbounded in time: the question is "has this page EVER been
+/// observed", and a window here would reintroduce exactly the drift the
+/// caller's query just removed.
+async fn page_has_observations(pg_db: &PgDb, page_label: &str) -> Result<bool, AuthoringError> {
+    let conn = pg_db
+        .pool()
+        .get()
+        .await
+        .map_err(|e| AuthoringError::Database(format!("PG pool error: {}", e)))?;
+
+    let row = conn
+        .query_one(
+            r#"SELECT EXISTS(
+                   SELECT 1
+                   FROM co_occurrence_observations
+                   WHERE spec_id = $1
+                     AND invalidated_at IS NULL
+               )"#,
+            &[&page_label],
         )
         .await
         .map_err(|e| {
             AuthoringError::Database(format!("PG query co_occurrence_observations: {}", e))
         })?;
 
-    Ok(rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
+    Ok(row.get::<_, bool>(0))
 }
 
 /// One discovered state from the global `state_discovery_artifacts.artifact`
@@ -1045,21 +1213,31 @@ mod tests {
     /// the adapter has never emitted, so these tests passed while the
     /// production path parsed every cluster as empty.
     fn cluster(id: &str, elements: &[&str]) -> serde_json::Value {
-        cluster_seen_in(id, elements, &["render-default"])
+        cluster_seen_in(id, elements, &[0])
     }
 
-    fn cluster_seen_in(id: &str, elements: &[&str], renders: &[&str]) -> serde_json::Value {
+    /// Deterministic stand-in for an observation id. Render ids in a real
+    /// artifact are `co_occurrence_observations.id` UUIDs passed through
+    /// discovery verbatim, and the page query now binds them as `uuid[]` — so
+    /// fixtures have to be UUID-shaped too, or they'd exercise a shape
+    /// production can never produce.
+    fn rid(tag: u128) -> Uuid {
+        Uuid::from_u128(tag)
+    }
+
+    fn cluster_seen_in(id: &str, elements: &[&str], renders: &[u128]) -> serde_json::Value {
         let element_ids: Vec<String> = elements.iter().map(|e| format!("reg:{e}")).collect();
+        let render_ids: Vec<String> = renders.iter().map(|r| rid(*r).to_string()).collect();
         serde_json::json!({
             "id": id,
             "name": format!("cluster-{}", id),
             "stateImageIds": element_ids,
-            "screenshotIds": renders,
+            "screenshotIds": render_ids,
         })
     }
 
-    fn render_set(ids: &[&str]) -> HashSet<String> {
-        ids.iter().map(|s| s.to_string()).collect()
+    fn render_set(ids: &[u128]) -> HashSet<Uuid> {
+        ids.iter().map(|i| rid(*i)).collect()
     }
 
     fn skeleton_from_artifact(body: &serde_json::Value, observation_count: i32) -> IrPageSpec {
@@ -1075,7 +1253,7 @@ mod tests {
             id: "account-billing".into(),
             name: "Auto-discovered: /account/billing".into(),
             description: Some(format!(
-                "Skeleton projected from {} observations over the last 90 days.",
+                "Skeleton projected from {} observations.",
                 observation_count
             )),
             metadata: None,
@@ -1169,26 +1347,26 @@ mod tests {
         // form one state; {d,e} appear on pages 2-3 and form another. Page 2
         // therefore has BOTH states active simultaneously (S_Ξ ⊆ S).
         let body = artifact_json(vec![
-            cluster_seen_in("abc", &["a", "b", "c"], &["p1", "p2", "p3", "p4"]),
-            cluster_seen_in("de", &["d", "e"], &["p2", "p3"]),
+            cluster_seen_in("abc", &["a", "b", "c"], &[1, 2, 3, 4]),
+            cluster_seen_in("de", &["d", "e"], &[2, 3]),
         ]);
         let clusters = extract_clusters(&body).expect("clusters parse");
 
-        let on_p1 = select_active_clusters(&clusters, &render_set(&["p1"]));
+        let on_p1 = select_active_clusters(&clusters, &render_set(&[1]));
         assert_eq!(
             on_p1.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
             vec!["abc"],
             "page 1 sees only the state spanning pages 1-4"
         );
 
-        let on_p2 = select_active_clusters(&clusters, &render_set(&["p2"]));
+        let on_p2 = select_active_clusters(&clusters, &render_set(&[2]));
         assert_eq!(
             on_p2.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
             vec!["abc", "de"],
             "page 2 has both states active at once"
         );
 
-        let on_p4 = select_active_clusters(&clusters, &render_set(&["p4"]));
+        let on_p4 = select_active_clusters(&clusters, &render_set(&[4]));
         assert_eq!(
             on_p4.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
             vec!["abc"],
@@ -1200,10 +1378,190 @@ mod tests {
     fn page_with_no_labelled_observations_selects_nothing() {
         // The guard against the old behaviour: an unlabelled page must yield
         // no states rather than every state in the application.
-        let body = artifact_json(vec![cluster_seen_in("abc", &["a"], &["p1"])]);
+        let body = artifact_json(vec![cluster_seen_in("abc", &["a"], &[1])]);
         let clusters = extract_clusters(&body).expect("clusters parse");
         assert!(select_active_clusters(&clusters, &render_set(&[])).is_empty());
-        assert!(select_active_clusters(&clusters, &render_set(&["p9"])).is_empty());
+        assert!(select_active_clusters(&clusters, &render_set(&[9])).is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // Artifact-bounded render intersection (A4/A5)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn normalize_render_id_accepts_uuids_and_strips_reg_prefix() {
+        let raw = "0fe4e39c-1b98-49e7-a73d-7a5f572a636c";
+        let expected = Uuid::parse_str(raw).unwrap();
+        assert_eq!(normalize_render_id(raw), Some(expected));
+        // Defensive: element ids are `reg:`-prefixed by the Python adapter, so
+        // a future adapter change that prefixes render ids too must degrade to
+        // a match rather than to a silent miss.
+        assert_eq!(normalize_render_id(&format!("reg:{raw}")), Some(expected));
+    }
+
+    #[test]
+    fn normalize_render_id_rejects_non_uuid_shapes() {
+        // The adapter's positional fallback and the pixel analyzers' synthetic
+        // ids name no observation row. They must be rejected rather than bound
+        // into a `uuid[]` parameter, which would fail the whole query instead
+        // of just missing on one id.
+        assert_eq!(normalize_render_id("render_0"), None);
+        assert_eq!(normalize_render_id("screenshot_000"), None);
+        assert_eq!(normalize_render_id(""), None);
+    }
+
+    #[test]
+    fn normalize_render_ids_unions_across_clusters_deduped_and_sorted() {
+        // The bound parameter is the union of every state's render-set — that
+        // is exactly the set the page intersection can draw from, so anything
+        // outside it is a row the query never needed to return.
+        let body = artifact_json(vec![
+            cluster_seen_in("abc", &["a"], &[3, 1, 2]),
+            cluster_seen_in("de", &["d"], &[2, 3]),
+        ]);
+        let clusters = extract_clusters(&body).expect("clusters parse");
+        let (resolved, rejected) = normalize_render_ids(&clusters);
+        assert_eq!(
+            resolved,
+            vec![rid(1), rid(2), rid(3)],
+            "union is deduped and deterministically ordered"
+        );
+        assert!(rejected.is_empty());
+    }
+
+    #[test]
+    fn normalize_render_ids_partitions_out_unbindable_ids() {
+        let body = serde_json::json!({
+            "states": [{
+                "id": "s1",
+                "stateImageIds": ["reg:a"],
+                "screenshotIds": [
+                    "0fe4e39c-1b98-49e7-a73d-7a5f572a636c",
+                    "render_0",
+                    "screenshot_000",
+                ],
+            }],
+            "elements": [],
+            "elementToRenders": {},
+        });
+        let clusters = extract_clusters(&body).expect("clusters parse");
+        let (resolved, rejected) = normalize_render_ids(&clusters);
+        assert_eq!(resolved.len(), 1, "only the UUID is bindable");
+        assert_eq!(
+            rejected,
+            vec!["render_0".to_string(), "screenshot_000".to_string()],
+            "non-UUID ids are reported, not silently dropped into the query"
+        );
+    }
+
+    #[test]
+    fn page_query_is_bounded_by_artifact_ids_not_by_time() {
+        // A4 regression guard. The defect WAS a time predicate in this query:
+        // it bounded the page's observations by `now() - 90 days` while the
+        // artifact had been derived at some earlier `derived_at` over some
+        // other `window_days`, so the two could only disagree — an artifact
+        // derived 60 days ago over a 90-day window references renders 0–150
+        // days old and the trailing filter dropped the 90–150-day slice.
+        //
+        // That predicate is invisible to every test that does not reach PG,
+        // which is why the guard is on the statement text: re-adding any time
+        // bound here fails this test.
+        assert!(
+            PAGE_RENDERS_SQL.contains("id = ANY($2::uuid[])"),
+            "the page query must be bounded by the artifact's render ids"
+        );
+        assert!(
+            !PAGE_RENDERS_SQL.contains("captured_at"),
+            "the page query must NOT re-introduce a time window — that is the \
+             A4 drift class; bound by the artifact instead. Got: {PAGE_RENDERS_SQL}"
+        );
+        // The two filters that must survive any rewrite of this query.
+        assert!(
+            PAGE_RENDERS_SQL.contains("spec_id = $1"),
+            "page scoping must stay"
+        );
+        assert!(
+            PAGE_RENDERS_SQL.contains("invalidated_at IS NULL"),
+            "an operator-invalidated observation must stop counting even when \
+             an older artifact still names it"
+        );
+    }
+
+    #[test]
+    fn an_aged_out_render_is_still_selected() {
+        // The behavioural half of A4: a state whose renders all predate the
+        // old trailing window is still selected, because selection is now
+        // driven by what the artifact names rather than by capture age.
+        let body = artifact_json(vec![
+            cluster_seen_in("old", &["a"], &[100, 101]),
+            cluster_seen_in("recent", &["b"], &[200]),
+        ]);
+        let clusters = extract_clusters(&body).expect("clusters parse");
+
+        // What PG returns is the intersection of the page's labelled rows with
+        // the artifact's render-set; here the page carries only "old" renders.
+        let active = select_active_clusters(&clusters, &render_set(&[100, 101]));
+        assert_eq!(
+            active.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["old"]
+        );
+    }
+
+    #[test]
+    fn selection_matches_prefixed_and_uppercase_render_ids() {
+        // Normalization is applied on BOTH sides of the comparison, so an
+        // artifact that ever emits a `reg:`-prefixed or uppercase render id
+        // still matches the canonical uuid PG returns. The old string equality
+        // would have silently missed these.
+        let canonical = rid(7);
+        let body = serde_json::json!({
+            "states": [{
+                "id": "prefixed",
+                "stateImageIds": ["reg:a"],
+                "screenshotIds": [format!("reg:{}", canonical.to_string().to_uppercase())],
+            }],
+            "elements": [],
+            "elementToRenders": {},
+        });
+        let clusters = extract_clusters(&body).expect("clusters parse");
+        let active = select_active_clusters(&clusters, &render_set(&[7]));
+        assert_eq!(
+            active.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["prefixed"]
+        );
+    }
+
+    #[test]
+    fn cluster_with_only_non_uuid_renders_is_never_selected() {
+        // Such a cluster contributes nothing to the bind array, so no id PG
+        // can return will ever select it. It must not fall through into S_Ξ.
+        let body = serde_json::json!({
+            "states": [
+                {
+                    "id": "synthetic",
+                    "stateImageIds": ["reg:a"],
+                    "screenshotIds": ["render_0", "screenshot_000"],
+                },
+                {
+                    "id": "real",
+                    "stateImageIds": ["reg:b"],
+                    "screenshotIds": [rid(5).to_string()],
+                },
+            ],
+            "elements": [],
+            "elementToRenders": {},
+        });
+        let clusters = extract_clusters(&body).expect("clusters parse");
+        let (bound, rejected) = normalize_render_ids(&clusters);
+        assert_eq!(bound, vec![rid(5)], "only the real render is bindable");
+        assert_eq!(rejected.len(), 2);
+
+        let active = select_active_clusters(&clusters, &render_set(&[5]));
+        assert_eq!(
+            active.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["real"],
+            "the synthetic-render cluster must not leak into S_Ξ"
+        );
     }
 
     #[test]

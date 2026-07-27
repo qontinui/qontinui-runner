@@ -29,10 +29,14 @@ use crate::mcp::types::{api_error, ApiResponse, ApiState};
 /// doc's chosen decay window — observations older than this are treated as
 /// stale and excluded. Callers may override per-request.
 ///
-/// `spec_authoring` reads the same constant when selecting a page's
-/// observations, so the window a state was discovered over and the window it
-/// is attributed to a page over cannot drift apart.
-pub(crate) const DEFAULT_WINDOW_DAYS: i32 = 90;
+/// This is derivation's window and derivation's alone. `spec_authoring` does
+/// NOT re-apply it: it scopes a page's observations by the artifact's own
+/// render-set instead, so there is no second window that could drift from the
+/// one an artifact was actually derived over. (It used to read this constant,
+/// which was wrong in a harmful direction — an artifact derived 60 days ago
+/// over a 90-day window references renders 0–150 days old, and a trailing
+/// 90-day filter on the consumer side silently dropped the 90–150-day slice.)
+const DEFAULT_WINDOW_DAYS: i32 = 90;
 
 /// Max time budget for the Python `discover_states_from_renders` call. The
 /// clustering is hierarchical agglomerative over up to O(fingerprints²), so
@@ -197,8 +201,12 @@ async fn load_observations(
     // id — the id is a UUID so the tiebreaker is deterministic. Pinning order
     // matters because hierarchical clustering can produce different
     // dendrograms for different orderings (see "Known risks #5" in the plan).
-    // tokio-postgres doesn't have the uuid feature enabled in this crate, so
-    // we `::text`-cast the UUID column and read it as a String.
+    // The `::text` cast is a convenience, not a necessity: `with-uuid-1` IS
+    // enabled on tokio-postgres here (see Cargo.toml, and `spec_authoring`
+    // binds and reads `Uuid` natively), but the render-log JSON these ids go
+    // into wants strings anyway, so casting in PG saves a `to_string()` per
+    // row. An earlier version of this comment claimed the feature was off —
+    // it never was.
     let rows = if let Some(sid) = spec_id {
         conn.query(
             r#"SELECT id::text, fingerprints
@@ -265,9 +273,11 @@ async fn persist_artifact(
 
     let spec_id_owned: Option<String> = spec_id.map(|s| s.to_string());
 
-    // $1::text::uuid — tokio-postgres lacks the uuid feature; a bare $1::uuid
-    // makes PG infer the parameter as uuid (fails on String). ::text::uuid
-    // keeps $1 typed as text and coerces at insertion.
+    // $1::text::uuid — `artifact_id` is a `String`, and a bare `$1::uuid`
+    // makes PG infer the parameter as uuid, which then rejects the String.
+    // `::text::uuid` keeps $1 typed as text and coerces at insertion. (Not a
+    // missing-feature workaround: `with-uuid-1` is enabled — binding a real
+    // `Uuid` here would work too. This is just the shape the id already has.)
     conn.execute(
         r#"INSERT INTO state_discovery_artifacts
            (id, spec_id, window_days, artifact, observation_count)
