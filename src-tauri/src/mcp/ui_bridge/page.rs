@@ -1776,15 +1776,15 @@ mod tab_activate_tests {
     ///
     /// Since iter-2 R2 the slice is GENERATED from the TS union, so this can no
     /// longer drift — these ids are the historical misses, kept as a canary on
-    /// the codegen itself. `memory-federation` was the live drift: present in
-    /// the union, absent from the hand-written Rust mirror.
+    /// the codegen itself. (`memory-federation` was the original live drift;
+    /// it has since been retired from the union entirely, so it now lives in
+    /// `retired_tab_ids_are_rejected` instead.)
     #[test]
     fn recently_added_tabs_are_accepted() {
         for id in &[
             "wrappers",
             "productivity",
             "settings-account",
-            "memory-federation",
             "settings-notifications",
         ] {
             validate_tab_id(id).unwrap_or_else(|_| {
@@ -1808,6 +1808,9 @@ mod tab_activate_tests {
             "monitor-issues",
             "monitor-learnings",
             "monitor-discoveries",
+            // Retired by 2026-07-26-claude-session-memory-cutover-to-coord
+            // Phase 3a (memory-dir federation deleted).
+            "memory-federation",
         ] {
             assert!(
                 validate_tab_id(id).is_err(),

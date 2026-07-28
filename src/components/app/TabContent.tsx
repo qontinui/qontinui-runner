@@ -150,11 +150,6 @@ const ProjectExplainerPage = lazy(() =>
     default: m.ProjectExplainerPage,
   })),
 );
-const MemoryFederationPage = lazy(() =>
-  import("../MemoryFederationPage").then((m) => ({
-    default: m.MemoryFederationPage,
-  })),
-);
 
 /** Register the active page with UI Bridge for AI discoverability */
 function PageRegistration({
@@ -1227,20 +1222,6 @@ export function TabContent({
             description="UI Bridge regression suites — run a suite, walk live registry assertions, and review coverage"
           />
           <RegressionTabPage />
-        </div>
-      );
-
-    case "memory-federation":
-      return (
-        <div data-page-id="memory-federation" className="h-full overflow-hidden">
-          <PageRegistration
-            id="memory-federation"
-            name="Memory Federation"
-            description="Cross-machine memory federation reconcile reports and health dashboard"
-          />
-          <Suspense fallback={<LazyFallback />}>
-            <MemoryFederationPage />
-          </Suspense>
         </div>
       );
 

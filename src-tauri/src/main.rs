@@ -1554,7 +1554,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::execution_variables::get_resolved_execution_context,
             commands::execution_variables::save_execution_variables_settings,
             commands::execution_variables::test_env_var,
-            commands::federation::get_federation_reports,
             commands::extraction::create_extraction_session,
             commands::extraction::export_state_structure,
             commands::extraction::export_training_data,
@@ -2266,38 +2265,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // to the webview without taking an AppHandle parameter.
             tauri_app_handle::set(app.handle().clone());
 
-            // Plan 2026-05-22-memories-on-coord-cross-machine.md Phase 5.G,
-            // generalized by 2026-05-24-federation-verify-and-gitop.md
-            // Phase 4 — initialize the process-wide observable-bridge
-            // registry. Each bridge mediates a per-session pull / watch /
-            // reconcile lifecycle (memory federation; git-ops next). Init
-            // failure is non-fatal — the spawn sites iterate the registry
-            // and an empty registry short-circuits all federation.
+            // Plan 2026-05-24-federation-verify-and-gitop.md Phase 4 —
+            // initialize the process-wide observable-bridge registry.
+            // Each bridge mediates a per-session pull / watch / reconcile
+            // lifecycle (git-ops today; the memory category was retired
+            // by 2026-07-26-claude-session-memory-cutover-to-coord Phase
+            // 3a). Init failure is non-fatal — the spawn sites iterate
+            // the registry and an empty registry short-circuits all
+            // federation.
             {
                 let mut bridges: Vec<
                     std::sync::Arc<dyn qontinui_runner_lib::observable_bridge::RunnerObservableBridge>,
                 > = Vec::new();
-                match qontinui_runner_lib::observable_bridge::memory::MemoryBridge::new() {
-                    Ok(bridge) => {
-                        let arc = std::sync::Arc::new(bridge);
-                        // Keep the concrete Arc available as Tauri State
-                        // (e.g. for runner-shutdown `shutdown_all`), and
-                        // register it as a trait object for dispatch.
-                        app.manage(arc.clone());
-                        bridges.push(arc);
-                        info!("memory federation bridge initialized");
-                    }
-                    Err(e) => {
-                        warn!(
-                            "memory federation bridge init failed ({}); feature disabled this session",
-                            e
-                        );
-                    }
-                }
-                // GitOpBridge — the second observable category (`git_op`).
-                // Registered unconditionally (default ON), mirroring the
-                // memory bridge. Init failure is non-fatal and independent:
-                // a failed git bridge must not disable memory federation.
+                // GitOpBridge — the `git_op` observable category.
+                // Registered unconditionally (default ON). Init failure
+                // is non-fatal.
                 match qontinui_runner_lib::observable_bridge::git_ops::GitOpBridge::new() {
                     Ok(bridge) => {
                         let arc = std::sync::Arc::new(bridge);

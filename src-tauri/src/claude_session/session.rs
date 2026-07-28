@@ -16,8 +16,7 @@ use tauri::Emitter;
 use tracing::{debug, error, info, warn};
 
 // `RunnerObservableBridge` is in scope so `bridge.pull` / `bridge.reconcile`
-// resolve through the trait — `MemoryBridge`'s impl is the only one
-// today and the receiver `Arc<MemoryBridge>` requires the trait.
+// resolve through the trait on the registry's `Arc<dyn …>` entries.
 use qontinui_runner_lib::observable_bridge::RunnerObservableBridge;
 
 use crate::claude_protocol::request_id::next_request_id;
@@ -123,14 +122,13 @@ pub struct ClaudeSession {
     /// git worktree. `None` means the session is running in the original
     /// working directory (the default for fresh sessions).
     worktree: Option<WorktreeInfo>,
-    /// Memory-federation context for this session, when federation is
-    /// enabled and identity could be resolved at spawn time. The waiter
-    /// thread (see `wait_for_child` callsite) reads it on subprocess
-    /// exit to fire the session-end reconcile + Tauri event broadcast.
-    /// `None` means federation is disabled or unconfigured — the session
-    /// runs purely against the local memory dir.
+    /// Observable-bridge federation context for this session, when
+    /// identity could be resolved at spawn time. The waiter thread (see
+    /// `wait_for_child` callsite) reads it on subprocess exit to fire
+    /// the session-end reconcile. `None` means federation is
+    /// unconfigured — the session runs purely locally.
     ///
-    /// Plan: `2026-05-22-memories-on-coord-cross-machine.md` Phase 5.D.
+    /// Plan: `2026-05-24-federation-verify-and-gitop.md`.
     federation_ctx: Option<qontinui_runner_lib::observable_bridge::SessionContext>,
     /// Worktree-isolation Phase 3 (restart-resilience): when a RESUMED chat
     /// session re-acquired its `kind=worktree` coord claim on startup, this
@@ -326,56 +324,38 @@ impl ClaudeSession {
             cmd.env("CLAUDE_CONFIG_DIR", config_dir.as_str());
         }
 
-        // ── Memory federation: spawn-time pull + start watcher ────────
+        // ── Observable-bridge federation: spawn-time pull + watcher ───
         //
-        // Plan 2026-05-22-memories-on-coord-cross-machine.md Phase 5.D.
-        // The materialization MUST land before `cmd.spawn()` because
-        // Claude's auto-memory subsystem reads `memory_dir` during init.
-        // The watcher starts immediately after pull so in-session writes
-        // get pushed to coord without waiting for session-end. All
-        // identity / toggle short-circuits return `None` so federation
-        // never blocks the spawn.
-        let federation_ctx = if crate::claude_session::federation::federation_enabled() {
-            match super::federation::build_federation_ctx(
-                session_id,
-                working_dir,
-                &ai_settings.claude_cli,
-                // Phase 8b (B2): thread the session's RECORDED tenant so the
-                // memory pool agrees with the coord record + JWT slot by
-                // construction. `stamp_session_tenant` records the coord side
-                // from `machine.json::active_tenant_id` (spawn input else
-                // this pin); resolving the SAME source here — rather than
-                // letting `build_federation_ctx` fall back to
-                // `paired_user.json::default_tenant_id` — is what closes the
-                // coord/memory split-brain. `None` on a single-tenant install
-                // (coord resolves the sole binding server-side).
-                crate::session::dual_write::resolve_active_tenant_id(),
-            ) {
-                Ok(ctx) => Some(ctx),
-                Err(reason) => {
-                    // Surface the skip reason to the UI (warn! already
-                    // logged inside build_federation_ctx); proceed locally.
-                    super::federation::emit_federation_skip(
-                        app_handle,
-                        session_id,
-                        reason.as_str(),
-                        reason.detail(),
-                    );
-                    None
-                }
+        // Plan 2026-05-24-federation-verify-and-gitop.md. The watcher
+        // starts immediately after pull so in-session activity gets
+        // pushed to coord without waiting for session-end. All identity
+        // short-circuits return `None` so federation never blocks the
+        // spawn.
+        let federation_ctx = match super::federation::build_federation_ctx(
+            session_id,
+            working_dir,
+            &ai_settings.claude_cli,
+            // Phase 8b (B2): thread the session's RECORDED tenant so the
+            // federated pool agrees with the coord record + JWT slot by
+            // construction. `stamp_session_tenant` records the coord side
+            // from `machine.json::active_tenant_id` (spawn input else
+            // this pin); resolving the SAME source here — rather than
+            // letting `build_federation_ctx` fall back to
+            // `paired_user.json::default_tenant_id` — is what closes the
+            // split-brain. `None` on a single-tenant install (coord
+            // resolves the sole binding server-side).
+            crate::session::dual_write::resolve_active_tenant_id(),
+        ) {
+            Ok(ctx) => Some(ctx),
+            Err(reason) => {
+                // warn! already logged inside build_federation_ctx;
+                // proceed locally.
+                debug!(
+                    "federation skipped for session {} ({}); proceeding locally",
+                    session_id, reason
+                );
+                None
             }
-        } else {
-            debug!(
-                "memory federation disabled via settings; skipping pull/watch for session {}",
-                session_id
-            );
-            super::federation::emit_federation_skip(
-                app_handle,
-                session_id,
-                "disabled",
-                "Memory federation disabled via settings kill-switch.",
-            );
-            None
         };
         let federation_ctx = if let Some(mut ctx) = federation_ctx {
             // Iterate every registered observable bridge: a per-bridge
@@ -1072,8 +1052,8 @@ impl ClaudeSession {
         let app_handle_for_waiter = app_handle.clone();
         let session_ctx_for_waiter = session_ctx.clone();
         let shared_stderr_for_waiter = shared_stderr;
-        // Memory federation: clone the federation context into the
-        // waiter so reconcile fires when the subprocess actually exits
+        // Observable-bridge federation: clone the federation context into
+        // the waiter so reconcile fires when the subprocess actually exits
         // (NOT when `spawn()` returns, which is just after init).
         let federation_ctx_for_waiter = federation_ctx.clone();
         // Interactive-agent log emitter (Phase 1b) — the waiter emits the
@@ -1098,14 +1078,13 @@ impl ClaudeSession {
             // Brief pause to let the stderr reader thread finish
             thread::sleep(Duration::from_millis(200));
 
-            // ── Memory federation: session-end reconcile ─────────────
+            // ── Observable-bridge federation: session-end reconcile ──
             //
             // Fires AFTER the subprocess exits (not after `spawn()`
             // returns — `spawn` returns once init handshakes, the
             // session continues until the CLI itself exits). Stops
-            // the watcher (idempotent), re-snapshots the memory dir,
-            // pushes any deltas the watcher missed, broadcasts a
-            // Tauri event for the React frontend banner. Plan Phase 5.D.
+            // the watcher (idempotent), pushes any deltas the watcher
+            // missed, and logs the per-bridge report.
             if let Some(ctx) = federation_ctx_for_waiter.as_ref() {
                 for b in qontinui_runner_lib::observable_bridge::global_registry() {
                     let category = b.category();
@@ -1113,17 +1092,7 @@ impl ClaudeSession {
                         b.stop_watching(ctx.session_id).await;
                         b.reconcile(ctx).await
                     });
-                    // Memory keeps its full Tauri-banner + coord telemetry;
-                    // other categories log-and-continue.
-                    if category == "memory" {
-                        super::federation::emit_federation_report(
-                            &app_handle_for_waiter,
-                            ctx,
-                            report,
-                        );
-                    } else {
-                        super::federation::log_bridge_report(category, ctx, report);
-                    }
+                    super::federation::log_bridge_report(category, ctx, report);
                 }
             }
 
@@ -1264,7 +1233,7 @@ impl ClaudeSession {
         })
     }
 
-    /// Bridge sync → async for the memory-federation calls made from
+    /// Bridge sync → async for the observable-bridge calls made from
     /// the spawn site (pull / start_watcher) and the wait-for-child
     /// thread (stop_watcher / reconcile). Prefers the caller's tokio
     /// runtime when one exists (we're typically inside Tauri's), falls

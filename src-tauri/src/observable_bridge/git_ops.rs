@@ -1,6 +1,4 @@
-//! `GitOpBridge` — the second [`RunnerObservableBridge`] category
-//! (`"git_op"`), the proof that the federation trait generalizes beyond
-//! memory.
+//! `GitOpBridge` — the [`RunnerObservableBridge`] category (`"git_op"`).
 //!
 //! Plan: `2026-05-24-federation-verify-and-gitop.md`, Phase 6.
 //!
@@ -45,9 +43,8 @@ use uuid::Uuid;
 use super::git_ops_client;
 use super::{ReconcileReport, RunnerObservableBridge, SessionContext};
 
-/// Git ops are less bursty than memory edits, but a rebase touches many
-/// refs at once — a longer window than memory's 250ms coalesces the
-/// burst into a sensible op sequence.
+/// Git ops are not very bursty, but a rebase touches many refs at once —
+/// a 500ms window coalesces the burst into a sensible op sequence.
 const DEBOUNCE_MS: u64 = 500;
 
 /// Sentinel comment written into our `pre-push` hook so we can recognize
@@ -59,9 +56,8 @@ const HOOK_BACKUP_NAME: &str = ".pre-push.qontinui-backup";
 
 /// One detected git op, derived from a reflog line or a hook push line,
 /// ready to become a [`RecordGitOpRequest`]. Bridge-internal — never
-/// crosses the [`RunnerObservableBridge`] trait (a git op has nothing
-/// structurally in common with a memory upsert, which is exactly why the
-/// trait carries no change type).
+/// crosses the [`RunnerObservableBridge`] trait (the trait deliberately
+/// carries no change type).
 #[derive(Debug, Clone)]
 struct GitOp {
     op_kind: String,

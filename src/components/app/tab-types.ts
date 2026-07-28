@@ -100,7 +100,6 @@ export type MainTabId =
   | "wrappers"
   | "productivity"
   | "regression"
-  | "memory-federation"
   | "helper-tasks";
 
 const VALID_TAB_IDS: MainTabId[] = [
@@ -203,7 +202,6 @@ const VALID_TAB_IDS: MainTabId[] = [
   "wrappers",
   "productivity",
   "regression",
-  "memory-federation",
   "helper-tasks",
 ];
 
@@ -334,7 +332,6 @@ export const TAB_LABELS: Record<MainTabId, string> = {
   wrappers: "Wrappers",
   productivity: "Productivity",
   regression: "Regression",
-  "memory-federation": "Memory Federation",
   "helper-tasks": "Helper Tasks",
 };
 

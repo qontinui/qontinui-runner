@@ -121,7 +121,6 @@ describe("the landing tab", () => {
 
 describe("R3: external tab ids are resolved, never cast", () => {
   it("accepts a live tab id verbatim", () => {
-    expect(resolveExternalTabId("memory-federation")).toBe("memory-federation");
     expect(resolveExternalTabId("settings-notifications")).toBe("settings-notifications");
     // A live id wins over its legacy-alias entry: an external caller asking for
     // `check-builder` means the Check Builder page, not the alias target.

@@ -11,8 +11,7 @@ use tauri::Emitter;
 use tracing::{debug, info, warn};
 
 // `RunnerObservableBridge` is in scope so `bridge.pull`/`bridge.reconcile`
-// resolve through the trait — `MemoryBridge`'s impl is the only one
-// today and the receiver `Arc<MemoryBridge>` requires the trait.
+// resolve through the trait on the registry's `Arc<dyn …>` entries.
 use qontinui_runner_lib::observable_bridge::RunnerObservableBridge;
 
 use crate::doctor::DoctorHandle;
@@ -282,7 +281,7 @@ fn extract_text_from_stream_json(json_line: &str) -> Option<String> {
 }
 
 /// Run a Claude CLI session inline (as a child process) and wait for completion.
-/// Bridge sync → async for memory-federation pull / start_watcher /
+/// Bridge sync → async for observable-bridge pull / start_watcher /
 /// reconcile calls from the inline session runner.
 ///
 /// `run_claude_session_inline` is invoked from a sync worker thread that
@@ -485,58 +484,41 @@ fn run_claude_session_inline(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    // ── Memory federation: spawn-time pull + start watcher ────────────
+    // ── Observable-bridge federation: spawn-time pull + watcher ───────
     //
-    // Plan 2026-05-22-memories-on-coord-cross-machine.md Phase 5.C.
-    // Resolve the federation context (`tenant_id` + `device_id` +
-    // `memory_dir` + `account_name` + `session_id`), pull the tenant
-    // pool into `memory_dir`, then start a per-session file watcher
-    // that pushes in-session edits to coord. All steps short-circuit
-    // silently on missing identity / disabled toggle / no global
+    // Plan 2026-05-24-federation-verify-and-gitop.md. Resolve the
+    // federation context (`tenant_id` + `device_id` + `account_name` +
+    // `session_id`), then run each registered bridge's pull + watcher.
+    // All steps short-circuit silently on missing identity / no global
     // bridge — federation is best-effort and never blocks the spawn.
-    let federation_ctx_opt = if crate::claude_session::federation::federation_enabled() {
+    let federation_ctx_opt = {
         let ai_settings = crate::settings::get_ai_settings();
         match crate::claude_session::federation::build_federation_ctx(
             session_id,
             working_dir,
             &ai_settings.claude_cli,
             // Phase 8b (B2): thread the session's RECORDED tenant so the
-            // memory pool agrees with the coord record + JWT slot by
+            // federated pool agrees with the coord record + JWT slot by
             // construction. `stamp_session_tenant` records the coord side
             // from `machine.json::active_tenant_id` (spawn input else this
             // pin); resolving the SAME source here — rather than letting
             // `build_federation_ctx` fall back to
             // `paired_user.json::default_tenant_id` — is what closes the
-            // coord/memory split-brain. `None` on a single-tenant install
-            // (coord resolves the sole binding server-side).
+            // split-brain. `None` on a single-tenant install (coord
+            // resolves the sole binding server-side).
             crate::session::dual_write::resolve_active_tenant_id(),
         ) {
             Ok(ctx) => Some(ctx),
             Err(reason) => {
-                // Surface the skip reason to the UI (warn! already logged
-                // inside build_federation_ctx); proceed locally.
-                crate::claude_session::federation::emit_federation_skip(
-                    app_handle,
-                    session_id,
-                    reason.as_str(),
-                    reason.detail(),
+                // warn! already logged inside build_federation_ctx;
+                // proceed locally.
+                debug!(
+                    "federation skipped for session {} ({}); proceeding locally",
+                    session_id, reason
                 );
                 None
             }
         }
-    } else {
-        debug!(
-            "memory federation disabled via settings (memory_federation_enabled=false); \
-             skipping pull/watch for session {}",
-            session_id
-        );
-        crate::claude_session::federation::emit_federation_skip(
-            app_handle,
-            session_id,
-            "disabled",
-            "Memory federation disabled via settings kill-switch.",
-        );
-        None
     };
     let federation_ctx_opt = if let Some(mut ctx) = federation_ctx_opt {
         // pull + start_watching must run in async context. Inline runner
@@ -2165,14 +2147,11 @@ fn run_claude_session_inline(
     // Remove PID from tracker now that session is complete
     remove_pid(&pid_tracker);
 
-    // ── Memory federation: session-end reconcile ─────────────────────
+    // ── Observable-bridge federation: session-end reconcile ──────────
     //
-    // Plan Phase 5.C — final pass after the subprocess exits, before
-    // the function returns. Stops the per-session watcher (idempotent),
-    // diffs the dir against the post-pull snapshot, pushes any deltas
-    // the watcher missed, and emits a report on Tauri's event bus +
-    // tracing. `app_handle` is in scope here, so we use the full
-    // emit_federation_report path.
+    // Final pass after the subprocess exits, before the function
+    // returns. Stops the per-session watcher (idempotent), pushes any
+    // deltas the watcher missed, and logs the per-bridge report.
     if let Some(ctx) = federation_ctx_opt.as_ref() {
         for b in qontinui_runner_lib::observable_bridge::global_registry() {
             let category = b.category();
@@ -2180,14 +2159,7 @@ fn run_claude_session_inline(
                 b.stop_watching(ctx.session_id).await;
                 b.reconcile(ctx).await
             });
-            // The memory category keeps its full Tauri-banner + coord
-            // telemetry surface; other categories log-and-continue so a
-            // second observable never crashes the session-end path.
-            if category == "memory" {
-                crate::claude_session::federation::emit_federation_report(app_handle, ctx, report);
-            } else {
-                crate::claude_session::federation::log_bridge_report(category, ctx, report);
-            }
+            crate::claude_session::federation::log_bridge_report(category, ctx, report);
         }
     }
 

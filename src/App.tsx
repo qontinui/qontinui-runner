@@ -60,7 +60,6 @@ import { BuildRefreshBanner } from "./components/BuildRefreshBanner";
 import { AutoUpdateChecker } from "./components/AutoUpdateChecker";
 import { ConflictModal } from "./components/ConflictModal";
 import { StolenBanner } from "./components/StolenBanner";
-import { MemoryFederationBanner } from "./components/MemoryFederationBanner";
 import { IncomingHandoffToastBridge } from "./components/session/IncomingHandoffToastBridge";
 import { WebIntegrationAuthBanner } from "./components/WebIntegrationAuthBanner";
 import { ApprovalDialog } from "./components/dag-workflow-editor";
@@ -818,7 +817,6 @@ function AppContent() {
           */}
           <ConflictModal />
           <StolenBanner />
-          <MemoryFederationBanner />
         </div>
       </RenderLogWrapper>
     </ProfilerWrapper>

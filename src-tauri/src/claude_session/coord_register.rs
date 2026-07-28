@@ -952,7 +952,7 @@ fn flush_batch(
     let take = queue.len().min(MAX_AGENT_LOG_BATCH);
     let batch: Vec<LogEntry> = queue.drain(..take).collect();
 
-    // Best-effort bearer auth (mirrors the federation report path). The ingest
+    // Best-effort bearer auth (mirrors the git-op record path). The ingest
     // route resolves the tenant from the body `device_id`, so a missing token
     // is non-fatal — we just omit the header.
     let token = crate::auth::AuthManager::new()
