@@ -1,10 +1,11 @@
 /**
  * Core hook for the Session Manager panel.
  *
- * Merges three data sources into a unified session view:
+ * Merges four data sources into a unified session view:
  * 1. Transcript sessions on disk (all accounts)
  * 2. Active PTY tabs in the current Runner window
  * 3. Session digests (frozen detection + work summary hints)
+ * 4. Claude Code's own live-session registry (the real window name)
  *
  * Provides search, filter, sort, grouping, and actions.
  */
@@ -18,6 +19,7 @@ import type { TerminalTab } from "./useTerminalManager";
 import type { SessionState } from "./useZoneLayout";
 import type { CommandResponse } from "./types";
 import { isInjectedSession } from "./syntheticTabs";
+import { useLiveClaudeSessionNames } from "./useLiveClaudeSessionNames";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -212,6 +214,20 @@ export interface UnifiedSession {
    * surface and `claude --resume`.
    */
   resumeName: string | null;
+  /**
+   * The name Claude Code itself is showing in this session's window right now,
+   * read from its live-session registry via {@link useLiveClaudeSessionNames}.
+   *
+   * **Outranks every other name field** — it is the string the operator is
+   * literally looking at, whereas `resumeName` is transcript-derived and matched
+   * the window name in only 11 of 33 measured cases (2026-07-23).
+   *
+   * `null` in two cases, both of which mean "keep showing what you show today":
+   * the session is not live (the registry only knows running processes), or its
+   * registry row is `nameSource: "derived"` — Claude Code's own cwd slug, which
+   * is weaker than `resumeName`/`displayName` and must not preempt them.
+   */
+  registryName: string | null;
   firstMessagePreview: string | null;
   messageCount: number;
   lastModified: string;
@@ -739,6 +755,13 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     return map;
   }, [tabs]);
 
+  // ── Claude Code's live window names (every 30s) ────────────────────────────
+  // `sessionId → window name`, operator-named live sessions only. A miss is
+  // meaningful: it means the registry has nothing better than the transcript
+  // name we already show (session closed, or `nameSource: "derived"`).
+
+  const registryNames = useLiveClaudeSessionNames();
+
   // ── Merge into UnifiedSession[] ────────────────────────────────────────────
 
   const allSessions = useMemo((): UnifiedSession[] => {
@@ -770,6 +793,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
             projectLabel: extractProjectLabel(s.project_path),
             displayName: s.display_name,
             resumeName: s.resume_name ?? null,
+            registryName: registryNames.get(s.session_id) ?? null,
             firstMessagePreview: s.first_message_preview,
             messageCount: s.message_count,
             lastModified: s.last_modified,
@@ -844,6 +868,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
           projectLabel: extractProjectLabel(s.project_path),
           displayName: s.display_name,
           resumeName: s.resume_name ?? null,
+          registryName: registryNames.get(s.session_id) ?? null,
           firstMessagePreview: s.first_message_preview,
           messageCount: s.message_count,
           lastModified: s.last_modified,
@@ -873,6 +898,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     staleTabs,
     digests,
     externalProcessCount,
+    registryNames,
     now,
   ]);
 
@@ -897,6 +923,9 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
       filtered = filtered.filter(
         (s) =>
           s.displayName.toLowerCase().includes(q) ||
+          // Searchable because it is the headline the card renders — typing the
+          // name you can see must find the card showing it.
+          (s.registryName?.toLowerCase().includes(q) ?? false) ||
           (s.resumeName?.toLowerCase().includes(q) ?? false) ||
           s.projectLabel.toLowerCase().includes(q) ||
           s.sessionId.toLowerCase().includes(q) ||
