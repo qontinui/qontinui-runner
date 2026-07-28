@@ -449,6 +449,32 @@ pub async fn create_ai_session(
         task_run_id, name
     );
 
+    // Agent-registry spawn authorization (plan
+    // `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c, served clause
+    // `agent-spawn-authorization`). This is the UI's "new chat": a
+    // request-scoped session the user explicitly asked for, so it is an
+    // `in_session_subagent` — implied-by-task and bounded, NOT a standing
+    // continuation. With no registry row it therefore keeps the legacy
+    // default (allow); a user who deselects it in the agent registry is
+    // honoured here.
+    //
+    // `None` for the agent name on purpose: `task_name` is a free-form chat
+    // title ("New Chat"), not a registry agent key, so passing it would both
+    // never match a row and let a chat titled after a policy-required agent
+    // trip the cold-start floor. The class row is the right key here.
+    let authz = crate::agent_authorization::authorize_spawn(
+        None,
+        crate::agent_authorization::SpawnPath::InSessionSubagent,
+    )
+    .await;
+    if let Some(refusal) = authz.refusal() {
+        return Ok(CommandResponse {
+            success: false,
+            message: Some(refusal),
+            data: None,
+        });
+    }
+
     // 1. Create task run record in DB
     let input = CreateTaskRunInput::new(task_run_id.clone(), name.clone())
         .with_prompt("AI session")

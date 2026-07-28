@@ -899,8 +899,17 @@ async fn handle_message(txt: &str, device_id: uuid::Uuid) -> anyhow::Result<()> 
             } else if envelope_is_gate_continuation(&value) {
                 match parse_gate_continuation_payload(&value) {
                     Some(payload) => {
-                        // Outcome counts matter only on the poll path.
-                        let _ = dispatch_gate_continuation(payload, device_id);
+                        // DETACHED, deliberately: `dispatch_gate_continuation`
+                        // now awaits the agent-registry check, which can pay a
+                        // coord round-trip. `handle_message` runs INLINE in the
+                        // WS read loop, so awaiting it here would stall the pump
+                        // (missing keepalive ticks → coord drops the connection →
+                        // reconnect churn → replay storm). Same reason
+                        // `dispatch_condition_check` spawns detached. Outcome
+                        // counts matter only on the poll path, which still awaits.
+                        tokio::spawn(async move {
+                            let _ = dispatch_gate_continuation(payload, device_id).await;
+                        });
                     }
                     None => warn!(
                         "agent_runtime: gate-continuation envelope on {channel} had no \
@@ -1082,6 +1091,44 @@ fn spawn_run_task(payload: LaunchPayload) {
     let stop = tokio_util::sync::CancellationToken::new();
     agent_stops().lock().unwrap().insert(agent_id, stop.clone());
     tokio::spawn(async move {
+        // Agent-registry spawn authorization (plan
+        // `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c, served
+        // clause `agent-spawn-authorization`). This is coord's primary
+        // auto-dispatch funnel (`events.agent.spawn_requested.<device_id>`):
+        // coord hands the runner a full launch payload and the agent runs on
+        // the user's own AI quota, outliving the request entirely. Standing
+        // per-path opt-in, default OFF for a fresh user.
+        //
+        // Inside the task, not before it: `authorize_spawn` can pay a coord
+        // round-trip and both callers sit inline in the WS pump, which must
+        // keep serving keepalives. The stop-token entry is registered
+        // synchronously above (so an immediate stop request still finds the
+        // agent) and is removed here on refusal; nothing else has been
+        // created yet, so there is no other state to unwind.
+        let authz = crate::agent_authorization::authorize_spawn(
+            None,
+            crate::agent_authorization::SpawnPath::StandingContinuation,
+        )
+        .await;
+        if !authz.allows_spawn() {
+            let reason = format!(
+                "agent-registry spawn authorization refused this launch ({}): {}",
+                authz.label(),
+                authz.reason().unwrap_or("no reason recorded")
+            );
+            warn!("agent_runtime: coord spawn-request agent_id={agent_id} NOT launched — {reason}");
+            agent_stops().lock().unwrap().remove(&agent_id);
+            // Report a TERMINAL outcome to coord. `run_agent_subprocess` is the
+            // only thing that posts spawn_complete/spawn_failed, so returning
+            // silently would leave coord's agent row in `spawning` forever and
+            // re-dispatch the same request on every reconnect — an endless
+            // dispatch/refuse loop. Unlike the gate-continuation path (whose
+            // row must stay PENDING and re-listable), a launch payload has no
+            // deferral shape: the honest answer is "this device will not run
+            // it, and here is why".
+            report_spawn_failed(agent_id, &reason, None, 0, None).await;
+            return;
+        }
         if let Err(e) = run_agent_subprocess(payload, stop).await {
             error!("agent_runtime: run_agent_subprocess failed: {e:#}");
         }
@@ -1759,7 +1806,8 @@ enum ConsumeTarget {
 /// **Claim-then-spawn-then-outcome** (the coord continuation contract). For a
 /// payload carrying a `gate_id` the whole dispatch is one async task that:
 ///
-/// 1. **Fast-path dedupe** (synchronous, before any I/O): [`claim_gate_dispatch`]
+/// 1. **Agent-registry authorization** (`agent-spawn-authorization`), then
+///    **fast-path dedupe**: [`claim_gate_dispatch`]
 ///    against the in-process set — a duplicate delivery (same `gate_id`) is
 ///    dropped here so a continuation delivered by both transports never even
 ///    starts a second task. This is the in-process guard; the network claim
@@ -1774,10 +1822,12 @@ enum ConsumeTarget {
 /// Absent `gate_id` (legacy coord) → no dedupe-by-id, no claim, no outcome:
 /// dispatch exactly once via [`spawn_gate_continuation_task`] (unchanged).
 ///
-/// Returns the synchronous fast-path outcome so the poll path can aggregate
-/// honest per-run counts for the coord self-report
-/// ([`post_continuation_poll_report`]); the WS fast-path ignores it.
-fn dispatch_gate_continuation(
+/// Returns the fast-path outcome so the poll path can aggregate honest per-run
+/// counts for the coord self-report ([`post_continuation_poll_report`]); the WS
+/// fast-path ignores it (and dispatches this fn detached, since the
+/// agent-registry check below may pay a coord round-trip and the WS read loop
+/// must keep serving keepalives).
+async fn dispatch_gate_continuation(
     payload: GateContinuationPayload,
     device_id: uuid::Uuid,
 ) -> DispatchOutcome {
@@ -1805,8 +1855,66 @@ fn dispatch_gate_continuation(
         );
         return DispatchOutcome::NotAddressedToSelf;
     }
+
+    // Agent-registry spawn authorization (plan
+    // `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c, served clause
+    // `agent-spawn-authorization`). A gate continuation / work-unit dispatch
+    // OUTLIVES the request that created it, so it is a `standing_continuation`:
+    // standing per-path opt-in, default OFF for a fresh user, never implied by
+    // a task. Checked HERE — after the addressed-to-self gate (so a
+    // continuation meant for another instance costs no lookup) and BEFORE the
+    // dedupe claim, so a denied continuation is never claimed and stays
+    // re-listable if the user later opts in.
+    //
+    // Note: an anchor key is a gate label, not a registry agent name, so this
+    // resolves against the per-path row. `crate::agent_authorization::SpawnDecision`
+    // is spelled out because this module has its OWN unrelated `SpawnDecision`
+    // (coord's claim verdict) — do not import it.
+    let authz = crate::agent_authorization::authorize_spawn(
+        None,
+        crate::agent_authorization::SpawnPath::StandingContinuation,
+    )
+    .await;
+    if !authz.allows_spawn() {
+        let reason = authz.reason().unwrap_or("no reason recorded").to_string();
+        warn!(
+            "agent_runtime: gate-continuation (gate_id={:?}, dispatch_id={:?}, source={}) \
+             NOT dispatched — {}: {}",
+            payload.gate_id,
+            payload.dispatch_id,
+            payload.source,
+            authz.label(),
+            reason
+        );
+        // Stamp a NON-CONSUMING reason so coord can see WHY the row is sitting
+        // pending, exactly as the `at_cap` / `duplicate_anchor` guards do. The
+        // row stays pending and re-listable (no consume claim is taken), but
+        // without this stamp coord sees a pending row with a null reason — the
+        // shape that stranded 51 continuations for two days.
+        if let Some(gate_id) = payload.gate_id {
+            if should_post_deferred_stamp(gate_id, std::time::Instant::now()) {
+                post_continuation_deferred(
+                    gate_id,
+                    device_id,
+                    format!("spawn_authorization_{}", authz.label()),
+                )
+                .await;
+            }
+        }
+        return DispatchOutcome::Denied;
+    }
+    if let crate::agent_authorization::SpawnDecision::Warn { reason } = &authz {
+        warn!(
+            "agent_runtime: gate-continuation (gate_id={:?}) proceeding under a \
+             warn_proceed disposition: {}",
+            payload.gate_id, reason
+        );
+    }
+
     if let Some(gate_id) = payload.gate_id {
-        // Synchronous fast-path: drop an in-process duplicate before any I/O.
+        // Fast-path dedupe: drop an in-process duplicate before any claim.
+        // (The agent-registry check above is the one I/O that precedes it — it
+        // must, so a refused dispatch never claims anything.)
         if !claim_gate_dispatch(gate_id) {
             debug!(
                 "agent_runtime: gate-continuation gate_id={gate_id} already dispatched; \
@@ -1836,7 +1944,9 @@ fn dispatch_gate_continuation(
         // frame AND the `pending-unit-dispatches` replay-poll path (both route
         // through here), so dedupe + ack happen regardless of arrival path.
         //
-        // Synchronous fast-path: drop an in-process duplicate before any I/O.
+        // Fast-path dedupe: drop an in-process duplicate before any claim.
+        // (The agent-registry check above is the one I/O that precedes it — it
+        // must, so a refused dispatch never claims anything.)
         if !claim_dispatch_dispatch(dispatch_id) {
             debug!(
                 "agent_runtime: unit-dispatch dispatch_id={dispatch_id} already dispatched; \
@@ -1888,6 +1998,11 @@ enum DispatchOutcome {
     AlreadyDispatched,
     /// Not addressed to this instance (the addressed instance spawns it).
     NotAddressedToSelf,
+    /// Refused by the agent registry (`agent-spawn-authorization`): the
+    /// tenant/user has not opted this device into standing continuations, or
+    /// has disabled them with a `block`/`degrade` disposition. No coord claim
+    /// is taken, so the row stays re-listable if the user opts in later.
+    Denied,
 }
 
 /// Poll coord for gate-continuation dispatches that landed while this runner was
@@ -1967,10 +2082,11 @@ async fn poll_pending_continuations(device_id: uuid::Uuid) {
         // shared seam dedupes + acks even if coord omitted it inside `payload`.
         let mut payload = row.payload;
         payload.gate_id = Some(row.gate_id);
-        match dispatch_gate_continuation(payload, device_id) {
+        match dispatch_gate_continuation(payload, device_id).await {
             DispatchOutcome::Dispatched => counts.dispatched_n += 1,
             DispatchOutcome::AlreadyDispatched => counts.already_dispatched += 1,
             DispatchOutcome::NotAddressedToSelf => counts.not_addressed_to_self += 1,
+            DispatchOutcome::Denied => counts.spawn_authorization_denied += 1,
         }
     }
     post_continuation_poll_report(device_id, counts).await;
@@ -1990,6 +2106,11 @@ struct PollRunCounts {
     dispatched_n: usize,
     already_dispatched: usize,
     not_addressed_to_self: usize,
+    /// Refused by the agent registry (`agent-spawn-authorization`). Counted
+    /// separately so coord can tell "the user has not opted this device into
+    /// standing continuations" apart from a dedupe drop or a dead poll loop —
+    /// the two look identical in `skipped_n` alone.
+    spawn_authorization_denied: usize,
     fetch_failed: bool,
 }
 
@@ -2022,6 +2143,12 @@ impl ContinuationPollReportBody {
         }
         if counts.not_addressed_to_self > 0 {
             skip_reasons.insert("not_addressed_to_self", counts.not_addressed_to_self);
+        }
+        if counts.spawn_authorization_denied > 0 {
+            skip_reasons.insert(
+                "spawn_authorization_denied",
+                counts.spawn_authorization_denied,
+            );
         }
         if counts.fetch_failed {
             skip_reasons.insert("fetch_failed", 1);
@@ -2185,7 +2312,7 @@ async fn poll_pending_unit_dispatches(device_id: uuid::Uuid) {
         let mut payload = row.payload;
         payload.dispatch_id = Some(row.dispatch_id);
         // Outcome counts are aggregated only on the gate-continuations poll.
-        let _ = dispatch_gate_continuation(payload, device_id);
+        let _ = dispatch_gate_continuation(payload, device_id).await;
     }
 }
 
@@ -2591,6 +2718,39 @@ async fn run_gate_continuation_inner(
         }
     }
 
+    // Step 1b: agent-registry spawn authorization (plan
+    // `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c, served clause
+    // `agent-spawn-authorization`). Placed with the other LOCAL guards and
+    // BEFORE step 2's coord claim, for the same reason they are: a dispatch
+    // this gate refuses must NOT burn a coord-side claim (contract item 4). If
+    // it ran after the claim, a refusal would consume the gate row at coord,
+    // leave it un-re-listable, and strand the work permanently the moment the
+    // user opts in.
+    //
+    // `dispatch_gate_continuation` already checked at the delivery seam; this
+    // is the backstop for any re-entry that reaches the inner run directly.
+    // Both read the same TTL cache, so the second check costs no round-trip.
+    // On refusal: release the in-process claim and post NO lifecycle
+    // spawn-failure — an authorization refusal is a standing decision, not a
+    // spawn fault, and the `at_cap` precedent above is explicit that fake
+    // spawn failures pollute the lifecycle channel.
+    let authz = crate::agent_authorization::authorize_spawn(
+        None,
+        crate::agent_authorization::SpawnPath::StandingContinuation,
+    )
+    .await;
+    if !authz.allows_spawn() {
+        warn!(
+            "agent_runtime: gate-continuation refused by the agent registry ({}): {} \
+             (anchor_key={:?})",
+            authz.label(),
+            authz.reason().unwrap_or("no reason recorded"),
+            payload.anchor_key
+        );
+        release_local_dispatch_claim(consume_target);
+        return Ok(());
+    }
+
     // Step 2: CLAIM-before-spawn (only with a gate_id / coord configured). Posted
     // AFTER the #469 guards pass and AWAITED — its result decides whether to
     // spawn. This closes the poll→cancel→spawn race: if a cancel landed between
@@ -2863,6 +3023,12 @@ async fn run_continuation_terminal(
     ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
 ) -> anyhow::Result<()> {
     use std::sync::Arc;
+
+    // NOTE: agent-registry spawn authorization for this path is enforced in
+    // `run_gate_continuation_inner` (step 1b), alongside the other local
+    // guards and BEFORE the coord consume claim. It deliberately does NOT run
+    // here: by this point the claim has been taken, so a refusal would consume
+    // the gate row at coord and strand the work. Do not add a check here.
 
     // Reach the managed Tauri state from this backend task via the process-
     // global AppHandle (set in main.rs::setup). If the runner has no Tauri
@@ -3168,6 +3334,27 @@ async fn run_condition_check_terminal(
                  (device-scoped WS filter already gated delivery)"
             ),
         }
+    }
+
+    // Agent-registry spawn authorization (plan
+    // `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c, served clause
+    // `agent-spawn-authorization`). A coord-dispatched condition check spawns
+    // an AI terminal that outlives the request that scheduled it — the same
+    // auto-dispatch class as a gate continuation, so it takes the same
+    // standing per-path opt-in.
+    let authz = crate::agent_authorization::authorize_spawn(
+        None,
+        crate::agent_authorization::SpawnPath::StandingContinuation,
+    )
+    .await;
+    if !authz.allows_spawn() {
+        warn!(
+            "agent_runtime: condition-check run_id={} NOT spawned — {}: {}",
+            payload.run_id,
+            authz.label(),
+            authz.reason().unwrap_or("no reason recorded")
+        );
+        return Ok(());
     }
 
     // A condition check is inherently operator-visible; there is no headless
@@ -5825,6 +6012,7 @@ mod tests {
                 dispatched_n: 2,
                 already_dispatched: 2,
                 not_addressed_to_self: 1,
+                spawn_authorization_denied: 0,
                 fetch_failed: false,
             },
         );
@@ -5840,6 +6028,30 @@ mod tests {
                     "already_dispatched": 2,
                     "not_addressed_to_self": 1,
                 },
+            })
+        );
+
+        // Agent-registry refusals get their OWN skip reason (Phase 4c), so
+        // coord can tell "the user has not opted this device into standing
+        // continuations" apart from a dedupe drop.
+        let denied = ContinuationPollReportBody::new(
+            dev,
+            PollRunCounts {
+                listed_n: 3,
+                dispatched_n: 0,
+                spawn_authorization_denied: 3,
+                ..Default::default()
+            },
+        );
+        let v = serde_json::to_value(&denied).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "device_id": "11111111-1111-1111-1111-111111111111",
+                "listed_n": 3,
+                "dispatched_n": 0,
+                "skipped_n": 3,
+                "skip_reasons": { "spawn_authorization_denied": 3 },
             })
         );
 

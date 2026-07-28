@@ -1538,6 +1538,37 @@ async fn spawn_instance(
         ));
     }
 
+    // Agent-registry spawn authorization (plan
+    // `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c, served clause
+    // `agent-spawn-authorization`).
+    //
+    // Classified `in_session_subagent`, deliberately: this launches a runner
+    // INSTANCE PROCESS, not an agent, so it consumes no AI quota by itself,
+    // and it is explicitly requested rather than self-initiated. Classifying
+    // it `standing_continuation` would make instance management default-OFF
+    // and break the fleet's own tooling for a spawn the clause does not
+    // govern. It is still gated so a user who deselects instance spawning in
+    // the agent registry is honoured.
+    //
+    // It resolves under the dedicated registry key `runner-instance` rather
+    // than the request's `name` (a runner-instance label, not a registry agent
+    // key). That key is what makes instance management SEPARABLE from AI
+    // subagents: with no `runner-instance` row present the class row still
+    // governs, so disabling the `in_session_subagent` class does also stop
+    // instance spawning — the key gives the user a way to re-enable just this
+    // one, rather than making the coupling impossible in the first place.
+    let authz = crate::agent_authorization::authorize_spawn(
+        Some("runner-instance"),
+        crate::agent_authorization::SpawnPath::InSessionSubagent,
+    )
+    .await;
+    if let Some(refusal) = authz.refusal() {
+        return Err((
+            axum::http::StatusCode::FORBIDDEN,
+            Json(ApiResponse::error(refusal)),
+        ));
+    }
+
     // Auto-allocate port if not specified
     let port = match body.port {
         Some(p) if p < 1024 => {
