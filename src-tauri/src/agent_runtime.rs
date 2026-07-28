@@ -4810,6 +4810,36 @@ mod tests {
         assert!(sid < flag, "--session-id must precede the injected flag");
     }
 
+    /// The real briefing injected on the direct-exec path carries the
+    /// attributable source marker as its FIRST line (attributability contract
+    /// on `terminal::runner_context` — incident coord #1242). Guards the
+    /// argv delivery path end-to-end: build the command with the actual
+    /// briefing and assert the `--append-system-prompt` value starts with it.
+    #[test]
+    fn continuation_command_system_prompt_carries_source_marker() {
+        let briefing = crate::terminal::runner_context(9876);
+        let cmd = build_continuation_claude_command(
+            "claude".to_string(),
+            "abc-123",
+            vec![],
+            "do the thing".to_string(),
+            Some(briefing),
+            &crate::claude_session::launch_spec::LaunchConfig::default(),
+        );
+        let flag = cmd
+            .iter()
+            .position(|a| a == "--append-system-prompt")
+            .expect("--append-system-prompt must be injected");
+        let prompt = cmd
+            .get(flag + 1)
+            .expect("the briefing text must immediately follow its flag");
+        assert!(
+            prompt.starts_with("[source: qontinui-runner/runner_context@"),
+            "injected system prompt must start with the source marker, got: {}",
+            &prompt[..prompt.len().min(80)]
+        );
+    }
+
     #[test]
     fn launch_payload_round_trips_through_envelope() {
         let payload = LaunchPayload {
