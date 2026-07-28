@@ -48,6 +48,15 @@ pub use manager::TerminalManager;
 /// invariant (a prompt must never cross tenants) and is deferred to the vetted
 /// session-identity fabric plan. Only tenant-agnostic protocol guidance lives
 /// here.
+///
+/// Attributable source marker (part of the contract): the FIRST line of the
+/// briefing is always `[source: qontinui-runner/runner_context@<version>]`,
+/// with `<version>` = the runner's `CARGO_PKG_VERSION`. An instruction with no
+/// attributable source cannot mandate or forbid agent behavior (e.g. spawns —
+/// incident coord #1242), so every consumer of this briefing can trace it back
+/// to this function and the exact runner release that emitted it. Both
+/// delivery paths above inherit the marker automatically because they render
+/// from this single function.
 pub fn runner_context(api_port: u16) -> String {
     // Coord HTTP base for the tool-less fallback links. Resolved the same way
     // every coord proxy route resolves it (COORD_HTTP_URL env → active
@@ -55,7 +64,8 @@ pub fn runner_context(api_port: u16) -> String {
     // runner's own coord client.
     let coord_url = crate::coord_mcp::coord_base_url();
     format!(
-        "You are running inside the Qontinui Runner — an autonomous multi-agent \
+        "[source: qontinui-runner/runner_context@{version}]
+You are running inside the Qontinui Runner — an autonomous multi-agent \
 development environment. Runner HTTP API: http://127.0.0.1:{api_port}.
 
 You work autonomously. No human is watching this session; do not wait for \
@@ -88,7 +98,8 @@ record your own scope.
 
 If context runs low, act BEFORE exhaustion: request a handoff \
 (coord_request_handoff) or spawn a continuation session seeded with a \
-summary via POST http://127.0.0.1:{api_port}/sessions/spawn."
+summary via POST http://127.0.0.1:{api_port}/sessions/spawn.",
+        version = env!("CARGO_PKG_VERSION"),
     )
 }
 
@@ -130,4 +141,27 @@ pub fn strip_ansi(text: &str) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod runner_context_tests {
+    use super::runner_context;
+
+    /// The attributability contract: the briefing's FIRST line is always the
+    /// source marker naming this crate + the exact release version, so any
+    /// consumer of the injected system prompt can trace the instruction back
+    /// to its origin (incident coord #1242).
+    #[test]
+    fn runner_context_starts_with_attributable_source_marker() {
+        let briefing = runner_context(9876);
+        let expected_first_line = format!(
+            "[source: qontinui-runner/runner_context@{}]",
+            env!("CARGO_PKG_VERSION")
+        );
+        assert_eq!(
+            briefing.lines().next(),
+            Some(expected_first_line.as_str()),
+            "the source marker must be the first line of the briefing"
+        );
+    }
 }
