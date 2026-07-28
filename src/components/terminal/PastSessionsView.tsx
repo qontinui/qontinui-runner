@@ -164,9 +164,17 @@ export const UNNAMED_PAST_SESSION = "(unnamed session)";
  *   right by construction.
  * - **Live, `nameSource: "derived"`** → miss. The map excludes derived rows, so
  *   Claude Code's `qontinui-root-ec` cwd slug can never displace a real name.
- * - **Closed** → always a miss, because the registry only ever describes
- *   running processes. Closed rows therefore keep exactly the `resumeName` they
- *   render today; this function must never regress them to blank.
+ * - **Closed** → normally a miss, so the row keeps exactly the `resumeName` it
+ *   renders today. This function must never regress a closed row to blank.
+ *
+ *   The map is keyed by `sessionId`, NOT by process, so "the registry only
+ *   describes running processes" does not by itself make every closed row a
+ *   miss: `/resume` reuses the same `sessionId` under a new pid, so a card
+ *   sitting in `state: "closed"` whose session was resumed in another window
+ *   WILL hit and take that live window name. That outcome is intended — the
+ *   live name is current and correct, and the guarantee this function actually
+ *   makes is "never blank, never a placeholder where a real name existed",
+ *   which still holds. Do not "fix" it by gating on `state`.
  *
  * Pure and exported so the contract is testable without a DOM (the runner's
  * vitest env is `node`).

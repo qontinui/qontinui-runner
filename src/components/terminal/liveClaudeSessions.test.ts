@@ -150,6 +150,21 @@ describe("registryNamesBySessionId", () => {
     expect(got.get("dup")).toBe("first");
   });
 
+  it("falls back to startedAt when updatedAt is missing, so the tiebreak never reverts to name order", () => {
+    // If a CLI build stops emitting `updatedAt`, the Rust reader substitutes 0
+    // for every row. Without the `startedAt` fallback they would all tie, and
+    // the winner would revert to read_live_sessions order — account, then
+    // NAME, then pid. Name order is precisely the bug the tiebreak exists to
+    // prevent, so this asserts the second anchor actually carries the decision.
+    //
+    // Reader order puts "aaa" first; startedAt says "zzz" is the live one.
+    const got = registryNamesBySessionId([
+      mk({ sessionId: "dup", pid: 10, name: "aaa", updatedAt: 0, startedAt: 1_000 }),
+      mk({ sessionId: "dup", pid: 11, name: "zzz", updatedAt: 0, startedAt: 9_000 }),
+    ]);
+    expect(got.get("dup")).toBe("zzz");
+  });
+
   it("trims the stored name", () => {
     // The gate tolerates padding; the card renders into a truncating span
     // where it would be visible.

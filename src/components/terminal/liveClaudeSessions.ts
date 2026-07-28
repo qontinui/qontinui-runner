@@ -126,6 +126,23 @@ export function isOperatorNamed(session: Pick<LiveClaudeSession, "name" | "nameS
  * Names are trimmed: the gate tolerates surrounding whitespace, but the cards
  * render into a truncating single-line span where padding is visible.
  */
+/**
+ * Recency key for the duplicate-`sessionId` tiebreak.
+ *
+ * Falls back `updatedAt` → `startedAt` → `0`. The fallback is load-bearing, not
+ * defensive padding: the Rust reader substitutes `0` for a missing key, so if a
+ * CLI build ever stops emitting `updatedAt`, EVERY row ties at 0 and the winner
+ * silently reverts to `read_live_sessions` order — account, then **name**, then
+ * pid. Ordering by name is exactly the bug this tiebreak exists to prevent (a
+ * rename re-sorts the pair and hands the card a sibling's name), so a fleet-wide
+ * missing field would reintroduce it invisibly. `startedAt` is already modelled
+ * end to end and is always present on a row that has a pid, so it is a free
+ * second anchor.
+ */
+function recencyOf(s: LiveClaudeSession): number {
+  return s.updatedAt || s.startedAt || 0;
+}
+
 export function registryNamesBySessionId(
   sessions: readonly LiveClaudeSession[],
 ): Map<string, string> {
@@ -133,7 +150,7 @@ export function registryNamesBySessionId(
   for (const s of sessions) {
     if (!s.sessionId || !isOperatorNamed(s)) continue;
     const held = bestById.get(s.sessionId);
-    if (held === undefined || (s.updatedAt ?? 0) > (held.updatedAt ?? 0)) {
+    if (held === undefined || recencyOf(s) > recencyOf(held)) {
       bestById.set(s.sessionId, s);
     }
   }
