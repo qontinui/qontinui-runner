@@ -102,8 +102,13 @@ jobs:
       - name: Resolve qontinui-web ref
         id: resolve_ref
         shell: bash
+        # Branch name via env, not `${{ }}` splicing: a refname may contain
+        # `" $ ( ) ; & |`, which would be executable shell here. Same reason as
+        # .github/actions/resolve-schemas-ref.
+        env:
+          BRANCH: ${{ github.head_ref || github.ref_name }}
         run: |
-          branch="${{ github.head_ref || github.ref_name }}"
+          branch="$BRANCH"
           if [ -n "$branch" ] && git ls-remote --heads https://github.com/qontinui/qontinui-web.git "$branch" | grep -q .; then
             echo "Using qontinui-web ref: $branch (matches this PR's branch)"
             echo "ref=$branch" >> "$GITHUB_OUTPUT"
@@ -132,11 +137,18 @@ jobs:
       # import it; alembic should still load. We skip the optional
       # `ml` poetry group (qontinui-train), keeping the install
       # weight reasonable.
+      - name: Resolve sibling qontinui-schemas ref
+        id: schemas-ref
+        uses: ./qontinui-runner/.github/actions/resolve-schemas-ref
+
       - name: Checkout sibling repos (qontinui-schemas, qontinui)
         run: |
           cd "$GITHUB_WORKSPACE"
-          git clone --depth 1 https://github.com/qontinui/qontinui-schemas.git
+          : "${SCHEMAS_REF:?resolve-schemas-ref produced no output}"
+          git clone --depth 1 --branch "$SCHEMAS_REF" https://github.com/qontinui/qontinui-schemas.git
           git clone --depth 1 https://github.com/qontinui/qontinui.git
+        env:
+          SCHEMAS_REF: ${{ steps.schemas-ref.outputs.ref }}
         shell: bash
 
       - name: Set up Python
