@@ -35,14 +35,30 @@ const FLEET_COMMANDS: &[(&str, &str)] = &[
 ];
 
 /// LF-normalized SHA-256 of each staged fleet command file, checked in so that
-/// a silent edit — or a re-stage that drifts from the claude-config source of
-/// truth — fails `cargo test fleet_commands` instead of shipping quietly to
+/// a silent edit fails `cargo test fleet_commands` instead of shipping quietly to
 /// every fleet device. The existing provisioning tests only assert non-empty +
 /// an H1 heading, so they would pass against fully-drifted or half-neutralized
 /// files; this hash is what actually pins the content.
 ///
-/// The claude-config repo is not reliably reachable from runner CI, so drift is
-/// caught by these hashes rather than by diffing against the source live.
+/// ## What this pin does NOT catch — read before trusting it
+///
+/// These hashes live in THIS repo, alongside the files they pin. So they detect
+/// **tampering** (a staged file edited without re-pinning) but are structurally
+/// blind to **staleness** (claude-config moves on and nobody re-stages). The two
+/// are different failure modes and only the first is covered here.
+///
+/// Measured 2026-07-28: `cargo test fleet_commands` was green on `main` while the
+/// bundle sat **229 lines behind** claude-config (80 in `implement-plan.md`, 149 in
+/// `vet-plan.md`), still serving fleet devices an archive-move guard that had been
+/// deliberately deleted upstream. Nothing in runner CI could have gone red.
+///
+/// Staleness is caught instead by **`fleet-bundle-drift.yml` in
+/// qontinui-claude-config** (path-filtered `push` + daily `schedule`), which diffs
+/// this repo's staged copies against the source — the direction runner CI cannot
+/// see, since the claude-config repo is private and not reliably reachable here.
+///
+/// **Do not delete either guard believing the other covers it.** This pin guards
+/// what `include_str!` actually embedded; that workflow guards freshness.
 ///
 /// ## Re-staging (run when the claude-config source legitimately changes)
 ///
