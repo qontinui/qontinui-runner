@@ -52,11 +52,22 @@ jobs:
         with:
           path: qontinui-runner
 
+      # Same deadlock class as every other schemas compile site: this job runs
+      # generate_types.sh (which builds against the ../../qontinui-schemas/rust
+      # path dep) and diffs schemas' checked-in artifacts, so on a coordinated
+      # pair it must read the schemas branch that carries the regenerated
+      # artifacts — otherwise it reds against main and tells you to do exactly
+      # the coordination it just prevented.
+      - name: Resolve sibling qontinui-schemas ref
+        id: schemas-ref
+        uses: ./qontinui-runner/.github/actions/resolve-schemas-ref
+
       - name: Checkout qontinui-schemas (sibling)
         uses: actions/checkout@v5
         with:
           repository: qontinui/qontinui-schemas
           path: qontinui-schemas
+          ref: ${{ steps.schemas-ref.outputs.ref }}
 
       # generate_types.sh runs `cargo build --bin export_schemas` which
       # links the runner lib (Tauri-dependent). Tauri 2.x on Linux probes

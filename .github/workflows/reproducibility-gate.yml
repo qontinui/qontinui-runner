@@ -56,10 +56,17 @@ jobs:
       # Same sibling-repo dance as ci.yml — src-tauri/Cargo.toml has a
       # path = "../../qontinui-schemas/rust" dep that won't resolve
       # without this checkout.
+      - name: Resolve sibling qontinui-schemas ref
+        id: schemas-ref
+        uses: ./.github/actions/resolve-schemas-ref
+
       - name: Checkout sibling repos
         run: |
           cd "$GITHUB_WORKSPACE/.."
-          git clone --depth 1 https://github.com/qontinui/qontinui-schemas.git
+          : "${SCHEMAS_REF:?resolve-schemas-ref produced no output}"
+          git clone --depth 1 --branch "$SCHEMAS_REF" https://github.com/qontinui/qontinui-schemas.git
+        env:
+          SCHEMAS_REF: ${{ steps.schemas-ref.outputs.ref }}
         shell: bash
 
       - name: Setup Rust

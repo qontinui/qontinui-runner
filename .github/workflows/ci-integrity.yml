@@ -30,6 +30,11 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/**'
+      # Composite actions are gate logic too: a gating workflow that delegates a
+      # decision to `uses: ./.github/actions/...` executes that action's shell
+      # inside required contexts. Without this glob a PR touching ONLY an action
+      # would not even trigger this guard.
+      - '.github/actions/**'
 
 permissions:
   contents: read
@@ -60,6 +65,7 @@ jobs:
           .github/workflows/clorinde-bindings-fresh.yml
           .github/workflows/schema-pg-sql-fresh.yml
           .github/workflows/qontinui-types-drift.yml
+          .github/actions/resolve-schemas-ref/action.yml
           EOF
 
           # Changed files in this PR (paths only). No checkout of untrusted

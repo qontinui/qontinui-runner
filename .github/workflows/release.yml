@@ -149,6 +149,14 @@ jobs:
       # in src-tauri/Cargo.toml). Without the sibling clone,
       # `cargo build` (invoked by `tauri build` below) fails to
       # resolve the path. Public org-owned repo, default github.token.
+      #
+      # Deliberately NOT using .github/actions/resolve-schemas-ref here, unlike
+      # every other schemas clone in this repo: a release must be built against
+      # published schemas, never against an unlanded feature branch. The action
+      # resolves on head_ref only and this workflow is tag-push /
+      # workflow_dispatch, so wiring it up would resolve to the default branch
+      # in practice — but state the intent explicitly rather than leaning on
+      # that, so the exclusion doesn't read as an oversight to be tidied up.
       - name: Checkout sibling repos
         run: |
           cd "$GITHUB_WORKSPACE/.."
