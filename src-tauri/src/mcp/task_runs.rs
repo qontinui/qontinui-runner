@@ -2267,6 +2267,22 @@ pub async fn create_ai_session(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     info!("Creating ad-hoc AI session: {}", req.task_name);
 
+    // Agent-registry spawn authorization (plan
+    // `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c, served clause
+    // `agent-spawn-authorization`). An ad-hoc AI session created over the
+    // runner API is request-scoped — the caller asked for it and it does not
+    // outlive the ask — so it is an `in_session_subagent`. `None` for the
+    // agent name: `task_name` is a free-form title ("Ad-hoc Chat"), not a
+    // registry agent key.
+    let authz = crate::agent_authorization::authorize_spawn(
+        None,
+        crate::agent_authorization::SpawnPath::InSessionSubagent,
+    )
+    .await;
+    if let Some(refusal) = authz.refusal() {
+        return Err((StatusCode::FORBIDDEN, refusal));
+    }
+
     let task_run_id = uuid::Uuid::new_v4().to_string();
 
     // Create task run record using builder pattern

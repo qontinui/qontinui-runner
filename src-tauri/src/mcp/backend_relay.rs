@@ -2015,6 +2015,25 @@ async fn handle_chat_create(api_state: &Arc<ApiState>, data: &Value) -> Option<V
     };
     let task_name = field("task_name").unwrap_or_else(|| "Remote Chat".to_string());
     let initial_prompt = field("prompt");
+    // Agent-registry spawn authorization (plan
+    // `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c, served clause
+    // `agent-spawn-authorization`). The mobile app asking for a chat is the
+    // same request-scoped shape as the runner API's ad-hoc session, so it is
+    // an `in_session_subagent`. Checked BEFORE the task-run row is inserted so
+    // a refusal leaves no orphan record. `None` for the agent name:
+    // `task_name` is a free-form title, not a registry agent key.
+    let authz = crate::agent_authorization::authorize_spawn(
+        None,
+        crate::agent_authorization::SpawnPath::InSessionSubagent,
+    )
+    .await;
+    if let Some(refusal) = authz.refusal() {
+        return Some(serde_json::json!({
+            "type": "chat_created",
+            "error": refusal
+        }));
+    }
+
     let task_run_id = uuid::Uuid::new_v4().to_string();
 
     let create_input = crate::database::CreateTaskRunInput::new(&task_run_id, &task_name)

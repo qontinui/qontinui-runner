@@ -102,6 +102,12 @@ pub struct SpawnSessionResponse {
     /// True when the role was recognised and the slash command was
     /// dispatched as the initial prompt; false for plain ad-hoc sessions.
     pub dispatched_slash_command: bool,
+    /// Set when the agent-registry decision was `warn_proceed`: the spawn went
+    /// ahead, but the caller is told which disposition fired. `None` on a plain
+    /// allow. (Denials and degrades never reach a response body — they are a
+    /// 403 with the reason.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spawn_authorization_warning: Option<String>,
 }
 
 /// The new session's first user message.
@@ -170,6 +176,26 @@ async fn spawn_session(
                 .to_string(),
         ));
     }
+
+    // Agent-registry spawn authorization (plan
+    // `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c, served clause
+    // `agent-spawn-authorization`). `/sessions/spawn` mints a session that
+    // OUTLIVES the request that asked for it, so it is a
+    // `standing_continuation`: a standing per-path opt-in, default OFF for a
+    // fresh user. The role (`auto-review`, `coordinate`, …) is the registry
+    // key when one was given; a plain spawn resolves against the per-path row.
+    let decision = crate::agent_authorization::authorize_spawn(
+        req.role.as_deref().filter(|r| !r.is_empty()),
+        crate::agent_authorization::SpawnPath::StandingContinuation,
+    )
+    .await;
+    if let Some(refusal) = decision.refusal() {
+        return Err((StatusCode::FORBIDDEN, refusal));
+    }
+    let authz_warning = match &decision {
+        crate::agent_authorization::SpawnDecision::Warn { reason } => Some(reason.clone()),
+        _ => None,
+    };
 
     let task_run_id = uuid::Uuid::new_v4().to_string();
 
@@ -270,6 +296,7 @@ async fn spawn_session(
                 state: "ready".to_string(),
                 role: role_for_response,
                 dispatched_slash_command: dispatched,
+                spawn_authorization_warning: authz_warning,
             }))
         }
         Ok(Err(e)) => {
@@ -283,6 +310,7 @@ async fn spawn_session(
                 state: "error".to_string(),
                 role: role_for_response,
                 dispatched_slash_command: false,
+                spawn_authorization_warning: authz_warning,
             }))
         }
         Err(join_err) => {
@@ -296,6 +324,7 @@ async fn spawn_session(
                 state: "error".to_string(),
                 role: role_for_response,
                 dispatched_slash_command: false,
+                spawn_authorization_warning: authz_warning,
             }))
         }
     }

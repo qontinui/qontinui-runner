@@ -209,6 +209,44 @@ pub async fn dispatch_subtask(
         run_id, subtask.task_id, task_run_id, subtask.repo
     );
 
+    // Agent-registry spawn authorization (plan
+    // `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c, served clause
+    // `agent-spawn-authorization`). The orchestration loop dispatches one
+    // worker session per subtask — this is the workflow fan-out the clause
+    // names, so it is `parallel_fanout`: bounded-needs-declaration, not a
+    // standing spawn. Checked FIRST, before the worktree is acquired and the
+    // account is picked, so a refusal leaves no allocated worktree behind.
+    let authz = crate::agent_authorization::authorize_spawn(
+        None,
+        crate::agent_authorization::SpawnPath::ParallelFanout,
+    )
+    .await;
+    if let Some(refusal) = authz.refusal() {
+        // Make the refusal TERMINAL for this subtask before returning.
+        //
+        // The conductor treats a dispatch `Err` as a transient failure and
+        // leaves the subtask `Submitted` so a later tick retries — on a 5s
+        // tick that turns a standing authorization decision into an infinite
+        // retry loop, one `warn!` per tick, with the orchestration run hung
+        // because `TickPlan::to_fail` only covers `Working` rows. An
+        // authorization refusal is a standing decision, not a transient fault:
+        // retrying cannot change it. Same lesson as the looping supervisor
+        // (which keeps a refusal out of its spawn-failure backoff) and
+        // `spawn_run_task` (which posts a terminal lifecycle outcome).
+        warn!("dispatch_subtask: {} refused: {refusal}", subtask.task_id);
+        if let Err(e) = pg
+            .set_subtask_state(run_id, &subtask.task_id, SubtaskState::Failed)
+            .await
+        {
+            warn!(
+                "dispatch_subtask: could not mark {} Failed after an authorization \
+                 refusal: {e}",
+                subtask.task_id
+            );
+        }
+        return Err(refusal);
+    }
+
     // 1. Worktree allocation (best-effort, mirrors terminal_create). When
     //    `repo` is None the helper is a no-op and returns the default cwd.
     let default_cwd = std::env::current_dir()

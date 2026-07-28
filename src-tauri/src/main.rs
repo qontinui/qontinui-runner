@@ -10,6 +10,11 @@
 #![allow(clippy::too_many_arguments)]
 
 mod action_service;
+// Plan `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c — runner-side
+// enforcement of the coord agent registry at every spawn funnel site.
+// Implements the served clause `agent-spawn-authorization`
+// (`policy/production-and-cost`).
+mod agent_authorization;
 mod agent_claims;
 mod agent_daemons;
 mod agent_pusher;
@@ -2238,6 +2243,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         // for any future migration that updates the frontend invoke sites.
         .setup(|app| {
             info!("Tauri application setup starting");
+
+            // Announce the agent-registry break-glass ONCE, loudly, if it is
+            // set. A per-spawn warn in a busy log is not discoverable; an
+            // operator who exported this months ago otherwise has no signal
+            // that spawn authorization is off on this runner.
+            agent_authorization::log_break_glass_at_startup();
 
             // Boot-restore remediation item 1 — classify THIS boot (crash
             // recovery vs planned restart) exactly once, synchronously,
