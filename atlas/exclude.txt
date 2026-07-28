@@ -65,6 +65,7 @@ project.custom_functions_id_seq
 project.dataset_items
 project.decisions
 project.deferred_questions
+project.design_policies
 project.detected_issues
 project.development_intelligence
 project.development_intelligence_id_seq
@@ -373,9 +374,11 @@ project.wsv_shadow_disagreements
 project.wsv_shadow_disagreements_id_seq
 coord.agent_logs
 coord.agent_questions
+coord.agent_registry
 coord.agent_sessions
 coord.agent_status
 coord.agent_tool_access
+coord.agent_user_prefs
 coord.agent_worktrees
 coord.alerts
 coord.alerts_id_seq
@@ -408,6 +411,7 @@ coord.conflict_resolutions
 coord.conflicts
 coord.consistent_snapshots
 coord.continuation_dispatches
+coord.continuation_poll_status
 coord.coordinator_decisions
 coord.coordinator_leader
 coord.correlation_topics
@@ -437,6 +441,7 @@ coord.findings
 coord.flag_registry
 coord.fleet_runtime_policy
 coord.fleet_runtime_policy_id_seq
+coord.footprint_drift_events
 coord.fs_observations
 coord.fs_observations_id_seq
 coord.gate_progress_samples
@@ -542,6 +547,8 @@ coord.session_events
 coord.session_events_id_seq
 coord.session_expectations
 coord.session_file_snapshots
+coord.session_handle_lineage
+coord.session_handles
 coord.session_messages
 coord.session_output
 coord.session_touched_files
@@ -579,6 +586,8 @@ coord.work_units
 coord.worker_heartbeats
 coord.worktree_census
 coord.worktree_census_id_seq
+coord.worktree_reclaim_events
+coord.worktree_reclaim_events_id_seq
 coord.worktree_volume
 coord.worktree_volume_id_seq
 coord.worktrees
