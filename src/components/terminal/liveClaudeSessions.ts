@@ -110,19 +110,36 @@ export function isOperatorNamed(session: Pick<LiveClaudeSession, "name" | "nameS
  * session (the registry only ever describes live processes, so a closed session
  * is always a miss and always keeps its `resumeName`).
  *
- * Several live processes may share one session id (22 of 80 on 2026-07-23). The
- * first operator-named row wins; `read_live_sessions` sorts by account then
- * name then pid, so "first" is stable across polls rather than PID-iteration
- * order.
+ * Several live processes may share one session id (22 of 80 on 2026-07-23), so
+ * one of them has to be chosen. **The most recently updated wins** — that is
+ * the window the operator is actually working in, and it is the only tiebreak
+ * that survives the event this feature exists to track. Picking the first row
+ * in `read_live_sessions` order (account → name → pid) looks stable but is
+ * keyed on the *name*, so renaming `"aaa"` to `"zzz2"` alongside a sibling
+ * `"zzz"` would re-sort the pair and make the card show the SIBLING's name —
+ * the rename appearing to do nothing, or worse, to pick the wrong window.
+ *
+ * Equal `updatedAt` (including the 0 the Rust reader substitutes when the
+ * registry omits the field) keeps the first row, i.e. `read_live_sessions`
+ * order, so the result is still deterministic across polls.
+ *
+ * Names are trimmed: the gate tolerates surrounding whitespace, but the cards
+ * render into a truncating single-line span where padding is visible.
  */
 export function registryNamesBySessionId(
   sessions: readonly LiveClaudeSession[],
 ): Map<string, string> {
-  const byId = new Map<string, string>();
+  const bestById = new Map<string, LiveClaudeSession>();
   for (const s of sessions) {
-    if (!s.sessionId || byId.has(s.sessionId)) continue;
-    if (!isOperatorNamed(s)) continue;
-    byId.set(s.sessionId, s.name);
+    if (!s.sessionId || !isOperatorNamed(s)) continue;
+    const held = bestById.get(s.sessionId);
+    if (held === undefined || (s.updatedAt ?? 0) > (held.updatedAt ?? 0)) {
+      bestById.set(s.sessionId, s);
+    }
+  }
+  const byId = new Map<string, string>();
+  for (const [sessionId, s] of bestById) {
+    byId.set(sessionId, s.name.trim());
   }
   return byId;
 }

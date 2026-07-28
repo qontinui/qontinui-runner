@@ -1,7 +1,10 @@
 import { useMemo, useState, useCallback } from "react";
 import { TerminalSquare, Copy, Check, RefreshCw, Layers, AlertTriangle } from "lucide-react";
 import { usePastSessions, type PastSession } from "./usePastSessions";
-import { useLiveClaudeSessionNames } from "./useLiveClaudeSessionNames";
+import {
+  refreshLiveClaudeSessionNames,
+  useLiveClaudeSessionNames,
+} from "./useLiveClaudeSessionNames";
 
 /**
  * Max cards rendered per cohort before a "Show N more" expander. A single crash
@@ -175,6 +178,27 @@ export function pastSessionDisplayName(
   return registryNames.get(session.claudeSessionId) || session.resumeName || UNNAMED_PAST_SESSION;
 }
 
+/**
+ * Tooltip for a past-session card: the headline, the session id, and — only
+ * when the registry name displaced a DIFFERENT transcript name — that
+ * transcript name too.
+ *
+ * The two disagreed in 22 of 33 measured cases, so promoting the registry name
+ * without this would make `resumeName` unreachable from the UI. The line is
+ * omitted when they agree so the common case stays a two-line tooltip.
+ */
+export function pastSessionTooltip(
+  session: Pick<PastSession, "claudeSessionId" | "resumeName">,
+  registryNames: ReadonlyMap<string, string>,
+): string {
+  const displayName = pastSessionDisplayName(session, registryNames);
+  const base = `${displayName}\n${session.claudeSessionId}`;
+  if (session.resumeName && session.resumeName !== displayName) {
+    return `${base}\ntranscript name: ${session.resumeName}`;
+  }
+  return base;
+}
+
 /** One past-session card: headline name + badges + copy/resume actions. */
 function PastSessionCard({
   session,
@@ -227,7 +251,7 @@ function PastSessionCard({
         />
         <span
           className="text-xs text-[#c0caf5] font-medium truncate flex-1"
-          title={`${displayName}\n${session.claudeSessionId}`}
+          title={pastSessionTooltip(session, registryNames)}
         >
           {displayName}
         </span>
@@ -317,11 +341,19 @@ function PastSessionCard({
  * its own `usePastSessions` hook.
  */
 export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps) {
-  const { sessions, loading, error, refresh } = usePastSessions();
+  const { sessions, loading, error, refresh: refreshSessions } = usePastSessions();
   // Live window names, for the subset of these rows whose process is still
   // running. Closed rows are always a miss and keep their `resumeName`.
   const registryNames = useLiveClaudeSessionNames();
   const cohorts = useMemo(() => groupByCohort(sessions), [sessions]);
+
+  // Refresh reloads BOTH halves of what a card shows. Reloading only the list
+  // would leave the headline names up to a poll period stale — the operator
+  // clicks Refresh precisely because they just renamed something.
+  const refresh = useCallback(() => {
+    refreshSessions();
+    void refreshLiveClaudeSessionNames();
+  }, [refreshSessions]);
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
 
   const toggleExpand = useCallback((cohortId: number) => {
