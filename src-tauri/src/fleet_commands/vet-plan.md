@@ -83,7 +83,19 @@ status publication is observability, not gating.
    back to `"machine_id"` if present (legacy shape). If neither
    source supplies a UUID, emit a single-line warning and skip the
    UPSERT (proceed to Step 1).
-2. **`current_repo`.** `basename "$(git rev-parse --show-toplevel)"`.
+2. **`current_repo`.** The MAIN repo's directory name —
+   `basename "$(dirname "$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)")"`.
+   NOT `basename` of `git rev-parse --show-toplevel`: from a linked git worktree
+   that returns the WORKTREE's own directory name (`ccfg-wt-pr161-followup`,
+   `qontinui-claude-config-wt-lna`), so the dashboard tile groups this session
+   under a repo that does not exist — and sessions run under
+   `QONTINUI_AGENT_WORKTREE_MODE=1`, so that is the common path, not an edge case.
+   `--git-common-dir` resolves to the main checkout's `.git` from a worktree and
+   from the canonical checkout alike, and `--path-format=absolute` (git >= 2.31)
+   keeps it from returning a relative `.git`. **If it prints nothing or `.`** —
+   not a git tree — omit `current_repo` rather than sending what the expression
+   then evaluates to (the parent directory's name, a wrong-but-plausible repo).
+   (Inside a git submodule it yields `modules`; no submodules exist here.)
 3. **`current_branch`.** `git symbolic-ref --short HEAD`.
 4. **`tenant_id`.** Env `QONTINUI_TENANT_ID` if set; otherwise omit
    the field (coord column is nullable).
@@ -377,25 +389,60 @@ this vet session as in-flight.
 
 A VETTED plan is **ready, dispatchable work** — not a human decision. When you
 stamp VETTED, register (or **refresh** an existing) `unit_ready` gate (coord
-tracks the plan as a generic **work unit**) so coord turns the ready plan into a
-queued continuation that dispatches into a session the operator can **see**,
-instead of leaving the plan to rot until someone clicks. This **replaces** the old
+tracks the plan as a generic **work unit**) so coord holds the ready plan as
+watched, dispatchable work instead of letting it rot until someone clicks — and,
+when one of the exceptions below applies, turns it into a queued continuation
+that dispatches into a session the operator can **see**. This **replaces** the old
 `operator_approval`-bootstrap gate that used to queue ready work: a work queue is
 `unit_ready`, NOT `operator_approval` (`operator_approval` is for genuine human
 decisions only — see the predicate guidance in `_gate-registration`).
 
-> **Under `/vet-imp`, register `unit_ready` NOTIFY-ONLY (omit `continuation_spawn`).**
-> When this vet runs as the first half of the `/vet-imp` chain, `/implement-plan`
-> executes IN THIS SAME SESSION immediately after the VETTED stamp. Attaching a
-> dispatching `continuation_spawn` to the `unit_ready` gate would make coord ALSO
-> queue a fresh runner-terminal session to run `/implement-plan` — a duplicate,
-> parallel implementation of the same plan (the exact concurrent-WIP clobber the
-> coordination layer exists to prevent). So under `/vet-imp`: still upsert the work
+> **DEFAULT: register the `unit_ready` gate CONTINUATION-LESS — omit the
+> continuation entirely: no `continuation` and no `continuation_prompt` (MCP
+> `coord_register_gate`), and no `continuation_spawn` (HTTP `register-gate`).**
+> All three spellings are the SAME knob (coord materializes both MCP fields into
+> the DB's `continuation_spawn` and both spawn), and the default is **omission**
+> — `continuation_spawn` NULL — *not* the typed `{"action":"notify_only"}`, which
+> stores a payload and is a different DB state.
+> The gate's durable record is always required — it is what keeps the ready plan
+> visible instead of silently dropped. The *dispatching* continuation is
+> the exception: charter rule 10 ("Finish to zero") makes a session finish its own
+> follow-ups in-session, and when the follow-up already runs in THIS session a
+> continuation makes coord ALSO queue a fresh runner-terminal session for
+> it — a duplicate, parallel run of the same work (the exact concurrent-WIP clobber
+> the coordination layer exists to prevent). So by default: still upsert the work
 > unit, mark it `vetted`, and register the `unit_ready` gate for registry/dashboard
-> visibility (it auto-clears by predicate), but WITHOUT `continuation_spawn`. The
-> in-session `/implement-plan` is the dispatch. Only register the continuation when
-> vetting STANDALONE (no implementation follows this session), where the dispatch
-> into a visible session is the whole point.
+> visibility (it auto-clears by predicate), but with NO continuation of any kind.
+>
+> **`/vet-imp` is the worked example:** when this vet runs as the first half of the
+> `/vet-imp` chain, `/implement-plan` executes IN THIS SAME SESSION immediately
+> after the VETTED stamp — that in-session run IS the dispatch.
+>
+> **Attach a continuation only when the follow-up will outlive this session**
+> — "finish to zero" is intent, and intent cannot survive exogenous session death:
+> (1) the wait exceeds charter rule 10's monitor window (rule 10 keeps a session
+> alive and monitoring only for "an observable signal and a short expected wait
+> (≲2h: deploy, CI, merge train)"); (2) vetting **STANDALONE**, where no
+> implementation follows this session and the dispatch into a visible session is
+> the whole point; (3) `operator_approval` / genuine human-decision gates, which
+> are unbounded in time (except sensitive work — security/credential/billing/
+> strategy — which stays notify-only unconditionally); (4) cross-session
+> dependency chains whose follow-up belongs to a different work unit or device.
+> **(3) and (4) do not arise in §5.4 by construction** — this section registers a
+> `unit_ready` gate on THIS plan's own work unit, and `operator_approval` is both
+> the wrong model here (a work queue is not a human decision) and 403-rejected on
+> the device-authed `register-gate` door. In §5.4, decide between (1) and (2) only.
+> Sessions also die exogenously (usage limit, crash, reboot) — if you are
+> *stopping* incomplete-because-WAITING, that is `/blocked`'s session-close
+> protocol and it takes a continuation. (Canonical: `_gate-registration` →
+> "Continuation policy".)
+>
+> **Verify the spawn path before relying on it.** `continuation_spawn` dispatch had
+> a verified failure on this device (`spawn_failed: Failed to spawn shell:
+> CreateProcessW ...` from a `%TEMP%\qontinui-identity-<uuid>\claude` shim path,
+> 2026-07-16, both gates of the pr-failing-check-details plan). Not asserted fixed
+> or still live — verify. If the spawn IS your recovery path, read the gate's
+> `continuation_consumed_outcome` rather than assuming a `consumed` continuation ran.
 
 Register exactly once per VETTED stamp (refresh, don't duplicate):
 
@@ -427,11 +474,12 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    the device-authed `register-gate` endpoint in step 4 does NOT upsert (it 404s if
    the slug is absent). The captured `work_unit_id` UUID anchors the gate AND is
    what the `unit_ready` predicate carries.
-2. **Resolve the operator's `device_id` DYNAMICALLY** (never hardcode a UUID):
+2. **Only if an exception above applies** (otherwise skip — the default gate has no
+   continuation): **resolve the operator's `device_id` DYNAMICALLY** (never hardcode a UUID):
    env `QONTINUI_MACHINE_ID` first, else read `~/.qontinui/machine.json` and parse
    `"device_id"` (fall back to `"machine_id"` if present). If neither yields a
-   UUID, skip the continuation spawn but still register the gate (notify-only) and
-   note it in the report.
+   UUID, skip the continuation spawn but still register the gate
+   (continuation-less) and note it in the report.
 3. **Check for an existing gate** anchored to this work unit
    (`GET $COORD_HTTP_URL/coord/gates?work_unit_id=<id>` — find an OPEN `unit_ready`
    gate for this plan). If one exists, **refresh** it (re-register / update the
@@ -467,8 +515,12 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
      upsert; pass `phase_name` (the plan title, or a synthetic label like
      `"vet→implement handoff"` for a whole-plan gate — `phase_name` is **required**,
      since coord's anchor is `work_unit_id` + `phase_name` together).
-   - **`continuation_spawn`:** target the operator's device with a **visible**
-     session —
+   - **`continuation_spawn` — OMIT IT unless an exception above applies.** Default
+     is continuation-less: this whole field absent on the HTTP body, and no
+     `continuation` / `continuation_prompt` on the MCP tool either — all three are
+     the same knob. When an exception DOES apply (most
+     often: vetting standalone, or a wait longer than rule 10's ≲2h window), target
+     the operator's device with a **visible** session —
      ```json
      {
        "target_device_id": "<device_id from step 2>",
@@ -502,6 +554,11 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    unknown/method-not-found (per-agent allow-set masking) fall back to the
    device-authed HTTP routes (upsert → register-gate), and NEVER report a gate
    registered/refreshed without a returned `gate_id`.
+   - **Dead transport is a different failure:** `"Command failed with no output"`
+     means the tool was present and the transport was dead, so the masking
+     fallback above never fires. Presume the registration **LOST**, run
+     **`/coord-revive`**, re-issue over the door it reports LIVE, and verify by
+     read. Canonical: `_gate-registration` → "Dead-transport honesty".
 
 (If coord doesn't yet accept `unit_ready` — e.g. the deploy that ships the
 work-unit surface hasn't landed — report the gate as NOT registered with the
@@ -542,7 +599,8 @@ leave it in the report.
   `deploy_healthy`, `claim_terminal`, `operator_approval`, `ci_green`,
   `ref_exists`, `metric_threshold`, `time_elapsed`, `unit_ready`,
   `migration_at_head`, `infra_drift_clear`, `file_exists`, `sql_count`,
-  `unit_status`, `gate_cleared`, `commit_live`; optional
+  `unit_status`, `gate_cleared`, `commit_live`; plus — **exception cases only,
+  see the Continuation bullet below** — an optional typed `continuation` or legacy
   `continuation_prompt`). **HTTP fallback** when MCP is unavailable — for a
   plan-anchored gate it is now TWO device-authed calls on coord's `require_jwt`
   sub-router (device/agent/service JWT all work): (1)
@@ -556,6 +614,39 @@ leave it in the report.
   from a device session too. A claim-anchored gate (no slug) uses MCP or
   `POST $COORD_HTTP_URL/coord/gates/register` (default `https://coord.qontinui.io`).
   Tenant derives server-side — never pass it.
+- **Continuation = OFF by default.** Register the gate, but **omit the
+  continuation ENTIRELY — no `continuation` and no `continuation_prompt` (MCP
+  `coord_register_gate`), and no `continuation_spawn` (HTTP `register-gate`)**.
+  All three spellings are the SAME knob: coord materializes both MCP fields into
+  the DB's `continuation_spawn` column and both spawn, so passing
+  `continuation_prompt` while faithfully "omitting `continuation_spawn`" still
+  produces the duplicate run. The default is **omission** (`continuation_spawn`
+  NULL) — *not* the typed `{"action":"notify_only"}`, which STORES a payload and
+  is a different DB state (use that only for a deliberate typed no-op). Under
+  charter rule 10 ("Finish to zero") this session finishes its own follow-ups, so
+  a redundant continuation queues a duplicate, parallel run of the same work (the
+  concurrent-WIP clobber the coordination layer exists to prevent). Attach one
+  only when the follow-up will **outlive** this session: a wait longer than rule
+  10's ≲2h monitor window; this session ending WITHOUT dispatching the follow-up
+  itself; an `operator_approval` / human-decision gate (unbounded in time — but
+  sensitive work stays notify-only unconditionally); or a cross-session chain
+  owned by a different work unit or device (**out-of-graph only** — a purely
+  in-graph dependency on another work unit is a DAG edge + `metadata.dispatch`,
+  not a gate). Sessions also die exogenously (usage limit, crash, reboot) — if
+  you are *stopping* incomplete-because-WAITING, that is `/blocked`'s
+  session-close protocol and it DOES take a continuation. **Clearance stays
+  record-only:** a continuation-less gate produces no dispatch and no
+  `coord.alerts` row on clear — the gate row + dashboard + `all_cleared` event
+  are the clear-time signal. **Failure now alerts regardless of continuation:**
+  a gate going `failed`/`misconfigured` raises a `gate_unclearable_terminal`
+  alert (`misconfigured` pages critical immediately; `failed` pages warning
+  after a 15-min grace), and a gate rotting open past ~7 days surfaces via the
+  gate doctor / info-level non-paging alerts. And if you DO
+  rely on a spawn, delivery is a live defect — continuations are being dispatched
+  but never consumed, and coord's 24h pending window drops them permanently — so
+  treat it as best-effort and read the gate's `continuation_consumed_outcome`
+  (a **null** outcome means never claimed, which is worse than a recorded
+  `spawn_failed`). (Canonical: `_gate-registration` → "Continuation policy".)
 - **`clearance_audience`:** set `agent` for agent-verifiable facts ("/vet-plan
   was run", "crate exists + tests green", "a dual run emitted evidence") so the
   session that completes the work can attest the gate itself; set `operator` for
@@ -584,6 +675,16 @@ leave it in the report.
   **"gate NOT registered — coord_register_gate not in this session's tool
   allow-set"** and fall back to HTTP (or surface to the operator). NEVER report a
   gate registered without a returned `gate_id`.
+- **Dead-transport honesty (the OTHER mask):** a call that returns **`"Command
+  failed with no output"`** is a *dead cached transport*, not a masked tool — the
+  tool is present and listed, so the fallback above never fires. Presume the
+  registration **LOST** (8 of 8 prod-adjudicable "no output" writes were adjudicated
+  lost on 2026-07-26, four of them `coord_register_gate`), run **`/coord-revive`**
+  for a typed verdict naming the door that is live right now, re-issue there, then
+  **verify by read** (`coord_gate_inspect(gate_id)`, or the anchor filter
+  `GET .../coord/gates?work_unit_id=<uuid>&phase_name=<name>`). A retry's success is
+  never evidence the original landed. The same applies to `coord_attest_gate` below.
+  Canonical: `_gate-registration` → "Dead-transport honesty".
 - The plan-file `## Gates` block is a **local convenience mirror only** — coord is
   the source of truth; never require it, never read it back as authoritative.
 - **Re-registering for the same plan/anchor:** first cancel the prior gate's
@@ -614,6 +715,12 @@ gate rots open until a human clicks it).
 - **Masked-tool honesty:** if `coord_attest_gate` is unknown/METHOD_NOT_FOUND it
   isn't in this session's allow-set → fall back to the HTTP attest route. NEVER
   claim a gate attested without a returned cleared `gate_id`.
+  A **`"Command failed with no output"`** attest is the *dead-transport* failure, not
+  allow-set masking — the tool was present, so that fallback never fires: presume the attest
+  **LOST**, run **`/coord-revive`**, re-issue over the live door, and read the gate
+  back to confirm `cleared`. A lost attest is the quiet one — the gate rots open
+  while this run reports the item done. Canonical: `_gate-registration` →
+  "Dead-transport honesty".
 - **Honesty:** NEVER report a deferred item as done without EITHER a cleared
   `gate_id` OR an explicit "gate not found" note.
 

@@ -634,8 +634,21 @@ a gate.
    canonical name post-unified-devices); fall back to `"machine_id"`
    if present (legacy shape). The coord wire-field name is `device_id`
    regardless of which local key supplied the UUID.
-2. **`current_repo`.** `basename "$(git rev-parse --show-toplevel)"`
-   from the worktree the skill is executing in.
+2. **`current_repo`.** The MAIN repo's directory name, resolved from the
+   worktree the skill is executing in —
+   `basename "$(dirname "$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)")"`.
+   NOT `basename` of `git rev-parse --show-toplevel`: from a linked git
+   worktree that returns the WORKTREE's own directory name
+   (`ccfg-wt-pr161-followup`, `qontinui-claude-config-wt-lna`), so the
+   dashboard tile groups this session under a repo that does not exist —
+   and sessions run under `QONTINUI_AGENT_WORKTREE_MODE=1`, so that is the
+   common path, not an edge case. `--git-common-dir` resolves to the main
+   checkout's `.git` from a worktree and from the canonical checkout alike,
+   and `--path-format=absolute` (git >= 2.31) keeps it from returning a
+   relative `.git`. **If it prints nothing or `.`** — not a git tree — omit
+   `current_repo` rather than sending what the expression then evaluates to
+   (the parent directory's name, a wrong-but-plausible repo). (Inside a git
+   submodule it yields `modules`; no submodules exist here.)
 3. **`current_branch`.** `git symbolic-ref --short HEAD` from the same
    worktree.
 4. **`tenant_id`.** Env `QONTINUI_TENANT_ID` if set; otherwise omit
@@ -1222,10 +1235,6 @@ Once Steps 1–5 land cleanly:
    `$QONTINUI_PLANS_DIR`** does a stamped plan move; that setting is the user
    opting in to a two-directory layout. The move happens **after** the stamp is
    committed — see item 3, which owns both halves in the right order.
-   **If you are not certain the archive dir is meant as a destination** — older
-   tooling used the same variable as a read-only second *lookup* path — do NOT move.
-   Stamp in place and say so in your report. An unmoved plan is trivially archived
-   later; a wrongly-moved one costs a search.
 
    > **Why the in-place default is spelled out** (operator incident, 2026-07-21).
    > This step once mandated a `mv` out of an untracked working directory into a
@@ -1321,7 +1330,8 @@ supersedes unit_ready for the dependency-gated case".)
   `deploy_healthy`, `claim_terminal`, `operator_approval`, `ci_green`,
   `ref_exists`, `metric_threshold`, `time_elapsed`, `unit_ready`,
   `migration_at_head`, `infra_drift_clear`, `file_exists`, `sql_count`,
-  `unit_status`, `gate_cleared`, `commit_live`; optional
+  `unit_status`, `gate_cleared`, `commit_live`; plus — **exception cases only,
+  see the Continuation bullet below** — an optional typed `continuation` or legacy
   `continuation_prompt` e.g. `run /implement-phase <stem> "Phase N"` for
   auto-resume). **HTTP fallback** when MCP is unavailable — for a plan-anchored gate
   it is now TWO device-authed calls on coord's `require_jwt` sub-router
@@ -1336,6 +1346,46 @@ supersedes unit_ready for the dependency-gated case".)
   `coord_register_gate` now works from a device session too. A claim-anchored gate
   (no slug) uses MCP or `POST $COORD_HTTP_URL/coord/gates/register` (default
   `https://coord.qontinui.io`). Tenant derives server-side — never pass it.
+- **Continuation = OFF by default.** Register the gate, but **omit the
+  continuation ENTIRELY — no `continuation` and no `continuation_prompt` (MCP
+  `coord_register_gate`), and no `continuation_spawn` (HTTP `register-gate`)**.
+  All three spellings are the SAME knob: coord materializes both MCP fields into
+  the DB's `continuation_spawn` column and both spawn, so passing
+  `continuation_prompt` while faithfully "omitting `continuation_spawn`" still
+  produces the duplicate run. The default is **omission** (`continuation_spawn`
+  NULL) — *not* the typed `{"action":"notify_only"}`, which STORES a payload and
+  is a different DB state (use that only for a deliberate typed no-op). Under
+  charter rule 10 ("Finish to zero") this session finishes its own follow-ups, so
+  a redundant continuation queues a duplicate, parallel run of the same work (the
+  concurrent-WIP clobber the coordination layer exists to prevent). Attach one
+  only when the follow-up will **outlive** this session: a wait longer than rule
+  10's ≲2h monitor window; this session ending WITHOUT dispatching the follow-up
+  itself; an `operator_approval` / human-decision gate (unbounded in time — but
+  sensitive work stays notify-only unconditionally); or a cross-session chain
+  owned by a different work unit or device (**out-of-graph only** — a purely
+  in-graph dependency on another work unit is a DAG edge + `metadata.dispatch`,
+  not a gate). Sessions also die exogenously (usage limit, crash, reboot) — if
+  you are *stopping* incomplete-because-WAITING, that is `/blocked`'s
+  session-close protocol and it DOES take a continuation. **Clearance stays
+  record-only:** a continuation-less gate produces no dispatch and no
+  `coord.alerts` row on clear — the gate row + dashboard + `all_cleared` event
+  are the clear-time signal. **Failure now alerts regardless of continuation:**
+  a gate going `failed`/`misconfigured` raises a `gate_unclearable_terminal`
+  alert (`misconfigured` pages critical immediately; `failed` pages warning
+  after a 15-min grace), and a gate rotting open past ~7 days surfaces via the
+  gate doctor / info-level non-paging alerts. And if you DO
+  rely on a spawn, delivery is a live defect — continuations are being dispatched
+  but never consumed, and coord's 24h pending window drops them permanently — so
+  treat it as best-effort and read the gate's `continuation_consumed_outcome`
+  (a **null** outcome means never claimed, which is worse than a recorded
+  `spawn_failed`). (Canonical: `_gate-registration` → "Continuation policy".)
+  - *Which half of this section's trigger you are in matters.* The
+    **phase-abort** half — a phase agent failed/aborted on an observable
+    condition — **is exception 2**: this session is not going to dispatch the
+    follow-up, so **continuation ON** there, exactly as `/implement-phase`'s
+    blocked-exit path says. The OFF-by-default headline above governs the other
+    half: a Step 6 "follow-up plan with open items" that this session is still
+    carrying.
 - **`clearance_audience`:** set `agent` for agent-verifiable facts ("/vet-plan
   was run", "crate exists + tests green", "a dual run emitted evidence") so the
   session that completes the work can attest the gate itself; set `operator` for
@@ -1365,6 +1415,16 @@ supersedes unit_ready for the dependency-gated case".)
   unknown/method-not-found, report **"gate NOT registered — coord_register_gate
   not in this session's tool allow-set"** and fall back to HTTP (or surface to the
   operator). NEVER report a gate registered without a returned `gate_id`.
+- **Dead-transport honesty (the OTHER mask):** a call that returns **`"Command
+  failed with no output"`** is a *dead cached transport*, not a masked tool — the
+  tool is present and listed, so the fallback above never fires. Presume the
+  registration **LOST** (8 of 8 prod-adjudicable "no output" writes were adjudicated
+  lost on 2026-07-26, four of them `coord_register_gate`), run **`/coord-revive`**
+  for a typed verdict naming the door that is live right now, re-issue there, then
+  **verify by read** (`coord_gate_inspect(gate_id)`, or the anchor filter
+  `GET .../coord/gates?work_unit_id=<uuid>&phase_name=<name>`). A retry's success is
+  never evidence the original landed. The same applies to `coord_attest_gate` below.
+  Canonical: `_gate-registration` → "Dead-transport honesty".
 - The optional plan-file `## Gates` block is a **local convenience mirror only** —
   coord is the source of truth; never require it, never read it back as
   authoritative.
@@ -1388,6 +1448,12 @@ gate rots open until a human clicks it.
 - **Masked-tool honesty:** if `coord_attest_gate` is unknown/METHOD_NOT_FOUND it
   isn't in this session's allow-set → fall back to the HTTP attest route. NEVER
   claim a gate attested without a returned cleared `gate_id`.
+  A **`"Command failed with no output"`** attest is the *dead-transport* failure, not
+  allow-set masking — the tool was present, so that fallback never fires: presume the attest
+  **LOST**, run **`/coord-revive`**, re-issue over the live door, and read the gate
+  back to confirm `cleared`. A lost attest is the quiet one — the gate rots open
+  while this run reports the item done. Canonical: `_gate-registration` →
+  "Dead-transport honesty".
 - **Honesty:** NEVER report a deferred item as done without EITHER a cleared
   `gate_id` OR an explicit "gate not found" note.
 

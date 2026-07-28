@@ -66,11 +66,11 @@ const FLEET_COMMANDS: &[(&str, &str)] = &[
 const STAGED_COMMAND_HASHES: &[(&str, &str)] = &[
     (
         "implement-plan.md",
-        "fc9c0a82309e9489ed23ac2e99374e37eec3c57db6e4f8074b942c82e273e34c",
+        "2e15de77fedc8694dbec165ece3791627a42ccf67d4669315ad6d15780de3aeb",
     ),
     (
         "vet-plan.md",
-        "8ee11c8a284a62f1fbd59ce81d43155720168edb035dccd704200223f03c2a51",
+        "b46a4d97bb6279404d246a59b92af37be947d8928f15df7e125f09d118f568f6",
     ),
 ];
 
