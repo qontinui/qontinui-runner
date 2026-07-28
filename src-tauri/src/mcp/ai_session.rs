@@ -1879,8 +1879,26 @@ pub async fn run_prompt(
 
     // Prepend runner-triggered context and supervisor instructions
     // This tells the AI session how to safely restart the runner if needed
+    // Attributability marker for the rules block below — same contract as
+    // `terminal::RUNNER_CONTEXT_SOURCE_MARKER` (incident coord #1242). This
+    // block is the one that MANDATES and FORBIDS ("do NOT restart the runner
+    // directly"), so it must name its own origin even more than the advisory
+    // briefing does. Distinct `/ai_session` path component: a reader must be
+    // able to tell WHICH runner-injected text a rule came from.
+    const RULES_SOURCE_MARKER: &str = concat!(
+        "[source: ",
+        env!("CARGO_PKG_NAME"),
+        "/ai_session@",
+        env!("CARGO_PKG_VERSION"),
+        "+",
+        env!("QONTINUI_GIT_SHA"),
+        "]"
+    );
+
     let supervisor_available = super::auto_continue::check_supervisor_available();
-    let runner_context = if supervisor_available {
+    // NOT `terminal::runner_context` — this is a separate, runner-triggered
+    // rules block about supervisor-mediated restarts.
+    let supervisor_rules_block = if supervisor_available {
         r#"## IMPORTANT: Runner-Triggered Session Context
 
 You are being run BY the qontinui-runner. You are a child process of the runner.
@@ -1934,7 +1952,7 @@ Tell the user: "The qontinui-runner needs to be restarted manually to apply chan
 "#
     };
 
-    enhanced_prompt = format!("{}{}", runner_context, enhanced_prompt);
+    enhanced_prompt = format!("{RULES_SOURCE_MARKER}\n{supervisor_rules_block}{enhanced_prompt}");
 
     // RemoteAgent: surface declared MCP connection refs in the prompt
     // header. Phase D does not yet merge these into a per-call MCP config

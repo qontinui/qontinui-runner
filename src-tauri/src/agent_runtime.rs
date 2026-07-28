@@ -4834,9 +4834,9 @@ mod tests {
             .get(flag + 1)
             .expect("the briefing text must immediately follow its flag");
         assert!(
-            prompt.starts_with("[source: qontinui-runner/runner_context@"),
+            prompt.starts_with(crate::terminal::RUNNER_CONTEXT_SOURCE_MARKER),
             "injected system prompt must start with the source marker, got: {}",
-            &prompt[..prompt.len().min(80)]
+            prompt.chars().take(80).collect::<String>()
         );
     }
 
