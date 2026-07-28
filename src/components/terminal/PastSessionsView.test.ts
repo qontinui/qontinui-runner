@@ -32,6 +32,7 @@ import {
   pastSessionCopyId,
   pastSessionDisplayName,
   pastSessionResumeId,
+  pastSessionTooltip,
   pastSessionsCohortToggleId,
 } from "./PastSessionsView";
 import { registryNamesBySessionId } from "./liveClaudeSessions";
@@ -131,6 +132,25 @@ describe("pastSessionDisplayName", () => {
     // …and a live registry name rescues even a nameless row.
     const names = registryNamesBySessionId([makeLiveRow("nameless", "recovered")]);
     expect(pastSessionDisplayName(nameless, names)).toBe("recovered");
+  });
+});
+
+describe("pastSessionTooltip", () => {
+  it("always names the session id", () => {
+    expect(pastSessionTooltip(makeSession("s1", 1, 1000), new Map())).toContain("s1");
+  });
+
+  it("keeps the transcript name reachable when the window name displaced it", () => {
+    const session = makeSession("live-4", 1, 1000);
+    const names = registryNamesBySessionId([makeLiveRow("live-4", "P3 window name")]);
+    const t = pastSessionTooltip(session, names);
+    expect(t).toContain("P3 window name");
+    expect(t).toContain(`transcript name: ${session.resumeName}`);
+  });
+
+  it("does not repeat the name when nothing displaced it", () => {
+    const closed = makeSession("closed-2", 1, 1000);
+    expect(pastSessionTooltip(closed, new Map())).not.toContain("transcript name:");
   });
 });
 

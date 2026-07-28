@@ -112,14 +112,49 @@ describe("registryNamesBySessionId", () => {
     expect(got.get("dup")).toBe("P3 window name");
   });
 
-  it("keeps the first operator-named row when several share an id", () => {
-    // `read_live_sessions` sorts account → name → pid, so "first" is stable
-    // across polls and the headline does not flicker.
+  it("picks the most recently updated process when several share an id", () => {
     const got = registryNamesBySessionId([
-      mk({ sessionId: "dup", pid: 10, name: "first" }),
-      mk({ sessionId: "dup", pid: 11, name: "second" }),
+      mk({ sessionId: "dup", pid: 10, name: "older window", updatedAt: 1_000 }),
+      mk({ sessionId: "dup", pid: 11, name: "newer window", updatedAt: 2_000 }),
+    ]);
+    expect(got.get("dup")).toBe("newer window");
+  });
+
+  it("does not let a rename hand the card a SIBLING process's name", () => {
+    // The trap a name-ordered tiebreak falls into. `read_live_sessions` sorts
+    // account → name → pid, so renaming the selected process can re-sort the
+    // pair and silently switch which window the card describes.
+    const before = registryNamesBySessionId([
+      mk({ sessionId: "dup", pid: 10, name: "aaa", updatedAt: 5_000 }),
+      mk({ sessionId: "dup", pid: 11, name: "zzz", updatedAt: 1_000 }),
+    ]);
+    expect(before.get("dup")).toBe("aaa");
+
+    // Operator renames pid 10 (the active one) to "zzz2". Sorted by name it is
+    // now SECOND — a first-wins tiebreak would show pid 11's "zzz" and the
+    // rename would look like it did nothing.
+    const after = registryNamesBySessionId([
+      mk({ sessionId: "dup", pid: 11, name: "zzz", updatedAt: 1_000 }),
+      mk({ sessionId: "dup", pid: 10, name: "zzz2", updatedAt: 6_000 }),
+    ]);
+    expect(after.get("dup")).toBe("zzz2");
+  });
+
+  it("keeps the first row when updatedAt ties, so the result is deterministic", () => {
+    // Includes the 0 the Rust reader substitutes when the registry omits the
+    // field — a whole-fleet tie must not flicker between polls.
+    const got = registryNamesBySessionId([
+      mk({ sessionId: "dup", pid: 10, name: "first", updatedAt: 0 }),
+      mk({ sessionId: "dup", pid: 11, name: "second", updatedAt: 0 }),
     ]);
     expect(got.get("dup")).toBe("first");
+  });
+
+  it("trims the stored name", () => {
+    // The gate tolerates padding; the card renders into a truncating span
+    // where it would be visible.
+    const got = registryNamesBySessionId([mk({ sessionId: "s", name: "  worktree prune  " })]);
+    expect(got.get("s")).toBe("worktree prune");
   });
 
   it("ignores rows with no session id, and is empty for no input", () => {

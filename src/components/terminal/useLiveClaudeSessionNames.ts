@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 import { extractLiveSessions, registryNamesBySessionId } from "./liveClaudeSessions";
@@ -8,14 +8,88 @@ import type { CommandResponse } from "./types";
  * How often to re-read Claude Code's live-session registry.
  *
  * The name changes when the operator runs `/rename`, so the cadence sets how
- * long a card can show a stale name. 30s matches the sibling
- * `transcript_find_external_processes` poll in `useSessionManager`, and the
- * read itself is ~20 sub-1KB JSON files (measured on the fleet's heaviest box,
- * 2026-07-28) — far too cheap to justify a cache or a push channel.
+ * long a card can show a stale name.
+ *
+ * **This is not a free read.** `terminal_claude_session_list_live` parses ~20
+ * sub-1KB JSON files (cheap) but first takes a full process-table snapshot to
+ * drop entries whose PID died — on Windows that spawns `powershell.exe` running
+ * `Get-CimInstance Win32_Process`, which dominates the cost. 30s matches the
+ * sibling `transcript_find_external_processes` poll in `useSessionManager`,
+ * which already pays for a snapshot of its own; do not raise the cadence
+ * without first caching that snapshot on the Rust side.
  */
 const REGISTRY_POLL_MS = 30_000;
 
 const EMPTY: ReadonlyMap<string, string> = new Map();
+
+// ── Module-scope store ───────────────────────────────────────────────────────
+// ONE poller for the whole webview, ref-counted across mounts, in the shape
+// `src/hooks/ui-bridge-events/singleton-listener.ts` established for this exact
+// "N components, one shared subscription" problem.
+//
+// Per-hook-instance state would be wrong on both axes: it multiplies the
+// process-table snapshot above by the number of mounted consumers (today
+// `useSessionManager` + `PastSessionsView`, which are visible simultaneously),
+// and their intervals are offset by mount time, so two surfaces could show
+// DIFFERENT names for the same session for up to a full poll period.
+
+let current: ReadonlyMap<string, string> = EMPTY;
+const subscribers = new Set<() => void>();
+let refCount = 0;
+let timer: ReturnType<typeof setInterval> | null = null;
+let inFlight = false;
+
+/**
+ * Re-read the registry now and publish the result if it changed.
+ *
+ * Exported so a manual "Refresh" affordance can converge the names it shows
+ * alongside the list it reloads, instead of leaving them up to a poll period
+ * stale.
+ *
+ * Fails soft in both directions: a command error, an unsuccessful response, or
+ * an exception all KEEP the last good map. A card showing its previous name is
+ * a far better outcome than every card blanking out.
+ */
+export async function refreshLiveClaudeSessionNames(): Promise<void> {
+  // The underlying command spawns a process-table snapshot, so a call can
+  // outlive the interval on a loaded box. Without this guard two overlapping
+  // reads race and the older response can overwrite the newer one.
+  if (inFlight) return;
+  inFlight = true;
+  try {
+    const res = await invoke<CommandResponse>("terminal_claude_session_list_live");
+    if (!res.success) return;
+    const next = registryNamesBySessionId(extractLiveSessions(res.data));
+    // Publish only on a real change so consumers memoized on this map (the
+    // `allSessions` build in `useSessionManager`) do not rebuild every poll.
+    if (sameNames(current, next)) return;
+    current = next;
+    for (const notify of subscribers) notify();
+  } catch {
+    // Command unavailable (older binary) or registry unreadable.
+  } finally {
+    inFlight = false;
+  }
+}
+
+function subscribe(onStoreChange: () => void): () => void {
+  subscribers.add(onStoreChange);
+  if (++refCount === 1) {
+    void refreshLiveClaudeSessionNames();
+    timer = setInterval(() => void refreshLiveClaudeSessionNames(), REGISTRY_POLL_MS);
+  }
+  return () => {
+    subscribers.delete(onStoreChange);
+    if (--refCount === 0 && timer !== null) {
+      clearInterval(timer);
+      timer = null;
+    }
+  };
+}
+
+function getSnapshot(): ReadonlyMap<string, string> {
+  return current;
+}
 
 /**
  * `sessionId → the name shown in that session's Claude Code window`, for every
@@ -39,46 +113,24 @@ const EMPTY: ReadonlyMap<string, string> = new Map();
  *   live/closed asymmetry in `PastSessionsView` fall out for free rather than
  *   needing a second branch.
  *
- * Fails soft to an empty map: a card showing its previous name is a far better
- * outcome than a panel that throws mid-render.
+ * The returned map's identity is stable while its contents are unchanged, so it
+ * is safe to use directly as a `useMemo` / `useEffect` dependency.
  */
 export function useLiveClaudeSessionNames(): ReadonlyMap<string, string> {
-  const [names, setNames] = useState<ReadonlyMap<string, string>>(EMPTY);
-  const cancelled = useRef(false);
-
-  const refresh = useCallback(async () => {
-    try {
-      const res = await invoke<CommandResponse>("terminal_claude_session_list_live");
-      if (cancelled.current) return;
-      const next = res.success ? registryNamesBySessionId(extractLiveSessions(res.data)) : EMPTY;
-      // Replace only on a real change so consumers memoized on this map (the
-      // `allSessions` build in `useSessionManager`) do not rebuild every poll.
-      setNames((prev) => (sameNames(prev, next) ? prev : next));
-    } catch {
-      // Command unavailable (older binary) or registry unreadable — keep the
-      // last good map rather than blanking every card.
-    }
-  }, []);
-
-  useEffect(() => {
-    cancelled.current = false;
-    // Defer the first read past the effect body so it cannot setState
-    // synchronously during mount.
-    void Promise.resolve().then(() => {
-      if (!cancelled.current) void refresh();
-    });
-    const interval = setInterval(() => void refresh(), REGISTRY_POLL_MS);
-    return () => {
-      cancelled.current = true;
-      clearInterval(interval);
-    };
-  }, [refresh]);
-
-  return names;
+  // Third argument = server snapshot; identical here because the store is
+  // client-only and starts empty.
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 }
 
-/** Shallow map equality — used to keep the state identity stable across polls. */
-function sameNames(a: ReadonlyMap<string, string>, b: ReadonlyMap<string, string>): boolean {
+/**
+ * Shallow map equality — the invariant the `useMemo` dependency rests on.
+ *
+ * Exported for tests: if this ever returns `false` for equal content, every
+ * poll rebuilds the whole `UnifiedSession[]` and the regression is invisible
+ * except as jank.
+ */
+export function sameNames(a: ReadonlyMap<string, string>, b: ReadonlyMap<string, string>): boolean {
+  if (a === b) return true;
   if (a.size !== b.size) return false;
   for (const [id, name] of a) {
     if (b.get(id) !== name) return false;

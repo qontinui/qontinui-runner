@@ -151,6 +151,44 @@ function isWorktreePath(path: string | undefined | null): boolean {
   );
 }
 
+/**
+ * Card headline: the string Claude Code is showing in this session's own window
+ * when we have it, else today's transcript-derived chain.
+ *
+ * `registryName` is null unless the session is LIVE and its registry row is
+ * operator-named, so a `derived` cwd slug or a closed session falls straight
+ * through to the previous chain untouched.
+ */
+export function sessionCardName(
+  session: Pick<UnifiedSession, "registryName" | "resumeName" | "displayName">,
+): string {
+  return session.registryName || session.resumeName || session.displayName;
+}
+
+/**
+ * Card tooltip: session id, headline, and — only when the registry name
+ * displaced a DIFFERENT transcript name — that transcript name too.
+ *
+ * Without the last line, promoting the registry name would make `resumeName` /
+ * `workSummaryHint` unreachable from the UI; they disagreed with the window
+ * name in 22 of 33 measured cases (2026-07-23), so "which one is this?" is a
+ * question the operator will actually have.
+ */
+export function sessionCardTooltip(
+  session: Pick<
+    UnifiedSession,
+    "sessionId" | "registryName" | "resumeName" | "workSummaryHint" | "displayName"
+  >,
+): string {
+  const headline = sessionCardName(session);
+  const base = `Session ${session.sessionId}\n${headline}`;
+  const transcriptName = session.resumeName || session.workSummaryHint || session.displayName;
+  if (transcriptName && transcriptName !== headline) {
+    return `${base}\ntranscript name: ${transcriptName}`;
+  }
+  return base;
+}
+
 export function SessionCard({
   session,
   isSelected,
@@ -375,7 +413,7 @@ export function SessionCard({
       <button
         onClick={() => onViewTranscript(session)}
         className="w-full text-left px-3 py-2 pr-20"
-        title={`Session ${session.sessionId}\n${session.registryName || session.resumeName || session.workSummaryHint || session.displayName}`}
+        title={sessionCardTooltip(session)}
       >
         {/* Row 1: Status dot + Name + Account badge */}
         <div className="flex items-center gap-1.5 mb-0.5">
@@ -396,16 +434,7 @@ export function SessionCard({
             style={{ backgroundColor: statusInfo.color }}
             title={statusInfo.label}
           />
-          {/*
-            `registryName` first: it is the string Claude Code is showing in
-            this session's own window right now. It is null unless the session
-            is live AND its registry row is operator-named, so a `derived` cwd
-            slug or a closed session falls straight through to the previous
-            chain untouched.
-          */}
-          <span className="text-xs text-[#a9b1d6] truncate flex-1">
-            {session.registryName || session.resumeName || session.displayName}
-          </span>
+          <span className="text-xs text-[#a9b1d6] truncate flex-1">{sessionCardName(session)}</span>
           {accountBadge && (
             <span
               className={`px-1 py-0 rounded text-[9px] font-medium shrink-0 ${accountBadge.bg} ${accountBadge.text}`}
