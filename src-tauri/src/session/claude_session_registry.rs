@@ -267,7 +267,8 @@ mod tests {
     fn name_source_survives_the_json_round_trip_as_camel_case() {
         // The frontend gate reads `nameSource`; a snake_case key there would
         // silently disable it (every row would look operator-named).
-        let derived = r#"{"pid":1,"sessionId":"s","name":"qontinui-root-ec","nameSource":"derived"}"#;
+        let derived =
+            r#"{"pid":1,"sessionId":"s","name":"qontinui-root-ec","nameSource":"derived"}"#;
         let s = parse_registry_file(derived, Path::new(".claude-gmail")).unwrap();
         let json = serde_json::to_value(&s).unwrap();
         assert_eq!(json["nameSource"], "derived");
