@@ -67,6 +67,16 @@ struct RegistryFile {
     /// Absent on very old CLI builds — such a row is unusable for display and
     /// is dropped by [`parse_registry_file`].
     name: Option<String>,
+    /// How Claude Code arrived at `name`. `"derived"` means *it* invented the
+    /// name from the cwd (`qontinui-root-ec`, `qontinui-coord-88`); an **absent**
+    /// key means an operator `/rename` (or a launch-time name) supplied it.
+    ///
+    /// Kept `Option` + `serde(default)` because most rows omit it entirely (12
+    /// of the 17 named rows on the operator's box on 2026-07-28), and because a
+    /// future CLI may add further variants. Consumers must treat any value
+    /// other than `"derived"` — including absent — as operator-chosen.
+    #[serde(default)]
+    name_source: Option<String>,
     cwd: Option<String>,
     #[serde(default)]
     kind: Option<String>,
@@ -86,6 +96,18 @@ pub struct LiveClaudeSession {
     pub session_id: String,
     /// The name shown in the session window and in `/resume`. Ground truth.
     pub name: String,
+    /// Provenance of [`Self::name`], verbatim from the registry file
+    /// (`nameSource`). `Some("derived")` marks Claude Code's own
+    /// `<dir>-<2hex>` auto-derivation, which is *weaker* than the names the
+    /// runner's other surfaces already show — callers must not let such a name
+    /// preempt an existing one. `None` (the common case) and any other value
+    /// mean the name is operator-chosen and should win.
+    ///
+    /// Deliberately **not** filtered here: [`read_live_sessions`] is also the
+    /// backing read for the `/copy-names` listing, which wants every live
+    /// session regardless of provenance. The precedence decision belongs at the
+    /// display site.
+    pub name_source: Option<String>,
     /// OS process id that reported this entry.
     pub pid: u32,
     /// Account + CLI wrapper derived from the owning config dir.
@@ -129,6 +151,7 @@ fn parse_registry_file(bytes: &str, config_dir: &Path) -> Option<LiveClaudeSessi
     Some(LiveClaudeSession {
         session_id: raw.session_id,
         name,
+        name_source: raw.name_source,
         pid: raw.pid,
         account,
         working_dir,
@@ -219,6 +242,58 @@ mod tests {
             s.resume_command,
             "cd 'D:/qontinui-root' && clp --resume b770ae37-1ffa-4888-a5d1-89d058307adf"
         );
+    }
+
+    #[test]
+    fn name_source_is_carried_through_verbatim() {
+        // The operator's box on 2026-07-28: 5 of 17 named rows look like this —
+        // Claude Code's own `<dir>-<2hex>` auto-derivation. The reader must
+        // surface the provenance (and must NOT drop the row) so the display
+        // sites can refuse to let it preempt a better name.
+        let derived = r#"{"pid":198780,"sessionId":"6c71bd20","cwd":"D:\\qontinui-root","kind":"interactive","entrypoint":"sdk-cli","name":"qontinui-coord-c7","nameSource":"derived"}"#;
+        let s = parse_registry_file(derived, Path::new("C:/claude/.claude-qontinui")).unwrap();
+        assert_eq!(s.name, "qontinui-coord-c7");
+        assert_eq!(s.name_source.as_deref(), Some("derived"));
+
+        // The other 12 carry no `nameSource` key at all and hold real operator
+        // names — absent means operator-chosen, not unknown.
+        let operator_named = r#"{"pid":1,"sessionId":"s","name":"worktree prune","cwd":"/x"}"#;
+        let s = parse_registry_file(operator_named, Path::new(".claude-gmail")).unwrap();
+        assert_eq!(s.name, "worktree prune");
+        assert_eq!(s.name_source, None);
+    }
+
+    #[test]
+    fn name_source_survives_the_json_round_trip_as_camel_case() {
+        // The frontend gate reads `nameSource`; a snake_case key there would
+        // silently disable it (every row would look operator-named).
+        let derived = r#"{"pid":1,"sessionId":"s","name":"qontinui-root-ec","nameSource":"derived"}"#;
+        let s = parse_registry_file(derived, Path::new(".claude-gmail")).unwrap();
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["nameSource"], "derived");
+
+        let plain = r#"{"pid":1,"sessionId":"s","name":"worktree prune"}"#;
+        let s = parse_registry_file(plain, Path::new(".claude-gmail")).unwrap();
+        let json = serde_json::to_value(&s).unwrap();
+        assert!(json["nameSource"].is_null());
+    }
+
+    #[test]
+    fn derived_rows_are_still_listed() {
+        // `/copy-names` wants every live session; only the display sites apply
+        // the precedence gate.
+        let root = tmpdir("derived");
+        let acct = root.join(".claude-paktis");
+        fs::write(
+            acct.join("sessions").join("42.json"),
+            r#"{"pid":42,"sessionId":"d","name":"qontinui-root-ec","nameSource":"derived"}"#,
+        )
+        .unwrap();
+        let live: HashSet<u32> = [42].into_iter().collect();
+        let got = read_live_sessions(&[acct], &live);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name_source.as_deref(), Some("derived"));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

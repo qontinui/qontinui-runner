@@ -1,6 +1,7 @@
 import { useMemo, useState, useCallback } from "react";
 import { TerminalSquare, Copy, Check, RefreshCw, Layers, AlertTriangle } from "lucide-react";
 import { usePastSessions, type PastSession } from "./usePastSessions";
+import { useLiveClaudeSessionNames } from "./useLiveClaudeSessionNames";
 
 /**
  * Max cards rendered per cohort before a "Show N more" expander. A single crash
@@ -144,12 +145,45 @@ function formatTimeAgo(ms: number): string {
   return formatWhen(ms);
 }
 
+/** Shown when a session has no usable name from any source. */
+export const UNNAMED_PAST_SESSION = "(unnamed session)";
+
+/**
+ * Headline name for one past-session card.
+ *
+ * `registryNames` is the live `sessionId → window name` map from
+ * {@link useLiveClaudeSessionNames}, and the precedence is deliberately
+ * asymmetric between live and closed rows:
+ *
+ * - **Live, operator-named** → the registry name wins. `resumeName` is scraped
+ *   from the transcript and matched the real window name in only 11 of 33
+ *   measured cases (2026-07-23), so where the two disagree the registry is
+ *   right by construction.
+ * - **Live, `nameSource: "derived"`** → miss. The map excludes derived rows, so
+ *   Claude Code's `qontinui-root-ec` cwd slug can never displace a real name.
+ * - **Closed** → always a miss, because the registry only ever describes
+ *   running processes. Closed rows therefore keep exactly the `resumeName` they
+ *   render today; this function must never regress them to blank.
+ *
+ * Pure and exported so the contract is testable without a DOM (the runner's
+ * vitest env is `node`).
+ */
+export function pastSessionDisplayName(
+  session: Pick<PastSession, "claudeSessionId" | "resumeName">,
+  registryNames: ReadonlyMap<string, string>,
+): string {
+  return registryNames.get(session.claudeSessionId) || session.resumeName || UNNAMED_PAST_SESSION;
+}
+
 /** One past-session card: headline name + badges + copy/resume actions. */
 function PastSessionCard({
   session,
+  registryNames,
   onResumePastSession,
 }: {
   session: PastSession;
+  /** Live window names by session id — see {@link pastSessionDisplayName}. */
+  registryNames: ReadonlyMap<string, string>;
   onResumePastSession?: (session: PastSession) => void;
 }) {
   const [copied, setCopied] = useState(false);
@@ -174,6 +208,7 @@ function PastSessionCard({
   }, [onResumePastSession, resumable, session]);
 
   const closed = session.state === "closed";
+  const displayName = pastSessionDisplayName(session, registryNames);
 
   return (
     <div
@@ -192,9 +227,9 @@ function PastSessionCard({
         />
         <span
           className="text-xs text-[#c0caf5] font-medium truncate flex-1"
-          title={`${session.resumeName}\n${session.claudeSessionId}`}
+          title={`${displayName}\n${session.claudeSessionId}`}
         >
-          {session.resumeName || "(unnamed session)"}
+          {displayName}
         </span>
         <span
           className="px-1 py-0 rounded text-[9px] font-medium shrink-0 bg-[#7aa2f7]/10 text-[#7aa2f7]"
@@ -283,6 +318,9 @@ function PastSessionCard({
  */
 export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps) {
   const { sessions, loading, error, refresh } = usePastSessions();
+  // Live window names, for the subset of these rows whose process is still
+  // running. Closed rows are always a miss and keep their `resumeName`.
+  const registryNames = useLiveClaudeSessionNames();
   const cohorts = useMemo(() => groupByCohort(sessions), [sessions]);
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
 
@@ -369,6 +407,7 @@ export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps)
                   <PastSessionCard
                     key={session.claudeSessionId}
                     session={session}
+                    registryNames={registryNames}
                     onResumePastSession={onResumePastSession}
                   />
                 ))}

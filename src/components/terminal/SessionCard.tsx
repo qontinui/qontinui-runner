@@ -375,7 +375,7 @@ export function SessionCard({
       <button
         onClick={() => onViewTranscript(session)}
         className="w-full text-left px-3 py-2 pr-20"
-        title={`Session ${session.sessionId}\n${session.resumeName || session.workSummaryHint || session.displayName}`}
+        title={`Session ${session.sessionId}\n${session.registryName || session.resumeName || session.workSummaryHint || session.displayName}`}
       >
         {/* Row 1: Status dot + Name + Account badge */}
         <div className="flex items-center gap-1.5 mb-0.5">
@@ -396,8 +396,15 @@ export function SessionCard({
             style={{ backgroundColor: statusInfo.color }}
             title={statusInfo.label}
           />
+          {/*
+            `registryName` first: it is the string Claude Code is showing in
+            this session's own window right now. It is null unless the session
+            is live AND its registry row is operator-named, so a `derived` cwd
+            slug or a closed session falls straight through to the previous
+            chain untouched.
+          */}
           <span className="text-xs text-[#a9b1d6] truncate flex-1">
-            {session.resumeName || session.displayName}
+            {session.registryName || session.resumeName || session.displayName}
           </span>
           {accountBadge && (
             <span

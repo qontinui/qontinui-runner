@@ -1,8 +1,11 @@
 import { describe, it, expect } from "vitest";
 
 import {
+  DERIVED_NAME_SOURCE,
   extractLiveSessions,
   groupByAccount,
+  isOperatorNamed,
+  registryNamesBySessionId,
   sharedSessionIds,
   type LiveClaudeSession,
 } from "./liveClaudeSessions";
@@ -42,6 +45,86 @@ describe("extractLiveSessions", () => {
     expect(extractLiveSessions("nope")).toEqual([]);
     expect(extractLiveSessions({})).toEqual([]);
     expect(extractLiveSessions({ sessions: "not-an-array" })).toEqual([]);
+  });
+});
+
+describe("isOperatorNamed (the nameSource gate)", () => {
+  it("rejects Claude Code's own derived cwd slug", () => {
+    // The regression this gate exists to prevent: `qontinui-root-ec` is WORSE
+    // than the transcript/plan-title name the card already shows, so letting it
+    // through would make the feature a net downgrade.
+    expect(isOperatorNamed(mk({ name: "qontinui-root-ec", nameSource: "derived" }))).toBe(false);
+    expect(
+      isOperatorNamed(mk({ name: "qontinui-coord-88", nameSource: DERIVED_NAME_SOURCE })),
+    ).toBe(false);
+  });
+
+  it("accepts a row with NO nameSource key — the absent-key majority", () => {
+    // 12 of the 17 named rows on the operator's box (2026-07-28) omit the key
+    // entirely and carry real `/rename` names. Absent must read as trustworthy,
+    // or the gate silently disables the whole feature.
+    const s = mk({ name: "worktree prune" });
+    delete (s as { nameSource?: unknown }).nameSource;
+    expect(isOperatorNamed(s)).toBe(true);
+    expect(isOperatorNamed(mk({ name: "worktree prune", nameSource: undefined }))).toBe(true);
+    // A runner binary predating the field can also send an explicit null.
+    expect(isOperatorNamed(mk({ name: "worktree prune", nameSource: null }))).toBe(true);
+  });
+
+  it("accepts an unrecognized future nameSource", () => {
+    // One-sided by design: only `"derived"` is disqualifying. Guessing wrong
+    // about a future variant costs us nothing worse than today's behaviour.
+    expect(isOperatorNamed(mk({ name: "n", nameSource: "launch-flag" }))).toBe(true);
+  });
+
+  it("rejects a blank name whatever its provenance", () => {
+    expect(isOperatorNamed(mk({ name: "" }))).toBe(false);
+    expect(isOperatorNamed(mk({ name: "   " }))).toBe(false);
+  });
+
+  it("degrades rather than throwing when `name` is missing entirely", () => {
+    // Same defensiveness `groupByAccount` applies to `account`: the payload
+    // reaches us through an unchecked cast and this runs during render.
+    const s = mk();
+    delete (s as { name?: unknown }).name;
+    expect(isOperatorNamed(s)).toBe(false);
+  });
+});
+
+describe("registryNamesBySessionId", () => {
+  it("indexes operator-named rows and omits derived ones", () => {
+    const got = registryNamesBySessionId([
+      mk({ sessionId: "good", name: "worktree prune" }),
+      mk({ sessionId: "slug", name: "qontinui-root-ec", nameSource: "derived" }),
+    ]);
+    expect(got.get("good")).toBe("worktree prune");
+    // A MISS is the contract: the caller keeps whatever it shows today.
+    expect(got.has("slug")).toBe(false);
+  });
+
+  it("lets an operator-named process win over a derived sibling on the same id", () => {
+    // 22 of 80 ids had several live processes on 2026-07-23; only one of them
+    // may carry the operator's name.
+    const got = registryNamesBySessionId([
+      mk({ sessionId: "dup", pid: 10, name: "qontinui-web-0c", nameSource: "derived" }),
+      mk({ sessionId: "dup", pid: 11, name: "P3 window name" }),
+    ]);
+    expect(got.get("dup")).toBe("P3 window name");
+  });
+
+  it("keeps the first operator-named row when several share an id", () => {
+    // `read_live_sessions` sorts account → name → pid, so "first" is stable
+    // across polls and the headline does not flicker.
+    const got = registryNamesBySessionId([
+      mk({ sessionId: "dup", pid: 10, name: "first" }),
+      mk({ sessionId: "dup", pid: 11, name: "second" }),
+    ]);
+    expect(got.get("dup")).toBe("first");
+  });
+
+  it("ignores rows with no session id, and is empty for no input", () => {
+    expect(registryNamesBySessionId([mk({ sessionId: "" })]).size).toBe(0);
+    expect(registryNamesBySessionId([]).size).toBe(0);
   });
 });
 
