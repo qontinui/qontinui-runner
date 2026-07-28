@@ -52,6 +52,12 @@
 //! `is_dirty` worktree (coord also filters these), and G6 (below) SKIPS any
 //! worktree that is currently building.
 //!
+//! "Dirty" here is **reclaim-scoped** ([`super::dirty`]): real work only, with
+//! the runner's own untracked scaffolding (`.claude/`, `.coord-mcp-status`,
+//! `.mcp.json`) excluded. Plain porcelain non-emptiness made ~34% of agent
+//! worktrees permanently unreclaimable, because provisioning one is what made
+//! it "dirty".
+//!
 //! ## G6 — in-flight-build guard (runner-only)
 //!
 //! Before executing ANY instruction's steps for a worktree, the runner
@@ -504,7 +510,10 @@ fn create_junction(link: &Path, _target: &Path) -> Result<(), String> {
 }
 
 /// Re-verify dirtiness at execution time (defense in depth — the pull may
-/// be stale). `true` when `git status --porcelain` is non-empty.
+/// be stale). Reclaim-scoped: `git status --porcelain` MINUS the runner's own
+/// untracked scaffolding, via [`super::dirty::porcelain_is_dirty`] — the same
+/// predicate the census reports with, so the two can never disagree and
+/// strand a worktree as "clean per coord, dirty per the runner" forever.
 pub(super) fn worktree_is_dirty(path: &Path) -> bool {
     let path_str = match path.to_str() {
         Some(s) => s,
@@ -513,7 +522,10 @@ pub(super) fn worktree_is_dirty(path: &Path) -> bool {
     crate::process_helpers::no_window("git")
         .args(["-C", path_str, "status", "--porcelain"])
         .output()
-        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .map(|o| {
+            o.status.success()
+                && super::dirty::porcelain_is_dirty(&String::from_utf8_lossy(&o.stdout))
+        })
         .unwrap_or(false)
 }
 
@@ -951,10 +963,12 @@ pub(super) fn backstop_eligible(
 /// a coord-vetted instruction, NOT fine for an autonomous local delete).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackstopDirty {
-    /// `git status --porcelain` succeeded and was empty, OR the dir has no
-    /// `.git` at all (plain leaked dir — nothing to be dirty).
+    /// `git status --porcelain` succeeded and reported no real work (empty,
+    /// or only the runner's own untracked scaffolding — see
+    /// [`super::dirty`]), OR the dir has no `.git` at all (plain leaked dir —
+    /// nothing to be dirty).
     Clean,
-    /// `git status --porcelain` succeeded and was non-empty — WIP, never
+    /// `git status --porcelain` succeeded and reported real work — WIP, never
     /// delete.
     Dirty,
     /// A `.git` file/dir is present but `git status` failed (corrupt or
@@ -974,10 +988,13 @@ fn backstop_dirty_verdict(path: &Path) -> BackstopDirty {
         .output()
     {
         Ok(o) if o.status.success() => {
-            if o.stdout.iter().all(|b| b.is_ascii_whitespace()) {
-                BackstopDirty::Clean
-            } else {
+            // Reclaim-scoped: the runner's own untracked scaffolding is not
+            // WIP. Without this the backstop is blocked by the very files it
+            // wrote when provisioning the worktree.
+            if super::dirty::porcelain_is_dirty(&String::from_utf8_lossy(&o.stdout)) {
                 BackstopDirty::Dirty
+            } else {
+                BackstopDirty::Clean
             }
         }
         // Status failed: only a dir with NO `.git` may be treated as clean;

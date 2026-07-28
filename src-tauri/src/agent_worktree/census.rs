@@ -1305,9 +1305,13 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
         .and_then(|s| s.parse::<i64>().ok())
         .map(|committed| chrono::Utc::now().timestamp().saturating_sub(committed));
 
-    // is_dirty — non-empty `git status --porcelain`.
+    // is_dirty — reclaim-scoped: `git status --porcelain` MINUS the runner's
+    // own untracked scaffolding (`.claude/`, `.coord-mcp-status`, `.mcp.json`).
+    // Plain non-emptiness marked ~34% of agent worktrees dirty forever purely
+    // because the runner provisioned them, which made them permanently
+    // unreclaimable. See `super::dirty` for the full rationale and scope.
     let is_dirty = git_capture(worktree, &["status", "--porcelain"])
-        .map(|s| !s.trim().is_empty())
+        .map(|s| super::dirty::porcelain_is_dirty(&s))
         .unwrap_or(false);
 
     let (nm_present, nm_is_junction, nm_bytes) = measure_dir(&worktree.join("node_modules"));
@@ -1806,6 +1810,55 @@ mod tests {
         let div = compute_canonical_base_divergence(path).expect("divergence Some");
         assert!(!div.is_empty(), "divergence string should be non-empty");
         assert!(div.starts_with("on:feature-x"), "got: {div}");
+    }
+
+    /// End-to-end at the census layer: a worktree holding ONLY the runner's
+    /// own untracked scaffolding must report `is_dirty: false`, while genuine
+    /// uncommitted work must still report `true`.
+    ///
+    /// The regression this pins: plain porcelain non-emptiness made every
+    /// provisioned agent worktree dirty forever, and since neither the census
+    /// nor the reclaim executor acts on a dirty worktree, ~34% of the backlog
+    /// (1,792 of 5,322 measured 2026-07-28) was permanently unreclaimable.
+    #[test]
+    fn capture_worktree_ignores_runner_scaffolding_but_not_real_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let wt = path.to_str().unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args([&["-C", wt], args].concat())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(path.join("a.txt"), b"x").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-q", "-m", "c1"]);
+        assert!(
+            !capture_worktree("qontinui-runner", path).is_dirty,
+            "a freshly committed tree is clean"
+        );
+
+        // Exactly what provisioning an agent worktree leaves behind.
+        std::fs::create_dir_all(path.join(".claude").join("agents")).unwrap();
+        std::fs::write(path.join(".claude").join("agents").join("r.md"), b"x").unwrap();
+        std::fs::write(path.join(".coord-mcp-status"), b"UNREACHABLE").unwrap();
+        std::fs::write(path.join(".mcp.json"), b"{}").unwrap();
+        assert!(
+            !capture_worktree("qontinui-runner", path).is_dirty,
+            "runner-written scaffolding alone must NOT read as dirty"
+        );
+
+        // A tracked modification still does.
+        std::fs::write(path.join("a.txt"), b"edited").unwrap();
+        assert!(
+            capture_worktree("qontinui-runner", path).is_dirty,
+            "a tracked modification must still read as dirty"
+        );
     }
 
     /// Ξ_Worktree P7.3 — `on:main` carve-out + ahead/behind formatting when
