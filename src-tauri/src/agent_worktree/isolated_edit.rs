@@ -69,6 +69,15 @@ pub struct IsolatedEditContext {
     // The declared touch set, captured so `Drop`'s verify call can scope the
     // FS-observation lookup to the same paths the predict declared.
     edit_loop_declared_paths: Vec<String>,
+
+    // Every ADDITIONAL agent id this context accumulated via
+    // [`IsolatedEditContext::acquire_additional`]. Each grow call runs a fresh
+    // `/agents/allocate`, so coord mints a NEW agent id — and
+    // `allocate_and_materialize_with_claim` registers that repo's credential
+    // helper under it. `agent_id` alone therefore does not name every
+    // credential install this context owns; `Drop` must tear down these too.
+    // Never contains `agent_id` itself (deduped on push).
+    extra_cred_agent_ids: Vec<String>,
 }
 
 impl Drop for IsolatedEditContext {
@@ -113,6 +122,30 @@ impl Drop for IsolatedEditContext {
                 self.edit_loop_correlation_id,
                 self.edit_loop_stash.clone(),
             );
+        }
+
+        // Tear down the per-agent git credential material installed by
+        // `allocate_and_materialize_with_claim` (one
+        // `setup_credential_helper_for_worktree` per materialized worktree,
+        // keyed on the AGENT id — a key space `SessionRegistry::close` never
+        // reaches, because it drains the coord SESSION uuid).
+        //
+        // Without this the install leaks three ways for the whole runner
+        // process lifetime: the worktree keeps a repo-local
+        // `credential.helper` + `credential.useHttpPath` pointing at a dead
+        // session's config; the `%TEMP%` config file holding a live coord push
+        // token survives until the >24h startup sweep; and — the costly one —
+        // the per-install refresh loop exits ONLY when that config file
+        // disappears, so it keeps POSTing `/coord/sessions/<id>/push-token`
+        // every 10 minutes forever. coord's `post_push_token` never validates
+        // that the id names a live session (it mints from the device's own
+        // auth), so the loop never even fails itself out: one immortal
+        // token-minting task per agent ever spawned.
+        //
+        // Detached-thread form: `Drop` must neither block a Tokio worker on
+        // `git config` subprocesses nor risk a panic-during-unwind.
+        for id in std::iter::once(&self.agent_id).chain(self.extra_cred_agent_ids.iter()) {
+            crate::credential_helper::spawn_cleanup_credential_helper(id.clone());
         }
 
         // Stop EVERY heartbeat first so no tick races with a release POST.
@@ -205,6 +238,14 @@ impl IsolatedEditContext {
             let hb =
                 spawn_claim_heartbeat(&self.coord_http_base, self.device_id, &self.agent_id, claim);
             self._heartbeats.push(hb);
+        }
+        // Record the grow call's own agent id so `Drop` tears down the
+        // credential helper allocate installed under it. coord mints a fresh
+        // id per allocate, so this is normally != `self.agent_id`; dedupe
+        // anyway rather than assume.
+        if result.agent_id != self.agent_id && !self.extra_cred_agent_ids.contains(&result.agent_id)
+        {
+            self.extra_cred_agent_ids.push(result.agent_id.clone());
         }
         self.active_claims.append(&mut result.active_claims);
         self.worktrees.append(&mut result.worktrees);
@@ -389,6 +430,7 @@ pub async fn acquire(
         edit_loop_stash,
         edit_loop_correlation_id,
         edit_loop_declared_paths,
+        extra_cred_agent_ids: Vec::new(),
     }))
 }
 
@@ -734,8 +776,19 @@ impl IsolatedEditContext {
         worktrees: Vec<MaterializedWorktree>,
         active_claims: Vec<ActiveClaim>,
     ) -> Self {
+        Self::for_test_with_agent_id("test-agent".to_string(), worktrees, active_claims)
+    }
+
+    /// [`Self::for_test`] with an explicit agent id — for tests that assert on
+    /// the per-agent credential teardown and must not collide with a parallel
+    /// test's `%TEMP%` config file.
+    pub(crate) fn for_test_with_agent_id(
+        agent_id: String,
+        worktrees: Vec<MaterializedWorktree>,
+        active_claims: Vec<ActiveClaim>,
+    ) -> Self {
         IsolatedEditContext {
-            agent_id: "test-agent".to_string(),
+            agent_id,
             worktrees,
             active_claims,
             _heartbeats: Vec::new(),
@@ -746,7 +799,16 @@ impl IsolatedEditContext {
             edit_loop_stash: super::edit_effect_loop::new_stash(),
             edit_loop_correlation_id: uuid::Uuid::nil(),
             edit_loop_declared_paths: Vec::new(),
+            extra_cred_agent_ids: Vec::new(),
         }
+    }
+
+    /// Test-only view of the credential-install ids `Drop` will tear down:
+    /// `agent_id` plus every id accumulated by `acquire_additional`.
+    pub(crate) fn cred_cleanup_ids(&self) -> Vec<&str> {
+        std::iter::once(self.agent_id.as_str())
+            .chain(self.extra_cred_agent_ids.iter().map(String::as_str))
+            .collect()
     }
 }
 
@@ -774,6 +836,65 @@ mod tests {
             agent_session_id: Some(uuid::Uuid::nil()),
         };
         (wt, claim)
+    }
+
+    /// Unique per-run agent id — the credential teardown resolves its config
+    /// file in the REAL `%TEMP%` (the production path), so the name must not
+    /// collide with a parallel test.
+    fn unique_agent_id(tag: &str) -> String {
+        format!(
+            "test-agent-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    #[test]
+    fn drop_tears_down_the_per_agent_credential_config() {
+        // The gap this closes: agent-worktree credential installs are keyed on
+        // the AGENT id, which `SessionRegistry::close` never sees — so nothing
+        // removed the `%TEMP%` token config, and the refresh loop (which exits
+        // only when that file disappears) ran for the runner's whole lifetime.
+        // Drop is the funnel that matches the agent-id key space.
+        let agent_id = unique_agent_id("drop");
+        let config_path = crate::credential_helper::config_file_path(&agent_id);
+        std::fs::write(&config_path, "{}").unwrap();
+
+        let mut ctx =
+            IsolatedEditContext::for_test_with_agent_id(agent_id.clone(), Vec::new(), Vec::new());
+        assert_eq!(ctx.cred_cleanup_ids(), vec![agent_id.as_str()]);
+        // Non-async test: keep Drop off its `tokio::spawn` release path.
+        ctx.active_claims.clear();
+        drop(ctx);
+
+        // Teardown runs on a detached thread — poll rather than assume it has
+        // already landed.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while config_path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            !config_path.exists(),
+            "Drop must remove the agent's credential config at {}",
+            config_path.display()
+        );
+    }
+
+    #[test]
+    fn cred_cleanup_ids_cover_every_install_key() {
+        // `acquire_additional` allocates again, so coord mints a NEW agent id
+        // and registers that repo's credential install under it. Drop must
+        // tear down the grow ids too, not just the acquire-time one.
+        let mut ctx = IsolatedEditContext::for_test(Vec::new(), Vec::new());
+        ctx.extra_cred_agent_ids.push("grow-1".to_string());
+        ctx.extra_cred_agent_ids.push("grow-2".to_string());
+        assert_eq!(
+            ctx.cred_cleanup_ids(),
+            vec!["test-agent", "grow-1", "grow-2"]
+        );
     }
 
     #[test]
