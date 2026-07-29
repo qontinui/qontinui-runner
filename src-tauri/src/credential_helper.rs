@@ -20,13 +20,21 @@ const MAX_CONSECUTIVE_REFRESH_FAILURES: u32 = 3;
 /// another runner instance sharing the same %TEMP%.
 const SWEEP_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// The repo-local git config keys [`set_git_credential_helper`] installs —
+/// and therefore exactly the keys [`cleanup_credential_helper`] must unset.
+/// Kept as one list so the install and teardown sides can never drift: a key
+/// added to the install without a matching unset would be left behind in the
+/// working dir's `.git/config` forever (which is what happened to
+/// `credential.useHttpPath`).
+const INSTALLED_LOCAL_KEYS: [&str; 2] = ["credential.helper", "credential.useHttpPath"];
+
 /// Per-session credential-helper state, keyed by the stringified coord
 /// session UUID (the exact `session_id` passed to
 /// [`setup_credential_helper`]).
 #[derive(Default)]
 struct SessionCredState {
-    /// Working dirs where a repo-local `credential.helper` was installed.
-    /// Drained by [`cleanup_credential_helper`], which unsets the key again.
+    /// Working dirs where the repo-local [`INSTALLED_LOCAL_KEYS`] were
+    /// written. Drained by [`cleanup_credential_helper`], which unsets them.
     dirs: Vec<PathBuf>,
     /// Whether a token refresh loop is currently live for this session —
     /// the dedupe bit that keeps a second `setup_credential_helper` call
@@ -57,7 +65,10 @@ fn credential_helper_binary_path() -> Option<PathBuf> {
     }
 }
 
-fn config_file_path(session_id: &str) -> PathBuf {
+/// The `%TEMP%` token-config path for a credential-helper install key.
+/// `pub(crate)` so the teardown funnels' tests can assert the file this
+/// module owns is actually gone.
+pub(crate) fn config_file_path(session_id: &str) -> PathBuf {
     std::env::temp_dir().join(format!("qontinui-git-cred-{session_id}.json"))
 }
 
@@ -199,11 +210,11 @@ fn set_git_credential_helper(
     let config_str = config_path.to_string_lossy().replace('\\', "/");
     let helper_value = format!("{binary_str} --config {config_str}");
 
-    git_config_local(working_dir, "credential.helper", &helper_value)?;
+    git_config_local(working_dir, INSTALLED_LOCAL_KEYS[0], &helper_value)?;
     // Without useHttpPath git never sends `path=` to the helper, and the
     // helper's repo-registry lookup is keyed on the request path — the
     // install would be a production no-op.
-    git_config_local(working_dir, "credential.useHttpPath", "true")?;
+    git_config_local(working_dir, INSTALLED_LOCAL_KEYS[1], "true")?;
 
     Ok(())
 }
@@ -766,11 +777,19 @@ async fn refresh_loop(coord_base: String, session_id: String, config_path: PathB
 }
 
 /// Tear down everything [`setup_credential_helper`] installed for a session:
-/// unset the repo-local `credential.helper` in every working dir the session
-/// registered, then remove the token config file (whose absence is also the
-/// refresh loop's exit signal). Idempotent and best-effort — every failure
-/// is debug!-logged, never propagated, because this runs inside the session
-/// close funnel which must not fail on credential hygiene.
+/// unset every repo-local key in [`INSTALLED_LOCAL_KEYS`] in each working dir
+/// the session registered, then remove the token config file (whose absence
+/// is also the refresh loop's exit signal). Idempotent and best-effort —
+/// every failure is debug!-logged, never propagated, because this runs inside
+/// teardown funnels which must not fail on credential hygiene.
+///
+/// `session_id` is whatever key the matching `setup_credential_helper` call
+/// used. Two disjoint key spaces exist and BOTH must be torn down:
+/// - the coord **session** UUID (terminal / worker installs), drained by
+///   `SessionRegistry::close`;
+/// - the coord **agent** id (agent-worktree installs made inside
+///   `allocate_and_materialize_with_claim`), drained by
+///   `IsolatedEditContext::drop`.
 pub fn cleanup_credential_helper(session_id: &str) {
     let dirs = registry()
         .lock()
@@ -787,30 +806,37 @@ pub fn cleanup_credential_helper(session_id: &str) {
             );
             continue;
         }
-        let output = crate::process_helpers::no_window("git")
-            .args([
-                "-C",
-                &dir.to_string_lossy(),
-                "config",
-                "--local",
-                "--unset-all",
-                "credential.helper",
-            ])
-            .output();
-        match output {
-            // Exit code 5 = key not present — the desired end state already
-            // holds (e.g. the operator hand-cleaned the repo).
-            Ok(out) if out.status.success() || out.status.code() == Some(5) => {}
-            Ok(out) => debug!(
-                "credential_helper: unset credential.helper in {} failed ({:?}): {}",
-                dir.display(),
-                out.status.code(),
-                String::from_utf8_lossy(&out.stderr)
-            ),
-            Err(e) => debug!(
-                "credential_helper: run git config --unset-all in {}: {e}",
-                dir.display()
-            ),
+        // Unset EVERY key the install wrote. Leaving `credential.useHttpPath`
+        // behind is not cosmetic: it permanently changes credential lookup for
+        // that repo, so the next helper in the chain (GCM) starts keying its
+        // store by full path and re-prompts per path — the very prompt class
+        // this subsystem exists to eliminate.
+        for key in INSTALLED_LOCAL_KEYS {
+            let output = crate::process_helpers::no_window("git")
+                .args([
+                    "-C",
+                    &dir.to_string_lossy(),
+                    "config",
+                    "--local",
+                    "--unset-all",
+                    key,
+                ])
+                .output();
+            match output {
+                // Exit code 5 = key not present — the desired end state already
+                // holds (e.g. the operator hand-cleaned the repo).
+                Ok(out) if out.status.success() || out.status.code() == Some(5) => {}
+                Ok(out) => debug!(
+                    "credential_helper: unset {key} in {} failed ({:?}): {}",
+                    dir.display(),
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+                Err(e) => debug!(
+                    "credential_helper: run git config --unset-all {key} in {}: {e}",
+                    dir.display()
+                ),
+            }
         }
     }
 
@@ -820,6 +846,21 @@ pub fn cleanup_credential_helper(session_id: &str) {
             debug!("credential_helper: cleanup config file failed: {e}");
         }
     }
+}
+
+/// [`cleanup_credential_helper`] on a detached thread — the form safe to call
+/// from a `Drop` impl.
+///
+/// Two reasons the direct call is wrong there. (1) Cleanup shells out to
+/// `git config` once per installed key per dir; running that inline blocks
+/// whichever thread the drop lands on, which for `IsolatedEditContext` is a
+/// Tokio worker. (2) Cleanup can panic on a poisoned registry mutex, and a
+/// panic raised while unwinding another panic aborts the process — the same
+/// hazard `IsolatedEditContext::drop` already guards its claim-release spawn
+/// against. A detached `std::thread` needs no runtime (unlike `tokio::spawn`,
+/// which itself panics outside one) and contains any panic to itself.
+pub fn spawn_cleanup_credential_helper(session_id: String) {
+    std::thread::spawn(move || cleanup_credential_helper(&session_id));
 }
 
 /// Delete stale credential config files (and orphaned `.tmp-*` siblings from
@@ -928,6 +969,15 @@ mod tests {
     // Collect the env-injected git config into (key -> value) pairs, honoring
     // GIT_CONFIG_COUNT, so a test can assert the LOGICAL config regardless of
     // index offset.
+    //
+    // The offset is NOT always zero. `non_interactive_git_env` deliberately
+    // APPENDS after whatever `GIT_CONFIG_COUNT` the process already inherited,
+    // so the pairs it owns run `base..count`, not `0..count`. Reading from 0
+    // panics on the inherited indices — which the runner reproduces on itself:
+    // `terminal/session.rs` injects exactly this env into every PTY it spawns,
+    // so the suite failed for anyone running it from inside a runner terminal
+    // while passing in CI's clean environment. Derive `base` the same way the
+    // production function does.
     fn injected_git_config(env: &[(String, String)]) -> Vec<(String, String)> {
         let get = |k: &str| -> Option<String> {
             env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone())
@@ -936,7 +986,15 @@ mod tests {
             .expect("GIT_CONFIG_COUNT set")
             .parse()
             .expect("GIT_CONFIG_COUNT numeric");
-        (0..count)
+        let base: usize = std::env::var("GIT_CONFIG_COUNT")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        assert!(
+            count >= base,
+            "GIT_CONFIG_COUNT {count} must extend the inherited {base}, not shrink it"
+        );
+        (base..count)
             .map(|i| {
                 (
                     get(&format!("GIT_CONFIG_KEY_{i}"))
@@ -1262,8 +1320,20 @@ mod tests {
             .status()
             .expect("git init");
         assert!(status.success());
-        git_config_local(repo.path(), "credential.helper", "C:/bin/helper.exe").unwrap();
-        assert!(git_config_get(repo.path(), "credential.helper").is_some());
+        // Install exactly what `set_git_credential_helper` writes, so the test
+        // pins the install/teardown pair rather than just one key.
+        set_git_credential_helper(
+            repo.path(),
+            Path::new("C:\\bin\\qontinui-git-credential.exe"),
+            Path::new("C:\\tmp\\cred.json"),
+        )
+        .unwrap();
+        for key in INSTALLED_LOCAL_KEYS {
+            assert!(
+                git_config_get(repo.path(), key).is_some(),
+                "{key} should be installed"
+            );
+        }
 
         let config_path = config_file_path(&session_id);
         std::fs::write(&config_path, "{}").unwrap();
@@ -1281,11 +1351,16 @@ mod tests {
 
         cleanup_credential_helper(&session_id);
 
-        assert_eq!(
-            git_config_get(repo.path(), "credential.helper"),
-            None,
-            "local credential.helper should be unset"
-        );
+        // EVERY installed key must be gone. `credential.useHttpPath` in
+        // particular: left behind, it keeps changing credential lookup for
+        // this repo long after the session that installed it ended.
+        for key in INSTALLED_LOCAL_KEYS {
+            assert_eq!(
+                git_config_get(repo.path(), key),
+                None,
+                "local {key} should be unset"
+            );
+        }
         assert!(!config_path.exists(), "config file should be removed");
         assert!(
             !registry().lock().unwrap().contains_key(&session_id),
