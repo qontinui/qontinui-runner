@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useMemo } from "react";
+import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { instanceStorage } from "@/lib/instance-storage";
@@ -8,9 +8,34 @@ export interface TerminalPageConfig {
   id: string;
   name: string;
   createdAt: number;
+  /**
+   * Default cwd for terminals spawned on this page (projects-dashboard plan
+   * §7.2 step 2). When a project is activated its root is written here, and
+   * `useTerminalManager.createTerminal` falls back to it whenever the caller
+   * passes no explicit `workingDir` — so EVERY future terminal on the page
+   * opens at the project root, not just the ones spawned at activation time.
+   *
+   * The fallback is applied frontend-side, BEFORE the value reaches the Rust
+   * `terminal_create` command: that command derives `intent_repo` from
+   * `working_dir` (`commands/terminal.rs:97-111`) and may then reassign
+   * `working_dir` to a freshly-allocated isolated worktree
+   * (`:122-128`). Passing `undefined` and letting Rust guess is therefore NOT
+   * equivalent — the page default has to arrive AS the `working_dir` argument.
+   *
+   * Optional: pages persisted before this field existed load unchanged (it is
+   * simply absent, and `resolveSpawnWorkingDir` then behaves exactly as
+   * before).
+   */
+  defaultWorkingDir?: string;
 }
 
-const STORAGE_KEY = "qontinui-terminal-pages";
+/**
+ * `instanceStorage` key holding the persisted `TerminalPageConfig[]`.
+ * Exported so the persistence round-trip is testable against the real key
+ * rather than a copy of it.
+ */
+export const PAGES_STORAGE_KEY = "qontinui-terminal-pages";
+const STORAGE_KEY = PAGES_STORAGE_KEY;
 const ACTIVE_PAGE_KEY = "qontinui-terminal-active-page";
 
 /**
@@ -28,7 +53,18 @@ function readPinnedPageId(): string | null {
   }
 }
 
-function loadPages(): TerminalPageConfig[] {
+/**
+ * The persisted page list, with the implicit "default" page injected when
+ * nothing has been persisted yet.
+ *
+ * Exported so callers that need the page roster OUTSIDE React (and the
+ * persistence round-trip tests) can read the same source the hook does. The
+ * value round-trips through `JSON.stringify`/`parse` in `instanceStorage`, so
+ * every own enumerable field on `TerminalPageConfig` — including the optional
+ * `defaultWorkingDir` — survives save/load unchanged, and a page persisted
+ * WITHOUT the field loads as a plain `TerminalPageConfig` with it absent.
+ */
+export function loadPages(): TerminalPageConfig[] {
   const pages = instanceStorage.getJSON<TerminalPageConfig[]>(STORAGE_KEY, []);
   if (pages.length === 0) {
     return [{ id: "default", name: "Terminal", createdAt: 0 }];
@@ -135,6 +171,112 @@ export function computeVisiblePages(
   return visible.length > 0 ? visible : pages;
 }
 
+/** Trim + treat blank as absent. Shared by the page-default helpers. */
+function cleanOptional(v: string | null | undefined): string | undefined {
+  const t = v?.trim();
+  return t ? t : undefined;
+}
+
+/**
+ * Pure: set (or, with `undefined`/blank, clear) a page's `defaultWorkingDir`.
+ *
+ * Returns the SAME array reference when nothing changed, so the caller can
+ * skip a redundant persist / re-render — same contract as `reconcilePages`.
+ * Clearing DELETES the key rather than storing `undefined`, so a cleared page
+ * serializes byte-identically to one that never had the field.
+ *
+ * Exported so the mutation is unit-testable without React or localStorage.
+ */
+export function applyPageDefaultWorkingDir(
+  pages: TerminalPageConfig[],
+  pageId: string,
+  dir: string | null | undefined,
+): TerminalPageConfig[] {
+  const next = cleanOptional(dir);
+  const idx = pages.findIndex((p) => p.id === pageId);
+  if (idx < 0) return pages;
+  if (pages[idx].defaultWorkingDir === next) return pages;
+  const updated = pages.slice();
+  if (next === undefined) {
+    const cleared = { ...pages[idx] };
+    delete cleared.defaultWorkingDir;
+    updated[idx] = cleared;
+  } else {
+    updated[idx] = { ...pages[idx], defaultWorkingDir: next };
+  }
+  return updated;
+}
+
+/** Outcome of {@link resolveProjectPage}. */
+export interface ProjectPageResolution {
+  /** The page id the project is bound to AFTER resolution. */
+  pageId: string;
+  /** The page list to persist (SAME reference as the input when unchanged). */
+  pages: TerminalPageConfig[];
+  /**
+   * True when the page did not exist and was created. The caller must persist
+   * `pageId` back onto the project record — a `created` resolution means the
+   * stored binding was absent or DANGLING.
+   */
+  created: boolean;
+}
+
+/**
+ * Pure: resolve a project's bound terminal page, tolerating a DANGLING id.
+ *
+ * Project → page binding is stored as `terminal_page_id` in Rust
+ * `settings.json`, while the pages themselves live in `instanceStorage`
+ * (localStorage, port-namespaced). Rust cannot read localStorage, so a stored
+ * id can perfectly legitimately name a page that does not exist in THIS
+ * window — a cleared WebView2 profile, a different runner instance, a page the
+ * operator deleted. Per plan §4 and §12 that is NORMAL, not exceptional:
+ *
+ *   - a bound id that EXISTS resolves to it (`created: false`);
+ *   - a bound id that does NOT exist is re-created UNDER THE SAME ID, named
+ *     after the project (`created: true`). Reusing the id rather than minting a
+ *     fresh one keeps the binding stable across windows: two windows that both
+ *     start dangling converge on one page id instead of forking two;
+ *   - no bound id at all mints a fresh uuid (`created: true`).
+ *
+ * It never throws and never returns "not found" — an activation must never
+ * fail on a dangling page id.
+ *
+ * A blank/absent `defaultWorkingDir` means "leave the page's default alone",
+ * NOT "clear it" — resolving a project page must never silently unpin an
+ * existing page's cwd. Clearing is the explicit job of
+ * {@link applyPageDefaultWorkingDir} (via the hook's `setPageDefaultWorkingDir`).
+ *
+ * `mintId` is injectable so the mint path is deterministic under test.
+ */
+export function resolveProjectPage(
+  pages: TerminalPageConfig[],
+  boundPageId: string | null | undefined,
+  projectName: string,
+  defaultWorkingDir?: string | null,
+  mintId: () => string = () => crypto.randomUUID(),
+): ProjectPageResolution {
+  const bound = cleanOptional(boundPageId);
+  const dir = cleanOptional(defaultWorkingDir);
+  const existing = bound ? pages.find((p) => p.id === bound) : undefined;
+
+  if (existing) {
+    return {
+      pageId: existing.id,
+      pages: dir ? applyPageDefaultWorkingDir(pages, existing.id, dir) : pages,
+      created: false,
+    };
+  }
+
+  const id = bound ?? mintId();
+  const page: TerminalPageConfig = {
+    id,
+    name: cleanOptional(projectName) ?? "Project",
+    createdAt: Date.now(),
+  };
+  if (dir) page.defaultWorkingDir = dir;
+  return { pageId: id, pages: [...pages, page], created: true };
+}
+
 export function reconcilePages(
   persisted: TerminalPageConfig[],
   backendPageIds: Iterable<string>,
@@ -167,6 +309,14 @@ export function useTerminalPages() {
   const isPinned = pinnedPageId !== null;
 
   const [allPages, setPages] = useState<TerminalPageConfig[]>(loadPages);
+  // Latest page roster, readable SYNCHRONOUSLY by `ensureProjectPage` (which
+  // must return the resolved page id to its caller immediately, before the
+  // `setPages` updater has run). Kept in sync from an effect and, eagerly,
+  // from the updaters that write it.
+  const allPagesRef = useRef<TerminalPageConfig[]>(allPages);
+  useEffect(() => {
+    allPagesRef.current = allPages;
+  }, [allPages]);
   const [activePageId, setActivePageIdState] = useState<string>(() =>
     isPinned ? pinnedPageId! : instanceStorage.getItem(ACTIVE_PAGE_KEY) || "default",
   );
@@ -290,6 +440,68 @@ export function useTerminalPages() {
       return updated;
     });
   }, []);
+
+  /**
+   * Set (or clear, with `undefined`) the cwd every terminal spawned on `id`
+   * defaults to. See `TerminalPageConfig.defaultWorkingDir`.
+   */
+  const setPageDefaultWorkingDir = useCallback((id: string, dir: string | null | undefined) => {
+    setPages((prev) => {
+      const updated = applyPageDefaultWorkingDir(prev, id, dir);
+      if (updated === prev) return prev; // no change — no persist, no re-render
+      savePages(updated);
+      allPagesRef.current = updated;
+      return updated;
+    });
+  }, []);
+
+  /**
+   * Resolve (creating if needed) the terminal page a project is bound to, set
+   * it as the page default cwd target, and activate it.
+   *
+   * The returned `pageId` is authoritative: when `created` is true the caller
+   * MUST persist it back onto the project's `terminal_page_id`, because the
+   * stored binding was absent or dangling (see {@link resolveProjectPage} —
+   * pages live in `instanceStorage`, the binding lives in Rust
+   * `settings.json`, so dangling ids are normal). Never throws; a dangling id
+   * can never fail an activation.
+   */
+  const ensureProjectPage = useCallback(
+    (opts: {
+      /** The project's stored `terminal_page_id`, if any. */
+      boundPageId?: string | null;
+      /** Used as the page name when a page has to be created. */
+      projectName: string;
+      /** The project root; becomes the page's `defaultWorkingDir`. */
+      defaultWorkingDir?: string | null;
+    }): { pageId: string; created: boolean } => {
+      const seed = resolveProjectPage(
+        allPagesRef.current,
+        opts.boundPageId,
+        opts.projectName,
+        opts.defaultWorkingDir,
+      );
+      setPages((prev) => {
+        // Re-resolve against the authoritative `prev` (the ref can lag by a
+        // tick), pinning the id already reported to the caller so the two
+        // resolutions cannot diverge: with `seed.pageId` as the bound id this
+        // is idempotent — present → no-op, absent → created under that id.
+        const { pages: updated } = resolveProjectPage(
+          prev,
+          seed.pageId,
+          opts.projectName,
+          opts.defaultWorkingDir,
+        );
+        if (updated === prev) return prev;
+        savePages(updated);
+        allPagesRef.current = updated;
+        return updated;
+      });
+      setActivePageId(seed.pageId);
+      return { pageId: seed.pageId, created: seed.created };
+    },
+    [setActivePageId],
+  );
 
   /**
    * Open + activate a page by an EXPLICIT id (unlike {@link addPage}, which
@@ -460,6 +672,8 @@ export function useTerminalPages() {
     openPage,
     removePage,
     renamePage,
+    setPageDefaultWorkingDir,
+    ensureProjectPage,
     /** True in a page-pinned pop-out window (shows one fixed page, minimal chrome). */
     isPinned,
   };

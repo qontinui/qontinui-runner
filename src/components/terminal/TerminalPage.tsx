@@ -64,6 +64,9 @@ import { HoldingLockBanner, shouldShowHoldingBanner } from "./HoldingLockBanner"
 import { WaitingLockBanner } from "./WaitingLockBanner";
 import { DeconflictAdvisoryBanner } from "./DeconflictAdvisoryBanner";
 import { CoordWarningBanner } from "./CoordWarningBanner";
+import { ProjectFolderChip } from "./ProjectFolderChip";
+import { useApplyZoneProfile } from "./useApplyZoneProfile";
+import { useZoneProfileRestore } from "./useZoneProfileRestore";
 
 const logger = createLogger("TerminalPage");
 
@@ -123,7 +126,9 @@ function TerminalPageInner({
     pageId,
     zoneLayout,
     terminalRefs,
-    pendingProfileSessionsRef,
+    // NOTE: `pendingProfileSessionsRef` is no longer read here — the
+    // zone-profile application that parks sessions on it moved to
+    // `useApplyZoneProfile`, which reads it off the same context.
   } = session;
 
   // Result-card surface — the ResultCardProvider wraps TerminalPageInner
@@ -955,6 +960,15 @@ function TerminalPageInner({
   const resolveTenantForSpawn = (explicit?: string): string | undefined =>
     pickSpawnTenant({ explicit, spawnTenantId, activeTenantId });
 
+  // Zone-profile application, lifted out of the `ZoneProfilePicker`'s inline
+  // `onLoadProfile` so the SAME logic also backs restore-by-name. The picker
+  // below now just hands this callback through; `useZoneProfileRestore` wires
+  // the by-name path a project activation uses (plan §7.2 step 3) and
+  // registers the `terminal-restore-zone-profile` window-event bridge for
+  // callers outside this provider tree.
+  const applyZoneProfile = useApplyZoneProfile({ createAndAssignTerminal, resolveTenantForSpawn });
+  useZoneProfileRestore(applyZoneProfile);
+
   const handleQuickLaunch = async (count: number, autoCommand?: string): Promise<string[]> => {
     const totalTabs = tabs.length + count;
     const layoutId = pickLayout(totalTabs);
@@ -1374,6 +1388,15 @@ function TerminalPageInner({
                 blocks input. */}
             <CoordWarningBanner activeTerminalId={activeId ?? undefined} />
 
+            {/* Projects dashboard §7.2 step 4 — activating a project must
+                never re-`cd` a live shell (an agent may be mid-edit). This
+                chip is the honest alternative: it reports how many live
+                terminals sit outside the active project's root and offers
+                [Move them] (open replacements, then close the originals) /
+                [Leave them]. Renders nothing when no project is active or
+                every terminal is already at the root. */}
+            <ProjectFolderChip />
+
             {/* Honest restore-status banner (Phase 5 + #548): restored tabs
                 whose `--resume` failed (operator retry), reconciled best-effort
                 matches (one-click confirm), and terminal-only / fresh-
@@ -1438,35 +1461,7 @@ function TerminalPageInner({
             zoneAssignments={zoneLayout.assignments}
             tabs={tabs}
             initialized={initialized}
-            onLoadProfile={async (profile) => {
-              zoneLayout.setLayoutId(profile.layoutId);
-              labelsAndTags.setZoneLabels(profile.labels);
-              labelsAndTags.setZoneNotes(profile.notes);
-              labelsAndTags.setPinnedZones(new Set(profile.pins));
-              transitionEffects.setAutoApprovePatterns(profile.autoApprovePatterns);
-              if (profile.sessions && profile.sessions.length > 0) {
-                pendingProfileSessionsRef.current = profile.sessions;
-                const existingTabCount = tabs.length;
-                const neededCount = profile.sessions.length;
-                const toCreate = Math.max(0, neededCount - existingTabCount);
-                for (let i = 0; i < toCreate; i++) {
-                  // These are brand-new blank terminals spawned NOW to fill the
-                  // profile's zones (not restored sessions carrying a stored
-                  // tenant), so they record the current acting tenant like any
-                  // other new spawn.
-                  await createAndAssignTerminal(undefined, undefined, resolveTenantForSpawn());
-                }
-                if (toCreate === 0) {
-                  const assignedTabs = new Set<string>();
-                  for (const s of profile.sessions) {
-                    const candidate = tabs.find((t) => !assignedTabs.has(t.id));
-                    if (!candidate) break;
-                    assignedTabs.add(candidate.id);
-                    zoneLayout.assignTabToZone(s.zoneIndex, candidate.id);
-                  }
-                }
-              }
-            }}
+            onLoadProfile={applyZoneProfile}
           />
         </div>
       </div>

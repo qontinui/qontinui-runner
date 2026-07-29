@@ -1,12 +1,17 @@
 /**
  * Where the runner opens.
  *
- * The Terminal-first IA has a trap that a "default tab" constant alone does not
- * close: `DEFAULT_TAB_ID` is only consulted when the persisted value is ABSENT
- * or unresolvable, and every existing install has a real one persisted — very
- * often `prompt-home`, which was the landing tab until this change and is now
- * behind the "advanced" disclosure. Landing there again would both miss the goal
- * and strand the user on a page their sidebar no longer lists.
+ * A "default tab" constant alone does not decide it: `DEFAULT_TAB_ID` is only
+ * consulted when the persisted value is ABSENT or unresolvable, and every
+ * existing install has a real one persisted — very often `prompt-home`, which
+ * was the landing tab before the Terminal-first IA and is now behind the
+ * "advanced" disclosure. Landing there again would both miss the goal and
+ * strand the user on a page their sidebar no longer lists.
+ *
+ * That asymmetry cuts both ways, and it is why moving the default from
+ * `terminal` to `projects` is safe: a fresh install has nothing persisted and
+ * gets Projects, while an existing one keeps whatever it had — `terminal`
+ * included, since it is still a visible nav item and so resolves to itself.
  *
  * These tests pin the rule that closes it, and — just as importantly — its
  * limits: a page that is simply not a sidebar item must NOT be bounced, or the
@@ -33,10 +38,28 @@ const VISUAL_IN_AI_MODE: LandingContext = {
 };
 
 describe("resolveLandingTab", () => {
-  it("opens on the Terminal for a cold start", () => {
+  it("opens on the default tab for a cold start", () => {
     expect(resolveLandingTab(null, NEITHER)).toBe(DEFAULT_TAB_ID);
     expect(resolveLandingTab("", NEITHER)).toBe(DEFAULT_TAB_ID);
     expect(resolveLandingTab("a-tab-that-never-existed", NEITHER)).toBe(DEFAULT_TAB_ID);
+  });
+
+  it("lands a fresh install on Projects but leaves an existing one on its tab", () => {
+    // The two halves of the DEFAULT_TAB_ID change, pinned against the literal
+    // ids rather than the constant — a test written in terms of
+    // `DEFAULT_TAB_ID` alone passes no matter what the constant is set to, and
+    // would not have caught the change flipping the wrong way.
+    //
+    // Nothing persisted (or nothing recognisable) -> Projects.
+    expect(resolveLandingTab(null, NEITHER)).toBe("projects");
+    expect(resolveLandingTab("a-tab-that-never-existed", NEITHER)).toBe("projects");
+
+    // Every install that has ever opened a tab has one persisted, and
+    // `terminal` is still a visible nav item in every disclosure state, so it
+    // resolves to itself and the landing tab does NOT move underneath anyone.
+    for (const ctx of [NEITHER, ADVANCED]) {
+      expect(resolveLandingTab("terminal", ctx)).toBe("terminal");
+    }
   });
 
   it("bounces a persisted tab that is now behind a disclosure", () => {
@@ -122,7 +145,11 @@ describe("resolveLandingTab", () => {
 
   it("resolves a legacy alias before judging it", () => {
     // `run-plan` aliases to `terminal`; `ai-builder` to the (gated) builder.
-    expect(resolveLandingTab("run-plan", NEITHER)).toBe(DEFAULT_TAB_ID);
+    // The alias target is then judged on its own merits: `terminal` is visible
+    // so it is honoured, and the gated builder is bounced to the default. (Both
+    // used to land on the default, because `terminal` WAS the default — an
+    // equality this assertion was accidentally riding on.)
+    expect(resolveLandingTab("run-plan", NEITHER)).toBe("terminal");
     expect(resolveLandingTab("ai-builder", NEITHER)).toBe(DEFAULT_TAB_ID);
     expect(resolveLandingTab("ai-builder", ADVANCED)).toBe("unified-workflow-builder");
   });

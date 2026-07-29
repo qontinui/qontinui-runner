@@ -1067,10 +1067,16 @@ pub async fn create_new_project(
         let step = "register";
         emit_progress(&app, step, "running", "Registering project");
         let project = SavedProject {
+            // `id` is left defaulted (empty): `add_saved_project` mints the
+            // UUID so there is exactly one place that assigns project ids.
             path: target_str.clone(),
             name: name.clone(),
             project_type: templates::project_type_for_template(&req.template).to_string(),
             manifest: templates::manifest_for_template(&req.template).to_string(),
+            // We just created the repo, so the slug is known here without
+            // shelling out to `git remote get-url` later.
+            repo_slug: remote.as_ref().map(|r| r.full_name.clone()),
+            ..Default::default()
         };
         if let Err(msg) = crate::commands::saved_projects::add_saved_project(project) {
             let e = NewProjectError::new("io", format!("Failed to save project: {}", msg));

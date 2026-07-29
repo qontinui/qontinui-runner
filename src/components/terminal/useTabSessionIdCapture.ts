@@ -56,6 +56,7 @@ import type { CommandResponse } from "./types";
 import type { TerminalTab } from "./useTerminalManager";
 import { createLogger } from "@/lib/logger";
 import { rememberSessionId } from "./lastKnownSessionIds";
+import { samePath } from "./pathCompare";
 
 const logger = createLogger("TabSessionIdCapture");
 
@@ -93,11 +94,6 @@ export function effectiveCaptureDir(
   return tabWorkingDir || startDir || "";
 }
 
-/** Normalize a path for equality: separators, trailing slash, Windows case. */
-function normalizePath(p: string): string {
-  return p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
-}
-
 /**
  * True when a transcript payload's `project_path` matches the directory the
  * probe asked for. Defense-in-depth behind the projectPath request filter:
@@ -108,8 +104,7 @@ function normalizePath(p: string): string {
  * Pure + exported for unit tests.
  */
 export function projectPathMatches(payloadProjectPath: string, workingDir: string): boolean {
-  if (!payloadProjectPath || !workingDir) return false;
-  return normalizePath(payloadProjectPath) === normalizePath(workingDir);
+  return samePath(payloadProjectPath, workingDir);
 }
 
 interface CaptureParams {

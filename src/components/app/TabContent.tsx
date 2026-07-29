@@ -155,6 +155,9 @@ const MemoryFederationPage = lazy(() =>
     default: m.MemoryFederationPage,
   })),
 );
+const ProjectsPage = lazy(() =>
+  import("../projects").then((m) => ({ default: m.ProjectsPage })),
+);
 
 /** Register the active page with UI Bridge for AI discoverability */
 function PageRegistration({
@@ -352,6 +355,20 @@ export function TabContent({
             description="Queue and manage multiple workflow executions"
           />
           <WorkflowQueueTab onNavigateToActive={() => setActiveTab("active")} onLog={addLog} />
+        </div>
+      );
+
+    case "projects":
+      return (
+        <div data-page-id="projects" className="h-full overflow-hidden">
+          <PageRegistration
+            id="projects"
+            name="Projects"
+            description="What you're building, and what state each project is in"
+          />
+          <Suspense fallback={<LazyFallback />}>
+            <ProjectsPage onNavigateToTerminal={() => setActiveTab("terminal")} />
+          </Suspense>
         </div>
       );
 

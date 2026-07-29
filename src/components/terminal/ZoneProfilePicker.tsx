@@ -1,24 +1,20 @@
 import { useState, useRef, useEffect, useCallback } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { Save, FolderOpen, Trash2, ChevronDown } from "lucide-react";
 import { useUIComponent, UIBridgeComponentScope } from "@qontinui/ui-bridge";
-
-export interface ZoneSessionInfo {
-  zoneIndex: number;
-  claudeSessionId: string;
-  claudeConfigDir?: string;
-}
-
-interface ZoneProfile {
-  layoutId: string;
-  labels: Record<number, string>;
-  notes: Record<number, string>;
-  pins: number[];
-  autoApprovePatterns: string[];
-  /** Claude session IDs per zone (added in later version, may be absent in old profiles) */
-  sessions?: ZoneSessionInfo[];
-}
+// Profile shape + persistence live in `zoneProfileStorage` so the same
+// profiles can be applied programmatically by name (`useZoneProfileRestore`)
+// without duplicating this component's load/save logic.
+import {
+  loadProfilesFromDb,
+  saveProfilesToDb,
+  loadActiveProfileFromDb,
+  saveActiveProfileToDb,
+  profileSettingKey,
+  activeProfileSettingKey,
+  type ZoneProfile,
+  type ZoneSessionInfo,
+} from "./zoneProfileStorage";
 
 interface ZoneProfilePickerProps {
   currentLayoutId: string;
@@ -37,58 +33,6 @@ interface ZoneProfilePickerProps {
 }
 
 const MAX_PROFILES = 10;
-
-function profileSettingKey(pageId: string): string {
-  return pageId === "default" ? "zone-profiles" : `zone-profiles:${pageId}`;
-}
-
-function activeProfileSettingKey(pageId: string): string {
-  return pageId === "default" ? "zone-active-profile" : `zone-active-profile:${pageId}`;
-}
-
-async function loadProfilesFromDb(pageId: string): Promise<Record<string, ZoneProfile>> {
-  try {
-    const result = await invoke<Record<string, ZoneProfile> | null>("setting_get", {
-      key: profileSettingKey(pageId),
-    });
-    return result ?? {};
-  } catch {
-    return {};
-  }
-}
-
-async function saveProfilesToDb(profiles: Record<string, ZoneProfile>, pageId: string) {
-  try {
-    await invoke("setting_set", {
-      key: profileSettingKey(pageId),
-      value: profiles,
-    });
-  } catch {
-    /* ignore save failures */
-  }
-}
-
-async function loadActiveProfileFromDb(pageId: string): Promise<string | null> {
-  try {
-    const result = await invoke<string | null>("setting_get", {
-      key: activeProfileSettingKey(pageId),
-    });
-    return result ?? null;
-  } catch {
-    return null;
-  }
-}
-
-async function saveActiveProfileToDb(name: string | null, pageId: string) {
-  try {
-    await invoke("setting_set", {
-      key: activeProfileSettingKey(pageId),
-      value: name,
-    });
-  } catch {
-    /* ignore save failures */
-  }
-}
 
 export function ZoneProfilePicker({
   currentLayoutId,
