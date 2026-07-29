@@ -1203,6 +1203,29 @@ CREATE TABLE coord.agent_questions (
 
 
 --
+-- Name: agent_registry; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.agent_registry (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    agent_name text NOT NULL,
+    purpose text DEFAULT ''::text NOT NULL,
+    trigger_condition text DEFAULT ''::text NOT NULL,
+    spawn_path text DEFAULT 'in_session_subagent'::text NOT NULL,
+    model text,
+    effort text,
+    default_enabled boolean DEFAULT true NOT NULL,
+    policy_required boolean DEFAULT false NOT NULL,
+    allowed_dispositions jsonb DEFAULT '["block", "degrade", "warn_proceed"]'::jsonb NOT NULL,
+    fanout_bound integer DEFAULT 15 NOT NULL,
+    definition_body text DEFAULT ''::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
 -- Name: agent_sessions; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -1245,6 +1268,20 @@ CREATE TABLE coord.agent_tool_access (
     tenant_id uuid NOT NULL,
     tool_name text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: agent_user_prefs; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.agent_user_prefs (
+    tenant_id uuid NOT NULL,
+    user_id uuid NOT NULL,
+    agent_name text NOT NULL,
+    enabled boolean NOT NULL,
+    disposition text,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 
@@ -3673,6 +3710,22 @@ CREATE TABLE coord.migration_revisions (
 
 
 --
+-- Name: onboarding_connect_states; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.onboarding_connect_states (
+    token_hash character varying(64) NOT NULL,
+    tenant_id uuid NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    consumed_at timestamp with time zone,
+    flow text,
+    target_login text,
+    target_installation_id bigint
+);
+
+
+--
 -- Name: operator_audit; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -3840,22 +3893,6 @@ CREATE TABLE coord.pending_pr_dependencies (
     upstream_pr_number integer NOT NULL,
     tenant_id uuid NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL
-);
-
-
---
--- Name: plan_pr_citations; Type: TABLE; Schema: coord; Owner: -
---
-
-CREATE TABLE coord.plan_pr_citations (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    tenant_id uuid,
-    plan_slug text NOT NULL,
-    repo text NOT NULL,
-    pr_number integer,
-    commit_sha text,
-    source text NOT NULL,
-    cited_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 
@@ -4223,6 +4260,32 @@ CREATE TABLE coord.process_sessions (
     exit_code integer,
     state text DEFAULT 'running'::text NOT NULL,
     error_count integer DEFAULT 0 NOT NULL
+);
+
+
+--
+-- Name: prompt_document_proposals; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.prompt_document_proposals (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    doc_kind text NOT NULL,
+    doc_name text NOT NULL,
+    clause_id text,
+    proposed_content text NOT NULL,
+    direction text NOT NULL,
+    from_tier text,
+    to_tier text,
+    rationale text NOT NULL,
+    proposed_by text NOT NULL,
+    base_version integer NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    decided_by text,
+    decided_at timestamp with time zone,
+    decision_note text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 
@@ -4824,7 +4887,6 @@ CREATE TABLE coord.sessions (
     repo text,
     branch text,
     correlation_topic text,
-    plan_slug text,
     task_run_id text,
     session_status text,
     last_progress_at timestamp with time zone,
@@ -6453,7 +6515,8 @@ CREATE TABLE project.co_occurrence_observations (
     invalidated_at timestamp with time zone,
     invalidated_reason text,
     invalidated_by text,
-    invalidation_token text
+    invalidation_token text,
+    app_id text
 );
 
 
@@ -15404,6 +15467,14 @@ ALTER TABLE ONLY coord.agent_questions
 
 
 --
+-- Name: agent_registry agent_registry_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.agent_registry
+    ADD CONSTRAINT agent_registry_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: agent_sessions agent_sessions_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -15417,6 +15488,14 @@ ALTER TABLE ONLY coord.agent_sessions
 
 ALTER TABLE ONLY coord.agent_status
     ADD CONSTRAINT agent_status_pkey PRIMARY KEY (device_id, work_unit_id, tenant_id);
+
+
+--
+-- Name: agent_user_prefs agent_user_prefs_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.agent_user_prefs
+    ADD CONSTRAINT agent_user_prefs_pkey PRIMARY KEY (tenant_id, user_id, agent_name);
 
 
 --
@@ -16164,6 +16243,14 @@ ALTER TABLE ONLY coord.migration_revisions
 
 
 --
+-- Name: onboarding_connect_states onboarding_connect_states_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.onboarding_connect_states
+    ADD CONSTRAINT onboarding_connect_states_pkey PRIMARY KEY (token_hash);
+
+
+--
 -- Name: operator_audit operator_audit_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -16273,14 +16360,6 @@ ALTER TABLE ONLY coord.agent_tool_access
 
 ALTER TABLE ONLY coord.pr_author_nudges
     ADD CONSTRAINT pk_pr_author_nudges PRIMARY KEY (repo, pr_number, reason);
-
-
---
--- Name: plan_pr_citations plan_pr_citations_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
---
-
-ALTER TABLE ONLY coord.plan_pr_citations
-    ADD CONSTRAINT plan_pr_citations_pkey PRIMARY KEY (id);
 
 
 --
@@ -16401,6 +16480,14 @@ ALTER TABLE ONLY coord.process_session_output
 
 ALTER TABLE ONLY coord.process_sessions
     ADD CONSTRAINT process_sessions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: prompt_document_proposals prompt_document_proposals_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.prompt_document_proposals
+    ADD CONSTRAINT prompt_document_proposals_pkey PRIMARY KEY (id);
 
 
 --
@@ -21586,6 +21673,13 @@ CREATE INDEX idx_migration_revisions_repo ON coord.migration_revisions USING btr
 
 
 --
+-- Name: idx_ocs_expires; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_ocs_expires ON coord.onboarding_connect_states USING btree (expires_at);
+
+
+--
 -- Name: idx_operator_audit_operator; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -21660,20 +21754,6 @@ CREATE INDEX idx_pie_source ON coord.prompt_injection_events USING btree (tenant
 --
 
 CREATE INDEX idx_pie_tenant_created ON coord.prompt_injection_events USING btree (tenant_id, created_at DESC);
-
-
---
--- Name: idx_plan_pr_citations_plan_slug; Type: INDEX; Schema: coord; Owner: -
---
-
-CREATE INDEX idx_plan_pr_citations_plan_slug ON coord.plan_pr_citations USING btree (plan_slug);
-
-
---
--- Name: idx_plan_pr_citations_repo_pr; Type: INDEX; Schema: coord; Owner: -
---
-
-CREATE INDEX idx_plan_pr_citations_repo_pr ON coord.plan_pr_citations USING btree (repo, pr_number);
 
 
 --
@@ -22734,6 +22814,13 @@ CREATE INDEX ix_primary_trees_app_id ON coord.primary_trees USING btree (app_id)
 
 
 --
+-- Name: ix_prompt_document_proposals_tenant_status; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_prompt_document_proposals_tenant_status ON coord.prompt_document_proposals USING btree (tenant_id, status, created_at DESC);
+
+
+--
 -- Name: ix_runner_sessions_connected_at; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -22773,6 +22860,13 @@ CREATE INDEX ix_test_targets_app ON coord.test_targets USING btree (app_id);
 --
 
 CREATE INDEX ix_test_targets_tenant ON coord.test_targets USING btree (tenant_id);
+
+
+--
+-- Name: uq_agent_registry_tenant_agent; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_agent_registry_tenant_agent ON coord.agent_registry USING btree (tenant_id, agent_name);
 
 
 --
@@ -22822,13 +22916,6 @@ CREATE UNIQUE INDEX uq_memory_links_edge ON coord.memory_links USING btree (tena
 --
 
 CREATE UNIQUE INDEX uq_memory_records_tenant_content_hash_live ON coord.memory_records USING btree (tenant_id, content_hash) WHERE ((is_tombstone = false) AND (superseded_by IS NULL) AND (valid_until IS NULL));
-
-
---
--- Name: uq_plan_pr_citations_dedupe; Type: INDEX; Schema: coord; Owner: -
---
-
-CREATE UNIQUE INDEX uq_plan_pr_citations_dedupe ON coord.plan_pr_citations USING btree (plan_slug, repo, pr_number, commit_sha) NULLS NOT DISTINCT;
 
 
 --
@@ -24368,7 +24455,7 @@ CREATE INDEX idx_observations_invalidation_token ON project.co_occurrence_observ
 -- Name: idx_observations_spec; Type: INDEX; Schema: project; Owner: -
 --
 
-CREATE INDEX idx_observations_spec ON project.co_occurrence_observations USING btree (spec_id, captured_at) WHERE (invalidated_at IS NULL);
+CREATE INDEX idx_observations_spec ON project.co_occurrence_observations USING btree (spec_id, app_id, captured_at) WHERE (invalidated_at IS NULL);
 
 
 --
