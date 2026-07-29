@@ -35,7 +35,27 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-SCHEMAS_JSON="$PROJECT_ROOT/target/schemas.json"
+
+# Resolve the cargo output directory the same way cargo itself does, instead of
+# hardcoding `$PROJECT_ROOT/target`. Builds in this repo routinely do NOT use
+# `target/`: `qontinui-claude-config/scripts/cargo-guard.sh` reroutes to
+# `target-agent/` when the running runner holds `target/` locked, and honours a
+# caller-supplied `CARGO_TARGET_DIR=../target-pool/slot-N`. With the old
+# hardcoded path, `cargo build` would succeed into the *other* directory,
+# `$PROJECT_ROOT/target/` would never be created, and the shell would then fail
+# setting up the `> "$SCHEMAS_JSON"` redirect below with the thoroughly
+# misleading `.../src-tauri/target/schemas.json: No such file or directory`.
+#
+# Precedence matches cargo: CARGO_TARGET_DIR, then CARGO_BUILD_TARGET_DIR (the
+# env form of `[build] target-dir`), then `<crate>/target`. A relative value is
+# interpreted relative to PROJECT_ROOT, which is where every cargo invocation
+# in this script runs from.
+CARGO_OUT_DIR="${CARGO_TARGET_DIR:-${CARGO_BUILD_TARGET_DIR:-$PROJECT_ROOT/target}}"
+case "$CARGO_OUT_DIR" in
+    /*|[A-Za-z]:[/\\]*) ;;                       # already absolute
+    *) CARGO_OUT_DIR="$PROJECT_ROOT/$CARGO_OUT_DIR" ;;
+esac
+SCHEMAS_JSON="$CARGO_OUT_DIR/schemas.json"
 
 SCHEMAS_DIR="${QONTINUI_SCHEMAS_DIR:-$PROJECT_ROOT/../../qontinui-schemas}"
 
@@ -86,7 +106,15 @@ done
 
 echo "==> Building export_schemas binary..."
 cd "$PROJECT_ROOT"
-cargo build --bin export_schemas --release 2>&1 | tail -5
+# No `| tail -N` here: a genuine build failure must print in full. The previous
+# `| tail -5` reliably truncated away the rustc diagnostic and left only the
+# trailing `error: could not compile ...` summary, which says nothing about the
+# cause.
+cargo build --bin export_schemas --release 2>&1
+
+# The redirect below cannot create missing parent directories, so make sure the
+# resolved cargo output dir exists even on a cold tree.
+mkdir -p "$CARGO_OUT_DIR"
 
 echo "==> Exporting schemas to $SCHEMAS_JSON..."
 # `$SCHEMAS_JSON` lives under src-tauri/target/, but cargo's default target dir
