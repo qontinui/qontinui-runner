@@ -502,6 +502,9 @@ export function ProjectCoordinator({
           // this layer — the wizard fills those in during scanning.
           const folderName = picked.split(/[\\/]/).filter(Boolean).slice(-1)[0] || picked;
           const entry: SavedProject = {
+            // Empty id — the Rust side mints a UUID on add. See
+            // `commands::saved_projects::add_saved_project`.
+            id: "",
             path: picked,
             name: folderName,
             projectType: "unknown",
@@ -982,15 +985,15 @@ function EditProjectsModal({
   onClose,
 }: {
   projects: SavedProject[];
-  onRemove: (path: string) => Promise<void>;
+  onRemove: (id: string) => Promise<void>;
   onClose: () => void;
 }) {
   const [removing, setRemoving] = useState<string | null>(null);
 
-  const handleRemove = async (path: string) => {
-    setRemoving(path);
+  const handleRemove = async (id: string) => {
+    setRemoving(id);
     try {
-      await onRemove(path);
+      await onRemove(id);
     } catch (err) {
       console.warn("[ProjectCoordinator] Remove failed:", err);
     } finally {
@@ -1024,7 +1027,7 @@ function EditProjectsModal({
           <ul className="flex flex-col gap-1 max-h-72 overflow-y-auto">
             {projects.map((p) => (
               <li
-                key={p.path}
+                key={p.id || p.path}
                 className="flex items-center gap-2 p-2 rounded border border-border bg-white/5"
               >
                 <div className="flex-1 min-w-0">
@@ -1033,12 +1036,12 @@ function EditProjectsModal({
                 </div>
                 <button
                   type="button"
-                  onClick={() => void handleRemove(p.path)}
-                  disabled={removing === p.path}
+                  onClick={() => void handleRemove(p.id)}
+                  disabled={removing === p.id}
                   className="px-2 py-1 text-xs rounded bg-red-500/10 text-red-400 border border-red-500/20
                              hover:bg-red-500/20 disabled:opacity-50 transition-colors"
                 >
-                  {removing === p.path ? "Removing..." : "Remove"}
+                  {removing === p.id ? "Removing..." : "Remove"}
                 </button>
               </li>
             ))}

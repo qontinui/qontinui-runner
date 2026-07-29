@@ -278,13 +278,56 @@ export function backfillClaudeSessionIds(
   return changed ? next : tabs;
 }
 
+/**
+ * Pure helper: resolve the `working_dir` argument for a spawn.
+ *
+ * Precedence is explicit-caller-value → the terminal PAGE's
+ * `defaultWorkingDir` (set when a project is activated, see
+ * `TerminalPageConfig.defaultWorkingDir`) → `null` (Rust picks its own
+ * default, the pre-project behavior). Blank / whitespace-only values on either
+ * input count as ABSENT, so an empty string from a form field falls through to
+ * the page default instead of spawning at "".
+ *
+ * WHY THE FALLBACK LIVES HERE (projects-dashboard plan §7.2 step 2): it must
+ * be applied BEFORE the value reaches the Rust `terminal_create` command. That
+ * command derives `intent_repo` from `working_dir`
+ * (`src-tauri/src/commands/terminal.rs:97-111`) and then hands it to
+ * `isolated_edit::acquire_for_terminal`, which under
+ * `QONTINUI_AGENT_WORKTREE_MODE` REASSIGNS `working_dir` to a freshly
+ * allocated isolated worktree (`:122-128`). Passing `undefined` and letting
+ * Rust guess is therefore not equivalent — the page default has to arrive as
+ * the `working_dir` argument or the repo intent (and any worktree allocation)
+ * is derived from the wrong directory.
+ *
+ * Exported so the precedence contract is unit-testable without React or Tauri.
+ */
+export function resolveSpawnWorkingDir(
+  explicit: string | undefined,
+  pageDefault: string | undefined,
+): string | null {
+  const clean = (v: string | undefined): string | undefined => {
+    const t = v?.trim();
+    return t ? t : undefined;
+  };
+  return clean(explicit) ?? clean(pageDefault) ?? null;
+}
+
 // `TerminalInfo` is imported from `@qontinui/shared-types/tauri-events` —
 // generated from the canonical Rust struct in
 // `qontinui-schemas/rust/src/terminal.rs`. Field names are camelCase via
 // `#[serde(rename_all = "camelCase")]`. Future serde renames break this
 // file at compile time instead of silently dropping events.
 
-export function useTerminalManager(pageId: string = "default", windowLabel: string = "main") {
+export function useTerminalManager(
+  pageId: string = "default",
+  windowLabel: string = "main",
+  /**
+   * This page's `defaultWorkingDir` (see `TerminalPageConfig`). Used by
+   * `createTerminal` whenever the caller passes no explicit `workingDir`, so
+   * every terminal spawned on a project-bound page opens at the project root.
+   */
+  defaultWorkingDir?: string,
+) {
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const nextTitleNum = useRef(1);
@@ -584,7 +627,11 @@ export function useTerminalManager(pageId: string = "default", windowLabel: stri
         const displayTitle = title ?? `Terminal ${nextTitleNum.current++}`;
         const result = await invoke<CommandResponse>("terminal_create", {
           title: displayTitle,
-          workingDir: workingDir ?? null,
+          // Page-default fallback applied HERE, before the Rust command sees
+          // it — `terminal_create` derives `intent_repo` from this value and
+          // may reassign it to an isolated worktree, so `null` is not
+          // equivalent to the page default. See `resolveSpawnWorkingDir`.
+          workingDir: resolveSpawnWorkingDir(workingDir, defaultWorkingDir),
           pageId: pageId !== "default" ? pageId : null,
           // F2/F3 — the tenant the operator picked for THIS spawn. Sent
           // EXPLICITLY (the caller resolves picker-choice ?? active pin) so
@@ -632,7 +679,7 @@ export function useTerminalManager(pageId: string = "default", windowLabel: stri
         return null;
       }
     },
-    [pageId, windowLabel],
+    [pageId, windowLabel, defaultWorkingDir],
   );
 
   const createPlanTab = useCallback((filePath: string): string => {

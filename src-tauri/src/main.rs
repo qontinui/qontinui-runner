@@ -138,6 +138,10 @@ mod pm_detect;
 mod process_capture;
 mod process_helpers;
 mod productivity;
+/// Projects dashboard — the server-side join over the saved-project
+/// registry (`ProjectSnapshot`). See `commands::saved_projects` for the
+/// registry itself.
+mod projects;
 mod prompt_library;
 mod prompt_snippets;
 mod prompts;
@@ -1908,9 +1912,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             repo_detection::register_repo_with_coord,
             repo_detection::tenant_for_repo,
             commands::saved_projects::add_saved_project,
+            commands::saved_projects::bind_project_processes,
+            commands::saved_projects::discover_projects,
             commands::saved_projects::list_saved_projects,
+            commands::saved_projects::project_snapshot,
             commands::saved_projects::remove_saved_project,
             commands::saved_projects::save_saved_projects,
+            commands::saved_projects::set_project_front_page,
             commands::screenshot::capture_and_upload_screenshot,
             commands::screenshot::capture_screenshot,
             commands::screenshot::capture_screenshot_via_python,
