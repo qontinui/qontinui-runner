@@ -60,11 +60,7 @@ export function ProvenanceBadge({
     return (
       <span
         className={`${base} bg-green-500/10 border-green-500/40 text-green-400 ${className ?? ""}`}
-        title={
-          provenanceMeta
-            ? `support=${provenanceMeta.support?.toFixed(2) ?? "?"}, contrast=${provenanceMeta.contrast?.toFixed(2) ?? "?"}`
-            : undefined
-        }
+        title={provenanceMeta ? `support=${provenanceMeta.support?.toFixed(2) ?? "?"}` : undefined}
       >
         observed{!compact && detail ? ` · ${detail}` : ""}
       </span>
@@ -110,8 +106,8 @@ export function ProvenanceBadge({
 
   // ai-generated (or any unknown forward-compat value) — gray. Omit the
   // N/M promotion-threshold segment: the compiled TS side doesn't have
-  // the M threshold locally (promotion logic is threshold-based on
-  // support/contrast, not observation count).
+  // the M threshold locally (promotion is threshold-based on cluster
+  // support, not observation count).
   return (
     <span
       className={`${base} bg-gray-500/10 border-gray-500/40 text-gray-400 ${className ?? ""}`}

@@ -51,10 +51,16 @@ import type {
  */
 export type StateProvenance = "ai-generated" | "observed" | "ai-fallback" | "git-supervised";
 
-/** Minimum per-state support (fraction) required to promote to `observed`. */
+/**
+ * Minimum per-cluster support required to promote to `observed`.
+ *
+ * "Support" is the discovery adapter's `confidence` field — the only numeric
+ * quality signal it emits (`DiscoveredState.to_dict` in
+ * `qontinui/src/qontinui/discovery/models.py`). A former `MIN_CONTRAST`
+ * threshold was deleted: it gated on a `contrast` field no producer has ever
+ * emitted, so `?? 0` made the whole `observed` lane permanently unreachable.
+ */
 export const MIN_SUPPORT = 0.75;
-/** Minimum contrast (gap from cross-cluster support) required for promotion. */
-export const MIN_CONTRAST = 0.1;
 /** Window during which a recently-invalidated state stays in `ai-fallback`. */
 export const INVALIDATION_WINDOW_HOURS = 24;
 
@@ -63,24 +69,72 @@ export const INVALIDATION_WINDOW_HOURS = 24;
 // ---------------------------------------------------------------------------
 
 /**
+ * One discovered state from a `state_discovery_artifacts.artifact` blob — a
+ * cluster of elements that share a render-set signature.
+ *
+ * Field names mirror the Python adapter's serialization
+ * (`DiscoveredState.to_dict` in `qontinui/src/qontinui/discovery/models.py`),
+ * which emits camelCase `stateImageIds` / `screenshotIds`, and are kept in
+ * lockstep with the Rust reader's `Cluster` struct
+ * (`src-tauri/src/workflow_generation/spec_authoring.rs`).
+ *
+ * An earlier revision of BOTH readers declared an `elements` key plus
+ * `support` / `contrast` / `state_hash` / `last_observed` — none of which the
+ * adapter has ever emitted. The Rust half was corrected by PR #886; this is
+ * the TypeScript half. Verified against a live row in
+ * `project.state_discovery_artifacts`: every cluster carries exactly
+ * `{ id, name, stateImageIds, screenshotIds, confidence, metadata }`.
+ */
+export interface DiscoveryCluster {
+  /** Cluster id (deterministic from the discovery side), e.g. `fp_state_ab12`. */
+  id: string;
+  /** Human-readable name. Falls back to `id` when absent. */
+  name?: string | null;
+  /**
+   * Element ids belonging to this state. The adapter prefixes them with
+   * `reg:`; readers strip that back to the bare fingerprint that capture
+   * wrote into `co_occurrence_observations`.
+   */
+  stateImageIds?: string[];
+  /**
+   * Observation ids this state was seen in — the state's **render-set**, i.e.
+   * the signature clustering grouped on. Its length is the state's real
+   * observation count.
+   */
+  screenshotIds?: string[];
+  /** Clustering confidence in [0, 1]. The only numeric quality signal emitted. */
+  confidence?: number;
+  /** Free-form adapter metadata; empty in practice today. */
+  metadata?: Record<string, unknown>;
+}
+
+/**
  * Shape of the artifact persisted by `POST /state-discovery/derive`.
- * Kept intentionally loose: Python clustering emits opaque fingerprint
- * strings for `elements` and a `state_hash` rather than a human-readable
- * name, so matching is by element-set shape rather than by name.
+ * Element ids are opaque `reg:<16-hex>` fingerprints rather than
+ * human-readable names, so matching is by element-set shape, not by name.
  */
 export interface DiscoveryArtifact {
   id?: string;
   spec_id?: string | null;
   derived_at?: string;
   artifact: {
-    states: Array<{
-      state_hash?: string;
-      elements?: string[];
-      support?: number;
-      contrast?: number;
-      last_observed?: string;
-    }>;
+    states: DiscoveryCluster[];
   };
+}
+
+/**
+ * Strip the discovery adapter's `reg:` namespace prefix from an element id,
+ * yielding the bare fingerprint stored on the observation. Mirrors
+ * `project_cluster_to_state` on the Rust side.
+ */
+function stripElementIdPrefix(elementId: string): string {
+  return elementId.startsWith("reg:") ? elementId.slice(4) : elementId;
+}
+
+/** Bare (prefix-stripped) element ids for a cluster, deduped and sorted. */
+function clusterElementIds(cluster: DiscoveryCluster): string[] {
+  const bare = (cluster.stateImageIds ?? []).filter(Boolean).map(stripElementIdPrefix);
+  return [...new Set(bare)].sort();
 }
 
 /**
@@ -107,9 +161,11 @@ export type GitProposalState = Record<string, { proposedAt: string; kind: string
 
 /** Metadata attached to a state describing how its provenance was decided. */
 export interface StateProvenanceMeta {
+  /** Cluster support — the discovery adapter's `confidence`, in [0, 1]. */
   support?: number;
-  contrast?: number;
+  /** Size of the matched cluster's render-set (`screenshotIds.length`). */
   observationCount?: number;
+  /** Derivation time of the artifact the match came from (ISO-8601). */
   lastObserved?: string;
   /** Only populated when `provenance === "ai-fallback"`. */
   invalidatedAt?: string;
@@ -229,7 +285,7 @@ export interface SpecCompilerInput {
  * @param discoveryArtifact   Optional output of `/state-discovery/derive`.
  *                            When provided, states whose element-set
  *                            overlaps a cluster with sufficient support
- *                            and contrast are promoted to `observed`.
+ *                            are promoted to `observed`.
  * @param invalidationState   Optional map of compiled-state-id → invalidation
  *                            timestamp. States invalidated within
  *                            `INVALIDATION_WINDOW_HOURS` force `ai-fallback`.
@@ -238,6 +294,14 @@ export interface SpecCompilerInput {
  *                            here without a strong-enough observed match
  *                            are tagged `git-supervised` instead of
  *                            `ai-generated`. See [D5 plan Phase 1 §3.3].
+ *
+ * @throws Every *ordinary* rejection is returned as `{ compiled: false }`;
+ *         this function has exactly ONE non-union exit. When two
+ *         `observed`/`ai-fallback` states inside one spec claim the same
+ *         element, two authoritative sources disagree — a hard bug, not bad
+ *         input — and an `Error` is thrown synchronously so it surfaces
+ *         immediately instead of being buried in a quarantine record. Every
+ *         call site must guard for it.
  */
 export function compileStateMachineFromSpecs(
   inputs: SpecCompilerInput[],
@@ -497,7 +561,7 @@ interface PromotionChoice {
  *
  * Priority order (top wins):
  *   1.   recent invalidation → ai-fallback
- *   2.   artifact match with sufficient support + contrast → observed
+ *   2.   artifact match with sufficient support → observed
  *   2.5. git supervision proposal (state present in the on-disk spec
  *        AND named in `gitProposals`) → git-supervised
  *   3.   default → ai-generated
@@ -528,23 +592,23 @@ function choosePromotion(
     }
   }
 
-  // Priority 2: artifact match with sufficient support + contrast → observed.
+  // Priority 2: artifact match with sufficient support → observed.
   const match = artifact ? matchArtifactCluster(specState, artifact) : undefined;
-  if (
-    match &&
-    (match.cluster.support ?? 0) >= MIN_SUPPORT &&
-    (match.cluster.contrast ?? 0) >= MIN_CONTRAST
-  ) {
-    const elements = artifactElementsToQueries(match.cluster.elements ?? []);
+  if (match && (match.cluster.confidence ?? 0) >= MIN_SUPPORT) {
+    const elements = artifactElementsToQueries(clusterElementIds(match.cluster));
     if (elements.length > 0) {
       return {
         provenance: "observed",
         elements,
         meta: {
-          support: match.cluster.support,
-          contrast: match.cluster.contrast,
-          observationCount: match.cluster.elements?.length,
-          lastObserved: match.cluster.last_observed,
+          support: match.cluster.confidence,
+          // The render-set is what the state was *observed* in; the element
+          // list is what it is made of. Reporting the latter as an
+          // observation count (as this did before) was simply wrong.
+          observationCount: match.cluster.screenshotIds?.length,
+          // Clusters carry no per-state timestamp, so the artifact's own
+          // derivation time is the honest recency signal.
+          lastObserved: artifact?.derived_at,
         },
       };
     }
@@ -580,18 +644,34 @@ function choosePromotion(
  *
  * 1. Build a loose key for each spec element from `(role, accessibleName
  *    ?? label ?? textContent, tagName)`.
- * 2. If any artifact cluster's `elements[]` contain a string that equals
- *    one of these loose keys, prefer that cluster (rich case — means the
- *    artifact side exposed structured fingerprints, not opaque hashes).
+ * 2. If any artifact cluster's `stateImageIds[]` contain a string that equals
+ *    one of these loose keys, prefer that cluster.
+ *
+ *    This arm is currently DEAD and should be read as such: it fires only
+ *    for a producer emitting bare `role|name|tag` triples, and no such
+ *    producer exists anywhere in the Python→Rust→TS chain. The real adapter
+ *    emits `reg:<16-hex>` digests; `fingerprint_to_criteria`'s structured
+ *    vocabulary is `id:` / `aria:` / `tag:` / `role:` — a DIFFERENT shape
+ *    that also never equals a loose key. Teaching this arm that vocabulary
+ *    (so structured fingerprints actually steer the match) is tracked
+ *    separately; see the matcher-exclusivity follow-up.
  * 3. Otherwise fall back to cluster-size proximity: pick the cluster whose
  *    element count is closest to the spec state's element count.
  * 4. If the artifact has no states, return undefined and the caller will
  *    choose `ai-generated`.
+ *
+ * NOTE (known limitation, pre-dates this reader's field-name fix): cluster
+ * selection is NOT exclusive. Two spec states with the same element count
+ * both select the same cluster and are then both promoted with that
+ * cluster's identical fingerprint set — which `collectElementCollisions`
+ * correctly rejects as an observed/observed double-claim by THROWING. Any
+ * caller that starts passing a real artifact must land greedy
+ * best-match-per-cluster assignment first.
  */
 function matchArtifactCluster(
   specState: SpecState,
   artifact: DiscoveryArtifact,
-): { cluster: DiscoveryArtifact["artifact"]["states"][number] } | undefined {
+): { cluster: DiscoveryCluster } | undefined {
   const clusters = artifact.artifact?.states ?? [];
   if (clusters.length === 0) return undefined;
 
@@ -599,9 +679,9 @@ function matchArtifactCluster(
 
   // Rich case: artifact elements look like structured keys.
   if (specKeys.length > 0) {
-    let best: { cluster: (typeof clusters)[number]; overlap: number } | undefined;
+    let best: { cluster: DiscoveryCluster; overlap: number } | undefined;
     for (const cluster of clusters) {
-      const els = cluster.elements ?? [];
+      const els = clusterElementIds(cluster);
       let overlap = 0;
       for (const key of specKeys) {
         if (els.includes(key)) overlap++;
@@ -616,9 +696,9 @@ function matchArtifactCluster(
   // Opaque case: match by cluster-size proximity.
   const specCount = specState.elements.length;
   if (specCount === 0) return undefined;
-  let closest: { cluster: (typeof clusters)[number]; diff: number } | undefined;
+  let closest: { cluster: DiscoveryCluster; diff: number } | undefined;
   for (const cluster of clusters) {
-    const count = cluster.elements?.length ?? 0;
+    const count = clusterElementIds(cluster).length;
     if (count === 0) continue;
     const diff = Math.abs(count - specCount);
     if (!closest || diff < closest.diff) {
@@ -651,28 +731,55 @@ function looseElementKey(criteria: Record<string, unknown>): string {
 }
 
 /**
- * Convert artifact element strings to engine ElementQuery objects. If
- * the string matches the loose-key shape (`role|name|tagName`) we recover
- * structured fields; otherwise we stash the opaque fingerprint in an
- * attribute so downstream consumers can still reason about uniqueness.
+ * Convert bare (already `reg:`-stripped, see {@link clusterElementIds})
+ * artifact fingerprints to engine ElementQuery objects.
+ *
+ * Decoding priority mirrors the Rust `fingerprint_to_criteria`
+ * (`spec_authoring.rs`) so both readers turn the same fingerprint into the
+ * same criteria: `id: > aria: > tag:<tag>:<text> > role:`, then the TS-only
+ * loose-key shape (`role|name|tagName`), then opaque.
+ *
+ * Opaque fingerprints are parked in a `data-fingerprint` attribute rather
+ * than in `text`: `stable_element_fingerprint` returns a one-way 16-char
+ * SHA-256 prefix, so asserting it as visible text would be a criterion that
+ * can never match. The attribute keeps a stable handle for the uniqueness
+ * pass (see `elementQueryKey`) without inventing a false signal.
  */
 function artifactElementsToQueries(elements: string[]): ElementQuery[] {
   const queries: ElementQuery[] = [];
   for (const el of elements) {
     if (!el) continue;
-    const parts = el.split("|");
-    if (parts.length === 3) {
-      const [role, name, tag] = parts;
-      const q: ElementQuery = {};
-      if (role) q.role = role;
-      if (name) q.ariaLabel = name;
+    const q: ElementQuery = {};
+    // Every branch guards on a NON-EMPTY payload. A bare `id:` / `aria:` /
+    // `role:` would otherwise decode to `{id: ""}` etc., which looks decoded
+    // but keys to "" in `elementQueryKey` — silently skipping the uniqueness
+    // pass, the exact hole the `id:` key branch exists to close. Empty
+    // payloads fall through to the opaque handle instead.
+    if (el.startsWith("id:")) {
+      if (el.length > 3) q.id = el.slice(3);
+    } else if (el.startsWith("aria:")) {
+      if (el.length > 5) q.ariaLabel = el.slice(5);
+    } else if (el.startsWith("tag:")) {
+      // `tag:<tag>:<text>` — split on the first colon only.
+      const rest = el.slice(4);
+      const sep = rest.indexOf(":");
+      const tag = sep >= 0 ? rest.slice(0, sep) : rest;
+      const text = sep >= 0 ? rest.slice(sep + 1) : "";
       if (tag) q.tagName = tag;
-      queries.push(q);
+      if (text) q.text = text;
+    } else if (el.startsWith("role:")) {
+      if (el.length > 5) q.role = el.slice(5);
     } else {
-      // Opaque fingerprint — preserve it in a synthetic attribute for
-      // equality checks in enforceElementUniqueness.
-      queries.push({ attributes: { "data-fingerprint": el } });
+      const parts = el.split("|");
+      if (parts.length === 3) {
+        const [role, name, tag] = parts;
+        if (role) q.role = role;
+        if (name) q.ariaLabel = name;
+        if (tag) q.tagName = tag;
+      }
     }
+    // Anything that decoded to nothing is an opaque digest.
+    queries.push(Object.keys(q).length > 0 ? q : { attributes: { "data-fingerprint": el } });
   }
   return queries;
 }
@@ -768,7 +875,12 @@ export function elementQueryKey(q: ElementQuery): string {
   const role = q.role ?? "";
   const name = q.ariaLabel ?? q.text ?? q.textContains ?? "";
   const tag = (q.tagName ?? "").toLowerCase();
-  if (!role && !name && !tag) return "";
+  // An `id:`-shaped artifact fingerprint decodes to an id-only query. Without
+  // this branch such a query keys to "" and is skipped by the uniqueness
+  // pass, so two states could both claim it undetected. Deliberately last:
+  // when a loose triple exists it stays the key, so this is purely additive
+  // over what previously returned "".
+  if (!role && !name && !tag) return q.id ? `id:${q.id}` : "";
   return `lk:${role}|${name.slice(0, 60)}|${tag}`;
 }
 
