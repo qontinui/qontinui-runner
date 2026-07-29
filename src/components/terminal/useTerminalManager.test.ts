@@ -22,6 +22,7 @@ import {
   shouldIngestCreatedTerminal,
   nextActiveIdAfterIngest,
   backfillClaudeSessionIds,
+  resolveSpawnWorkingDir,
   type TerminalTab,
   type SessionIdsByTerminal,
 } from "./useTerminalManager";
@@ -282,5 +283,40 @@ describe("backfillClaudeSessionIds", () => {
   it("leaves tabs with no matching record untouched", () => {
     const out = backfillClaudeSessionIds([tab("unknown-term")], map);
     expect(out[0].claudeSessionId).toBeUndefined();
+  });
+});
+
+describe("resolveSpawnWorkingDir (page defaultWorkingDir fallback)", () => {
+  // Projects-dashboard plan §7.2 step 2: the page default must arrive AS the
+  // `working_dir` argument to the Rust `terminal_create`, because that command
+  // derives `intent_repo` from it (commands/terminal.rs:97-111) and may then
+  // reassign it to an isolated worktree (:122-128). Passing `null` and letting
+  // Rust guess is NOT equivalent — hence the fallback is resolved here.
+  const ROOT = "D:\\projects\\pizzeria";
+
+  it("falls back to the page default when the caller passes no workingDir", () => {
+    expect(resolveSpawnWorkingDir(undefined, ROOT)).toBe(ROOT);
+  });
+
+  it("lets an explicit workingDir win over the page default", () => {
+    expect(resolveSpawnWorkingDir("D:\\elsewhere", ROOT)).toBe("D:\\elsewhere");
+  });
+
+  it("treats a blank explicit value as absent and falls through to the page default", () => {
+    expect(resolveSpawnWorkingDir("   ", ROOT)).toBe(ROOT);
+    expect(resolveSpawnWorkingDir("", ROOT)).toBe(ROOT);
+  });
+
+  it("returns null (pre-project behavior) when neither is set", () => {
+    // `null` is what the Tauri command has always received for an unpinned
+    // spawn — the fallback must not change that path.
+    expect(resolveSpawnWorkingDir(undefined, undefined)).toBeNull();
+    expect(resolveSpawnWorkingDir(undefined, "  ")).toBeNull();
+    expect(resolveSpawnWorkingDir("", "")).toBeNull();
+  });
+
+  it("trims the value it forwards", () => {
+    expect(resolveSpawnWorkingDir(` ${ROOT} `, undefined)).toBe(ROOT);
+    expect(resolveSpawnWorkingDir(undefined, ` ${ROOT} `)).toBe(ROOT);
   });
 });

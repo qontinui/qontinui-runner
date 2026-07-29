@@ -322,7 +322,11 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     ProxyableCommand {
         name: "add_saved_project",
         description: "Append a project to the saved list. Idempotent by normalized path.",
-        args_schema: r#"{"type":"object","required":["project"],"properties":{"project":{"type":"object","required":["path","name","projectType","manifest"],"properties":{"path":{"type":"string"},"name":{"type":"string"},"projectType":{"type":"string"},"manifest":{"type":"string"}}}}}"#,
+        // `id` is optional: it carries `#[serde(default)]` and the Rust side
+        // mints a UUID when it arrives empty or absent. Every other field the
+        // Projects dashboard added is likewise optional, so this schema stays
+        // the minimal contract an automation caller must satisfy.
+        args_schema: r#"{"type":"object","required":["project"],"properties":{"project":{"type":"object","required":["path","name","projectType","manifest"],"properties":{"id":{"type":"string"},"path":{"type":"string"},"name":{"type":"string"},"projectType":{"type":"string"},"manifest":{"type":"string"}}}}}"#,
         response_schema: r#"{"type":"null"}"#,
         // Required `project` arg; empty-args probe would error.
         probe_with_empty_args: false,
@@ -330,10 +334,10 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     },
     ProxyableCommand {
         name: "remove_saved_project",
-        description: "Remove a saved project by path. No-op if the path isn't in the list.",
-        args_schema: r#"{"type":"object","required":["path"],"properties":{"path":{"type":"string"}}}"#,
+        description: "Remove a saved project by id. No-op if the id isn't in the list.",
+        args_schema: r#"{"type":"object","required":["id"],"properties":{"id":{"type":"string"}}}"#,
         response_schema: r#"{"type":"null"}"#,
-        // Required `path` arg; empty-args probe would error.
+        // Required `id` arg; empty-args probe would error.
         probe_with_empty_args: false,
         observe_projection: None,
     },

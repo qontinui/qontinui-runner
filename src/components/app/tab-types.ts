@@ -1,6 +1,7 @@
 export type LogSubTab = "general" | "image" | "actions";
 
 export type MainTabId =
+  | "projects"
   | "prompt-home"
   | "gui-automation"
   | "workflow-queue"
@@ -103,6 +104,7 @@ export type MainTabId =
   | "helper-tasks";
 
 const VALID_TAB_IDS: MainTabId[] = [
+  "projects",
   "prompt-home",
   "gui-automation",
   "workflow-queue",
@@ -211,18 +213,34 @@ export const SIDEBAR_COLLAPSED_KEY = "qontinui-sidebar-collapsed";
  * The tab the runner opens on when nothing else decides it: a cold start with
  * no persisted `activeTab`, or a persisted value that no longer names a page.
  *
- * Terminal, not the Home prompt. The Terminal is the runner's primary surface —
- * most sessions are Claude Code / shell sessions run from it — while the Home
- * prompt page composes a verification-agentic LOOP WORKFLOW and now lives
- * behind the "Show advanced automation features" disclosure. Landing a fresh
- * install on a page its own sidebar no longer lists would be the worst of both.
+ * Projects, not the Terminal. This SUPERSEDES the previous Terminal-first
+ * argument, which was right about the Home prompt (it composes a
+ * verification-agentic LOOP WORKFLOW and lives behind the "Show advanced
+ * automation features" disclosure, so landing a fresh install there would
+ * strand the user on a page their own sidebar no longer lists) but wrong about
+ * what a first-run user is ready for. The Terminal is still where the work
+ * happens — most sessions are Claude Code / shell sessions run from it — but it
+ * opens on a directory the user has to already know. Projects answers the prior
+ * question: what am I building, and what state is each one in. That is the
+ * question someone has before they have a path, so it is what a cold start
+ * should show.
+ *
+ * Changing this constant is safe for existing installs, and that is a property
+ * of `resolveLandingTab` (`landing-tab.ts:102`) rather than a hope:
+ * `DEFAULT_TAB_ID` is consulted ONLY when nothing is persisted or the persisted
+ * tab is unreachable — the fallthroughs are `landing-tab.ts:113`/`:119` for a
+ * gated-or-invisible nav id, and the two in `migrateTabId` below (its `!stored`
+ * guard and its final return) for an absent/unknown stored value. Every install
+ * that has ever opened a tab has one persisted, and `terminal` stays reachable
+ * and visible, so it keeps resolving to itself. Only a fresh install lands on
+ * Projects.
  *
  * Every fallback in the app routes through this constant rather than
  * hard-coding a tab id, so the landing page is one edit — the previous spread
  * of literal `?? "prompt-home"` defaults across App.tsx, the UI Bridge event
  * hooks and the sidebar is exactly how a default drifts out of sync.
  */
-export const DEFAULT_TAB_ID: MainTabId = "terminal";
+export const DEFAULT_TAB_ID: MainTabId = "projects";
 
 /**
  * Human-readable labels for every `MainTabId`. Authoritative source for the
@@ -233,6 +251,7 @@ export const DEFAULT_TAB_ID: MainTabId = "terminal";
  * have an entry here (the runtime test in `page.rs::tabs_list` asserts this).
  */
 export const TAB_LABELS: Record<MainTabId, string> = {
+  projects: "Projects",
   "prompt-home": "Home",
   "gui-automation": "Execute",
   "workflow-queue": "Workflow Queue",
@@ -354,6 +373,7 @@ export type TabSection = "nav" | "run" | "monitor" | "settings" | "build" | "con
  * infer them. Everything not in this set falls through to the prefix rule.
  */
 const NAV_TAB_IDS: ReadonlySet<MainTabId> = new Set<MainTabId>([
+  "projects",
   "prompt-home",
   "gui-automation",
   "workflow-queue",

@@ -2116,6 +2116,17 @@ pub struct Settings {
     /// Back-compat: missing key in an existing settings.json loads as empty.
     #[serde(default)]
     pub saved_projects: Vec<SavedProject>,
+    /// `SavedProject.id` of the currently-active project, or `None` when the
+    /// user has not picked one yet.
+    ///
+    /// Deliberately server-side rather than in the frontend's
+    /// port-namespaced `instanceStorage`: only `settings.json` lets the
+    /// runner restore (and optionally auto-start) the last project at boot
+    /// before any frontend has mounted, lets the MCP/HTTP API answer "which
+    /// project is current" so an agent's tools inherit the root, and
+    /// survives a cleared WebView2 profile.
+    #[serde(default)]
+    pub active_project_id: Option<String>,
     /// Trace API gate (Section 5b of the UI Bridge redesign). When enabled,
     /// `/trace/...` routes are mounted on the runner's HTTP API and the
     /// runner persists causal traces to `project.ui_bridge_events` (requires
@@ -2284,23 +2295,13 @@ impl Default for LockYieldPolicySettings {
 /// wizard's project picker). Persisted to `settings.json` under the
 /// `saved_projects` key.
 ///
-/// Serialized as camelCase on the wire so JS/TS consumers (wizard, UI Bridge
-/// Integration panel) can bind directly. The struct is deliberately loose —
-/// `project_type` is a free-form string so new frameworks do not require a
-/// schema change.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SavedProject {
-    /// Absolute path to the project root.
-    pub path: String,
-    /// Human-friendly display name (usually the directory basename).
-    pub name: String,
-    /// Framework/language tag, e.g. "react", "python", "rust", "node".
-    /// Kept loose (String) so future frameworks need no schema change.
-    pub project_type: String,
-    /// Manifest file that identified the project (e.g. "package.json").
-    pub manifest: String,
-}
+/// The canonical definition now lives in `qontinui-schemas`
+/// (`qontinui_types::projects::SavedProject`) so the TypeScript and Python
+/// bindings are generated rather than hand-mirrored — the struct grew from 4
+/// fields to 16 with the Projects dashboard, which is exactly where a
+/// hand-mirror starts lying. Re-exported here so `settings::SavedProject`
+/// keeps working for every existing consumer.
+pub use qontinui_types::projects::SavedProject;
 
 // ============================================================================
 // World State Verifier Settings
@@ -3521,6 +3522,19 @@ pub fn get_saved_projects() -> Vec<SavedProject> {
 /// Tauri-command module.
 pub fn save_saved_projects(projects: Vec<SavedProject>) -> Result<(), String> {
     update_settings(|settings| settings.saved_projects = projects)
+}
+
+/// Get the `SavedProject.id` of the active project, if one is selected.
+pub fn get_active_project_id() -> Option<String> {
+    load_settings()
+        .active_project_id
+        .filter(|id| !id.trim().is_empty())
+}
+
+/// Set (or clear, with `None`) the active project.
+pub fn save_active_project_id(id: Option<String>) -> Result<(), String> {
+    let normalized = id.filter(|s| !s.trim().is_empty());
+    update_settings(|settings| settings.active_project_id = normalized)
 }
 
 // ============================================================================

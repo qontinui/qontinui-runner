@@ -12,13 +12,19 @@
  * covers the reconciliation behavior without booting React or Tauri.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 
+import { instanceStorage } from "@/lib/instance-storage";
+import { resolveSpawnWorkingDir } from "./useTerminalManager";
 import {
   reconcilePages,
   computeVisiblePages,
   pageIdsFromTerminals,
   pageIdsFromSessions,
+  applyPageDefaultWorkingDir,
+  resolveProjectPage,
+  loadPages,
+  PAGES_STORAGE_KEY,
   type TerminalPageConfig,
 } from "./useTerminalPages";
 
@@ -181,5 +187,154 @@ describe("computeVisiblePages (default-tab visibility)", () => {
     const pages = [OP_A, DEFAULT];
     const out = computeVisiblePages(pages, new Set(["op-a", "default"]));
     expect(out.map((p) => p.id)).toEqual(["op-a", "default"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Projects dashboard §7.2 — `defaultWorkingDir` + dangling-page-id tolerance.
+// ---------------------------------------------------------------------------
+
+describe("applyPageDefaultWorkingDir", () => {
+  const PAGES: TerminalPageConfig[] = [DEFAULT, { id: "op-a", name: "My Work", createdAt: 100 }];
+  const ROOT = "D:\\projects\\pizzeria";
+
+  it("sets the page default and leaves every other page untouched", () => {
+    const out = applyPageDefaultWorkingDir(PAGES, "op-a", ROOT);
+    expect(out).not.toBe(PAGES);
+    expect(out.find((p) => p.id === "op-a")!.defaultWorkingDir).toBe(ROOT);
+    expect(out.find((p) => p.id === "default")).toBe(DEFAULT);
+  });
+
+  it("trims, and treats a blank value as CLEARING the field", () => {
+    expect(applyPageDefaultWorkingDir(PAGES, "op-a", `  ${ROOT}  `)[1].defaultWorkingDir).toBe(
+      ROOT,
+    );
+    const set = applyPageDefaultWorkingDir(PAGES, "op-a", ROOT);
+    const cleared = applyPageDefaultWorkingDir(set, "op-a", "   ");
+    // Cleared DELETES the key, so a cleared page serializes byte-identically
+    // to one that never carried the field.
+    expect("defaultWorkingDir" in cleared[1]).toBe(false);
+  });
+
+  it("returns the SAME array reference when nothing changed (no persist, no re-render)", () => {
+    expect(applyPageDefaultWorkingDir(PAGES, "op-a", undefined)).toBe(PAGES);
+    const set = applyPageDefaultWorkingDir(PAGES, "op-a", ROOT);
+    expect(applyPageDefaultWorkingDir(set, "op-a", ROOT)).toBe(set);
+    // Unknown page id is a no-op, never a throw.
+    expect(applyPageDefaultWorkingDir(PAGES, "ghost", ROOT)).toBe(PAGES);
+  });
+});
+
+describe("resolveProjectPage (dangling terminal_page_id tolerance)", () => {
+  // The binding lives in Rust `settings.json`; the pages live in
+  // `instanceStorage` (localStorage, port-namespaced) which Rust cannot read.
+  // A bound id naming a page that does not exist in THIS window is therefore
+  // NORMAL (plan §4/§12) and must never fail an activation.
+  const PAGES: TerminalPageConfig[] = [DEFAULT, { id: "bound", name: "Pizzeria", createdAt: 100 }];
+  const ROOT = "D:\\projects\\pizzeria";
+  const mint = () => "minted-uuid";
+
+  it("returns the existing page when the bound id resolves", () => {
+    const out = resolveProjectPage(PAGES, "bound", "Papa's Pizzeria", undefined, mint);
+    expect(out).toMatchObject({ pageId: "bound", created: false });
+    expect(out.pages).toBe(PAGES); // nothing to persist
+  });
+
+  it("updates the existing page's defaultWorkingDir without renaming it", () => {
+    const out = resolveProjectPage(PAGES, "bound", "Papa's Pizzeria", ROOT, mint);
+    expect(out.created).toBe(false);
+    const page = out.pages.find((p) => p.id === "bound")!;
+    expect(page.defaultWorkingDir).toBe(ROOT);
+    // The operator's own page name is never overwritten by the project name.
+    expect(page.name).toBe("Pizzeria");
+  });
+
+  it("never CLEARS an existing page default when no root is supplied", () => {
+    // "no root given" means "leave it alone" — resolving a project page must
+    // not silently unpin a page whose cwd is already set.
+    const pinned = resolveProjectPage(PAGES, "bound", "Papa's Pizzeria", ROOT, mint).pages;
+    const out = resolveProjectPage(pinned, "bound", "Papa's Pizzeria", undefined, mint);
+    expect(out.pages).toBe(pinned);
+    expect(out.pages.find((p) => p.id === "bound")!.defaultWorkingDir).toBe(ROOT);
+  });
+
+  it("re-creates a DANGLING bound id under the same id, named after the project", () => {
+    const out = resolveProjectPage(PAGES, "gone-from-this-window", "Papa's Pizzeria", ROOT, mint);
+    // Same id → the binding stays stable across windows instead of forking.
+    expect(out.pageId).toBe("gone-from-this-window");
+    expect(out.created).toBe(true);
+    const page = out.pages.find((p) => p.id === "gone-from-this-window")!;
+    expect(page.name).toBe("Papa's Pizzeria");
+    expect(page.defaultWorkingDir).toBe(ROOT);
+    // Existing pages survive.
+    expect(out.pages.slice(0, 2)).toEqual(PAGES);
+  });
+
+  it("mints a fresh id when the project has no binding yet", () => {
+    for (const bound of [undefined, null, "", "   "]) {
+      const out = resolveProjectPage(PAGES, bound, "Papa's Pizzeria", ROOT, mint);
+      expect(out).toMatchObject({ pageId: "minted-uuid", created: true });
+    }
+  });
+
+  it("is idempotent when re-resolved with the id it just reported", () => {
+    // This is exactly what `ensureProjectPage` does: resolve against the ref,
+    // then re-resolve inside the `setPages` updater pinned to the reported id.
+    const first = resolveProjectPage(PAGES, null, "Papa's Pizzeria", ROOT, mint);
+    const second = resolveProjectPage(first.pages, first.pageId, "Papa's Pizzeria", ROOT, mint);
+    expect(second.pageId).toBe(first.pageId);
+    expect(second.created).toBe(false);
+    expect(second.pages).toBe(first.pages);
+  });
+
+  it("falls back to a generic page name when the project has none", () => {
+    const out = resolveProjectPage(PAGES, null, "   ", undefined, mint);
+    expect(out.pages.find((p) => p.id === "minted-uuid")!.name).toBe("Project");
+  });
+
+  it("omits defaultWorkingDir entirely when no root is supplied", () => {
+    const out = resolveProjectPage(PAGES, null, "Papa's Pizzeria", undefined, mint);
+    expect("defaultWorkingDir" in out.pages.find((p) => p.id === "minted-uuid")!).toBe(false);
+  });
+});
+
+describe("page persistence round-trip (defaultWorkingDir)", () => {
+  // `loadPages`/`savePages` go through `instanceStorage` → JSON in
+  // localStorage. vitest's environment is "node", so stub the global the same
+  // way the webview provides it.
+  beforeEach(() => {
+    const store = new Map<string, string>();
+    (globalThis as Record<string, unknown>).localStorage = {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => void store.set(k, v),
+      removeItem: (k: string) => void store.delete(k),
+      key: (i: number) => [...store.keys()][i] ?? null,
+      get length() {
+        return store.size;
+      },
+      clear: () => store.clear(),
+    };
+  });
+
+  it("round-trips defaultWorkingDir through save → load unchanged", () => {
+    const saved: TerminalPageConfig[] = [
+      { id: "op-a", name: "Pizzeria", createdAt: 100, defaultWorkingDir: "D:\\projects\\pizzeria" },
+    ];
+    instanceStorage.setJSON(PAGES_STORAGE_KEY, saved);
+    expect(loadPages()).toEqual(saved);
+  });
+
+  it("loads a page persisted WITHOUT the field (pre-projects layout) unchanged", () => {
+    const legacy = [{ id: "op-a", name: "My Work", createdAt: 100 }];
+    instanceStorage.setJSON(PAGES_STORAGE_KEY, legacy);
+    const loaded = loadPages();
+    expect(loaded).toEqual(legacy);
+    expect(loaded[0].defaultWorkingDir).toBeUndefined();
+    // …and a spawn on such a page behaves exactly as before the field existed.
+    expect(resolveSpawnWorkingDir(undefined, loaded[0].defaultWorkingDir)).toBeNull();
+  });
+
+  it("still injects the implicit default page when nothing is persisted", () => {
+    expect(loadPages()).toEqual([{ id: "default", name: "Terminal", createdAt: 0 }]);
   });
 });
