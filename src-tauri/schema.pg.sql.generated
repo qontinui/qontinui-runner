@@ -3782,7 +3782,9 @@ CREATE TABLE coord.operators (
     sso_subject text NOT NULL,
     sso_provider text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    last_login_at timestamp with time zone
+    last_login_at timestamp with time zone,
+    disabled_at timestamp with time zone,
+    disabled_reason text
 );
 
 
