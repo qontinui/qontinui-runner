@@ -311,9 +311,11 @@ class AiShellCommandGeneratorService:
         import os
         import sys
 
-        # Debug log file (same as executor)
+        # Debug log file (same as executor). ~ expands from USERPROFILE on
+        # Windows and HOME elsewhere; the old literal fallback named one
+        # machine's Windows account.
         debug_log = os.path.join(
-            os.environ.get("USERPROFILE", "C:\\Users\\Joshua"), ".qontinui", "ai-shell-debug.log"
+            os.path.expanduser("~"), ".qontinui", "ai-shell-debug.log"
         )
 
         def debug(msg):

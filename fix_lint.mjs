@@ -1,9 +1,13 @@
 // Script to add eslint-disable-next-line comments to fix ESLint errors
 // Run with: node fix_lint.mjs
 import { readFileSync, writeFileSync } from 'fs';
-import { join } from 'path';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
 
-const BASE = 'C:/Users/jspin/Documents/qontinui-root/qontinui-runner';
+// This script lives at the repo root, so its own directory IS the base. The
+// literal `C:/Users/<account>/...` path it used to carry resolved on exactly
+// one machine and silently rewrote nothing anywhere else.
+const BASE = dirname(fileURLToPath(import.meta.url));
 
 // SUPPRESSIONS: [relative_path, line_number (1-based error line), rule]
 // For multi-error lines: the script deduplicates them

@@ -25,7 +25,10 @@ function Create-Workflow {
     }
 }
 
-$setupScriptDir = "C:\Users\jspin\Documents\qontinui-root\qontinui-runner\examples\demo-workflows"
+# The demo setup scripts sit beside this file, so derive the directory from the
+# script's own location rather than a literal user profile (which resolved on
+# exactly one machine and pointed every demo workflow at a missing directory).
+$setupScriptDir = $PSScriptRoot
 
 # ============================================================
 # Demo 1: Fix Buggy Calculator
