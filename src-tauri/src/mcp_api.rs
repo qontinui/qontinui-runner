@@ -877,7 +877,7 @@ fn resolve_caller_session_id(
         .try_state::<Arc<crate::claude_session::SessionManager>>()
         .and_then(|sm| sm.task_run_id_for_workdir(&workdir));
     match task_run_id {
-        // Primary chain hit — semantics unchanged from Phase 0/#841.
+        // Primary chain hit.
         Some(task_run_id) => {
             let Some(registrar) = state
                 .app_handle
@@ -885,8 +885,16 @@ fn resolve_caller_session_id(
             else {
                 return (None, SelfIdOutcome::NoSession);
             };
+            // The registrar lookup is the REGISTERED-ness FILTER, not the
+            // value: it proves this session actually registered with coord
+            // (and so has a `coord.agent_sessions` row), but the id it holds
+            // is the per-boot `coord.sessions.id`, which is the wrong id
+            // space for this header — see `anchor_as_caller_session`.
             match registrar.session_id_for(&task_run_id) {
-                Some(sid) => (Some(sid), SelfIdOutcome::Injected),
+                Some(_) => match anchor_as_caller_session(&task_run_id) {
+                    Some(sid) => (Some(sid), SelfIdOutcome::Injected),
+                    None => (None, SelfIdOutcome::NoSession),
+                },
                 None => (None, SelfIdOutcome::NoSession),
             }
         }
@@ -922,9 +930,35 @@ fn resolve_caller_via_lifecycle(state: &Arc<ApiState>, workdir: &str) -> Option<
         .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()?;
     let records = store.open_records(); // snapshot under the store lock
     let target_canon = std::fs::canonicalize(workdir).ok();
+    // The closure stays the REGISTERED-ness filter (it still consults the
+    // registrar, so phantom spawn-time shell records that never registered
+    // are still excluded); `select_lifecycle_caller` now yields the record's
+    // own ANCHOR as the caller id rather than the registrar's value.
     select_lifecycle_caller(&records, workdir, target_canon.as_deref(), |csid| {
-        registrar.session_id_for(csid)
+        registrar.session_id_for(csid).is_some()
     })
+}
+
+/// The caller-session id to put on `X-Coord-Caller-Session` for a session
+/// anchored on `claude_session_id`.
+///
+/// coord validates this header with `agent_sessions::session_on_device`
+/// (fail-closed) before trusting it, so it MUST be a `coord.agent_sessions.id`
+/// bound to this device — which is the durable anchor, NOT the per-boot
+/// `coord.sessions.id` that `AiCoordRegistrar` mints and holds in its R4
+/// index. coord's `create_session` upserts
+/// `coord.agent_sessions(id = claude_code_session_id, device_id)` from the
+/// anchor the runner publishes, so the anchor is the id that exists in that
+/// table.
+///
+/// Shipping the registrar's value instead is why the Phase-0 chain could not
+/// work even fully armed: the header arrived, failed `session_on_device`, and
+/// coord silently fell back to its fuzzy `recent_session_for_device` guess —
+/// visible only as `coord_self_id_resolution_total{outcome="injected_invalid"}`.
+/// That is a DIFFERENT failure from the 2026-07-22 arm-collapse (the header
+/// never being SENT at all).
+fn anchor_as_caller_session(claude_session_id: &str) -> Option<uuid::Uuid> {
+    uuid::Uuid::parse_str(claude_session_id.trim()).ok()
 }
 
 /// Pure candidate selection for the lifecycle fallback (unit-testable without
@@ -947,7 +981,7 @@ fn select_lifecycle_caller(
     records: &[crate::session::session_lifecycle_store::TerminalSessionRecord],
     workdir: &str,
     target_canon: Option<&std::path::Path>,
-    resolve: impl Fn(&str) -> Option<uuid::Uuid>,
+    is_registered: impl Fn(&str) -> bool,
 ) -> Option<uuid::Uuid> {
     let mut best: Option<(i64, &str, uuid::Uuid)> = None;
     for rec in records {
@@ -957,7 +991,13 @@ fn select_lifecycle_caller(
         if !lifecycle_workdir_matches(dir, workdir, target_canon) {
             continue;
         }
-        let Some(sid) = resolve(&rec.claude_session_id) else {
+        if !is_registered(&rec.claude_session_id) {
+            continue;
+        }
+        // The ANCHOR is the caller id (see `anchor_as_caller_session`); a
+        // record whose anchor is not a uuid cannot name a
+        // `coord.agent_sessions` row, so it is not a candidate.
+        let Some(sid) = anchor_as_caller_session(&rec.claude_session_id) else {
             continue;
         };
         let candidate = (rec.last_seen_at, rec.claude_session_id.as_str(), sid);
@@ -4720,87 +4760,107 @@ mod self_id_chain_tests {
         }
     }
 
+    /// Anchors are real uuids in every selection test now: the selected
+    /// caller id IS the record's anchor (a `coord.agent_sessions` id), so a
+    /// placeholder like `"match"` is no longer a valid fixture.
+    const ANCHOR_A: &str = "aaaaaaaa-0000-4000-8000-000000000001";
+    const ANCHOR_B: &str = "bbbbbbbb-0000-4000-8000-000000000002";
+
+    fn uuid_of(s: &str) -> uuid::Uuid {
+        uuid::Uuid::parse_str(s).expect("fixture anchor must be a uuid")
+    }
+
     #[test]
-    fn lifecycle_selection_picks_the_matching_registered_record() {
-        let sid = uuid::Uuid::new_v4();
+    fn lifecycle_selection_yields_the_anchor_not_the_registrar_value() {
+        // THE id-space fix: coord validates `X-Coord-Caller-Session` with
+        // `session_on_device` against `coord.agent_sessions`, where the
+        // registrar's per-boot `coord.sessions` uuid never appears. The
+        // selected id must therefore be the record's own anchor.
         let records = vec![
-            rec("other-dir", Some("D:/elsewhere"), 50),
-            rec("match", Some("D:/repo"), 10),
+            rec(ANCHOR_B, Some("D:/elsewhere"), 50),
+            rec(ANCHOR_A, Some("D:/repo"), 10),
         ];
-        let got = select_lifecycle_caller(&records, "D:/repo", None, |csid| {
-            (csid == "match").then_some(sid)
-        });
-        assert_eq!(got, Some(sid));
+        let got = select_lifecycle_caller(&records, "D:/repo", None, |csid| csid == ANCHOR_A);
+        assert_eq!(got, Some(uuid_of(ANCHOR_A)));
     }
 
     #[test]
     fn lifecycle_selection_skips_unregistered_records() {
         // A workdir-matching record whose session never registered (phantom
         // spawn-time shell record, pre-Phase-3 session) must not resolve —
-        // the resolver closure is the registration filter.
-        let records = vec![rec("phantom", Some("D:/repo"), 99)];
-        let got = select_lifecycle_caller(&records, "D:/repo", None, |_| None);
+        // the closure remains the registration filter even though it no
+        // longer supplies the value.
+        let records = vec![rec(ANCHOR_A, Some("D:/repo"), 99)];
+        let got = select_lifecycle_caller(&records, "D:/repo", None, |_| false);
         assert_eq!(got, None, "unregistered record must not inject");
+    }
+
+    #[test]
+    fn lifecycle_selection_skips_non_uuid_anchors() {
+        // An anchor that is not a uuid cannot name a `coord.agent_sessions`
+        // row, so it is not a candidate even when registered.
+        let records = vec![rec("not-a-uuid", Some("D:/repo"), 99)];
+        let got = select_lifecycle_caller(&records, "D:/repo", None, |_| true);
+        assert_eq!(got, None, "non-uuid anchor must not inject");
     }
 
     #[test]
     fn lifecycle_selection_prefers_most_recently_seen_on_shared_workdir() {
         // Interactive sessions can share a workdir; the workdir-scoped
         // most-recent pick is the deterministic tie-break.
-        let old_sid = uuid::Uuid::new_v4();
-        let new_sid = uuid::Uuid::new_v4();
         let records = vec![
-            rec("older", Some("D:/repo"), 100),
-            rec("newer", Some("D:/repo"), 200),
+            rec(ANCHOR_A, Some("D:/repo"), 100),
+            rec(ANCHOR_B, Some("D:/repo"), 200),
         ];
-        let got = select_lifecycle_caller(&records, "D:/repo", None, |csid| match csid {
-            "older" => Some(old_sid),
-            "newer" => Some(new_sid),
-            _ => None,
-        });
-        assert_eq!(got, Some(new_sid));
+        let got = select_lifecycle_caller(&records, "D:/repo", None, |_| true);
+        assert_eq!(got, Some(uuid_of(ANCHOR_B)));
 
         // If the newer record is unregistered, the older registered one wins.
-        let got = select_lifecycle_caller(&records, "D:/repo", None, |csid| {
-            (csid == "older").then_some(old_sid)
-        });
-        assert_eq!(got, Some(old_sid));
+        let got = select_lifecycle_caller(&records, "D:/repo", None, |csid| csid == ANCHOR_A);
+        assert_eq!(got, Some(uuid_of(ANCHOR_A)));
     }
 
     #[test]
     fn lifecycle_selection_equal_timestamps_break_deterministically() {
-        let a = uuid::Uuid::new_v4();
-        let b = uuid::Uuid::new_v4();
         let records = vec![
-            rec("aaaa", Some("D:/repo"), 100),
-            rec("bbbb", Some("D:/repo"), 100),
+            rec(ANCHOR_A, Some("D:/repo"), 100),
+            rec(ANCHOR_B, Some("D:/repo"), 100),
         ];
-        let resolve = |csid: &str| match csid {
-            "aaaa" => Some(a),
-            "bbbb" => Some(b),
-            _ => None,
-        };
-        let got1 = select_lifecycle_caller(&records, "D:/repo", None, resolve);
+        let got1 = select_lifecycle_caller(&records, "D:/repo", None, |_| true);
         // Reversed input order must yield the same pick (lexicographically
         // greatest claude_session_id on a timestamp tie).
         let reversed: Vec<_> = records.iter().rev().cloned().collect();
-        let got2 = select_lifecycle_caller(&reversed, "D:/repo", None, resolve);
+        let got2 = select_lifecycle_caller(&reversed, "D:/repo", None, |_| true);
         assert_eq!(got1, got2, "selection must be input-order independent");
-        assert_eq!(got1, Some(b));
+        assert_eq!(got1, Some(uuid_of(ANCHOR_B)));
+    }
+
+    #[test]
+    fn anchor_as_caller_session_accepts_only_uuids() {
+        assert_eq!(
+            super::anchor_as_caller_session(ANCHOR_A),
+            Some(uuid_of(ANCHOR_A))
+        );
+        assert_eq!(
+            super::anchor_as_caller_session(&format!("  {ANCHOR_A}  ")),
+            Some(uuid_of(ANCHOR_A)),
+            "surrounding whitespace is tolerated"
+        );
+        assert_eq!(super::anchor_as_caller_session("not-a-uuid"), None);
+        assert_eq!(super::anchor_as_caller_session(""), None);
     }
 
     #[test]
     fn lifecycle_selection_misses_cleanly() {
         // No records / no workdir match / recordless working_dir → None
         // (header simply absent, as today).
-        let sid = uuid::Uuid::new_v4();
         assert_eq!(
-            select_lifecycle_caller(&[], "D:/repo", None, |_| Some(sid)),
+            select_lifecycle_caller(&[], "D:/repo", None, |_| true),
             None
         );
-        let records = vec![rec("x", None, 10), rec("y", Some("D:/other"), 10)];
+        let records = vec![rec(ANCHOR_A, None, 10), rec(ANCHOR_B, Some("D:/other"), 10)];
         assert_eq!(
-            select_lifecycle_caller(&records, "D:/repo", None, |_| Some(sid)),
+            select_lifecycle_caller(&records, "D:/repo", None, |_| true),
             None
         );
     }
