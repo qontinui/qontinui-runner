@@ -13,6 +13,23 @@
 #   ./scripts/generate_types.sh --ts-only   # TypeScript only
 #   ./scripts/generate_types.sh --py-only   # Python only
 #   ./scripts/generate_types.sh --dry-run   # Print schemas without generating
+#
+# Environment overrides (all optional; defaults preserve the historical
+# sibling-checkout layout that CI recreates):
+#
+#   QONTINUI_SCHEMAS_DIR   Root of the qontinui-schemas checkout to READ the
+#                          codegen helper scripts from.
+#   QONTINUI_TS_OUT_DIR    Where the per-type TypeScript .d.ts + index.ts go.
+#   QONTINUI_PY_OUT_DIR    Where the Pydantic modules go.
+#
+# The output overrides exist so a caller that must NOT mutate the schemas
+# checkout (notably `.pre-commit-hooks/gen-events-drift.sh`, which runs
+# against a shared multi-agent working tree) can redirect every write into a
+# scratch directory it owns and then compare, rather than regenerating in
+# place. This script DELETES stale artifacts in the output directories
+# (`rm -f "$TS_OUT_DIR"/*.d.ts`, `rm -f "$PER_TYPE_DIR"/*.py`), so pointing an
+# output at a working tree that holds someone else's uncommitted work destroys
+# it. Redirect, don't regenerate in place.
 
 set -euo pipefail
 
@@ -20,8 +37,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCHEMAS_JSON="$PROJECT_ROOT/target/schemas.json"
 
-TS_OUT_DIR="$PROJECT_ROOT/../../qontinui-schemas/ts/src/generated"
-PY_OUT_DIR="$PROJECT_ROOT/../../qontinui-schemas/src/qontinui_schemas/generated"
+SCHEMAS_DIR="${QONTINUI_SCHEMAS_DIR:-$PROJECT_ROOT/../../qontinui-schemas}"
+
+TS_OUT_DIR="${QONTINUI_TS_OUT_DIR:-$SCHEMAS_DIR/ts/src/generated}"
+PY_OUT_DIR="${QONTINUI_PY_OUT_DIR:-$SCHEMAS_DIR/src/qontinui_schemas/generated}"
 
 # On Windows (Git Bash / MSYS), POSIX-style paths like /d/foo are not
 # understood by native Windows binaries (node, npx). Convert to Windows paths
@@ -70,6 +89,12 @@ cd "$PROJECT_ROOT"
 cargo build --bin export_schemas --release 2>&1 | tail -5
 
 echo "==> Exporting schemas to $SCHEMAS_JSON..."
+# `$SCHEMAS_JSON` lives under src-tauri/target/, but cargo's default target dir
+# for this workspace is qontinui-runner/target/ — so in a fresh worktree the
+# parent directory does not exist and the redirection below dies with
+# "No such file or directory" before anything is generated. (CI sidesteps this
+# by overriding CARGO_TARGET_DIR to src-tauri/target.) Create it explicitly.
+mkdir -p "$(dirname "$SCHEMAS_JSON")"
 cargo run --bin export_schemas --release -- --pretty > "$SCHEMAS_JSON"
 
 # schemars v1 emits `oneOf` for serde-tagged enums but no sibling
@@ -77,7 +102,7 @@ cargo run --bin export_schemas --release -- --pretty > "$SCHEMAS_JSON"
 # proper `Annotated[Union[...], Field(discriminator='...')]` tagged
 # unions — without it, every variant is tried in turn (slow, poor errors).
 # The post-processor is idempotent; safe to run unconditionally.
-DISCR_SCRIPT="$PROJECT_ROOT/../../qontinui-schemas/scripts/add_discriminators.py"
+DISCR_SCRIPT="$SCHEMAS_DIR/scripts/add_discriminators.py"
 if [ -f "$DISCR_SCRIPT" ] && command -v python >/dev/null 2>&1; then
     echo "==> Annotating oneOf unions with discriminator keyword..."
     # Convert MSYS paths to Windows form for native python.exe — same
@@ -114,7 +139,7 @@ if [ "$PY_ONLY" = false ]; then
     # `declareExternallyReferenced: false`, and injects proper
     # `import type { X } from './X'` statements. Result: one canonical
     # declaration per type, no stubs, no `$1` aliases after tsup bundling.
-    COMPILE_SCRIPT="$PROJECT_ROOT/../../qontinui-schemas/scripts/compile_typescript.mjs"
+    COMPILE_SCRIPT="$SCHEMAS_DIR/scripts/compile_typescript.mjs"
     if [ ! -f "$COMPILE_SCRIPT" ]; then
         echo "ERROR: $COMPILE_SCRIPT not found"
         exit 1
