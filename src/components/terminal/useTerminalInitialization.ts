@@ -358,7 +358,8 @@ export function claimInitForPage(seen: Set<string>, pageId: string): boolean {
  * without booting React.
  */
 export type ReconnectDecision =
-  { kind: "abort-restore" } | { kind: "proceed"; reconnectedTabIds: readonly string[] };
+  | { kind: "abort-restore" }
+  | { kind: "proceed"; reconnectedTabIds: readonly string[] };
 
 export function decideReconnectOutcome(
   reconnectedTabIds: readonly string[] | null,
