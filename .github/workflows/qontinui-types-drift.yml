@@ -28,6 +28,12 @@ on:
       - "src-tauri/src/tauri_event_payloads.rs"
       - "src-tauri/src/relay_envelopes.rs"
       - "src-tauri/scripts/generate_types.sh"
+      # The gate must re-run when the gate itself changes. Without these two
+      # entries a PR that edits this workflow (or the sibling-ref action it
+      # depends on) never exercises it, so the edit lands unverified — which
+      # is exactly how a drift check can rot into a vacuous green unnoticed.
+      - ".github/workflows/qontinui-types-drift.yml"
+      - ".github/actions/resolve-schemas-ref/action.yml"
   push:
     branches: [main]
     paths:
@@ -35,6 +41,12 @@ on:
       - "src-tauri/src/tauri_event_payloads.rs"
       - "src-tauri/src/relay_envelopes.rs"
       - "src-tauri/scripts/generate_types.sh"
+      # The gate must re-run when the gate itself changes. Without these two
+      # entries a PR that edits this workflow (or the sibling-ref action it
+      # depends on) never exercises it, so the edit lands unverified — which
+      # is exactly how a drift check can rot into a vacuous green unnoticed.
+      - ".github/workflows/qontinui-types-drift.yml"
+      - ".github/actions/resolve-schemas-ref/action.yml"
 
 env:
   # generate_types.sh runs `cargo build --bin export_schemas`, which compiles
@@ -134,18 +146,93 @@ jobs:
           CARGO_TARGET_DIR: ${{ github.workspace }}/qontinui-runner/src-tauri/target
         run: bash qontinui-runner/src-tauri/scripts/generate_types.sh
 
+      # Uploaded unconditionally so a red run hands you the exact bytes CI
+      # expected. Reproducing this output locally needs the full Rust
+      # toolchain plus the pinned datamodel-codegen; downloading the artifact
+      # and committing it into a qontinui-schemas PR is the cheap path.
+      # `warn` rather than `error` on missing files: this step also runs on
+      # runs where regeneration itself died, and that must surface as the
+      # regen failure it is, not as a second misleading upload failure.
+      - name: Upload regenerated bindings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regenerated-bindings
+          path: |
+            qontinui-schemas/ts/src/generated
+            qontinui-schemas/src/qontinui_schemas/generated
+          if-no-files-found: warn
+
       # `-I '^#   timestamp:'` ignores hunks whose only changed lines
       # are the datamodel-codegen timestamp header (rewritten every
       # run regardless of schema content). Same trick the schemas-side
       # workflow uses.
+      #
+      # ── Anti-vacuity guard ─────────────────────────────────────────────
+      #
+      # `git diff` compares the working tree against the INDEX, so it cannot
+      # see untracked files. `ts/src/generated` had ZERO tracked files in
+      # qontinui-schemas from 34709ada (2026-06-25) until qontinui-schemas#108
+      # restored them: the regen step above recreated the whole directory as
+      # untracked output and the diff below reported nothing. The TypeScript
+      # arm of this gate was vacuously green for its entire life; only the
+      # Python arm (533 tracked files) carried signal. A gate that cannot go
+      # red is worse than no gate, because it manufactures confidence.
+      #
+      # Three arms now, mirroring qontinui-schemas/.github/workflows/
+      # schema-drift.yml — keep the two in step:
+      #   arm 0 (baseline)  — the checked-in copy exists at all. Without it
+      #                       arms 1 and 2 are both meaningless.
+      #   arm 1 (untracked) — a NEW type appears, so the regen writes a file
+      #                       git does not track and `git diff` cannot see it.
+      #                       Also catches a repeat of the index sweep, one
+      #                       file at a time.
+      #   arm 2 (diff)      — an EXISTING file changed, or was deleted because
+      #                       its type was removed.
+      #
+      # All three in ONE step deliberately: split across steps they would each
+      # need `if: always()` to report independently, which also makes them run
+      # after a FAILED regeneration, where every arm reports garbage that
+      # buries the real error.
       - name: Check for drift
         working-directory: qontinui-schemas
         run: |
-          if ! git diff --exit-code -I '^#   timestamp:' \
+          set -uo pipefail
+          status=0
+
+          # arm 0 — baseline present?
+          for dir in ts/src/generated src/qontinui_schemas/generated; do
+            n="$(git ls-files -- "$dir" | wc -l)"
+            echo "baseline $dir: $n tracked file(s)"
+            if [ "$n" -eq 0 ]; then
+              echo "::error::qontinui-schemas $dir has ZERO tracked files, so this drift check is vacuous."
+              echo "It cannot detect runner-side drift in those bindings until they are committed there."
+              status=1
+            fi
+          done
+
+          # arm 1 — regenerated files qontinui-schemas is not tracking
+          new_files="$(git ls-files --others --exclude-standard -- \
+              ts/src/generated \
+              src/qontinui_schemas/generated)"
+          if [ -n "$new_files" ]; then
+            echo "::error::Regeneration produced generated files not checked in to qontinui-schemas:"
+            printf '%s\n' "$new_files"
+            status=1
+          fi
+
+          # arm 2 — tracked files that changed or were deleted
+          if ! git diff --exit-code -I '^#   timestamp:' -- \
               ts/src/generated \
               src/qontinui_schemas/generated; then
-            echo "::error::This runner-side change would cause drift in qontinui-schemas's checked-in TS/Python artifacts."
-            echo "Coordinate the schemas update: open a qontinui-schemas PR with regenerated artifacts and merge it before/with this PR."
-            echo "Local regen: bash src-tauri/scripts/generate_types.sh"
-            exit 1
+            echo "::error::This runner-side change would drift qontinui-schemas's checked-in TS/Python artifacts."
+            status=1
           fi
+
+          if [ "$status" -ne 0 ]; then
+            echo "Coordinate the schemas update: open a qontinui-schemas PR with the regenerated"
+            echo "artifacts and land it before/with this PR."
+            echo "Local regen: bash src-tauri/scripts/generate_types.sh"
+            echo "Or download this run's 'regenerated-bindings' artifact and commit its contents."
+          fi
+          exit "$status"
