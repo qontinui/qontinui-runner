@@ -737,7 +737,8 @@ const PageSessionScope = memo(function PageSessionScope({
         }>("analyze_session_summary", { input: text });
         if (result.success && result.data) {
           const data = result.data as
-            Array<{ type?: string; content?: string }> | { panels?: Array<{ content?: string }> };
+            | Array<{ type?: string; content?: string }>
+            | { panels?: Array<{ content?: string }> };
           let summaryContent: string | null = null;
 
           if (Array.isArray(data)) {
