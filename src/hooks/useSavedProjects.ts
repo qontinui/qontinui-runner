@@ -20,14 +20,41 @@ import { createLogger } from "@/lib/logger";
 const log = createLogger("useSavedProjects");
 
 /**
- * Wire shape for a persisted project. Matches the Rust `SavedProject` struct
- * serialized as camelCase.
+ * Wire shape for a persisted project. Mirrors
+ * `qontinui_types::projects::SavedProject` (qontinui-schemas
+ * `rust/src/projects.rs`) serialized as camelCase.
+ *
+ * TODO(shared-types): this should be
+ * `import type { SavedProject } from "@qontinui/shared-types"` — the Rust
+ * struct is the source of truth and the TS binding is generated from it.
+ * It cannot be today: this app consumes `@qontinui/shared-types` from **npm**
+ * (`package.json` `^0.6.0`; `vite.config.ts:242` notes the deliberate move off
+ * path aliases), and the newest published version is 0.8.1. The schemas repo's
+ * `ts/src/generated/` tree — which `ts/src/index.ts` already imports from —
+ * was deleted in `a95d51da` (2026-06-29), so `npm run build` fails there and
+ * the `ts-v0.9.0` publish never landed. Restoring that tree and publishing the
+ * next version is the unblock; swap this declaration for the import and bump
+ * the dependency range in the same change.
  */
 export interface SavedProject {
+  /** Stable UUID key. Survives a path move. */
+  id: string;
   path: string;
   name: string;
   projectType: string;
   manifest: string;
+  description?: string;
+  emoji?: string;
+  color?: string;
+  frontPageUrl?: string;
+  processIds?: string[];
+  /** A hint, not a handle — the page may not exist in this window. */
+  terminalPageId?: string;
+  zoneProfile?: string;
+  repoSlug?: string;
+  notes?: string;
+  pinned?: boolean;
+  lastOpenedMs?: number;
 }
 
 export interface UseSavedProjectsResult {
@@ -36,7 +63,8 @@ export interface UseSavedProjectsResult {
   error: string | null;
   refresh: () => Promise<void>;
   addProject: (project: SavedProject) => Promise<void>;
-  removeProject: (path: string) => Promise<void>;
+  /** Keyed by `SavedProject.id` — a project's path can move, its id cannot. */
+  removeProject: (id: string) => Promise<void>;
   saveAll: (projects: SavedProject[]) => Promise<void>;
 }
 
@@ -120,13 +148,13 @@ export function useSavedProjects(): UseSavedProjectsResult {
   );
 
   const removeProject = useCallback(
-    async (path: string) => {
+    async (id: string) => {
       if (!isTauriAvailable()) {
         log.warn("Tauri runtime not available; cannot remove saved project");
         return;
       }
       try {
-        await invoke<void>("remove_saved_project", { path });
+        await invoke<void>("remove_saved_project", { id });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         log.error("Failed to remove saved project", msg);

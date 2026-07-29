@@ -73,7 +73,7 @@ import { useWindowAssignments, MAIN_WINDOW_LABEL } from "./WindowAssignmentsCont
 import { useTerminalManager } from "../useTerminalManager";
 import { useZoneLayout } from "../useZoneLayout";
 import { type TerminalInstanceHandle } from "../TerminalInstance";
-import { type ZoneSessionInfo } from "../ZoneProfilePicker";
+import { type ZoneSessionInfo } from "../zoneProfileStorage";
 import { writeWhenReady } from "../writeWhenReady";
 
 import { useSessionStateTracking } from "../useSessionStateTracking";
@@ -186,6 +186,14 @@ export const TerminalSessionContext = createContext<TerminalSessionContextValue 
 interface PageSessionScopeProps {
   pageId: string;
   /**
+   * This page's `TerminalPageConfig.defaultWorkingDir` — the cwd terminals
+   * spawned on this page default to when the caller passes none (set when a
+   * project is activated). Threaded into `useTerminalManager` so the fallback
+   * is applied before the Rust `terminal_create` command derives `intent_repo`
+   * from `working_dir` (projects-dashboard plan §7.2 step 2).
+   */
+  defaultWorkingDir?: string;
+  /**
    * Publish (or, with `null`, retract) this page's computed session value to
    * the lifted `TerminalSessionProvider`. The provider keeps a Map keyed by
    * pageId and surfaces the ACTIVE page's value through context.
@@ -220,6 +228,7 @@ interface PageSessionScopeProps {
 // its OWN session hooks change.
 const PageSessionScope = memo(function PageSessionScope({
   pageId,
+  defaultWorkingDir,
   register,
   onNavigateToBuilder,
   onNavigateToActive,
@@ -232,7 +241,7 @@ const PageSessionScope = memo(function PageSessionScope({
   const { windowLabel: myWindowLabel, isOwned, windowForPage } = useWindowAssignments();
 
   // ---- TerminalCore ----
-  const terminalManager = useTerminalManager(pageId, myWindowLabel);
+  const terminalManager = useTerminalManager(pageId, myWindowLabel, defaultWorkingDir);
   const {
     tabs: allTabs,
     activeId,
@@ -278,10 +287,7 @@ const PageSessionScope = memo(function PageSessionScope({
   const tabIds = useMemo(() => tabs.map((t) => t.id), [tabs]);
   // Live-tab set so the zone layout can exclude exited tombstones from the
   // hidden-but-LIVE "N more" count (and surface them separately).
-  const liveTabIds = useMemo(
-    () => new Set(tabs.filter((t) => t.isAlive).map((t) => t.id)),
-    [tabs],
-  );
+  const liveTabIds = useMemo(() => new Set(tabs.filter((t) => t.isAlive).map((t) => t.id)), [tabs]);
   const zoneLayout = useZoneLayout(tabIds, pageId, myWindowLabel, liveTabIds);
 
   // Page-namespaced zone labels / notes / pins / tags. Moved into the scope
@@ -826,8 +832,12 @@ const PageSessionScope = memo(function PageSessionScope({
 });
 
 interface TerminalSessionProviderProps {
-  /** Every terminal page that should keep live state (all stay mounted). */
-  pages: Array<{ id: string }>;
+  /**
+   * Every terminal page that should keep live state (all stay mounted).
+   * `defaultWorkingDir` (from `TerminalPageConfig`) is carried through so each
+   * page's `createTerminal` can fall back to it — see `PageSessionScopeProps`.
+   */
+  pages: Array<{ id: string; defaultWorkingDir?: string }>;
   /** The page the operator is currently viewing — its value is surfaced. */
   activePageId: string;
   onNavigateToBuilder?: () => void;
@@ -875,20 +885,23 @@ export function TerminalSessionProvider({
   // Always mount the active page even if it isn't yet in `pages` (e.g. a page
   // removed from the list while still selected, mid-transition) so the page
   // tree always has a value to read once its scope publishes.
-  const scopedPageIds = useMemo(() => {
-    const ids = pages.map((p) => p.id);
-    if (!ids.includes(activePageId)) ids.push(activePageId);
-    return ids;
+  const scopedPages = useMemo(() => {
+    const scoped = pages.map((p) => ({ id: p.id, defaultWorkingDir: p.defaultWorkingDir }));
+    if (!scoped.some((p) => p.id === activePageId)) {
+      scoped.push({ id: activePageId, defaultWorkingDir: undefined });
+    }
+    return scoped;
   }, [pages, activePageId]);
 
   const activeValue = values[activePageId] ?? null;
 
   return (
     <>
-      {scopedPageIds.map((id) => (
+      {scopedPages.map((p) => (
         <PageSessionScope
-          key={id}
-          pageId={id}
+          key={p.id}
+          pageId={p.id}
+          defaultWorkingDir={p.defaultWorkingDir}
           register={register}
           onNavigateToBuilder={onNavigateToBuilder}
           onNavigateToActive={onNavigateToActive}

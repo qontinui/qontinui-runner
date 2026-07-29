@@ -14,11 +14,16 @@ interface Project {
 
 /**
  * Map the wizard's internal Project shape to the persistence wire shape.
- * The only difference is `type` -> `projectType` (camelCase JSON contract
- * expected by the Rust `save_saved_projects` command).
+ * `type` -> `projectType` is the camelCase JSON contract expected by the Rust
+ * `save_saved_projects` command.
+ *
+ * `id` is left empty: the wizard has no identity to assign, and
+ * `save_saved_projects` mints a UUID for every entry that arrives without one
+ * (`commands::saved_projects::backfill_ids`).
  */
 function toSavedProject(project: Project): SavedProject {
   return {
+    id: "",
     path: project.path,
     name: project.name,
     projectType: project.type,

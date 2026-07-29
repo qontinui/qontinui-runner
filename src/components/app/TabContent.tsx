@@ -355,6 +355,23 @@ export function TabContent({
         </div>
       );
 
+    // PLACEHOLDER. The Projects dashboard itself is a later phase; this arm
+    // exists now because `projects` is already `DEFAULT_TAB_ID`, and the switch
+    // is exhaustiveness-checked (`assertNeverTab`) — a MainTabId with no case
+    // is a `tsc` failure, not a runtime surprise. Replace the body, not the
+    // arm, when the real page lands.
+    case "projects":
+      return (
+        <div data-page-id="projects" className="h-full overflow-auto p-6">
+          <PageRegistration
+            id="projects"
+            name="Projects"
+            description="What you're building, and what state each project is in"
+          />
+          <h1 className="text-xl font-semibold text-foreground">Projects</h1>
+        </div>
+      );
+
     case "productivity":
       return (
         <div data-page-id="productivity" className="h-full flex flex-col">
