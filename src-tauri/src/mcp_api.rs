@@ -614,6 +614,14 @@ async fn health(
         // chains missed (plain shell, or a session that never sniffed/
         // registered).
         "selfId": self_id_health_snapshot(),
+        // Session-fabric Phase 3: how each `POST /coord/session-handles/register`
+        // ended, since this process booted. coord records nothing for a
+        // REFUSED bind, so a systematically-denied registry (the wrong
+        // `agent_session_id` id space — see `claude_session::session_handle`)
+        // is only visible here: `denied` climbing with `minted`/`rebound`
+        // flat means every handle is being dropped, which reads identically
+        // to "coord has not deployed the route" from the outside.
+        "sessionHandles": crate::claude_session::session_handle::health_snapshot(),
         "ai": {
             "configured": ai_configured,
             "running": ai_running,
