@@ -235,6 +235,15 @@ export function DocFinderModal({ onSelect, onClose, defaultRoot }: DocFinderModa
   const runScan = useCallback(async (scanRoot: string) => {
     setIsScanning(true);
     setScanError(null);
+    // No root at all: scanForDocs("") would readDir("") and swallow the error,
+    // leaving "No document files found in " with a dangling empty path. Say
+    // what is actually wrong and point at the recovery.
+    if (!scanRoot) {
+      setScannedFiles([]);
+      setScanError('No root directory selected — click "Change" to pick one.');
+      setIsScanning(false);
+      return;
+    }
     try {
       const files = await scanForDocs(scanRoot);
       files.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
@@ -616,8 +625,11 @@ function SearchTab({
       {/* Root selector */}
       <div className="px-3 pb-2 flex items-center gap-2 text-[11px]">
         <span className="text-[#565f89] shrink-0">Root:</span>
-        <span className="text-[#a9b1d6] truncate" title={root}>
-          {truncatePath(root)}
+        <span
+          className={root ? "text-[#a9b1d6] truncate" : "text-[#565f89] italic truncate"}
+          title={root || "no root selected"}
+        >
+          {root ? truncatePath(root) : "(none selected)"}
         </span>
         <button
           onClick={onChangeRoot}
