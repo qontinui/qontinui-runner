@@ -2363,9 +2363,12 @@ class QontinuiExecutor:
         import os
         import sys
 
-        # Debug log file
+        # Debug log file. ~ expands from USERPROFILE on Windows and HOME
+        # elsewhere; the old literal fallback named one machine's Windows
+        # account, so on any other login this aimed at a profile that does not
+        # exist (and os.makedirs below would then create it).
         debug_log = os.path.join(
-            os.environ.get("USERPROFILE", "C:\\Users\\Joshua"),
+            os.path.expanduser("~"),
             ".qontinui",
             "ai-shell-debug.log",
         )

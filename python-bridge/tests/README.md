@@ -214,7 +214,7 @@ Provides shared fixtures and utilities:
 ### Run all tests
 
 ```bash
-cd /mnt/c/Users/jspin/Documents/qontinui-root/qontinui-runner/python-bridge
+cd "$QONTINUI_ROOT"/qontinui-runner/python-bridge   # or wherever you cloned it
 pytest tests/
 ```
 
@@ -329,7 +329,7 @@ These tests are designed to run in CI/CD pipelines:
 Ensure you're running pytest from the python-bridge directory:
 
 ```bash
-cd /mnt/c/Users/jspin/Documents/qontinui-root/qontinui-runner/python-bridge
+cd "$QONTINUI_ROOT"/qontinui-runner/python-bridge   # or wherever you cloned it
 pytest tests/
 ```
 

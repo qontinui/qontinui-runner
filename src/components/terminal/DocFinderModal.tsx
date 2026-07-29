@@ -39,7 +39,17 @@ const SKIP_DIRS = new Set([
   ".next",
   ".dev-logs",
 ]);
-const DEFAULT_ROOT = "C:\\Users\\jspin\\Documents\\qontinui-root";
+/**
+ * Last-resort root when the caller passes no `defaultRoot`.
+ *
+ * This was a literal `C:\Users\<account>\Documents\qontinui-root`, which
+ * resolved on exactly one machine — everywhere else the finder opened on a
+ * non-existent directory and scanned nothing. Callers should pass
+ * `defaultRoot` (TerminalPage supplies the active tab's working directory);
+ * this empty value keeps the input editable and the scan a no-op until a real
+ * root is known, rather than pointing confidently at someone else's profile.
+ */
+const DEFAULT_ROOT = "";
 
 const SEARCH_ITEM_HEIGHT = 50;
 const CONTENT_ITEM_HEIGHT = 66;

@@ -45,14 +45,14 @@ $ErrorActionPreference = "Stop"
 # physical path. The Windows Firewall service runs as SYSTEM and does NOT
 # see per-logon subst drives, so a `Program=` rule registered against
 # `D:\qontinui-root\...` will not match a process whose kernel image path
-# is `C:\Users\jspin\Documents\qontinui-root\...` (the substed source).
+# is `C:\Users\<windows-user>\Documents\qontinui-root\...` (the substed source).
 # Result: rules silently fail to match and every spawn pops the "Allow
 # access" dialog. Resolve substs at rule-creation time so the recorded
 # Program path is what the firewall service actually sees at match time.
 function Resolve-SubstPath {
     param([Parameter(Mandatory)][string]$Path)
     # Parse `subst` output once into a drive-letter -> real-root map.
-    # Lines look like: `D:\: => C:\Users\jspin\Documents`
+    # Lines look like: `D:\: => C:\Users\<windows-user>\Documents`
     $script:_SubstMap = $script:_SubstMap
     if ($null -eq $script:_SubstMap) {
         $script:_SubstMap = @{}

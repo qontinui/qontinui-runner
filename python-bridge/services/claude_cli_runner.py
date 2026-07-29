@@ -20,8 +20,11 @@ def _debug_log(msg: str) -> None:
     import datetime
     import sys
 
+    # ~ expands from USERPROFILE on Windows and HOME elsewhere. The old literal
+    # fallback named one machine's Windows account, so on any other login it
+    # aimed the debug log at a profile that does not exist.
     debug_log = os.path.join(
-        os.environ.get("USERPROFILE", "C:\\Users\\Joshua"), ".qontinui", "ai-shell-debug.log"
+        os.path.expanduser("~"), ".qontinui", "ai-shell-debug.log"
     )
     ts = datetime.datetime.now().isoformat()
     line = f"[{ts}] [CLI_RUNNER] {msg}\n"

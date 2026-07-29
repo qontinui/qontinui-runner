@@ -1159,6 +1159,10 @@ function TerminalPageInner({
 
         {showDocFinder && (
           <DocFinderModal
+            // The active terminal's cwd is the right place to start looking —
+            // and it is a real path on THIS machine, unlike the literal
+            // operator profile the modal used to fall back to.
+            defaultRoot={activeTab?.workingDir || undefined}
             onSelect={(filePath) => {
               handleOpenDocFile(filePath);
               setShowDocFinder(false);
