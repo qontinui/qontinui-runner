@@ -866,7 +866,12 @@ mod tests {
             obj.contains_key("HelperAnswer"),
             "Missing HelperAnswer schema"
         );
-        assert_eq!(obj.len(), 531, "Expected 531 schema entries");
+        // 531 + the 10 Projects-dashboard types registered above (SavedProject,
+        // ProjectSnapshot, ProcessStatusLite, SessionSource, SessionLite,
+        // GitCommitLite, GitLite, PendingQuestion, HealthLevel, HealthLite).
+        // Independently corroborated by the codegen, which reports
+        // "Processing 541 top-level types" and emits 541 .d.ts files.
+        assert_eq!(obj.len(), 541, "Expected 541 schema entries");
 
         // Sanity-check that qontinui_types re-exports are present
         assert!(
