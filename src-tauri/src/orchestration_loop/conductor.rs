@@ -87,6 +87,17 @@ pub struct OrchestrationRunConfig {
     /// Seconds a `Gone` worker (vanished from the SessionManager) is tolerated
     /// before being failed — covers a transient restart window.
     pub gone_grace_secs: i64,
+    /// The agent registry's declared `parallel_fanout` bound, refreshed from
+    /// coord once per tick by the live loop (see
+    /// [`crate::agent_authorization::current_fanout_bound`]).
+    ///
+    /// `None` = not resolved yet (the very first tick, or a caller — every
+    /// test — that does not consult the registry), in which case only
+    /// `concurrency_cap` applies. This is a runner-local cache of a coord
+    /// value, deliberately re-read each tick rather than carried, so a user
+    /// changing the bound in the web settings page takes effect within about a
+    /// registry TTL without restarting the run.
+    pub fanout_bound: Option<u32>,
 }
 
 impl Default for OrchestrationRunConfig {
@@ -99,6 +110,31 @@ impl Default for OrchestrationRunConfig {
             report_timeout_secs: 90,
             report_reprompt_grace_secs: 90,
             gone_grace_secs: 60,
+            fanout_bound: None,
+        }
+    }
+}
+
+impl OrchestrationRunConfig {
+    /// How many workers may be dispatched-and-not-terminal at once, honouring
+    /// BOTH the run's own conservative cap and the agent registry's declared
+    /// `parallel_fanout` bound.
+    ///
+    /// The registry bound is a policy ceiling (served clause
+    /// `agent-spawn-authorization`: "Parallel fan-out: bound declared up front
+    /// (registry default 15)"), so it can only ever LOWER the effective cap —
+    /// it never raises a run above the cap the caller asked for. When the
+    /// ceiling bites, the surplus ready subtasks simply stay queued and land on
+    /// later ticks: that is the clause's degrade to sequential, expressed where
+    /// it is observable, and it can never fail a task.
+    ///
+    /// Floored at 1 so a hostile or fat-fingered `0` degrades to sequential
+    /// rather than wedging the run — the same clamp
+    /// [`crate::agent_authorization::current_fanout_bound`] applies.
+    pub fn effective_concurrency_cap(&self) -> usize {
+        match self.fanout_bound {
+            Some(b) => self.concurrency_cap.min(b.max(1) as usize).max(1),
+            None => self.concurrency_cap,
         }
     }
 }
@@ -608,7 +644,15 @@ pub fn compute_tick<S: SignalSource>(
     // Dispatch (step 3) — ready subtasks in topo order, capped by remaining
     // concurrency. `still_inflight` already reflects completions/failures
     // decided above so a tick can both complete and dispatch.
-    let slots = config.concurrency_cap.saturating_sub(still_inflight);
+    //
+    // The cap is `min(concurrency_cap, registry fanout_bound)` — this is where
+    // the served clause's declared parallel fan-out bound actually binds, since
+    // it is derived fresh from the durable rows every tick and therefore cannot
+    // leak. Ready work beyond the cap stays queued for a later tick: the
+    // clause's degrade-to-sequential, never a failure.
+    let slots = config
+        .effective_concurrency_cap()
+        .saturating_sub(still_inflight);
     if slots > 0 {
         for st in ready_subtasks(subtasks, &order).into_iter().take(slots) {
             plan.to_dispatch.push(st.task_id.clone());
@@ -1143,7 +1187,7 @@ pub async fn run_orchestration<D: Dispatcher, S: SignalSource, G: CoordGateClien
     dispatcher: D,
     signals: S,
     gate_client: G,
-    config: OrchestrationRunConfig,
+    mut config: OrchestrationRunConfig,
     mut stop_rx: watch::Receiver<bool>,
 ) {
     info!(
@@ -1184,6 +1228,27 @@ pub async fn run_orchestration<D: Dispatcher, S: SignalSource, G: CoordGateClien
                 continue;
             }
         };
+
+        // Refresh the registry's declared parallel fan-out bound for THIS tick.
+        // Served clause `agent-spawn-authorization`: "Parallel fan-out: bound
+        // declared up front (registry default 15)." It is re-read rather than
+        // captured at run start so a user changing it mid-run takes effect, and
+        // it is folded into the dispatch cap below (never carried in memory as
+        // an in-flight count, which is what makes it leak-proof). Cache-backed
+        // — one coord round-trip per registry TTL, not per tick.
+        let refreshed_bound = crate::agent_authorization::current_fanout_bound(None).await;
+        if config.fanout_bound != Some(refreshed_bound) {
+            info!(
+                "conductor: run {run_id} parallel fan-out bound {:?} → {refreshed_bound} \
+                 (effective dispatch cap {})",
+                config.fanout_bound,
+                config
+                    .concurrency_cap
+                    .min(refreshed_bound.max(1) as usize)
+                    .max(1)
+            );
+            config.fanout_bound = Some(refreshed_bound);
+        }
 
         let now = Utc::now().timestamp();
         let plan = compute_tick(&subtasks, &signals, &mut timers, &config, now);
@@ -1449,6 +1514,78 @@ mod tests {
         c.concurrency_cap = 2;
         let plan = compute_tick(&rows, &signals, &mut timers, &c, 0);
         assert_eq!(plan.to_dispatch.len(), 2, "cap limits dispatch to 2");
+    }
+
+    /// The served clause's declared parallel fan-out bound must actually bind
+    /// on dispatch — this is where the registry's `fanout_bound` stops being
+    /// decorative. It can only ever LOWER the run's own cap, and the surplus
+    /// ready work stays queued (degrade to sequential) rather than failing.
+    #[test]
+    fn the_registry_fanout_bound_caps_dispatch() {
+        struct Case {
+            name: &'static str,
+            concurrency_cap: usize,
+            fanout_bound: Option<u32>,
+            want_dispatched: usize,
+        }
+
+        let cases = [
+            Case {
+                name: "no resolved bound → only the run's own cap applies",
+                concurrency_cap: 4,
+                fanout_bound: None,
+                want_dispatched: 4,
+            },
+            Case {
+                name: "a lower registry bound caps the run",
+                concurrency_cap: 4,
+                fanout_bound: Some(2),
+                want_dispatched: 2,
+            },
+            Case {
+                name: "a higher registry bound never RAISES the run's cap",
+                concurrency_cap: 2,
+                fanout_bound: Some(15),
+                want_dispatched: 2,
+            },
+            Case {
+                name: "a bound of 1 is sequential, not a stall",
+                concurrency_cap: 4,
+                fanout_bound: Some(1),
+                want_dispatched: 1,
+            },
+            Case {
+                name: "a bound of 0 degrades to sequential, never to zero",
+                concurrency_cap: 4,
+                fanout_bound: Some(0),
+                want_dispatched: 1,
+            },
+        ];
+
+        for c in cases {
+            let rows = vec![
+                mk("A", 0, &[], SubtaskState::Submitted),
+                mk("B", 1, &[], SubtaskState::Submitted),
+                mk("C", 2, &[], SubtaskState::Submitted),
+                mk("D", 3, &[], SubtaskState::Submitted),
+                mk("E", 4, &[], SubtaskState::Submitted),
+            ];
+            let signals = FakeSignals(Map::new());
+            let mut timers = ReadyIdleTimers::default();
+            let mut cf = cfg();
+            cf.concurrency_cap = c.concurrency_cap;
+            cf.fanout_bound = c.fanout_bound;
+            let plan = compute_tick(&rows, &signals, &mut timers, &cf, 0);
+            assert_eq!(
+                plan.to_dispatch.len(),
+                c.want_dispatched,
+                "case: {}",
+                c.name
+            );
+            // Never a failure: the surplus stays queued for a later tick.
+            assert!(plan.to_fail.is_empty(), "case: {}", c.name);
+            assert!(!plan.done, "case: {}", c.name);
+        }
     }
 
     #[test]

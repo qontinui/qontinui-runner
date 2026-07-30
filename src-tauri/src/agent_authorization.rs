@@ -101,22 +101,79 @@
 //! the same agent (see [`lookup_row`]). Otherwise an ordinary in-session
 //! opt-in would silently imply the standing one.
 //!
+//! # Parallel fan-out bound
+//!
+//! The clause's other half: *"Parallel fan-out: bound declared up front
+//! (registry default 15). On breach, degrade to sequential and keep working —
+//! never hard-fail mid-task. Escalate only if sequential still cannot
+//! complete."*
+//!
+//! [`authorize_fanout_spawn`] is the entry point for the `parallel_fanout`
+//! class. It runs the same matrix as [`authorize_spawn`] and then, when the
+//! spawn is authorized, admits it against the governing row's `fanout_bound`
+//! ([`DEFAULT_FANOUT_BOUND`] when no row declares one, clamped to at least 1):
+//!
+//! * a free slot → [`SpawnDecision::Allow`] plus a [`FanoutSlot`];
+//! * no free slot → the caller **queues** for one and, once admitted, gets
+//!   [`SpawnDecision::SerializeToBound`] plus the slot. This is the degrade to
+//!   sequential: the work still happens, one at a time. It is deliberately NOT
+//!   a refusal — [`SpawnDecision::allows_spawn`] is true for it and
+//!   [`SpawnDecision::refusal`] is `None`, so a breach can never be mistaken
+//!   for a denial by a call site that does not know the variant.
+//! * nothing frees within [`FANOUT_WAIT_BUDGET`] → [`FanoutAdmission::SlotUnavailable`],
+//!   which is **transient**: the caller retries later rather than failing the
+//!   task. That is the only outcome that can stall work, and it is the point
+//!   the clause says to escalate from ("the declared fan-out bound is reached
+//!   with work outstanding and sequential degradation cannot complete").
+//!
+//! Accounting is a [`tokio::sync::Semaphore`] per lane, keyed by the row that
+//! SUPPLIED the bound ([`Verdict::bound_source`]) so that several agents falling
+//! back to one class row share that row's bound instead of getting one bound
+//! each. The decrement is the permit's `Drop`, so it runs on the happy path, on
+//! every `?`/early return, and on unwind from a panic — a leaked count would
+//! wedge fan-out for the life of the process, which is strictly worse than the
+//! unenforced bound this replaced.
+//!
+//! ## Two layers, because one is not enough
+//!
+//! A [`FanoutSlot`] covers a spawn's *admission* — the critical section the
+//! caller holds it across — not the spawned worker's whole life. That alone
+//! would be nominal enforcement: the orchestration conductor dispatches
+//! sequentially within a tick, so its admission occupancy is ≤ 1 and a bound of
+//! 15 could never bind. Bounding a worker's lifetime with the same guard would
+//! need a release hook on a path a crash or a missed reconcile can skip, i.e.
+//! exactly the leak this shape rules out.
+//!
+//! So the bound is enforced twice, at the two points that can actually observe
+//! it:
+//!
+//! 1. **Batch sizing (the layer that binds).** [`current_fanout_bound`] is a
+//!    read-only resolve the orchestration conductor folds into its per-tick
+//!    concurrency cap (`min(concurrency_cap, fanout_bound)`), so the number of
+//!    workers *alive at once* honours the registry. It is leak-proof by
+//!    construction: the conductor re-derives in-flight count from the durable
+//!    rows every tick and carries nothing in memory. A cap that admits fewer
+//!    dispatches than there is ready work IS the clause's degrade to
+//!    sequential — the remaining subtasks stay queued and land on later ticks.
+//! 2. **Admission (the layer that is exact).** [`authorize_fanout_spawn`]
+//!    additionally serializes concurrent *admissions* across callers that do
+//!    not share a conductor (several runs, several funnel sites), which the
+//!    per-tick cap cannot see.
+//!
 //! # Known gaps (stated, not implied)
 //!
-//! * `fanout_bound` is parsed and logged but **not enforced**; no funnel site
-//!   yet declares a fan-out bound or degrades to sequential on breach. That
-//!   half of the clause is unimplemented.
 //! * The cold-start `policy_required` floor is currently unreachable from every
 //!   wired call site, because no runner funnel site names a subagent that is
 //!   both policy-required and non-standing. It is kept because the matrix cell
 //!   is specified and becomes live the moment such a site exists.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
 use serde::Deserialize;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tracing::{error, info, warn};
 
 /// How long a successfully-resolved registry snapshot counts as fresh.
@@ -222,8 +279,8 @@ pub enum SpawnPath {
     InSessionSubagent,
     /// Workflow-style parallel fan-out. Bound declared up front (registry
     /// default 15); on breach the caller degrades to sequential rather than
-    /// hard-failing mid-task. The bound itself is not yet enforced — see the
-    /// "Known gaps" section in the module docs.
+    /// hard-failing mid-task. Enforced by [`authorize_fanout_spawn`] — see
+    /// "Parallel fan-out bound" in the module docs.
     ParallelFanout,
     /// A spawn that OUTLIVES the request: gate continuations, auto-dispatch,
     /// shepherd/steward spawns, `/sessions/spawn` continuations, looping
@@ -290,6 +347,16 @@ impl Disposition {
 pub enum SpawnDecision {
     /// Spawn.
     Allow,
+    /// Spawn — but only after queueing behind the declared `parallel_fanout`
+    /// bound, i.e. the clause's *degrade to sequential*. The work proceeds; it
+    /// simply did not run in parallel. **Not a refusal:** [`Self::allows_spawn`]
+    /// is true and [`Self::refusal`] is `None`, so a call site that predates
+    /// this variant cannot mistake a bound breach for a denial — the direction
+    /// the clause mandates ("never hard-fail mid-task").
+    ///
+    /// `in_flight` is the occupancy observed at the moment admission was
+    /// refused, i.e. before this spawn queued.
+    SerializeToBound { bound: u32, in_flight: u32 },
     /// Do not spawn; the requesting session performs the work inline instead.
     DegradeToInline { reason: String },
     /// Spawn, but surface the warning prominently.
@@ -301,14 +368,20 @@ pub enum SpawnDecision {
 impl SpawnDecision {
     /// True when the caller may go ahead and spawn.
     pub fn allows_spawn(&self) -> bool {
-        matches!(self, SpawnDecision::Allow | SpawnDecision::Warn { .. })
+        matches!(
+            self,
+            SpawnDecision::Allow
+                | SpawnDecision::Warn { .. }
+                | SpawnDecision::SerializeToBound { .. }
+        )
     }
 
-    /// The reason text for any non-`Allow` outcome, for surfacing to the
-    /// caller. `None` only for a plain `Allow`.
+    /// The reason text for any outcome that carries one, for surfacing to the
+    /// caller. `None` for `Allow` and for `SerializeToBound` — both authorize
+    /// the spawn, and the fan-out numbers travel in the variant's own fields.
     pub fn reason(&self) -> Option<&str> {
         match self {
-            SpawnDecision::Allow => None,
+            SpawnDecision::Allow | SpawnDecision::SerializeToBound { .. } => None,
             SpawnDecision::DegradeToInline { reason }
             | SpawnDecision::Warn { reason }
             | SpawnDecision::Deny { reason } => Some(reason),
@@ -330,6 +403,7 @@ impl SpawnDecision {
     pub fn label(&self) -> &'static str {
         match self {
             SpawnDecision::Allow => "allow",
+            SpawnDecision::SerializeToBound { .. } => "serialize_to_bound",
             SpawnDecision::DegradeToInline { .. } => "degrade_to_inline",
             SpawnDecision::Warn { .. } => "warn_proceed",
             SpawnDecision::Deny { .. } => "deny",
@@ -358,8 +432,9 @@ pub struct RegistryAgent {
     /// Whether a disable of this agent must still leave a gate behind.
     #[serde(default)]
     pub policy_required: bool,
-    /// Declared parallel fan-out bound (registry default 15). Logged with every
-    /// decision. **Not enforced** — see "Known gaps" in the module docs.
+    /// Declared parallel fan-out bound. Logged with every decision and
+    /// enforced by [`authorize_fanout_spawn`]; absent means
+    /// [`DEFAULT_FANOUT_BOUND`].
     #[serde(default)]
     pub fanout_bound: Option<u32>,
     /// **Defaults to `false` when absent.** The contract always sends it; a row
@@ -416,6 +491,11 @@ pub(crate) struct Verdict {
     pub stale_for: Option<Duration>,
     pub policy_required: bool,
     pub fanout_bound: Option<u32>,
+    /// `agent_name` of the row that supplied `fanout_bound`; `None` when no row
+    /// governed the spawn. This — not the requested agent name — is what keys
+    /// the fan-out lane, so several agents falling back to one class row share
+    /// that row's bound instead of getting one bound each. See [`fanout_key`].
+    pub bound_source: Option<String>,
 }
 
 impl Verdict {
@@ -427,6 +507,7 @@ impl Verdict {
             stale_for: None,
             policy_required: false,
             fanout_bound: None,
+            bound_source: None,
         }
     }
 }
@@ -692,6 +773,7 @@ fn decide_from_rows(
     v.stale_for = stale_for;
     v.policy_required = row.policy_required;
     v.fanout_bound = row.fanout_bound;
+    v.bound_source = Some(row.agent_name.clone());
     v
 }
 
@@ -699,6 +781,10 @@ fn decide_from_rows(
 fn annotate(decision: SpawnDecision, note: &str) -> SpawnDecision {
     match decision {
         SpawnDecision::Allow => SpawnDecision::Allow,
+        // `decide` never produces this variant (it is minted by the fan-out
+        // gate, after the matrix has already run), so there is nothing to
+        // annotate.
+        d @ SpawnDecision::SerializeToBound { .. } => d,
         SpawnDecision::DegradeToInline { reason } => SpawnDecision::DegradeToInline {
             reason: format!("{reason} [{note}]"),
         },
@@ -1054,6 +1140,417 @@ async fn fetch_effective() -> Fetched {
 }
 
 // ---------------------------------------------------------------------------
+// Parallel fan-out bound
+// ---------------------------------------------------------------------------
+
+/// Fan-out bound applied when no governing registry row declares one.
+///
+/// The clause names this number: *"Parallel fan-out: bound declared up front
+/// (registry default 15)."*
+pub const DEFAULT_FANOUT_BOUND: u32 = 15;
+
+/// Default wait budget for [`authorize_fanout_spawn`].
+///
+/// A slot covers a spawn's admission (seconds), so a wait this long means the
+/// lane is genuinely wedged rather than busy. It must be BOUNDED: an
+/// unbounded wait would hang a caller forever on one spawn, which is the
+/// "hard-fail mid-task" the clause forbids wearing a different hat.
+///
+/// **A caller on a reconcile loop must NOT use this default** — its own tick is
+/// already the retry mechanism, so queueing inside the tick stalls every other
+/// thing that tick does. Such callers pass a near-zero budget to
+/// [`authorize_fanout_spawn_with_budget`] and treat
+/// [`FanoutAdmission::SlotUnavailable`] as "try again next tick".
+pub const FANOUT_WAIT_BUDGET: Duration = Duration::from_secs(120);
+
+/// Ceiling on a declared fan-out bound.
+///
+/// A bound above this is indistinguishable from unbounded, and clamping keeps
+/// `bound as usize` honest on a 32-bit target where a hostile or fat-fingered
+/// `fanout_bound: 4_000_000_000` would otherwise truncate.
+const MAX_FANOUT_BOUND: u32 = 1024;
+
+/// The bound governing one spawn: the row's declared bound, else
+/// [`DEFAULT_FANOUT_BOUND`].
+///
+/// Clamped to at least 1. A row declaring `0` means "no parallelism", which is
+/// *sequential* — one at a time — not a permanent deadlock; the clause admits
+/// no reading in which a bound becomes a hard failure.
+fn effective_fanout_bound(declared: Option<u32>) -> u32 {
+    declared
+        .unwrap_or(DEFAULT_FANOUT_BOUND)
+        .clamp(1, MAX_FANOUT_BOUND)
+}
+
+/// Accounting key for one fan-out lane.
+///
+/// The argument is the `agent_name` of the row that SUPPLIED the bound
+/// ([`Verdict::bound_source`]), not the agent the caller asked about. That
+/// distinction is the whole point: when `worker-a` and `worker-b` both fall
+/// back to the single `parallel_fanout` class row, keying on the requested name
+/// would give them two independent lanes of 15 — 30 concurrent spawns against a
+/// declared bound of 15. Keying on the row makes them share the one lane the
+/// row describes. `None` (no row governed) is the class lane.
+///
+/// Case-folded, because the registry lookup that produced the bound is
+/// case-insensitive too — two spellings of one row must not get two lanes.
+fn fanout_key(bound_source: Option<&str>) -> String {
+    bound_source
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .unwrap_or(SpawnPath::ParallelFanout.as_wire())
+        .to_ascii_lowercase()
+}
+
+/// RAII admission ticket for ONE in-flight `parallel_fanout` spawn.
+///
+/// The count IS the semaphore's permit count, so the decrement is the permit's
+/// `Drop`: it runs on the happy path, on every `?`/early return, and on unwind
+/// from a panic. Nothing has to remember to release it. That is the whole
+/// reason this is a guard rather than a counter the caller decrements — a
+/// leaked count would wedge fan-out for the life of the process, strictly
+/// worse than the unenforced bound it replaced.
+#[must_use = "hold the FanoutSlot for the lifetime of the spawn — dropping it \
+              immediately releases the fan-out slot"]
+pub struct FanoutSlot {
+    /// Held solely for its `Drop`. Never read.
+    _permit: OwnedSemaphorePermit,
+    key: String,
+    bound: u32,
+}
+
+impl FanoutSlot {
+    /// The bound this slot was admitted against.
+    pub fn bound(&self) -> u32 {
+        self.bound
+    }
+
+    /// The lane this slot belongs to.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+}
+
+impl std::fmt::Debug for FanoutSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FanoutSlot")
+            .field("key", &self.key)
+            .field("bound", &self.bound)
+            .finish()
+    }
+}
+
+impl Drop for FanoutSlot {
+    fn drop(&mut self) {
+        // `debug!`, not `info!`: this fires once per dispatch on a busy
+        // orchestration run, and the Error/Auto-Fix Monitors read this log.
+        tracing::debug!(
+            fanout_key = %self.key,
+            bound = self.bound,
+            "parallel fan-out slot released"
+        );
+    }
+}
+
+/// One lane's permits plus the bound they represent.
+struct FanoutLane {
+    sem: Arc<Semaphore>,
+    /// Total permits `sem` currently carries (available + outstanding).
+    /// Tracked so a registry change to `fanout_bound` is reconciled instead of
+    /// silently ignored for the life of the process.
+    bound: u32,
+}
+
+/// Per-lane fan-out accounting.
+///
+/// A `std::sync::Mutex` (not the module's async one) guards the lane map on
+/// purpose: the map is only ever touched for the microseconds it takes to
+/// clone an `Arc`, and every `.await` in [`Self::admit`] happens after the
+/// guard is dropped.
+pub(crate) struct FanoutGate {
+    lanes: std::sync::Mutex<HashMap<String, FanoutLane>>,
+}
+
+/// Internal result of an admission attempt, before it is dressed as a
+/// [`FanoutAdmission`].
+#[derive(Debug)]
+enum Admit {
+    /// A slot was free.
+    Now(FanoutSlot),
+    /// The bound was full; this spawn queued and was then admitted.
+    Serialized {
+        slot: FanoutSlot,
+        bound: u32,
+        in_flight: u32,
+        waited: Duration,
+    },
+    /// The bound was full and stayed full for the whole budget.
+    Unavailable { bound: u32, waited: Duration },
+}
+
+impl FanoutGate {
+    pub(crate) fn new() -> Self {
+        FanoutGate {
+            lanes: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// How many lanes the map currently holds (tests: eviction).
+    #[cfg(test)]
+    fn lane_count(&self) -> usize {
+        match self.lanes.lock() {
+            Ok(g) => g.len(),
+            Err(e) => e.into_inner().len(),
+        }
+    }
+
+    /// The lane keys currently held (tests: eviction).
+    #[cfg(test)]
+    fn lane_keys(&self) -> Vec<String> {
+        match self.lanes.lock() {
+            Ok(g) => g.keys().cloned().collect(),
+            Err(e) => e.into_inner().keys().cloned().collect(),
+        }
+    }
+
+    /// The lane for `key`, reconciled to `bound`. Returns the semaphore and the
+    /// total permits it actually carries (which can exceed `bound` mid-shrink —
+    /// see below).
+    fn lane(&self, key: &str, bound: u32) -> (Arc<Semaphore>, u32) {
+        // A poisoned lock must never wedge fan-out: recovering the inner value
+        // is strictly better than panicking every subsequent spawn.
+        let mut lanes = match self.lanes.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        // Opportunistic eviction while the guard is already held. Only lanes
+        // that are FULLY idle go — no outstanding slot and no queued waiter
+        // (both hold an `Arc` clone, so `strong_count > 1` catches them), and
+        // every permit back home. Evicting a live lane would let the next
+        // admission mint a SECOND semaphore for the same key and double the
+        // bound. Today the map holds one entry; this keeps a future caller that
+        // keys by a per-invocation name (a task id, a worktree slug) from
+        // growing it for the life of the process.
+        lanes.retain(|k, l| {
+            k == key
+                || Arc::strong_count(&l.sem) > 1
+                || l.sem.available_permits() != l.bound as usize
+        });
+        let lane = lanes.entry(key.to_string()).or_insert_with(|| FanoutLane {
+            sem: Arc::new(Semaphore::new(bound as usize)),
+            bound,
+        });
+        match lane.bound.cmp(&bound) {
+            std::cmp::Ordering::Less => {
+                lane.sem.add_permits((bound - lane.bound) as usize);
+                lane.bound = bound;
+            }
+            std::cmp::Ordering::Greater => {
+                // `forget_permits` can only take permits that are AVAILABLE
+                // right now, so a shrink while slots are outstanding is
+                // partial. Record what actually happened rather than the wish —
+                // claiming the smaller bound here would leave the extra permits
+                // live forever; the remainder is reclaimed on a later admission
+                // once the outstanding slots come back.
+                let forgotten = lane.sem.forget_permits((lane.bound - bound) as usize) as u32;
+                lane.bound -= forgotten;
+            }
+            std::cmp::Ordering::Equal => {}
+        }
+        (Arc::clone(&lane.sem), lane.bound)
+    }
+
+    /// Admit one spawn into `key`'s lane, queueing for up to `budget`.
+    async fn admit(&self, key: &str, bound: u32, budget: Duration) -> Admit {
+        let (sem, total) = self.lane(key, bound);
+        // Occupancy BEFORE this spawn. Clamped because a mid-shrink lane can
+        // momentarily report more available permits than `total`.
+        let in_flight = total.saturating_sub(sem.available_permits().min(total as usize) as u32);
+
+        if let Ok(permit) = Arc::clone(&sem).try_acquire_owned() {
+            return Admit::Now(FanoutSlot {
+                _permit: permit,
+                key: key.to_string(),
+                bound: total,
+            });
+        }
+
+        // ONE line per serialization event — not per tick, and not per poll of
+        // the wait. This is the clause's degrade-to-sequential becoming
+        // observable, so it is worth a `warn!`.
+        warn!(
+            fanout_key = %key,
+            bound = total,
+            in_flight,
+            wait_budget_ms = budget.as_millis() as u64,
+            "parallel fan-out bound reached — degrading to sequential: this spawn queues \
+             for a slot instead of being refused"
+        );
+
+        let started = Instant::now();
+        match tokio::time::timeout(budget, Arc::clone(&sem).acquire_owned()).await {
+            Ok(Ok(permit)) => Admit::Serialized {
+                slot: FanoutSlot {
+                    _permit: permit,
+                    key: key.to_string(),
+                    bound: total,
+                },
+                bound: total,
+                in_flight,
+                waited: started.elapsed(),
+            },
+            // The semaphore is never closed, so this is unreachable in
+            // practice; treat it exactly like exhaustion rather than panicking.
+            Ok(Err(_closed)) => Admit::Unavailable {
+                bound: total,
+                waited: started.elapsed(),
+            },
+            Err(_elapsed) => Admit::Unavailable {
+                bound: total,
+                waited: budget,
+            },
+        }
+    }
+}
+
+static FANOUT: Lazy<FanoutGate> = Lazy::new(FanoutGate::new);
+
+/// Outcome of one `parallel_fanout` admission.
+#[derive(Debug)]
+pub enum FanoutAdmission {
+    /// Go ahead and spawn, holding `slot` for the spawn's lifetime.
+    ///
+    /// `decision` is [`SpawnDecision::Allow`] when a slot was free,
+    /// [`SpawnDecision::SerializeToBound`] when this spawn queued behind the
+    /// bound first, and [`SpawnDecision::Warn`] when the registry recorded a
+    /// `warn_proceed` disposition — the recorded disposition outranks the
+    /// serialization note, because the clause requires the session to say which
+    /// disposition applied (the serialization is logged either way).
+    Admitted {
+        decision: SpawnDecision,
+        slot: FanoutSlot,
+    },
+    /// The registry matrix refused the spawn. **Terminal** — retrying cannot
+    /// change it.
+    Refused(SpawnDecision),
+    /// The bound was fully occupied and nothing freed within
+    /// [`FANOUT_WAIT_BUDGET`]. **Transient** — retry later; per the clause this
+    /// must NOT be turned into a task failure. This is the point the clause
+    /// says to escalate from, if sequential progress still cannot complete.
+    SlotUnavailable {
+        key: String,
+        bound: u32,
+        waited: Duration,
+    },
+}
+
+/// Authorize ONE `parallel_fanout` spawn and admit it against the declared
+/// fan-out bound, queueing for up to [`FANOUT_WAIT_BUDGET`].
+///
+/// Use this instead of [`authorize_spawn`] for the `parallel_fanout` class:
+/// `authorize_spawn` runs the matrix but does no fan-out accounting, so it
+/// cannot honour the bound. **Callers on a reconcile loop want
+/// [`authorize_fanout_spawn_with_budget`] instead** — see the budget's docs.
+pub async fn authorize_fanout_spawn(agent_name: Option<&str>) -> FanoutAdmission {
+    authorize_fanout_spawn_with_budget(agent_name, FANOUT_WAIT_BUDGET).await
+}
+
+/// [`authorize_fanout_spawn`] with an explicit queueing budget.
+///
+/// A caller whose own loop already retries (the orchestration conductor's tick)
+/// passes a near-zero budget: queueing INSIDE such a loop stalls every other
+/// thing that iteration does — completions, gate registration, the stall
+/// fingerprint — for the whole budget, once per queued spawn. Returning
+/// [`FanoutAdmission::SlotUnavailable`] immediately and letting the next tick
+/// retry is the same degrade-to-sequential with a one-tick granularity instead
+/// of a multi-minute freeze.
+pub async fn authorize_fanout_spawn_with_budget(
+    agent_name: Option<&str>,
+    wait_budget: Duration,
+) -> FanoutAdmission {
+    let path = SpawnPath::ParallelFanout;
+    let resolved = CACHE.resolve_at(Instant::now(), fetch_effective).await;
+    let verdict = decide(resolved.as_resolution(), agent_name, path);
+    log_verdict(&verdict, agent_name, path);
+
+    let decision = apply_break_glass(verdict.decision.clone(), verdict.rule, agent_name, path);
+    admit_fanout(&FANOUT, &verdict, decision, wait_budget).await
+}
+
+/// The fan-out bound currently governing `agent_name`'s `parallel_fanout`
+/// spawns.
+///
+/// Read-only: it resolves the (cached) registry and runs the matrix, but takes
+/// no slot and mints no decision. For call sites that must SIZE a batch up
+/// front — the orchestration conductor caps how many workers it dispatches per
+/// tick — rather than admit one spawn at a time. Deliberately does not log the
+/// verdict: this is called every tick, and the per-spawn path already logs.
+pub async fn current_fanout_bound(agent_name: Option<&str>) -> u32 {
+    let resolved = CACHE.resolve_at(Instant::now(), fetch_effective).await;
+    let verdict = decide(
+        resolved.as_resolution(),
+        agent_name,
+        SpawnPath::ParallelFanout,
+    );
+    effective_fanout_bound(verdict.fanout_bound)
+}
+
+/// The admission half of [`authorize_fanout_spawn_with_budget`], split from the
+/// resolve/decide half so it can be driven in tests against a local gate and a
+/// synthetic verdict — including the paths that must NOT touch the gate.
+async fn admit_fanout(
+    gate: &FanoutGate,
+    verdict: &Verdict,
+    decision: SpawnDecision,
+    wait_budget: Duration,
+) -> FanoutAdmission {
+    // Returns BEFORE the gate is touched: a refused spawn must never consume
+    // (or queue for) a slot it is not going to use.
+    if !decision.allows_spawn() {
+        return FanoutAdmission::Refused(decision);
+    }
+
+    let bound = effective_fanout_bound(verdict.fanout_bound);
+    let key = fanout_key(verdict.bound_source.as_deref());
+    match gate.admit(&key, bound, wait_budget).await {
+        Admit::Now(slot) => FanoutAdmission::Admitted { decision, slot },
+        Admit::Serialized {
+            slot,
+            bound,
+            in_flight,
+            waited,
+        } => {
+            info!(
+                fanout_key = %key,
+                bound,
+                in_flight,
+                waited_ms = waited.as_millis() as u64,
+                "parallel fan-out: slot granted after serializing behind the bound"
+            );
+            // A recorded `warn_proceed` disposition must survive — the clause
+            // requires saying which disposition applied. Only a plain `Allow`
+            // is upgraded to `SerializeToBound`.
+            let decision = if matches!(decision, SpawnDecision::Allow) {
+                SpawnDecision::SerializeToBound { bound, in_flight }
+            } else {
+                decision
+            };
+            FanoutAdmission::Admitted { decision, slot }
+        }
+        Admit::Unavailable { bound, waited } => {
+            warn!(
+                fanout_key = %key,
+                bound,
+                waited_ms = waited.as_millis() as u64,
+                "parallel fan-out: no slot freed within the wait budget — the caller should \
+                 retry later; this is NOT a task failure"
+            );
+            FanoutAdmission::SlotUnavailable { key, bound, waited }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
@@ -1072,24 +1569,33 @@ pub async fn authorize_spawn(agent_name: Option<&str>, spawn_path: SpawnPath) ->
     let resolved = CACHE.resolve_at(Instant::now(), fetch_effective).await;
     let verdict = decide(resolved.as_resolution(), agent_name, spawn_path);
     log_verdict(&verdict, agent_name, spawn_path);
+    apply_break_glass(verdict.decision, verdict.rule, agent_name, spawn_path)
+}
 
-    // Break-glass is applied AFTER the verdict so it can be scoped: it may
-    // override the gate's own fail-safe refusals, never a recorded user
-    // disable ("a spawn the user has explicitly deselected: never").
-    if !verdict.decision.allows_spawn()
-        && authz_disabled()
-        && break_glass_may_override(verdict.rule)
-    {
+/// Apply the operator break-glass to a verdict, if it is in scope.
+///
+/// Applied AFTER the verdict so it can be scoped: it may override the gate's
+/// own fail-safe refusals, never a recorded user disable ("a spawn the user has
+/// explicitly deselected: never"). Shared by [`authorize_spawn`] and
+/// [`authorize_fanout_spawn`] so the two entry points cannot drift on which
+/// refusals the flag may lift.
+fn apply_break_glass(
+    decision: SpawnDecision,
+    rule: &'static str,
+    agent_name: Option<&str>,
+    spawn_path: SpawnPath,
+) -> SpawnDecision {
+    if !decision.allows_spawn() && authz_disabled() && break_glass_may_override(rule) {
         warn!(
             agent = agent_name.unwrap_or("-"),
             spawn_path = spawn_path.as_wire(),
-            rule = verdict.rule,
+            rule,
             "spawn authorization BYPASSED by QONTINUI_SPAWN_AUTHZ_DISABLED (fail-safe \
              refusal only; user disables are still honoured)"
         );
         return SpawnDecision::Allow;
     }
-    verdict.decision
+    decision
 }
 
 /// Edge-trigger for [`log_verdict`].
@@ -2042,5 +2548,537 @@ mod tests {
         assert!(matches!(r.as_resolution(), Resolution::Stale { .. }));
         let v = decide(r.as_resolution(), None, SpawnPath::StandingContinuation);
         assert_eq!(v.decision.label(), "deny");
+    }
+
+    // -- parallel fan-out bound ---------------------------------------------
+
+    /// Short budget for the "nothing will ever free" cases, so a wedged lane
+    /// is proven bounded without making the suite slow.
+    const T_SHORT: Duration = Duration::from_millis(50);
+    /// Budget for the cases where a slot IS released concurrently.
+    const T_GRANT: Duration = Duration::from_secs(5);
+
+    /// Take a slot that must be available immediately.
+    async fn take_now(gate: &FanoutGate, key: &str, bound: u32) -> FanoutSlot {
+        match gate.admit(key, bound, T_SHORT).await {
+            Admit::Now(slot) => slot,
+            other => panic!("expected an immediate slot on lane `{key}`, got {other:?}"),
+        }
+    }
+
+    /// The bound-resolution table: what a declared (or absent) `fanout_bound`
+    /// actually governs.
+    #[test]
+    fn effective_fanout_bound_defaults_to_fifteen_and_clamps_to_sequential() {
+        struct Case {
+            name: &'static str,
+            declared: Option<u32>,
+            want: u32,
+        }
+
+        assert_eq!(
+            DEFAULT_FANOUT_BOUND, 15,
+            "the clause names 15 as the registry default"
+        );
+
+        let cases = [
+            Case {
+                name: "no registry row / no declared bound → the registry default",
+                declared: None,
+                want: 15,
+            },
+            Case {
+                name: "a row-specified bound is honoured verbatim",
+                declared: Some(3),
+                want: 3,
+            },
+            Case {
+                name: "a bound of 1 is already sequential",
+                declared: Some(1),
+                want: 1,
+            },
+            Case {
+                name: "a bound of 0 means no parallelism → sequential, never a deadlock",
+                declared: Some(0),
+                want: 1,
+            },
+            Case {
+                name: "a large bound is not clamped down",
+                declared: Some(100),
+                want: 100,
+            },
+        ];
+
+        for c in cases {
+            assert_eq!(
+                effective_fanout_bound(c.declared),
+                c.want,
+                "case: {}",
+                c.name
+            );
+        }
+    }
+
+    /// The bound must survive the matrix: a row's `fanout_bound` reaches the
+    /// verdict, and its absence resolves to the registry default.
+    #[test]
+    fn a_row_declared_fanout_bound_reaches_the_verdict() {
+        let declared = vec![RegistryAgent {
+            fanout_bound: Some(3),
+            ..row_for("parallel_fanout", "parallel_fanout", true)
+        }];
+        let v = decide(
+            Resolution::Fresh(&declared),
+            None,
+            SpawnPath::ParallelFanout,
+        );
+        assert_eq!(v.decision.label(), "allow");
+        assert_eq!(v.fanout_bound, Some(3));
+        assert_eq!(effective_fanout_bound(v.fanout_bound), 3);
+
+        // A named agent's own row carries its own bound.
+        let named = vec![RegistryAgent {
+            fanout_bound: Some(2),
+            ..row_for("worker", "parallel_fanout", true)
+        }];
+        let v = decide(
+            Resolution::Fresh(&named),
+            Some("worker"),
+            SpawnPath::ParallelFanout,
+        );
+        assert_eq!(effective_fanout_bound(v.fanout_bound), 2);
+
+        // No row at all: allowed (legacy default) and bounded by the registry
+        // default rather than by nothing.
+        let v = decide(Resolution::Fresh(&[]), None, SpawnPath::ParallelFanout);
+        assert_eq!(v.rule, "no-row-legacy-default-allow");
+        assert_eq!(v.fanout_bound, None);
+        assert_eq!(
+            effective_fanout_bound(v.fanout_bound),
+            DEFAULT_FANOUT_BOUND,
+            "an undeclared bound must still be a bound"
+        );
+    }
+
+    /// The whole point of the variant: a breach authorizes the spawn. A call
+    /// site that does not know `SerializeToBound` must not read it as a
+    /// refusal, because the clause forbids hard-failing mid-task.
+    #[test]
+    fn serialize_to_bound_authorizes_the_spawn_and_is_not_a_refusal() {
+        let d = SpawnDecision::SerializeToBound {
+            bound: 2,
+            in_flight: 2,
+        };
+        assert!(d.allows_spawn());
+        assert!(
+            d.refusal().is_none(),
+            "a fan-out bound breach must never surface as a refusal"
+        );
+        assert!(d.reason().is_none());
+        assert_eq!(d.label(), "serialize_to_bound");
+        assert_eq!(
+            annotate(d.clone(), "stale snapshot"),
+            d,
+            "staleness annotation has nothing to say about a fan-out breach"
+        );
+    }
+
+    #[test]
+    fn fanout_key_folds_case_and_falls_back_to_the_class() {
+        assert_eq!(fanout_key(None), "parallel_fanout");
+        assert_eq!(fanout_key(Some("   ")), "parallel_fanout");
+        assert_eq!(
+            fanout_key(Some("Code-Reviewer")),
+            "code-reviewer",
+            "two spellings of one agent must not get two lanes, i.e. twice the bound"
+        );
+    }
+
+    /// Admission under the bound is immediate; the (bound+1)-th spawn
+    /// SERIALIZES — it queues for a slot and then proceeds — rather than being
+    /// denied.
+    #[tokio::test]
+    async fn the_bound_plus_first_spawn_serializes_rather_than_being_denied() {
+        let gate = FanoutGate::new();
+        let a = take_now(&gate, "lane", 2).await;
+        let b = take_now(&gate, "lane", 2).await;
+
+        // Release one slot shortly after the third admission starts queueing.
+        let (_, admitted) = tokio::join!(
+            async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                drop(a);
+            },
+            gate.admit("lane", 2, T_GRANT)
+        );
+
+        match admitted {
+            Admit::Serialized {
+                bound, in_flight, ..
+            } => {
+                assert_eq!(bound, 2);
+                assert_eq!(
+                    in_flight, 2,
+                    "in_flight is the occupancy observed when admission was refused"
+                );
+            }
+            other => panic!("the 3rd spawn under a bound of 2 must serialize, got {other:?}"),
+        }
+        drop(b);
+    }
+
+    /// The registry default end-to-end: 15 admitted immediately, the 16th
+    /// serialized.
+    #[tokio::test]
+    async fn the_default_bound_admits_fifteen_then_serializes() {
+        let gate = FanoutGate::new();
+        let bound = effective_fanout_bound(None);
+        assert_eq!(bound, 15);
+
+        let mut held = Vec::new();
+        for _ in 0..bound {
+            held.push(take_now(&gate, "default", bound).await);
+        }
+
+        let (_, admitted) = tokio::join!(
+            async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                // The trailing `;` is load-bearing: it drops the popped slot
+                // HERE, inside the block. As a tail expression the slot would
+                // escape into the `join!` tuple, no permit would be released,
+                // and this test would sit until `T_GRANT`.
+                held.pop();
+            },
+            gate.admit("default", bound, T_GRANT)
+        );
+        match admitted {
+            Admit::Serialized {
+                bound: b,
+                in_flight,
+                ..
+            } => {
+                assert_eq!(b, 15);
+                assert_eq!(in_flight, 15);
+            }
+            other => panic!("the 16th spawn must serialize, not be refused: {other:?}"),
+        }
+    }
+
+    /// The counter must release on EVERY exit path — success, an early `Err`
+    /// return, and a panic unwinding through the holder. A leaked count would
+    /// wedge fan-out for the life of the process.
+    #[tokio::test]
+    async fn the_slot_releases_on_success_error_and_panic_paths() {
+        let gate = Arc::new(FanoutGate::new());
+
+        // Success path.
+        let slot = take_now(&gate, "release", 1).await;
+        drop(slot);
+        drop(take_now(&gate, "release", 1).await);
+
+        // Error path: a holder that returns Err before dropping explicitly.
+        async fn fallible(gate: &FanoutGate) -> Result<(), String> {
+            let _slot = take_now(gate, "release", 1).await;
+            Err("boom".to_string())
+        }
+        assert!(fallible(&gate).await.is_err());
+        drop(take_now(&gate, "release", 1).await);
+
+        // Panic path: unwind through the guard.
+        let g = Arc::clone(&gate);
+        let handle = tokio::spawn(async move {
+            let _slot = match g.admit("release", 1, T_SHORT).await {
+                Admit::Now(s) => s,
+                other => panic!("setup: expected an immediate slot, got {other:?}"),
+            };
+            panic!("simulated failure while holding the fan-out slot");
+        });
+        assert!(handle.await.is_err(), "the task must have panicked");
+
+        // ... and the slot is free again for a later spawn.
+        let slot = take_now(&gate, "release", 1).await;
+        assert_eq!(slot.bound(), 1);
+        assert_eq!(slot.key(), "release");
+    }
+
+    /// A lane that never frees reports `Unavailable` within the budget — the
+    /// wait is bounded, never an infinite hang. The caller treats this as
+    /// transient, not as a task failure.
+    #[tokio::test]
+    async fn the_wait_is_bounded_when_no_slot_ever_frees() {
+        let gate = FanoutGate::new();
+        let held = take_now(&gate, "wedged", 1).await;
+        // Measure from OUTSIDE the call: the reported `waited` is the budget by
+        // construction on the timeout arm, so asserting on it proves nothing.
+        // What must be proven is that the call RETURNS, and returns near the
+        // budget rather than hanging.
+        let started = Instant::now();
+        let outcome = gate.admit("wedged", 1, T_SHORT).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= T_SHORT && elapsed < T_SHORT * 20,
+            "the wait must end at ~the budget, not hang or return early: {elapsed:?}"
+        );
+        match outcome {
+            Admit::Unavailable { bound, waited } => {
+                assert_eq!(bound, 1);
+                assert_eq!(waited, T_SHORT);
+            }
+            other => panic!("a permanently full lane must time out, got {other:?}"),
+        }
+        drop(held);
+        drop(take_now(&gate, "wedged", 1).await);
+    }
+
+    /// Lanes are per bound-source row: filling one must not starve another.
+    #[tokio::test]
+    async fn lanes_are_independent_per_key() {
+        let gate = FanoutGate::new();
+        // Wedge alpha (bound 1, one slot out).
+        let a = take_now(&gate, "alpha", 1).await;
+        assert!(
+            matches!(
+                gate.admit("alpha", 1, T_SHORT).await,
+                Admit::Unavailable { .. }
+            ),
+            "alpha's own lane is full"
+        );
+
+        // ... and WHILE alpha is wedged, beta admits its full bound of 2
+        // immediately. Two distinct assertions, so independence is proved
+        // directly rather than inferred from an absence of panics.
+        let b1 = take_now(&gate, "beta", 2).await;
+        let b2 = take_now(&gate, "beta", 2).await;
+        assert!(
+            matches!(
+                gate.admit("beta", 2, T_SHORT).await,
+                Admit::Unavailable { bound: 2, .. }
+            ),
+            "beta enforces its OWN bound, not alpha's"
+        );
+        drop((a, b1, b2));
+    }
+
+    /// A registry change to `fanout_bound` is reconciled onto the live lane
+    /// instead of being ignored for the life of the process.
+    #[tokio::test]
+    async fn a_raised_bound_is_reconciled_onto_the_live_lane() {
+        let gate = FanoutGate::new();
+        let s1 = take_now(&gate, "grow", 1).await;
+        assert!(matches!(
+            gate.admit("grow", 1, T_SHORT).await,
+            Admit::Unavailable { .. }
+        ));
+
+        // The registry raises the bound to 3 — two more slots appear.
+        let s2 = take_now(&gate, "grow", 3).await;
+        let s3 = take_now(&gate, "grow", 3).await;
+        assert!(
+            matches!(
+                gate.admit("grow", 3, T_SHORT).await,
+                Admit::Unavailable { bound: 3, .. }
+            ),
+            "and the lane then enforces the RAISED bound"
+        );
+        drop((s1, s2, s3));
+    }
+
+    /// Shrinking is honest about what it could actually do: permits that are
+    /// OUT cannot be forgotten, so the shrink completes on a later admission
+    /// rather than being recorded as if it had already happened.
+    #[tokio::test]
+    async fn a_lowered_bound_shrinks_partially_then_reclaims_the_rest() {
+        let gate = FanoutGate::new();
+        let s1 = take_now(&gate, "shrink", 3).await;
+        let s2 = take_now(&gate, "shrink", 3).await;
+        let s3 = take_now(&gate, "shrink", 3).await;
+
+        // All three slots are out: a shrink to 1 can forget nothing yet.
+        let (_, total) = gate.lane("shrink", 1);
+        assert_eq!(total, 3, "outstanding permits cannot be forgotten");
+
+        drop(s2);
+        drop(s3);
+        // The freed permits are reclaimed on the next admission.
+        let (_, total) = gate.lane("shrink", 1);
+        assert_eq!(total, 1);
+
+        drop(s1);
+        let s = take_now(&gate, "shrink", 1).await;
+        assert!(
+            matches!(
+                gate.admit("shrink", 1, T_SHORT).await,
+                Admit::Unavailable { bound: 1, .. }
+            ),
+            "the lane now enforces the lowered bound"
+        );
+        drop(s);
+    }
+
+    /// A row declaring `fanout_bound: 0` is sequential, not a permanent stall.
+    #[tokio::test]
+    async fn a_zero_bound_is_sequential_not_a_deadlock() {
+        let gate = FanoutGate::new();
+        let bound = effective_fanout_bound(Some(0));
+        let s = take_now(&gate, "zero", bound).await;
+        assert_eq!(s.bound(), 1);
+        drop(s);
+        drop(take_now(&gate, "zero", bound).await);
+    }
+
+    // -- the admission seam (`admit_fanout`) --------------------------------
+
+    /// A synthetic verdict: what the matrix would have produced.
+    fn verdict_with(bound: Option<u32>, source: Option<&str>) -> Verdict {
+        Verdict {
+            fanout_bound: bound,
+            bound_source: source.map(str::to_string),
+            ..Verdict::new(SpawnDecision::Allow, "test")
+        }
+    }
+
+    /// A refused spawn must never touch the gate. This is the counter-leak
+    /// class at its most direct: a slot taken (or queued for) by a spawn that
+    /// will not happen is a slot no later spawn ever gets back.
+    #[tokio::test]
+    async fn a_refusal_never_consumes_a_fanout_slot() {
+        let refusals = [
+            SpawnDecision::Deny {
+                reason: "blocked".to_string(),
+            },
+            SpawnDecision::DegradeToInline {
+                reason: "degrade".to_string(),
+            },
+        ];
+
+        for decision in refusals {
+            let gate = FanoutGate::new();
+            let label = decision.label();
+            let v = verdict_with(Some(1), None);
+            match admit_fanout(&gate, &v, decision, T_SHORT).await {
+                FanoutAdmission::Refused(d) => assert_eq!(d.label(), label),
+                other => panic!("{label} must be Refused, got {other:?}"),
+            }
+            // The lane's single slot is still there for a spawn that IS
+            // authorized — the refusal consumed nothing.
+            drop(take_now(&gate, "parallel_fanout", 1).await);
+        }
+    }
+
+    /// A plain `Allow` that had to queue is reported as `SerializeToBound`; a
+    /// recorded `warn_proceed` disposition outranks it, because the clause
+    /// requires the session to say which disposition applied.
+    #[tokio::test]
+    async fn serialization_upgrades_allow_but_preserves_a_recorded_warn() {
+        for (input, want_label) in [
+            (SpawnDecision::Allow, "serialize_to_bound"),
+            (
+                SpawnDecision::Warn {
+                    reason: "user disabled with warn_proceed".to_string(),
+                },
+                "warn_proceed",
+            ),
+        ] {
+            let gate = FanoutGate::new();
+            let held = take_now(&gate, "parallel_fanout", 1).await;
+            let v = verdict_with(Some(1), None);
+
+            let (_, admission) = tokio::join!(
+                async {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    drop(held);
+                },
+                admit_fanout(&gate, &v, input, T_GRANT)
+            );
+            match admission {
+                FanoutAdmission::Admitted { decision, .. } => {
+                    assert_eq!(decision.label(), want_label);
+                    assert!(decision.allows_spawn());
+                }
+                other => panic!("expected Admitted/{want_label}, got {other:?}"),
+            }
+        }
+    }
+
+    /// The lane is keyed by the row that SUPPLIED the bound, not by the agent
+    /// the caller asked about. Two agents falling back to one class row must
+    /// share that row's bound — otherwise a declared bound of N becomes N per
+    /// distinct caller name.
+    #[tokio::test]
+    async fn the_lane_is_keyed_by_the_row_that_supplied_the_bound() {
+        let gate = FanoutGate::new();
+        // Both verdicts resolved against the SAME class row, which is what
+        // `bound_source` records — even though the callers named different
+        // agents.
+        let a = verdict_with(Some(1), Some("parallel_fanout"));
+        let b = verdict_with(Some(1), Some("parallel_fanout"));
+
+        let held = match admit_fanout(&gate, &a, SpawnDecision::Allow, T_SHORT).await {
+            FanoutAdmission::Admitted { slot, .. } => slot,
+            other => panic!("first admission must succeed, got {other:?}"),
+        };
+        match admit_fanout(&gate, &b, SpawnDecision::Allow, T_SHORT).await {
+            FanoutAdmission::SlotUnavailable { key, bound, .. } => {
+                assert_eq!(key, "parallel_fanout");
+                assert_eq!(bound, 1, "one row, one bound — not one bound per caller");
+            }
+            other => panic!("the second caller must share the row's lane, got {other:?}"),
+        }
+        drop(held);
+
+        // A verdict with no governing row lands on the class lane too.
+        let none = verdict_with(None, None);
+        match admit_fanout(&gate, &none, SpawnDecision::Allow, T_SHORT).await {
+            FanoutAdmission::Admitted { slot, .. } => {
+                assert_eq!(slot.key(), "parallel_fanout");
+                assert_eq!(slot.bound(), DEFAULT_FANOUT_BOUND);
+            }
+            other => panic!("expected Admitted, got {other:?}"),
+        }
+    }
+
+    /// An absurd declared bound is clamped rather than trusted into
+    /// `Semaphore::new`.
+    #[test]
+    fn an_absurd_declared_bound_is_clamped() {
+        assert_eq!(effective_fanout_bound(Some(u32::MAX)), MAX_FANOUT_BOUND);
+        assert_eq!(
+            effective_fanout_bound(Some(MAX_FANOUT_BOUND)),
+            MAX_FANOUT_BOUND
+        );
+    }
+
+    /// Fully idle lanes are evicted so a caller keying by a per-invocation name
+    /// cannot grow the map for the life of the process — but a lane with an
+    /// outstanding slot is NEVER evicted (a second semaphore for a live key
+    /// would double the bound).
+    #[tokio::test]
+    async fn idle_lanes_are_evicted_but_live_ones_are_not() {
+        let gate = FanoutGate::new();
+        let live = take_now(&gate, "live", 1).await;
+        drop(take_now(&gate, "idle", 1).await);
+        assert_eq!(gate.lane_count(), 2);
+
+        // Any later lane resolution sweeps the fully-idle lane and keeps the
+        // live one (whose only slot is still out).
+        let _ = gate.lane("live", 1);
+        let keys = gate.lane_keys();
+        assert!(
+            keys.contains(&"live".to_string()),
+            "live lane kept: {keys:?}"
+        );
+        assert!(
+            !keys.contains(&"idle".to_string()),
+            "fully idle lane evicted: {keys:?}"
+        );
+
+        // The live lane still enforces its bound — eviction did not mint a
+        // second semaphore behind its back.
+        assert!(matches!(
+            gate.admit("live", 1, T_SHORT).await,
+            Admit::Unavailable { .. }
+        ));
+        drop(live);
+        drop(take_now(&gate, "live", 1).await);
     }
 }
