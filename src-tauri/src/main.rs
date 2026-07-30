@@ -3769,6 +3769,28 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
 
+            // Start the state-discovery derive loop. Derives states ONCE,
+            // GLOBALLY (spec_id = None → artifact written with spec_id NULL,
+            // which is what `spec_authoring::load_latest_global_artifact`
+            // selects) on a nightly cadence, after a one-hour initial delay so
+            // startup finishes first. Overridable via
+            // QONTINUI_STATE_DERIVE_{INTERVAL,INITIAL_DELAY}_SECS and
+            // QONTINUI_STATE_DERIVE_WINDOW_DAYS.
+            //
+            // This lives in the runner, not the dev-only supervisor: the
+            // supervisor's flywheel cron ran the identical global derivation
+            // once per registered app (N byte-identical artifacts per night)
+            // and only the operator has a supervisor at all, so no ordinary
+            // user ever got derivation. Same fire-and-forget contract as the
+            // drift detector above.
+            {
+                let derive_app_state: Arc<commands::AppState> =
+                    app.state::<Arc<commands::AppState>>().inner().clone();
+                tauri::async_runtime::spawn(async move {
+                    crate::state_discovery::run_derive_loop(derive_app_state).await;
+                });
+            }
+
             // Start error monitor service in background
             info!("Starting error monitor service");
             let error_monitor_config = ErrorMonitorConfig::default();
