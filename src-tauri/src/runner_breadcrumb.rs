@@ -350,7 +350,7 @@ pub fn resolve_live_runner() -> Option<PortBreadcrumb> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_env::env_lock;
+    use crate::test_env::{env_lock, EnvVarRestore};
 
     fn rec(port: u16, pid: u32, started_at_ms: i64) -> PortBreadcrumb {
         PortBreadcrumb {
@@ -365,8 +365,29 @@ mod tests {
     /// The primary gets the bare file name; every other port is suffixed — so a
     /// temp runner can never clobber the primary's record. (With
     /// `QONTINUI_PRIMARY_PORT` unset, the primary defaults to [`PRIMARY_PORT`].)
+    ///
+    /// [`breadcrumb_file_name`] READS the process-global env via
+    /// [`preferred_primary_port`], so this test must both hold `env_lock()` and
+    /// PIN the variable to unset. Sibling tests set `QONTINUI_PRIMARY_PORT=9878`
+    /// under that same lock, and `cargo test` runs the binary's tests on parallel
+    /// threads sharing one env, so an unlocked read could land inside a sibling's
+    /// set/restore window and see 9878 — making `PRIMARY_PORT` non-primary and
+    /// yielding the suffixed `api-port-9876.json`, a real intermittent red on
+    /// main (2026-07-30). The lock is the reader half of the serialization the
+    /// mutators already take. The pin is needed because the documented default
+    /// only holds when nothing else names a primary: an ambient
+    /// `QONTINUI_PRIMARY_PORT` in a developer's shell would fail this test for the
+    /// same reason, as would a sibling that panicked before restoring.
+    ///
+    /// `_restore` is declared AFTER `_env_lock` on purpose — locals drop in
+    /// reverse declaration order, so the env is restored while the lock is still
+    /// held, and only then does the lock release.
     #[test]
     fn file_name_namespaces_non_primary_ports() {
+        let _env_lock = env_lock();
+        let _restore = EnvVarRestore::capture(&[PRIMARY_PORT_ENV]);
+        std::env::remove_var(PRIMARY_PORT_ENV);
+
         assert_eq!(breadcrumb_file_name(PRIMARY_PORT), "api-port.json");
         assert_eq!(breadcrumb_file_name(9879), "api-port-9879.json");
     }
