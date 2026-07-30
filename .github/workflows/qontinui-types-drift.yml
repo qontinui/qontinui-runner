@@ -15,7 +15,9 @@ name: qontinui-types drift
 # The two workflows together form a two-sided contract:
 #   - schemas-side fires on rust/src/** changes
 #   - runner-side fires on the four runner schema files
-#   - both run the same generate_types.sh + git diff -I '^#   timestamp:'
+#   - both run the same generate_types.sh, then invoke the SAME checker,
+#     qontinui-schemas/scripts/check-generated-drift.sh, so the two sides
+#     cannot silently diverge on what counts as drift
 #
 # A red signal here means: regenerate qontinui-schemas's artifacts and
 # coordinate the merge (qontinui-schemas PR before/with this runner PR).
@@ -28,6 +30,12 @@ on:
       - "src-tauri/src/tauri_event_payloads.rs"
       - "src-tauri/src/relay_envelopes.rs"
       - "src-tauri/scripts/generate_types.sh"
+      # The gate must re-run when the gate itself changes. Without these two
+      # entries a PR that edits this workflow (or the sibling-ref action it
+      # depends on) never exercises it, so the edit lands unverified — which
+      # is exactly how a drift check can rot into a vacuous green unnoticed.
+      - ".github/workflows/qontinui-types-drift.yml"
+      - ".github/actions/resolve-schemas-ref/**"
   push:
     branches: [main]
     paths:
@@ -35,6 +43,12 @@ on:
       - "src-tauri/src/tauri_event_payloads.rs"
       - "src-tauri/src/relay_envelopes.rs"
       - "src-tauri/scripts/generate_types.sh"
+      # The gate must re-run when the gate itself changes. Without these two
+      # entries a PR that edits this workflow (or the sibling-ref action it
+      # depends on) never exercises it, so the edit lands unverified — which
+      # is exactly how a drift check can rot into a vacuous green unnoticed.
+      - ".github/workflows/qontinui-types-drift.yml"
+      - ".github/actions/resolve-schemas-ref/**"
 
 env:
   # generate_types.sh runs `cargo build --bin export_schemas`, which compiles
@@ -114,6 +128,9 @@ jobs:
 
       # Pin must match qontinui-schemas/.github/workflows/schema-drift.yml.
       # If you bump one side, bump the other in the same release window.
+      # The TypeScript generators (json-schema-to-typescript, prettier) are
+      # pinned exactly in qontinui-schemas/package.json for the same reason,
+      # so both repos resolve them identically from the npm install above.
       - name: Install datamodel-code-generator
         run: pip install 'datamodel-code-generator==0.57.0'
 
@@ -126,6 +143,15 @@ jobs:
           mkdir -p qontinui-runner/dist
           printf '<!DOCTYPE html><html><head></head><body>qontinui-types-drift CI stub</body></html>\n' > qontinui-runner/dist/index.html
 
+      # generate_types.sh warns-and-skips instead of failing when node or
+      # datamodel-codegen is missing, leaving the working tree pristine — which
+      # would make every arm of the check below report a green it never
+      # verified. The arms verify the BASELINE; this verifies that the
+      # REGENERATION will actually happen. See the script for detail.
+      - name: Preflight — codegen toolchain present
+        working-directory: qontinui-schemas
+        run: bash scripts/check-generated-drift.sh --preflight
+
       # CARGO_TARGET_DIR override: qontinui-runner is a workspace, so
       # cargo's default target-dir is qontinui-runner/target/. But
       # generate_types.sh hardcodes per-package target. Force agreement.
@@ -134,18 +160,47 @@ jobs:
           CARGO_TARGET_DIR: ${{ github.workspace }}/qontinui-runner/src-tauri/target
         run: bash qontinui-runner/src-tauri/scripts/generate_types.sh
 
-      # `-I '^#   timestamp:'` ignores hunks whose only changed lines
-      # are the datamodel-codegen timestamp header (rewritten every
-      # run regardless of schema content). Same trick the schemas-side
-      # workflow uses.
+      # Uploaded on failed runs too, so a red drift check hands you the exact
+      # bytes CI expected to commit into the paired qontinui-schemas PR,
+      # instead of a diff to reverse-engineer.
+      #
+      # `!cancelled()` rather than `always()`: `always()` also runs during
+      # cancellation, and `continue-on-error` keeps a transient upload blip
+      # from reddening an otherwise-green gate. This artifact is purely
+      # diagnostic — it must never be the reason the gate fails, in either
+      # direction.
+      - name: Upload regenerated bindings
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: regenerated-bindings
+          path: |
+            qontinui-schemas/ts/src/generated
+            qontinui-schemas/src/qontinui_schemas/generated
+          # `warn` rather than `error`: this step also runs on runs where
+          # regeneration itself died, and that must surface as the regen
+          # failure it is, not as a second misleading upload failure.
+          if-no-files-found: warn
+
+      # The anti-vacuity guard. Implementation lives in qontinui-schemas at
+      # scripts/check-generated-drift.sh and is invoked from THE SAME FILE by
+      # that repo's schema-drift.yml — we already check qontinui-schemas out
+      # above (at the coordinated ref) in order to regenerate into it, so the
+      # script is right there.
+      #
+      # Sharing it is deliberate. These two workflows are one cross-repo
+      # contract, and a comment asking humans to keep them in step is not a
+      # mechanism — they diverged once inside a single change. Sharing makes
+      # the check travel on the same branch as the bindings it guards.
+      #
+      # Short version: `git diff` is blind to untracked files, so a gate that
+      # only diffs can be silenced by untracking its own baseline. That is
+      # exactly what happened — qontinui-schemas' ts/src/generated was swept
+      # out of the index in 34709ada and the TypeScript arm of this gate was
+      # vacuously green from then until qontinui-schemas#108. So the script
+      # also asserts the baseline exists (arm 0) and looks for untracked
+      # regenerated output (arm 1), not just a diff (arm 2).
       - name: Check for drift
         working-directory: qontinui-schemas
-        run: |
-          if ! git diff --exit-code -I '^#   timestamp:' \
-              ts/src/generated \
-              src/qontinui_schemas/generated; then
-            echo "::error::This runner-side change would cause drift in qontinui-schemas's checked-in TS/Python artifacts."
-            echo "Coordinate the schemas update: open a qontinui-schemas PR with regenerated artifacts and merge it before/with this PR."
-            echo "Local regen: bash src-tauri/scripts/generate_types.sh"
-            exit 1
-          fi
+        run: bash scripts/check-generated-drift.sh --verify

@@ -1,8 +1,15 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+const mockInvoke = vi.fn();
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: (...args: unknown[]) => mockInvoke(...args),
+}));
 
 import {
   DERIVED_NAME_SOURCE,
   extractLiveSessions,
+  extractLiveSessionsStrict,
+  fetchLiveClaudeSessionIds,
   groupByAccount,
   isOperatorNamed,
   registryNamesBySessionId,
@@ -178,6 +185,26 @@ describe("registryNamesBySessionId", () => {
   });
 });
 
+describe("extractLiveSessionsStrict (liveness polarity)", () => {
+  it("accepts the {sessions:[…]} envelope and a bare array", () => {
+    expect(extractLiveSessionsStrict({ sessions: [mk()] })).toHaveLength(1);
+    expect(extractLiveSessionsStrict([mk()])).toHaveLength(1);
+    expect(extractLiveSessionsStrict({ sessions: [] })).toEqual([]);
+    expect(extractLiveSessionsStrict([])).toEqual([]);
+  });
+
+  it("maps any other shape to null (indeterminate), never []", () => {
+    // A shape surprise flowing through the tolerant extractor becomes [] =
+    // "definitively no live sessions" → the restore path forks everything.
+    expect(extractLiveSessionsStrict(null)).toBeNull();
+    expect(extractLiveSessionsStrict(undefined)).toBeNull();
+    expect(extractLiveSessionsStrict("nope")).toBeNull();
+    expect(extractLiveSessionsStrict({})).toBeNull();
+    expect(extractLiveSessionsStrict({ session: [mk()] })).toBeNull(); // renamed key
+    expect(extractLiveSessionsStrict({ sessions: "not-an-array" })).toBeNull();
+  });
+});
+
 describe("sharedSessionIds", () => {
   it("reports ids held by more than one live process", () => {
     // The restore-duplication symptom: one session id, several live processes,
@@ -198,6 +225,78 @@ describe("sharedSessionIds", () => {
 
   it("is empty for no sessions", () => {
     expect(sharedSessionIds([]).size).toBe(0);
+  });
+});
+
+describe("fetchLiveClaudeSessionIds (P1 restore-idempotence liveness source)", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+  });
+
+  it("returns the deduped set of live session ids", async () => {
+    mockInvoke.mockResolvedValueOnce({
+      success: true,
+      message: null,
+      data: {
+        sessions: [
+          // Two live processes on ONE id — the exact duplication symptom;
+          // the set collapses them.
+          mk({ sessionId: "dup", pid: 10 }),
+          mk({ sessionId: "dup", pid: 11 }),
+          mk({ sessionId: "solo", pid: 12 }),
+        ],
+      },
+    });
+    const ids = await fetchLiveClaudeSessionIds();
+    expect(mockInvoke).toHaveBeenCalledWith("terminal_claude_session_list_live");
+    expect(ids).not.toBeNull();
+    expect([...ids!].sort()).toEqual(["dup", "solo"]);
+  });
+
+  it("returns an EMPTY set (not null) when no process is live", async () => {
+    // Empty-and-known must stay distinguishable from unreadable: an empty set
+    // allows respawns, null forbids them.
+    mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: { sessions: [] } });
+    const ids = await fetchLiveClaudeSessionIds();
+    expect(ids).not.toBeNull();
+    expect(ids!.size).toBe(0);
+  });
+
+  it("returns null (indeterminate → fail closed) when the invoke rejects", async () => {
+    mockInvoke.mockRejectedValueOnce(new Error("ipc down"));
+    expect(await fetchLiveClaudeSessionIds()).toBeNull();
+  });
+
+  it("returns null on an unsuccessful or payload-less response", async () => {
+    mockInvoke.mockResolvedValueOnce({ success: false, message: "boom", data: null });
+    expect(await fetchLiveClaudeSessionIds()).toBeNull();
+    mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: null });
+    expect(await fetchLiveClaudeSessionIds()).toBeNull();
+  });
+
+  it("returns null (indeterminate) on a misshapen payload — never an empty set", async () => {
+    // `data: {}` (no sessions key), a renamed key, and a non-array `sessions`
+    // must all fail CLOSED: [] would green-light respawning every session.
+    mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: {} });
+    expect(await fetchLiveClaudeSessionIds()).toBeNull();
+    mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: { session: [mk()] } });
+    expect(await fetchLiveClaudeSessionIds()).toBeNull();
+    mockInvoke.mockResolvedValueOnce({
+      success: true,
+      message: null,
+      data: { sessions: "not-an-array" },
+    });
+    expect(await fetchLiveClaudeSessionIds()).toBeNull();
+  });
+
+  it("ignores rows without a usable sessionId instead of throwing", async () => {
+    mockInvoke.mockResolvedValueOnce({
+      success: true,
+      message: null,
+      data: { sessions: [mk({ sessionId: "ok" }), { pid: 1 }, null, mk({ sessionId: "" })] },
+    });
+    const ids = await fetchLiveClaudeSessionIds();
+    expect([...ids!]).toEqual(["ok"]);
   });
 });
 
