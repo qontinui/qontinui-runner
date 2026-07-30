@@ -781,7 +781,17 @@ mod tests {
         // A drive root that keeps its separator (constructed, not normalized)
         // must still take the trailing-separator branch.
         assert!(is_under("e:\\", "e:\\foo"));
-        assert!(!is_under("e:\\", "e:\\"));
+        // Self-match is TRUE by contract: `is_under` answers "same directory
+        // OR descendant" (see its doc comment), and the `candidate == root`
+        // early return fires before the trailing-separator branch is reached.
+        // This assertion previously expected `false`, which contradicted that
+        // contract and failed on Windows only — the test is #[cfg(windows)],
+        // so Linux never ran it.
+        assert!(is_under("e:\\", "e:\\"));
+        // The meaningful negative for a drive root: a DIFFERENT drive is not a
+        // descendant, whatever the separators. `strip_prefix` fails outright,
+        // so this never reaches the trailing-separator branch.
+        assert!(!is_under("e:\\", "f:\\foo"));
     }
 
     #[test]
