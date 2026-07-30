@@ -77,12 +77,35 @@ pub enum AuthoringError {
     /// needs visiting (or capture needs to be labelling it), not derivation.
     #[error("page '{page_label}' has no labelled observations")]
     NoPageObservations { page_label: String },
-    /// The page HAS labelled observations, but none of them is in the newest
-    /// artifact's render-set — every visit postdates that derivation, so no
-    /// discovered state can be shown active here. The fix is a re-derive, not
-    /// more visits.
+    /// The page has observations **newer than the artifact**, and none of them
+    /// is in its render-set. The visits genuinely postdate the derivation, so
+    /// the fix is a re-derive, not more visits.
+    ///
+    /// The `captured_at > derived_at` half of the predicate is what earns the
+    /// prescription. Without it this variant also caught pages whose
+    /// observations predate the artifact and were *skipped* by it — see
+    /// [`Self::ObservedButUnclustered`] — and told them to re-derive, which
+    /// would never have helped.
     #[error("none of {total_states} discovered states are active on page '{page_label}'")]
     NoActiveStates {
+        page_label: String,
+        total_states: usize,
+    },
+    /// The page has labelled observations, all of them older than the newest
+    /// artifact, and none of them made it into that artifact's render-set.
+    ///
+    /// Re-deriving cannot fix this: the derivation already saw these rows and
+    /// declined them. The reachable cause is an observation that carries no
+    /// fingerprints — `state_discovery::derive::load_observations` `continue`s
+    /// on an empty `fingerprints` array, so the row is labelled for the page,
+    /// non-invalidated, and can never appear in any artifact. (A cluster whose
+    /// `screenshotIds` are all non-UUID lands here too; that one is warned
+    /// about separately at load.)
+    #[error(
+        "page '{page_label}' has observations, but the newest artifact was derived over them \
+         and clustered none"
+    )]
+    ObservedButUnclustered {
         page_label: String,
         total_states: usize,
     },
@@ -239,59 +262,105 @@ async fn load_and_project_skeleton(
     // time window that query carried (`captured_at >= now() - 90 days`), which
     // could only ever disagree with the window the artifact was really derived
     // over. See [`load_page_render_ids`] for the full argument.
-    let (artifact_renders, unparseable) = normalize_render_ids(&clusters);
-    if !unparseable.is_empty() {
+    let normalized = normalize_render_ids(&clusters);
+    if !normalized.rejected.is_empty() {
         tracing::warn!(
             "spec_authoring: discovery artifact {} carries {} non-UUID screenshotId(s) \
              (e.g. {:?}) — they name no observation row and are ignored",
             artifact.artifact_id,
-            unparseable.len(),
-            unparseable.iter().take(3).collect::<Vec<_>>()
+            normalized.rejected.len(),
+            normalized.rejected.iter().take(3).collect::<Vec<_>>()
         );
     }
-    if artifact_renders.is_empty() {
+    if normalized.union.is_empty() {
+        // Both shapes are "no bindable render id", but they are different
+        // defects and the message must not assert the wrong one: `rejected`
+        // non-empty means discovery emitted ids of the wrong *kind*
+        // (`render_0`, `screenshot_000`), while `rejected` empty means the
+        // `screenshotIds` arrays were themselves empty — ids dropped in
+        // passthrough rather than mangled.
+        //
+        // The all-empty shape is normally caught by the `all(render_ids
+        // .is_empty())` guard above, so this second branch is unreachable as
+        // the code stands today (every raw id either resolves or is rejected).
+        // It exists so the message stays true rather than merely lucky: relax
+        // that guard — to tolerate one empty cluster, say — and the wrong
+        // half of this message would otherwise start being printed.
+        let detail = if normalized.rejected.is_empty() {
+            format!(
+                "discovery artifact {} has states whose screenshotIds are all empty — the \
+                 render ids were dropped in passthrough, not mangled",
+                artifact.artifact_id
+            )
+        } else {
+            format!(
+                "discovery artifact {} has {} screenshotId(s) and none of them is a UUID \
+                 (e.g. {:?}) — discovery ran over a render log whose ids are not \
+                 observation ids",
+                artifact.artifact_id,
+                normalized.rejected.len(),
+                normalized.rejected.iter().take(3).collect::<Vec<_>>()
+            )
+        };
         return Err(AuthoringError::MalformedAiOutput(format!(
-            "discovery artifact {} has screenshotIds but none of them is a UUID — \
-             page scoping is impossible; discovery ran over a render log whose ids \
-             are not observation ids",
-            artifact.artifact_id
+            "{detail}; page scoping is impossible"
+        )));
+    }
+    if normalized.union.len() > MAX_BOUND_RENDERS {
+        // Fail loudly rather than degrade silently. See [`MAX_BOUND_RENDERS`].
+        return Err(AuthoringError::Database(format!(
+            "discovery artifact {} names {} renders, above the {} bind ceiling for the \
+             page-scoping query — narrow the derivation window so the artifact fits",
+            artifact.artifact_id,
+            normalized.union.len(),
+            MAX_BOUND_RENDERS
         )));
     }
 
     // Project S down to S_Ξ.
-    let page_renders = load_page_render_ids(pg_db, &candidate_id, &artifact_renders).await?;
+    let page_renders = load_page_render_ids(pg_db, &candidate_id, &normalized.union).await?;
     if page_renders.is_empty() {
-        // Two very different causes land here, and collapsing them is what
-        // made a producer/consumer key mismatch require a code read to
-        // diagnose. Since the query is now bounded by the artifact, an empty
-        // result no longer means "this page has no observations" — it means
-        // "no observation THIS ARTIFACT was derived from carries this page's
-        // label". So ask PG the one extra question that separates them. It
-        // runs only on the failure path, and `EXISTS` short-circuits on
-        // `idx_observations_spec`.
-        return Err(if page_has_observations(pg_db, &candidate_id).await? {
-            // The page has been observed, but every one of those observations
-            // postdates the newest artifact. Fix: re-derive, not more visits.
-            AuthoringError::NoActiveStates {
-                page_label: candidate_id,
-                total_states: clusters.len(),
-            }
-        } else {
+        // Three different causes land here, and collapsing them is what made a
+        // producer/consumer key mismatch require a code read to diagnose. Since
+        // the query is now bounded by the artifact, an empty result no longer
+        // means "this page has no observations" — it means "no observation THIS
+        // ARTIFACT was derived from carries this page's label". So ask PG the
+        // one extra question that separates them, bounded by the artifact's own
+        // `derived_at` so the answer names the cause rather than guessing at
+        // it. It runs only on the failure path, and both `EXISTS` halves
+        // short-circuit on `idx_observations_spec`.
+        let seen = page_observation_history(pg_db, &candidate_id, artifact.derived_at).await?;
+        return Err(if !seen.ever {
             // Nothing was ever labelled for this page. Fix: visit it, or make
             // capture label it.
             AuthoringError::NoPageObservations {
                 page_label: candidate_id,
             }
+        } else if seen.since_derivation {
+            // The page has been observed since the artifact was derived, so a
+            // re-derive really can pick those visits up.
+            AuthoringError::NoActiveStates {
+                page_label: candidate_id,
+                total_states: clusters.len(),
+            }
+        } else {
+            // Observed, but every observation predates the artifact — the
+            // derivation already saw them and clustered none. Re-deriving would
+            // do exactly the same thing again.
+            AuthoringError::ObservedButUnclustered {
+                page_label: candidate_id,
+                total_states: clusters.len(),
+            }
         });
     }
 
-    // Non-empty by construction: `page_renders ⊆ artifact_renders`, and every
-    // id in `artifact_renders` came from some cluster's render-set, so any id
-    // that comes back selects at least the cluster it came from.
-    let active = select_active_clusters(&clusters, &page_renders);
+    // Non-empty by construction: `page_renders ⊆ normalized.union`, and every
+    // id in the union came from some cluster's render-set, so any id that comes
+    // back selects at least the cluster it came from.
+    let active = select_active_clusters(&clusters, &normalized.per_cluster, &page_renders);
     debug_assert!(
         !active.is_empty(),
-        "page_renders ⊆ artifact_renders, so a non-empty page_renders must select a cluster"
+        "page_renders ⊆ normalized.union, so a non-empty page_renders must select a cluster"
     );
 
     // Project each active cluster, then sort states by id for determinism.
@@ -313,7 +382,7 @@ async fn load_and_project_skeleton(
             states.len(),
             clusters.len(),
             page_renders.len(),
-            artifact_renders.len(),
+            normalized.union.len(),
             artifact.observation_count
         )),
         metadata: None,
@@ -337,6 +406,11 @@ async fn load_and_project_skeleton(
 struct LoadedArtifact {
     artifact_id: String,
     observation_count: i32,
+    /// When the derivation ran. Load-bearing on the failure path: it is the
+    /// boundary that separates "this page's visits postdate the derivation"
+    /// (re-derive) from "the derivation saw them and clustered none"
+    /// (re-deriving changes nothing). See [`page_observation_history`].
+    derived_at: chrono::DateTime<chrono::Utc>,
     body: serde_json::Value,
 }
 
@@ -348,18 +422,27 @@ struct LoadedArtifact {
 /// state spanning pages 1-4 is active on each of them, which is the whole
 /// point of deriving globally. Order is preserved from the artifact so callers
 /// keep their own determinism contract.
+///
+/// `per_cluster_renders` is [`NormalizedRenders::per_cluster`] — positionally
+/// aligned with `clusters`. It is passed in rather than re-derived here so the
+/// ids that bound the query and the ids that answer it come from a single
+/// normalization: two independent passes over the same raw strings is exactly
+/// the producer/consumer drift this module keeps being bitten by.
 fn select_active_clusters<'a>(
     clusters: &'a [Cluster],
+    per_cluster_renders: &[Vec<Uuid>],
     page_renders: &HashSet<Uuid>,
 ) -> Vec<&'a Cluster> {
+    debug_assert_eq!(
+        clusters.len(),
+        per_cluster_renders.len(),
+        "per-cluster render ids must be positionally aligned with the clusters they came from"
+    );
     clusters
         .iter()
-        .filter(|c| {
-            c.render_ids
-                .iter()
-                .filter_map(|r| normalize_render_id(r))
-                .any(|id| page_renders.contains(&id))
-        })
+        .zip(per_cluster_renders)
+        .filter(|(_, renders)| renders.iter().any(|id| page_renders.contains(id)))
+        .map(|(cluster, _)| cluster)
         .collect()
 }
 
@@ -380,31 +463,56 @@ fn normalize_render_id(raw: &str) -> Option<Uuid> {
     Uuid::parse_str(raw.strip_prefix("reg:").unwrap_or(raw)).ok()
 }
 
-/// Union every cluster's render-set, split into the ids that name an
-/// observation row and the ones that cannot.
+/// The single normalization of an artifact's raw `screenshotIds`.
 ///
-/// This union is the bound on [`load_page_render_ids`]. Both halves are sorted
-/// and deduped, so the same artifact always produces the same bound parameter
-/// (and the same warning) — the determinism contract extends to the query.
-fn normalize_render_ids(clusters: &[Cluster]) -> (Vec<Uuid>, Vec<String>) {
+/// Both consumers read from this one pass: [`union`](Self::union) bounds the
+/// page query, [`per_cluster`](Self::per_cluster) answers it in
+/// [`select_active_clusters`]. An earlier revision parsed the raw ids twice —
+/// once to build the bound, once to test membership — which left two
+/// independent implementations of "which observation does this id name" free to
+/// drift apart. That is the same failure mode as the producer/consumer key
+/// mismatch this module exists to have fixed.
+struct NormalizedRenders {
+    /// Every resolvable render id across all clusters, deduped and sorted.
+    union: Vec<Uuid>,
+    /// Ids that are not UUID-shaped, deduped and sorted. Reported, not bound.
+    rejected: Vec<String>,
+    /// Per-cluster resolvable render ids, positionally aligned with the
+    /// `clusters` slice this was built from. Deduped and sorted per cluster.
+    per_cluster: Vec<Vec<Uuid>>,
+}
+
+/// Normalize every cluster's render-set once, keeping both the union (the bound
+/// on [`load_page_render_ids`]) and the per-cluster breakdown (the membership
+/// test in [`select_active_clusters`]).
+///
+/// Every output is sorted and deduped, so the same artifact always produces the
+/// same bound parameter and the same warning — the determinism contract extends
+/// to the query.
+fn normalize_render_ids(clusters: &[Cluster]) -> NormalizedRenders {
     let mut resolved: BTreeSet<Uuid> = BTreeSet::new();
     let mut rejected: BTreeSet<String> = BTreeSet::new();
+    let mut per_cluster: Vec<Vec<Uuid>> = Vec::with_capacity(clusters.len());
     for cluster in clusters {
+        let mut mine: BTreeSet<Uuid> = BTreeSet::new();
         for raw in &cluster.render_ids {
             match normalize_render_id(raw) {
                 Some(id) => {
                     resolved.insert(id);
+                    mine.insert(id);
                 }
                 None => {
                     rejected.insert(raw.clone());
                 }
             }
         }
+        per_cluster.push(mine.into_iter().collect());
     }
-    (
-        resolved.into_iter().collect(),
-        rejected.into_iter().collect(),
-    )
+    NormalizedRenders {
+        union: resolved.into_iter().collect(),
+        rejected: rejected.into_iter().collect(),
+        per_cluster,
+    }
 }
 
 /// Load the newest non-empty global artifact.
@@ -424,7 +532,7 @@ async fn load_latest_global_artifact(
 
     let rows = conn
         .query(
-            r#"SELECT id::text, artifact, observation_count
+            r#"SELECT id::text, artifact, observation_count, derived_at
                FROM state_discovery_artifacts
                WHERE spec_id IS NULL
                  AND observation_count > 0
@@ -444,13 +552,35 @@ async fn load_latest_global_artifact(
     let artifact_id: String = row.get(0);
     let body: serde_json::Value = row.get(1);
     let observation_count: i32 = row.get(2);
+    // Selected even though the projection itself never looks at it: it is the
+    // boundary the failure-path diagnosis in [`page_observation_history`] needs,
+    // and fetching it here costs nothing on a row we are already reading.
+    let derived_at: chrono::DateTime<chrono::Utc> = row.get(3);
 
     Ok(LoadedArtifact {
         artifact_id,
         observation_count,
+        derived_at,
         body,
     })
 }
+
+/// Ceiling on how many render ids may be bound into [`PAGE_RENDERS_SQL`].
+///
+/// The bound parameter is the union of every cluster's render-set — roughly
+/// every clustered observation across *all* pages — and it is re-sent on every
+/// `load_and_project_skeleton` call. At 100k observations that is a ~1.6 MB
+/// binary `uuid[]` per call plus a `ScalarArrayOpExpr` evaluated over the whole
+/// `idx_observations_spec` scan. That is the deliberate trade documented on
+/// [`load_page_render_ids`], but a trade with no ceiling eventually stops being
+/// one, so the ceiling is explicit and it fails loudly: silently truncating the
+/// bound would shrink `S_Ξ` and read as "this page is unobserved", which is
+/// precisely the class of silent wrongness this whole change removes.
+///
+/// 50k is chosen to sit an order of magnitude above the corpora we actually
+/// see, so hitting it means the observation retention policy needs attention,
+/// not that the query needs tuning.
+const MAX_BOUND_RENDERS: usize = 50_000;
 
 /// The page-scoping query, hoisted to a `const` so a test can pin its shape.
 ///
@@ -493,7 +623,9 @@ const PAGE_RENDERS_SQL: &str = r#"SELECT id
 /// `ScalarArrayOpExpr` filter rather than a pure index seek. Correctness by
 /// construction is worth that: the alternative (bind `derived_at` +
 /// `window_days` off the artifact row) keeps a time predicate here and so
-/// keeps the whole drift class alive, merely narrowing it.
+/// keeps the whole drift class alive, merely narrowing it. It is a trade with
+/// a ceiling, though — see [`MAX_BOUND_RENDERS`], which the caller enforces
+/// before it gets here.
 ///
 /// Two filters are still load-bearing. Observations captured before page
 /// labelling existed carry `spec_id IS NULL` and are correctly excluded — they
@@ -522,20 +654,45 @@ async fn load_page_render_ids(
     Ok(rows.into_iter().map(|r| r.get::<_, Uuid>(0)).collect())
 }
 
-/// Does this page have *any* non-invalidated observation, ignoring the
-/// artifact?
+/// What the page's observation history looks like relative to one artifact.
+struct PageObservationHistory {
+    /// Has this page EVER carried a non-invalidated observation?
+    ever: bool,
+    /// Has it carried one captured *after* the artifact was derived?
+    since_derivation: bool,
+}
+
+/// Ask PG the two questions that separate the three causes of an empty
+/// intersection, in one round trip.
 ///
-/// Only called when [`load_page_render_ids`] came back empty, to separate the
-/// two causes that produce that: a page nothing was ever labelled for (fix:
-/// visit it, or make capture label it) versus a page that has been observed
-/// only since the newest artifact was derived (fix: re-derive). Both used to
-/// be distinguishable from the render-id query alone, because that query was
-/// not bounded by the artifact; now they are not, so this asks directly.
+/// Only called when [`load_page_render_ids`] came back empty. That query is
+/// bounded by the artifact, so an empty result no longer distinguishes the
+/// causes on its own, and they need genuinely different fixes:
 ///
-/// Deliberately unbounded in time: the question is "has this page EVER been
-/// observed", and a window here would reintroduce exactly the drift the
-/// caller's query just removed.
-async fn page_has_observations(pg_db: &PgDb, page_label: &str) -> Result<bool, AuthoringError> {
+/// | `ever` | `since_derivation` | cause | fix |
+/// |--------|--------------------|-------|-----|
+/// | false  | –                  | nothing was ever labelled for this page | visit it, or make capture label it |
+/// | true   | true               | the page's visits postdate the derivation | re-derive |
+/// | true   | false              | the derivation saw these rows and clustered none | *not* a re-derive |
+///
+/// The third row is why `since_derivation` exists. A time-unbounded "has this
+/// page been observed" probe cannot see it, so the caller used to answer
+/// "re-derive" for it — and re-deriving would never fix it. The reachable cause
+/// is `state_discovery::derive::load_observations` skipping observations with an
+/// empty `fingerprints` array: those rows are labelled, non-invalidated, and
+/// structurally unable to appear in any artifact.
+///
+/// `ever` stays deliberately unbounded in time — the question really is "EVER",
+/// and a window there would reintroduce exactly the drift the caller's query
+/// just removed. `since_derivation` is bounded by the artifact's own
+/// `derived_at` rather than by a wall-clock window, for the same reason.
+///
+/// Both halves are `EXISTS`, so both short-circuit on `idx_observations_spec`.
+async fn page_observation_history(
+    pg_db: &PgDb,
+    page_label: &str,
+    derived_at: chrono::DateTime<chrono::Utc>,
+) -> Result<PageObservationHistory, AuthoringError> {
     let conn = pg_db
         .pool()
         .get()
@@ -549,15 +706,25 @@ async fn page_has_observations(pg_db: &PgDb, page_label: &str) -> Result<bool, A
                    FROM co_occurrence_observations
                    WHERE spec_id = $1
                      AND invalidated_at IS NULL
+               ),
+               EXISTS(
+                   SELECT 1
+                   FROM co_occurrence_observations
+                   WHERE spec_id = $1
+                     AND invalidated_at IS NULL
+                     AND captured_at > $2
                )"#,
-            &[&page_label],
+            &[&page_label, &derived_at],
         )
         .await
         .map_err(|e| {
             AuthoringError::Database(format!("PG query co_occurrence_observations: {}", e))
         })?;
 
-    Ok(row.get::<_, bool>(0))
+    Ok(PageObservationHistory {
+        ever: row.get::<_, bool>(0),
+        since_derivation: row.get::<_, bool>(1),
+    })
 }
 
 /// One discovered state from the global `state_discovery_artifacts.artifact`
@@ -1240,6 +1407,17 @@ mod tests {
         ids.iter().map(|i| rid(*i)).collect()
     }
 
+    /// Run the production selection path end to end: normalize once, then
+    /// select from that normalization. Tests call this rather than
+    /// [`select_active_clusters`] directly so they exercise the same single
+    /// pass production does — a test-local re-parse of the raw ids would
+    /// re-open exactly the two-implementations drift `NormalizedRenders`
+    /// closes.
+    fn active_on<'a>(clusters: &'a [Cluster], page_renders: &HashSet<Uuid>) -> Vec<&'a Cluster> {
+        let normalized = normalize_render_ids(clusters);
+        select_active_clusters(clusters, &normalized.per_cluster, page_renders)
+    }
+
     fn skeleton_from_artifact(body: &serde_json::Value, observation_count: i32) -> IrPageSpec {
         // Helper that mirrors the projection path without touching PG.
         let clusters = extract_clusters(body).expect("clusters parse");
@@ -1352,21 +1530,21 @@ mod tests {
         ]);
         let clusters = extract_clusters(&body).expect("clusters parse");
 
-        let on_p1 = select_active_clusters(&clusters, &render_set(&[1]));
+        let on_p1 = active_on(&clusters, &render_set(&[1]));
         assert_eq!(
             on_p1.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
             vec!["abc"],
             "page 1 sees only the state spanning pages 1-4"
         );
 
-        let on_p2 = select_active_clusters(&clusters, &render_set(&[2]));
+        let on_p2 = active_on(&clusters, &render_set(&[2]));
         assert_eq!(
             on_p2.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
             vec!["abc", "de"],
             "page 2 has both states active at once"
         );
 
-        let on_p4 = select_active_clusters(&clusters, &render_set(&[4]));
+        let on_p4 = active_on(&clusters, &render_set(&[4]));
         assert_eq!(
             on_p4.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
             vec!["abc"],
@@ -1380,8 +1558,8 @@ mod tests {
         // no states rather than every state in the application.
         let body = artifact_json(vec![cluster_seen_in("abc", &["a"], &[1])]);
         let clusters = extract_clusters(&body).expect("clusters parse");
-        assert!(select_active_clusters(&clusters, &render_set(&[])).is_empty());
-        assert!(select_active_clusters(&clusters, &render_set(&[9])).is_empty());
+        assert!(active_on(&clusters, &render_set(&[])).is_empty());
+        assert!(active_on(&clusters, &render_set(&[9])).is_empty());
     }
 
     // -----------------------------------------------------------------
@@ -1420,13 +1598,21 @@ mod tests {
             cluster_seen_in("de", &["d"], &[2, 3]),
         ]);
         let clusters = extract_clusters(&body).expect("clusters parse");
-        let (resolved, rejected) = normalize_render_ids(&clusters);
+        let normalized = normalize_render_ids(&clusters);
         assert_eq!(
-            resolved,
+            normalized.union,
             vec![rid(1), rid(2), rid(3)],
             "union is deduped and deterministically ordered"
         );
-        assert!(rejected.is_empty());
+        assert!(normalized.rejected.is_empty());
+        // The per-cluster breakdown is what `select_active_clusters` tests
+        // membership against, so it must be aligned and per-cluster sorted —
+        // not the union repeated.
+        assert_eq!(
+            normalized.per_cluster,
+            vec![vec![rid(1), rid(2), rid(3)], vec![rid(2), rid(3)]],
+            "each cluster keeps its own render-set, positionally aligned"
+        );
     }
 
     #[test]
@@ -1445,12 +1631,35 @@ mod tests {
             "elementToRenders": {},
         });
         let clusters = extract_clusters(&body).expect("clusters parse");
-        let (resolved, rejected) = normalize_render_ids(&clusters);
-        assert_eq!(resolved.len(), 1, "only the UUID is bindable");
+        let normalized = normalize_render_ids(&clusters);
+        assert_eq!(normalized.union.len(), 1, "only the UUID is bindable");
         assert_eq!(
-            rejected,
+            normalized.rejected,
             vec!["render_0".to_string(), "screenshot_000".to_string()],
             "non-UUID ids are reported, not silently dropped into the query"
+        );
+    }
+
+    #[test]
+    fn bind_ceiling_is_a_ceiling_and_not_a_truncation() {
+        // The value must stay well clear of realistic corpora — hitting it
+        // should mean "retention needs attention", not "normal Tuesday".
+        assert!(
+            MAX_BOUND_RENDERS >= 50_000,
+            "a ceiling below the corpora we actually see would fail healthy artifacts"
+        );
+        // And it must be a hard stop: nothing anywhere may `truncate`/`take`
+        // the bound to fit, because a silently shortened bound shrinks S_Ξ and
+        // reads as "this page is unobserved" — the exact silent wrongness this
+        // module keeps being bitten by. The guard is that the ceiling is only
+        // ever compared against, never used as a length.
+        let body = artifact_json(vec![cluster_seen_in("abc", &["a"], &[1, 2, 3])]);
+        let clusters = extract_clusters(&body).expect("clusters parse");
+        let normalized = normalize_render_ids(&clusters);
+        assert_eq!(
+            normalized.union.len(),
+            3,
+            "normalization never caps; the caller rejects an oversized artifact outright"
         );
     }
 
@@ -1500,7 +1709,7 @@ mod tests {
 
         // What PG returns is the intersection of the page's labelled rows with
         // the artifact's render-set; here the page carries only "old" renders.
-        let active = select_active_clusters(&clusters, &render_set(&[100, 101]));
+        let active = active_on(&clusters, &render_set(&[100, 101]));
         assert_eq!(
             active.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
             vec!["old"]
@@ -1524,7 +1733,7 @@ mod tests {
             "elementToRenders": {},
         });
         let clusters = extract_clusters(&body).expect("clusters parse");
-        let active = select_active_clusters(&clusters, &render_set(&[7]));
+        let active = active_on(&clusters, &render_set(&[7]));
         assert_eq!(
             active.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
             vec!["prefixed"]
@@ -1552,11 +1761,20 @@ mod tests {
             "elementToRenders": {},
         });
         let clusters = extract_clusters(&body).expect("clusters parse");
-        let (bound, rejected) = normalize_render_ids(&clusters);
-        assert_eq!(bound, vec![rid(5)], "only the real render is bindable");
-        assert_eq!(rejected.len(), 2);
+        let normalized = normalize_render_ids(&clusters);
+        assert_eq!(
+            normalized.union,
+            vec![rid(5)],
+            "only the real render is bindable"
+        );
+        assert_eq!(normalized.rejected.len(), 2);
+        assert_eq!(
+            normalized.per_cluster,
+            vec![vec![], vec![rid(5)]],
+            "the synthetic-render cluster resolves to an empty render-set"
+        );
 
-        let active = select_active_clusters(&clusters, &render_set(&[5]));
+        let active = active_on(&clusters, &render_set(&[5]));
         assert_eq!(
             active.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
             vec!["real"],

@@ -649,6 +649,7 @@ fn authoring_error_reason(
         EmptyArtifact => "empty-artifact",
         NoPageObservations { .. } => "no-page-observations",
         NoActiveStates { .. } => "no-active-states",
+        ObservedButUnclustered { .. } => "observed-but-unclustered",
         MalformedAiOutput(_) => "malformed-ai-output",
         AiDispatchFailed(_) => "ai-dispatch-failed",
         ExistingSpecMissing(_) => "existing-spec-missing",
@@ -674,9 +675,19 @@ fn authoring_error_detail(
             page_label,
             total_states,
         } => format!(
-            "page '{}' has observations, but none of them is in the newest \
-             discovery artifact's render-set, so none of its {} states can be \
-             shown active here — re-derive to pick the page's visits up",
+            "page '{}' has been observed since the newest discovery artifact was derived, \
+             and none of its observations is in that artifact's render-set, so none of its \
+             {} states can be shown active here — re-derive to pick the page's newer visits up",
+            page_label, total_states
+        ),
+        ObservedButUnclustered {
+            page_label,
+            total_states,
+        } => format!(
+            "page '{}' has observations, all of them older than the newest discovery \
+             artifact, and that derivation clustered none of them into its {} states — \
+             re-deriving will not change this; the observations most likely carry no \
+             fingerprints, so they can never enter an artifact",
             page_label, total_states
         ),
         MalformedAiOutput(s) => format!("malformed AI output: {}", s),
@@ -1170,6 +1181,46 @@ mod tests {
 
     // `spec_id_to_pathname` behaviour is owned and tested by
     // `spec_api::slug`, together with its inverse.
+
+    /// Only the variant that actually means "your visits postdate the
+    /// derivation" may prescribe a re-derive.
+    ///
+    /// Regression guard for a diagnosis that asserted a cause it had not
+    /// measured: an empty page/artifact intersection used to map to
+    /// `NoActiveStates` unconditionally, so a page whose observations carry no
+    /// fingerprints — skipped by `derive::load_observations`, and therefore
+    /// unable to enter ANY artifact — was told to re-derive forever.
+    #[test]
+    fn only_the_stale_artifact_diagnosis_prescribes_a_re_derive() {
+        use crate::workflow_generation::spec_authoring::AuthoringError;
+
+        let stale = AuthoringError::NoActiveStates {
+            page_label: "account-billing".into(),
+            total_states: 3,
+        };
+        let unclustered = AuthoringError::ObservedButUnclustered {
+            page_label: "account-billing".into(),
+            total_states: 3,
+        };
+
+        assert_ne!(
+            authoring_error_reason(&stale),
+            authoring_error_reason(&unclustered),
+            "the two causes must be machine-distinguishable, not just worded differently"
+        );
+
+        let stale_detail = authoring_error_detail(&stale);
+        assert!(
+            stale_detail.contains("re-derive"),
+            "the stale-artifact case is the one a re-derive fixes: {stale_detail}"
+        );
+
+        let unclustered_detail = authoring_error_detail(&unclustered);
+        assert!(
+            unclustered_detail.contains("re-deriving will not change this"),
+            "the unclustered case must say re-deriving won't help: {unclustered_detail}"
+        );
+    }
 
     #[test]
     fn infer_target_spec_id_strips_src_pages() {
