@@ -65,12 +65,15 @@ repos:
         files: '^src-tauri/(src/(event_system/types|tauri_event_payloads|relay_envelopes|findings/types|schema_export)\.rs|scripts/generate_types\.sh)$'
         pass_filenames: false
 
-      # Pre-push only: cargo fmt --check + clippy -D warnings, mirroring
-      # CI's Rust gate. Runs once per `git push` (not per commit), and
-      # only when src-tauri/ changed in the pushed range. Lets you catch
-      # the same lint/fmt failures CI would 8-15 min later in 60-90s
-      # locally. Bypass with `git push --no-verify` or
-      # QONTINUI_PREPUSH_SKIP=1.
+      # Pre-push only: cargo fmt (auto-apply, never blocks) + cargo clippy
+      # (deny-tier blocks), mirroring CI's Rust gate. Runs once per
+      # `git push` (not per commit), and only when src-tauri/ changed in
+      # the pushed range. Lets you catch the same lint/fmt failures CI
+      # would 8-15 min later in 60-90s locally.
+      #
+      # The halves are decoupled: QONTINUI_PREPUSH_SKIP=1 skips only the
+      # expensive clippy build and still auto-applies fmt.
+      # QONTINUI_PREPUSH_SKIP_ALL=1 skips both.
       #
       # Install once with: pre-commit install --hook-type pre-push
       - id: cargo-prepush

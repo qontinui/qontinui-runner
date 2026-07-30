@@ -5,17 +5,34 @@
 # auto-applies (never blocks), and clippy runs plain (no `-D warnings`) so only
 # deny-tier (correctness/suspicious) lints from Cargo.toml [lints.clippy] block.
 #
-# Skip with `git push --no-verify` if you genuinely want CI to be the
-# source of truth (e.g. you're pushing a WIP branch you don't expect to
-# pass yet).
+# The two halves are DECOUPLED, and the skip switch governs only the expensive
+# one. `cargo fmt` takes seconds and can only help you; `cargo clippy` builds
+# the whole workspace and is the thing people actually need to escape. Wiring
+# both to a single switch meant anyone who skipped the slow build also silently
+# lost the free formatting fix — and CI runs `cargo fmt -- --check` BEFORE
+# `cargo test` inside the required `test (ubuntu-22.04)` / `test
+# (windows-latest)` contexts, so the entire Rust suite never even executed.
+# That stranded runner#812 and runner#806 on pure whitespace in 2026-07.
 #
-# Set QONTINUI_PREPUSH_SKIP=1 to bypass without `--no-verify` (useful
-# when iterating on docs-only changes that don't touch src-tauri/).
+#   QONTINUI_PREPUSH_SKIP=1      skip clippy; cargo fmt STILL auto-applies
+#   QONTINUI_PREPUSH_SKIP_ALL=1  skip both — the explicit total escape hatch
+#   git push --no-verify         skips both, because git never invokes the hook
+#                                at all. Nothing in this file can preserve fmt
+#                                for you in that case; prefer
+#                                QONTINUI_PREPUSH_SKIP=1.
 set -euo pipefail
 
-if [[ "${QONTINUI_PREPUSH_SKIP:-}" == "1" ]]; then
-  echo "[pre-push] QONTINUI_PREPUSH_SKIP=1 — skipping cargo fmt + clippy"
+if [[ "${QONTINUI_PREPUSH_SKIP_ALL:-}" == "1" ]]; then
+  echo "[pre-push] QONTINUI_PREPUSH_SKIP_ALL=1 — skipping cargo fmt + clippy"
   exit 0
+fi
+
+# Backwards compatible: the long-standing name keeps working, but now scopes to
+# the expensive half only. Other sessions and docs reference it, so it must not
+# change meaning to "runs nothing" — it means "don't make me pay for clippy".
+SKIP_CLIPPY=0
+if [[ "${QONTINUI_PREPUSH_SKIP:-}" == "1" ]]; then
+  SKIP_CLIPPY=1
 fi
 
 # If nothing under src-tauri/ changed since the last push to this remote,
@@ -58,16 +75,44 @@ restore_lock() {
 }
 trap restore_lock EXIT
 
-# T2 (formatting) — auto-apply, never block. Run `cargo fmt` (writes) instead
-# of `cargo fmt -- --check` (fails). Re-stage anything it rewrote so the
-# formatted result rides in this push rather than failing it. Formatting is
-# mechanical; there is no value in bouncing a push over whitespace.
+# T2 (formatting) — auto-apply, never block, and never governed by the skip
+# switches above. Run `cargo fmt` (writes) instead of `cargo fmt -- --check`
+# (fails). Formatting is mechanical; there is no value in bouncing a push over
+# whitespace, and CI is where `--check` does the enforcing.
 echo "[pre-push] cargo fmt (auto-apply)"
+
+# Fingerprint the src-tauri worktree against HEAD so we can tell whether fmt
+# actually rewrote anything. A content hash rather than a filename list: a file
+# that was already dirty before fmt and then got reformatted too would not show
+# up as a change in the name set. Falls back to a constant when the fingerprint
+# can't be taken, so a diagnostic can never be the thing that blocks a push.
+fmt_fingerprint() {
+  git -C "$ROOT" diff HEAD -- src-tauri | git hash-object --stdin || echo "unavailable"
+}
+fmt_before="$(fmt_fingerprint)"
 cargo fmt
+fmt_after="$(fmt_fingerprint)"
+
 # Re-stage any src-tauri files fmt rewrote. `git add -u` on the src-tauri tree
 # picks up tracked-file modifications only (no new/untracked files). Best-effort:
 # if nothing changed this is a no-op.
 git -C "$ROOT" add -u -- src-tauri || true
+
+if [[ "$fmt_before" != "$fmt_after" ]]; then
+  echo
+  echo "[pre-push] NOTE — cargo fmt rewrote files, and they are now STAGED."
+  echo "          A pre-push hook cannot alter commits that are already being"
+  echo "          pushed, so THIS push still carries the unformatted tree and"
+  echo "          CI's required 'Format Rust code check' will red it. Commit"
+  echo "          (or amend) the staged fmt fix and push again."
+  echo
+fi
+
+if [[ "$SKIP_CLIPPY" == "1" ]]; then
+  echo "[pre-push] QONTINUI_PREPUSH_SKIP=1 — skipping clippy (fmt above still ran)."
+  echo "[pre-push] cargo gate passed (fmt only; CI will gate clippy)."
+  exit 0
+fi
 
 # T1 (correctness) — block. Plain `cargo clippy`: NO `--all-targets` (that
 # compiles #[cfg(test)] modules this PR didn't touch — stricter than CI and a
