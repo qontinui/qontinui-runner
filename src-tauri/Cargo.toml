@@ -67,7 +67,15 @@ mdns-sd = "0.11"
 # Plan mention: cocool97/adb_client. Features: `usb` for direct USB device I/O,
 # `mdns` for adb mDNS services. The crate is sync; call via tokio::spawn_blocking.
 adb_client = { version = "3", features = ["usb", "mdns"] }
-reqwest = { version = "0.13", features = ["json", "multipart", "blocking", "stream", "form"] }
+# `hickory-dns` swaps reqwest's default `GaiResolver` — which resolves through
+# blocking `getaddrinfo` dispatched onto tokio's blocking pool — for the async
+# hickory resolver. Without it, every request costs a blocking-pool slot; the
+# runner pinned that pool near its 512-thread ceiling and DNS resolution queued
+# until requests hit their own timeouts (coord answers in <0.5s but calls failed
+# as `operation timed out`). `coord_http::coord_client` fixes the coord paths by
+# sharing one pooled client; this feature protects the ~160 call sites that
+# still construct clients per request.
+reqwest = { version = "0.13", features = ["json", "multipart", "blocking", "stream", "form", "hickory-dns"] }
 open = "5"
 hostname = "0.4"
 # Row 2 Phase 1 (fleet topology): used by `fleet::detect_resources` to

@@ -282,11 +282,11 @@ async fn pre_allocate_claim(
         metadata,
     );
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("build claim http client: {e}"))?;
-    let resp = crate::auth::attach_device_auth(client.post(&url).json(&body))
+    let client = crate::coord_http::coord_client()
+        .ok_or_else(|| "no shared coord client".to_string())?;
+    let resp = crate::auth::attach_device_auth(
+        client.post(&url).timeout(Duration::from_secs(10)).json(&body),
+    )
         .send()
         .await
         .map_err(|e| format!("POST {url}: {e}"))?;
@@ -573,11 +573,11 @@ async fn heartbeat_once(
         agent_session_id,
         serde_json::json!({}),
     );
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| format!("build heartbeat client: {e}"))?;
-    let resp = crate::auth::attach_device_auth(client.post(&url).json(&body))
+    let client = crate::coord_http::coord_client()
+        .ok_or_else(|| "no shared coord client".to_string())?;
+    let resp = crate::auth::attach_device_auth(
+        client.post(&url).timeout(Duration::from_secs(5)).json(&body),
+    )
         .send()
         .await
         .map_err(|e| format!("POST {url}: {e}"))?;
@@ -623,17 +623,13 @@ pub async fn release_claim_best_effort(
         agent_session_id,
         serde_json::json!({}),
     );
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("release_claim_best_effort: build client failed: {e}");
-            return;
-        }
+    let Some(client) = crate::coord_http::coord_client() else {
+        warn!("release_claim_best_effort: no shared coord client");
+        return;
     };
-    match crate::auth::attach_device_auth(client.post(&url).json(&body))
+    match crate::auth::attach_device_auth(
+        client.post(&url).timeout(Duration::from_secs(5)).json(&body),
+    )
         .send()
         .await
     {
