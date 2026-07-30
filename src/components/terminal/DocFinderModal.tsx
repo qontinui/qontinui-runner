@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 import { readDir, readTextFile } from "@tauri-apps/plugin-fs";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { FileText, Search, X, FolderOpen, Brain, Loader2 } from "lucide-react";
+import { pathSeparatorFor, normalizeRoot, joinPath, relativeToRoot } from "./docFinderPaths";
 
 /* ── Types ────────────────────────────────────────────────────────────── */
 
@@ -59,7 +60,11 @@ const VIRTUAL_BUFFER = 10;
 
 async function scanForDocs(root: string, maxDepth = 5, maxFiles = 1000): Promise<ScannedFile[]> {
   const results: ScannedFile[] = [];
-  const normalizedRoot = root.replace(/\//g, "\\").replace(/\\$/, "");
+  // The separator comes from the root, not from an assumption: since the root
+  // is the active terminal's working directory it is platform-native, and
+  // forcing backslashes broke the scan outright on Linux. See docFinderPaths.
+  const sep = pathSeparatorFor(root);
+  const normalizedRoot = normalizeRoot(root, sep);
 
   // BFS queue: [dirPath, depth]
   const queue: [string, number][] = [[normalizedRoot, 0]];
@@ -74,7 +79,7 @@ async function scanForDocs(root: string, maxDepth = 5, maxFiles = 1000): Promise
         if (results.length >= maxFiles) break;
         const name = entry.name;
         if (!name) continue;
-        const fullPath = `${dir}\\${name}`;
+        const fullPath = joinPath(dir, name, sep);
 
         if (entry.isDirectory) {
           if (!SKIP_DIRS.has(name) && !name.startsWith(".")) {
@@ -86,7 +91,7 @@ async function scanForDocs(root: string, maxDepth = 5, maxFiles = 1000): Promise
             results.push({
               name,
               path: fullPath,
-              relativePath: fullPath.slice(normalizedRoot.length + 1),
+              relativePath: relativeToRoot(normalizedRoot, fullPath, sep),
             });
           }
         }
