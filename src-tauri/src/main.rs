@@ -3775,6 +3775,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // and only the operator has a supervisor at all, so no ordinary
             // user ever got derivation. Same fire-and-forget contract as the
             // drift detector above.
+            //
+            // EVERY instance runs this setup and the runner is explicitly
+            // multi-instance (secondaries on :9877+, same box, same Postgres),
+            // so the loop must not be trusted to be singular just because it is
+            // spawned once here. It guards itself: a Postgres advisory lock
+            // keeps one writer across instances *and* machines, and a
+            // persisted-cadence check off `state_discovery_artifacts` keeps the
+            // schedule wall-clock rather than restart-relative. See
+            // `state_discovery::derive::DERIVE_LOCK_KEY`.
             {
                 let derive_app_state: Arc<commands::AppState> =
                     app.state::<Arc<commands::AppState>>().inner().clone();

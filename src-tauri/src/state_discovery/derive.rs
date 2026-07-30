@@ -49,6 +49,16 @@ const DERIVE_INTERVAL_FLOOR_SECS: u64 = 600;
 /// [`DERIVE_INITIAL_DELAY_ENV`].
 const DEFAULT_DERIVE_INITIAL_DELAY_SECS: u64 = 3_600;
 
+/// Below this the initial delay is warned about rather than rejected. It is
+/// **not** a floor: `0` stays legal because the persisted-cadence check in
+/// [`global_derive_is_recent`] already prevents a frequently-restarted runner
+/// from re-clustering on every boot, so the only thing a short delay can still
+/// do is make the *first* derive of a genuinely-due period race the rest of
+/// startup. That is worth a WARN, not a silent override of what the operator
+/// asked for — and hard-flooring it would take away the one-shot behaviour the
+/// env var exists to give test harnesses.
+const DERIVE_INITIAL_DELAY_WARN_FLOOR_SECS: u64 = 60;
+
 /// Wall-clock budget for one derive tick. Generously above [`BRIDGE_TIMEOUT`]
 /// so the bridge's own timeout normally fires first; this only catches a
 /// wedged PG pool. Exceeding it drops the tick and keeps the loop alive.
@@ -210,6 +220,64 @@ pub async fn derive(
 // Background global derive loop
 // ---------------------------------------------------------------------------
 
+/// Namespace the derive loop's Postgres advisory-lock key is derived from.
+///
+/// The string, not the number, is the thing a human picks; the number is
+/// mechanical (see [`DERIVE_LOCK_KEY`]). Anything else that wants a
+/// `pg_advisory_lock` in this database should pick its own namespace string
+/// here and get its own key the same way, so keys cannot be chosen by
+/// eyeballing and colliding.
+const DERIVE_LOCK_NAMESPACE: &str = "qontinui:state-discovery:global-derive";
+
+/// FNV-1a/64. Const so the key below is computed at compile time.
+///
+/// Deliberately not a cryptographic hash and deliberately not a runtime one:
+/// the requirement is only "the same string always yields the same 64-bit
+/// number, on every machine, forever", and a hand-written 20-line const fn is a
+/// far smaller commitment than pulling a hasher into a `const` context.
+const fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        i += 1;
+    }
+    hash
+}
+
+/// Advisory-lock key for the global derive loop: FNV-1a/64 of
+/// [`DERIVE_LOCK_NAMESPACE`], reinterpreted as the `bigint` Postgres wants.
+///
+/// # Why an advisory lock at all
+///
+/// Every runner instance runs this loop, and the runner is explicitly
+/// multi-instance — secondaries listen on `:9877`+ on the same box and share
+/// the same Postgres (see `runner-instances.md`). Without a guard, N instances
+/// each write a byte-identical global artifact per night, which is *precisely*
+/// the defect this loop exists to remove from the supervisor's per-app cron. It
+/// also compounds downstream: `spec_authoring::load_latest_global_artifact` is
+/// `ORDER BY derived_at DESC LIMIT 1`, so N racing writers make every page's
+/// projection depend on which same-second row happened to win.
+///
+/// # Why a *Postgres* advisory lock and not an in-process guard
+///
+/// The database is the only thing all the writers share. A `OnceLock`/mutex
+/// would serialise the instances on one box and do nothing at all for the
+/// two-machines-one-database case, which is a supported topology here.
+///
+/// # How the key was chosen
+///
+/// It is the FNV-1a/64 digest of [`DERIVE_LOCK_NAMESPACE`], evaluated in a
+/// `const fn` so the value is fixed at compile time and can never drift from
+/// the name it is documented as meaning. Postgres advisory locks live in one
+/// flat 2^64 keyspace per database, so the only real requirement on the value
+/// is that nothing else picks it; a digest of a repo-qualified namespace string
+/// makes accidental collision as unlikely as the keyspace allows, and makes the
+/// derivation reproducible by anyone reading this file. (At the time of
+/// writing, nothing else in the runner takes a `pg_advisory_lock` at all.)
+const DERIVE_LOCK_KEY: i64 = fnv1a64(DERIVE_LOCK_NAMESPACE.as_bytes()) as i64;
+
 /// Resolve the loop cadence from [`DERIVE_INTERVAL_ENV`], defaulting to
 /// [`DEFAULT_DERIVE_INTERVAL_SECS`] and flooring at
 /// [`DERIVE_INTERVAL_FLOOR_SECS`].
@@ -223,7 +291,8 @@ fn derive_interval_secs() -> u64 {
 
 /// Resolve the pre-first-tick delay from [`DERIVE_INITIAL_DELAY_ENV`],
 /// defaulting to [`DEFAULT_DERIVE_INITIAL_DELAY_SECS`]. Not floored — `0` is a
-/// legitimate value for a test harness that wants an immediate derive.
+/// legitimate value for a test harness that wants an immediate derive; see
+/// [`DERIVE_INITIAL_DELAY_WARN_FLOOR_SECS`] for why it is warned about instead.
 fn derive_initial_delay_secs() -> u64 {
     std::env::var(DERIVE_INITIAL_DELAY_ENV)
         .ok()
@@ -268,17 +337,46 @@ fn derive_window_days() -> i32 {
 /// artifacts per night) and only ever ran on the operator's dev-only supervisor,
 /// so no ordinary user got derivation at all.
 ///
+/// # Single writer, and a cadence that survives restarts
+///
+/// Every instance runs this loop, so the tick is guarded twice: a Postgres
+/// advisory lock ([`DERIVE_LOCK_KEY`]) makes at most one instance *anywhere*
+/// derive at a time, and a persisted-cadence check
+/// ([`global_derive_is_recent`]) makes the schedule wall-clock rather than
+/// restart-relative. Neither alone is enough — the lock lets a restarted
+/// instance derive again immediately after another finished, and the cadence
+/// check alone leaves two instances racing inside the same second.
+///
 /// Errors inside a tick log but never kill the loop.
 pub async fn run_derive_loop(app_state: Arc<crate::commands::AppState>) {
+    // All three knobs are resolved ONCE, here. Re-reading only some of them per
+    // tick made the configuration half-live: `tokio::time::interval` is built
+    // once so a changed interval could never take effect, while a re-read
+    // window silently could — two env vars documented identically behaving
+    // differently. One resolution point, one log line.
     let interval_secs = derive_interval_secs();
     let initial_delay_secs = derive_initial_delay_secs();
+    let window_days = derive_window_days();
 
     info!(
-        "state-derive: starting global derive loop (interval={}s, initial_delay={}s, window_days={})",
+        "state-derive: starting global derive loop (interval={}s, initial_delay={}s, \
+         window_days={}, cadence_threshold={}s, lock_key={})",
         interval_secs,
         initial_delay_secs,
-        derive_window_days()
+        window_days,
+        cadence_threshold_secs(interval_secs),
+        DERIVE_LOCK_KEY
     );
+
+    if initial_delay_secs < DERIVE_INITIAL_DELAY_WARN_FLOOR_SECS {
+        warn!(
+            "state-derive: {}={}s is below the {}s advisory floor — a derive that is \
+             genuinely due will start while PG bootstrap, the Python bridge warm-up and the \
+             default-SM auto-load are still running, and clustering is O(fingerprints²). \
+             Intended for test harnesses only.",
+            DERIVE_INITIAL_DELAY_ENV, initial_delay_secs, DERIVE_INITIAL_DELAY_WARN_FLOOR_SECS
+        );
+    }
 
     // One-shot initial delay so PG bootstrap, the Python bridge warm-up and the
     // default-SM auto-load all finish before the first (heavy) derivation. The
@@ -288,44 +386,236 @@ pub async fn run_derive_loop(app_state: Arc<crate::commands::AppState>) {
     tokio::time::sleep(Duration::from_secs(initial_delay_secs)).await;
 
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
-    // Explicit, NOT the `Burst` default: a tick that outruns the interval must
-    // drop the missed tick rather than queue back-to-back clustering passes.
+    // Explicit, NOT the `Burst` default. The tick is hard-capped at
+    // `DERIVE_TICK_BUDGET` (300 s) and the interval floors at 600 s, so a tick
+    // cannot in fact outrun its interval today and this is defence-in-depth: if
+    // either constant is ever retuned so they overlap, `Skip` drops the missed
+    // tick instead of queueing back-to-back clustering passes.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         // First tick resolves immediately — i.e. at `initial_delay_secs` after
         // start, never at process start.
         ticker.tick().await;
+        run_guarded_tick(&app_state, window_days, interval_secs).await;
+    }
+}
 
-        let window_days = derive_window_days();
-        let pg_db = app_state.pg_db.clone();
-        // spec_id = None → global corpus, artifact persisted with spec_id NULL.
-        match tokio::time::timeout(
-            DERIVE_TICK_BUDGET,
-            derive(pg_db, app_state.clone(), None, window_days),
-        )
+/// Tolerance subtracted from the interval when asking "has a derive already
+/// happened this period?".
+///
+/// `derived_at` is stamped when the artifact is *inserted*, i.e. one derive
+/// duration after the tick that produced it, while ticks fire at a fixed offset
+/// from loop start. Comparing against the bare interval would therefore find
+/// the previous artifact a few seconds too young on every tick and skip it —
+/// halving the real cadence, forever. The tolerance has to cover one derive,
+/// which is bounded by [`DERIVE_TICK_BUDGET`]; it is additionally capped at 10%
+/// of the interval so a short configured cadence cannot be pulled to twice its
+/// configured rate by a large fixed tolerance.
+fn cadence_threshold_secs(interval_secs: u64) -> u64 {
+    let tolerance = DERIVE_TICK_BUDGET.as_secs().min(interval_secs / 10);
+    interval_secs.saturating_sub(tolerance)
+}
+
+/// One tick: take the cross-instance lock, run the (cadence-gated) derive,
+/// release the lock.
+///
+/// # The unlock contract
+///
+/// A `pg_advisory_lock` is held by the *session*, i.e. by the pooled
+/// connection, and deadpool's default recycling is `Fast` — it does not
+/// `DISCARD ALL` — so a lock left behind is not cleaned up when the connection
+/// goes back to the pool. It would sit there wedging every future tick on every
+/// instance until that backend died. So the release is structural, not
+/// best-effort:
+///
+/// - the lock-held region is exactly one expression ([`run_locked_tick`]), with
+///   the unlock on the next line, so there is no `return` or `?` between them —
+///   the skip path, the error path and the timeout path all leave through the
+///   same statement;
+/// - the derive itself runs on its own task, so a panic inside it arrives here
+///   as a `JoinError` instead of unwinding past the unlock;
+/// - and if the process dies outright, its backend connection dies with it and
+///   Postgres releases the lock for us.
+///
+/// The connection is taken for the lock's lifetime rather than re-fetched from
+/// the pool, because a session-scoped lock taken on one pooled connection and
+/// released on another simply would not release. (`pg_advisory_xact_lock` would
+/// self-release, but only by holding a transaction open for the whole
+/// clustering pass — trading a leak risk for a guaranteed long
+/// idle-in-transaction. Not worth it.) The pool is `max_size=8` and a derive
+/// uses two connections briefly, so holding one more is comfortable.
+async fn run_guarded_tick(
+    app_state: &Arc<crate::commands::AppState>,
+    window_days: i32,
+    interval_secs: u64,
+) {
+    let pg_db = app_state.pg_db.clone();
+
+    let conn = match pg_db.pool().get().await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("state-derive: tick skipped, PG pool error: {}", e);
+            return;
+        }
+    };
+
+    match conn
+        .query_one("SELECT pg_try_advisory_lock($1)", &[&DERIVE_LOCK_KEY])
         .await
-        {
-            Ok(Ok(v)) => {
-                let observation_count = v.get("observation_count").and_then(|n| n.as_i64());
-                match observation_count {
-                    Some(n) => info!(
-                        "state-derive: global derivation complete (observations={}, window_days={})",
-                        n, window_days
-                    ),
-                    None => warn!(
-                        "state-derive: global derivation complete but observation_count was \
-                         absent from the persisted artifact — response shape may have drifted"
-                    ),
-                }
+    {
+        Ok(row) => {
+            if !row.get::<_, bool>(0) {
+                info!(
+                    "state-derive: another instance holds the derive lock ({}); skipping tick",
+                    DERIVE_LOCK_KEY
+                );
+                return;
             }
-            Ok(Err(e)) => warn!("state-derive: tick failed: {}", e),
-            Err(_) => warn!(
-                "state-derive: tick exceeded {}s budget; skipping",
-                DERIVE_TICK_BUDGET.as_secs()
-            ),
+        }
+        Err(e) => {
+            warn!(
+                "state-derive: could not take the derive lock ({}): {}; skipping tick",
+                DERIVE_LOCK_KEY, e
+            );
+            return;
         }
     }
+
+    // ---- LOCK HELD. Nothing between here and the unlock may return early. ----
+    run_locked_tick(&conn, &pg_db, app_state, window_days, interval_secs).await;
+
+    if let Err(e) = conn
+        .query_one("SELECT pg_advisory_unlock($1)", &[&DERIVE_LOCK_KEY])
+        .await
+    {
+        // Not fatal for this tick, but it does mean the lock is still held on
+        // this connection, so say so loudly rather than logging at debug.
+        error!(
+            "state-derive: failed to release the derive lock ({}): {} — it stays held until \
+             this pooled connection is closed, which will stall derivation fleet-wide",
+            DERIVE_LOCK_KEY, e
+        );
+    }
+    // ---- LOCK RELEASED. ----
+}
+
+/// The body of a tick, run with [`DERIVE_LOCK_KEY`] held. Never returns a
+/// result: the caller's only job afterwards is to unlock, and giving it a value
+/// to inspect would invite an early return between the two.
+async fn run_locked_tick(
+    conn: &deadpool_postgres::Client,
+    pg_db: &Arc<PgDb>,
+    app_state: &Arc<crate::commands::AppState>,
+    window_days: i32,
+    interval_secs: u64,
+) {
+    match global_derive_is_recent(conn, interval_secs).await {
+        Ok(Some(last)) => {
+            info!(
+                "state-derive: newest global artifact was derived at {}, inside the {}s cadence \
+                 threshold; skipping tick",
+                last,
+                cadence_threshold_secs(interval_secs)
+            );
+            return;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            // Fail closed. An unreadable artifact table is exactly the state in
+            // which a blind derive is most likely to be the second one today.
+            warn!("state-derive: cadence check failed: {}; skipping tick", e);
+            return;
+        }
+    }
+
+    // spec_id = None → global corpus, artifact persisted with spec_id NULL.
+    //
+    // On its own task so a panic surfaces here as a `JoinError` rather than
+    // unwinding through the caller's frame while the advisory lock is held.
+    let mut handle = tokio::spawn(derive(pg_db.clone(), app_state.clone(), None, window_days));
+
+    // Bound to a `let` rather than matched inline: the temporary `Timeout`
+    // future holds the `&mut handle` borrow for as long as it lives, and a
+    // `match` on it would keep it alive across the arms — where the timeout arm
+    // needs `handle` back to abort it.
+    let outcome = tokio::time::timeout(DERIVE_TICK_BUDGET, &mut handle).await;
+
+    match outcome {
+        Ok(Ok(Ok(v))) => {
+            let observation_count = v.get("observation_count").and_then(|n| n.as_i64());
+            match observation_count {
+                Some(n) => info!(
+                    "state-derive: global derivation complete (observations={}, window_days={})",
+                    n, window_days
+                ),
+                None => warn!(
+                    "state-derive: global derivation complete but observation_count was \
+                     absent from the persisted artifact — response shape may have drifted"
+                ),
+            }
+        }
+        Ok(Ok(Err(e))) => warn!("state-derive: tick failed: {}", e),
+        Ok(Err(join_err)) => warn!("state-derive: derivation task died: {}", join_err),
+        Err(_) => {
+            // Dropping a `JoinHandle` detaches the task rather than cancelling
+            // it, so the abort is what actually stops the run — without it the
+            // derive would carry on writing after the lock came off.
+            handle.abort();
+            warn!(
+                "state-derive: tick exceeded {}s budget; aborted",
+                DERIVE_TICK_BUDGET.as_secs()
+            );
+        }
+    }
+}
+
+/// Has a global derive already happened inside the current cadence period?
+///
+/// Returns `Some(derived_at)` when it has (caller skips the tick), `None` when
+/// a derive is due. This is what makes the schedule wall-clock rather than
+/// restart-relative: the loop's own timer starts at process start with nothing
+/// persisted, so a runner restarted every ≤1 h would never reach its first
+/// nightly tick, and one restarted every 2 h would derive every 2 h — 12× the
+/// intended load, each pass a full O(fingerprints²) clustering round-trip. The
+/// supervisor cron this loop replaces was wall-clock scheduled; this restores
+/// that property from the only durable clock available, the artifact table.
+///
+/// `spec_id IS NULL` matches exactly what the loop writes (and what
+/// `spec_authoring::load_latest_global_artifact` reads). Empty artifacts count:
+/// "we ran and found nothing" is still a run, and excluding them would make a
+/// corpus-less runner re-cluster on every tick.
+///
+/// The comparison is done in Postgres, not in Rust, because `derived_at` is
+/// written by Postgres' own `DEFAULT now()` — comparing it against `now()` on
+/// the same server is immune to runner/DB clock skew.
+async fn global_derive_is_recent(
+    conn: &deadpool_postgres::Client,
+    interval_secs: u64,
+) -> Result<Option<String>, String> {
+    let threshold_secs = cadence_threshold_secs(interval_secs) as i64;
+
+    // `($1::bigint || ' seconds')::interval` mirrors the `::int || ' days'`
+    // idiom in `load_observations`: it keeps $1 typed as a plain integer
+    // parameter rather than asking tokio-postgres for an `INTERVAL`.
+    // `MAX(derived_at)` is an index-only lookup on `idx_discovery_spec_derived`.
+    let row = conn
+        .query_one(
+            r#"SELECT MAX(derived_at)::text,
+                      COALESCE(
+                          MAX(derived_at) > now() - ($1::bigint || ' seconds')::interval,
+                          false
+                      )
+               FROM state_discovery_artifacts
+               WHERE spec_id IS NULL"#,
+            &[&threshold_secs],
+        )
+        .await
+        .map_err(|e| format!("PG query state_discovery_artifacts: {}", e))?;
+
+    let last: Option<String> = row.get(0);
+    let too_recent: bool = row.get(1);
+    Ok(if too_recent { last } else { None })
 }
 
 /// Minimal shape we need from the observations table for derivation.
@@ -481,5 +771,56 @@ mod tests {
     #[test]
     fn tick_budget_exceeds_bridge_timeout() {
         assert!(DERIVE_TICK_BUDGET > BRIDGE_TIMEOUT);
+    }
+
+    /// `fnv1a64` must be real FNV-1a/64, not something that merely looks like
+    /// it — the advisory-lock key's whole claim to being reproducible rests on
+    /// the algorithm being the published one. These are the reference vectors.
+    #[test]
+    fn fnv1a64_matches_the_reference_vectors() {
+        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a64(b"foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    /// The lock key is pinned to a literal on purpose. Two instances only
+    /// exclude each other if they agree on the number, so changing
+    /// `DERIVE_LOCK_NAMESPACE` is a rolling-upgrade hazard (old and new
+    /// binaries would take different locks and both derive) and must be a
+    /// deliberate, visible edit rather than a silent consequence of a rename.
+    #[test]
+    fn lock_key_is_pinned_to_the_namespace_digest() {
+        assert_eq!(DERIVE_LOCK_KEY, -5_268_553_599_984_485_251);
+        assert_eq!(
+            DERIVE_LOCK_KEY as u64,
+            fnv1a64(DERIVE_LOCK_NAMESPACE.as_bytes())
+        );
+    }
+
+    /// The cadence threshold must sit *below* the interval, or `derived_at`
+    /// (stamped one derive-duration after the tick that produced it) would look
+    /// too young on every tick and halve the real cadence forever.
+    #[test]
+    fn cadence_threshold_leaves_room_for_one_derive() {
+        // Default 24 h cadence: the tolerance is the whole tick budget.
+        let day = DEFAULT_DERIVE_INTERVAL_SECS;
+        assert_eq!(
+            cadence_threshold_secs(day),
+            day - DERIVE_TICK_BUDGET.as_secs()
+        );
+
+        // At the floor the 10% cap binds instead, so a short configured cadence
+        // can't be pulled to twice its rate by a large fixed tolerance.
+        let floor = DERIVE_INTERVAL_FLOOR_SECS;
+        assert_eq!(cadence_threshold_secs(floor), floor - floor / 10);
+
+        // And it is always a real skip window, never zero or negative.
+        for interval in [floor, 3_600, day] {
+            let t = cadence_threshold_secs(interval);
+            assert!(
+                t > 0 && t < interval,
+                "threshold {t} out of range for {interval}"
+            );
+        }
     }
 }
