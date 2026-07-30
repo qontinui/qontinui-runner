@@ -34,6 +34,36 @@ use crate::mcp::types::{api_error, ApiResponse, ApiState};
 /// is attributed to a page over cannot drift apart.
 pub(crate) const DEFAULT_WINDOW_DAYS: i32 = 90;
 
+/// Cadence of the background global derive loop, in seconds. Overridable via
+/// [`DERIVE_INTERVAL_ENV`]; floored at [`DERIVE_INTERVAL_FLOOR_SECS`] so a
+/// mis-set env var can't turn a Python clustering round-trip into a hot loop.
+const DEFAULT_DERIVE_INTERVAL_SECS: u64 = 86_400;
+
+/// Lower bound on the derive cadence. Derivation is O(fingerprints²) inside
+/// Python; anything under 10 min is a misconfiguration, not a preference.
+const DERIVE_INTERVAL_FLOOR_SECS: u64 = 600;
+
+/// Delay before the loop's *first* derive. Startup (PG pool, Python bridge
+/// warm-up, auto-load of the default SM) must finish first, and a heavy
+/// clustering pass at process start would compete with it. Overridable via
+/// [`DERIVE_INITIAL_DELAY_ENV`].
+const DEFAULT_DERIVE_INITIAL_DELAY_SECS: u64 = 3_600;
+
+/// Wall-clock budget for one derive tick. Generously above [`BRIDGE_TIMEOUT`]
+/// so the bridge's own timeout normally fires first; this only catches a
+/// wedged PG pool. Exceeding it drops the tick and keeps the loop alive.
+const DERIVE_TICK_BUDGET: Duration = Duration::from_secs(300);
+
+/// Cadence override for the background derive loop, in seconds.
+pub const DERIVE_INTERVAL_ENV: &str = "QONTINUI_STATE_DERIVE_INTERVAL_SECS";
+
+/// Override for the delay before the loop's first derive, in seconds.
+pub const DERIVE_INITIAL_DELAY_ENV: &str = "QONTINUI_STATE_DERIVE_INITIAL_DELAY_SECS";
+
+/// Override for the loop's observation lookback window, in days. Replaces the
+/// supervisor's retired `QONTINUI_FLYWHEEL_DERIVE_WINDOW_DAYS`.
+pub const DERIVE_WINDOW_DAYS_ENV: &str = "QONTINUI_STATE_DERIVE_WINDOW_DAYS";
+
 /// Max time budget for the Python `discover_states_from_renders` call. The
 /// clustering is hierarchical agglomerative over up to O(fingerprints²), so
 /// growth is quadratic in the fingerprint universe, not in observation count.
@@ -176,6 +206,128 @@ pub async fn derive(
     .await
 }
 
+// ---------------------------------------------------------------------------
+// Background global derive loop
+// ---------------------------------------------------------------------------
+
+/// Resolve the loop cadence from [`DERIVE_INTERVAL_ENV`], defaulting to
+/// [`DEFAULT_DERIVE_INTERVAL_SECS`] and flooring at
+/// [`DERIVE_INTERVAL_FLOOR_SECS`].
+fn derive_interval_secs() -> u64 {
+    std::env::var(DERIVE_INTERVAL_ENV)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_DERIVE_INTERVAL_SECS)
+        .max(DERIVE_INTERVAL_FLOOR_SECS)
+}
+
+/// Resolve the pre-first-tick delay from [`DERIVE_INITIAL_DELAY_ENV`],
+/// defaulting to [`DEFAULT_DERIVE_INITIAL_DELAY_SECS`]. Not floored — `0` is a
+/// legitimate value for a test harness that wants an immediate derive.
+fn derive_initial_delay_secs() -> u64 {
+    std::env::var(DERIVE_INITIAL_DELAY_ENV)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_DERIVE_INITIAL_DELAY_SECS)
+}
+
+/// Resolve the lookback window from [`DERIVE_WINDOW_DAYS_ENV`], defaulting to
+/// [`DEFAULT_WINDOW_DAYS`]. Non-positive values are ignored rather than
+/// clamped — a `0` in the environment is a typo, not a request for an empty
+/// window.
+fn derive_window_days() -> i32 {
+    std::env::var(DERIVE_WINDOW_DAYS_ENV)
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .filter(|d| *d > 0)
+        .unwrap_or(DEFAULT_WINDOW_DAYS)
+}
+
+/// Background loop that derives states **once, globally**, on a nightly-ish
+/// cadence. Spawned from `main.rs` alongside the drift detector.
+///
+/// # Why one global derive and not one per app / per spec
+///
+/// A state is a set of elements sharing a render-set signature, and several
+/// states are active at once: elements `{a,b,c}` seen on pages 1-4 form one
+/// state, `{d,e}` seen on pages 2-3 form another, and page 2 has BOTH.
+/// Clustering therefore needs the cross-view render pool — deriving per page
+/// would give every persistent element on that page an identical render-set,
+/// collapsing the page into one mega-state and duplicating shared chrome N
+/// times. The page label is a **selection key, not a partition key**; the
+/// per-page projection happens downstream in
+/// `workflow_generation::spec_authoring::load_and_project_skeleton`.
+///
+/// So `spec_id` is deliberately `None`: the artifact is written with
+/// `spec_id IS NULL`, which is exactly what
+/// `spec_authoring::load_latest_global_artifact` selects on. Passing a concrete
+/// spec id here would make the artifacts unreadable to the only consumer.
+///
+/// This loop also replaces the supervisor's per-app flywheel derive step, which
+/// ran the identical global derivation once per registered app (N byte-identical
+/// artifacts per night) and only ever ran on the operator's dev-only supervisor,
+/// so no ordinary user got derivation at all.
+///
+/// Errors inside a tick log but never kill the loop.
+pub async fn run_derive_loop(app_state: Arc<crate::commands::AppState>) {
+    let interval_secs = derive_interval_secs();
+    let initial_delay_secs = derive_initial_delay_secs();
+
+    info!(
+        "state-derive: starting global derive loop (interval={}s, initial_delay={}s, window_days={})",
+        interval_secs,
+        initial_delay_secs,
+        derive_window_days()
+    );
+
+    // One-shot initial delay so PG bootstrap, the Python bridge warm-up and the
+    // default-SM auto-load all finish before the first (heavy) derivation. The
+    // drift detector achieves the same by discarding `interval`'s immediate
+    // first tick; a 24 h cadence can't use that trick, because the first derive
+    // would then be a day out on every restart.
+    tokio::time::sleep(Duration::from_secs(initial_delay_secs)).await;
+
+    let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+    // Explicit, NOT the `Burst` default: a tick that outruns the interval must
+    // drop the missed tick rather than queue back-to-back clustering passes.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        // First tick resolves immediately — i.e. at `initial_delay_secs` after
+        // start, never at process start.
+        ticker.tick().await;
+
+        let window_days = derive_window_days();
+        let pg_db = app_state.pg_db.clone();
+        // spec_id = None → global corpus, artifact persisted with spec_id NULL.
+        match tokio::time::timeout(
+            DERIVE_TICK_BUDGET,
+            derive(pg_db, app_state.clone(), None, window_days),
+        )
+        .await
+        {
+            Ok(Ok(v)) => {
+                let observation_count = v.get("observation_count").and_then(|n| n.as_i64());
+                match observation_count {
+                    Some(n) => info!(
+                        "state-derive: global derivation complete (observations={}, window_days={})",
+                        n, window_days
+                    ),
+                    None => warn!(
+                        "state-derive: global derivation complete but observation_count was \
+                         absent from the persisted artifact — response shape may have drifted"
+                    ),
+                }
+            }
+            Ok(Err(e)) => warn!("state-derive: tick failed: {}", e),
+            Err(_) => warn!(
+                "state-derive: tick exceeded {}s budget; skipping",
+                DERIVE_TICK_BUDGET.as_secs()
+            ),
+        }
+    }
+}
+
 /// Minimal shape we need from the observations table for derivation.
 struct LoadedObservation {
     id: String,
@@ -290,4 +442,44 @@ async fn persist_artifact(
         "observation_count": observation_count,
         "artifact": artifact_body,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The env helpers must fall back to the documented defaults when nothing
+    /// is set. Guarded on the var being absent so a deliberately-configured
+    /// dev box doesn't fail its own test run (same pattern as
+    /// `agent_worktree::fs_backstop`).
+    #[test]
+    fn env_helpers_default_when_unset() {
+        if std::env::var(DERIVE_INTERVAL_ENV).is_err() {
+            assert_eq!(derive_interval_secs(), DEFAULT_DERIVE_INTERVAL_SECS);
+        }
+        if std::env::var(DERIVE_INITIAL_DELAY_ENV).is_err() {
+            assert_eq!(
+                derive_initial_delay_secs(),
+                DEFAULT_DERIVE_INITIAL_DELAY_SECS
+            );
+        }
+        if std::env::var(DERIVE_WINDOW_DAYS_ENV).is_err() {
+            assert_eq!(derive_window_days(), DEFAULT_WINDOW_DAYS);
+        }
+    }
+
+    /// The cadence floor must sit at or below the default, otherwise the
+    /// `.max()` in `derive_interval_secs` would silently override the default.
+    #[test]
+    fn interval_floor_is_below_default() {
+        const { assert!(DERIVE_INTERVAL_FLOOR_SECS <= DEFAULT_DERIVE_INTERVAL_SECS) };
+    }
+
+    /// The tick budget must exceed the bridge timeout, so a slow-but-working
+    /// clustering pass is cut off by the bridge (with a real error) rather
+    /// than by the loop's outer guard (with a generic "budget exceeded").
+    #[test]
+    fn tick_budget_exceeds_bridge_timeout() {
+        assert!(DERIVE_TICK_BUDGET > BRIDGE_TIMEOUT);
+    }
 }
