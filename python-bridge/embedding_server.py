@@ -43,8 +43,20 @@ CPU vs CUDA embeddings of the same texts agree to a minimum cosine of
 embedding_client.rs) still names the same space and stored vectors stay
 comparable.
 
-The device therefore defaults to `cpu` and CUDA is opt-in via
-`EMBEDDING_DEVICE`.
+Environment
+-----------
+    EMBEDDING_HOST / EMBEDDING_PORT  bind address (127.0.0.1:8001)
+    EMBEDDING_DEVICE                 cpu (default) | cuda | mps.  "auto" is
+                                     rejected — it silently means "cuda" here.
+                                     An accelerator that turns out to be
+                                     unusable downgrades to cpu rather than
+                                     failing on the first request.
+    EMBEDDING_TORCH_THREADS          torch intra-op threads (default 4)
+    EMBEDDING_CACHE_SIZE             LRU entries, memory-only (default 4096)
+
+The runner's Process Manager passes no env of its own (`dev_services.rs` uses
+an empty map) but the child inherits the runner's environment, so these are set
+on the runner process, not per-service.
 """
 
 import os
@@ -79,18 +91,34 @@ DEFAULT_DEVICE = "cpu"
 
 #: Intra-op thread count for CPU inference.  Left unbounded, torch grabs one
 #: thread per core (16 on the dev box) and every request pays fork/join barrier
-#: costs on a machine that is already busy.  Measured single-text latency here:
-#: 4 threads 12.2 ms, 8 threads 21.5 ms, 2 threads 35.7 ms, 1 thread 33.2 ms.
+#: costs on a machine that is already busy.  Single-text latency on a loaded box
+#: measured fastest around 4 (4: 12.2 ms, 8: 21.5 ms, 1-2: 33-36 ms) — those are
+#: single-shot samples on a contended machine, so treat 4 as a sane bound rather
+#: than a tuned optimum.  This bounds intra-op parallelism only; interop and OMP
+#: pools are left to torch's defaults.
 DEFAULT_TORCH_THREADS = 4
+MAX_TORCH_THREADS = 64
 
-#: Entries in the in-memory embedding cache.  Bounded (LRU) and memory-only —
-#: 4096 x 384 float32 is ~6 MB.  Disk persistence is deliberately off: the
-#: library's default writes one .npy per distinct text into the temp dir with
-#: no bound at all.
+#: Entries in the in-memory embedding cache.  Bounded (LRU) and memory-only.
+#: Entries are copied in (see `_build_cache`), so 4096 x 384 float32 really is
+#: ~6 MB.  Disk persistence is deliberately off: the library's default writes
+#: one .npy per distinct text into the temp dir with no bound at all.
 DEFAULT_CACHE_SIZE = 4096
+MAX_CACHE_SIZE = 1_000_000
+
+#: Texts embedded per acquisition of `_inference_lock`.  A batch request is
+#: server-issued (memory_synthesis.rs forwards `job.input_texts` verbatim) and
+#: unbounded, but `_inference_lock` serialises every endpoint — so one large job
+#: would otherwise hold the lock for seconds and time out unrelated callers,
+#: which budget 10 s (phase_helpers.rs) and 30 s (embedding_client.rs).
+#: Chunking bounds the hold to ~0.1 s without capping what a caller may ask for.
+#: Staying at or below 100 also keeps sentence-transformers' `show_progress_bar`
+#: heuristic (`len(texts) > 100`) off, so no tqdm bar sprays into the runner's
+#: captured stderr.
+TEXTS_PER_LOCK = 64
 
 
-def _env_int(name: str, default: int, minimum: int) -> int:
+def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     """Read an int from the environment, falling back to `default` on garbage."""
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
@@ -100,8 +128,11 @@ def _env_int(name: str, default: int, minimum: int) -> int:
     except ValueError:
         print(f"[embedding-server] {name}={raw!r} is not an integer; using {default}", flush=True)
         return default
-    if value < minimum:
-        print(f"[embedding-server] {name}={value} is below {minimum}; using {default}", flush=True)
+    if not minimum <= value <= maximum:
+        print(
+            f"[embedding-server] {name}={value} is outside [{minimum}, {maximum}]; using {default}",
+            flush=True,
+        )
         return default
     return value
 
@@ -133,8 +164,14 @@ def resolve_device(raw: str | None) -> str:
 
 
 DEVICE = resolve_device(os.environ.get("EMBEDDING_DEVICE"))
-TORCH_THREADS = _env_int("EMBEDDING_TORCH_THREADS", DEFAULT_TORCH_THREADS, minimum=1)
-CACHE_SIZE = _env_int("EMBEDDING_CACHE_SIZE", DEFAULT_CACHE_SIZE, minimum=1)
+TORCH_THREADS = _env_int(
+    "EMBEDDING_TORCH_THREADS", DEFAULT_TORCH_THREADS, minimum=1, maximum=MAX_TORCH_THREADS
+)
+CACHE_SIZE = _env_int("EMBEDDING_CACHE_SIZE", DEFAULT_CACHE_SIZE, minimum=1, maximum=MAX_CACHE_SIZE)
+
+#: The device actually in use.  Differs from `DEVICE` when an accelerator was
+#: requested but is not usable on this machine — see `_usable_device`.
+EFFECTIVE_DEVICE = DEVICE
 
 # ---------------------------------------------------------------------------
 # Lazy-loaded, thread-safe embedding provider singleton
@@ -151,8 +188,64 @@ _provider_lock = threading.Lock()
 _inference_lock = threading.Lock()
 
 
+def _usable_device(device: str, torch_module) -> str:
+    """Downgrade to CPU when the requested accelerator is not actually usable.
+
+    Asking for an unavailable accelerator does not fail loudly: the model load
+    raises on the *first request*, the endpoint catches it, and the caller gets
+    HTTP 200 with an empty embedding — which the Rust client stores verbatim
+    (`src-tauri/src/database/embedding_client.rs` deserialises `embedding` and
+    never reads `success`).  An empty vector in the memory store is worse than a
+    slow one, so probe first and fall back.
+
+    Args:
+        device: The configured device name.
+        torch_module: The imported `torch` module (injected so this is testable
+            without the ML stack).
+
+    Returns:
+        `device` if it is usable here, otherwise ``"cpu"``.
+    """
+    if device == "cuda" and not torch_module.cuda.is_available():
+        print(
+            "[embedding-server] EMBEDDING_DEVICE=cuda but no usable CUDA runtime; using 'cpu'",
+            flush=True,
+        )
+        return "cpu"
+    if device == "mps":
+        backends = getattr(torch_module.backends, "mps", None)
+        if backends is None or not backends.is_available():
+            print(
+                "[embedding-server] EMBEDDING_DEVICE=mps but no usable MPS backend; using 'cpu'",
+                flush=True,
+            )
+            return "cpu"
+    return device
+
+
+def _build_cache(cache_cls, max_size: int):
+    """Build a bounded, memory-only embedding cache that stores copies.
+
+    `EmbeddingCache.set_batch` zips the `(N, 384)` result with the texts, and
+    iterating a 2-D numpy array yields *row views* whose `.base` is the whole
+    parent array.  Caching a view pins the entire batch — one surviving row out
+    of a 5000-text job retains ~7 MB — so the LRU's entry-count bound would not
+    be a byte bound at all.  Copying on the way in makes it one.
+
+    Args:
+        cache_cls: The `EmbeddingCache` class (injected for testability).
+        max_size: Maximum number of entries to retain.
+    """
+
+    class _CopyingEmbeddingCache(cache_cls):  # type: ignore[valid-type,misc]
+        def set(self, text, model, embedding):
+            super().set(text, model, embedding.copy())
+
+    return _CopyingEmbeddingCache(max_size=max_size, persist_to_disk=False)
+
+
 def _get_provider():
-    global _provider
+    global _provider, EFFECTIVE_DEVICE
     if _provider is not None:
         return _provider
     with _provider_lock:
@@ -168,36 +261,43 @@ def _get_provider():
         )
 
         torch.set_num_threads(TORCH_THREADS)
+        device = _usable_device(DEVICE, torch)
 
         config = EmbeddingConfig(
             provider=EmbeddingProviderType.SENTENCE_TRANSFORMERS,
-            device=DEVICE,
+            device=device,
         )
-        base = get_embedding_provider(config)
-        _provider = CachedEmbeddingProvider(
-            base,
-            cache=EmbeddingCache(max_size=CACHE_SIZE, persist_to_disk=False),
+        provider = CachedEmbeddingProvider(
+            get_embedding_provider(config),
+            cache=_build_cache(EmbeddingCache, CACHE_SIZE),
         )
         print(
             f"[embedding-server] Loaded model={config.get_model_name()} "
-            f"dim={_provider.dimension} device={DEVICE} "
+            f"dim={provider.dimension} device={device} "
             f"torch_threads={torch.get_num_threads()} cache_max={CACHE_SIZE}",
             flush=True,
         )
+        # Publish last: the fast path above is lock-free, so nothing may observe
+        # a half-initialised provider.
+        EFFECTIVE_DEVICE = device
+        _provider = provider
     return _provider
 
 
 def _memory_mb() -> dict[str, float]:
     """Best-effort process memory snapshot for the status probe.
 
-    psutil is not a declared dependency of python-bridge, so this degrades to
-    an empty dict rather than failing the probe.
+    psutil arrives transitively (it is in poetry.lock, not pyproject.toml), and
+    `memory_info()` can raise AccessDenied on a hardened Windows box — so this
+    degrades to an empty dict rather than flipping a healthy service to
+    `available: false`.
     """
     try:
         import psutil
-    except ImportError:
+
+        info = psutil.Process().memory_info()
+    except Exception:
         return {}
-    info = psutil.Process().memory_info()
     return {
         "private_mb": round(getattr(info, "private", info.rss) / (1024 * 1024), 1),
         "rss_mb": round(info.rss / (1024 * 1024), 1),
@@ -230,6 +330,7 @@ class BatchEmbeddingResponse(BaseModel):
     success: bool
     embeddings: list[list[float]]
     embedding_dim: int
+    error: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +347,9 @@ def compute_text_embedding(request: TextEmbeddingRequest):
         provider = _get_provider()
         with _inference_lock:
             vec = provider.embed(request.text)
+        # `.tolist()` is load-bearing, not cosmetic: on a cache hit `vec` IS the
+        # cached array, so anything that mutated it in place would corrupt every
+        # later hit.  Serialise by copying; never hand `vec` onward.
         return TextEmbeddingResponse(
             success=True,
             embedding=vec.tolist(),
@@ -262,21 +366,38 @@ def compute_text_embedding(request: TextEmbeddingRequest):
 
 @app.post("/api/embeddings/compute-batch", response_model=BatchEmbeddingResponse)
 def compute_batch_embedding(request: BatchEmbeddingRequest):
-    """Compute 384-dim embeddings for multiple texts."""
+    """Compute 384-dim embeddings for multiple texts.
+
+    Order and count of `embeddings` always mirror `texts` — the Rust caller
+    hard-rejects a mismatch (`src-tauri/src/memory/tenant_sync.rs`).
+    """
     try:
+        import numpy as np
+
         provider = _get_provider()
-        with _inference_lock:
-            matrix = provider.embed_batch(request.texts)
+        texts = request.texts
+        if not texts:
+            with _inference_lock:
+                matrix = provider.embed_batch(texts)
+        else:
+            # Chunked so a large job cannot hold `_inference_lock` long enough
+            # to time out a concurrent caller.  See TEXTS_PER_LOCK.
+            chunks = []
+            for start in range(0, len(texts), TEXTS_PER_LOCK):
+                with _inference_lock:
+                    chunks.append(provider.embed_batch(texts[start : start + TEXTS_PER_LOCK]))
+            matrix = chunks[0] if len(chunks) == 1 else np.vstack(chunks)
         return BatchEmbeddingResponse(
             success=True,
             embeddings=[row.tolist() for row in matrix],
             embedding_dim=int(matrix.shape[1]) if len(matrix) > 0 else 384,
         )
-    except Exception:
+    except Exception as e:
         return BatchEmbeddingResponse(
             success=False,
             embeddings=[],
             embedding_dim=0,
+            error=str(e),
         )
 
 
@@ -289,13 +410,14 @@ def embedding_status():
             "available": True,
             "model": "all-MiniLM-L6-v2",
             "dimension": provider.dimension,
-            "device": DEVICE,
+            "device": EFFECTIVE_DEVICE,
+            "requested_device": DEVICE,
             "torch_threads": TORCH_THREADS,
             "cache": provider.cache_stats(),
             "memory": _memory_mb(),
         }
     except Exception as e:
-        return {"available": False, "error": str(e), "device": DEVICE}
+        return {"available": False, "error": str(e), "requested_device": DEVICE}
 
 
 # ---------------------------------------------------------------------------
