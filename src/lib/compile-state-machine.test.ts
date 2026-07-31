@@ -1,14 +1,20 @@
 /**
  * Tests for compileStateMachineFromSpecs.
  *
- * Focus: the duplicate-elements quarantine path. Successful compilation
- * paths are exercised indirectly by the rest of the runner; these tests
- * pin two invariants:
+ * Focus: the duplicate-elements quarantine path and the exclusive
+ * spec-state ↔ artifact-cluster assignment. Successful compilation paths are
+ * exercised indirectly by the rest of the runner; these tests pin four
+ * invariants:
  *   1. Element uniqueness is enforced **per-spec**: two states inside the
  *      same spec sharing an element triggers a quarantine.
  *   2. The same element appearing in two different specs is FINE — that's
  *      the whole point of per-spec scoping (e.g. "Save" button on
  *      TasksPage and ChecksPage shouldn't collide).
+ *   3. Cluster assignment is EXCLUSIVE: no two spec states may be promoted
+ *      onto the same cluster, so two states sharing an element count no
+ *      longer collide by construction.
+ *   4. That assignment is deterministic — same inputs, same result, whatever
+ *      order the states were declared in.
  */
 
 import { describe, it, expect } from "vitest";
@@ -53,8 +59,8 @@ function makeSingleStateSpec(specDescription: string, stateId: string, label: st
 
 /**
  * Build a spec whose states each claim `elementCount` distinct button
- * elements. Element count is what the opaque cluster-size-proximity arm of
- * `matchArtifactCluster` keys on, so it is the lever these artifact tests
+ * elements. Element count is what the size-proximity tier of
+ * `assignClustersToStates` keys on, so it is the lever these artifact tests
  * pull to steer a state at a specific cluster.
  */
 function makeSpecWithElementCounts(
@@ -162,6 +168,42 @@ const CLUSTER_12: DiscoveryCluster = {
     "reg:c903de4e7d0234d3",
     "reg:d738c06805ef0817",
     "reg:e073f42cc5c5c905",
+  ],
+};
+
+/**
+ * An 8-element cluster that OVERLAPS `CLUSTER_8` on exactly one element
+ * (`reg:ee71472921be0054`); its other seven ids are borrowed from
+ * `CLUSTER_12`, so every value here still comes from the same real row.
+ *
+ * Co-occurrence clustering does not guarantee disjoint element sets across
+ * clusters — shared chrome routinely lands in more than one render-set — so
+ * two DISTINCT clusters claiming one element is a real artifact shape, and it
+ * is the only remaining route to an observed/observed double-claim now that
+ * cluster assignment is exclusive. The tests that pin the hard invariant use
+ * this rather than the old "two states, one cluster" shape, which the
+ * assignment now makes impossible by construction.
+ */
+const CLUSTER_8_OVERLAPPING: DiscoveryCluster = {
+  id: "fp_state_overlapping01",
+  name: "overlapping (8 elements)",
+  metadata: {},
+  confidence: 0.85,
+  screenshotIds: [
+    "0d43cb6d-30c6-43a0-bc5d-978ee413fd82",
+    "3548f81e-438d-4e94-8713-80ce684a08df",
+    "a0cc4ba3-b39e-480a-a17d-4730e22f2fcf",
+  ],
+  stateImageIds: [
+    "reg:2cb8fe51659b8838",
+    "reg:2cdbd39bcf0340d8",
+    "reg:4600966709943788",
+    "reg:61e42e6c010ac100",
+    "reg:67016769ddda63cd",
+    "reg:92bc5420f878857e",
+    "reg:a0d22181d1e29247",
+    // The single shared element — also in CLUSTER_8.
+    "reg:ee71472921be0054",
   ],
 };
 
@@ -291,16 +333,253 @@ describe("compileStateMachineFromSpecs", () => {
     // Per-spec scoping means both observed states must live in the SAME
     // spec to trigger the throw.
     //
-    // Both states carry 8 elements, so cluster-size proximity steers BOTH at
-    // CLUSTER_8; promotion then replaces their (distinct) spec elements with
-    // that cluster's single shared fingerprint set → collision.
+    // Exclusive assignment means two states can no longer share one cluster,
+    // so the collision has to come from the artifact itself: two DISTINCT
+    // clusters that both claim `ee71472921be0054`. Each 8-element state takes
+    // one of the two 8-element clusters, both promote, and their fingerprint
+    // sets intersect.
     const config = makeSpecWithElementCounts("a", [
       { stateId: "sa", elementCount: 8 },
       { stateId: "sb", elementCount: 8 },
     ]);
     expect(() =>
-      compileStateMachineFromSpecs([{ specId: "a", config }], makeArtifact([CLUSTER_8])),
+      compileStateMachineFromSpecs(
+        [{ specId: "a", config }],
+        makeArtifact([CLUSTER_8, CLUSTER_8_OVERLAPPING]),
+      ),
     ).toThrow(/one-state-per-element invariant violated/);
+  });
+});
+
+describe("exclusive cluster assignment", () => {
+  it("gives two same-size states in one spec DIFFERENT clusters instead of throwing", () => {
+    // THE regression this change exists for. Before exclusive assignment,
+    // `matchArtifactCluster` ran per state and independently steered BOTH
+    // 8-element states at CLUSTER_8; both were promoted to `observed` with
+    // that cluster's identical fingerprint set, and the cross-state
+    // uniqueness check then correctly rejected them by THROWING.
+    //
+    // That is the common case, not an edge case: measured over the real spec
+    // corpus, 64 of 67 specs have at least two states sharing an element
+    // count. It stayed latent only because every caller passed `undefined`
+    // for the artifact.
+    //
+    // CLUSTER_8 (8 elements) and CLUSTER_12 (12 elements) are disjoint, and
+    // both sit inside an 8-element state's tolerance of max(2, ceil(8/2)) = 4.
+    const config = makeSpecWithElementCounts("a", [
+      { stateId: "sa", elementCount: 8 },
+      { stateId: "sb", elementCount: 8 },
+    ]);
+
+    const result = compileStateMachineFromSpecs(
+      [{ specId: "a", config }],
+      makeArtifact([CLUSTER_8, CLUSTER_12]),
+    );
+
+    // 1. It does not throw, and it does not quarantine.
+    expect(result.compiled).toBe(true);
+    if (!result.compiled) return;
+
+    // 2. Both states were promoted...
+    const byId = new Map(result.stateMachine.states.map((s) => [s.id, s]));
+    expect(byId.get("sa")?.provenance).toBe("observed");
+    expect(byId.get("sb")?.provenance).toBe("observed");
+
+    // 3. ...onto DIFFERENT clusters. `observationCount` is the render-set
+    //    size, which differs between the two (14 vs 5), so it identifies
+    //    which cluster each state actually claimed.
+    expect(byId.get("sa")?.provenanceMeta?.observationCount).toBe(14);
+    expect(byId.get("sb")?.provenanceMeta?.observationCount).toBe(5);
+    expect(byId.get("sa")?.provenanceMeta?.support).toBe(CLUSTER_8.confidence);
+    expect(byId.get("sb")?.provenanceMeta?.support).toBe(CLUSTER_12.confidence);
+
+    // Both were won on shape alone, and the record says so — an operator can
+    // tell these apart from an evidence-backed promotion without re-deriving.
+    expect(byId.get("sa")?.provenanceMeta?.matchTier).toBe("size-proximity");
+    expect(byId.get("sa")?.provenanceMeta?.sizeDifference).toBe(0);
+    expect(byId.get("sb")?.provenanceMeta?.matchTier).toBe("size-proximity");
+    expect(byId.get("sb")?.provenanceMeta?.sizeDifference).toBe(4);
+    expect(byId.get("sa")?.provenanceMeta?.sharedElementCount).toBeUndefined();
+
+    // 4. And their element sets are genuinely disjoint — the property the
+    //    old code violated by handing both states the same fingerprints.
+    const fingerprints = (stateId: string) =>
+      new Set(
+        (byId.get(stateId)?.requiredElements ?? []).map((q) => q.attributes?.["data-fingerprint"]),
+      );
+    const saFps = fingerprints("sa");
+    const sbFps = fingerprints("sb");
+    expect(saFps.size).toBe(8);
+    expect(sbFps.size).toBe(12);
+    expect([...saFps].filter((f) => sbFps.has(f))).toEqual([]);
+  });
+
+  it("leaves the losing state `ai-generated` when there is only one cluster to go round", () => {
+    // The exclusivity guarantee in its sharpest form: one cluster, two
+    // equally-good claimants. Exactly one wins; the loser keeps its
+    // AI-authored elements rather than being promoted onto a cluster
+    // another state has an equal claim to. This is the precise input that
+    // used to throw.
+    const config = makeSpecWithElementCounts("a", [
+      { stateId: "sa", elementCount: 8 },
+      { stateId: "sb", elementCount: 8 },
+    ]);
+
+    const result = compileStateMachineFromSpecs(
+      [{ specId: "a", config }],
+      makeArtifact([CLUSTER_8]),
+    );
+
+    expect(result.compiled).toBe(true);
+    if (!result.compiled) return;
+
+    const byId = new Map(result.stateMachine.states.map((s) => [s.id, s]));
+    // Tie-break is state id ascending, so "sa" takes the only cluster.
+    expect(byId.get("sa")?.provenance).toBe("observed");
+    expect(byId.get("sb")?.provenance).toBe("ai-generated");
+    expect(result.stats.provenanceCounts.observed).toBe(1);
+    expect(result.stats.provenanceCounts["ai-generated"]).toBe(1);
+
+    // The loser's spec-authored elements survive untouched — it is not
+    // stripped, and it does not inherit the winner's fingerprints.
+    expect(byId.get("sb")?.provenanceMeta).toBeUndefined();
+    expect(byId.get("sb")?.requiredElements).toHaveLength(8);
+    expect(byId.get("sb")?.requiredElements[0].ariaLabel).toBe("sb-element-0");
+  });
+
+  it("assigns deterministically — same inputs twice produce an identical assignment", () => {
+    // A pure tie: both states carry 10 elements, and both clusters sit at
+    // |size - 10| = 2, inside the tolerance of max(2, ceil(10/2)) = 5. Every
+    // one of the four (state, cluster) candidates therefore has the SAME tier
+    // and the SAME strength, so nothing but the deterministic tie-break
+    // decides the outcome. Without one, the winner would fall out of input
+    // order or sort internals and the same specs would compile to different
+    // observed element sets on different runs.
+    const makeInputs = (states: Array<{ stateId: string; elementCount: number }>) => [
+      { specId: "a", config: makeSpecWithElementCounts("a", states) },
+    ];
+    const project = (result: ReturnType<typeof compileStateMachineFromSpecs>) => {
+      if (!result.compiled) throw new Error("expected a compiled result");
+      // Sorted by id so the projection reflects the ASSIGNMENT only, never
+      // the order states happened to be declared in.
+      return [...result.stateMachine.states]
+        .sort((x, y) => x.id.localeCompare(y.id))
+        .map((s) => ({
+          id: s.id,
+          provenance: s.provenance,
+          support: s.provenanceMeta?.support,
+          elements: s.requiredElements.map((q) => q.attributes?.["data-fingerprint"]),
+        }));
+    };
+
+    const declared = [
+      { stateId: "sa", elementCount: 10 },
+      { stateId: "sb", elementCount: 10 },
+    ];
+    const artifactClusters = [CLUSTER_8, CLUSTER_12];
+
+    const first = project(
+      compileStateMachineFromSpecs(makeInputs(declared), makeArtifact(artifactClusters)),
+    );
+    const second = project(
+      compileStateMachineFromSpecs(makeInputs(declared), makeArtifact(artifactClusters)),
+    );
+
+    // 1. Run-to-run stability.
+    expect(second).toEqual(first);
+
+    // 2. The tie-break is by ID, not by declaration order: reversing the
+    //    order the states are declared in must not move a single element.
+    const reversed = project(
+      compileStateMachineFromSpecs(
+        makeInputs([...declared].reverse()),
+        makeArtifact(artifactClusters),
+      ),
+    );
+    expect(reversed).toEqual(first);
+
+    // 3. And it is the documented rule — state id ascending paired with
+    //    cluster id ascending ("fp_state_9435…" < "fp_state_d695…").
+    expect(first.map((s) => s.id)).toEqual(["sa", "sb"]);
+    expect(first[0].support).toBe(CLUSTER_8.confidence);
+    expect(first[1].support).toBe(CLUSTER_12.confidence);
+  });
+
+  it("prefers a shared-element match over a perfectly size-matched one", () => {
+    // The two-tier intent, preserved rather than flattened into one number:
+    // a structured overlap (the state and the cluster canonically name the
+    // SAME element) always outranks mere size proximity, however good the
+    // size match is.
+    //
+    // This also pins that the structured tier is REACHABLE. It used to be
+    // annotated as dead, and was: it compared spec `role|name|tag` triples
+    // against raw artifact ids, and the adapter emits neither. Keying both
+    // sides through `elementQueryKey` — the compiler's own canonical element
+    // identity, the same predicate the uniqueness pass uses — makes an
+    // `id:` fingerprint match a spec element carrying that id.
+    const spec: SpecConfig = {
+      version: "1",
+      description: "tiers",
+      groups: [],
+      stateMachine: {
+        states: [
+          {
+            id: "st",
+            name: "st",
+            elements: [{ id: "save-button" }, { role: "button", accessibleName: "Other" }],
+            transitions: [],
+          },
+        ],
+      },
+    };
+
+    // Shares one element with the state, but is WAY off on size: |6 - 2| = 4,
+    // outside the size tolerance of max(2, ceil(2/2)) = 2. It is admissible
+    // only via the structured tier — which is exactly the point.
+    const sharesAnElement: DiscoveryCluster = {
+      id: "fp_state_aaa_structured",
+      name: null,
+      confidence: 0.9,
+      screenshotIds: ["r1", "r2", "r3"],
+      stateImageIds: [
+        "reg:id:save-button",
+        "reg:2cb8fe51659b8838",
+        "reg:2cdbd39bcf0340d8",
+        "reg:4600966709943788",
+        "reg:61e42e6c010ac100",
+        "reg:67016769ddda63cd",
+      ],
+    };
+    // A flawless size match (|2 - 2| = 0) that shares nothing with the state.
+    // Sorts FIRST by cluster id, so a tier-blind greedy pass would take it.
+    const perfectSizeOnly: DiscoveryCluster = {
+      id: "fp_state_aaa_opaque",
+      name: null,
+      confidence: 0.95,
+      screenshotIds: ["r4"],
+      stateImageIds: ["reg:92bc5420f878857e", "reg:a0d22181d1e29247"],
+    };
+
+    const result = compileStateMachineFromSpecs(
+      [{ specId: "tiers", config: spec }],
+      makeArtifact([perfectSizeOnly, sharesAnElement]),
+    );
+
+    expect(result.compiled).toBe(true);
+    if (!result.compiled) return;
+    const [state] = result.stateMachine.states;
+    expect(state.provenance).toBe("observed");
+    // Structured tier won despite the other cluster being a perfect size
+    // match with HIGHER confidence and a lower cluster id.
+    expect(state.provenanceMeta?.support).toBe(sharesAnElement.confidence);
+    expect(state.requiredElements).toHaveLength(6);
+    expect(state.requiredElements).toContainEqual({ id: "save-button" });
+
+    // And the record distinguishes this from the size-proximity promotions
+    // above: one shared element, no size term.
+    expect(state.provenanceMeta?.matchTier).toBe("element-overlap");
+    expect(state.provenanceMeta?.sharedElementCount).toBe(1);
+    expect(state.provenanceMeta?.sizeDifference).toBeUndefined();
   });
 });
 
@@ -308,7 +587,7 @@ describe("discovery-artifact provenance promotion", () => {
   it("promotes a spec state to `observed` from a REAL-shaped artifact", () => {
     // This is the regression the whole change exists for: before the fix the
     // reader looked for `elements` / `support` / `contrast`, none of which the
-    // adapter emits, so `matchArtifactCluster` returned undefined for every
+    // adapter emits, so the matcher returned undefined for every
     // cluster and NO state could ever reach `observed`.
     const config = makeSpecWithElementCounts("dashboard", [
       { stateId: "dashboard-loaded", elementCount: 8 },
@@ -373,10 +652,10 @@ describe("discovery-artifact provenance promotion", () => {
     expect(byId.get("s12")?.provenanceMeta?.observationCount).toBe(5);
   });
 
-  it("leaves a state `ai-generated` when the matched cluster is below MIN_SUPPORT", () => {
-    // Same code path, same real shape — only `confidence` differs. Pins that
-    // the support gate is what rejects this state, not a failed match: the
-    // 3-element spec state lines up exactly with the 3-element cluster.
+  it("leaves a state `ai-generated` when the only cluster is below MIN_SUPPORT", () => {
+    // Same code path, same real shape — only `confidence` differs. The
+    // 3-element spec state lines up EXACTLY with the 3-element cluster, so
+    // shape is not what rejects it; support is.
     expect(CLUSTER_3_LOW_CONFIDENCE.confidence).toBeLessThan(MIN_SUPPORT);
     const config = makeSpecWithElementCounts("sparse", [
       { stateId: "sparse-state", elementCount: 3 },
@@ -394,6 +673,121 @@ describe("discovery-artifact provenance promotion", () => {
     // Spec-authored elements survive untouched.
     expect(state.requiredElements).toHaveLength(3);
     expect(state.requiredElements[0].ariaLabel).toBe("sparse-state-element-0");
+  });
+
+  it("does not let a below-MIN_SUPPORT cluster shadow a promotable one", () => {
+    // A below-support cluster can never promote anything, so under exclusive
+    // assignment it must not be allowed to hold a claim: doing so would block
+    // the claiming state from a cluster that COULD promote it while promoting
+    // nobody. `buildClusterPool` therefore drops it before scoring, rather
+    // than matching first and gating on support afterwards.
+    //
+    // This is a deliberate behaviour change. The old matcher picked the
+    // size-closest cluster first, so the 3-element low-confidence cluster
+    // shadowed everything else for a 3-element state and it fell to
+    // `ai-generated`. Now the state takes the best cluster that can actually
+    // support a promotion, provided it is still within tolerance —
+    // |8 - 3| = 5 is outside max(2, ceil(3/2)) = 2, so CLUSTER_8 is NOT it;
+    // the low-confidence cluster is simply gone, and nothing admissible
+    // remains.
+    const config = makeSpecWithElementCounts("sparse", [
+      { stateId: "sparse-state", elementCount: 3 },
+    ]);
+    const shadowed = compileStateMachineFromSpecs(
+      [{ specId: "sparse", config }],
+      makeArtifact([CLUSTER_3_LOW_CONFIDENCE, CLUSTER_8]),
+    );
+    expect(shadowed.compiled).toBe(true);
+    if (!shadowed.compiled) return;
+    expect(shadowed.stateMachine.states[0].provenance).toBe("ai-generated");
+
+    // Same state, but now a promotable cluster IS within tolerance
+    // (|4 - 3| = 1 <= 2). The low-confidence 3-element cluster is an exact
+    // size match and would have won under the old match-then-gate order;
+    // because it is pre-filtered out, the 4-element cluster wins instead and
+    // the state is promoted rather than silently left AI-authored.
+    const promotable: DiscoveryCluster = {
+      id: "fp_state_promotable4",
+      name: null,
+      metadata: {},
+      confidence: 0.91,
+      screenshotIds: ["r1", "r2"],
+      stateImageIds: [
+        "reg:2cb8fe51659b8838",
+        "reg:2cdbd39bcf0340d8",
+        "reg:4600966709943788",
+        "reg:61e42e6c010ac100",
+      ],
+    };
+    const unshadowed = compileStateMachineFromSpecs(
+      [{ specId: "sparse", config }],
+      makeArtifact([CLUSTER_3_LOW_CONFIDENCE, promotable]),
+    );
+    expect(unshadowed.compiled).toBe(true);
+    if (!unshadowed.compiled) return;
+    const [state] = unshadowed.stateMachine.states;
+    expect(state.provenance).toBe("observed");
+    expect(state.provenanceMeta?.support).toBe(0.91);
+    expect(state.requiredElements).toHaveLength(4);
+  });
+
+  it("does not let an element-less cluster shadow a promotable one", () => {
+    // Same shadowing hazard, different filter. `["reg:"]` is one raw id that
+    // strips to "" and decodes to ZERO element queries, so the cluster cannot
+    // promote anything. The old matcher counted raw ids, so it scored as a
+    // perfect size match for a 1-element state, won, and then failed the
+    // element-count guard — leaving the state `ai-generated` while a usable
+    // cluster sat unclaimed. The pool now counts DECODED elements, so it is
+    // excluded up front.
+    const elementLess: DiscoveryCluster = {
+      id: "fp_state_aaa_empty",
+      name: null,
+      metadata: {},
+      confidence: 0.95,
+      screenshotIds: ["r1"],
+      stateImageIds: ["reg:"],
+    };
+    const usable: DiscoveryCluster = {
+      id: "fp_state_bbb_usable",
+      name: null,
+      metadata: {},
+      confidence: 0.9,
+      screenshotIds: ["r2", "r3"],
+      stateImageIds: ["reg:2cb8fe51659b8838", "reg:2cdbd39bcf0340d8"],
+    };
+    const config = makeSpecWithElementCounts("thin", [{ stateId: "thin-state", elementCount: 1 }]);
+    const result = compileStateMachineFromSpecs(
+      [{ specId: "thin", config }],
+      makeArtifact([elementLess, usable]),
+    );
+
+    expect(result.compiled).toBe(true);
+    if (!result.compiled) return;
+    const [state] = result.stateMachine.states;
+    expect(state.provenance).toBe("observed");
+    expect(state.provenanceMeta?.support).toBe(0.9);
+    expect(state.requiredElements).toHaveLength(2);
+  });
+
+  it("rejects a NaN confidence instead of promoting on it", () => {
+    // The support gate is written as a negated ACCEPT (`!(c >= MIN_SUPPORT)`)
+    // rather than a REJECT (`c < MIN_SUPPORT`) because those are not
+    // complements under NaN. Written the other way a NaN would pass the pool
+    // and be persisted as `provenanceMeta.support: NaN`.
+    const nanConfidence = {
+      ...CLUSTER_8,
+      id: "fp_state_nan",
+      confidence: NaN,
+    } as DiscoveryCluster;
+    const config = makeSpecWithElementCounts("nan", [{ stateId: "n", elementCount: 8 }]);
+    const result = compileStateMachineFromSpecs(
+      [{ specId: "nan", config }],
+      makeArtifact([nanConfidence]),
+    );
+
+    expect(result.compiled).toBe(true);
+    if (!result.compiled) return;
+    expect(result.stateMachine.states[0].provenance).toBe("ai-generated");
   });
 
   it("ignores the phantom pre-#886 artifact keys entirely", () => {
@@ -461,19 +855,30 @@ describe("discovery-artifact provenance promotion", () => {
     // for `elementQueryKey` to hash. If that keyed to "" the uniqueness pass
     // would skip it and two observed states could silently both claim the
     // same element — the exact invariant this compiler exists to protect.
+    //
+    // Under exclusive assignment the two states must take DIFFERENT clusters,
+    // so the shared `id:save-button` has to come from two distinct clusters
+    // that both name it.
     const idOnly: DiscoveryCluster = {
-      id: "fp_state_id_only",
+      id: "fp_state_id_only_a",
       name: null,
       confidence: 0.9,
       screenshotIds: ["r1"],
       stateImageIds: ["reg:id:save-button"],
     };
+    const idOnlyPlus: DiscoveryCluster = {
+      id: "fp_state_id_only_b",
+      name: null,
+      confidence: 0.9,
+      screenshotIds: ["r2"],
+      stateImageIds: ["reg:id:save-button", "reg:aria:Save changes"],
+    };
     const config = makeSpecWithElementCounts("dup", [
       { stateId: "d1", elementCount: 1 },
-      { stateId: "d2", elementCount: 1 },
+      { stateId: "d2", elementCount: 2 },
     ]);
     expect(() =>
-      compileStateMachineFromSpecs([{ specId: "dup", config }], makeArtifact([idOnly])),
+      compileStateMachineFromSpecs([{ specId: "dup", config }], makeArtifact([idOnly, idOnlyPlus])),
     ).toThrow(/one-state-per-element invariant violated/);
   });
 
