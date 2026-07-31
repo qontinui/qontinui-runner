@@ -474,15 +474,12 @@ pub async fn move_terminal_handler(
     let terminal_manager = get_terminal_manager(&state);
     let app_handle = state.app_handle.clone();
 
-    let page_id = request
-        .page_id
-        .filter(|p| !p.is_empty())
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(api_error("pageId is required and must be non-empty")),
-            )
-        })?;
+    let page_id = request.page_id.filter(|p| !p.is_empty()).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(api_error("pageId is required and must be non-empty")),
+        )
+    })?;
 
     info!("HTTP: Moving terminal {} to page {}", id, page_id);
 
