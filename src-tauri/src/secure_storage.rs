@@ -414,33 +414,33 @@ impl SecureStorage {
     /// `MOVEFILE_REPLACE_EXISTING` on Windows, so the swap is atomic on NTFS
     /// just like POSIX rename).
     ///
-    /// The file is then hardened to owner-only (`fs_perms::restrict_to_owner`):
-    /// Unix `0600`, Windows protected owner-only DACL. Ordering is deliberate —
-    /// `fs_perms::write_owner_only` would restrict the file but is a plain
-    /// truncate-then-write, so using it here would trade the torn-write bug
-    /// above for the permission fix. Atomicity is the property a racing reader
-    /// depends on, so it wins; the hardening is layered on top of the swapped-in
-    /// file. That leaves a brief window after the rename where the new inode
-    /// carries default (parent-inherited) permissions — narrower than the
-    /// whole-write window a non-atomic owner-only write would leave open, and
-    /// the contents are AES-GCM-bound to this machine/user regardless.
+    /// The file is ALSO owner-only (Unix `0600`, Windows protected owner-only
+    /// DACL), and specifically owner-only *from the moment it exists* —
+    /// `atomic_write_owner_only` hardens the temp file before the rename.
     ///
-    /// Hardening failure is logged, not fatal: losing the credential write over
-    /// the permission step would be worse than a readable-but-encrypted file.
+    /// Both properties are required and the ordering is not interchangeable:
+    ///
+    /// - `fs_perms::write_owner_only` alone is a plain truncate-then-write, so
+    ///   it would trade the torn-write bug above for the permission fix.
+    /// - `atomic_write` followed by a permission fix leaves the ciphertext
+    ///   world-readable for the whole write (the temp is created with the
+    ///   default umask), and — because the rename installs a NEW inode — a
+    ///   failure of that post-hoc fix would leave a previously-`0600` store at
+    ///   `0644`, silently de-hardening a file that was already safe.
+    ///
+    /// Hardening failure therefore FAILS the write rather than warning: the
+    /// alternative is publishing a readable credential store while reporting
+    /// success. Note the AES-GCM key derives from hostname / service / username
+    /// — all inputs another LOCAL user can reproduce — so "it's encrypted" is
+    /// not a substitute for the file mode against the local-reader threat this
+    /// hardening exists for.
     fn save_tokens(&self, tokens: &StoredTokens) -> Result<()> {
         let json = serde_json::to_vec(tokens).context("Failed to serialize tokens")?;
 
         let encrypted = self.encrypt(&json)?;
 
-        crate::fs_atomic::atomic_write(&self.storage_path, &encrypted)
+        crate::fs_atomic::atomic_write_owner_only(&self.storage_path, &encrypted)
             .context("Failed to write storage file")?;
-
-        if let Err(e) = crate::fs_perms::restrict_to_owner(&self.storage_path) {
-            tracing::warn!(
-                "secure_storage: owner-only hardening failed ({e}); the store is written \
-                 and still AES-GCM-bound to this machine/user"
-            );
-        }
 
         debug!("Saved tokens to secure storage");
         Ok(())

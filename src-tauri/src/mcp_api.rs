@@ -1066,6 +1066,19 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// (`coord_migration_reserve`, `coord_reserve_resource`), and policy/state
 /// mutation (`coord_request_policy`, `coord_flag_state`, `coord_flag_states`).
 ///
+/// LOAD-BEARING, do not strip as "reads nobody uses": `coord_list_prompt_documents`
+/// and `coord_get_prompt_document` are how the fleet reads served POLICY, and the
+/// `/policy` skill's transport cascade calls them through THIS proxy (a
+/// `tools/call` POST to `/coord-mcp` with the `.mcp.json` nonce). Every session is
+/// required to read policy before substantive work, so omitting them does not fail
+/// loudly — `/policy` silently falls through to its last-resort `qontinui-dev-notes`
+/// mirrors and the fleet starts booting off stale policy with nothing surfaced.
+/// `coord_gate_list` / `coord_withdraw_gate` are the same story for `/gate-sweep`
+/// and `/gate`, which already document driving them over this proxy.
+///
+/// `coord_write_prompt_document` stays OUT: policy authorship is tenant-gated and
+/// belongs to an operator, not a device nonce.
+///
 /// MUST stay sorted — membership is a `binary_search`.
 const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_ack_message",
@@ -1074,6 +1087,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_attest_gate",
     "coord_blockers",
     "coord_build_info",
+    "coord_can",
     "coord_change_conflict",
     "coord_check_gate_predicate",
     "coord_check_install_safety",
@@ -1084,6 +1098,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_claim_release",
     "coord_conflict_check",
     "coord_declare_intent",
+    "coord_diagnose",
     "coord_diff_impact",
     "coord_edit_predict",
     "coord_edit_predict_and_check",
@@ -1098,12 +1113,15 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_find_references",
     "coord_gate_doctor",
     "coord_gate_inspect",
+    "coord_gate_list",
     "coord_gate_status",
     "coord_get_answer",
+    "coord_get_prompt_document",
     "coord_inbox",
     "coord_is_commit_live",
     "coord_is_merge_safe",
     "coord_layering_triage",
+    "coord_list_prompt_documents",
     "coord_list_worktrees",
     "coord_memory_record",
     "coord_memory_search",
@@ -1130,7 +1148,11 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_twin_catalog",
     "coord_typecheck_file",
     "coord_who_is_working_on",
+    "coord_withdraw_gate",
+    "coord_work_unit_add_citation",
     "coord_work_unit_list",
+    "coord_work_unit_list_citations",
+    "coord_work_unit_remove_citation",
     "coord_work_unit_transition",
     "coord_work_unit_upsert",
     "coord_yield",
@@ -5126,7 +5148,12 @@ mod coord_mcp_body_gate_tests {
     /// The MCP handshake + the legitimate coordination surface forwards.
     #[test]
     fn allows_handshake_and_coordination_tools() {
-        for method in ["initialize", "tools/list", "ping", "notifications/initialized"] {
+        for method in [
+            "initialize",
+            "tools/list",
+            "ping",
+            "notifications/initialized",
+        ] {
             assert!(
                 gate(serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":{}}))
                     .is_ok(),
@@ -5190,7 +5217,12 @@ mod coord_mcp_body_gate_tests {
     /// gate closes (resources/prompts/logging/arbitrary methods).
     #[test]
     fn rejects_non_allowlisted_methods_and_malformed_bodies() {
-        for method in ["resources/read", "prompts/get", "logging/setLevel", "shutdown"] {
+        for method in [
+            "resources/read",
+            "prompts/get",
+            "logging/setLevel",
+            "shutdown",
+        ] {
             assert!(
                 gate(serde_json::json!({"jsonrpc":"2.0","id":1,"method":method})).is_err(),
                 "{method} must be refused"
@@ -5199,10 +5231,10 @@ mod coord_mcp_body_gate_tests {
         // No method at all.
         assert!(gate(serde_json::json!({"jsonrpc":"2.0","id":1})).is_err());
         // tools/call with no tool name.
-        assert!(
-            gate(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}))
-                .is_err()
-        );
+        assert!(gate(
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}})
+        )
+        .is_err());
         // Not JSON at all.
         let err = coord_mcp_body_gate(b"not json {").unwrap_err();
         assert_eq!(err.id, serde_json::Value::Null);
@@ -5222,7 +5254,11 @@ mod coord_mcp_body_gate_tests {
             {"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"coord_request_merge"}},
         ]))
         .unwrap_err();
-        assert_eq!(id, serde_json::json!(9), "the offending element's id is echoed");
+        assert_eq!(
+            id,
+            serde_json::json!(9),
+            "the offending element's id is echoed"
+        );
         assert!(gate(serde_json::json!([])).is_err(), "empty batch refused");
     }
 }
