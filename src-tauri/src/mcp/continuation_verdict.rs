@@ -394,7 +394,10 @@ fn rules_cache() -> &'static Mutex<Option<(Instant, String)>> {
 
 /// Device JWT + coord base, the exact accessor pair `fleet_policy_poller`
 /// uses. `Err` = cannot consult coord (⇒ Unreachable ⇒ allow).
-fn coord_client_parts() -> Result<(String, String), String> {
+///
+/// Shared with [`crate::mcp::session_compliance`], which rides the same Stop
+/// hook and must present the same credential against the same coord base.
+pub(super) fn coord_client_parts() -> Result<(String, String), String> {
     let jwt = crate::auth::AuthManager::new()
         .get_access_token()
         .ok()
@@ -406,7 +409,10 @@ fn coord_client_parts() -> Result<(String, String), String> {
     Ok((base.trim_end_matches('/').to_string(), jwt))
 }
 
-fn http_client() -> Result<reqwest::Client, String> {
+/// Short-timeout HTTP client for turn-end coord reads. Shared with
+/// [`crate::mcp::session_compliance`] — a turn-end hook must never hang on a
+/// slow coord.
+pub(super) fn http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(4))
         .build()
@@ -586,6 +592,72 @@ pub struct VerdictResponse {
     /// The status word the decision saw (`absent` when coord had none,
     /// `unreachable` when coord could not be consulted).
     pub status_seen: String,
+    /// Which feature produced this verdict: `continuation` (the
+    /// [`FLAG_ENV`]-gated session-autonomy arm) or `compliance` (the
+    /// coord-config-gated POLICY_COMPLIANCE nudge). Explicit because the two
+    /// are switched independently, so `{"mode":"off","decision":"block"}` is a
+    /// legitimate response and anything asserting "flag off ⇒ never blocks"
+    /// must discriminate on THIS field, not on `mode`.
+    pub source: &'static str,
+}
+
+/// Deliver a session-compliance nudge as a `block` verdict, subject to the
+/// loop guards this module already owns.
+///
+/// The compliance check (plan `2026-07-30-session-compliance-report-
+/// enforcement.md` §A4) deliberately does NOT rebuild the guards: it inherits
+/// the rolling hourly cap here, and the `stop_hook_active` short-circuit
+/// inside [`crate::mcp::session_compliance::observe_turn_end`]. The
+/// once-per-session marker is consumed only on actual DELIVERY — a candidate
+/// the cap swallowed stays eligible for a later turn.
+///
+/// `None` = do not nudge; the caller falls through to its own verdict.
+fn deliver_compliance_nudge(
+    session_key: &str,
+    nudge: Option<crate::mcp::session_compliance::ComplianceNudge>,
+    mode: Mode,
+) -> Option<VerdictResponse> {
+    let nudge = nudge?;
+    let now = Instant::now();
+    if cap_registry().would_exceed(session_key, now, effective_cap()) {
+        info!(
+            session = %session_key,
+            "continuation-verdict: session-compliance nudge suppressed — hourly cap reached"
+        );
+        return None;
+    }
+    // Compare-and-set: two Stops racing for one session must not both deliver.
+    // Losing the claim means another turn already sent it — allow this stop.
+    if !crate::mcp::session_compliance::mark_nudged(&nudge.session_id) {
+        return None;
+    }
+    cap_registry().record(session_key, now);
+    let reason = "session-compliance: verdict `unverified` with a non-empty coord footprint \
+                  — nudging once"
+        .to_string();
+    // The same one-line-per-Stop verdict log the continuation arm writes, so
+    // the soak sample is not blind on exactly the turns that blocked.
+    info!(
+        session = %session_key,
+        mode = mode.as_str(),
+        status = "compliance",
+        decision = "block",
+        would_block = true,
+        stop_hook_active = false,
+        claude_session = %nudge.session_id,
+        reason = %reason,
+        "continuation-verdict"
+    );
+    Some(VerdictResponse {
+        decision: "block",
+        prompt: Some(nudge.prompt),
+        mode: mode.as_str(),
+        reason,
+        would_block: true,
+        session: session_key.to_string(),
+        status_seen: "compliance".to_string(),
+        source: "compliance",
+    })
 }
 
 /// Compute the continuation verdict for `session_key` given the raw Stop-hook
@@ -593,9 +665,21 @@ pub struct VerdictResponse {
 pub async fn continuation_verdict(session_key: &str, hook_input: &Value) -> VerdictResponse {
     let mode = Mode::from_env();
 
-    // Fast path: dark flag ⇒ allow with ZERO coord traffic (the hook is
-    // provisioned fleet-wide, so this is the hot path until the ramp).
+    // Session compliance-report detection + verdict emit (plan
+    // `2026-07-30-session-compliance-report-enforcement.md` §A1). Runs on
+    // EVERY Stop, independent of [`FLAG_ENV`]: that flag governs the
+    // CONTINUATION feature, whereas compliance enforcement is switched by
+    // coord's per-tenant config and nothing else (there is deliberately no
+    // second local flag). Fail-open — every error path yields `None`, and the
+    // whole call is inert until coord serves the config route.
+    let compliance = crate::mcp::session_compliance::observe_turn_end(hook_input).await;
+
+    // Fast path: dark flag ⇒ allow with ZERO continuation coord traffic (the
+    // hook is provisioned fleet-wide, so this is the hot path until the ramp).
     if mode == Mode::Off {
+        if let Some(v) = deliver_compliance_nudge(session_key, compliance, mode) {
+            return v;
+        }
         debug!(
             session = %session_key,
             "continuation-verdict: flag off — allow"
@@ -608,6 +692,7 @@ pub async fn continuation_verdict(session_key: &str, hook_input: &Value) -> Verd
             would_block: false,
             session: session_key.to_string(),
             status_seen: "unconsulted".to_string(),
+            source: "continuation",
         };
     }
 
@@ -624,6 +709,15 @@ pub async fn continuation_verdict(session_key: &str, hook_input: &Value) -> Verd
     let cap_exhausted = cap_registry().would_exceed(session_key, now, cap);
 
     let verdict = decide(mode, stop_hook_active, &status, cap_exhausted);
+
+    // A continuation block already carries its own prompt — never stack a
+    // second one onto the same turn. The compliance nudge is offered only
+    // when the continuation arm allows the stop.
+    if verdict.decision != "block" {
+        if let Some(v) = deliver_compliance_nudge(session_key, compliance, mode) {
+            return v;
+        }
+    }
 
     let status_seen = match &status {
         StatusFetch::Reachable(Some(s)) => s.clone(),
@@ -658,6 +752,7 @@ pub async fn continuation_verdict(session_key: &str, hook_input: &Value) -> Verd
         would_block: verdict.would_block,
         session: session_key.to_string(),
         status_seen,
+        source: "continuation",
     }
 }
 
@@ -956,5 +1051,64 @@ mod tests {
     fn default_rules_text_is_the_umbrella_prompt() {
         assert!(DEFAULT_CONTINUATION_RULES.contains("follow-ups"));
         assert!(DEFAULT_CONTINUATION_RULES.contains("finished"));
+    }
+
+    // ── Session-compliance nudge delivery ────────────────────────────────
+    //
+    // These pin the three §A4 invariants that live on THIS side of the seam:
+    // the cap is inherited (not rebuilt), the nudge is independent of
+    // `FLAG_ENV`, and the once-per-session claim is only consumed on real
+    // delivery.
+
+    use crate::mcp::session_compliance::ComplianceNudge;
+
+    fn nudge_for(session: &str) -> ComplianceNudge {
+        ComplianceNudge {
+            session_id: session.to_string(),
+            prompt: "produce the block".to_string(),
+        }
+    }
+
+    #[test]
+    fn no_candidate_means_no_block() {
+        assert!(deliver_compliance_nudge("cv-none", None, Mode::On).is_none());
+    }
+
+    #[test]
+    fn a_candidate_blocks_even_when_the_continuation_flag_is_off() {
+        // The compliance feature is switched by coord's per-tenant config, NOT
+        // by FLAG_ENV — a dark continuation ramp must not disable it.
+        let key = "cv-off-mode-still-blocks";
+        let v = deliver_compliance_nudge(key, Some(nudge_for(key)), Mode::Off)
+            .expect("compliance blocks under Mode::Off");
+        assert_eq!(v.decision, "block");
+        assert_eq!(v.source, "compliance");
+        assert_eq!(v.mode, "off");
+        assert_eq!(v.prompt.as_deref(), Some("produce the block"));
+        // Delivery consumed the session's single claim.
+        assert!(!crate::mcp::session_compliance::mark_nudged(key));
+    }
+
+    #[test]
+    fn an_exhausted_cap_suppresses_the_nudge_and_leaves_it_eligible() {
+        let key = "cv-cap-exhausted";
+        let now = Instant::now();
+        for _ in 0..effective_cap() {
+            cap_registry().record(key, now);
+        }
+        assert!(deliver_compliance_nudge(key, Some(nudge_for(key)), Mode::On).is_none());
+        // The once-per-session claim must NOT have been burned by a nudge the
+        // cap swallowed — a later turn is still allowed to deliver it.
+        assert!(
+            crate::mcp::session_compliance::mark_nudged(key),
+            "cap suppression must leave the session's nudge claim unconsumed"
+        );
+    }
+
+    #[test]
+    fn a_session_already_nudged_is_not_nudged_again() {
+        let key = "cv-already-nudged";
+        assert!(crate::mcp::session_compliance::mark_nudged(key));
+        assert!(deliver_compliance_nudge(key, Some(nudge_for(key)), Mode::On).is_none());
     }
 }

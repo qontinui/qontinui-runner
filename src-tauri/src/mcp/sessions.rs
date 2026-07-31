@@ -722,6 +722,23 @@ async fn context_low(Path(id): Path<String>, body: axum::body::Bytes) -> Json<se
 }
 
 // =============================================================================
+// /sessions/compliance-coverage
+// =============================================================================
+
+/// `GET /sessions/compliance-coverage` — the §A1a coverage bound: an honest,
+/// STATIC statement of which sessions the compliance check can see.
+///
+/// Consumed by the qontinui-web enforcement panel so the operator is told the
+/// boundary directly instead of inferring it. It is deliberately not a
+/// computed number — see
+/// [`crate::mcp::session_compliance::coverage_bound`] for why deriving it from
+/// the runner's `liveUntracked` tracking-health metric would be confidently
+/// wrong.
+async fn compliance_coverage() -> Json<crate::mcp::session_compliance::CoverageBound> {
+    Json(crate::mcp::session_compliance::coverage_bound())
+}
+
+// =============================================================================
 // Routes
 // =============================================================================
 
@@ -854,6 +871,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/sessions/spawn", post(spawn_session))
         .route("/sessions/{id}/message", post(send_message))
         .route("/sessions/history", get(list_history))
+        .route("/sessions/compliance-coverage", get(compliance_coverage))
         .route("/sessions/{id}/touched-files", get(get_touched_files))
         .route("/sessions/{id}/transcript", get(get_transcript))
         .route(

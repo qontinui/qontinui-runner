@@ -163,7 +163,7 @@ pub(crate) fn account_from_config_dir(config_dir: Option<&str>) -> PastSessionAc
 /// `config_dir`; falls back to scanning every known Claude config dir (a
 /// session's account may have been re-encoded / moved). Requires a
 /// `working_dir` to build the encoded project path.
-fn resolve_transcript_path(
+pub(crate) fn resolve_transcript_path(
     config_dir: Option<&str>,
     working_dir: Option<&str>,
     session_id: &str,
