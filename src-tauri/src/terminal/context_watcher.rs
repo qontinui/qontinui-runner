@@ -31,6 +31,16 @@
 //! spawn path so the session still gets a continuation (the debounce means
 //! this is the single recovery attempt either way).
 //!
+//! A spawned continuation also inherits the exhausted session's
+//! [`InheritedContext`] — its working directory and its Claude account. The
+//! cwd is the load-bearing half: the summary prompt tells the continuation to
+//! `git status` "in the working directory" and inspect worktrees, which means
+//! nothing if the session starts in the runner process's cwd (wherever the exe
+//! was launched). Both are validated in-process and OMITTED when unusable,
+//! because the spawn handler rejects a bad `cwd`/`account` outright and losing
+//! the whole continuation over an echoed-back detail would make this recovery
+//! path less robust than not carrying them at all.
+//!
 //! The transition is then reported through the runner's EXISTING coord
 //! status-report surface — a `progress` outbox row draining to
 //! `PATCH /sessions/:id {progress:{…}}` (`session::coord_sync`). When the
@@ -477,17 +487,107 @@ fn report_transition(
     }
 }
 
-/// Spawn a continuation session through the EXISTING `POST /sessions/spawn`
-/// handler (loopback — the same code path agents use), seeded with the
-/// handoff-summary prompt. Returns the new `taskRunId`.
-async fn spawn_continuation(
+/// What a continuation inherits from the session it replaces: WHERE that
+/// session was working, and WHICH Claude account it was working as.
+///
+/// Both are resolved against live in-process state and are `None` when
+/// unusable, because this is a best-effort recovery path: the spawn handler
+/// 400s an unusable `cwd` and 400/409s an unresolvable `account`, and losing
+/// the whole continuation over an echoed-back detail would make the feature
+/// LESS robust than not carrying them at all. Validate here, omit on doubt.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct InheritedContext {
+    /// The source terminal's working directory, when it still exists.
+    pub cwd: Option<String>,
+    /// The source session's pinned Claude `config_dir`, when it still resolves
+    /// to a logged-in roster account.
+    pub account: Option<String>,
+}
+
+/// Keep a source terminal's working directory only if it still names a live
+/// directory. The unit-test seam for the cwd half of [`InheritedContext`] —
+/// it touches the filesystem (one `is_dir`), so it takes the path as an
+/// argument rather than reaching for the terminal itself.
+///
+/// Blank is what a terminal spawned with no explicit cwd carries; a path that
+/// no longer resolves is typically a worktree the platform already reclaimed.
+pub fn usable_cwd(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || !std::path::Path::new(trimmed).is_dir() {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Resolve what the continuation inherits from the terminal it replaces.
+///
+/// Called only on the spawn path — the handoff path carries this state through
+/// coord's restorable bundle instead, so it must not pay for these lookups.
+fn inherited_context(terminal_id: &str) -> InheritedContext {
+    use tauri::Manager;
+
+    let cwd = crate::tauri_app_handle::current()
+        .and_then(|app| {
+            app.try_state::<Arc<crate::terminal::TerminalManager>>()
+                .and_then(|tm| tm.get(terminal_id))
+        })
+        .and_then(|session| usable_cwd(session.working_dir()));
+
+    InheritedContext {
+        cwd,
+        account: source_account(terminal_id),
+    }
+}
+
+/// The Claude account the exhausted session was running as, as a roster
+/// `config_dir` the spawn handler will accept.
+///
+/// Read from the session-lifecycle store's spawn-time record (`config_dir` is
+/// STICKY there) and then RE-RESOLVED through the same roster validation the
+/// spawn handler applies, so an account that has since been removed from the
+/// roster or logged out degrades to `None` — global resolution — instead of
+/// 400/409-ing the continuation away.
+fn source_account(terminal_id: &str) -> Option<String> {
+    use tauri::Manager;
+
+    let app = crate::tauri_app_handle::current()?;
+    let store =
+        app.try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()?;
+    let config_dir = store
+        .find_open_by_terminal(terminal_id)?
+        .config_dir
+        .filter(|d| !d.trim().is_empty())?;
+
+    match crate::ai_provider::resolve_requested_account(&config_dir) {
+        Ok(resolved) => Some(resolved.config_dir),
+        Err(e) => {
+            debug!(
+                terminal = %terminal_id,
+                config_dir = %config_dir,
+                error = %e.message(),
+                "context_watcher: source account no longer resolvable — continuation falls back \
+                 to global account resolution"
+            );
+            None
+        }
+    }
+}
+
+/// The exact `POST /sessions/spawn` body a continuation is spawned with. Pure,
+/// so the wire contract is pinned by a test instead of by a live spawn — the
+/// field names here are load-bearing and have silently drifted once already
+/// (an earlier revision sent `initial_prompt`, which deserialized to `None`
+/// and handed the continuation the generic greeting instead of its summary).
+///
+/// `cwd` and `account` are OMITTED rather than sent as `null` when unknown,
+/// so the handler's own defaults apply untouched.
+pub fn spawn_body(
     terminal_id: &str,
     title: Option<&str>,
     coord_session_id: Option<uuid::Uuid>,
-) -> Result<String, String> {
-    let port = crate::mcp::types::get_mcp_api_port();
-    let url = format!("http://127.0.0.1:{port}/sessions/spawn");
-    let body = json!({
+    inherited: &InheritedContext,
+) -> Value {
+    let mut body = json!({
         "task_name": format!(
             "Continuation of {}",
             title.filter(|t| !t.trim().is_empty()).unwrap_or(terminal_id)
@@ -496,6 +596,35 @@ async fn spawn_continuation(
         // the prompt is used verbatim as the first user message).
         "prompt": handoff_summary_prompt(terminal_id, title, coord_session_id),
     });
+    let map = body.as_object_mut().expect("json! built an object");
+    // The continuation's whole job is to recover work in a specific
+    // directory — the summary prompt tells it to `git status` there — so the
+    // source terminal's cwd is the load-bearing half of this body.
+    if let Some(cwd) = &inherited.cwd {
+        map.insert("cwd".to_string(), json!(cwd));
+    }
+    // Continue as the SAME Claude account, so a fleet running several accounts
+    // does not silently migrate the work onto whichever one global resolution
+    // happens to pick.
+    if let Some(account) = &inherited.account {
+        map.insert("account".to_string(), json!(account));
+    }
+    body
+}
+
+/// Spawn a continuation session through the EXISTING `POST /sessions/spawn`
+/// handler (loopback — the same code path agents use), seeded with the
+/// handoff-summary prompt and the exhausted session's inherited context.
+/// Returns the new `taskRunId`.
+async fn spawn_continuation(
+    terminal_id: &str,
+    title: Option<&str>,
+    coord_session_id: Option<uuid::Uuid>,
+) -> Result<String, String> {
+    let port = crate::mcp::types::get_mcp_api_port();
+    let url = format!("http://127.0.0.1:{port}/sessions/spawn");
+    let inherited = inherited_context(terminal_id);
+    let body = spawn_body(terminal_id, title, coord_session_id, &inherited);
     let client = reqwest::Client::builder()
         // The spawn handler blocks through the CLI init handshake; give it
         // room.
@@ -527,6 +656,8 @@ async fn spawn_continuation(
     info!(
         terminal = %terminal_id,
         continuation = %task_run_id,
+        cwd = inherited.cwd.as_deref().unwrap_or("<runner default>"),
+        account = inherited.account.as_deref().unwrap_or("<global resolution>"),
         "context_watcher: continuation session spawned with handoff-summary prompt"
     );
     Ok(task_run_id)
@@ -680,5 +811,74 @@ mod tests {
         let p = handoff_summary_prompt("term-9", None, None);
         assert!(p.contains("unnamed session"));
         assert!(p.contains("term-9"));
+    }
+
+    // ── inherited context: the continuation's cwd + account ──────────────
+
+    #[test]
+    fn usable_cwd_keeps_only_live_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        assert_eq!(usable_cwd(&path), Some(path.clone()));
+        // Surrounding whitespace is trimmed, not rejected.
+        assert_eq!(usable_cwd(&format!("  {path}  ")), Some(path.clone()));
+
+        // A terminal spawned with no explicit cwd carries a blank string.
+        assert_eq!(usable_cwd(""), None);
+        assert_eq!(usable_cwd("   "), None);
+        // A worktree the platform already reclaimed.
+        assert_eq!(
+            usable_cwd(&format!("{path}/gone-{}", uuid::Uuid::new_v4())),
+            None
+        );
+        // A FILE is not a working directory.
+        let file = dir.path().join("f.txt");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(usable_cwd(&file.to_string_lossy()), None);
+    }
+
+    #[test]
+    fn spawn_body_pins_the_wire_contract() {
+        // The field names here are the contract with
+        // `mcp::sessions::SpawnSessionRequest`. `prompt` (NOT `initial_prompt`)
+        // is the one that has already drifted once and silently handed a
+        // continuation the generic greeting; the rest ride along with it.
+        let cid = uuid::Uuid::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let inherited = InheritedContext {
+            cwd: Some(cwd.clone()),
+            account: Some("C:/roster/hotmail".to_string()),
+        };
+
+        let body = spawn_body("term-9", Some("fix auth bug"), Some(cid), &inherited);
+        assert_eq!(body["task_name"], json!("Continuation of fix auth bug"));
+        assert_eq!(
+            body["prompt"],
+            json!(handoff_summary_prompt(
+                "term-9",
+                Some("fix auth bug"),
+                Some(cid)
+            ))
+        );
+        assert_eq!(body["cwd"], json!(cwd));
+        assert_eq!(body["account"], json!("C:/roster/hotmail"));
+        // No `role`: the handler 400s role+prompt together.
+        assert!(body.get("role").is_none());
+    }
+
+    #[test]
+    fn spawn_body_omits_unknown_context_rather_than_nulling_it() {
+        // A `null` cwd/account would have to be special-cased by the handler;
+        // an ABSENT field lets its own `#[serde(default)]` defaults apply.
+        let body = spawn_body("term-9", None, None, &InheritedContext::default());
+        assert!(body.get("cwd").is_none(), "unknown cwd is omitted");
+        assert!(body.get("account").is_none(), "unknown account is omitted");
+        // Falls back to the terminal id when the session has no title.
+        assert_eq!(body["task_name"], json!("Continuation of term-9"));
+
+        // A blank title is treated as absent, same as the prompt builder.
+        let body = spawn_body("term-9", Some("   "), None, &InheritedContext::default());
+        assert_eq!(body["task_name"], json!("Continuation of term-9"));
     }
 }

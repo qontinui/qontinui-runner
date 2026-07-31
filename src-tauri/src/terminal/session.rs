@@ -1882,6 +1882,15 @@ impl TerminalSession {
         self.coord_session_id.lock().ok().and_then(|g| *g)
     }
 
+    /// The directory this terminal's shell was started in — the same value
+    /// [`Self::info`] reports, without cloning the whole snapshot. Frozen at
+    /// spawn (a `cd` inside the shell does not move it), which is what makes
+    /// it the right seed for a continuation session: it names the workspace
+    /// the terminal was opened against.
+    pub fn working_dir(&self) -> &str {
+        &self.working_dir
+    }
+
     /// Read the session's current display title (see [`Self::set_title`]).
     /// Poison-tolerant: title is pure text with no invariants to preserve.
     pub fn title(&self) -> String {
