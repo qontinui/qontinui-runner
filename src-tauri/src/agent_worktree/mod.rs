@@ -282,14 +282,17 @@ async fn pre_allocate_claim(
         metadata,
     );
 
-    let client = crate::coord_http::coord_client()
-        .ok_or_else(|| "no shared coord client".to_string())?;
+    let client =
+        crate::coord_http::coord_client().ok_or_else(|| "no shared coord client".to_string())?;
     let resp = crate::auth::attach_device_auth(
-        client.post(&url).timeout(Duration::from_secs(10)).json(&body),
+        client
+            .post(&url)
+            .timeout(Duration::from_secs(10))
+            .json(&body),
     )
-        .send()
-        .await
-        .map_err(|e| format!("POST {url}: {e}"))?;
+    .send()
+    .await
+    .map_err(|e| format!("POST {url}: {e}"))?;
     let status = resp.status();
     let body_text = resp
         .text()
@@ -573,14 +576,17 @@ async fn heartbeat_once(
         agent_session_id,
         serde_json::json!({}),
     );
-    let client = crate::coord_http::coord_client()
-        .ok_or_else(|| "no shared coord client".to_string())?;
+    let client =
+        crate::coord_http::coord_client().ok_or_else(|| "no shared coord client".to_string())?;
     let resp = crate::auth::attach_device_auth(
-        client.post(&url).timeout(Duration::from_secs(5)).json(&body),
+        client
+            .post(&url)
+            .timeout(Duration::from_secs(5))
+            .json(&body),
     )
-        .send()
-        .await
-        .map_err(|e| format!("POST {url}: {e}"))?;
+    .send()
+    .await
+    .map_err(|e| format!("POST {url}: {e}"))?;
     let status = resp.status();
     let body_text = resp.text().await.map_err(|e| format!("read body: {e}"))?;
     if !status.is_success() {
@@ -628,10 +634,13 @@ pub async fn release_claim_best_effort(
         return;
     };
     match crate::auth::attach_device_auth(
-        client.post(&url).timeout(Duration::from_secs(5)).json(&body),
+        client
+            .post(&url)
+            .timeout(Duration::from_secs(5))
+            .json(&body),
     )
-        .send()
-        .await
+    .send()
+    .await
     {
         Ok(r) => {
             debug!(
