@@ -250,9 +250,7 @@ impl ComplianceConfig {
                 .and_then(Value::as_str)
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
-            prompt_document_version: obj
-                .get("prompt_document_version")
-                .and_then(Value::as_i64),
+            prompt_document_version: obj.get("prompt_document_version").and_then(Value::as_i64),
         })
     }
 
@@ -512,7 +510,9 @@ impl ComplianceVerdict {
                 .to_string(),
             reconciliation: body.get("reconciliation").cloned().unwrap_or(Value::Null),
             footprint_prs: fp.map(|f| string_list(f.get("prs"))).unwrap_or_default(),
-            footprint_commits: fp.map(|f| string_list(f.get("commits"))).unwrap_or_default(),
+            footprint_commits: fp
+                .map(|f| string_list(f.get("commits")))
+                .unwrap_or_default(),
             footprint_claims: fp.map(|f| string_list(f.get("claims"))).unwrap_or_default(),
         }
     }
@@ -1098,7 +1098,8 @@ mod tests {
 
     #[test]
     fn extracts_an_unfenced_block() {
-        let text = "<!-- POLICY_COMPLIANCE v1 -->\n{\"schema\":\"policy-compliance/1\",\"items\":[]}";
+        let text =
+            "<!-- POLICY_COMPLIANCE v1 -->\n{\"schema\":\"policy-compliance/1\",\"items\":[]}";
         assert!(extract_compliance_block(text).is_some());
     }
 
@@ -1137,7 +1138,8 @@ mod tests {
 
     #[test]
     fn malformed_json_is_not_a_pass() {
-        let text = "<!-- POLICY_COMPLIANCE v1 -->\n```json\n{ \"schema\": \"policy-compliance/1\", \
+        let text =
+            "<!-- POLICY_COMPLIANCE v1 -->\n```json\n{ \"schema\": \"policy-compliance/1\", \
                     \"items\": [ {\"ref\": }\n```";
         assert!(extract_compliance_block(text).is_none());
     }
@@ -1425,7 +1427,10 @@ mod tests {
         let b = "session-compliance-test-marker-b";
         assert!(!already_nudged(a));
         assert!(mark_nudged(a), "first claim wins");
-        assert!(!mark_nudged(a), "second claim must lose — one nudge per session");
+        assert!(
+            !mark_nudged(a),
+            "second claim must lose — one nudge per session"
+        );
         assert!(already_nudged(a));
         assert!(!already_nudged(b));
     }
