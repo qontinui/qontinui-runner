@@ -123,10 +123,56 @@ fi
 # while `warn`-tier (style/complexity/perf) lints are emitted but do not fail
 # the push. See plan 2026-07-05-lint-tiers-and-diff-scoped-gates.
 echo "[pre-push] cargo clippy (levels from Cargo.toml [lints.clippy]; deny-tier blocks)"
-if ! cargo clippy; then
+
+# Capture clippy's output as well as showing it, so the failure message below can
+# name the ACTUAL cause instead of asserting one.
+#
+# This block used to be `if ! cargo clippy; then echo "a deny-tier lint fired"`,
+# which mapped EVERY non-zero exit onto one specific cause. That is false-safe in
+# the worst direction: it accuses you of writing a correctness bug when the
+# toolchain, the build cache, or the machine is at fault, and the message is
+# specific enough to be believed. Three distinct non-lint failures were observed
+# on one box on 2026-07-29 alone — a truncated `libserde-*.rmeta` (`E0786`) left
+# by an OOM-killed build, `tauri-runtime-wry` aborting with
+# STATUS_STACK_BUFFER_OVERRUN, and a cold build heading for the bin crate that
+# OOMs — every one of them reported as "a deny-tier clippy lint fired".
+#
+# `set -o pipefail` is already on (line 23), so the pipeline's status is cargo's
+# whenever cargo is the failing stage.
+CLIPPY_LOG="$(mktemp)"
+cleanup_clippy_log() { rm -f "$CLIPPY_LOG"; }
+trap 'restore_lock; cleanup_clippy_log' EXIT
+
+if ! cargo clippy 2>&1 | tee "$CLIPPY_LOG"; then
+  rc=$?
   echo
-  echo "[pre-push] FAIL — a deny-tier (correctness/suspicious) clippy lint fired."
-  echo "          Fix the lint, or QONTINUI_PREPUSH_SKIP=1 git push to let CI gate."
+  # Classify by what the log actually contains. Order matters: resource and
+  # toolchain failures can also emit an `error:` line, so they are tested first.
+  if grep -qiE 'memory allocation of|handle_alloc_error|out of memory|STATUS_STACK_BUFFER_OVERRUN|0xc0000409|SIGKILL|\bKilled\b' "$CLIPPY_LOG"; then
+    echo "[pre-push] FAIL — the build ran out of memory. This is NOT a lint failure."
+    echo "          rustc aborted on an allocation. Nothing is wrong with your code."
+    echo "          Free memory (close peer builds; check vmmemWSL) and retry, or"
+    echo "          QONTINUI_PREPUSH_SKIP=1 git push to let CI gate."
+  elif grep -qE 'E0786|invalid metadata files|failed to mmap' "$CLIPPY_LOG"; then
+    echo "[pre-push] FAIL — corrupt build cache. This is NOT a lint failure."
+    echo "          A .rmeta is truncated, usually from a previously killed build."
+    echo "          Delete the named artifact AND its debug/.fingerprint/<crate>-*"
+    echo "          dir, then retry. (A bare 'cargo clean' is blocked on shared"
+    echo "          target dirs, so remove just the one crate's files.)"
+  elif [[ "$rc" -eq 127 ]] || grep -qiE 'command not found|could not execute|no such file or directory' "$CLIPPY_LOG"; then
+    echo "[pre-push] FAIL — clippy could not run at all (exit $rc). This is NOT a lint failure."
+    echo "          Check the toolchain: rustup component add clippy."
+  elif grep -qE '^error(\[|:)' "$CLIPPY_LOG"; then
+    echo "[pre-push] FAIL — a deny-tier (correctness/suspicious) clippy lint fired."
+    echo "          Fix the lint, or QONTINUI_PREPUSH_SKIP=1 git push to let CI gate."
+  else
+    # Honest terminal: non-zero, but nothing in the log identifies why. Say that
+    # rather than guessing — a wrong specific cause is worse than an admitted
+    # unknown.
+    echo "[pre-push] FAIL — cargo clippy exited $rc, but the output identifies no"
+    echo "          specific cause. Full output is above. Do NOT assume a lint:"
+    echo "          re-run 'cargo clippy' directly before changing any code."
+  fi
   exit 1
 fi
 
