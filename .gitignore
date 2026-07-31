@@ -166,3 +166,12 @@ target-wt/
 # .mcp.json at launch — a live credential, never commit it.
 # (Was only in .git/info/exclude — local-only, lost on fresh clone/CI.)
 .mcp.json
+
+# Vision capture scratch cache. The runner writes UI Bridge captures here at
+# RUNTIME, into its own repo root:
+#   src-tauri/src/mcp/ui_bridge/vision_routes.rs -> current_runner_path().join("tmp_vision_cache")
+# Leaving it untracked-but-not-ignored makes any checkout that has served a
+# capture permanently dirty, which silently disables dev-start's
+# Resolve-PrimaryTreeStaleness auto-fast-forward (it self-heals only a CLEAN
+# tree) — that is how a shared checkout drifts tens of commits behind main.
+tmp_vision_cache/
