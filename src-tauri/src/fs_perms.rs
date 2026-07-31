@@ -97,9 +97,7 @@ mod imp {
     use std::path::Path;
 
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE};
-    use windows_sys::Win32::Security::Authorization::{
-        SetNamedSecurityInfoW, SE_FILE_OBJECT,
-    };
+    use windows_sys::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
         AddAccessAllowedAceEx, GetLengthSid, GetTokenInformation, InitializeAcl, TokenUser,
         ACL as WIN_ACL, ACL_REVISION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
@@ -167,9 +165,8 @@ mod imp {
             // ACL layout: header + one ACCESS_ALLOWED_ACE. The ACE struct
             // already embeds the first 4 SID bytes in `SidStart`, hence the
             // canonical `+ sid_len - 4` sizing from the Win32 docs.
-            let ace_size = std::mem::size_of::<
-                windows_sys::Win32::Security::ACCESS_ALLOWED_ACE,
-            >() as u32
+            let ace_size = std::mem::size_of::<windows_sys::Win32::Security::ACCESS_ALLOWED_ACE>()
+                as u32
                 + sid_len
                 - 4;
             let acl_size = std::mem::size_of::<WIN_ACL>() as u32 + ace_size;
@@ -270,7 +267,10 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o700, "credential dir must be owner-only, got {mode:o}");
+            assert_eq!(
+                mode, 0o700,
+                "credential dir must be owner-only, got {mode:o}"
+            );
         }
 
         let inner = dir.join("cred.json");
@@ -284,7 +284,8 @@ mod tests {
     /// coord-mcp regardless, which only works if the failure is returnable.
     #[test]
     fn restricting_a_missing_path_errors_rather_than_panicking() {
-        let missing = std::env::temp_dir().join(format!("fs-perms-absent-{}", uuid::Uuid::new_v4()));
+        let missing =
+            std::env::temp_dir().join(format!("fs-perms-absent-{}", uuid::Uuid::new_v4()));
         assert!(restrict_to_owner(&missing).is_err());
         assert!(restrict_dir_to_owner(&missing).is_err());
     }
