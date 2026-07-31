@@ -724,6 +724,26 @@ mod tests {
             "/auto-review"
         );
     }
+
+    #[test]
+    fn the_context_handoff_watcher_payload_deserializes_verbatim() {
+        // Pins the exact body `terminal::context_watcher::spawn_continuation`
+        // POSTs (session-autonomy-fabric Phase 7). The field is snake_case
+        // `prompt` — this struct has no `rename_all` — and carries NO `role`,
+        // because the handler 400s on role+prompt. An earlier revision of the
+        // watcher sent `initial_prompt`, which silently deserialized to
+        // `prompt: None` and handed the continuation session the generic
+        // greeting instead of its handoff summary. This is that regression.
+        let req: SpawnSessionRequest =
+            serde_json::from_str(r#"{"task_name":"Continuation of x","prompt":"handoff summary"}"#)
+                .unwrap();
+        assert_eq!(req.prompt.as_deref(), Some("handoff summary"));
+        assert!(req.role.is_none());
+        assert_eq!(
+            initial_prompt_for(None, req.args.as_deref(), req.prompt.as_deref()),
+            "handoff summary"
+        );
+    }
 }
 
 pub fn routes() -> Router<Arc<ApiState>> {
@@ -738,48 +758,4 @@ pub fn routes() -> Router<Arc<ApiState>> {
             post(continuation_verdict),
         )
         .route("/sessions/{id}/context-low", post(context_low))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ── initial_prompt_for precedence (Phase 7 seeded spawns) ──────────
-
-    #[test]
-    fn role_slash_command_wins_over_initial_prompt() {
-        let p = initial_prompt_for(Some("/auto-review"), None, Some("seeded prompt"));
-        assert_eq!(p, "/auto-review");
-        let p = initial_prompt_for(Some("/coordinate"), Some(" repo=x "), Some("seeded"));
-        assert_eq!(p, "/coordinate repo=x");
-    }
-
-    #[test]
-    fn initial_prompt_seeds_roleless_spawns() {
-        let p = initial_prompt_for(None, None, Some("You are the continuation of…"));
-        assert_eq!(p, "You are the continuation of…");
-        // Args without a role are ignored (existing behaviour).
-        let p = initial_prompt_for(None, Some("args"), Some("seeded"));
-        assert_eq!(p, "seeded");
-    }
-
-    #[test]
-    fn empty_initial_prompt_falls_back_to_generic() {
-        for ip in [None, Some(""), Some("   ")] {
-            let p = initial_prompt_for(None, None, ip);
-            assert!(p.contains("AI assistant"), "generic fallback for {ip:?}");
-        }
-    }
-
-    #[test]
-    fn spawn_request_deserializes_initial_prompt_leniently() {
-        let req: SpawnSessionRequest =
-            serde_json::from_str(r#"{"task_name":"t","initial_prompt":"go"}"#).unwrap();
-        assert_eq!(req.initial_prompt.as_deref(), Some("go"));
-        assert!(req.role.is_none());
-        // Absent field defaults to None — existing callers are unaffected.
-        let req: SpawnSessionRequest = serde_json::from_str(r#"{}"#).unwrap();
-        assert!(req.initial_prompt.is_none());
-        assert_eq!(req.task_name, "Coordinator-spawned session");
-    }
 }
