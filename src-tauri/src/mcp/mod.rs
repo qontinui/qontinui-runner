@@ -123,6 +123,7 @@ pub mod sdk_client;
 pub mod sdk_terminal_buffer;
 pub mod security_audit;
 pub mod server;
+pub mod session_compliance;
 pub mod session_message_poller;
 pub mod session_recap;
 pub mod sessions;

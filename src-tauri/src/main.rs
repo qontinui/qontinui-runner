@@ -2675,12 +2675,25 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // holds this store for the handle hook, and a strong closure
                 // capture would create a permanent Arc cycle. A csid the
                 // registrar never registered no-ops inside close_session.
+                //
+                // The same observer FINALIZES the session's POLICY_COMPLIANCE
+                // verdict (plan
+                // `2026-07-30-session-compliance-report-enforcement.md` §A1):
+                // detection keys on TURN end (exact, already wired through the
+                // Stop hook), and this single-fire close is the one moment the
+                // runner can say the verdict is settled rather than a
+                // mid-session snapshot. Coord's store is last-write-wins per
+                // session, so a close-time re-emit simply overwrites with the
+                // best-informed verdict. Weak store handle for the same
+                // reason as above — the store owns this closure.
                 {
                     let reg = std::sync::Arc::downgrade(&ai_coord_registrar);
+                    let store = std::sync::Arc::downgrade(&lifecycle_store);
                     lifecycle_store.attach_close_observer(move |csid| {
                         if let Some(r) = reg.upgrade() {
                             r.close_session(csid);
                         }
+                        mcp::session_compliance::finalize_on_close(csid, &store);
                     });
                 }
                 // Append-only session-snapshot HISTORY (session-restore
