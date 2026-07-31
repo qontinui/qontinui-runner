@@ -14,7 +14,10 @@
 //!   not hand it to a session, because the only alternatives were the five
 //!   fixed roles or a generic session that did not know what it was for.
 //!   (`POST /task-runs` takes a prompt but only inserts a row; it spawns
-//!   nothing, so it is not a substitute.)
+//!   nothing, so it is not a substitute.) Optional `account` and `cwd` pin the
+//!   Claude account and the directory the session starts in; omitting either
+//!   keeps the pre-existing defaults (global account resolution, the runner
+//!   process's cwd).
 //! - `POST /sessions/<id>/message` — HTTP wrapper around the
 //!   `send_user_message` Tauri command at
 //!   `commands::ai_session::send_user_message`.
@@ -96,6 +99,20 @@ pub struct SpawnSessionRequest {
     /// Omitting it reproduces today's behaviour exactly.
     #[serde(default)]
     pub account: Option<String>,
+    /// Optional working directory the spawned session starts in.
+    ///
+    /// Without it every spawn starts in the RUNNER PROCESS's cwd — wherever
+    /// the exe happened to be launched from, which is nowhere the caller has
+    /// work. That is invisible for a role spawn (the slash command carries its
+    /// own context) but load-bearing for a seeded free-form `prompt`: the
+    /// context-exhaustion watcher's handoff summary tells the continuation to
+    /// run `git status` "in the working directory" and inspect worktrees,
+    /// which only means anything if the continuation actually starts in the
+    /// exhausted session's directory (session-autonomy-fabric Phase 7).
+    ///
+    /// Omitting it reproduces today's behaviour exactly.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 fn default_session_name() -> String {
@@ -157,6 +174,32 @@ fn initial_prompt_for(
                 .to_string(),
         },
     }
+}
+
+/// Resolve the caller's requested `cwd` into the directory the spawned session
+/// should start in.
+///
+/// `Ok(None)` ⇒ no usable request; the caller falls back to the runner
+/// process's cwd (the pre-existing behaviour). `Ok(Some(dir))` ⇒ start there.
+/// `Err(msg)` ⇒ 400.
+///
+/// Whitespace-only reads as absent, so a caller that builds the path by
+/// string-joining and ends up with `"  "` gets the honest fallback rather than
+/// a spawn in `"  "`. A named-but-nonexistent directory is a 400 rather than a
+/// silent fallback: a caller that asked for a cwd and got the runner's install
+/// directory instead would debug the wrong thing entirely — which is exactly
+/// the failure this field exists to remove.
+fn resolve_spawn_cwd(requested: Option<&str>) -> Result<Option<String>, String> {
+    let Some(cwd) = requested.map(str::trim).filter(|c| !c.is_empty()) else {
+        return Ok(None);
+    };
+    if !std::path::Path::new(cwd).is_dir() {
+        return Err(format!(
+            "`cwd` is not an existing directory: {cwd}. Omit the field to start the session in \
+             the runner's working directory."
+        ));
+    }
+    Ok(Some(cwd.to_string()))
 }
 
 async fn spawn_session(
@@ -245,6 +288,12 @@ async fn spawn_session(
         })
     });
 
+    // Validate the requested cwd BEFORE creating any state, for the same
+    // reason the account override is resolved above: a bad path should 400
+    // cleanly, not leave an orphaned task-run row behind.
+    let requested_cwd =
+        resolve_spawn_cwd(req.cwd.as_deref()).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
     let task_run_id = uuid::Uuid::new_v4().to_string();
 
     let input = CreateTaskRunInput::new(&task_run_id, &req.task_name)
@@ -263,9 +312,11 @@ async fn spawn_session(
         .inner()
         .clone();
 
-    let working_dir = std::env::current_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| ".".to_string());
+    let working_dir = requested_cwd.unwrap_or_else(|| {
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string())
+    });
 
     // Build the initial prompt. For role-driven spawns the prompt IS the
     // slash command line — Claude Code resolves `/coordinate` against the
@@ -743,6 +794,58 @@ mod tests {
             initial_prompt_for(None, req.args.as_deref(), req.prompt.as_deref()),
             "handoff summary"
         );
+    }
+
+    // ── spawn cwd (session-autonomy-fabric Phase 7 follow-up) ──────────
+
+    #[test]
+    fn absent_cwd_defers_to_the_runner_process_dir() {
+        // `Ok(None)` is the "use the pre-existing default" signal, so every
+        // caller that never heard of this field behaves exactly as before.
+        assert_eq!(resolve_spawn_cwd(None), Ok(None));
+        assert_eq!(resolve_spawn_cwd(Some("")), Ok(None));
+        assert_eq!(resolve_spawn_cwd(Some("   ")), Ok(None));
+    }
+
+    #[test]
+    fn existing_cwd_is_accepted_and_trimmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        assert_eq!(resolve_spawn_cwd(Some(&path)), Ok(Some(path.clone())));
+        assert_eq!(
+            resolve_spawn_cwd(Some(&format!("  {path}  "))),
+            Ok(Some(path))
+        );
+    }
+
+    #[test]
+    fn nonexistent_cwd_is_a_400_not_a_silent_fallback() {
+        // The whole point of the field is that the session lands where the
+        // caller said. Falling back to the runner's install dir on a typo
+        // would reproduce the bug this fixes, one layer down.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-dir").to_string_lossy().to_string();
+        let err = resolve_spawn_cwd(Some(&missing)).unwrap_err();
+        assert!(err.contains(&missing), "error names the offending path");
+
+        // A FILE is not a working directory either.
+        let file = dir.path().join("f.txt");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(resolve_spawn_cwd(Some(&file.to_string_lossy())).is_err());
+    }
+
+    #[test]
+    fn spawn_request_deserializes_cwd_and_defaults_it_to_none() {
+        let req: SpawnSessionRequest = serde_json::from_str(
+            r#"{"task_name":"t","prompt":"p","cwd":"D:/qontinui-root","account":"hotmail"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.cwd.as_deref(), Some("D:/qontinui-root"));
+        assert_eq!(req.account.as_deref(), Some("hotmail"));
+
+        // Absent field defaults to None — existing callers are unaffected.
+        let req: SpawnSessionRequest = serde_json::from_str(r#"{"task_name":"t"}"#).unwrap();
+        assert!(req.cwd.is_none());
     }
 }
 
