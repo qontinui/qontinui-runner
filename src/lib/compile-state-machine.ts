@@ -13,6 +13,19 @@
  * are then tagged `observed`, `ai-fallback`, or `ai-generated` and the
  * observed/ai-fallback subset is checked for cross-state element
  * uniqueness (the one-state-per-element invariant).
+ *
+ * Spec states are matched to artifact clusters by an EXCLUSIVE greedy
+ * assignment computed once per compile (`assignClustersToStates`): one
+ * cluster per state, one state per cluster. Selecting a cluster per state
+ * independently — as this module did before — hands the same cluster to
+ * every state with the same element count and so violates the very
+ * uniqueness invariant above.
+ *
+ * Exclusivity removes the compiler's SELF-INFLICTED uniqueness violations,
+ * not every possible one. Co-occurrence clusters may legitimately share
+ * elements with each other, so an artifact can still hand two states two
+ * different clusters that name the same element — a genuine
+ * authoritative-source disagreement, and one this compiler still throws on.
  */
 
 import type {
@@ -167,6 +180,26 @@ export interface StateProvenanceMeta {
   observationCount?: number;
   /** Derivation time of the artifact the match came from (ISO-8601). */
   lastObserved?: string;
+  /**
+   * Only populated when `provenance === "observed"`. Which tier of
+   * {@link assignClustersToStates} awarded the cluster:
+   *
+   * - `element-overlap` — the state and the cluster canonically named the
+   *   same element(s). Direct evidence; see `sharedElementCount`.
+   * - `size-proximity`  — no shared element; the cluster was merely the
+   *   right shape. A bounded GUESS; see `sizeDifference`.
+   *
+   * This distinction has to be on the record. Both tiers produce an
+   * identical-looking `observed` state whose spec-authored elements have been
+   * replaced by artifact fingerprints, so without it a consumer cannot tell a
+   * promotion backed by evidence from one backed by a size coincidence — and
+   * on a real opaque-digest artifact the size tier is by far the common case.
+   */
+  matchTier?: "element-overlap" | "size-proximity";
+  /** Elements the state and cluster shared. Only for `element-overlap`. */
+  sharedElementCount?: number;
+  /** `|clusterElements − stateElements|`. Only for `size-proximity`. */
+  sizeDifference?: number;
   /** Only populated when `provenance === "ai-fallback"`. */
   invalidatedAt?: string;
   /** Only populated when `provenance === "git-supervised"`. ISO-8601. */
@@ -309,6 +342,12 @@ export function compileStateMachineFromSpecs(
   invalidationState?: InvalidationState,
   gitProposals?: GitProposalState,
 ): CompilationResult {
+  // One clock for the whole compile. Both the invalidation window and the
+  // emitted timestamps read it, so a state cannot be judged "not invalidated"
+  // by the assignment pre-pass and "invalidated" by the promotion a
+  // millisecond later. Deliberate side effect: the state machine's
+  // `createdAt` / `updatedAt` are now compile-START rather than compile-end.
+  const now = Date.now();
   const warnings: string[] = [];
   const allStates: StateDefinitionWithProvenance[] = [];
   const allTransitions: TransitionDefinition[] = [];
@@ -328,6 +367,16 @@ export function compileStateMachineFromSpecs(
   // on the quarantine record for offline inspection.
   const specs: SpecConfig[] = inputs.map((i) => i.config);
 
+  // Exclusive spec-state → cluster assignment, computed ONCE for the whole
+  // compile. This cannot be done per state: "at most one state per cluster"
+  // is a property of the whole (state, cluster) bipartite set, so a per-state
+  // call can only ever re-derive the same locally-best answer and hand the
+  // same cluster to every state that shares an element count. See
+  // {@link assignClustersToStates}.
+  const clusterAssignment = discoveryArtifact
+    ? assignClustersToStates(inputs, discoveryArtifact, invalidationState, now)
+    : undefined;
+
   for (const input of inputs) {
     const spec = input.config;
     if (!spec.stateMachine?.states?.length) continue;
@@ -345,10 +394,12 @@ export function compileStateMachineFromSpecs(
       // Compile base state then decide its provenance.
       const baseState = convertState(specState);
       const promotion = choosePromotion(
-        specState,
+        specState.id,
+        clusterAssignment?.get(specState.id),
         discoveryArtifact,
         invalidationState,
         gitProposals,
+        now,
       );
 
       const compiledState: StateDefinitionWithProvenance = {
@@ -438,7 +489,6 @@ export function compileStateMachineFromSpecs(
     return { compiled: false, reason: "quarantined", quarantine, stats };
   }
 
-  const now = Date.now();
   return {
     compiled: true,
     stateMachine: {
@@ -544,7 +594,7 @@ function convertAction(specAction: SpecTransitionAction): EngineTransitionAction
 }
 
 // ---------------------------------------------------------------------------
-// Provenance: spec-state ↔ artifact-cluster matching & promotion
+// Provenance: spec-state ↔ artifact-cluster assignment & promotion
 // ---------------------------------------------------------------------------
 
 interface PromotionChoice {
@@ -555,16 +605,361 @@ interface PromotionChoice {
 }
 
 /**
+ * A cluster admitted to the assignment pool, with everything derived from it
+ * hoisted out of the O(states × clusters) scoring pass. Previously
+ * `clusterElementIds` was re-run for every (state, cluster) pair inside a
+ * per-state call; it now runs once per cluster, and the decoded queries are
+ * reused verbatim as the promoted state's element list.
+ */
+interface PoolCluster {
+  cluster: DiscoveryCluster;
+  /**
+   * Decoded element queries — exactly what a promotion installs on the state.
+   * Non-empty by pool admission, so a promotion can never produce an
+   * element-less `observed` state.
+   */
+  elements: ElementQuery[];
+  /**
+   * Canonical keys of `elements`, in the SAME form `elementQueryKey`
+   * produces for compiled spec elements. Tier-1 overlap is a set
+   * intersection over these.
+   */
+  keys: Set<string>;
+}
+
+/** A compiled state eligible to claim a cluster, with its keys hoisted. */
+interface PoolState {
+  stateId: string;
+  /** Number of compiled elements — the size-proximity term. */
+  elementCount: number;
+  /** Canonical keys of the state's compiled elements. */
+  keys: Set<string>;
+}
+
+/**
+ * Match strength tier. Lower is stronger, and a tier-1 pair ALWAYS outranks
+ * every tier-2 pair regardless of the numbers inside them — the two tiers
+ * measure different things (shared elements vs. merely similar size) and are
+ * deliberately not commensurable.
+ *
+ * - `1` — structured overlap: the state and the cluster canonically name at
+ *   least one of the SAME elements. Direct evidence.
+ * - `2` — size proximity: no shared element, but the cluster is roughly the
+ *   right shape. A guess, and only ever a fallback.
+ */
+type MatchTier = 1 | 2;
+
+/** One scored (state, cluster) pair, before greedy assignment. */
+interface MatchCandidate {
+  stateId: string;
+  /** Index into the sorted pool; also the final determinism tie-break. */
+  clusterIndex: number;
+  tier: MatchTier;
+  /** Higher is better WITHIN a tier; never compared across tiers. */
+  strength: number;
+}
+
+/**
+ * One state's winning claim: the cluster it was awarded, plus WHY. The tier
+ * and its evidence are carried through to `provenanceMeta` so a `size-proximity`
+ * guess is distinguishable from an `element-overlap` match after the fact.
+ */
+interface ClusterClaim {
+  pool: PoolCluster;
+  tier: MatchTier;
+  /** Shared element keys for tier 1; size difference for tier 2. */
+  evidence: number;
+}
+
+/**
+ * Exclusive assignment: `stateId → ClusterClaim`. A state appears at most
+ * once, and no two states map to the same cluster.
+ */
+type ClusterAssignment = ReadonlyMap<string, ClusterClaim>;
+
+/**
+ * Size-proximity admissibility bound, preserved verbatim from the pre-exclusive
+ * matcher: a cluster is a plausible fallback match only if its element count is
+ * within `max(2, ceil(specCount / 2))` of the state's.
+ *
+ * The bound matters MORE under exclusive assignment, not less. Without it,
+ * greedy assignment degenerates into "everyone gets whatever is left": the last
+ * unassigned state would take a wildly wrong-sized cluster simply because it was
+ * the only one still free, and be promoted to `observed` on that basis. Falling
+ * back to `ai-generated` is strictly better than a confidently wrong `observed`.
+ */
+function sizeProximityTolerance(elementCount: number): number {
+  return Math.max(2, Math.ceil(elementCount / 2));
+}
+
+/**
+ * Total order over candidates. Every field is compared, so the sort is a true
+ * total order and does not depend on `Array.prototype.sort` stability.
+ *
+ * Order: stronger tier, then stronger score within the tier, then **state id
+ * ascending**, then cluster (pool index, which is cluster id ascending).
+ *
+ * The id-ascending tie-breaks are the determinism contract, and are not
+ * decorative: two spec states with the same element count produce candidates
+ * of identical tier AND identical strength for every cluster, so without a
+ * deterministic tie-break the winner would be decided by input order or by
+ * engine sort internals — and the same specs would compile to different
+ * observed element sets on different runs.
+ *
+ * Comparison is by `<` on the raw strings, NOT `localeCompare`: the order has
+ * to be identical on every machine that compiles the same specs, and
+ * `localeCompare` is locale-sensitive.
+ *
+ * The id-ascending rule is borrowed from the sibling Rust reader's
+ * determinism contract (`load_and_project_skeleton`,
+ * src-tauri/src/workflow_generation/spec_authoring.rs). Note that is a
+ * borrowed convention, not a shared contract: that function projects clusters
+ * 1:1 into states and does no state↔cluster matching, so there is nothing
+ * there to keep in lockstep with this — changing one does not oblige changing
+ * the other.
+ */
+function compareCandidates(a: MatchCandidate, b: MatchCandidate): number {
+  if (a.tier !== b.tier) return a.tier - b.tier;
+  if (a.strength !== b.strength) return b.strength - a.strength;
+  if (a.stateId !== b.stateId) return a.stateId < b.stateId ? -1 : 1;
+  return a.clusterIndex - b.clusterIndex;
+}
+
+/**
+ * Build the pool of clusters that could actually promote a state, sorted by
+ * cluster id ascending so pool indices are a deterministic tie-break.
+ *
+ * Two filters, both of which exist because an exclusive claim now has a COST —
+ * a cluster one state takes is a cluster no other state can have:
+ *
+ * 1. `confidence < MIN_SUPPORT` — such a cluster can never promote anything
+ *    (the support gate would reject it), so letting it consume an exclusive
+ *    claim is a pure loss: it would block the claiming state from taking a
+ *    promotable cluster while promoting nobody. Before exclusivity this was
+ *    a harmless post-hoc gate; now it has to be a pre-filter.
+ * 2. zero decoded elements — an element-less cluster promotes a state to
+ *    `observed` with nothing to match on. Note the count is taken AFTER
+ *    decoding, not from the raw id list: `["reg:"]` is one raw id that
+ *    decodes to zero queries.
+ */
+function buildClusterPool(artifact: DiscoveryArtifact): PoolCluster[] {
+  const clusters = artifact.artifact?.states ?? [];
+  const pool: PoolCluster[] = [];
+  for (const cluster of clusters) {
+    // Negated ACCEPT rather than a REJECT comparison, deliberately: `<` and
+    // `>=` are not complements under NaN, and a cast-in artifact can carry
+    // one. Written as `< MIN_SUPPORT` a NaN confidence would sail through the
+    // pool and be persisted as `provenanceMeta.support: NaN`.
+    if (!((cluster.confidence ?? 0) >= MIN_SUPPORT)) continue;
+    const elements = artifactElementsToQueries(clusterElementIds(cluster));
+    if (elements.length === 0) continue;
+    const keys = new Set(elements.map(elementQueryKey).filter((k) => k.length > 0));
+    pool.push({ cluster, elements, keys });
+  }
+  pool.sort((a, b) => (a.cluster.id < b.cluster.id ? -1 : a.cluster.id > b.cluster.id ? 1 : 0));
+  return pool;
+}
+
+/**
+ * Collect the states that may claim a cluster, in compile order.
+ *
+ * Mirrors the main loop's two skip rules exactly, because assigning a cluster
+ * to a state the compile will not promote wastes the cluster:
+ *   - duplicate state ids: first occurrence wins, same as `seenStateIds`;
+ *   - states under an active invalidation: priority 1 forces `ai-fallback`
+ *     regardless of any artifact match, so they must not hold a claim.
+ */
+function collectPoolStates(
+  inputs: SpecCompilerInput[],
+  invalidationState: InvalidationState | undefined,
+  now: number,
+): PoolState[] {
+  const states: PoolState[] = [];
+  const seen = new Set<string>();
+  for (const input of inputs) {
+    for (const specState of input.config.stateMachine?.states ?? []) {
+      if (seen.has(specState.id)) continue;
+      seen.add(specState.id);
+      if (activeInvalidation(specState.id, invalidationState, now)) continue;
+      const elements = specState.elements.map(convertElementCriteria);
+      if (elements.length === 0) continue;
+      states.push({
+        stateId: specState.id,
+        elementCount: elements.length,
+        keys: new Set(elements.map(elementQueryKey).filter((k) => k.length > 0)),
+      });
+    }
+  }
+  return states;
+}
+
+/** Number of canonical element keys two sets share. */
+function keyOverlap(a: Set<string>, b: Set<string>): number {
+  // Iterate the smaller set; `Set.has` is O(1).
+  const [small, large] = a.size <= b.size ? [a, b] : [b, a];
+  let overlap = 0;
+  for (const key of small) {
+    if (large.has(key)) overlap++;
+  }
+  return overlap;
+}
+
+/**
+ * Greedy best-match-per-cluster assignment.
+ *
+ * Every artifact cluster may be claimed by at most ONE spec state, and every
+ * spec state matches at most one cluster.
+ *
+ * ## Why this has to be exclusive
+ *
+ * The predecessor picked a cluster per spec state INDEPENDENTLY, so two states
+ * with the same element count both selected the same cluster, were both
+ * promoted to `observed`, and were handed that cluster's identical fingerprint
+ * set as their element list. `collectElementCollisions` then correctly saw two
+ * authoritative states claiming the same elements and THREW. That is not an
+ * edge case: measured over the real spec corpus, 64 of 67 specs have at least
+ * two states sharing an element count. The lane stayed green only because every
+ * caller passed `undefined` for the artifact.
+ *
+ * ## Algorithm
+ *
+ * 1. Score every (state, cluster) pair once — see {@link MatchTier}.
+ * 2. Sort all candidates into a deterministic total order
+ *    ({@link compareCandidates}).
+ * 3. Walk them in order, taking a pair whenever neither its state nor its
+ *    cluster is already claimed.
+ *
+ * Greedy on a total order is deterministic and O(n log n) in the candidate
+ * count, but it is not optimal, and the cost is cardinality rather than just
+ * score: a state can be starved out of the ONLY cluster it was admissible
+ * for by a state that had alternatives. (State `x` admits only `c10`; state
+ * `y` admits `c10` at diff 0 and `c12` at diff 2; greedy gives `y` → `c10`
+ * and leaves `x` unmatched, where `x` → `c10`, `y` → `c12` would promote
+ * both.) Maximising matched pairs would need Hungarian-style matching. The
+ * trade is deliberate: the scores are heuristics over noisy signals, and a
+ * stable, explainable assignment is worth more than an optimal one over
+ * weights that are themselves guesses — an unmatched state falls back to its
+ * AI-authored elements, which is a safe outcome, not a broken one.
+ *
+ * A state that loses every cluster it was admissible for simply gets no match
+ * and falls through to `git-supervised` / `ai-generated`. That is the intended
+ * outcome: it is better for the loser to keep its AI-authored elements than to
+ * be promoted onto a cluster another state has a stronger claim to.
+ */
+function assignClustersToStates(
+  inputs: SpecCompilerInput[],
+  artifact: DiscoveryArtifact,
+  invalidationState: InvalidationState | undefined,
+  now: number,
+): ClusterAssignment {
+  const assignment = new Map<string, ClusterClaim>();
+  const pool = buildClusterPool(artifact);
+  if (pool.length === 0) return assignment;
+  const states = collectPoolStates(inputs, invalidationState, now);
+  if (states.length === 0) return assignment;
+
+  const candidates: MatchCandidate[] = [];
+  for (const state of states) {
+    for (let clusterIndex = 0; clusterIndex < pool.length; clusterIndex++) {
+      const pc = pool[clusterIndex];
+
+      // Tier 1 — structured overlap. Both sides are keyed with
+      // `elementQueryKey`, the compiler's own canonical element identity: the
+      // very predicate `collectElementCollisions` uses to decide whether two
+      // states claim the SAME element. So "this state and this cluster share
+      // an element" means exactly what it says, and a tier-1 match is real
+      // evidence rather than a coincidence of sizes.
+      //
+      // This replaces an arm that compared spec `role|name|tag` triples
+      // against RAW artifact ids. That arm was documented as dead and was:
+      // the adapter emits `reg:`-prefixed digests and structured `id:` /
+      // `aria:` / `tag:` / `role:` fingerprints, none of which is ever equal
+      // to a bare triple. Keying both sides through the decoder makes the
+      // tier REACHABLE — `id:save-button` now matches a spec element carrying
+      // that id — which is why it is kept rather than deleted.
+      //
+      // Reachable, not yet routine: on the artifact rows we have, every
+      // element id is a 16-hex digest that decodes opaque and keys as
+      // `fp:<digest>`, which no spec element can ever produce. So today this
+      // tier fires only for the structured vocabulary the Rust
+      // `fingerprint_to_criteria` also emits, and size proximity carries the
+      // real corpus. `provenanceMeta.matchTier` records which one won so that
+      // ratio is measurable rather than assumed.
+      const overlap = keyOverlap(state.keys, pc.keys);
+      if (overlap > 0) {
+        candidates.push({ stateId: state.stateId, clusterIndex, tier: 1, strength: overlap });
+        // No tier-2 twin for a pair that already has a tier-1 candidate: tier
+        // 1 always sorts first, so the twin could only ever be reached after
+        // this same cluster was already claimed by this same state.
+        continue;
+      }
+
+      // Tier 2 — size proximity, bounded. Negated so that, as everywhere else,
+      // higher `strength` is better.
+      const diff = Math.abs(pc.elements.length - state.elementCount);
+      if (diff <= sizeProximityTolerance(state.elementCount)) {
+        candidates.push({ stateId: state.stateId, clusterIndex, tier: 2, strength: -diff });
+      }
+    }
+  }
+
+  candidates.sort(compareCandidates);
+
+  const claimedStates = new Set<string>();
+  const claimedClusters = new Set<number>();
+  for (const candidate of candidates) {
+    if (claimedStates.has(candidate.stateId)) continue;
+    if (claimedClusters.has(candidate.clusterIndex)) continue;
+    claimedStates.add(candidate.stateId);
+    claimedClusters.add(candidate.clusterIndex);
+    assignment.set(candidate.stateId, {
+      pool: pool[candidate.clusterIndex],
+      tier: candidate.tier,
+      // `strength` is negated for tier 2 so that higher is always better;
+      // undo that here so the recorded evidence reads as the size difference
+      // it actually is.
+      evidence: candidate.tier === 1 ? candidate.strength : -candidate.strength,
+    });
+  }
+  return assignment;
+}
+
+/**
+ * The state's invalidation timestamp if one is active right now, else
+ * `undefined`. Shared by the assignment pre-pass (which must not hand a
+ * cluster to a state that priority 1 will force to `ai-fallback`) and by
+ * `choosePromotion` itself, so the two can never disagree.
+ */
+function activeInvalidation(
+  stateId: string,
+  invalidationState: InvalidationState | undefined,
+  now: number,
+): string | undefined {
+  const invalidation = invalidationState?.[stateId];
+  if (!invalidation?.invalidatedAt) return undefined;
+  const invalidatedMs = Date.parse(invalidation.invalidatedAt);
+  if (Number.isNaN(invalidatedMs)) return undefined;
+  const ageHours = (now - invalidatedMs) / 3_600_000;
+  if (ageHours < 0 || ageHours >= INVALIDATION_WINDOW_HOURS) return undefined;
+  return invalidation.invalidatedAt;
+}
+
+/**
  * Decide a compiled state's provenance given the discovery artifact and
  * any pending invalidation. See the "Merging" table in the observation
  * pipeline plan for the priority order.
  *
  * Priority order (top wins):
  *   1.   recent invalidation → ai-fallback
- *   2.   artifact match with sufficient support → observed
+ *   2.   this state's exclusive cluster claim → observed
  *   2.5. git supervision proposal (state present in the on-disk spec
  *        AND named in `gitProposals`) → git-supervised
  *   3.   default → ai-generated
+ *
+ * This function no longer SEARCHES for a cluster — it is handed the one the
+ * whole-compile assignment awarded this state, or nothing. Cluster selection
+ * is a property of the entire (state, cluster) set and cannot be decided one
+ * state at a time; see {@link assignClustersToStates}.
  *
  * The 2.5 lane sits between observed and ai-generated by design: a git
  * proposal proves the state exists in version control (reproducible,
@@ -572,46 +967,47 @@ interface PromotionChoice {
  * weaker than `observed`. See D5 Phase 1 plan §3.3.
  */
 function choosePromotion(
-  specState: SpecState,
+  stateId: string,
+  assigned: ClusterClaim | undefined,
   artifact: DiscoveryArtifact | undefined,
   invalidationState: InvalidationState | undefined,
   gitProposals: GitProposalState | undefined,
+  now: number,
 ): PromotionChoice {
   // Priority 1: recent invalidation → ai-fallback.
-  const invalidation = invalidationState?.[specState.id];
-  if (invalidation?.invalidatedAt) {
-    const invalidatedMs = Date.parse(invalidation.invalidatedAt);
-    if (!Number.isNaN(invalidatedMs)) {
-      const ageHours = (Date.now() - invalidatedMs) / 3_600_000;
-      if (ageHours >= 0 && ageHours < INVALIDATION_WINDOW_HOURS) {
-        return {
-          provenance: "ai-fallback",
-          meta: { invalidatedAt: invalidation.invalidatedAt },
-        };
-      }
-    }
+  const invalidatedAt = activeInvalidation(stateId, invalidationState, now);
+  if (invalidatedAt) {
+    return { provenance: "ai-fallback", meta: { invalidatedAt } };
   }
 
-  // Priority 2: artifact match with sufficient support → observed.
-  const match = artifact ? matchArtifactCluster(specState, artifact) : undefined;
-  if (match && (match.cluster.confidence ?? 0) >= MIN_SUPPORT) {
-    const elements = artifactElementsToQueries(clusterElementIds(match.cluster));
-    if (elements.length > 0) {
-      return {
-        provenance: "observed",
-        elements,
-        meta: {
-          support: match.cluster.confidence,
-          // The render-set is what the state was *observed* in; the element
-          // list is what it is made of. Reporting the latter as an
-          // observation count (as this did before) was simply wrong.
-          observationCount: match.cluster.screenshotIds?.length,
-          // Clusters carry no per-state timestamp, so the artifact's own
-          // derivation time is the honest recency signal.
-          lastObserved: artifact?.derived_at,
-        },
-      };
+  // Priority 2: this state's EXCLUSIVE cluster claim → observed.
+  //
+  // Both gates the old inline code applied here are now pool-admission
+  // invariants rather than post-hoc checks (see `buildClusterPool`): an
+  // assigned cluster always has `confidence >= MIN_SUPPORT` and always decodes
+  // to at least one element. Re-checking them here would be dead code, and
+  // dead defensive code is how the `contrast` gate hid an unreachable lane.
+  if (assigned) {
+    const meta: StateProvenanceMeta = {
+      support: assigned.pool.cluster.confidence,
+      // The render-set is what the state was *observed* in; the element
+      // list is what it is made of. Reporting the latter as an
+      // observation count (as this did before) was simply wrong.
+      observationCount: assigned.pool.cluster.screenshotIds?.length,
+      // Clusters carry no per-state timestamp, so the artifact's own
+      // derivation time is the honest recency signal.
+      lastObserved: artifact?.derived_at,
+    };
+    // Record HOW the cluster was won, not just that it was. See
+    // `StateProvenanceMeta.matchTier`.
+    if (assigned.tier === 1) {
+      meta.matchTier = "element-overlap";
+      meta.sharedElementCount = assigned.evidence;
+    } else {
+      meta.matchTier = "size-proximity";
+      meta.sizeDifference = assigned.evidence;
     }
+    return { provenance: "observed", elements: assigned.pool.elements, meta };
   }
 
   // Priority 2.5: git supervision proposal. The spec state is present
@@ -619,7 +1015,7 @@ function choosePromotion(
   // git-supervision ring named it — that's "sufficient support" per
   // Phase 1. Recency is implicit: the consumer hook prunes old entries
   // before producing the map.
-  const proposal = gitProposals?.[specState.id];
+  const proposal = gitProposals?.[stateId];
   if (proposal) {
     return {
       provenance: "git-supervised",
@@ -632,102 +1028,6 @@ function choosePromotion(
 
   // Priority 3: default — keep AI-authored elements.
   return { provenance: "ai-generated" };
-}
-
-/**
- * Match a spec state to an artifact cluster.
- *
- * The TS side does not have access to the Rust `stable_element_fingerprint`
- * function, and in practice artifact `elements[]` are opaque hash strings
- * produced by clustering. So we cannot compare spec elements to artifact
- * elements directly. The fallback heuristic for this first iteration:
- *
- * 1. Build a loose key for each spec element from `(role, accessibleName
- *    ?? label ?? textContent, tagName)`.
- * 2. If any artifact cluster's `stateImageIds[]` contain a string that equals
- *    one of these loose keys, prefer that cluster.
- *
- *    This arm is currently DEAD and should be read as such: it fires only
- *    for a producer emitting bare `role|name|tag` triples, and no such
- *    producer exists anywhere in the Python→Rust→TS chain. The real adapter
- *    emits `reg:<16-hex>` digests; `fingerprint_to_criteria`'s structured
- *    vocabulary is `id:` / `aria:` / `tag:` / `role:` — a DIFFERENT shape
- *    that also never equals a loose key. Teaching this arm that vocabulary
- *    (so structured fingerprints actually steer the match) is tracked
- *    separately; see the matcher-exclusivity follow-up.
- * 3. Otherwise fall back to cluster-size proximity: pick the cluster whose
- *    element count is closest to the spec state's element count.
- * 4. If the artifact has no states, return undefined and the caller will
- *    choose `ai-generated`.
- *
- * NOTE (known limitation, pre-dates this reader's field-name fix): cluster
- * selection is NOT exclusive. Two spec states with the same element count
- * both select the same cluster and are then both promoted with that
- * cluster's identical fingerprint set — which `collectElementCollisions`
- * correctly rejects as an observed/observed double-claim by THROWING. Any
- * caller that starts passing a real artifact must land greedy
- * best-match-per-cluster assignment first.
- */
-function matchArtifactCluster(
-  specState: SpecState,
-  artifact: DiscoveryArtifact,
-): { cluster: DiscoveryCluster } | undefined {
-  const clusters = artifact.artifact?.states ?? [];
-  if (clusters.length === 0) return undefined;
-
-  const specKeys = specState.elements.map(looseElementKey).filter((k) => k.length > 0);
-
-  // Rich case: artifact elements look like structured keys.
-  if (specKeys.length > 0) {
-    let best: { cluster: DiscoveryCluster; overlap: number } | undefined;
-    for (const cluster of clusters) {
-      const els = clusterElementIds(cluster);
-      let overlap = 0;
-      for (const key of specKeys) {
-        if (els.includes(key)) overlap++;
-      }
-      if (overlap > 0 && (!best || overlap > best.overlap)) {
-        best = { cluster, overlap };
-      }
-    }
-    if (best) return { cluster: best.cluster };
-  }
-
-  // Opaque case: match by cluster-size proximity.
-  const specCount = specState.elements.length;
-  if (specCount === 0) return undefined;
-  let closest: { cluster: DiscoveryCluster; diff: number } | undefined;
-  for (const cluster of clusters) {
-    const count = clusterElementIds(cluster).length;
-    if (count === 0) continue;
-    const diff = Math.abs(count - specCount);
-    if (!closest || diff < closest.diff) {
-      closest = { cluster, diff };
-    }
-  }
-  // Require at least rough shape alignment; if no cluster exists within
-  // 2× the spec count, treat as unmatched — safer to fall back to AI.
-  if (closest && closest.diff <= Math.max(2, Math.ceil(specCount / 2))) {
-    return { cluster: closest.cluster };
-  }
-  return undefined;
-}
-
-/**
- * Loose element key mirroring the matching formula specified in the plan:
- *   `${role}|${(accessibleName||label||textContent||'').slice(0,60)}|${tagName?.toLowerCase()||''}`
- * Used both for spec elements and (opportunistically) for artifact
- * elements that happen to carry structured text.
- */
-function looseElementKey(criteria: Record<string, unknown>): string {
-  const role = (criteria.role as string | undefined) ?? "";
-  const name =
-    (criteria.accessibleName as string | undefined) ??
-    (criteria.label as string | undefined) ??
-    (criteria.textContent as string | undefined) ??
-    "";
-  const tag = ((criteria.tagName as string | undefined) ?? "").toLowerCase();
-  return `${role}|${name.slice(0, 60)}|${tag}`;
 }
 
 /**
