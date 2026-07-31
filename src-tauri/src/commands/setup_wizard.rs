@@ -301,9 +301,11 @@ fn take_connect_state_if_valid(presented: &str) -> Result<(), String> {
         // the deep link to a DIFFERENT runner window than the one that started
         // it. The web "Complete in this browser instead" fallback recovers all
         // three — the message points there rather than implying an error.
-        None => Err("no pending GitHub connect flow in this runner window — start it \
+        None => Err(
+            "no pending GitHub connect flow in this runner window — start it \
                      from Connect GitHub here, or use \"Complete in this browser instead\""
-            .to_string()),
+                .to_string(),
+        ),
         Some((nonce, minted_at)) => {
             if minted_at.elapsed() > CONNECT_STATE_TTL {
                 *slot = None;

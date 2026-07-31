@@ -292,9 +292,10 @@ mod tests {
 
     #[test]
     fn parses_github_connected_url() {
-        let url =
-            Url::parse("qontinui://github-connected?code=abc123&installation_id=143833618&state=deadbeef")
-                .unwrap();
+        let url = Url::parse(
+            "qontinui://github-connected?code=abc123&installation_id=143833618&state=deadbeef",
+        )
+        .unwrap();
         assert_eq!(url.scheme(), SCHEME);
         assert_eq!(url.host_str(), Some(GITHUB_CONNECTED_HOST));
         let params: HashMap<String, String> = url
