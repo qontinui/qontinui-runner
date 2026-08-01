@@ -370,6 +370,20 @@ mod tests {
             let mut cmd = std::process::Command::new(&bash);
             cmd.arg("-c")
                 .arg(&driver)
+                // CONTAINMENT — load-bearing, not tidiness. The driver runs
+                // `install left-pad`, and the shim FAILS OPEN to the real tool
+                // whenever the runner looks unreachable (by design). Without an
+                // explicit cwd the child inherits cargo's, which is the crate
+                // root `src-tauri/` — and that has no `package.json`, so a real
+                // npm walks UP and mutates the REPO ROOT's package.json,
+                // writes a package-lock.json into a pnpm repo, and populates
+                // node_modules/. That happened on 2026-07-31: the pollution is
+                // invisible in isolation and only reproduces under full-suite
+                // parallel load (every submodule passes clean on its own),
+                // which is what made it look like an unexplained supply-chain
+                // event for hours. Pin the cwd to the tempdir so the blast
+                // radius is the tempdir, whichever branch the shim takes.
+                .current_dir(tmp.path())
                 .env("PATH", &path)
                 .env("QONTINUI_INSTALL_INTERCEPT_PORT", use_port.to_string())
                 .env("QONTINUI_INSTALL_INTERCEPT_MODE", mode)
@@ -525,6 +539,12 @@ mod tests {
             let mut cmd = std::process::Command::new(&bash);
             cmd.arg("-c")
                 .arg(&driver)
+                // CONTAINMENT — see the sibling smoke test. This test is the
+                // fail-open one, so BOTH its cases deliberately drive the shim
+                // down the real-tool passthrough; without a pinned cwd a real
+                // `npm install left-pad` mutates the repo root. Keep it in the
+                // tempdir.
+                .current_dir(tmp.path())
                 .env("PATH", &path)
                 .env("QONTINUI_INSTALL_INTERCEPT_MODE", "observe")
                 .env_remove("QONTINUI_INSTALL_INTERCEPT_GUARD")
