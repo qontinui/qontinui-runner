@@ -98,7 +98,8 @@ const LABEL_RELEASE_POLL_MS: u64 = 50;
 /// NOTE: setting `additional_browser_args` REPLACES wry's default
 /// `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection`, so those
 /// are re-listed here. Windows-only (no-op elsewhere).
-const MAIN_WINDOW_BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,\
+const MAIN_WINDOW_BROWSER_ARGS: &str =
+    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,\
      CalculateNativeWinOcclusion,IntensiveWakeUpThrottling \
      --disable-background-timer-throttling \
      --disable-renderer-backgrounding \
@@ -186,10 +187,8 @@ pub fn build_main_window(
     // falling through to the hardcoded 9876. Without this, hooks on a temp
     // runner route their reads at the primary.
     let intended_api_port = crate::mcp::types::get_mcp_api_port();
-    builder = builder.initialization_script(format!(
-        "window.__QONTINUI_PORT__ = {};",
-        intended_api_port
-    ));
+    builder =
+        builder.initialization_script(format!("window.__QONTINUI_PORT__ = {};", intended_api_port));
 
     builder = spec.placement.configure_builder(builder);
 
@@ -320,7 +319,9 @@ pub fn plan_action(reason: RecoveryReason, attempt: u32) -> RecoveryAction {
         // The browser process is gone: the CoreWebView2 is unusable, so the
         // reload rung is not merely unlikely to work — it is a no-op. Skip
         // straight to recreate.
-        RecoveryReason::ProcessFailed(ProcessFailureKind::BrowserExited) => RecoveryAction::Recreate,
+        RecoveryReason::ProcessFailed(ProcessFailureKind::BrowserExited) => {
+            RecoveryAction::Recreate
+        }
         // WebView2 recovers these on its own; the top-level document survives.
         RecoveryReason::ProcessFailed(
             ProcessFailureKind::FrameRenderExited | ProcessFailureKind::Ancillary(_),
@@ -601,9 +602,7 @@ pub async fn trigger_ui_recovery(
             reason = reason.as_str(),
             "UI recovery skipped: server mode (this runner has no webview by design)"
         );
-        return RecoveryOutcome::Skipped {
-            why: "server_mode",
-        };
+        return RecoveryOutcome::Skipped { why: "server_mode" };
     }
 
     // ── Hard gate 2: no window was ever built (window creation failed, or
@@ -1296,10 +1295,7 @@ mod tests {
         // checked before any window lookup, and `main_window_spec()` before any
         // destroy/rebuild — see `trigger_ui_recovery`.)
         assert_eq!(
-            RecoveryOutcome::Skipped {
-                why: "server_mode"
-            }
-            .as_str(),
+            RecoveryOutcome::Skipped { why: "server_mode" }.as_str(),
             "skipped"
         );
     }
