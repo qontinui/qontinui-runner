@@ -426,7 +426,7 @@ async fn health(
     axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
 ) -> Json<serde_json::Value> {
     let uptime_secs = state.started_at.elapsed().as_secs();
-    let last_pong = state.ui_bridge_last_pong.load(Ordering::Relaxed);
+    let last_pong = state.app_state.ui_bridge_last_pong.load(Ordering::Relaxed);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -558,9 +558,16 @@ async fn health(
     // downgrade. Depends on B-1's pool timeout — plus a 2s ceiling here — so
     // the probe itself can never hang the handler.
     let pg_reachable = pg_liveness_probe().await;
+    // A dead WebView2 host leaves the Rust backend serving happily, so neither
+    // `ui_error` (React error boundary) nor `recent_crash` (startup-only dump
+    // scan) can see it. `last_pong` can — it advances off the unconditional 3s
+    // ping loop for as long as any UI is alive.
+    let ui_dead =
+        crate::ui_error::ui_stale(last_pong, pong_age_ms, crate::ui_error::UI_DEAD_AFTER_MS);
     let derived_status = crate::ui_error::compute_derived_status(
         ui_error_snapshot.is_some(),
         recent_crash_snapshot.is_some(),
+        Some(ui_dead),
         embedding_reachable_cached(),
         pg_reachable,
     );
@@ -3046,7 +3053,6 @@ pub fn create_router(
         ui_bridge_pending_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         ui_bridge_circuit_breaker: Arc::new(crate::mcp::ui_bridge::UiBridgeCircuitBreaker::new()),
         ui_bridge_semaphore: Arc::new(tokio::sync::Semaphore::new(6)),
-        ui_bridge_last_pong: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ui_bridge_ready: Arc::new(tokio::sync::Notify::new()),
         ui_bridge_dedup: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         ui_bridge_console_error_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -3477,7 +3483,7 @@ pub fn create_router(
 
     // Set up UI Bridge pong listener for frontend liveness tracking
     {
-        let last_pong = api_state.ui_bridge_last_pong.clone();
+        let last_pong = api_state.app_state.ui_bridge_last_pong.clone();
         let ready = api_state.ui_bridge_ready.clone();
         let handle = app_handle.clone();
 

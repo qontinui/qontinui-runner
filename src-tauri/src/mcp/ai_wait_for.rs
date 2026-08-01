@@ -206,6 +206,7 @@ pub async fn ai_wait_for_handler(
     // Short-circuit when the SDK hasn't connected yet — don't burn the
     // full timeout waiting for a snapshot that will never come.
     let last_pong = state
+        .app_state
         .ui_bridge_last_pong
         .load(std::sync::atomic::Ordering::Relaxed);
     if last_pong == 0 {

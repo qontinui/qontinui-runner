@@ -207,7 +207,16 @@ pub(super) fn classify_frontend_state(i: FrontendStateInputs) -> FrontendState {
         FrontendState::NeverPonged
     } else if i.has_ui_error {
         FrontendState::TreeCrashed
-    } else if i.last_pong_age_ms > 30000 {
+    } else if crate::ui_error::ui_stale(
+        i.last_pong,
+        i.last_pong_age_ms,
+        crate::ui_error::UI_STALE_AFTER_MS,
+    ) {
+        // Same predicate `compute_derived_status` uses, at the diagnostics
+        // calibration. The `last_pong == 0` half is belt-and-braces here — the
+        // branches above already short-circuit every never-ponged case — but
+        // it documents the intent at both call sites and stops the two ladders
+        // from drifting if either set of branches is ever reordered.
         FrontendState::Stale
     } else {
         FrontendState::Responsive
@@ -232,14 +241,30 @@ pub(super) struct UiErrorSignals {
 /// Read the Rust-side crash signals: the React `ErrorBoundary` report held on
 /// `AppState` plus the `derived_status` the `/health` endpoint and every
 /// heartbeat already compute from it.
-pub(super) async fn gather_ui_error_signals(state: &Arc<ApiState>) -> UiErrorSignals {
+///
+/// `last_pong` / `last_pong_age_ms` are passed in rather than re-read here:
+/// both callers already computed them for `classify_frontend_state`, and
+/// sharing the same pair keeps the diagnostics verdict (`FrontendState`) and
+/// the status verdict (`derived_status`) computed off one observation of the
+/// atomic.
+pub(super) async fn gather_ui_error_signals(
+    state: &Arc<ApiState>,
+    last_pong: u64,
+    last_pong_age_ms: u64,
+) -> UiErrorSignals {
     let ui_error = state.app_state.ui_error.get().await;
     let recent_crash = state.app_state.crash_dumps.get().await;
     // `pg_reachable = None`: this signal gatherer does not run a DB round-trip;
     // the bounded PG liveness probe lives only in the `/health` handler (B-5).
+    let ui_dead = crate::ui_error::ui_stale(
+        last_pong,
+        last_pong_age_ms,
+        crate::ui_error::UI_DEAD_AFTER_MS,
+    );
     let derived_status = crate::ui_error::compute_derived_status(
         ui_error.is_some(),
         recent_crash.is_some(),
+        Some(ui_dead),
         crate::mcp_api::embedding_reachable_cached(),
         None,
     );
@@ -275,6 +300,7 @@ pub(super) async fn gather_readiness_diagnostics(state: &Arc<ApiState>) -> Readi
     use tauri::Manager;
 
     let last_pong = state
+        .app_state
         .ui_bridge_last_pong
         .load(std::sync::atomic::Ordering::Relaxed);
     let console_error_count = state
@@ -316,7 +342,7 @@ pub(super) async fn gather_readiness_diagnostics(state: &Arc<ApiState>) -> Readi
 
     // Join the Rust-side crash state in. This survives a dead React tree,
     // which is precisely when the IPC-backed surfaces stop answering.
-    let ui_error = gather_ui_error_signals(state).await;
+    let ui_error = gather_ui_error_signals(state, last_pong, last_pong_age_ms).await;
 
     let frontend_state = classify_frontend_state(FrontendStateInputs {
         window_exists,
@@ -442,6 +468,7 @@ pub async fn ui_bridge_request_sync_in_window(
     // event listeners are set up after a supervisor-triggered restart.
     {
         let pong_check = state
+            .app_state
             .ui_bridge_last_pong
             .load(std::sync::atomic::Ordering::Relaxed);
         if pong_check == 0 {
@@ -463,6 +490,7 @@ pub async fn ui_bridge_request_sync_in_window(
 
     // 2. Check frontend liveness (warn if stale, but don't fail — let IPC timeout handle it)
     let last_pong = state
+        .app_state
         .ui_bridge_last_pong
         .load(std::sync::atomic::Ordering::Relaxed);
     if last_pong > 0 {
@@ -944,6 +972,75 @@ mod frontend_state_tests {
 
         // None of them are ready — last_pong is 0.
         assert!(!classify_frontend_state(base).is_ready(base.last_pong));
+    }
+
+    #[test]
+    fn stale_and_dead_rungs_cannot_drift_apart() {
+        // The invariant the single-predicate refactor exists to protect.
+        // `classify_frontend_state` (diagnostics) and `compute_derived_status`
+        // (status) read the SAME `last_pong` atomic through the SAME
+        // `ui_stale` predicate at two calibrations, so they can only ever
+        // escalate in one direction: diagnostics say `Stale` well before
+        // status says dead. Two hand-rolled ladders would drift silently.
+        use crate::ui_error::{
+            compute_derived_status, ui_stale, UI_DEAD_AFTER_MS, UI_STALE_AFTER_MS,
+        };
+
+        assert!(UI_STALE_AFTER_MS < UI_DEAD_AFTER_MS);
+        let between = (UI_STALE_AFTER_MS + UI_DEAD_AFTER_MS) / 2;
+
+        let i = FrontendStateInputs {
+            last_pong_age_ms: between,
+            ..healthy()
+        };
+        assert_eq!(
+            classify_frontend_state(i),
+            FrontendState::Stale,
+            "an age past UI_STALE_AFTER_MS must classify as Stale"
+        );
+        let ui_dead = ui_stale(i.last_pong, i.last_pong_age_ms, UI_DEAD_AFTER_MS);
+        assert!(!ui_dead);
+        assert_eq!(
+            compute_derived_status(false, false, Some(ui_dead), Some(true), Some(true)),
+            "healthy",
+            "the same age must still be healthy for the status rung"
+        );
+
+        // Past the dead rung, both surfaces agree the UI is gone.
+        let i = FrontendStateInputs {
+            last_pong_age_ms: UI_DEAD_AFTER_MS + 1,
+            ..healthy()
+        };
+        assert_eq!(classify_frontend_state(i), FrontendState::Stale);
+        let ui_dead = ui_stale(i.last_pong, i.last_pong_age_ms, UI_DEAD_AFTER_MS);
+        assert!(ui_dead);
+        assert_eq!(
+            compute_derived_status(false, false, Some(ui_dead), Some(true), Some(true)),
+            "errored"
+        );
+    }
+
+    #[test]
+    fn classify_uses_the_shared_stale_predicate_at_the_diagnostics_rung() {
+        // De-duplication guard: the `> 30_000` literal that used to live in
+        // `classify_frontend_state` is now `ui_stale(.., UI_STALE_AFTER_MS)`.
+        // Behavior must be byte-identical either side of the boundary.
+        use crate::ui_error::UI_STALE_AFTER_MS;
+
+        let at = FrontendStateInputs {
+            last_pong_age_ms: UI_STALE_AFTER_MS,
+            ..healthy()
+        };
+        assert_eq!(
+            classify_frontend_state(at),
+            FrontendState::Responsive,
+            "exactly at the threshold is still responsive (strict >)"
+        );
+        let past = FrontendStateInputs {
+            last_pong_age_ms: UI_STALE_AFTER_MS + 1,
+            ..healthy()
+        };
+        assert_eq!(classify_frontend_state(past), FrontendState::Stale);
     }
 
     #[test]

@@ -184,9 +184,19 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
             // round-trip (the bounded PG liveness probe lives only in the
             // `/health` handler), so it passes unknown rather than probing on
             // every tick.
+            //
+            // `ui_dead` is a REAL value here, not `None`. A dead WebView2 host
+            // is invisible to `ui_error` (the React error boundary cannot run)
+            // and to `recent_crash` (the dump scan is startup-only), and
+            // nothing polls `/health` on an end user's machine — this
+            // heartbeat is one of only two paths by which the failure is ever
+            // visible off-box. That is why `ui_bridge_last_pong` lives on
+            // `AppState`: this loop only ever holds an `Arc<AppState>`.
+            let ui_dead = crate::ui_error::ui_dead_now(&app_state.ui_bridge_last_pong);
             let base_status = crate::ui_error::compute_derived_status(
                 ui_error_snapshot.is_some(),
                 recent_crash_snapshot.is_some(),
+                Some(ui_dead),
                 crate::mcp_api::embedding_reachable_cached(),
                 None,
             );

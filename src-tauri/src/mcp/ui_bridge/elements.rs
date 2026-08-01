@@ -2355,6 +2355,7 @@ pub async fn ui_bridge_discover_handler(
             if element_count == 0 {
                 if let Some(obj) = data.as_object_mut() {
                     let last_pong = state
+                        .app_state
                         .ui_bridge_last_pong
                         .load(std::sync::atomic::Ordering::Relaxed);
 

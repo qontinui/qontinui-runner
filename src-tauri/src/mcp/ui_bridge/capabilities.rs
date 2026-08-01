@@ -954,6 +954,7 @@ pub async fn ui_bridge_pong_handler(
         .unwrap_or_default()
         .as_millis() as u64;
     state
+        .app_state
         .ui_bridge_last_pong
         .store(now, std::sync::atomic::Ordering::Relaxed);
     // Unblock any requests waiting for frontend readiness
@@ -983,6 +984,7 @@ pub async fn ui_bridge_ipc_response_handler(
         .unwrap_or_default()
         .as_millis() as u64;
     state
+        .app_state
         .ui_bridge_last_pong
         .store(now, std::sync::atomic::Ordering::Relaxed);
     Json(ApiResponse::success(
