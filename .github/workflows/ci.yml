@@ -709,6 +709,28 @@ jobs:
         # not parse untrusted network XML through these paths (build-time
         # manifests/plists). These are the ONLY two quick-xml advisories in
         # the DB as of 2026-07-02. Revisit when tauri/gtk bump to >= 0.41.
+        #
+        # --ignore RUSTSEC-2026-0118 + RUSTSEC-2026-0119: two hickory-proto
+        # 0.25.2 advisories, reached via reqwest's `hickory-dns` feature (the
+        # async resolver that keeps DNS off tokio's blocking pool). reqwest
+        # 0.13 pins hickory-resolver 0.25.2, so neither is upgradable from
+        # here. Neither is reachable in THIS build:
+        #
+        #   0118 (NSEC3 closest-encloser proof enters an unbounded loop on
+        #   cross-zone responses; "No fixed upgrade is available!") lives in
+        #   DNSSEC validation, which is NOT COMPILED IN. Verified with
+        #   `cargo tree -e features -i hickory-proto`: the enabled feature set
+        #   is exactly {futures-io, std, tokio} and contains no `dnssec*`
+        #   feature, so the validation path does not exist in the binary.
+        #
+        #   0119 (CPU exhaustion from O(n²) name compression) is in message
+        #   ENCODING — i.e. queries we construct for hostnames WE configure
+        #   (coord, localhost, api). Triggering it needs control of the names
+        #   being encoded, which already implies control of runner config.
+        #
+        # Re-check both if a `dnssec` feature is ever enabled on hickory-proto,
+        # or if the runner starts resolving attacker-supplied hostnames.
+        # Revisit when reqwest bumps hickory-resolver to >= 0.26.1.
         run: |
           # --locked: install cargo-audit against its OWN bundled Cargo.lock.
           # Without it, cargo resolves cargo-audit's transitive deps to latest
@@ -717,7 +739,7 @@ jobs:
           # and reds this job on every PR (an upstream ecosystem drift, not a
           # runner vulnerability). --locked pins to cargo-audit's tested deps.
           cargo install cargo-audit --locked
-          cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
+          cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4

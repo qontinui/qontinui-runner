@@ -106,11 +106,25 @@ fn coord_http_base() -> String {
     qontinui_runner_lib::profiles::coord_base_with_source().0
 }
 
-fn http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("build http client: {e}"))
+/// The module's coord client, built once.
+///
+/// All three claim commands share the same 10s deadline, so it stays baked into
+/// the client and callers are unchanged. Rebuilding a `reqwest::Client` per
+/// request costs a fresh TLS handshake and a blocking-pool DNS slot each time —
+/// see [`crate::coord_http::coord_client`] for why that starved coord calls into
+/// spurious timeouts.
+fn http_client() -> Result<&'static reqwest::Client, String> {
+    static CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .pool_idle_timeout(Duration::from_secs(90))
+                .build()
+                .ok()
+        })
+        .as_ref()
+        .ok_or_else(|| "build http client".to_string())
 }
 
 /// `claims_acquire` — wrapper around `POST /claims/acquire`. Returns

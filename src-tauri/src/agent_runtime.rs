@@ -2030,18 +2030,17 @@ async fn poll_pending_continuations(device_id: uuid::Uuid) {
     // Every fetch-failure exit below still self-reports (all-zeros +
     // `skip_reasons.fetch_failed`): coord must be able to tell "poll loop
     // alive but the pull route failing" apart from "poll loop dead".
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("agent_runtime: pending-continuations client build failed: {e:#}");
-            post_continuation_poll_report(device_id, PollRunCounts::fetch_failure()).await;
-            return;
-        }
+    let Some(client) = crate::coord_http::coord_client() else {
+        warn!("agent_runtime: pending-continuations: no shared coord client");
+        post_continuation_poll_report(device_id, PollRunCounts::fetch_failure()).await;
+        return;
     };
-    let resp = match client.get(&url).send().await {
+    let resp = match client
+        .get(&url)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             warn!("agent_runtime: pending-continuations GET failed (continuing): {e:#}");
@@ -2179,18 +2178,18 @@ async fn post_continuation_poll_report(device_id: uuid::Uuid, counts: PollRunCou
         return;
     };
     let url = format!("{base}/coord/agents/continuation-poll-report");
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("agent_runtime: poll-report client build failed (continuing): {e:#}");
-            return;
-        }
+    let Some(client) = crate::coord_http::coord_client() else {
+        warn!("agent_runtime: poll-report: no shared coord client (continuing)");
+        return;
     };
     let body = ContinuationPollReportBody::new(device_id, counts);
-    match client.post(&url).json(&body).send().await {
+    match client
+        .post(&url)
+        .timeout(Duration::from_secs(5))
+        .json(&body)
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             debug!(
                 "agent_runtime: poll self-report posted (listed={} dispatched={} skipped={})",
@@ -2258,17 +2257,16 @@ async fn poll_pending_unit_dispatches(device_id: uuid::Uuid) {
         return;
     };
     let url = format!("{base}/coord/agents/pending-unit-dispatches?device_id={device_id}");
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("agent_runtime: pending-unit-dispatches client build failed: {e:#}");
-            return;
-        }
+    let Some(client) = crate::coord_http::coord_client() else {
+        warn!("agent_runtime: pending-unit-dispatches: no shared coord client");
+        return;
     };
-    let resp = match client.get(&url).send().await {
+    let resp = match client
+        .get(&url)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             warn!("agent_runtime: pending-unit-dispatches GET failed (continuing): {e:#}");
@@ -2339,19 +2337,19 @@ async fn post_continuation_claim(gate_id: uuid::Uuid, device_id: uuid::Uuid) -> 
         return SpawnDecision::Spawn;
     };
     let url = format!("{base}/coord/gates/{gate_id}/continuation-consumed");
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return SpawnDecision::SpawnDespiteClaimError {
-                cause: format!("claim client build failed: {e:#}"),
-            };
-        }
+    let Some(client) = crate::coord_http::coord_client() else {
+        return SpawnDecision::SpawnDespiteClaimError {
+            cause: "no shared coord client".to_string(),
+        };
     };
     let body = ContinuationConsumedBody::claim(device_id);
-    match client.post(&url).json(&body).send().await {
+    match client
+        .post(&url)
+        .timeout(Duration::from_secs(5))
+        .json(&body)
+        .send()
+        .await
+    {
         Ok(resp) => {
             let status = resp.status().as_u16();
             // Body is needed only to distinguish the 409 cancelled shape; read
@@ -2379,20 +2377,18 @@ async fn post_continuation_outcome(
         return;
     };
     let url = format!("{base}/coord/gates/{gate_id}/continuation-consumed");
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(
-                "agent_runtime: continuation-outcome client build failed gate_id={gate_id}: {e:#}"
-            );
-            return;
-        }
+    let Some(client) = crate::coord_http::coord_client() else {
+        warn!("agent_runtime: continuation-outcome: no shared coord client gate_id={gate_id}");
+        return;
     };
     let body = ContinuationConsumedBody::outcome(device_id, spawned, detail);
-    match client.post(&url).json(&body).send().await {
+    match client
+        .post(&url)
+        .timeout(Duration::from_secs(5))
+        .json(&body)
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             debug!(
                 "agent_runtime: continuation-outcome posted gate_id={gate_id} spawned={spawned}"
@@ -2470,21 +2466,21 @@ async fn post_continuation_deferred(gate_id: uuid::Uuid, device_id: uuid::Uuid, 
         return;
     };
     let url = format!("{base}/coord/gates/{gate_id}/continuation-deferred");
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            debug!(
-                "agent_runtime: continuation-deferred client build failed \
-                 gate_id={gate_id} (continuing): {e:#}"
-            );
-            return;
-        }
+    let Some(client) = crate::coord_http::coord_client() else {
+        debug!(
+            "agent_runtime: continuation-deferred: no shared coord client \
+             gate_id={gate_id} (continuing)"
+        );
+        return;
     };
     let body = ContinuationDeferredBody { device_id, reason };
-    match client.post(&url).json(&body).send().await {
+    match client
+        .post(&url)
+        .timeout(Duration::from_secs(5))
+        .json(&body)
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             debug!(
                 "agent_runtime: continuation-deferred posted gate_id={gate_id} reason={}",
@@ -2532,21 +2528,21 @@ async fn post_unit_dispatch_consumed(dispatch_id: uuid::Uuid, device_id: uuid::U
         return;
     };
     let url = format!("{base}/coord/agents/unit-dispatches/{dispatch_id}/consumed");
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(
-                "agent_runtime: unit-dispatch consume client build failed \
-                 dispatch_id={dispatch_id}: {e:#}"
-            );
-            return;
-        }
+    let Some(client) = crate::coord_http::coord_client() else {
+        warn!(
+            "agent_runtime: unit-dispatch consume: no shared coord client \
+             dispatch_id={dispatch_id}"
+        );
+        return;
     };
     let body = UnitDispatchConsumedBody { device_id };
-    match client.post(&url).json(&body).send().await {
+    match client
+        .post(&url)
+        .timeout(Duration::from_secs(5))
+        .json(&body)
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             debug!("agent_runtime: unit-dispatch consume posted dispatch_id={dispatch_id}");
         }
@@ -4482,14 +4478,16 @@ async fn post_log_line(agent_id: uuid::Uuid, line: &LogLine) -> bool {
         return false;
     };
     let url = format!("{base}/agents/{agent_id}/log");
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
+    let Some(client) = crate::coord_http::coord_client() else {
+        return false;
     };
-    match client.post(&url).json(line).send().await {
+    match client
+        .post(&url)
+        .timeout(Duration::from_secs(3))
+        .json(line)
+        .send()
+        .await
+    {
         Ok(resp) => resp.status().is_success(),
         Err(_) => false,
     }
@@ -4532,11 +4530,11 @@ async fn heartbeat_once(payload: &LaunchPayload) -> anyhow::Result<()> {
         machine_id: payload.target_device_id.to_string(),
         ttl_seconds: 3600,
     };
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()?;
+    let client = crate::coord_http::coord_client()
+        .ok_or_else(|| anyhow::anyhow!("no shared coord client"))?;
     let resp = client
         .post(format!("{base}/claims/heartbeat"))
+        .timeout(Duration::from_secs(5))
         .json(&body)
         .send()
         .await?;
@@ -4573,14 +4571,16 @@ async fn report_spawn_complete(
         pr_context,
     };
     let url = format!("{base}/agents/{agent_id}/spawn-complete");
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return,
+    let Some(client) = crate::coord_http::coord_client() else {
+        return;
     };
-    match client.post(&url).json(&body).send().await {
+    match client
+        .post(&url)
+        .timeout(Duration::from_secs(5))
+        .json(&body)
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             info!("agent_runtime: spawn-complete posted agent_id={agent_id}");
         }
@@ -4620,14 +4620,16 @@ async fn report_spawn_failed(
         pr_context,
     };
     let url = format!("{base}/agents/{agent_id}/spawn-failed");
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return,
+    let Some(client) = crate::coord_http::coord_client() else {
+        return;
     };
-    match client.post(&url).json(&body).send().await {
+    match client
+        .post(&url)
+        .timeout(Duration::from_secs(5))
+        .json(&body)
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             warn!("agent_runtime: spawn-failed posted agent_id={agent_id} reason={reason}");
         }
