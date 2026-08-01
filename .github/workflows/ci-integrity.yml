@@ -70,8 +70,20 @@ jobs:
 
           # Changed files in this PR (paths only). No checkout of untrusted
           # code; `removed` files are included so deletions are caught too.
+          #
+          # BOTH `filename` and `previous_filename` — a rename is the one way to
+          # remove a gate without the old path ever appearing in `filename`.
+          # GitHub reports a rename with status `renamed`, `filename` = the NEW
+          # path and `previous_filename` = the old one; it does NOT emit a
+          # separate `removed` entry for the old path. So a PR doing
+          # `git mv .github/workflows/ci.yml .github/workflows/ci-old.yml`
+          # matched nothing in GATING while actually deleting the gate at its
+          # guarded path — the trigger fired (`.github/workflows/**`) and the
+          # job went green. Reading both keys closes that. `// empty` is
+          # required because `previous_filename` is ABSENT on non-renamed
+          # entries, and a bare `.previous_filename` would emit `null` lines.
           CHANGED="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" \
-            --jq '.[].filename')"
+            --jq '.[] | .filename, (.previous_filename // empty)')"
 
           HITS=""
           while IFS= read -r gate; do
