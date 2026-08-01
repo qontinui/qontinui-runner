@@ -528,7 +528,17 @@ impl ComplianceVerdict {
 }
 
 /// Coerce a footprint array into display strings. Accepts plain strings and
-/// objects (preferring the identifying field coord is most likely to carry).
+/// objects.
+///
+/// The `{repo, pr_number}` arm is NOT optional politeness — it is the shape
+/// coord actually emits for `footprint.prs` (`session_footprint` in coord's
+/// `session_compliance.rs`), and `pr_number` is a NUMBER. A key-hunt that only
+/// accepts string-valued fields drops every PR, which silently defeats §A4's
+/// condition 3: a session that authored PRs and skipped the footer — the exact
+/// case this plan was commissioned for — reads as an empty footprint and is
+/// permanently exempt from the nudge. It also makes the nudge text assert
+/// "PRs `none`" about a session with PRs, which is the `ux-priorities#honesty`
+/// failure this feature exists to catch.
 fn string_list(v: Option<&Value>) -> Vec<String> {
     let Some(arr) = v.and_then(Value::as_array) else {
         return Vec::new();
@@ -536,10 +546,29 @@ fn string_list(v: Option<&Value>) -> Vec<String> {
     arr.iter()
         .filter_map(|e| match e {
             Value::String(s) => Some(s.trim().to_string()),
-            Value::Object(_) => ["ref", "pr", "sha", "key", "id", "resource_key"]
-                .iter()
-                .find_map(|k| e.get(*k).and_then(Value::as_str))
-                .map(|s| s.trim().to_string()),
+            Value::Object(_) => {
+                // coord's PR shape first: `owner/repo#N`, tolerating a
+                // number-or-string `pr_number`.
+                let pr = e
+                    .get("pr_number")
+                    .and_then(|n| {
+                        n.as_i64()
+                            .map(|i| i.to_string())
+                            .or_else(|| n.as_str().map(str::to_string))
+                    })
+                    .map(|num| match e.get("repo").and_then(Value::as_str) {
+                        Some(repo) if !repo.trim().is_empty() => {
+                            format!("{}#{}", repo.trim(), num)
+                        }
+                        _ => format!("#{num}"),
+                    });
+                pr.or_else(|| {
+                    ["ref", "pr", "sha", "key", "id", "resource_key"]
+                        .iter()
+                        .find_map(|k| e.get(*k).and_then(Value::as_str))
+                        .map(|s| s.trim().to_string())
+                })
+            }
             _ => None,
         })
         .filter(|s| !s.is_empty())
@@ -629,25 +658,39 @@ pub fn mark_nudged(session_id: &str) -> bool {
 
 /// Refs coord could not reconcile, for the "contradicted" arm of the nudge.
 ///
-/// Coord's `reconciliation` payload shape is defined by the parallel Phase 3
-/// work, so this reads leniently: a top-level array, `{"unreconciled": […]}`,
-/// or `{"items": […]}` with a per-item reconciled/status marker. Anything it
-/// does not recognize yields an empty list and the nudge falls back to coord's
-/// own `reason` string — never a fabricated claim about which item failed.
+/// Coord's key is `unreconciled_refs` (Phase 3 `reconciliation_payload`);
+/// `unreconciled` and `items` are kept as lenient fallbacks. Probing only the
+/// latter two left the primary lookup dead and made the result depend on
+/// coord's `items[]` carrying a per-item marker — which, combined with
+/// a marker-is-missing-means-failed reading, would name every
+/// item as "failed to reconcile" the moment coord emitted markerless items.
+/// That is a fabricated claim about the session's own work, so the primary key
+/// is probed first and the markerless case falls back to coord's `reason`.
 pub fn unreconciled_refs(reconciliation: &Value) -> Vec<String> {
-    let arr = match reconciliation {
-        Value::Array(a) => Some(a),
-        Value::Object(_) => reconciliation
-            .get("unreconciled")
-            .and_then(Value::as_array)
-            .or_else(|| reconciliation.get("items").and_then(Value::as_array)),
-        _ => None,
+    // `explicit` = the array is ALREADY the failure list, so every entry counts
+    // without needing a per-item marker. `items` is the full set, where only an
+    // entry that explicitly says it failed may be named — a markerless entry
+    // there is UNKNOWN, and calling it failed invents a claim about the
+    // session's work.
+    let (arr, explicit) = match reconciliation {
+        Value::Array(a) => (Some(a), true),
+        Value::Object(_) => {
+            match reconciliation
+                .get("unreconciled_refs")
+                .and_then(Value::as_array)
+                .or_else(|| reconciliation.get("unreconciled").and_then(Value::as_array))
+            {
+                Some(a) => (Some(a), true),
+                None => (reconciliation.get("items").and_then(Value::as_array), false),
+            }
+        }
+        _ => (None, true),
     };
     let Some(arr) = arr else {
         return Vec::new();
     };
     arr.iter()
-        .filter(|e| !item_reconciled(e))
+        .filter(|e| if explicit { true } else { explicitly_failed(e) })
         .filter_map(|e| match e {
             Value::String(s) => Some(s.trim().to_string()),
             Value::Object(_) => ["ref", "item", "id", "pr"]
@@ -660,15 +703,20 @@ pub fn unreconciled_refs(reconciliation: &Value) -> Vec<String> {
         .collect()
 }
 
-/// Treat an entry as reconciled only when it explicitly says so. An entry with
-/// no marker at all (e.g. a plain `unreconciled` list) counts as failed.
-fn item_reconciled(e: &Value) -> bool {
+/// Does this entry of a FULL `items[]` list explicitly say it failed to
+/// reconcile? Used only for the non-explicit arm of [`unreconciled_refs`].
+///
+/// A missing marker returns `false` — deliberately. In a full item list,
+/// absence of a marker means UNKNOWN, and naming an unknown item as failed
+/// would put a fabricated claim about the session's own work into the nudge.
+/// Coord's `reason` string carries the honest fallback in that case.
+fn explicitly_failed(e: &Value) -> bool {
     if let Some(b) = e
         .get("reconciled")
         .or_else(|| e.get("ok"))
         .and_then(Value::as_bool)
     {
-        return b;
+        return !b;
     }
     if let Some(s) = e
         .get("status")
@@ -678,7 +726,7 @@ fn item_reconciled(e: &Value) -> bool {
     {
         return matches!(
             s.trim().to_ascii_lowercase().as_str(),
-            "reconciled" | "verified" | "ok" | "confirmed"
+            "unreconciled" | "unverified" | "failed" | "contradicted" | "mismatch"
         );
     }
     false
