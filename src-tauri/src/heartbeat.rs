@@ -201,6 +201,39 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                 None,
             );
 
+            // Phase 1b backstop → Phase 2 recovery. The `ProcessFailed` event
+            // is the precise, immediate detector, but it only fires where a
+            // WebView2 process actually died and the handler actually
+            // attached: not on macOS/Linux, and not if the subscription
+            // failed. This tick is the cross-platform net that catches a UI
+            // which stopped answering for any other reason (wedged renderer,
+            // hung main thread) — the failure the event cannot see.
+            //
+            // Spawned rather than awaited: `trigger_ui_recovery` sleeps
+            // through its backoff, and the heartbeat must keep publishing
+            // `derived_status: "errored"` to the fleet WHILE recovery is being
+            // attempted. Re-entry is safe and cheap — `RECOVERY_IN_PROGRESS`
+            // makes a second call a no-op, and the loop guard owns the attempt
+            // budget — so firing this on every stale tick costs nothing.
+            if ui_dead {
+                if let Some(handle) = crate::tauri_app_handle::current() {
+                    tokio::spawn(async move {
+                        let outcome = crate::webview_recovery::trigger_ui_recovery(
+                            &handle,
+                            crate::webview_recovery::RecoveryReason::HeartbeatStale,
+                        )
+                        .await;
+                        debug!(
+                            outcome = outcome.as_str(),
+                            "heartbeat staleness backstop: UI recovery attempt finished"
+                        );
+                    });
+                }
+                // No `AppHandle` yet means no Tauri runtime (still starting, or
+                // a unit-test context). Nothing to recover, so drop it silently
+                // — the same contract `tauri_app_handle::current()` documents.
+            }
+
             // Phase 5 — provisioning completeness gate. A runner is
             // provisioning-complete only once it holds a live coord device JWT
             // (doctor check 5). ADVISORY by default: surface + log loudly but
