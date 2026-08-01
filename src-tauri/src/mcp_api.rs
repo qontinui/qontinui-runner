@@ -4373,6 +4373,18 @@ pub fn create_router(
         // here before its hard taskkill so in-flight turns flush, dirty
         // worktrees are stashed to refs/wip/*, and coord claims persist.
         .route("/drain", post(drain_handler))
+        // Manually trigger the dead-webview recovery ladder (plan
+        // 2026-08-01-runner-dead-webview-is-invisible-to-health, Phase 2). An
+        // operator/debug affordance ONLY — the shipped detection path is the
+        // push `ProcessFailed` event plus the heartbeat backstop. It exists
+        // because nothing on this API could reach the webview before:
+        // `ui_bridge_reload_webview` is a `#[tauri::command]` that is absent
+        // from the invoke allowlist, so /reload, /ui/reload, /ui-bridge/reload
+        // and /api/reload all 404.
+        .route(
+            "/ui/recover",
+            post(crate::webview_recovery::recover_ui_handler),
+        )
         // Loopback live-token proxy for coord /mcp — device-provisioned
         // sessions' `.mcp.json` points here so each MCP request carries a
         // freshly-read device JWT instead of a 4h-TTL snapshot. Nonce-gated
