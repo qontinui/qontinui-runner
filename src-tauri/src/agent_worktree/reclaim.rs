@@ -151,7 +151,8 @@ pub struct PollerHealth {
 pub fn poller_health() -> PollerHealth {
     let last_success = POLLER_LAST_SUCCESS_UNIX.load(std::sync::atomic::Ordering::Relaxed);
     PollerHealth {
-        consecutive_failures: POLLER_CONSECUTIVE_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
+        consecutive_failures: POLLER_CONSECUTIVE_FAILURES
+            .load(std::sync::atomic::Ordering::Relaxed),
         last_success_unix: (last_success != 0).then_some(last_success),
         last_error: POLLER_LAST_ERROR.lock().ok().and_then(|g| g.clone()),
     }
