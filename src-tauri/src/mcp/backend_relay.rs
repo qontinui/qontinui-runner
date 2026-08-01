@@ -1149,9 +1149,17 @@ async fn run_heartbeat_sender<S>(
         // `pg_reachable = None`: the web-backend heartbeat relay does not run
         // a DB round-trip; the bounded PG liveness probe lives only in the
         // `/health` handler.
+        //
+        // `ui_dead` is NOT `None` here, and that matters: nothing polls
+        // `/health` on an end user's machine, so this relay (and the
+        // operations heartbeat) are the only paths by which a dead UI is ever
+        // visible off-box. Passing `None` would fix the status precisely where
+        // it was already observable and leave it broken everywhere else.
+        let ui_dead = crate::ui_error::ui_dead_now(&api_state.app_state.ui_bridge_last_pong);
         let derived_status = crate::ui_error::compute_derived_status(
             ui_error_snapshot.is_some(),
             recent_crash_snapshot.is_some(),
+            Some(ui_dead),
             crate::mcp_api::embedding_reachable_cached(),
             None,
         )

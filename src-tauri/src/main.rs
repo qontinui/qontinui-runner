@@ -1097,6 +1097,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         process_capture_manager: TokioMutex::new(None), // Initialized in setup()
         api_ready: AtomicBool::new(false),              // Set when MCP API server binds
         frontend_ready: AtomicBool::new(false), // Set on first successful UI Bridge IPC response
+        // 0 = no UI has ever ponged. Advanced by the `ui-bridge-pong` listener.
+        ui_bridge_last_pong: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         api_port: AtomicU16::new(crate::mcp::types::get_mcp_api_port()), // Updated when server binds
         api_lan_bound: AtomicBool::new(false), // Derived from the actual bound address when server binds
         ai_pid_tracker: Arc::new(std::sync::Mutex::new(Vec::new())),

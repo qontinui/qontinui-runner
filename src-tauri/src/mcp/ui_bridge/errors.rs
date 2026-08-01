@@ -200,6 +200,7 @@ pub async fn ui_bridge_diagnostics_handler(
     let failure_count = state.ui_bridge_circuit_breaker.get_failure_count().await;
     let available_permits = state.ui_bridge_semaphore.available_permits();
     let last_pong = state
+        .app_state
         .ui_bridge_last_pong
         .load(std::sync::atomic::Ordering::Relaxed);
     let pending_count = state
@@ -214,7 +215,16 @@ pub async fn ui_bridge_diagnostics_handler(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let last_pong_age_ms = if last_pong > 0 { now_ms - last_pong } else { 0 };
+    // `saturating_sub`, not `-`: `last_pong` is a wall-clock stamp, so a
+    // backwards clock step (NTP, sleep/resume) can leave it ahead of `now_ms`
+    // and a plain subtraction underflows and panics. A "future" pong reads as
+    // age 0 — maximally fresh, the honest answer. This age now also feeds
+    // `derived_status`, so it must not be able to take the handler down.
+    let last_pong_age_ms = if last_pong > 0 {
+        now_ms.saturating_sub(last_pong)
+    } else {
+        0
+    };
 
     // Check Tauri main window state
     let main_window = state
@@ -234,7 +244,7 @@ pub async fn ui_bridge_diagnostics_handler(
     // Join the Rust-side crash state in. `/health` and every heartbeat have
     // always carried it; the UI-Bridge routes never did, so a driver looking
     // at UI-Bridge routes could not see the throw the runner was holding.
-    let ui_error = gather_ui_error_signals(&state).await;
+    let ui_error = gather_ui_error_signals(&state, last_pong, last_pong_age_ms).await;
 
     let frontend_state = classify_frontend_state(FrontendStateInputs {
         window_exists,
@@ -311,6 +321,7 @@ pub async fn ui_bridge_readiness_handler(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let diag = gather_readiness_diagnostics(&state).await;
     let last_pong = state
+        .app_state
         .ui_bridge_last_pong
         .load(std::sync::atomic::Ordering::Relaxed);
 

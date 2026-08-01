@@ -175,8 +175,11 @@ pub struct ApiState {
     pub ui_bridge_circuit_breaker: Arc<crate::mcp::ui_bridge::UiBridgeCircuitBreaker>,
     /// UI Bridge concurrency semaphore (max 6 concurrent requests)
     pub ui_bridge_semaphore: Arc<tokio::sync::Semaphore>,
-    /// Last frontend pong timestamp (epoch ms)
-    pub ui_bridge_last_pong: Arc<std::sync::atomic::AtomicU64>,
+    // NOTE: `ui_bridge_last_pong` deliberately does NOT live here. It moved to
+    // `AppState` (`commands::AppState::ui_bridge_last_pong`) so the heartbeat
+    // sinks, which only ever receive an `Arc<AppState>`, can read UI liveness
+    // too. Reach it from here as `state.app_state.ui_bridge_last_pong` — the
+    // same way this struct reaches `app_state.ui_error`.
     /// Readiness gate — notified on first pong. Requests wait on this during startup.
     pub ui_bridge_ready: Arc<tokio::sync::Notify>,
     /// Pending dedup channels for read-only UI Bridge requests

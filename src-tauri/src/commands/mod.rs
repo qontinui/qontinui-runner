@@ -144,7 +144,7 @@ use crate::tiered_info::RunRecordingHandler;
 use crate::video_recorder::VideoRecordingService;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU16};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 use tokio::sync::Mutex as TokioMutex;
@@ -360,6 +360,22 @@ pub struct AppState {
     /// responsive" from "the React app has actually mounted past `App.tsx`'s
     /// loading screen branch and is ready for UI Bridge calls".
     pub frontend_ready: AtomicBool,
+    /// Last frontend pong timestamp (epoch ms), or 0 if no UI has ever
+    /// checked in.
+    ///
+    /// Rust emits `ui-bridge-ping` unconditionally every 3s and the frontend
+    /// answers `ui-bridge-pong`, so this advances on its own whenever a UI is
+    /// alive — no external driver required. That makes it the one signal that
+    /// stays correct when the WebView2 host dies underneath a healthy Rust
+    /// backend (`frontend_ready` above does NOT: it tracks UI-Bridge IPC
+    /// traffic, not UI presence, and is a one-way latch).
+    ///
+    /// Lives on `AppState` rather than `ApiState` so *every* status sink can
+    /// read it — the heartbeat loops only ever get an `Arc<AppState>`, and
+    /// they are the only paths by which a dead UI is visible off-box on an end
+    /// user's machine (nothing polls `/health` there). Interpret it through
+    /// `crate::ui_error::ui_stale`, never with an open-coded threshold.
+    pub ui_bridge_last_pong: Arc<AtomicU64>,
     /// Actual port the HTTP API server bound to.
     /// Set by `mcp_api::start_server` after successful bind.
     pub api_port: AtomicU16,
