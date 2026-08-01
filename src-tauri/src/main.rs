@@ -234,6 +234,7 @@ mod vga;
 mod video_recorder;
 mod vision;
 mod wake_handler; // Phase F.1 — qontinui:// custom-URL deep-link wake handler
+mod webview_recovery; // Dead-webview detection (WebView2 ProcessFailed) + in-process recovery
 mod win32_compat;
 mod window_assignments;
 mod window_manager;
@@ -3312,6 +3313,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
 
+                // Record the headless decision for the dead-webview recovery
+                // path (plan 2026-08-01-runner-dead-webview-is-invisible-to-health,
+                // Phases 1a/2). A server-mode runner has NO webview, ever, so
+                // `ProcessFailed` subscription and window recreate must both be
+                // inert — it must never be conscripted into growing a window it
+                // was launched to not have.
+                webview_recovery::set_server_mode(server_mode);
+
                 // Always create the window programmatically. tauri.conf.json
                 // has "windows": [] so there's no declarative window.
                 // This lets us set data_directory() for test runners
@@ -3322,8 +3331,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // to a hidden 0x0 tool window here. See plan Phase 1.5 validation.
                 } else {
                     use crate::window_placement::WindowPlacement;
-
-                    let url = tauri::WebviewUrl::App("index.html".into());
 
                     // ── Resolve placement + decorations ────────────────
                     //
@@ -3422,84 +3429,31 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         WindowPlacement::Maximized
                     };
 
-                    let mut builder = tauri::WebviewWindowBuilder::new(app, "main", url)
-                        .title("Qontinui Runner")
-                        .inner_size(initial_size.0, initial_size.1)
-                        .min_inner_size(1200.0, 700.0)
-                        .fullscreen(false)
-                        .resizable(true)
-                        .decorations(resolved_decorations.unwrap_or(true))
-                        // Phase P2.2 of `tmp_plans/sw-cache-invalidation.md`:
-                        // mark the embedded index.html as `no-store` so a
-                        // webview that survives a binary swap can't serve a
-                        // stale shell whose <script src> tags point at
-                        // hashed asset filenames the new bundle no longer
-                        // contains. Hashed `/assets/*` responses pass
-                        // through with their default headers.
-                        .on_web_resource_request(asset_headers::stamp_no_store_on_index)
-                        // Keep the WebView2 renderer live when the window is
-                        // backgrounded / occluded / on another virtual desktop.
-                        // Without these flags Chromium throttles the page's
-                        // timers to ~1/min and, after ~5 min hidden, freezes it
-                        // entirely: the terminal panes then keep showing the
-                        // last-painted frame (a mid-turn spinner) while the
-                        // frontend's session-advancing loops (state polling,
-                        // auto-approve, auto-restart) stall — so an operator
-                        // returning to a backgrounded runner sees stale "busy"
-                        // frames and no overnight progress. The Rust backend is
-                        // never throttled; this only realigns the webview with
-                        // it. `CalculateNativeWinOcclusion` off is the key flag
-                        // for the frozen frame (Windows native-occlusion
-                        // detection otherwise marks an occluded window hidden
-                        // and stops compositing). NOTE: setting
-                        // additional_browser_args REPLACES wry's default
-                        // `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection`,
-                        // so those are re-listed here. Windows-only (no-op
-                        // elsewhere). A truly *minimized* window still can't
-                        // composite, but with these flags its JS keeps running
-                        // so state stays current and it repaints instantly on
-                        // restore.
-                        .additional_browser_args(
-                            "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,\
-                             CalculateNativeWinOcclusion,IntensiveWakeUpThrottling \
-                             --disable-background-timer-throttling \
-                             --disable-renderer-backgrounding \
-                             --disable-backgrounding-occluded-windows",
-                        );
+                    // The whole builder chain (title, sizes, decorations, the
+                    // `no-store` index header, the renderer-throttling browser
+                    // args, the isolated WebView2 profile, the
+                    // `window.__QONTINUI_PORT__` injection and the placement)
+                    // lives in ONE place — `webview_recovery::build_main_window`
+                    // — because the dead-webview recovery path has to build the
+                    // *same* window again after a WebView2 browser-process
+                    // death. Duplicating the chain there would let the
+                    // recovered window silently drift from the real one.
+                    let spec = webview_recovery::MainWindowSpec {
+                        data_dir: data_dir.clone(),
+                        initial_size,
+                        decorations: resolved_decorations.unwrap_or(true),
+                        placement,
+                        is_secondary,
+                    };
 
-                    if let Some(ref dir) = data_dir {
-                        builder = builder.data_directory(dir.clone());
-                    }
-
-                    // Inject the intended API port as a global so the frontend's
-                    // synchronous port-resolution fast-path (`window.__QONTINUI_PORT__`,
-                    // used by useFileLockTracking / useRegistryAwareness /
-                    // useMidSessionProbe / LaunchMenu / useSessionManager / etc.)
-                    // resolves to the *actual* runner port on temp/secondary instances
-                    // instead of silently falling through to the hardcoded 9876.
-                    // Without this, hooks on a temp runner route their reads at the
-                    // primary. The async `get_api_port` IPC + `setApiPort` path
-                    // remains the source of truth if the bound port differs from the
-                    // intended one (port-fallback rare case).
-                    let intended_api_port = crate::mcp::types::get_mcp_api_port();
-                    builder = builder.initialization_script(format!(
-                        "window.__QONTINUI_PORT__ = {};",
-                        intended_api_port
-                    ));
-
-                    builder = placement.configure_builder(builder);
-
-                    match builder.build() {
+                    match webview_recovery::build_main_window(app.handle(), &spec) {
                         Ok(win) => {
-                            placement.finalize(&win);
-                            let _ = win.show();
-                            let _ = win.set_focus();
-                            info!(
-                                "Main window created (secondary={}, isolated={}, placement={:?})",
-                                is_secondary,
-                                data_dir.is_some(),
-                                placement
-                            );
+                            // Phase 1a: subscribe to WebView2 `ProcessFailed` so a
+                            // browser/renderer process death is a PUSH notification
+                            // at the moment of failure rather than something only a
+                            // stale heartbeat can infer. Best-effort — a failure to
+                            // attach is logged and the heartbeat backstop covers it.
+                            webview_recovery::attach_process_failed_handler(&win);
                         }
                         Err(e) => {
                             error!("Failed to create main window: {}", e);
@@ -4780,7 +4734,20 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Tauri application built successfully");
     app.run(|_, event| {
-        if let tauri::RunEvent::ExitRequested { .. } = event {
+        if let tauri::RunEvent::ExitRequested { api, .. } = event {
+            // Dead-webview recovery (plan
+            // 2026-08-01-runner-dead-webview-is-invisible-to-health, Phase 2)
+            // destroys the main window and immediately rebuilds it. Tauri
+            // treats "the last window was destroyed" as an exit request, so
+            // letting this through mid-swap would terminate the process and
+            // every in-flight session — the plan's explicit non-goal. Veto the
+            // exit for exactly the duration of the swap; the flag is cleared by
+            // a Drop guard on every path, including failure.
+            if webview_recovery::window_swap_in_progress() {
+                info!("Exit request vetoed: a webview-recovery window swap is in flight");
+                api.prevent_exit();
+                return;
+            }
             info!("Application exit requested");
             // Phase 2: ensure the shutdown flag is set on ANY exit path (incl.
             // a programmatic `app.exit(0)` that didn't route through the main
