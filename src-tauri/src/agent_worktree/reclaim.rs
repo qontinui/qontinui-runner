@@ -108,6 +108,93 @@ const DEFAULT_PRUNE_INTERVAL_SECS: u64 = 86_400;
 /// `QONTINUI_WORKTREE_BACKSTOP_MAX_AGE_SECS`.
 const DEFAULT_BACKSTOP_MAX_AGE_SECS: u64 = 14 * 86_400;
 
+/// After this many CONSECUTIVE failed pulls the poller stops warning at `warn`
+/// and starts reporting at `error` with a distinct marker. At the 300s default
+/// cadence this is ~25 minutes — long enough that an ordinary coord blip or
+/// deploy stays quiet, short enough that a genuine outage is loud the same
+/// hour rather than five days later.
+const RECLAIM_FAILURE_ESCALATION_STREAK: u64 = 5;
+
+// ---------------------------------------------------------------------------
+// Poller health — published so "the reaper is dead" is a READ, not an autopsy.
+// ---------------------------------------------------------------------------
+
+/// Consecutive failed pulls; reset to 0 by any success.
+static POLLER_CONSECUTIVE_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Unix seconds of the last SUCCESSFUL pull. 0 = never succeeded this process.
+static POLLER_LAST_SUCCESS_UNIX: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// The most recent failure message (already carries its source chain).
+static POLLER_LAST_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// A snapshot of the background poller's health.
+///
+/// This exists because of the 2026-07-28 → 08-01 outage: the poller failed
+/// every pull for five days while the endpoint that REPORTS on reclaim kept
+/// answering `coord_reachable: true` — because that field describes the
+/// reporting request the endpoint had just made, not the executor. A health
+/// signal that reports on its own inputs rather than on the subsystem's output
+/// cannot detect that subsystem being dead. These fields describe the EXECUTOR.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PollerHealth {
+    /// Consecutive failed pulls. `0` with a recent `last_success_unix` is the
+    /// only combination that means "the executor is working".
+    pub consecutive_failures: u64,
+    /// Unix seconds of the last successful pull; `None` = never, this process.
+    pub last_success_unix: Option<u64>,
+    /// Last failure, with its full cause chain. `None` while healthy.
+    pub last_error: Option<String>,
+}
+
+/// Read the poller's health. Cheap; safe from any thread.
+pub fn poller_health() -> PollerHealth {
+    let last_success = POLLER_LAST_SUCCESS_UNIX.load(std::sync::atomic::Ordering::Relaxed);
+    PollerHealth {
+        consecutive_failures: POLLER_CONSECUTIVE_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
+        last_success_unix: (last_success != 0).then_some(last_success),
+        last_error: POLLER_LAST_ERROR.lock().ok().and_then(|g| g.clone()),
+    }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Record a successful pull.
+fn note_poll_success() {
+    POLLER_CONSECUTIVE_FAILURES.store(0, std::sync::atomic::Ordering::Relaxed);
+    POLLER_LAST_SUCCESS_UNIX.store(now_unix(), std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut g) = POLLER_LAST_ERROR.lock() {
+        *g = None;
+    }
+}
+
+/// Record a failed pull and log it at a level that reflects the STREAK, not
+/// just the one tick. A lone failure is a blip; an unbroken run of them is an
+/// outage, and it must not keep reading as routine noise.
+fn note_poll_failure(err: &str) {
+    let streak = POLLER_CONSECUTIVE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if let Ok(mut g) = POLLER_LAST_ERROR.lock() {
+        *g = Some(err.to_string());
+    }
+    if streak >= RECLAIM_FAILURE_ESCALATION_STREAK {
+        let since = match POLLER_LAST_SUCCESS_UNIX.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => "never succeeded this process".to_string(),
+            t => format!("last success {}s ago", now_unix().saturating_sub(t)),
+        };
+        tracing::error!(
+            "worktree_reclaim: RECLAIM POLLER DOWN — {streak} consecutive failed pulls \
+             ({since}); NO worktree can be reclaimed while this persists: {err}"
+        );
+    } else {
+        warn!("worktree_reclaim: {err}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Wire types — coord serializes these.
 // ---------------------------------------------------------------------------
@@ -397,6 +484,20 @@ fn unlink_junction(path: &Path) -> Result<(), String> {
 /// falls back to a plain `remove_dir_all`. Safe to call only AFTER every
 /// junction has been unlinked (the caller's plan guarantees the ordering).
 /// Idempotent: a missing dir is `Ok(())`.
+///
+/// ## INV-W5 — never recursively delete a real clone
+///
+/// The fallback is unconditional: it does not care WHY `git worktree remove`
+/// failed. On a repo root that command always fails ("is a main working tree"),
+/// so the `remove_dir_all` below would delete the whole clone, object store
+/// included. Neither dirty guard catches it — a clean clone is genuinely clean.
+///
+/// So prove the structure before destroying it, exactly as [`unlink_junction`]
+/// proves a path is a reparse point before unlinking: a linked worktree has
+/// `.git` as a FILE, a clone has it as a DIRECTORY. This guard is the last mile
+/// and covers every caller — coord-issued instructions, the coord-absent
+/// backstop sweep, and anything added later — so a classifier defect upstream
+/// can cost a wasted instruction but never a repository.
 pub(super) fn remove_worktree(path: &Path) -> Result<(), String> {
     if !path.exists() {
         debug!(
@@ -404,6 +505,15 @@ pub(super) fn remove_worktree(path: &Path) -> Result<(), String> {
             path.display()
         );
         return Ok(());
+    }
+    if super::census::is_git_clone_root(path) {
+        // Err, not a silent Ok: this must not be counted as a removal, and it
+        // must be loud enough to diagnose the upstream misclassification.
+        return Err(format!(
+            "refusing to remove {} — `.git` is a DIRECTORY, so this is a real \
+             clone, not a linked worktree (INV-W5)",
+            path.display()
+        ));
     }
     let path_str = path.to_string_lossy().to_string();
     // `git -C <wt> worktree remove --force <wt>` prunes the registration.
@@ -883,9 +993,8 @@ pub(super) fn prune_parent_repo(repo_root: &Path) {
 
 /// Enumerate every canonical repo checkout under the workspace root —
 /// reuses the census's discovery contract exactly (`qontinui_root()` for the
-/// root, [`super::census::is_canonical_repo_dir`] for the name filter, plus
-/// a `.git` presence check) so there is no second repo-discovery notion to
-/// drift from.
+/// root, [`super::census::is_canonical_repo_root`] for the repo-root test) so
+/// there is no second repo-discovery notion to drift from.
 fn enumerate_canonical_checkouts() -> Vec<PathBuf> {
     let Some(root) = super::census::qontinui_root() else {
         return Vec::new();
@@ -894,13 +1003,7 @@ fn enumerate_canonical_checkouts() -> Vec<PathBuf> {
     if let Ok(entries) = std::fs::read_dir(&root) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if super::census::is_canonical_repo_dir(name) && path.join(".git").exists() {
+            if path.is_dir() && super::census::is_canonical_repo_root(&path) {
                 out.push(path);
             }
         }
@@ -1203,11 +1306,11 @@ pub(super) async fn fetch_pull() -> Result<Option<(Uuid, ReclaimPull)>, String> 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
-        .map_err(|e| format!("build reclaim http client: {e}"))?;
+        .map_err(|e| format!("build reclaim http client: {}", error_chain(&e)))?;
     let resp = crate::coord_http::coord_get(&client, &url)
         .send()
         .await
-        .map_err(|e| format!("GET {url}: {e}"))?;
+        .map_err(|e| format!("GET {url}: {}", error_chain(&e)))?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
@@ -1221,14 +1324,54 @@ pub(super) async fn fetch_pull() -> Result<Option<(Uuid, ReclaimPull)>, String> 
     Ok(Some((device_id, pull)))
 }
 
-/// One reclaim cycle: pull + execute. Returns `Ok(live_armed)` on a clean
-/// skip or a successful pull — the bool is `true` iff coord responded
-/// successfully AND at least one arming flag was on (the signal that flips
-/// the poller's monotonic `coord_ever_live`, permanently suppressing the
-/// Phase 4 backstop). `Err` only on a transport / non-2xx failure.
-pub async fn tick_once() -> Result<bool, String> {
+/// Render an error together with its FULL source chain.
+///
+/// `reqwest`'s `Display` prints only `error sending request for url (…)` and
+/// leaves the thing that actually explains the failure — the OS error, the DNS
+/// or TLS fault — reachable only via [`std::error::Error::source`]. A bare
+/// `format!("{e}")` therefore produces a line that names a symptom and no
+/// cause, which is not a diagnosable log entry.
+///
+/// This is not hypothetical. Between 2026-07-28 and 2026-08-01 the reclaim
+/// poller failed 100 % of its pulls for five days and emitted ~140 identical
+/// WARN lines per day, every one of them cause-free; the box reached coord
+/// fine over the same URL throughout, and the on-demand path calling THIS
+/// function succeeded the whole time. The outage was undiagnosable from the
+/// logs by construction.
+fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    use std::fmt::Write as _;
+    let mut out = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        let _ = write!(out, ": {cause}");
+        source = cause.source();
+    }
+    out
+}
+
+/// What one reclaim cycle actually did.
+///
+/// This used to be a bare `bool` meaning `live_armed`, which made a SUCCESSFUL
+/// pull with arming off (the default posture) indistinguishable from "no
+/// device_id configured — did nothing". Any health signal built on that bool
+/// would report a perfectly healthy unarmed poller as never having succeeded.
+/// The two cases are different facts, so they get different variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickOutcome {
+    /// No device_id / no coord_url — nothing was attempted. Not a success and
+    /// not a failure.
+    Skipped,
+    /// coord answered. `live_armed` is true iff at least one arming flag was
+    /// on — the signal that flips the poller's monotonic `coord_ever_live` and
+    /// permanently suppresses the Phase 4 backstop.
+    Pulled { live_armed: bool },
+}
+
+/// One reclaim cycle: pull + execute. `Err` only on a transport / non-2xx
+/// failure.
+pub async fn tick_once() -> Result<TickOutcome, String> {
     let Some((_device_id, pull)) = fetch_pull().await? else {
-        return Ok(false);
+        return Ok(TickOutcome::Skipped);
     };
     let live_armed = pull.rejunction_armed || pull.remove_armed;
 
@@ -1240,7 +1383,7 @@ pub async fn tick_once() -> Result<bool, String> {
     tokio::task::spawn_blocking(move || execute_pull(&pull))
         .await
         .map_err(|e| format!("reclaim execution panicked: {e}"))?;
-    Ok(live_armed)
+    Ok(TickOutcome::Pulled { live_armed })
 }
 
 /// Spawn the periodic reclaim poller. Interval from
@@ -1294,17 +1437,22 @@ pub fn spawn_reclaim() {
         loop {
             tick.tick().await;
             match tick_once().await {
-                Ok(true) => {
-                    if !coord_ever_live {
+                Ok(TickOutcome::Pulled { live_armed }) => {
+                    // coord answered: a success for health purposes whether or
+                    // not anything was armed.
+                    note_poll_success();
+                    if live_armed && !coord_ever_live {
                         info!(
                             "worktree_reclaim: coord live+armed — local backstop permanently \
                              suppressed for this poller session"
                         );
                     }
-                    coord_ever_live = true;
+                    coord_ever_live |= live_armed;
                 }
-                Ok(false) => {}
-                Err(e) => warn!("worktree_reclaim: {e}"),
+                // Nothing attempted (unconfigured). Not a success — it must not
+                // reset a failure streak — and not a failure either.
+                Ok(TickOutcome::Skipped) => {}
+                Err(e) => note_poll_failure(&e),
             }
 
             let interval = Duration::from_secs(prune_interval_secs());
@@ -1332,6 +1480,98 @@ pub fn spawn_reclaim() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The health signal must separate "idle" from "dead". This is the single
+    /// test that touches the poller-health statics; keep it that way, they are
+    /// process-global.
+    #[test]
+    fn poller_health_distinguishes_dead_from_healthy() {
+        // Fresh process state: never succeeded, no failures.
+        let h = poller_health();
+        assert_eq!(h.consecutive_failures, 0);
+        assert_eq!(h.last_success_unix, None);
+
+        for _ in 0..RECLAIM_FAILURE_ESCALATION_STREAK {
+            note_poll_failure("GET https://coord…: error sending request: os error 10054");
+        }
+        let h = poller_health();
+        assert_eq!(h.consecutive_failures, RECLAIM_FAILURE_ESCALATION_STREAK);
+        assert!(
+            h.last_error.as_deref().is_some_and(|e| e.contains("10054")),
+            "the cause chain must survive into the health signal"
+        );
+        // Still zero successes — the state the 5-day outage was actually in,
+        // and the one `coord_reachable: true` could not express.
+        assert_eq!(h.last_success_unix, None);
+
+        note_poll_success();
+        let h = poller_health();
+        assert_eq!(h.consecutive_failures, 0, "a success clears the streak");
+        assert!(h.last_success_unix.is_some());
+        assert_eq!(h.last_error, None);
+    }
+
+    /// `reqwest`'s Display names a symptom; the cause lives in `source()`.
+    #[test]
+    fn error_chain_includes_causes() {
+        #[derive(Debug)]
+        struct Inner;
+        impl std::fmt::Display for Inner {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "os error 10054")
+            }
+        }
+        impl std::error::Error for Inner {}
+
+        #[derive(Debug)]
+        struct Outer(Inner);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "error sending request for url")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let rendered = error_chain(&Outer(Inner));
+        assert_eq!(rendered, "error sending request for url: os error 10054");
+    }
+
+    /// INV-W5. A dir whose `.git` is a DIRECTORY is a real clone: refuse, and
+    /// prove the tree is still on disk afterwards. `git worktree remove` fails
+    /// on a repo root, and before this guard the unconditional `remove_dir_all`
+    /// fallback deleted the whole clone.
+    #[test]
+    fn remove_worktree_refuses_a_real_clone() {
+        let dir = tempfile::tempdir().unwrap();
+        let clone = dir.path().join("qontinui-coord-wt-prcreate-fix");
+        std::fs::create_dir_all(clone.join(".git")).unwrap();
+        std::fs::write(clone.join("src.rs"), b"work").unwrap();
+
+        let err = remove_worktree(&clone).expect_err("a real clone must not be removable");
+        assert!(err.contains("INV-W5"), "unexpected error: {err}");
+        assert!(clone.join(".git").is_dir(), "object store must survive");
+        assert!(clone.join("src.rs").exists(), "worktree files must survive");
+    }
+
+    /// The guard must not block the case reclaim actually exists for: a linked
+    /// worktree, whose `.git` is a FILE.
+    #[test]
+    fn remove_worktree_still_removes_a_linked_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("qontinui-coord-wt-real");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: /x/.git/worktrees/y").unwrap();
+
+        // `git worktree remove` fails here (not a registered worktree); the
+        // `remove_dir_all` fallback is what completes it — exactly the path
+        // INV-W5 must leave intact.
+        remove_worktree(&wt).expect("a linked worktree is still removable");
+        assert!(!wt.exists());
+    }
 
     fn instr(action: ReclaimAction, junctioned: &[&str], is_dirty: bool) -> ReclaimInstruction {
         ReclaimInstruction {

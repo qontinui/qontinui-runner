@@ -193,9 +193,9 @@ pub fn should_alarm(is_dirty: bool, holder: Option<&Holder>, obs_len: usize) -> 
 }
 
 /// Enumerate the governed canonical checkouts under `root`: every top-level
-/// `qontinui-*` dir that is a CANONICAL repo root (not a `-wt-`/`-wt` worktree
-/// dir) and has a `.git`. Reuses the census enumeration predicate
-/// [`super::census::is_canonical_repo_dir`] so the backstop governs exactly
+/// `qontinui-*` dir whose `.git` is a DIRECTORY (a real clone, not a linked
+/// worktree). Reuses the census enumeration predicate
+/// [`super::census::is_canonical_repo_root`] so the backstop governs exactly
 /// the set the census reports — they never drift.
 ///
 /// Returns `(repo_name, canonical_path)` pairs.
@@ -214,10 +214,7 @@ fn governed_canonical_checkouts(root: &Path) -> Vec<(String, PathBuf)> {
             Some(n) => n.to_string(),
             None => continue,
         };
-        if !super::census::is_canonical_repo_dir(&name) {
-            continue;
-        }
-        if path.join(".git").exists() {
+        if super::census::is_canonical_repo_root(&path) {
             out.push((name, path));
         }
     }
