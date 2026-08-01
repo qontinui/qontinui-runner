@@ -1612,7 +1612,11 @@ mod tests {
     fn make_worktree(root: &Path, name: &str) -> PathBuf {
         let p = root.join(name);
         std::fs::create_dir_all(&p).unwrap();
-        std::fs::write(p.join(".git"), "gitdir: D:/qontinui-root/x/.git/worktrees/y").unwrap();
+        std::fs::write(
+            p.join(".git"),
+            "gitdir: D:/qontinui-root/x/.git/worktrees/y",
+        )
+        .unwrap();
         p
     }
 
@@ -1622,7 +1626,10 @@ mod tests {
         let root = dir.path();
 
         assert!(is_git_clone_root(&make_clone(root, "qontinui-runner")));
-        assert!(!is_git_clone_root(&make_worktree(root, "qontinui-runner-wt-pnpm")));
+        assert!(!is_git_clone_root(&make_worktree(
+            root,
+            "qontinui-runner-wt-pnpm"
+        )));
         // No `.git` at all — a plain dir is not a clone.
         std::fs::create_dir_all(root.join("node_modules")).unwrap();
         assert!(!is_git_clone_root(&root.join("node_modules")));
