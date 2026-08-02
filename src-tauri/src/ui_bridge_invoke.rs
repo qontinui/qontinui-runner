@@ -354,6 +354,39 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         probe_with_empty_args: false,
         observe_projection: None,
     },
+    ProxyableCommand {
+        name: "set_project_pinned",
+        description: "Pin or unpin a saved project. Pinned projects sort first in the grid and earn a sidebar row. Returns the value actually stored, so a caller can reconcile an optimistic toggle against the persisted truth. Errors when no saved project has that id.",
+        args_schema: r#"{"type":"object","required":["id","pinned"],"properties":{"id":{"type":"string"},"pinned":{"type":"boolean"}}}"#,
+        response_schema: r#"{"type":"boolean"}"#,
+        // Required args + it mutates the registry.
+        probe_with_empty_args: false,
+        observe_projection: None,
+    },
+    // Projects dashboard §7.1 step 3 — the Preview window. Declared here on
+    // purpose: the preview is a real webview, so it is itself a UI Bridge
+    // target, and an automation caller that can OPEN it can drive the site it
+    // shows ("show me my site" → "click that button for me") on one surface.
+    ProxyableCommand {
+        name: "open_project_preview",
+        // Tauri v2 camelCases command arguments, so the wire names are
+        // `projectId` / `url` / `title`.
+        description: "Open (or focus + re-navigate) the Preview webview window for a project, pointed at `url`. One window per project, keyed by project id — a second call reuses and raises the existing window rather than stacking another. Returns `true` when a new window was created, `false` when an existing one was reused; both are success. Only `http://` / `https://` are accepted — `file:`, `data:` and `javascript:` are refused, since the preview window is not governed by the app CSP.",
+        args_schema: r#"{"type":"object","required":["projectId","url"],"properties":{"projectId":{"type":"string"},"url":{"type":"string"},"title":{"type":["string","null"]}}}"#,
+        response_schema: r#"{"type":"boolean"}"#,
+        // Required args + it opens a window; an empty-args probe would error.
+        probe_with_empty_args: false,
+        observe_projection: None,
+    },
+    ProxyableCommand {
+        name: "close_project_preview",
+        description: "Close a project's Preview window. Returns `true` when a window was closed, `false` when none was open — closing an absent preview is not an error, so a caller can offer it unconditionally.",
+        args_schema: r#"{"type":"object","required":["projectId"],"properties":{"projectId":{"type":"string"}}}"#,
+        response_schema: r#"{"type":"boolean"}"#,
+        // Required `projectId` arg; empty-args probe would error.
+        probe_with_empty_args: false,
+        observe_projection: None,
+    },
     // Productivity Stack — Phase 3 (in-product /decompose-plan replacement).
     ProxyableCommand {
         name: "decompose_plan",

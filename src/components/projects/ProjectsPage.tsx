@@ -21,7 +21,10 @@ import { useUIComponent } from "@qontinui/ui-bridge";
 import { useSavedProjects, type SavedProject } from "@/hooks/useSavedProjects";
 import { setActiveProjectHint } from "@/components/terminal/activeProject";
 import { useProjectSnapshots } from "./useProjectSnapshots";
+import { useProjectOpen } from "./useProjectOpen";
+import { sortProjects } from "./cardExtras";
 import { ProjectCard } from "./ProjectCard";
+import { ProjectDetail } from "./ProjectDetail";
 import { ProjectEmptyState } from "./ProjectEmptyState";
 
 const log = createLogger("ProjectsPage");
@@ -37,9 +40,19 @@ export interface ProjectsPageProps {
 export function ProjectsPage({ onNavigateToTerminal }: ProjectsPageProps) {
   const { projects, loading, error, refresh, saveAll } = useSavedProjects();
   const { snapshots, refresh: refreshSnapshots } = useProjectSnapshots(projects);
+  const { phases: openPhases, open: openProject, dismiss: dismissOpen } = useProjectOpen();
 
   const [scanning, setScanning] = useState(false);
   const [scanMessage, setScanMessage] = useState<string | null>(null);
+  /**
+   * Which project's detail view is showing (§5.2), or `null` for the grid.
+   *
+   * Held as an id rather than the project object so a background refresh of the
+   * registry re-renders the detail with fresh fields instead of pinning a stale
+   * copy — and so a project deleted while its detail is open falls back to the
+   * grid rather than rendering a ghost.
+   */
+  const [detailId, setDetailId] = useState<string | null>(null);
 
   /**
    * "Find on disk" — pick a folder, scan it, and merge anything new into the
@@ -104,6 +117,31 @@ export function ProjectsPage({ onNavigateToTerminal }: ProjectsPageProps) {
     });
   }, []);
 
+  /**
+   * Pin / unpin (§5.1).
+   *
+   * Persists first, then re-reads the registry, rather than toggling local
+   * state optimistically: `set_project_pinned` returns the value it actually
+   * stored, and a failed write that left the card looking pinned would be a
+   * lie the next refresh silently reverts.
+   */
+  const handleTogglePin = useCallback(
+    async (project: SavedProject) => {
+      try {
+        await invoke<boolean>("set_project_pinned", {
+          id: project.id,
+          pinned: !(project.pinned ?? false),
+        });
+        await refresh();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.error("set_project_pinned failed", msg);
+        setScanMessage(`Could not pin that project: ${msg}`);
+      }
+    },
+    [refresh],
+  );
+
   /** "Work on it" — activate, then hand off to the Terminal. */
   const handleWorkOnIt = useCallback(
     (project: SavedProject) => {
@@ -114,19 +152,21 @@ export function ProjectsPage({ onNavigateToTerminal }: ProjectsPageProps) {
   );
 
   /**
-   * "Open" — currently the same activation as "Work on it".
+   * "Open" — §7.1: start what the project needs, wait for it, then show it in
+   * the Preview window.
    *
-   * Starting the project's processes and showing its front page is §7.1, a
-   * later step that depends on the process-manager binding. Rather than wire a
-   * dead button, this does the part that works today and is honest about it in
-   * the title attribute.
+   * It activates first so the Terminal is already bound to the project by the
+   * time the site comes up: the user who then wants to change something is in
+   * the right directory without a second click. It does NOT navigate to the
+   * Terminal — Open's whole point is that the user stays looking at the
+   * dashboard while the prose reports progress, and then at their site.
    */
   const handleOpen = useCallback(
     (project: SavedProject) => {
       activateProject(project);
-      onNavigateToTerminal?.();
+      void openProject(project, snapshots[project.id]);
     },
-    [activateProject, onNavigateToTerminal],
+    [activateProject, openProject, snapshots],
   );
 
   // Declared after the callbacks so the action handlers can close over them.
@@ -182,6 +222,23 @@ export function ProjectsPage({ onNavigateToTerminal }: ProjectsPageProps) {
     );
   }
 
+  // Resolved every render: a project removed while its detail was open simply
+  // has no match, and the page falls back to the grid instead of a ghost.
+  const detailProject = detailId ? projects.find((p) => p.id === detailId) : undefined;
+  if (detailProject) {
+    return (
+      <ProjectDetail
+        project={detailProject}
+        snapshot={snapshots[detailProject.id]}
+        openPhase={openPhases[detailProject.id]}
+        onBack={() => setDetailId(null)}
+        onOpen={handleOpen}
+        onWorkOnIt={handleWorkOnIt}
+        onRefresh={refreshSnapshots}
+      />
+    );
+  }
+
   if (projects.length === 0) {
     return (
       <div className="h-full" data-page-id="projects">
@@ -217,13 +274,17 @@ export function ProjectsPage({ onNavigateToTerminal }: ProjectsPageProps) {
       ) : null}
 
       <div className="grid flex-1 auto-rows-min grid-cols-[repeat(auto-fill,minmax(18rem,1fr))] gap-4 overflow-auto p-6">
-        {projects.map((project) => (
+        {sortProjects(projects).map((project) => (
           <ProjectCard
             key={project.id}
             project={project}
             snapshot={snapshots[project.id]}
+            openPhase={openPhases[project.id]}
             onOpen={handleOpen}
             onWorkOnIt={handleWorkOnIt}
+            onDismissOpen={dismissOpen}
+            onShowDetail={setDetailId}
+            onTogglePin={(p) => void handleTogglePin(p)}
           />
         ))}
       </div>

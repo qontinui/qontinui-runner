@@ -542,6 +542,20 @@ pub fn set_project_front_page(id: String, url: Option<String>) -> Result<(), Str
     }
 }
 
+/// Pin or unpin a project (plan §5.1 card extras).
+///
+/// A pinned project sorts first in the grid and earns a sidebar row. Returns
+/// the value actually stored so the caller can reconcile its optimistic toggle
+/// against the persisted truth rather than assuming its own write won.
+#[tauri::command]
+pub fn set_project_pinned(id: String, pinned: bool) -> Result<bool, String> {
+    if update_project(&id, |p| p.pinned = pinned)? {
+        Ok(pinned)
+    } else {
+        Err(format!("No saved project with id {id}"))
+    }
+}
+
 /// Bind the set of managed-process config ids this project owns.
 ///
 /// Replaces the existing binding wholesale (the UI edits the whole set), and

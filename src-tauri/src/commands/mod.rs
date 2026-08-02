@@ -218,6 +218,7 @@ pub mod performance_metrics; // Performance metrics dashboard
 pub mod playwright_settings;
 pub mod productivity; // Phase 1 productivity stack: plans/tasks/upcoming-claims
 pub mod project_logs;
+pub mod project_preview; // Projects dashboard §7.1 — the per-project Preview webview window
 pub mod rag;
 pub mod recap; // Session recap overview
 pub mod regression; // UI Bridge regression suite + run + diagnosis + per-assertion exercise log persistence (Section 11 Phase A2)
