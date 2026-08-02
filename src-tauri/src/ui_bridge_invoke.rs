@@ -341,6 +341,19 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         probe_with_empty_args: false,
         observe_projection: None,
     },
+    ProxyableCommand {
+        name: "set_project_terminal_page",
+        // The Tauri arg is `page_id`; the wire name an invoke caller sends is
+        // the camelCase `pageId` (Tauri v2 camelCases command arguments), so
+        // that is what this schema declares.
+        description: "Bind the Terminal page a project activates onto (plan §7.2 step 1). `pageId` is a HINT, not a handle: pages live in the frontend's instanceStorage, which Rust cannot read, so this stores whatever id the frontend settled on without validating it. Pass `null` to unbind. Errors when no saved project has that id.",
+        args_schema: r#"{"type":"object","required":["id"],"properties":{"id":{"type":"string"},"pageId":{"type":["string","null"]}}}"#,
+        response_schema: r#"{"type":"null"}"#,
+        // Required `id` arg + it mutates the registry; an empty-args probe
+        // would error anyway, but mark it explicit.
+        probe_with_empty_args: false,
+        observe_projection: None,
+    },
     // Productivity Stack — Phase 3 (in-product /decompose-plan replacement).
     ProxyableCommand {
         name: "decompose_plan",

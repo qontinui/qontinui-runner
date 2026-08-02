@@ -45,6 +45,50 @@ export type RestoreProfileByName = (
 ) => Promise<boolean>;
 
 /**
+ * The most recent restore request no page has consumed yet.
+ *
+ * A window event only reaches listeners that are ALREADY mounted, and a
+ * project activation dispatches one in the same commit that switches to the
+ * project's page. When that page is brand-new (or was re-created from a
+ * dangling id), `TerminalSessionProvider` is still showing its loading gate at
+ * that moment — `TerminalPage`, and therefore this hook's listener, is not
+ * mounted yet, so the event lands on nobody. That case is not hypothetical:
+ * zone profiles live in the runner's Rust settings, page-namespaced, so a
+ * re-created page CAN own profiles even though `instanceStorage` has never
+ * heard of it.
+ *
+ * So the request is also queued here. `useZoneProfileRestore`'s effect drains
+ * it on mount and on every page switch, which is exactly when the missing
+ * listener appears. Module-level (not React state) because the producer is
+ * outside the terminal tree entirely.
+ */
+let pendingRestore: RestoreZoneProfileDetail | null = null;
+
+/**
+ * Take the queued request when it targets `pageId` (or names no page at all).
+ * Consuming CLEARS it — a restore is one-shot, never replayed on the next
+ * page switch. Exported so the hand-off contract is unit-testable without
+ * React.
+ */
+export function takePendingZoneProfileRestore(pageId: string): RestoreZoneProfileDetail | null {
+  if (!pendingRestore) return null;
+  const target = pendingRestore.pageId?.trim();
+  if (target && target !== pageId) return null;
+  const taken = pendingRestore;
+  pendingRestore = null;
+  return taken;
+}
+
+/**
+ * Drop any queued request. Activating a project that has NO `zone_profile`
+ * calls this, so a previous project's undelivered restore can never surface
+ * later on an unrelated page switch.
+ */
+export function cancelZoneProfileRestore(): void {
+  pendingRestore = null;
+}
+
+/**
  * Returns `restoreProfileByName(name)` → `true` when a profile with that name
  * existed on the target page and was applied, `false` when it did not.
  *
@@ -75,23 +119,40 @@ export function useZoneProfileRestore(
   );
 
   useEffect(() => {
+    // Drain a request that was dispatched before this page's tree existed
+    // (see `pendingRestore`). `restoreProfileByName` changes identity with
+    // `pageId`, so this re-runs on every page switch — which is precisely when
+    // the previously-missing listener appears.
+    const queued = takePendingZoneProfileRestore(pageId);
+    if (queued?.profileName) {
+      void restoreProfileByName(queued.profileName, { pageId: queued.pageId });
+    }
+
     const handler = (e: Event) => {
       const detail = (e as CustomEvent<RestoreZoneProfileDetail>).detail;
       if (!detail?.profileName) return;
+      // Claim it out of the queue so the mount-drain above cannot apply the
+      // same profile a second time on the next page switch.
+      takePendingZoneProfileRestore(detail.pageId?.trim() || pageId);
       void restoreProfileByName(detail.profileName, { pageId: detail.pageId });
     };
     window.addEventListener(RESTORE_ZONE_PROFILE_EVENT, handler as EventListener);
     return () => window.removeEventListener(RESTORE_ZONE_PROFILE_EVENT, handler as EventListener);
-  }, [restoreProfileByName]);
+  }, [restoreProfileByName, pageId]);
 
   return restoreProfileByName;
 }
 
 /**
  * Fire-and-forget restore request from outside the terminal tree (e.g. the
- * Projects page's activation flow). No-op when the terminal page is not
- * mounted — an activation must not depend on it.
+ * Projects page's activation flow). Never throws and never blocks — an
+ * activation must not depend on the terminal tree being mounted.
+ *
+ * The request is QUEUED as well as dispatched: when the target page's tree is
+ * not mounted yet the event lands on nobody, and the queue is what lets the
+ * page pick it up the moment it mounts (see `pendingRestore`).
  */
 export function requestZoneProfileRestore(detail: RestoreZoneProfileDetail): void {
+  pendingRestore = detail;
   window.dispatchEvent(new CustomEvent(RESTORE_ZONE_PROFILE_EVENT, { detail }));
 }

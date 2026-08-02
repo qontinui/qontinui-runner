@@ -14,8 +14,8 @@
 //! - [`discover_projects`] — scan a workspace dir for candidate projects.
 //! - [`project_snapshot`] — the joined dashboard view (see
 //!   [`crate::projects::snapshot`]).
-//! - [`set_project_front_page`] / [`bind_project_processes`] — targeted
-//!   field updates keyed by id.
+//! - [`set_project_front_page`] / [`bind_project_processes`] /
+//!   [`set_project_terminal_page`] — targeted field updates keyed by id.
 //!
 //! # Path normalization
 //!
@@ -556,6 +556,30 @@ pub fn bind_project_processes(id: String, process_ids: Vec<String>) -> Result<()
         }
     }
     if update_project(&id, |p| p.process_ids = deduped.clone())? {
+        Ok(())
+    } else {
+        Err(format!("No saved project with id {id}"))
+    }
+}
+
+/// Bind (or, with `None`, unbind) the Terminal page this project activates
+/// onto.
+///
+/// This stores a **hint, not a handle** (plan §4). The pages themselves live
+/// in the frontend's `instanceStorage` — localStorage, port-namespaced — which
+/// Rust cannot read, so an id written here can perfectly legitimately name a
+/// page that does not exist in some future window (a cleared WebView2
+/// profile, a different runner instance, a page the operator deleted). There
+/// is therefore nothing on this side to validate the id against, and this
+/// command deliberately does not try: the frontend's `resolveProjectPage`
+/// tolerates a dangling id by re-creating the page under it, then calls back
+/// here with whatever id it settled on.
+#[tauri::command]
+pub fn set_project_terminal_page(id: String, page_id: Option<String>) -> Result<(), String> {
+    let page_id = page_id
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+    if update_project(&id, |p| p.terminal_page_id = page_id.clone())? {
         Ok(())
     } else {
         Err(format!("No saved project with id {id}"))

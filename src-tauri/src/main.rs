@@ -1928,6 +1928,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::saved_projects::remove_saved_project,
             commands::saved_projects::save_saved_projects,
             commands::saved_projects::set_project_front_page,
+            commands::saved_projects::set_project_terminal_page,
             commands::screenshot::capture_and_upload_screenshot,
             commands::screenshot::capture_screenshot,
             commands::screenshot::capture_screenshot_via_python,

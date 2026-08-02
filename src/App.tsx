@@ -76,6 +76,7 @@ import { Sidebar } from "./components/navigation";
 import { TerminalPage } from "./components/terminal";
 import { TerminalPageTabBar } from "./components/terminal/TerminalPageTabBar";
 import { SessionRecoveryBanner } from "./components/terminal/SessionRecoveryBanner";
+import { useProjectPageActivation } from "./components/terminal/useProjectPageActivation";
 import { useTerminalPages } from "./components/terminal/useTerminalPages";
 import { useTerminalWindowActions } from "./components/terminal/useTerminalWindowActions";
 import { TerminalPageProvider } from "./components/terminal/TerminalPageContext";
@@ -178,6 +179,15 @@ function AppContent() {
   } = useAppNavigation();
 
   const terminalPages = useTerminalPages();
+  // Projects-dashboard §7.2 steps 1–3: bind an activated project to its
+  // Terminal page, pin that page's cwd to the project root, and reinstate its
+  // zone profile. Mounted HERE — not in the Projects tab — because the page
+  // roster lives in `terminalPages`, and because the Terminal tree stays
+  // mounted (hidden) on every tab, so an activation from any surface lands.
+  useProjectPageActivation({
+    activePageId: terminalPages.activePageId,
+    ensureProjectPage: terminalPages.ensureProjectPage,
+  });
   const { popOutPage } = useTerminalWindowActions();
   const [showReorganize, setShowReorganize] = useState(false);
 

@@ -2,13 +2,19 @@
  * The terminal surface's read-only view of "which project is active".
  *
  * The Projects dashboard owns project state (Rust `settings.json` +
- * `ProjectContext`, projects-dashboard plan §4/§10). The terminal only needs
- * one fact from it — the active project's ROOT PATH — to answer "are any of
- * these terminals in a different folder?" (§7.2 step 4). Rather than couple
- * the terminal tree to the projects tree, activation is published as a
+ * `ProjectContext`, projects-dashboard plan §4/§10). Rather than couple the
+ * terminal tree to the projects tree, activation is published as a
  * `project-activated` window `CustomEvent` (the event name the plan's §10
  * already assigns to `ProjectContext`), exactly like the existing
  * `terminal-open-page` / `navigate-to-active` idioms.
+ *
+ * The hint carries the four fields §7.2 needs and nothing else: the terminal
+ * side cannot read the project registry — it has no Tauri call for it and no
+ * business owning one — so this event IS the transport. `path` answers "are
+ * any of these terminals in a different folder?" (step 4, `ProjectFolderChip`);
+ * `id` + `terminalPageId` + `zoneProfile` drive the page binding, its
+ * `defaultWorkingDir`, and the profile restore (steps 1–3,
+ * `useProjectPageActivation`).
  *
  * The last hint is mirrored into `instanceStorage` so the answer survives a
  * webview reload and is available on the FIRST render (no flash of a stale
@@ -30,8 +36,24 @@ export interface ActiveProjectHint {
   id?: string;
   /** Display name, used to label a page / chip. */
   name?: string;
-  /** The project root on disk — the only field the terminal surface needs. */
+  /** The project root on disk — the only field the CHIP needs. */
   path?: string;
+  /**
+   * `SavedProject.terminalPageId` — the page this project last resolved onto.
+   *
+   * A hint about a hint: the binding is persisted in Rust `settings.json`
+   * while the pages live in `instanceStorage`, so this id can name a page that
+   * does not exist in this window. `resolveProjectPage` tolerates that by
+   * re-creating the page under the same id; it is never an error. Absent means
+   * "no page bound yet".
+   */
+  terminalPageId?: string;
+  /**
+   * `SavedProject.zoneProfile` — the zone profile to reinstate on activation
+   * (§7.2 step 3). A NAME, resolved against the target page's saved profiles;
+   * a profile the operator has since deleted degrades to "nothing to restore".
+   */
+  zoneProfile?: string;
 }
 
 /** The cached hint, or `null` when no project has been activated. */

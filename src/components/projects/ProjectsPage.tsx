@@ -72,9 +72,7 @@ export function ProjectsPage({ onNavigateToTerminal }: ProjectsPageProps) {
         return;
       }
       await saveAll([...projects, ...found]);
-      setScanMessage(
-        found.length === 1 ? "Added 1 project." : `Added ${found.length} projects.`,
-      );
+      setScanMessage(found.length === 1 ? "Added 1 project." : `Added ${found.length} projects.`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       log.error("discover_projects failed", msg);
@@ -85,18 +83,34 @@ export function ProjectsPage({ onNavigateToTerminal }: ProjectsPageProps) {
   }, [projects, saveAll]);
 
   /**
-   * "Work on it" — publish the activation and hand off to the Terminal.
+   * Publish the activation. Everything §7.2 asks for downstream —
+   * bind/create the project's Terminal page, pin that page's
+   * `defaultWorkingDir` to the project root, reinstate `zoneProfile`, and
+   * offer to move terminals that sit elsewhere — happens in
+   * `useProjectPageActivation` and `ProjectFolderChip`, both of which follow
+   * this event. This page never reaches into the terminal tree itself; see
+   * `components/terminal/activeProject.ts` for the contract.
    *
-   * The terminal surface listens for `project-activated` and reconciles its
-   * pages to the new root; this page does not reach into the terminal tree
-   * itself. See `components/terminal/activeProject.ts` for the contract.
+   * `terminalPageId` and `zoneProfile` ride along because the terminal side
+   * has no way to read the project registry: the hint IS the transport.
    */
+  const activateProject = useCallback((project: SavedProject) => {
+    setActiveProjectHint({
+      id: project.id,
+      name: project.name,
+      path: project.path,
+      terminalPageId: project.terminalPageId,
+      zoneProfile: project.zoneProfile,
+    });
+  }, []);
+
+  /** "Work on it" — activate, then hand off to the Terminal. */
   const handleWorkOnIt = useCallback(
     (project: SavedProject) => {
-      setActiveProjectHint({ id: project.id, name: project.name, path: project.path });
+      activateProject(project);
       onNavigateToTerminal?.();
     },
-    [onNavigateToTerminal],
+    [activateProject, onNavigateToTerminal],
   );
 
   /**
@@ -109,10 +123,10 @@ export function ProjectsPage({ onNavigateToTerminal }: ProjectsPageProps) {
    */
   const handleOpen = useCallback(
     (project: SavedProject) => {
-      setActiveProjectHint({ id: project.id, name: project.name, path: project.path });
+      activateProject(project);
       onNavigateToTerminal?.();
     },
-    [onNavigateToTerminal],
+    [activateProject, onNavigateToTerminal],
   );
 
   // Declared after the callbacks so the action handlers can close over them.
