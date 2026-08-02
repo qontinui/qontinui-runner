@@ -354,6 +354,22 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         probe_with_empty_args: false,
         observe_projection: None,
     },
+    // The dashboard's own backend join. Declared because an automation caller
+    // that can open the Projects page should be able to ask the SAME question
+    // the page asks — "what is this project doing right now?" — instead of
+    // scraping the rendered card for it. Missing since the dashboard shipped:
+    // the command was registered in `main.rs` but never declared here, so it was
+    // neither discoverable nor proxyable (found 2026-08-02 while verifying the
+    // dashboard through the UI Bridge on a temp runner).
+    ProxyableCommand {
+        name: "project_snapshot",
+        description: "Return the joined live view of ONE saved project by id: its managed processes (with state + port health), live and recent sessions, git branch/dirty-count/last-commits, pending questions, a traffic-light `health` with a plain-English `reason`, rolling 7-day spend, and `lastActivityMs`. This is the exact payload the Projects dashboard renders, computed server-side. `spend7dUsd` absent means NOT MEASURED — distinct from 0, which means measured and free. Errors when no saved project has that id.",
+        args_schema: r#"{"type":"object","required":["id"],"properties":{"id":{"type":"string"}}}"#,
+        response_schema: r#"{"type":"object","required":["project","processes","liveSessions","recentSessions","questions","health"],"properties":{"project":{"type":"object"},"processes":{"type":"array","items":{"type":"object"}},"liveSessions":{"type":"array"},"recentSessions":{"type":"array"},"git":{"type":["object","null"]},"questions":{"type":"array"},"health":{"type":"object"},"spend7dUsd":{"type":["number","null"]},"lastActivityMs":{"type":["integer","null"]}}}"#,
+        // Required `id` arg; an empty-args probe would error. Read-only.
+        probe_with_empty_args: false,
+        observe_projection: None,
+    },
     ProxyableCommand {
         name: "set_project_pinned",
         description: "Pin or unpin a saved project. Pinned projects sort first in the grid and earn a sidebar row. Returns the value actually stored, so a caller can reconcile an optimistic toggle against the persisted truth. Errors when no saved project has that id.",
