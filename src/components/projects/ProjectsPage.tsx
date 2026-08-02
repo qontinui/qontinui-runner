@@ -20,6 +20,7 @@ import { createLogger } from "@/lib/logger";
 import { useUIComponent } from "@qontinui/ui-bridge";
 import { useSavedProjects, type SavedProject } from "@/hooks/useSavedProjects";
 import { setActiveProjectHint } from "@/components/terminal/activeProject";
+import { buildFixPrompt } from "./fixThis";
 import { useProjectSnapshots } from "./useProjectSnapshots";
 import { useProjectOpen } from "./useProjectOpen";
 import { sortProjects } from "./cardExtras";
@@ -107,15 +108,20 @@ export function ProjectsPage({ onNavigateToTerminal }: ProjectsPageProps) {
    * `terminalPageId` and `zoneProfile` ride along because the terminal side
    * has no way to read the project registry: the hint IS the transport.
    */
-  const activateProject = useCallback((project: SavedProject) => {
-    setActiveProjectHint({
-      id: project.id,
-      name: project.name,
-      path: project.path,
-      terminalPageId: project.terminalPageId,
-      zoneProfile: project.zoneProfile,
-    });
-  }, []);
+  const activateProject = useCallback(
+    (project: SavedProject, seed?: { prompt: string; id: string }) => {
+      setActiveProjectHint({
+        id: project.id,
+        name: project.name,
+        path: project.path,
+        terminalPageId: project.terminalPageId,
+        zoneProfile: project.zoneProfile,
+        seedPrompt: seed?.prompt,
+        seedPromptId: seed?.id,
+      });
+    },
+    [],
+  );
 
   /**
    * Pin / unpin (§5.1).
@@ -149,6 +155,42 @@ export function ProjectsPage({ onNavigateToTerminal }: ProjectsPageProps) {
       onNavigateToTerminal?.();
     },
     [activateProject, onNavigateToTerminal],
+  );
+
+  /**
+   * "Fix this" (§8.4) — `Work on it`, plus the failure description an agent
+   * needs, so Stefan never has to write the bug report himself. He can see the
+   * red dot; he cannot say which process died or what it printed.
+   *
+   * The prompt is composed HERE rather than in the terminal because this is
+   * where the snapshot lives — the terminal side has no access to the project
+   * registry, let alone its health (`activeProject.ts` states that contract),
+   * which is exactly why the seed rides on the activation hint.
+   *
+   * A fresh `seedPromptId` per click is what keeps one click to one agent: the
+   * hint is cached in `instanceStorage` and replayed on reload and on
+   * cross-window `storage` events, so without an identity the consumer would
+   * re-spawn a session every time the webview reloaded.
+   */
+  const handleFixThis = useCallback(
+    (project: SavedProject) => {
+      const prompt = buildFixPrompt({
+        projectName: project.name,
+        projectPath: project.path,
+        snapshot: snapshots[project.id],
+      });
+      if (!prompt) {
+        // The card only offers this on amber/red, so reaching here means the
+        // snapshot changed under the click. Degrade to plain activation rather
+        // than spawning an agent with nothing to go on.
+        log.warn("Fix this: no fix prompt could be composed; falling back to Work on it");
+        handleWorkOnIt(project);
+        return;
+      }
+      activateProject(project, { prompt, id: crypto.randomUUID() });
+      onNavigateToTerminal?.();
+    },
+    [activateProject, handleWorkOnIt, onNavigateToTerminal, snapshots],
   );
 
   /**
@@ -282,6 +324,7 @@ export function ProjectsPage({ onNavigateToTerminal }: ProjectsPageProps) {
             openPhase={openPhases[project.id]}
             onOpen={handleOpen}
             onWorkOnIt={handleWorkOnIt}
+            onFixThis={handleFixThis}
             onDismissOpen={dismissOpen}
             onShowDetail={setDetailId}
             onTogglePin={(p) => void handleTogglePin(p)}
