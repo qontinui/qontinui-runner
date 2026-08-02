@@ -39,6 +39,26 @@ pub struct EnvAgentConfig {
     /// for a hand-written config that omitted it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enrolled_at: Option<String>,
+    /// Directory the toolchain `--version` probes run in — the **declared
+    /// capture scope**.
+    ///
+    /// The `versions` section's `node`/`python`/`rustc` keys are OBSERVED values
+    /// from bounded `<cmd> --version` shells, so their answer depends on the cwd
+    /// and PATH the probe runs under. Before this field existed the probe simply
+    /// inherited the runner process's cwd, which made the captured value a
+    /// function of how the runner happened to be launched — two processes on one
+    /// box could legitimately report different versions, and the drift oracle
+    /// they feed was correspondingly non-deterministic.
+    ///
+    /// `None` (the common case) resolves to the user's home directory, which
+    /// measures the box's DEFAULT toolchain — what shim-based managers (rustup's
+    /// default toolchain, `nvm alias default`, `pyenv global`) answer outside any
+    /// project tree. Set this to a project root to measure that tree instead;
+    /// that is also the root a P2b apply anchors a pinfile to.
+    ///
+    /// See [`super::collectors::probe_scope_root`] for the full resolution order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_root: Option<String>,
 }
 
 impl EnvAgentConfig {
@@ -95,6 +115,7 @@ mod tests {
             machine_id: "machine-abc".to_string(),
             environment_id: "env-123".to_string(),
             enrolled_at: Some("2026-06-22T00:00:00Z".to_string()),
+            scope_root: Some("D:/qontinui-root".to_string()),
         };
         let pretty = serde_json::to_vec_pretty(&cfg).unwrap();
         std::fs::write(&path, pretty).unwrap();
@@ -102,6 +123,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(loaded.machine_id, "machine-abc");
         assert_eq!(loaded.environment_id, "env-123");
+        assert_eq!(loaded.scope_root.as_deref(), Some("D:/qontinui-root"));
         assert!(loaded.is_enrolled());
     }
 
@@ -112,8 +134,35 @@ mod tests {
             machine_id: "".to_string(),
             environment_id: "".to_string(),
             enrolled_at: None,
+            scope_root: None,
         };
         assert!(!cfg.is_enrolled());
+    }
+
+    /// A config written before `scope_root` existed must still load, with the
+    /// field absent rather than erroring — the field is `#[serde(default)]` and
+    /// every enrolled box on the fleet has such a file on disk today.
+    #[test]
+    fn legacy_config_without_scope_root_deserializes() {
+        let raw = r#"{"backend_url":"http://h:8000","machine_id":"m","environment_id":"e"}"#;
+        let parsed: EnvAgentConfig = serde_json::from_str(raw).expect("must decode");
+        assert!(parsed.scope_root.is_none());
+        assert!(parsed.is_enrolled());
+    }
+
+    /// `scope_root` is skipped when None, so an unconfigured box's file keeps its
+    /// existing shape — no spurious `"scope_root": null` churn on every save.
+    #[test]
+    fn scope_root_omitted_from_json_when_unset() {
+        let cfg = EnvAgentConfig {
+            backend_url: "http://h:8000".to_string(),
+            machine_id: "m".to_string(),
+            environment_id: "e".to_string(),
+            enrolled_at: None,
+            scope_root: None,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(!json.contains("scope_root"), "got {json}");
     }
 
     #[test]
