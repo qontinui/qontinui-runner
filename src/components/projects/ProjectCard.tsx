@@ -17,6 +17,7 @@ import { useUIComponent } from "@qontinui/ui-bridge";
 import type { SavedProject } from "@/hooks/useSavedProjects";
 import type { HealthLevel, ProjectSnapshot } from "./types";
 import { isLiveProcessState } from "./types";
+import { shouldOfferFix } from "./fixThis";
 import { formatRelativeActivity } from "./relativeTime";
 import { isOpenBusy, openProse, type OpenPhase } from "./openProject";
 import { formatWeeklySpend } from "./cardExtras";
@@ -96,6 +97,11 @@ export interface ProjectCardProps {
   onShowDetail?: (projectId: string) => void;
   /** Pin/unpin — pinned projects sort first and earn a sidebar row (§5.1). */
   onTogglePin?: (project: SavedProject) => void;
+  /**
+   * Launch an agent on this project's failure, with the observed error text
+   * already attached (§8.4). Only ever called while the card is amber/red.
+   */
+  onFixThis?: (project: SavedProject) => void;
 }
 
 export function ProjectCard({
@@ -107,7 +113,12 @@ export function ProjectCard({
   onDismissOpen,
   onShowDetail,
   onTogglePin,
+  onFixThis,
 }: ProjectCardProps) {
+  // Whether the amber/red [Fix this] affordance applies right now. Computed
+  // from the snapshot, so it is absent while loading and on a green/unknown
+  // project — see `fixThis.ts` for why `unknown` is excluded.
+  const offerFix = shouldOfferFix(snapshot) && onFixThis !== undefined;
   useUIComponent({
     id: `projects.card-${project.id}`,
     name: `Project card: ${project.name}`,
@@ -135,6 +146,14 @@ export function ProjectCard({
         description: `Open the detail view for "${project.name}".`,
         handler: () => {
           onShowDetail?.(project.id);
+        },
+      },
+      {
+        id: "fix-this",
+        label: "Fix this",
+        description: `Launch an agent on "${project.name}"'s reported failure, with the error text attached.`,
+        handler: () => {
+          onFixThis?.(project);
         },
       },
       {
@@ -293,6 +312,24 @@ export function ProjectCard({
             </button>
           ) : null}
         </div>
+      ) : null}
+
+      {/*
+        [Fix this] (§8.4) — only on amber/red, and only when a fix prompt could
+        actually be composed. It sits ABOVE Open/Work-on-it and spans the full
+        width because when a project is broken it is the only action that
+        matters; burying it as a third equal button would make the user choose
+        between three verbs while looking at a red dot.
+      */}
+      {offerFix ? (
+        <button
+          type="button"
+          onClick={() => onFixThis?.(project)}
+          data-testid={`project-card-fix-${project.id}`}
+          className="mt-4 w-full rounded-md bg-amber-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-amber-700 dark:bg-amber-700 dark:hover:bg-amber-600"
+        >
+          Fix this
+        </button>
       ) : null}
 
       <div className="mt-4 flex gap-2">

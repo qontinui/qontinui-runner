@@ -56,6 +56,12 @@ import { useTabSessionIdCapture } from "./useTabSessionIdCapture";
 import { useSessionBoundEvents } from "./useSessionBoundEvents";
 import { buildSessionOpenArgs, type SessionOrigin } from "./sessionRecordArgs";
 import { buildAiLaunchCommand } from "./aiLaunchCommand";
+import {
+  getActiveProjectHint,
+  subscribeActiveProject,
+  type ActiveProjectHint,
+} from "./activeProject";
+import { markSeedConsumed, planSeedPrompt } from "./seedPrompt";
 import { rememberSessionId } from "./lastKnownSessionIds";
 import { useRegistryAwareness } from "./useRegistryAwareness";
 import { useMidSessionProbe, useMidSessionProbeEnabled } from "./useMidSessionProbe";
@@ -1099,6 +1105,47 @@ function TerminalPageInner({
   const insertPromptText = (tabId: string, text: string): void => {
     writeToTerminalById(terminalRefs.current, tabId, text);
   };
+
+  /*
+   * [Fix this] (projects-dashboard §8.4) — the terminal end of the activation
+   * hint's `seedPrompt`.
+   *
+   * The Projects page composes the failure description (it owns the health
+   * snapshot; the terminal side cannot read the project registry at all) and
+   * publishes it on the activation. Here we spawn ONE AI session seeded with
+   * it, reusing `spawnWithPromptText` so account selection, the launch-spec
+   * build and the session-id pinning stay on the single path `/spawn-ai`
+   * already uses.
+   *
+   * `planSeedPrompt` owns the replay guard, and it is load-bearing rather than
+   * defensive: the hint is cached and re-delivered on webview reload and on
+   * cross-window `storage` events, so keying on the prompt's PRESENCE would
+   * turn one click into a new agent every reload, against the user's own
+   * quota. The id is marked consumed BEFORE the spawn — a spawn that throws
+   * midway may still have started a session, and re-running it would be worse
+   * than skipping a fix the user can retry with another click.
+   */
+  // The ref keeps the subscription stable: `spawnWithPromptText` is rebuilt
+  // every render, so depending on it directly would tear down and re-add the
+  // listener continuously — and the mount-time `consume` would re-run each
+  // time, which only the replay guard would be saving us from.
+  const spawnSeedRef = useRef(spawnWithPromptText);
+  useEffect(() => {
+    spawnSeedRef.current = spawnWithPromptText;
+  });
+  useEffect(() => {
+    // Fire for the hint already cached at mount (the [Fix this] click happens
+    // on the Projects tab, and this page may only mount on the navigation that
+    // follows it), then for every subsequent activation.
+    const consume = (hint: ActiveProjectHint | null) => {
+      const seed = planSeedPrompt(hint);
+      if (!seed) return;
+      markSeedConsumed(seed.id);
+      void spawnSeedRef.current(seed.prompt);
+    };
+    consume(getActiveProjectHint());
+    return subscribeActiveProject(consume);
+  }, []);
 
   useTerminalCommands({
     spawnPlain: handleQuickLaunch,

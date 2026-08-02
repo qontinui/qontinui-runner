@@ -54,6 +54,35 @@ export interface ActiveProjectHint {
    * a profile the operator has since deleted degrades to "nothing to restore".
    */
   zoneProfile?: string;
+  /**
+   * Free text an agent should START FROM, when this activation was triggered
+   * by something that already knows what needs doing — today that is the
+   * card's **[Fix this]** on an amber/red project (§8.4), which carries the
+   * health reason so the user never has to describe the failure themselves.
+   *
+   * Absent on an ordinary activation, and that is the common case: `Open` and
+   * `Work on it` bind a terminal and stop there. A hint carrying this field is
+   * asking for an AI session to be SPAWNED, which is why it is opt-in per
+   * activation rather than a project property — the same project activates
+   * with no seed a moment later.
+   *
+   * Deliberately NOT persisted-and-replayed like the rest of the hint. It is
+   * mirrored into `instanceStorage` with everything else (the cache is a
+   * verbatim copy of the event), but the consumer keys off
+   * {@link ActiveProjectHint.seedPromptId} so a reload cannot re-spawn an
+   * agent for a fix the user already asked for once.
+   */
+  seedPrompt?: string;
+  /**
+   * Identity of THIS seed request, minted per [Fix this] click.
+   *
+   * The consumer records the ids it has acted on and ignores repeats. Without
+   * it, the cached hint would re-fire an AI spawn on every webview reload and
+   * every cross-window `storage` event — turning one click into an unbounded
+   * number of agent sessions against the user's own quota. Present iff
+   * {@link ActiveProjectHint.seedPrompt} is.
+   */
+  seedPromptId?: string;
 }
 
 /** The cached hint, or `null` when no project has been activated. */
