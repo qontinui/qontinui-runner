@@ -517,13 +517,28 @@ impl ComplianceVerdict {
         }
     }
 
-    /// Has coord independently observed ANY work for this session? §A4's
-    /// condition 3 — the guard that keeps the nudge from nagging every session
-    /// at its first pause.
+    /// Has coord independently observed work that a report would be DUE for?
+    /// §A4's condition 3 — the guard that keeps the nudge from nagging every
+    /// session at its first pause.
+    ///
+    /// **Claims are deliberately excluded.** The plan originally specified
+    /// "PRs, commits, or claims", which is wrong: coord builds `claims` from
+    /// `claims_audit` rows with `claim_kind IN ('symbol','file_glob')`, and the
+    /// fleet's `/preflight` protocol acquires file-glob claims BEFORE the first
+    /// line of code is written. Claims therefore measure work *started*, not
+    /// work *done* — they are non-empty from turn 1 of essentially every
+    /// session. Combined with the other two conditions (`enabled && applicable`,
+    /// and `verdict == "unverified"`, which is by definition what an unfinished
+    /// session gets via `reason: "absent"`), including claims would fire the
+    /// nudge at the FIRST pause of any session that ran preflight — telling it
+    /// to "produce the block now" when it has barely started. That is precisely
+    /// the per-turn nag condition 3 exists to prevent, and it would have gone
+    /// live the moment an operator flipped the web toggle.
+    ///
+    /// A PR or a commit is evidence that something landed-or-is-landing and a
+    /// report is genuinely owed.
     pub fn footprint_is_empty(&self) -> bool {
-        self.footprint_prs.is_empty()
-            && self.footprint_commits.is_empty()
-            && self.footprint_claims.is_empty()
+        self.footprint_prs.is_empty() && self.footprint_commits.is_empty()
     }
 }
 
@@ -547,21 +562,35 @@ fn string_list(v: Option<&Value>) -> Vec<String> {
         .filter_map(|e| match e {
             Value::String(s) => Some(s.trim().to_string()),
             Value::Object(_) => {
-                // coord's PR shape first: `owner/repo#N`, tolerating a
+                // A `sha` wins over `pr_number`. coord's `session_commits`
+                // emits {sha, repo, branch, pr_number, recorded_at} — a commit
+                // pushed on a PR branch carries a NON-NULL `pr_number`, which
+                // is the normal case. Probing the PR arm first would render
+                // every such commit as `owner/repo#N` in the COMMITS list:
+                // false, and useless to the session being nudged, which needs
+                // the sha to fill `evidence.sha` on its retry.
+                let sha = e
+                    .get("sha")
+                    .and_then(Value::as_str)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+
+                // coord's PR shape: `owner/repo#N`, tolerating a
                 // number-or-string `pr_number`.
-                let pr = e
-                    .get("pr_number")
-                    .and_then(|n| {
-                        n.as_i64()
-                            .map(|i| i.to_string())
-                            .or_else(|| n.as_str().map(str::to_string))
-                    })
-                    .map(|num| match e.get("repo").and_then(Value::as_str) {
-                        Some(repo) if !repo.trim().is_empty() => {
-                            format!("{}#{}", repo.trim(), num)
-                        }
-                        _ => format!("#{num}"),
-                    });
+                let pr = sha.or_else(|| {
+                    e.get("pr_number")
+                        .and_then(|n| {
+                            n.as_i64()
+                                .map(|i| i.to_string())
+                                .or_else(|| n.as_str().map(str::to_string))
+                        })
+                        .map(|num| match e.get("repo").and_then(Value::as_str) {
+                            Some(repo) if !repo.trim().is_empty() => {
+                                format!("{}#{}", repo.trim(), num)
+                            }
+                            _ => format!("#{num}"),
+                        })
+                });
                 pr.or_else(|| {
                     ["ref", "pr", "sha", "key", "id", "resource_key"]
                         .iter()
@@ -742,11 +771,22 @@ pub fn nudge_text(v: &ComplianceVerdict) -> String {
             list.join(", ")
         }
     }
-    let mut out = String::from(
+    // The opening sentence MUST branch on why the verdict is unverified. A
+    // block that was emitted but failed reconciliation is not a missing block,
+    // and opening with "You did not emit..." there is a false statement about
+    // the session's own work — two lines above this function then says "...in
+    // the block you did emit", contradicting it. Asserting something untrue to
+    // provoke a correction is exactly the `ux-priorities#honesty` failure this
+    // feature was commissioned to catch.
+    let block_absent = v.reason.trim() == "absent" || v.reason.trim().is_empty();
+    let mut out = String::from(if block_absent {
         "You did not emit the POLICY_COMPLIANCE block required by \
-         `policy/session-protocol` v4 Step 3.\n",
-    );
-    if v.reason.trim() != "absent" && !v.reason.trim().is_empty() {
+         `policy/session-protocol` v4 Step 3.\n"
+    } else {
+        "Your POLICY_COMPLIANCE block (required by `policy/session-protocol` \
+         v4 Step 3) did not reconcile against coord's own record.\n"
+    });
+    if !block_absent {
         let refs = unreconciled_refs(&v.reconciliation);
         if refs.is_empty() {
             out.push_str(&format!(
@@ -766,7 +806,11 @@ pub fn nudge_text(v: &ComplianceVerdict) -> String {
         render(&v.footprint_commits),
         render(&v.footprint_claims),
     ));
-    out.push_str("Produce the block now, reconciled against those observations.");
+    out.push_str(if block_absent {
+        "Produce the block now, reconciled against those observations."
+    } else {
+        "Re-emit the block, reconciled against those observations."
+    });
     out
 }
 
@@ -1403,6 +1447,86 @@ mod tests {
             "footprint": {"prs": [], "commits": [], "claims": []}
         }));
         assert!(v.footprint_is_empty());
+    }
+
+    /// §A4 condition 3: CLAIMS ALONE MUST NOT ARM THE NUDGE.
+    ///
+    /// coord builds `footprint.claims` from `claims_audit` rows of kind
+    /// `symbol`/`file_glob`, and the fleet's `/preflight` protocol acquires
+    /// file-glob claims before the first line of code is written. If claims
+    /// counted, this footprint would be non-empty at turn 1 of nearly every
+    /// session — and since an unfinished session's verdict is `unverified`
+    /// with `reason: "absent"` by construction, the nudge would fire at its
+    /// FIRST pause. That is the per-turn nag condition 3 exists to prevent.
+    #[test]
+    fn claims_alone_do_not_arm_the_nudge() {
+        let v = ComplianceVerdict::from_body(&json!({
+            "verdict": "unverified", "reason": "absent",
+            "footprint": {
+                "prs": [], "commits": [],
+                "claims": ["src/**/*.rs", "qontinui-runner:src/mcp/*"]
+            }
+        }));
+        assert!(!v.footprint_claims.is_empty(), "claims still parsed");
+        assert!(
+            v.footprint_is_empty(),
+            "claims measure work STARTED, not work DONE — they must not arm the nudge"
+        );
+
+        // A single PR or commit DOES arm it: a report is genuinely owed.
+        let v = ComplianceVerdict::from_body(&json!({
+            "verdict": "unverified", "reason": "absent",
+            "footprint": {"prs": ["o/r#1"], "commits": [], "claims": []}
+        }));
+        assert!(!v.footprint_is_empty());
+    }
+
+    /// A commit object carrying a non-null `pr_number` — the normal case for a
+    /// commit pushed on a PR branch — must render as its SHA, not as a PR ref.
+    /// The session being nudged needs the sha to fill `evidence.sha`.
+    #[test]
+    fn a_commit_with_a_pr_number_renders_its_sha() {
+        let v = ComplianceVerdict::from_body(&json!({
+            "verdict": "unverified", "reason": "absent",
+            "footprint": {
+                "prs": [],
+                "commits": [{
+                    "sha": "abc1234", "repo": "qontinui/qontinui-runner",
+                    "branch": "feat/x", "pr_number": 923,
+                    "recorded_at": "2026-07-30T00:00:00Z"
+                }],
+                "claims": []
+            }
+        }));
+        assert_eq!(
+            v.footprint_commits,
+            vec!["abc1234"],
+            "a commit must not render as owner/repo#N"
+        );
+    }
+
+    /// A block that WAS emitted but failed reconciliation must not be told it
+    /// emitted nothing — the nudge would contradict itself two lines later.
+    #[test]
+    fn the_nudge_does_not_claim_an_emitted_block_is_missing() {
+        let emitted = ComplianceVerdict::from_body(&json!({
+            "verdict": "unverified",
+            "reason": "2 of 5 item(s) could not be reconciled: A1, B2",
+            "reconciliation": {},
+            "footprint": {"prs": ["o/r#1"], "commits": [], "claims": []}
+        }));
+        let text = nudge_text(&emitted);
+        assert!(
+            !text.contains("You did not emit"),
+            "must not assert absence about a block that was emitted: {text}"
+        );
+        assert!(text.contains("did not reconcile"));
+
+        let absent = ComplianceVerdict::from_body(&json!({
+            "verdict": "unverified", "reason": "absent",
+            "footprint": {"prs": ["o/r#1"], "commits": [], "claims": []}
+        }));
+        assert!(nudge_text(&absent).contains("You did not emit"));
     }
 
     // ── nudge text ───────────────────────────────────────────────────────
