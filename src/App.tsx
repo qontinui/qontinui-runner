@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useState, useCallback, useRef, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ApolloProvider } from "@apollo/client/react";
 
@@ -545,7 +545,13 @@ function AppContent() {
   // (AppWithTutorials' fixed-position siblings, BuildRefreshBanner) so they
   // go `inert` in lockstep with the main tree — otherwise Tab from the
   // LoginScreen walks into their invisible controls.
-  useEffect(() => {
+  //
+  // useLayoutEffect, not useEffect: the main tree's `inert` is applied during
+  // render (below), while the siblings only learn about it through this
+  // publish. A passive effect runs AFTER paint, so the overlay would paint for
+  // one frame with the siblings still focusable — "in lockstep" has to mean
+  // the same commit, not the next one.
+  useLayoutEffect(() => {
     setAuthOverlay(authOverlay);
     return () => setAuthOverlay(null);
   }, [authOverlay]);

@@ -24,12 +24,22 @@ export function setAuthOverlay(surface: AuthGateOverlay | null): void {
   for (const l of [...listeners]) l();
 }
 
-function subscribe(listener: () => void): () => void {
+/**
+ * The store half of the `useSyncExternalStore` contract. Exported (rather than
+ * module-private) so it can be unit-tested directly: vitest runs
+ * `environment: "node"` with no React Testing Library, so the React binding
+ * below is not exercisable in a test — same precedent as the helpers
+ * `useTerminalInitialization.ts` exports for its own tests.
+ */
+export function subscribe(listener: () => void): () => void {
   listeners.add(listener);
-  return () => listeners.delete(listener);
+  return () => {
+    listeners.delete(listener);
+  };
 }
 
-function getSnapshot(): AuthGateOverlay | null {
+/** Current overlay surface. See {@link subscribe} for why this is exported. */
+export function getSnapshot(): AuthGateOverlay | null {
   return currentOverlay;
 }
 
