@@ -662,6 +662,76 @@ pub fn tree_reset_path_for_port(port: u16) -> PathBuf {
     crate::session::claude_hook::session_restore_dir().join(file)
 }
 
+/// Filters for [`read_tree_resets`]. All optional; `Default` reads everything.
+#[derive(Debug, Default, Clone)]
+pub struct TreeResetQuery {
+    /// Keep only rows whose server stamp `ts` is >= this epoch-millis bound.
+    pub since_ms: Option<i64>,
+    /// Keep only rows whose `mount_number` is >= this. Pass `Some(2)` for the
+    /// genuine-REmount filter the [`TreeResetReport::mount_number`] doc
+    /// describes (mount #1 is a normal boot, recorded but not a reset).
+    pub min_mount_number: Option<u32>,
+    /// Keep at most this many rows, retaining the NEWEST ones (the file is
+    /// append-only, so this is a tail).
+    pub limit: Option<usize>,
+}
+
+/// Reader for the tree-reset history written by [`record_tree_reset`].
+///
+/// The P0 observability artifact was write-only until this existed: rows landed
+/// in `tree-resets.jsonl` and the only way to reach them was to locate the file
+/// on the runner host by hand. The plan that introduced the writer
+/// (`2026-07-23-runner-restore-duplication-and-auth-flap-fixes`, P0) states the
+/// rows are "the only way to *verify* P1/P2 rather than assume them", so they
+/// need a read path — see `GET /sessions/tree-resets`.
+///
+/// Rows come back in file order (chronological, oldest first) after filtering.
+/// Fail-open exactly like [`read_all_snapshot_sessions`]: a missing or
+/// unreadable file yields an empty vec, and a corrupt line is skipped rather
+/// than aborting the read — an observability surface must never be the thing
+/// that fails.
+///
+/// OBSERVABILITY-ONLY, and it does NOT weaken the module invariant above: that
+/// invariant bans a read API over the SESSION-SNAPSHOTS file for restore code,
+/// and this reads the separate tree-reset file. Like
+/// [`read_all_snapshot_sessions`], it must never be called from a restore path
+/// — a tree-reset row describes that a remount happened, never what to restore.
+pub fn read_tree_resets(path: &Path, q: &TreeResetQuery) -> Vec<TreeResetRecord> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(), // missing / unreadable — fail open
+    };
+    let mut rows: Vec<TreeResetRecord> = Vec::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let rec: TreeResetRecord = match serde_json::from_str(line) {
+            Ok(r) => r,
+            Err(_) => continue, // skip a corrupt line — do not abort
+        };
+        if q.since_ms.is_some_and(|since| rec.ts < since) {
+            continue;
+        }
+        if q.min_mount_number
+            .is_some_and(|min| rec.report.mount_number < min)
+        {
+            continue;
+        }
+        rows.push(rec);
+    }
+    // Tail to `limit`, keeping the newest rows but preserving chronological
+    // order within the returned window.
+    if let Some(limit) = q.limit {
+        let len = rows.len();
+        if len > limit {
+            rows.drain(..len - limit);
+        }
+    }
+    rows
+}
+
 /// Append one tree-reset row to `path`, stamping the timestamps now.
 /// Best-effort like every append in this module: a failure is logged, never
 /// propagated — the report must never affect the initialization flow.
@@ -1180,5 +1250,120 @@ mod tests {
                 client_ts: None,
             },
         ); // must not panic
+    }
+
+    // ── Tree-reset reader (`GET /sessions/tree-resets`) ──────────────────────
+
+    /// Helper: a report carrying just the fields the reader filters on.
+    fn reset_report(mount_number: u32) -> TreeResetReport {
+        TreeResetReport {
+            mount_number,
+            authenticated: Some(true),
+            navigation_type: Some("navigate".to_string()),
+            page_ids: vec!["default".to_string()],
+            open_record_count: Some(3),
+            time_origin: Some(1_699_999_990_000.0),
+            client_ts: Some(1_699_999_999_900),
+        }
+    }
+
+    /// Rows come back in file order (chronological) with the flattened payload
+    /// intact — the round-trip the HTTP handler serves.
+    #[test]
+    fn read_tree_resets_returns_rows_chronologically() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tree-resets.jsonl");
+        record_tree_reset_at(&path, 1_700_000_000_000, reset_report(1));
+        record_tree_reset_at(&path, 1_700_000_001_000, reset_report(2));
+        record_tree_reset_at(&path, 1_700_000_002_000, reset_report(3));
+
+        let rows = read_tree_resets(&path, &TreeResetQuery::default());
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.iter().map(|r| r.ts).collect::<Vec<_>>(),
+            vec![1_700_000_000_000, 1_700_000_001_000, 1_700_000_002_000],
+            "oldest first"
+        );
+        assert_eq!(rows[1].report, reset_report(2), "payload round-trips");
+    }
+
+    /// `min_mount_number: 2` isolates genuine REmounts — mount #1 is a normal
+    /// boot, recorded but not a tree reset. This is the filter P2 verification
+    /// runs (the count must stay flat across an auth flip).
+    #[test]
+    fn read_tree_resets_min_mount_number_isolates_remounts() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tree-resets.jsonl");
+        record_tree_reset_at(&path, 1_700_000_000_000, reset_report(1));
+        record_tree_reset_at(&path, 1_700_000_001_000, reset_report(2));
+        record_tree_reset_at(&path, 1_700_000_002_000, reset_report(1));
+
+        let rows = read_tree_resets(
+            &path,
+            &TreeResetQuery {
+                min_mount_number: Some(2),
+                ..Default::default()
+            },
+        );
+        assert_eq!(rows.len(), 1, "only the mount #2 row is a remount");
+        assert_eq!(rows[0].report.mount_number, 2);
+    }
+
+    /// `since_ms` is inclusive on the server stamp; `limit` tails to the
+    /// NEWEST rows while keeping them in chronological order.
+    #[test]
+    fn read_tree_resets_applies_since_and_limit() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tree-resets.jsonl");
+        for i in 0..5 {
+            record_tree_reset_at(&path, 1_700_000_000_000 + i * 1_000, reset_report(1));
+        }
+
+        let since = read_tree_resets(
+            &path,
+            &TreeResetQuery {
+                since_ms: Some(1_700_000_002_000),
+                ..Default::default()
+            },
+        );
+        assert_eq!(since.len(), 3, "since_ms is inclusive");
+        assert_eq!(since[0].ts, 1_700_000_002_000);
+
+        let tail = read_tree_resets(
+            &path,
+            &TreeResetQuery {
+                limit: Some(2),
+                ..Default::default()
+            },
+        );
+        assert_eq!(tail.len(), 2);
+        assert_eq!(
+            tail.iter().map(|r| r.ts).collect::<Vec<_>>(),
+            vec![1_700_000_003_000, 1_700_000_004_000],
+            "limit keeps the newest rows, still oldest-first"
+        );
+    }
+
+    /// Fail-open like `read_all_snapshot_sessions`: a corrupt line is skipped
+    /// rather than aborting, and a missing file reads as empty — an
+    /// observability surface must never be the thing that fails.
+    #[test]
+    fn read_tree_resets_fails_open_on_corrupt_line_and_missing_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tree-resets.jsonl");
+        record_tree_reset_at(&path, 1_700_000_000_000, reset_report(2));
+        record_tree_reset_at(&path, 1_700_000_001_000, reset_report(3));
+        // Corrupt the FIRST line; the second must still be returned.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<&str> = raw.lines().collect();
+        lines[0] = "{not json";
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let rows = read_tree_resets(&path, &TreeResetQuery::default());
+        assert_eq!(rows.len(), 1, "corrupt line skipped, not fatal");
+        assert_eq!(rows[0].report.mount_number, 3);
+
+        let missing = read_tree_resets(&dir.path().join("nope.jsonl"), &TreeResetQuery::default());
+        assert!(missing.is_empty(), "missing file reads as empty");
     }
 }

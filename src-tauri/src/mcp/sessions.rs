@@ -643,6 +643,58 @@ async fn list_history(
 }
 
 // =============================================================================
+// /sessions/tree-resets
+// =============================================================================
+
+/// Query params for `GET /sessions/tree-resets` — snake_case keys
+/// (`since_ms`, `min_mount_number`, `limit`), mapped onto
+/// [`crate::session::snapshot_history::TreeResetQuery`].
+#[derive(Debug, Default, Deserialize)]
+pub struct TreeResetsQuery {
+    pub since_ms: Option<i64>,
+    pub min_mount_number: Option<u32>,
+    pub limit: Option<usize>,
+}
+
+/// `GET /sessions/tree-resets` — the read side of the P0 tree-reset
+/// observability log.
+///
+/// `terminal_report_tree_reset` has appended a durable row per terminal-tree
+/// mount since P0, but nothing read the file: verifying that an auth flip no
+/// longer remounts the tree (the P2 fix) meant locating `tree-resets.jsonl`
+/// under the session-restore dir on the runner host by hand. This exposes it
+/// over the same API surface as `/sessions/history`.
+///
+/// Returns `{ treeResets, count, remountCount }`, chronological (oldest
+/// first). `remountCount` counts rows with `mountNumber > 1` — the
+/// genuine-REmount filter the report type documents, and the number that must
+/// stay flat across an auth flip for P2 to hold.
+///
+/// Read-only and infallible by construction: the reader fails open, so a
+/// runner that has never reported returns an empty list rather than an error,
+/// and there is no error arm to return at all (unlike `list_history`, which
+/// can fail to resolve the lifecycle store).
+async fn list_tree_resets(Query(q): Query<TreeResetsQuery>) -> Json<serde_json::Value> {
+    // Port-scoped path, matching the write side in `terminal_report_tree_reset`.
+    let port = crate::mcp::types::get_mcp_api_port();
+    let path = crate::session::snapshot_history::tree_reset_path_for_port(port);
+    let rows = crate::session::snapshot_history::read_tree_resets(
+        &path,
+        &crate::session::snapshot_history::TreeResetQuery {
+            since_ms: q.since_ms,
+            min_mount_number: q.min_mount_number,
+            limit: q.limit,
+        },
+    );
+    let remount_count = rows.iter().filter(|r| r.report.mount_number > 1).count();
+    Json(serde_json::json!({
+        "treeResets": rows,
+        "count": rows.len(),
+        "remountCount": remount_count,
+    }))
+}
+
+// =============================================================================
 // /sessions/<id>/continuation-verdict
 // =============================================================================
 
@@ -872,6 +924,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/sessions/{id}/message", post(send_message))
         .route("/sessions/history", get(list_history))
         .route("/sessions/compliance-coverage", get(compliance_coverage))
+        .route("/sessions/tree-resets", get(list_tree_resets))
         .route("/sessions/{id}/touched-files", get(get_touched_files))
         .route("/sessions/{id}/transcript", get(get_transcript))
         .route(
