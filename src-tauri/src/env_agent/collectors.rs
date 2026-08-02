@@ -212,23 +212,64 @@ pub async fn collect_db_schema() -> Option<Section> {
     }
 }
 
+/// Resolve the directory the toolchain `--version` probes run in — the
+/// **declared capture scope**.
+///
+/// Resolution order, first hit wins:
+/// 1. `EnvAgentConfig::scope_root`, when set AND the path exists. A configured
+///    but missing path falls through rather than failing the capture: the
+///    collectors are fail-open by construction, and a stale config entry must
+///    not silently zero the whole `versions` section.
+/// 2. The user's home directory — the box's DEFAULT toolchain, i.e. what
+///    shim-based managers answer outside any project tree.
+/// 3. `None`, meaning "spawn without setting a cwd" (inherit). Only reachable
+///    when there is no home directory at all.
+///
+/// **Deliberately NOT the compile-time `CARGO_MANIFEST_DIR`.** That path
+/// measures which source tree the binary was BUILT from, not the box — the same
+/// confusion that makes `runner_crate_version` and friends repo-derived rather
+/// than appliable. Anchoring the probe there would reintroduce that bug on the
+/// observed keys, which are the only ones a P2b apply can actually move.
+///
+/// **Deliberately NOT the inherited cwd.** That is the defect this exists to
+/// fix: it makes the captured version a function of how the runner was
+/// launched, so the drift oracle cannot be trusted to compare like with like.
+pub fn probe_scope_root() -> Option<std::path::PathBuf> {
+    if let Some(configured) = super::config::EnvAgentConfig::load()
+        .and_then(|c| c.scope_root)
+        .map(std::path::PathBuf::from)
+    {
+        if configured.is_dir() {
+            return Some(configured);
+        }
+    }
+    dirs::home_dir().filter(|h| h.is_dir())
+}
+
 /// Run a bounded `<cmd> --version` (3s budget) and return the trimmed first
 /// line of stdout (falling back to stderr). Returns `None` on spawn failure,
 /// timeout, or non-zero exit. Mirrors `fleet::detect_claude_code_now`'s bounded
 /// subprocess pattern.
-fn version_of(cmd: &str, args: &[&str]) -> Option<String> {
+///
+/// `cwd` is the declared capture scope (see [`probe_scope_root`]). `None`
+/// inherits the parent's cwd — reserved for the no-home-directory case, since
+/// an inherited cwd is exactly what makes this probe non-deterministic.
+fn version_of(cmd: &str, args: &[&str], cwd: Option<&Path>) -> Option<String> {
     use std::io::Read;
     use std::process::Stdio;
     use std::time::Instant;
 
     let started = Instant::now();
-    let mut child = crate::process_helpers::no_window(cmd)
+    let mut command = crate::process_helpers::no_window(cmd);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::piped());
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+    let mut child = command.spawn().ok()?;
 
     let deadline = started + Duration::from_secs(3);
     loop {
@@ -355,13 +396,21 @@ pub fn collect_versions() -> Section {
     }
 
     // ---- bounded `--version` shells (optional, 3s budget each) ----
-    if let Some(v) = version_of("rustc", &["--version"]) {
+    //
+    // These three are the ONLY keys in this section that describe the box rather
+    // than the source tree the binary was built from, and (post web #808 /
+    // runner #818 derived-key filtering) the only ones a P2b apply can move. All
+    // three run in the DECLARED scope root so the answer does not depend on how
+    // the runner process was launched.
+    let scope = probe_scope_root();
+    let scope_ref = scope.as_deref();
+    if let Some(v) = version_of("rustc", &["--version"], scope_ref) {
         put(&mut section, "rustc", v);
     }
-    if let Some(v) = version_of("node", &["--version"]) {
+    if let Some(v) = version_of("node", &["--version"], scope_ref) {
         put(&mut section, "node", v);
     }
-    if let Some(v) = version_of("python", &["--version"]) {
+    if let Some(v) = version_of("python", &["--version"], scope_ref) {
         put(&mut section, "python", v);
     }
 
@@ -741,6 +790,113 @@ mod tests {
             !json.contains("supersecret123"),
             "secret value leaked into env_contract: {json}"
         );
+    }
+
+    // ---- probe scope root (declared capture scope) ----
+
+    /// Spawn a shell that prints its own cwd, through `version_of`'s plumbing.
+    /// `version_of` returns the first stdout line, so `pwd` / `cd` round-trips.
+    fn cwd_probe(cwd: Option<&Path>) -> Option<String> {
+        #[cfg(windows)]
+        let (cmd, args) = ("cmd", ["/c", "cd"]);
+        #[cfg(not(windows))]
+        let (cmd, args) = ("sh", ["-c", "pwd"]);
+        version_of(cmd, &args, cwd)
+    }
+
+    /// The load-bearing property: the probe runs in the directory it is GIVEN,
+    /// not the one the runner process happens to be sitting in. Without this,
+    /// `node`/`python`/`rustc` are a function of how the runner was launched and
+    /// the drift oracle they feed compares unlike with unlike.
+    #[test]
+    fn version_of_runs_in_the_supplied_scope_root() {
+        let dir = tempfile::tempdir().unwrap();
+        // Distinctive component: Windows may report an 8.3-shortened or
+        // case-differing prefix, so assert on the leaf rather than equality.
+        let scoped = dir.path().join("qontinui_scope_probe_marker");
+        std::fs::create_dir_all(&scoped).unwrap();
+
+        // Deliberately NOT a silent skip on `None`. Every platform this builds on
+        // ships the shell used here (`cmd` on Windows, `sh` elsewhere), so a
+        // `None` means the probe plumbing is broken — and a test that quietly
+        // returns instead would report the same "ok" as a real pass.
+        let out = cwd_probe(Some(&scoped)).expect("cwd probe produced no output — shell missing?");
+        assert!(
+            out.to_lowercase().contains("qontinui_scope_probe_marker"),
+            "probe did not run in the supplied scope root; reported cwd: {out}"
+        );
+    }
+
+    /// Two probes with DIFFERENT scope roots must report different cwds — the
+    /// direct expression of "capture is scope-determined". A probe that ignored
+    /// its cwd argument would pass the test above by accident if the process
+    /// already sat in the right place; this one cannot be passed that way.
+    #[test]
+    fn version_of_scope_root_actually_varies_the_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("scope_a");
+        let b = dir.path().join("scope_b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        let out_a = cwd_probe(Some(&a)).expect("cwd probe (a) produced no output");
+        let out_b = cwd_probe(Some(&b)).expect("cwd probe (b) produced no output");
+        assert_ne!(
+            out_a.to_lowercase(),
+            out_b.to_lowercase(),
+            "probe reported the same cwd for two different scope roots"
+        );
+        assert!(out_a.to_lowercase().ends_with("scope_a"), "got {out_a}");
+        assert!(out_b.to_lowercase().ends_with("scope_b"), "got {out_b}");
+    }
+
+    /// A configured scope root that does not exist must FALL THROUGH to the home
+    /// directory, not be returned and not abort the capture. The collectors are
+    /// fail-open: a stale config entry must never silently zero the `versions`
+    /// section, which is what returning a nonexistent cwd would do (every spawn
+    /// would fail and every observed key would go missing).
+    #[test]
+    fn probe_scope_root_falls_through_when_configured_path_is_missing() {
+        let _env_lock = env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let prior_home = std::env::var("HOME").ok();
+        let prior_profile = std::env::var("USERPROFILE").ok();
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("USERPROFILE", home.path());
+
+        // Enrolled config naming a scope root that is not there.
+        let qdir = home.path().join(".qontinui");
+        std::fs::create_dir_all(&qdir).unwrap();
+        let missing = home.path().join("definitely_not_created");
+        std::fs::write(
+            qdir.join("env-agent.json"),
+            serde_json::json!({
+                "backend_url": "http://localhost:8000",
+                "machine_id": "m",
+                "environment_id": "e",
+                "scope_root": missing.to_string_lossy(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let resolved = probe_scope_root();
+
+        match prior_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match prior_profile {
+            Some(v) => std::env::set_var("USERPROFILE", v),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+
+        let resolved = resolved.expect("should fall back to home, not return None");
+        assert_ne!(
+            resolved, missing,
+            "returned a nonexistent configured scope root"
+        );
+        assert!(resolved.is_dir(), "fallback must be a real directory");
     }
 
     /// Secret-safety: a password-bearing DSN in the profile never leaks the

@@ -158,11 +158,18 @@ pub fn run_enroll(params: EnrollParams) -> Result<EnrollOutcome, String> {
         .map_err(|e| format!("failed to store machine key: {e}"))?;
 
     // Then write env-agent.json with the RESPONSE environment_id.
+    //
+    // `scope_root` is CARRIED FORWARD from any existing config rather than reset.
+    // This write replaces the whole file, so defaulting it to `None` here would
+    // silently erase an operator's declared capture scope on every re-enroll —
+    // and the symptom would be a box quietly re-measuring a different toolchain,
+    // not an error.
     let cfg = EnvAgentConfig {
         backend_url: backend.clone(),
         machine_id: parsed.machine_id.clone(),
         environment_id: environment_id.clone(),
         enrolled_at: Some(chrono::Utc::now().to_rfc3339()),
+        scope_root: EnvAgentConfig::load().and_then(|prior| prior.scope_root),
     };
     cfg.save()
         .map_err(|e| format!("enrolled + key stored, but writing env-agent.json failed: {e}"))?;
