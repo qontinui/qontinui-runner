@@ -679,9 +679,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // supervisor health-probe killed the runner before it could come up
     // (the 2026-06 startup outage). Detaching it onto the publishers runtime
     // keeps coord-base latency entirely OFF the `/health`-bind critical path.
-    // The clone of `pg_db` for that thread is taken here so the borrow is
-    // resolved before `pg_db` is moved into later state.
-    let fleet_publish_pg = pg_db.clone();
+    //
+    // The clone below is taken here so the borrow is resolved before `pg_db` is
+    // moved into later state. It is no longer for the budget publish — that
+    // parameter was vestigial from the direct-PG era and unread since Phase 3
+    // moved the write to coord HTTP, so it is gone. The pool is still needed on
+    // that thread by `env_agent::publish_pg_pool`, which hands it to the
+    // lib-side `db_schema` collector.
+    let publishers_thread_pg = pg_db.clone();
 
     // fleet heartbeat — see plan §5 and fleet.rs::spawn_heartbeat.
     //
@@ -771,19 +776,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             };
             rt.block_on(async {
                 // STARTUP-RESILIENCE (§8): the one-shot DeviceBudget publish,
-                // moved OFF the boot critical path (see the `fleet_publish_pg`
+                // moved OFF the boot critical path (see the `publishers_thread_pg`
                 // comment up by the PG bootstrap). It's `await`-ed here on the
                 // publishers runtime so a coord 503 (its ~60-120s backoff
                 // ladder) can no longer delay `run_app()` reaching the MCP
-                // `/health` bind. Args are unchanged from the original
-                // synchronous call (`&fleet_pg`, `MachineRole::Agent`).
-                // Nothing downstream depends on its completion — it's a
-                // best-effort registry UPSERT; the periodic publishers /
-                // heartbeat below re-assert this device's presence regardless.
+                // `/health` bind. Nothing downstream depends on its
+                // completion — it's a best-effort registry UPSERT, and
+                // `fleet::spawn_budget_republisher` (on the heartbeat thread)
+                // re-asserts the budget columns thereafter, so a boot-time
+                // failure self-heals within one re-publish interval rather
+                // than persisting for the process's lifetime.
                 // It runs FIRST in this block so the initial registration
                 // still happens promptly once coord is reachable, before the
                 // periodic publishers begin their cadences.
-                fleet::publish_on_startup(&fleet_publish_pg, fleet::MachineRole::Agent).await;
+                // No-op on a secondary instance — see `budget_publish_allowed`.
+                fleet::publish_on_startup(fleet::MachineRole::Agent).await;
 
                 // Fleet auto-response rules: arm from the on-disk cache first
                 // (so a session that hit the transient rate-limit message during
@@ -834,7 +841,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // picked up), and logs+swallows push failures. NEVER awaited
                 // synchronously — kept off the boot critical path like the
                 // sibling publishers above.
-                qontinui_runner_lib::env_agent::publish_pg_pool(fleet_publish_pg.pool().clone());
+                qontinui_runner_lib::env_agent::publish_pg_pool(
+                    publishers_thread_pg.pool().clone(),
+                );
                 qontinui_runner_lib::env_agent::spawn_env_capture();
                 // Phase 3 — dispatched self-enroll: subscribe to coord's
                 // `events.devenv.enroll_requested.<device_id>` directive on its
