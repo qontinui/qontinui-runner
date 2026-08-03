@@ -1404,7 +1404,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::backup::get_export_summary,
             commands::backup::get_import_preview,
             commands::backup::import_all_data,
-            commands::build_id::get_build_id,
             commands::checkpoint_browser::add_sample_checkpoints,
             commands::checkpoint_browser::clear_all_checkpoints,
             commands::checkpoint_browser::compare_orchestrator_checkpoints,

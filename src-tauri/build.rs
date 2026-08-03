@@ -30,11 +30,11 @@ fn main() {
     // updated ACL (e.g. adding a window label); otherwise gen/ stays stale and
     // the new permission silently never takes effect until a clean build.
     println!("cargo:rerun-if-changed=capabilities");
-    // Force a re-run on every cargo build so RUNNER_BUILD_ID's millisecond
-    // suffix actually changes between invocations. Without this, cargo will
-    // cache the build-script output and re-stamp identical values into the
-    // binary, defeating the SW-cache-invalidation watcher on rebuilds where
-    // no other inputs changed.
+    // Force a re-run on every cargo build so RUNNER_BUILD_ID is re-read from
+    // the current `dist/build-id.txt` on every invocation. Without this, cargo
+    // caches the build-script output and re-stamps a stale value into the
+    // binary, so /health would report provenance for a dist the exe no longer
+    // embeds on rebuilds where no other input changed.
     println!("cargo:rerun-if-changed=build.rs");
 
     // Embed the current git SHA so the running binary can report exactly which
@@ -58,47 +58,61 @@ fn main() {
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=QONTINUI_GIT_SHA={}", git_sha_short);
 
-    // RUNNER_BUILD_ID — the SW-cache-invalidation signal. Vite is the
-    // single source of truth: `vite.config.ts` computes the value once
-    // (`<git-sha-short>-<unix-ms>`), bakes it into index.html as
+    // RUNNER_BUILD_ID — compile-time build provenance, surfaced on /health.
+    // Vite is the single source of truth: `vite.config.ts` computes the value
+    // once (`<git-sha-short>-<unix-ms>`), bakes it into index.html as
     // `<meta name="build-id">`, AND writes it to `dist/build-id.txt`.
-    // We read that file here and re-emit the same string as the cargo env
-    // so the meta tag and the binary's compile-time stamp match exactly
-    // for any freshly-built binary. Without this, Vite's `Date.now()` and
-    // cargo's `SystemTime::now()` capture would always differ by tens of
-    // seconds, causing `useBuildIdWatcher` to fire on every cold spawn
-    // instead of only on real mid-session binary swaps.
+    // We read that file here and re-emit the same string as the cargo env, so
+    // the binary reports the identity of the dist it actually embedded rather
+    // than an unrelated value invented at cargo time.
     //
-    // Fallback: if `dist/build-id.txt` is missing (e.g. a manual `cargo
-    // build` without a prior `npm run build`), compute fresh from
-    // git+timestamp. This degrades gracefully — the binary is still
-    // stamped with *something* — but the meta-tag/env match guarantee
-    // only holds when the supervisor's standard build sequence runs
-    // (`npm run build` → `cargo build`).
+    // Fallback: if `dist/build-id.txt` is missing (e.g. a bare `cargo build` /
+    // `cargo check` with no prior `pnpm run build`), emit the explicit
+    // `unstamped-<git-sha>` sentinel plus a cargo warning. The old behaviour
+    // — inventing `git sha + SystemTime::now()` — was silently and
+    // permanently WRONG: it baked a build-id that matched no dist anywhere,
+    // and /health then reported that invention as if it were provenance
+    // (plan 2026-07-28-runner-build-id-banner-permanent-false-positive, D1).
+    // A sentinel says "this build did not come from a Vite dist" out loud.
+    //
+    // Deliberately a sentinel and NOT a hard failure: a bare cargo build with
+    // no dist is the normal inner dev loop (`cargo check` / `cargo test` /
+    // `cargo-guard.sh`), and panicking here would break it. The supervisor's
+    // pre-cargo gate is where this fails hard — `verify_frontend_built` /
+    // `dist_index_ok` in qontinui-supervisor refuse to hand off to cargo
+    // without a non-empty `dist/build-id.txt`. The two cover disjoint entry
+    // points: the gate covers supervisor-driven builds, this sentinel covers
+    // manual ones the supervisor never sees.
+    let git_sha_for_fallback = || {
+        std::process::Command::new("git")
+            .args(["rev-parse", "--short", "HEAD"])
+            .output()
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    String::from_utf8(o.stdout)
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "unknown".to_string())
+    };
     let runner_build_id = std::fs::read_to_string("../dist/build-id.txt")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| {
-            let git_sha = std::process::Command::new("git")
-                .args(["rev-parse", "--short", "HEAD"])
-                .output()
-                .ok()
-                .and_then(|o| {
-                    if o.status.success() {
-                        String::from_utf8(o.stdout)
-                            .ok()
-                            .map(|s| s.trim().to_string())
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_else(|| "unknown".to_string());
-            let unix_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
-            format!("{}-{}", git_sha, unix_ms)
+            let sentinel = format!("unstamped-{}", git_sha_for_fallback());
+            println!(
+                "cargo:warning=dist/build-id.txt missing or empty — stamping \
+                 RUNNER_BUILD_ID={}. This binary did not come from a Vite dist; \
+                 /health will report it as unstamped. Run `pnpm run build` \
+                 before `cargo build` for a real build-id.",
+                sentinel
+            );
+            sentinel
         });
     println!("cargo:rustc-env=RUNNER_BUILD_ID={}", runner_build_id);
     // Re-stamp when Vite writes a new build-id (covered by the broader
