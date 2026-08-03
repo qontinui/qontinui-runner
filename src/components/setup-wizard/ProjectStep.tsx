@@ -1,7 +1,16 @@
 import { useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { FolderOpen, Search, Loader2, Package, CheckSquare, Square, HardDrive, GitBranch } from "lucide-react";
+import {
+  FolderOpen,
+  Search,
+  Loader2,
+  Package,
+  CheckSquare,
+  Square,
+  HardDrive,
+  GitBranch,
+} from "lucide-react";
 import type { SavedProject } from "../../hooks/useSavedProjects";
 import { GithubRepoPicker } from "./GithubRepoPicker";
 
@@ -29,6 +38,21 @@ function toSavedProject(project: Project): SavedProject {
     projectType: project.type,
     manifest: project.manifest,
   };
+}
+
+/**
+ * Label for the Projects-step advance button.
+ *
+ * The button is deliberately NEVER disabled — discovering projects is optional,
+ * and the step's own escape hatch is the "Skip" label this returns for an empty
+ * selection. It used to be gated on `scanned`, which only flips true after a
+ * successful local scan or clone: a user who opened "Clone from GitHub" and hit
+ * the sign-in wall got a button that said "Skip" and refused to be clicked, with
+ * no way forward short of switching modes and scanning an unrelated folder.
+ */
+export function projectsAdvanceLabel(selectedCount: number): string {
+  if (selectedCount === 0) return "Skip";
+  return `Continue with ${selectedCount} project${selectedCount !== 1 ? "s" : ""}`;
 }
 
 interface ProjectStepProps {
@@ -207,23 +231,27 @@ export function ProjectStep({
 
       {/* Folder picker */}
       {mode === "local" && (
-      <div className="flex gap-2 items-center max-w-xl mx-auto w-full">
-        <button className="btn-secondary flex items-center gap-2 shrink-0" onClick={pickFolder}>
-          <FolderOpen className="w-4 h-4" />
-          Browse
-        </button>
-        <div className="flex-1 panel px-3 py-2 text-sm truncate min-w-0">
-          {scanPath || <span className="text-muted-foreground">No folder selected</span>}
+        <div className="flex gap-2 items-center max-w-xl mx-auto w-full">
+          <button className="btn-secondary flex items-center gap-2 shrink-0" onClick={pickFolder}>
+            <FolderOpen className="w-4 h-4" />
+            Browse
+          </button>
+          <div className="flex-1 panel px-3 py-2 text-sm truncate min-w-0">
+            {scanPath || <span className="text-muted-foreground">No folder selected</span>}
+          </div>
+          <button
+            className="btn-primary flex items-center gap-2 shrink-0"
+            onClick={scanWorkspace}
+            disabled={!scanPath || scanning}
+          >
+            {scanning ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <Search className="w-4 h-4" />
+            )}
+            Scan
+          </button>
         </div>
-        <button
-          className="btn-primary flex items-center gap-2 shrink-0"
-          onClick={scanWorkspace}
-          disabled={!scanPath || scanning}
-        >
-          {scanning ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
-          Scan
-        </button>
-      </div>
       )}
 
       {error && (
@@ -298,10 +326,9 @@ export function ProjectStep({
         <button className="btn-secondary" onClick={onBack}>
           Back
         </button>
-        <button className="btn-primary" onClick={handleNext} disabled={!scanned}>
-          {selectedProjects.length > 0
-            ? `Continue with ${selectedProjects.length} project${selectedProjects.length !== 1 ? "s" : ""}`
-            : "Skip"}
+        {/* Never `disabled` — see projectsAdvanceLabel. */}
+        <button className="btn-primary" onClick={handleNext}>
+          {projectsAdvanceLabel(selectedProjects.length)}
         </button>
       </div>
     </div>

@@ -31,8 +31,12 @@ const TIER_CARDS: {
   {
     id: "qontinui_account",
     title: "Sign in to Qontinui (Tier 2)",
+    // NOT "sign-in completes in step 5" — the AI Provider step has no account
+    // surface, and never had one. Sign-in happens either in the Projects step
+    // (when you choose "Clone from GitHub") or on the login screen the runner
+    // shows as soon as setup finishes.
     blurb:
-      "Multi-machine coordination via your Qontinui account. Sign-in completes in step 5 (AI Provider) → Account.",
+      "Multi-machine coordination via your Qontinui account. You'll sign in at the Projects step or right after setup.",
     Icon: Cloud,
   },
 ];
