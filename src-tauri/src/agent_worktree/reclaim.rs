@@ -537,7 +537,62 @@ pub(super) fn remove_worktree(path: &Path) -> Result<(), String> {
             .map_err(|e| format!("remove worktree dir {}: {e}", path.display()))?;
         info!("worktree_reclaim: removed worktree dir {}", path.display());
     }
+    // A session dir we just emptied is garbage — prune it here so husks can
+    // never accumulate 1:1 with successful reclaims.
+    prune_empty_session_parent(path);
     Ok(())
+}
+
+/// Remove `worktree`'s parent when our removal just emptied it.
+///
+/// Session worktrees live at `<root>/<session-uuid>/<repo>`, so reclaiming the
+/// `<repo>` checkout leaves the `<session-uuid>` dir behind as an empty husk.
+/// Nothing else ever removed it on the coord-instructed path, so husks grew one
+/// per successful reclaim — 1,554 of them observed on the operator's box
+/// 2026-08-03 against only 28 populated dirs, which makes any directory-count
+/// measurement of "how many worktrees are left" wildly wrong.
+///
+/// Two guards, mirroring [`backstop_sweep`]'s existing hygiene step (which
+/// already did this for its own path — this brings the coord-instructed path
+/// to parity):
+///
+///  1. **Non-recursive `remove_dir`** — never `remove_dir_all`. It fails
+///     harmlessly when anything remains, so a sibling repo worktree for the
+///     same session (concurrently allocated, or simply not yet reclaimed) is
+///     never destroyed. That makes the operation inherently race-safe.
+///  2. **UUID-named parents only** — the same scope test `backstop_sweep`
+///     applies. The worktree root itself, `qontinui-root`, and operator
+///     scratch dirs are not UUID-named, so this can never walk up out of the
+///     session layer no matter what path a caller passes.
+///
+/// Best-effort by construction: every failure is expected traffic (non-empty,
+/// already gone, or held), so nothing here can fail a reclaim.
+fn prune_empty_session_parent(worktree: &Path) {
+    let Some(parent) = worktree.parent() else {
+        return;
+    };
+    let is_session = parent
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| Uuid::parse_str(n).is_ok());
+    if !is_session {
+        debug!(
+            "worktree_reclaim: parent {} is not a session-uuid dir — not pruning",
+            parent.display()
+        );
+        return;
+    }
+    match std::fs::remove_dir(parent) {
+        Ok(()) => info!(
+            "worktree_reclaim: pruned empty session dir {}",
+            parent.display()
+        ),
+        Err(e) => debug!(
+            "worktree_reclaim: session dir {} not pruned ({e}) — expected when \
+             siblings remain",
+            parent.display()
+        ),
+    }
 }
 
 /// Create (or recreate) a junction at `link` pointing at `target`
@@ -1572,6 +1627,85 @@ mod tests {
         // INV-W5 must leave intact.
         remove_worktree(&wt).expect("a linked worktree is still removable");
         assert!(!wt.exists());
+    }
+
+    /// Build `<root>/<session-uuid>/<repo>` with `.git` as a FILE (a linked
+    /// worktree, the shape `remove_worktree` accepts).
+    fn session_worktree(root: &Path, session: &str, repo: &str) -> PathBuf {
+        let wt = root.join(session).join(repo);
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: /x/.git/worktrees/y").unwrap();
+        wt
+    }
+
+    /// The husk regression: reclaiming the only repo under a session dir must
+    /// leave NO empty `<session-uuid>` dir behind. Before this, husks grew one
+    /// per successful reclaim (1,554 observed vs 28 populated, 2026-08-03).
+    #[test]
+    fn removing_the_last_repo_prunes_the_empty_session_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = "019fbb21-e55d-7ef2-bbc1-5c371871e41b";
+        let wt = session_worktree(dir.path(), session, "qontinui-coord");
+
+        remove_worktree(&wt).expect("removable");
+
+        assert!(!wt.exists(), "repo dir removed");
+        assert!(
+            !dir.path().join(session).exists(),
+            "empty session dir must be pruned, not left as a husk"
+        );
+    }
+
+    /// Race safety: a sibling repo worktree under the same session must never
+    /// be destroyed. `remove_dir` is non-recursive, so a non-empty parent
+    /// simply fails and is left alone.
+    #[test]
+    fn session_dir_with_a_surviving_sibling_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = "019fbb22-ee8c-7193-9fb5-dfe211e55579";
+        let a = session_worktree(dir.path(), session, "qontinui-coord");
+        let b = session_worktree(dir.path(), session, "qontinui-runner");
+
+        remove_worktree(&a).expect("removable");
+
+        assert!(!a.exists(), "target removed");
+        assert!(b.exists(), "sibling worktree MUST survive");
+        assert!(
+            dir.path().join(session).exists(),
+            "session dir with a surviving sibling must not be pruned"
+        );
+    }
+
+    /// Scope guard: only UUID-named parents are governed, so the prune can
+    /// never walk up into the worktree root, `qontinui-root`, or an operator
+    /// scratch dir — no matter what path a caller passes.
+    #[test]
+    fn non_uuid_parent_is_never_pruned() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("qontinui-root");
+        let wt = parent.join("qr-wt-p2b");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: /x/.git/worktrees/y").unwrap();
+
+        remove_worktree(&wt).expect("removable");
+
+        assert!(!wt.exists(), "worktree removed");
+        assert!(
+            parent.exists(),
+            "a non-UUID parent must never be pruned even when empty"
+        );
+    }
+
+    /// Idempotent + harmless on the paths that are not session-shaped at all.
+    #[test]
+    fn prune_empty_session_parent_is_safe_on_odd_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        // Already-absent parent: no panic, no error.
+        prune_empty_session_parent(&dir.path().join("019fbb26-3b3b-7361-bd98-f11c7d4131e0/gone"));
+        // A path with no parent at all.
+        prune_empty_session_parent(Path::new("x"));
+        // Root-ish path.
+        prune_empty_session_parent(Path::new("/"));
     }
 
     fn instr(action: ReclaimAction, junctioned: &[&str], is_dirty: bool) -> ReclaimInstruction {
