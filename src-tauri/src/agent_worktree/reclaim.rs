@@ -108,6 +108,14 @@ const DEFAULT_PRUNE_INTERVAL_SECS: u64 = 86_400;
 /// `QONTINUI_WORKTREE_BACKSTOP_MAX_AGE_SECS`.
 const DEFAULT_BACKSTOP_MAX_AGE_SECS: u64 = 14 * 86_400;
 
+/// Default age floor for the empty-session-dir sweep — 1 hour. Allocation
+/// creates `<session-uuid>/` and only then runs a network fetch + `git
+/// worktree add`, so a *legitimately* empty session dir exists for as long as
+/// that takes. An hour is far beyond any allocation and far below the age of
+/// a real husk. Override via
+/// `QONTINUI_WORKTREE_EMPTY_SESSION_MIN_AGE_SECS`.
+const DEFAULT_EMPTY_SESSION_MIN_AGE_SECS: u64 = 3_600;
+
 /// After this many CONSECUTIVE failed pulls the poller stops warning at `warn`
 /// and starts reporting at `error` with a distinct marker. At the 300s default
 /// cadence this is ~25 minutes — long enough that an ordinary coord blip or
@@ -571,11 +579,7 @@ fn prune_empty_session_parent(worktree: &Path) {
     let Some(parent) = worktree.parent() else {
         return;
     };
-    let is_session = parent
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| Uuid::parse_str(n).is_ok());
-    if !is_session {
+    if !is_session_uuid_dir(parent) {
         debug!(
             "worktree_reclaim: parent {} is not a session-uuid dir — not pruning",
             parent.display()
@@ -593,6 +597,18 @@ fn prune_empty_session_parent(worktree: &Path) {
             parent.display()
         ),
     }
+}
+
+/// Is `path`'s final segment a session UUID?
+///
+/// The scope test every session-dir prune shares. The worktree root itself,
+/// `qontinui-root`, and operator scratch dirs are not UUID-named, so a prune
+/// keyed on this can never walk up out of the session layer no matter what
+/// path a caller passes.
+fn is_session_uuid_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| Uuid::parse_str(n).is_ok())
 }
 
 /// Create (or recreate) a junction at `link` pointing at `target`
@@ -997,6 +1013,105 @@ fn backstop_max_age_secs() -> u64 {
     )
 }
 
+/// Age floor for the empty-session-dir sweep.
+fn empty_session_min_age_secs() -> u64 {
+    parse_secs_env(
+        std::env::var("QONTINUI_WORKTREE_EMPTY_SESSION_MIN_AGE_SECS")
+            .ok()
+            .as_deref(),
+        DEFAULT_EMPTY_SESSION_MIN_AGE_SECS,
+    )
+}
+
+/// Prune session dirs that are ALREADY empty when the maintenance pass runs.
+///
+/// [`prune_empty_session_parent`] closes the husk trap going FORWARD, but only
+/// for a dir *this process* just emptied. Two husk classes it cannot reach:
+///
+///  1. **Pre-existing** — emptied by a build older than that prune, or while
+///     the runner was down. Their `<repo>` child is already gone, so
+///     `remove_worktree` will never run for them again and the forward-only
+///     prune can never see them. 10 such husks were on the operator's box
+///     2026-08-03 against 20 populated dirs.
+///  2. **Allocated, never populated** — [`super::allocate_and_materialize_with_claim`] creates
+///     `<session-uuid>/` *before* the locality fetch and `git worktree add`,
+///     so a failure in either leaves the empty parent behind. 494 of these
+///     were measured 2026-07-27 against a 6,666-dir root; no removal path is
+///     ever invoked for them at all.
+///
+/// Both classes had exactly one sweeper — [`backstop_sweep`]'s hygiene step —
+/// and that sweep returns early whenever coord has ever been live, which, now
+/// that reclaim is armed in production, is always. So the husk backlog was
+/// permanent in the steady state the fleet actually runs in. This pass runs
+/// UNCONDITIONALLY instead.
+///
+/// Unconditional is safe here because, unlike the backstop, this destroys
+/// nothing: `remove_dir` is non-recursive, so a dir holding ANY entry — a live
+/// worktree, a half-finished checkout, a stray file — fails harmlessly and is
+/// left alone. That also makes it inherently race-safe against a concurrent
+/// allocation rather than race-checked. No dirty guard is needed for the same
+/// reason: an empty dir has no work to lose. Two guards remain:
+///
+///  1. **UUID-named only** ([`is_session_uuid_dir`]) — the shared scope test.
+///  2. **An age floor** — allocation creates the parent and only then runs a
+///     network fetch, so a legitimately empty session dir exists for as long
+///     as that fetch takes. An unreadable mtime is never old enough
+///     (conservative, matching [`dir_age_secs`]'s contract).
+fn prune_empty_session_dirs() {
+    let Some(root) = session_worktree_root() else {
+        debug!("worktree_husk_prune: no session-worktree root resolved — skipping");
+        return;
+    };
+    let pruned = prune_empty_session_dirs_in(&root, empty_session_min_age_secs());
+    if pruned > 0 {
+        info!(
+            "worktree_husk_prune: pruned {pruned} empty session dir(s) under {}",
+            root.display()
+        );
+    }
+}
+
+/// Pure-ish core of [`prune_empty_session_dirs`]: `root` and the age floor are
+/// resolved by the caller so tests can drive a tempdir without mutating the
+/// process-global environment (which would be flaky under parallel tests —
+/// the same split [`super::canonical_paths`] uses). Returns the count pruned.
+fn prune_empty_session_dirs_in(root: &Path, min_age_secs: u64) -> usize {
+    let entries = match std::fs::read_dir(root) {
+        Ok(r) => r,
+        Err(_) => return 0, // root absent → nothing leaked
+    };
+    let mut pruned = 0usize;
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() || !is_session_uuid_dir(&dir) {
+            continue;
+        }
+        // Unmeasurable age is never old enough.
+        let Some(age) = dir_age_secs(&dir) else {
+            continue;
+        };
+        if age < min_age_secs {
+            continue;
+        }
+        // Non-recursive: succeeds ONLY if the dir is genuinely empty, so a
+        // populated session is never touched.
+        match std::fs::remove_dir(&dir) {
+            Ok(()) => {
+                debug!(
+                    "worktree_husk_prune: pruned empty session dir {}",
+                    dir.display()
+                );
+                pruned += 1;
+            }
+            Err(e) => debug!(
+                "worktree_husk_prune: {} not pruned ({e}) — expected when populated",
+                dir.display()
+            ),
+        }
+    }
+    pruned
+}
+
 /// The exact git argv (after the `git` binary) for a registration prune of
 /// `repo_root`. Pure — unit tests pin the invocation shape.
 fn prune_command_args(repo_root: &Path) -> Vec<String> {
@@ -1209,11 +1324,7 @@ fn backstop_sweep(coord_ever_live: bool) {
         }
         // Only session-UUID dirs are governed — anything else under the
         // root (operator scratch, unrelated tooling) is out of scope.
-        let is_session = session_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| Uuid::parse_str(n).is_ok());
-        if !is_session {
+        if !is_session_uuid_dir(&session_dir) {
             debug!(
                 "worktree_backstop: {} is not a session-uuid dir — out of scope",
                 session_dir.display()
@@ -1518,6 +1629,11 @@ pub fn spawn_reclaim() {
                 // Blocking pool: the pass runs git subprocesses + dir walks.
                 if let Err(e) = tokio::task::spawn_blocking(move || {
                     prune_all_canonical_checkouts();
+                    // Unconditional (unlike the backstop below): removing an
+                    // ALREADY-empty dir destroys nothing, and the backstop —
+                    // the only other sweeper — is suppressed whenever coord
+                    // is live, i.e. always in the armed steady state.
+                    prune_empty_session_dirs();
                     backstop_sweep(ever_live);
                 })
                 .await
@@ -1706,6 +1822,90 @@ mod tests {
         prune_empty_session_parent(Path::new("x"));
         // Root-ish path.
         prune_empty_session_parent(Path::new("/"));
+    }
+
+    // -----------------------------------------------------------------------
+    // The BACKLOG sweep — husks that already exist when the pass runs, which
+    // the forward-only `prune_empty_session_parent` can never reach.
+    // -----------------------------------------------------------------------
+
+    /// The gap `prune_empty_session_parent` leaves: a husk whose `<repo>`
+    /// child is ALREADY gone (emptied by an older build, by a removal that
+    /// happened while the runner was down, or by an allocation that created
+    /// the parent and never populated it). `remove_worktree` never runs for
+    /// these again, and the only other sweeper — `backstop_sweep` — is
+    /// suppressed whenever coord is live. So this pass must reach them.
+    #[test]
+    fn already_empty_session_dirs_are_pruned() {
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("019fbb27-1111-7111-8111-111111111111");
+        let b = root.path().join("019fbb28-2222-7222-8222-222222222222");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        // floor 0 — every dir is old enough.
+        assert_eq!(prune_empty_session_dirs_in(root.path(), 0), 2);
+        assert!(!a.exists(), "husk pruned");
+        assert!(!b.exists(), "husk pruned");
+    }
+
+    /// A populated session dir must survive untouched. `remove_dir` is
+    /// non-recursive, so this holds no matter what the dir contains — the
+    /// guard is the syscall itself, not a check that could go stale between
+    /// look and leap.
+    #[test]
+    fn populated_session_dir_survives_the_sweep() {
+        let root = tempfile::tempdir().unwrap();
+        let live = session_worktree(
+            root.path(),
+            "019fbb29-3333-7333-8333-333333333333",
+            "qontinui-runner",
+        );
+        let husk = root.path().join("019fbb2a-4444-7444-8444-444444444444");
+        std::fs::create_dir_all(&husk).unwrap();
+
+        assert_eq!(prune_empty_session_dirs_in(root.path(), 0), 1);
+        assert!(live.exists(), "a live worktree MUST survive");
+        assert!(!husk.exists(), "the husk beside it is still pruned");
+    }
+
+    /// Scope guard: a non-UUID child of the root is never touched, even when
+    /// empty — operator scratch dirs live beside the session dirs.
+    #[test]
+    fn non_uuid_dirs_are_never_swept() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = root.path().join("qr-wt-p2b");
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        assert_eq!(prune_empty_session_dirs_in(root.path(), 0), 0);
+        assert!(scratch.exists(), "a non-UUID dir must never be swept");
+    }
+
+    /// Race guard: allocation creates `<session-uuid>/` and only THEN runs a
+    /// network fetch + `git worktree add`, so a legitimately empty session dir
+    /// exists for as long as that takes. The age floor keeps the sweep off it.
+    #[test]
+    fn freshly_allocated_empty_session_dir_is_below_the_age_floor() {
+        let root = tempfile::tempdir().unwrap();
+        let allocating = root.path().join("019fbb2b-5555-7555-8555-555555555555");
+        std::fs::create_dir_all(&allocating).unwrap();
+
+        // Just created, so far below the 1h default floor.
+        assert_eq!(
+            prune_empty_session_dirs_in(root.path(), DEFAULT_EMPTY_SESSION_MIN_AGE_SECS),
+            0
+        );
+        assert!(
+            allocating.exists(),
+            "an in-flight allocation must not be swept out from under itself"
+        );
+    }
+
+    /// An absent root is "nothing leaked", not an error.
+    #[test]
+    fn sweep_on_an_absent_root_is_a_no_op() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(prune_empty_session_dirs_in(&root.path().join("gone"), 0), 0);
     }
 
     fn instr(action: ReclaimAction, junctioned: &[&str], is_dirty: bool) -> ReclaimInstruction {
