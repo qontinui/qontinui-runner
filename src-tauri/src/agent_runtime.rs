@@ -76,8 +76,13 @@ pub struct LaunchPayload {
     pub jwt_exp: i64,
     pub initial_prompt: String,
     pub claim_token: String,
-    #[serde(default)]
-    pub plan_slug: Option<String>,
+    /// Work unit this spawn belongs to. Coord renamed the wire key
+    /// `plan_slug` → `work_unit_slug`; during the dual-read window we accept
+    /// EITHER name. `alias` (not a second field) is deliberate: serde treats
+    /// an alias as the same field, so a body carrying BOTH keys fails hard
+    /// with `duplicate field` instead of silently preferring one.
+    #[serde(default, alias = "plan_slug")]
+    pub work_unit_slug: Option<String>,
     #[serde(default)]
     pub plan_phase: Option<u32>,
     #[serde(default)]
@@ -5051,7 +5056,7 @@ mod tests {
             jwt_exp: 0,
             initial_prompt: "go".to_string(),
             claim_token: "agent:00000000-0000-0000-0000-000000000000".to_string(),
-            plan_slug: Some("readiness".to_string()),
+            work_unit_slug: Some("readiness".to_string()),
             plan_phase: Some(4),
             correlation_topic: Some("my-coordination-topic".to_string()),
         };
@@ -5066,7 +5071,8 @@ mod tests {
                 "jwt_exp": payload.jwt_exp,
                 "initial_prompt": payload.initial_prompt,
                 "claim_token": payload.claim_token,
-                "plan_slug": payload.plan_slug,
+                // Legacy coord emit — the key coord still writes today.
+                "plan_slug": payload.work_unit_slug,
                 "plan_phase": payload.plan_phase,
             }),
         }))
@@ -5079,6 +5085,66 @@ mod tests {
         assert_eq!(round_tripped.worktrees.len(), 1);
         assert_eq!(round_tripped.worktrees[0].repo, "qontinui-runner");
         assert_eq!(round_tripped.plan_phase, Some(4));
+        // Legacy `plan_slug` still lands in the renamed field via the alias.
+        assert_eq!(round_tripped.work_unit_slug.as_deref(), Some("readiness"));
+    }
+
+    /// Minimal `LaunchPayload` body with the slug key left to the caller, so
+    /// the dual-read tests below differ ONLY in which key they carry.
+    fn launch_body_with(slug_keys: serde_json::Value) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "agent_id": uuid::Uuid::nil(),
+            "target_device_id": uuid::Uuid::nil(),
+            "worktrees": [],
+            "jwt": "tok",
+            "jwt_exp": 0,
+            "initial_prompt": "go",
+            "claim_token": "agent:00000000-0000-0000-0000-000000000000",
+        });
+        let map = body.as_object_mut().unwrap();
+        for (k, v) in slug_keys.as_object().unwrap() {
+            map.insert(k.clone(), v.clone());
+        }
+        body
+    }
+
+    #[test]
+    fn launch_payload_accepts_legacy_plan_slug_key() {
+        // Un-renamed coord (every coord shipping today) emits `plan_slug`.
+        let body = launch_body_with(serde_json::json!({ "plan_slug": "some-unit" }));
+        let p: LaunchPayload = serde_json::from_value(body).unwrap();
+        assert_eq!(p.work_unit_slug.as_deref(), Some("some-unit"));
+    }
+
+    #[test]
+    fn launch_payload_accepts_new_work_unit_slug_key() {
+        // Post-rename coord emits `work_unit_slug`.
+        let body = launch_body_with(serde_json::json!({ "work_unit_slug": "some-unit" }));
+        let p: LaunchPayload = serde_json::from_value(body).unwrap();
+        assert_eq!(p.work_unit_slug.as_deref(), Some("some-unit"));
+    }
+
+    #[test]
+    fn launch_payload_absent_slug_is_none() {
+        let body = launch_body_with(serde_json::json!({}));
+        let p: LaunchPayload = serde_json::from_value(body).unwrap();
+        assert_eq!(p.work_unit_slug, None);
+    }
+
+    #[test]
+    fn launch_payload_rejects_both_slug_keys() {
+        // A body carrying BOTH names is ambiguous — serde's alias handling
+        // makes that a hard `duplicate field` error rather than a silent
+        // preference. This is the property we WANT; pin it.
+        let body = launch_body_with(serde_json::json!({
+            "plan_slug": "old-name",
+            "work_unit_slug": "new-name",
+        }));
+        let err = serde_json::from_value::<LaunchPayload>(body).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate field"),
+            "expected a duplicate-field rejection, got: {err}"
+        );
     }
 
     #[test]
