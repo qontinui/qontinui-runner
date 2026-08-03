@@ -27,6 +27,7 @@ import type { HealthLevel, ProjectSnapshot, SessionLite } from "./types";
 import { isLiveProcessState } from "./types";
 import { buildDigest, describeSessionWhen, type DigestLine } from "./projectDigest";
 import { isOpenBusy, openProse, type OpenPhase } from "./openProject";
+import { FrontPageAddress } from "./FrontPageAddress";
 
 const log = createLogger("ProjectDetail");
 
@@ -194,6 +195,8 @@ export function ProjectDetail({
             </ul>
           </section>
         ) : null}
+
+        <FrontPageAddress project={project} onSaved={() => onRefresh?.()} />
 
         <section>
           <h2 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
