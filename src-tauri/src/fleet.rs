@@ -493,6 +493,20 @@ pub async fn publish_budget(
     resources: Resources,
     disk_reserved_gb: u64,
 ) -> Result<(), String> {
+    publish_budget_now(role, resources, disk_reserved_gb).await
+}
+
+/// [`publish_budget`] without the vestigial pool argument.
+///
+/// Exists because [`spawn_budget_republisher`] runs on the `fleet-heartbeat`
+/// thread, which holds no `PgDb` — and manufacturing one to satisfy a
+/// parameter the function never reads would be worse than this split. The
+/// public signature is left alone so the boot call site stays untouched.
+async fn publish_budget_now(
+    role: MachineRole,
+    resources: Resources,
+    disk_reserved_gb: u64,
+) -> Result<(), String> {
     let device = match load_device_file() {
         Some(d) => d,
         None => {
@@ -590,6 +604,72 @@ pub async fn publish_on_startup(pg: &Arc<PgDb>, role: MachineRole) {
     if let Err(e) = publish_budget(pg, role, resources, 0).await {
         warn!("fleet::publish_on_startup failed (non-fatal — runner still boots): {e}");
     }
+}
+
+/// Re-publish cadence for [`spawn_budget_republisher`], in seconds.
+/// Overridable via `COORD_BUDGET_REPUBLISH_SECS`, floored at 60s.
+const BUDGET_REPUBLISH_DEFAULT_SECS: u64 = 600;
+
+/// Resolve the re-publish interval, applying the 60s floor.
+fn budget_republish_secs() -> u64 {
+    std::env::var("COORD_BUDGET_REPUBLISH_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(BUDGET_REPUBLISH_DEFAULT_SECS)
+        .max(60)
+}
+
+/// Periodically re-assert this device's budget, so a clobbered or stale
+/// `coord.devices` row self-heals instead of persisting until the next reboot.
+///
+/// ## Why this exists
+///
+/// The budget publish used to be a one-shot at boot, and the heartbeat never
+/// touches the budget columns — so whatever `coord.devices` held after startup
+/// was frozen for the process's lifetime. Two properties made that fragile:
+/// coord's `upsert_budget` does `SET max_concurrent_builds = $8`
+/// unconditionally (no COALESCE, no guard), and every runner instance on this
+/// machine — including the `test-*`/`named-*` ones the supervisor spawns —
+/// shares one `~/.qontinui/machine.json`, hence one `device_id`.
+///
+/// On 2026-07-28T08:31:18Z those combined: a test runner spawned for a
+/// verification job read `ci_node.enabled` as false in its own instance
+/// settings, published `max_concurrent_builds = 0` over the primary's row, and
+/// exited. Coord's shadow-lane dispatcher requires capacity > 0, so it elected
+/// no device for the next six days while the primary sat there heartbeating
+/// `healthy`. Nothing recovered it because nothing re-published.
+///
+/// A periodic re-assert bounds that damage to one interval. It does NOT stop a
+/// sibling instance from writing the wrong value — the real fix for THAT is
+/// per-instance device identity — but it does stop a wrong value from being
+/// permanent, which is what turned a transient race into a six-day outage.
+///
+/// Runs on the caller's runtime; `main.rs` puts it on the dedicated
+/// `fleet-heartbeat` thread rather than `fleet-publishers`, so the sweep tasks
+/// that block that runtime for minutes at a time (the 2026-06-03 heartbeat
+/// starvation) cannot stall the re-assert either.
+pub fn spawn_budget_republisher(role: MachineRole) {
+    let secs = budget_republish_secs();
+    info!("fleet::budget_republisher: starting, interval={secs}s");
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(secs));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The boot publish already ran on the publishers thread; skip the
+        // immediate tick `interval` always yields so the first re-assert
+        // happens one full period later.
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            // Resources are re-detected each tick: disk fills, and the
+            // ci_node settings this derives `max_concurrent_builds` from can
+            // change while the runner is up (the setting is designed to need
+            // no restart — `ci_node/subscription.rs` re-reads it every loop).
+            let resources = detect_resources();
+            if let Err(e) = publish_budget_now(role, resources, 0).await {
+                warn!("fleet::budget_republisher: re-publish failed (will retry): {e}");
+            }
+        }
+    });
 }
 
 // =============================================================================
@@ -3403,6 +3483,37 @@ fn execute_build_and_restart(app: &qontinui_types::apps::App, app_id: &str) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- periodic budget re-publish ----
+
+    /// The cadence knob, including the floor. A misconfigured `0` must not
+    /// turn the re-assert into a hot loop hammering coord's budget endpoint —
+    /// `tokio::time::interval` with a zero period never yields.
+    #[test]
+    fn budget_republish_interval_defaults_and_floors() {
+        let prev = std::env::var("COORD_BUDGET_REPUBLISH_SECS").ok();
+
+        std::env::remove_var("COORD_BUDGET_REPUBLISH_SECS");
+        assert_eq!(budget_republish_secs(), BUDGET_REPUBLISH_DEFAULT_SECS);
+
+        std::env::set_var("COORD_BUDGET_REPUBLISH_SECS", "120");
+        assert_eq!(budget_republish_secs(), 120);
+
+        // Below the floor, and unparseable, both fall back to something sane.
+        std::env::set_var("COORD_BUDGET_REPUBLISH_SECS", "0");
+        assert_eq!(budget_republish_secs(), 60, "0 must floor to 60s");
+        std::env::set_var("COORD_BUDGET_REPUBLISH_SECS", "not-a-number");
+        assert_eq!(
+            budget_republish_secs(),
+            BUDGET_REPUBLISH_DEFAULT_SECS,
+            "garbage must fall back to the default, not to 0"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("COORD_BUDGET_REPUBLISH_SECS", v),
+            None => std::env::remove_var("COORD_BUDGET_REPUBLISH_SECS"),
+        }
+    }
 
     // ---- repo-freshness Layer 1 — fetch interval gate ----
 
