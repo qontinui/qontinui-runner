@@ -686,9 +686,7 @@ fn tune_config_for_open(config: &mut Value, framework: &str, path: &str) -> Opti
         if !expo_supports_web(path) {
             // No web target. Start the dev server (still useful) but do NOT
             // claim an address — `expo start` would serve Metro, not the app.
-            config
-                .as_object_mut()?
-                .remove("health_port");
+            config.as_object_mut()?.remove("health_port");
             return None;
         }
         let port = first_free_port(default_port.unwrap_or(8081))?;
@@ -976,7 +974,10 @@ mod framework_key_tests {
             "config and returned port agree"
         );
         let args: Vec<String> = serde_json::from_value(cfg["args"].clone()).expect("args");
-        assert!(args.contains(&"--web".to_string()), "serves the app, not Metro");
+        assert!(
+            args.contains(&"--web".to_string()),
+            "serves the app, not Metro"
+        );
         assert!(
             args.windows(2)
                 .any(|w| w[0] == "--port" && w[1] == chosen.to_string()),
@@ -1031,7 +1032,10 @@ mod framework_key_tests {
         let p = free.local_addr().expect("addr").port();
         drop(free);
         let mut ok = json!({"health_port": p, "args": ["npm", "start"]});
-        assert_eq!(tune_config_for_open(&mut ok, "nextjs", "/nonexistent"), Some(p));
+        assert_eq!(
+            tune_config_for_open(&mut ok, "nextjs", "/nonexistent"),
+            Some(p)
+        );
     }
 
     #[test]
