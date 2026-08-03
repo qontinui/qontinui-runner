@@ -273,6 +273,23 @@ export function ProjectCard({
         {/* Spend is omitted when NOT MEASURED, but shown at $0.00 — "it cost
             nothing" is a real answer to "is this costing me money?". */}
         {spend ? <span title="Agent spend over the last 7 days">{spend}</span> : null}
+        {/* An EXPLICIT route to the detail view (§5.2).
+            The project name is also a button, but it renders as a heading and
+            only reveals itself on hover — which meant the detail view, and with
+            it the ONLY way to change a project's web address once set, was
+            effectively undiscoverable. Reported live: "there's no way for me to
+            change the URL from 8081 to 8082".
+            Kept visually secondary rather than made a third primary button, so
+            Open / Work on it stay the two unambiguous actions §5.1 intends. */}
+        {onShowDetail ? (
+          <button
+            type="button"
+            onClick={() => onShowDetail(project.id)}
+            className="underline hover:text-foreground"
+          >
+            Details &amp; settings
+          </button>
+        ) : null}
       </p>
 
       {/* §7.1: "surfaced as prose, not a spinner". The stderr tail is the
@@ -310,13 +327,31 @@ export function ProjectCard({
               because it is a real webview and therefore a UI Bridge target;
               the browser is there for when the operator wants their own. */}
           {openPhase.kind === "done" ? (
-            <button
-              type="button"
-              onClick={() => void openUrl(openPhase.url)}
-              className="mt-1 text-xs text-muted-foreground underline hover:text-foreground"
-            >
-              Open in browser instead
-            </button>
+            <div className="mt-1 flex flex-wrap gap-x-3 text-xs text-muted-foreground">
+              <button
+                type="button"
+                onClick={() => void openUrl(openPhase.url)}
+                className="underline hover:text-foreground"
+              >
+                Open in browser instead
+              </button>
+              {/* A SUCCESSFUL open can still show the wrong thing: the address
+                  is whatever the user (or autoconfigure) recorded, and another
+                  service may own that port. Observed live — Expo's default 8081
+                  was held by EDB Postgres's Apache, so Open cheerfully
+                  displayed a Postgres status page. Success means "we opened the
+                  address", never "this is your app", so the correction has to
+                  be reachable from the success state too. */}
+              {onShowDetail ? (
+                <button
+                  type="button"
+                  onClick={() => onShowDetail(project.id)}
+                  className="underline hover:text-foreground"
+                >
+                  Not the right page? Change the address
+                </button>
+              ) : null}
+            </div>
           ) : null}
           {/* The one failure the user can fix without leaving the card. Offered
               in place precisely because the old copy told them to add an
