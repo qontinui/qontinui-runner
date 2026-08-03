@@ -132,6 +132,8 @@ async fn run_orchestrator(
     // schedule a tail starting from EOF for any whose mtime is within the
     // last STARTUP_RECENCY.
     let now = SystemTime::now();
+    let mut transcripts_on_disk = 0usize;
+    let mut recent_transcripts = 0usize;
     for config_dir in &config_dirs {
         for project in &workspace_paths {
             let sessions = match list_sessions(config_dir, project) {
@@ -152,6 +154,7 @@ async fn run_orchestrator(
                 if !jsonl.exists() {
                     continue;
                 }
+                transcripts_on_disk += 1;
                 let mtime_ok = std::fs::metadata(&jsonl)
                     .ok()
                     .and_then(|m| m.modified().ok())
@@ -160,6 +163,7 @@ async fn run_orchestrator(
                 if !mtime_ok {
                     continue;
                 }
+                recent_transcripts += 1;
                 schedule_tail(
                     &tasks,
                     s.session_id.clone(),
@@ -172,6 +176,44 @@ async fn run_orchestrator(
                 .await;
             }
         }
+    }
+
+    // ── 1a. Transcript-absence symptom check ──────────────────────────────
+    //
+    // This watcher is the ONLY populator of `coord.session_touched_files` for
+    // PTY-launched AI tabs, so "no transcripts" means coord's cross-session
+    // file-conflict traffic light is blind for the dominant session type —
+    // with no second writer to cover it. Nothing used to notice: a 2026-07-28
+    // report of "13 live sessions, zero transcripts" ran for a week on a
+    // misdiagnosed cause and was ultimately traced to a probe that searched
+    // `$HOME/.claude` while the fleet sets `CLAUDE_CONFIG_DIR` per account —
+    // i.e. it would have reported zero no matter what.
+    //
+    // So this logs the config dirs it ACTUALLY searched. That is the whole
+    // point: it makes "we looked in the wrong place" distinguishable from
+    // "persistence is off", which is exactly the distinction the original
+    // investigation could not make.
+    let searched: Vec<String> = config_dirs
+        .iter()
+        .map(|d| d.to_string_lossy().to_string())
+        .collect();
+    if transcripts_on_disk == 0 {
+        warn!(
+            config_dirs = %searched.join(", "),
+            workspace_paths = %workspace_paths.join(", "),
+            "transcript_watcher: ZERO Claude transcripts found for any watched workspace path. \
+             coord.session_touched_files will not populate for PTY tabs, so cross-session file \
+             conflict detection is blind for them. Verify the config dirs listed here are the \
+             ones the CLI actually writes to (CLAUDE_CONFIG_DIR is set per account) BEFORE \
+             concluding that transcript persistence is off."
+        );
+    } else {
+        info!(
+            transcripts_on_disk,
+            recent_transcripts,
+            config_dirs = %searched.join(", "),
+            "transcript_watcher: startup discovery complete"
+        );
     }
 
     // ── 2. Live watching ──────────────────────────────────────────────────

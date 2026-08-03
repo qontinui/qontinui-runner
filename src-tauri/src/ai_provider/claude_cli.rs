@@ -334,6 +334,8 @@ pub(crate) fn score_options_via_cli(
         cmd.env("CLAUDE_CONFIG_DIR", dir);
     }
     cmd.env_remove("CLAUDECODE");
+    // Same rule, sibling marker — see `session::transport::claude_cli` docs.
+    cmd.env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV);
     cmd.env("QONTINUI_TRACE_ID", uuid::Uuid::new_v4().to_string());
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())

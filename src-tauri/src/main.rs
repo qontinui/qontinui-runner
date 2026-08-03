@@ -423,6 +423,23 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting Qontinui Runner v{}", env!("CARGO_PKG_VERSION"));
 
+    // Report inherited Claude Code process-topology markers
+    // (plan `2026-07-28-runner-transcript-persistence-env-leak` §5). The leak
+    // ran unnoticed for months because nothing watched for it; this line alone
+    // would have caught it. Spawn sites strip the markers, so panes are
+    // unaffected — this reports what THIS process inherited, which is the
+    // evidence of where the marker entered.
+    {
+        let inherited = qontinui_runner_lib::claude_env::inherited_session_markers();
+        if !inherited.is_empty() {
+            warn!(
+                markers = %inherited.join(","),
+                "{}",
+                qontinui_runner_lib::claude_env::inherited_markers_detail(&inherited)
+            );
+        }
+    }
+
     // Initialize Sentry for crash reporting (release builds only).
     // The guard must live for the entire application lifetime — when it drops, Sentry shuts down.
     #[cfg(not(debug_assertions))]

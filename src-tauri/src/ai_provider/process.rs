@@ -17,6 +17,8 @@ pub(super) fn spawn_and_wait_with_doctor(
     // Remove CLAUDECODE env var so nested Claude CLI sessions don't refuse to start.
     // The runner legitimately needs to spawn Claude CLI as a subprocess, not as a nested session.
     cmd.env_remove("CLAUDECODE");
+    // Same rule, sibling marker — see `session::transport::claude_cli` docs.
+    cmd.env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV);
 
     // Inject trace ID for cross-process correlation
     cmd.env("QONTINUI_TRACE_ID", uuid::Uuid::new_v4().to_string());
