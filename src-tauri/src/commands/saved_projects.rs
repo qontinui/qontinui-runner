@@ -32,6 +32,7 @@
 //! directory was renamed later — we still want `remove_saved_project` and
 //! the joins to behave.
 
+use serde_json::{json, Value};
 use std::sync::OnceLock;
 
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
@@ -605,6 +606,112 @@ pub(crate) fn resolve_framework_key(path: &str, stored_project_type: &str) -> St
     stored_project_type.trim().replace('-', "_")
 }
 
+/// Whether a TCP port on loopback is free to bind RIGHT NOW.
+///
+/// Used to stop [`autoconfigure_project`] storing a framework's DEFAULT port
+/// when something else already owns it. Observed live: Expo's default 8081 was
+/// held by the Apache that ships with EDB Postgres, so a naive
+/// `http://localhost:8081` opened a Postgres status page and confidently
+/// presented it as the user's app.
+///
+/// A bind probe, not a connect probe: "can the dev server take this port"
+/// is the actual question, and a connect probe cannot distinguish a free port
+/// from one whose owner is merely idle.
+fn port_is_free(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+/// The first free port at or after `start`, searched over a small window.
+///
+/// `None` when the whole window is occupied — the caller then reports the
+/// conflict rather than picking a port it has not verified.
+fn first_free_port(start: u16) -> Option<u16> {
+    (start..=start.saturating_add(20)).find(|p| port_is_free(*p))
+}
+
+/// Whether an Expo/React-Native project can serve itself over the web.
+///
+/// A React Native app has no web front page by default, so `Open` — which
+/// points a webview at a URL — is only meaningful when `react-native-web` is
+/// present (or the project declares a `web` script). Without it, `expo start`
+/// serves Metro's dev tooling, not the app, and opening that would be another
+/// confidently-wrong answer dressed as success.
+fn expo_supports_web(path: &str) -> bool {
+    let pkg_path = std::path::Path::new(path).join("package.json");
+    let Ok(contents) = std::fs::read_to_string(&pkg_path) else {
+        return false;
+    };
+    let Ok(pkg) = serde_json::from_str::<Value>(&contents) else {
+        return false;
+    };
+    let has_dep = |name: &str| {
+        pkg.get("dependencies").and_then(|d| d.get(name)).is_some()
+            || pkg
+                .get("devDependencies")
+                .and_then(|d| d.get(name))
+                .is_some()
+    };
+    has_dep("react-native-web")
+        || pkg
+            .get("scripts")
+            .and_then(|s| s.get("web"))
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.contains("--web"))
+}
+
+/// Adjust a suggested process config so the address it implies is actually
+/// reachable and actually the user's project.
+///
+/// Two corrections, both learned from a live failure:
+///
+/// 1. **React Native must serve WEB.** `configs_for_framework` suggests
+///    `expo start`, which is right for the process manager but serves Metro's
+///    dev tooling — not the app. `Open` points a webview at the URL, so for a
+///    web-capable Expo project we run `expo start --web`. A project WITHOUT
+///    web support gets no URL at all rather than one that opens dev tooling
+///    and calls it the app.
+/// 2. **The default port may be taken.** Expo's 8081 was held by EDB
+///    Postgres's Apache on the reporting machine. We bind-probe and move to
+///    the first free port, passing it explicitly so the dev server and the
+///    stored URL cannot disagree.
+///
+/// Returns the port the URL should use, or `None` when no honest URL exists.
+fn tune_config_for_open(config: &mut Value, framework: &str, path: &str) -> Option<u16> {
+    let default_port = config
+        .get("health_port")
+        .and_then(Value::as_u64)
+        .and_then(|p| u16::try_from(p).ok());
+
+    if framework == "react_native" {
+        if !expo_supports_web(path) {
+            // No web target. Start the dev server (still useful) but do NOT
+            // claim an address — `expo start` would serve Metro, not the app.
+            config
+                .as_object_mut()?
+                .remove("health_port");
+            return None;
+        }
+        let port = first_free_port(default_port.unwrap_or(8081))?;
+        let obj = config.as_object_mut()?;
+        obj.insert(
+            "args".to_string(),
+            json!(["expo", "start", "--web", "--port", port.to_string()]),
+        );
+        obj.insert("health_port".to_string(), json!(port));
+        return Some(port);
+    }
+
+    // Every other framework: keep the suggested command, but only claim the
+    // port if it is genuinely available. An occupied port means the URL would
+    // point at whatever already owns it.
+    let port = default_port?;
+    if port_is_free(port) {
+        Some(port)
+    } else {
+        None
+    }
+}
+
 /// What [`autoconfigure_project`] actually did, so the UI can report it
 /// truthfully instead of implying more than happened.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -679,14 +786,14 @@ pub async fn autoconfigure_project(
     let mut process_names = Vec::new();
     let mut port: Option<u16> = None;
 
-    for value in configs {
-        // The port is read from the SUGGESTION, not from the saved config, so a
-        // deserialize that drops an unknown field cannot silently lose it.
+    for mut value in configs {
+        // Correct the suggestion BEFORE persisting it: point React Native at
+        // its web target, and move off a port something else already owns. The
+        // port comes back from the tuner rather than the raw suggestion, so the
+        // stored URL and the dev server's actual port cannot disagree.
+        let tuned = tune_config_for_open(&mut value, &framework, &project.path);
         if port.is_none() {
-            port = value
-                .get("health_port")
-                .and_then(|p| p.as_u64())
-                .and_then(|p| u16::try_from(p).ok());
+            port = tuned;
         }
         let config: qontinui_types::process_management::ProcessConfig =
             serde_json::from_value(value)
@@ -836,6 +943,95 @@ mod framework_key_tests {
         // Nothing known at all stays empty, so the caller reports honestly
         // instead of inventing a framework.
         assert_eq!(resolve_framework_key(&path, ""), "");
+    }
+
+    /// The live failure: Expo's default 8081 was owned by EDB Postgres's
+    /// Apache, so a naive config stored `http://localhost:8081` and opened a
+    /// Postgres status page as though it were the user's app. The tuner must
+    /// move to a free port AND pass it to the dev server, so the two cannot
+    /// disagree.
+    #[test]
+    fn react_native_moves_off_an_occupied_port_and_serves_web() {
+        let dir = std::env::temp_dir().join(format!("qr-port-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"m","dependencies":{"expo":"~52","react-native":"0.76","react-native-web":"~0.19"}}"#,
+        )
+        .expect("write");
+        let path = dir.to_string_lossy().to_string();
+
+        // Occupy a port for real, then demand it as the default.
+        let squatter = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind squatter");
+        let taken = squatter.local_addr().expect("addr").port();
+        assert!(!port_is_free(taken), "the squatter really holds it");
+
+        let mut cfg = json!({"health_port": taken, "args": ["expo", "start"]});
+        let chosen = tune_config_for_open(&mut cfg, "react_native", &path).expect("a free port");
+
+        assert_ne!(chosen, taken, "must not hand back the occupied port");
+        assert_eq!(
+            cfg["health_port"].as_u64(),
+            Some(chosen as u64),
+            "config and returned port agree"
+        );
+        let args: Vec<String> = serde_json::from_value(cfg["args"].clone()).expect("args");
+        assert!(args.contains(&"--web".to_string()), "serves the app, not Metro");
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--port" && w[1] == chosen.to_string()),
+            "the port is passed to expo, so the URL cannot drift from reality: {args:?}"
+        );
+
+        drop(squatter);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A React Native project with NO web support gets no URL at all. `expo
+    /// start` would serve Metro's dev tooling, and opening that while calling
+    /// it the user's app is the failure mode this whole change exists to stop.
+    #[test]
+    fn react_native_without_web_support_claims_no_url() {
+        let dir = std::env::temp_dir().join(format!("qr-noweb-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"m","dependencies":{"expo":"~52","react-native":"0.76"}}"#,
+        )
+        .expect("write");
+        let path = dir.to_string_lossy().to_string();
+        assert!(!expo_supports_web(&path));
+
+        let mut cfg = json!({"health_port": 8081, "args": ["expo", "start"]});
+        assert_eq!(tune_config_for_open(&mut cfg, "react_native", &path), None);
+        assert!(
+            cfg.get("health_port").is_none(),
+            "no port claimed either — the process still runs, but nothing pretends it serves a page"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Non-RN frameworks keep their suggested command, but an occupied port
+    /// yields no URL rather than one pointing at whatever already owns it.
+    #[test]
+    fn other_frameworks_decline_an_occupied_port() {
+        let squatter = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let taken = squatter.local_addr().expect("addr").port();
+
+        let mut busy = json!({"health_port": taken, "args": ["npm", "start"]});
+        assert_eq!(
+            tune_config_for_open(&mut busy, "nextjs", "/nonexistent"),
+            None,
+            "an occupied port must not become a stored URL"
+        );
+        drop(squatter);
+
+        let free = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let p = free.local_addr().expect("addr").port();
+        drop(free);
+        let mut ok = json!({"health_port": p, "args": ["npm", "start"]});
+        assert_eq!(tune_config_for_open(&mut ok, "nextjs", "/nonexistent"), Some(p));
     }
 
     #[test]
