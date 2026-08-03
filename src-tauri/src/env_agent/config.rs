@@ -56,7 +56,14 @@ pub struct EnvAgentConfig {
     /// project tree. Set this to a project root to measure that tree instead;
     /// that is also the root a P2b apply anchors a pinfile to.
     ///
-    /// See [`super::collectors::probe_scope_root`] for the full resolution order.
+    /// Set it with `qontinui-runner env scope-root --path <dir>` (which validates
+    /// the directory and stores it absolute) rather than by hand — the value
+    /// **must be an absolute path**. A relative one is rejected at probe time,
+    /// because it would resolve against the runner's launch directory and so
+    /// reintroduce exactly the launch-dependence this field exists to remove.
+    ///
+    /// See [`super::collectors::resolve_probe_scope`] for the full resolution
+    /// order and the rejection reasons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope_root: Option<String>,
 }
