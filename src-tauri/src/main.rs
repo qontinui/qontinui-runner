@@ -729,6 +729,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             };
             rt.block_on(async {
                 fleet::spawn_heartbeat();
+                // Budget re-assert rides THIS thread, not `fleet-publishers`,
+                // for the same reason the heartbeat does: the publisher
+                // runtime's sweeps block their only worker for minutes at a
+                // time. It is also the thread that demonstrably survived the
+                // 2026-07-28 incident window. See
+                // `fleet::spawn_budget_republisher` for why a one-shot boot
+                // publish left a clobbered capacity column stuck for six days.
+                fleet::spawn_budget_republisher(fleet::MachineRole::Agent);
                 // Park this thread's runtime forever so the spawned
                 // interval task keeps ticking for the runner's lifetime.
                 std::future::pending::<()>().await;
