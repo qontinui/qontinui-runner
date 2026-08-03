@@ -54,8 +54,10 @@ describe("spawnFromPlan", () => {
     const [command, args] = mockInvoke.mock.calls[0];
     expect(command).toBe("spawn_from_plan");
     // Tauri auto-converts the snake_case Rust params to camelCase JS keys.
+    // `workUnitSlug` (NOT `planSlug`) — coord's post-rename wire key; the
+    // exact-shape `toEqual` is what keeps the legacy key from creeping back.
     expect(args).toEqual({
-      planSlug: "2026-05-19-coordinator-production-readiness",
+      workUnitSlug: "2026-05-19-coordinator-production-readiness",
       planPhase: "Phase 4",
       repos: ["qontinui-web", "qontinui-runner"],
       intent: "spawn-from-plan demo",

@@ -431,14 +431,24 @@ export interface SpawnAgentResult {
   [k: string]: unknown;
 }
 
-/** Spawn an agent from a plan/phase tuple via coord.
+/** Spawn an agent from a work-unit/phase tuple via coord.
  *
  *  Mirrors the web SpawnModal contract verbatim:
- *    - `planSlug` + `phase` identify the plan + phase the agent is
- *      working under;
- *    - `repos` is the list of repo slugs the agent declares;
+ *    - `workUnitSlug` + `phase` identify the work unit + phase the agent
+ *      is working under. Coord renamed this wire key from `plan_slug`
+ *      (plan `2026-07-28-coord-post-plan-slug-surfaces-rename`); the Rust
+ *      command sends `work_unit_slug` and only that key — see
+ *      `spawn_request_body` for why sending both would 400;
+ *    - `phase` is free text here but a NUMBER on coord's wire — the Rust
+ *      command reduces "4" / "Phase 4" to `4` and rejects non-numeric input
+ *      rather than silently dropping it;
+ *    - `repos` is the list of repo slugs the agent declares — the Rust
+ *      command expands them into coord's `[{repo}]` spec shape;
  *    - `intent` is a one-liner describing the work;
  *    - `initialPrompt` is the first-tick message coord delivers.
+ *
+ *  `target_device_id` is NOT a parameter: coord requires it and the runner
+ *  fills in its own device, since this modal has no device picker.
  *
  *  `declaredOverlapPaths` is optional — when the operator declares
  *  overlap up-front, coord can pre-detect conflicts in the L2
@@ -446,7 +456,7 @@ export interface SpawnAgentResult {
  *  lazily as the agent starts editing.
  */
 export async function spawnFromPlan(
-  planSlug: string,
+  workUnitSlug: string,
   phase: string,
   repos: string[],
   intent: string,
@@ -465,7 +475,7 @@ export async function spawnFromPlan(
   // but the backend command owns base resolution now (it is not forwarded).
   void coordBase;
   const res = await invoke<SpawnAgentResult>("spawn_from_plan", {
-    planSlug,
+    workUnitSlug,
     planPhase: phase,
     repos,
     intent,
