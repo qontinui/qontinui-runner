@@ -129,14 +129,15 @@ enum Cmd {
     /// (feat/devenv-environments). `enroll` binds this machine to a web
     /// environment via a per-machine API key; `capture` pushes a secret-free
     /// config envelope; `pull` previews what would change here to match the
-    /// canonical machine; `show` prints enrollment state.
+    /// canonical machine; `show` prints enrollment state; `scope-root` declares
+    /// which directory the toolchain version probes measure.
     Env {
         #[command(subcommand)]
         sub: EnvCmd,
     },
 }
 
-// `EnvCmd` (the `env enroll/capture/pull/show` subcommand tree) lives in
+// `EnvCmd` (the `env enroll/capture/pull/show/scope-root` subcommand tree) lives in
 // `qontinui_runner_lib::profile_cli` so this bin AND the main runner binary's
 // pre-GUI CLI mode share one implementation.
 
