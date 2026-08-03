@@ -28,16 +28,32 @@ function snap(processes: ProcessStatusLite[]): ProjectSnapshot {
 }
 
 describe("planOpen", () => {
-  it("refuses to run without a front page address", () => {
+  it("refuses to run without a front page address, and FLAGS it as fixable", () => {
     const plan = planOpen({ frontPageUrl: null, processIds: ["a"], snapshot: snap([]) });
     expect(plan.url).toBeNull();
-    expect(plan.blockedReason).toContain("front page address");
+    expect(plan.blockedReason).toContain("address");
     expect(plan.toStart).toEqual([]);
+    // `needsFrontPage` is what turns a dead end into an in-place remedy. The
+    // copy no longer says "add one and try again" — that instructed an action
+    // the product did not offer, since nothing ever called
+    // `set_project_front_page`. The flag drives the affordance instead.
+    expect(plan.needsFrontPage).toBe(true);
+    expect(plan.blockedReason).not.toContain("try again");
   });
 
   it("treats a whitespace-only address as absent", () => {
     const plan = planOpen({ frontPageUrl: "   ", processIds: [], snapshot: snap([]) });
-    expect(plan.blockedReason).toContain("front page address");
+    expect(plan.blockedReason).toContain("address");
+    expect(plan.needsFrontPage).toBe(true);
+  });
+
+  it("does NOT flag needsFrontPage on other blocks", () => {
+    // A pending snapshot is a wait, not a missing-configuration problem.
+    // Offering "set up an address" there would invite the user to change
+    // something that is already correct.
+    const plan = planOpen({ frontPageUrl: "http://localhost:3000", processIds: ["a"] });
+    expect(plan.blockedReason).toContain("Still checking");
+    expect(plan.needsFrontPage).toBeFalsy();
   });
 
   it("opens a project that declares no processes", () => {

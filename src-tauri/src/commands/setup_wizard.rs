@@ -628,7 +628,7 @@ fn build_process_config(
 ///
 /// Returns a framework key like "nextjs", "fastapi", "vite", etc.
 /// Falls back to a generic key like "node_dev" or empty string.
-fn detect_framework(path: &str, generic_type: &str) -> String {
+pub(crate) fn detect_framework(path: &str, generic_type: &str) -> String {
     let dir = std::path::Path::new(path);
 
     match generic_type {
@@ -777,7 +777,7 @@ fn detect_node_port(path: &str, script_name: &str, default_port: u16) -> u16 {
 }
 
 /// Generate process configs for a detected framework.
-fn configs_for_framework(name: &str, path: &str, framework: &str) -> Vec<Value> {
+pub(crate) fn configs_for_framework(name: &str, path: &str, framework: &str) -> Vec<Value> {
     match framework {
         "nextjs" => {
             let port = detect_node_port(path, "dev", 3000);

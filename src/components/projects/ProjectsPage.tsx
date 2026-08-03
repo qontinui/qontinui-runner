@@ -158,6 +158,24 @@ export function ProjectsPage({ onNavigateToTerminal }: ProjectsPageProps) {
   );
 
   /**
+   * The project just gained a front-page address. Re-read the registry and
+   * retry `Open` with the fresh record.
+   *
+   * The retry passes the URL EXPLICITLY rather than re-reading `projects`:
+   * `refresh()` updates state asynchronously, so the closure here would still
+   * see the stale project and fail the same way — telling the user their fix
+   * did not work when it did.
+   */
+  const handleFrontPageConfigured = useCallback(
+    async (project: SavedProject, url: string) => {
+      await refresh();
+      await refreshSnapshots();
+      void openProject({ ...project, frontPageUrl: url }, snapshots[project.id]);
+    },
+    [openProject, refresh, refreshSnapshots, snapshots],
+  );
+
+  /**
    * "Fix this" (§8.4) — `Work on it`, plus the failure description an agent
    * needs, so Stefan never has to write the bug report himself. He can see the
    * red dot; he cannot say which process died or what it printed.
@@ -325,6 +343,7 @@ export function ProjectsPage({ onNavigateToTerminal }: ProjectsPageProps) {
             onOpen={handleOpen}
             onWorkOnIt={handleWorkOnIt}
             onFixThis={handleFixThis}
+            onFrontPageConfigured={(p, url) => void handleFrontPageConfigured(p, url)}
             onDismissOpen={dismissOpen}
             onShowDetail={setDetailId}
             onTogglePin={(p) => void handleTogglePin(p)}

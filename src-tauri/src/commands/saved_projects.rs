@@ -542,6 +542,118 @@ pub fn set_project_front_page(id: String, url: Option<String>) -> Result<(), Str
     }
 }
 
+/// What [`autoconfigure_project`] actually did, so the UI can report it
+/// truthfully instead of implying more than happened.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoconfigureOutcome {
+    /// The framework key detection settled on (`react_native`, `nextjs`, …).
+    /// Empty when nothing was recognised — the honest "we don't know" case.
+    pub detected_framework: String,
+    /// The front-page URL now stored, or `None` when no port could be inferred.
+    pub front_page_url: Option<String>,
+    /// Process configs created AND bound to the project.
+    pub process_names: Vec<String>,
+}
+
+/// One-click setup for a project the user has not configured by hand.
+///
+/// The `Open` flow needs two things a discovered project does not have: a
+/// front-page URL and at least one bound process to serve it. Before this,
+/// neither could be supplied from the UI at all — `set_project_front_page` and
+/// `bind_project_processes` existed and were registered, but nothing in the
+/// frontend ever called them, so `Open` told the user to "add a front page
+/// address" while offering nowhere to add one. Worse, for the framework where
+/// that gap bites hardest (React Native, which serves no web page of its own)
+/// the user would also have had to know that Expo means `localhost:8081`.
+///
+/// This reuses the setup wizard's OWN detection rather than re-deriving it:
+/// [`crate::commands::setup_wizard::detect_framework`] reads the manifest, and
+/// [`crate::commands::setup_wizard::configs_for_framework`] already knows that
+/// `react_native` means `npx expo start` on port 8081. That knowledge existed
+/// and was simply unreachable from the Projects page.
+///
+/// **Honest about failure.** An unrecognised project returns
+/// `detected_framework: ""` with no URL and no processes rather than guessing a
+/// port — the caller then falls back to asking the user, which is a real
+/// answer. Nothing here is destructive: it only ADDS a process config and fills
+/// two empty fields, and the user can edit or clear both afterwards.
+#[tauri::command]
+pub async fn autoconfigure_project(
+    id: String,
+    state: tauri::State<'_, std::sync::Arc<crate::commands::AppState>>,
+) -> Result<AutoconfigureOutcome, String> {
+    let project = load_projects_backfilled()
+        .into_iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| format!("No saved project with id {id}"))?;
+
+    let framework =
+        crate::commands::setup_wizard::detect_framework(&project.path, &project.project_type);
+    let configs = if framework.is_empty() {
+        Vec::new()
+    } else {
+        crate::commands::setup_wizard::configs_for_framework(
+            &project.name,
+            &project.path,
+            &framework,
+        )
+    };
+
+    if configs.is_empty() {
+        info!(
+            "autoconfigure_project({id}): no config for detected framework {:?} — \
+             leaving the project untouched so the caller can ask the user",
+            framework
+        );
+        return Ok(AutoconfigureOutcome {
+            detected_framework: framework,
+            front_page_url: None,
+            process_names: Vec::new(),
+        });
+    }
+
+    let mut process_ids = project.process_ids.clone();
+    let mut process_names = Vec::new();
+    let mut port: Option<u16> = None;
+
+    for value in configs {
+        // The port is read from the SUGGESTION, not from the saved config, so a
+        // deserialize that drops an unknown field cannot silently lose it.
+        if port.is_none() {
+            port = value
+                .get("health_port")
+                .and_then(|p| p.as_u64())
+                .and_then(|p| u16::try_from(p).ok());
+        }
+        let config: qontinui_types::process_management::ProcessConfig =
+            serde_json::from_value(value)
+                .map_err(|e| format!("suggested process config was not a ProcessConfig: {e}"))?;
+        let (pid, pname) = (config.id.clone(), config.name.clone());
+        crate::process_capture::commands::save_process_config(config, state.clone()).await?;
+        if !process_ids.contains(&pid) {
+            process_ids.push(pid);
+        }
+        process_names.push(pname);
+    }
+
+    bind_project_processes(id.clone(), process_ids)?;
+
+    let front_page_url = port.map(|p| format!("http://localhost:{p}"));
+    if front_page_url.is_some() {
+        set_project_front_page(id.clone(), front_page_url.clone())?;
+    }
+
+    info!(
+        "autoconfigure_project({id}): framework={framework} processes={process_names:?} url={front_page_url:?}"
+    );
+    Ok(AutoconfigureOutcome {
+        detected_framework: framework,
+        front_page_url,
+        process_names,
+    })
+}
+
 /// Pin or unpin a project (plan §5.1 card extras).
 ///
 /// A pinned project sorts first in the grid and earns a sidebar row. Returns

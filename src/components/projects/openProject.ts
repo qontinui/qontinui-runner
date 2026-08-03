@@ -30,7 +30,21 @@ export type OpenPhase =
   /** Every process is ready; the preview window is being pointed at the site. */
   | { kind: "opening"; url: string }
   | { kind: "done"; url: string }
-  | { kind: "failed"; message: string; detail?: string };
+  | {
+      kind: "failed";
+      message: string;
+      detail?: string;
+      /**
+       * Set when the ONLY thing missing is a front-page address, so the UI can
+       * offer to fix it in place instead of leaving the user at a dead end.
+       *
+       * This exists because the message it replaces ("add one and try
+       * again") instructed an action the product did not offer: nothing in the
+       * frontend ever called `set_project_front_page`, so there was nowhere to
+       * add one. A remedy the user cannot perform is worse than no message.
+       */
+      needsFrontPage?: boolean;
+    };
 
 /**
  * What an `Open` run has to do, derived from the project and its snapshot.
@@ -50,6 +64,12 @@ export interface OpenPlan {
    * starting anything. `null` means go ahead.
    */
   blockedReason: string | null;
+  /**
+   * True when `blockedReason` is purely "no front-page address". The caller
+   * turns this into an in-place remedy (detect the framework, or let the user
+   * type an address) rather than a dead end.
+   */
+  needsFrontPage?: boolean;
 }
 
 export interface OpenPlanInput {
@@ -74,8 +94,12 @@ export function planOpen({ frontPageUrl, processIds, snapshot }: OpenPlanInput):
     return {
       toStart: [],
       url: null,
-      blockedReason:
-        "This project has no front page address yet. Add one (for example http://localhost:3000) and try again.",
+      // No "add one and try again" — the UI now offers the remedy inline, so
+      // the copy states the fact and lets the affordance below it do the
+      // instructing. Telling someone to do a thing is only useful when the
+      // thing is reachable.
+      blockedReason: "This project doesn't have an address to open yet.",
+      needsFrontPage: true,
     };
   }
 
