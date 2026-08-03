@@ -639,13 +639,22 @@ async fn health(
         // by build.rs via QONTINUI_GIT_SHA. Manual-test sessions can assert
         // the temp runner is actually running the commit under debug.
         "gitSha": env!("QONTINUI_GIT_SHA"),
-        // Compile-time build identifier (`<git-sha-short>-<unix-ms>`) baked
-        // into the binary by build.rs. Vite bakes the same value into
-        // index.html as `<meta name="build-id">`. The shared
-        // `useBuildIdWatcher` hook polls this endpoint and fires its
-        // onBuildIdChange callback when the page's meta tag diverges from
-        // the running binary's value — the only divergence vector is a
-        // mid-session binary swap behind the live webview.
+        // Compile-time build PROVENANCE: which Vite dist this binary
+        // embedded. `build.rs` reads `dist/build-id.txt` (written by
+        // `vite.config.ts`, format `<git-sha-short>-<unix-ms>`) and re-emits
+        // it, so this value names the exact frontend bundle inside the exe.
+        // A build made without a prior `pnpm run build` reports the explicit
+        // `unstamped-<git-sha>` sentinel instead.
+        //
+        // NOT a staleness signal. This is a compile-time constant of the
+        // running process, as is the `<meta name="build-id">` tag in the
+        // embedded HTML — replacing the exe on disk changes neither, so
+        // comparing them can only ever detect a BUILD-time inconsistency,
+        // never a live binary swap. The runner's refresh banner made exactly
+        // that comparison and was a permanent false positive; it was deleted
+        // (plan 2026-07-28-runner-build-id-banner-permanent-false-positive).
+        // For "is this runner out of date", use `buildDrift` below — it is
+        // the only field here that can change while the window is open.
         "buildId": env!("RUNNER_BUILD_ID"),
         // origin/main's current SHA + drift verdict vs the embedded gitSha
         // (see `crate::build_drift`). All-null until the first background
@@ -687,9 +696,11 @@ async fn health(
             "framework": "tauri",
             "capabilities": ["control", "renderLog", "debug"],
         },
-        // Top-level mirror of `data.buildId` so the shared
-        // `useBuildIdWatcher` hook (qontinui/ui-bridge/react) can read
-        // the field directly from the response root without an adapter.
+        // Top-level mirror of `data.buildId` so fleet consumers (the
+        // supervisor's health cache, manual-test sessions asserting "this
+        // temp runner is the commit I'm debugging") can read the field from
+        // the response root without descending into `data`. Same provenance
+        // semantics — and same non-semantics — as `data.buildId` above.
         "buildId": env!("RUNNER_BUILD_ID"),
         // Phase 3J.2 — top-level mirrors of `derived_status` and `ui_error`
         // so supervisor/fleet consumers can read them without descending into

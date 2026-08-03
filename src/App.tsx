@@ -56,7 +56,6 @@ import { useAccountMigrationNotifications } from "./hooks/useAccountMigrationNot
 import { useStateMachineRegistration } from "./hooks/useStateMachineRegistration";
 
 import { ToastContainer } from "./components/ToastContainer";
-import { BuildRefreshBanner } from "./components/BuildRefreshBanner";
 import { AutoUpdateChecker } from "./components/AutoUpdateChecker";
 import { ConflictModal } from "./components/ConflictModal";
 import { StolenBanner } from "./components/StolenBanner";
@@ -542,7 +541,7 @@ function AppContent() {
   const authOverlay = presentation.mode === "overlay" ? presentation.surface : null;
 
   // Publish the overlay state for sibling trees rendered OUTSIDE AppContent
-  // (AppWithTutorials' fixed-position siblings, BuildRefreshBanner) so they
+  // (AppWithTutorials' fixed-position siblings, BackgroundTaskPill) so they
   // go `inert` in lockstep with the main tree — otherwise Tab from the
   // LoginScreen walks into their invisible controls.
   //
@@ -969,8 +968,8 @@ function AppWithTutorials() {
             OUTSIDE AppContent's inert wrapper, so they take the same inert
             guard via the overlay store — without it they stay in the tab
             order (invisible but Enter-activatable) while an auth overlay is
-            up. This also intentionally hides BuildRefreshBanner-class fixed
-            UI behind the login surface; the operator handles updates after
+            up. This also intentionally hides notification-class fixed UI
+            behind the login surface; the operator handles updates after
             signing in.
           */}
           <AuthOverlayInertBoundary>
@@ -1146,17 +1145,6 @@ function TauriEventNamesLoader() {
 export default function App() {
   return (
     <ApolloProvider client={getGraphQLClient()}>
-      {/*
-        BuildRefreshBanner sits outside UIBridgeProvider so it keeps watching
-        even if the bridge tears down (e.g. during navigation/error states).
-        Banner is hidden by default and only renders the toast when
-        `invoke('get_build_id')` reports a value different from the
-        `<meta name="build-id">` baked into the embedded index.html — i.e.
-        the runner exe was swapped while this webview stayed open.
-      */}
-      <AuthOverlayInertBoundary>
-        <BuildRefreshBanner />
-      </AuthOverlayInertBoundary>
       {/* Launch-time auto-update check: prompts + installs a newer signed
           release on startup. Renders nothing; fail-open. */}
       <AutoUpdateChecker />
