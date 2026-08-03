@@ -542,6 +542,69 @@ pub fn set_project_front_page(id: String, url: Option<String>) -> Result<(), Str
     }
 }
 
+/// The COARSE project type [`crate::commands::setup_wizard::detect_framework`]
+/// expects, derived from the manifest actually on disk.
+///
+/// This exists because the runner has **two** framework vocabularies and they
+/// are not interchangeable:
+///
+/// - `setup_discovery` produces rich, hyphenated keys (`react-native`,
+///   `nextjs`, …). That is what `SavedProject.project_type` holds.
+/// - `setup_wizard::detect_framework` consumes a COARSE type (`node`,
+///   `python`, `rust`, `go`, `flutter`) and *returns* the underscored key
+///   `configs_for_framework` matches on (`react_native`).
+///
+/// Passing the rich key where the coarse one belongs falls through
+/// `detect_framework`'s `_ => String::new()` arm, and the caller then reports
+/// "we couldn't work out how this project starts" for a project it understands
+/// perfectly well. That was a live bug: an Expo app with `expo` and
+/// `react-native` right there in its `dependencies` never reached the
+/// `has_dep("expo")` check, because its `project_type` was `react-native` and
+/// the match arm wanted `node`.
+///
+/// Reading the manifest is also more trustworthy than the stored type: the
+/// registry value was written once at discovery and can be stale or absent,
+/// whereas the file on disk is what the project IS now.
+fn coarse_project_type(path: &str) -> &'static str {
+    let dir = std::path::Path::new(path);
+    if dir.join("package.json").exists() {
+        "node"
+    } else if dir.join("pyproject.toml").exists()
+        || dir.join("requirements.txt").exists()
+        || dir.join("setup.py").exists()
+    {
+        "python"
+    } else if dir.join("Cargo.toml").exists() {
+        "rust"
+    } else if dir.join("go.mod").exists() {
+        "go"
+    } else if dir.join("pubspec.yaml").exists() {
+        "flutter"
+    } else {
+        ""
+    }
+}
+
+/// Resolve the `configs_for_framework` key for a project, preferring what is on
+/// disk and falling back to the stored type.
+///
+/// The fallback normalises the rich vocabulary's hyphens to underscores, so a
+/// project whose manifest we cannot read still resolves when its recorded
+/// `project_type` happens to name a framework `configs_for_framework` knows.
+/// Belt and braces on purpose: the disk read is the accurate path, the stored
+/// type is the one that survives a moved/unreadable directory.
+pub(crate) fn resolve_framework_key(path: &str, stored_project_type: &str) -> String {
+    let coarse = coarse_project_type(path);
+    if !coarse.is_empty() {
+        let key = crate::commands::setup_wizard::detect_framework(path, coarse);
+        if !key.is_empty() {
+            return key;
+        }
+    }
+    // Fallback: the stored rich key, normalised. `react-native` → `react_native`.
+    stored_project_type.trim().replace('-', "_")
+}
+
 /// What [`autoconfigure_project`] actually did, so the UI can report it
 /// truthfully instead of implying more than happened.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -588,8 +651,7 @@ pub async fn autoconfigure_project(
         .find(|p| p.id == id)
         .ok_or_else(|| format!("No saved project with id {id}"))?;
 
-    let framework =
-        crate::commands::setup_wizard::detect_framework(&project.path, &project.project_type);
+    let framework = resolve_framework_key(&project.path, &project.project_type);
     let configs = if framework.is_empty() {
         Vec::new()
     } else {
@@ -727,6 +789,75 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
 // ============================================================================
 // Tests
 // ============================================================================
+
+#[cfg(test)]
+mod framework_key_tests {
+    use super::*;
+
+    /// The live bug: an Expo app whose `project_type` is the RICH key
+    /// `react-native` must still resolve to the `react_native` key
+    /// `configs_for_framework` matches on.
+    ///
+    /// Passing `project_type` straight to `detect_framework` fell through its
+    /// `_ => String::new()` arm — the coarse arm wanted `node` — so
+    /// `autoconfigure_project` reported "we couldn't work out how this project
+    /// starts" for a project with `expo` and `react-native` in its
+    /// dependencies. The two vocabularies are not interchangeable and this
+    /// pins that they are bridged.
+    #[test]
+    fn expo_project_resolves_despite_the_rich_project_type() {
+        let dir = std::env::temp_dir().join(format!("qr-fw-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"mobile","dependencies":{"expo":"~52.0.0","react-native":"0.76.0"}}"#,
+        )
+        .expect("write package.json");
+        let path = dir.to_string_lossy().to_string();
+
+        assert_eq!(coarse_project_type(&path), "node", "package.json ⇒ node");
+        assert_eq!(
+            resolve_framework_key(&path, "react-native"),
+            "react_native",
+            "an Expo app must resolve even though project_type is the hyphenated rich key"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// With no readable manifest, the stored rich key is normalised rather than
+    /// discarded — a moved or unreadable directory should degrade, not fail.
+    #[test]
+    fn falls_back_to_the_normalised_stored_type() {
+        let missing = std::env::temp_dir().join("qr-fw-does-not-exist-xyz");
+        let path = missing.to_string_lossy().to_string();
+        assert_eq!(coarse_project_type(&path), "");
+        assert_eq!(resolve_framework_key(&path, "react-native"), "react_native");
+        // Nothing known at all stays empty, so the caller reports honestly
+        // instead of inventing a framework.
+        assert_eq!(resolve_framework_key(&path, ""), "");
+    }
+
+    #[test]
+    fn coarse_type_recognises_the_other_manifests() {
+        for (file, expected) in [
+            ("Cargo.toml", "rust"),
+            ("go.mod", "go"),
+            ("pyproject.toml", "python"),
+            ("pubspec.yaml", "flutter"),
+        ] {
+            let dir = std::env::temp_dir().join(format!("qr-fw-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            std::fs::write(dir.join(file), "").expect("write manifest");
+            assert_eq!(
+                coarse_project_type(&dir.to_string_lossy()),
+                expected,
+                "{file} ⇒ {expected}"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
