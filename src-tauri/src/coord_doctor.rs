@@ -1,8 +1,10 @@
 //! `coord doctor` — one-command runner self-check for coord access + gate
 //! registration (plan 2026-06-13 Phase 4).
 //!
-//! Runs EIGHT ordered checks, STOPS at the first red, and reports that link +
-//! its fix. Green on all eight ⇒ "this runner can set gates." The output is
+//! Runs NINE ordered checks: eight BLOCKING ones that stop at the first red
+//! and report that link + its fix, plus one ADVISORY check that always runs
+//! (a warning that never changes the verdict — see [`CheckResult::advisory`]).
+//! Green on all nine ⇒ "this runner can set gates." The output is
 //! copy-pasteable and **identical across machines**, so MSI / spaceship / a
 //! fresh box all self-diagnose the same way.
 //!
@@ -42,6 +44,17 @@ pub struct CheckResult {
     pub ok: bool,
     pub detail: String,
     pub fix: String,
+    /// A failure here is a WARNING, not a blocker: it does not stop the chain
+    /// and does not flip [`DoctorReport::overall_ok`].
+    ///
+    /// This report answers exactly one question — "can this runner set gates?"
+    /// — so a red must mean "no". Hygiene findings (an inherited Claude
+    /// session marker, say) are worth surfacing but do not stop gate
+    /// registration, and reporting one as `BLOCKED` would make the report lie
+    /// about its own subject. Defaults to `false`; `serde` omits it so the
+    /// existing JSON shape is unchanged for blocking checks.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub advisory: bool,
 }
 
 /// The whole self-check: the ordered checks actually RUN (the driver stops
@@ -61,7 +74,11 @@ impl DoctorReport {
         out.push_str("coord doctor — runner gate-access self-check\n");
         out.push_str("============================================\n");
         for (i, c) in self.checks.iter().enumerate() {
-            let mark = if c.ok { "PASS" } else { "FAIL" };
+            let mark = match (c.ok, c.advisory) {
+                (true, _) => "PASS",
+                (false, true) => "WARN",
+                (false, false) => "FAIL",
+            };
             out.push_str(&format!(
                 "{}. [{}] {} — {}\n",
                 i + 1,
@@ -76,10 +93,25 @@ impl DoctorReport {
         out.push_str("--------------------------------------------\n");
         if self.overall_ok {
             out.push_str("OK: this runner can set gates.\n");
+            // Advisory reds do not change the verdict, but a silent warning is
+            // a warning nobody acts on — name them under the OK line.
+            let warned: Vec<&str> = self
+                .checks
+                .iter()
+                .filter(|c| !c.ok && c.advisory)
+                .map(|c| c.name.as_str())
+                .collect();
+            if !warned.is_empty() {
+                out.push_str(&format!(
+                    "   (warnings, not blocking: {})\n",
+                    warned.join(", ")
+                ));
+            }
         } else {
-            // The first (only) red is the one to fix; name it again so a
-            // glance at the last line is enough.
-            let first_red = self.checks.iter().find(|c| !c.ok);
+            // The first BLOCKING red is the one to fix; name it again so a
+            // glance at the last line is enough. Advisory reds are skipped
+            // here — they never blocked anything.
+            let first_red = self.checks.iter().find(|c| !c.ok && !c.advisory);
             match first_red {
                 Some(c) => out.push_str(&format!("BLOCKED at: {} — {}\n", c.name, c.fix)),
                 None => out.push_str("BLOCKED (no check ran).\n"),
@@ -100,9 +132,12 @@ pub struct Check<'a> {
     pub name: &'static str,
     pub fix: &'static str,
     pub run: Box<dyn FnOnce() -> (bool, String) + 'a>,
+    /// See [`CheckResult::advisory`]. Constructed via [`Check::advisory`].
+    pub advisory: bool,
 }
 
 impl<'a> Check<'a> {
+    /// A BLOCKING check: a failure stops the chain and fails the report.
     pub fn new(
         name: &'static str,
         fix: &'static str,
@@ -112,30 +147,83 @@ impl<'a> Check<'a> {
             name,
             fix,
             run: Box::new(run),
+            advisory: false,
+        }
+    }
+
+    /// An ADVISORY check: a failure is reported as a warning, but the chain
+    /// continues and the overall verdict is unaffected. Use for findings that
+    /// are worth an operator's attention yet do not stop this runner from
+    /// registering gates.
+    pub fn advisory(
+        name: &'static str,
+        fix: &'static str,
+        run: impl FnOnce() -> (bool, String) + 'a,
+    ) -> Self {
+        Self {
+            name,
+            fix,
+            run: Box::new(run),
+            advisory: true,
+        }
+    }
+
+    /// Build a check from its [`CheckSpec`], taking `name`, `fix` AND
+    /// `advisory` from the table.
+    ///
+    /// Preferred over hand-picking [`Check::new`] vs [`Check::advisory`]: the
+    /// spec table is what the onboarding doc renders from, so choosing the
+    /// constructor independently lets the doc claim a check blocks while the
+    /// live chain treats it as advisory (or vice versa). Here they are one
+    /// value.
+    pub fn from_spec(spec: &'static CheckSpec, run: impl FnOnce() -> (bool, String) + 'a) -> Self {
+        Self {
+            name: spec.name,
+            fix: spec.fix,
+            run: Box::new(run),
+            advisory: spec.advisory,
         }
     }
 }
 
-/// Run `checks` in order, STOPPING at (and including) the first red. Returns a
-/// [`DoctorReport`] whose `checks` are exactly the ones that ran. Pure over the
-/// injected closures — the unit tests drive it with fake checks to assert the
-/// ordering / first-red-stops behavior without any live runner.
+/// Run `checks` in order. The first red in a BLOCKING check stops the rest of
+/// the blocking chain (each one presupposes the previous, so running on is
+/// noise). **Advisory checks always run**, even after a blocking red.
+///
+/// That asymmetry is deliberate. An advisory check is independent of the
+/// credential chain — an inherited env marker has nothing to do with whether
+/// you are signed in — so gating it behind "everything else is green" would
+/// hide it on exactly the misconfigured machines most likely to have it. A
+/// detector that silently does not run is the failure class this whole plan
+/// exists to fix (`2026-07-28-runner-transcript-persistence-env-leak` §5: the
+/// leak "ran indefinitely because nothing watched for it").
+///
+/// Returns a [`DoctorReport`] whose `checks` are the blocking prefix that ran
+/// PLUS every advisory check. Pure over the injected closures — the unit tests
+/// drive it with fake checks to assert this without any live runner.
 pub fn run_checks(checks: Vec<Check<'_>>) -> DoctorReport {
     let mut results = Vec::with_capacity(checks.len());
     let mut overall_ok = true;
+    let mut blocked = false;
     for check in checks {
+        // A blocking red suppresses only the remaining BLOCKING checks.
+        if blocked && !check.advisory {
+            continue;
+        }
         let name = check.name;
         let fix = check.fix;
+        let advisory = check.advisory;
         let (ok, detail) = (check.run)();
         results.push(CheckResult {
             name: name.to_string(),
             ok,
             detail,
             fix: fix.to_string(),
+            advisory,
         });
-        if !ok {
+        if !ok && !advisory {
             overall_ok = false;
-            break; // first red stops the chain
+            blocked = true;
         }
     }
     DoctorReport {
@@ -145,7 +233,7 @@ pub fn run_checks(checks: Vec<Check<'_>>) -> DoctorReport {
 }
 
 // ===========================================================================
-// Single source of truth — the static spec for each of the 8 checks.
+// Single source of truth — the static spec for each of the 9 checks.
 //
 // `name` and `fix` are sourced FROM here by `diagnose()` (so the live report
 // can't drift from this table), and the onboarding doc is GENERATED from here
@@ -169,9 +257,14 @@ pub struct CheckSpec {
     pub verifies: &'static str,
     /// Actionable fix (matches the live `CheckResult::fix`).
     pub fix: &'static str,
+    /// Whether this check is ADVISORY (see [`CheckResult::advisory`]).
+    ///
+    /// `diagnose()` picks `Check::advisory` vs `Check::new` FROM this flag, so
+    /// the table and the live chain cannot disagree about which checks block.
+    pub advisory: bool,
 }
 
-/// The 8 checks in `diagnose()` order. THE single source of truth for check
+/// The 9 checks in `diagnose()` order. THE single source of truth for check
 /// names + fixes (the live report sources them here) and for the onboarding
 /// doc (which is generated from here). Index 5 (check 6, device-JWT-live) is
 /// also the source the `DEVICE_JWT_LIVE_CHECK_NAME`/`_FIX` constants derive
@@ -183,6 +276,7 @@ pub const CHECK_SPECS: &[CheckSpec] = &[
         verifies: "a Claude account with live credentials is present \
                    (a valid ~/.claude/.credentials.json)",
         fix: "run /login",
+        advisory: false,
     },
     CheckSpec {
         name: "tier",
@@ -190,6 +284,7 @@ pub const CHECK_SPECS: &[CheckSpec] = &[
         verifies: "the runner tier is set to qontinui_account \
                    (settings.json::tier == \"qontinui_account\")",
         fix: "set runner tier to Qontinui account",
+        advisory: false,
     },
     CheckSpec {
         name: "credential_store_readable",
@@ -199,6 +294,7 @@ pub const CHECK_SPECS: &[CheckSpec] = &[
                    unreadable store reports itself instead of being \
                    misdiagnosed as 'not signed in' or 'no tenant'",
         fix: "credential store unreadable — check file permissions / OS keychain access",
+        advisory: false,
     },
     CheckSpec {
         name: "paired_signed_in",
@@ -206,6 +302,7 @@ pub const CHECK_SPECS: &[CheckSpec] = &[
         verifies: "paired_user.json is present and a bearer is stored in the \
                    access-token slot",
         fix: "sign in / re-pair",
+        advisory: false,
     },
     CheckSpec {
         name: "tenant_resolvable",
@@ -213,6 +310,7 @@ pub const CHECK_SPECS: &[CheckSpec] = &[
         verifies: "a tenant_id resolves from the OAuth/runner-bearer claim, the \
                    outgoing device-JWT, or machine.json::active_tenant_id",
         fix: "machine.json missing active_tenant_id",
+        advisory: false,
     },
     CheckSpec {
         name: "device_jwt_live",
@@ -220,6 +318,7 @@ pub const CHECK_SPECS: &[CheckSpec] = &[
         verifies: "a live coord device JWT is present in the access-token slot \
                    and is not near expiry",
         fix: "kick refresher / re-pair",
+        advisory: false,
     },
     CheckSpec {
         name: "mcp_json_valid",
@@ -228,6 +327,7 @@ pub const CHECK_SPECS: &[CheckSpec] = &[
                    port, its nonce is a registered proxy key, and the bearer is \
                    a coord device JWT",
         fix: "stale config — reprovision",
+        advisory: false,
     },
     CheckSpec {
         name: "coord_reachable",
@@ -235,6 +335,18 @@ pub const CHECK_SPECS: &[CheckSpec] = &[
         verifies: "a one-shot tools/list JSON-RPC round-trips 200 against the \
                    configured coord /mcp endpoint",
         fix: "coord unreachable",
+        advisory: false,
+    },
+    CheckSpec {
+        name: "no_inherited_session_markers",
+        title: "No inherited Claude session markers",
+        verifies: "this runner process did NOT inherit Claude Code's \
+                   process-topology markers (CLAUDECODE, \
+                   CLAUDE_CODE_CHILD_SESSION) from whatever launched it — a \
+                   marked runner is mislabelled as a nested session",
+        fix: "restart the runner from a shell without the markers (via \
+              dev-start.ps1 / the supervisor); spawns are stripped either way",
+        advisory: true,
     },
 ];
 
@@ -278,23 +390,37 @@ pub fn render_onboarding_doc() -> String {
     );
     out.push_str("## Provisioning checklist\n\n");
     for (i, s) in CHECK_SPECS.iter().enumerate() {
-        out.push_str(&format!("### {}. {} (`{}`)\n\n", i + 1, s.title, s.name));
+        let suffix = if s.advisory { " — ADVISORY" } else { "" };
+        out.push_str(&format!(
+            "### {}. {} (`{}`){}\n\n",
+            i + 1,
+            s.title,
+            s.name,
+            suffix
+        ));
         out.push_str(&format!("Verifies: {}\n\n", s.verifies));
+        if s.advisory {
+            out.push_str(
+                "Advisory: a failure here is a **warning**, not a blocker — it does not \
+                 stop gate registration and does not fail the report. It also runs even \
+                 when an earlier check went red.\n\n",
+            );
+        }
         out.push_str(&format!("**Fix:** {}\n\n", s.fix));
     }
     out.push_str("---\n\n");
     out.push_str(
-        "`coord doctor` runs these checks live and **stops at the first \
-         failure**, naming that one link plus its fix. Run it from \
-         **Settings → Account** in the runner app, or headless via the \
-         `coord_doctor` bin (`cargo run --bin coord_doctor`). Green on all \
-         eight ⇒ this runner can set gates.\n",
+        "`coord doctor` runs these checks live. The **blocking** checks stop at the \
+         first failure, naming that one link plus its fix; **advisory** checks always \
+         run and only ever warn. Run it from **Settings → Account** in the runner app, \
+         or headless via the `coord_doctor` bin (`cargo run --bin coord_doctor`). Green \
+         on all of them ⇒ this runner can set gates.\n",
     );
     out
 }
 
 // ===========================================================================
-// Real wiring — the 8 checks, reusing existing predicates / on-disk state.
+// Real wiring — the 9 checks, reusing existing predicates / on-disk state.
 // ===========================================================================
 
 /// Runtime-only facts the lib can't observe on its own. Injected so the Tauri
@@ -347,6 +473,7 @@ pub fn diagnose(inputs: &DoctorInputs) -> DoctorReport {
     let s_tenant = spec("tenant_resolvable");
     let s_mcp = spec("mcp_json_valid");
     let s_coord = spec("coord_reachable");
+    let s_markers = spec("no_inherited_session_markers");
 
     let checks = vec![
         Check::new(s_claude.name, s_claude.fix, move || {
@@ -474,9 +601,37 @@ pub fn diagnose(inputs: &DoctorInputs) -> DoctorReport {
             })
         },
         Check::new(s_coord.name, s_coord.fix, coord_reachable_check),
+        // ADVISORY (flag comes from CHECK_SPECS, see `Check::from_spec`): an
+        // inherited marker is worth fixing but does not stop this runner
+        // registering gates, so it must not produce a BLOCKED verdict. Being
+        // advisory it also runs even when an earlier check went red — which is
+        // the point, since env hygiene is independent of the credential chain.
+        Check::from_spec(s_markers, inherited_session_markers_check),
     ];
 
     run_checks(checks)
+}
+
+/// Check 9 — this process did not inherit Claude Code's process-topology
+/// markers.
+///
+/// Ordered LAST deliberately: the driver stops at the first red, and every
+/// preceding check is a hard blocker for gate registration whereas this one is
+/// hygiene — a marked runner still registers gates fine. Putting it earlier
+/// would mask a genuine credential failure behind an env-cleanliness warning.
+fn inherited_session_markers_check() -> (bool, String) {
+    let inherited = crate::claude_env::inherited_session_markers();
+    if inherited.is_empty() {
+        (
+            true,
+            "no inherited Claude Code session markers on this process".into(),
+        )
+    } else {
+        (
+            false,
+            crate::claude_env::inherited_markers_detail(&inherited),
+        )
+    }
 }
 
 // ===========================================================================
@@ -532,6 +687,7 @@ pub fn device_jwt_live_check() -> CheckResult {
         ok,
         detail,
         fix: DEVICE_JWT_LIVE_CHECK_FIX.to_string(),
+        advisory: false,
     }
 }
 
@@ -954,6 +1110,102 @@ mod tests {
     fn red(name: &'static str) -> Check<'static> {
         Check::new(name, "fix-it", || (false, "red".into()))
     }
+    fn advisory_red(name: &'static str) -> Check<'static> {
+        Check::advisory(name, "fix-it", || (false, "advisory red".into()))
+    }
+
+    // Advisory tier (plan 2026-07-28-runner-transcript-persistence-env-leak).
+    // The report answers "can this runner set gates?" — a hygiene finding must
+    // not make it answer "no".
+
+    #[test]
+    fn advisory_red_does_not_stop_the_chain_or_fail_the_report() {
+        let report = run_checks(vec![green("a"), advisory_red("hygiene"), green("c")]);
+        assert!(
+            report.overall_ok,
+            "an advisory red must not flip the overall verdict"
+        );
+        assert_eq!(
+            report.checks.len(),
+            3,
+            "an advisory red must not stop later checks running"
+        );
+        assert!(!report.checks[1].ok);
+        assert!(report.checks[1].advisory);
+    }
+
+    #[test]
+    fn blocking_red_still_stops_even_after_an_advisory_red() {
+        let report = run_checks(vec![advisory_red("hygiene"), red("b"), green("c")]);
+        assert!(!report.overall_ok);
+        assert_eq!(report.checks.len(), 2, "blocking red still stops the chain");
+    }
+
+    #[test]
+    fn render_marks_advisory_red_as_warn_and_never_blocked() {
+        let out = run_checks(vec![green("a"), advisory_red("hygiene")]).render();
+        assert!(
+            out.contains("[WARN] hygiene"),
+            "advisory red renders WARN:\n{out}"
+        );
+        assert!(
+            !out.contains("[FAIL]"),
+            "advisory red must not render FAIL:\n{out}"
+        );
+        assert!(
+            out.contains("OK: this runner can set gates."),
+            "verdict must stay OK:\n{out}"
+        );
+        assert!(
+            out.contains("warnings, not blocking: hygiene"),
+            "the warning must still be named under the OK line:\n{out}"
+        );
+        assert!(!out.contains("BLOCKED"), "must never claim BLOCKED:\n{out}");
+    }
+
+    #[test]
+    fn render_blocked_verdict_names_the_blocking_check_not_the_advisory_one() {
+        let out = run_checks(vec![advisory_red("hygiene"), red("real")]).render();
+        assert!(
+            out.contains("BLOCKED at: real"),
+            "the BLOCKED line must name the blocking check:\n{out}"
+        );
+        assert!(
+            !out.contains("BLOCKED at: hygiene"),
+            "an advisory red must never be reported as the blocker:\n{out}"
+        );
+    }
+
+    #[test]
+    fn marker_check_is_registered_advisory_in_the_live_chain() {
+        // Guards the whole point of the tier: if someone re-registers this
+        // check with `Check::new`, an inherited env marker would start
+        // reporting "this runner cannot set gates", which is false.
+        let _g = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[
+            crate::claude_env::CLAUDECODE_ENV,
+            crate::claude_env::CLAUDE_CHILD_SESSION_ENV,
+        ]);
+        for name in crate::claude_env::INHERITED_SESSION_MARKERS {
+            std::env::set_var(name, "1");
+        }
+        let report = run_checks(vec![Check::from_spec(
+            spec("no_inherited_session_markers"),
+            inherited_session_markers_check,
+        )]);
+        assert!(
+            report.overall_ok,
+            "inherited markers must not block gate access"
+        );
+        assert!(!report.checks[0].ok, "inherited markers must still be RED");
+        assert!(
+            report.checks[0]
+                .detail
+                .contains("CLAUDE_CODE_CHILD_SESSION"),
+            "detail names the marker: {}",
+            report.checks[0].detail
+        );
+    }
 
     #[test]
     fn all_green_runs_every_check_and_passes() {
@@ -1087,8 +1339,14 @@ mod tests {
     // ---- Phase 5 — CHECK_SPECS single-source-of-truth + onboarding doc ----
 
     #[test]
-    fn check_specs_has_exactly_eight_entries() {
-        assert_eq!(CHECK_SPECS.len(), 8);
+    fn check_specs_has_exactly_nine_entries_eight_blocking_one_advisory() {
+        assert_eq!(CHECK_SPECS.len(), 9);
+        // The split matters more than the total: the doc prose, the module
+        // doc, and `render_onboarding_doc` all describe the two classes, and
+        // the blocking count is what "green on all of them ⇒ can set gates"
+        // actually refers to.
+        assert_eq!(CHECK_SPECS.iter().filter(|s| !s.advisory).count(), 8);
+        assert_eq!(CHECK_SPECS.iter().filter(|s| s.advisory).count(), 1);
     }
 
     #[test]
@@ -1132,18 +1390,76 @@ mod tests {
             !report.checks.is_empty(),
             "diagnose should always run at least check 1"
         );
-        for (i, c) in report.checks.iter().enumerate() {
+
+        // Advisory checks run even after a blocking red, so the report is no
+        // longer one contiguous prefix of CHECK_SPECS. Compare the two classes
+        // separately: the BLOCKING results must still be a positional prefix of
+        // the blocking specs, and every advisory result must be a spec that is
+        // actually flagged advisory.
+        let blocking_specs: Vec<&CheckSpec> = CHECK_SPECS.iter().filter(|s| !s.advisory).collect();
+        let blocking_ran: Vec<&CheckResult> =
+            report.checks.iter().filter(|c| !c.advisory).collect();
+        for (i, c) in blocking_ran.iter().enumerate() {
             assert_eq!(
-                c.name, CHECK_SPECS[i].name,
-                "check at position {i} is {:?} but CHECK_SPECS[{i}] is {:?}",
-                c.name, CHECK_SPECS[i].name
+                c.name, blocking_specs[i].name,
+                "blocking check at position {i} is {:?} but the blocking spec there is {:?}",
+                c.name, blocking_specs[i].name
             );
             // The live `fix` is sourced from the spec → must match too.
             assert_eq!(
-                c.fix, CHECK_SPECS[i].fix,
-                "fix at position {i} drifted from CHECK_SPECS"
+                c.fix, blocking_specs[i].fix,
+                "fix at blocking position {i} drifted from CHECK_SPECS"
             );
         }
+
+        for c in report.checks.iter().filter(|c| c.advisory) {
+            let spec = CHECK_SPECS
+                .iter()
+                .find(|s| s.name == c.name)
+                .unwrap_or_else(|| panic!("advisory check {:?} has no CHECK_SPECS entry", c.name));
+            assert!(
+                spec.advisory,
+                "check {:?} ran advisory but CHECK_SPECS says it blocks — \
+                 build it with Check::from_spec so the two cannot drift",
+                c.name
+            );
+            assert_eq!(c.fix, spec.fix, "advisory fix drifted from CHECK_SPECS");
+        }
+    }
+
+    #[test]
+    fn advisory_checks_run_even_when_an_earlier_check_is_red() {
+        // The regression this guards: with the old first-red-stops driver, an
+        // advisory check registered last was unreachable on any runner with a
+        // credential problem — i.e. the hygiene detector was disabled on
+        // exactly the machines most likely to need it.
+        let report = diagnose(&DoctorInputs::default());
+        assert!(
+            report.checks.iter().any(|c| c.advisory),
+            "every advisory check must run regardless of blocking failures; \
+             report ran: {:?}",
+            report.checks.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            report.checks.iter().filter(|c| c.advisory).count(),
+            CHECK_SPECS.iter().filter(|s| s.advisory).count(),
+            "ALL advisory specs must appear in the report"
+        );
+    }
+
+    #[test]
+    fn exactly_the_marker_check_is_advisory_in_the_spec_table() {
+        let advisory: Vec<&str> = CHECK_SPECS
+            .iter()
+            .filter(|s| s.advisory)
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(
+            advisory,
+            vec!["no_inherited_session_markers"],
+            "adding an advisory check is a deliberate act — a check that does \
+             not block gate access must be justified here"
+        );
     }
 
     #[test]

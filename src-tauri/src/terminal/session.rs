@@ -498,6 +498,14 @@ impl TerminalSession {
 
         // Remove CLAUDECODE env var so Claude CLI works inside the terminal
         cmd.env_remove("CLAUDECODE");
+        // Same reason, same class of marker: CLAUDE_CODE_CHILD_SESSION says
+        // "you are a nested session". A PTY tab is a TOP-LEVEL session, but the
+        // runner inherits the marker from whatever launched it (typically the
+        // supervisor, which inherits it from a Claude Code session) and would
+        // otherwise pass it to every `claude` typed into a pane. Defense in
+        // depth — the supervisor strips it at the runner spawn, this covers a
+        // runner started by any other means.
+        cmd.env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV);
 
         // Set TERM for proper color/capability support.
         // xterm.js is a full xterm-compatible terminal, so use xterm-256color on all

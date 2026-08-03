@@ -20,14 +20,34 @@
 //!    placeholder handle so the session row + outbox entry exist before
 //!    the workflow executor takes over.
 //!
-//! Per `D:\qontinui-root\qontinui-runner\CLAUDE.md` "Claude CLI Spawning":
-//! every spawn site must `env_remove("CLAUDECODE")` to keep Claude from
-//! detecting a "nested session". The PTY-driven path inherits the
-//! environment from `TerminalManager::create`, which already strips
-//! `CLAUDECODE` via `process_helpers::cmd_no_window` on Windows + the
-//! `terminal/session::spawn` env scrub on Unix. The agentic path delegates
-//! to `ClaudeSession::spawn` which has the same scrub (see
-//! `claude_session/session.rs:184`).
+//! **The spawn-site strip rule.** Every Claude CLI spawn site must
+//! `env_remove` EVERY marker in
+//! `qontinui_runner_lib::claude_env::INHERITED_SESSION_MARKERS`
+//! — currently `CLAUDECODE` and `CLAUDE_CODE_CHILD_SESSION` — to keep Claude
+//! from detecting a "nested session". Both are process-topology markers that
+//! are inherited by the whole process tree with nothing clearing them, so a
+//! runner launched from a Claude Code session passes them to every `claude` it
+//! ever spawns.
+//!
+//! (This rule previously cited `qontinui-runner/CLAUDE.md` "Claude CLI
+//! Spawning". That file is gitignored — untracked since `5976c1a7` — so it is
+//! not a durable home for a rule the build depends on. The `claude_env` module
+//! is now the source of truth, and it is compiled, so a new marker added there
+//! is visible here rather than in a file most checkouts do not have.)
+//!
+//! The PTY-driven path inherits its environment from the `CommandBuilder` in
+//! `terminal::session::TerminalSession::spawn`, which strips both markers on
+//! every platform. (An earlier revision of this note credited
+//! `process_helpers::cmd_no_window` for the Windows half; that helper only sets
+//! a creation flag and calls no `env_remove` at all — the scrub was always the
+//! `terminal/session` one.) The agentic path delegates to
+//! `ClaudeSession::spawn`, which has the same scrub.
+//!
+//! **Adding a marker to `INHERITED_SESSION_MARKERS` does NOT auto-strip it.**
+//! Spawn sites call `env_remove` on their own `Command` / `CommandBuilder`
+//! types, which share no trait — so a new marker needs a matching line at each
+//! site. The list drives the startup warning and the `coord doctor`
+//! `no_inherited_session_markers` check, which is what surfaces the gap.
 
 use std::sync::Arc;
 

@@ -119,6 +119,8 @@ pub async fn run_fix_agent(
         model,
     ])
     .env_remove("CLAUDECODE")
+    // Same rule, sibling marker — see `session::transport::claude_cli` docs.
+    .env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV)
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
 
