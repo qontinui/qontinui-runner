@@ -3,21 +3,27 @@
  *
  * Plan `2026-05-19-coordinator-production-readiness.md` Phase 4 (Wave 4).
  *
- * Inputs match the qontinui-web SpawnModal verbatim so operators have
- * the same affordance whether they're in the browser console or the
- * Tauri runner dashboard:
+ * The operator-visible inputs match the qontinui-web SpawnModal so the
+ * affordance is the same in the browser console and the Tauri runner
+ * dashboard:
  *
- *   - plan_slug (free-text — runner has no /admin/coord/plans listing
+ *   - work unit slug (free-text — runner has no /admin/coord/plans listing
  *     to pre-seed from; operator types the slug they want to spawn for)
- *   - plan_phase
+ *   - phase (a NUMBER on the wire — see `parse_plan_phase` in the Rust
+ *     command; "Phase 4" is accepted and reduced to 4)
  *   - repos (multi-select checkbox list of known repos)
  *   - intent
  *   - declared_overlap_paths (optional, newline-delimited)
  *   - initial_prompt
  *
- * Submit → `spawnFromPlan` in coordinatorApi.ts (POSTs to coord direct).
- * On success the banner shows the returned agent_id; on failure the
- * banner shows the HTTP error string.
+ * Deliberately NOT mirrored: web's device picker. The runner spawns on the
+ * device it is running on, so the Rust command fills `target_device_id`
+ * itself.
+ *
+ * Submit → `spawnFromPlan` in coordinatorApi.ts → the `spawn_from_plan`
+ * Tauri command, which owns the coord wire shape (the operator's inputs and
+ * coord's `SpawnRequest` fields are NOT one-to-one). On success the banner
+ * shows the returned agent_id; on failure the banner shows coord's error.
  */
 
 import { useCallback, useEffect, useState } from "react";
@@ -29,8 +35,8 @@ export interface SpawnFromPlanModalProps {
   open: boolean;
   /** Called when the user dismisses the modal. */
   onClose: () => void;
-  /** Optional plan slug pre-seed. */
-  initialPlanSlug?: string | null;
+  /** Optional work-unit slug pre-seed. */
+  initialWorkUnitSlug?: string | null;
   /** Optional plan phase pre-seed. */
   initialPhase?: string | null;
   /** Called after a successful spawn with the coord response. */
@@ -51,11 +57,11 @@ const KNOWN_REPOS = [
 export function SpawnFromPlanModal({
   open,
   onClose,
-  initialPlanSlug,
+  initialWorkUnitSlug,
   initialPhase,
   onSuccess,
 }: SpawnFromPlanModalProps) {
-  const [planSlug, setPlanSlug] = useState("");
+  const [workUnitSlug, setWorkUnitSlug] = useState("");
   const [phase, setPhase] = useState("");
   const [selectedRepos, setSelectedRepos] = useState<string[]>([]);
   const [otherRepos, setOtherRepos] = useState("");
@@ -69,7 +75,7 @@ export function SpawnFromPlanModal({
   // Reset on open.
   useEffect(() => {
     if (!open) return;
-    setPlanSlug(initialPlanSlug ?? "");
+    setWorkUnitSlug(initialWorkUnitSlug ?? "");
     setPhase(initialPhase ?? "");
     setSelectedRepos([]);
     setOtherRepos("");
@@ -79,7 +85,7 @@ export function SpawnFromPlanModal({
     setBusy(false);
     setError(null);
     setResult(null);
-  }, [open, initialPlanSlug, initialPhase]);
+  }, [open, initialWorkUnitSlug, initialPhase]);
 
   // Esc-to-close.
   useEffect(() => {
@@ -117,7 +123,7 @@ export function SpawnFromPlanModal({
           .map((s) => s.trim())
           .filter(Boolean);
         const out = await spawnFromPlan(
-          planSlug.trim(),
+          workUnitSlug.trim(),
           phase.trim(),
           repos,
           intent.trim(),
@@ -134,7 +140,7 @@ export function SpawnFromPlanModal({
       }
     },
     [
-      planSlug,
+      workUnitSlug,
       phase,
       selectedRepos,
       otherRepos,
@@ -149,7 +155,7 @@ export function SpawnFromPlanModal({
 
   const canSubmit =
     !busy &&
-    planSlug.trim().length > 0 &&
+    workUnitSlug.trim().length > 0 &&
     phase.trim().length > 0 &&
     intent.trim().length > 0 &&
     initialPrompt.trim().length > 0 &&
@@ -196,12 +202,12 @@ export function SpawnFromPlanModal({
 
           <label className="block">
             <span className="block text-xs font-medium text-foreground mb-1">
-              Plan slug
+              Work unit slug
             </span>
             <input
               type="text"
-              value={planSlug}
-              onChange={(e) => setPlanSlug(e.target.value)}
+              value={workUnitSlug}
+              onChange={(e) => setWorkUnitSlug(e.target.value)}
               placeholder="2026-05-19-coordinator-production-readiness"
               className="w-full px-2 py-1.5 rounded border border-border bg-background text-sm text-foreground font-mono placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-primary/40"
               disabled={busy}
@@ -217,7 +223,7 @@ export function SpawnFromPlanModal({
               type="text"
               value={phase}
               onChange={(e) => setPhase(e.target.value)}
-              placeholder='e.g. "Phase 4" or "Wave 4 — spawn UI"'
+              placeholder='4 — coord stores a phase NUMBER ("Phase 4" also works)'
               className="w-full px-2 py-1.5 rounded border border-border bg-background text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-primary/40"
               disabled={busy}
               data-ui-bridge-id="productivity.spawn-from-plan-modal-phase"
