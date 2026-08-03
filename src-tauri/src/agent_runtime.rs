@@ -76,17 +76,49 @@ pub struct LaunchPayload {
     pub jwt_exp: i64,
     pub initial_prompt: String,
     pub claim_token: String,
-    /// Work unit this spawn belongs to. Coord renamed the wire key
-    /// `plan_slug` → `work_unit_slug`; during the dual-read window we accept
-    /// EITHER name. `alias` (not a second field) is deliberate: serde treats
-    /// an alias as the same field, so a body carrying BOTH keys fails hard
-    /// with `duplicate field` instead of silently preferring one.
-    #[serde(default, alias = "plan_slug")]
-    pub work_unit_slug: Option<String>,
+    /// Work unit this spawn belongs to, under the post-rename key.
+    ///
+    /// Read it through [`LaunchPayload::work_unit_slug`], never directly —
+    /// coord emits BOTH keys during the dual window and the accessor applies
+    /// the precedence.
+    ///
+    /// The `_new` suffix exists only to free the `work_unit_slug` *identifier*
+    /// for the accessor; the WIRE key is plain `work_unit_slug` via the
+    /// `rename`. Dropping that rename makes the runner silently look for a
+    /// `work_unit_slug_new` key coord never sends, so the new-key path goes
+    /// dead while the legacy fallback keeps it looking healthy.
+    #[serde(default, rename = "work_unit_slug")]
+    pub work_unit_slug_new: Option<String>,
+    /// The legacy key. **Two fields, deliberately NOT `#[serde(alias)]`.**
+    ///
+    /// An alias would make serde treat the two spellings as the SAME field, so
+    /// a body carrying both would fail with `duplicate field`. That hard-fail
+    /// is the right behaviour for a REQUEST coord receives (one caller sends
+    /// one name; both is genuinely ambiguous — see coord's `SpawnRequest`),
+    /// but it is exactly wrong here: this struct parses a payload coord
+    /// *deliberately* dual-emits during the rename window, so an alias would
+    /// reject every spawn from a renamed coord. Verified: coord's
+    /// `LaunchPayload` serializes `{"plan_slug":…,"work_unit_slug":…}`, which
+    /// an aliased field rejects with ``duplicate field `work_unit_slug` ``.
+    #[serde(default)]
+    pub plan_slug: Option<String>,
     #[serde(default)]
     pub plan_phase: Option<u32>,
     #[serde(default)]
     pub correlation_topic: Option<String>,
+}
+
+impl LaunchPayload {
+    /// The work-unit slug under either wire spelling, new key winning.
+    ///
+    /// Coord dual-emits `work_unit_slug` alongside the legacy `plan_slug` for
+    /// one release; after it drops the legacy key this collapses to a plain
+    /// read of `work_unit_slug_new` and the `plan_slug` field goes away.
+    pub fn work_unit_slug(&self) -> Option<&str> {
+        self.work_unit_slug_new
+            .as_deref()
+            .or(self.plan_slug.as_deref())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -5056,7 +5088,8 @@ mod tests {
             jwt_exp: 0,
             initial_prompt: "go".to_string(),
             claim_token: "agent:00000000-0000-0000-0000-000000000000".to_string(),
-            work_unit_slug: Some("readiness".to_string()),
+            work_unit_slug_new: Some("readiness".to_string()),
+            plan_slug: None,
             plan_phase: Some(4),
             correlation_topic: Some("my-coordination-topic".to_string()),
         };
@@ -5072,7 +5105,7 @@ mod tests {
                 "initial_prompt": payload.initial_prompt,
                 "claim_token": payload.claim_token,
                 // Legacy coord emit — the key coord still writes today.
-                "plan_slug": payload.work_unit_slug,
+                "plan_slug": payload.work_unit_slug(),
                 "plan_phase": payload.plan_phase,
             }),
         }))
@@ -5085,8 +5118,8 @@ mod tests {
         assert_eq!(round_tripped.worktrees.len(), 1);
         assert_eq!(round_tripped.worktrees[0].repo, "qontinui-runner");
         assert_eq!(round_tripped.plan_phase, Some(4));
-        // Legacy `plan_slug` still lands in the renamed field via the alias.
-        assert_eq!(round_tripped.work_unit_slug.as_deref(), Some("readiness"));
+        // Legacy `plan_slug` still resolves through the accessor.
+        assert_eq!(round_tripped.work_unit_slug(), Some("readiness"));
     }
 
     /// Minimal `LaunchPayload` body with the slug key left to the caller, so
@@ -5113,7 +5146,7 @@ mod tests {
         // Un-renamed coord (every coord shipping today) emits `plan_slug`.
         let body = launch_body_with(serde_json::json!({ "plan_slug": "some-unit" }));
         let p: LaunchPayload = serde_json::from_value(body).unwrap();
-        assert_eq!(p.work_unit_slug.as_deref(), Some("some-unit"));
+        assert_eq!(p.work_unit_slug(), Some("some-unit"));
     }
 
     #[test]
@@ -5121,30 +5154,58 @@ mod tests {
         // Post-rename coord emits `work_unit_slug`.
         let body = launch_body_with(serde_json::json!({ "work_unit_slug": "some-unit" }));
         let p: LaunchPayload = serde_json::from_value(body).unwrap();
-        assert_eq!(p.work_unit_slug.as_deref(), Some("some-unit"));
+        assert_eq!(p.work_unit_slug(), Some("some-unit"));
+    }
+
+    /// THE cross-repo compatibility test.
+    ///
+    /// coord's Stage 2 `LaunchPayload` dual-emits BOTH keys for one release
+    /// (two real fields, each `skip_serializing_if`), so the body on the wire
+    /// is literally `{…,"plan_slug":"x","work_unit_slug":"x"}`. An earlier
+    /// draft of this struct used `#[serde(alias = "plan_slug")]`, which made
+    /// exactly that body fail with ``duplicate field `work_unit_slug` `` —
+    /// i.e. EVERY spawn from a renamed coord would have failed to parse.
+    /// This test is what keeps the two repos' windows compatible; if it is
+    /// ever "simplified" back to an alias, spawns break fleet-wide.
+    #[test]
+    fn launch_payload_accepts_coords_dual_emitted_both_keys() {
+        let body = launch_body_with(serde_json::json!({
+            "plan_slug": "2026-07-28-some-unit",
+            "work_unit_slug": "2026-07-28-some-unit",
+        }));
+        let p: LaunchPayload = serde_json::from_value(body)
+            .expect("coord dual-emits both keys — this MUST parse, not duplicate-field");
+        // Assert the NEW field specifically, not just the accessor. Coord emits
+        // the same value under both keys, so an accessor-only assertion would
+        // still pass with the new key entirely unwired (resolving through the
+        // legacy fallback) — it would not catch a missing
+        // `#[serde(rename = "work_unit_slug")]`, which is exactly the bug that
+        // reached this test once already.
+        assert_eq!(
+            p.work_unit_slug_new.as_deref(),
+            Some("2026-07-28-some-unit"),
+            "the post-rename key must be READ, not merely tolerated"
+        );
+        assert_eq!(p.work_unit_slug(), Some("2026-07-28-some-unit"));
+    }
+
+    #[test]
+    fn launch_payload_new_key_wins_when_both_disagree() {
+        // Defensive: if a mid-rename coord ever emits divergent values, the
+        // post-rename key is authoritative.
+        let body = launch_body_with(serde_json::json!({
+            "plan_slug": "old-name",
+            "work_unit_slug": "new-name",
+        }));
+        let p: LaunchPayload = serde_json::from_value(body).unwrap();
+        assert_eq!(p.work_unit_slug(), Some("new-name"));
     }
 
     #[test]
     fn launch_payload_absent_slug_is_none() {
         let body = launch_body_with(serde_json::json!({}));
         let p: LaunchPayload = serde_json::from_value(body).unwrap();
-        assert_eq!(p.work_unit_slug, None);
-    }
-
-    #[test]
-    fn launch_payload_rejects_both_slug_keys() {
-        // A body carrying BOTH names is ambiguous — serde's alias handling
-        // makes that a hard `duplicate field` error rather than a silent
-        // preference. This is the property we WANT; pin it.
-        let body = launch_body_with(serde_json::json!({
-            "plan_slug": "old-name",
-            "work_unit_slug": "new-name",
-        }));
-        let err = serde_json::from_value::<LaunchPayload>(body).unwrap_err();
-        assert!(
-            err.to_string().contains("duplicate field"),
-            "expected a duplicate-field rejection, got: {err}"
-        );
+        assert_eq!(p.work_unit_slug(), None);
     }
 
     #[test]
