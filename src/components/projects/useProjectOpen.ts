@@ -26,12 +26,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { createLogger } from "@/lib/logger";
 import type { SavedProject } from "@/hooks/useSavedProjects";
 import type { ProjectSnapshot } from "./types";
-import {
-  describeStartFailure,
-  planOpen,
-  stderrTailOf,
-  type OpenPhase,
-} from "./openProject";
+import { describeStartFailure, planOpen, stderrTailOf, type OpenPhase } from "./openProject";
 
 const log = createLogger("useProjectOpen");
 
@@ -100,7 +95,8 @@ export function useProjectOpen(): UseProjectOpen {
       if (plan.blockedReason || !plan.url) {
         setPhase(project.id, {
           kind: "failed",
-          message: plan.blockedReason ?? "This project has no front page address yet.",
+          message: plan.blockedReason ?? "This project doesn't have an address to open yet.",
+          needsFrontPage: plan.needsFrontPage,
         });
         return;
       }

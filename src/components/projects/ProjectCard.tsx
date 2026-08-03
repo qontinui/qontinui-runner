@@ -18,6 +18,7 @@ import type { SavedProject } from "@/hooks/useSavedProjects";
 import type { HealthLevel, ProjectSnapshot } from "./types";
 import { isLiveProcessState } from "./types";
 import { shouldOfferFix } from "./fixThis";
+import { FrontPageSetup } from "./FrontPageSetup";
 import { formatRelativeActivity } from "./relativeTime";
 import { isOpenBusy, openProse, type OpenPhase } from "./openProject";
 import { formatWeeklySpend } from "./cardExtras";
@@ -102,6 +103,11 @@ export interface ProjectCardProps {
    * already attached (§8.4). Only ever called while the card is amber/red.
    */
   onFixThis?: (project: SavedProject) => void;
+  /**
+   * The project just gained a front-page address (via `Set it up for me` or a
+   * typed URL). The page refreshes the registry and retries `Open`.
+   */
+  onFrontPageConfigured?: (project: SavedProject, url: string) => void;
 }
 
 export function ProjectCard({
@@ -114,6 +120,7 @@ export function ProjectCard({
   onShowDetail,
   onTogglePin,
   onFixThis,
+  onFrontPageConfigured,
 }: ProjectCardProps) {
   // Whether the amber/red [Fix this] affordance applies right now. Computed
   // from the snapshot, so it is absent while loading and on a green/unknown
@@ -310,6 +317,15 @@ export function ProjectCard({
             >
               Open in browser instead
             </button>
+          ) : null}
+          {/* The one failure the user can fix without leaving the card. Offered
+              in place precisely because the old copy told them to add an
+              address while giving them nowhere to add it. */}
+          {openPhase.kind === "failed" && openPhase.needsFrontPage && onFrontPageConfigured ? (
+            <FrontPageSetup
+              project={project}
+              onConfigured={(url) => onFrontPageConfigured(project, url)}
+            />
           ) : null}
         </div>
       ) : null}
