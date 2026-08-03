@@ -197,7 +197,15 @@ async fn run_orchestrator(
         .iter()
         .map(|d| d.to_string_lossy().to_string())
         .collect();
-    if transcripts_on_disk == 0 {
+    if workspace_paths.is_empty() {
+        // Nothing was searched, so "zero found" carries no information —
+        // emitting the warning here would be the same looked-in-the-wrong-place
+        // false signal it exists to prevent.
+        info!(
+            config_dirs = %searched.join(", "),
+            "transcript_watcher: no workspace paths tracked yet; transcript-absence check skipped"
+        );
+    } else if transcripts_on_disk == 0 {
         warn!(
             config_dirs = %searched.join(", "),
             workspace_paths = %workspace_paths.join(", "),
