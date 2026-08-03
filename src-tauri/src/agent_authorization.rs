@@ -47,14 +47,13 @@
 //! | unresolvable, no usable snapshot | `policy_required` (cold-start floor) | non-standing | `DegradeToInline` — never silently skip a required gate |
 //! | unresolvable, no usable snapshot | optional | non-standing | `Allow` — a coord outage must not break the fleet |
 //! | runner unpaired (no device JWT), no snapshot | — | any | `Allow` — there is no tenant, so there is no preference to honour |
-//! | coord answers **404** | — | any | `Allow` (registry endpoint not deployed on this coord; logged at `error!`) |
 //!
 //! Note the class column on the `policy_required` row: the standing check runs
 //! FIRST, so a policy-required *standing* spawn is denied rather than degraded.
 //! Denying is the stronger of the two and the standing opt-in is the harder
 //! rule ("never implied by a task"), so it wins.
 //!
-//! Three rows deserve their reasoning spelled out:
+//! Two rows deserve their reasoning spelled out:
 //!
 //! * **Stale beats cold, but not forever.** The last-known-good snapshot
 //!   outlives its freshness — that is what keeps a coord outage from tripping
@@ -67,23 +66,23 @@
 //!   tenant, so there is no recorded user preference to honour — denying would
 //!   *invent* one and would stop local looping agents on an offline runner.
 //!   Same category as "coord has no registry", not "coord is down".
-//! * **404 is a rollout state, not an outage.** This module ships ahead of the
-//!   coord endpoint (its PR is DRAFT-held on that dependency). A coord build
-//!   without the route must not hard-deny every standing spawn on the fleet, so
-//!   a 404 specifically reads as "registry feature absent" → allow, loudly.
-//!   **Fence:** [`fetch_effective`] refuses to issue the request at all without
-//!   a device JWT, so this arm is only ever reached by an *authenticated* 404 —
-//!   a proxy that 404s unauthenticated probes to hide routes cannot trigger it.
-//!   **Sunset:** this arm is temporary and its removal is tracked by coord gate
-//!   `706b53d5-c68e-4b80-baf2-31e71a385cb9` (work unit
-//!   `2026-07-28-migrate-claude-md-into-qontinui`, phase "Phase 4c — sunset the
-//!   runner 404 allow-all rollout arm"). Delete [`Fetched::NotDeployed`], the
-//!   [`Resolution::NotDeployed`] arm, the `registry-endpoint-not-deployed` rule
-//!   and its tests once the endpoint returns 200 in production, so an
-//!   unexpected 404 falls through to the normal unresolvable matrix. A rollout
-//!   allow-everything with no removal trigger is how a gate quietly dies.
-//!   Every OTHER failure (timeout, connection refused, 401/403, 5xx, decode
-//!   error) is a genuine unresolvable and takes the matrix above.
+//! **The 404 allow-all rollout arm is GONE** (Phase 4c, coord gate
+//! `706b53d5-c68e-4b80-baf2-31e71a385cb9`, work unit
+//! `2026-07-28-migrate-claude-md-into-qontinui`). While this module shipped
+//! ahead of the coord endpoint, an authenticated 404 read as "registry feature
+//! absent" → `Allow`, loudly, so a coord build without the route could not
+//! hard-deny every standing spawn on the fleet. The endpoint is live in
+//! production, so that arm is now DELETED rather than left as a standing
+//! allow-everything: a 404 is just another non-success status and falls through
+//! to the normal unresolvable matrix above, exactly like a timeout, a connection
+//! refusal, a 401/403, a 5xx, or a decode error. A rollout allow-everything with
+//! no removal trigger is how a gate quietly dies.
+//!
+//! Sunset evidence (2026-08-03): `GET /coord/agent-registry/effective` answers
+//! **200** with a device JWT (10 rows, including the `standing_continuation`
+//! class row coord PR #1330 seeds) and **401** unauthenticated — never 404. The
+//! `standing_continuation` row's presence in the live response is itself the
+//! feature marker proving production runs code at or after that seed.
 //!
 //! # Spawn-path classes
 //!
@@ -469,10 +468,9 @@ pub(crate) enum Resolution<'a> {
         error: &'a str,
         age: Duration,
     },
-    /// No usable snapshot: never resolved, or the snapshot aged out.
+    /// No usable snapshot: never resolved, or the snapshot aged out. A 404 from
+    /// coord lands here like any other non-success status (Phase 4c).
     Unresolved { error: &'a str },
-    /// coord answered 404 — this coord build has no registry endpoint.
-    NotDeployed,
     /// This runner holds no device JWT, so it has no coord tenant and there is
     /// no recorded preference to honour.
     Unpaired,
@@ -550,24 +548,128 @@ fn on_policy_required_floor(agent_name: Option<&str>) -> bool {
 /// standing one, which is exactly what "never implied by a task" forbids. A row
 /// with no declared class is class-agnostic and still governs.
 ///
-/// The fence is part of the SELECTION, not a post-filter on an
-/// already-chosen row. `(agent_name, spawn_path)` is the registry's natural key
-/// — one agent legitimately has one row per class — so picking "the first row
-/// with this name" and then rejecting it for a class mismatch would skip the
-/// agent's OWN correctly-classed row and fall through to the class default.
-/// For a standing spawn that means silently denying the exact opt-in the user
-/// recorded.
+/// The fence is part of the SELECTION, not a post-filter on an already-chosen
+/// row: picking "the first row with this name" and then rejecting it for a
+/// class mismatch would skip the agent's OWN correctly-classed row and fall
+/// through to the class default. For a standing spawn that means silently
+/// denying the exact opt-in the user recorded. That is why step 1 below selects
+/// *through* the fence rather than filtering after it, and it is unchanged.
+///
+/// **Disable floor (step 2).** The fall-through must never make a user's
+/// recorded disable WEAKER than a class default. The registry's unique key is
+/// `uq_agent_registry_tenant_agent (tenant_id, agent_name)` — **one row per
+/// agent, not one per (agent, class)** — and the qontinui-web seeder classes
+/// every role agent `in_session_subagent` and never rewrites that class, while
+/// user prefs carry no `spawn_path` at all and fold onto that single row. So a
+/// user who deselects `merge-train-steward` produces exactly one row, classed
+/// `in_session_subagent`, `enabled:false`. Asked about a STANDING spawn of that
+/// agent, step 1 correctly finds nothing — and before this floor, step 3 handed
+/// the decision to the permissive `standing_continuation` class row (coord PR
+/// #1330 seeds it `default_enabled = true`) and returned `Allow`. That spawns,
+/// standing, an agent the user explicitly deselected: the one thing
+/// `agent-spawn-authorization` calls "never — no policy, project file, or
+/// launcher instruction may re-mandate it".
+///
+/// So when the agent has no correctly-classed row but DOES carry a disable
+/// under another class, the most restrictive such disable governs unless the
+/// class row is itself more restrictive.
+///
+/// The floor is deliberately **restrictive-only and asymmetric**, mirroring the
+/// clause's own asymmetry: a disable is absolute ("never"), an enable is a
+/// standing *per-path* opt-in ("never implied by a task"). A class-mismatched
+/// ENABLE therefore still does not imply the standing opt-in — only a
+/// class-mismatched DISABLE carries across. Restrictive-only also means the
+/// floor cannot regress the case the fence exists for: it is consulted only
+/// after step 1 has already failed, so no correctly-classed opt-in is ever
+/// skipped.
 fn lookup_row<'a>(
     rows: &'a [RegistryAgent],
     agent_name: Option<&str>,
     path: SpawnPath,
-) -> Option<&'a RegistryAgent> {
-    if let Some(name) = agent_name {
-        if let Some(row) = find_governing(rows, name, path) {
-            return Some(row);
+) -> Option<Governing<'a>> {
+    let Some(name) = agent_name else {
+        return find_governing(rows, path.as_wire(), path).map(Governing::direct);
+    };
+
+    // 1. The agent's own correctly-classed row is an explicit statement about
+    //    THIS class. It governs outright, enabled or disabled.
+    if let Some(row) = find_governing(rows, name, path) {
+        return Some(Governing::direct(row));
+    }
+
+    // 2/3. No row for this class. Take the more restrictive of the class
+    //      default and any disable the user recorded for this agent elsewhere.
+    let class_row = find_governing(rows, path.as_wire(), path);
+    let Some(disabled) = most_restrictive_disable(rows, name) else {
+        return class_row.map(Governing::direct);
+    };
+    match class_row {
+        Some(cls) if restrictiveness(cls) > restrictiveness(disabled) => {
+            Some(Governing::direct(cls))
+        }
+        _ => Some(Governing::via_floor(disabled)),
+    }
+}
+
+/// The row governing one spawn, plus how it was selected.
+///
+/// `via_floor` is carried so the verdict can say WHY a disable applied: an
+/// operator reading the log needs to distinguish "you disabled this agent for
+/// this class" from "you disabled this agent under another class and the floor
+/// carried it across", because only the second is surprising.
+struct Governing<'a> {
+    row: &'a RegistryAgent,
+    via_floor: bool,
+}
+
+impl<'a> Governing<'a> {
+    fn direct(row: &'a RegistryAgent) -> Self {
+        Governing {
+            row,
+            via_floor: false,
         }
     }
-    find_governing(rows, path.as_wire(), path)
+
+    fn via_floor(row: &'a RegistryAgent) -> Self {
+        Governing {
+            row,
+            via_floor: true,
+        }
+    }
+}
+
+/// How strongly a row refuses, as a total order for picking the governing row.
+///
+/// Ordering only — these numbers are not a wire value and are never logged.
+/// `None`/unparseable disposition ranks with `degrade`, matching the documented
+/// no-disposition fallback ("the only option that both honours the cost
+/// decision and keeps the gate").
+fn restrictiveness(row: &RegistryAgent) -> u8 {
+    if row.enabled {
+        return 0;
+    }
+    match row.disposition.as_deref().and_then(Disposition::from_wire) {
+        Some(Disposition::WarnProceed) => 1,
+        Some(Disposition::Block) => 3,
+        Some(Disposition::Degrade) | None => 2,
+    }
+}
+
+/// The most restrictive DISABLED row carrying `name`, whatever class it
+/// declares.
+///
+/// Case-folded to match [`find_governing`]'s loose pass — two spellings of one
+/// agent must not let a disable slip the floor. Picking the maximum (rather
+/// than the first) makes the floor independent of row ordering, so a `block`
+/// recorded under one class cannot be masked by a `warn_proceed` under another
+/// that happens to arrive first.
+fn most_restrictive_disable<'a>(
+    rows: &'a [RegistryAgent],
+    name: &str,
+) -> Option<&'a RegistryAgent> {
+    rows.iter()
+        .filter(|r| r.agent_name.eq_ignore_ascii_case(name) && !r.enabled)
+        .max_by_key(|r| restrictiveness(r))
 }
 
 /// Does this row govern spawns of `path`? A row with no declared (or blank)
@@ -622,9 +724,6 @@ pub(crate) fn decide(
     path: SpawnPath,
 ) -> Verdict {
     match resolution {
-        Resolution::NotDeployed => {
-            Verdict::new(SpawnDecision::Allow, "registry-endpoint-not-deployed")
-        }
         Resolution::Unpaired => Verdict::new(SpawnDecision::Allow, "runner-unpaired-no-tenant"),
         Resolution::Unresolved { error } => decide_unresolved(error, agent_name, path),
         Resolution::Fresh(rows) => decide_from_rows(rows, agent_name, path, None),
@@ -685,7 +784,7 @@ fn decide_from_rows(
     stale_for: Option<Duration>,
 ) -> Verdict {
     let who = describe(agent_name, path);
-    let Some(row) = lookup_row(rows, agent_name, path) else {
+    let Some(Governing { row, via_floor }) = lookup_row(rows, agent_name, path) else {
         let mut v = if path.outlives_request() {
             Verdict::new(
                 SpawnDecision::Deny {
@@ -770,6 +869,24 @@ fn decide_from_rows(
             }
         }
     };
+    // The cross-class disable floor fired: say so, and say which row carried
+    // it. Only ever reached for a DISABLED row, so `annotate` always has a
+    // reason to append to (it leaves `Allow` untouched by construction).
+    if via_floor {
+        v.rule = "registry-row-disabled-other-class-floor";
+        v.decision = annotate(
+            v.decision,
+            &format!(
+                "the disable is recorded on this agent's `{}` row; a class default must \
+                 never weaken a disable the user recorded",
+                row.spawn_path
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("(class-agnostic)")
+            ),
+        );
+    }
     v.stale_for = stale_for;
     v.policy_required = row.policy_required;
     v.fanout_bound = row.fanout_bound;
@@ -806,8 +923,6 @@ fn annotate(decision: SpawnDecision, note: &str) -> SpawnDecision {
 #[derive(Debug)]
 pub(crate) enum Fetched {
     Ok(Vec<RegistryAgent>),
-    /// coord has no registry endpoint (an AUTHENTICATED 404).
-    NotDeployed,
     /// This runner holds no device JWT — no request was issued.
     Unpaired,
     Err(String),
@@ -818,7 +933,6 @@ pub(crate) enum Fetched {
 enum Posture {
     #[default]
     Available,
-    NotDeployed,
     Unpaired,
 }
 
@@ -841,7 +955,6 @@ impl Resolved {
                 age: self.age.unwrap_or_default(),
             },
             (None, _) => match self.posture {
-                Posture::NotDeployed => Resolution::NotDeployed,
                 Posture::Unpaired => Resolution::Unpaired,
                 Posture::Available => Resolution::Unresolved {
                     error: self
@@ -901,26 +1014,6 @@ impl CacheInner {
     }
 }
 
-/// Hourly rate limiter for the `NotDeployed` `error!`. Returns true at most
-/// once an hour per process.
-fn not_deployed_log_due(now: Instant) -> bool {
-    use std::sync::Mutex;
-    static LAST: Lazy<Mutex<Option<Instant>>> = Lazy::new(|| Mutex::new(None));
-    const EVERY: Duration = Duration::from_secs(3600);
-
-    let mut last = match LAST.lock() {
-        Ok(g) => g,
-        Err(e) => e.into_inner(),
-    };
-    match *last {
-        Some(t) if now.saturating_duration_since(t) < EVERY => false,
-        _ => {
-            *last = Some(now);
-            true
-        }
-    }
-}
-
 pub(crate) struct RegistryCache {
     ttl: Duration,
     error_backoff: Duration,
@@ -970,8 +1063,8 @@ impl RegistryCache {
                 posture: Posture::Available,
             };
         }
-        // A cached `NotDeployed` / `Unpaired` posture is honoured for the TTL
-        // too — it is a resolved answer, just not a row-bearing one.
+        // A cached `Unpaired` posture is honoured for the TTL too — it is a
+        // resolved answer, just not a row-bearing one.
         let posture_cached = inner
             .attempted_at
             .is_some_and(|t| now.saturating_duration_since(t) < self.ttl);
@@ -1005,34 +1098,6 @@ impl RegistryCache {
                     age: None,
                     error: None,
                     posture: Posture::Available,
-                }
-            }
-            Fetched::NotDeployed => {
-                // coord has DISOWNED the endpoint. Keeping the old snapshot
-                // would let a later transport error resurrect rows from a route
-                // coord says does not exist, so drop it.
-                // Rate-limited: this fires once per TTL on every runner
-                // predating the coord endpoint, and the Error/Auto-Fix
-                // Monitors read this log. Once an hour is enough to keep the
-                // temporary allow-all visible without flooding them.
-                if not_deployed_log_due(now) {
-                    error!(
-                        "agent registry: coord returned 404 for {REGISTRY_PATH} — the registry \
-                         endpoint is not deployed on this coord. Spawn authorization is \
-                         ALLOW-ALL until it ships; this rollout arm is temporary and must be \
-                         removed once the endpoint is live fleet-wide (coord gate \
-                         706b53d5-c68e-4b80-baf2-31e71a385cb9)."
-                    );
-                }
-                inner.agents = None;
-                inner.fetched_at = None;
-                inner.last_error = None;
-                inner.posture = Posture::NotDeployed;
-                Resolved {
-                    agents: None,
-                    age: None,
-                    error: None,
-                    posture: Posture::NotDeployed,
                 }
             }
             Fetched::Unpaired => {
@@ -1100,10 +1165,11 @@ fn redact_url(url: &str) -> String {
 /// write path presents, so this read feeds the one auth-coverage metric. No
 /// token is minted here and none is logged.
 ///
-/// The `have_device_token` pre-check is load-bearing beyond avoiding a pointless
-/// request: it guarantees the [`Fetched::NotDeployed`] arm is only ever reached
-/// by an AUTHENTICATED 404, so a gateway that 404s unauthenticated probes to
-/// hide routes cannot turn the gate into allow-all.
+/// The `have_device_token` pre-check avoids issuing a request that cannot
+/// succeed, and keeps an unpaired runner on the `Unpaired` posture rather than
+/// booking a spurious transport error against the registry. (It used to carry a
+/// second, heavier duty — guaranteeing the 404 allow-all arm was only reachable
+/// by an AUTHENTICATED 404 — which Phase 4c retired along with that arm.)
 async fn fetch_effective() -> Fetched {
     let base = match crate::mcp::agent_worktrees::coord_http_base() {
         Ok(b) => b,
@@ -1123,9 +1189,10 @@ async fn fetch_effective() -> Fetched {
         Err(e) => return Fetched::Err(format!("GET {safe_url}: {e}")),
     };
     let status = resp.status();
-    if status == reqwest::StatusCode::NOT_FOUND {
-        return Fetched::NotDeployed;
-    }
+    // NOTE: 404 is deliberately NOT special-cased any more (Phase 4c). It is a
+    // non-success status like any other and becomes a genuine unresolvable, so
+    // a coord that has lost the route hard-denies standing spawns rather than
+    // silently authorizing every one of them.
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
         let excerpt: String = body.chars().take(200).collect();
@@ -2075,6 +2142,131 @@ mod tests {
         assert_eq!(v.rule, "no-row-standing-continuation-default-off");
     }
 
+    /// REGRESSION (coord finding `90a76706-647d-4be6-af83-5acf6338e573`).
+    ///
+    /// The class fence must never let the per-PATH class row *weaken* a disable
+    /// the user recorded against this agent under another class. Before the
+    /// disable floor, the name lookup rejected the user's `in_session_subagent`
+    /// disable on class grounds and fell through to the permissive
+    /// `standing_continuation` class row — spawning, standing, an agent the user
+    /// had explicitly deselected.
+    ///
+    /// Latent until PR #1330 seeded a permissive `standing_continuation` row;
+    /// live the moment any tenant records its first disable.
+    #[test]
+    fn a_class_mismatched_disable_is_never_weakened_by_the_class_row() {
+        let disabled = |name: &str, class: &str, disp: Option<&str>| RegistryAgent {
+            disposition: disp.map(str::to_string),
+            ..row_for(name, class, false)
+        };
+
+        // The exact production shape: the user's disable is classed
+        // `in_session_subagent`; the tenant carries the seeded permissive
+        // `standing_continuation` class row.
+        for (disp, want_label) in [
+            (Some("block"), "deny"),
+            (Some("degrade"), "degrade_to_inline"),
+            (None, "degrade_to_inline"),
+        ] {
+            let rows = vec![
+                disabled("merge-train-steward", "in_session_subagent", disp),
+                row("standing_continuation", true, None, false),
+            ];
+            let v = decide(
+                Resolution::Fresh(&rows),
+                Some("merge-train-steward"),
+                SpawnPath::StandingContinuation,
+            );
+            assert_eq!(
+                v.decision.label(),
+                want_label,
+                "a recorded disable (disposition {disp:?}) must not be weakened to \
+                 `allow` by the permissive class row"
+            );
+            assert_eq!(v.rule, "registry-row-disabled-other-class-floor");
+        }
+
+        // `warn_proceed` is the user's own choice to proceed without the agent,
+        // so it stays a Warn — the floor never STRENGTHENS a recorded choice.
+        let rows = vec![
+            disabled(
+                "merge-train-steward",
+                "in_session_subagent",
+                Some("warn_proceed"),
+            ),
+            row("standing_continuation", true, None, false),
+        ];
+        let v = decide(
+            Resolution::Fresh(&rows),
+            Some("merge-train-steward"),
+            SpawnPath::StandingContinuation,
+        );
+        assert_eq!(v.decision.label(), "warn_proceed");
+
+        // The floor is the MOST RESTRICTIVE of the candidates, so it cannot be
+        // flipped by row ordering: a `block` elsewhere outranks a
+        // `warn_proceed` elsewhere regardless of which comes first.
+        for order in 0..2 {
+            let mut rows = vec![
+                disabled("merge-train-steward", "in_session_subagent", Some("block")),
+                disabled(
+                    "merge-train-steward",
+                    "parallel_fanout",
+                    Some("warn_proceed"),
+                ),
+            ];
+            if order == 1 {
+                rows.reverse();
+            }
+            rows.push(row("standing_continuation", true, None, false));
+            let v = decide(
+                Resolution::Fresh(&rows),
+                Some("merge-train-steward"),
+                SpawnPath::StandingContinuation,
+            );
+            assert_eq!(v.decision.label(), "deny", "order {order}");
+        }
+    }
+
+    /// The floor must not regress the two properties `lookup_row`'s doc comment
+    /// exists to protect: an explicit same-class ENABLE still wins, and a
+    /// class-mismatched ENABLE still does NOT imply the standing opt-in.
+    #[test]
+    fn the_disable_floor_preserves_the_documented_enable_semantics() {
+        // A correctly-classed ENABLE beats a disable recorded under another
+        // class — the floor only applies when the agent has NO row for this
+        // class, so the recorded opt-in is never skipped.
+        let rows = vec![
+            RegistryAgent {
+                disposition: Some("block".to_string()),
+                ..row_for("merge-train-steward", "in_session_subagent", false)
+            },
+            row_for("merge-train-steward", "standing_continuation", true),
+        ];
+        let v = decide(
+            Resolution::Fresh(&rows),
+            Some("merge-train-steward"),
+            SpawnPath::StandingContinuation,
+        );
+        assert_eq!(
+            v.decision.label(),
+            "allow",
+            "the agent's own standing_continuation opt-in must still win"
+        );
+        assert_eq!(v.rule, "registry-row-enabled");
+
+        // A class-mismatched ENABLE is still not a standing opt-in: the floor
+        // is restrictive-only, so this still falls to the class default.
+        let rows = vec![row_for("merge-train-steward", "in_session_subagent", true)];
+        let v = decide(
+            Resolution::Fresh(&rows),
+            Some("merge-train-steward"),
+            SpawnPath::StandingContinuation,
+        );
+        assert_eq!(v.decision.label(), "deny");
+        assert_eq!(v.rule, "no-row-standing-continuation-default-off");
+    }
+
     /// Coord unreachable and no usable snapshot.
     #[test]
     fn decision_matrix_unresolvable_cold() {
@@ -2171,18 +2363,52 @@ mod tests {
         assert!(reason.contains("1234s old"), "and how stale: {reason}");
     }
 
-    /// A coord build with no registry endpoint must not freeze the fleet.
+    /// PHASE 4c: the 404 allow-all rollout arm is gone. A 404 is now an
+    /// ordinary non-success status, so it reaches [`decide`] as
+    /// `Unresolved` and takes the normal fail-safe matrix — standing spawns
+    /// DENY instead of being silently authorized.
+    ///
+    /// The rollout arm existed because this module shipped ahead of the coord
+    /// endpoint; the endpoint is live in production (200 with a device JWT, 401
+    /// unauthenticated — never 404), so the arm is deleted rather than left as a
+    /// standing allow-everything.
     #[test]
-    fn not_deployed_allows_every_class() {
-        for path in [
-            SpawnPath::InSessionSubagent,
-            SpawnPath::ParallelFanout,
+    fn a_404_now_takes_the_unresolvable_matrix_not_allow_all() {
+        let err = "coord returned 404 Not Found for GET https://coord.qontinui.io/...: ";
+
+        // The direction that matters: a standing spawn is DENIED, where the
+        // retired arm would have allowed it.
+        let v = decide(
+            Resolution::Unresolved { error: err },
+            Some("merge-train-steward"),
             SpawnPath::StandingContinuation,
-        ] {
-            let v = decide(Resolution::NotDeployed, Some("code-reviewer"), path);
-            assert_eq!(v.decision.label(), "allow", "path {}", path.as_wire());
-            assert_eq!(v.rule, "registry-endpoint-not-deployed");
-        }
+        );
+        assert_eq!(
+            v.decision.label(),
+            "deny",
+            "a 404 must no longer authorize a standing spawn"
+        );
+        assert_eq!(v.rule, "unresolvable-standing-continuation-default-off");
+
+        // A policy-required non-standing agent still degrades rather than
+        // silently skipping its gate.
+        let v = decide(
+            Resolution::Unresolved { error: err },
+            Some("code-reviewer"),
+            SpawnPath::InSessionSubagent,
+        );
+        assert_eq!(v.decision.label(), "degrade_to_inline");
+        assert_eq!(v.rule, "unresolvable-policy-required-degrade");
+
+        // ... and an optional non-standing spawn still proceeds, so a coord
+        // outage does not break the fleet.
+        let v = decide(
+            Resolution::Unresolved { error: err },
+            Some("some-optional-helper"),
+            SpawnPath::InSessionSubagent,
+        );
+        assert_eq!(v.decision.label(), "allow");
+        assert_eq!(v.rule, "unresolvable-optional-allow");
     }
 
     /// An unpaired runner has no tenant, so it has no preference to honour —
@@ -2233,6 +2459,13 @@ mod tests {
         ));
         assert!(!break_glass_may_override(
             "registry-row-disabled-no-disposition-fallback"
+        ));
+        // A disable carried across classes by the floor is still a recorded
+        // user disable — the break-glass must not lift it either. This holds by
+        // the `registry-row-disabled` prefix, so keep that prefix if the rule is
+        // ever renamed.
+        assert!(!break_glass_may_override(
+            "registry-row-disabled-other-class-floor"
         ));
         assert!(break_glass_may_override(
             "no-row-standing-continuation-default-off"
@@ -2480,41 +2713,62 @@ mod tests {
         assert_eq!(v.decision.label(), "deny");
     }
 
+    /// PHASE 4c, cache half: a 404 is no longer a distinct posture, so it is
+    /// carried as an ordinary transport error and the last-known-good snapshot
+    /// still decides until it ages out.
+    ///
+    /// This is a deliberate behaviour change. The retired `NotDeployed` arm
+    /// DISOWNED the snapshot, because a 404 was read as coord positively
+    /// asserting the feature does not exist. A 404 now carries no such meaning,
+    /// and "stale beats cold" is the right default for every other failure —
+    /// it keeps a recorded user preference in force across a coord blip instead
+    /// of reverting to class defaults. [`MAX_SNAPSHOT_AGE`] still bounds it.
     #[tokio::test]
-    async fn not_deployed_is_cached_and_disowns_the_old_snapshot() {
+    async fn a_404_is_an_ordinary_error_and_keeps_the_snapshot() {
         let ttl = Duration::from_secs(90);
         let cache = RegistryCache::new(ttl, Duration::from_secs(15));
         let t0 = Instant::now();
 
-        // A good snapshot first...
+        // A good snapshot first: the user has DISABLED the standing class.
         cache
             .resolve_at(t0, || async {
-                Fetched::Ok(vec![row("standing_continuation", true, None, false)])
+                Fetched::Ok(vec![row(
+                    "standing_continuation",
+                    false,
+                    Some("block"),
+                    false,
+                )])
             })
             .await;
-        // ... then coord disowns the endpoint.
-        let r = cache
-            .resolve_at(t0 + ttl, || async { Fetched::NotDeployed })
-            .await;
-        assert!(matches!(r.as_resolution(), Resolution::NotDeployed));
 
-        // Cached for the TTL.
+        // ... then coord starts 404ing. That arrives as a plain error.
         let r = cache
-            .resolve_at(t0 + ttl + Duration::from_secs(1), || async {
-                panic!("must not refetch inside the TTL")
+            .resolve_at(t0 + ttl, || async {
+                Fetched::Err("coord returned 404 Not Found for GET .../effective: ".into())
             })
-            .await;
-        assert!(matches!(r.as_resolution(), Resolution::NotDeployed));
-        assert_eq!(cache.attempts().await, 2);
-
-        // And a LATER transport error must not resurrect the disowned rows.
-        let r = cache
-            .resolve_at(t0 + ttl * 3, || async { Fetched::Err("coord 503".into()) })
             .await;
         assert!(
-            matches!(r.as_resolution(), Resolution::Unresolved { .. }),
-            "a 404-disowned endpoint must not leave a usable snapshot behind"
+            matches!(r.as_resolution(), Resolution::Stale { .. }),
+            "a 404 must not disown the snapshot — it is an ordinary failure now"
         );
+
+        // The user's recorded disable is still honoured, not replaced by a
+        // permissive default.
+        let v = decide(r.as_resolution(), None, SpawnPath::StandingContinuation);
+        assert_eq!(v.decision.label(), "deny");
+        assert_eq!(v.rule, "registry-row-disabled-disposition");
+
+        // Past the ceiling the snapshot expires and the cold matrix applies —
+        // still a deny for a standing spawn, never an allow-all.
+        let r = cache
+            .resolve_at(t0 + MAX_SNAPSHOT_AGE + Duration::from_secs(1), || async {
+                Fetched::Err("coord returned 404 Not Found".into())
+            })
+            .await;
+        assert!(matches!(r.as_resolution(), Resolution::Unresolved { .. }));
+        let v = decide(r.as_resolution(), None, SpawnPath::StandingContinuation);
+        assert_eq!(v.decision.label(), "deny");
+        assert_eq!(v.rule, "unresolvable-standing-continuation-default-off");
     }
 
     #[tokio::test]
