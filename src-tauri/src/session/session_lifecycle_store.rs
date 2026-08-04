@@ -29,6 +29,7 @@
 //! default; the poll re-discovers live sessions).
 
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -282,12 +283,66 @@ pub struct TerminalSessionRecord {
     pub handle: Option<String>,
 }
 
-/// Durable map of `claude_session_id -> TerminalSessionRecord`. Cheap to
-/// clone-share via `Arc`; every mutation takes the lock and rewrites the
-/// backing file atomically.
+/// One durable, self-contained mutation appended to the write-ahead log.
+///
+/// The registry used to durably record a mutation by rewriting the WHOLE map
+/// (`to_vec_pretty` → `.json.tmp` → `rename`), making every terminal spawn
+/// O(total sessions) and the aggregate O(N²). A delta is O(1) in the number
+/// of sessions: one `write_all` of one line.
+///
+/// Both variants are IDEMPOTENT and last-writer-wins per key, so replaying a
+/// suffix that the snapshot already contains (the crash-between-snapshot-and-
+/// truncate window) is harmless.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "camelCase")]
+enum LifecycleDelta {
+    /// Insert-or-replace the record under its own `claude_session_id`.
+    /// `Box`ed so the enum stays small (the record is ~20 fields).
+    Upsert { rec: Box<TerminalSessionRecord> },
+    /// Delete the record stored under `id`.
+    Remove { id: String },
+}
+
+/// Append this many deltas before forcing a compaction, regardless of whether
+/// the idle/heartbeat compaction has had a chance to run. Bounds both the WAL
+/// file size and the boot replay cost under a spawn burst.
+const WAL_COMPACT_APPENDS: usize = 512;
+
+/// Open-in-append WAL handle plus its compaction bookkeeping.
+///
+/// The handle is kept open across appends (re-opening per mutation would put a
+/// directory lookup + create back on the spawn path) and is dropped on
+/// compaction, which truncates the file.
+#[derive(Debug, Default)]
+struct WalWriter {
+    file: Option<std::fs::File>,
+    /// Deltas appended since the last successful compaction.
+    appends: usize,
+}
+
+/// Durable map of `claude_session_id -> TerminalSessionRecord`.
+///
+/// Cheap to clone-share via `Arc`. Durability is a **write-ahead log of
+/// per-record deltas** (`terminal-sessions.wal.jsonl`) compacted into the JSON
+/// snapshot (`terminal-sessions.json`); a mutation costs one appended line, not
+/// a whole-map rewrite. See [`LifecycleDelta`] and [`SessionLifecycleStore::compact`].
 #[derive(Debug)]
 pub struct SessionLifecycleStore {
     path: PathBuf,
+    /// Sibling write-ahead log — `<path>` with the extension replaced by
+    /// `wal.jsonl`. Derived once at [`Self::open`].
+    wal_path: PathBuf,
+    /// WAL append handle.
+    ///
+    /// LOCK ORDER — `map` then `wal`, never the reverse. Every delta is written
+    /// while its mutation still holds the map lock, so the WAL order is exactly
+    /// the mutation order and replay is last-writer-wins with no sequence
+    /// numbers. (The old whole-map `persist` ran OUTSIDE the lock and could
+    /// therefore let a stale snapshot land after a fresher one, silently losing
+    /// a mutation; deltas under the lock remove that race outright.)
+    /// [`Self::compact`] takes both in the same order, so an appender is either
+    /// entirely inside the snapshot it truncates or entirely after it.
+    wal: Mutex<WalWriter>,
     map: Mutex<HashMap<String, TerminalSessionRecord>>,
     /// Optional write-only sink for the append-only snapshot HISTORY
     /// ([`crate::session::snapshot_history`], Phase 4 of the session-restore
@@ -344,21 +399,41 @@ impl std::fmt::Debug for CloseObserver {
 }
 
 impl SessionLifecycleStore {
-    /// Open (or initialize) the store at `path`, loading any existing map.
+    /// Open (or initialize) the store at `path`: load the JSON snapshot, then
+    /// replay the sibling write-ahead log over it.
+    ///
+    /// A TORN TAIL (the process died mid-append) is dropped, never fatal — see
+    /// [`replay_wal`]. When the replay found anything it could not use (a torn
+    /// tail or an unparsable line), the store is compacted immediately so the
+    /// next append can never be concatenated onto a partial line.
     pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let map = load_map(&path);
-        Ok(Self {
+        let wal_path = wal_path_for(&path);
+        let mut map = load_map(&path);
+        let replay = replay_wal(&wal_path, &mut map);
+        let store = Self {
             path,
+            wal_path,
+            wal: Mutex::new(WalWriter::default()),
             map: Mutex::new(map),
             snapshot_history: OnceLock::new(),
             restore_emitter: OnceLock::new(),
             transcript_probe: OnceLock::new(),
             close_observer: OnceLock::new(),
-        })
+        };
+        if replay.applied > 0 || replay.damaged {
+            info!(
+                applied = replay.applied,
+                damaged = replay.damaged,
+                path = %store.wal_path.display(),
+                "session_lifecycle_store: replayed write-ahead log — folding into the snapshot"
+            );
+            store.compact();
+        }
+        Ok(store)
     }
 
     /// Attach the close observer (once, at startup) — invoked with the
@@ -501,13 +576,27 @@ impl SessionLifecycleStore {
         }
     }
 
-    /// Append a CHANGE snapshot of the full registry to the history sink,
-    /// if attached. Called by every layout-meaningful mutation AFTER the
-    /// registry write; best-effort by construction (the sink never fails the
-    /// registry path).
-    fn snapshot_change(&self, snapshot: &HashMap<String, TerminalSessionRecord>) {
+    /// Append a CHANGE entry for the records this mutation actually touched,
+    /// if a history sink is attached. Called by every layout-meaningful
+    /// mutation AFTER the registry write; best-effort by construction (the sink
+    /// never fails the registry path).
+    ///
+    /// PER-RECORD, not the full registry: an append used to serialize every
+    /// session in the store on every mutation, making the audit trail O(N) per
+    /// spawn and the aggregate O(N²) — the same cost class the WAL removed from
+    /// the registry itself. The only reader,
+    /// [`crate::session::snapshot_history::read_all_snapshot_sessions`], already
+    /// merges newest-`ts`-per-session-id across lines, so a delta line and a
+    /// whole-registry line reconstruct identically. The 5-minute HEARTBEAT
+    /// ([`Self::snapshot_heartbeat`]) still writes the FULL registry and remains
+    /// the recovery anchor.
+    fn snapshot_change(&self, changed: impl IntoIterator<Item = TerminalSessionRecord>) {
         if let Some(history) = self.snapshot_history.get() {
-            history.record_change(self.snapshot_sessions(snapshot.values().cloned()));
+            let sessions = self.snapshot_sessions(changed);
+            if sessions.is_empty() {
+                return;
+            }
+            history.record_change(sessions);
         }
     }
 
@@ -516,6 +605,12 @@ impl SessionLifecycleStore {
     /// itself enforces the minimum heartbeat spacing, so calling this every
     /// poll tick is cheap.
     pub fn snapshot_heartbeat(&self) {
+        // Idle compaction: the liveness poll is the store's periodic tick, so
+        // fold any accumulated WAL into the snapshot here. Runs whether or not
+        // a history sink is attached, and does nothing when no mutation has
+        // landed since the last fold — an idle runner converges on a compact
+        // snapshot without any mutation ever paying an O(N) rewrite.
+        self.compact_if_dirty();
         let Some(history) = self.snapshot_history.get() else {
             return;
         };
@@ -560,7 +655,7 @@ impl SessionLifecycleStore {
         // `observed` bind). `confirmed_at` is `Option<i64>` (Copy) — safe to
         // read here before `rec`'s fields are moved into the entry below.
         let new_is_confirmed = rec.confirmed_at.is_some();
-        let (snapshot, merged) = {
+        let (merged, superseded) = {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
                 Err(e) => {
@@ -666,6 +761,7 @@ impl SessionLifecycleStore {
             //     `new_is_confirmed`: only a NEW CONFIRMED binding retires a prior
             //     confirmed sibling — an authoritative-but-UNCONFIRMED incoming
             //     (itself not yet proven) must NOT evict a confirmed row.
+            let mut superseded: Vec<TerminalSessionRecord> = Vec::new();
             if (new_is_authoritative || new_is_confirmed) && !new_terminal_id.is_empty() {
                 for other in m.values_mut() {
                     if other.claude_session_id == new_id
@@ -678,6 +774,7 @@ impl SessionLifecycleStore {
                         other.state = "closed".to_string();
                         other.closed_at = Some(now);
                         other.close_reason = Some("superseded".to_string());
+                        superseded.push(other.clone());
                         info!(
                             terminal_id = %new_terminal_id,
                             superseded = %other.claude_session_id,
@@ -688,6 +785,7 @@ impl SessionLifecycleStore {
                         other.state = "closed".to_string();
                         other.closed_at = Some(now);
                         other.close_reason = Some("superseded-terminal-reuse".to_string());
+                        superseded.push(other.clone());
                         info!(
                             terminal_id = %new_terminal_id,
                             superseded = %other.claude_session_id,
@@ -697,10 +795,19 @@ impl SessionLifecycleStore {
                     }
                 }
             }
-            (m.clone(), merged)
+            // O(1) durable write: the merged record plus any sibling this open
+            // superseded — never the whole map.
+            let mut deltas = Vec::with_capacity(1 + superseded.len());
+            deltas.push(LifecycleDelta::Upsert {
+                rec: Box::new(merged.clone()),
+            });
+            deltas.extend(superseded.iter().map(|r| LifecycleDelta::Upsert {
+                rec: Box::new(r.clone()),
+            }));
+            self.persist(m, &deltas);
+            (merged, superseded)
         };
-        self.persist(&snapshot);
-        self.snapshot_change(&snapshot);
+        self.snapshot_change(std::iter::once(merged.clone()).chain(superseded));
         // Phase 4 cloud mirror — emit AFTER the durable local write, from
         // the MERGED record (origin/confirmation preservation applied).
         self.mirror_restore_record(&merged);
@@ -718,7 +825,7 @@ impl SessionLifecycleStore {
     /// and when a sibling open session still shares the workdir.
     pub fn record_close(&self, claude_session_id: &str, reason: &str) {
         let now = Utc::now().timestamp_millis();
-        let (snapshot, closed_workdir) = {
+        let (closed, closed_workdir, workdir_still_in_use) = {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
                 Err(e) => {
@@ -726,19 +833,31 @@ impl SessionLifecycleStore {
                     return;
                 }
             };
-            let workdir = match m.get_mut(claude_session_id) {
+            let closed = match m.get_mut(claude_session_id) {
                 Some(rec) if rec.state == "open" => {
                     rec.state = "closed".to_string();
                     rec.closed_at = Some(now);
                     rec.close_reason = Some(reason.to_string());
-                    rec.working_dir.clone()
+                    rec.clone()
                 }
                 _ => return, // absent or already closed — nothing to flush
             };
-            (m.clone(), workdir)
+            let workdir = closed.working_dir.clone();
+            // Answered under the lock rather than off a full-map clone — the
+            // clone existed only to serve this one query.
+            let still_in_use = workdir.as_deref().is_some_and(|wd| {
+                m.values()
+                    .any(|r| r.state == "open" && r.working_dir.as_deref() == Some(wd))
+            });
+            self.persist(
+                m,
+                &[LifecycleDelta::Upsert {
+                    rec: Box::new(closed.clone()),
+                }],
+            );
+            (closed, workdir, still_in_use)
         };
-        self.persist(&snapshot);
-        self.snapshot_change(&snapshot);
+        self.snapshot_change(std::iter::once(closed));
         // Fabric Phase 3 (review W2): notify AFTER the durable local write,
         // outside the map lock, and only on a REAL open→closed transition
         // (the early return above skips repeat/absent closes). Best-effort:
@@ -755,9 +874,6 @@ impl SessionLifecycleStore {
             return; // the session lives on under a new record — keep its nonce
         }
         if let Some(wd) = closed_workdir {
-            let workdir_still_in_use = snapshot
-                .values()
-                .any(|r| r.state == "open" && r.working_dir.as_deref() == Some(wd.as_str()));
             if !workdir_still_in_use {
                 crate::coord_mcp::release_workdir_on_session_close(&wd);
             }
@@ -767,21 +883,26 @@ impl SessionLifecycleStore {
     /// Bump `last_seen_at` on a present session. No-op (no write) if absent.
     pub fn touch(&self, claude_session_id: &str) {
         let now = Utc::now().timestamp_millis();
-        let snapshot = {
-            let mut m = match self.map.lock() {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!(error = %e, "session_lifecycle_store: lock poisoned on touch");
-                    return;
-                }
-            };
-            match m.get_mut(claude_session_id) {
-                Some(rec) => rec.last_seen_at = now,
-                None => return,
+        let mut m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on touch");
+                return;
             }
-            m.clone()
         };
-        self.persist(&snapshot);
+        let touched = match m.get_mut(claude_session_id) {
+            Some(rec) => {
+                rec.last_seen_at = now;
+                rec.clone()
+            }
+            None => return,
+        };
+        self.persist(
+            m,
+            &[LifecycleDelta::Upsert {
+                rec: Box::new(touched),
+            }],
+        );
     }
 
     /// Update the persisted `title` of the OPEN record hosted by
@@ -796,7 +917,7 @@ impl SessionLifecycleStore {
     /// write) if no open record references the terminal, or the title is
     /// already current.
     pub fn update_title_by_terminal(&self, terminal_id: &str, title: &str) {
-        let snapshot = {
+        let changed = {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
                 Err(e) => {
@@ -814,10 +935,16 @@ impl SessionLifecycleStore {
                 return; // already current — nothing to flush
             }
             rec.title = Some(title.to_string());
-            m.clone()
+            let changed = rec.clone();
+            self.persist(
+                m,
+                &[LifecycleDelta::Upsert {
+                    rec: Box::new(changed.clone()),
+                }],
+            );
+            changed
         };
-        self.persist(&snapshot);
-        self.snapshot_change(&snapshot);
+        self.snapshot_change(std::iter::once(changed));
     }
 
     /// Re-point an OPEN record at the terminal that now hosts it, without
@@ -841,7 +968,7 @@ impl SessionLifecycleStore {
     /// No-op (no write, no flush) when the session is absent, not `open`, or
     /// already bound to `terminal_id`.
     pub fn rebind_terminal(&self, claude_session_id: &str, terminal_id: &str, zone_index: i32) {
-        let snapshot = {
+        let changed = {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
                 Err(e) => {
@@ -860,10 +987,16 @@ impl SessionLifecycleStore {
             }
             rec.terminal_id = terminal_id.to_string();
             rec.zone_index = zone_index;
-            m.clone()
+            let changed = rec.clone();
+            self.persist(
+                m,
+                &[LifecycleDelta::Upsert {
+                    rec: Box::new(changed.clone()),
+                }],
+            );
+            changed
         };
-        self.persist(&snapshot);
-        self.snapshot_change(&snapshot);
+        self.snapshot_change(std::iter::once(changed));
     }
 
     /// Mirror a terminal-page move into the durable registry, resolved by
@@ -874,7 +1007,7 @@ impl SessionLifecycleStore {
     /// Sibling of [`Self::update_title_by_terminal`]. No-op (no write) if no
     /// open record references the terminal, or the page is already current.
     pub fn update_page_by_terminal(&self, terminal_id: &str, page_id: &str) {
-        let snapshot = {
+        let changed = {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
                 Err(e) => {
@@ -892,10 +1025,16 @@ impl SessionLifecycleStore {
                 return; // already current — nothing to flush
             }
             rec.page_id = page_id.to_string();
-            m.clone()
+            let changed = rec.clone();
+            self.persist(
+                m,
+                &[LifecycleDelta::Upsert {
+                    rec: Box::new(changed.clone()),
+                }],
+            );
+            changed
         };
-        self.persist(&snapshot);
-        self.snapshot_change(&snapshot);
+        self.snapshot_change(std::iter::once(changed));
     }
 
     /// Mark a present session as restore-pending (a boot-restore is about to
@@ -905,42 +1044,52 @@ impl SessionLifecycleStore {
     /// No-op (no write) if the session is absent.
     pub fn mark_restore_pending(&self, claude_session_id: &str) {
         let now = Utc::now().timestamp_millis();
-        let snapshot = {
-            let mut m = match self.map.lock() {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!(error = %e, "session_lifecycle_store: lock poisoned on mark_restore_pending");
-                    return;
-                }
-            };
-            match m.get_mut(claude_session_id) {
-                Some(rec) => rec.restore_pending_at = Some(now),
-                None => return,
+        let mut m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on mark_restore_pending");
+                return;
             }
-            m.clone()
         };
-        self.persist(&snapshot);
+        let changed = match m.get_mut(claude_session_id) {
+            Some(rec) => {
+                rec.restore_pending_at = Some(now);
+                rec.clone()
+            }
+            None => return,
+        };
+        self.persist(
+            m,
+            &[LifecycleDelta::Upsert {
+                rec: Box::new(changed),
+            }],
+        );
     }
 
     /// Clear a session's restore-pending marker (resume handshake verified —
     /// the session is live again). No-op (no write) if the session is absent
     /// or the marker is already clear.
     pub fn clear_restore_pending(&self, claude_session_id: &str) {
-        let snapshot = {
-            let mut m = match self.map.lock() {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!(error = %e, "session_lifecycle_store: lock poisoned on clear_restore_pending");
-                    return;
-                }
-            };
-            match m.get_mut(claude_session_id) {
-                Some(rec) if rec.restore_pending_at.is_some() => rec.restore_pending_at = None,
-                _ => return, // absent or already clear — nothing to flush
+        let mut m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on clear_restore_pending");
+                return;
             }
-            m.clone()
         };
-        self.persist(&snapshot);
+        let changed = match m.get_mut(claude_session_id) {
+            Some(rec) if rec.restore_pending_at.is_some() => {
+                rec.restore_pending_at = None;
+                rec.clone()
+            }
+            _ => return, // absent or already clear — nothing to flush
+        };
+        self.persist(
+            m,
+            &[LifecycleDelta::Upsert {
+                rec: Box::new(changed),
+            }],
+        );
     }
 
     /// Flip a present session from PROVISIONAL to CONFIRMED (a provider's
@@ -953,7 +1102,7 @@ impl SessionLifecycleStore {
     /// auto-resume vs treat-as-plain-shell; this method just records the signal.
     pub fn confirm_session(&self, claude_session_id: &str) {
         let now = Utc::now().timestamp_millis();
-        let (snapshot, confirmed) = {
+        let confirmed = {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
                 Err(e) => {
@@ -968,10 +1117,15 @@ impl SessionLifecycleStore {
                 }
                 _ => return, // absent or already confirmed — nothing to flush
             };
-            (m.clone(), confirmed)
+            self.persist(
+                m,
+                &[LifecycleDelta::Upsert {
+                    rec: Box::new(confirmed.clone()),
+                }],
+            );
+            confirmed
         };
-        self.persist(&snapshot);
-        self.snapshot_change(&snapshot);
+        self.snapshot_change(std::iter::once(confirmed.clone()));
         // Phase 4 cloud mirror — a confirmation flip changes the record's
         // honest restore tier (terminal_only → full for a Full-tier
         // provider), which is a material wire-field change.
@@ -989,7 +1143,7 @@ impl SessionLifecycleStore {
     /// terminal-grid row) is a debug-logged no-op — this method never creates
     /// records (a handle-only row would be a phantom restore candidate).
     pub fn set_handle(&self, claude_session_id: &str, handle: &str) {
-        let snapshot = {
+        {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
                 Err(e) => {
@@ -1019,9 +1173,14 @@ impl SessionLifecycleStore {
                 ),
             }
             rec.handle = Some(handle.to_string());
-            m.clone()
-        };
-        self.persist(&snapshot);
+            let changed = rec.clone();
+            self.persist(
+                m,
+                &[LifecycleDelta::Upsert {
+                    rec: Box::new(changed),
+                }],
+            );
+        }
     }
 
     /// Re-key a record from `old_id` to `new_id`: remove the entry stored under
@@ -1047,7 +1206,7 @@ impl SessionLifecycleStore {
         if old_id == new_id {
             return;
         }
-        let snapshot = {
+        let rekeyed = {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
                 Err(e) => {
@@ -1067,11 +1226,21 @@ impl SessionLifecycleStore {
                 return; // old id absent — nothing to re-key
             };
             rec.claude_session_id = new_id.to_string();
-            m.insert(new_id.to_string(), rec);
-            m.clone()
+            m.insert(new_id.to_string(), rec.clone());
+            self.persist(
+                m,
+                &[
+                    LifecycleDelta::Remove {
+                        id: old_id.to_string(),
+                    },
+                    LifecycleDelta::Upsert {
+                        rec: Box::new(rec.clone()),
+                    },
+                ],
+            );
+            rec
         };
-        self.persist(&snapshot);
-        self.snapshot_change(&snapshot);
+        self.snapshot_change(std::iter::once(rekeyed));
     }
 
     /// Remove a record outright (session-restore-redesign Phase 4 reconcile
@@ -1080,22 +1249,29 @@ impl SessionLifecycleStore {
     /// phantom provisional record (authoritative-but-unconfirmed, no live process
     /// and no transcript) can never auto-resume on any future boot. No-op (no
     /// write) if the id is absent.
+    /// A removal appends only a `Remove` delta and NO snapshot-history entry: a
+    /// `SnapshotSession` can only express a record that exists, and the history
+    /// reader ([`crate::session::snapshot_history::read_all_snapshot_sessions`])
+    /// merges the newest line per id — so even under the old full-registry
+    /// append, a removed id kept showing up from the older lines that still
+    /// carried it. Omitting the entry is therefore behavior-preserving.
     pub fn remove_session(&self, claude_session_id: &str) {
-        let snapshot = {
-            let mut m = match self.map.lock() {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!(error = %e, "session_lifecycle_store: lock poisoned on remove_session");
-                    return;
-                }
-            };
-            if m.remove(claude_session_id).is_none() {
-                return; // absent — nothing to flush
+        let mut m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on remove_session");
+                return;
             }
-            m.clone()
         };
-        self.persist(&snapshot);
-        self.snapshot_change(&snapshot);
+        if m.remove(claude_session_id).is_none() {
+            return; // absent — nothing to flush
+        }
+        self.persist(
+            m,
+            &[LifecycleDelta::Remove {
+                id: claude_session_id.to_string(),
+            }],
+        );
     }
 
     /// Clone of the open record currently hosted by `terminal_id`, if any.
@@ -1379,7 +1555,7 @@ impl SessionLifecycleStore {
     /// (and rewrite) every closed row for the primary's whole uptime.
     /// Atomic-writes only if something changed.
     pub fn prune(&self, now: i64, live_terminal_ids: &HashSet<String>) {
-        let snapshot = {
+        {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
                 Err(e) => {
@@ -1435,9 +1611,12 @@ impl SessionLifecycleStore {
             if m.len() == before {
                 return; // nothing pruned — skip the write
             }
-            m.clone()
-        };
-        self.persist(&snapshot);
+        }
+        // A prune drops an unbounded number of rows and already scanned the
+        // whole map, so it is O(N) by construction — fold straight into a fresh
+        // snapshot rather than appending N `Remove` deltas. Runs on the slow
+        // liveness poll, never on the spawn path.
+        self.compact();
     }
 
     /// One-time boot repair for the P4 registry corruption (plan
@@ -1462,7 +1641,7 @@ impl SessionLifecycleStore {
     /// silent cap).
     pub fn repair_terminal_id_collisions(&self) -> usize {
         let now = Utc::now().timestamp_millis();
-        let (snapshot, closed) = {
+        let (closed_recs, closed) = {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
                 Err(e) => {
@@ -1481,6 +1660,7 @@ impl SessionLifecycleStore {
                 }
             }
             let mut closed = 0usize;
+            let mut closed_recs: Vec<TerminalSessionRecord> = Vec::new();
             for (_terminal, ids) in by_terminal {
                 if ids.len() < 2 {
                     continue; // no collision on this terminal
@@ -1514,6 +1694,7 @@ impl SessionLifecycleStore {
                         rec.state = "closed".to_string();
                         rec.closed_at = Some(now);
                         rec.close_reason = Some("superseded-terminal-reuse".to_string());
+                        closed_recs.push(rec.clone());
                         closed += 1;
                     }
                 }
@@ -1521,22 +1702,155 @@ impl SessionLifecycleStore {
             if closed == 0 {
                 return 0; // nothing collapsed — skip the write
             }
-            (m.clone(), closed)
+            (closed_recs, closed)
         };
-        self.persist(&snapshot);
-        self.snapshot_change(&snapshot);
+        // Boot-time bulk repair — one compaction rather than N deltas.
+        self.compact();
+        self.snapshot_change(closed_recs);
         closed
     }
 
-    /// Best-effort atomic flush. A write failure is logged, not propagated —
-    /// the in-memory map still reflects the mutation for this process.
-    fn persist(&self, snapshot: &HashMap<String, TerminalSessionRecord>) {
-        if let Err(e) = write_map(&self.path, snapshot) {
+    /// Durably record one mutation as O(1) appended WAL lines.
+    ///
+    /// MUST be called while the caller still holds the `map` lock (the guard is
+    /// taken by reference purely to make that a compile-time requirement) — see
+    /// the `wal` field doc for why the ordering matters. Returns whether the WAL
+    /// has grown past [`WAL_COMPACT_APPENDS`], which the caller folds into the
+    /// snapshot AFTER releasing the map lock (see [`Self::persist`]).
+    ///
+    /// Best-effort exactly like the whole-map rewrite it replaces: a write
+    /// failure is logged, not propagated — the in-memory map still reflects the
+    /// mutation for this process.
+    #[must_use = "a full WAL must be compacted once the map lock is released"]
+    fn wal_append(
+        &self,
+        _guard: &std::sync::MutexGuard<'_, HashMap<String, TerminalSessionRecord>>,
+        deltas: &[LifecycleDelta],
+    ) -> bool {
+        if deltas.is_empty() {
+            return false;
+        }
+        let mut w = match self.wal.lock() {
+            Ok(w) => w,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: WAL lock poisoned — mutation kept in memory only");
+                return false;
+            }
+        };
+        // One buffer, one `write_all`: a delta line must reach the file whole or
+        // not at all as far as the OS is concerned, so a crash can only ever
+        // truncate the tail (which `replay_wal` drops).
+        let mut buf = Vec::with_capacity(deltas.len() * 512);
+        for d in deltas {
+            match serde_json::to_writer(&mut buf, d) {
+                Ok(()) => buf.push(b'\n'),
+                Err(e) => {
+                    warn!(error = %e, "session_lifecycle_store: WAL serialize failed — delta dropped");
+                    return false;
+                }
+            }
+        }
+        if w.file.is_none() {
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.wal_path)
+            {
+                Ok(f) => w.file = Some(f),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        path = %self.wal_path.display(),
+                        "session_lifecycle_store: WAL open failed — mutation kept in memory only"
+                    );
+                    return false;
+                }
+            }
+        }
+        let Some(file) = w.file.as_mut() else {
+            return false;
+        };
+        if let Err(e) = file.write_all(&buf) {
+            warn!(
+                error = %e,
+                path = %self.wal_path.display(),
+                "session_lifecycle_store: WAL append failed — mutation kept in memory only"
+            );
+            // Drop the handle so the next append re-opens rather than keeping
+            // writing through a broken descriptor.
+            w.file = None;
+            return false;
+        }
+        w.appends += deltas.len();
+        w.appends >= WAL_COMPACT_APPENDS
+    }
+
+    /// Fold the WAL into the JSON snapshot and truncate it.
+    ///
+    /// Ordering is what makes this crash-safe: the snapshot is written and
+    /// renamed into place FIRST, and only then is the WAL truncated. A crash in
+    /// between replays deltas the snapshot already contains — idempotent — while
+    /// the reverse order would lose them outright.
+    ///
+    /// Takes `map` then `wal` (the store-wide lock order), so no append can
+    /// straddle the truncation.
+    pub fn compact(&self) {
+        let m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on compact");
+                return;
+            }
+        };
+        let mut w = match self.wal.lock() {
+            Ok(w) => w,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: WAL lock poisoned on compact");
+                return;
+            }
+        };
+        if let Err(e) = write_map(&self.path, &m) {
             warn!(
                 error = %e,
                 path = %self.path.display(),
-                "session_lifecycle_store: persist failed — kept in memory only"
+                "session_lifecycle_store: snapshot rewrite failed — WAL kept, nothing lost"
             );
+            return; // keep the WAL: it is still the durable record
+        }
+        // Snapshot is on disk and renamed into place — the WAL is now redundant.
+        w.file = None;
+        match std::fs::File::create(&self.wal_path) {
+            Ok(_) => w.appends = 0,
+            Err(e) => warn!(
+                error = %e,
+                path = %self.wal_path.display(),
+                "session_lifecycle_store: WAL truncate failed — replay will re-apply committed deltas (idempotent)"
+            ),
+        }
+    }
+
+    /// Fold the WAL into the snapshot when it has anything in it. Called from
+    /// the liveness poll's heartbeat so an idle runner converges on a compact
+    /// snapshot without any mutation ever paying an O(N) rewrite.
+    fn compact_if_dirty(&self) {
+        let dirty = matches!(self.wal.lock(), Ok(w) if w.appends > 0);
+        if dirty {
+            self.compact();
+        }
+    }
+
+    /// Durably record one mutation, compacting when the WAL has grown past its
+    /// bound. Call with the map guard still held; it is consumed so the
+    /// compaction (which re-takes the map lock) can only run after release.
+    fn persist(
+        &self,
+        guard: std::sync::MutexGuard<'_, HashMap<String, TerminalSessionRecord>>,
+        deltas: &[LifecycleDelta],
+    ) {
+        let full = self.wal_append(&guard, deltas);
+        drop(guard);
+        if full {
+            self.compact();
         }
     }
 }
@@ -1681,9 +1995,118 @@ fn load_map(path: &Path) -> HashMap<String, TerminalSessionRecord> {
 fn write_map(path: &Path, map: &HashMap<String, TerminalSessionRecord>) -> std::io::Result<()> {
     let tmp = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec_pretty(map).map_err(std::io::Error::other)?;
-    std::fs::write(&tmp, &bytes)?;
+    // fsync the temp file BEFORE the rename: the rename is what publishes the
+    // snapshot, and publishing a name that points at unflushed bytes is exactly
+    // how a compaction can lose the deltas it is about to truncate.
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
     std::fs::rename(tmp, path)?;
     Ok(())
+}
+
+/// Write-ahead-log path for a snapshot path: `terminal-sessions.json` →
+/// `terminal-sessions.wal.jsonl`, always a sibling so both live under the same
+/// instance-scoped directory.
+fn wal_path_for(path: &Path) -> PathBuf {
+    path.with_extension("wal.jsonl")
+}
+
+/// Outcome of a WAL replay — enough to decide whether the log needs folding
+/// into the snapshot before the next append.
+#[derive(Debug, Default, Clone, Copy)]
+struct WalReplay {
+    /// Deltas successfully applied to the map.
+    applied: usize,
+    /// The log ended mid-line (a crash during an append) or held a line that
+    /// could not be parsed. Either way the file must be rewritten before any
+    /// further append, or the next line would be concatenated onto the partial
+    /// one and corrupt an otherwise-good record.
+    damaged: bool,
+}
+
+/// Replay `wal_path` over `map`, in file order, last-writer-wins per key.
+///
+/// CRASH SAFETY. Appends are whole-line `write_all`s, so the only damage a
+/// crash can do is truncate the final line. A trailing segment with no `\n`
+/// terminator is therefore treated as NEVER COMMITTED and dropped — it is the
+/// mutation that was in flight when the process died, which the old whole-map
+/// rewrite would equally have lost (its `.json.tmp` would simply not have been
+/// renamed). Every complete line before it is committed and is applied.
+///
+/// A complete-but-unparsable line (schema drift, media corruption) is skipped
+/// with a warning rather than aborting the replay: one bad delta must not cost
+/// the operator every restorable session, the same fail-soft rule
+/// [`load_map`] applies to the snapshot.
+fn replay_wal(wal_path: &Path, map: &mut HashMap<String, TerminalSessionRecord>) -> WalReplay {
+    let bytes = match std::fs::read(wal_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return WalReplay::default(),
+        Err(e) => {
+            warn!(
+                error = %e,
+                path = %wal_path.display(),
+                "session_lifecycle_store: WAL read failed — snapshot used as-is"
+            );
+            return WalReplay::default();
+        }
+    };
+    if bytes.is_empty() {
+        return WalReplay::default();
+    }
+    let mut out = WalReplay::default();
+    let mut malformed = 0usize;
+    // Only `\n`-terminated segments are committed; `split` yields a trailing
+    // empty slice for a well-terminated file and the torn partial otherwise.
+    let mut segments: Vec<&[u8]> = bytes.split(|b| *b == b'\n').collect();
+    match segments.pop() {
+        Some(tail) if !tail.is_empty() => {
+            out.damaged = true;
+            warn!(
+                bytes = tail.len(),
+                path = %wal_path.display(),
+                "session_lifecycle_store: torn WAL tail (crash mid-append) — dropping the uncommitted line"
+            );
+        }
+        _ => {}
+    }
+    for seg in segments {
+        if seg.iter().all(|b| b.is_ascii_whitespace()) {
+            continue;
+        }
+        match serde_json::from_slice::<LifecycleDelta>(seg) {
+            Ok(LifecycleDelta::Upsert { rec }) => {
+                let mut rec = *rec;
+                rec.origin = normalize_origin(rec.origin);
+                map.insert(rec.claude_session_id.clone(), rec);
+                out.applied += 1;
+            }
+            Ok(LifecycleDelta::Remove { id }) => {
+                map.remove(&id);
+                out.applied += 1;
+            }
+            Err(e) => {
+                malformed += 1;
+                out.damaged = true;
+                warn!(
+                    error = %e,
+                    path = %wal_path.display(),
+                    "session_lifecycle_store: malformed WAL delta — skipped, keeping the rest"
+                );
+            }
+        }
+    }
+    if malformed > 0 {
+        warn!(
+            malformed,
+            applied = out.applied,
+            path = %wal_path.display(),
+            "session_lifecycle_store: WAL replay dropped malformed delta(s)"
+        );
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1849,6 +2272,203 @@ mod tests {
             confirmed_at: None,
             handle: None,
         }
+    }
+
+    // ── Write-ahead log (Phase 6, B1) ───────────────────────────────────────
+    //
+    // A mutation costs ONE appended delta line instead of a whole-map JSON
+    // rewrite. These prove the three properties that buys us nothing without:
+    // deltas survive a reopen, a torn tail loses only the uncommitted line, and
+    // compaction is idempotent against replay.
+
+    /// A mutation is durable via the WAL alone — no compaction needed — and the
+    /// JSON snapshot has NOT been rewritten (that is the whole O(1) point).
+    #[test]
+    fn wal_makes_a_mutation_durable_without_rewriting_the_snapshot() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let wal = wal_path_for(&path);
+
+        {
+            let store = SessionLifecycleStore::open(&path).unwrap();
+            store.record_open(rec("sess-wal"));
+            assert!(wal.exists(), "the mutation must have landed in the WAL");
+            let snapshot = std::fs::read_to_string(&path).unwrap_or_default();
+            assert!(
+                !snapshot.contains("sess-wal"),
+                "the whole-map snapshot must NOT be rewritten per mutation — that is the \
+                 O(total sessions) cost this replaces (snapshot was: {snapshot})"
+            );
+        }
+
+        let reopened = SessionLifecycleStore::open(&path).unwrap();
+        assert!(
+            reopened.get("sess-wal").is_some(),
+            "a WAL-only mutation must survive a reopen"
+        );
+    }
+
+    /// Every mutation kind round-trips through the WAL, including the two that
+    /// DELETE (`remove_session`, `rekey_session`) — a replay that only ever
+    /// upserts would resurrect them.
+    #[test]
+    fn wal_replays_upserts_removals_and_rekeys_in_order() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        {
+            let store = SessionLifecycleStore::open(&path).unwrap();
+            store.record_open(rec("keep"));
+            store.record_open(rec("drop"));
+            store.record_open(rec("old-id"));
+            store.remove_session("drop");
+            store.rekey_session("old-id", "new-id");
+            store.update_title_by_terminal("term-abc", "renamed");
+        }
+        let reopened = SessionLifecycleStore::open(&path).unwrap();
+        assert!(reopened.get("keep").is_some());
+        assert!(
+            reopened.get("drop").is_none(),
+            "a Remove delta must survive replay"
+        );
+        assert!(reopened.get("old-id").is_none(), "the rekey source is gone");
+        assert!(
+            reopened.get("new-id").is_some(),
+            "the rekey target is there"
+        );
+    }
+
+    /// CRASH SAFETY. A process killed mid-append leaves a partial final line.
+    /// Every line before it is committed and must be replayed; the partial one
+    /// was never committed and must be dropped — not fatal, and not silently
+    /// half-parsed.
+    #[test]
+    fn torn_wal_tail_drops_only_the_uncommitted_line() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let wal = wal_path_for(&path);
+        {
+            let store = SessionLifecycleStore::open(&path).unwrap();
+            store.record_open(rec("committed-1"));
+            let mut r = rec("committed-2");
+            r.terminal_id = "term-two".to_string();
+            store.record_open(r);
+        }
+        // Append a HALF-written third delta: valid prefix, no newline.
+        let torn = serde_json::to_string(&LifecycleDelta::Upsert {
+            rec: Box::new(rec("torn")),
+        })
+        .unwrap();
+        let mut f = std::fs::OpenOptions::new().append(true).open(&wal).unwrap();
+        f.write_all(&torn.as_bytes()[..torn.len() / 2]).unwrap();
+        drop(f);
+
+        let reopened = SessionLifecycleStore::open(&path).unwrap();
+        assert!(
+            reopened.get("committed-1").is_some() && reopened.get("committed-2").is_some(),
+            "a torn tail must not cost the committed records before it"
+        );
+        assert!(
+            reopened.get("torn").is_none(),
+            "an unterminated tail line was never committed and must be dropped"
+        );
+        // The damaged log is folded into a clean snapshot on open, so the NEXT
+        // append can never be concatenated onto the partial line.
+        assert_eq!(
+            std::fs::read_to_string(&wal).unwrap(),
+            "",
+            "a damaged WAL must be compacted away at open"
+        );
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("committed-1"));
+    }
+
+    /// A complete-but-unparsable delta (schema drift, media corruption) costs
+    /// only itself — the same fail-soft rule `load_map` applies to the snapshot.
+    #[test]
+    fn malformed_wal_line_drops_only_that_delta() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let wal = wal_path_for(&path);
+        {
+            let store = SessionLifecycleStore::open(&path).unwrap();
+            store.record_open(rec("before"));
+        }
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&wal).unwrap();
+            writeln!(f, "{{\"op\":\"upsert\",\"rec\":\"not a record\"}}").unwrap();
+            let mut r = rec("after");
+            r.terminal_id = "term-after".to_string();
+            let good = serde_json::to_string(&LifecycleDelta::Upsert { rec: Box::new(r) }).unwrap();
+            writeln!(f, "{good}").unwrap();
+        }
+        let reopened = SessionLifecycleStore::open(&path).unwrap();
+        assert!(reopened.get("before").is_some());
+        assert!(
+            reopened.get("after").is_some(),
+            "a bad line must not abort the replay of the good ones after it"
+        );
+    }
+
+    /// Compaction publishes the snapshot BEFORE truncating the WAL, so the
+    /// crash window replays deltas the snapshot already holds. Replay is
+    /// last-writer-wins per key, so that is a no-op — prove it.
+    #[test]
+    fn replaying_a_wal_the_snapshot_already_contains_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let wal = wal_path_for(&path);
+        {
+            let store = SessionLifecycleStore::open(&path).unwrap();
+            store.record_open(rec("sess-x"));
+            let before = std::fs::read_to_string(&wal).unwrap();
+            store.compact();
+            // Simulate the crash window: snapshot written + renamed, WAL not
+            // yet truncated.
+            std::fs::write(&wal, before).unwrap();
+        }
+        let reopened = SessionLifecycleStore::open(&path).unwrap();
+        let all = reopened.all_records();
+        assert_eq!(all.len(), 1, "a replayed-twice record must not duplicate");
+        assert_eq!(all[0].claude_session_id, "sess-x");
+    }
+
+    /// The WAL is bounded: past [`WAL_COMPACT_APPENDS`] the store folds it into
+    /// the snapshot on its own, so boot replay cost stays bounded no matter how
+    /// long the runner has been up.
+    #[test]
+    fn wal_compacts_itself_past_the_append_bound() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let wal = wal_path_for(&path);
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.record_open(rec("sess-touch"));
+        for _ in 0..WAL_COMPACT_APPENDS {
+            store.touch("sess-touch");
+        }
+        assert!(
+            std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0) < 4096,
+            "the WAL must have been folded into the snapshot, not grown without bound"
+        );
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("sess-touch"));
+    }
+
+    /// Idle compaction: the liveness poll's heartbeat folds a dirty WAL into
+    /// the snapshot, so an idle runner converges without any mutation paying an
+    /// O(N) rewrite.
+    #[test]
+    fn heartbeat_folds_a_dirty_wal_into_the_snapshot() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let wal = wal_path_for(&path);
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.record_open(rec("sess-hb"));
+        assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+        store.snapshot_heartbeat();
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0);
+        assert!(std::fs::read_to_string(&path).unwrap().contains("sess-hb"));
     }
 
     /// The `terminal_id -> claude_session_id` reverse index that the enriched

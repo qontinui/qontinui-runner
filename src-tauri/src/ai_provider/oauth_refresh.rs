@@ -8,19 +8,136 @@
 //!   TOKEN_URL  = https://platform.claude.com/v1/oauth/token
 //!   CLIENT_ID  = 9d1c250a-e61b-44d9-88ed-5944d1962f5e
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
-/// Try to refresh an expired Claude OAuth token, updating the credentials file in place.
+/// Refresh proactively once the token is within this long of expiring, so an
+/// account in ordinary use is topped up long before it can hard-expire and
+/// never needs a refresh ON the spawn path. 10 minutes.
+const REFRESH_LEAD_MS: i64 = 10 * 60 * 1000;
+
+/// Minimum spacing between background refresh ATTEMPTS for one credentials
+/// file. A refresh that fails (offline, revoked grant, 5xx) must not turn every
+/// subsequent spawn into another token POST.
+#[cfg_attr(test, allow(dead_code))]
+const REFRESH_RETRY_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Per-credentials-file background-refresh bookkeeping.
+#[cfg_attr(test, allow(dead_code))]
+#[derive(Debug, Default)]
+struct RefreshState {
+    in_flight: bool,
+    last_attempt: Option<Instant>,
+}
+
+/// Background refresh state, keyed by credentials path.
+#[cfg_attr(test, allow(dead_code))]
+static REFRESH_STATE: once_cell::sync::Lazy<Mutex<HashMap<PathBuf, RefreshState>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Ask for a background OAuth refresh of `creds_path` and return IMMEDIATELY.
+///
+/// This is the whole point of the module's redesign: the refresh used to run
+/// inline on the terminal/AI spawn path (`creds_path_is_valid` →
+/// `try_refresh_credentials`), so one expired token put a full HTTPS round-trip
+/// to `platform.claude.com` — unbounded, and serialized with every other spawn
+/// through the tokio worker it parked — between the operator's click and their
+/// PTY. Spawn now always uses the credentials that are on disk *right now*; the
+/// refresh lands out of band and the next spawn picks it up.
+///
+/// Deduped (one in-flight refresh per file) and backed off
+/// ([`REFRESH_RETRY_BACKOFF`]) so a burst of spawns, or a persistently failing
+/// grant, cannot become a token-endpoint storm.
+pub(crate) fn request_background_refresh(creds_path: &Path) {
+    // Under test the request is RECORDED and never performed: a unit test must
+    // not POST to platform.claude.com. Recording it is also what lets the tests
+    // assert that the credential predicates now ASK for a refresh where they
+    // used to block on one.
+    #[cfg(test)]
+    {
+        if let Ok(mut log) = tests::REFRESH_REQUESTS.lock() {
+            log.push(creds_path.to_path_buf());
+        }
+    }
+    #[cfg(not(test))]
+    spawn_background_refresh(creds_path);
+}
+
+/// Claim the refresh slot for `creds_path` (dedupe + backoff) and run the
+/// refresh on a dedicated OS thread. Split out of
+/// [`request_background_refresh`] so the test build can stub the whole
+/// side-effect at one seam.
+#[cfg(not(test))]
+fn spawn_background_refresh(creds_path: &Path) {
+    let path = creds_path.to_path_buf();
+    {
+        let mut state = match REFRESH_STATE.lock() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "OAuth refresh: state lock poisoned — skipping background refresh");
+                return;
+            }
+        };
+        let entry = state.entry(path.clone()).or_default();
+        if entry.in_flight {
+            return;
+        }
+        if entry
+            .last_attempt
+            .is_some_and(|t| t.elapsed() < REFRESH_RETRY_BACKOFF)
+        {
+            return;
+        }
+        entry.in_flight = true;
+        entry.last_attempt = Some(Instant::now());
+    }
+
+    // A dedicated OS thread rather than `spawn_blocking`: this must not consume
+    // a runtime worker, and `refresh_credentials_blocking` builds/drops a
+    // `reqwest::blocking` runtime that dislikes an ambient one.
+    let spawned = std::thread::Builder::new()
+        .name("oauth-refresh".to_string())
+        .spawn(move || {
+            if refresh_credentials_blocking(&path).is_none() {
+                warn!(
+                    path = %path.display(),
+                    "OAuth background refresh failed — the next spawn uses the existing token and \
+                     the provider surfaces its own auth prompt if it has expired"
+                );
+            }
+            if let Ok(mut state) = REFRESH_STATE.lock() {
+                if let Some(entry) = state.get_mut(&path) {
+                    entry.in_flight = false;
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        warn!(error = %e, "OAuth refresh: could not spawn background refresh thread");
+        if let Ok(mut state) = REFRESH_STATE.lock() {
+            if let Some(entry) = state.get_mut(creds_path) {
+                entry.in_flight = false;
+            }
+        }
+    }
+}
+
+/// Refresh an expired Claude OAuth token, updating the credentials file in place.
 ///
 /// Returns the new access token on success, `None` if the credentials are
 /// missing a `refreshToken`, the network call fails, or the server rejects the
 /// request.
-pub(crate) fn try_refresh_credentials(creds_path: &Path) -> Option<String> {
+///
+/// **BLOCKS on the network.** Never call this from a spawn path — use
+/// [`request_background_refresh`]. The remaining direct callers are surfaces
+/// where the operator is explicitly waiting on the result (the account-settings
+/// re-auth command, the warm API provider's own retry).
+pub(crate) fn refresh_credentials_blocking(creds_path: &Path) -> Option<String> {
     let content = match std::fs::read_to_string(creds_path) {
         Ok(c) => c,
         Err(e) => {
@@ -75,7 +192,9 @@ pub(crate) fn try_refresh_credentials(creds_path: &Path) -> Option<String> {
     // `reqwest::blocking::Client`'s internal tokio runtime is created and
     // dropped outside any existing async runtime context. Without this,
     // dropping the client inside `tokio::task::spawn_blocking` panics with
-    // "Cannot drop a runtime in a context where blocking is not allowed".
+    // "Cannot drop a runtime in a context where blocking is not allowed" —
+    // still load-bearing for the two `spawn_blocking` callers that remain
+    // (`commands::ai_settings::probe_account_usage`, the warm API provider).
     let request_body = serde_json::json!({
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
@@ -170,19 +289,22 @@ pub(crate) fn try_refresh_credentials(creds_path: &Path) -> Option<String> {
     Some(new_access_token)
 }
 
-/// Ensure the OAuth credentials for `config_dir` are valid, refreshing silently
-/// if expired.
+/// Best-effort pre-flight for subprocess invocations (`claude --print`,
+/// interactive stream-json, `ClaudeSession::spawn`): if the credentials for
+/// `config_dir` are expired or about to be, kick off a BACKGROUND refresh.
 ///
-/// This is a best-effort pre-flight for subprocess invocations
-/// (`claude --print`, interactive stream-json). Failures are logged but never
-/// propagated — the subprocess can surface any real auth error on its own.
+/// **Never blocks and never waits for the network.** It used to `.join()` a
+/// token POST before the subprocess could start, which is exactly the
+/// unbounded, session-count-multiplying stall Phase 6 removes. The subprocess
+/// spawns against whatever credentials are on disk; if they are past expiry the
+/// provider surfaces its own auth prompt — the same UX as a refresh that fails
+/// today, which was already swallowed with a warn.
 pub(crate) fn try_ensure_valid_credentials(config_dir: Option<&str>) {
     if let Some(path) = find_creds_path(config_dir) {
-        if is_expired(&path) {
-            debug!("OAuth token expired — attempting silent refresh before subprocess spawn");
-            if try_refresh_credentials(&path).is_none() {
-                warn!("OAuth refresh failed — subprocess may encounter auth errors");
-            }
+        let snap = read_creds_snapshot(&path);
+        if snap.needs_refresh(now_ms()) && snap.has_refresh_token {
+            debug!("OAuth token expiring — requesting background refresh (spawn is not blocked)");
+            request_background_refresh(&path);
         }
     }
 }
@@ -247,15 +369,82 @@ fn macos_keychain_has_claude_credentials() -> bool {
         .unwrap_or(false)
 }
 
-/// Shared validity core: an existing creds file that is unexpired, or expired
-/// but refreshed in place. `try_refresh_credentials` returns `None` with no
-/// network call when there is no `refreshToken`, so an expired, unrefreshable
-/// account deterministically reports invalid.
+/// Shared validity core, NON-BLOCKING: an existing creds file that is
+/// unexpired, or expired but still holding a `refreshToken` (so a refresh can
+/// bring it back).
+///
+/// This used to answer the expired case by performing the refresh INLINE — a
+/// network round-trip on the terminal- and AI-spawn paths (`config.rs` →
+/// `has_valid_credentials` → here). It now answers from the file alone and
+/// hands the refresh to [`request_background_refresh`], which also fires
+/// PROACTIVELY within [`REFRESH_LEAD_MS`] of expiry so a live account is
+/// normally refreshed long before any spawn could care.
+///
+/// The verdict is unchanged in both directions that matter:
+/// - unexpired → valid (as before);
+/// - expired with NO `refreshToken` → invalid, deterministically and with no
+///   network call (as before — the old inline refresh returned `None` there);
+/// - expired WITH a `refreshToken` → valid, where before it was "valid iff the
+///   inline refresh succeeded". The account is the one the operator has, the
+///   refresh is already in flight, and a lost race surfaces the provider's own
+///   auth prompt instead of an "no authenticated Claude account" abort.
 fn creds_path_is_valid(creds_path: &Path) -> bool {
     if !creds_path.exists() {
         return false;
     }
-    !is_expired(creds_path) || try_refresh_credentials(creds_path).is_some()
+    let snap = read_creds_snapshot(creds_path);
+    let now = now_ms();
+    if snap.needs_refresh(now) && snap.has_refresh_token {
+        request_background_refresh(creds_path);
+    }
+    !snap.is_expired(now) || snap.has_refresh_token
+}
+
+/// The two facts every credential decision here needs, read in ONE parse.
+///
+/// Deliberately lenient: an unreadable or unparsable file, or one with no
+/// `expiresAt`, yields `expires_at_ms == 0` — "expiry unknown", treated as NOT
+/// expired. That is the pre-existing behaviour of `is_expired`, preserved so a
+/// hand-edited or provider-specific credentials layout is never demoted to
+/// "invalid account" on a parse quirk.
+#[derive(Debug, Default, Clone, Copy)]
+struct CredsSnapshot {
+    expires_at_ms: i64,
+    has_refresh_token: bool,
+}
+
+impl CredsSnapshot {
+    fn is_expired(&self, now_ms: i64) -> bool {
+        self.expires_at_ms != 0 && now_ms >= self.expires_at_ms
+    }
+
+    /// Expired, or close enough that a proactive refresh is worth starting.
+    fn needs_refresh(&self, now_ms: i64) -> bool {
+        self.expires_at_ms != 0 && now_ms >= self.expires_at_ms - REFRESH_LEAD_MS
+    }
+}
+
+fn read_creds_snapshot(creds_path: &Path) -> CredsSnapshot {
+    let Ok(content) = std::fs::read_to_string(creds_path) else {
+        return CredsSnapshot::default();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return CredsSnapshot::default();
+    };
+    let oauth = &json["claudeAiOauth"];
+    CredsSnapshot {
+        expires_at_ms: oauth["expiresAt"].as_i64().unwrap_or(0),
+        has_refresh_token: oauth["refreshToken"]
+            .as_str()
+            .is_some_and(|t| !t.is_empty()),
+    }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
 }
 
 fn find_creds_path(config_dir: Option<&str>) -> Option<PathBuf> {
@@ -283,30 +472,19 @@ fn find_creds_path(config_dir: Option<&str>) -> Option<PathBuf> {
     None
 }
 
-fn is_expired(creds_path: &Path) -> bool {
-    let content = match std::fs::read_to_string(creds_path) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let json: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let expires_at_ms = json["claudeAiOauth"]["expiresAt"].as_i64().unwrap_or(0);
-    if expires_at_ms == 0 {
-        return false;
-    }
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-    now_ms >= expires_at_ms
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// Background-refresh requests recorded instead of performed under test
+    /// (see [`request_background_refresh`]).
+    pub(super) static REFRESH_REQUESTS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    /// Drain the recorded refresh requests.
+    fn taken_refresh_requests() -> Vec<PathBuf> {
+        std::mem::take(&mut *REFRESH_REQUESTS.lock().expect("refresh log"))
+    }
 
     /// Write a `.credentials.json` into a fresh temp dir and return
     /// `(tempdir_guard, dir_path_string)`. The guard must be kept alive for
@@ -358,11 +536,72 @@ mod tests {
 
     #[test]
     fn has_valid_credentials_false_when_expired_and_no_refresh_token() {
-        // Empty refreshToken → `try_refresh_credentials` returns `None` with no
-        // network call, so an expired, unrefreshable account is rejected
-        // deterministically (no live HTTP in this unit test).
+        // Empty refreshToken → nothing can bring the account back, so an
+        // expired, unrefreshable account is rejected deterministically and no
+        // refresh is even requested (no live HTTP in this unit test).
+        let _ = taken_refresh_requests();
         let (_guard, path) = dir_with_creds(past_ms(), "");
         assert!(!has_valid_credentials(&path));
+        assert!(
+            taken_refresh_requests().is_empty(),
+            "an unrefreshable account must not queue a pointless token POST"
+        );
+    }
+
+    /// Phase 6 (B3): the spawn-path credential predicate must never perform a
+    /// network call. An expired-but-refreshable account is now reported VALID
+    /// with a BACKGROUND refresh requested, instead of blocking the spawn on an
+    /// inline token POST whose result decided the verdict.
+    #[test]
+    fn expired_but_refreshable_is_valid_and_only_queues_a_background_refresh() {
+        let _ = taken_refresh_requests();
+        let (guard, path) = dir_with_creds(past_ms(), "rt-present");
+        assert!(
+            has_valid_credentials(&path),
+            "an expired account with a refresh token must stay usable — the provider surfaces \
+             its own auth prompt if the refresh loses the race"
+        );
+        let requested = taken_refresh_requests();
+        assert_eq!(
+            requested,
+            vec![guard.path().join(".credentials.json")],
+            "exactly one background refresh should have been requested, and no inline one performed"
+        );
+    }
+
+    /// Proactive top-up: a token inside [`REFRESH_LEAD_MS`] of expiry is still
+    /// valid AND queues a refresh, so ordinary use keeps an account current and
+    /// a spawn never meets a hard-expired token in the first place.
+    #[test]
+    fn near_expiry_token_is_valid_and_queues_a_proactive_refresh() {
+        let _ = taken_refresh_requests();
+        let soon = now_ms() + REFRESH_LEAD_MS / 2;
+        let (guard, path) = dir_with_creds(soon, "rt-present");
+        assert!(has_valid_credentials(&path));
+        assert_eq!(
+            taken_refresh_requests(),
+            vec![guard.path().join(".credentials.json")]
+        );
+    }
+
+    /// A comfortably-live token must not generate any refresh traffic at all.
+    #[test]
+    fn healthy_token_queues_no_refresh() {
+        let _ = taken_refresh_requests();
+        let (_guard, path) = dir_with_creds(future_ms(), "rt-present");
+        assert!(has_valid_credentials(&path));
+        assert!(taken_refresh_requests().is_empty());
+    }
+
+    /// An unparsable credentials file keeps its historical verdict: expiry is
+    /// UNKNOWN, which is not "expired", so the account is not demoted.
+    #[test]
+    fn unparsable_credentials_are_not_treated_as_expired() {
+        let _ = taken_refresh_requests();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(".credentials.json"), b"{not json").expect("write");
+        assert!(has_valid_credentials(&dir.path().to_string_lossy()));
+        assert!(taken_refresh_requests().is_empty());
     }
 
     #[test]

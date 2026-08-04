@@ -101,7 +101,19 @@ pub fn session_restore_dir() -> PathBuf {
 /// launch that can't write the hook simply omits `--settings` (identity still
 /// pinned via `--session-id`; only the confirmation hook is absent). The hook
 /// script is marked executable on Unix.
+///
+/// CACHED PER `base_dir` (Phase 6, B2). The four files are byte-identical for a
+/// given `base_dir` — the scripts are `include_str!`'d constants and the
+/// settings file only substitutes paths derived from `base_dir` — yet every
+/// terminal spawn rewrote all four plus three `chmod`s. After the first
+/// materialize in this process a spawn costs four `stat`s (proving the files are
+/// still there) and nothing else. An externally deleted or modified file falls
+/// straight through to a full rewrite, so the cache can never serve a path that
+/// is not on disk.
 pub fn materialize(base_dir: &Path) -> Option<PathBuf> {
+    if let Some(settings_path) = cached_materialization(base_dir) {
+        return Some(settings_path);
+    }
     if let Err(e) = std::fs::create_dir_all(base_dir) {
         tracing::warn!(
             error = %e,
@@ -155,7 +167,38 @@ pub fn materialize(base_dir: &Path) -> Option<PathBuf> {
         return None;
     }
 
+    if let Ok(mut done) = MATERIALIZED.lock() {
+        done.insert(base_dir.to_path_buf(), settings_path.clone());
+    }
     Some(settings_path)
+}
+
+/// Base dirs whose hook set this process has already materialized, mapped to
+/// the settings path [`materialize`] returned for them.
+static MATERIALIZED: once_cell::sync::Lazy<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, PathBuf>>,
+> = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Every file [`materialize`] is responsible for, in `base_dir`.
+fn hook_files(base_dir: &Path) -> [PathBuf; 4] {
+    [
+        base_dir.join(HOOK_SCRIPT_NAME),
+        base_dir.join(STOP_HOOK_SCRIPT_NAME),
+        base_dir.join(PRECOMPACT_HOOK_SCRIPT_NAME),
+        base_dir.join(HOOK_SETTINGS_NAME),
+    ]
+}
+
+/// The settings path for `base_dir` if this process already materialized it AND
+/// all four files are still present. `None` (⇒ full rewrite) otherwise, so an
+/// operator who deletes the dir gets it back on the next spawn.
+fn cached_materialization(base_dir: &Path) -> Option<PathBuf> {
+    let settings_path = MATERIALIZED.lock().ok()?.get(base_dir)?.clone();
+    if hook_files(base_dir).iter().all(|p| p.exists()) {
+        Some(settings_path)
+    } else {
+        None
+    }
 }
 
 #[cfg(unix)]

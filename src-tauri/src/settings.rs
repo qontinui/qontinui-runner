@@ -2016,7 +2016,12 @@ impl Default for CiNodeSettings {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+// `Clone` exists so [`read_settings_from_disk`] can serve a cached parse
+// instead of re-reading and re-parsing the file on every call (twice — once to
+// `Settings`, once to `serde_json::Value` for the migration check). Handing a
+// caller a clone of an already-parsed document is strictly cheaper than the
+// parse it replaces; it is not an invitation to clone settings casually.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_config_path: Option<String>,
@@ -2680,10 +2685,73 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// One cached parse of the settings document, validated against the file's
+/// identity metadata. Both fields are compared: mtime alone is not a safe
+/// invalidation signal on Windows (FAT-derived volumes and same-tick rewrites
+/// can repeat a timestamp), and a length change catches the common
+/// edit-in-place case that a repeated timestamp would hide. In-process writes
+/// do not rely on either — [`save_settings`] drops the entry outright.
+struct CachedSettings {
+    mtime: std::time::SystemTime,
+    len: u64,
+    settings: Settings,
+}
+
+/// mtime-checked cache of the parsed settings document, keyed by path.
+///
+/// Terminal spawn read + double-parsed `settings.json` on every open
+/// (`terminal/session.rs` → `get_ai_settings` → here) and `ClaudeSession::spawn`
+/// did it a second, independent time — so N concurrent opens paid 2N full JSON
+/// parses of the whole document for values that change only when the operator
+/// edits them. Follows the in-repo precedent at
+/// `crate::terminal::transcript`'s `CachedSession`.
+static SETTINGS_CACHE: once_cell::sync::Lazy<std::sync::Mutex<HashMap<PathBuf, CachedSettings>>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Drop every cached parse. Called after any in-process write so a
+/// read-modify-write never observes its own pre-write document, independent of
+/// filesystem timestamp granularity.
+fn invalidate_settings_cache() {
+    if let Ok(mut c) = SETTINGS_CACHE.lock() {
+        c.clear();
+    }
+}
+
 /// Read + parse the persisted settings document, WITHOUT any env overlays,
 /// roster overlay, or tier migration. This is the raw on-disk truth plus its
 /// provenance — the base every read-modify-write must start from.
+///
+/// Served from an mtime+size-validated cache ([`SETTINGS_CACHE`]) when the file
+/// has not changed since the last successful parse. Only an AUTHORITATIVE
+/// `Loaded` result is ever cached — a fresh install, an unresolvable path and
+/// an unreadable/corrupt file all re-check the disk every call, so the
+/// "settings unreadable" banner still clears the instant the file is fixed.
 fn read_settings_from_disk() -> LoadedSettings {
+    let path = match get_settings_path() {
+        Ok(p) => p,
+        Err(e) => {
+            let error = format!("cannot resolve settings path: {e}");
+            error!("Settings unreadable — refusing to synthesize defaults: {error}");
+            record_settings_fault(Some(SettingsFault {
+                path: settings_path_for_display(),
+                error: error.clone(),
+                detected_at_unix: now_unix(),
+            }));
+            return LoadedSettings {
+                settings: Settings::default(),
+                provenance: SettingsProvenance::Unreadable,
+                error: Some(error),
+            };
+        }
+    };
+    read_settings_from_path(&path)
+}
+
+/// [`read_settings_from_disk`] against an explicit path. Split out so the cache
+/// behaviour is testable against a tempdir without touching the process-global
+/// `QONTINUI_CONFIG_DIR` (which would race every sibling test that reads real
+/// settings).
+fn read_settings_from_path(path: &std::path::Path) -> LoadedSettings {
     let unreadable = |error: String| {
         error!("Settings unreadable — refusing to synthesize defaults: {error}");
         record_settings_fault(Some(SettingsFault {
@@ -2698,21 +2766,37 @@ fn read_settings_from_disk() -> LoadedSettings {
         }
     };
 
-    let path = match get_settings_path() {
-        Ok(p) => p,
-        Err(e) => return unreadable(format!("cannot resolve settings path: {e}")),
+    // ONE stat answers both "does it exist" and "is the cache still valid" —
+    // the old `path.exists()` was already a stat, so this adds no syscall.
+    let (mtime, len) = match fs::metadata(path) {
+        Ok(md) => (md.modified().ok(), md.len()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            record_settings_fault(None);
+            return LoadedSettings {
+                settings: Settings::default(),
+                provenance: SettingsProvenance::FreshInstall,
+                error: None,
+            };
+        }
+        Err(e) => return unreadable(format!("stat failed: {e}")),
     };
 
-    if !path.exists() {
-        record_settings_fault(None);
-        return LoadedSettings {
-            settings: Settings::default(),
-            provenance: SettingsProvenance::FreshInstall,
-            error: None,
-        };
+    if let Some(mtime) = mtime {
+        if let Ok(cache) = SETTINGS_CACHE.lock() {
+            if let Some(hit) = cache.get(path) {
+                if hit.mtime == mtime && hit.len == len {
+                    record_settings_fault(None);
+                    return LoadedSettings {
+                        settings: hit.settings.clone(),
+                        provenance: SettingsProvenance::Loaded,
+                        error: None,
+                    };
+                }
+            }
+        }
     }
 
-    let contents = match fs::read_to_string(&path) {
+    let contents = match fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => return unreadable(format!("read failed: {e}")),
     };
@@ -2729,6 +2813,21 @@ fn read_settings_from_disk() -> LoadedSettings {
                 migrate_metadata_sync_flag(&raw, &mut s);
             }
             record_settings_fault(None);
+            // Cache the POST-migration document: the migration is a pure
+            // function of the file bytes, so a cache hit must be
+            // indistinguishable from a fresh parse.
+            if let Some(mtime) = mtime {
+                if let Ok(mut cache) = SETTINGS_CACHE.lock() {
+                    cache.insert(
+                        path.to_path_buf(),
+                        CachedSettings {
+                            mtime,
+                            len,
+                            settings: s.clone(),
+                        },
+                    );
+                }
+            }
             LoadedSettings {
                 settings: s,
                 provenance: SettingsProvenance::Loaded,
@@ -3156,6 +3255,13 @@ pub fn save_settings(settings: &Settings) -> Result<(), String> {
 
     crate::fs_atomic::atomic_write(&path, contents.as_bytes())
         .map_err(|e| format!("Failed to write settings: {}", e))?;
+
+    // Every settings write in this process goes through here, so this is the
+    // one place the parse cache has to be dropped. Doing it AFTER the write
+    // means a concurrent reader either sees the old document (already true
+    // before this call) or re-parses the new one — never a cached parse that
+    // outlives the bytes it came from.
+    invalidate_settings_cache();
 
     Ok(())
 }
@@ -3695,6 +3801,81 @@ pub fn save_lock_yield_policy_settings(policy: LockYieldPolicySettings) -> Resul
 #[cfg(test)]
 mod openai_compatible_defaults_tests {
     use super::*;
+
+    // ── settings.json parse cache (Phase 6, B5) ─────────────────────────────
+
+    /// Both spawn paths read + DOUBLE-parsed `settings.json` on every open. The
+    /// cache must serve an unchanged file, and — this is the part that would
+    /// silently break the app — it must NOT serve a file that has changed.
+    #[test]
+    fn settings_cache_serves_unchanged_and_invalidates_on_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, br#"{"claude_default_launch_command":"first"}"#).expect("write");
+
+        let first = read_settings_from_path(&path);
+        assert_eq!(first.provenance, SettingsProvenance::Loaded);
+        assert_eq!(
+            first.settings.claude_default_launch_command.as_deref(),
+            Some("first")
+        );
+
+        // Unchanged file → cache hit, same values.
+        let cached = read_settings_from_path(&path);
+        assert_eq!(
+            cached.settings.claude_default_launch_command.as_deref(),
+            Some("first")
+        );
+
+        // Rewrite with DIFFERENT content. The length differs, so the guard
+        // catches it even if the filesystem timestamp has not ticked.
+        std::fs::write(
+            &path,
+            br#"{"claude_default_launch_command":"second-and-longer"}"#,
+        )
+        .expect("rewrite");
+        let refreshed = read_settings_from_path(&path);
+        assert_eq!(
+            refreshed.settings.claude_default_launch_command.as_deref(),
+            Some("second-and-longer"),
+            "an mtime/size change must invalidate the cached parse"
+        );
+    }
+
+    /// A corrupt file must never be cached: the "settings unreadable" banner
+    /// has to clear the moment the operator fixes the file, and a missing file
+    /// must keep reporting `FreshInstall` rather than a stale prior parse.
+    #[test]
+    fn settings_cache_never_serves_a_missing_or_corrupt_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        assert_eq!(
+            read_settings_from_path(&path).provenance,
+            SettingsProvenance::FreshInstall
+        );
+
+        std::fs::write(&path, br#"{"claude_default_launch_command":"good"}"#).expect("write");
+        assert_eq!(
+            read_settings_from_path(&path).provenance,
+            SettingsProvenance::Loaded
+        );
+
+        std::fs::write(&path, b"{ this is not json").expect("corrupt");
+        assert_eq!(
+            read_settings_from_path(&path).provenance,
+            SettingsProvenance::Unreadable,
+            "a corrupt file must not be masked by the previous good parse"
+        );
+
+        std::fs::write(&path, br#"{"claude_default_launch_command":"good"}"#).expect("repair");
+        let repaired = read_settings_from_path(&path);
+        assert_eq!(repaired.provenance, SettingsProvenance::Loaded);
+        assert_eq!(
+            repaired.settings.claude_default_launch_command.as_deref(),
+            Some("good")
+        );
+    }
 
     /// Fresh install: no `openai_compatible` key at all → serde `default`
     /// fires and DeepSeek is configured out of the box (plan D3).

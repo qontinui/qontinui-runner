@@ -475,19 +475,18 @@ pub async fn create_ai_session(
         });
     }
 
-    // 1. Create task run record in DB
+    // 1. Create the task-run record in PG — CONCURRENTLY with the spawn below
+    // (Phase 6, B7), not before it. The row is keyed by a `task_run_id` this
+    // command already minted, so nothing in the spawn depends on the INSERT
+    // having landed; serializing them simply added a full database round-trip
+    // to the front of every AI-session open. The future is polled to completion
+    // alongside the spawn in the `join!` further down, and a failed insert still
+    // fails the command (tearing the spawned session back down) so the
+    // "no task run ⇒ no session" contract is unchanged.
     let input = CreateTaskRunInput::new(task_run_id.clone(), name.clone())
         .with_prompt("AI session")
         .with_workflow_type("chat");
-    let create_ok = app_state.pg_db().create_task_run(&input).await.is_ok();
-
-    if !create_ok {
-        return Ok(CommandResponse {
-            success: false,
-            message: Some("Failed to create task run record".to_string()),
-            data: None,
-        });
-    }
+    let create_task_run = app_state.pg_db().create_task_run(&input);
 
     // Session-automation Phase 0 (R1) — register the authenticated session into
     // coord.sessions carrying its task_run_id, so it is visible + addressable +
@@ -516,7 +515,7 @@ pub async fn create_ai_session(
     let handle = app_handle.clone();
     let trid = task_run_id.clone();
     let name_for_ctx = name.clone();
-    let spawn_result = tokio::task::spawn_blocking(move || {
+    let spawn_task = tokio::task::spawn_blocking(move || {
         let working_dir = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string());
@@ -572,8 +571,30 @@ pub async fn create_ai_session(
                 Err(e)
             }
         }
-    })
-    .await;
+    });
+
+    // The PG insert and the CLI spawn are independent — run them together and
+    // pay `max(db, spawn)` instead of `db + spawn`.
+    let (create_result, spawn_result) = tokio::join!(create_task_run, spawn_task);
+
+    if create_result.is_err() {
+        // Contract preserved: no task-run row ⇒ no session. The spawn may have
+        // succeeded in parallel, so tear it back down rather than leaking a live
+        // CLI child bound to a row that does not exist.
+        if let Some(session) = session_manager.remove(&task_run_id) {
+            if let Err(e) = session.close() {
+                warn!(
+                    "create_ai_session: failed to close the session spawned alongside a failed \
+                     task-run insert ({task_run_id}): {e}"
+                );
+            }
+        }
+        return Ok(CommandResponse {
+            success: false,
+            message: Some("Failed to create task run record".to_string()),
+            data: None,
+        });
+    }
 
     // 3. Best-effort emergent-task row so the deconflicter/banner have
     // somewhere to attach. Runs in the outer async context (PG access is
