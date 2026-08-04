@@ -86,8 +86,8 @@ status publication is observability, not gating.
 2. **`current_repo`.** The MAIN repo's directory name —
    `basename "$(dirname "$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)")"`.
    NOT `basename` of `git rev-parse --show-toplevel`: from a linked git worktree
-   that returns the WORKTREE's own directory name (`ccfg-wt-pr161-followup`,
-   `qontinui-claude-config-wt-lna`), so the dashboard tile groups this session
+   that returns the WORKTREE's own directory name (`myrepo-wt-pr161-followup`,
+   `myrepo-wt-lna`), so the dashboard tile groups this session
    under a repo that does not exist — and sessions run under
    `QONTINUI_AGENT_WORKTREE_MODE=1`, so that is the common path, not an edge case.
    `--git-common-dir` resolves to the main checkout's `.git` from a worktree and
@@ -414,9 +414,54 @@ decisions only — see the predicate guidance in `_gate-registration`).
 > unit, mark it `vetted`, and register the `unit_ready` gate for registry/dashboard
 > visibility (it auto-clears by predicate), but with NO continuation of any kind.
 >
-> **`/vet-imp` is the worked example:** when this vet runs as the first half of the
-> `/vet-imp` chain, `/implement-plan` executes IN THIS SAME SESSION immediately
-> after the VETTED stamp — that in-session run IS the dispatch.
+> **EXCEPTION — `/vet-imp` INVERTS this default (changed 2026-07-28).** When this
+> vet runs as the first half of the `/vet-imp` chain, **attach the
+> continuation.** This reverses the previous rule, and the reversal is
+> deliberate — do not "fix" it back.
+>
+> *What the old rule argued, and why it was right on its own terms.* Under
+> `/vet-imp`, `/implement-plan` executes IN THIS SAME SESSION immediately after
+> the VETTED stamp, so that in-session run IS the dispatch; a continuation would
+> ALSO queue a fresh runner-terminal session for the same plan — a duplicate,
+> parallel implementation, the exact concurrent-WIP clobber the coordination
+> layer exists to prevent. That reasoning still holds **for a chain that
+> completes**, and it is why the inversion is paired with a cancel rather than
+> being a simple flip.
+>
+> *Why the inversion is acceptable.* `/implement-plan` **cancels this pending
+> continuation when it stamps IN PROGRESS** (its Step 0.5, via
+> `POST $COORD_HTTP_URL/coord/gates/<gate_id>/continuation-cancel` — the same
+> takeover mechanism its Step 0.6 has always used), so the moment the in-session
+> implementation genuinely takes over it retires the queued spawn itself.
+>
+> **Be precise about the residual gap: the cancel is post-dispatch-only.** A
+> 404 from that route means the continuation has not dispatched YET — it is
+> still armed, and this route cannot touch it (`_gate-registration` →
+> "Continuation cancel + refresh"). At the IN PROGRESS stamp that is the
+> *expected* state, so `/implement-plan` Step 0.5 also applies the pre-dispatch
+> remedy (mute/reject the gate) and, failing that, reports honestly that a
+> redundant terminal may still spawn. A spawn that does slip through lands on a
+> plan already stamped IN PROGRESS and should stand down at Step 0.45
+> reconnaissance / Step 0.6 claim conflict.
+>
+> So the honest trade is not "duplicate runs are impossible" — it is: a
+> **silent** strand (old behaviour, plan rots unnoticed) has been exchanged for
+> a **visible** redundant terminal in the residual case, which the operator can
+> see and close, and which two further gates should stop on their own.
+>
+> *Why the inversion is now necessary.* The old default disabled the safety net
+> at exactly the moment it was needed. `/vet-imp` stalled after vetting
+> repeatedly (diagnosed 2026-07-28, reproduced live): the plan got stamped
+> VETTED, the gate cleared, and the chain ended without `/implement-plan` ever
+> being invoked — leaving the plan **STRANDED**, vetted with nothing queued to
+> pick it up. Standalone `/vet-plan` would have queued a dispatching
+> continuation and self-healed; `/vet-imp` specifically opted out of it.
+>
+> Net effect: **a completed chain cancels its own safety net; a dropped chain
+> self-heals into a fresh, visible session.**
+>
+> Follow step 2's `device_id` resolution and step 4's `continuation_spawn` shape
+> below — including a populated `repos` — exactly as the standalone case does.
 >
 > **Attach a continuation only when the follow-up will outlive this session**
 > — "finish to zero" is intent, and intent cannot survive exogenous session death:
@@ -424,14 +469,21 @@ decisions only — see the predicate guidance in `_gate-registration`).
 > alive and monitoring only for "an observable signal and a short expected wait
 > (≲2h: deploy, CI, merge train)"); (2) vetting **STANDALONE**, where no
 > implementation follows this session and the dispatch into a visible session is
-> the whole point; (3) `operator_approval` / genuine human-decision gates, which
+> the whole point — **or vetting under `/vet-imp`, per the inversion above,
+> where the continuation is the net under a chain that may drop and
+> `/implement-plan` Step 0.5 cancels it when the chain holds**;
+> (3) `operator_approval` / genuine human-decision gates, which
 > are unbounded in time (except sensitive work — security/credential/billing/
 > strategy — which stays notify-only unconditionally); (4) cross-session
 > dependency chains whose follow-up belongs to a different work unit or device.
 > **(3) and (4) do not arise in §5.4 by construction** — this section registers a
 > `unit_ready` gate on THIS plan's own work unit, and `operator_approval` is both
 > the wrong model here (a work queue is not a human decision) and 403-rejected on
-> the device-authed `register-gate` door. In §5.4, decide between (1) and (2) only.
+> the device-authed `register-gate` door. In §5.4, decide between (1) and (2) only
+> — and note that (2) now covers BOTH standalone vetting and `/vet-imp`, so in
+> practice §5.4 attaches a continuation in the common cases and omits it only for
+> the narrower "this session is carrying the work to completion and the wait is
+> inside rule 10's window" residue.
 > Sessions also die exogenously (usage limit, crash, reboot) — if you are
 > *stopping* incomplete-because-WAITING, that is `/blocked`'s session-close
 > protocol and it takes a continuation. (Canonical: `_gate-registration` →
@@ -519,7 +571,8 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
      is continuation-less: this whole field absent on the HTTP body, and no
      `continuation` / `continuation_prompt` on the MCP tool either — all three are
      the same knob. When an exception DOES apply (most
-     often: vetting standalone, or a wait longer than rule 10's ≲2h window), target
+     often: vetting standalone, **vetting under `/vet-imp`** — see the inversion
+     above — or a wait longer than rule 10's ≲2h window), target
      the operator's device with a **visible** session —
      ```json
      {
@@ -571,8 +624,8 @@ the coord work-unit registry so the `unit_ready` predicate can see it:
 (or the step-1 upsert carrying `status:"vetted"`). The registry is directly
 writable — there is no longer a plan-ingest worker mirroring the plan directory,
 so this explicit transition is what marks the unit vetted (the plan `.md` VETTED
-stamp + its commit/push remain the operator-private artifact record). (claude-config
-is NOT a coord sole-authority repo — its PRs land via normal GitHub flow.)
+stamp + its commit/push remain the operator-private artifact record). (A repo that is
+NOT coord sole-authority lands its PRs via normal GitHub flow.)
 
 ### 5.5. Offer to register a coord gate for a flagged-but-not-fixed item
 
@@ -726,6 +779,31 @@ gate rots open until a human clicks it).
 
 ### 6. Report
 
+**First, decide WHO this report is for — it changes whether the turn ends.**
+This skill has two callers, and only one of them wants a finished-looking
+deliverable at this point:
+
+| Invocation | What Step 6 does |
+|---|---|
+| **Standalone `/vet-plan`** | Emit the report and END THE TURN. Vetting is the whole job. |
+| **First half of the `/vet-imp` chain** | **COLLECT** the report and **DO NOT END THE TURN.** Return control to the orchestrator, which carries it into `/vet-imp` Step 3. |
+
+If you were invoked by `/vet-imp` (you will have been called via the Skill tool
+from that orchestrator, with the plan path passed through), the chain is
+**not finished** when you stamp VETTED — `/implement-plan` still has to run, in
+this same session, on this same plan. So:
+
+- **Do NOT write an end-of-turn summary.** Hand your report content back as an
+  intermediate result; `/vet-imp` Step 5 emits the single combined report at the
+  true end of the chain.
+- **Do NOT write "proceeding to /implement-plan"** (or any equivalent) and stop.
+  That sentence is the observed stall: it reads as a completed hand-off while
+  nothing was actually invoked. See `/vet-imp`'s "Never narrate the hand-off"
+  rule — the confirmation text and the `Skill: implement-plan` call belong in
+  the SAME assistant turn, with the Skill call last.
+- The VETTED stamp is a **midpoint**, not a finish line. Treat reaching it as
+  the trigger to continue, not as a deliverable.
+
 Brief — under 150 words. State:
 - What the plan was about (one sentence)
 - The 2–5 material defects found, each with the section they were in
@@ -734,7 +812,15 @@ Brief — under 150 words. State:
 - Open questions you **resolved using the Decision policy**, with the deciding priority in parentheses (e.g. "picked registry-backed lookup (scalability)")
 - Anything you flagged for the user that you did NOT auto-fix — limit this to product/scope/stakeholder calls the Decision policy can't decide; engineering trade-offs should already be resolved in the plan
 
-End-of-turn summary: one or two sentences.
+End-of-turn summary: one or two sentences — **when invoked standalone.**
+
+**When invoked as the first half of `/vet-imp`: do NOT end the turn.** There is
+no end-of-turn summary here, because this is not the end of the turn. Return
+control to the `/vet-imp` orchestrator so it can run its Step 3 VETTED gate and
+then invoke `Skill: implement-plan`. Ending the turn at this line is the
+mechanical cause of the vet→implement stall diagnosed 2026-07-28: `/vet-plan`
+was written as a standalone skill, and when it was composed into `/vet-imp` this
+instruction fired and `/vet-imp`'s Steps 3-5 were never reached.
 
 ## Rules
 
