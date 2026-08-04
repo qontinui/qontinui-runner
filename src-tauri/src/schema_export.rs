@@ -874,12 +874,14 @@ mod tests {
             obj.contains_key("HelperAnswer"),
             "Missing HelperAnswer schema"
         );
-        // 531 + the 10 Projects-dashboard types registered above (SavedProject,
-        // ProjectSnapshot, ProcessStatusLite, SessionSource, SessionLite,
-        // GitCommitLite, GitLite, PendingQuestion, HealthLevel, HealthLite).
+        // 531 + the 10 Projects-dashboard types (SavedProject, ProjectSnapshot,
+        // ProcessStatusLite, SessionSource, SessionLite, GitCommitLite, GitLite,
+        // PendingQuestion, HealthLevel, HealthLite) + the 2 agent-command types
+        // (AgentCommand, AgentCommandVersion — plan
+        // 2026-07-29-account-versioned-agent-commands).
         // Independently corroborated by the codegen, which reports
-        // "Processing 541 top-level types" and emits 541 .d.ts files.
-        assert_eq!(obj.len(), 541, "Expected 541 schema entries");
+        // "Processing 543 top-level types" and emits 543 .d.ts files.
+        assert_eq!(obj.len(), 543, "Expected 543 schema entries");
 
         // Sanity-check that qontinui_types re-exports are present
         assert!(

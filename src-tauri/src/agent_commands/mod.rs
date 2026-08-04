@@ -71,9 +71,6 @@ const FETCH_LIMIT: u32 = 500;
 /// cwd.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
-/// Longest accepted command name.
-const MAX_NAME_LEN: usize = 64;
-
 /// Filename of the on-disk override cache, under the runner's per-instance
 /// config dir (`dirs::config_dir()/com.qontinui.runner[/instance-<name>]`) —
 /// the same convention `prompts.rs` and `backup.rs` already use for per-device
@@ -130,28 +127,25 @@ impl ResolvedCommand {
 
 /// Reject anything that is not a safe, provisionable command slug.
 ///
-/// Restricted to ASCII alphanumerics plus `-` and `_`. That excludes `/`, `\`,
-/// `:` and — critically — `.`, so `..` can never appear and the name can never
-/// escape `.claude/commands/`.
+/// Delegates to [`qontinui_types::agent_commands::validate_agent_command_name`],
+/// the CANONICAL rule shared by every surface that writes a command name (this
+/// registry, the qontinui-web service, the frontend editor). Do not re-implement
+/// it here: `name` becomes a path component under `.claude/commands/`, and three
+/// independent notions of "valid" is exactly the drift that definition exists to
+/// prevent.
+///
+/// Two properties matter for THIS caller specifically:
+///
+/// * The charset (lowercase ASCII alphanumerics plus `-`) excludes `/`, `\`, `:`
+///   and — critically — `.`, so `..` can never appear and a name can never escape
+///   `.claude/commands/`.
+/// * It rejects the **Windows reserved device stems** (`nul`, `con`, `aux`,
+///   `com1`, …). That arm is not theoretical here: the fleet runs on Windows,
+///   where `fs::write` to `nul.md` SUCCEEDS and silently discards, and
+///   provisioning is fail-soft and only warns on `Err` — so an override named
+///   `nul` would have logged a clean success for a command that does not exist.
 fn validate_name(name: &str) -> Result<(), String> {
-    if name.is_empty() {
-        return Err("empty command name".to_string());
-    }
-    if name.len() > MAX_NAME_LEN {
-        return Err(format!(
-            "command name is {} bytes, over the {MAX_NAME_LEN}-byte limit",
-            name.len()
-        ));
-    }
-    if let Some(bad) = name
-        .chars()
-        .find(|c| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_'))
-    {
-        return Err(format!(
-            "command name contains {bad:?}; only ASCII letters, digits, '-' and '_' are allowed"
-        ));
-    }
-    Ok(())
+    qontinui_types::agent_commands::validate_agent_command_name(name).map_err(|e| e.to_string())
 }
 
 /// Validate one fetched override into a [`ResolvedCommand`], or explain why it
@@ -725,13 +719,32 @@ mod tests {
             "vet plan",
             "vet.plan",
             "",
+            // Windows reserved device stems. NOT theoretical: the fleet runs on
+            // Windows, where fs::write to `nul.md` SUCCEEDS and discards, and
+            // provisioning is fail-soft (warns on Err only) — so accepting one
+            // would log a clean success for a command that does not exist.
+            "nul",
+            "NUL",
+            "con",
+            "aux",
+            "com1",
+            "prn",
+            "lpt1",
+            // Rejected by the canonical slug rule: uppercase and '_' are not
+            // part of the shared charset, so a name that resolves on one
+            // surface can never be rejected by another.
+            "Vet-Plan",
+            "vet_plan",
         ] {
             assert!(
                 validate_name(bad).is_err(),
                 "{bad:?} must be rejected as a command name"
             );
         }
-        for good in ["vet-plan", "implement-plan", "my_command", "cmd2"] {
+        // `my_command` was accepted before this module delegated to the
+        // canonical validator; the shared charset is lowercase alnum + '-'
+        // only, so an underscore is now correctly rejected (asserted above).
+        for good in ["vet-plan", "implement-plan", "my-command", "cmd2"] {
             assert!(validate_name(good).is_ok(), "{good:?} should be accepted");
         }
         // And the rejection reaches the registry, not just the validator.
