@@ -731,6 +731,50 @@ jobs:
         # Re-check both if a `dnssec` feature is ever enabled on hickory-proto,
         # or if the runner starts resolving attacker-supplied hostnames.
         # Revisit when reqwest bumps hickory-resolver to >= 0.26.1.
+        #
+        # --ignore RUSTSEC-2026-0235: rkyv 0.7.46, out-of-bounds reads from
+        # insufficient archive validation on archives containing Rc/Arc.
+        # Disclosed 2026-05-13, published to the RustSec DB 2026-08-04, and it
+        # immediately red-ed the `security` check on EVERY open runner PR
+        # (e.g. #954, #955 — neither of which changes Cargo.lock). main only
+        # read green because its last `security` run predated the publication,
+        # and would have gone red on its next one.
+        #
+        # NOT UPGRADABLE FROM HERE. The advisory's fix is >= 0.8.17, a
+        # semver-MAJOR bump, so `cargo update -p rkyv` cannot reach it. rkyv
+        # enters the lock through exactly one edge:
+        #
+        #   qontinui-runner -> qontinui-db (src-tauri/clorinde)
+        #                   -> rust_decimal 1.42.0 -> rkyv 0.7.46
+        #
+        # rust_decimal declares `rkyv = { version = "0.7.46", optional = true }`,
+        # and no published rust_decimal — through the current latest, 1.42.1 —
+        # takes rkyv >= 0.8 as a NORMAL dependency: every release pins a
+        # `^0.7.x` range that resolves to 0.7.46, and 0.8.x appears there only
+        # as a dev-dependency (`rkyv-0_8`), which never enters our lock. So no
+        # reachable version of the intermediate crate moves us off the 0.7
+        # line, and the 0.7 line has no patched release (0.7.46 is its last).
+        #
+        # NOT REACHABLE — the crate is not merely unused at runtime, it is
+        # NEVER COMPILED. rkyv is gated behind rust_decimal's optional `rkyv`
+        # feature; qontinui-db enables only `db-postgres`, so the feature is
+        # never activated. Verified on this tree:
+        #
+        #   $ cargo tree -i rkyv --target all --all-features
+        #   warning: nothing to print.
+        #
+        # It is in Cargo.lock solely because Cargo resolves optional deps into
+        # the lockfile regardless of feature activation — the same reason
+        # `borsh` (rust_decimal's other unactivated optional dep) is pinned
+        # there and equally never built — and cargo-audit reads the lockfile
+        # without feature awareness. No rkyv code ships in any runner artifact,
+        # so no rkyv archive is ever deserialized by the runner.
+        #
+        # REVIEW BY 2026-11-04 (or sooner on either trigger): drop this ignore
+        # the moment rust_decimal ships a release depending on rkyv >= 0.8.17,
+        # and RE-ASSESS IMMEDIATELY if anything ever enables rust_decimal's
+        # `rkyv`/`rkyv-safe` feature — that would make the vulnerable code real
+        # and this justification void. Tracking: qontinui/qontinui-runner#956.
         run: |
           # --locked: install cargo-audit against its OWN bundled Cargo.lock.
           # Without it, cargo resolves cargo-audit's transitive deps to latest
@@ -739,7 +783,7 @@ jobs:
           # and reds this job on every PR (an upstream ecosystem drift, not a
           # runner vulnerability). --locked pins to cargo-audit's tested deps.
           cargo install cargo-audit --locked
-          cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119
+          cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119 --ignore RUSTSEC-2026-0235
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
