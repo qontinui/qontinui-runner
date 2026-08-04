@@ -1383,6 +1383,33 @@ mod cloud_sync_tests {
 }
 
 #[cfg(test)]
+mod memory_link_expansion_tests {
+    use super::*;
+
+    /// Plan `2026-07-29-memory-link-expansion-retrieval-arm` Phase 3: the
+    /// link-expansion retrieval arm ships default-OFF until the recall-efficacy
+    /// harness can measure it. Both a fresh install (`Settings::default()`) and
+    /// an upgrading settings.json missing the key must land on `false`.
+    #[test]
+    fn memory_link_expansion_defaults_off() {
+        assert!(!Settings::default().memory_link_expansion_enabled);
+        let parsed: Settings = serde_json::from_str("{}").expect("empty object must deserialize");
+        assert!(!parsed.memory_link_expansion_enabled);
+    }
+
+    /// An explicit opt-in round-trips through serialization, so the flag can be
+    /// flipped on once the harness lands.
+    #[test]
+    fn memory_link_expansion_explicit_value_round_trips() {
+        let parsed: Settings = serde_json::from_str(r#"{"memory_link_expansion_enabled": true}"#)
+            .expect("must deserialize");
+        assert!(parsed.memory_link_expansion_enabled);
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert!(json.contains("\"memory_link_expansion_enabled\":true"));
+    }
+}
+
+#[cfg(test)]
 mod session_metadata_sync_tests {
     use super::*;
 
@@ -2196,6 +2223,21 @@ pub struct Settings {
     /// play for this field.
     #[serde(default)]
     pub ci_node: CiNodeSettings,
+    /// Ask the cloud memory endpoint (`POST /api/v1/memory/query`) for the
+    /// link-expansion retrieval arm — the third RRF arm that one-hop-expands
+    /// over `coord.memory_links` (plan
+    /// `2026-07-29-memory-link-expansion-retrieval-arm`, Phase 4).
+    ///
+    /// Default FALSE, deliberately: that plan's Phase 3 ships the arm
+    /// default-off and turns it on only once the efficacy harness in
+    /// `2026-07-29-memory-recall-efficacy-benchmark` can measure whether it
+    /// helps recall or just adds noise — and that plan is still DRAFT. Sending
+    /// `link_expansion: true` unconditionally would default an unmeasured
+    /// ranking change ON, which is exactly what Phase 3 forbids. The flag makes
+    /// the wire-through shippable now and flippable later. A missing key in an
+    /// existing settings.json loads as false.
+    #[serde(default)]
+    pub memory_link_expansion_enabled: bool,
 }
 
 fn default_session_metadata_sync_enabled() -> bool {
@@ -3563,6 +3605,12 @@ pub fn get_cloud_sync_enabled() -> bool {
 /// Persist the cloud session sync consent flag.
 pub fn save_cloud_sync_enabled(enabled: bool) -> Result<(), String> {
     update_settings(|settings| settings.cloud_sync_enabled = enabled)
+}
+
+/// Get the cloud memory link-expansion arm flag. Default false — see
+/// [`Settings::memory_link_expansion_enabled`].
+pub fn get_memory_link_expansion_enabled() -> bool {
+    load_settings().memory_link_expansion_enabled
 }
 
 /// Get the session metadata sync consent flag (gate 2). Default true.
