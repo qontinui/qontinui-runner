@@ -68,6 +68,7 @@
 //! - **Idle-shutdown + restart-on-crash** — irrelevant for the one-shot
 //!   path. Revisit if we ever go long-lived.
 
+use qontinui_runner_lib::claude_env::StripInheritedClaudeMarkers;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
@@ -134,6 +135,10 @@ pub async fn command_interpret(
     );
 
     let output = crate::process_helpers::tokio_no_window("claude")
+        // Tier-3 routing still spawns a real `claude`, so the inherited
+        // topology markers must not ride along. `tokio_no_window` sets a
+        // creation flag and scrubs nothing. See `claude_env`.
+        .strip_inherited_claude_markers()
         .arg("-p")
         .arg("--output-format")
         .arg("json")

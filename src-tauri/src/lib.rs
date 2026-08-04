@@ -70,7 +70,8 @@ pub mod claude_env;
 // `coord doctor` self-check (plan 2026-06-13 Phase 4). Lifted into the lib so
 // BOTH the standalone `coord_doctor` bin and the in-app Tauri command
 // (`crate::coord_doctor` in the runner binary) share one driver + formatter +
-// the 7-check wiring. Reuses the lib's `auth`/`pair`/`secure_storage`/`profiles`
+// the 9-check wiring (8 blocking + 1 advisory). Reuses the lib's
+// `auth`/`pair`/`secure_storage`/`profiles`
 // modules (which compile into the runner binary too), so the bin and the
 // command produce an identical report.
 pub mod coord_doctor;

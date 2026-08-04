@@ -1,10 +1,15 @@
 //! `coord_doctor` — headless runner self-check for coord access + gate
 //! registration (plan 2026-06-13 Phase 4).
 //!
-//! Runs the SAME eight ordered checks as the in-app `coord_doctor` Tauri
-//! command (both delegate to `qontinui_runner_lib::coord_doctor`), STOPS at the
-//! first red, and prints the link + its fix. Green on all eight ⇒ "this runner
-//! can set gates."
+//! Runs the SAME nine ordered checks as the in-app `coord_doctor` Tauri command
+//! (both delegate to `qontinui_runner_lib::coord_doctor`) and prints the link +
+//! its fix. Eight are BLOCKING — they stop at the first red; the ninth is
+//! ADVISORY and always runs, even after a blocking red, rendering `WARN`
+//! without changing the verdict. Green on all of them ⇒ "this runner can set
+//! gates."
+//!
+//! The exit code follows `overall_ok`, so an advisory red alone still exits 0 —
+//! a warning is not a gate failure, and CI callers must not treat it as one.
 //!
 //! ## Bound-port caveat
 //!
@@ -18,7 +23,8 @@
 //! ## Usage
 //!
 //! ```text
-//! coord_doctor                   # human-readable report; exit 0 = can set gates, 1 = blocked
+//! coord_doctor                   # human-readable report; exit 0 = can set gates (advisory
+//!                                # warnings included), 1 = blocked
 //! coord_doctor --json            # machine-readable DoctorReport JSON
 //! coord_doctor --onboarding-doc  # emit the generated onboarding checklist (markdown), exit 0
 //! ```

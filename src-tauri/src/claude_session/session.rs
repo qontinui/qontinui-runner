@@ -3,6 +3,7 @@
 //! Manages the lifecycle of a Claude CLI process using the stream-json protocol.
 //! Supports multiple turns, user message queuing, and interrupt.
 
+use qontinui_runner_lib::claude_env::StripInheritedClaudeMarkers;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -313,11 +314,10 @@ impl ClaudeSession {
         let cli_arg_refs: Vec<&str> = cli_args.iter().map(|s| s.as_str()).collect();
         cmd.args(&cli_arg_refs)
             .current_dir(working_dir)
-            // Remove CLAUDECODE env var to prevent "nested session" detection.
-            // The runner spawns Claude CLI as an automation tool, not as a nested session.
-            .env_remove("CLAUDECODE")
-            // Same rule, sibling marker — see `session::transport::claude_cli` docs.
-            .env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV)
+            // Strip the inherited Claude Code topology markers to prevent
+            // "nested session" detection. The runner spawns Claude CLI as an
+            // automation tool, not as a nested session. See `claude_env`.
+            .strip_inherited_claude_markers()
             .env("QONTINUI_TRACE_ID", uuid::Uuid::new_v4().to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

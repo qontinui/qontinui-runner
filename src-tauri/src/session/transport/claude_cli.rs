@@ -20,14 +20,14 @@
 //!    placeholder handle so the session row + outbox entry exist before
 //!    the workflow executor takes over.
 //!
-//! **The spawn-site strip rule.** Every Claude CLI spawn site must
-//! `env_remove` EVERY marker in
-//! `qontinui_runner_lib::claude_env::INHERITED_SESSION_MARKERS`
-//! — currently `CLAUDECODE` and `CLAUDE_CODE_CHILD_SESSION` — to keep Claude
-//! from detecting a "nested session". Both are process-topology markers that
-//! are inherited by the whole process tree with nothing clearing them, so a
-//! runner launched from a Claude Code session passes them to every `claude` it
-//! ever spawns.
+//! **The spawn-site strip rule.** Every Claude CLI spawn site must call
+//! `qontinui_runner_lib::claude_env::StripInheritedClaudeMarkers::strip_inherited_claude_markers`,
+//! which removes every marker in `claude_env::INHERITED_SESSION_MARKERS` —
+//! currently `CLAUDECODE` and `CLAUDE_CODE_CHILD_SESSION` — to keep Claude from
+//! detecting a "nested session". Both are process-topology markers that are
+//! inherited by the whole process tree with nothing clearing them, so a runner
+//! launched from a Claude Code session passes them to every `claude` it ever
+//! spawns.
 //!
 //! (This rule previously cited `qontinui-runner/CLAUDE.md` "Claude CLI
 //! Spawning". That file is gitignored — untracked since `5976c1a7` — so it is
@@ -43,11 +43,19 @@
 //! `terminal/session` one.) The agentic path delegates to
 //! `ClaudeSession::spawn`, which has the same scrub.
 //!
-//! **Adding a marker to `INHERITED_SESSION_MARKERS` does NOT auto-strip it.**
-//! Spawn sites call `env_remove` on their own `Command` / `CommandBuilder`
-//! types, which share no trait — so a new marker needs a matching line at each
-//! site. The list drives the startup warning and the `coord doctor`
-//! `no_inherited_session_markers` check, which is what surfaces the gap.
+//! **Adding a marker to `INHERITED_SESSION_MARKERS` DOES auto-strip it** at
+//! every site, because the sites go through the shared trait rather than
+//! open-coding `env_remove`. (This was not true when the marker list first
+//! landed — spawn sites hand-rolled the strip on their own `Command` /
+//! `CommandBuilder` types, and three live `claude` spawn sites were missed as a
+//! direct result. Two guard tests now cover it:
+//! `no_spawn_site_open_codes_the_strip` fails the build if a site hand-rolls
+//! the strip again, and `every_claude_spawn_site_strips` fails if a NEW
+//! Claude-bound spawn strips nothing. The second is the one that would have
+//! caught the three misses; it is a textual heuristic over the command shapes
+//! this repo writes, so treat it as a backstop rather than a proof.) The list
+//! also drives the startup warning and the `coord doctor`
+//! `no_inherited_session_markers` check.
 
 use std::sync::Arc;
 

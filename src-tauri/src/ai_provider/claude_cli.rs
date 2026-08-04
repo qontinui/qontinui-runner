@@ -6,6 +6,7 @@ use super::types::AiResponse;
 use crate::doctor::DoctorHandle;
 use crate::settings::{self, CliExecutionMode};
 use crate::str_utils::truncate_str;
+use qontinui_runner_lib::claude_env::StripInheritedClaudeMarkers;
 use tracing::{debug, error, info, warn};
 
 /// Run a prompt via Claude CLI.
@@ -297,9 +298,11 @@ fn scorer_claude_program(settings: &ClaudeCliSettings) -> String {
 /// Auth/config reuse: resolves the effective config dir the same way the rest
 /// of the CLI provider does ([`get_effective_config_dir`]) and exports it as
 /// `CLAUDE_CONFIG_DIR`, refreshing OAuth credentials first — so the one-shot
-/// authenticates as the SAME account the runner's sessions use. `CLAUDECODE` is
-/// removed so a runner already running inside Claude Code can still spawn the
-/// nested print call (mirrors [`process::spawn_and_wait_with_doctor`]).
+/// authenticates as the SAME account the runner's sessions use. Every inherited
+/// Claude topology marker (`CLAUDECODE` AND `CLAUDE_CODE_CHILD_SESSION`, see
+/// `claude_env`) is removed so a runner already running inside Claude Code can
+/// still spawn the nested print call (mirrors
+/// [`process::spawn_and_wait_with_doctor`]).
 ///
 /// Bounded by `timeout`: the child is killed and `None` returned if it does not
 /// exit in time, so a wedged CLI never strands the scheduler task.
@@ -333,9 +336,9 @@ pub(crate) fn score_options_via_cli(
     if let Some(dir) = config_dir.as_deref() {
         cmd.env("CLAUDE_CONFIG_DIR", dir);
     }
-    cmd.env_remove("CLAUDECODE");
-    // Same rule, sibling marker — see `session::transport::claude_cli` docs.
-    cmd.env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV);
+    // Strip the inherited Claude Code topology markers so this spawn is not
+    // mislabelled as a nested session — see `claude_env` for the rule.
+    cmd.strip_inherited_claude_markers();
     cmd.env("QONTINUI_TRACE_ID", uuid::Uuid::new_v4().to_string());
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())

@@ -9,6 +9,7 @@
 //! on every launch/stop and **deleted** on intentional close so that a normal
 //! shutdown does not trigger restoration on the next start.
 
+use qontinui_runner_lib::claude_env::StripInheritedClaudeMarkers;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -405,10 +406,10 @@ impl InstanceManager {
             }
         }
 
-        // Critical: remove CLAUDECODE env var so Claude CLI can start inside the instance
-        cmd.env_remove("CLAUDECODE");
-        // Same rule, sibling marker — see `session::transport::claude_cli` docs.
-        cmd.env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV);
+        // Critical: strip the inherited Claude Code topology markers so Claude
+        // CLI can start inside the instance, and so the instance does not pass
+        // them on to every `claude` IT spawns. See `claude_env`.
+        cmd.strip_inherited_claude_markers();
 
         // Create the process in a new process group (Windows)
         #[cfg(target_os = "windows")]

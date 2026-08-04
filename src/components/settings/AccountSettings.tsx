@@ -90,10 +90,13 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
   const [cognitoState, setCognitoState] = useState<"idle" | "signing-in">("idle");
 
   // --- Coord Doctor self-check (plan 2026-06-13 Phase 4) --------------------
-  // Invokes the `coord_doctor_run` Tauri command, which runs the 7 ordered
-  // checks (claude account → tier → paired/signed-in → tenant → device JWT →
-  // .mcp.json valid → coord reachable), stops at the first red, and names the
-  // fix. This is the in-app surface for "why can't this runner set gates?".
+  // Invokes the `coord_doctor_run` Tauri command, which runs 9 ordered checks:
+  // 8 BLOCKING (claude account → tier → credential store readable →
+  // paired/signed-in → tenant → device JWT → .mcp.json valid → coord
+  // reachable), which stop at the first red and name the fix, plus 1 ADVISORY
+  // (no inherited Claude session markers), which always runs — even after a
+  // blocking red — and only ever warns.
+  // This is the in-app surface for "why can't this runner set gates?".
   const [doctor, setDoctor] = useState<DoctorReport | null>(null);
   const [doctorRunning, setDoctorRunning] = useState(false);
 

@@ -6,6 +6,7 @@
 //! - `run_claude_session_interactive` — bidirectional session via `ClaudeSession`
 //! - `run_claude_session_interactive_with_retry` — interactive with retry
 
+use qontinui_runner_lib::claude_env::StripInheritedClaudeMarkers;
 use std::sync::Arc;
 use tauri::Emitter;
 use tracing::{debug, info, warn};
@@ -476,11 +477,10 @@ fn run_claude_session_inline(
     let mut cmd = crate::process_helpers::cmd_no_window();
     cmd.args(&cli_args)
         .current_dir(working_dir)
-        // Remove CLAUDECODE env var to prevent "nested session" detection.
-        // The runner spawns Claude CLI as an automation tool, not as a nested session.
-        .env_remove("CLAUDECODE")
-        // Same rule, sibling marker — see `session::transport::claude_cli` docs.
-        .env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV)
+        // Strip the inherited Claude Code topology markers to prevent "nested
+        // session" detection. The runner spawns Claude CLI as an automation
+        // tool, not as a nested session. See `claude_env`.
+        .strip_inherited_claude_markers()
         .env("QONTINUI_TRACE_ID", uuid::Uuid::new_v4().to_string())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

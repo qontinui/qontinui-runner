@@ -3,6 +3,7 @@
 //! Spawns a shell via `portable-pty`, manages reader/writer threads,
 //! and emits Tauri events for output and exit.
 
+use qontinui_runner_lib::claude_env::StripInheritedClaudeMarkers;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
@@ -496,16 +497,15 @@ impl TerminalSession {
         };
         cmd.cwd(&cwd);
 
-        // Remove CLAUDECODE env var so Claude CLI works inside the terminal
-        cmd.env_remove("CLAUDECODE");
-        // Same reason, same class of marker: CLAUDE_CODE_CHILD_SESSION says
-        // "you are a nested session". A PTY tab is a TOP-LEVEL session, but the
-        // runner inherits the marker from whatever launched it (typically the
-        // supervisor, which inherits it from a Claude Code session) and would
-        // otherwise pass it to every `claude` typed into a pane. Defense in
-        // depth — the supervisor strips it at the runner spawn, this covers a
-        // runner started by any other means.
-        cmd.env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV);
+        // Strip the inherited Claude Code topology markers so Claude CLI works
+        // inside the terminal. A PTY tab is a TOP-LEVEL session, but the runner
+        // inherits the markers from whatever launched it (typically the
+        // supervisor, which inherits them from a Claude Code session) and would
+        // otherwise pass them to every `claude` typed into a pane. Defense in
+        // depth — the supervisor strips them at the runner spawn
+        // (`qontinui-supervisor/src/process/manager.rs`, verified), this covers
+        // a runner started by any other means. See `claude_env`.
+        cmd.strip_inherited_claude_markers();
 
         // Set TERM for proper color/capability support.
         // xterm.js is a full xterm-compatible terminal, so use xterm-256color on all

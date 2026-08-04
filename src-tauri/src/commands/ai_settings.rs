@@ -15,6 +15,7 @@ use crate::settings::{
     OpenAiCompatibleSettings, PiCliSettings,
 };
 use anyhow::Result;
+use qontinui_runner_lib::claude_env::StripInheritedClaudeMarkers;
 use serde::{Deserialize, Serialize};
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
@@ -455,6 +456,7 @@ async fn test_claude_cli_connection(settings: &ClaudeCliSettings) -> Result<Stri
             // On Windows, use cmd.exe /c to handle .cmd files from npm install
             crate::process_helpers::tokio_cmd_no_window()
                 .args(["/c", claude_program, "--version"])
+                .strip_inherited_claude_markers()
                 .output()
                 .await
                 .map_err(|e| {
@@ -466,6 +468,7 @@ async fn test_claude_cli_connection(settings: &ClaudeCliSettings) -> Result<Stri
         }
         CliExecutionMode::Wsl => crate::process_helpers::tokio_no_window("wsl")
             .args([claude_program, "--version"])
+            .strip_inherited_claude_markers()
             .output()
             .await
             .map_err(|e| {
@@ -476,6 +479,7 @@ async fn test_claude_cli_connection(settings: &ClaudeCliSettings) -> Result<Stri
             })?,
         CliExecutionMode::Native => crate::process_helpers::tokio_no_window(claude_program)
             .args(["--version"])
+            .strip_inherited_claude_markers()
             .output()
             .await
             .map_err(|e| {
@@ -1773,6 +1777,10 @@ pub async fn refresh_claude_cli_auth() -> Result<CommandResponse, String> {
                 "-Command",
                 &ps_script,
             ])
+            // The shell this opens runs `claude auth login`, so it is a Claude
+            // CLI spawn site like any other and must not hand the inherited
+            // topology markers down to it. See `claude_env`.
+            .strip_inherited_claude_markers()
             .output()
             .await
             .map_err(|e| {
@@ -1806,6 +1814,17 @@ pub async fn refresh_claude_cli_auth() -> Result<CommandResponse, String> {
         for (term, args) in &terminals {
             if tokio::process::Command::new(term)
                 .args(args)
+                // Same rule as the Windows arm: the terminal this opens runs
+                // `claude auth login`. See `claude_env`.
+                //
+                // Effective for the `gnome-terminal` / `xterm` arms, which
+                // inherit this env. It is a NO-OP for the macOS `open -a
+                // Terminal` arm — LaunchServices starts Terminal.app out of our
+                // process tree, so it never had our env to begin with. Applied
+                // uniformly anyway: the rule is "every spawn site strips", and
+                // an exception here would only invite the next reader to guess
+                // which arms need it.
+                .strip_inherited_claude_markers()
                 .output()
                 .await
                 .is_ok()

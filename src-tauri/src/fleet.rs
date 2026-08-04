@@ -31,6 +31,7 @@
 //! but the coord doesn't enforce caps yet (Phase 5). Failures here log
 //! a warning and are swallowed; the runner still boots.
 
+use qontinui_runner_lib::claude_env::StripInheritedClaudeMarkers;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1267,6 +1268,10 @@ fn detect_claude_code_now() -> bool {
 
     let started = Instant::now();
     let child = crate::process_helpers::no_window("claude")
+        // Even a `--version` probe is a `claude` spawn, and the rule is "every
+        // spawn site strips" — no per-site judgement about which invocations
+        // "matter". See `claude_env`.
+        .strip_inherited_claude_markers()
         .arg("--version")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

@@ -46,6 +46,7 @@
 //! until flush succeeds. The local file is the source of truth; coord
 //! ingest is the streaming surface.
 
+use qontinui_runner_lib::claude_env::StripInheritedClaudeMarkers;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -4330,6 +4331,13 @@ async fn spawn_claude_child(workdir: &str, initial_prompt: &str) -> anyhow::Resu
     let bin = claude_bin_path();
     let mut cmd = crate::process_helpers::tokio_no_window(&bin);
     cmd.current_dir(workdir)
+        // Strip the inherited Claude Code topology markers. This is a genuine
+        // TOP-LEVEL `claude`, but the runner inherits the markers from whatever
+        // launched it and `tokio_no_window` only sets a creation flag — it does
+        // no scrubbing. Missing here, this spawn (agent subprocesses and the
+        // headless gate-continuation arm) was the one Claude CLI site the
+        // original strip pass overlooked. See `claude_env`.
+        .strip_inherited_claude_markers()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

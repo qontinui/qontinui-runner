@@ -2,6 +2,7 @@
 //!
 //! Ported from the supervisor's pipeline mode fix agent.
 
+use qontinui_runner_lib::claude_env::StripInheritedClaudeMarkers;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -118,9 +119,8 @@ pub async fn run_fix_agent(
         "--model",
         model,
     ])
-    .env_remove("CLAUDECODE")
-    // Same rule, sibling marker — see `session::transport::claude_cli` docs.
-    .env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV)
+    // See `claude_env` — one helper strips every inherited topology marker.
+    .strip_inherited_claude_markers()
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
 

@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use crate::doctor::{DoctorHandle, ProcessRegistration, ProcessType};
+use qontinui_runner_lib::claude_env::StripInheritedClaudeMarkers;
 use std::process::{Command, Stdio};
 use tracing::{debug, warn};
 
@@ -14,11 +15,10 @@ pub(super) fn spawn_and_wait_with_doctor(
     label: &str,
     doctor_handle: Option<&DoctorHandle>,
 ) -> std::io::Result<std::process::Output> {
-    // Remove CLAUDECODE env var so nested Claude CLI sessions don't refuse to start.
-    // The runner legitimately needs to spawn Claude CLI as a subprocess, not as a nested session.
-    cmd.env_remove("CLAUDECODE");
-    // Same rule, sibling marker — see `session::transport::claude_cli` docs.
-    cmd.env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV);
+    // Strip the inherited Claude Code topology markers so nested Claude CLI
+    // sessions don't refuse to start. The runner legitimately needs to spawn
+    // Claude CLI as a subprocess, not as a nested session. See `claude_env`.
+    cmd.strip_inherited_claude_markers();
 
     // Inject trace ID for cross-process correlation
     cmd.env("QONTINUI_TRACE_ID", uuid::Uuid::new_v4().to_string());
