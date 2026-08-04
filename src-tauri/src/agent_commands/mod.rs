@@ -260,8 +260,7 @@ impl AgentCommandRegistry {
                 None => out.push(b),
             }
         }
-        let builtin_names: HashSet<&str> =
-            self.builtin.iter().map(|c| c.name.as_str()).collect();
+        let builtin_names: HashSet<&str> = self.builtin.iter().map(|c| c.name.as_str()).collect();
         for o in &self.overrides {
             if !builtin_names.contains(o.name.as_str()) {
                 out.push(o);
@@ -460,9 +459,9 @@ fn fetch_overrides_blocking(base_url: &str) -> FetchOutcome {
             rt.block_on(fetch_overrides_async(&url))
         });
     match handle {
-        Ok(h) => h.join().unwrap_or_else(|_| {
-            FetchOutcome::Unavailable("the fetch thread panicked".to_string())
-        }),
+        Ok(h) => h
+            .join()
+            .unwrap_or_else(|_| FetchOutcome::Unavailable("the fetch thread panicked".to_string())),
         Err(e) => FetchOutcome::Unavailable(format!("could not spawn a fetch thread: {e}")),
     }
 }
@@ -690,10 +689,7 @@ mod tests {
             resolve_with(FetchOutcome::Unavailable("dns failure".to_string()), None);
         assert_eq!(action, CacheAction::Keep);
         assert_eq!(registry.override_count(), 0);
-        assert_eq!(
-            registry.get(first).unwrap().source,
-            CommandSource::Builtin
-        );
+        assert_eq!(registry.get(first).unwrap().source, CommandSource::Builtin);
     }
 
     /// Gate: a malformed override falls back to the embedded default (and the
