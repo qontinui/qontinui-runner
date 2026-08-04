@@ -104,6 +104,8 @@
     "validate:ws-actions": "node scripts/validate-ws-actions.mjs",
     "coverage-diff": "node scripts/coverage-diff.mjs",
     "coverage-diff:test": "node --test scripts/__tests__/coverage-diff.test.mjs",
+    "perf-harness": "node scripts/perf-harness.mjs",
+    "perf-harness:test": "node --test scripts/__tests__/perf-harness-lib.test.mjs",
     "vocab:gen": "node scripts/validate-ws-actions.mjs --emit-doc ui-bridge/docs-site/docs/wrappers/action-vocabulary.md",
     "vocab:check": "node scripts/validate-ws-actions.mjs --check-doc ui-bridge/docs-site/docs/wrappers/action-vocabulary.md",
     "dev": "vite",

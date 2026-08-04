@@ -175,3 +175,8 @@ target-wt/
 # Resolve-PrimaryTreeStaleness auto-fast-forward (it self-heals only a CLEAN
 # tree) — that is how a shared checkout drifts tens of commits behind main.
 tmp_vision_cache/
+
+# Perf-harness run artifacts (scripts/perf-harness.mjs). Run JSONs and rendered
+# markdown tables are measurements of a specific machine at a specific moment —
+# they belong in the plan doc or a PR comment, never in the tree.
+.perf-harness/
