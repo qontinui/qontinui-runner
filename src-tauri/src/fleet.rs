@@ -496,6 +496,61 @@ pub async fn publish_budget(
     publish_budget_now(role, resources, disk_reserved_gb).await
 }
 
+/// Whether THIS runner instance may write MACHINE-SCOPED state to coord.
+///
+/// Machine-scoped means: any column on `coord.devices` that describes the BOX
+/// rather than the process — role, CPU/memory/disk, `max_concurrent_*`,
+/// `served_git_sha`, `claude_code_available`, the capture counters. Every
+/// runner instance on a machine reads the same `~/.qontinui/machine.json`
+/// (`load_device_file` resolves it straight from `dirs::home_dir()`,
+/// deliberately outside `instance::scope_path`), so they all address ONE
+/// `coord.devices` row. Instance *settings* are per-instance; device
+/// *identity* is not. Nothing downstream can tell which instance wrote a
+/// value.
+///
+/// That is not theoretical. On 2026-07-28T08:31:18Z a `test-*` runner spawned
+/// for a verification job evaluated `ci_node.enabled` as false in its own
+/// instance settings and published `max_concurrent_builds = 0` over the
+/// primary's row. coord's shadow lane elected no device for six days
+/// (qontinui-coord#1325 floors the read; qontinui-runner#940 re-publishes on a
+/// 10-minute cadence). Both of those BOUND the damage. This is the guard that
+/// prevents the write.
+///
+/// ## Why `owns_shared_root_state`, NOT `is_secondary`
+///
+/// `is_secondary()` keys on `QONTINUI_INSTANCE_NAME` alone, so a secondary the
+/// supervisor spawned WITHOUT that variable reads as primary and would sail
+/// through this guard — failing OPEN on exactly the spawn path that caused the
+/// incident. `owns_shared_root_state()` resolves through `resolve_data_subdir`,
+/// which also detects a secondary by `primary_port` or a non-default API port,
+/// so a nameless secondary fails CLOSED. It is the same predicate that already
+/// decides who may write the shared umbrella-root `.mcp.json` — the identical
+/// question (may this instance write state the whole box shares) asked of a
+/// different file.
+///
+/// `reason` names the write for the log line. Logged at most once per reason
+/// per process: these paths run on 30-second and 10-minute cadences, and a
+/// per-tick line would bury the one-time fact that this instance is muted.
+pub(crate) fn may_publish_machine_state(reason: &str) -> bool {
+    if crate::instance::owns_shared_root_state() {
+        return true;
+    }
+    static LOGGED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let logged = LOGGED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    if let Ok(mut seen) = logged.lock() {
+        if seen.insert(reason.to_string()) {
+            info!(
+                "fleet: skipping {reason} — this is a SECONDARY instance (name={:?}) and \
+                 machine-scoped coord state belongs to the primary. See \
+                 fleet::may_publish_machine_state.",
+                crate::instance::instance_name()
+            );
+        }
+    }
+    false
+}
+
 /// [`publish_budget`] without the vestigial pool argument.
 ///
 /// Exists because [`spawn_budget_republisher`] runs on the `fleet-heartbeat`
@@ -507,6 +562,9 @@ async fn publish_budget_now(
     resources: Resources,
     disk_reserved_gb: u64,
 ) -> Result<(), String> {
+    if !may_publish_machine_state("budget publish") {
+        return Ok(());
+    }
     let device = match load_device_file() {
         Some(d) => d,
         None => {
@@ -640,15 +698,20 @@ fn budget_republish_secs() -> u64 {
 /// `healthy`. Nothing recovered it because nothing re-published.
 ///
 /// A periodic re-assert bounds that damage to one interval. It does NOT stop a
-/// sibling instance from writing the wrong value — the real fix for THAT is
-/// per-instance device identity — but it does stop a wrong value from being
-/// permanent, which is what turned a transient race into a six-day outage.
+/// sibling instance from writing the wrong value — that is
+/// [`may_publish_machine_state`]'s job, and this task is gated on it too, so a
+/// secondary never even starts the loop.
 ///
 /// Runs on the caller's runtime; `main.rs` puts it on the dedicated
 /// `fleet-heartbeat` thread rather than `fleet-publishers`, so the sweep tasks
 /// that block that runtime for minutes at a time (the 2026-06-03 heartbeat
 /// starvation) cannot stall the re-assert either.
 pub fn spawn_budget_republisher(role: MachineRole) {
+    // Checked HERE as well as inside `publish_budget_now`, so a secondary holds
+    // no timer at all rather than waking every 10 minutes to decline.
+    if !may_publish_machine_state("budget republisher") {
+        return;
+    }
     let secs = budget_republish_secs();
     info!("fleet::budget_republisher: starting, interval={secs}s");
     tokio::spawn(async move {
@@ -1023,6 +1086,17 @@ fn is_false(b: &bool) -> bool {
 /// [`claude_code_probe`] (cached 60s). Failures are reported as
 /// `Err(String)` so the caller can log them; the loop never panics.
 pub async fn heartbeat_to_coord() -> Result<(), String> {
+    // The register payload is machine-scoped end to end — `hostname`,
+    // `claude_code_available`, the capture/monitor counters and
+    // `served_git_sha*` are all straight writes onto the shared device row.
+    // `served_git_sha` is the sharpest: coord's `runner_served_sha` gate
+    // predicate reads it, so a secondary built from a different ref would make
+    // coord believe the MACHINE serves that build. A secondary has nothing
+    // honest to contribute here — the primary keeps `last_seen_at` fresh — so
+    // it stays off the wire entirely rather than sending a partial payload.
+    if !may_publish_machine_state("device heartbeat") {
+        return Ok(());
+    }
     let device = match load_device_file() {
         Some(d) => d,
         None => {
@@ -2952,6 +3026,12 @@ pub async fn publish_tree_state() -> Result<(), String> {
 /// above. Failures `warn!` and retry on the next tick; the loop never
 /// panics.
 pub fn spawn_tree_publisher() {
+    // `coord.primary_trees` rows are keyed by this device and describe the
+    // repos on the BOX (walked from `QONTINUI_ROOT`), so they are
+    // machine-scoped by the same definition the budget publish is.
+    if !may_publish_machine_state("tree publisher") {
+        return;
+    }
     let secs: u64 = std::env::var("COORD_TREE_PUBLISH_INTERVAL_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -3483,6 +3563,86 @@ fn execute_build_and_restart(app: &qontinui_types::apps::App, app_id: &str) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- machine-scoped write guard (secondary instances) ----
+
+    /// Source of THIS file, for the wiring pins below.
+    const FLEET_SRC: &str = include_str!("fleet.rs");
+
+    /// [`FLEET_SRC`] with the test module cut off — the PRODUCTION half.
+    ///
+    /// `include_str!` pulls in this file's own tests, which breaks a source
+    /// pin two ways. A call site written inside a `#[cfg(test)]` fn would
+    /// satisfy a "the writer is guarded" assertion that production code does
+    /// not; and a negative assertion matches the very string literal it is
+    /// written with — which is exactly how the first version of
+    /// `the_guard_uses_the_fail_closed_predicate` failed: the only occurrence
+    /// of the forbidden text in the whole file was its own `assert!`.
+    fn prod_src() -> &'static str {
+        FLEET_SRC
+            .split_once("\n#[cfg(test)]")
+            .map(|(before, _)| before)
+            .unwrap_or(FLEET_SRC)
+    }
+
+    /// Every machine-scoped writer must consult
+    /// [`may_publish_machine_state`]. Pinned at the SOURCE level rather than
+    /// through the env deliberately: the fail-closed predicate reads
+    /// `QONTINUI_PORT`, which `scheduler_service`'s tests mutate on other
+    /// harness threads, so an env-driven assertion here would flake — the same
+    /// reasoning `instance::primary_keeps_the_unscoped_path` records.
+    ///
+    /// What this actually catches is the regression that matters: someone adds
+    /// a fourth publisher, or refactors one, and the guard silently does not
+    /// travel with it. A secondary then resumes clobbering the shared row and
+    /// nothing fails until a six-day outage.
+    #[test]
+    fn every_machine_scoped_writer_is_guarded() {
+        for reason in [
+            "budget publish",
+            "budget republisher",
+            "device heartbeat",
+            "tree publisher",
+        ] {
+            let call = format!("may_publish_machine_state({reason:?})");
+            assert!(
+                prod_src().contains(&call),
+                "no guarded call site for {reason:?} — every writer of a \
+                 machine-scoped coord.devices column must be gated on \
+                 may_publish_machine_state"
+            );
+        }
+    }
+
+    /// The guard must delegate to the FAIL-CLOSED predicate.
+    ///
+    /// `is_secondary()` keys on `QONTINUI_INSTANCE_NAME` alone, so a secondary
+    /// the supervisor spawned without that variable reads as PRIMARY and sails
+    /// through — fail-OPEN on precisely the spawn path that caused the
+    /// 2026-07-28 clobber (a `test-*` runner zeroing the primary's
+    /// `max_concurrent_builds`). `owns_shared_root_state()` also detects a
+    /// secondary by `primary_port` or a non-default API port, so a nameless
+    /// one fails closed. Swapping them back would compile, pass every other
+    /// test, and quietly reopen the hole.
+    #[test]
+    fn the_guard_uses_the_fail_closed_predicate() {
+        assert!(
+            prod_src().contains("fn may_publish_machine_state")
+                && prod_src().contains("instance::owns_shared_root_state()"),
+            "may_publish_machine_state must delegate to owns_shared_root_state"
+        );
+        // Split so the needle does not appear contiguously in this file — a
+        // literal here would be found by its own scan. `concat!` rebuilds it
+        // at compile time.
+        let fail_open = concat!("instance::", "is_secondary()");
+        assert!(
+            !prod_src().contains(fail_open),
+            "fleet.rs must not gate machine-scoped writes on the \
+             QONTINUI_INSTANCE_NAME-only predicate — it fails OPEN for a \
+             secondary spawned without that variable, which is the spawn path \
+             that caused the 2026-07-28 clobber"
+        );
+    }
 
     // ---- periodic budget re-publish ----
 

@@ -1565,6 +1565,17 @@ fn warn_on_low_disk(volumes: &[VolumeReport]) {
 /// empty for the whole multi-hour walk, and its server-side persist blew the
 /// old 15s client timeout).
 pub fn spawn_census() {
+    // The census POSTs to `/coord/worktree-census/{device_id}` — device-keyed
+    // state describing the whole machine's worktrees. Every instance on the
+    // box shares one device_id, so a secondary's walk would overwrite the
+    // primary's inventory with its own view, and the reclaim/reaper decisions
+    // downstream act on whichever landed last. Same rule as the fleet
+    // publishers: only the instance that owns shared root state publishes it.
+    // Nothing is lost by gating — the primary's walk sees the same filesystem,
+    // including worktrees a secondary created.
+    if !crate::fleet::may_publish_machine_state("worktree census") {
+        return;
+    }
     let secs: u64 = std::env::var("QONTINUI_WORKTREE_CENSUS_INTERVAL_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
