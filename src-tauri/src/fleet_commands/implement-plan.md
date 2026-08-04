@@ -295,8 +295,69 @@ coord computes from the work unit's landing predicate, so a direct
 `to_status:"shipped"` POST is rejected with `status_is_derived`. The plan `.md`
 stamp (in place — Step 6) + any commit/push STAY (the operator-private artifact workflow), but
 the coord `in_progress` transition is this explicit call, not a side effect of the
-file push. (claude-config is NOT a coord sole-authority repo — its PRs land via
-normal GitHub flow.)
+file push. (A repo that is NOT coord sole-authority lands its PRs via normal
+GitHub flow.)
+
+#### Cancel the vet→implement safety-net continuation (do this AT the stamp)
+
+The IN PROGRESS stamp is the moment this session provably took the work over, so
+it is the moment to retire the net that was armed in case it didn't.
+
+Since 2026-07-28 `/vet-plan` §5.4 registers the plan's `unit_ready` gate **WITH**
+a dispatching `continuation_spawn` even under `/vet-imp` — because the `/vet-imp`
+chain was observed to stall after vetting, leaving plans stranded. That
+continuation exists solely to rescue a chain that dropped. This session did not
+drop: it is stamping IN PROGRESS. So cancel it, or the runner will spawn a
+redundant terminal running `/implement-plan` on the plan you are already
+implementing (the pending row survives up to 24h and the runner's in-process
+dedupe set is forgotten across restarts).
+
+**Branch on the GATE ROW, not on an HTTP status.** Resolve the work unit for
+this plan-stem, then `GET $COORD_HTTP_URL/coord/gates?work_unit_id=<id>` and look
+at each row's `continuation_spawn` / `continuation_dispatched_at` /
+`continuation_consumed_at` / `continuation_cancelled_at` fields:
+
+| Row state | What it means | What to do |
+|---|---|---|
+| `continuation_spawn != null` ∧ `dispatched_at == null` | **PRE-DISPATCH — the net is ARMED.** At this stamp, moments after §5.4 registered the gate, **this is the EXPECTED state.** | **Mute or reject the GATE** (coord skips muted gates when evaluating, so muting genuinely suppresses the dispatch); once `coord_withdraw_gate` lands, withdraw it. Do **NOT** POST `continuation-cancel` — see below. |
+| `dispatched_at != null` ∧ `consumed_at == null` ∧ `cancelled_at == null` | Dispatched, not yet consumed. | `POST $COORD_HTTP_URL/coord/gates/<gate_id>/continuation-cancel` `{cancelled_by, reason}` — the Step 0.6 call, with the response handling below. |
+| no row carries a `continuation_spawn` | Genuinely nothing pending — e.g. a standalone `/implement-plan` whose gate was registered continuation-less. | Say so and proceed. **Do not mute anything.** |
+
+**Why the row and not the status code.** `continuation-cancel` governs the
+**post-dispatch window only** (`_gate-registration` → "Continuation cancel +
+refresh"). Against an armed-but-undispatched continuation it 404s, and a 404
+reads as "nothing pending" — so branching on the status would make the
+pre-dispatch case, which is the *common* case here, silently indistinguishable
+from success and leave the net armed on every completed chain.
+
+Responses, once you are in the dispatched row-state:
+
+- **200 `{cancelled:true}`** — the net is retired. The clean outcome.
+- **401 / 403** — `continuation-cancel` is a `TenantId`/operator-bearer route,
+  not the device-keyed layer, and this session holds a device JWT. The net is
+  still armed: narrate it and say a redundant terminal **may still spawn**.
+  Never let an auth failure read as benign.
+- **409 `already_consumed`** — the rescue spawn already fired. Say so honestly:
+  a second session may now be working this plan, so reconcile before launching
+  phase agents rather than claiming a clean takeover.
+
+**Best-effort throughout — this MUST NOT block the stamp or Step 1.** If none of
+it lands, proceed and report the residual honestly.
+
+**Second line of defence, when the cancel does not land.** A continuation that
+spawns anyway runs `/implement-plan` on a plan this session has already stamped
+IN PROGRESS, so that run hits Step 0.45's concurrent-work reconnaissance and
+Step 0.6's phase-claim conflict and should stand down. That is a real mitigation
+and it is why the residual risk is acceptable — but it is a *behavioural* gate,
+not a mechanical one, so do not treat it as a reason to skip the cancel.
+
+**Run it once per run.** Doing it here means Step 0.6's copy is normally a no-op
+second sweep; that is deliberate belt-and-braces, since Step 0.6 is skipped
+entirely in non-coord environments and on the claim-conflict path. If you already
+cancelled here, Step 0.6's sweep will simply find nothing pending — do not report
+it as a second cancellation.
+
+(canonical spec: `_gate-registration` → "Continuation cancel + refresh" — keep in sync)
 
 #### Single-stamp invariant — applies to Step 0.5 and Step 6
 
@@ -422,8 +483,17 @@ Taking the phase claim directly means THIS session is doing the work a
 `unit_ready` gate's continuation may have queued as a fresh runner-terminal
 spawn. Leaving that pending continuation alive means the runner spawns a
 **redundant terminal** on its next WS reconnect (its in-process dedupe set is
-forgotten across restarts, and the pending row survives up to 24h). So,
-**best-effort, right after the FIRST phase claim of this run succeeds** (do it
+forgotten across restarts, and the pending row survives up to 24h).
+
+**Normally Step 0.5 already did this** — it cancels at the IN PROGRESS stamp,
+which is earlier, and that earlier cancel is what makes `/vet-plan` §5.4's
+`/vet-imp` continuation inversion safe. This copy is the backstop for the paths
+where Step 0.5's cancel did not run or did not land: a non-coord environment, a
+transport failure, or a gate that only became pending between the stamp and here.
+If nothing is pending, say "no pending continuation to cancel" — do not report a
+second cancellation of the same gate.
+
+So, **best-effort, right after the FIRST phase claim of this run succeeds** (do it
 once per run, not per phase):
 
 1. Resolve the `work_unit_id` for this plan-stem via
@@ -639,7 +709,7 @@ a gate.
    `basename "$(dirname "$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)")"`.
    NOT `basename` of `git rev-parse --show-toplevel`: from a linked git
    worktree that returns the WORKTREE's own directory name
-   (`ccfg-wt-pr161-followup`, `qontinui-claude-config-wt-lna`), so the
+   (`myrepo-wt-pr161-followup`, `myrepo-wt-lna`), so the
    dashboard tile groups this session under a repo that does not exist —
    and sessions run under `QONTINUI_AGENT_WORKTREE_MODE=1`, so that is the
    common path, not an edge case. `--git-common-dir` resolves to the main
