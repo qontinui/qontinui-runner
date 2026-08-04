@@ -2,29 +2,41 @@
 //! project slash commands into a spawned session's working directory.
 //!
 //! `claude` discovers project slash commands from `<cwd>/.claude/commands/*.md`.
-//! A gate-continuation session is spawned with a fresh worktree as its cwd; on a
-//! non-operator device there is no `~/.claude/commands` and no
-//! `qontinui-claude-config` checkout, so the fleet vet/implement procedures would
-//! be unresolvable. This module BUNDLES the two command procedures into the
-//! runner binary via `include_str!` and writes them into the session cwd, so the
-//! commands resolve regardless of what (if anything) is in the device's home dir.
+//! A gate-continuation session is spawned with a fresh worktree as its cwd, and
+//! on most devices there is no `~/.claude/commands` at all, so the fleet
+//! vet/implement procedures would be unresolvable. This module BUNDLES the two
+//! command procedures into the runner binary via `include_str!` and writes them
+//! into the session cwd, so the commands resolve regardless of what (if
+//! anything) is in the device's home dir.
 //!
-//! This is the fleet-portable sibling of `provision_agent_definitions` in
-//! `agent_runtime.rs` (which copies subagent defs from a `qontinui-claude-config`
-//! checkout). Where that path requires an operator checkout, this one carries the
-//! assets in the binary — see that function's doc comment for the broader
-//! fleet-portability rationale.
+//! ## The `.md` files in `fleet_commands/` are the CANONICAL sources
+//!
+//! They are not staged copies of anything. They are ordinary files in this
+//! public repository: edit them in place, review the change through a normal
+//! pull request, and git history is the tamper record. There is no upstream to
+//! re-sync from and no hash to re-pin — a diff in `git log` is the complete
+//! account of how a shipped command body came to say what it says.
+//!
+//! Adding a command is adding a `.md` file next to them plus one line in
+//! [`FLEET_COMMANDS`]. Nothing in this module or its consumers may assume the
+//! bundle is two commands.
+//!
+//! Because these bodies ship to every fleet device, they must stay free of any
+//! one operator's absolute paths — see
+//! [`tests::staged_fleet_commands_have_no_plan_path_hardcodes`].
 
 use std::path::Path;
 
 use tracing::{info, warn};
 
-/// `/vet-plan` procedure, bundled into the binary. Source of truth:
-/// `qontinui-claude-config/.claude/commands/vet-plan.md`, staged here at build time.
+/// `/vet-plan` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/vet-plan.md` in this repository — edit it
+/// there.
 const VET_PLAN: &str = include_str!("fleet_commands/vet-plan.md");
 
-/// `/implement-plan` procedure, bundled into the binary. Source of truth:
-/// `qontinui-claude-config/.claude/commands/implement-plan.md`, staged here.
+/// `/implement-plan` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/implement-plan.md` in this repository — edit
+/// it there.
 const IMPLEMENT_PLAN: &str = include_str!("fleet_commands/implement-plan.md");
 
 /// The command files to provision, as `(filename, contents)`. The filename is
@@ -34,66 +46,10 @@ const FLEET_COMMANDS: &[(&str, &str)] = &[
     ("implement-plan.md", IMPLEMENT_PLAN),
 ];
 
-/// LF-normalized SHA-256 of each staged fleet command file, checked in so that
-/// a silent edit fails `cargo test fleet_commands` instead of shipping quietly to
-/// every fleet device. The existing provisioning tests only assert non-empty +
-/// an H1 heading, so they would pass against fully-drifted or half-neutralized
-/// files; this hash is what actually pins the content.
-///
-/// ## What this pin does NOT catch — read before trusting it
-///
-/// These hashes live in THIS repo, alongside the files they pin. So they detect
-/// **tampering** (a staged file edited without re-pinning) but are structurally
-/// blind to **staleness** (claude-config moves on and nobody re-stages). The two
-/// are different failure modes and only the first is covered here.
-///
-/// Measured 2026-07-28: `cargo test fleet_commands` was green on `main` while the
-/// bundle sat **229 lines behind** claude-config (80 in `implement-plan.md`, 149 in
-/// `vet-plan.md`), still serving fleet devices an archive-move guard that had been
-/// deliberately deleted upstream. Nothing in runner CI could have gone red.
-///
-/// Staleness is caught instead by **`fleet-bundle-drift.yml` in
-/// qontinui-claude-config** (path-filtered `push` + daily `schedule`), which diffs
-/// this repo's staged copies against the source — the direction runner CI cannot
-/// see, since the claude-config repo is private and not reliably reachable here.
-///
-/// **Do not delete either guard believing the other covers it.** This pin guards
-/// what `include_str!` actually embedded; that workflow guards freshness.
-///
-/// ## Re-staging (run when the claude-config source legitimately changes)
-///
-/// From a workspace root holding both checkouts:
-///
-/// ```sh
-/// cp qontinui-claude-config/.claude/commands/implement-plan.md \
-///    qontinui-runner/src-tauri/src/fleet_commands/implement-plan.md
-/// cp qontinui-claude-config/.claude/commands/vet-plan.md \
-///    qontinui-runner/src-tauri/src/fleet_commands/vet-plan.md
-/// cd qontinui-runner/src-tauri/src/fleet_commands
-/// for f in implement-plan.md vet-plan.md; do
-///   printf '%s  %s\n' "$(tr -d '\r' < "$f" | sha256sum | cut -d' ' -f1)" "$f"
-/// done
-/// ```
-///
-/// Paste the printed hashes below. The hash is taken over content with CR bytes
-/// stripped (`*.md` is `text eol=lf` in `.gitattributes`), so it is stable
-/// regardless of the checkout's line-ending policy or the build host's
-/// `core.autocrlf`.
-const STAGED_COMMAND_HASHES: &[(&str, &str)] = &[
-    (
-        "implement-plan.md",
-        "2e15de77fedc8694dbec165ece3791627a42ccf67d4669315ad6d15780de3aeb",
-    ),
-    (
-        "vet-plan.md",
-        "b46a4d97bb6279404d246a59b92af37be947d8928f15df7e125f09d118f568f6",
-    ),
-];
-
 /// Provision the bundled fleet command procedures into `<workdir>/.claude/commands/`
 /// so a `claude` session spawned with `workdir` as its cwd can resolve `/vet-plan`
 /// and `/implement-plan` as PROJECT-scoped slash commands — even on a device with
-/// no `~/.claude/commands` and no `qontinui-claude-config` checkout.
+/// no `~/.claude/commands`.
 ///
 /// Fail-soft (mirrors `coord_mcp::provision_coord_mcp_for_session`): any IO error
 /// is logged via `tracing::warn!` and swallowed — a provisioning failure must
@@ -182,48 +138,13 @@ mod tests {
         assert_eq!(provision_fleet_commands_into(&commands_dir).unwrap(), 2);
     }
 
-    /// LF-normalized SHA-256 hex of `s` — CR bytes stripped so the hash matches
-    /// regardless of whether `include_str!` embedded LF or CRLF for this build.
-    fn lf_sha256_hex(s: &str) -> String {
-        use sha2::{Digest, Sha256};
-        let normalized = s.replace('\r', "");
-        Sha256::digest(normalized.as_bytes())
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
-    }
-
-    /// The drift guard: each staged fleet command must match its checked-in
-    /// LF-normalized hash. A mismatch means the bundled copy was edited (or the
-    /// claude-config source changed) without re-staging — see the re-stage
-    /// procedure documented on `STAGED_COMMAND_HASHES`.
-    #[test]
-    fn staged_fleet_commands_match_checked_in_hashes() {
-        assert_eq!(
-            STAGED_COMMAND_HASHES.len(),
-            FLEET_COMMANDS.len(),
-            "every staged fleet command needs exactly one checked-in hash"
-        );
-        for (name, contents) in FLEET_COMMANDS {
-            let expected = STAGED_COMMAND_HASHES
-                .iter()
-                .find(|(n, _)| n == name)
-                .unwrap_or_else(|| panic!("no checked-in hash for staged fleet command {name}"))
-                .1;
-            let actual = lf_sha256_hex(contents);
-            assert_eq!(
-                actual, expected,
-                "staged fleet command {name} drifted from its checked-in hash — it was \
-                 edited without re-staging from the claude-config source of truth (or the \
-                 source changed and the hash was not updated). See the re-stage procedure \
-                 documented on STAGED_COMMAND_HASHES."
-            );
-        }
-    }
-
-    /// The staged copies must never re-acquire the operator's absolute plan
-    /// paths. Scope to the specific hardcode patterns Phase 3 neutralized — NOT
-    /// bare `qontinui-dev-notes`, which legitimately appears as a repo name.
+    /// The bundled commands must never acquire the operator's absolute plan
+    /// paths. Scope to the specific hardcode patterns that were neutralized —
+    /// NOT bare `qontinui-dev-notes`, which legitimately appears as a repo name.
+    ///
+    /// This guard is independent of where the bodies come from, and it got MORE
+    /// load-bearing once these files became the canonical, user-facing
+    /// defaults: whatever is here ships to every fleet device.
     #[test]
     fn staged_fleet_commands_have_no_plan_path_hardcodes() {
         const FORBIDDEN: &[&str] = &[
@@ -235,8 +156,9 @@ mod tests {
             for pat in FORBIDDEN {
                 assert!(
                     !contents.contains(pat),
-                    "staged fleet command {name} contains forbidden plan-path hardcode {pat:?} \
-                     — neutralize it in the claude-config source and re-stage"
+                    "bundled fleet command {name} contains forbidden plan-path hardcode \
+                     {pat:?} — an operator-local absolute path must never ship to a fleet \
+                     device; rewrite it in src-tauri/src/fleet_commands/{name}"
                 );
             }
         }
