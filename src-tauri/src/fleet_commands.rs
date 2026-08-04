@@ -53,10 +53,8 @@ const IMPLEMENT_PLAN: &str = include_str!("fleet_commands/implement-plan.md");
 /// The embedded default commands, as `(name, body)`. `name` is the slash
 /// command `claude` will expose and the filename stem written under
 /// `.claude/commands/` (`vet-plan` -> `vet-plan.md` -> `/vet-plan`).
-pub(crate) const FLEET_COMMANDS: &[(&str, &str)] = &[
-    ("vet-plan", VET_PLAN),
-    ("implement-plan", IMPLEMENT_PLAN),
-];
+pub(crate) const FLEET_COMMANDS: &[(&str, &str)] =
+    &[("vet-plan", VET_PLAN), ("implement-plan", IMPLEMENT_PLAN)];
 
 /// Provision the resolved agent commands into `<workdir>/.claude/commands/` so
 /// a `claude` session spawned with `workdir` as its cwd can resolve them as

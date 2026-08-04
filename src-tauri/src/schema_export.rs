@@ -34,9 +34,9 @@ use serde_json::{Map, Value};
 pub fn export_all_schemas() -> Value {
     use qontinui_types::{
         accessibility as qa, agent_commands as qac, ai_workflows as qaw, app_events as qae,
-        apps as qap, completeness_verdict as qcv, config as qcfg, constraints as qc, discovery as qdc,
-        execution as qe, findings as qfn, functional_spec as qfs, geometry as qg, git_ops as qgo,
-        helper_task as qht, ir as qir, mcp_config as qmc, memory as qmem,
+        apps as qap, completeness_verdict as qcv, config as qcfg, constraints as qc,
+        discovery as qdc, execution as qe, findings as qfn, functional_spec as qfs, geometry as qg,
+        git_ops as qgo, helper_task as qht, ir as qir, mcp_config as qmc, memory as qmem,
         orchestration_config as qoc, priorities_profile as qpp, process_management as qpm,
         projects as qprj, rag as qr, runner as qrn, scheduler as qs, spec_api_events as qsae,
         spec_check as qsc, state_machine as qsm, targets as qt, task_run as qtr, terminal as qtm,
