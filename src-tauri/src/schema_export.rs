@@ -33,8 +33,8 @@ use serde_json::{Map, Value};
 /// canonical types directly so there is no duplication.
 pub fn export_all_schemas() -> Value {
     use qontinui_types::{
-        accessibility as qa, ai_workflows as qaw, app_events as qae, apps as qap,
-        completeness_verdict as qcv, config as qcfg, constraints as qc, discovery as qdc,
+        accessibility as qa, agent_commands as qac, ai_workflows as qaw, app_events as qae,
+        apps as qap, completeness_verdict as qcv, config as qcfg, constraints as qc, discovery as qdc,
         execution as qe, findings as qfn, functional_spec as qfs, geometry as qg, git_ops as qgo,
         helper_task as qht, ir as qir, mcp_config as qmc, memory as qmem,
         orchestration_config as qoc, priorities_profile as qpp, process_management as qpm,
@@ -753,6 +753,14 @@ pub fn export_all_schemas() -> Value {
     add!("MemorySummary", qmem::MemorySummary);
     add!("MemoryWithHistory", qmem::MemoryWithHistory);
     add!("MemoryListResponse", qmem::MemoryListResponse);
+
+    // ── qontinui-types: agent_commands (account-versioned agent commands —
+    // plan 2026-07-29-account-versioned-agent-commands.md Phase 2). The
+    // ACCOUNT-OVERRIDE layer only: the defaults ship embedded in this binary
+    // (`fleet_commands.rs`), so these types model customization, never the
+    // default itself. ──
+    add!("AgentCommand", qac::AgentCommand);
+    add!("AgentCommandVersion", qac::AgentCommandVersion);
 
     // ── qontinui-types: git_ops (coord-mediated GitOp federation —
     // plan 2026-05-24-federation-verify-and-gitop.md Phase 5) ──
