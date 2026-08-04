@@ -77,11 +77,19 @@ fn tee_into_scrollback(
     data: &[u8],
 ) -> u64 {
     if let Ok(mut sb) = scrollback.lock() {
-        for &byte in data {
-            if sb.len() >= SCROLLBACK_CAPACITY {
-                sb.pop_front();
+        // Slice append, not byte-by-byte: `extend` copies the run in one go and
+        // a single up-front `drain` makes room, instead of a bounds check +
+        // `pop_front` per byte on every chunk of every session.
+        if data.len() >= SCROLLBACK_CAPACITY {
+            // The chunk alone overflows the ring — keep only its tail.
+            sb.clear();
+            sb.extend(&data[data.len() - SCROLLBACK_CAPACITY..]);
+        } else {
+            let overflow = (sb.len() + data.len()).saturating_sub(SCROLLBACK_CAPACITY);
+            if overflow > 0 {
+                sb.drain(..overflow);
             }
-            sb.push_back(byte);
+            sb.extend(data);
         }
         total_produced.fetch_add(data.len() as u64, Ordering::Relaxed)
     } else {
@@ -576,6 +584,12 @@ impl TerminalSession {
         // set on the child env below. `get_effective_config_dir` runs only when
         // no caller pin — identical to the prior behavior.
         let effective_claude_config_dir: Option<String> = caller_config_dir_value.or_else(|| {
+            // Phase 0 instrumentation: this is B3/B5 — an uncached
+            // `settings.json` read + double parse, plus a possible INLINE
+            // blocking OAuth refresh POST inside `get_effective_config_dir`.
+            let _span =
+                tracing::debug_span!("terminal_spawn.resolve_config_dir", terminal_id = %id)
+                    .entered();
             let ai_settings = crate::settings::get_ai_settings();
             crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli)
         });
@@ -589,15 +603,23 @@ impl TerminalSession {
         // spawn (zero transcript race — the §3b determinism mechanism). Runs
         // AFTER caller `extra_env` so the identity dir wins on PATH. Fail-open:
         // any failure injects nothing and the terminal still spawns.
-        Self::apply_identity_seam(
-            &mut cmd,
-            &id,
-            &app_handle,
-            &cwd,
-            &title,
-            &page_id,
-            effective_claude_config_dir.clone(),
-        );
+        {
+            // Phase 0 instrumentation: the identity seam is the largest single
+            // block of synchronous I/O on the spawn path (hook files, coord-mcp
+            // provisioning, shim materialization, the lifecycle-store record).
+            // The inner segments carry their own child spans.
+            let _span =
+                tracing::debug_span!("terminal_spawn.identity_seam", terminal_id = %id).entered();
+            Self::apply_identity_seam(
+                &mut cmd,
+                &id,
+                &app_handle,
+                &cwd,
+                &title,
+                &page_id,
+                effective_claude_config_dir.clone(),
+            );
+        }
 
         // ---- Install-interception PATH-shim seam (plan §4 Phase 1) ----------
         // Behind the master flag `QONTINUI_INSTALL_INTERCEPT_ENABLED` (default
@@ -737,29 +759,58 @@ impl TerminalSession {
                 // flush passes `gated: false` — the dying terminal's final
                 // frame is bounded (≤ SYNC_FLUSH_BYTE_CAP) and there may be
                 // no future chunk to reveal a gap after it.
+                //
+                // Consumer gating (perf): each of the three legs is checked
+                // BEFORE the shared base64 encode, so a chunk nobody can
+                // receive — webview emission paused by flow control, no SSE
+                // subscriber, no WS relay client — costs zero encoding and
+                // zero allocation. Previously the encode AND a full `String`
+                // clone for the SSE send ran unconditionally on every chunk of
+                // every session. The flow-control decision itself is unchanged;
+                // it is only evaluated earlier in the same call.
                 let emit_impl = |payload: &[u8], offset: u64, gated: bool| {
-                    let encoded = STANDARD.encode(payload);
-                    // Broadcast to HTTP/SSE subscribers (ignore if no receivers)
-                    let _ = reader_output_tx.send(encoded.clone());
-                    // Broadcast to backend relay for remote mobile access
-                    crate::event_system::broadcast_ws_notification(
-                        &reader_app,
-                        "terminal-output",
-                        &serde_json::json!({
-                            "terminal_id": &reader_id,
-                            "data": &encoded,
-                        }),
-                    );
-
                     // Webview delivery is the only backpressure-gated leg.
-                    if gated {
+                    let to_webview = if gated {
                         let sent = reader_bytes_sent.load(Ordering::Relaxed);
                         let acked = reader_bytes_acked.load(Ordering::Relaxed);
                         let gap = sent.saturating_sub(acked);
-                        if !emission_gate.borrow_mut().should_emit(gap) {
+                        if emission_gate.borrow_mut().should_emit(gap) {
+                            true
+                        } else {
                             reader_emission_skipped.store(true, Ordering::Relaxed);
-                            return;
+                            false
                         }
+                    } else {
+                        true
+                    };
+                    let to_sse = reader_output_tx.receiver_count() > 0;
+                    let to_ws = crate::event_system::ws_notification_has_receivers(&reader_app);
+                    if !to_webview && !to_sse && !to_ws {
+                        return;
+                    }
+
+                    let encoded = STANDARD.encode(payload);
+
+                    // Broadcast to HTTP/SSE subscribers (skipped when none —
+                    // the `send` would drop the value anyway, and the clone is
+                    // a full copy of the base64 payload).
+                    if to_sse {
+                        let _ = reader_output_tx.send(encoded.clone());
+                    }
+                    // Broadcast to backend relay for remote mobile access
+                    if to_ws {
+                        crate::event_system::broadcast_ws_notification(
+                            &reader_app,
+                            "terminal-output",
+                            &serde_json::json!({
+                                "terminal_id": &reader_id,
+                                "data": &encoded,
+                            }),
+                        );
+                    }
+
+                    if !to_webview {
+                        return;
                     }
                     let event = TerminalOutputWire {
                         terminal_id: &reader_id,
@@ -1423,7 +1474,14 @@ impl TerminalSession {
         // (identity still rides the spawn-time --session-id pin; only the
         // confirmation hook is absent).
         let hook_dir = crate::session::claude_hook::session_restore_dir();
-        match crate::session::claude_hook::materialize(&hook_dir) {
+        // Phase 0 instrumentation: 4 hook files + 3 `set_executable` calls per
+        // spawn, with no content/mtime skip.
+        let hook_span =
+            tracing::debug_span!("terminal_spawn.claude_hook_materialize", terminal_id = %terminal_id)
+                .entered();
+        let hook_result = crate::session::claude_hook::materialize(&hook_dir);
+        drop(hook_span);
+        match hook_result {
             Some(settings_path) => {
                 cmd.env(
                     crate::session::claude_hook::CLAUDE_SETTINGS_ENV,
@@ -1457,26 +1515,41 @@ impl TerminalSession {
         // and `provision_coord_mcp_config_file` returns None on an unresolvable
         // bound port — then we inject nothing (no broken `--mcp-config`, no cwd
         // breadcrumb pollution), mirroring the `--settings` fail-open.
-        if crate::coord_mcp::workdir_declares_coord_mcp(cwd) {
-            info!(
-                terminal_id = %terminal_id,
-                "coord-mcp: cwd already declares coord-mcp — skipping --mcp-config injection"
-            );
-        } else if let Some(cfg_path) = crate::coord_mcp::provision_coord_mcp_config_file(cwd) {
-            cmd.env(
-                crate::coord_mcp::MCP_CONFIG_ENV,
-                cfg_path.to_string_lossy().as_ref(),
-            );
-            info!(
-                terminal_id = %terminal_id,
-                path = %cfg_path.display(),
-                "coord-mcp: QONTINUI_MCP_CONFIG injected for universal --mcp-config delivery"
-            );
+        {
+            // Phase 0 instrumentation: `.mcp.json` read+parse and, on the
+            // provisioning branch, a nonce registration that re-encrypts the
+            // WHOLE secure-storage token store (B2).
+            let _span =
+                tracing::debug_span!("terminal_spawn.coord_mcp_provision", terminal_id = %terminal_id)
+                    .entered();
+            if crate::coord_mcp::workdir_declares_coord_mcp(cwd) {
+                info!(
+                    terminal_id = %terminal_id,
+                    "coord-mcp: cwd already declares coord-mcp — skipping --mcp-config injection"
+                );
+            } else if let Some(cfg_path) = crate::coord_mcp::provision_coord_mcp_config_file(cwd) {
+                cmd.env(
+                    crate::coord_mcp::MCP_CONFIG_ENV,
+                    cfg_path.to_string_lossy().as_ref(),
+                );
+                info!(
+                    terminal_id = %terminal_id,
+                    path = %cfg_path.display(),
+                    "coord-mcp: QONTINUI_MCP_CONFIG injected for universal --mcp-config delivery"
+                );
+            }
         }
 
         // 3. Materialize the always-on identity shims + prepend their dir.
+        // Phase 0 instrumentation: 4 rendered scripts + 2 exe copies + a
+        // hardlink, per terminal, with no caching (B2).
         let base_dir = std::env::temp_dir();
-        match shim_materializer::materialize_identity(&base_dir, terminal_id) {
+        let shim_span =
+            tracing::debug_span!("terminal_spawn.shim_materialize", terminal_id = %terminal_id)
+                .entered();
+        let identity = shim_materializer::materialize_identity(&base_dir, terminal_id);
+        drop(shim_span);
+        match identity {
             Some(identity_dir) => {
                 let current_path = std::env::var("PATH").ok();
                 let new_path =
@@ -1507,6 +1580,12 @@ impl TerminalSession {
         if let Some(store) = app_handle
             .try_state::<std::sync::Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
         {
+            // Phase 0 instrumentation: B1 — a full-map clone + whole-file JSON
+            // rewrite + a full-registry snapshot-history line, i.e. the O(N)
+            // term in spawn latency.
+            let _span =
+                tracing::debug_span!("terminal_spawn.record_open", terminal_id = %terminal_id)
+                    .entered();
             crate::commands::terminal::record_pinned_session_open(
                 store.inner(),
                 pinned.clone(),
@@ -1744,6 +1823,24 @@ impl TerminalSession {
                 }
             }
         }
+    }
+
+    /// Monotonic count of every byte this session's PTY has ever produced.
+    ///
+    /// LOCK-FREE by construction: a single relaxed load of the same
+    /// `AtomicU64` the reader thread bumps inside `tee_into_scrollback`. The
+    /// periodic full-fleet grid scanners (`auto_response`, `usage_limit`,
+    /// `context_watcher`) use it as a change detector so they can skip a
+    /// session whose screen cannot have moved since their last pass. Going via
+    /// [`Self::info`] instead would take the title lock AND the exit-code lock
+    /// per session per tick, which is exactly the contention the skip exists to
+    /// avoid.
+    ///
+    /// Relaxed is sufficient: the value is a monotonic hint compared against
+    /// the scanner's own previous observation, and a stale read only costs one
+    /// deferred scan on the next tick (the counter never goes backwards).
+    pub fn total_bytes_produced(&self) -> u64 {
+        self.total_bytes_produced.load(Ordering::Relaxed)
     }
 
     /// Get terminal info for the frontend.

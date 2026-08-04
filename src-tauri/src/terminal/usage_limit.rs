@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::output_scan::normalize;
 
@@ -91,6 +91,13 @@ pub fn window_indicates_usage_limit(window: &str) -> Option<&'static str> {
 /// edge map).
 static FIRE_STATE: Mutex<Option<HashMap<String, Option<Instant>>>> = Mutex::new(None);
 
+/// Per-terminal output-byte watermarks so a tick skips sessions whose rendered
+/// screen cannot have changed since the previous pass (see
+/// [`super::scan_gate`]). This scanner keeps its OWN gate — sharing one with
+/// `auto_response` would let whichever tick ran first consume the change on the
+/// other's behalf.
+static SCAN_GATE: Mutex<Option<super::scan_gate::ScanGate>> = Mutex::new(None);
+
 /// Pure firing decision: given the matched pattern (if any), the terminal's
 /// last-fired time, and `now`, return the pattern iff a hint should fire and
 /// update `last_fired`. Debounce-gated level trigger. The unit-test seam.
@@ -133,8 +140,17 @@ pub fn scan_grids_once() {
     {
         let mut state = FIRE_STATE.lock().unwrap_or_else(|e| e.into_inner());
         let map = state.get_or_insert_with(HashMap::new);
+        let mut gate_guard = SCAN_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        let gate = gate_guard.get_or_insert_with(super::scan_gate::ScanGate::new);
         let now = Instant::now();
         for (tid, session) in &sessions {
+            // Skip sessions that produced no output since the last pass — the
+            // rendered screen is byte-identical, so a limit message frozen on
+            // an idle terminal is not re-detected. One relaxed atomic load
+            // instead of a grid lock + full screen render.
+            if !gate.should_scan(tid, session.total_bytes_produced()) {
+                continue;
+            }
             // Read the *rendered* screen text (rows joined by `\n`). The grid is
             // the VT-parsed cell buffer, so this sees text inside a full-screen
             // TUI that synchronized-output batching hides from a byte scan.
@@ -154,7 +170,8 @@ pub fn scan_grids_once() {
         // Drop state for terminals that have gone away.
         let live: HashSet<&String> = sessions.iter().map(|(t, _)| t).collect();
         map.retain(|tid, _| live.contains(tid));
-    } // fire-state lock released
+        gate.retain_live(&live);
+    } // fire-state + scan-gate locks released
 
     for (tid, pattern) in to_fire {
         info!(
@@ -189,7 +206,13 @@ pub fn spawn_grid_scan_loop() {
         debug!("usage_limit: grid-scan loop started");
         loop {
             ticker.tick().await;
-            scan_grids_once();
+            // Locking every session's grid and rendering a full screen is CPU
+            // + lock work, not I/O — keep it off the runtime's worker pool
+            // (same shape as `build_drift::run_periodic`). A panicked sweep is
+            // logged and the loop keeps ticking.
+            if let Err(e) = tokio::task::spawn_blocking(scan_grids_once).await {
+                warn!(error = %e, "usage_limit: grid-scan task panicked");
+            }
         }
     });
 }

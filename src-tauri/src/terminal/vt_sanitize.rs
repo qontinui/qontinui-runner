@@ -33,8 +33,7 @@
 //! arbitrary byte boundaries). We hold the bytes of an in-progress, not-yet-
 //! emitted escape sequence in **per-terminal carry state** keyed by
 //! `terminal_id`. Because [`OutputHook::process`] takes `&self` (the trait is
-//! `Send + Sync`), the carry map uses interior mutability
-//! (`Mutex<HashMap<String, Carry>>`).
+//! `Send + Sync`), the carry uses interior mutability.
 //!
 //! ## Hot-path discipline
 //!
@@ -42,9 +41,22 @@
 //! plain printable output: when a chunk (with no pending carry) contains no
 //! `ESC` byte, it is returned unchanged with no scanning beyond a single
 //! `memchr`-style search and no per-byte allocation.
+//!
+//! ### Per-terminal carry ownership (perf)
+//!
+//! ONE hook instance is registered on the process-wide interceptor, so a single
+//! `Mutex<HashMap<String, Carry>>` meant every session's reader thread queued on
+//! one exclusive lock — and, worse, that guard was held across the *whole*
+//! `sanitize_chunk` scan, not just the map lookup. The carry is now owned by a
+//! **per-terminal slot** (`Arc<Mutex<Carry>>`): the shared map is behind an
+//! `RwLock` whose guard is dropped before any scanning, and the only lock held
+//! across a scan is that terminal's own slot — uncontended, because exactly one
+//! reader thread feeds a given terminal. Sessions no longer serialize against
+//! each other here. Terminals that never emit an `ESC` never allocate a slot and
+//! never take the write lock at all.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 
 use super::interceptor::OutputHook;
 
@@ -92,35 +104,67 @@ struct Carry {
 /// module docs for the full classification.
 #[derive(Default)]
 pub struct VtSanitizeHook {
-    carries: Mutex<HashMap<String, Carry>>,
+    /// Terminal id → that terminal's OWN carry slot. The map guard is only
+    /// ever held for the lookup/insert; the scan runs under the per-terminal
+    /// slot lock (see the module docs).
+    carries: RwLock<HashMap<String, Arc<Mutex<Carry>>>>,
 }
 
 impl VtSanitizeHook {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// This terminal's carry slot, or `None` when it has none yet and the
+    /// caller decided one isn't needed. Takes only the shared read lock in the
+    /// steady state; the exclusive write lock is taken at most once per
+    /// terminal (the first chunk that contains an `ESC`).
+    fn slot_for(&self, terminal_id: &str, needed: bool) -> Option<Arc<Mutex<Carry>>> {
+        match self.carries.read() {
+            Ok(map) => {
+                if let Some(slot) = map.get(terminal_id) {
+                    return Some(slot.clone());
+                }
+            }
+            // A poisoned lock must not corrupt the stream — pass through.
+            Err(_) => return None,
+        }
+        if !needed {
+            return None;
+        }
+        match self.carries.write() {
+            Ok(mut map) => Some(
+                map.entry(terminal_id.to_string())
+                    .or_insert_with(|| Arc::new(Mutex::new(Carry::default())))
+                    .clone(),
+            ),
+            Err(_) => None,
+        }
+    }
 }
 
 impl OutputHook for VtSanitizeHook {
     fn process(&self, terminal_id: &str, data: &[u8]) -> Vec<u8> {
-        // Lock the carry map and pull this terminal's pending bytes (if any).
-        let mut carries = match self.carries.lock() {
+        // Fast path part 1: a terminal that has never carried anything and
+        // whose chunk holds no ESC needs no state at all — no write lock, no
+        // allocation, no scan.
+        let has_esc = data.contains(&ESC);
+        let Some(slot) = self.slot_for(terminal_id, has_esc) else {
+            return data.to_vec();
+        };
+
+        // The map guard is released above; from here the only lock held is
+        // this terminal's own slot, which only its reader thread touches.
+        let mut entry = match slot.lock() {
             Ok(c) => c,
-            // A poisoned lock must not corrupt the stream — pass through.
             Err(_) => return data.to_vec(),
         };
 
-        // Fast path: no carry AND no ESC in this chunk → nothing to do.
-        if !carries
-            .get(terminal_id)
-            .map(|c| !c.pending.is_empty())
-            .unwrap_or(false)
-            && !data.contains(&ESC)
-        {
+        // Fast path part 2: no carry AND no ESC in this chunk → nothing to do.
+        if entry.pending.is_empty() && !has_esc {
             return data.to_vec();
         }
 
-        let entry = carries.entry(terminal_id.to_string()).or_default();
         let pending = std::mem::take(&mut entry.pending);
         let (mut out, new_pending) = sanitize_chunk(&pending, data);
         if new_pending.len() > MAX_PENDING {
