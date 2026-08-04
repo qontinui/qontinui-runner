@@ -1291,12 +1291,15 @@ function TerminalPageInner({
 
           <div className="flex-1 relative overflow-hidden">
             {tabs.length > 0 ? (
+              /* Every prop here is identity-stable (useZoneActions callbacks,
+                 the memoized handleExit, and useMidSessionProbe's stable
+                 `feed`), which is what makes ZoneGrid's React.memo hold. */
               <ZoneGrid
                 onZoneClick={handleZoneClick}
                 onZoneDoubleClick={handleZoneDoubleClick}
                 onExit={handleExit}
                 onExportZone={handleExportZone}
-                onUserInputLine={(tabId, input) => midSessionProbe.feed(tabId, input)}
+                onUserInputLine={midSessionProbe.feed}
               />
             ) : (
               <div className="h-full flex flex-col items-center justify-center text-[#565f89] gap-2">
