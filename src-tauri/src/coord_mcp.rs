@@ -174,6 +174,26 @@ struct NonceBinding {
     /// slot, byte-identical to pre-B3 behavior). Unused for Agent nonces —
     /// their bearer is the agent JWT, whose tenant claim is frozen at mint.
     session_tenant: Option<Uuid>,
+    /// The runner TERMINAL this nonce was provisioned for, frozen at mint time
+    /// (same pattern and lifetime as `session_tenant`).
+    ///
+    /// **Why the terminal and not the workdir.** Caller self-identification
+    /// (session-fabric Phase 0) resolves `nonce → … → coord agent_session_id`.
+    /// The `workdir` leg cannot be deterministic: a workdir is NOT unique — on
+    /// the operator's box 8 live sessions share one repo dir — so
+    /// workdir → session is 1:N and any pick is a guess. The TERMINAL is the
+    /// runner's only 1:1 handle: the runner spawns the PTY, mints this nonce for
+    /// it, and the durable lifecycle record already carries `terminal_id` beside
+    /// `claude_session_id` (`session::session_lifecycle_store`). So a binding
+    /// that knows its terminal resolves EXACTLY, with no tie-break.
+    ///
+    /// `None` for the bindings that genuinely have no terminal: the in-cwd
+    /// `.mcp.json` writer (that file is shared by every session in the cwd by
+    /// construction), the `/coord-mcp/provision-session` mint route (bare
+    /// sessions the runner did not spawn), the boot restore, and the on-disk
+    /// adopt (neither persisted form carries a terminal). Those keep the
+    /// workdir leg as their fallback. Read via [`terminal_id_for_nonce`].
+    terminal_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1080,6 +1100,12 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> us
                 // its original tenant is unrecoverable, and defaulting is the
                 // safe (never cross-tenant) choice.
                 session_tenant: None,
+                // Likewise the persisted store carries no terminal id, so a
+                // restored nonce cannot claim one — caller self-identification
+                // falls back to the workdir leg for it. Faking a terminal here
+                // would be worse than a miss: it would name a PTY that died
+                // with the previous runner process.
+                terminal_id: None,
             });
         }
         map.len()
@@ -1090,16 +1116,29 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> us
 
 /// Mint + register a fresh PERSISTENT per-session DEVICE proxy nonce for
 /// `workdir`, returning it. Any prior persistent nonce registered for the same
-/// workdir is evicted — a re-provision rewrites `.mcp.json`, so the old nonce is
-/// unreachable and keeping it would only widen the accept set. The updated set is
-/// mirrored to the encrypted store (Phase 3b) so it survives a restart.
+/// workdir AND the same `terminal_id` is evicted — a re-provision rewrites the
+/// config, so the old nonce is unreachable and keeping it would only widen the
+/// accept set. The updated set is mirrored to the encrypted store (Phase 3b) so
+/// it survives a restart.
+///
+/// `terminal_id` is the runner terminal this nonce is being provisioned for, and
+/// it is what makes caller self-identification deterministic (see
+/// [`NonceBinding::terminal_id`]). It also NARROWS eviction, so two terminals
+/// sharing one cwd each keep their own live nonce instead of 401ing each other —
+/// see [`mint_and_register_nonce`]'s eviction rule. `None` = a caller with no
+/// terminal (the in-cwd `.mcp.json` writer, the boot self-heal), which preserves
+/// the previous same-workdir eviction behavior exactly.
 ///
 /// This is the RUNNER-SPAWN path (the identity seam, the terminal chokepoint,
-/// the boot self-heal). Its semantics are deliberately unchanged by plan
-/// 2026-07-17 — see [`register_session_proxy_nonce`] for the mint-route path.
-fn register_proxy_nonce(workdir: &str) -> String {
-    let (nonce, snapshot) =
-        mint_and_register_nonce(workdir, ProxyPrincipal::Device, NonceLifetime::Persistent);
+/// the boot self-heal). Its semantics are otherwise deliberately unchanged by
+/// plan 2026-07-17 — see [`register_session_proxy_nonce`] for the mint-route path.
+fn register_proxy_nonce(workdir: &str, terminal_id: Option<&str>) -> String {
+    let (nonce, snapshot) = mint_and_register_nonce(
+        workdir,
+        ProxyPrincipal::Device,
+        NonceLifetime::Persistent,
+        terminal_id,
+    );
     persist_proxy_nonces(&snapshot);
     nonce
 }
@@ -1135,9 +1174,21 @@ fn register_proxy_nonce(workdir: &str) -> String {
 /// shorten the TTL to paper over this — it would 401 live sessions mid-turn
 /// (the MCP client never re-reads its config) — and do NOT re-add cwd-scoped
 /// eviction, which caused the sibling-DoS.
+///
+/// # No terminal id — by construction
+///
+/// The binding is minted with `terminal_id: None`. This route exists precisely
+/// FOR sessions the runner did not spawn: there is no PTY, so there is no
+/// terminal to name, and caller self-identification falls back to the workdir
+/// leg for these nonces. Do not invent one here — a fabricated terminal id would
+/// resolve confidently to somebody else's session.
 fn register_session_proxy_nonce(workdir: &str) -> String {
-    let (nonce, _snapshot) =
-        mint_and_register_nonce(workdir, ProxyPrincipal::Device, NonceLifetime::ephemeral());
+    let (nonce, _snapshot) = mint_and_register_nonce(
+        workdir,
+        ProxyPrincipal::Device,
+        NonceLifetime::ephemeral(),
+        None,
+    );
     nonce
 }
 
@@ -1146,6 +1197,11 @@ fn register_session_proxy_nonce(workdir: &str) -> String {
 /// agent nonce must hard-fail closed across a restart, which is automatic since
 /// [`persist_proxy_nonces`] drops non-device bindings. The per-request bearer
 /// comes from the agent's own [`AGENT_TOKENS`] slot, never the device JWT.
+///
+/// `terminal_id: None` — a headless agent subprocess is spawned directly
+/// (`agent_runtime::run_agent_subprocess`), never through the PTY/terminal seam,
+/// so it has no terminal to bind. Its identity is the agent JWT, not a caller
+/// session header.
 pub(crate) fn register_agent_proxy_nonce(workdir: &str, agent_id: Uuid) -> String {
     // Persistent lifetime = today's semantics (no expiry). It is NOT a disk
     // persistence decision: `device_nonce_snapshot` drops every agent binding
@@ -1154,6 +1210,7 @@ pub(crate) fn register_agent_proxy_nonce(workdir: &str, agent_id: Uuid) -> Strin
         workdir,
         ProxyPrincipal::Agent { agent_id },
         NonceLifetime::Persistent,
+        None,
     );
     // Mirror to the store as a no-op for the agent entry (device entries in the
     // same snapshot, if any, are still persisted) — `persist_proxy_nonces`
@@ -1168,12 +1225,25 @@ pub(crate) fn register_agent_proxy_nonce(workdir: &str, agent_id: Uuid) -> Strin
 /// ([`persist_proxy_nonces_with_store`]) instead of the default store reached
 /// via the process-global `QONTINUI_SECURE_STORAGE_DIR`.
 ///
-/// **Eviction rule (plan 2026-07-17 §1/E):**
-/// - A **PERSISTENT** mint evicts the prior persistent-same-workdir nonce (the
-///   runner-spawn re-provision case) and graces the evicted DEVICE ones. Within
-///   the Persistent class this is byte-for-byte the previous behavior (every
-///   runner-spawn nonce was Persistent, so "same workdir" and "same workdir +
-///   same class" select the same set).
+/// **Eviction rule (plan 2026-07-17 §1/E; narrowed by plan
+/// 2026-08-04-runner-caller-session-self-id-resolution Stage 1):**
+/// - A **PERSISTENT** mint evicts the prior persistent nonces for the same
+///   workdir **AND the same `terminal_id`** (the runner-spawn re-provision
+///   case) and graces the evicted DEVICE ones.
+///
+///   The `terminal_id` half of that key is what lets two terminals share one
+///   cwd. Evicting on workdir alone was correct while the nonce was a
+///   per-workdir credential; now that the identity seam mints one per TERMINAL
+///   (see [`NonceBinding::terminal_id`] and [`mcp_config_file_name`]),
+///   workdir-only eviction would mean terminal 2's spawn 401s terminal 1's
+///   already-connected MCP client — the sibling-DoS the ephemeral class already
+///   had to fix. Two live persistent nonces for one workdir is therefore a
+///   sanctioned state, exactly as two ephemeral ones already were.
+///
+///   When BOTH sides carry `terminal_id: None` the rule degenerates to the
+///   previous "same workdir + same class" one, byte-for-byte: a re-provision
+///   into the same cwd by a terminal-less caller (the in-cwd `.mcp.json`
+///   writer, the boot self-heal) still evicts its predecessor.
 /// - An **EPHEMERAL** mint evicts **NOTHING**. Two DIFFERENT bare sessions
 ///   routinely share a cwd, and an ephemeral eviction is NOT graced (grace is
 ///   for runner-initiated re-provisions only), so removing a sibling ephemeral
@@ -1194,6 +1264,7 @@ fn mint_and_register_nonce(
     workdir: &str,
     principal: ProxyPrincipal,
     lifetime: NonceLifetime,
+    terminal_id: Option<&str>,
 ) -> (String, HashMap<String, NonceBinding>) {
     // Two v4 UUIDs (~244 bits of randomness) — v4, NOT v7: the v7 prefix is a
     // timestamp, which would gut the entropy this nonce exists to provide.
@@ -1239,9 +1310,13 @@ fn mint_and_register_nonce(
                     return false;
                 }
             }
-            // (2) Class-scoped eviction. Only a PERSISTENT mint evicts, and only
-            // the prior PERSISTENT same-workdir nonces (today's PTY re-provision
-            // behavior — never an ephemeral, so the class-scoping holds). An
+            // (2) Class- AND terminal-scoped eviction. Only a PERSISTENT mint
+            // evicts, and only the prior PERSISTENT nonces for the same workdir
+            // AND the same terminal (the PTY re-provision case — never an
+            // ephemeral, so the class-scoping holds). Adding the terminal to the
+            // key is what lets two terminals share a cwd without the second
+            // spawn 401ing the first one's live MCP client; with both sides
+            // `None` it is byte-for-byte the previous same-workdir rule. An
             // EPHEMERAL mint evicts NOTHING: two DIFFERENT bare sessions routinely
             // share a cwd, and an ephemeral eviction is not graced, so removing a
             // sibling ephemeral nonce would 401 the other session's
@@ -1251,7 +1326,11 @@ fn mint_and_register_nonce(
             // in-flight client that cached one keeps validating until it
             // reconnects; agent nonces are NOT graced (they hard-fail closed on
             // re-mint), so they are dropped without being collected.
-            if !ephemeral && b.workdir == workdir && !b.lifetime.is_ephemeral() {
+            if !ephemeral
+                && b.workdir == workdir
+                && b.terminal_id.as_deref() == terminal_id
+                && !b.lifetime.is_ephemeral()
+            {
                 if b.principal == ProxyPrincipal::Device {
                     evicted_graceable.push(n.clone());
                 } else {
@@ -1268,6 +1347,10 @@ fn mint_and_register_nonce(
                 principal,
                 lifetime,
                 session_tenant,
+                // Frozen at mint time, exactly like `session_tenant`. This is
+                // the deterministic leg of caller self-identification — see
+                // [`NonceBinding::terminal_id`] / [`terminal_id_for_nonce`].
+                terminal_id: terminal_id.map(str::to_string),
             },
         );
         grace_evicted_device_nonces(&evicted_graceable);
@@ -1287,7 +1370,7 @@ fn mint_and_register_nonce(
             "evict",
             workdir,
             n,
-            "superseded by same-workdir persistent re-mint",
+            "superseded by same-workdir+same-terminal persistent re-mint",
         );
         log_rotation_event("grace", workdir, n, &grace_cause);
     }
@@ -1296,7 +1379,7 @@ fn mint_and_register_nonce(
             "evict",
             workdir,
             n,
-            "superseded by same-workdir persistent re-mint (agent — fails closed, never graced)",
+            "superseded by same-workdir+same-terminal persistent re-mint (agent — fails closed, never graced)",
         );
     }
     log_rotation_event("mint", workdir, &nonce, mint_cause);
@@ -1393,6 +1476,27 @@ pub(crate) const CALLER_SESSION_HEADER: &str = "x-coord-caller-session";
 /// coord `agent_session_id`.
 pub(crate) fn workdir_for_nonce(nonce: &str) -> Option<String> {
     live_binding(nonce).map(|b| b.workdir)
+}
+
+/// The runner TERMINAL a registered proxy nonce was provisioned for
+/// ([`NonceBinding::terminal_id`]). `None` for an empty, unregistered, or
+/// no-longer-valid nonce ([`live_binding`]) — and also for a live binding that
+/// legitimately has no terminal (restored, adopted, mint-route, in-cwd
+/// `.mcp.json`, agent).
+///
+/// This is the **deterministic** leg of session-fabric Phase 0 caller
+/// self-identification: `nonce → terminal_id → the OPEN lifecycle record with
+/// that terminal → its `claude_session_id` → coord `agent_session_id`. Every
+/// hop is 1:1, so there is no `last_seen_at` tie-break and no ambiguity. The
+/// [`workdir_for_nonce`] leg stays as the FALLBACK for the terminal-less
+/// bindings above, where it is inherently 1:N (a workdir can host many
+/// sessions) and therefore a guess.
+///
+/// Goes through the same [`live_binding`] chokepoint as every other lookup, so
+/// expiry and revocation apply identically — an expired ephemeral or an
+/// opted-out machine yields `None` here too, never a stale identity.
+pub(crate) fn terminal_id_for_nonce(nonce: &str) -> Option<String> {
+    live_binding(nonce).and_then(|b| b.terminal_id)
 }
 
 /// Resolve `nonce`'s binding IF it is currently VALID, applying the
@@ -1570,9 +1674,17 @@ pub(crate) fn release_workdir_on_session_close(workdir: &str) {
         persist_proxy_nonces(&snapshot);
     }
     // Reap the app-data --mcp-config file for this workdir (its nonce is dead).
+    //
+    // Workdir-keyed name only (`None`): this entry point knows the workdir, not
+    // the terminal. Per-TERMINAL config files ([`mcp_config_file_name`] with a
+    // terminal id) are therefore not reaped here — they are left to the
+    // session-restore reaper ([`reap_stale_session_restore_configs_in`]), which
+    // drops any config whose nonce is no longer registered, and every nonce for
+    // this workdir was just revoked above. So the credential dies immediately
+    // either way; only the (already-dead) file lingers until the next reap.
     let cfg = crate::session::claude_hook::session_restore_dir()
         .join("coord-mcp")
-        .join(mcp_config_file_name(workdir));
+        .join(mcp_config_file_name(workdir, None));
     if cfg.exists() {
         if let Err(e) = std::fs::remove_file(&cfg) {
             warn!(
@@ -1863,8 +1975,16 @@ pub(crate) fn resolve_bound_api_port() -> Option<u16> {
 /// bearer. The proxy injects a live device JWT per request, so the config
 /// survives the 4h token TTL that kills static-bearer configs in sessions
 /// that outlive their snapshot (the MCP client never re-reads `.mcp.json`).
+///
+/// Mints with `terminal_id: None`, deliberately: `<workdir>/.mcp.json` is ONE
+/// file in a shared cwd, read by every session launched there, so a terminal id
+/// on its binding would be a lie — it would name whichever terminal happened to
+/// write the file last while serving all the others. These nonces keep the
+/// workdir fallback for caller self-identification. The per-terminal key lives
+/// on the app-data `--mcp-config` delivery instead
+/// ([`provision_coord_mcp_config_file`]), which really is one file per terminal.
 pub(crate) fn write_coord_mcp_proxy_config(primary_wt: &str, bound_port: u16) {
-    let nonce = register_proxy_nonce(primary_wt);
+    let nonce = register_proxy_nonce(primary_wt, None);
     write_mcp_json(primary_wt, &coord_mcp_proxy_config_json(bound_port, &nonce));
 }
 
@@ -2421,14 +2541,28 @@ pub(crate) fn workdir_declares_coord_mcp(workdir: &str) -> bool {
     v.pointer("/mcpServers/coord-mcp").is_some()
 }
 
-/// Stable per-workdir filename for the runner-owned coord-mcp `--mcp-config` file.
-/// A non-cryptographic hash of the absolute workdir keeps the name short (Windows
-/// path limits) and collision-free in practice, and STABLE across re-spawns into
-/// the same cwd so a restart reuses one path (rewritten with the fresh nonce).
-fn mcp_config_file_name(workdir: &str) -> String {
+/// Filename for the runner-owned coord-mcp `--mcp-config` file: a
+/// non-cryptographic hash of the **terminal id** when one is known, else of the
+/// absolute workdir. Hashing keeps the name short (Windows path limits) and
+/// collision-free in practice.
+///
+/// **Per TERMINAL, not per workdir** (plan
+/// 2026-08-04-runner-caller-session-self-id-resolution Stage 1). The name is
+/// STABLE across re-spawns of the same terminal, so a restart reuses one path
+/// (rewritten with the fresh nonce) — the same stability property the
+/// workdir-keyed name had, moved onto the finer key. This is what makes two
+/// terminals in one cwd get two files and therefore two NONCES instead of
+/// sharing one: with a single shared file, `nonce → session` is 1:N and caller
+/// self-identification can never be deterministic (see
+/// [`NonceBinding::terminal_id`]).
+///
+/// `terminal_id: None` falls back to hashing the workdir — byte-identical to the
+/// previous behavior — for the callers that have no terminal (the boot
+/// self-heal, session-close reaping of legacy workdir-named files).
+fn mcp_config_file_name(workdir: &str, terminal_id: Option<&str>) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    workdir.hash(&mut h);
+    terminal_id.unwrap_or(workdir).hash(&mut h);
     format!("coord-mcp-{:016x}.json", h.finish())
 }
 
@@ -2457,10 +2591,19 @@ fn mcp_config_file_name(workdir: &str) -> String {
 /// into the user's cwd (the pollution non-goal). The nonce is DEVICE-principal and
 /// persisted ([`register_proxy_nonce`]), so an already-written file keeps
 /// validating across an orphan-outliving-a-restart edge.
-pub(crate) fn provision_coord_mcp_config_file(workdir: &str) -> Option<std::path::PathBuf> {
+///
+/// `terminal_id` is the seam's terminal. It keys BOTH the nonce binding (making
+/// caller self-identification deterministic — [`NonceBinding::terminal_id`]) and
+/// the app-data filename ([`mcp_config_file_name`]), so two terminals in one cwd
+/// get two files and two live nonces rather than racing one. `None` degrades to
+/// the previous per-workdir behavior in full.
+pub(crate) fn provision_coord_mcp_config_file(
+    workdir: &str,
+    terminal_id: Option<&str>,
+) -> Option<std::path::PathBuf> {
     // The shared mint core (§2): fail-closed port resolve + a DEVICE, cwd-bound
     // nonce. `Persistent` = the runner-spawn class — today's semantics exactly.
-    let mcp_config = mint_device_proxy_config(workdir, NonceLifetime::Persistent)?;
+    let mcp_config = mint_device_proxy_config(workdir, NonceLifetime::Persistent, terminal_id)?;
     let dir = crate::session::claude_hook::session_restore_dir().join("coord-mcp");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         warn!(
@@ -2480,7 +2623,7 @@ pub(crate) fn provision_coord_mcp_config_file(workdir: &str) -> Option<std::path
             dir.display()
         );
     }
-    let file = dir.join(mcp_config_file_name(workdir));
+    let file = dir.join(mcp_config_file_name(workdir, terminal_id));
     match crate::fs_perms::write_owner_only(
         &file,
         serde_json::to_string_pretty(&mcp_config)
@@ -2536,14 +2679,21 @@ pub(crate) fn provision_coord_mcp_config_file(workdir: &str) -> Option<std::path
 /// exactly the stale-:9879 config this plan's Phase-0 probe found in the wild).
 /// The route cannot bypass this: it has no port argument to pass.
 ///
-/// `lifetime` is the ONLY axis the two callers differ on — see [`NonceLifetime`]
-/// for why the mint route's nonces are bounded and the seam's are not.
-fn mint_device_proxy_config(workdir: &str, lifetime: NonceLifetime) -> Option<serde_json::Value> {
+/// `lifetime` and `terminal_id` are the ONLY axes the two callers differ on —
+/// see [`NonceLifetime`] for why the mint route's nonces are bounded and the
+/// seam's are not, and [`NonceBinding::terminal_id`] for why only the seam can
+/// name a terminal (the route serves sessions the runner did not spawn, so the
+/// ephemeral arm below ignores the argument by construction).
+fn mint_device_proxy_config(
+    workdir: &str,
+    lifetime: NonceLifetime,
+    terminal_id: Option<&str>,
+) -> Option<serde_json::Value> {
     let bound_port = resolve_bound_api_port()?;
     let nonce = if lifetime.is_ephemeral() {
         register_session_proxy_nonce(workdir)
     } else {
-        register_proxy_nonce(workdir)
+        register_proxy_nonce(workdir, terminal_id)
     };
     Some(coord_mcp_proxy_config_json(bound_port, &nonce))
 }
@@ -2564,8 +2714,12 @@ fn mint_device_proxy_config(workdir: &str, lifetime: NonceLifetime) -> Option<se
 ///
 /// `None` = the bound port is unresolvable ⇒ the route must 503 rather than mint
 /// a nonce paired with a port nothing is listening on.
+///
+/// Passes `terminal_id: None` — this route serves BARE sessions the runner did
+/// not spawn, so there is no terminal to bind (see
+/// [`register_session_proxy_nonce`]).
 pub(crate) fn provision_session_proxy_config(workdir: &str) -> Option<serde_json::Value> {
-    mint_device_proxy_config(workdir, NonceLifetime::ephemeral())
+    mint_device_proxy_config(workdir, NonceLifetime::ephemeral(), None)
 }
 
 /// Read the per-session proxy NONCE out of an existing coord-mcp `.mcp.json`, if
@@ -2706,13 +2860,18 @@ fn qontinui_root_dir() -> Option<std::path::PathBuf> {
 fn adopt_on_disk_nonce(workdir: &str, nonce: &str) {
     let (snapshot, evicted) = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
-        // Persistent class only — an adopted nonce came from a runner-written
-        // `.mcp.json`, and must NOT evict a bare session's ephemeral nonce for
-        // the same workdir (the class-scoping rationale in
-        // `mint_and_register_nonce`).
+        // Persistent AND terminal-less only — an adopted nonce came from a
+        // runner-written `.mcp.json`, and must NOT evict a bare session's
+        // ephemeral nonce for the same workdir (the class-scoping rationale in
+        // `mint_and_register_nonce`) nor a live TERMINAL's per-terminal nonce
+        // for it (the same rationale applied to the terminal key: the adopted
+        // nonce replaces the shared `.mcp.json` credential, which is the
+        // terminal-less one). Byte-for-byte the previous behavior before
+        // per-terminal nonces existed, when every persistent binding was
+        // terminal-less.
         let mut evicted: Vec<String> = Vec::new();
         map.retain(|n, b| {
-            if b.workdir == workdir && !b.lifetime.is_ephemeral() {
+            if b.workdir == workdir && b.terminal_id.is_none() && !b.lifetime.is_ephemeral() {
                 evicted.push(n.clone());
                 return false;
             }
@@ -2730,6 +2889,12 @@ fn adopt_on_disk_nonce(workdir: &str, nonce: &str) {
                 // default slot (`device_bearer_for(None)`), the pre-B3 behavior
                 // for these device nonces (never cross-tenant).
                 session_tenant: None,
+                // Same reason for the terminal: a `.mcp.json` carries only URL
+                // + nonce, so the terminal the file was originally provisioned
+                // for is unrecoverable — and that terminal's PTY died with the
+                // previous runner anyway. Caller self-identification falls back
+                // to the workdir leg for an adopted nonce.
+                terminal_id: None,
             },
         );
         (map.clone(), evicted)
@@ -3081,7 +3246,7 @@ mod tests {
         let wd = dir.to_string_lossy().to_string();
 
         // A live PTY terminal's nonce for this cwd (runner-spawn class).
-        let pty_nonce = register_proxy_nonce(&wd);
+        let pty_nonce = register_proxy_nonce(&wd, None);
         // A bare session mints for the SAME cwd (mint-route class).
         let bare_nonce = register_session_proxy_nonce(&wd);
         assert_ne!(pty_nonce, bare_nonce);
@@ -3163,6 +3328,7 @@ mod tests {
                         expires_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
                     },
                     session_tenant: None,
+                    terminal_id: None,
                 },
             );
             map.insert(
@@ -3175,12 +3341,13 @@ mod tests {
                             + std::time::Duration::from_secs(3600),
                     },
                     session_tenant: None,
+                    terminal_id: None,
                 },
             );
         }
 
         // Any mint triggers the opportunistic sweep.
-        let persistent = register_proxy_nonce(&wd);
+        let persistent = register_proxy_nonce(&wd, None);
 
         let map = proxy_nonces().lock().unwrap();
         assert!(
@@ -3216,6 +3383,7 @@ mod tests {
                     expires_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
                 },
                 session_tenant: None,
+                terminal_id: None,
             },
         );
         assert!(
@@ -3231,8 +3399,127 @@ mod tests {
         // the property nonce persistence + the restart grace window depend on
         // (the MCP client never re-reads its config), and the reason the TTL is
         // scoped to the mint route instead of applied globally.
-        let persistent = register_proxy_nonce(&wd);
+        let persistent = register_proxy_nonce(&wd, None);
         assert!(proxy_nonce_is_valid(&persistent));
+    }
+
+    /// Stage 1 — a persistent mint FREEZES the terminal it was provisioned for,
+    /// and [`terminal_id_for_nonce`] reads it back. This is the deterministic
+    /// leg of caller self-identification; without it the resolver only has the
+    /// 1:N workdir.
+    ///
+    /// (This assertion is not optional bookkeeping: `src-tauri/Cargo.toml` sets
+    /// `[lints.rust] dead_code = "allow"`, so an UNREAD field produces no build
+    /// warning in this crate. A test that reads it is the only deadness check
+    /// available here.)
+    #[test]
+    fn terminal_id_for_nonce_returns_the_minted_terminal() {
+        let wd = format!("D:/selfid-terminal-{}", uuid::Uuid::now_v7());
+        let term = format!("terminal-{}", uuid::Uuid::now_v7());
+
+        let nonce = register_proxy_nonce(&wd, Some(term.as_str()));
+
+        assert_eq!(
+            terminal_id_for_nonce(&nonce).as_deref(),
+            Some(term.as_str()),
+            "a persistent mint must freeze the terminal it was provisioned for"
+        );
+        // The workdir leg is unchanged and still resolves alongside it.
+        assert_eq!(workdir_for_nonce(&nonce).as_deref(), Some(wd.as_str()));
+
+        // Same `live_binding` chokepoint ⇒ same expiry/revocation rules: an
+        // unknown nonce resolves to no terminal, never a stale one.
+        assert_eq!(terminal_id_for_nonce("no-such-nonce"), None);
+        assert_eq!(terminal_id_for_nonce(""), None);
+    }
+
+    /// Stage 1, THE point of the change — two terminals sharing ONE workdir get
+    /// two DISTINCT live nonces, each resolving to its own terminal. The 1:1
+    /// property caller self-identification needs.
+    ///
+    /// It also pins the eviction narrowing that makes it possible: the second
+    /// terminal's mint must NOT evict the first's nonce. Under the old
+    /// workdir-only rule it would have, 401ing terminal 1's already-connected
+    /// MCP client the moment terminal 2 spawned in the same repo dir — the
+    /// sibling-DoS the ephemeral class already had to fix.
+    #[test]
+    fn two_terminals_in_one_workdir_get_two_nonces_each_naming_its_own_terminal() {
+        let wd = format!("D:/selfid-two-terminals-{}", uuid::Uuid::now_v7());
+        let t1 = format!("terminal-a-{}", uuid::Uuid::now_v7());
+        let t2 = format!("terminal-b-{}", uuid::Uuid::now_v7());
+
+        let n1 = register_proxy_nonce(&wd, Some(t1.as_str()));
+        let n2 = register_proxy_nonce(&wd, Some(t2.as_str()));
+        assert_ne!(n1, n2, "each terminal gets its own nonce");
+
+        assert!(
+            proxy_nonces().lock().unwrap().contains_key(&n1),
+            "a second terminal's mint must NOT evict the first terminal's LIVE \
+             nonce for the same workdir (it would 401 its MCP client mid-session)"
+        );
+        assert!(proxy_nonce_is_valid(&n1));
+        assert!(proxy_nonce_is_valid(&n2));
+
+        assert_eq!(terminal_id_for_nonce(&n1).as_deref(), Some(t1.as_str()));
+        assert_eq!(terminal_id_for_nonce(&n2).as_deref(), Some(t2.as_str()));
+        // Both still name the same workdir — which is exactly why the workdir
+        // leg alone can never disambiguate them.
+        assert_eq!(workdir_for_nonce(&n1).as_deref(), Some(wd.as_str()));
+        assert_eq!(workdir_for_nonce(&n2).as_deref(), Some(wd.as_str()));
+
+        // Re-provisioning the SAME terminal (a re-spawn into the same cwd) still
+        // evicts its own predecessor — narrowed, not removed.
+        let n1b = register_proxy_nonce(&wd, Some(t1.as_str()));
+        assert_ne!(n1b, n1);
+        assert!(
+            !proxy_nonces().lock().unwrap().contains_key(&n1),
+            "a same-terminal re-mint still evicts that terminal's prior nonce"
+        );
+        assert!(
+            proxy_nonces().lock().unwrap().contains_key(&n2),
+            "...and never touches the sibling terminal's"
+        );
+    }
+
+    /// Regression guard for the UNCHANGED path: a terminal-less mint resolves to
+    /// `terminal_id: None` (so the resolver falls back to the workdir leg rather
+    /// than inventing an identity), and it still evicts a prior terminal-less
+    /// nonce for the same workdir — byte-for-byte the pre-Stage-1 rule.
+    ///
+    /// It must also leave a per-TERMINAL nonce for that workdir alone: the
+    /// in-cwd `.mcp.json` writer and the boot self-heal both mint terminal-less,
+    /// and neither may 401 a live terminal's client.
+    #[test]
+    fn terminalless_mint_has_no_terminal_and_still_evicts_its_own_class() {
+        let wd = format!("D:/selfid-terminalless-{}", uuid::Uuid::now_v7());
+        let term = format!("terminal-live-{}", uuid::Uuid::now_v7());
+
+        let owned = register_proxy_nonce(&wd, Some(term.as_str()));
+        let a = register_proxy_nonce(&wd, None);
+        assert_eq!(
+            terminal_id_for_nonce(&a),
+            None,
+            "a terminal-less mint must not claim a terminal — a wrong identity \
+             is worse than an absent one"
+        );
+        assert_eq!(workdir_for_nonce(&a).as_deref(), Some(wd.as_str()));
+
+        let b = register_proxy_nonce(&wd, None);
+        assert!(
+            !proxy_nonces().lock().unwrap().contains_key(&a),
+            "a terminal-less re-provision into the same cwd still evicts its \
+             terminal-less predecessor (unchanged behavior)"
+        );
+        assert!(proxy_nonces().lock().unwrap().contains_key(&b));
+        assert!(
+            proxy_nonces().lock().unwrap().contains_key(&owned),
+            "a terminal-less mint must never evict a per-terminal nonce for the \
+             same workdir"
+        );
+        assert_eq!(
+            terminal_id_for_nonce(&owned).as_deref(),
+            Some(term.as_str())
+        );
     }
 
     /// §1/E — an ephemeral nonce NEVER reaches disk. The store has no expiry
@@ -3244,7 +3531,7 @@ mod tests {
         let (dir, store) = temp_store("ephemeral-never-persisted");
         let wd = format!("D:/persist-test/{}", uuid::Uuid::now_v7());
 
-        let persistent = register_proxy_nonce(&wd);
+        let persistent = register_proxy_nonce(&wd, None);
         let ephemeral = register_session_proxy_nonce(&wd);
 
         let snapshot = proxy_nonces().lock().unwrap().clone();
@@ -3310,7 +3597,7 @@ mod tests {
         let wd = dir.to_string_lossy().to_string();
 
         assert!(
-            provision_coord_mcp_config_file(&wd).is_none(),
+            provision_coord_mcp_config_file(&wd, None).is_none(),
             "no bound port ⇒ no --mcp-config file (fail-closed)"
         );
         // And no cwd pollution — the degraded breadcrumb belongs to the workdir
@@ -3322,16 +3609,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The per-workdir `--mcp-config` filename is stable for a given workdir and
-    /// distinct across workdirs (so two cwds never collide on one app-data file).
+    /// The `--mcp-config` filename is stable for a given key and distinct across
+    /// keys, on BOTH axes: per-terminal when a terminal id is known (Stage 1 —
+    /// this is what stops two terminals in one cwd from sharing one file and
+    /// therefore one nonce), and per-workdir when it is not (the unchanged
+    /// fallback).
     #[test]
     fn mcp_config_file_name_is_stable_and_workdir_distinct() {
-        let a1 = mcp_config_file_name("D:/repo/one");
-        let a2 = mcp_config_file_name("D:/repo/one");
-        let b = mcp_config_file_name("D:/repo/two");
+        let a1 = mcp_config_file_name("D:/repo/one", None);
+        let a2 = mcp_config_file_name("D:/repo/one", None);
+        let b = mcp_config_file_name("D:/repo/two", None);
         assert_eq!(a1, a2, "stable across calls for one workdir");
         assert_ne!(a1, b, "distinct across workdirs");
         assert!(a1.starts_with("coord-mcp-") && a1.ends_with(".json"));
+
+        // THE Stage-1 property: two terminals sharing ONE cwd get two names.
+        let t1 = mcp_config_file_name("D:/repo/one", Some("term-1"));
+        let t2 = mcp_config_file_name("D:/repo/one", Some("term-2"));
+        assert_ne!(
+            t1, t2,
+            "two terminals in one workdir must get distinct --mcp-config files \
+             (one shared file ⇒ one shared nonce ⇒ caller self-id cannot resolve)"
+        );
+        assert_eq!(
+            t1,
+            mcp_config_file_name("D:/repo/one", Some("term-1")),
+            "stable per terminal across re-spawns"
+        );
+        assert!(t1.starts_with("coord-mcp-") && t1.ends_with(".json"));
+
+        // The terminal id, not the workdir, is the key when present: the SAME
+        // terminal in a DIFFERENT cwd keeps its name...
+        assert_eq!(
+            t1,
+            mcp_config_file_name("D:/repo/elsewhere", Some("term-1")),
+            "the terminal id is the key when present"
+        );
+        // ...and none of the terminal-keyed names collide with the workdir one.
+        assert_ne!(t1, a1);
     }
 
     /// A temp-dir-backed [`SecureStorage`] for the persistence tests — injected
@@ -3424,7 +3739,7 @@ mod tests {
             format!("h.{payload}.s")
         };
         let dir = std::env::temp_dir().join(format!("coord-mcp-gate-{}", uuid::Uuid::new_v4()));
-        let nonce = register_proxy_nonce(&dir.to_string_lossy());
+        let nonce = register_proxy_nonce(&dir.to_string_lossy(), None);
         let device = mk("device");
         let dev_p = ProxyPrincipal::Device;
 
@@ -3533,7 +3848,7 @@ mod tests {
         // And a device principal must reject an agent bearer.
         let dev_dir =
             std::env::temp_dir().join(format!("coord-mcp-dgate-{}", uuid::Uuid::new_v4()));
-        let dev_nonce = register_proxy_nonce(&dev_dir.to_string_lossy());
+        let dev_nonce = register_proxy_nonce(&dev_dir.to_string_lossy(), None);
         assert_eq!(
             proxy_request_gate(Some(&dev_nonce), Some(&mk("agent")), &device_p)
                 .unwrap_err()
@@ -3583,7 +3898,7 @@ mod tests {
         // bearer is still a hard 401 backstop (the proxy handler only reaches
         // the gate AFTER the bounded re-mint produced a usable bearer).
         let dir = std::env::temp_dir().join(format!("coord-mcp-p3-{}", uuid::Uuid::new_v4()));
-        let nonce = register_proxy_nonce(&dir.to_string_lossy());
+        let nonce = register_proxy_nonce(&dir.to_string_lossy(), None);
         let dev_p = ProxyPrincipal::Device;
         assert_eq!(
             proxy_request_gate(Some(&nonce), None, &dev_p)
@@ -3997,8 +4312,12 @@ mod tests {
         // Mint a nonce in the live map, then mirror the snapshot to the INJECTED
         // store (the `register_proxy_nonce` body, split across its seams).
         let workdir = store_dir.join("session-wd").to_string_lossy().to_string();
-        let (nonce, snapshot) =
-            mint_and_register_nonce(&workdir, ProxyPrincipal::Device, NonceLifetime::Persistent);
+        let (nonce, snapshot) = mint_and_register_nonce(
+            &workdir,
+            ProxyPrincipal::Device,
+            NonceLifetime::Persistent,
+            None,
+        );
         persist_proxy_nonces_with_store(&store, &snapshot);
         assert!(proxy_nonce_is_valid(&nonce));
 
@@ -4044,13 +4363,18 @@ mod tests {
             &agent_wd,
             ProxyPrincipal::Agent { agent_id },
             NonceLifetime::Persistent,
+            None,
         );
         persist_proxy_nonces_with_store(&store, &snapshot);
 
         // Also mint a DEVICE nonce and persist.
         let dev_wd = store_dir.join("dev-wd").to_string_lossy().to_string();
-        let (dev_nonce, snapshot) =
-            mint_and_register_nonce(&dev_wd, ProxyPrincipal::Device, NonceLifetime::Persistent);
+        let (dev_nonce, snapshot) = mint_and_register_nonce(
+            &dev_wd,
+            ProxyPrincipal::Device,
+            NonceLifetime::Persistent,
+            None,
+        );
         persist_proxy_nonces_with_store(&store, &snapshot);
 
         let persisted = store.load_coord_mcp_nonces();
@@ -4097,6 +4421,7 @@ mod tests {
             "/tmp/coord-mcp-persist-off-wd",
             ProxyPrincipal::Device,
             NonceLifetime::Persistent,
+            None,
         );
         assert!(
             proxy_nonce_is_valid(&nonce),
@@ -4599,9 +4924,9 @@ mod tests {
     fn remint_graces_evicted_device_nonce_but_never_agent() {
         // Device: mint A, then re-mint B for the SAME workdir → A graced, B live.
         let wd = format!("D:/grace-wt-{}", uuid::Uuid::now_v7());
-        let a = register_proxy_nonce(&wd);
+        let a = register_proxy_nonce(&wd, None);
         assert!(proxy_nonce_is_valid(&a));
-        let b = register_proxy_nonce(&wd);
+        let b = register_proxy_nonce(&wd, None);
         assert_ne!(a, b);
         assert!(proxy_nonce_is_valid(&b), "the fresh device nonce is live");
         assert!(
@@ -4668,8 +4993,8 @@ mod tests {
         );
         let wd = format!("D:/grace-ttl-wt-{}", uuid::Uuid::now_v7());
         let before = std::time::Instant::now();
-        let a = register_proxy_nonce(&wd);
-        let _b = register_proxy_nonce(&wd); // evicts + graces `a`
+        let a = register_proxy_nonce(&wd, None);
+        let _b = register_proxy_nonce(&wd, None); // evicts + graces `a`
         let expires_at = graced_nonces()
             .lock()
             .unwrap()
@@ -4727,8 +5052,8 @@ mod tests {
         let dir = rotation_log_test_dir();
 
         let wd = format!("D:/rot-forensics-wt-{}", uuid::Uuid::now_v7());
-        let a = register_proxy_nonce(&wd); // mint
-        let b = register_proxy_nonce(&wd); // mint + evict(a) + grace(a)
+        let a = register_proxy_nonce(&wd, None); // mint
+        let b = register_proxy_nonce(&wd, None); // mint + evict(a) + grace(a)
         evict_proxy_nonces_for_workdir(&wd); // evict(b) + grace(b)
         let adopted = format!(
             "{}{}",
@@ -4793,7 +5118,7 @@ mod tests {
         let dir = rotation_log_test_dir();
 
         let wd = format!("D:/rot-reject-wt-{}", uuid::Uuid::now_v7());
-        let live = register_proxy_nonce(&wd);
+        let live = register_proxy_nonce(&wd, None);
         // A key this runner never minted — the shape a client presents after
         // its own was evicted and the registry moved on.
         let stranger = format!(
@@ -4888,7 +5213,7 @@ mod tests {
     fn revoked_nonce_no_longer_validates_including_grace() {
         // Live revoke.
         let wd = format!("D:/revoke-wt-{}", uuid::Uuid::now_v7());
-        let nonce = register_proxy_nonce(&wd);
+        let nonce = register_proxy_nonce(&wd, None);
         assert!(proxy_nonce_is_valid(&nonce));
         revoke_proxy_nonce(&nonce);
         assert!(
@@ -4901,8 +5226,8 @@ mod tests {
         // Graced revoke: re-mint moves the first nonce onto grace, where it
         // still validates — an explicit revoke must kill that too.
         let wd2 = format!("D:/revoke-grace-wt-{}", uuid::Uuid::now_v7());
-        let old = register_proxy_nonce(&wd2);
-        let _new = register_proxy_nonce(&wd2);
+        let old = register_proxy_nonce(&wd2, None);
+        let _new = register_proxy_nonce(&wd2, None);
         assert!(
             proxy_nonce_is_valid(&old),
             "precondition: the superseded nonce rides the grace TTL"
@@ -4921,13 +5246,13 @@ mod tests {
     #[test]
     fn release_workdir_on_session_close_revokes_and_reaps() {
         let wd = format!("D:/close-wt-{}", uuid::Uuid::now_v7());
-        let current = register_proxy_nonce(&wd);
+        let current = register_proxy_nonce(&wd, None);
         assert!(proxy_nonce_is_valid(&current));
 
         // Seed the app-data config file the release must reap.
         let cfg_dir = crate::session::claude_hook::session_restore_dir().join("coord-mcp");
         std::fs::create_dir_all(&cfg_dir).unwrap();
-        let cfg = cfg_dir.join(mcp_config_file_name(&wd));
+        let cfg = cfg_dir.join(mcp_config_file_name(&wd, None));
         std::fs::write(&cfg, "{}").unwrap();
 
         release_workdir_on_session_close(&wd);
@@ -4960,7 +5285,7 @@ mod tests {
 
         // (a) Our port, REGISTERED nonce → keep.
         let wd = format!("D:/reap-live-wt-{}", uuid::Uuid::now_v7());
-        let live_nonce = register_proxy_nonce(&wd);
+        let live_nonce = register_proxy_nonce(&wd, None);
         let keep_ours = dir.join("keep-ours.json");
         std::fs::write(&keep_ours, cfg_body(bound_port, &live_nonce)).unwrap();
 
