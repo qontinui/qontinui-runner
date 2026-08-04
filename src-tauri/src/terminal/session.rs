@@ -1449,12 +1449,22 @@ impl TerminalSession {
         // and `provision_coord_mcp_config_file` returns None on an unresolvable
         // bound port — then we inject nothing (no broken `--mcp-config`, no cwd
         // breadcrumb pollution), mirroring the `--settings` fail-open.
+        //
+        // THIS terminal's id is passed through: it keys both the app-data
+        // filename and the minted nonce binding, so two terminals sharing one
+        // cwd get two config files and two live nonces instead of racing a
+        // single per-workdir one. That is what makes coord-caller
+        // self-identification resolvable — the proxy maps `nonce → terminal_id
+        // → the open lifecycle record → claude_session_id`, all 1:1, where the
+        // workdir leg is 1:N and could only ever guess.
         if crate::coord_mcp::workdir_declares_coord_mcp(cwd) {
             info!(
                 terminal_id = %terminal_id,
                 "coord-mcp: cwd already declares coord-mcp — skipping --mcp-config injection"
             );
-        } else if let Some(cfg_path) = crate::coord_mcp::provision_coord_mcp_config_file(cwd) {
+        } else if let Some(cfg_path) =
+            crate::coord_mcp::provision_coord_mcp_config_file(cwd, Some(terminal_id))
+        {
             cmd.env(
                 crate::coord_mcp::MCP_CONFIG_ENV,
                 cfg_path.to_string_lossy().as_ref(),
