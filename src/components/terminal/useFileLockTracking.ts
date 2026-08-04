@@ -19,10 +19,11 @@
  * consumers that only need the scalar.
  */
 
-import { useState, useEffect, useRef } from "react";
+import { useEffect, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { resolvePort } from "@/lib/runner-api";
 import type { TerminalTab } from "./useTerminalManager";
+import { getTerminalHotStore } from "./terminalHotStore";
 
 // ── Pure helpers (exported for tests) ────────────────────────────────────────
 
@@ -106,6 +107,32 @@ export type LockState = {
    */
   holderIdleMs?: number;
 };
+
+/**
+ * Field-wise equality for two {@link LockState}s.
+ *
+ * The 10 s `/file-locks/info` poll rebuilds every tab's state object from
+ * scratch, so a reference check alone can never bail out and the sweep
+ * republished a brand-new map (and re-rendered every consumer) on every tick
+ * even when nothing about the locks had moved. Callers reuse the previous
+ * object when this returns true, which lets the hot store's identity check
+ * short-circuit the publish entirely.
+ */
+export function lockStateEquals(
+  a: LockState | undefined,
+  b: LockState | undefined,
+): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return (
+    a.kind === b.kind &&
+    a.filePath === b.filePath &&
+    a.counterpartyName === b.counterpartyName &&
+    a.sinceMs === b.sinceMs &&
+    a.waiterCount === b.waiterCount &&
+    a.holderIdleMs === b.holderIdleMs
+  );
+}
 
 /**
  * Backwards-compat helper: returns the `kind` of a {@link LockState}
@@ -267,13 +294,11 @@ interface FileLockLongWaitSignaledEvent {
 }
 
 /**
- * Return shape of {@link useFileLockTracking}.
- *
- * Phase 3 widened the hook from a bare `Record<string, LockState>` to
- * an object so callers can pull `pendingYieldRequests` (per-holder-tab
- * incoming yield request queues) without a second hook + a duplicate
- * `tabs` ref. Existing consumers destructure `{ lockStates }` for the
- * old slot.
+ * The three maps {@link useFileLockTracking} publishes into the page's
+ * terminal hot store. Kept as a named interface because it documents the
+ * routing/dedup invariants of each map; consumers read the fields through
+ * `useHotField(pageId, "lockStates" | "pendingYieldRequests" |
+ * "pendingLongWaitSignals")` or `useTabHotSlice`.
  */
 export interface FileLockTracking {
   lockStates: Record<string, LockState>;
@@ -313,24 +338,18 @@ export interface FileLockTracking {
   pendingLongWaitSignals: Record<string, IncomingLongWaitSignal[]>;
 }
 
-export function useFileLockTracking(tabs: TerminalTab[]): FileLockTracking {
-  const [lockStates, setLockStates] = useState<Record<string, LockState>>({});
-  const [pendingYieldRequests, setPendingYieldRequests] = useState<
-    Record<string, IncomingYieldRequest[]>
-  >({});
-  const [pendingLongWaitSignals, setPendingLongWaitSignals] = useState<
-    Record<string, IncomingLongWaitSignal[]>
-  >({});
-  // The long-wait-signaled listener needs the live `lockStates` to find
-  // every WAITER tab currently waiting on the broadcast `file_path`
-  // without going through findTabByHolderName (the holder may not have
-  // a tab in this window). A ref keeps the listener closure stable —
-  // re-subscribing on every state change would tear down + rebuild the
-  // Tauri listener.
-  const lockStatesRef = useRef(lockStates);
-  useEffect(() => {
-    lockStatesRef.current = lockStates;
-  }, [lockStates]);
+/**
+ * Track per-tab file-lock state for one terminal page.
+ *
+ * Phase 1 of the render-storm plan moved the three maps out of React state
+ * and into the page's {@link getTerminalHotStore}: they used to be spread into
+ * the single `TerminalSessionContext` value, so a 10 s poll tick re-rendered
+ * the entire terminal page. Consumers now read them with `useHotField` /
+ * `useTabHotSlice`, and the hook itself holds no reactive state at all — it is
+ * a pure publisher, so it never re-renders its host.
+ */
+export function useFileLockTracking(pageId: string, tabs: TerminalTab[]): void {
+  const store = getTerminalHotStore(pageId);
   const tabsRef = useRef(tabs);
   useEffect(() => {
     tabsRef.current = tabs;
@@ -369,6 +388,23 @@ export function useFileLockTracking(tabs: TerminalTab[]): FileLockTracking {
 
   // Listen for file-lock events
   useEffect(() => {
+    // Functional publishers with `useState`-setter semantics: returning the
+    // same object from the updater is the no-change bailout (the store drops
+    // it without notifying anyone).
+    const setLockStates = (
+      updater: (prev: Record<string, LockState>) => Record<string, LockState>,
+    ) => store.updateField("lockStates", updater);
+    const setPendingYieldRequests = (
+      updater: (
+        prev: Record<string, IncomingYieldRequest[]>,
+      ) => Record<string, IncomingYieldRequest[]>,
+    ) => store.updateField("pendingYieldRequests", updater);
+    const setPendingLongWaitSignals = (
+      updater: (
+        prev: Record<string, IncomingLongWaitSignal[]>,
+      ) => Record<string, IncomingLongWaitSignal[]>,
+    ) => store.updateField("pendingLongWaitSignals", updater);
+
     let unlistenWaiting: (() => void) | null = null;
     let unlistenAcquired: (() => void) | null = null;
     let unlistenReleased: (() => void) | null = null;
@@ -609,10 +645,10 @@ export function useFileLockTracking(tabs: TerminalTab[]): FileLockTracking {
             : estimated_remaining_ms,
         signaledAtMs: signaled_at,
       };
-      // Find every waiter tab currently blocked on this file. The
-      // listener closure captured `lockStates` via the ref above so a
-      // late-mounting tab still picks up signals on the next event.
-      const currentLockStates = lockStatesRef.current;
+      // Find every waiter tab currently blocked on this file. Read straight
+      // from the hot store so the listener closure stays stable — it is
+      // always the live map, with no ref-sync effect to keep in step.
+      const currentLockStates = store.getField("lockStates");
       const waiterTabIds: string[] = [];
       for (const tab of tabsRef.current) {
         const s = currentLockStates[tab.id];
@@ -657,7 +693,7 @@ export function useFileLockTracking(tabs: TerminalTab[]): FileLockTracking {
       unlistenYieldRequested?.();
       unlistenLongWaitSignaled?.();
     };
-  }, []);
+  }, [store]);
 
   // Poll /file-locks/info to detect which tabs hold locks
   useEffect(() => {
@@ -723,8 +759,15 @@ export function useFileLockTracking(tabs: TerminalTab[]): FileLockTracking {
         // gives a correct lower bound.
         const waiterCountByHolder = deriveWaiterCounts(waitingHolders.current.values());
 
-        setLockStates((prev) => {
+        store.updateField("lockStates", (prev) => {
           const next: Record<string, LockState> = {};
+          // Reuse the previous object for every tab whose state is
+          // field-identical, so an unchanged sweep publishes nothing at all
+          // (the store bails on reference equality across the whole map).
+          const put = (tabId: string, state: LockState) => {
+            const before = prev[tabId];
+            next[tabId] = lockStateEquals(before, state) ? (before as LockState) : state;
+          };
           for (const tab of tabsRef.current) {
             const held = holderEntries.get(tab.title);
             if (held && held.length > 0) {
@@ -740,17 +783,17 @@ export function useFileLockTracking(tabs: TerminalTab[]): FileLockTracking {
                 prevState?.kind === "holding" && prevState.sinceMs !== undefined
                   ? prevState.sinceMs
                   : oldest.acquired_at;
-              next[tab.id] = {
+              put(tab.id, {
                 kind: "holding",
                 filePath: oldest.file_path,
                 waiterCount: waiterCountByHolder.get(tab.title) ?? 0,
                 sinceMs,
-              };
+              });
               continue;
             }
             const waiting = waitingHolders.current.get(tab.title);
             if (waiting) {
-              next[tab.id] = {
+              put(tab.id, {
                 kind: "waiting",
                 filePath: waiting.filePath,
                 counterpartyName: waiting.blockedBy,
@@ -759,7 +802,7 @@ export function useFileLockTracking(tabs: TerminalTab[]): FileLockTracking {
                 // We DON'T attach holderIdleMs on holding or idle
                 // branches; the field is a waiter-only signal.
                 holderIdleMs: idleByHolderName.get(waiting.blockedBy),
-              };
+              });
               continue;
             }
             // Preserve a recently-set holding/waiting state from events
@@ -773,7 +816,7 @@ export function useFileLockTracking(tabs: TerminalTab[]): FileLockTracking {
             ) {
               next[tab.id] = prevState;
             } else {
-              next[tab.id] = { kind: "idle" };
+              put(tab.id, { kind: "idle" });
             }
           }
           return next;
@@ -789,7 +832,5 @@ export function useFileLockTracking(tabs: TerminalTab[]): FileLockTracking {
       active = false;
       clearInterval(interval);
     };
-  }, []);
-
-  return { lockStates, pendingYieldRequests, pendingLongWaitSignals };
+  }, [store]);
 }

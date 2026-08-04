@@ -58,6 +58,7 @@ import {
 } from "../liveClaudeSessions";
 import type { CommandAction, CommandResult, ResolverContext } from "./types";
 import { useCommandAction } from "./useCommandAction";
+import { getTerminalHotStore } from "../terminalHotStore";
 import { useOrchestrateCommand } from "./orchestrateCommand";
 
 /**
@@ -293,8 +294,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     closeTerminal,
     terminalRefs,
     sessionStates,
-    stateDurations,
-    lastOutputLines,
+    pageId,
     stateTimeAccum: stateTimeAccumRef,
     zoneLayout,
     workflowGen,
@@ -1155,10 +1155,12 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
           autoApproveCount: transitionEffects.autoApproveCount ?? 0,
           autoRestartCount: transitionEffects.autoRestartCount ?? 0,
           stateTimeAccum: stateTimeAccumRef.current,
-          lastOutputLines,
+          // Read the hot maps lazily at command time — subscribing would
+          // re-register every command action on each output frame.
+          lastOutputLines: getTerminalHotStore(pageId).getField("lastOutputLines"),
           assignments: zoneLayout.assignments,
           zoneLabels: labelsAndTags.zoneLabels,
-          stateDurations,
+          stateDurations: getTerminalHotStore(pageId).getField("stateDurations"),
         }),
       );
       return ok();

@@ -1,16 +1,26 @@
+import { useHotField } from "./useTerminalHotStore";
+
 interface OutputSearchBarProps {
   outputSearch: string;
   onSearchChange: (value: string) => void;
   onClose: () => void;
-  lastOutputLines: Record<string, string[]>;
+  /** Terminal page whose output the match count is computed over. */
+  pageId: string;
 }
 
+/**
+ * Subscribes to `lastOutputLines` itself (rather than taking the map as a
+ * prop) so the live match count stays live without dragging `TerminalPage`
+ * into a per-output-frame re-render — the bar is only mounted while the
+ * operator has search open (plan Phase 1).
+ */
 export function OutputSearchBar({
   outputSearch,
   onSearchChange,
   onClose,
-  lastOutputLines,
+  pageId,
 }: OutputSearchBarProps) {
+  const lastOutputLines = useHotField(pageId, "lastOutputLines");
   return (
     <div className="flex items-center gap-2 px-3 h-8 bg-[#13141f] border-b border-[#2a2d3d] shrink-0">
       <span className="text-[10px] text-[#565f89] shrink-0">Search:</span>

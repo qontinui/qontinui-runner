@@ -55,6 +55,7 @@ import {
 import type { SessionState } from "./useZoneLayout";
 
 import { useTerminalSession } from "./contexts";
+import { useHotField } from "./useTerminalHotStore";
 import { useWrapperTools } from "@/hooks/useWrapperTools";
 import { BatchActions } from "./BatchActions";
 
@@ -114,7 +115,8 @@ const STATE_COLORS: Record<SessionState, string> = {
 
 export function StatusStrip() {
   const session = useTerminalSession();
-  const { sessionStates, fileLockStates, zoneLayout, workflowGen, sessionManager } = session;
+  const { sessionStates, pageId, zoneLayout, workflowGen, sessionManager } = session;
+  const fileLockStates = useHotField(pageId, "lockStates");
   const planFileName = workflowGen.planFileName;
   const isPlanLoading = workflowGen.isPlanLoading;
   const {

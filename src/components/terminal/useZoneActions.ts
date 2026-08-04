@@ -5,8 +5,11 @@ import type { SessionState } from "./useZoneLayout";
 import type { UIAction } from "./useUIState";
 import type { TerminalTab } from "./useTerminalManager";
 import type { Metrics } from "./useEventHistory";
+import { getTerminalHotStore } from "./terminalHotStore";
 
 interface UseZoneActionsParams {
+  /** Terminal page whose hot store the export/sort actions read output from. */
+  pageId: string;
   tabs: TerminalTab[];
   dispatch: React.Dispatch<UIAction>;
   zoneLayout: {
@@ -21,7 +24,6 @@ interface UseZoneActionsParams {
   };
   stateTracking: {
     sessionStates: Record<string, SessionState>;
-    lastOutputLines: Record<string, string[]>;
   };
   labelsAndTags: {
     zoneLabels: Record<number, string>;
@@ -43,6 +45,7 @@ interface UseZoneActionsParams {
 }
 
 export function useZoneActions({
+  pageId,
   tabs,
   dispatch,
   zoneLayout,
@@ -54,6 +57,10 @@ export function useZoneActions({
   incrementMetric,
   setNotification,
 }: UseZoneActionsParams) {
+  // Exports read the last rendered lines lazily at click time, straight out of
+  // the page hot store — taking the whole map as a dependency re-created these
+  // callbacks (and everything downstream of them) on every output frame.
+  const hotStore = getTerminalHotStore(pageId);
   const handleZoneClick = useCallback(
     (zoneIndex: number, ctrlKey?: boolean) => {
       if (ctrlKey) {
@@ -182,7 +189,7 @@ export function useZoneActions({
       const tab = tabs.find((t) => t.id === tabId);
       if (!tab) continue;
       const state = stateTracking.sessionStates[tabId] ?? "idle";
-      const output = stateTracking.lastOutputLines[tabId] ?? [];
+      const output = hotStore.getLastOutputLines(tabId);
       lines.push("");
       lines.push(`--- Zone ${Number(zoneStr) + 1}: ${tab.title} [${state}] ---`);
       if (tab.workingDir) lines.push(`    Dir: ${tab.workingDir}`);
@@ -200,7 +207,7 @@ export function useZoneActions({
       lines.push("--- Unassigned Sessions ---");
       for (const tab of unassigned) {
         const state = stateTracking.sessionStates[tab.id] ?? "idle";
-        const output = stateTracking.lastOutputLines[tab.id] ?? [];
+        const output = hotStore.getLastOutputLines(tab.id);
         lines.push(`  ${tab.title} [${state}]`);
         if (output.length > 0) lines.push(...output.map((l) => `    ${l}`));
       }
@@ -220,7 +227,7 @@ export function useZoneActions({
     zoneLayout.layoutId,
     zoneLayout.assignments,
     stateTracking.sessionStates,
-    stateTracking.lastOutputLines,
+    hotStore,
     setNotification,
   ]);
 
@@ -229,7 +236,7 @@ export function useZoneActions({
       const tabId = zoneLayout.assignments[zoneIndex];
       if (!tabId) return;
       const tab = tabs.find((t) => t.id === tabId);
-      const lines = stateTracking.lastOutputLines[tabId] ?? [];
+      const lines = hotStore.getLastOutputLines(tabId);
       const title = tab?.title ?? `Zone ${zoneIndex + 1}`;
       const state = stateTracking.sessionStates[tabId] ?? "idle";
       const label = labelsAndTags.zoneLabels[zoneIndex] ?? "";
@@ -284,7 +291,7 @@ export function useZoneActions({
     },
     [
       tabs,
-      stateTracking.lastOutputLines,
+      hotStore,
       stateTracking.sessionStates,
       labelsAndTags.zoneLabels,
       zoneLayout.assignments,

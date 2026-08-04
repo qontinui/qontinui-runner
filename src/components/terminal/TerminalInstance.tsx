@@ -1,4 +1,12 @@
-import { useEffect, useRef, useState, useCallback, forwardRef, useImperativeHandle } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  useCallback,
+  forwardRef,
+  memo,
+  useImperativeHandle,
+} from "react";
 import { FilePathLinkProvider } from "./FilePathLinkProvider";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -163,8 +171,16 @@ const TERMINAL_OPTIONS = {
  */
 const DEAD_TERMINAL_SCROLLBACK = 2000;
 
-export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInstanceProps>(
-  function TerminalInstanceInner(
+/**
+ * `memo(forwardRef(...))` (plan `2026-07-28-runner-many-sessions-performance`
+ * Phase 1). The xterm host is the single most expensive node in the zone tree
+ * and it re-rendered on every parent render — a state-duration tick, a
+ * sparkline update, any context churn. Its props are stabilized at the ZoneGrid
+ * call site (`instanceHandlers`), so the memo genuinely holds and the only
+ * re-renders left are real prop changes (visibility, reconnect state).
+ */
+const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanceProps>(
+  function TerminalInstanceRender(
     {
       terminalId,
       visible,
@@ -1414,3 +1430,5 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
     );
   },
 );
+
+export const TerminalInstance = memo(TerminalInstanceInner);

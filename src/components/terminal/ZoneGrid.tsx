@@ -1,4 +1,12 @@
-import { useCallback, useMemo, useReducer, useRef, useEffect, type RefObject } from "react";
+import {
+  memo,
+  useCallback,
+  useMemo,
+  useReducer,
+  useRef,
+  useEffect,
+  type RefObject,
+} from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { TerminalTab } from "./useTerminalManager";
 import type { SessionState, ZoneAssignments } from "./useZoneLayout";
@@ -43,6 +51,7 @@ import {
   zoneForTab,
 } from "./flowScrollRouting";
 import { writeToTerminalById } from "./writeToTerminalById";
+import { useTabHotSlice } from "./useTerminalHotStore";
 
 export type ViewMode = "auto" | "full" | "compact";
 
@@ -127,7 +136,15 @@ function createInitialGridState(layout: LayoutPreset): GridState {
   };
 }
 
-export function ZoneGrid({
+/**
+ * `React.memo` (plan `2026-07-28-runner-many-sessions-performance` Phase 1):
+ * `TerminalPage` re-renders for plenty of reasons that have nothing to do with
+ * the grid, and every one of those used to walk the whole zone tree. The five
+ * props are stable `useCallback`s from `useZoneActions`, so the memo actually
+ * holds. Hot per-tab data no longer flows through here at all — each
+ * `ZoneCell` subscribes to its own tab's slice of the terminal hot store.
+ */
+function ZoneGridInner({
   onZoneClick,
   onZoneDoubleClick,
   onExit,
@@ -158,10 +175,7 @@ export function ZoneGrid({
   const onAssignTab = zoneLayout.assignTabToZone;
   const stateTracking = session;
   const sessionStates = stateTracking.sessionStates;
-  const lastOutputLines = stateTracking.lastOutputLines;
-  const stateDurations = stateTracking.stateDurations;
   const staleTabs = stateTracking.staleTabs;
-  const activityData = stateTracking.activityData;
   // Session-state tracking is fed by the single global `terminal-output` tap in
   // `TerminalSessionContext.PageSessionScope` (Phase 2), NOT by instance
   // `onOutput` callbacks — so tracking survives Phase 3 instance unmounting.
@@ -420,6 +434,34 @@ export function ZoneGrid({
     [onZoneClick],
   );
 
+  // Stable grid-state handlers. These were five inline lambdas at the ZoneCell
+  // call site, so every ZoneCell got five fresh props on every ZoneGrid render
+  // and could never be memoized. `dispatch` from useReducer is stable, so
+  // these identities never change; the per-zone ones take the zone index as an
+  // argument instead of closing over it.
+  const setDropTarget = useCallback(
+    (zone: number | null) => dispatch({ type: "SET_DROP_TARGET", zone }),
+    [],
+  );
+  const setContextMenu = useCallback(
+    (menu: { x: number; y: number; zoneIndex: number } | null) =>
+      dispatch({ type: "SET_CONTEXT_MENU", menu }),
+    [],
+  );
+  const toggleFilterInput = useCallback(
+    (zoneIndex: number) => dispatch({ type: "TOGGLE_FILTER_INPUT", zoneIndex }),
+    [],
+  );
+  const setZoneFilter = useCallback(
+    (zoneIndex: number, value: string) =>
+      dispatch({ type: "SET_ZONE_FILTER", zoneIndex, value }),
+    [],
+  );
+  const clearZoneFilter = useCallback(
+    (zoneIndex: number) => dispatch({ type: "CLEAR_ZONE_FILTER", zoneIndex }),
+    [],
+  );
+
   // Layer 1 of plans/terminal-grid-bootstrap-redesign.md — exclusive
   // classification per render. Without this, a tab can briefly satisfy
   // BOTH the unassigned (HiddenTerminal) and assigned (inline visible)
@@ -574,8 +616,8 @@ export function ZoneGrid({
           registerCell={registerCell}
           unregisterCell={unregisterCell}
           focusedZone={focusedZone}
+          pageId={pageId}
           sessionStates={sessionStates}
-          lastOutputLines={lastOutputLines}
           terminalRefs={terminalRefs}
           onZoneClick={onZoneClick}
           onZoneDoubleClick={onZoneDoubleClick}
@@ -587,14 +629,12 @@ export function ZoneGrid({
           onTitleChange={onTitleChange}
           onAssignTab={onAssignTab}
           flashingTabs={flashingTabs}
-          stateDurations={stateDurations}
           selectedZones={selectedZones}
           staleTabs={staleTabs}
           pinnedZones={pinnedZones}
           onTogglePin={onTogglePin}
           outputSearchQuery={outputSearchQuery}
           swapSource={swapSource}
-          activityData={activityData}
           zoneLabels={zoneLabels}
           onSetZoneLabel={onSetZoneLabel}
           onRestartInZone={onRestartInZone}
@@ -615,17 +655,11 @@ export function ZoneGrid({
           showFilterInput={gridState.showFilterInput}
           zoneFilters={gridState.zoneFilters}
           handleZoneMouseDown={handleZoneMouseDown}
-          onSetDropTarget={(zone) => dispatch({ type: "SET_DROP_TARGET", zone })}
-          onSetContextMenu={(menu) => dispatch({ type: "SET_CONTEXT_MENU", menu })}
-          onToggleFilterInput={() => dispatch({ type: "TOGGLE_FILTER_INPUT", zoneIndex: zoneIdx })}
-          onSetZoneFilter={(value) =>
-            dispatch({
-              type: "SET_ZONE_FILTER",
-              zoneIndex: zoneIdx,
-              value,
-            })
-          }
-          onClearZoneFilter={() => dispatch({ type: "CLEAR_ZONE_FILTER", zoneIndex: zoneIdx })}
+          onSetDropTarget={setDropTarget}
+          onSetContextMenu={setContextMenu}
+          onToggleFilterInput={toggleFilterInput}
+          onSetZoneFilter={setZoneFilter}
+          onClearZoneFilter={clearZoneFilter}
         />
       ))}
 
@@ -786,7 +820,9 @@ export function ZoneGrid({
   );
 }
 
-function ZoneCell({
+export const ZoneGrid = memo(ZoneGridInner);
+
+function ZoneCellInner({
   zone,
   zoneIdx,
   tabs,
@@ -796,8 +832,8 @@ function ZoneCell({
   registerCell,
   unregisterCell,
   focusedZone,
+  pageId,
   sessionStates,
-  lastOutputLines,
   terminalRefs,
   onZoneClick: _onZoneClick,
   onZoneDoubleClick,
@@ -809,14 +845,12 @@ function ZoneCell({
   onTitleChange,
   onAssignTab,
   flashingTabs,
-  stateDurations,
   selectedZones,
   staleTabs,
   pinnedZones,
   onTogglePin,
   outputSearchQuery,
   swapSource,
-  activityData,
   zoneLabels,
   onSetZoneLabel,
   onRestartInZone,
@@ -852,8 +886,9 @@ function ZoneCell({
   registerCell: (tabId: string, el: HTMLElement) => void;
   unregisterCell: (tabId: string) => void;
   focusedZone: number;
+  /** Owning terminal page — selects this cell's slice of the hot store. */
+  pageId: string;
   sessionStates: Record<string, SessionState>;
-  lastOutputLines: Record<string, string[]>;
   terminalRefs: Map<string, RefObject<TerminalInstanceHandle | null>>;
   onZoneClick: (zoneIndex: number, ctrlKey?: boolean) => void;
   onZoneDoubleClick: (zoneIndex: number) => void;
@@ -865,14 +900,12 @@ function ZoneCell({
   onTitleChange: (tabId: string, title: string) => void;
   onAssignTab?: (zoneIndex: number, tabId: string) => void;
   flashingTabs?: Set<string>;
-  stateDurations?: Record<string, string>;
   selectedZones?: Set<number>;
   staleTabs?: Set<string>;
   pinnedZones?: Set<number>;
   onTogglePin?: (zoneIndex: number) => void;
   outputSearchQuery?: string;
   swapSource?: number | null;
-  activityData?: Record<string, number[]>;
   zoneLabels?: Record<number, string>;
   onSetZoneLabel?: (zoneIndex: number, label: string) => void;
   onRestartInZone?: (zoneIndex: number) => void;
@@ -895,11 +928,16 @@ function ZoneCell({
   handleZoneMouseDown: (zoneIndex: number, e: React.MouseEvent) => void;
   onSetDropTarget: (zone: number | null) => void;
   onSetContextMenu: (menu: { x: number; y: number; zoneIndex: number } | null) => void;
-  onToggleFilterInput: () => void;
-  onSetZoneFilter: (value: string) => void;
-  onClearZoneFilter: () => void;
+  onToggleFilterInput: (zoneIndex: number) => void;
+  onSetZoneFilter: (zoneIndex: number, value: string) => void;
+  onClearZoneFilter: (zoneIndex: number) => void;
 }) {
   const tabId = assignments[zoneIdx];
+  // Per-tab subscription — THIS is what stops one pane's output frame from
+  // re-rendering the other 39 zones (plan §0 A1). Only the cell whose tab
+  // produced output (or whose duration/sparkline/lock state moved) re-renders.
+  const hot = useTabHotSlice(pageId, tabId);
+  const lastLines = hot.lastOutputLines;
   const tab = tabs.find((t) => t.id === tabId);
   const classification = tab ? tabClassification.get(tab.id) : undefined;
   // A far-offscreen assigned zone in flow mode: render only the CompactZoneCard,
@@ -913,6 +951,43 @@ function ZoneCell({
     !!tab &&
     tab.type !== "plan" &&
     (classification === "assigned" || classification === "assigned-live");
+
+  // Zero-arg wrapper for ZoneLabel's `onToggleFilter` slot; stable so the
+  // label doesn't get a fresh prop on every cell render.
+  const handleToggleFilterInput = useCallback(
+    () => onToggleFilterInput(zoneIdx),
+    [onToggleFilterInput, zoneIdx],
+  );
+
+  // Per-tab TerminalInstance callbacks, hoisted out of JSX so the memoized
+  // instance actually short-circuits: inline arrows would hand it five fresh
+  // props on every ZoneCell render (e.g. a duration tick) and force a full
+  // re-render of the xterm host.
+  const instanceHandlers = useMemo(
+    () =>
+      tabId
+        ? {
+            onReconnected: () => onReconnected(tabId),
+            onExit: (code: number | null) => onExit(tabId, code),
+            onFirstInput: (input: string) => onFirstInput(tabId, input),
+            onUserInputLine: onUserInputLine
+              ? (input: string) => onUserInputLine(tabId, input)
+              : undefined,
+            onShellIntegration: (event: ShellIntegrationEvent) =>
+              onShellIntegration(tabId, event),
+            onTitleChange: (title: string) => onTitleChange(tabId, title),
+          }
+        : null,
+    [
+      tabId,
+      onReconnected,
+      onExit,
+      onFirstInput,
+      onUserInputLine,
+      onShellIntegration,
+      onTitleChange,
+    ],
+  );
 
   // Reusable zone-cell DOM registry (Phase 3 observer target + Phase 4 scroll
   // routing). Register only in flow mode — preset layouts never scroll.
@@ -944,7 +1019,7 @@ function ZoneCell({
   const isStale = tab && staleTabs?.has(tab.id);
   const searchMatch =
     tab && outputSearchQuery
-      ? (lastOutputLines[tab.id] ?? []).some((l) =>
+      ? lastLines.some((l) =>
           l.toLowerCase().includes(outputSearchQuery.toLowerCase()),
         )
       : false;
@@ -1109,14 +1184,14 @@ function ZoneCell({
               tab={tab}
               state={state}
               zoneIndex={zoneIdx}
-              lastLines={lastOutputLines[tab.id] ?? []}
+              lastLines={lastLines}
               onQuickApprove={() => writeToTerminalById(terminalRefs, tab.id, "y\r")}
               onQuickReject={() => writeToTerminalById(terminalRefs, tab.id, "n\r")}
               onSendCommand={(text) => writeToTerminalById(terminalRefs, tab.id, `${text}\r`)}
-              duration={stateDurations?.[tab.id]}
+              duration={hot.stateDuration}
               isStale={isStale ?? false}
               searchQuery={outputSearchQuery}
-              activity={activityData?.[tab.id]}
+              activity={hot.activity}
               zoneLabel={zoneLabels?.[zoneIdx]}
               onSetZoneLabel={
                 onSetZoneLabel ? (label) => onSetZoneLabel(zoneIdx, label) : undefined
@@ -1153,9 +1228,9 @@ function ZoneCell({
                 const ref = terminalRefs.get(tab.id);
                 ref?.current?.scrollToBottom();
               }}
-              outputLineCount={(lastOutputLines[tab.id] ?? []).length}
-              outputByteSize={(lastOutputLines[tab.id] ?? []).reduce((sum, l) => sum + l.length, 0)}
-              onToggleFilter={onToggleFilterInput}
+              outputLineCount={lastLines.length}
+              outputByteSize={lastLines.reduce((sum, l) => sum + l.length, 0)}
+              onToggleFilter={handleToggleFilterInput}
               filterActive={!!zoneFilters[zoneIdx]}
             />
           )}
@@ -1168,11 +1243,11 @@ function ZoneCell({
               <input
                 autoFocus
                 value={zoneFilters[zoneIdx] ?? ""}
-                onChange={(e) => onSetZoneFilter(e.target.value)}
+                onChange={(e) => onSetZoneFilter(zoneIdx, e.target.value)}
                 onKeyDown={(e) => {
                   e.stopPropagation();
                   if (e.key === "Escape") {
-                    onToggleFilterInput();
+                    onToggleFilterInput(zoneIdx);
                   }
                 }}
                 onMouseDown={(e) => e.stopPropagation()}
@@ -1183,10 +1258,10 @@ function ZoneCell({
               {zoneFilters[zoneIdx] && (
                 <>
                   <span className="text-[9px] text-[#e0af68] font-mono">
-                    {countMatches(lastOutputLines[tab.id] ?? [], zoneFilters[zoneIdx])} matches
+                    {countMatches(lastLines, zoneFilters[zoneIdx])} matches
                   </span>
                   <button
-                    onClick={() => onClearZoneFilter()}
+                    onClick={() => onClearZoneFilter(zoneIdx)}
                     onMouseDown={(e) => e.stopPropagation()}
                     className="text-[9px] text-[#565f89] hover:text-[#f7768e] px-1"
                   >
@@ -1203,14 +1278,14 @@ function ZoneCell({
               onTogglePin={onTogglePin ? () => onTogglePin(zoneIdx) : undefined}
               onMaximize={() => onZoneDoubleClick(zoneIdx)}
               onCopyOutput={() => {
-                const lines = lastOutputLines[tab.id] ?? [];
+                const lines = lastLines;
                 navigator.clipboard.writeText(lines.join("\n"));
               }}
               onScrollToBottom={() => {
                 const ref = terminalRefs.get(tab.id);
                 ref?.current?.scrollToBottom();
               }}
-              lastLines={lastOutputLines[tab.id] ?? []}
+              lastLines={lastLines}
               state={state}
               onRestart={onRestartInZone ? () => onRestartInZone(zoneIdx) : undefined}
               onExportZone={onExportZone ? (fmt) => onExportZone(zoneIdx, fmt) : undefined}
@@ -1243,20 +1318,18 @@ function ZoneCell({
                   the hidden mount (renderHiddenTabs) owns unassigned tabs. This
                   keeps the dual-mount race impossible (exactly-one-or-zero owner
                   per tab) that would otherwise evict UI Bridge registrations. */}
-              {shouldMountInstance && (
+              {shouldMountInstance && instanceHandlers && (
                 <TerminalInstance
                   ref={terminalRefs.get(tab.id)}
                   terminalId={tab.id}
                   visible={!showCompactCard}
                   isReconnecting={tab.isReconnecting}
-                  onReconnected={() => onReconnected(tab.id)}
-                  onExit={(code) => onExit(tab.id, code)}
-                  onFirstInput={(input) => onFirstInput(tab.id, input)}
-                  onUserInputLine={
-                    onUserInputLine ? (input) => onUserInputLine(tab.id, input) : undefined
-                  }
-                  onShellIntegration={(event) => onShellIntegration(tab.id, event)}
-                  onTitleChange={(title) => onTitleChange(tab.id, title)}
+                  onReconnected={instanceHandlers.onReconnected}
+                  onExit={instanceHandlers.onExit}
+                  onFirstInput={instanceHandlers.onFirstInput}
+                  onUserInputLine={instanceHandlers.onUserInputLine}
+                  onShellIntegration={instanceHandlers.onShellIntegration}
+                  onTitleChange={instanceHandlers.onTitleChange}
                 />
               )}
             </div>
@@ -1296,3 +1369,5 @@ function ZoneCell({
     </div>
   );
 }
+
+const ZoneCell = memo(ZoneCellInner);

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { memo, useState, useEffect, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   TerminalSquare,
@@ -189,7 +189,11 @@ export function sessionCardTooltip(
   return base;
 }
 
-export function SessionCard({
+/**
+ * Memoized: the session manager renders one card per session, so an unrelated
+ * re-render of the panel used to walk every card (plan Phase 1).
+ */
+function SessionCardInner({
   session,
   isSelected,
   isChecked,
@@ -827,3 +831,5 @@ export function SessionCard({
     </div>
   );
 }
+
+export const SessionCard = memo(SessionCardInner);
