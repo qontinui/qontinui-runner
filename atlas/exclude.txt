@@ -6,6 +6,8 @@ project.active_workflows_id_seq
 project.activity_logs
 project.activity_timeline
 project.activity_timeline_id_seq
+project.agent_command_versions
+project.agent_commands
 project.agentic_metric_baselines
 project.agentic_metric_scores
 project.ai_prompt_templates
@@ -372,6 +374,7 @@ project.wrapper_ratings
 project.wrapper_ratings_id_seq
 project.wsv_shadow_disagreements
 project.wsv_shadow_disagreements_id_seq
+coord.agent_action_reports
 coord.agent_logs
 coord.agent_questions
 coord.agent_registry
@@ -494,6 +497,7 @@ coord.migration_observations
 coord.migration_observations_id_seq
 coord.migration_reservations
 coord.migration_revisions
+coord.onboarding_connect_states
 coord.operator_audit
 coord.operator_membership_sync
 coord.operator_roles
@@ -504,10 +508,7 @@ coord.outbound_budget_observations
 coord.page_spec_paths
 coord.pending_installations
 coord.pending_pr_dependencies
-coord.plan_pr_citations
 coord.policy_clauses
-coord.policy_documents
-coord.policy_documents_id_seq
 coord.policy_rule_resolutions
 coord.policy_rules
 coord.pr_author_nudges
@@ -523,6 +524,7 @@ coord.priority_sets
 coord.process_session_output
 coord.process_session_output_id_seq
 coord.process_sessions
+coord.prompt_document_proposals
 coord.prompt_document_versions
 coord.prompt_documents
 coord.prompt_injection_events
@@ -543,6 +545,9 @@ coord.scheduler_ticks
 coord.scheduler_ticks_id_seq
 coord.schema_drift_events
 coord.schema_drift_events_id_seq
+coord.session_compliance
+coord.session_compliance_config
+coord.session_compliance_config_versions
 coord.session_events
 coord.session_events_id_seq
 coord.session_expectations
