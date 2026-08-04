@@ -1,10 +1,10 @@
-//! Fleet-portable provisioning of the `/vet-plan` and `/implement-plan`
-//! project slash commands into a spawned session's working directory.
+//! The agent command procedures this binary ships, and their provisioning into
+//! a spawned session's working directory.
 //!
 //! `claude` discovers project slash commands from `<cwd>/.claude/commands/*.md`.
 //! A gate-continuation session is spawned with a fresh worktree as its cwd, and
 //! on most devices there is no `~/.claude/commands` at all, so the fleet
-//! vet/implement procedures would be unresolvable. This module BUNDLES the two
+//! vet/implement procedures would be unresolvable. This module BUNDLES the
 //! command procedures into the runner binary via `include_str!` and writes them
 //! into the session cwd, so the commands resolve regardless of what (if
 //! anything) is in the device's home dir.
@@ -21,6 +21,15 @@
 //! [`FLEET_COMMANDS`]. Nothing in this module or its consumers may assume the
 //! bundle is two commands.
 //!
+//! ## Defaults, not the last word
+//!
+//! What is embedded here is the **default**. A signed-in account may override
+//! any command by name, and `crate::agent_commands` resolves
+//! `fresh fetch → disk cache → embedded default` before anything is written.
+//! Because the default is compiled in, an unauthenticated, offline, or
+//! first-run device still gets a working command set and the network is never
+//! on the critical path.
+//!
 //! Because these bodies ship to every fleet device, they must stay free of any
 //! one operator's absolute paths — see
 //! [`tests::staged_fleet_commands_have_no_plan_path_hardcodes`].
@@ -28,6 +37,8 @@
 use std::path::Path;
 
 use tracing::{info, warn};
+
+use crate::agent_commands::AgentCommandRegistry;
 
 /// `/vet-plan` procedure, bundled into the binary. Canonical source:
 /// `src-tauri/src/fleet_commands/vet-plan.md` in this repository — edit it
@@ -39,36 +50,46 @@ const VET_PLAN: &str = include_str!("fleet_commands/vet-plan.md");
 /// it there.
 const IMPLEMENT_PLAN: &str = include_str!("fleet_commands/implement-plan.md");
 
-/// The command files to provision, as `(filename, contents)`. The filename is
-/// the slash-command name `claude` will expose (e.g. `vet-plan.md` -> `/vet-plan`).
-const FLEET_COMMANDS: &[(&str, &str)] = &[
-    ("vet-plan.md", VET_PLAN),
-    ("implement-plan.md", IMPLEMENT_PLAN),
+/// The embedded default commands, as `(name, body)`. `name` is the slash
+/// command `claude` will expose and the filename stem written under
+/// `.claude/commands/` (`vet-plan` -> `vet-plan.md` -> `/vet-plan`).
+pub(crate) const FLEET_COMMANDS: &[(&str, &str)] = &[
+    ("vet-plan", VET_PLAN),
+    ("implement-plan", IMPLEMENT_PLAN),
 ];
 
-/// Provision the bundled fleet command procedures into `<workdir>/.claude/commands/`
-/// so a `claude` session spawned with `workdir` as its cwd can resolve `/vet-plan`
-/// and `/implement-plan` as PROJECT-scoped slash commands — even on a device with
-/// no `~/.claude/commands`.
+/// Provision the resolved agent commands into `<workdir>/.claude/commands/` so
+/// a `claude` session spawned with `workdir` as its cwd can resolve them as
+/// PROJECT-scoped slash commands — even on a device with no
+/// `~/.claude/commands`.
 ///
-/// Fail-soft (mirrors `coord_mcp::provision_coord_mcp_for_session`): any IO error
-/// is logged via `tracing::warn!` and swallowed — a provisioning failure must
-/// never abort an otherwise-launchable spawn (the session simply lacks the
-/// commands, the same state as before this feature). Idempotent: existing files
-/// are overwritten.
+/// The set written is [`crate::agent_commands::resolve_registry`]'s output:
+/// the account's overrides where it has any, the embedded defaults otherwise.
+///
+/// Fail-soft (mirrors `coord_mcp::provision_coord_mcp_for_session`): any IO
+/// error is logged via `tracing::warn!` and swallowed — a provisioning failure
+/// must never abort an otherwise-launchable spawn (the session simply lacks the
+/// commands, the same state as before this feature). Resolution is fail-soft
+/// too: a failed fetch, a rejected credential, a malformed override, or a
+/// broken cache each degrade one step and warn, never propagate. Idempotent:
+/// existing files are overwritten.
 pub(crate) fn provision_fleet_commands_for_session(workdir: &str) {
+    let registry = crate::agent_commands::resolve_registry();
     let commands_dir = Path::new(workdir).join(".claude").join("commands");
-    match provision_fleet_commands_into(&commands_dir) {
+    match provision_fleet_commands_into(&commands_dir, &registry) {
         Ok(written) => {
             info!(
-                "fleet_commands: provisioned {written} fleet command(s) into {}",
-                commands_dir.display()
+                "fleet_commands: provisioned {written} agent command(s) into {} \
+                 ({} account override(s), {} embedded default(s) available)",
+                commands_dir.display(),
+                registry.override_count(),
+                registry.builtin_count(),
             );
         }
         Err(e) => {
             warn!(
-                "fleet_commands: failed to provision fleet commands into {} \
-                 (continuing spawn; /vet-plan and /implement-plan may not resolve): {e}",
+                "fleet_commands: failed to provision agent commands into {} \
+                 (continuing spawn; the fleet slash commands may not resolve): {e}",
                 commands_dir.display()
             );
         }
@@ -76,16 +97,19 @@ pub(crate) fn provision_fleet_commands_for_session(workdir: &str) {
 }
 
 /// Core of [`provision_fleet_commands_for_session`]: create `commands_dir` and
-/// write every bundled command file into it (overwrite/idempotent), returning the
+/// write every resolved command into it (overwrite/idempotent), returning the
 /// count written. Split out so a unit test can drive it against a tempdir and
 /// assert the result — mirroring how `provision_agent_definitions` factored out
 /// its `_from_root` core.
-fn provision_fleet_commands_into(commands_dir: &Path) -> std::io::Result<usize> {
+fn provision_fleet_commands_into(
+    commands_dir: &Path,
+    registry: &AgentCommandRegistry,
+) -> std::io::Result<usize> {
     std::fs::create_dir_all(commands_dir)?;
     let mut written = 0usize;
-    for (name, contents) in FLEET_COMMANDS {
-        let dst = commands_dir.join(name);
-        std::fs::write(&dst, contents)?;
+    for command in registry.all() {
+        let dst = commands_dir.join(command.file_name());
+        std::fs::write(&dst, &command.body)?;
         written += 1;
     }
     Ok(written)
@@ -96,28 +120,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn provisions_both_fleet_commands_into_dir() {
+    fn provisions_every_embedded_command_into_dir() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let commands_dir = tmp.path().join(".claude").join("commands");
+        let registry = AgentCommandRegistry::new();
 
-        let written = provision_fleet_commands_into(&commands_dir).expect("provision");
-        assert_eq!(written, 2, "should provision exactly two fleet commands");
-
-        let vet = commands_dir.join("vet-plan.md");
-        let implement = commands_dir.join("implement-plan.md");
-        assert!(vet.exists(), "vet-plan.md should exist");
-        assert!(implement.exists(), "implement-plan.md should exist");
-
-        let vet_body = std::fs::read_to_string(&vet).expect("read vet-plan.md");
-        let implement_body = std::fs::read_to_string(&implement).expect("read implement-plan.md");
-        assert!(!vet_body.is_empty(), "vet-plan.md should be non-empty");
-        assert!(
-            !implement_body.is_empty(),
-            "implement-plan.md should be non-empty"
+        let written = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
+        assert_eq!(
+            written,
+            FLEET_COMMANDS.len(),
+            "should provision every embedded command"
         );
 
-        // Substrings verified present near the top of each staged file
+        // Every embedded default lands, byte-identically to what
+        // `include_str!` embedded.
+        for (name, body) in FLEET_COMMANDS {
+            let path = commands_dir.join(format!("{name}.md"));
+            assert!(path.exists(), "{name}.md should exist");
+            let on_disk = std::fs::read_to_string(&path).expect("read command");
+            assert!(!on_disk.is_empty(), "{name}.md should be non-empty");
+            assert_eq!(
+                &on_disk, body,
+                "{name}.md must be written byte-identically to the embedded default"
+            );
+        }
+
+        // Substrings verified present near the top of each bundled file
         // (the `# Vet Plan` / `# Implement Plan` H1 headings).
+        let vet_body = std::fs::read_to_string(commands_dir.join("vet-plan.md")).unwrap();
+        let implement_body =
+            std::fs::read_to_string(commands_dir.join("implement-plan.md")).unwrap();
         assert!(
             vet_body.contains("Vet Plan"),
             "vet-plan.md should contain 'Vet Plan'"
@@ -132,10 +164,50 @@ mod tests {
     fn provision_is_idempotent_overwrite() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let commands_dir = tmp.path().join(".claude").join("commands");
+        let registry = AgentCommandRegistry::new();
 
-        assert_eq!(provision_fleet_commands_into(&commands_dir).unwrap(), 2);
+        assert_eq!(
+            provision_fleet_commands_into(&commands_dir, &registry).unwrap(),
+            FLEET_COMMANDS.len()
+        );
         // Second run over the same dir must succeed (overwrite, not error).
-        assert_eq!(provision_fleet_commands_into(&commands_dir).unwrap(), 2);
+        assert_eq!(
+            provision_fleet_commands_into(&commands_dir, &registry).unwrap(),
+            FLEET_COMMANDS.len()
+        );
+    }
+
+    /// An account override must land INSTEAD of the same-named default — one
+    /// file per name, carrying the override's body.
+    #[test]
+    fn override_is_provisioned_in_place_of_the_default() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let commands_dir = tmp.path().join(".claude").join("commands");
+
+        let (name, default_body) = FLEET_COMMANDS[0];
+        let mut registry = AgentCommandRegistry::new();
+        registry.set_overrides(vec![qontinui_types::agent_commands::AgentCommand {
+            id: "id-1".to_string(),
+            organization_id: Some("org-1".to_string()),
+            created_by_user_id: None,
+            name: name.to_string(),
+            body: "# my own procedure\n".to_string(),
+            checksum: None,
+            is_shared: false,
+            current_version: 1,
+            created_at: "2026-08-04T00:00:00Z".to_string(),
+            updated_at: "2026-08-04T00:00:00Z".to_string(),
+        }]);
+
+        let written = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
+        assert_eq!(
+            written,
+            FLEET_COMMANDS.len(),
+            "an override replaces a default; it does not add a file"
+        );
+        let on_disk = std::fs::read_to_string(commands_dir.join(format!("{name}.md"))).unwrap();
+        assert_eq!(on_disk, "# my own procedure\n");
+        assert_ne!(on_disk, default_body);
     }
 
     /// The bundled commands must never acquire the operator's absolute plan
@@ -156,9 +228,9 @@ mod tests {
             for pat in FORBIDDEN {
                 assert!(
                     !contents.contains(pat),
-                    "bundled fleet command {name} contains forbidden plan-path hardcode \
+                    "bundled agent command {name} contains forbidden plan-path hardcode \
                      {pat:?} — an operator-local absolute path must never ship to a fleet \
-                     device; rewrite it in src-tauri/src/fleet_commands/{name}"
+                     device; rewrite it in src-tauri/src/fleet_commands/{name}.md"
                 );
             }
         }

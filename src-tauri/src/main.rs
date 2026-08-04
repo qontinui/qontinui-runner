@@ -16,6 +16,12 @@ mod action_service;
 // (`policy/production-and-cost`).
 mod agent_authorization;
 mod agent_claims;
+// Plan `2026-07-29-account-versioned-agent-commands.md` Phase 3 — resolves the
+// slash commands provisioned into a spawned session's `.claude/commands/`:
+// embedded defaults (`fleet_commands`), optionally overridden per account via
+// the qontinui-web HTTP API, with a disk cache so an offline start keeps the
+// user's own commands.
+mod agent_commands;
 mod agent_daemons;
 mod agent_pusher;
 // Plan `2026-05-19-coordinator-production-readiness.md` Phase 4 —
