@@ -10,7 +10,8 @@
 //! All authed with the runner's device-JWT via [`crate::auth::attach_device_auth`]
 //! (the same bearer the rest of the runner's coord calls present) — the runner
 //! step is server-side, so it holds the device JWT directly and does NOT need
-//! the loopback write-forwarder (which serves `register-plan`/`attest` and —
+//! the loopback write-forwarder (which serves the claim-anchored gate
+//! `register`/`attest` and —
 //! since the device-session coord-surface-hardening follow-up — the work-unit
 //! registry routes, for nonce-only in-terminal sessions).
 //!
