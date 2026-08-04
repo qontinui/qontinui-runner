@@ -4,10 +4,13 @@ import remarkGfm from "remark-gfm";
 import { X, Send, Square, Hammer } from "lucide-react";
 import { cn } from "../../lib/utils";
 import type { AiMessage, AiSessionState } from "@qontinui/shared-types";
+import { StreamingMessageView } from "../shared/StreamingMessageView";
 
 interface AiFixPanelProps {
   messages: AiMessage[];
   streamingContent: string;
+  /** Characters dropped by the streaming retention cap, if any. */
+  streamingDroppedChars?: number;
   sessionState: AiSessionState;
   processName: string;
   className?: string;
@@ -20,6 +23,7 @@ interface AiFixPanelProps {
 export function AiFixPanel({
   messages,
   streamingContent,
+  streamingDroppedChars = 0,
   sessionState,
   processName,
   className,
@@ -141,12 +145,15 @@ export function AiFixPanel({
           ),
         )}
 
-        {/* Streaming content */}
+        {/* Streaming content — plain tail while in flight; the completed
+            message above renders full markdown once the turn ends. */}
         {isProcessing && streamingContent && (
-          <div className="prose prose-invert prose-sm max-w-none text-xs [&_pre]:bg-black/30 [&_pre]:rounded-md [&_pre]:p-2 [&_pre]:overflow-x-auto [&_code]:text-amber-300 [&_code]:text-xs [&_a]:text-cyan-400 [&_h1]:text-sm [&_h2]:text-sm [&_h3]:text-xs [&_p]:text-xs [&_li]:text-xs [&_p]:my-1 [&_ul]:my-1 [&_ol]:my-1">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{streamingContent}</ReactMarkdown>
-            <span className="inline-block w-1.5 h-3 bg-amber-400 animate-pulse ml-0.5" />
-          </div>
+          <StreamingMessageView
+            content={streamingContent}
+            droppedChars={streamingDroppedChars}
+            className="text-zinc-300"
+            showCaret
+          />
         )}
 
         {/* Processing with no content yet (after initial response) */}

@@ -31,7 +31,15 @@ import { useAiSession } from "../../hooks/useAiSession";
 interface ProcessStatus {
   id: string;
   name: string;
-  state: "stopped" | "starting" | "building" | "running" | "healthy" | "stopping" | "failed" | "externally_owned";
+  state:
+    | "stopped"
+    | "starting"
+    | "building"
+    | "running"
+    | "healthy"
+    | "stopping"
+    | "failed"
+    | "externally_owned";
   pid: number | null;
   uptime_secs: number | null;
   port_healthy: boolean | null;
@@ -141,6 +149,7 @@ export function ProcessManagerTab() {
     sessionState: aiSessionState,
     messages: aiMessages,
     streamingContent: aiStreamingContent,
+    streamingDroppedChars: aiStreamingDroppedChars,
     createSession: aiCreateSession,
     sendMessage: aiSendMessage,
     interrupt: aiInterrupt,
@@ -872,6 +881,7 @@ Be concise and actionable.`;
                   className="h-1/2"
                   messages={aiMessages}
                   streamingContent={aiStreamingContent}
+                  streamingDroppedChars={aiStreamingDroppedChars}
                   sessionState={aiSessionState}
                   processName={selected.name}
                   onSendFollowUp={aiSendMessage}

@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useCallback } from "react";
+import React, { memo, useState, useMemo, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeRaw from "rehype-raw";
@@ -295,7 +295,7 @@ const SAFE_URL_TRANSFORM = (url: string): string => {
   return "";
 };
 
-export function MarkdownViewer({ content, className, isAnimated = false }: MarkdownViewerProps) {
+function MarkdownViewerImpl({ content, className, isAnimated = false }: MarkdownViewerProps) {
   const processedContent = useMemo(() => {
     let processed = content;
 
@@ -333,3 +333,10 @@ export function MarkdownViewer({ content, className, isAnimated = false }: Markd
     </div>
   );
 }
+
+/**
+ * Memoised: this is the leaf that runs `ReactMarkdown` (remark + rehype parse of
+ * the whole message). A new `groups` identity in an AI conversation must not
+ * re-parse every message in the backlog — plan 2026-07-28 §A5e.
+ */
+export const MarkdownViewer = memo(MarkdownViewerImpl);
