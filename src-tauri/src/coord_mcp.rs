@@ -1474,39 +1474,85 @@ pub(crate) fn release_workdir_on_session_close(workdir: &str) {
             return;
         }
     }
-    let (revoked, snapshot) = {
+    let (revoked_nonces, snapshot) = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
-        let before = map.len();
-        map.retain(|_, b| b.workdir != workdir);
-        let revoked = before - map.len();
-        (revoked, (revoked > 0).then(|| map.clone()))
+        let mut revoked_nonces: Vec<String> = Vec::new();
+        map.retain(|n, b| {
+            if b.workdir == workdir {
+                revoked_nonces.push(n.clone());
+                return false;
+            }
+            true
+        });
+        let snapshot = (!revoked_nonces.is_empty()).then(|| map.clone());
+        (revoked_nonces, snapshot)
     };
+    let revoked = revoked_nonces.len();
     if let Some(snapshot) = snapshot {
         persist_proxy_nonces(&snapshot);
     }
-    // Reap the app-data --mcp-config file for this workdir (its nonce is dead).
+    // Reap every app-data --mcp-config file whose nonce we just revoked.
     //
-    // Workdir-keyed name only (`None`): this entry point knows the workdir, not
-    // the terminal. Per-TERMINAL config files ([`mcp_config_file_name`] with a
-    // terminal id) are therefore not reaped here — they are left to the
-    // session-restore reaper ([`reap_stale_session_restore_configs_in`]), which
-    // drops any config whose nonce is no longer registered, and every nonce for
-    // this workdir was just revoked above. So the credential dies immediately
-    // either way; only the (already-dead) file lingers until the next reap.
-    let cfg = crate::session::claude_hook::session_restore_dir()
-        .join("coord-mcp")
-        .join(mcp_config_file_name(workdir, None));
-    if cfg.exists() {
-        if let Err(e) = std::fs::remove_file(&cfg) {
-            warn!(
-                "coord_mcp: failed to reap session-restore config {}: {e}",
-                cfg.display()
-            );
-        }
-    }
+    // Keyed on the NONCE, not on a recomputed filename. The filename is derived
+    // from the terminal when there is one ([`mcp_config_file_name`]), and this
+    // entry point knows only the workdir — so a name-based reap would find the
+    // workdir-derived file and silently miss every per-TERMINAL one. Matching on
+    // the revoked nonce set is exact for both classes and needs no terminal id
+    // plumbed down here: the retain above already collected precisely the nonces
+    // this close killed, and each config file carries its nonce in-band
+    // ([`read_proxy_nonce`]).
+    //
+    // The credential was already dead the moment the retain dropped it; this is
+    // hygiene, so it is best-effort and a failure only warns. The broader
+    // session-restore reaper ([`reap_stale_session_restore_configs_in`]) remains
+    // the backstop for files whose nonce was never registered at all.
+    reap_configs_for_revoked_nonces(
+        &crate::session::claude_hook::session_restore_dir().join("coord-mcp"),
+        &revoked_nonces,
+    );
     if revoked > 0 {
         info!("coord_mcp: session close revoked {revoked} proxy nonce(s) for {workdir}");
     }
+}
+
+/// Remove every `--mcp-config` file in `dir` whose in-band proxy nonce is in
+/// `revoked`. Injectable `dir` so tests never touch the real app-data path.
+///
+/// Nonce-keyed rather than name-keyed on purpose — see the call site in
+/// [`release_workdir_on_session_close`]: per-TERMINAL config filenames are
+/// derived from the terminal id, which that entry point does not have, so
+/// recomputing a name would reap only the workdir-derived file. Returns the
+/// number of files removed. Best-effort throughout: an unreadable dir, an
+/// unparseable file, or a failed unlink never propagates — the credential these
+/// files carry is already dead by the time this runs.
+fn reap_configs_for_revoked_nonces(dir: &Path, revoked: &[String]) -> usize {
+    if revoked.is_empty() {
+        return 0;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(nonce) = read_proxy_nonce(&path) else {
+            continue;
+        };
+        if !revoked.contains(&nonce) {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(e) => warn!(
+                "coord_mcp: failed to reap session-restore config {}: {e}",
+                path.display()
+            ),
+        }
+    }
+    removed
 }
 
 /// True iff something is LISTENING on `127.0.0.1:port` (a short connect probe).
@@ -5058,21 +5104,38 @@ mod tests {
         );
     }
 
-    /// Credential-hygiene Task 5 — session-close release: revokes the
-    /// workdir's live nonce and reaps the app-data session-restore config file
-    /// for that workdir. (Graced predecessors are left to expire on their own
-    /// ≤90s TTL — the grace registry is keyed only by nonce.)
+    /// Credential-hygiene Task 5 — session-close release: revokes EVERY live
+    /// nonce for the workdir and reaps each one's app-data session-restore
+    /// config file. (Graced predecessors are left to expire on their own ≤90s
+    /// TTL — the grace registry is keyed only by nonce.)
+    ///
+    /// The reap is NONCE-keyed, so the seeded fixtures must carry their nonce
+    /// in band exactly as the real writer emits it — a bare `{}` placeholder
+    /// carries none and is correctly left alone. Both filename classes are
+    /// covered: the workdir-derived name and a per-TERMINAL one, whose name
+    /// this entry point cannot recompute (it has no terminal id) and which a
+    /// name-keyed reap therefore missed.
     #[test]
     fn release_workdir_on_session_close_revokes_and_reaps() {
+        let cfg_body = |nonce: &str| {
+            format!(
+                r#"{{"mcpServers":{{"coord-mcp":{{"type":"http","url":"http://127.0.0.1:9876/coord-mcp","headers":{{"X-Coord-Mcp-Proxy-Key":"{nonce}"}}}}}}}}"#
+            )
+        };
+
         let wd = format!("D:/close-wt-{}", uuid::Uuid::now_v7());
         let current = register_proxy_nonce(&wd, None);
+        let per_terminal = register_proxy_nonce(&wd, Some("terminal-close-1"));
         assert!(proxy_nonce_is_valid(&current));
+        assert!(proxy_nonce_is_valid(&per_terminal));
 
-        // Seed the app-data config file the release must reap.
+        // Seed the app-data config files the release must reap.
         let cfg_dir = crate::session::claude_hook::session_restore_dir().join("coord-mcp");
         std::fs::create_dir_all(&cfg_dir).unwrap();
         let cfg = cfg_dir.join(mcp_config_file_name(&wd, None));
-        std::fs::write(&cfg, "{}").unwrap();
+        let cfg_terminal = cfg_dir.join(mcp_config_file_name(&wd, Some("terminal-close-1")));
+        std::fs::write(&cfg, cfg_body(&current)).unwrap();
+        std::fs::write(&cfg_terminal, cfg_body(&per_terminal)).unwrap();
 
         release_workdir_on_session_close(&wd);
 
@@ -5081,8 +5144,17 @@ mod tests {
             "session close must revoke the workdir's live nonce"
         );
         assert!(
+            !proxy_nonce_is_valid(&per_terminal),
+            "session close must revoke the workdir's per-terminal nonce too"
+        );
+        assert!(
             !cfg.exists(),
             "session close must reap the workdir's session-restore config file"
+        );
+        assert!(
+            !cfg_terminal.exists(),
+            "session close must reap the PER-TERMINAL config file, whose name it \
+             cannot recompute — the reap is keyed on the revoked nonce, not the name"
         );
     }
 
@@ -5137,6 +5209,65 @@ mod tests {
 
         // Cleanup.
         revoke_proxy_nonce(&live_nonce);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Session close must reap the config file of EVERY nonce it revoked —
+    /// including per-TERMINAL ones, whose filename is derived from the terminal
+    /// id that `release_workdir_on_session_close` does not have. This is the
+    /// regression guard for the name-keyed reap that per-terminal nonces broke:
+    /// a name-based lookup finds only the workdir-derived file and silently
+    /// leaves every terminal-keyed sibling on disk.
+    #[test]
+    fn revoked_nonce_reap_matches_terminal_keyed_configs_not_just_the_workdir_name() {
+        let dir = std::env::temp_dir().join(format!("coord-mcp-revreap-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_body = |nonce: &str| {
+            format!(
+                r#"{{"mcpServers":{{"coord-mcp":{{"type":"http","url":"http://127.0.0.1:9876/coord-mcp","headers":{{"X-Coord-Mcp-Proxy-Key":"{nonce}"}}}}}}}}"#
+            )
+        };
+
+        let wd = format!("D:/revreap-wt-{}", uuid::Uuid::now_v7());
+        // Two terminals in ONE workdir (the case that motivated per-terminal
+        // nonces) plus the terminal-less/workdir-derived form.
+        let n_t1 = register_proxy_nonce(&wd, Some("terminal-alpha"));
+        let n_t2 = register_proxy_nonce(&wd, Some("terminal-beta"));
+        let n_none = register_proxy_nonce(&wd, None);
+        assert_ne!(n_t1, n_t2, "distinct terminals must hold distinct nonces");
+
+        // Named exactly as production names them — terminal-derived for the two
+        // terminals, workdir-derived for the terminal-less one.
+        let f_t1 = dir.join(mcp_config_file_name(&wd, Some("terminal-alpha")));
+        let f_t2 = dir.join(mcp_config_file_name(&wd, Some("terminal-beta")));
+        let f_none = dir.join(mcp_config_file_name(&wd, None));
+        std::fs::write(&f_t1, cfg_body(&n_t1)).unwrap();
+        std::fs::write(&f_t2, cfg_body(&n_t2)).unwrap();
+        std::fs::write(&f_none, cfg_body(&n_none)).unwrap();
+
+        // A bystander config for a DIFFERENT workdir's nonce — never revoked
+        // here, so it must survive.
+        let other_wd = format!("D:/revreap-other-{}", uuid::Uuid::now_v7());
+        let n_other = register_proxy_nonce(&other_wd, Some("terminal-gamma"));
+        let f_other = dir.join(mcp_config_file_name(&other_wd, Some("terminal-gamma")));
+        std::fs::write(&f_other, cfg_body(&n_other)).unwrap();
+
+        let removed = reap_configs_for_revoked_nonces(&dir, &[n_t1, n_t2, n_none]);
+
+        assert_eq!(removed, 3, "all three revoked-nonce configs reaped");
+        assert!(!f_t1.exists(), "terminal-alpha's config reaped");
+        assert!(!f_t2.exists(), "terminal-beta's config reaped");
+        assert!(!f_none.exists(), "workdir-derived config reaped");
+        assert!(
+            f_other.exists(),
+            "another workdir's live nonce must not be reaped by this close"
+        );
+
+        // An empty revoked set is a no-op, not a directory sweep.
+        assert_eq!(reap_configs_for_revoked_nonces(&dir, &[]), 0);
+        assert!(f_other.exists());
+
+        revoke_proxy_nonce(&n_other);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

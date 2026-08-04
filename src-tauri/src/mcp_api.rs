@@ -1114,12 +1114,24 @@ fn resolve_caller_session_id(
 /// leg is a pair of exact lookups — deliberately no `last_seen_at` tie-break,
 /// because there is nothing to break a tie between.
 ///
-/// Deliberately does NOT apply the lifecycle leg's `origin == "authoritative"`
-/// guard. That guard exists to stop a workdir match from resolving to a
-/// same-cwd *sibling's* possibly-foreign id; here the record is not a match
-/// among many but THE record for the terminal this nonce was minted for, so
-/// there is no sibling to confuse it with, and coord still validates the
-/// anchor fail-closed with `session_on_device`.
+/// Applies the SAME `origin == "authoritative"` guard as the lifecycle leg,
+/// and the reason is worth stating because the obvious argument against it is
+/// wrong. That argument: the guard exists to stop a workdir match resolving to
+/// a same-cwd *sibling's* id, and here the record is not one match among many
+/// but THE record for the terminal this nonce was minted for — no sibling to
+/// confuse it with. True, and irrelevant: `origin` does not describe how many
+/// records matched, it describes whether the ANCHOR ITSELF is trustworthy. A
+/// `"reconciled"` record was recovered by a backstop (freshest-transcript
+/// mtime / process-start anchoring) and its own doc says it "may name a
+/// foreign session". Being the unique record for a terminal does not make a
+/// guessed anchor correct — uniqueness is not correctness. Shipping it would
+/// hand coord a confidently wrong identity, the one failure this whole chain
+/// is built to avoid (a wrong id is worse than no id, because coord's fuzzy
+/// fallback is at least honestly fuzzy).
+///
+/// A guarded-out record simply falls through to the workdir chain, which
+/// applies the same guard and reports the miss as `RecordUnregistered` — so
+/// the outcome stays honest without needing a variant of its own.
 ///
 /// A `None` at any hop falls through to the workdir chain — the binding
 /// simply carries no terminal (restore, adopt, mint route, in-cwd
@@ -1135,7 +1147,10 @@ fn resolve_caller_via_terminal(state: &Arc<ApiState>, nonce: &str) -> Option<uui
 
 /// Pure terminal-keyed selection (unit-testable without a Tauri app): the
 /// anchor of the single OPEN record hosted by `terminal_id`. Returns `None`
-/// when no open record names that terminal or its anchor is not a uuid.
+/// when no open record names that terminal, when that record's anchor is not
+/// authoritative (see [`resolve_caller_via_terminal`] — a reconciled anchor may
+/// name a foreign session even though the record is uniquely the terminal's),
+/// or when its anchor is not a uuid.
 fn select_terminal_caller(
     records: &[crate::session::session_lifecycle_store::TerminalSessionRecord],
     terminal_id: &str,
@@ -1143,6 +1158,7 @@ fn select_terminal_caller(
     records
         .iter()
         .find(|rec| rec.terminal_id == terminal_id)
+        .filter(|rec| lifecycle_record_is_authoritative(rec))
         .and_then(|rec| anchor_as_caller_session(&rec.claude_session_id))
 }
 
@@ -5556,6 +5572,31 @@ mod self_id_chain_tests {
         assert_eq!(select_terminal_caller(&records, "term-nope"), None);
         let bad = vec![rec("not-a-uuid", Some("D:/repo"), 1)];
         assert_eq!(select_terminal_caller(&bad, "term-not-a-uuid"), None);
+    }
+
+    /// The terminal leg applies the authoritative guard too. Being the UNIQUE
+    /// record for a terminal does not make a guessed anchor correct: a
+    /// `reconciled` id "may name a foreign session" by its own definition, so
+    /// resolving it would ship a confidently wrong identity — the exact failure
+    /// this chain exists to prevent. Uniqueness is not correctness.
+    #[test]
+    fn terminal_selection_refuses_a_non_authoritative_anchor() {
+        for origin in [Some(ORIGIN_RECONCILED.to_string()), None] {
+            let mut r = rec(ANCHOR_A, Some("D:/repo"), 100);
+            r.origin = origin.clone();
+            assert_eq!(
+                select_terminal_caller(&[r], &format!("term-{ANCHOR_A}")),
+                None,
+                "a {origin:?}-origin anchor must NOT resolve, even as the terminal's only record"
+            );
+        }
+        // The authoritative counterpart on the same terminal still resolves —
+        // so this guard rejects untrustworthy anchors, not the leg itself.
+        let good = rec(ANCHOR_A, Some("D:/repo"), 100);
+        assert_eq!(
+            select_terminal_caller(&[good], &format!("term-{ANCHOR_A}")),
+            Some(uuid_of(ANCHOR_A))
+        );
     }
 
     #[test]
