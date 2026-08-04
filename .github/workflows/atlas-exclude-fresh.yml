@@ -101,10 +101,26 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
-    # `contents: write` pushes the refresh branch; `pull-requests: write` opens
-    # or edits its PR. Both are used ONLY by the self-heal step, which is gated
-    # to schedule/dispatch on main -- the pull_request path never writes.
+    # Two runs on main (the nightly plus a workflow_dispatch, or two dispatches)
+    # would otherwise interleave `checkout -B` / `push --force` on the same bot
+    # branch and both call `gh pr create` -- leaving the branch tip from the
+    # LOSING run and reddening the other on "a pull request already exists".
+    # Keyed on github.ref so pull_request runs get their own groups.
+    # cancel-in-progress: false so a dispatch never kills a nightly mid-push.
+    concurrency:
+      group: atlas-exclude-fresh-${{ github.ref }}
+      cancel-in-progress: false
+
+    # `contents: write` pushes the refresh branch; `pull-requests: write` lets
+    # the self-heal step list/edit/reopen its PR. Job-level permissions are NOT
+    # event-conditional, so a same-repo pull_request run also carries this token
+    # even though no step on that path writes anything -- the gating is in the
+    # step `if:`, not in the token. (Fork PRs are capped read-only by GitHub.)
+    # Note `pull-requests: write` does not buy `gh pr create` while the repo has
+    # "Allow GitHub Actions to create and approve pull requests" disabled; see
+    # the header.
     permissions:
       contents: write
       pull-requests: write
@@ -247,6 +263,14 @@ jobs:
           fresh="$RUNNER_TEMP/exclude.fresh.txt"
           log="$RUNNER_TEMP/exclude.check.log"
 
+          # Publish the trigger split as an OUTPUT, unconditionally and before
+          # any exit path, so the self-heal step consumes the same value this
+          # step branched on. Re-encoding the predicate in the step `if:` would
+          # let the two silently diverge -- and the divergence that matters
+          # (SELF_HEAL true, `if:` false) is a GREEN nightly with undelivered
+          # drift, i.e. exactly the 12-silent-nights failure being fixed here.
+          echo "self_heal=$SELF_HEAL" >> "$GITHUB_OUTPUT"
+
           # Capture rather than stream: on drift the script prints GitHub
           # `::error::` annotations, and on the self-heal path this job ends
           # GREEN -- letting the annotation through would paint a successful run
@@ -278,10 +302,37 @@ jobs:
             exit "$rc"
           fi
 
+          # SHAPE GUARD -- the difference between "a migration moved a table" and
+          # "a whole schema read as empty". regen_exclude.ps1's own guard only
+          # rejects a GLOBALLY empty list, and Invoke-PgQuery only throws on a
+          # non-zero psql exit: a query that exits 0 with zero rows (schema
+          # renamed, not visible, search_path/permissions changed) yields a
+          # plausible-looking list, writes -Out, and reports STALE. Without this,
+          # self-heal would auto-author a PR that DROPS every coord.* exclusion
+          # -- the precise footgun this workflow exists to prevent. `-s` alone is
+          # far weaker than the real invariant.
+          #
+          # wc -l, never `grep -c`: a `grep -c ... || echo 0` style guard reads
+          # as passing on an empty file, which is the failure being guarded.
+          if ! grep -q '^project\.' "$fresh" || ! grep -q '^coord\.' "$fresh"; then
+            cat "$log"
+            echo "::error::Regenerated list is missing an ENTIRE schema (no project.* or no coord.* patterns). That is a bad read, not drift. Not self-healing."
+            exit 1
+          fi
+          committed_n=$(wc -l < atlas/exclude.txt)
+          fresh_n=$(wc -l < "$fresh")
+          if [ "$fresh_n" -lt $(( committed_n * 3 / 4 )) ]; then
+            cat "$log"
+            echo "::error::Regenerated list shrank $committed_n -> $fresh_n patterns (>25%). Refusing to self-heal a mass removal; regenerate by hand and inspect."
+            exit 1
+          fi
+
           echo "drift=true" >> "$GITHUB_OUTPUT"
-          # Everything from the drift header down becomes the PR body's diff
-          # block, so a reviewer sees which tables moved and why.
-          sed -n '/^Drift (committed vs fresh):/,$p' "$log" > "$RUNNER_TEMP/exclude.drift.txt"
+          # The drift entries (header line dropped -- the PR body supplies its
+          # own heading) become the body's diff block, so a reviewer sees which
+          # tables moved and why. `//` reuses the range's own regex, so the
+          # matched header is the only line excluded.
+          sed -n '/^Drift (committed vs fresh):/,${//!p}' "$log" > "$RUNNER_TEMP/exclude.drift.txt"
 
           if [ "$SELF_HEAL" = "true" ]; then
             sed 's/^::error:://' "$log"
@@ -299,14 +350,16 @@ jobs:
       - name: Open or update the exclude.txt refresh PR
         if: >-
           steps.exclude_check.outputs.drift == 'true'
-          && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-          && github.ref == 'refs/heads/main'
+          && steps.exclude_check.outputs.self_heal == 'true'
         working-directory: qontinui-runner
         shell: bash
         env:
-          # Same token chain as the checkout above, so the push and the PR are
-          # authored consistently. Whether the PAT was actually available
-          # changes what a reviewer must do next, so surface it in the body.
+          # Same PAT as the checkout above, so the push and the PR are authored
+          # consistently. The checkout's expression additionally withholds the
+          # PAT on pull_request; that clause is unnecessary here because this
+          # step is gated to schedule/dispatch on main and never runs on a PR.
+          # Whether the PAT was actually available changes what a reviewer must
+          # do next, so surface it in the body.
           GH_TOKEN: ${{ secrets.CLORINDE_AUTOCOMMIT_TOKEN || secrets.GITHUB_TOKEN }}
           PAT_AVAILABLE: ${{ secrets.CLORINDE_AUTOCOMMIT_TOKEN != '' }}
           REPO: ${{ github.repository }}
@@ -318,6 +371,21 @@ jobs:
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Resolve the PR BEFORE touching the branch. Once a human marks it
+          # ready for review it can be a live merge-train candidate, and moving
+          # the branch tip out from under an in-flight proposal is a known wedge
+          # class in this fleet. Leave it strictly alone and say so; the nightly
+          # after it lands refreshes normally against the new main.
+          existing="$(gh pr list --repo "$REPO" --head "$BRANCH" --base main --state open \
+            --json number,isDraft --jq '.[0] | select(.) | "\(.number) \(.isDraft)"' || true)"
+          existing_num="${existing%% *}"
+          existing_draft="${existing##* }"
+          if [ -n "$existing_num" ] && [ "$existing_draft" != "true" ]; then
+            echo "::warning::Refresh PR #$existing_num is marked ready for review (possible merge-train candidate)."
+            echo "::warning::Not force-pushing '$BRANCH' under it. The next run after it lands will refresh against the new main."
+            exit 0
+          fi
 
           # Rebuild the branch from THIS run's triggering commit every time, so
           # the PR stays a single commit against current main and never
@@ -332,12 +400,17 @@ jobs:
           # and installs toolchains, and none of that belongs in the commit.
           git add -- atlas/exclude.txt
           if git diff --cached --quiet; then
-            # Contradiction guard: the check step only reaches this step when it
-            # found drift, so main's exclude.txt cannot equal the fresh list.
-            # If it somehow does, there is no diff to open a PR for -- bail
-            # rather than push an empty branch that `gh pr create` would reject.
-            echo "::warning::drift was reported but exclude.txt already matches the fresh list -- nothing to push."
-            exit 0
+            # Contradiction guard. This step only runs when the check step found
+            # drift, so main's exclude.txt cannot equal the fresh list: the
+            # script normalizes CRLF before comparing, a missing trailing
+            # newline shows up as a line-set difference, and a case-only delta
+            # still produces a real byte diff after the cp above. Unreachable by
+            # construction -- which is exactly why it exits 1 rather than 0.
+            # Failing costs nothing in the impossible case, and a ::warning:: on
+            # a green nightly would be precisely as invisible as the 12 red
+            # nights were. This closes the last silent-green path in the step.
+            echo "::error::drift was reported but exclude.txt already matches the fresh list. This should be unreachable -- investigate before trusting the guard."
+            exit 1
           fi
           git commit -m "$TITLE"
 
@@ -396,23 +469,38 @@ jobs:
           EOF
           } > "$body"
 
-          existing="$(gh pr list --repo "$REPO" --head "$BRANCH" --base main --state open --json number --jq '.[0].number // empty')"
-          if [ -n "$existing" ]; then
-            gh pr edit "$existing" --repo "$REPO" --title "$TITLE" --body-file "$body"
-            url="$(gh pr view "$existing" --repo "$REPO" --json url --jq .url)"
-            echo "Updated existing refresh PR: $url"
+          if [ -z "$existing_num" ]; then
+            # A CLOSED (not merged) PR would otherwise make `gh pr create`
+            # succeed every night -- GitHub allows a new PR for a head whose
+            # previous PR was closed -- turning "one PR" into one per night.
+            # Reopen the maintainer's PR instead. mergedAt is the discriminator:
+            # gh reports state CLOSED for merged PRs too, and a merged one must
+            # never be reopened.
+            existing_num="$(gh pr list --repo "$REPO" --head "$BRANCH" --base main --state closed \
+              --json number,mergedAt --jq 'map(select(.mergedAt == null)) | last | .number // empty' || true)"
+            if [ -n "$existing_num" ]; then
+              echo "Reopening previously closed refresh PR #$existing_num."
+              gh pr reopen "$existing_num" --repo "$REPO"
+            fi
+          fi
+
+          if [ -n "$existing_num" ]; then
+            gh pr edit "$existing_num" --repo "$REPO" --title "$TITLE" --body-file "$body"
+            url="$(gh pr view "$existing_num" --repo "$REPO" --json url --jq .url)"
+            echo "Updated refresh PR: $url"
           else
-            # A failure here is almost always CONFIGURATION, not drift: the repo
-            # currently has "Allow GitHub Actions to create and approve pull
-            # requests" disabled (`can_approve_pull_request_reviews: false`), and
-            # a fine-grained PAT needs `Pull requests: write` on top of
-            # `Contents: write`. Say so explicitly rather than leaving a bare
-            # 403, and fail the job -- the branch below is already pushed, so the
-            # fix is one click away, but a nightly that found REAL drift and
-            # could not deliver it must not end green.
+            # A failure here is almost always CONFIGURATION rather than drift:
+            # the repo currently has "Allow GitHub Actions to create and approve
+            # pull requests" disabled (`can_approve_pull_request_reviews:
+            # false`), and a fine-grained PAT needs `Pull requests: write` on top
+            # of `Contents: write`. (Other 422 causes exist -- a >65536-char body,
+            # a branch-protection refusal -- so gh's own stderr above is the
+            # authority.) Fail the job: the branch was pushed above, so the fix
+            # is one click away, but a nightly that found REAL drift and could
+            # not deliver it must not end green.
             if ! url="$(gh pr create --repo "$REPO" --base main --head "$BRANCH" --draft --title "$TITLE" --body-file "$body")"; then
               echo "::error::Branch '$BRANCH' was pushed with the regenerated exclude.txt, but opening its PR failed."
-              echo "::error::This is a permissions/config issue, not schema drift. Fix EITHER of:"
+              echo "::error::Usually permissions/config, not schema drift (see gh's error above). Fix EITHER of:"
               echo "::error::  (a) Settings > Actions > General > Workflow permissions: enable 'Allow GitHub Actions to create and approve pull requests'; or"
               echo "::error::  (b) grant the CLORINDE_AUTOCOMMIT_TOKEN PAT 'Pull requests: write' on $REPO."
               echo "::error::Meanwhile, open the PR by hand from '$BRANCH' -- the fix is already committed there."
@@ -431,12 +519,13 @@ jobs:
       # (mirrors schema-pg-sql-fresh.yml:214-220). Keyed on the step's `drift`
       # output rather than `failure()`, because the self-heal path now ends the
       # job GREEN while still having produced a fresh list worth keeping.
-      # `always()` is required for this step to run at all after the check step
-      # exits 1 on the pull_request path. `warn` (not `error`) on missing file:
-      # a DB-connection failure throws before -Out is written, and we don't want
-      # an artifact-missing error to mask the real DB error.
+      # `!cancelled()` is required for this step to run at all after the check
+      # step exits 1 on the pull_request path (and is tighter than `always()`,
+      # which would also fire on cancellation). `warn` (not `error`) on missing
+      # file: a DB-connection failure throws before -Out is written, and we
+      # don't want an artifact-missing error to mask the real DB error.
       - name: Upload regenerated exclude.txt (on drift)
-        if: always() && steps.exclude_check.outputs.drift == 'true'
+        if: ${{ !cancelled() && steps.exclude_check.outputs.drift == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: atlas-exclude-fresh
