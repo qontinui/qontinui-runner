@@ -1583,13 +1583,17 @@ impl TerminalSession {
         }
 
         // 3. Materialize the always-on identity shims + prepend their dir.
-        // Phase 0 instrumentation: 4 rendered scripts + 2 exe copies + a
-        // hardlink, per terminal, with no caching (B2).
+        // Phase 6 (B2): the dir is CONTENT-ADDRESSED per runner build and
+        // shared by every terminal, so this costs 4 rendered scripts + 2 exe
+        // copies + a hardlink ONCE per build instead of once per spawn. See
+        // `shim_materializer::identity_build_tag` for the staleness check that
+        // replaces the old "every spawn re-copies, so it is accidentally
+        // fresh" behavior.
         let base_dir = std::env::temp_dir();
         let shim_span =
             tracing::debug_span!("terminal_spawn.shim_materialize", terminal_id = %terminal_id)
                 .entered();
-        let identity = shim_materializer::materialize_identity(&base_dir, terminal_id);
+        let identity = shim_materializer::materialize_identity(&base_dir);
         drop(shim_span);
         match identity {
             Some(identity_dir) => {
@@ -2167,6 +2171,11 @@ impl TerminalSession {
         // reaped. Best-effort + no-op when interception was never enabled (the
         // dir simply won't exist). The stale-sweep at the next materialize reaps
         // anything a crash left behind.
+        //
+        // This reaps the INSTALL-INTERCEPT dir only. The always-on IDENTITY dir
+        // is shared by every terminal of this runner build (Phase 6, B2), so
+        // deleting it here would pull the PATH shims out from under every other
+        // live pane; `sweep_stale` owns its lifetime instead.
         crate::install_effects_producer::intercept::shim_materializer::cleanup(
             &std::env::temp_dir(),
             &self.id,

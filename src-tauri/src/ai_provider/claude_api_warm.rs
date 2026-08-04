@@ -184,7 +184,7 @@ fn resolve_oauth_from_path(creds_path: &Path) -> Option<String> {
                 "Warm credential: OAuth token expired (expires_at={}, now={}); attempting refresh",
                 expires_at_ms, now_ms
             );
-            return super::oauth_refresh::try_refresh_credentials(creds_path);
+            return super::oauth_refresh::refresh_credentials_blocking(creds_path);
         }
     }
 

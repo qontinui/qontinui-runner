@@ -373,32 +373,54 @@ impl ClaudeSession {
             // Iterate every registered observable bridge: a per-bridge
             // pull failure skips that bridge's watcher but never kills the
             // session or the other bridges.
-            Self::block_on_async(async {
-                for b in qontinui_runner_lib::observable_bridge::global_registry() {
-                    match b.pull(&mut ctx).await {
-                        Ok(()) => {
-                            if let Err(e) = std::sync::Arc::clone(b).start_watching(&ctx).await {
+            //
+            // BOUNDED (Phase 6, B7). This is a `block_on_async` nested inside
+            // the caller's `spawn_blocking`, so however long the bridges take is
+            // added verbatim to AI-session open latency — with no ceiling. There
+            // is exactly ONE bridge registered today (`GitOpBridge`), so
+            // parallelising the loop would buy nothing; a WHOLE-LOOP timeout
+            // budget is what actually caps the stall. On expiry the session
+            // opens un-federated, which is the same outcome the `Err` arms
+            // already produce and which the reconcile pass repairs.
+            let federation_budget = std::time::Duration::from_secs(10);
+            let federated = Self::block_on_async(async {
+                tokio::time::timeout(federation_budget, async {
+                    for b in qontinui_runner_lib::observable_bridge::global_registry() {
+                        match b.pull(&mut ctx).await {
+                            Ok(()) => {
+                                if let Err(e) = std::sync::Arc::clone(b).start_watching(&ctx).await {
+                                    warn!(
+                                        "federation[{}]: start_watching failed for session {} ({}); \
+                                         continuing without watcher — reconcile will still run",
+                                        b.category(),
+                                        session_id,
+                                        e
+                                    );
+                                }
+                            }
+                            Err(e) => {
                                 warn!(
-                                    "federation[{}]: start_watching failed for session {} ({}); \
-                                     continuing without watcher — reconcile will still run",
+                                    "federation[{}]: pull failed for session {} ({}); \
+                                     skipping watcher for this bridge",
                                     b.category(),
                                     session_id,
                                     e
                                 );
                             }
                         }
-                        Err(e) => {
-                            warn!(
-                                "federation[{}]: pull failed for session {} ({}); \
-                                 skipping watcher for this bridge",
-                                b.category(),
-                                session_id,
-                                e
-                            );
-                        }
                     }
-                }
+                })
+                .await
+                .is_ok()
             });
+            if !federated {
+                warn!(
+                    session_id,
+                    budget_ms = federation_budget.as_millis() as u64,
+                    "federation: spawn-time pull exceeded its budget — opening the session \
+                     un-federated; reconcile will still run"
+                );
+            }
             Some(ctx)
         } else {
             None

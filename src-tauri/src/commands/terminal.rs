@@ -135,20 +135,30 @@ pub async fn terminal_create(
     // context before it is parked on the session; each var is omitted when it
     // does not resolve. See `agent_worktree::session_env`.
     let extra_env = crate::agent_worktree::session_env::session_extra_env(isolated_ctx.as_ref());
-    // Phase 0 instrumentation: the whole blocking spawn (PTY open, identity
-    // seam, child exec). Its child spans break the interior down.
-    let create_span = tracing::debug_span!("terminal_spawn.manager_create").entered();
-    let info = terminal_manager.create(
-        title.clone(),
-        working_dir.clone(),
-        page_id,
-        cols,
-        rows,
-        app_handle,
-        command,
-        extra_env,
-    )?;
-    drop(create_span);
+    // Phase 6 (B4): the whole blocking spawn (PTY open, identity seam, child
+    // exec) runs on a BLOCKING thread, matching the AI path
+    // (`commands::ai_session`). It used to be a bare synchronous call on a
+    // tokio worker, so K concurrent opens parked K runtime workers for the full
+    // spawn duration and starved every other async task in the runner.
+    // Phase 0 instrumentation: its child spans break the interior down.
+    let create_manager = terminal_manager.inner().clone();
+    let create_title = title.clone();
+    let create_working_dir = working_dir.clone();
+    let info = tokio::task::spawn_blocking(move || {
+        let _create_span = tracing::debug_span!("terminal_spawn.manager_create").entered();
+        create_manager.create(
+            create_title,
+            create_working_dir,
+            page_id,
+            cols,
+            rows,
+            app_handle,
+            command,
+            extra_env,
+        )
+    })
+    .await
+    .map_err(|e| format!("terminal spawn task failed: {e}"))??;
 
     // Park the isolated edit context on the terminal session so its
     // heartbeat + claim live as long as the PTY. Cleared in `close()`.
@@ -193,6 +203,22 @@ pub async fn terminal_create(
     // old row + mints a duplicate. On a persisted-but-GC'd row the resume
     // falls back to a fresh register (new id), which we persist over the
     // stale one. Either way the pane ends with a live coord session id.
+    //
+    // DELIBERATELY STILL ON THE CRITICAL PATH (Phase 6, §4 Q2 — do not "optimize"
+    // these into a `tokio::spawn` without re-reading that resolution):
+    //   * the coord CLAIM above (`acquire_for_terminal`) returns the value that
+    //     BECOMES `working_dir`, a spawn input — it can never move after spawn;
+    //   * `attach_output_pipe` below subscribes to a live broadcast of PTY
+    //     output, so deferring it drops the session's first bytes;
+    //   * `set_coord_session_id` + the `set_on_exit` close hook must move
+    //     together WITH registration or a PTY that exits first leaves a coord
+    //     ghost;
+    //   * `credential_helper::setup_credential_helper` hard-requires coord to
+    //     already know the session (it is already `tokio::spawn`ed below).
+    // What Phase 6 actually removed from this path is the network: the OAuth
+    // refresh is now a background refresher (`ai_provider::oauth_refresh`), and
+    // pinned-session verification was already off-path
+    // (`poll_and_verify_pinned_session`).
     let registry = session_registry.inner().clone();
     let persisted = pane_store.get(&pane_key);
     // Phase 0 instrumentation: the coord-registration segment of spawn

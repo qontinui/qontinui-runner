@@ -47,11 +47,42 @@ const IDENTITY_SHIM_CMD: &str = include_str!("../../../resources/intercept/ident
 /// flag. `claude` is provider #1, `gemini` #2.
 pub const IDENTITY_TOOLS: &[&str] = &["claude", "gemini"];
 
-/// Filename prefix for a per-terminal IDENTITY shim dir
-/// (`qontinui-identity-<terminal_id>`). Distinct from [`SHIM_DIR_PREFIX`] so the
-/// always-on identity family has its own lifecycle (it is materialized even when
-/// install interception is off), while [`sweep_stale`]/[`cleanup`] reap BOTH.
+/// Filename prefix for the CONTENT-ADDRESSED identity shim dir
+/// (`qontinui-identity-<build-tag>`, see [`identity_build_tag`]). Distinct from
+/// [`SHIM_DIR_PREFIX`] so the always-on identity family has its own lifecycle
+/// (it is materialized even when install interception is off).
+///
+/// Historically this was `qontinui-identity-<terminal_id>` — one dir, 4 script
+/// writes, 2 `qontinui-shim.exe` copies and a `qontinui-pr.exe` hardlink PER
+/// TERMINAL SPAWN, with no cache of any kind. The bytes are not
+/// terminal-specific ([`render_identity`] substitutes only `@@TOOL@@` and
+/// `@@SHIM_DIR@@`; the terminal id rides env vars), so the dir is now shared
+/// across every terminal of one runner build. The prefix is unchanged so
+/// [`sweep_stale`] still reaps the legacy per-terminal dirs.
 pub const IDENTITY_DIR_PREFIX: &str = "qontinui-identity-";
+
+/// Completion marker written LAST inside a materialized identity dir. Its
+/// presence means "this dir is complete and matches its build tag"; its absence
+/// means a materialize was interrupted and must be redone. Also carries the
+/// dir's liveness timestamp (see [`refresh_identity_liveness`]).
+const IDENTITY_MARKER: &str = ".qontinui-identity-build";
+
+/// How stale the identity dir's liveness marker may get before an in-use dir
+/// re-touches it. Far below [`STALE_SHIM_MAX_AGE`], so a dir in continuous use
+/// is never swept, while a burst of spawns costs ZERO writes.
+const IDENTITY_TOUCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Minimum spacing between orphan sweeps driven off the always-on identity
+/// path. The sweep is a `read_dir` of the system temp dir — cheap, but not
+/// something a 40-terminal restore should do 40 times.
+const SWEEP_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// When the always-on identity path last swept orphans.
+static LAST_SWEEP: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// Serializes the (rare) materialization of the shared identity dir so a burst
+/// of concurrent spawns writes it once rather than N times over each other.
+static IDENTITY_MATERIALIZE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Env var carrying the per-PTY terminal id the identity shim echoes back when
 /// it confirms a session (plan §3b). Always injected at spawn.
@@ -221,19 +252,51 @@ pub fn materialize(
     })
 }
 
-/// Materialize the ALWAYS-ON session-restore identity shims for `terminal_id`
-/// into a fresh per-terminal identity bin dir and return its absolute path to
-/// PREPEND to the child `PATH` (plan §3b). Unlike [`materialize`], this is NOT
-/// gated by the install-intercept master flag — the out-of-box session-restore
-/// guarantee applies to every user with zero setup.
+/// Materialize the ALWAYS-ON session-restore identity shims into the
+/// CONTENT-ADDRESSED shim dir for this runner build and return its absolute path
+/// to PREPEND to the child `PATH` (plan §3b). Unlike [`materialize`], this is
+/// NOT gated by the install-intercept master flag — the out-of-box
+/// session-restore guarantee applies to every user with zero setup.
 ///
 /// The identity shims (`claude`, `gemini`) append
 /// `--session-id $QONTINUI_PINNED_SESSION_ID` to the real provider argv (the
 /// runner pre-generates that id per terminal and injects it as env). On any IO
 /// failure returns `None` (fail-open: a shim we couldn't write must never break
 /// the terminal — the seam just doesn't prepend the identity dir).
-pub fn materialize_identity(base_dir: &Path, terminal_id: &str) -> Option<PathBuf> {
-    let dir = base_dir.join(format!("{IDENTITY_DIR_PREFIX}{terminal_id}"));
+///
+/// SHARED, not per-terminal (Phase 6, B2). The rendered bytes contain no
+/// terminal-specific data — [`render_identity`] substitutes only `@@TOOL@@` and
+/// `@@SHIM_DIR@@`, and the terminal id rides `QONTINUI_TERMINAL_ID` /
+/// `QONTINUI_PINNED_SESSION_ID` in the child env — so one dir per runner build
+/// serves every terminal. After the first materialize a spawn costs a single
+/// `stat`. The three things that made per-terminal dirs load-bearing are
+/// handled explicitly: teardown no longer deletes it ([`cleanup`]), the orphan
+/// reaper now actually runs ([`maybe_sweep_stale`]), and staleness across a
+/// runner update is an explicit check ([`identity_build_tag`]).
+pub fn materialize_identity(base_dir: &Path) -> Option<PathBuf> {
+    // Q5(b): the orphan reaper used to be invoked ONLY from `materialize`, the
+    // flag-gated install-intercept path — dark by default — so identity dirs
+    // leaked forever. It now hangs off THIS always-on path (rate-limited), which
+    // is the only one every terminal actually takes.
+    maybe_sweep_stale(base_dir);
+
+    let dir = base_dir.join(format!("{IDENTITY_DIR_PREFIX}{}", identity_build_tag()));
+    let marker = dir.join(IDENTITY_MARKER);
+
+    // FAST PATH — a complete dir for THIS build already exists. Zero writes:
+    // no scripts, no exe copies, no hardlink. This is what every spawn after the
+    // first one costs.
+    if let Ok(md) = std::fs::metadata(&marker) {
+        refresh_identity_liveness(&marker, &md);
+        return Some(dir);
+    }
+
+    let _guard = IDENTITY_MATERIALIZE_LOCK.lock();
+    // Re-check under the lock: a peer spawn may have just materialized it.
+    if std::fs::metadata(&marker).is_ok() {
+        return Some(dir);
+    }
+
     if let Err(e) = std::fs::create_dir_all(&dir) {
         tracing::warn!(
             error = %e,
@@ -257,7 +320,125 @@ pub fn materialize_identity(base_dir: &Path, terminal_id: &str) -> Option<PathBu
     // PATH dir. Best-effort, fail-open: an absent/uncopyable binary never
     // breaks the terminal — the identity dir still materializes.
     materialize_session_cli(&dir);
+
+    // The marker goes LAST and is what makes the fast path safe: a crash
+    // part-way through the writes above leaves no marker, so the next spawn
+    // rewrites the dir rather than PATH-prepending a half-written one.
+    if let Err(e) = std::fs::write(&marker, identity_build_tag().as_bytes()) {
+        tracing::warn!(
+            error = %e,
+            dir = %dir.display(),
+            "session-restore: identity marker write failed — the dir will be re-materialized next spawn"
+        );
+    }
+    tracing::debug!(
+        dir = %dir.display(),
+        "session-restore: materialized the shared identity shim dir for this runner build"
+    );
     Some(dir)
+}
+
+/// Content/version tag for the identity shim dir — the Q5(c) staleness check
+/// that had NO equivalent before.
+///
+/// Nothing used to keep a materialized shim current across a runner update
+/// except the accident that every single spawn re-rendered the scripts and
+/// re-copied `qontinui-shim.exe` from `current_exe().parent()`. Caching removes
+/// that accidental refresh, so staleness has to become explicit: the tag hashes
+/// everything whose change would make a materialized dir wrong —
+///
+/// - the runner executable's path, size and mtime (a runner update changes at
+///   least one, and it is the source of both copied binaries);
+/// - the `qontinui-shim` stub's own size and mtime, and the `qontinui-pr`
+///   session CLI's, since those are copied in verbatim;
+/// - the shim TEMPLATE bodies and the tool list, so editing
+///   `identity_shim.bash` invalidates every materialized dir.
+///
+/// A changed tag yields a different directory NAME, so the new dir is
+/// materialized fresh and the old one is reaped by [`sweep_stale`] once nothing
+/// has touched it for [`STALE_SHIM_MAX_AGE`] — no in-place overwrite of files a
+/// live terminal may be executing. This is the hazard
+/// [`materialize_persistent_identity`] still demonstrates: written once on an
+/// operator click, no refresh path, stale `claude.exe` after every update.
+fn identity_build_tag() -> &'static str {
+    use std::hash::{Hash, Hasher};
+    static TAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TAG.get_or_init(|| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        // Template + tool-set identity.
+        IDENTITY_SHIM_BASH.hash(&mut h);
+        #[cfg(target_os = "windows")]
+        IDENTITY_SHIM_CMD.hash(&mut h);
+        IDENTITY_TOOLS.hash(&mut h);
+        SESSION_CLI_BIN.hash(&mut h);
+        // Runner build identity + every binary copied into the dir.
+        if let Ok(exe) = std::env::current_exe() {
+            exe.to_string_lossy().hash(&mut h);
+            hash_file_identity(&mut h, &exe);
+            if let Some(parent) = exe.parent() {
+                hash_file_identity(&mut h, &parent.join(SESSION_CLI_BIN));
+            }
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(stub) = locate_stub_exe() {
+            hash_file_identity(&mut h, &stub);
+        }
+        format!("{:016x}", h.finish())
+    })
+}
+
+/// Fold a file's size + mtime into `h`. An unreadable/absent file contributes a
+/// stable "absent" marker rather than being skipped, so the tag still changes
+/// when a binary appears or disappears.
+fn hash_file_identity(h: &mut impl std::hash::Hasher, path: &Path) {
+    use std::hash::Hash;
+    match std::fs::metadata(path) {
+        Ok(md) => {
+            md.len().hash(h);
+            let nanos = md
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            nanos.hash(h);
+        }
+        Err(_) => u128::MAX.hash(h),
+    }
+}
+
+/// Keep a shared identity dir out of the orphan sweeper's sights while it is in
+/// use, WITHOUT refcounting terminals (Q5(a)): rewriting the marker bumps its
+/// mtime, and [`sweep_stale`] ages a dir by the newest mtime it contains. Only
+/// done once [`IDENTITY_TOUCH_INTERVAL`] has passed, so a burst of spawns
+/// performs no writes at all.
+fn refresh_identity_liveness(marker: &Path, md: &std::fs::Metadata) {
+    let stale = md
+        .modified()
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|age| age >= IDENTITY_TOUCH_INTERVAL)
+        .unwrap_or(true);
+    if stale {
+        let _ = std::fs::write(marker, identity_build_tag().as_bytes());
+    }
+}
+
+/// Rate-limited [`sweep_stale`] for the always-on identity path.
+fn maybe_sweep_stale(base_dir: &Path) {
+    let due = match LAST_SWEEP.lock() {
+        Ok(mut last) => {
+            let due = last.is_none_or(|t| t.elapsed() >= SWEEP_MIN_INTERVAL);
+            if due {
+                *last = Some(std::time::Instant::now());
+            }
+            due
+        }
+        Err(_) => false,
+    };
+    if due {
+        sweep_stale(base_dir, STALE_SHIM_MAX_AGE);
+    }
 }
 
 /// The session-CLI binary filename [`materialize_session_cli`] delivers.
@@ -588,21 +769,28 @@ fn set_executable(_path: &Path) -> std::io::Result<()> {
 /// Best-effort: a removal failure is logged at debug and ignored — cleanup must
 /// never interfere with teardown, and the stale-sweep ([`sweep_stale`]) reaps
 /// any leftover on the next materialize.
+/// Reaps ONLY the per-terminal install-intercept dir (`qontinui-shim-<id>`).
+///
+/// Q5(a): it used to reap `qontinui-identity-<id>` as well, which is precisely
+/// what made the identity dir un-shareable — one terminal exiting would
+/// `remove_dir_all` a directory every other live terminal still has on its
+/// PATH. The identity dir is now content-addressed and shared per runner build
+/// ([`materialize_identity`]), so it has no per-terminal owner to clean up
+/// after; its lifetime is handled by [`sweep_stale`], which reaps it once
+/// nothing has touched it for [`STALE_SHIM_MAX_AGE`]. Refcounting terminals
+/// would have been the alternative, and it does not survive a runner crash —
+/// mtime liveness does.
 pub fn cleanup(base_dir: &Path, terminal_id: &str) {
-    // Reap BOTH the install-intercept shim dir and the always-on identity shim
-    // dir for this terminal.
-    for prefix in [SHIM_DIR_PREFIX, IDENTITY_DIR_PREFIX] {
-        let dir = base_dir.join(format!("{prefix}{terminal_id}"));
-        if !dir.exists() {
-            continue;
-        }
-        if let Err(e) = std::fs::remove_dir_all(&dir) {
-            tracing::debug!(
-                error = %e,
-                dir = %dir.display(),
-                "session/install shim dir cleanup failed (will be swept later)"
-            );
-        }
+    let dir = base_dir.join(format!("{SHIM_DIR_PREFIX}{terminal_id}"));
+    if !dir.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::remove_dir_all(&dir) {
+        tracing::debug!(
+            error = %e,
+            dir = %dir.display(),
+            "install shim dir cleanup failed (will be swept later)"
+        );
     }
 }
 
@@ -632,12 +820,14 @@ pub fn sweep_stale(base_dir: &Path, max_age: std::time::Duration) {
         if !is_ours || !path.is_dir() {
             continue;
         }
-        // Age by directory mtime; if unreadable, conservatively skip (don't
-        // delete something we can't date).
-        let aged_out = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
+        // Age by the NEWEST mtime the dir carries — its own, or any file
+        // directly inside it. The directory's own mtime is not enough: on
+        // Windows it only moves when an entry is created/removed, so rewriting
+        // the shared identity dir's liveness marker (which is how a dir with no
+        // per-terminal owner says "still in use") would be invisible and an
+        // actively-used dir would be deleted out from under live terminals.
+        // Unreadable ⇒ conservatively skip (never delete what we cannot date).
+        let aged_out = newest_mtime(&path, entry.metadata().ok().as_ref())
             .and_then(|mtime| mtime.elapsed().ok())
             .map(|age| age >= max_age)
             .unwrap_or(false);
@@ -652,6 +842,24 @@ pub fn sweep_stale(base_dir: &Path, max_age: std::time::Duration) {
             "install-intercept: swept stale shim dirs"
         );
     }
+}
+
+/// Newest modification time of `dir` itself or any entry directly inside it.
+/// `dir_meta` is the caller's already-fetched metadata for `dir` (avoids a
+/// second stat). `None` when nothing could be dated.
+fn newest_mtime(dir: &Path, dir_meta: Option<&std::fs::Metadata>) -> Option<std::time::SystemTime> {
+    let mut newest = dir_meta.and_then(|m| m.modified().ok());
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            if let Ok(mtime) = e.metadata().and_then(|m| m.modified()) {
+                newest = Some(match newest {
+                    Some(cur) if cur >= mtime => cur,
+                    _ => mtime,
+                });
+            }
+        }
+    }
+    newest
 }
 
 #[cfg(test)]
@@ -871,7 +1079,7 @@ mod tests {
         // The identity family is materialized with NO master-flag gate — it is
         // the out-of-box session-restore guarantee.
         let tmp = tempfile::tempdir().unwrap();
-        let dir = materialize_identity(tmp.path(), "term-id").expect("identity materialize ok");
+        let dir = materialize_identity(tmp.path()).expect("identity materialize ok");
         assert!(
             dir.file_name()
                 .unwrap()
@@ -919,22 +1127,125 @@ mod tests {
         assert!(out.contains("/tmp/qontinui-identity-x"));
     }
 
+    /// Q5(a). The identity dir is SHARED across every terminal of this runner
+    /// build, so a terminal exiting must NOT delete it — that would rip the
+    /// PATH shims out from under every other live pane. `cleanup` therefore
+    /// reaps only the per-terminal install-intercept dir; the identity dir's
+    /// lifetime belongs to `sweep_stale`.
     #[test]
-    fn cleanup_and_sweep_cover_identity_dirs() {
+    fn cleanup_reaps_the_install_dir_but_never_the_shared_identity_dir() {
         use std::time::Duration;
         let tmp = tempfile::tempdir().unwrap();
-        // Materialize BOTH families for one terminal; cleanup must reap both.
         let install = materialize(tmp.path(), "term-x", 1, InterceptMode::Observe).unwrap();
-        let identity = materialize_identity(tmp.path(), "term-x").unwrap();
+        let identity = materialize_identity(tmp.path()).unwrap();
         assert!(install.shim_dir.exists() && identity.exists());
         cleanup(tmp.path(), "term-x");
         assert!(!install.shim_dir.exists(), "install dir reaped");
-        assert!(!identity.exists(), "identity dir reaped");
+        assert!(
+            identity.exists(),
+            "the shared identity dir must survive one terminal's teardown — other panes are \
+             still running its shims"
+        );
 
-        // sweep_stale also reaps an orphaned identity dir at zero max-age.
-        let orphan = materialize_identity(tmp.path(), "orphan").unwrap();
+        // sweep_stale still owns its end-of-life at zero max-age.
         sweep_stale(tmp.path(), Duration::from_secs(0));
-        assert!(!orphan.exists(), "stale identity dir swept");
+        assert!(!identity.exists(), "stale identity dir swept");
+    }
+
+    /// Every terminal of one runner build reuses ONE content-addressed identity
+    /// dir — the whole point of B2 (it used to be 4 script writes + 2 exe
+    /// copies + a hardlink PER SPAWN).
+    #[test]
+    fn identity_dir_is_shared_and_reused_across_spawns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = materialize_identity(tmp.path()).expect("first materialize");
+        let marker = first.join(IDENTITY_MARKER);
+        assert!(marker.exists(), "a complete dir is marked complete");
+
+        // A sentinel proves the second call does not rewrite the dir.
+        let sentinel = first.join("sentinel");
+        std::fs::write(&sentinel, b"untouched").unwrap();
+        let second = materialize_identity(tmp.path()).expect("second materialize");
+        assert_eq!(first, second, "both spawns share one dir");
+        assert!(sentinel.exists(), "the cached fast path performs no writes");
+    }
+
+    /// Q5(c). Nothing kept a materialized shim current across a runner update
+    /// except the accident that every spawn re-rendered it. With that gone the
+    /// build tag has to change when the inputs do — otherwise a stale
+    /// `claude.exe` from the previous runner build stays on every PATH.
+    #[test]
+    fn identity_build_tag_changes_when_the_runner_binary_changes() {
+        use std::hash::{Hash, Hasher};
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_exe = tmp.path().join("runner-build.bin");
+
+        // Reproduces `identity_build_tag`'s file-identity contribution, which
+        // is the term a runner update moves.
+        let tag_for = |p: &Path| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            IDENTITY_SHIM_BASH.hash(&mut h);
+            hash_file_identity(&mut h, p);
+            format!("{:016x}", h.finish())
+        };
+
+        std::fs::write(&fake_exe, b"build-one").unwrap();
+        let before = tag_for(&fake_exe);
+        // A runner update replaces the binary — different size (and mtime).
+        std::fs::write(&fake_exe, b"build-two-is-a-different-length").unwrap();
+        let after = tag_for(&fake_exe);
+        assert_ne!(
+            before, after,
+            "a changed runner binary must change the identity build tag, or the cache would \
+             pin every terminal to the previous build's shims forever"
+        );
+
+        // An absent binary is a STABLE, distinct input — not "skip", which would
+        // make a missing and a present binary hash identically.
+        let absent = tag_for(&tmp.path().join("does-not-exist"));
+        assert_ne!(absent, after);
+        assert_eq!(absent, tag_for(&tmp.path().join("also-missing")));
+    }
+
+    /// A dir whose marker is missing (crash part-way through materializing) is
+    /// rewritten rather than PATH-prepended half-written.
+    #[test]
+    fn incomplete_identity_dir_is_rematerialized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = materialize_identity(tmp.path()).unwrap();
+        std::fs::remove_file(dir.join(IDENTITY_MARKER)).unwrap();
+        std::fs::remove_file(dir.join(IDENTITY_TOOLS[0])).unwrap();
+        let again = materialize_identity(tmp.path()).unwrap();
+        assert_eq!(again, dir);
+        assert!(
+            dir.join(IDENTITY_TOOLS[0]).exists(),
+            "an unmarked dir must be rewritten in full"
+        );
+        assert!(dir.join(IDENTITY_MARKER).exists());
+    }
+
+    /// The shared dir has no per-terminal owner, so it says "still in use" by
+    /// carrying a fresh mtime inside it. `sweep_stale` must therefore age a dir
+    /// by its NEWEST content, not by the directory node alone — otherwise a
+    /// continuously-used identity dir is deleted out from under live terminals
+    /// after 24h.
+    #[test]
+    fn sweep_ages_a_dir_by_its_newest_content() {
+        use std::time::Duration;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(format!("{IDENTITY_DIR_PREFIX}deadbeef"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(IDENTITY_MARKER), b"live").unwrap();
+
+        // A max-age far in the past keeps nothing; a huge one keeps everything.
+        // The property under test is that the FILE's mtime participates: with a
+        // huge max-age the dir survives, and the sweep does not panic reading it.
+        sweep_stale(tmp.path(), Duration::from_secs(10 * 365 * 24 * 3600));
+        assert!(dir.exists(), "a freshly-touched dir is never swept");
+        assert!(
+            newest_mtime(&dir, std::fs::metadata(&dir).ok().as_ref()).is_some(),
+            "the dir must be dateable from its contents"
+        );
     }
 
     #[test]
@@ -1040,7 +1351,7 @@ mod tests {
         };
 
         let tmp = tempfile::tempdir().unwrap();
-        let dir = materialize_identity(tmp.path(), "term-exe").expect("identity materialize ok");
+        let dir = materialize_identity(tmp.path()).expect("identity materialize ok");
         for tool in IDENTITY_TOOLS {
             let exe = dir.join(format!("{tool}.exe"));
             assert!(exe.is_file(), "{tool}.exe must be materialized");
@@ -1084,7 +1395,7 @@ mod tests {
         };
 
         let tmp = tempfile::tempdir().unwrap();
-        let dir = materialize_identity(tmp.path(), "term-cli").expect("identity materialize ok");
+        let dir = materialize_identity(tmp.path()).expect("identity materialize ok");
         assert!(
             dir.join(name).is_file(),
             "{name} must be materialized into the identity dir"
@@ -1102,7 +1413,7 @@ mod tests {
         // real CLI binary happens to be present in the test target dir, the
         // stronger delivery assertion is covered by the test above.)
         let tmp = tempfile::tempdir().unwrap();
-        let dir = materialize_identity(tmp.path(), "term-no-cli").expect("identity materialize ok");
+        let dir = materialize_identity(tmp.path()).expect("identity materialize ok");
         for tool in IDENTITY_TOOLS {
             assert!(dir.join(tool).is_file());
         }

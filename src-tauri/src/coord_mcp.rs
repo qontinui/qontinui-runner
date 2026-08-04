@@ -799,8 +799,110 @@ fn persist_proxy_nonces(map: &HashMap<String, NonceBinding>) {
     if !nonce_persistence_enabled() {
         return;
     }
+    enqueue_nonce_persist(device_nonce_snapshot(map));
+}
+
+/// Debounce window for the encrypted whole-store nonce write.
+///
+/// Persisting a nonce costs a full decrypt + parse of the ENTIRE `StoredTokens`
+/// document (`load_tokens_for_write`) and then a re-serialize + AES-GCM encrypt
+/// + atomic rewrite of the whole thing (`save_tokens`) — for a single map entry.
+/// That sat on the terminal spawn path, once per spawn. Coalescing means a burst
+/// of spawns (a boot restore of 40 panes) pays ONE store rewrite instead of 40.
+const NONCE_PERSIST_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// Coalescing state for the debounced nonce persist.
+#[derive(Default)]
+struct NoncePersistQueue {
+    /// The newest snapshot awaiting a write, if any.
+    pending: Option<HashMap<String, String>>,
+    /// Whether the flush thread is alive (it drains until `pending` is empty).
+    flushing: bool,
+    /// The last snapshot actually written, so an unchanged map costs nothing.
+    last_written: Option<HashMap<String, String>>,
+}
+
+static NONCE_PERSIST: once_cell::sync::Lazy<std::sync::Mutex<NoncePersistQueue>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(NoncePersistQueue::default()));
+
+/// Queue `snapshot` for a debounced write, starting the flush thread if needed.
+///
+/// Losing an in-flight snapshot to a crash is already the designed failure mode
+/// of this store: an unrestored nonce simply 401s and the next provisioning
+/// re-mints (see [`crate::secure_storage::SecureStorage::load_coord_mcp_nonces`]).
+/// The in-memory registry stays authoritative for this process either way, so
+/// nothing a live session depends on rides the debounce.
+fn enqueue_nonce_persist(snapshot: HashMap<String, String>) {
+    let start_thread = {
+        let mut q = match NONCE_PERSIST.lock() {
+            Ok(q) => q,
+            Err(e) => {
+                warn!("coord_mcp: nonce persist queue poisoned ({e}) — nonces not persisted");
+                return;
+            }
+        };
+        if q.last_written.as_ref() == Some(&snapshot) && q.pending.is_none() {
+            return; // already durable and nothing newer queued
+        }
+        q.pending = Some(snapshot);
+        if q.flushing {
+            false
+        } else {
+            q.flushing = true;
+            true
+        }
+    };
+    if !start_thread {
+        return; // an existing flush thread will pick the newer snapshot up
+    }
+    let spawned = std::thread::Builder::new()
+        .name("coord-mcp-nonce-persist".to_string())
+        .spawn(flush_nonce_persist_loop);
+    if let Err(e) = spawned {
+        warn!("coord_mcp: could not start nonce persist thread ({e}) — persisting inline");
+        if let Ok(mut q) = NONCE_PERSIST.lock() {
+            q.flushing = false;
+        }
+        flush_nonce_persist_once();
+    }
+}
+
+/// Sleep out the debounce, write, and repeat while newer snapshots keep landing.
+fn flush_nonce_persist_loop() {
+    loop {
+        std::thread::sleep(NONCE_PERSIST_DEBOUNCE);
+        flush_nonce_persist_once();
+        match NONCE_PERSIST.lock() {
+            Ok(mut q) => {
+                if q.pending.is_none() {
+                    q.flushing = false;
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+/// Write whatever snapshot is pending (if any) to the encrypted store.
+fn flush_nonce_persist_once() {
+    let snapshot = match NONCE_PERSIST.lock() {
+        Ok(mut q) => match q.pending.take() {
+            Some(s) => s,
+            None => return,
+        },
+        Err(_) => return,
+    };
     match crate::secure_storage::SecureStorage::new() {
-        Ok(store) => persist_proxy_nonces_with_store(&store, map),
+        Ok(store) => {
+            if let Err(e) = store.store_coord_mcp_nonces(&snapshot) {
+                warn!("coord_mcp: failed to persist proxy nonces: {e}");
+                return;
+            }
+            if let Ok(mut q) = NONCE_PERSIST.lock() {
+                q.last_written = Some(snapshot);
+            }
+        }
         Err(e) => {
             warn!("coord_mcp: secure storage unavailable, proxy nonces not persisted: {e}");
         }
@@ -812,6 +914,11 @@ fn persist_proxy_nonces(map: &HashMap<String, NonceBinding>) {
 /// mutating `QONTINUI_SECURE_STORAGE_DIR` (which is process-global and pollutes
 /// every other test that reads the default store). The `nonce_persistence_enabled`
 /// gate is the CALLER's concern — handing a store IS the decision to persist.
+/// Test-only since the production path became debounced ([`enqueue_nonce_persist`]):
+/// the default-store write now happens on the flush thread, which owns its own
+/// `SecureStorage`. Kept because it is the seam the persistence tests use to
+/// assert WHAT gets persisted without touching the developer's real store.
+#[cfg(test)]
 fn persist_proxy_nonces_with_store(
     store: &crate::secure_storage::SecureStorage,
     map: &HashMap<String, NonceBinding>,
