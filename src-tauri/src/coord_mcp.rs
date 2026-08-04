@@ -2398,27 +2398,50 @@ pub(crate) fn workdir_declares_coord_mcp(workdir: &str) -> bool {
 }
 
 /// Filename for the runner-owned coord-mcp `--mcp-config` file: a
-/// non-cryptographic hash of the **terminal id** when one is known, else of the
-/// absolute workdir. Hashing keeps the name short (Windows path limits) and
-/// collision-free in practice.
+/// non-cryptographic hash of the **`(workdir, terminal_id)` pair**. Hashing
+/// keeps the name short (Windows path limits) and collision-free in practice.
 ///
-/// **Per TERMINAL, not per workdir** (plan
+/// **Per (workdir, TERMINAL), not per workdir alone** (plan
 /// 2026-08-04-runner-caller-session-self-id-resolution Stage 1). The name is
-/// STABLE across re-spawns of the same terminal, so a restart reuses one path
-/// (rewritten with the fresh nonce) — the same stability property the
-/// workdir-keyed name had, moved onto the finer key. This is what makes two
-/// terminals in one cwd get two files and therefore two NONCES instead of
-/// sharing one: with a single shared file, `nonce → session` is 1:N and caller
-/// self-identification can never be deterministic (see
+/// STABLE across re-spawns of the same terminal in the same cwd, so a restart
+/// reuses one path (rewritten with the fresh nonce) — the same stability
+/// property the workdir-keyed name had, moved onto the finer key. This is what
+/// makes two terminals in one cwd get two files and therefore two NONCES
+/// instead of sharing one: with a single shared file, `nonce → session` is 1:N
+/// and caller self-identification can never be deterministic (see
 /// [`NonceBinding::terminal_id`]).
 ///
-/// `terminal_id: None` falls back to hashing the workdir — byte-identical to the
-/// previous behavior — for the callers that have no terminal (the boot
+/// ## Why the workdir stays in the key even when a terminal is present
+///
+/// The nonce-registry EVICTION key is `(workdir, terminal_id)` — a persistent
+/// mint evicts prior persistent nonces matching BOTH (see
+/// [`register_proxy_nonce`]). Hashing the terminal ALONE made the two keys
+/// disagree: a terminal re-provisioned into a different cwd (`(W1, T)` then
+/// `(W2, T)`) mapped to the SAME filename, so the single file was overwritten
+/// with the new nonce while the `(W1, T)` binding — a different key — was
+/// never evicted. Persistent nonces have no TTL, so the superseded credential
+/// stayed live and valid with no file left pointing at it: unreachable, but
+/// still accepted if leaked. Keying both the same way means every file the
+/// registry supersedes is a file that gets rewritten, and vice versa.
+///
+/// `terminal_id: None` hashes the workdir ALONE — byte-identical to the
+/// original behavior, and byte-identical to the eviction rule's own
+/// both-sides-`None` case — for the callers that have no terminal (the boot
 /// self-heal, session-close reaping of legacy workdir-named files).
 fn mcp_config_file_name(workdir: &str, terminal_id: Option<&str>) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    terminal_id.unwrap_or(workdir).hash(&mut h);
+    match terminal_id {
+        // Both components, so the name moves with the eviction key. `Hash` for
+        // `&str` writes a length-delimiting terminator, so ("ab", "c") and
+        // ("a", "bc") do not collide.
+        Some(t) => {
+            workdir.hash(&mut h);
+            t.hash(&mut h);
+        }
+        // Legacy/terminal-less shape, unchanged.
+        None => workdir.hash(&mut h),
+    }
     format!("coord-mcp-{:016x}.json", h.finish())
 }
 
@@ -3476,10 +3499,21 @@ mod tests {
     }
 
     /// The `--mcp-config` filename is stable for a given key and distinct across
-    /// keys, on BOTH axes: per-terminal when a terminal id is known (Stage 1 —
-    /// this is what stops two terminals in one cwd from sharing one file and
-    /// therefore one nonce), and per-workdir when it is not (the unchanged
-    /// fallback).
+    /// keys, on BOTH axes: it varies with the TERMINAL (Stage 1 — this is what
+    /// stops two terminals in one cwd from sharing one file and therefore one
+    /// nonce) **and** with the WORKDIR, because the key is the
+    /// `(workdir, terminal_id)` PAIR. Terminal-less callers hash the workdir
+    /// alone, unchanged.
+    ///
+    /// The same-terminal-different-cwd assertion is INVERTED from what it was.
+    /// It used to pin "the terminal id is the key when present", i.e. `(W1, T)`
+    /// and `(W2, T)` share one filename. That disagreed with the nonce
+    /// registry, which evicts on the `(workdir, terminal_id)` PAIR: a terminal
+    /// re-provisioned into a new cwd overwrote the one file with the new nonce
+    /// while the `(W1, T)` binding — never matched by the eviction rule, and
+    /// with no TTL to expire it — stayed live and valid with no file pointing
+    /// at it. A superseded credential left accepting requests. Two keys, two
+    /// files: eviction and rewrite now cover exactly the same set.
     #[test]
     fn mcp_config_file_name_is_stable_and_workdir_distinct() {
         let a1 = mcp_config_file_name("D:/repo/one", None);
@@ -3504,15 +3538,21 @@ mod tests {
         );
         assert!(t1.starts_with("coord-mcp-") && t1.ends_with(".json"));
 
-        // The terminal id, not the workdir, is the key when present: the SAME
-        // terminal in a DIFFERENT cwd keeps its name...
-        assert_eq!(
+        // THE eviction-agreement property: the key is the PAIR, so the same
+        // terminal re-provisioned into a DIFFERENT cwd gets a DIFFERENT name.
+        // Sharing one name there orphaned the old `(workdir, terminal)`
+        // binding — never evicted, no TTL, still valid.
+        assert_ne!(
             t1,
             mcp_config_file_name("D:/repo/elsewhere", Some("term-1")),
-            "the terminal id is the key when present"
+            "same terminal in a different cwd must get a different file: the \
+             nonce registry evicts on (workdir, terminal_id), so a shared name \
+             would leave the prior binding live-but-unreachable"
         );
-        // ...and none of the terminal-keyed names collide with the workdir one.
+        // The terminal-less shape still hashes the workdir alone, and does not
+        // collide with the paired names.
         assert_ne!(t1, a1);
+        assert_ne!(t2, a1);
     }
 
     /// A temp-dir-backed [`SecureStorage`] for the persistence tests — injected

@@ -619,10 +619,15 @@ async fn health(
         // Interactive/sniffed sessions resolve either deterministically off
         // the nonce's terminal (`injected_via_terminal`) or via the Phase-3
         // workdir fallback (`injected_via_lifecycle`). The former
-        // `no_task_run` bucket is split into the gate that actually rejected
-        // — `no_lifecycle_record` / `record_unregistered` /
+        // `no_task_run` bucket is split into the gate that actually rejected:
+        // the TERMINAL leg's — `terminal_record_missing` /
+        // `terminal_record_unadmitted` / `terminal_anchor_not_uuid` /
+        // `ambiguous_terminal`, all of which are FINAL for the call (a known
+        // terminal never falls through to the workdir legs, which would answer
+        // with a sibling terminal's session) — and the WORKDIR leg's:
+        // `no_lifecycle_record` / `record_unregistered` /
         // `record_anchor_not_uuid` / `ambiguous_workdir` /
-        // `resolver_state_missing` — and `recent_misses` carries a bounded
+        // `resolver_state_missing`. `recent_misses` carries a bounded
         // sample (proxy workdir + the record dirs on hand) so a
         // `no_lifecycle_record` verdict can be told apart from a
         // wrong-granularity one.
@@ -797,6 +802,37 @@ pub(crate) enum SelfIdOutcome {
     NonDevicePrincipal,
     /// No `X-Coord-Mcp-Proxy-Key` on the request.
     NoNonce,
+    /// Terminal leg, gate 1: the binding NAMES a terminal, but no OPEN
+    /// lifecycle record carries that `terminal_id`. Terminal-leg misses are
+    /// TERMINAL for the whole chain — they never fall through to the workdir
+    /// legs, because a workdir shared with a sibling terminal would answer
+    /// with the SIBLING's session id (see [`TerminalLeg`]). A wrong id is
+    /// worse than no id.
+    TerminalRecordMissing,
+    /// Terminal leg, gate 2: the terminal's OPEN record exists but its
+    /// `origin` is not one the runner may publish as an identity claim (see
+    /// [`lifecycle_record_anchor_is_trusted`] — `reconciled` "may name a
+    /// foreign session", a `None` origin predates the field). Withheld, not
+    /// fallen through: same reason as [`SelfIdOutcome::TerminalRecordMissing`].
+    TerminalRecordUnadmitted,
+    /// Terminal leg, gate 3: the terminal's OPEN record is admitted but its
+    /// `claude_session_id` does not parse as a uuid, so it cannot name a
+    /// `coord.agent_sessions` row (see [`anchor_as_caller_session`]).
+    TerminalAnchorNotUuid,
+    /// Terminal leg, gate 4: MORE THAN ONE open record names this terminal,
+    /// so the terminal key is not 1:1 for this call and the caller is
+    /// genuinely unidentifiable on it.
+    ///
+    /// The durable registry really can hold several `open` rows on one
+    /// `terminal_id` — a reused terminal whose prior runs' exit-closes never
+    /// fired (`session_lifecycle_store::repair_terminal_id_collisions`, which
+    /// records **54** open rows on one terminal). Deliberately refused rather
+    /// than ranked: the store's own `open_authority_key` prefers CONFIRMED
+    /// rows, and in the dangerous window (a reused terminal between PTY spawn
+    /// and the SessionStart hook's confirmation) the STALE row is the
+    /// confirmed one — so authority-ranking would actively prefer the
+    /// PREVIOUS run's session id. See [`select_terminal_caller`].
+    AmbiguousTerminal,
     /// The nonce is not in the live binding map.
     NoWorkdir,
     /// Lifecycle leg, gate 1: no OPEN lifecycle record's `working_dir`
@@ -809,9 +845,16 @@ pub(crate) enum SelfIdOutcome {
     /// debugger.
     NoLifecycleRecord,
     /// Lifecycle leg, gate 2: ≥1 record matched the workdir, but none carried
-    /// `origin == "authoritative"` — i.e. every match was a phantom
-    /// spawn-time shell record or a `reconciled` id that "may name a foreign
-    /// session". Correctly withheld: a wrong id is worse than no id.
+    /// a TRUSTED anchor origin — i.e. every match was a phantom spawn-time
+    /// shell record (`origin: None`) or a `reconciled` id that "may name a
+    /// foreign session". Correctly withheld: a wrong id is worse than no id.
+    ///
+    /// The admitted set is `authoritative` **and `observed`** (see
+    /// [`lifecycle_record_anchor_is_trusted`]) — an earlier build admitted
+    /// only `authoritative` and so bucketed 8 of the operator's 34 open
+    /// records here, which made this counter read as "untrustworthy anchor"
+    /// when the real cause was a too-narrow admission set. It now means what
+    /// it says.
     RecordUnregistered,
     /// Lifecycle leg, gate 3: ≥1 admitted record, but no `claude_session_id`
     /// parsed as a UUID, so none can name a `coord.agent_sessions` row (see
@@ -852,6 +895,10 @@ impl SelfIdOutcome {
             Self::InjectedViaLifecycle => "injected_via_lifecycle",
             Self::NonDevicePrincipal => "non_device_principal",
             Self::NoNonce => "no_nonce",
+            Self::TerminalRecordMissing => "terminal_record_missing",
+            Self::TerminalRecordUnadmitted => "terminal_record_unadmitted",
+            Self::TerminalAnchorNotUuid => "terminal_anchor_not_uuid",
+            Self::AmbiguousTerminal => "ambiguous_terminal",
             Self::NoWorkdir => "no_workdir",
             Self::NoLifecycleRecord => "no_lifecycle_record",
             Self::RecordUnregistered => "record_unregistered",
@@ -862,12 +909,53 @@ impl SelfIdOutcome {
         }
     }
 
-    pub(crate) const ALL: [Self; 12] = [
+    /// This outcome's counter slot, as an EXHAUSTIVE match.
+    ///
+    /// The counter index must never be derived by searching [`Self::ALL`]:
+    /// that was `ALL.iter().position(..).unwrap_or(0)`, and slot 0 is
+    /// [`Self::Injected`] — the SUCCESS counter. A variant missing from `ALL`
+    /// (or a duplicated `ALL` entry masking one) therefore counted MISSES AS
+    /// INJECTIONS, the worst possible failure direction for a diagnostic whose
+    /// only job is to say which link broke. Nothing caught it either:
+    /// `Cargo.toml` sets `dead_code`/`unused_*` to `"allow"`, and the arity
+    /// assertion in the tests passes just fine for 13 variants with one `ALL`
+    /// entry written twice.
+    ///
+    /// An exhaustive `match` makes the COMPILER the guard: adding a variant
+    /// without giving it a slot is a build error, not a silent miscount.
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::Injected => 0,
+            Self::InjectedViaTerminal => 1,
+            Self::InjectedViaLifecycle => 2,
+            Self::NonDevicePrincipal => 3,
+            Self::NoNonce => 4,
+            Self::TerminalRecordMissing => 5,
+            Self::TerminalRecordUnadmitted => 6,
+            Self::TerminalAnchorNotUuid => 7,
+            Self::AmbiguousTerminal => 8,
+            Self::NoWorkdir => 9,
+            Self::NoLifecycleRecord => 10,
+            Self::RecordUnregistered => 11,
+            Self::RecordAnchorNotUuid => 12,
+            Self::AmbiguousWorkdir => 13,
+            Self::ResolverStateMissing => 14,
+            Self::NoSession => 15,
+        }
+    }
+
+    /// Every outcome, in counter-slot order — `ALL[i].index() == i`, asserted
+    /// in the tests so the two orderings cannot drift.
+    pub(crate) const ALL: [Self; 16] = [
         Self::Injected,
         Self::InjectedViaTerminal,
         Self::InjectedViaLifecycle,
         Self::NonDevicePrincipal,
         Self::NoNonce,
+        Self::TerminalRecordMissing,
+        Self::TerminalRecordUnadmitted,
+        Self::TerminalAnchorNotUuid,
+        Self::AmbiguousTerminal,
         Self::NoWorkdir,
         Self::NoLifecycleRecord,
         Self::RecordUnregistered,
@@ -878,19 +966,16 @@ impl SelfIdOutcome {
     ];
 }
 
-/// Per-outcome counters, in declaration order of [`SelfIdOutcome::ALL`].
-fn self_id_counters() -> &'static [std::sync::atomic::AtomicU64; 12] {
-    static COUNTERS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; 12]> =
+/// Per-outcome counters, indexed by [`SelfIdOutcome::index`] (which is the
+/// declaration order of [`SelfIdOutcome::ALL`]).
+fn self_id_counters() -> &'static [std::sync::atomic::AtomicU64; 16] {
+    static COUNTERS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; 16]> =
         std::sync::OnceLock::new();
     COUNTERS.get_or_init(Default::default)
 }
 
 fn record_self_id_outcome(outcome: SelfIdOutcome) {
-    let idx = SelfIdOutcome::ALL
-        .iter()
-        .position(|o| *o == outcome)
-        .unwrap_or(0);
-    self_id_counters()[idx].fetch_add(1, Ordering::Relaxed);
+    self_id_counters()[outcome.index()].fetch_add(1, Ordering::Relaxed);
 }
 
 /// How many recent lifecycle-leg misses `GET /health` carries. BOUNDED on
@@ -1005,10 +1090,13 @@ fn self_id_miss_sample_json() -> serde_json::Value {
 /// lifecycle-leg misses).
 pub(crate) fn self_id_health_snapshot() -> serde_json::Value {
     let mut obj = serde_json::Map::new();
-    for (i, outcome) in SelfIdOutcome::ALL.iter().enumerate() {
+    for outcome in SelfIdOutcome::ALL {
+        // Keyed on `index()`, not the iteration position — the same
+        // compiler-checked mapping `record_self_id_outcome` writes through, so
+        // a series can never render another variant's count.
         obj.insert(
             outcome.label().to_string(),
-            serde_json::json!(self_id_counters()[i].load(Ordering::Relaxed)),
+            serde_json::json!(self_id_counters()[outcome.index()].load(Ordering::Relaxed)),
         );
     }
     obj.insert("recent_misses".to_string(), self_id_miss_sample_json());
@@ -1022,10 +1110,14 @@ pub(crate) fn self_id_health_snapshot() -> serde_json::Value {
 ///
 /// 1. **Terminal leg (exact).** `nonce → terminal_id → the OPEN lifecycle
 ///    record for that terminal → its anchor`. The runner mints a nonce per
-///    terminal and hosts one session per terminal, so every hop is 1:1: no
-///    tie-break, no ambiguity, no guess. Only bindings minted with a terminal
-///    can take it (restored/adopted nonces, the mint route and an in-cwd
-///    `.mcp.json` carry none) — those fall through, they do not fail.
+///    terminal and a PTY hosts one LIVE session, so the hop is 1:1 by intent:
+///    no recency tie-break, no guess. Only bindings minted with a terminal
+///    reach it — restored/adopted nonces, the mint route and an in-cwd
+///    `.mcp.json` carry none, and those (and ONLY those) fall through to the
+///    workdir legs. A binding whose terminal IS known but does not resolve
+///    STOPS here with a typed `terminal_*` outcome; it must never fall
+///    through, because the workdir legs would answer with a same-cwd sibling
+///    terminal's session id. See [`TerminalLeg`].
 /// 2. **Primary chain.** `nonce → workdir → task_run_id → coord
 ///    agent_session_id`, for runner-managed sessions with a worktree.
 /// 3. **Lifecycle fallback (fabric Phase 3).** `nonce → workdir → open
@@ -1057,11 +1149,15 @@ fn resolve_caller_session_id(
     };
     // Leg 1 — the deterministic terminal key (Phase A's `terminal_id_for_nonce`).
     // Tried BEFORE any workdir resolution because it is exact where the
-    // workdir legs are a guess. A miss here is not a failure: it means this
-    // binding carries no terminal, and the workdir chain below is the
-    // designed fallback for that.
-    if let Some(sid) = resolve_caller_via_terminal(state, nonce) {
-        return (Some(sid), SelfIdOutcome::InjectedViaTerminal);
+    // workdir legs are a guess. THREE-WAY on purpose: "this binding has no
+    // terminal" and "this binding's terminal did not resolve" are opposite
+    // situations, and collapsing them into one `None` is what let a
+    // terminal-known miss inherit a SIBLING terminal's id off the shared
+    // workdir — see [`TerminalLeg`].
+    match resolve_caller_via_terminal(state, nonce) {
+        TerminalLeg::Resolved(sid) => return (Some(sid), SelfIdOutcome::InjectedViaTerminal),
+        TerminalLeg::Miss(outcome) => return (None, outcome),
+        TerminalLeg::NoTerminal => {}
     }
     let Some(workdir) = crate::coord_mcp::workdir_for_nonce(nonce) else {
         return (None, SelfIdOutcome::NoWorkdir);
@@ -1104,62 +1200,162 @@ fn resolve_caller_session_id(
     }
 }
 
-/// Leg 1: resolve the caller from the nonce's TERMINAL — the only key the
-/// runner owns 1:1 with a session.
+/// The three genuinely different things leg 1 can say. Collapsing them into
+/// an `Option` is the FALLTHROUGH DEFECT: a `None` meant both "no terminal on
+/// this binding, use the workdir chain" and "this terminal's record was
+/// rejected", and the second must NOT reach the workdir chain.
+///
+/// The counterexample is ordinary on this box. Terminal `T1`'s nonce carries
+/// `terminal_id = T1`; `T1`'s record is absent or unadmitted. Terminal `T2`
+/// shares the cwd and is that workdir's SINGLE admitted candidate. Leg 3 then
+/// resolves — with full confidence — to `T2`'s anchor, and every one of
+/// `T1`'s coord calls is labelled as `T2`. The earlier claim that a rejected
+/// record "falls through to the workdir chain, which applies the same guard
+/// and reports `RecordUnregistered`" only holds when the workdir hosts no
+/// OTHER admitted record; when it does, the guard is satisfied by the wrong
+/// session. The runner had the information to know better, and now uses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalLeg {
+    /// The binding carries NO terminal (restore, adopt, the mint route, an
+    /// in-cwd `.mcp.json`) — the majority of persisted nonces today. Fall
+    /// through to the workdir chain, unchanged.
+    NoTerminal,
+    /// The terminal named exactly one admitted open record with a uuid anchor.
+    Resolved(uuid::Uuid),
+    /// The terminal IS known but did not resolve. STOP — never fall through:
+    /// the workdir chain would answer with a DIFFERENT terminal's session.
+    Miss(SelfIdOutcome),
+}
+
+/// Leg 1: resolve the caller from the nonce's TERMINAL — the finest key the
+/// runner owns, and the only one that is 1:1 with a live session.
 ///
 /// `terminal_id_for_nonce` (coord_mcp) returns the terminal a live binding was
-/// minted for; the durable lifecycle store holds at most one OPEN record per
-/// terminal, and that record's `claude_session_id` IS the coord
-/// `agent_sessions` anchor (see [`anchor_as_caller_session`]). So the whole
-/// leg is a pair of exact lookups — deliberately no `last_seen_at` tie-break,
-/// because there is nothing to break a tie between.
+/// minted for, and the OPEN lifecycle record for that terminal carries the
+/// coord `agent_sessions` anchor (see [`anchor_as_caller_session`]). A PTY
+/// hosts at most one LIVE session, so the *intended* mapping is exact — but
+/// the durable registry can still hold several stale `open` rows on one
+/// terminal, which is why [`select_terminal_caller`] refuses instead of
+/// picking. Deliberately no recency/authority tie-break; see there.
 ///
-/// Applies the SAME `origin == "authoritative"` guard as the lifecycle leg,
-/// and the reason is worth stating because the obvious argument against it is
-/// wrong. That argument: the guard exists to stop a workdir match resolving to
-/// a same-cwd *sibling's* id, and here the record is not one match among many
-/// but THE record for the terminal this nonce was minted for — no sibling to
-/// confuse it with. True, and irrelevant: `origin` does not describe how many
-/// records matched, it describes whether the ANCHOR ITSELF is trustworthy. A
-/// `"reconciled"` record was recovered by a backstop (freshest-transcript
-/// mtime / process-start anchoring) and its own doc says it "may name a
-/// foreign session". Being the unique record for a terminal does not make a
-/// guessed anchor correct — uniqueness is not correctness. Shipping it would
-/// hand coord a confidently wrong identity, the one failure this whole chain
-/// is built to avoid (a wrong id is worse than no id, because coord's fuzzy
+/// Applies the same anchor-trust guard as the lifecycle leg
+/// ([`lifecycle_record_anchor_is_trusted`]), and the reason is worth stating
+/// because the obvious argument against it is wrong. That argument: the guard
+/// exists to stop a workdir match resolving to a same-cwd *sibling's* id, and
+/// here the record is THE record for the terminal this nonce was minted for —
+/// no sibling to confuse it with. True, and irrelevant: `origin` does not
+/// describe how many records matched, it describes whether the ANCHOR ITSELF
+/// is trustworthy. A `"reconciled"` record was recovered by a backstop
+/// (freshest-transcript mtime) and its own doc says it "may name a foreign
+/// session". Being the unique record for a terminal does not make a guessed
+/// anchor correct — uniqueness is not correctness. Shipping it would hand
+/// coord a confidently wrong identity, the one failure this whole chain is
+/// built to avoid (a wrong id is worse than no id, because coord's fuzzy
 /// fallback is at least honestly fuzzy).
 ///
-/// A guarded-out record simply falls through to the workdir chain, which
-/// applies the same guard and reports the miss as `RecordUnregistered` — so
-/// the outcome stays honest without needing a variant of its own.
-///
-/// A `None` at any hop falls through to the workdir chain — the binding
-/// simply carries no terminal (restore, adopt, mint route, in-cwd
-/// `.mcp.json`), which is the majority of persisted nonces today.
-fn resolve_caller_via_terminal(state: &Arc<ApiState>, nonce: &str) -> Option<uuid::Uuid> {
-    let terminal_id = crate::coord_mcp::terminal_id_for_nonce(nonce)?;
-    let store = state
+/// Every rejection is a [`TerminalLeg::Miss`], NOT a fallthrough — see
+/// [`TerminalLeg`] for why. That includes a missing lifecycle store: the
+/// terminal is known and we cannot check it, so refusing is the honest answer
+/// (counted as [`SelfIdOutcome::ResolverStateMissing`], which should read 0 —
+/// the store is managed at `main.rs:2786`).
+fn resolve_caller_via_terminal(state: &Arc<ApiState>, nonce: &str) -> TerminalLeg {
+    let terminal_id = crate::coord_mcp::terminal_id_for_nonce(nonce);
+    if terminal_id.is_none() {
+        // Same verdict [`terminal_leg`] would give, taken BEFORE the store
+        // fetch so the no-terminal majority never snapshots `open_records()`
+        // for nothing — and so the workdir leg's own snapshot is never a
+        // second clone of the same set.
+        return TerminalLeg::NoTerminal;
+    }
+    let Some(store) = state
         .app_handle
-        .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()?;
+        .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+    else {
+        return TerminalLeg::Miss(SelfIdOutcome::ResolverStateMissing);
+    };
     let records = store.open_records(); // snapshot under the store lock
-    select_terminal_caller(&records, &terminal_id)
+    terminal_leg(&records, terminal_id.as_deref())
+}
+
+/// The pure three-way leg-1 decision (unit-testable without a Tauri app), so
+/// the "known terminal ⇒ never fall through" rule is asserted against the code
+/// production actually runs rather than re-derived in a test.
+fn terminal_leg(
+    records: &[crate::session::session_lifecycle_store::TerminalSessionRecord],
+    terminal_id: Option<&str>,
+) -> TerminalLeg {
+    let Some(terminal_id) = terminal_id else {
+        return TerminalLeg::NoTerminal;
+    };
+    match select_terminal_caller(records, terminal_id) {
+        Ok(sid) => TerminalLeg::Resolved(sid),
+        Err(outcome) => TerminalLeg::Miss(outcome),
+    }
 }
 
 /// Pure terminal-keyed selection (unit-testable without a Tauri app): the
-/// anchor of the single OPEN record hosted by `terminal_id`. Returns `None`
-/// when no open record names that terminal, when that record's anchor is not
-/// authoritative (see [`resolve_caller_via_terminal`] — a reconciled anchor may
-/// name a foreign session even though the record is uniquely the terminal's),
-/// or when its anchor is not a uuid.
+/// anchor of the single OPEN record hosted by `terminal_id`.
+///
+/// ## Why this counts instead of using `.find()`
+///
+/// This used to be `records.iter().find(|rec| rec.terminal_id == terminal_id)`,
+/// on the belief that the store holds at most one OPEN record per terminal.
+/// It does not. `session_lifecycle_store` documents that the durable registry
+/// "can hold several `open` rows on one `terminal_id`" (a reused terminal
+/// whose prior runs' exit-closes never fired) and ships
+/// `repair_terminal_id_collisions` to collapse them — whose doc records **54**
+/// open rows on a single terminal. `open_records()` iterates a `HashMap`'s
+/// `values()`, so `.find()` was HASH-ORDER NONDETERMINISTIC and could return a
+/// PREVIOUS run's `claude_session_id`.
+///
+/// ## Why it refuses instead of ranking
+///
+/// The store's `open_authority_key` — `(confirmed_at.is_some(),
+/// last_seen_at, opened_at)` — is the right tie-break for RESTORE, and the
+/// wrong one here. In the dangerous window (a reused terminal between PTY
+/// spawn and the new session's SessionStart-hook confirmation) the STALE row
+/// is the confirmed one and the fresh row is not, so authority-ranking
+/// actively PREFERS the wrong session. Exactly the window where a caller is
+/// most likely to be misattributed. So >1 open record naming the terminal is
+/// [`SelfIdOutcome::AmbiguousTerminal`]: counted, named, and headerless.
+///
+/// Two records naming the SAME session are one candidate, not an ambiguity —
+/// there is only one identity to publish (mirrors
+/// [`select_lifecycle_caller`]).
 fn select_terminal_caller(
     records: &[crate::session::session_lifecycle_store::TerminalSessionRecord],
     terminal_id: &str,
-) -> Option<uuid::Uuid> {
-    records
-        .iter()
-        .find(|rec| rec.terminal_id == terminal_id)
-        .filter(|rec| lifecycle_record_is_authoritative(rec))
-        .and_then(|rec| anchor_as_caller_session(&rec.claude_session_id))
+) -> Result<uuid::Uuid, SelfIdOutcome> {
+    let mut matched = 0usize;
+    let mut admitted = 0usize;
+    let mut candidates: Vec<uuid::Uuid> = Vec::new();
+    for rec in records {
+        if rec.terminal_id != terminal_id {
+            continue;
+        }
+        matched += 1;
+        if !lifecycle_record_anchor_is_trusted(rec) {
+            continue;
+        }
+        admitted += 1;
+        let Some(sid) = anchor_as_caller_session(&rec.claude_session_id) else {
+            continue;
+        };
+        if !candidates.contains(&sid) {
+            candidates.push(sid);
+        }
+    }
+    if matched == 0 {
+        return Err(SelfIdOutcome::TerminalRecordMissing);
+    }
+    if admitted == 0 {
+        return Err(SelfIdOutcome::TerminalRecordUnadmitted);
+    }
+    match candidates.len() {
+        0 => Err(SelfIdOutcome::TerminalAnchorNotUuid),
+        1 => Ok(candidates[0]),
+        _ => Err(SelfIdOutcome::AmbiguousTerminal),
+    }
 }
 
 /// Phase-3 fallback leg: resolve the caller's coord `agent_session_id` from
@@ -1229,7 +1425,8 @@ fn anchor_as_caller_session(claude_session_id: &str) -> Option<uuid::Uuid> {
 enum LifecycleMiss {
     /// No OPEN record's `working_dir` matched.
     NoRecord,
-    /// Records matched, none was `origin == "authoritative"`.
+    /// Records matched, none carried a trusted anchor origin
+    /// ([`lifecycle_record_anchor_is_trusted`]).
     Unregistered,
     /// Admitted records existed, none had a uuid anchor.
     AnchorNotUuid,
@@ -1248,25 +1445,48 @@ impl LifecycleMiss {
     }
 }
 
-/// Whether a lifecycle record's id is one the runner KNOWS, and may therefore
-/// publish as this device's caller identity.
+/// Whether a lifecycle record's ANCHOR is one the runner KNOWS, and may
+/// therefore publish as this device's caller identity.
 ///
-/// `"authoritative"` means the runner pre-pinned `--session-id`, lifted the id
-/// from a typed `--resume`/`--session-id`, or a provider hook POSTed it
-/// (`session_lifecycle_store`). `"reconciled"` is explicitly documented as
-/// possibly naming a FOREIGN session, and a `None` origin predates the field —
-/// neither is admissible for an identity claim, and both are exactly the
-/// phantom spawn-time shell record this guard exists to exclude.
-fn lifecycle_record_is_authoritative(
+/// All four live `origin` values, and the verdict on each
+/// (`session/session_lifecycle_store.rs`):
+///
+/// | `origin` | admitted | why |
+/// |---|---|---|
+/// | `Some("authoritative")` | **yes** | the runner pre-pinned `--session-id`, lifted it from a typed `--resume`/`--session-id`, or a provider hook POSTed it — the id is KNOWN, not derived. |
+/// | `Some("observed")` | **yes** | a claude-process-start-anchored, uniquely-correlated transcript bind: "the transcript proves the session exists". Derived, but derived from proof, not from a guess. |
+/// | `Some("reconciled")` | no | recovered by a freshest-transcript-mtime backstop and documented as possibly naming a **foreign** session. A guessed anchor stays out however unique its record is. |
+/// | `None` | no | predates the field — the phantom spawn-time shell record this guard exists to exclude. |
+///
+/// The `observed` tier is not a new judgement here: `restore_record_emitter.rs:264`
+/// already gates the FULL restore tier (which re-resumes a session by id) on
+/// `Some(ORIGIN_AUTHORITATIVE) | Some(ORIGIN_OBSERVED)`, i.e. the runner already
+/// trusts an observed anchor enough to hand it back to `claude --resume`. Naming
+/// the same session to coord is strictly the weaker claim, and coord re-validates
+/// it fail-closed with `session_on_device` on top. Admitting only `authoritative`
+/// silently withheld **8 of the operator's 34 open records** at 2026-08-04 and
+/// mis-bucketed them into `record_unregistered`, whose `/health` doc then
+/// misdescribed the residual.
+///
+/// Note the deliberate asymmetry with `restore_record_emitter`: it additionally
+/// requires `confirmed_at.is_some()`, because a wrong RESTORE re-opens a foreign
+/// conversation in the operator's face. This gate needs no such confirmation —
+/// `origin` alone answers "is the anchor derived from proof", and an unconfirmed
+/// row that is the workdir's/terminal's sole candidate is still the right id.
+fn lifecycle_record_anchor_is_trusted(
     rec: &crate::session::session_lifecycle_store::TerminalSessionRecord,
 ) -> bool {
-    rec.origin.as_deref() == Some(crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE)
+    use crate::session::session_lifecycle_store::{ORIGIN_AUTHORITATIVE, ORIGIN_OBSERVED};
+    matches!(
+        rec.origin.as_deref(),
+        Some(ORIGIN_AUTHORITATIVE) | Some(ORIGIN_OBSERVED)
+    )
 }
 
 /// Pure candidate selection for the lifecycle fallback (unit-testable without
 /// a Tauri app). Among OPEN lifecycle records whose `working_dir` matches the
 /// proxy-provisioned `workdir` and which pass
-/// [`lifecycle_record_is_authoritative`], resolves the caller **only when
+/// [`lifecycle_record_anchor_is_trusted`], resolves the caller **only when
 /// exactly one** distinct uuid anchor remains.
 ///
 /// ## Ambiguity: no winner, ever
@@ -1281,9 +1501,11 @@ fn lifecycle_record_is_authoritative(
 /// worse than no id: coord's fuzzy device-wide fallback is at least honestly
 /// fuzzy, while a wrong header is believed. So a multi-candidate workdir now
 /// resolves to [`LifecycleMiss::Ambiguous`] — counted, named, and headerless.
-/// The single-candidate workdir, the common case, still resolves exactly, and
-/// the terminal leg ([`select_terminal_caller`]) is unaffected: it is 1:1 by
-/// construction and can never be ambiguous.
+/// The single-candidate workdir, the common case, still resolves exactly. The
+/// terminal leg ([`select_terminal_caller`]) applies the SAME refusal on its
+/// own key — the terminal→session mapping is 1:1 for LIVE sessions but the
+/// durable registry can retain stale `open` rows on a reused terminal, so it
+/// too counts rather than picks.
 ///
 /// ## Why there is no registrar consultation here
 ///
@@ -1303,7 +1525,8 @@ fn lifecycle_record_is_authoritative(
 /// (see [`anchor_as_caller_session`]). An anchor with no `coord.agent_sessions`
 /// row is therefore already rejected server-side and coord falls back exactly
 /// as it does today — the runner-side filter prevented no misattribution. The
-/// durable `origin == "authoritative"` guard that replaces it keeps the
+/// durable anchor-origin guard that replaces it
+/// ([`lifecycle_record_anchor_is_trusted`]) keeps the
 /// anti-phantom property AND survives a restart, which an in-process map
 /// cannot.
 fn select_lifecycle_caller(
@@ -1322,7 +1545,7 @@ fn select_lifecycle_caller(
             continue;
         }
         matched += 1;
-        if !lifecycle_record_is_authoritative(rec) {
+        if !lifecycle_record_anchor_is_trusted(rec) {
             continue;
         }
         admitted += 1;
@@ -5293,11 +5516,11 @@ pub async fn start_server(
 mod self_id_chain_tests {
     use super::{
         select_lifecycle_caller, select_terminal_caller, self_id_health_snapshot,
-        self_id_miss_sample_dirs, self_id_miss_samples, LifecycleMiss, SelfIdOutcome,
-        SELF_ID_MISS_SAMPLE_CAP,
+        self_id_miss_sample_dirs, self_id_miss_samples, terminal_leg, LifecycleMiss, SelfIdOutcome,
+        TerminalLeg, SELF_ID_MISS_SAMPLE_CAP,
     };
     use crate::session::session_lifecycle_store::{
-        TerminalSessionRecord, ORIGIN_AUTHORITATIVE, ORIGIN_RECONCILED,
+        TerminalSessionRecord, ORIGIN_AUTHORITATIVE, ORIGIN_OBSERVED, ORIGIN_RECONCILED,
     };
 
     #[test]
@@ -5311,7 +5534,47 @@ mod self_id_chain_tests {
             labels.len(),
             "duplicate self-id outcome label — the /health series would collide: {labels:?}"
         );
-        assert_eq!(SelfIdOutcome::ALL.len(), 12);
+        // 12 before the terminal-leg fix; +4 terminal-leg gates
+        // (`terminal_record_missing`, `terminal_record_unadmitted`,
+        // `terminal_anchor_not_uuid`, `ambiguous_terminal`).
+        assert_eq!(SelfIdOutcome::ALL.len(), 16);
+    }
+
+    /// FIX 5: the counter slot is a compiler-checked `match`, not a search of
+    /// `ALL` that fell back to slot 0 — which is `Injected`, the SUCCESS
+    /// counter. This asserts the two orderings agree AND that every variant
+    /// lands in a slot of its own, end to end through `/health`.
+    #[test]
+    fn every_outcome_counts_into_its_own_slot() {
+        for (i, outcome) in SelfIdOutcome::ALL.iter().enumerate() {
+            assert_eq!(
+                outcome.index(),
+                i,
+                "`{}` occupies ALL[{i}] but indexes to slot {} — the /health \
+                 series would render another variant's count",
+                outcome.label(),
+                outcome.index()
+            );
+        }
+
+        // Round-trip: bumping each variant once must move exactly its own
+        // series by exactly one. A variant miscounted into slot 0 shows up
+        // here as `injected` moving by 2.
+        let before = self_id_health_snapshot();
+        for outcome in SelfIdOutcome::ALL {
+            super::record_self_id_outcome(outcome);
+        }
+        let after = self_id_health_snapshot();
+        for outcome in SelfIdOutcome::ALL {
+            let b = before[outcome.label()].as_u64().expect("counter is a u64");
+            let a = after[outcome.label()].as_u64().expect("counter is a u64");
+            assert_eq!(
+                a,
+                b + 1,
+                "`{}` did not increment its own slot ({b} → {a})",
+                outcome.label()
+            );
+        }
     }
 
     #[test]
@@ -5466,12 +5729,19 @@ mod self_id_chain_tests {
         );
     }
 
+    /// FIX 3: the admitted set is the two anchor origins derived from
+    /// PROOF — `authoritative` (the id was known) and `observed` (a
+    /// process-start-anchored, uniquely-correlated transcript bind, the same
+    /// tier `restore_record_emitter.rs:264` already trusts enough to
+    /// `claude --resume`). `reconciled` ("may name a foreign session") and a
+    /// `None` origin (predates the field) stay out.
+    ///
+    /// This test used to assert `authoritative` was the ONLY admitted origin.
+    /// That was the defect: `observed` is a live third value, and admitting
+    /// only `authoritative` silently withheld 8 of the operator's 34 open
+    /// records while mis-bucketing them into `record_unregistered`.
     #[test]
-    fn lifecycle_selection_admits_only_authoritative_origins() {
-        // The durable anti-phantom guard that REPLACED the registrar filter:
-        // `reconciled` "may name a foreign session" and a `None` origin
-        // predates the field, so neither may be published as this device's
-        // identity.
+    fn lifecycle_selection_admits_the_proof_backed_origins_only() {
         for origin in [Some(ORIGIN_RECONCILED), None] {
             let records = vec![rec_with_origin(ANCHOR_A, Some("D:/repo"), origin)];
             assert_eq!(
@@ -5480,14 +5750,24 @@ mod self_id_chain_tests {
                 "origin {origin:?} must not be admitted"
             );
         }
-        let records = vec![rec_with_origin(
-            ANCHOR_A,
-            Some("D:/repo"),
-            Some(ORIGIN_AUTHORITATIVE),
-        )];
+        for origin in [ORIGIN_AUTHORITATIVE, ORIGIN_OBSERVED] {
+            let records = vec![rec_with_origin(ANCHOR_A, Some("D:/repo"), Some(origin))];
+            assert_eq!(
+                select_lifecycle_caller(&records, "D:/repo", None),
+                Ok(uuid_of(ANCHOR_A)),
+                "origin {origin} must be admitted"
+            );
+        }
+        // An `observed` record is a full candidate, not a tiebreak-loser: it
+        // makes a workdir AMBIGUOUS alongside an authoritative sibling rather
+        // than being silently dropped so the other one "wins".
+        let mixed = vec![
+            rec_with_origin(ANCHOR_A, Some("D:/repo"), Some(ORIGIN_AUTHORITATIVE)),
+            rec_with_origin(ANCHOR_B, Some("D:/repo"), Some(ORIGIN_OBSERVED)),
+        ];
         assert_eq!(
-            select_lifecycle_caller(&records, "D:/repo", None),
-            Ok(uuid_of(ANCHOR_A))
+            select_lifecycle_caller(&mixed, "D:/repo", None),
+            Err(LifecycleMiss::Ambiguous)
         );
     }
 
@@ -5551,7 +5831,7 @@ mod self_id_chain_tests {
     }
 
     #[test]
-    fn terminal_selection_is_exact_and_never_ambiguous() {
+    fn terminal_selection_is_exact_on_a_shared_workdir() {
         // The deterministic leg: the nonce names a terminal, the terminal
         // names one open record, that record's anchor is the caller. The
         // 13-way-shared workdir is irrelevant here — which is the whole point
@@ -5562,41 +5842,140 @@ mod self_id_chain_tests {
         ];
         assert_eq!(
             select_terminal_caller(&records, &format!("term-{ANCHOR_A}")),
-            Some(uuid_of(ANCHOR_A))
+            Ok(uuid_of(ANCHOR_A))
         );
         assert_eq!(
             select_terminal_caller(&records, &format!("term-{ANCHOR_B}")),
-            Some(uuid_of(ANCHOR_B))
+            Ok(uuid_of(ANCHOR_B))
         );
-        // Unknown terminal / non-uuid anchor fall through to the workdir leg.
-        assert_eq!(select_terminal_caller(&records, "term-nope"), None);
+        // Each gate is now its own typed outcome instead of a bare `None`.
+        assert_eq!(
+            select_terminal_caller(&records, "term-nope"),
+            Err(SelfIdOutcome::TerminalRecordMissing)
+        );
         let bad = vec![rec("not-a-uuid", Some("D:/repo"), 1)];
-        assert_eq!(select_terminal_caller(&bad, "term-not-a-uuid"), None);
+        assert_eq!(
+            select_terminal_caller(&bad, "term-not-a-uuid"),
+            Err(SelfIdOutcome::TerminalAnchorNotUuid)
+        );
     }
 
-    /// The terminal leg applies the authoritative guard too. Being the UNIQUE
+    /// FIX 1: the durable registry really can hold SEVERAL open rows on one
+    /// `terminal_id` (`repair_terminal_id_collisions` records 54 on one), and
+    /// `open_records()` walks a `HashMap`, so the old `.find()` returned a
+    /// hash-order-arbitrary row — possibly a PREVIOUS run's session id.
+    ///
+    /// The fixture is the dangerous window deliberately: the STALE row is the
+    /// CONFIRMED one and the fresh row is not, which is precisely the shape
+    /// where the store's `open_authority_key` (`confirmed_at.is_some()`,
+    /// `last_seen_at`, `opened_at`) would rank the WRONG session first. So the
+    /// leg refuses rather than ranks.
+    #[test]
+    fn terminal_selection_refuses_two_open_rows_on_one_terminal() {
+        let mut stale = rec(ANCHOR_A, Some("D:/repo"), 100);
+        stale.terminal_id = "term-reused".to_string();
+        stale.confirmed_at = Some(50); // the stale row is the CONFIRMED one
+        let mut fresh = rec(ANCHOR_B, Some("D:/repo"), 200);
+        fresh.terminal_id = "term-reused".to_string();
+        fresh.confirmed_at = None; // …the live one is not confirmed yet
+
+        // Order-independent on purpose: the bug this replaces was hash-order
+        // dependent, so an order-sensitive test would pass while broken.
+        for records in [
+            vec![stale.clone(), fresh.clone()],
+            vec![fresh.clone(), stale.clone()],
+        ] {
+            assert_eq!(
+                select_terminal_caller(&records, "term-reused"),
+                Err(SelfIdOutcome::AmbiguousTerminal),
+                "two open rows on one terminal must refuse, in EITHER input order"
+            );
+        }
+
+        // Two rows naming the SAME session are one candidate, not an
+        // ambiguity — there is only one identity to publish.
+        let mut twin = stale.clone();
+        twin.last_seen_at = 900;
+        assert_eq!(
+            select_terminal_caller(&[stale, twin], "term-reused"),
+            Ok(uuid_of(ANCHOR_A))
+        );
+    }
+
+    /// FIX 2 — THE fallthrough regression. A binding whose terminal is
+    /// KNOWN-but-unresolvable must not inherit a same-cwd SIBLING terminal's
+    /// id. Before the three-way [`TerminalLeg`], leg 1 returned a bare `None`
+    /// here and the workdir chain answered with T2's anchor at full
+    /// confidence — every one of T1's coord calls labelled as T2.
+    #[test]
+    fn a_known_terminal_that_misses_never_inherits_a_siblings_id() {
+        let workdir = "D:/repo";
+        // T2: the workdir's SINGLE admitted candidate.
+        let mut t2 = rec(ANCHOR_B, Some(workdir), 200);
+        t2.terminal_id = "T2".to_string();
+        // T1: same cwd, record present but NOT admitted.
+        let mut t1 = rec_with_origin(ANCHOR_A, Some(workdir), Some(ORIGIN_RECONCILED));
+        t1.terminal_id = "T1".to_string();
+
+        for (records, expected) in [
+            (
+                vec![t1.clone(), t2.clone()],
+                SelfIdOutcome::TerminalRecordUnadmitted,
+            ),
+            // …and the same when T1 has no open record at all.
+            (vec![t2.clone()], SelfIdOutcome::TerminalRecordMissing),
+        ] {
+            // The payload the bug would have shipped: the workdir leg DOES
+            // resolve here, confidently, to the wrong session.
+            assert_eq!(
+                select_lifecycle_caller(&records, workdir, None),
+                Ok(uuid_of(ANCHOR_B)),
+                "fixture invalid: the workdir must have exactly one admitted candidate"
+            );
+            // Leg 1 must therefore STOP, not fall through.
+            assert_eq!(
+                terminal_leg(&records, Some("T1")),
+                TerminalLeg::Miss(expected),
+                "a known-but-unresolvable terminal must be a typed miss, never a fallthrough"
+            );
+        }
+
+        // The ONLY fallthrough arm: the binding carries no terminal at all
+        // (restore, adopt, mint route, in-cwd `.mcp.json`) — unchanged.
+        assert_eq!(terminal_leg(&[t2.clone()], None), TerminalLeg::NoTerminal);
+        // And a terminal that DOES resolve still resolves.
+        assert_eq!(
+            terminal_leg(&[t2], Some("T2")),
+            TerminalLeg::Resolved(uuid_of(ANCHOR_B))
+        );
+    }
+
+    /// The terminal leg applies the anchor-trust guard too. Being the UNIQUE
     /// record for a terminal does not make a guessed anchor correct: a
     /// `reconciled` id "may name a foreign session" by its own definition, so
     /// resolving it would ship a confidently wrong identity — the exact failure
     /// this chain exists to prevent. Uniqueness is not correctness.
     #[test]
-    fn terminal_selection_refuses_a_non_authoritative_anchor() {
+    fn terminal_selection_refuses_an_untrusted_anchor() {
         for origin in [Some(ORIGIN_RECONCILED.to_string()), None] {
             let mut r = rec(ANCHOR_A, Some("D:/repo"), 100);
             r.origin = origin.clone();
             assert_eq!(
                 select_terminal_caller(&[r], &format!("term-{ANCHOR_A}")),
-                None,
+                Err(SelfIdOutcome::TerminalRecordUnadmitted),
                 "a {origin:?}-origin anchor must NOT resolve, even as the terminal's only record"
             );
         }
-        // The authoritative counterpart on the same terminal still resolves —
-        // so this guard rejects untrustworthy anchors, not the leg itself.
-        let good = rec(ANCHOR_A, Some("D:/repo"), 100);
-        assert_eq!(
-            select_terminal_caller(&[good], &format!("term-{ANCHOR_A}")),
-            Some(uuid_of(ANCHOR_A))
-        );
+        // FIX 3: both TRUSTED origins resolve on this leg — so the guard
+        // rejects untrustworthy anchors, not the leg itself.
+        for origin in [ORIGIN_AUTHORITATIVE, ORIGIN_OBSERVED] {
+            let good = rec_with_origin(ANCHOR_A, Some("D:/repo"), Some(origin));
+            assert_eq!(
+                select_terminal_caller(&[good], &format!("term-{ANCHOR_A}")),
+                Ok(uuid_of(ANCHOR_A)),
+                "origin {origin} must be admitted"
+            );
+        }
     }
 
     #[test]
