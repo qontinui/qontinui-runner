@@ -37,7 +37,7 @@
 import { useMemo, useState, useEffect, useCallback } from "react";
 import { useExecution } from "../contexts/ExecutionContext";
 import { useActionLogView } from "./useActionLogView";
-import { useLogManager } from "./useLogManager";
+import { useLogData } from "./useLogManager";
 import type {
   ExecutionState,
   ExecutionStatus,
@@ -246,7 +246,7 @@ export function useDashboardState(options: UseDashboardStateOptions = {}): UseDa
   });
 
   // Get image recognition logs
-  const { imageLogs } = useLogManager();
+  const { imageLogs } = useLogData();
 
   // Local UI state for pause (runner doesn't actually support pause)
   const [isPaused, setIsPaused] = useState(false);

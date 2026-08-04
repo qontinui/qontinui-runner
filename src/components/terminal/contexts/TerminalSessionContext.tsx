@@ -79,17 +79,11 @@ import { fetchLiveClaudeSessionIds } from "../liveClaudeSessions";
 import { decideColdResume } from "../useTerminalInitialization";
 
 import { useSessionStateTracking } from "../useSessionStateTracking";
-import { useUnreadTracking } from "../useUnreadTracking";
 import { useOutputSnapshots } from "../useOutputSnapshots";
 import { useTerminalFindings } from "../useTerminalFindings";
 
 import { useFileConflicts } from "../useFileConflicts";
-import {
-  useFileLockTracking,
-  type LockState,
-  type IncomingYieldRequest,
-  type IncomingLongWaitSignal,
-} from "../useFileLockTracking";
+import { useFileLockTracking } from "../useFileLockTracking";
 import { useSessionPersistence } from "../useSessionPersistence";
 
 import { useShellIntegration } from "../useShellIntegration";
@@ -150,7 +144,6 @@ export interface TerminalSessionContextValue extends TerminalManagerReturn, Stat
   labelsAndTags: LabelsAndTagsReturn;
 
   // — SessionState extras —
-  unreadZones: ReturnType<typeof useUnreadTracking>["unreadZones"];
   snapshots: SnapshotsReturn;
   processOutputRef: React.MutableRefObject<((tabId: string, text: string) => void) | undefined>;
   activeFindings: FindingsReturn["activeFindings"];
@@ -158,12 +151,13 @@ export interface TerminalSessionContextValue extends TerminalManagerReturn, Stat
 
   // — ShellInfra —
   fileConflicts: FileConflictsReturn;
-  /** Per-tab lock state keyed by tab.id. */
-  fileLockStates: Record<string, LockState>;
-  /** Per-tab incoming yield request queues keyed by holder tab.id. */
-  pendingYieldRequests: Record<string, IncomingYieldRequest[]>;
-  /** Per-tab incoming long-wait signals keyed by WAITER tab.id. */
-  pendingLongWaitSignals: Record<string, IncomingLongWaitSignal[]>;
+  /**
+   * File-lock maps (`lockStates`, `pendingYieldRequests`,
+   * `pendingLongWaitSignals`) are NOT on this value — they live in the page's
+   * terminal hot store and are read with `useHotField(pageId, …)` /
+   * `useTabHotSlice(pageId, tabId)`. Same for `lastOutputLines`,
+   * `activityData` and `stateDurations`.
+   */
   sessionPersistence: SessionPersistenceReturn;
 
   // — AiFeatures —
@@ -459,6 +453,7 @@ const PageSessionScope = memo(function PageSessionScope({
   const processOutputRef = useRef<((tabId: string, text: string) => void) | undefined>(undefined);
 
   const stateTracking = useSessionStateTracking({
+    pageId,
     tabs: tabsWithSynthetic,
     seedLastOutput: syntheticSeedLastOutput,
     processOutput: (tabId, text) => processOutputRef.current?.(tabId, text),
@@ -473,13 +468,7 @@ const PageSessionScope = memo(function PageSessionScope({
     },
   });
 
-  const { unreadZones } = useUnreadTracking(
-    zoneLayout.focusedZone,
-    zoneLayout.assignments,
-    stateTracking.lastOutputLines,
-  );
-
-  const snapshots = useOutputSnapshots(stateTracking.lastOutputLines);
+  const snapshots = useOutputSnapshots(pageId);
 
   const { processOutput, activeFindings, allFindings } = useTerminalFindings(activeId ?? null);
 
@@ -620,11 +609,9 @@ const PageSessionScope = memo(function PageSessionScope({
 
   // ---- ShellInfra ----
   const fileConflicts = useFileConflicts();
-  const {
-    lockStates: fileLockStates,
-    pendingYieldRequests,
-    pendingLongWaitSignals,
-  } = useFileLockTracking(tabs);
+  // Publishes into the page hot store; holds no reactive state of its own, so
+  // a lock poll no longer re-renders this scope (and with it the whole page).
+  useFileLockTracking(pageId, tabs);
   const sessionPersistence = useSessionPersistence(pageId);
 
   // ---- AiFeatures ----
@@ -793,16 +780,12 @@ const PageSessionScope = memo(function PageSessionScope({
       labelsAndTags,
       // SessionState (spread)
       ...stateTracking,
-      unreadZones,
       snapshots,
       processOutputRef,
       activeFindings,
       allFindings,
       // ShellInfra
       fileConflicts,
-      fileLockStates,
-      pendingYieldRequests,
-      pendingLongWaitSignals,
       sessionPersistence,
       // AiFeatures
       shellIntegration,
@@ -828,14 +811,10 @@ const PageSessionScope = memo(function PageSessionScope({
       zoneLayout,
       labelsAndTags,
       stateTracking,
-      unreadZones,
       snapshots,
       activeFindings,
       allFindings,
       fileConflicts,
-      fileLockStates,
-      pendingYieldRequests,
-      pendingLongWaitSignals,
       sessionPersistence,
       shellIntegration,
       workflowGen,

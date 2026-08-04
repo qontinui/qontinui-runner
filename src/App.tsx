@@ -33,10 +33,9 @@ import {
 import {
   useApiReady,
   useActionLogView,
-  useLogManager,
+  useLogActions,
   useUIState,
   useModalState,
-  useLogFilter,
   useProjectSelection,
   useProjectLogs,
   useBackgroundActivities,
@@ -290,19 +289,17 @@ function AppContent() {
   // sync setState in useEffect to clear on tab-switch (set-state-in-effect).
   const editWorkflowId = activeTab === "unified-workflow-builder" ? rawEditWorkflowId : null;
 
+  // Actions only — deliberately NOT `useLogManager()`. Subscribing to log
+  // CONTENT here re-rendered the entire app (terminal tree included) on every
+  // AI/log line; the three panels that render logs subscribe themselves via
+  // `useLogData()` (plan `2026-07-28-runner-many-sessions-performance` §0 A2).
   const {
-    logs,
-    imageLogs,
-    aiOutputLogs,
     addLog,
-    addAiOutputLog,
     clearGeneralLogs,
     clearImageLogs,
     clearAiOutputLogs,
     copyLogs,
-    logCount,
-    imageLogCount,
-  } = useLogManager();
+  } = useLogActions();
 
   const {
     viewData: actionLogViewData,
@@ -315,7 +312,6 @@ function AppContent() {
 
   const uiState = useUIState();
   const modalState = useModalState();
-  const { logLevel, setLogLevel, filteredLogs } = useLogFilter(logs);
   const projectSelection = useProjectSelection();
   const projectLogs = useProjectLogs();
   const globalLogSources = useGlobalLogSources();
@@ -664,18 +660,6 @@ function AppContent() {
                   activeTab={activeTab}
                   setActiveTab={setActiveTab}
                   addLog={addLog}
-                  addAiOutputLog={addAiOutputLog}
-                  logs={logs}
-                  imageLogs={imageLogs}
-                  aiOutputLogs={aiOutputLogs}
-                  clearGeneralLogs={clearGeneralLogs}
-                  clearImageLogs={clearImageLogs}
-                  clearAiOutputLogs={clearAiOutputLogs}
-                  logCount={logCount}
-                  imageLogCount={imageLogCount}
-                  filteredLogs={filteredLogs}
-                  logLevel={logLevel}
-                  setLogLevel={setLogLevel}
                   uiState={uiState}
                   modalState={modalState}
                   actionLogViewData={actionLogViewData}

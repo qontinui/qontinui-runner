@@ -15,6 +15,7 @@ import React, { useMemo, useState, useCallback, useRef, useEffect } from "react"
 import type { TerminalTab } from "./useTerminalManager";
 import { instanceStorage } from "@/lib/instance-storage";
 import { useTerminalSession, useZoneMetadata, useUIStateCx } from "./contexts";
+import { useHotField } from "./useTerminalHotStore";
 import { SpawnTenantPicker } from "./SpawnTenantPicker";
 import {
   LayoutGrid,
@@ -708,7 +709,8 @@ export const ZoneControlPanel = React.memo(function ZoneControlPanel({
   const zoneCount = zoneLayout.layout.zones.length;
   const onFocusZone = zoneLayout.setFocusedZone;
   const layoutId = zoneLayout.layoutId;
-  const { sessionStates, lastOutputLines } = session;
+  const { sessionStates } = session;
+  const lastOutputLines = useHotField(pageId, "lastOutputLines");
   const { labelsAndTags } = useZoneMetadata();
   const zoneLabels = labelsAndTags.zoneLabels;
   const zoneNotes = labelsAndTags.zoneNotes;

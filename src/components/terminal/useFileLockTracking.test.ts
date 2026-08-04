@@ -33,6 +33,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 import {
   deriveWaiterCounts,
+  lockStateEquals,
   lockStateFromAcquired,
   lockStateFromWaiting,
   lockStateKind,
@@ -712,5 +713,65 @@ describe("holderIdleMs join — /sessions/idle-status × /file-locks/info", () =
     const idle: LockState = { kind: "idle" };
     expect(holding.holderIdleMs).toBeUndefined();
     expect(idle.holderIdleMs).toBeUndefined();
+  });
+});
+
+// ── lockStateEquals — the 10 s poll's no-change bailout ─────────────────────
+//
+// The `/file-locks/info` sweep rebuilds every tab's LockState from scratch, so
+// without a field-wise comparison it republished a brand-new map on every tick
+// and re-rendered every lock consumer for nothing (plan
+// `2026-07-28-runner-many-sessions-performance` §0 A10). The poll reuses the
+// PREVIOUS object whenever this returns true, which lets the hot store's
+// identity check drop the publish entirely.
+
+describe("lockStateEquals", () => {
+  it("treats structurally identical states as equal across object identities", () => {
+    const a: LockState = {
+      kind: "holding",
+      filePath: "src/lib.rs",
+      sinceMs: 1000,
+      waiterCount: 2,
+    };
+    const b: LockState = {
+      kind: "holding",
+      filePath: "src/lib.rs",
+      sinceMs: 1000,
+      waiterCount: 2,
+    };
+    expect(a).not.toBe(b);
+    expect(lockStateEquals(a, b)).toBe(true);
+  });
+
+  it("is reflexive and handles undefined on either side", () => {
+    const a: LockState = { kind: "idle" };
+    expect(lockStateEquals(a, a)).toBe(true);
+    expect(lockStateEquals(undefined, undefined)).toBe(true);
+    expect(lockStateEquals(a, undefined)).toBe(false);
+    expect(lockStateEquals(undefined, a)).toBe(false);
+  });
+
+  it("detects a change in every compared field", () => {
+    const base: LockState = {
+      kind: "waiting",
+      filePath: "a.rs",
+      counterpartyName: "Worker 1",
+      sinceMs: 10,
+      waiterCount: 0,
+      holderIdleMs: 500,
+    };
+    expect(lockStateEquals(base, { ...base, kind: "holding" })).toBe(false);
+    expect(lockStateEquals(base, { ...base, filePath: "b.rs" })).toBe(false);
+    expect(lockStateEquals(base, { ...base, counterpartyName: "Worker 2" })).toBe(false);
+    expect(lockStateEquals(base, { ...base, sinceMs: 11 })).toBe(false);
+    expect(lockStateEquals(base, { ...base, waiterCount: 1 })).toBe(false);
+    expect(lockStateEquals(base, { ...base, holderIdleMs: 501 })).toBe(false);
+  });
+
+  it("distinguishes an absent optional field from an explicit value", () => {
+    const withCount: LockState = { kind: "holding", waiterCount: 0 };
+    const withoutCount: LockState = { kind: "holding" };
+    // `undefined` vs 0 is a real difference in the rendered banner copy.
+    expect(lockStateEquals(withCount, withoutCount)).toBe(false);
   });
 });
