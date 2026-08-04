@@ -452,54 +452,15 @@ declare module "@qontinui/ui-bridge-auto" {
 // =============================================================================
 
 // =============================================================================
-// react-window v2 API (package.json wants ^2.2.7, v1 installed with v1 types)
+// react-window
 // =============================================================================
-
-declare module "react-window" {
-  import type { Component, Ref, CSSProperties, ComponentType } from "react";
-
-  /**
-   * react-window v2 RowComponentProps: the component receives `index`, `style`,
-   * plus all properties from the generic type T (spread via rowProps).
-   */
-  export type RowComponentProps<T = Record<string, never>> = {
-    index: number;
-    style: CSSProperties;
-  } & T;
-
-  export interface ListProps<RP = Record<string, never>> {
-    listRef?: Ref<unknown>;
-    rowCount: number;
-    rowHeight: number | ((index: number) => number);
-    rowComponent: ComponentType<RowComponentProps<RP>>;
-    rowProps?: RP;
-    overscanCount?: number;
-    style?: CSSProperties;
-    className?: string;
-    width?: number | string;
-    height?: number | string;
-    [key: string]: unknown;
-  }
-
-  export class List<RP = Record<string, never>> extends Component<ListProps<RP>> {}
-
-  export function useListRef(initial: unknown): Ref<unknown>;
-
-  // v1 exports (still available at runtime)
-  export class FixedSizeList<_T = unknown> extends Component<Record<string, unknown>> {}
-  export class VariableSizeList<_T = unknown> extends Component<Record<string, unknown>> {}
-  export class FixedSizeGrid<_T = unknown> extends Component<Record<string, unknown>> {}
-  export class VariableSizeGrid<_T = unknown> extends Component<Record<string, unknown>> {}
-  export function areEqual(
-    prevProps: Record<string, unknown>,
-    nextProps: Record<string, unknown>,
-  ): boolean;
-  export function shouldComponentUpdate(
-    this: Component,
-    nextProps: Record<string, unknown>,
-    nextState: Record<string, unknown>,
-  ): boolean;
-}
+// No shim: react-window v2 (^2.2.7) ships its own complete types
+// (node_modules/react-window/dist/react-window.d.ts), including `List`,
+// `RowComponentProps`, `useListRef` and `useDynamicRowHeight`. An ambient
+// `declare module "react-window"` here would SHADOW those real types — which is
+// how this file ended up asserting "v1 installed with v1 types" long after v2
+// landed, and why `useDynamicRowHeight` appeared not to exist.
+// =============================================================================
 
 // =============================================================================
 // html2canvas (missing type declarations)

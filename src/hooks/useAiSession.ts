@@ -11,6 +11,8 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { AiMessage, AiSessionState } from "@qontinui/shared-types";
 import { parseOutputLog } from "@qontinui/workflow-utils";
 import { instanceStorage } from "@/lib/instance-storage";
+import { FrameBatchScheduler } from "@/lib/ai-streaming/frameBatchScheduler";
+import { StreamingTextBuffer } from "@/lib/ai-streaming/streamingBuffer";
 
 /** Payload from the "ai-output" Tauri event. */
 interface AiOutputEvent {
@@ -42,15 +44,47 @@ export function useAiSession() {
   const [sessionState, setSessionState] = useState<AiSessionState>("disconnected");
   const [messages, setMessages] = useState<AiMessage[]>([]);
   const [streamingContent, setStreamingContent] = useState("");
+  const [streamingDroppedChars, setStreamingDroppedChars] = useState(0);
   const [isGeneratingWorkflow, setIsGeneratingWorkflow] = useState(false);
   const [toolActivity, setToolActivity] = useState<string | null>(null);
 
-  const streamingBufferRef = useRef("");
+  /**
+   * Accumulator for the in-flight response. Appends land here synchronously
+   * (so nothing can be lost or reordered) while the React state update that
+   * drives rendering is coalesced by `streamingFlushRef` — one setState per
+   * animation frame, or per 100 ms when frames are suspended, instead of one
+   * per streamed line. See plan 2026-07-28 §A5a/A5b.
+   */
+  const [streamingBuffer] = useState(() => new StreamingTextBuffer());
+  const streamingFlushRef = useRef<FrameBatchScheduler | null>(null);
   const taskRunIdRef = useRef<string | null>(null);
   const sessionStateRef = useRef<AiSessionState>("disconnected");
   const restoredRef = useRef(false);
   const restorePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastToolActivityRef = useRef(0);
+
+  // Built in an effect (not on the render path) so the flush closure is never
+  // constructed during render. This effect is declared before the Tauri
+  // listener effects below, which are the only callers of `schedule()`.
+  useEffect(() => {
+    const scheduler = new FrameBatchScheduler(() => {
+      setStreamingContent(streamingBuffer.text);
+      setStreamingDroppedChars(streamingBuffer.droppedChars);
+    });
+    streamingFlushRef.current = scheduler;
+    return () => {
+      scheduler.dispose();
+      streamingFlushRef.current = null;
+    };
+  }, [streamingBuffer]);
+
+  /** Drop any pending flush and clear the buffer + its rendered mirror. */
+  const resetStreaming = useCallback(() => {
+    streamingFlushRef.current?.cancel();
+    streamingBuffer.reset();
+    setStreamingContent("");
+    setStreamingDroppedChars(0);
+  }, [streamingBuffer]);
 
   // Keep refs in sync with state
   useEffect(() => {
@@ -212,8 +246,8 @@ export function useAiSession() {
       // The Rust backend strips the \n delimiter when reading stdout line-by-line,
       // so we restore it here to preserve paragraph breaks in markdown.
       setToolActivity(null);
-      streamingBufferRef.current += line + "\n";
-      setStreamingContent(streamingBufferRef.current);
+      streamingBuffer.append(line + "\n");
+      streamingFlushRef.current?.schedule();
     }).then((fn) => {
       if (cancelled) {
         fn(); // Immediately unlisten if effect was already cleaned up
@@ -230,11 +264,17 @@ export function useAiSession() {
       // Only process events for our session
       if (!taskRunIdRef.current || eventTaskRunId !== taskRunIdRef.current) return;
 
-      // Flush streaming buffer on transition to ready or closed
-      if ((state === "ready" || state === "closed") && streamingBufferRef.current.trim()) {
-        const content = streamingBufferRef.current;
-        streamingBufferRef.current = "";
-        setStreamingContent("");
+      // Flush streaming buffer on transition to ready or closed.
+      // Reading `.text` folds every pending append, so a batched flush that
+      // hasn't fired yet can never drop the tail of the response.
+      const bufferedText = state === "ready" || state === "closed" ? streamingBuffer.text : "";
+      if ((state === "ready" || state === "closed") && bufferedText.trim()) {
+        const dropped = streamingBuffer.droppedChars;
+        const content =
+          dropped > 0
+            ? `_[${dropped} earlier characters of this response were trimmed by the streaming retention cap]_\n\n${bufferedText}`
+            : bufferedText;
+        resetStreaming();
         setMessages((prev) => {
           // If the last message is also from AI (no user message in between),
           // merge content into that message instead of creating a new bubble.
@@ -273,114 +313,120 @@ export function useAiSession() {
         unlisten();
       }
     };
-  }, []);
+  }, [resetStreaming, streamingBuffer]);
 
-  const switchSession = useCallback(async (newTaskRunId: string) => {
-    // Clear current streaming state
-    streamingBufferRef.current = "";
-    setStreamingContent("");
-    setToolActivity(null);
-    setMessages([]);
-    setSessionState("disconnected");
+  const switchSession = useCallback(
+    async (newTaskRunId: string) => {
+      // Clear current streaming state
+      resetStreaming();
+      setToolActivity(null);
+      setMessages([]);
+      setSessionState("disconnected");
 
-    // Set the new session
-    setTaskRunId(newTaskRunId);
-    taskRunIdRef.current = newTaskRunId; // Sync ref immediately
-    try {
-      instanceStorage.setItem(STORAGE_KEY, newTaskRunId);
-    } catch {
-      // Ignore storage errors
-    }
+      // Set the new session
+      setTaskRunId(newTaskRunId);
+      taskRunIdRef.current = newTaskRunId; // Sync ref immediately
+      try {
+        instanceStorage.setItem(STORAGE_KEY, newTaskRunId);
+      } catch {
+        // Ignore storage errors
+      }
 
-    // Check if session has a live CLI process
-    try {
-      const stateResponse = await invoke<CommandResponse>("get_ai_session_state", {
-        taskRunId: newTaskRunId,
-      });
-      const state = stateResponse.data?.state as string | undefined;
-      if (state && state !== "not_found" && state !== "closed") {
-        setSessionState(state as AiSessionState);
-      } else {
-        // No live process — show as stopped/historical
+      // Check if session has a live CLI process
+      try {
+        const stateResponse = await invoke<CommandResponse>("get_ai_session_state", {
+          taskRunId: newTaskRunId,
+        });
+        const state = stateResponse.data?.state as string | undefined;
+        if (state && state !== "not_found" && state !== "closed") {
+          setSessionState(state as AiSessionState);
+        } else {
+          // No live process — show as stopped/historical
+          setSessionState("closed");
+        }
+      } catch {
         setSessionState("closed");
       }
-    } catch {
-      setSessionState("closed");
-    }
 
-    // Load messages from DB
-    try {
-      const outputResponse = await invoke<CommandResponse>("get_ai_output", {
-        taskRunId: newTaskRunId,
-      });
-      if (outputResponse.success && outputResponse.data?.output_log) {
-        const parsed = parseOutputLog(outputResponse.data.output_log as string);
-        setMessages(parsed);
-      }
-    } catch (e) {
-      console.error("[useAiSession] Failed to load session messages:", e);
-    }
-  }, []);
-
-  const createSession = useCallback(async (taskName?: string) => {
-    try {
-      const response = await invoke<CommandResponse>("create_ai_session", {
-        taskName: taskName || "New Session",
-      });
-
-      if (response.success && response.data) {
-        const newId = response.data.task_run_id as string;
-        setTaskRunId(newId);
-        taskRunIdRef.current = newId; // Sync ref immediately so sendMessage works right after
-        const state = (response.data.state as AiSessionState) || "ready";
-        setSessionState(state);
-        sessionStateRef.current = state;
-        setMessages([]);
-        streamingBufferRef.current = "";
-        setStreamingContent("");
-        try {
-          instanceStorage.setItem(STORAGE_KEY, newId);
-        } catch {
-          // Ignore storage errors
+      // Load messages from DB
+      try {
+        const outputResponse = await invoke<CommandResponse>("get_ai_output", {
+          taskRunId: newTaskRunId,
+        });
+        if (outputResponse.success && outputResponse.data?.output_log) {
+          const parsed = parseOutputLog(outputResponse.data.output_log as string);
+          setMessages(parsed);
         }
-        return newId;
+      } catch (e) {
+        console.error("[useAiSession] Failed to load session messages:", e);
       }
-      return null;
-    } catch (e) {
-      console.error("[useAiSession] Failed to create session:", e);
-      return null;
-    }
-  }, []);
+    },
+    [resetStreaming],
+  );
 
-  const sendMessage = useCallback(async (content: string) => {
-    // Use ref to get the latest taskRunId — avoids stale closure when called
-    // immediately after createSession (React state update hasn't flushed yet)
-    const currentTaskRunId = taskRunIdRef.current;
-    if (!currentTaskRunId || sessionStateRef.current === "restoring") return;
+  const createSession = useCallback(
+    async (taskName?: string) => {
+      try {
+        const response = await invoke<CommandResponse>("create_ai_session", {
+          taskName: taskName || "New Session",
+        });
 
-    // Add user message to local state immediately
-    setMessages((prev) => [
-      ...prev,
-      { role: "user", content, timestamp: new Date().toISOString() },
-    ]);
-
-    // Reset streaming buffer for new AI response
-    streamingBufferRef.current = "";
-    setStreamingContent("");
-
-    try {
-      const response = await invoke<CommandResponse>("send_user_message", {
-        taskRunId: currentTaskRunId,
-        message: content,
-      });
-
-      if (response.data?.state) {
-        setSessionState(response.data.state as AiSessionState);
+        if (response.success && response.data) {
+          const newId = response.data.task_run_id as string;
+          setTaskRunId(newId);
+          taskRunIdRef.current = newId; // Sync ref immediately so sendMessage works right after
+          const state = (response.data.state as AiSessionState) || "ready";
+          setSessionState(state);
+          sessionStateRef.current = state;
+          setMessages([]);
+          resetStreaming();
+          try {
+            instanceStorage.setItem(STORAGE_KEY, newId);
+          } catch {
+            // Ignore storage errors
+          }
+          return newId;
+        }
+        return null;
+      } catch (e) {
+        console.error("[useAiSession] Failed to create session:", e);
+        return null;
       }
-    } catch (e) {
-      console.error("[useAiSession] Failed to send message:", e);
-    }
-  }, []);
+    },
+    [resetStreaming],
+  );
+
+  const sendMessage = useCallback(
+    async (content: string) => {
+      // Use ref to get the latest taskRunId — avoids stale closure when called
+      // immediately after createSession (React state update hasn't flushed yet)
+      const currentTaskRunId = taskRunIdRef.current;
+      if (!currentTaskRunId || sessionStateRef.current === "restoring") return;
+
+      // Add user message to local state immediately
+      setMessages((prev) => [
+        ...prev,
+        { role: "user", content, timestamp: new Date().toISOString() },
+      ]);
+
+      // Reset streaming buffer for new AI response
+      resetStreaming();
+
+      try {
+        const response = await invoke<CommandResponse>("send_user_message", {
+          taskRunId: currentTaskRunId,
+          message: content,
+        });
+
+        if (response.data?.state) {
+          setSessionState(response.data.state as AiSessionState);
+        }
+      } catch (e) {
+        console.error("[useAiSession] Failed to send message:", e);
+      }
+    },
+    [resetStreaming],
+  );
 
   const interrupt = useCallback(async () => {
     if (!taskRunId) return;
@@ -461,18 +507,25 @@ export function useAiSession() {
     setTaskRunId(null);
     setSessionState("disconnected");
     setMessages([]);
-    streamingBufferRef.current = "";
-    setStreamingContent("");
+    resetStreaming();
     setIsGeneratingWorkflow(false);
     setToolActivity(null);
     instanceStorage.removeItem(STORAGE_KEY);
-  }, []);
+  }, [resetStreaming]);
 
   return {
     taskRunId,
     sessionState,
     messages,
+    /**
+     * Full retained text of the in-flight response. Updated on a coalesced
+     * cadence (one animation frame, or 100 ms when frames are suspended), NOT
+     * once per streamed line. Render it via `StreamingMessageView` rather than
+     * pushing it through a markdown parser — see plan 2026-07-28 §A5a/A5b.
+     */
     streamingContent,
+    /** Characters discarded by the streaming retention cap (0 in normal use). */
+    streamingDroppedChars,
     isGeneratingWorkflow,
     toolActivity,
     createSession,
