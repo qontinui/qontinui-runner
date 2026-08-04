@@ -40,8 +40,9 @@
 //! | resolved | present, `enabled=false`, `disposition=degrade` | any | `DegradeToInline` |
 //! | resolved | present, `enabled=false`, `disposition=warn_proceed` | any | `Warn` |
 //! | resolved | present, `enabled=false`, **no** disposition | any | `DegradeToInline` (documented fallback) |
-//! | resolved | absent | `standing_continuation` | `Deny` (default-OFF; needs an explicit opt-in row) |
-//! | resolved | absent | other | `Allow` (legacy default, logged) |
+//! | resolved | absent for this class, but the agent carries a DISABLE under another class | any | that disable governs — the class default never weakens it (`registry-row-disabled-other-class-floor`; see [`lookup_row`]) |
+//! | resolved | absent, no disable anywhere | `standing_continuation` | `Deny` (default-OFF; needs an explicit opt-in row) |
+//! | resolved | absent, no disable anywhere | other | `Allow` (legacy default, logged) |
 //! | unresolvable, snapshot held and younger than [`MAX_SNAPSHOT_AGE`] | — | — | decided from the stale snapshot, flagged with its age |
 //! | unresolvable, no usable snapshot | — | `standing_continuation` | `Deny` — a standing opt-in is never presumed |
 //! | unresolvable, no usable snapshot | `policy_required` (cold-start floor) | non-standing | `DegradeToInline` — never silently skip a required gate |
@@ -66,6 +67,7 @@
 //!   tenant, so there is no recorded user preference to honour — denying would
 //!   *invent* one and would stop local looping agents on an offline runner.
 //!   Same category as "coord has no registry", not "coord is down".
+//!
 //! **The 404 allow-all rollout arm is GONE** (Phase 4c, coord gate
 //! `706b53d5-c68e-4b80-baf2-31e71a385cb9`, work unit
 //! `2026-07-28-migrate-claude-md-into-qontinui`). While this module shipped
@@ -95,10 +97,17 @@
 //! `armed=true` contract. The operator's own tenant is seeded opted-IN by the
 //! web seed script, so fleet autonomy does not regress.
 //!
-//! A row is only consulted for the class it declares: an agent the user enabled
-//! for `in_session_subagent` use does NOT thereby opt into standing spawns of
-//! the same agent (see [`lookup_row`]). Otherwise an ordinary in-session
-//! opt-in would silently imply the standing one.
+//! An ENABLED row is only consulted for the class it declares: an agent the
+//! user enabled for `in_session_subagent` use does NOT thereby opt into
+//! standing spawns of the same agent (see [`lookup_row`]). Otherwise an ordinary
+//! in-session opt-in would silently imply the standing one.
+//!
+//! A DISABLED row is the exception, and deliberately so: it carries across
+//! classes rather than being fenced out, because the registry stores one row per
+//! AGENT and the class on it is an artifact of seeding, not a scope the user
+//! chose. See [`lookup_row`]'s "disable floor". The asymmetry mirrors the
+//! clause's own: a disable is absolute ("never"), an enable is a per-path
+//! opt-in ("never implied by a task").
 //!
 //! # Parallel fan-out bound
 //!
@@ -587,6 +596,11 @@ fn lookup_row<'a>(
     agent_name: Option<&str>,
     path: SpawnPath,
 ) -> Option<Governing<'a>> {
+    // No agent name: the caller knows only its class (a gate continuation
+    // carries a gate_id, not an agent). The floor cannot apply here — it keys
+    // off a NAMED agent's recorded disable, and there is no name to look up.
+    // That is not a hole: with no name there is no per-agent preference to
+    // honour, so the class row IS the whole of the user's recorded intent.
     let Some(name) = agent_name else {
         return find_governing(rows, path.as_wire(), path).map(Governing::direct);
     };
@@ -607,7 +621,11 @@ fn lookup_row<'a>(
         Some(cls) if restrictiveness(cls) > restrictiveness(disabled) => {
             Some(Governing::direct(cls))
         }
-        _ => Some(Governing::via_floor(disabled)),
+        // Includes `class_row == None`: with no class row the alternative is
+        // the permissive `no-row-legacy-default-allow` arm, which is exactly
+        // the kind of default the floor exists to stop from outranking a
+        // recorded disable.
+        _ => Some(Governing::via_floor(disabled, class_row)),
     }
 }
 
@@ -617,8 +635,21 @@ fn lookup_row<'a>(
 /// operator reading the log needs to distinguish "you disabled this agent for
 /// this class" from "you disabled this agent under another class and the floor
 /// carried it across", because only the second is surprising.
+///
+/// `bound_row` is deliberately SEPARATE from `row`. `row` decides the verdict;
+/// `bound_row` supplies the `parallel_fanout` accounting ([`Verdict::fanout_bound`]
+/// and [`Verdict::bound_source`], which keys the lane). They coincide for a
+/// directly-selected row, but a floor row is a statement about the AGENT, not
+/// about fan-out — letting it supply the bound would move the spawn off the
+/// shared class lane onto a per-agent one and hand it `DEFAULT_FANOUT_BOUND`
+/// instead of the class row's declared bound. That is the "two lanes of 15
+/// against a declared bound of 15" failure [`fanout_key`] exists to prevent, and
+/// it would be a permissiveness leak in an otherwise restrictive-only change.
+/// So a floor row keeps the CLASS row's accounting (or none, which is the class
+/// lane at the default bound).
 struct Governing<'a> {
     row: &'a RegistryAgent,
+    bound_row: Option<&'a RegistryAgent>,
     via_floor: bool,
 }
 
@@ -626,13 +657,15 @@ impl<'a> Governing<'a> {
     fn direct(row: &'a RegistryAgent) -> Self {
         Governing {
             row,
+            bound_row: Some(row),
             via_floor: false,
         }
     }
 
-    fn via_floor(row: &'a RegistryAgent) -> Self {
+    fn via_floor(row: &'a RegistryAgent, class_row: Option<&'a RegistryAgent>) -> Self {
         Governing {
             row,
+            bound_row: class_row,
             via_floor: true,
         }
     }
@@ -659,10 +692,17 @@ fn restrictiveness(row: &RegistryAgent) -> u8 {
 /// declares.
 ///
 /// Case-folded to match [`find_governing`]'s loose pass — two spellings of one
-/// agent must not let a disable slip the floor. Picking the maximum (rather
-/// than the first) makes the floor independent of row ordering, so a `block`
-/// recorded under one class cannot be masked by a `warn_proceed` under another
-/// that happens to arrive first.
+/// agent must not let a disable slip the floor.
+///
+/// Picking the maximum (rather than the first) makes the resulting DECISION
+/// independent of row ordering: a `block` recorded under one class cannot be
+/// masked by a `warn_proceed` under another that happens to arrive first. Note
+/// `max_by_key` returns the LAST maximum, so among several disables of EQUAL
+/// restrictiveness the chosen row still depends on order — that is harmless
+/// here because equally-restrictive rows produce the same decision and
+/// disposition, and the fan-out accounting deliberately does not come from this
+/// row (see [`Governing`]). The only order-visible residue is which row's
+/// `spawn_path` is quoted in the reason text.
 fn most_restrictive_disable<'a>(
     rows: &'a [RegistryAgent],
     name: &str,
@@ -784,7 +824,12 @@ fn decide_from_rows(
     stale_for: Option<Duration>,
 ) -> Verdict {
     let who = describe(agent_name, path);
-    let Some(Governing { row, via_floor }) = lookup_row(rows, agent_name, path) else {
+    let Some(Governing {
+        row,
+        bound_row,
+        via_floor,
+    }) = lookup_row(rows, agent_name, path)
+    else {
         let mut v = if path.outlives_request() {
             Verdict::new(
                 SpawnDecision::Deny {
@@ -889,8 +934,9 @@ fn decide_from_rows(
     }
     v.stale_for = stale_for;
     v.policy_required = row.policy_required;
-    v.fanout_bound = row.fanout_bound;
-    v.bound_source = Some(row.agent_name.clone());
+    // Fan-out accounting comes from `bound_row`, not `row` — see [`Governing`].
+    v.fanout_bound = bound_row.and_then(|r| r.fanout_bound);
+    v.bound_source = bound_row.map(|r| r.agent_name.clone());
     v
 }
 
@@ -1170,6 +1216,25 @@ fn redact_url(url: &str) -> String {
 /// booking a spurious transport error against the registry. (It used to carry a
 /// second, heavier duty — guaranteeing the 404 allow-all arm was only reachable
 /// by an AUTHENTICATED 404 — which Phase 4c retired along with that arm.)
+/// Map a non-success registry response to a [`Fetched`].
+///
+/// Split out of [`fetch_effective`] purely so it is TESTABLE without HTTP. It
+/// is the one decision point Phase 4c turned from a special case into a
+/// uniformity, and a comment cannot enforce that: re-adding
+/// `if status == NOT_FOUND { return Fetched::NotDeployed }` inside an `async fn`
+/// that no test can reach would leave the whole suite green. The test
+/// `every_non_success_status_including_404_is_a_plain_error` pins it.
+fn classify_failure(status: reqwest::StatusCode, body: &str, safe_url: &str) -> Fetched {
+    // 404 is deliberately NOT special-cased (Phase 4c): it is a non-success
+    // status like any other and becomes a genuine unresolvable, so a coord that
+    // has lost the route hard-denies standing spawns rather than silently
+    // authorizing every one of them.
+    let excerpt: String = body.chars().take(200).collect();
+    Fetched::Err(format!(
+        "coord returned {status} for GET {safe_url}: {excerpt}"
+    ))
+}
+
 async fn fetch_effective() -> Fetched {
     let base = match crate::mcp::agent_worktrees::coord_http_base() {
         Ok(b) => b,
@@ -1189,16 +1254,9 @@ async fn fetch_effective() -> Fetched {
         Err(e) => return Fetched::Err(format!("GET {safe_url}: {e}")),
     };
     let status = resp.status();
-    // NOTE: 404 is deliberately NOT special-cased any more (Phase 4c). It is a
-    // non-success status like any other and becomes a genuine unresolvable, so
-    // a coord that has lost the route hard-denies standing spawns rather than
-    // silently authorizing every one of them.
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        let excerpt: String = body.chars().take(200).collect();
-        return Fetched::Err(format!(
-            "coord returned {status} for GET {safe_url}: {excerpt}"
-        ));
+        return classify_failure(status, &body, &safe_url);
     }
     match resp.json::<EffectiveRegistry>().await {
         Ok(reg) => Fetched::Ok(reg.agents),
@@ -1785,8 +1843,8 @@ mod tests {
     // -- the decision matrix ------------------------------------------------
 
     /// Every (row state × disposition) cell of the resolved half of the matrix,
-    /// across all three spawn classes. Cold/stale/not-deployed/unpaired
-    /// resolutions have their own tests below.
+    /// across all three spawn classes. Cold/stale/unpaired resolutions have
+    /// their own tests below.
     #[test]
     fn decision_matrix_resolved() {
         struct Case {
@@ -2060,11 +2118,17 @@ mod tests {
         assert_eq!(v.rule, "registry-row-disabled-disposition");
     }
 
-    /// `(agent_name, spawn_path)` is the registry's natural key, so ONE agent
-    /// legitimately has one row PER CLASS. The class fence must select the
-    /// agent's correctly-classed row, not reject the first one it happens to
-    /// find and fall through to the class default — that would silently deny
-    /// the exact standing opt-in the user recorded.
+    /// The class fence must SELECT the agent's correctly-classed row, not
+    /// reject the first one it happens to find and fall through to the class
+    /// default — that would silently deny the exact standing opt-in the user
+    /// recorded.
+    ///
+    /// Note coord's live key is `(tenant_id, agent_name)`, so today one agent
+    /// has exactly ONE row and the multi-row cases below cannot arise from
+    /// coord. They are kept deliberately: the runner must not depend on that
+    /// key, and if the registry ever grows a per-class key these are the
+    /// semantics it must have. (`lookup_row`'s disable floor exists precisely
+    /// because the key is currently per-agent — see its docs.)
     #[test]
     fn one_agent_with_a_row_per_class_resolves_each_class_to_its_own_row() {
         // Deliberately ordered so the NON-matching row is found first.
@@ -2226,6 +2290,102 @@ mod tests {
             );
             assert_eq!(v.decision.label(), "deny", "order {order}");
         }
+    }
+
+    /// PHASE 4c, the mapping itself: EVERY non-success status, 404 included,
+    /// becomes a plain `Fetched::Err`.
+    ///
+    /// This is the test that actually holds the sunset in place. Re-adding
+    /// `if status == NOT_FOUND { return Fetched::NotDeployed }` is a one-line
+    /// change inside an `async fn` no other test can reach, so without this the
+    /// whole suite would stay green while the allow-all arm came back.
+    #[test]
+    fn every_non_success_status_including_404_is_a_plain_error() {
+        use reqwest::StatusCode;
+        for status in [
+            StatusCode::NOT_FOUND,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+        ] {
+            let f = classify_failure(status, "body", "https://coord.example/x");
+            let Fetched::Err(msg) = f else {
+                panic!("{status} must map to Fetched::Err, not a bespoke posture");
+            };
+            assert!(msg.contains(status.as_str()), "reason names the status: {msg}");
+        }
+    }
+
+    /// The floor must not hand fan-out accounting to the row it selected: a
+    /// floor row is a statement about the AGENT, not about fan-out. Letting it
+    /// supply `bound_source` would move the spawn onto a per-agent lane and
+    /// hand it the default bound instead of the class row's declared one —
+    /// a permissiveness leak in an otherwise restrictive-only change.
+    #[test]
+    fn the_floor_never_supplies_the_fanout_bound() {
+        let rows = vec![
+            RegistryAgent {
+                disposition: Some("warn_proceed".to_string()),
+                fanout_bound: Some(99),
+                ..row_for("worker", "in_session_subagent", false)
+            },
+            RegistryAgent {
+                fanout_bound: Some(3),
+                ..row_for("parallel_fanout", "parallel_fanout", true)
+            },
+        ];
+        let v = decide(
+            Resolution::Fresh(&rows),
+            Some("worker"),
+            SpawnPath::ParallelFanout,
+        );
+        // The disable still governs the DECISION...
+        assert_eq!(v.decision.label(), "warn_proceed");
+        assert_eq!(v.rule, "registry-row-disabled-other-class-floor");
+        // ... but the CLASS row supplies the bound and keys the lane.
+        assert_eq!(v.fanout_bound, Some(3), "must not inherit the floor row's 99");
+        assert_eq!(v.bound_source.as_deref(), Some("parallel_fanout"));
+
+        // With no class row at all, accounting falls to the class lane at the
+        // default bound rather than minting a per-agent lane.
+        let rows = vec![RegistryAgent {
+            disposition: Some("warn_proceed".to_string()),
+            fanout_bound: Some(99),
+            ..row_for("worker", "in_session_subagent", false)
+        }];
+        let v = decide(
+            Resolution::Fresh(&rows),
+            Some("worker"),
+            SpawnPath::ParallelFanout,
+        );
+        assert_eq!(v.fanout_bound, None);
+        assert_eq!(v.bound_source, None);
+        assert_eq!(fanout_key(v.bound_source.as_deref()), "parallel_fanout");
+    }
+
+    /// The floor also outranks the permissive `no-row-legacy-default-allow`
+    /// arm, not just an enabled class row — that arm is exactly the kind of
+    /// default a recorded disable must beat.
+    #[test]
+    fn the_floor_outranks_the_legacy_no_row_allow() {
+        let rows = vec![RegistryAgent {
+            disposition: Some("block".to_string()),
+            ..row_for("merge-train-steward", "standing_continuation", false)
+        }];
+        // No row governs the in-session class, and no in_session_subagent class
+        // row exists, so the old code took `no-row-legacy-default-allow`.
+        let v = decide(
+            Resolution::Fresh(&rows),
+            Some("merge-train-steward"),
+            SpawnPath::InSessionSubagent,
+        );
+        assert_eq!(
+            v.decision.label(),
+            "deny",
+            "a recorded disable must beat the legacy no-row allow"
+        );
+        assert_eq!(v.rule, "registry-row-disabled-other-class-floor");
     }
 
     /// The floor must not regress the two properties `lookup_row`'s doc comment
