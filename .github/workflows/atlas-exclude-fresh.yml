@@ -377,14 +377,57 @@ jobs:
           # the branch tip out from under an in-flight proposal is a known wedge
           # class in this fleet. Leave it strictly alone and say so; the nightly
           # after it lands refreshes normally against the new main.
-          existing="$(gh pr list --repo "$REPO" --head "$BRANCH" --base main --state open \
-            --json number,isDraft --jq '.[0] | select(.) | "\(.number) \(.isDraft)"' || true)"
-          existing_num="${existing%% *}"
-          existing_draft="${existing##* }"
-          if [ -n "$existing_num" ] && [ "$existing_draft" != "true" ]; then
-            echo "::warning::Refresh PR #$existing_num is marked ready for review (possible merge-train candidate)."
-            echo "::warning::Not force-pushing '$BRANCH' under it. The next run after it lands will refresh against the new main."
-            exit 0
+          # NO `|| true` here. An error suppressed into an empty value reads as a
+          # confident "there is no PR" and silently skips the ready-guard below,
+          # letting a transient gh 403 force-push under a live merge-train
+          # candidate -- the exact wedge this guard exists to prevent. `set -e`
+          # failing loud is the right posture for a step about to force-push.
+          # (`// empty` already covers the genuinely-absent case: jq exits 0 and
+          # emits nothing on an empty array.)
+          existing_num="$(gh pr list --repo "$REPO" --head "$BRANCH" --base main --state open \
+            --json number --jq '.[0].number // empty')"
+
+          if [ -n "$existing_num" ]; then
+            # Queried separately rather than parsed out of a "<num> <bool>"
+            # string: that parse depends on gh emitting raw scalars, and if it
+            # ever quoted them every draft PR would read as ready and this step
+            # would become a permanent SILENT no-op -- the failure class this
+            # whole change exists to remove.
+            existing_draft="$(gh pr view "$existing_num" --repo "$REPO" --json isDraft --jq '.isDraft')"
+            if [ "$existing_draft" != "true" ]; then
+              # Ready for review => possibly a live merge-train candidate, so the
+              # branch is left strictly alone. But exiting green with real drift
+              # undelivered is the same void this change exists to close (and
+              # would contradict the create-failure path below), and a PR can sit
+              # marked-ready in the train for days. So deliver it as a comment on
+              # the PR the human is already watching -- keyed on a hash of the
+              # drift block, so a PR that sits there does not collect an
+              # identical comment every night.
+              echo "::warning::Refresh PR #$existing_num is marked ready for review (possible merge-train candidate)."
+              echo "::warning::Not force-pushing '$BRANCH' under it. The next run after it lands will refresh against the new main."
+              drift_sha="$(sha256sum "$RUNNER_TEMP/exclude.drift.txt" | cut -c1-16)"
+              # Materialize the comments before grepping instead of piping into
+              # `grep -q`: grep exits early on a match, which SIGPIPEs gh, and
+              # under `pipefail` that turns a successful dedup HIT into a
+              # non-zero pipeline -- i.e. the dedup would fail open and comment
+              # again every night, the exact spam it exists to prevent.
+              gh pr view "$existing_num" --repo "$REPO" --json comments \
+                --jq '.comments[].body' > "$RUNNER_TEMP/pr-comments.txt"
+              if grep -qF "atlas-drift:$drift_sha" "$RUNNER_TEMP/pr-comments.txt"; then
+                echo "Drift unchanged since the last comment on #$existing_num; not commenting again."
+              else
+                {
+                  printf 'Further drift was detected after this PR was marked ready for review, so `%s` was **not** force-pushed — it may be a live merge-train candidate.\n\n' "$BRANCH"
+                  printf 'Run: %s\n\n' "$RUN_URL"
+                  printf 'Once this PR lands, the next scheduled run refreshes against the new `main`.\n\n```\n'
+                  cat "$RUNNER_TEMP/exclude.drift.txt"
+                  printf '```\n\n<!-- atlas-drift:%s -->\n' "$drift_sha"
+                } > "$RUNNER_TEMP/pr-comment.md"
+                gh pr comment "$existing_num" --repo "$REPO" --body-file "$RUNNER_TEMP/pr-comment.md"
+                echo "Commented the new drift on #$existing_num."
+              fi
+              exit 0
+            fi
           fi
 
           # Rebuild the branch from THIS run's triggering commit every time, so
@@ -475,9 +518,11 @@ jobs:
             # previous PR was closed -- turning "one PR" into one per night.
             # Reopen the maintainer's PR instead. mergedAt is the discriminator:
             # gh reports state CLOSED for merged PRs too, and a merged one must
-            # never be reopened.
+            # never be reopened. `first`, not `last`: gh returns newest-first, so
+            # `last` would reopen the OLDEST closed PR. No `|| true`, same reason
+            # as the open-PR lookup above.
             existing_num="$(gh pr list --repo "$REPO" --head "$BRANCH" --base main --state closed \
-              --json number,mergedAt --jq 'map(select(.mergedAt == null)) | last | .number // empty' || true)"
+              --json number,mergedAt --jq 'map(select(.mergedAt == null)) | first | .number // empty')"
             if [ -n "$existing_num" ]; then
               echo "Reopening previously closed refresh PR #$existing_num."
               gh pr reopen "$existing_num" --repo "$REPO"
