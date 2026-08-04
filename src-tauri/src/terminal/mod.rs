@@ -15,6 +15,7 @@ pub mod grid;
 pub mod interceptor;
 pub mod manager;
 pub mod output_scan;
+mod scan_gate;
 pub mod session;
 pub mod transcript;
 pub mod transcript_watcher;

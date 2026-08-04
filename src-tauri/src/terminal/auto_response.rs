@@ -150,6 +150,12 @@ fn rules_active() -> bool {
 /// [`scheduler::STATE`]). Outer key: terminal id; inner: rule id -> matching.
 static GRID_EDGE: Mutex<Option<HashMap<String, HashMap<String, bool>>>> = Mutex::new(None);
 
+/// Per-terminal output-byte watermarks so a tick skips sessions whose rendered
+/// screen cannot have changed since the previous pass (see
+/// [`super::scan_gate`]). Option-wrapped for const initialization, exactly like
+/// [`GRID_EDGE`], and pruned to the live set alongside it.
+static SCAN_GATE: Mutex<Option<super::scan_gate::ScanGate>> = Mutex::new(None);
+
 /// Pure edge-detection core: given a terminal's normalized screen text, the
 /// compiled rules, and that terminal's prior per-rule match flags, return the
 /// indices of rules that just transitioned no-match -> match (rising edges),
@@ -198,7 +204,16 @@ pub fn scan_grids_once() {
         };
         let mut edge = GRID_EDGE.lock().unwrap_or_else(|e| e.into_inner());
         let map = edge.get_or_insert_with(HashMap::new);
+        let mut gate_guard = SCAN_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        let gate = gate_guard.get_or_insert_with(super::scan_gate::ScanGate::new);
         for (tid, session) in &sessions {
+            // Skip sessions that produced no output since the last pass: their
+            // grid text is identical, so `collect_rising_edges` would compute
+            // the same per-rule flags and find no rising edge. One relaxed
+            // atomic load instead of a grid lock + full screen render.
+            if !gate.should_scan(tid, session.total_bytes_produced()) {
+                continue;
+            }
             // Read the *rendered* screen text (rows joined by `\n`) — the grid
             // is the VT-parsed cell buffer, so this is immune to the
             // synchronized-output frame batching that hides text from a raw
@@ -224,7 +239,8 @@ pub fn scan_grids_once() {
         // Drop edge state for terminals that have gone away.
         let live: std::collections::HashSet<&String> = sessions.iter().map(|(t, _)| t).collect();
         map.retain(|tid, _| live.contains(tid));
-    } // rules + edge locks released
+        gate.retain_live(&live);
+    } // rules + edge + scan-gate locks released
 
     for (tid, rid, action, backoff, context) in to_fire {
         scheduler::on_match(&tid, &rid, &action, &backoff, &context);
@@ -252,6 +268,18 @@ fn scan_interval() -> Duration {
 /// Phase 7) — it rides the SAME rendered-grid cadence instead of adding a
 /// second poll loop, and is a zero-cost early-out while its flag
 /// (`QONTINUI_CONTEXT_HANDOFF`) is dark.
+/// The sweep both grid consumers share, run as ONE blocking unit.
+///
+/// Both scans lock every live session's grid and materialize a full screen
+/// `String`, which is CPU + lock work, not I/O — running it directly inside the
+/// async block parked a tokio worker for the whole sweep on every tick. It now
+/// rides `spawn_blocking` (same shape as `build_drift::run_periodic`), so a
+/// slow sweep can never starve the runtime's worker pool.
+fn scan_once_blocking() {
+    scan_grids_once();
+    super::context_watcher::scan_terminals_once();
+}
+
 pub fn spawn_grid_scan_loop() {
     tauri::async_runtime::spawn(async move {
         let mut ticker = tokio::time::interval(scan_interval());
@@ -259,8 +287,11 @@ pub fn spawn_grid_scan_loop() {
         info!("auto_response: grid-scan loop started");
         loop {
             ticker.tick().await;
-            scan_grids_once();
-            super::context_watcher::scan_terminals_once();
+            // Join errors are non-fatal: a panicked sweep is logged and the
+            // loop keeps ticking (a dead scanner is worse than a skipped tick).
+            if let Err(e) = tokio::task::spawn_blocking(scan_once_blocking).await {
+                warn!(error = %e, "auto_response: grid-scan task panicked");
+            }
         }
     });
 }

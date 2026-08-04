@@ -108,6 +108,12 @@ fn threshold_pct() -> u32 {
 /// `auto_response::GRID_EDGE`). NEVER pruned — see module docs.
 static FIRED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
+/// Per-terminal output-byte watermarks so a tick skips sessions whose rendered
+/// screen cannot have changed since the previous pass (see
+/// [`super::scan_gate`]). Own gate per scanner — see the note on
+/// `usage_limit::SCAN_GATE`.
+static SCAN_GATE: Mutex<Option<super::scan_gate::ScanGate>> = Mutex::new(None);
+
 /// Has this session already fired? (Read-only peek for the decision seam.)
 fn already_fired(key: &str) -> bool {
     let guard = FIRED.lock().unwrap_or_else(|e| e.into_inner());
@@ -230,7 +236,30 @@ pub fn scan_terminals_once() {
     };
     let threshold = threshold_pct();
 
-    for (tid, session) in tm.sessions_snapshot() {
+    let sessions = tm.sessions_snapshot();
+    {
+        // Prune watermarks for terminals that have gone away before the sweep,
+        // so a dead terminal's entry cannot outlive it. The gate lock is
+        // released before any grid work.
+        let live: HashSet<&String> = sessions.iter().map(|(t, _)| t).collect();
+        let mut gate_guard = SCAN_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        gate_guard
+            .get_or_insert_with(super::scan_gate::ScanGate::new)
+            .retain_live(&live);
+    }
+
+    for (tid, session) in sessions {
+        // Skip sessions that produced no output since the last pass: the
+        // rendered screen is byte-identical, so the (pure) context-low
+        // predicate would return exactly what it returned last tick. One
+        // relaxed atomic load instead of a grid lock + full screen render.
+        {
+            let mut gate_guard = SCAN_GATE.lock().unwrap_or_else(|e| e.into_inner());
+            let gate = gate_guard.get_or_insert_with(super::scan_gate::ScanGate::new);
+            if !gate.should_scan(&tid, session.total_bytes_produced()) {
+                continue;
+            }
+        }
         // Rendered screen text (rows joined by `\n`) — same read the
         // auto-response scanner uses; immune to synchronized-output frame
         // batching. `snapshot_context_low` wants per-row lines.
