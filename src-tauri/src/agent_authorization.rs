@@ -2313,7 +2313,10 @@ mod tests {
             let Fetched::Err(msg) = f else {
                 panic!("{status} must map to Fetched::Err, not a bespoke posture");
             };
-            assert!(msg.contains(status.as_str()), "reason names the status: {msg}");
+            assert!(
+                msg.contains(status.as_str()),
+                "reason names the status: {msg}"
+            );
         }
     }
 
@@ -2344,7 +2347,11 @@ mod tests {
         assert_eq!(v.decision.label(), "warn_proceed");
         assert_eq!(v.rule, "registry-row-disabled-other-class-floor");
         // ... but the CLASS row supplies the bound and keys the lane.
-        assert_eq!(v.fanout_bound, Some(3), "must not inherit the floor row's 99");
+        assert_eq!(
+            v.fanout_bound,
+            Some(3),
+            "must not inherit the floor row's 99"
+        );
         assert_eq!(v.bound_source.as_deref(), Some("parallel_fanout"));
 
         // With no class row at all, accounting falls to the class lane at the
