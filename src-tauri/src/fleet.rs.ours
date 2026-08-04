@@ -470,48 +470,6 @@ fn write_last_budget_cache(body: &DeviceBudgetRequest, device_id: &str) {
     }
 }
 
-/// May this runner instance publish the device budget?
-///
-/// `coord.devices` is keyed by the `device_id` in `~/.qontinui/machine.json`,
-/// and every runner on the machine — primary, `test-*`, `named-*` — shares that
-/// one file. Instance *settings* are path-isolated per instance
-/// ([`crate::instance::scope_path`]); device *identity* is not. So a secondary's
-/// budget publish does not describe a second device, it OVERWRITES the row
-/// describing the machine, and coord's `upsert_budget` does
-/// `SET max_concurrent_builds = $8` unconditionally — no COALESCE, no guard.
-///
-/// That is not hypothetical. On 2026-07-28T08:31:18Z a `test-9877` runner,
-/// spawned for a verification job, read `ci_node.enabled` as false in its own
-/// instance settings, published `max_concurrent_builds = 0` over the primary's
-/// row, and exited. Coord's shadow-lane dispatcher requires capacity > 0, so it
-/// elected no device for six days while the primary sat there heartbeating
-/// `healthy`. ~/.qontinui/last_budget.json — also machine-wide, also not
-/// instance-scoped — was overwritten with the same zero, so the operator's
-/// offline lifeline agreed with the wrong value.
-///
-/// [`spawn_budget_republisher`] bounded that damage to one interval, but bounding
-/// is not preventing: a long-lived secondary now RE-publishes its wrong value
-/// every interval, flapping the column against the primary's republisher instead
-/// of clobbering it once. This is the other half of the fix — the source of the
-/// wrong value, which
-/// `qontinui-dev-notes/investigation-results/2026-08-01-merge-train-anomalies-a-e.md`
-/// item A lists as its second fix-surface bullet ("test/verification runners must
-/// not publish the shared machine identity's budget").
-///
-/// Deliberately keyed on [`crate::instance::owns_shared_root_state`] rather than
-/// [`crate::instance::is_secondary`]: `is_secondary` reads only
-/// `QONTINUI_INSTANCE_NAME`, so a secondary the supervisor spawned without that
-/// env var would read as PRIMARY and be allowed to write — the exact fail-open
-/// the ownership helper exists to close. It is the same "may I own shared,
-/// machine-wide state" question the umbrella-root `.mcp.json` writer asks, and
-/// the device row is that kind of state.
-///
-/// Pure so the decision is testable without touching process-global env, which
-/// races the parallel test harness.
-fn budget_publish_allowed(owns_shared_root_state: bool) -> bool {
-    owns_shared_root_state
-}
-
 /// Publish role + budget to `coord.devices` via `POST
 /// /coord/devices/{device_id}/budget`. Best-effort: failures log a
 /// warning and return Ok(()) so they don't break startup.
@@ -526,13 +484,6 @@ fn budget_publish_allowed(owns_shared_root_state: bool) -> bool {
 /// retry + last-budget cache (see module docs) preserve the
 /// runner-bootable-when-coord-down property of the old direct-PG path.
 ///
-<<<<<<< HEAD
-/// Takes no `PgDb`. The pool argument was vestigial from the direct-PG era and
-/// unread since Phase 3 moved the write to coord HTTP; this is the "follow-up
-/// cleanup PR" its doc comment promised. Dropping it also removes the reason
-/// [`spawn_budget_republisher`] needed a separate pool-free entry point — it
-/// runs on the `fleet-heartbeat` thread, which holds no `PgDb`.
-=======
 /// The `_pg` parameter is retained for now — call sites pass the connection
 /// pool from `main.rs::run_app()`. Once coord HTTP is universally available
 /// the parameter can be removed in a follow-up cleanup PR.
@@ -601,30 +552,19 @@ pub(crate) fn may_publish_machine_state(reason: &str) -> bool {
 }
 
 /// [`publish_budget`] without the vestigial pool argument.
->>>>>>> dd58db38 (fix(fleet): only the primary instance writes machine-scoped coord state)
 ///
-/// **Only the instance that owns shared machine-wide state publishes.** See
-/// [`budget_publish_allowed`] for why a secondary must not.
-pub async fn publish_budget(
+/// Exists because [`spawn_budget_republisher`] runs on the `fleet-heartbeat`
+/// thread, which holds no `PgDb` — and manufacturing one to satisfy a
+/// parameter the function never reads would be worse than this split. The
+/// public signature is left alone so the boot call site stays untouched.
+async fn publish_budget_now(
     role: MachineRole,
     resources: Resources,
     disk_reserved_gb: u64,
 ) -> Result<(), String> {
-<<<<<<< HEAD
-    if !budget_publish_allowed(crate::instance::owns_shared_root_state()) {
-        info!(
-            instance = ?crate::instance::instance_name(),
-            "fleet::publish_budget: this runner is a SECONDARY instance — skipping budget publish \
-             so it cannot clobber the shared device row (see `budget_publish_allowed`)."
-        );
-        return Ok(());
-    }
-
-=======
     if !may_publish_machine_state("budget publish") {
         return Ok(());
     }
->>>>>>> dd58db38 (fix(fleet): only the primary instance writes machine-scoped coord state)
     let device = match load_device_file() {
         Some(d) => d,
         None => {
@@ -716,10 +656,10 @@ pub async fn publish_budget(
 }
 
 /// Convenience: detect + publish in one call with default reservations.
-/// Used from `main.rs::run_app()`.
-pub async fn publish_on_startup(role: MachineRole) {
+/// Used from `main.rs::run_app()` after PG initialization.
+pub async fn publish_on_startup(pg: &Arc<PgDb>, role: MachineRole) {
     let resources = detect_resources();
-    if let Err(e) = publish_budget(role, resources, 0).await {
+    if let Err(e) = publish_budget(pg, role, resources, 0).await {
         warn!("fleet::publish_on_startup failed (non-fatal — runner still boots): {e}");
     }
 }
@@ -757,36 +697,19 @@ fn budget_republish_secs() -> u64 {
 /// no device for the next six days while the primary sat there heartbeating
 /// `healthy`. Nothing recovered it because nothing re-published.
 ///
-<<<<<<< HEAD
-/// A periodic re-assert bounds that damage to one interval. The other half —
-/// stopping a sibling instance from writing the wrong value in the first place —
-/// is [`budget_publish_allowed`], which is also why this is a no-op on a
-/// secondary: re-asserting on a 10-minute timer from an instance that must not
-/// write at all would just flap the column against the primary's republisher.
-=======
 /// A periodic re-assert bounds that damage to one interval. It does NOT stop a
 /// sibling instance from writing the wrong value — that is
 /// [`may_publish_machine_state`]'s job, and this task is gated on it too, so a
 /// secondary never even starts the loop.
->>>>>>> dd58db38 (fix(fleet): only the primary instance writes machine-scoped coord state)
 ///
 /// Runs on the caller's runtime; `main.rs` puts it on the dedicated
 /// `fleet-heartbeat` thread rather than `fleet-publishers`, so the sweep tasks
 /// that block that runtime for minutes at a time (the 2026-06-03 heartbeat
 /// starvation) cannot stall the re-assert either.
 pub fn spawn_budget_republisher(role: MachineRole) {
-<<<<<<< HEAD
-    if !budget_publish_allowed(crate::instance::owns_shared_root_state()) {
-        info!(
-            instance = ?crate::instance::instance_name(),
-            "fleet::budget_republisher: SECONDARY instance — not starting. Only the instance that \
-             owns shared machine-wide state re-asserts the device budget."
-        );
-=======
     // Checked HERE as well as inside `publish_budget_now`, so a secondary holds
     // no timer at all rather than waking every 10 minutes to decline.
     if !may_publish_machine_state("budget republisher") {
->>>>>>> dd58db38 (fix(fleet): only the primary instance writes machine-scoped coord state)
         return;
     }
     let secs = budget_republish_secs();
@@ -805,7 +728,7 @@ pub fn spawn_budget_republisher(role: MachineRole) {
             // change while the runner is up (the setting is designed to need
             // no restart — `ci_node/subscription.rs` re-reads it every loop).
             let resources = detect_resources();
-            if let Err(e) = publish_budget(role, resources, 0).await {
+            if let Err(e) = publish_budget_now(role, resources, 0).await {
                 warn!("fleet::budget_republisher: re-publish failed (will retry): {e}");
             }
         }
@@ -815,8 +738,7 @@ pub fn spawn_budget_republisher(role: MachineRole) {
 // =============================================================================
 // HTTP heartbeat to coord (plan 2026-05-18-push-aware-fleet-liveness.md §5).
 //
-// The HTTP `publish_budget` path above covers the budget columns only, and
-// only from the instance that owns shared machine-wide state. To keep
+// The HTTP `publish_budget` path above is a one-shot at boot. To keep
 // `coord.devices.last_seen_at` fresh under coord's new push-aware liveness
 // model, the runner periodically POSTs `{device_id, hostname}` to coord's
 // `/coord/devices/register` endpoint. The handler's UPSERT refreshes
@@ -3641,7 +3563,6 @@ fn execute_build_and_restart(app: &qontinui_types::apps::App, app_id: &str) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_env::{env_lock, EnvVarRestore};
 
     // ---- machine-scoped write guard (secondary instances) ----
 
@@ -3728,17 +3649,9 @@ mod tests {
     /// The cadence knob, including the floor. A misconfigured `0` must not
     /// turn the re-assert into a hot loop hammering coord's budget endpoint —
     /// `tokio::time::interval` with a zero period never yields.
-    ///
-    /// Holds `env_lock` for the whole body and restores via `EnvVarRestore`,
-    /// per the convention in `main.rs::test_env`: this binary's tests run in
-    /// parallel and `std::env` is process-global, so an unsynchronized
-    /// set/read pair is the flake class fixed 2026-07-11. The hand-rolled
-    /// save/restore this replaces also leaked the var on the panic path,
-    /// because an `assert!` failure skipped the restore at the end.
     #[test]
     fn budget_republish_interval_defaults_and_floors() {
-        let _env = env_lock();
-        let _restore = EnvVarRestore::capture(&["COORD_BUDGET_REPUBLISH_SECS"]);
+        let prev = std::env::var("COORD_BUDGET_REPUBLISH_SECS").ok();
 
         std::env::remove_var("COORD_BUDGET_REPUBLISH_SECS");
         assert_eq!(budget_republish_secs(), BUDGET_REPUBLISH_DEFAULT_SECS);
@@ -3755,52 +3668,10 @@ mod tests {
             BUDGET_REPUBLISH_DEFAULT_SECS,
             "garbage must fall back to the default, not to 0"
         );
-    }
 
-    // ---- who may write the shared device row ----
-
-    /// The 2026-07-28 outage in one assertion: a runner that does not own
-    /// shared machine-wide state must not publish the budget, because
-    /// `coord.devices` is keyed by the machine-wide `device_id` every instance
-    /// shares. A secondary's publish is not an insert, it is an overwrite —
-    /// and coord's `upsert_budget` sets `max_concurrent_builds` with no
-    /// COALESCE, so a `test-*` runner that reads `ci_node.enabled` as false in
-    /// its own instance settings zeroes the primary's capacity and un-elects
-    /// the machine from the shadow lane.
-    ///
-    /// Pinned on the pure core rather than through the env, because
-    /// `owns_shared_root_state` reads `QONTINUI_PORT` — which
-    /// `scheduler_service`'s tests mutate on other harness threads.
-    #[test]
-    fn only_the_shared_state_owner_publishes_the_budget() {
-        assert!(
-            budget_publish_allowed(true),
-            "the primary owns the machine's device row and must keep publishing"
-        );
-        assert!(
-            !budget_publish_allowed(false),
-            "a secondary must never write the shared device row — this is the \
-             2026-07-28 six-day shadow-lane outage"
-        );
-    }
-
-    /// The guard must be the SAME predicate the republisher uses, not just the
-    /// boot path. Re-asserting on a timer from an instance that may not write
-    /// would replace a one-shot clobber with a permanent flap: the secondary's
-    /// zero and the primary's real capacity alternating every interval, which
-    /// is strictly harder to diagnose than the original bug.
-    ///
-    /// This pins the coupling that makes that impossible — both entry points
-    /// funnel through `budget_publish_allowed`, so a secondary contributes no
-    /// writes at all rather than half of them.
-    #[test]
-    fn republisher_and_boot_publish_share_one_ownership_predicate() {
-        for owns in [true, false] {
-            assert_eq!(
-                budget_publish_allowed(owns),
-                owns,
-                "both call sites must gate on shared-state ownership alone"
-            );
+        match prev {
+            Some(v) => std::env::set_var("COORD_BUDGET_REPUBLISH_SECS", v),
+            None => std::env::remove_var("COORD_BUDGET_REPUBLISH_SECS"),
         }
     }
 
