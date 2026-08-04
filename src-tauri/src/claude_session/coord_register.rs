@@ -121,8 +121,16 @@ struct Inner {
     /// close/evict and caller-self resolution work without a scan. `forward`
     /// is the inject resolver Phase 1 consumes (a sniffed id simply misses in
     /// `SessionManager.get` — sniffed sessions have no inject transport);
-    /// `reverse` is the lifecycle/heartbeat/self-id path keyed by what
-    /// callers already hold.
+    /// `reverse` is the lifecycle/heartbeat path keyed by what callers
+    /// already hold.
+    ///
+    /// **Both maps are in-process only** — created empty in
+    /// [`AiCoordRegistrar::new`], never rehydrated from the durable lifecycle
+    /// store. A `reverse` hit therefore means "this runner process registered
+    /// this session since boot", which is strictly narrower than "coord knows
+    /// this session". Caller self-identification deliberately does NOT gate on
+    /// it for that reason (it dropped 678 of 678 resolutions); see
+    /// [`Self::session_id_for`].
     forward: Mutex<HashMap<Uuid, String>>,
     reverse: Mutex<HashMap<String, Uuid>>,
     /// Session-identity fabric Phase 1 — lifecycle store the registrar
@@ -183,16 +191,32 @@ impl AiCoordRegistrar {
             .and_then(|g| g.get(session_id).cloned())
     }
 
-    /// R4 — resolve a runner `task_run_id` to its coord `session_id` (the
-    /// durable handle). Consumed by the coord-mcp proxy's caller
-    /// self-identification (session-fabric Phase 0) and the inject-audit /
-    /// observability path.
-    pub fn session_id_for(&self, task_run_id: &str) -> Option<Uuid> {
+    /// R4 — resolve a session key to its coord `session_id` (the durable
+    /// handle). Consumed by the inject-audit / observability path.
+    ///
+    /// **The parameter is the R4/R6 index key — `claude_session_id` — for BOTH
+    /// planes, and the two keyspaces are UNIFIED.** It reads like a bug at the
+    /// pinned-plane call sites, which pass a `task_run_id`; it is not. The
+    /// reverse map is keyed by `claude_session_id` (`register_inner` inserts
+    /// `rev.insert(claude_session_id, …)`), and the runner pins every
+    /// registrar-managed session's CLI session id to its `task_run_id`, so a
+    /// pinned session's `task_run_id` *is* its `claude_session_id`. The sniffed
+    /// plane passes the typed `--resume` id directly. Hence `session_key`, not
+    /// `task_run_id` — the old name described one caller, not the key.
+    ///
+    /// **In-process and non-durable.** `reverse` is constructed empty in
+    /// [`AiCoordRegistrar::new`] and is never rehydrated from the lifecycle
+    /// store, so a hit means "**this runner process** registered this session
+    /// **since boot**", NOT "this session is known to coord". Anything that
+    /// needs the latter must consult a durable source — which is why the
+    /// caller-self-identification path no longer uses this as a
+    /// registered-ness filter (see `mcp_api::select_lifecycle_caller`).
+    pub fn session_id_for(&self, session_key: &str) -> Option<Uuid> {
         self.inner
             .reverse
             .lock()
             .ok()
-            .and_then(|g| g.get(task_run_id).copied())
+            .and_then(|g| g.get(session_key).copied())
     }
 
     /// R1/R2 — register (or idempotently re-register) an authenticated AI
