@@ -66,9 +66,9 @@ import {
   type RefObject,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { TerminalOutputEvent } from "@qontinui/shared-types/tauri-events";
 import { useWindowAssignments, MAIN_WINDOW_LABEL } from "./WindowAssignmentsContext";
+import { subscribeTerminalOutputStream } from "../terminalEventDemux";
+import { hasRenderConsumer } from "../terminalRenderConsumers";
 
 import { useTerminalManager } from "../useTerminalManager";
 import { useZoneLayout } from "../useZoneLayout";
@@ -483,12 +483,15 @@ const PageSessionScope = memo(function PageSessionScope({
   // `activityData`, …) used to be fed ONLY by `onOutput` callbacks fired from
   // MOUNTED `TerminalInstance` components. Phase 3 unmounts offscreen instances
   // to virtualize large grids — which would make those sessions state-blind.
-  // This single always-mounted listener decouples tracking from instance mount
+  // This single always-mounted subscriber decouples tracking from instance mount
   // state: it taps `terminal-output` once per page-scope and feeds
   // `stateTracking.handleOutput` for every one of THIS page's tabs regardless of
-  // which instances are currently rendered. `TerminalInstance` keeps its OWN
-  // `terminal-output` listener for the xterm write path; only the *tracking*
-  // feed moved here (the `onOutput`→`handleOutput` wiring in `ZoneGrid` is gone).
+  // which instances are currently rendered — and, since Phase 2 of the
+  // many-sessions plan, regardless of whether a mounted pane is visible. Only
+  // the *tracking* feed lives here (the `onOutput`→`handleOutput` wiring in
+  // `ZoneGrid` is gone); `TerminalInstance` owns the xterm write path via a
+  // per-terminal handler on the same demuxed listener (`terminalEventDemux`),
+  // NOT a second `listen()` of its own.
   //
   // Placed at the per-`PageSessionScope` level (not once at the provider root):
   // each scope already owns exactly one page's tab roster AND that page's
@@ -526,18 +529,18 @@ const PageSessionScope = memo(function PageSessionScope({
   useEffect(() => {
     const coalescer = coalescerRef.current;
     let rafHandle: ReturnType<typeof requestAnimationFrame> | null = null;
-    let unlisten: UnlistenFn | null = null;
-    let disposed = false;
-    // Proxy-ack accumulator for tabs with NO mounted TerminalInstance
-    // (virtualized-offscreen or non-active page). The backend gates webview
-    // emission on acked bytes (see session.rs EmissionGate); without a
-    // mounted pane nobody render-acks, emission for the tab would stop at
-    // the high watermark, and THIS tap — the consumer that keeps session-
-    // state tracking mount-independent — would go blind. The tap is a real
-    // consumer, so it acks the bytes it consumed, but ONLY while no
-    // instance is mounted for the tab (a mounted instance's render-based
-    // acks must not be double-counted). Acks batch per rAF flush so the
-    // invoke rate is one call per tab per frame at most.
+    // Proxy-ack accumulator for tabs NOTHING is rendering — no mounted
+    // TerminalInstance (virtualized-offscreen or non-active page) or a
+    // mounted-but-HIDDEN one, which stops writing to xterm and stops its ack
+    // timer under the Phase-2 visibility tier. The backend gates webview
+    // emission on acked bytes (see session.rs EmissionGate); with nobody
+    // render-acking, emission for the tab would stop at the high watermark,
+    // and THIS tap — the consumer that keeps session-state tracking
+    // mount-independent — would go blind. The tap is a real consumer, so it
+    // acks the bytes it consumed, but ONLY while no pane is rendering the tab
+    // (a rendering pane's render-based acks must not be double-counted); see
+    // `terminalRenderConsumers.ts`. Acks batch per rAF flush so the invoke
+    // rate is one call per tab per frame at most.
     const pendingAcks = new Map<string, number>();
 
     // rAF suspends in occluded/minimized windows (WebView2), which would
@@ -573,37 +576,28 @@ const PageSessionScope = memo(function PageSessionScope({
       timeoutHandle = setTimeout(flush, ACK_FLUSH_FLOOR_MS);
     };
 
-    (async () => {
-      const un = await listen<TerminalOutputEvent>("terminal-output", (event) => {
-        const tid = event.payload.terminalId;
-        // Drop events for tabs this scope doesn't own (another page/window) or
-        // doesn't know about — exactly one scope owns any given terminalId.
-        if (!tabIdSetRef.current.has(tid)) return;
-        const bytes = base64ToBytes(event.payload.data);
-        coalescer.push(tid, bytes);
-        // `.current` on the per-tab ref is non-null exactly while a
-        // TerminalInstance is mounted for the tab (set by its
-        // useImperativeHandle, cleared on unmount).
-        if (bytes.length > 0 && !terminalRefs.current.get(tid)?.current) {
-          pendingAcks.set(tid, (pendingAcks.get(tid) ?? 0) + bytes.length);
-        }
-        scheduleFlush();
-      });
-      if (disposed) {
-        un();
-        return;
+    // Shares the window's ONE `terminal-output` listener with the per-terminal
+    // demux (Phase 2 / A3) instead of installing a second global tap.
+    const unlisten = subscribeTerminalOutputStream((payload) => {
+      const tid = payload.terminalId;
+      // Drop events for tabs this scope doesn't own (another page/window) or
+      // doesn't know about — exactly one scope owns any given terminalId.
+      if (!tabIdSetRef.current.has(tid)) return;
+      const bytes = base64ToBytes(payload.data);
+      coalescer.push(tid, bytes);
+      if (bytes.length > 0 && !hasRenderConsumer(tid)) {
+        pendingAcks.set(tid, (pendingAcks.get(tid) ?? 0) + bytes.length);
       }
-      unlisten = un;
-    })();
+      scheduleFlush();
+    });
 
     return () => {
-      disposed = true;
       if (rafHandle !== null) cancelAnimationFrame(rafHandle);
       if (timeoutHandle !== null) clearTimeout(timeoutHandle);
       // Do NOT flush on teardown: the scope only unmounts when its whole page is
       // removed, so its tracker + tabs are going away too — a trailing sub-frame
       // update would target unmounted state. Just release the listener.
-      unlisten?.();
+      unlisten();
     };
   }, []);
 

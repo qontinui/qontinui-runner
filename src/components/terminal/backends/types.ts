@@ -89,6 +89,15 @@ export interface TerminalBackendOptions {
    *   ghosting investigation. No-op on ghostty (Canvas-only, no WebGL).
    */
   gpuAcceleration?: "auto" | "dom";
+  /**
+   * Stable pane identity (the terminal id). Used as the key of the WebGL
+   * context LRU (`webglContextLru.ts`): browsers cap concurrent GL contexts
+   * at ~8-16 per process while a flow grid keeps ~18-30 panes live, so the
+   * runner evicts the least valuable holder to the Canvas renderer itself
+   * rather than letting the driver kill one at random. Omit to opt a backend
+   * out of the cap; ignored by backends with no WebGL (ghostty is Canvas 2D).
+   */
+  instanceKey?: string;
 }
 
 // ---------------------------------------------------------------------------

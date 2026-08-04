@@ -60,13 +60,13 @@ describe("acquireSingletonListener", () => {
     r3();
   });
 
-  it("dispatches to the LATEST handler without re-subscribing", async () => {
+  it("fans out to EVERY live handler without re-subscribing", async () => {
     const first = vi.fn();
     const release1 = acquireSingletonListener(EVT, first);
     await Promise.resolve();
 
-    const latest = vi.fn();
-    const release2 = acquireSingletonListener(EVT, latest); // adopts latest handler
+    const second = vi.fn();
+    const release2 = acquireSingletonListener(EVT, second);
     await Promise.resolve();
 
     // Still one underlying listener.
@@ -76,11 +76,37 @@ describe("acquireSingletonListener", () => {
     const evt = { payload: { request_id: "x" } };
     listenCalls[0].cb(evt);
 
-    expect(first).not.toHaveBeenCalled();
-    expect(latest).toHaveBeenCalledWith(evt);
+    // Both consumers see it — the single-slot design that dropped `first`
+    // is what made this primitive unusable for `terminal-output`.
+    expect(first).toHaveBeenCalledWith(evt);
+    expect(second).toHaveBeenCalledWith(evt);
 
+    // A released handler stops receiving; the survivor keeps the listener.
     release1();
+    listenCalls[0].cb(evt);
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(second).toHaveBeenCalledTimes(2);
+
     release2();
+  });
+
+  it("isolates a throwing handler from its siblings", async () => {
+    const boom = vi.fn(() => {
+      throw new Error("handler blew up");
+    });
+    const sibling = vi.fn();
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const r1 = acquireSingletonListener(EVT, boom);
+    const r2 = acquireSingletonListener(EVT, sibling);
+    await Promise.resolve();
+
+    expect(() => listenCalls[0].cb({ payload: {} })).not.toThrow();
+    expect(sibling).toHaveBeenCalledTimes(1);
+    expect(consoleError).toHaveBeenCalled();
+
+    consoleError.mockRestore();
+    r1();
+    r2();
   });
 
   it("simulates the StrictMode mount→unmount→remount race without leaking", async () => {

@@ -15,6 +15,7 @@ import type {
   TerminalSearchOptions,
   TerminalSearchResults,
 } from "./types";
+import { acquireWebglSlot, type WebglSlotHandle } from "./webglContextLru";
 
 /**
  * Match-highlight colors for find-in-terminal, aligned with the Tokyo Night
@@ -47,9 +48,19 @@ export class XtermBackend implements ITerminalBackend {
   private gpuRenderer: WebglAddon | CanvasAddon | null = null;
   /** `matchMedia` DPR listener teardown — see `open()`. */
   private dprCleanup: (() => void) | null = null;
+  /**
+   * This pane's WebGL LRU registration, or `null` when it holds no context
+   * (DOM renderer, Canvas fallback, evicted, or no instance key supplied).
+   * See `webglContextLru.ts` — browsers cap concurrent GL contexts well below
+   * the number of panes a busy flow grid keeps live.
+   */
+  private webglSlot: WebglSlotHandle | null = null;
+  /** Pane identity used as the LRU key (the terminal id). */
+  private readonly instanceKey: string | null;
 
   constructor(options: TerminalBackendOptions = {}) {
     this.gpuAcceleration = options.gpuAcceleration ?? "auto";
+    this.instanceKey = options.instanceKey ?? null;
     this.term = new Terminal({
       fontSize: options.fontSize,
       fontFamily: options.fontFamily,
@@ -108,28 +119,20 @@ export class XtermBackend implements ITerminalBackend {
         const webgl = new WebglAddon();
         webgl.onContextLoss(() => {
           console.warn("[XtermBackend] WebGL context lost, falling back to Canvas");
-          webgl.dispose();
-          this.gpuRenderer = null;
-          // Fall back to canvas renderer on context loss
-          try {
-            const canvas = new CanvasAddon();
-            this.term.loadAddon(canvas);
-            this.gpuRenderer = canvas;
-          } catch {
-            // DOM renderer is the final fallback — already active
-          }
+          this.loadCanvasRenderer(webgl);
         });
         this.term.loadAddon(webgl);
         this.gpuRenderer = webgl;
+        // Claim an LRU slot AFTER the context exists, so a failed WebGL init
+        // never evicts a healthy pane. Claiming may downgrade the least
+        // valuable holder — the browser would otherwise kill one of ours at
+        // random, mid-frame.
+        if (this.instanceKey) {
+          this.webglSlot = acquireWebglSlot(this.instanceKey, () => this.loadCanvasRenderer(webgl));
+        }
       } catch {
         // WebGL not available, try canvas
-        try {
-          const canvas = new CanvasAddon();
-          this.term.loadAddon(canvas);
-          this.gpuRenderer = canvas;
-        } catch {
-          // DOM renderer is the final fallback — already active
-        }
+        this.loadCanvasRenderer(null);
       }
     }
 
@@ -162,6 +165,58 @@ export class XtermBackend implements ITerminalBackend {
   }
 
   /**
+   * Switch this terminal to the Canvas renderer, disposing the WebGL addon
+   * (and releasing its GL context) when one is active. Shared by all three
+   * downgrade triggers: a real driver context loss, an LRU eviction, and a
+   * WebGL construction failure. Canvas failing leaves the DOM renderer, which
+   * is always already active underneath.
+   *
+   * Idempotent: an eviction and a driver context loss can both fire for the
+   * same addon, and the second one must not stack a second CanvasAddon on top.
+   */
+  private loadCanvasRenderer(webgl: WebglAddon | null): void {
+    if (webgl) {
+      if (this.gpuRenderer !== webgl) return; // already downgraded
+      // `WebglAddon.dispose()` drops the canvas but never calls
+      // `WEBGL_lose_context.loseContext()`, so the GL context lives until the
+      // canvas is garbage-collected — which browsers do lazily, exactly when
+      // the cap matters most. Force the release so the LRU is a real cap and
+      // not an advisory one.
+      const canvases = this.container ? Array.from(this.container.querySelectorAll("canvas")) : [];
+      webgl.dispose();
+      for (const el of canvases) {
+        try {
+          const gl = (el.getContext("webgl2") ?? el.getContext("webgl")) as {
+            getExtension(name: string): { loseContext(): void } | null;
+          } | null;
+          gl?.getExtension("WEBGL_lose_context")?.loseContext();
+        } catch {
+          // Not a GL canvas (the 2D fallback layer), or the context is gone.
+        }
+      }
+      // The slot is gone either way: on eviction the LRU already dropped it,
+      // and on a driver context loss keeping it would hold a phantom context.
+      this.webglSlot?.release();
+      this.webglSlot = null;
+    } else if (this.gpuRenderer) {
+      // Re-entering from a non-WebGL path: don't leak the previous renderer.
+      try {
+        this.gpuRenderer.dispose();
+      } catch {
+        // Already torn down.
+      }
+    }
+    this.gpuRenderer = null;
+    try {
+      const canvas = new CanvasAddon();
+      this.term.loadAddon(canvas);
+      this.gpuRenderer = canvas;
+    } catch {
+      // DOM renderer is the final fallback — already active
+    }
+  }
+
+  /**
    * Clear the active GPU renderer's glyph texture atlas. No-op on the DOM
    * renderer (`gpuRenderer === null`). Called on DPR / font-size / theme
    * changes — each invalidates cached glyphs and a stale atlas ghosts.
@@ -173,6 +228,8 @@ export class XtermBackend implements ITerminalBackend {
   dispose(): void {
     this.dprCleanup?.();
     this.dprCleanup = null;
+    this.webglSlot?.release();
+    this.webglSlot = null;
     this.gpuRenderer = null;
     this.term.dispose();
   }
