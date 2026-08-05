@@ -46,8 +46,32 @@ fn write_zsh_zdotdir(content: &str) -> Option<std::path::PathBuf> {
     Some(dir)
 }
 
-/// Maximum scrollback buffer capacity (1 MB).
-const SCROLLBACK_CAPACITY: usize = 1_048_576;
+/// Default maximum scrollback buffer capacity (1 MB).
+///
+/// Since Phase 8 of `plans/2026-07-28-runner-many-sessions-performance.md`
+/// this is the *default* of `settings.performance.scrollback_capacity_bytes`
+/// rather than a hard constant — [`resolved_scrollback_capacity`] reads the
+/// setting (floored at [`crate::settings::MIN_SCROLLBACK_CAPACITY`]) once per
+/// spawn and the reader thread carries the resolved value.
+///
+/// It stays here, and `settings::default_scrollback_capacity_bytes` returns
+/// **this** constant, so the ring's historical size has exactly one
+/// definition: a settings.json with no `performance` key resolves back to the
+/// same 1 MiB the reader always used.
+pub(crate) const SCROLLBACK_CAPACITY: usize = 1_048_576;
+
+/// The scrollback ring capacity this process should give a session spawned
+/// now: the operator's setting with the floor applied.
+///
+/// Read once per spawn from the process-cached performance snapshot (no
+/// settings-file I/O on the spawn path — that is root cause B5 of the same
+/// plan), so a saved change applies to the next terminal and existing rings
+/// keep the size they were allocated with. That is deliberate: resizing a
+/// live ring would either drop replayable history or silently reallocate a
+/// megabyte per open session.
+fn resolved_scrollback_capacity() -> usize {
+    crate::settings::get_performance_settings().effective_scrollback_capacity()
+}
 
 /// Append a chunk of processed PTY output to a session's scrollback ring
 /// buffer and bump its monotonic byte counter — the exact teeing step the
@@ -71,21 +95,27 @@ const SCROLLBACK_CAPACITY: usize = 1_048_576;
 /// pair — [`TerminalSession::get_scrollback_buffer`] relies on this to
 /// compute an exact `end_offset` (off-by-one-chunk here would make the
 /// frontend double-write or drop a chunk at the replay boundary).
+///
+/// `capacity` is the session's ring size, resolved once at spawn from
+/// [`resolved_scrollback_capacity`] and carried by the reader thread — passed
+/// in rather than re-read here so the per-chunk hot path never touches
+/// settings state.
 fn tee_into_scrollback(
     scrollback: &Arc<Mutex<VecDeque<u8>>>,
     total_produced: &Arc<AtomicU64>,
     data: &[u8],
+    capacity: usize,
 ) -> u64 {
     if let Ok(mut sb) = scrollback.lock() {
         // Slice append, not byte-by-byte: `extend` copies the run in one go and
         // a single up-front `drain` makes room, instead of a bounds check +
         // `pop_front` per byte on every chunk of every session.
-        if data.len() >= SCROLLBACK_CAPACITY {
+        if data.len() >= capacity {
             // The chunk alone overflows the ring — keep only its tail.
             sb.clear();
-            sb.extend(&data[data.len() - SCROLLBACK_CAPACITY..]);
+            sb.extend(&data[data.len() - capacity..]);
         } else {
-            let overflow = (sb.len() + data.len()).saturating_sub(SCROLLBACK_CAPACITY);
+            let overflow = (sb.len() + data.len()).saturating_sub(capacity);
             if overflow > 0 {
                 sb.drain(..overflow);
             }
@@ -715,7 +745,12 @@ impl TerminalSession {
         let bytes_sent = Arc::new(AtomicU64::new(0));
         let bytes_acked = Arc::new(AtomicU64::new(0));
         let emission_skipped = Arc::new(AtomicBool::new(false));
-        let scrollback_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(SCROLLBACK_CAPACITY)));
+        // Operator-tunable ring size (Phase 8). Resolved ONCE here, then
+        // carried by the reader thread — the ring is allocated to it and the
+        // per-chunk tee is bounded by it, so both halves agree for this
+        // session's whole life even if the setting changes underneath.
+        let scrollback_capacity = resolved_scrollback_capacity();
+        let scrollback_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(scrollback_capacity)));
         let total_bytes_produced = Arc::new(AtomicU64::new(0));
         let grid_generation = Arc::new(AtomicU64::new(0));
         let grid = Arc::new(Mutex::new(Grid::new(cols, rows)));
@@ -894,7 +929,12 @@ impl TerminalSession {
                             // returned start offset is stamped onto the
                             // event below for replay dedup.
                             let chunk_offset =
-                                tee_into_scrollback(&reader_scrollback, &reader_total_bytes, &data);
+                                tee_into_scrollback(
+                                    &reader_scrollback,
+                                    &reader_total_bytes,
+                                    &data,
+                                    scrollback_capacity,
+                                );
 
                             // Tee through the VT parser into the per-session cell grid.
                             // Detect the first OSC 0/2 title transition by
@@ -2853,7 +2893,7 @@ mod tests {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        tee_into_scrollback(&scrollback, &total, &buf[..n]);
+                        tee_into_scrollback(&scrollback, &total, &buf[..n], SCROLLBACK_CAPACITY);
                     }
                 }
             }
@@ -2951,6 +2991,102 @@ mod tests {
             buf_a, buf_b,
             "two terminals returned byte-identical scrollback buffers"
         );
+    }
+
+    // ── Configurable scrollback ring (many-sessions plan Phase 8) ────────
+
+    /// The stock capacity is the historical 1 MiB: with no `performance`
+    /// key in settings.json, the ring behaves exactly as it always did.
+    #[test]
+    fn default_scrollback_capacity_is_the_historical_1mib() {
+        assert_eq!(
+            crate::settings::PerformanceSettings::default().effective_scrollback_capacity(),
+            SCROLLBACK_CAPACITY
+        );
+    }
+
+    /// The value a spawn will actually allocate follows the setting, with the
+    /// floor applied. Without this, `spawn` could be reverted to the bare
+    /// constant and the rest of the ring tests would stay green.
+    #[test]
+    fn resolved_capacity_follows_the_setting() {
+        let _guard = crate::settings::perf_test_lock();
+        crate::settings::set_performance_cache(crate::settings::PerformanceSettings::default());
+        assert_eq!(resolved_scrollback_capacity(), SCROLLBACK_CAPACITY);
+
+        crate::settings::set_performance_cache(crate::settings::PerformanceSettings {
+            scrollback_capacity_bytes: 4 * 1024 * 1024,
+            ..crate::settings::PerformanceSettings::default()
+        });
+        assert_eq!(resolved_scrollback_capacity(), 4 * 1024 * 1024);
+
+        // Under the floor the SPAWN value is clamped, not the stored one.
+        crate::settings::set_performance_cache(crate::settings::PerformanceSettings {
+            scrollback_capacity_bytes: 1,
+            ..crate::settings::PerformanceSettings::default()
+        });
+        assert_eq!(
+            resolved_scrollback_capacity(),
+            crate::settings::MIN_SCROLLBACK_CAPACITY
+        );
+
+        crate::settings::set_performance_cache(crate::settings::PerformanceSettings::default());
+    }
+
+    /// The ring honors the capacity it was given: it keeps the newest
+    /// `capacity` bytes and drops the oldest, while the monotonic byte
+    /// counter still reports everything that was produced. (The counter is
+    /// the offset the frontend dedups a replay against, so a smaller ring
+    /// must NOT make it lie.)
+    #[test]
+    fn tee_honors_a_configured_capacity() {
+        let ring = Arc::new(Mutex::new(VecDeque::<u8>::new()));
+        let total = Arc::new(AtomicU64::new(0));
+
+        // 100 bytes into a 16-byte ring.
+        let data: Vec<u8> = (0u8..100).collect();
+        let start = tee_into_scrollback(&ring, &total, &data, 16);
+
+        assert_eq!(start, 0, "first chunk starts at offset 0");
+        assert_eq!(
+            total.load(Ordering::Relaxed),
+            100,
+            "the counter counts produced bytes, not retained ones"
+        );
+        let retained: Vec<u8> = ring.lock().unwrap().iter().copied().collect();
+        assert_eq!(retained.len(), 16, "ring is bounded by the given capacity");
+        assert_eq!(
+            retained,
+            (84u8..100).collect::<Vec<u8>>(),
+            "the ring keeps the NEWEST bytes"
+        );
+    }
+
+    /// A larger configured capacity retains more — the knob moves in both
+    /// directions, and under the cap nothing is dropped at all.
+    #[test]
+    fn tee_retains_everything_under_the_configured_capacity() {
+        let ring = Arc::new(Mutex::new(VecDeque::<u8>::new()));
+        let total = Arc::new(AtomicU64::new(0));
+        let data: Vec<u8> = (0u8..100).collect();
+
+        tee_into_scrollback(&ring, &total, &data, 4096);
+
+        let retained: Vec<u8> = ring.lock().unwrap().iter().copied().collect();
+        assert_eq!(retained, data, "nothing evicted below the capacity");
+    }
+
+    /// Successive chunks return their absolute start offsets regardless of
+    /// ring size — the replay-dedup contract survives a small ring.
+    #[test]
+    fn tee_start_offsets_are_absolute_under_a_small_ring() {
+        let ring = Arc::new(Mutex::new(VecDeque::<u8>::new()));
+        let total = Arc::new(AtomicU64::new(0));
+
+        assert_eq!(tee_into_scrollback(&ring, &total, &[1, 2, 3, 4], 4), 0);
+        assert_eq!(tee_into_scrollback(&ring, &total, &[5, 6], 4), 4);
+        assert_eq!(tee_into_scrollback(&ring, &total, &[7], 4), 6);
+        assert_eq!(total.load(Ordering::Relaxed), 7);
     }
 
     // ── EmissionGate hysteresis (webview emission backpressure) ──────────

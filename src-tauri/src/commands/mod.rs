@@ -214,6 +214,7 @@ pub mod orchestration_loop_configs; // Orchestration loop saved config CRUD
 pub mod otel_settings; // OpenTelemetry settings (endpoint, sampling, enable/disable)
 pub mod page_spec_store; // User-saved page specs (persist generated specs to app data dir)
 pub mod performance_metrics; // Performance metrics dashboard
+pub mod performance_settings; // Operator-tunable performance caps (many-sessions plan Phase 8)
 pub mod playwright_settings;
 pub mod productivity; // Phase 1 productivity stack: plans/tasks/upcoming-claims
 pub mod project_logs;

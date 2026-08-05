@@ -2304,6 +2304,12 @@ pub struct Settings {
     /// existing settings.json loads as false.
     #[serde(default)]
     pub memory_link_expansion_enabled: bool,
+    /// Performance caps and tiering knobs (plan
+    /// `2026-07-28-runner-many-sessions-performance` Phase 8). Every field
+    /// defaults to the value that was hardcoded before the phase, so a
+    /// settings.json without the key behaves exactly as it did.
+    #[serde(default)]
+    pub performance: PerformanceSettings,
 }
 
 fn default_session_metadata_sync_enabled() -> bool {
@@ -2327,6 +2333,142 @@ impl Default for Settings {
     fn default() -> Self {
         serde_json::from_str("{}")
             .expect("Settings must deserialize from an empty JSON object — every field needs a serde default")
+    }
+}
+
+// ============================================================================
+// Performance Settings (plan 2026-07-28-runner-many-sessions-performance §8)
+// ============================================================================
+
+/// Operator-tunable caps for the many-sessions performance work.
+///
+/// Phase 8 of `plans/2026-07-28-runner-many-sessions-performance.md` — the
+/// "safety rail". Every knob here was a hardcoded constant before this
+/// struct existed, and **every default reproduces that constant exactly**,
+/// so a `settings.json` written before this key existed loads and behaves
+/// identically. Nothing in here can refuse work: the session knob is a
+/// display threshold for an advisory banner, deliberately never a cap (plan
+/// §5 rejects a hard session cap as a capability regression).
+///
+/// Read through [`get_performance_settings`], which serves a process-cached
+/// snapshot so the terminal-spawn path never pays a settings-file read for
+/// these values. [`save_performance_settings`] refreshes that cache, so a
+/// save is live for the *next* terminal spawn with no restart. The two
+/// grid-scan loops are the exception — they read their interval once when
+/// spawned at startup, so a change there needs a runner restart (the
+/// settings UI says so).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerformanceSettings {
+    /// Maximum terminal panes allowed to hold a WebGL rendering context at
+    /// once, per window. Browsers cap live WebGL contexts at ~8-16 per
+    /// process and silently kill the oldest beyond that; the flow grid can
+    /// keep ~18-30 panes live. Consumed by the frontend's WebGL LRU.
+    #[serde(default = "default_max_webgl_panes")]
+    pub max_webgl_panes: u32,
+    /// Flush cadence (ms) for the `background` emission tier — a pane that
+    /// is mounted but not the one the operator is looking at. Consumed by
+    /// the visibility-tiered emission path.
+    #[serde(default = "default_background_flush_interval_ms")]
+    pub background_flush_interval_ms: u64,
+    /// Flush cadence (ms) for the `unwatched` emission tier — a session with
+    /// no mounted pane at all. `0` (the default) means **no webview emit**:
+    /// output accumulates in the scrollback ring and replays on reveal.
+    /// A positive value emits at that cadence instead. Consumed by the
+    /// visibility-tiered emission path.
+    #[serde(default)]
+    pub unwatched_flush_interval_ms: u64,
+    /// Per-session scrollback ring capacity in bytes. This ring is the
+    /// source of truth that makes visibility-tiered emission lossless, so
+    /// shrinking it trades replay fidelity for memory (plan §5 argues
+    /// against shrinking it; the knob exists for operators who have
+    /// measured otherwise). Clamped to [`MIN_SCROLLBACK_CAPACITY`] at use.
+    #[serde(default = "default_scrollback_capacity_bytes")]
+    pub scrollback_capacity_bytes: usize,
+    /// Cadence (ms) of the two full-fleet grid scanners (auto-response and
+    /// usage-limit detection). Floored at [`MIN_GRID_SCAN_INTERVAL_MS`].
+    /// The per-scanner env vars
+    /// (`QONTINUI_AUTO_RESPONSE_SCAN_INTERVAL_MS`,
+    /// `QONTINUI_USAGE_LIMIT_SCAN_INTERVAL_MS`) still win over this value —
+    /// they remain the higher-precedence escape hatch.
+    #[serde(default = "default_grid_scan_interval_ms")]
+    pub grid_scan_interval_ms: u64,
+    /// Default `Intent::share_output` for terminal sessions mirrored into
+    /// coord. This is a **config/correctness** knob, not a performance one:
+    /// no per-terminal coord output pipe exists (`output_pipe: None` on both
+    /// terminal registration paths), so turning it off changes what the
+    /// intent JSON declares to coord and — via
+    /// [`crate::session::intent::Intent::effective_redact_secrets`] — the
+    /// default for secret redaction. Default `true`, matching the value
+    /// that used to be hardcoded at both terminal create sites.
+    #[serde(default = "default_share_terminal_output")]
+    pub share_terminal_output: bool,
+    /// Explicit `Intent::redact_secrets` for terminal sessions. `None` (the
+    /// default) keeps the historical behavior: redaction follows
+    /// `share_terminal_output`. `Some(true)`/`Some(false)` pins it.
+    #[serde(default)]
+    pub redact_terminal_secrets: Option<bool>,
+    /// Open-session count past which the terminal page shows a **dismissible
+    /// advisory banner**. WARN ONLY — nothing consults this value to block,
+    /// throttle or refuse a spawn, and nothing may (plan §5).
+    #[serde(default = "default_max_sessions_warn")]
+    pub max_sessions_warn: u32,
+}
+
+/// Floor for [`PerformanceSettings::grid_scan_interval_ms`]. Mirrors the
+/// floor the env-var overrides have always enforced.
+pub const MIN_GRID_SCAN_INTERVAL_MS: u64 = 200;
+
+/// Floor for [`PerformanceSettings::scrollback_capacity_bytes`] (64 KiB).
+/// Below this the ring stops being a usable replay source for a reveal.
+pub const MIN_SCROLLBACK_CAPACITY: usize = 64 * 1024;
+
+fn default_max_webgl_panes() -> u32 {
+    8
+}
+
+fn default_background_flush_interval_ms() -> u64 {
+    250
+}
+
+/// The reader thread's historical ring size, so "no `performance` key in
+/// settings.json" and "the constant the reader always used" cannot drift
+/// apart.
+fn default_scrollback_capacity_bytes() -> usize {
+    crate::terminal::session::SCROLLBACK_CAPACITY
+}
+
+fn default_grid_scan_interval_ms() -> u64 {
+    1500
+}
+
+fn default_share_terminal_output() -> bool {
+    true
+}
+
+fn default_max_sessions_warn() -> u32 {
+    30
+}
+
+impl Default for PerformanceSettings {
+    /// Round-trips through an empty JSON object for the same reason
+    /// [`Settings::default`] does — a derived `Default` would ignore every
+    /// `#[serde(default = "fn")]` above and silently zero the caps.
+    fn default() -> Self {
+        serde_json::from_str("{}").expect(
+            "PerformanceSettings must deserialize from an empty JSON object — every field needs a serde default",
+        )
+    }
+}
+
+impl PerformanceSettings {
+    /// Grid-scan interval with the floor applied.
+    pub fn effective_grid_scan_interval_ms(&self) -> u64 {
+        self.grid_scan_interval_ms.max(MIN_GRID_SCAN_INTERVAL_MS)
+    }
+
+    /// Scrollback ring capacity with the floor applied.
+    pub fn effective_scrollback_capacity(&self) -> usize {
+        self.scrollback_capacity_bytes.max(MIN_SCROLLBACK_CAPACITY)
     }
 }
 
@@ -3504,6 +3646,160 @@ pub fn save_world_state_verifier_settings(wsv: WorldStateVerifierSettings) -> Re
     crate::config_facade::save_setting(wsv)
 }
 
+// ----------------------------------------------------------------------------
+// Performance settings — process-cached (plan 2026-07-28 ... Phase 8)
+// ----------------------------------------------------------------------------
+
+/// A cached [`PerformanceSettings`] plus the `settings.json` mtime it was
+/// built at (`None` = the file did not exist, i.e. a fresh install).
+#[derive(Debug, Clone)]
+struct CachedPerformance {
+    perf: PerformanceSettings,
+    mtime: Option<std::time::SystemTime>,
+    /// Trust this entry regardless of the file's mtime. Set only by
+    /// [`set_performance_cache`], whose whole purpose is to override disk.
+    pinned: bool,
+}
+
+/// Process-wide snapshot of [`PerformanceSettings`], validated by mtime.
+///
+/// These values are read on the terminal-spawn path (scrollback capacity,
+/// `share_output`), which is exactly the path the same plan is trying to make
+/// O(1) — so they must not add another `settings.json` read + double parse per
+/// spawn (root cause B5). A cached hit costs one `fs::metadata` instead, the
+/// same shape `terminal/transcript.rs` already uses for its file cache.
+///
+/// The mtime check is not just tidiness. `settings.json` is shared by every
+/// runner instance on the box, so a save from a temp runner (or a hand edit)
+/// must not leave the primary — which policy forbids restarting — serving a
+/// stale `share_terminal_output`. That knob is a privacy declaration; silently
+/// ignoring a change to it would be worse than the file read it saves.
+///
+/// The cell is initialised to `None` with **no work in the initialiser**: the
+/// fill calls [`load_settings_full`], which itself can read the keychain and
+/// even write a migrated settings file, and a `OnceLock` initialiser that
+/// re-entered `get_performance_settings` would deadlock the process with no
+/// escape.
+static PERFORMANCE_CACHE: std::sync::OnceLock<std::sync::RwLock<Option<CachedPerformance>>> =
+    std::sync::OnceLock::new();
+
+fn performance_cache() -> &'static std::sync::RwLock<Option<CachedPerformance>> {
+    PERFORMANCE_CACHE.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// `settings.json`'s last-modified time, or `None` when it cannot be stated
+/// (missing file, unresolvable path). `None` is treated as "no evidence the
+/// cache is still valid", which forces a re-read rather than trusting it.
+fn settings_mtime() -> Option<std::time::SystemTime> {
+    let path = get_settings_path().ok()?;
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+/// Get the performance caps.
+///
+/// Served from the process cache while `settings.json`'s mtime matches what
+/// the cache was built at; otherwise re-read from disk.
+///
+/// **A non-authoritative read is never cached.** `load_settings_full` returns
+/// `Settings::default()` with `provenance = Unreadable` when the file exists
+/// but cannot be read or parsed — e.g. a concurrent atomic rename by another
+/// runner instance during our boot. Memoizing that would silently and
+/// permanently revert `share_terminal_output` to `true` for the life of a
+/// process that policy forbids restarting. So the defaults are returned for
+/// this call only, and the next call retries; the surrounding code takes the
+/// same stance (`read_settings_from_disk` refuses to synthesize defaults;
+/// `update_settings` refuses to write on a non-authoritative base).
+pub fn get_performance_settings() -> PerformanceSettings {
+    let mtime = settings_mtime();
+    {
+        let cell = performance_cache();
+        let guard = match cell.read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(cached) = guard.as_ref() {
+            if cached.pinned || cached.mtime == mtime {
+                return cached.perf.clone();
+            }
+        }
+    }
+
+    let loaded = load_settings_full();
+    let perf = loaded.settings.performance.clone();
+    if loaded.is_authoritative() {
+        store_performance_cache(CachedPerformance {
+            perf: perf.clone(),
+            mtime,
+            pinned: false,
+        });
+    } else {
+        error!(
+            "performance settings: settings.json unreadable ({}) — using built-in caps for this \
+             call WITHOUT caching them; will retry on the next read",
+            loaded.error.as_deref().unwrap_or("unknown error")
+        );
+    }
+    perf
+}
+
+/// Persist performance caps and refresh the process cache so the change is
+/// live for the next terminal spawn.
+pub fn save_performance_settings(perf: PerformanceSettings) -> Result<(), String> {
+    crate::config_facade::save_setting(perf.clone())?;
+    // Re-stamp with the mtime our own write just produced, so this entry is a
+    // normal (invalidatable) cache hit rather than a pin — a peer runner that
+    // writes the file a second later must still win.
+    store_performance_cache(CachedPerformance {
+        perf,
+        mtime: settings_mtime(),
+        pinned: false,
+    });
+    Ok(())
+}
+
+/// Pin the cached snapshot to `perf` regardless of what is on disk.
+///
+/// The seam tests use to exercise a non-default cap without touching the real
+/// settings file. **Test-only by construction**: pinned entries survive an
+/// mtime change, which would defeat the cross-instance invalidation production
+/// depends on — [`save_performance_settings`] re-stamps the real mtime instead.
+#[cfg(test)]
+pub fn set_performance_cache(perf: PerformanceSettings) {
+    store_performance_cache(CachedPerformance {
+        perf,
+        mtime: None,
+        pinned: true,
+    });
+}
+
+/// Serializes tests that mutate the process-global performance cache.
+///
+/// `cargo test` runs tests in parallel threads inside one process, so two
+/// tests pinning different caps would race. Every test that calls
+/// [`set_performance_cache`] holds this for its duration — including tests in other modules
+/// (`terminal::session`, `commands::terminal`), which is why it is `pub`.
+#[cfg(test)]
+static PERF_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire the performance-cache test lock. Poison is ignored: a panicking
+/// test must not wedge every other test that touches the cache.
+#[cfg(test)]
+pub fn perf_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    match PERF_TEST_LOCK.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn store_performance_cache(entry: CachedPerformance) {
+    let cell = performance_cache();
+    let mut guard = match cell.write() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(entry);
+}
+
 /// Get the interactive sessions enabled setting
 pub fn get_interactive_sessions_enabled() -> bool {
     crate::config_facade::get_interactive_sessions_enabled()
@@ -3983,5 +4279,174 @@ mod openai_compatible_defaults_tests {
                 .expect("must deserialize");
         assert_eq!(parsed.base_url, "http://localhost:8080/v1");
         assert_eq!(parsed.model, "llama-3");
+    }
+}
+
+#[cfg(test)]
+mod performance_settings_tests {
+    use super::*;
+
+    /// Every default reproduces the constant that was hardcoded before
+    /// Phase 8. If one of these changes, an existing install's behavior
+    /// changes on upgrade — which is exactly what the phase promised not to
+    /// do.
+    #[test]
+    fn defaults_match_the_previously_hardcoded_values() {
+        let p = PerformanceSettings::default();
+        assert_eq!(p.max_webgl_panes, 8);
+        assert_eq!(p.background_flush_interval_ms, 250);
+        assert_eq!(
+            p.unwatched_flush_interval_ms, 0,
+            "0 means 'no webview emit', the tier's defined behavior"
+        );
+        assert_eq!(p.scrollback_capacity_bytes, 1_048_576);
+        assert_eq!(p.grid_scan_interval_ms, 1500);
+        assert!(p.share_terminal_output, "was a hardcoded `true`");
+        assert_eq!(
+            p.redact_terminal_secrets, None,
+            "None keeps redaction following share_output, as before"
+        );
+        assert_eq!(p.max_sessions_warn, 30);
+    }
+
+    /// A settings.json written before this key existed must load with every
+    /// default — the back-compat guarantee for the whole phase.
+    #[test]
+    fn missing_block_loads_defaults() {
+        let parsed: PerformanceSettings =
+            serde_json::from_str("{}").expect("empty object must deserialize");
+        assert_eq!(parsed, PerformanceSettings::default());
+    }
+
+    /// The same, one level up: a whole `Settings` with no `performance` key.
+    #[test]
+    fn settings_without_the_performance_key_loads_defaults() {
+        let parsed: Settings =
+            serde_json::from_str(r#"{"app_mode":"advanced"}"#).expect("must deserialize");
+        assert_eq!(parsed.performance, PerformanceSettings::default());
+    }
+
+    /// A partially-specified block keeps the operator's value and defaults
+    /// the rest — so adding a knob later never rewrites an existing one.
+    #[test]
+    fn partial_block_defaults_the_rest() {
+        let parsed: PerformanceSettings = serde_json::from_str(r#"{"max_sessions_warn": 12}"#)
+            .expect("partial object must deserialize");
+        assert_eq!(parsed.max_sessions_warn, 12);
+        assert_eq!(parsed.max_webgl_panes, 8);
+        assert_eq!(parsed.scrollback_capacity_bytes, 1_048_576);
+    }
+
+    /// Serialize → deserialize is lossless, including the tri-state
+    /// `redact_terminal_secrets`.
+    #[test]
+    fn round_trips_through_json() {
+        let original = PerformanceSettings {
+            max_webgl_panes: 4,
+            background_flush_interval_ms: 500,
+            unwatched_flush_interval_ms: 2000,
+            scrollback_capacity_bytes: 4_194_304,
+            grid_scan_interval_ms: 3000,
+            share_terminal_output: false,
+            redact_terminal_secrets: Some(true),
+            max_sessions_warn: 50,
+        };
+        let json = serde_json::to_string(&original).expect("serialize");
+        let back: PerformanceSettings = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, original);
+    }
+
+    /// The grid-scan floor is applied at USE, not at save — an operator's
+    /// stored value round-trips unmangled while the scanner still never
+    /// spins faster than the floor.
+    #[test]
+    fn grid_scan_floor_applies_at_use() {
+        let p = PerformanceSettings {
+            grid_scan_interval_ms: 5,
+            ..PerformanceSettings::default()
+        };
+        assert_eq!(p.grid_scan_interval_ms, 5, "stored value is untouched");
+        assert_eq!(
+            p.effective_grid_scan_interval_ms(),
+            MIN_GRID_SCAN_INTERVAL_MS
+        );
+        let stock = PerformanceSettings::default();
+        assert_eq!(stock.effective_grid_scan_interval_ms(), 1500);
+    }
+
+    /// Same for the scrollback ring: a value below the 64 KiB floor is
+    /// clamped at use, and the stock 1 MiB passes through untouched.
+    #[test]
+    fn scrollback_floor_applies_at_use() {
+        let p = PerformanceSettings {
+            scrollback_capacity_bytes: 128,
+            ..PerformanceSettings::default()
+        };
+        assert_eq!(p.effective_scrollback_capacity(), MIN_SCROLLBACK_CAPACITY);
+        let stock = PerformanceSettings::default();
+        assert_eq!(stock.effective_scrollback_capacity(), 1_048_576);
+    }
+
+    /// The pin seam serves what it was given, so the tests that exercise a
+    /// non-default cap without touching the real settings file are exercising
+    /// the same accessor production reads.
+    #[test]
+    fn pinned_cache_is_what_the_accessor_serves() {
+        let _guard = perf_test_lock();
+        let custom = PerformanceSettings {
+            max_sessions_warn: 3,
+            scrollback_capacity_bytes: 2_000_000,
+            share_terminal_output: false,
+            ..PerformanceSettings::default()
+        };
+        set_performance_cache(custom.clone());
+        assert_eq!(get_performance_settings(), custom);
+
+        set_performance_cache(PerformanceSettings::default());
+        assert_eq!(get_performance_settings(), PerformanceSettings::default());
+    }
+
+    /// Pinning is what makes the other modules' cache tests deterministic:
+    /// a pin survives whatever `settings.json` says, so a test never depends
+    /// on the developer's real file. (The disk-read arm — including the
+    /// never-cache-a-non-authoritative-read rule — is deliberately NOT unit
+    /// tested: exercising it means letting `load_settings_full` touch the
+    /// operator's real settings dir, which it may WRITE to for the
+    /// tier/local_user_id migration.)
+    #[test]
+    fn pinning_is_independent_of_disk() {
+        let _guard = perf_test_lock();
+        let a = PerformanceSettings {
+            max_sessions_warn: 1,
+            ..PerformanceSettings::default()
+        };
+        let b = PerformanceSettings {
+            max_sessions_warn: 2,
+            ..PerformanceSettings::default()
+        };
+        set_performance_cache(a);
+        assert_eq!(get_performance_settings().max_sessions_warn, 1);
+        set_performance_cache(b);
+        assert_eq!(get_performance_settings().max_sessions_warn, 2);
+
+        set_performance_cache(PerformanceSettings::default());
+    }
+
+    /// The soft session rail is a NUMBER the UI compares against — there is
+    /// no "enabled" flag, no refusal path, and nothing here that a spawn
+    /// could consult to say no. Locked in as a test because §5 of the plan
+    /// explicitly rejects a hard cap.
+    #[test]
+    fn session_rail_is_advisory_only() {
+        let p = PerformanceSettings::default();
+        // A number, always positive, and the type carries no refusal state.
+        assert!(p.max_sessions_warn > 0);
+        // Setting it to zero does not become "allow zero sessions" — it is
+        // a display threshold, so it simply warns from the first session.
+        let eager = PerformanceSettings {
+            max_sessions_warn: 0,
+            ..p
+        };
+        assert_eq!(eager.max_sessions_warn, 0);
     }
 }

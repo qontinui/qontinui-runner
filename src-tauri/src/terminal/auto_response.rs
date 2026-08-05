@@ -247,17 +247,17 @@ pub fn scan_grids_once() {
     }
 }
 
-/// Grid-scan interval. Overridable via
-/// `QONTINUI_AUTO_RESPONSE_SCAN_INTERVAL_MS` (floored at 200ms). 1.5s is well
-/// under the default 60s backoff, so the (idle, on-screen) rate-limit error is
-/// caught promptly while costing a trivial regex pass per terminal per tick.
+/// Grid-scan interval. Resolved from
+/// `QONTINUI_AUTO_RESPONSE_SCAN_INTERVAL_MS` (the higher-precedence escape
+/// hatch), else `settings.performance.grid_scan_interval_ms`, else the
+/// historical 1500 ms — that setting's default. Floored at 200 ms either
+/// way. 1.5s is well under the default 60s backoff, so the (idle, on-screen)
+/// rate-limit error is caught promptly while costing a trivial regex pass per
+/// terminal per tick. See `terminal::scan_interval` for the precedence rules.
 fn scan_interval() -> Duration {
-    let ms = std::env::var("QONTINUI_AUTO_RESPONSE_SCAN_INTERVAL_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&n| n >= 200)
-        .unwrap_or(1500);
-    Duration::from_millis(ms)
+    crate::terminal::scan_interval::scan_interval_from_env(
+        "QONTINUI_AUTO_RESPONSE_SCAN_INTERVAL_MS",
+    )
 }
 
 /// Spawn the periodic grid scanner for the process lifetime. Detached; each
