@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "base_sha": "d9d231281eeea252a2d213a6098e31c3a999a030",
+  "ours_sha": "19b75a7f78d4a5c4738aaa62f50aab67ab9fb948",
+  "theirs_sha": "f4b406426ca69481eb62b34c91d0a463bcd2f98a",
+  "entries": [
+    {
+      "path": "src-tauri/src/settings.rs",
+      "base_oid": "a0797c2e97de879eb7b0b6cdf70c9867d3fa87a4",
+      "ours_oid": "0f53e33610a0798f77d8dff625f5ce0c9dc52ca1",
+      "theirs_oid": "f347a3614873a785bd480ca50bbd13cbbe6d66bd",
+      "base_path": "src-tauri/src/settings.rs.base",
+      "ours_path": "src-tauri/src/settings.rs.ours",
+      "theirs_path": "src-tauri/src/settings.rs.theirs",
+      "hunks": [
+        "<<<<<<< HEAD\n    /// Ask the cloud memory endpoint (`POST /api/v1/memory/query`) for the\n    /// link-expansion retrieval arm — the third RRF arm that one-hop-expands\n    /// over `coord.memory_links` (plan\n    /// `2026-07-29-memory-link-expansion-retrieval-arm`, Phase 4).\n    ///\n    /// Default FALSE, deliberately: that plan's Phase 3 ships the arm\n    /// default-off and turns it on only once the efficacy harness in\n    /// `2026-07-29-memory-recall-efficacy-benchmark` can measure whether it\n    /// helps recall or just adds noise — and that plan is still DRAFT. Sending\n    /// `link_expansion: true` unconditionally would default an unmeasured\n    /// ranking change ON, which is exactly what Phase 3 forbids. The flag makes\n    /// the wire-through shippable now and flippable later. A missing key in an\n    /// existing settings.json loads as false.\n    #[serde(default)]\n    pub memory_link_expansion_enabled: bool,\n=======\n    /// Performance caps and tiering knobs (plan\n    /// `2026-07-28-runner-many-sessions-performance` Phase 8). Every field\n    /// defaults to the value that was hardcoded before the phase, so a\n    /// settings.json without the key behaves exactly as it did.\n    #[serde(default)]\n    pub performance: PerformanceSettings,\n>>>>>>> 19b75a7f (feat(perf): expose the many-sessions caps as settings, with a soft session rail)\n"
+      ]
+    },
+    {
+      "path": "src-tauri/src/terminal/mod.rs",
+      "base_oid": "cbc135eefce9ef79e6a868c980f4370b6acc30f3",
+      "ours_oid": "1fe8accdba860ef9ac8af44f263f815259486ae7",
+      "theirs_oid": "65544ea4f29d798d7ef95608d78b795251587cc2",
+      "base_path": "src-tauri/src/terminal/mod.rs.base",
+      "ours_path": "src-tauri/src/terminal/mod.rs.ours",
+      "theirs_path": "src-tauri/src/terminal/mod.rs.theirs",
+      "hunks": [
+        "<<<<<<< HEAD\nmod scan_gate;\n=======\npub mod scan_interval;\n>>>>>>> 19b75a7f (feat(perf): expose the many-sessions caps as settings, with a soft session rail)\n"
+      ]
+    },
+    {
+      "path": "src-tauri/src/terminal/session.rs",
+      "base_oid": "efaf3da88a083bc3977ce100fb8d52defdafd975",
+      "ours_oid": "39d68b5a769dd866d96ba50433c4cfaafdec87f9",
+      "theirs_oid": "f192e20eb40a831cbf5ddc433cd5312fd6414e10",
+      "base_path": "src-tauri/src/terminal/session.rs.base",
+      "ours_path": "src-tauri/src/terminal/session.rs.ours",
+      "theirs_path": "src-tauri/src/terminal/session.rs.theirs",
+      "hunks": [
+        "<<<<<<< HEAD\n        // Slice append, not byte-by-byte: `extend` copies the run in one go and\n        // a single up-front `drain` makes room, instead of a bounds check +\n        // `pop_front` per byte on every chunk of every session.\n        if data.len() >= SCROLLBACK_CAPACITY {\n            // The chunk alone overflows the ring — keep only its tail.\n            sb.clear();\n            sb.extend(&data[data.len() - SCROLLBACK_CAPACITY..]);\n        } else {\n            let overflow = (sb.len() + data.len()).saturating_sub(SCROLLBACK_CAPACITY);\n            if overflow > 0 {\n                sb.drain(..overflow);\n=======\n        for &byte in data {\n            if sb.len() >= capacity {\n                sb.pop_front();\n>>>>>>> 19b75a7f (feat(perf): expose the many-sessions caps as settings, with a soft session rail)\n"
+      ]
+    }
+  ]
+}
