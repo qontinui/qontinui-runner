@@ -34,8 +34,8 @@ use std::path::PathBuf;
 
 use serde_json::{json, Value};
 
-use super::apply_services;
 use super::pull::{ApplyPlan, SectionPlan, SectionPolicy};
+use super::{apply_services, apply_versions};
 
 /// What the caller asked for.
 #[derive(Debug, Clone, Default)]
@@ -218,6 +218,11 @@ fn dispatch(section: &SectionPlan, opts: &ApplyOptions) -> SectionApply {
     match name {
         apply_services::SERVICES_SECTION => {
             let out = apply_services::apply_section(section, opts.profile.as_deref(), opts.confirm);
+            audit_if_applied(&out);
+            out
+        }
+        apply_versions::VERSIONS_SECTION => {
+            let out = apply_versions::apply_section(section, opts.confirm);
             audit_if_applied(&out);
             out
         }
