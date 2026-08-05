@@ -3,12 +3,12 @@
 //! Spawns a shell via `portable-pty`, manages reader/writer threads,
 //! and emits Tauri events for output and exit.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, oneshot};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -19,6 +19,10 @@ use tracing::{debug, info, warn};
 use super::grid::{Grid, GridPerformer};
 use super::interceptor::OutputInterceptor;
 use super::types::{TerminalExitEvent, TerminalId, TerminalInfo};
+use super::visibility::{
+    ActivityDigestState, BackgroundHold, TerminalActivityWire, VisibilityState, VisibilityTier,
+    ACTIVITY_DIGEST_LINES, ACTIVITY_EVENT,
+};
 
 /// Shell integration scripts embedded at compile time.
 #[cfg(target_os = "windows")]
@@ -186,6 +190,66 @@ impl EmissionGate {
     }
 }
 
+/// What the webview leg does with one chunk, given the session's visibility
+/// tier (Phase 5 / A4). Pure so the tiering policy is unit-testable without a
+/// PTY, a Tauri app or a webview.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebviewAdmission {
+    /// Emit this payload as its own `terminal-output` event now.
+    Now,
+    /// Accumulate it into the session's background window; it leaves with the
+    /// next flush (≥250 ms, or the byte cap).
+    Hold,
+    /// Do not deliver it to the webview at all. The chunk still reached the
+    /// scrollback ring, SSE, WS and coord upstream of this decision.
+    Skip,
+}
+
+/// Decide the webview leg for one chunk.
+///
+/// **This function governs the webview and nothing else.** Its callers have
+/// already served the SSE broadcast, the WS relay and the scrollback ring, so
+/// no tier can cost an external consumer a byte.
+///
+/// - `Focused` — today's behavior exactly: the flow-control [`EmissionGate`]
+///   decides, because a mounted visible pane is the one consumer that actually
+///   render-acks.
+/// - `Background` — a pane is mounted but hidden, so nothing renders and
+///   nothing render-acks; the gate has no ack source and would wedge at the
+///   high watermark (which is precisely why the frontend used to synthesize
+///   proxy-acks for it). The tier itself is the flow control instead: at most
+///   one event per [`BACKGROUND_FLUSH_INTERVAL`], bounded by
+///   [`BACKGROUND_HOLD_BYTE_CAP`]. Deterministic, and one fewer IPC round trip
+///   per frame than the acks it replaces.
+/// - `Unwatched` — no pane anywhere: nothing is emitted. `Skip` reports back
+///   whether the caller should raise `emission_skipped`, which is what makes a
+///   later upgrade emit a resume marker and pull a ring resync.
+///
+/// `gated` is false only for the reader's exit flush: a dying terminal's final
+/// frame has no successor chunk to reveal a gap, so it ships regardless of tier
+/// (bounded by `SYNC_FLUSH_BYTE_CAP`).
+fn admit_to_webview(
+    tier: VisibilityTier,
+    gated: bool,
+    gate: &mut EmissionGate,
+    gap: u64,
+) -> WebviewAdmission {
+    if !gated {
+        return WebviewAdmission::Now;
+    }
+    match tier {
+        VisibilityTier::Unwatched => WebviewAdmission::Skip,
+        VisibilityTier::Background => WebviewAdmission::Hold,
+        VisibilityTier::Focused => {
+            if gate.should_emit(gap) {
+                WebviewAdmission::Now
+            } else {
+                WebviewAdmission::Skip
+            }
+        }
+    }
+}
+
 /// Byte cap for a held DEC-2026 (synchronized-output) frame: flush the
 /// accumulated frame once it reaches this size even if `?2026l` hasn't
 /// arrived, so a runaway/never-closed `?2026h` block can't buffer unbounded.
@@ -299,6 +363,28 @@ struct TerminalOutputWire<'a> {
     /// live chunks — see `terminal_get_scrollback` and the frontend's
     /// `scrollbackReplay.ts`.
     offset: u64,
+}
+
+/// Emit one `terminal-output` event to the webview.
+///
+/// Shared by the reader thread, the background-window flush (which the
+/// visibility sweeper can also drive) and the flow-control resume marker, so
+/// every webview emission for a session goes through one place with one wire
+/// shape. `encoded` is already base64; `offset` is the absolute stream offset
+/// of its first byte.
+fn emit_terminal_output(app: &AppHandle, terminal_id: &str, encoded: &str, offset: u64) {
+    let event = TerminalOutputWire {
+        terminal_id,
+        data: encoded,
+        offset,
+    };
+    if let Err(e) = app.emit("terminal-output", &event) {
+        warn!(
+            terminal_id = %terminal_id,
+            error = %e,
+            "Failed to emit terminal output event"
+        );
+    }
 }
 
 /// ANSI bracketed-paste begin marker.
@@ -422,6 +508,20 @@ pub struct TerminalSession {
     /// while emission is paused would leave the pane stale forever (no
     /// further chunk arrives to reveal the gap).
     emission_skipped: Arc<AtomicBool>,
+    /// Phase 5 (A4 backend half) — how much webview service this session is
+    /// entitled to, merged across every window that reports on it. Read by the
+    /// reader thread on every chunk (one relaxed atomic load); written by
+    /// `terminal_set_visibility` on layout changes only.
+    visibility: Arc<VisibilityState>,
+    /// The open `background` webview window: chunks accumulated since the last
+    /// flush. Drained by the reader thread on the next chunk, or by the
+    /// visibility sweeper when the session went quiet mid-window. The mutex is
+    /// also the serialization point for this session's webview emission, which
+    /// is what keeps held bytes ahead of anything emitted after a tier change.
+    background_hold: Arc<Mutex<BackgroundHold>>,
+    /// Cadence gate for the `terminal-activity` digest that feeds state
+    /// tracking while this session is `unwatched`.
+    activity_digest: Arc<Mutex<ActivityDigestState>>,
     /// Ring buffer of recent raw PTY output for reconnection.
     scrollback_buffer: Arc<Mutex<VecDeque<u8>>>,
     /// Monotonic counter of all bytes ever produced by the PTY.
@@ -715,6 +815,9 @@ impl TerminalSession {
         let bytes_sent = Arc::new(AtomicU64::new(0));
         let bytes_acked = Arc::new(AtomicU64::new(0));
         let emission_skipped = Arc::new(AtomicBool::new(false));
+        let visibility = Arc::new(VisibilityState::new());
+        let background_hold = Arc::new(Mutex::new(BackgroundHold::new(Instant::now())));
+        let activity_digest = Arc::new(Mutex::new(ActivityDigestState::new(Instant::now())));
         let scrollback_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(SCROLLBACK_CAPACITY)));
         let total_bytes_produced = Arc::new(AtomicU64::new(0));
         let grid_generation = Arc::new(AtomicU64::new(0));
@@ -747,6 +850,8 @@ impl TerminalSession {
         let reader_bytes_sent = bytes_sent.clone();
         let reader_bytes_acked = bytes_acked.clone();
         let reader_emission_skipped = emission_skipped.clone();
+        let reader_visibility = visibility.clone();
+        let reader_background_hold = background_hold.clone();
         let reader_scrollback = scrollback_buffer.clone();
         let reader_total_bytes = total_bytes_produced.clone();
         let reader_output_tx = output_tx.clone();
@@ -801,69 +906,116 @@ impl TerminalSession {
                 //
                 // Consumer gating (perf): each of the three legs is checked
                 // BEFORE the shared base64 encode, so a chunk nobody can
-                // receive — webview emission paused by flow control, no SSE
-                // subscriber, no WS relay client — costs zero encoding and
-                // zero allocation. Previously the encode AND a full `String`
-                // clone for the SSE send ran unconditionally on every chunk of
-                // every session. The flow-control decision itself is unchanged;
-                // it is only evaluated earlier in the same call.
+                // receive — webview emission paused by flow control or turned
+                // off by the visibility tier, no SSE subscriber, no WS relay
+                // client — costs zero encoding and zero allocation. Previously
+                // the encode AND a full `String` clone for the SSE send ran
+                // unconditionally on every chunk of every session. The
+                // flow-control decision itself is unchanged; it is only
+                // evaluated earlier in the same call.
+                //
+                // Visibility tiering (Phase 5 / A4) applies to the webview leg
+                // ONLY, and is evaluated in [`admit_to_webview`] AFTER the SSE
+                // and WS legs have been served: the SSE broadcast, the WS relay
+                // and (through them) the coord output pipe receive every chunk,
+                // in order, byte-identical, in every tier.
                 let emit_impl = |payload: &[u8], offset: u64, gated: bool| {
-                    // Webview delivery is the only backpressure-gated leg.
-                    let to_webview = if gated {
-                        let sent = reader_bytes_sent.load(Ordering::Relaxed);
-                        let acked = reader_bytes_acked.load(Ordering::Relaxed);
-                        let gap = sent.saturating_sub(acked);
-                        if emission_gate.borrow_mut().should_emit(gap) {
-                            true
-                        } else {
-                            reader_emission_skipped.store(true, Ordering::Relaxed);
-                            false
-                        }
-                    } else {
-                        true
-                    };
+                    let tier = reader_visibility.tier();
+                    let sent = reader_bytes_sent.load(Ordering::Relaxed);
+                    let acked = reader_bytes_acked.load(Ordering::Relaxed);
+                    let gap = sent.saturating_sub(acked);
+                    let admission = admit_to_webview(
+                        tier,
+                        gated,
+                        &mut emission_gate.borrow_mut(),
+                        gap,
+                    );
+                    if admission == WebviewAdmission::Skip {
+                        // The webview is missing these bytes; raise the flag
+                        // that makes `ack` (or a tier upgrade) emit a resume
+                        // marker so the frontend resyncs from the ring.
+                        reader_emission_skipped.store(true, Ordering::Relaxed);
+                    }
+
                     let to_sse = reader_output_tx.receiver_count() > 0;
                     let to_ws = crate::event_system::ws_notification_has_receivers(&reader_app);
-                    if !to_webview && !to_sse && !to_ws {
+                    if admission == WebviewAdmission::Skip && !to_sse && !to_ws {
                         return;
                     }
 
-                    let encoded = STANDARD.encode(payload);
+                    // A held chunk is not the payload the webview will receive
+                    // (the flush ships the whole accumulated window), so it
+                    // does not need encoding here — one encode per ≥250 ms
+                    // window instead of one per chunk.
+                    let encoded = if to_sse || to_ws || admission == WebviewAdmission::Now {
+                        Some(STANDARD.encode(payload))
+                    } else {
+                        None
+                    };
 
                     // Broadcast to HTTP/SSE subscribers (skipped when none —
                     // the `send` would drop the value anyway, and the clone is
                     // a full copy of the base64 payload).
-                    if to_sse {
+                    if let (true, Some(encoded)) = (to_sse, encoded.as_ref()) {
                         let _ = reader_output_tx.send(encoded.clone());
                     }
                     // Broadcast to backend relay for remote mobile access
-                    if to_ws {
+                    if let (true, Some(encoded)) = (to_ws, encoded.as_ref()) {
                         crate::event_system::broadcast_ws_notification(
                             &reader_app,
                             "terminal-output",
                             &serde_json::json!({
                                 "terminal_id": &reader_id,
-                                "data": &encoded,
+                                "data": encoded,
                             }),
                         );
                     }
 
-                    if !to_webview {
+                    if admission == WebviewAdmission::Skip {
                         return;
                     }
-                    let event = TerminalOutputWire {
-                        terminal_id: &reader_id,
-                        data: &encoded,
-                        offset,
-                    };
-                    if let Err(e) = reader_app.emit("terminal-output", &event) {
-                        warn!(
-                            terminal_id = %reader_id,
-                            error = %e,
-                            "Failed to emit terminal output event"
-                        );
+
+                    // Serialize the webview leg on the hold mutex so held
+                    // background bytes can never be overtaken by a chunk the
+                    // tier let through after them.
+                    let mut hold = reader_background_hold
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let now = Instant::now();
+                    match admission {
+                        WebviewAdmission::Hold => {
+                            hold.push(payload, offset);
+                            if let Some((window, window_offset)) = hold.take_if_due(now) {
+                                emit_terminal_output(
+                                    &reader_app,
+                                    &reader_id,
+                                    &STANDARD.encode(&window),
+                                    window_offset,
+                                );
+                            }
+                        }
+                        WebviewAdmission::Now => {
+                            // Drain anything the previous tier held first.
+                            if let Some((window, window_offset)) = hold.take_now(now) {
+                                emit_terminal_output(
+                                    &reader_app,
+                                    &reader_id,
+                                    &STANDARD.encode(&window),
+                                    window_offset,
+                                );
+                            }
+                            let encoded = encoded.expect("Now always encodes");
+                            emit_terminal_output(&reader_app, &reader_id, &encoded, offset);
+                            // Flow control accounts only for bytes delivered
+                            // under the gate — i.e. the `focused` tier and the
+                            // exit flush. Counting held/hidden bytes would let
+                            // the gap balloon while nobody can ack, so the pane
+                            // would find the gate already paused on its way
+                            // back to `focused`.
+                            reader_bytes_sent.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                        }
+                        WebviewAdmission::Skip => unreachable!("returned above"),
                     }
-                    reader_bytes_sent.fetch_add(payload.len() as u64, Ordering::Relaxed);
                 };
                 let emit_chunk = |payload: &[u8], offset: u64| emit_impl(payload, offset, true);
 
@@ -1121,6 +1273,9 @@ impl TerminalSession {
             bytes_sent,
             bytes_acked,
             emission_skipped,
+            visibility,
+            background_hold,
+            activity_digest,
             scrollback_buffer,
             total_bytes_produced,
             grid_generation,
@@ -1857,23 +2012,161 @@ impl TerminalSession {
         self.bytes_acked.fetch_add(bytes, Ordering::Relaxed);
         let sent = self.bytes_sent.load(Ordering::Relaxed);
         let acked = self.bytes_acked.load(Ordering::Relaxed);
-        if sent.saturating_sub(acked) <= FLOW_LOW_WATERMARK
-            && self.emission_skipped.swap(false, Ordering::Relaxed)
-        {
-            if let Some(app) = &self.app_handle {
-                let event = TerminalOutputWire {
-                    terminal_id: &self.id,
-                    data: "",
-                    offset: self.total_bytes_produced.load(Ordering::Relaxed),
-                };
-                if let Err(e) = app.emit("terminal-output", &event) {
-                    warn!(
-                        terminal_id = %self.id,
-                        error = %e,
-                        "Failed to emit flow-control resume marker"
-                    );
-                }
+        if sent.saturating_sub(acked) <= FLOW_LOW_WATERMARK {
+            self.emit_resume_marker_if_skipped();
+        }
+    }
+
+    /// Emit the zero-length resume marker if the webview is known to be missing
+    /// bytes, clearing the flag.
+    ///
+    /// Two callers raise the flag: the flow-control gate pausing a `focused`
+    /// session, and the `unwatched` tier declining to emit at all. Both recover
+    /// the same way — the marker's offset jumps past what the frontend last
+    /// saw, its gap detection fires, and it replays the scrollback ring.
+    fn emit_resume_marker_if_skipped(&self) {
+        if !self.emission_skipped.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        let Some(app) = &self.app_handle else {
+            return;
+        };
+        emit_terminal_output(
+            app,
+            &self.id,
+            "",
+            self.total_bytes_produced.load(Ordering::Relaxed),
+        );
+    }
+
+    // ---- Phase 5: visibility-tiered webview emission (A4 backend half) ----
+
+    /// This session's merged visibility tier. Lock-free.
+    pub fn visibility_tier(&self) -> VisibilityTier {
+        self.visibility.tier()
+    }
+
+    /// Record one window's view of this session (the `terminal_set_visibility`
+    /// command) and settle any work the resulting tier change implies.
+    pub fn set_visibility(&self, window: &str, tier: VisibilityTier) {
+        let before = self.visibility.tier();
+        let after = self.visibility.report(window, tier);
+        self.on_tier_changed(before, after);
+    }
+
+    /// Drop reports from windows that no longer exist (driven by the sweeper on
+    /// the window-membership edge). A closed pop-out that last said `focused`
+    /// would otherwise pin its terminals at full rate forever.
+    pub fn retain_visibility_windows(&self, live: &BTreeSet<String>) {
+        let before = self.visibility.tier();
+        let after = self.visibility.retain_windows(live);
+        self.on_tier_changed(before, after);
+    }
+
+    /// Settle the two things a tier change owes the webview.
+    fn on_tier_changed(&self, before: VisibilityTier, after: VisibilityTier) {
+        if before == after {
+            return;
+        }
+        // Leaving `background` with bytes still held: ship them now, so
+        // nothing emitted under the new tier can overtake them.
+        if before == VisibilityTier::Background {
+            self.flush_background_window(true);
+        }
+        // Leaving `unwatched`: the webview missed everything produced while
+        // the session was dark. Emit the resume marker so the frontend's gap
+        // detection pulls a ring replay, and re-baseline the digest so the
+        // next dark window reports only what it actually misses.
+        if before == VisibilityTier::Unwatched {
+            self.emit_resume_marker_if_skipped();
+            if let Ok(mut st) = self.activity_digest.lock() {
+                st.rebaseline(
+                    Instant::now(),
+                    self.total_bytes_produced.load(Ordering::Relaxed),
+                );
             }
+        }
+    }
+
+    /// Flush the held `background` window if its ≥250 ms spacing has elapsed
+    /// (or its byte cap tripped). Driven by the visibility sweeper so the tail
+    /// of a burst still lands when the session goes quiet mid-window — the
+    /// reader thread is parked in a blocking `read()` at exactly that moment
+    /// and could only act on the next byte, which may never come.
+    pub fn flush_background_window_if_due(&self) {
+        self.flush_background_window(false);
+    }
+
+    fn flush_background_window(&self, force: bool) {
+        let Some(app) = &self.app_handle else {
+            return;
+        };
+        let mut hold = self
+            .background_hold
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let taken = if force {
+            hold.take_now(now)
+        } else {
+            hold.take_if_due(now)
+        };
+        // Emit under the lock: it is this session's webview ordering point.
+        if let Some((window, offset)) = taken {
+            emit_terminal_output(app, &self.id, &STANDARD.encode(&window), offset);
+        }
+    }
+
+    /// Emit the `terminal-activity` digest if this session is `unwatched` and
+    /// its ≤1 Hz budget allows.
+    ///
+    /// Only `unwatched` sessions emit one: `focused` and `background` sessions
+    /// still deliver `terminal-output`, which is what the page-level tap feeds
+    /// state tracking from. Emitting for them too would duplicate that feed and
+    /// double-count the activity sparkline.
+    pub fn emit_activity_digest_if_due(&self) {
+        if self.visibility.tier() != VisibilityTier::Unwatched {
+            return;
+        }
+        let Some(app) = &self.app_handle else {
+            return;
+        };
+        let total = self.total_bytes_produced.load(Ordering::Relaxed);
+        let delta = {
+            let mut st = self
+                .activity_digest
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match st.take_if_due(Instant::now(), total) {
+                Some(delta) => delta,
+                None => return,
+            }
+        };
+        // The RENDERED screen tail, not the raw bytes: the grid resolves cursor
+        // motion, line rewrites and full-frame TUI redraws the same way xterm
+        // does, so a digest-fed tab's `lastOutputLines` match a mounted tab's.
+        let lines = self
+            .grid
+            .lock()
+            .map(|g| g.lines())
+            .unwrap_or_else(|e| e.into_inner().lines());
+        let mut lines: Vec<String> = lines.into_iter().filter(|l| !l.trim().is_empty()).collect();
+        if lines.len() > ACTIVITY_DIGEST_LINES {
+            lines.drain(..lines.len() - ACTIVITY_DIGEST_LINES);
+        }
+
+        let event = TerminalActivityWire {
+            terminal_id: &self.id,
+            total_bytes_produced: total,
+            bytes_delta: delta,
+            lines,
+        };
+        if let Err(e) = app.emit(ACTIVITY_EVENT, &event) {
+            warn!(
+                terminal_id = %self.id,
+                error = %e,
+                "Failed to emit terminal activity digest"
+            );
         }
     }
 
@@ -2300,6 +2593,9 @@ mod tests {
             bytes_sent: Arc::new(AtomicU64::new(0)),
             bytes_acked: Arc::new(AtomicU64::new(0)),
             emission_skipped: Arc::new(AtomicBool::new(false)),
+            visibility: Arc::new(VisibilityState::new()),
+            background_hold: Arc::new(Mutex::new(BackgroundHold::new(Instant::now()))),
+            activity_digest: Arc::new(Mutex::new(ActivityDigestState::new(Instant::now()))),
             scrollback_buffer: Arc::new(Mutex::new(VecDeque::new())),
             total_bytes_produced: Arc::new(AtomicU64::new(0)),
             grid_generation: Arc::new(AtomicU64::new(0)),
@@ -2332,6 +2628,141 @@ mod tests {
         let sink = emitted.clone();
         c.flush_remaining(move |p, o| sink.lock().unwrap().push((p.to_vec(), o)));
         Arc::try_unwrap(emitted).unwrap().into_inner().unwrap()
+    }
+
+    // ---- Phase 5: visibility-tiered webview admission ----
+
+    /// `focused` is today's behavior, byte for byte: the flow-control gate is
+    /// the only thing that can hold a chunk back.
+    #[test]
+    fn focused_tier_defers_entirely_to_the_flow_control_gate() {
+        let mut gate = EmissionGate::new();
+        assert_eq!(
+            admit_to_webview(VisibilityTier::Focused, true, &mut gate, 0),
+            WebviewAdmission::Now
+        );
+        // Cross the high watermark → the gate pauses, as before Phase 5.
+        assert_eq!(
+            admit_to_webview(
+                VisibilityTier::Focused,
+                true,
+                &mut gate,
+                FLOW_HIGH_WATERMARK + 1
+            ),
+            WebviewAdmission::Skip
+        );
+        // Hysteresis: still paused between LOW and HIGH.
+        assert_eq!(
+            admit_to_webview(
+                VisibilityTier::Focused,
+                true,
+                &mut gate,
+                FLOW_LOW_WATERMARK + 1
+            ),
+            WebviewAdmission::Skip
+        );
+        assert_eq!(
+            admit_to_webview(VisibilityTier::Focused, true, &mut gate, FLOW_LOW_WATERMARK),
+            WebviewAdmission::Now
+        );
+    }
+
+    /// `background` never consults the gate: nothing renders a hidden pane, so
+    /// no render-ack can ever arrive and an ack-gated tier would wedge at the
+    /// high watermark (the wedge the frontend proxy-ack existed to paper over).
+    /// The ≥250 ms hold is the flow control instead.
+    #[test]
+    fn background_tier_holds_and_never_wedges_on_acks() {
+        let mut gate = EmissionGate::new();
+        for gap in [0, FLOW_LOW_WATERMARK, FLOW_HIGH_WATERMARK * 100] {
+            assert_eq!(
+                admit_to_webview(VisibilityTier::Background, true, &mut gate, gap),
+                WebviewAdmission::Hold,
+                "gap {gap} must not change the background decision"
+            );
+        }
+        // The gate was never advanced, so a return to `focused` starts open.
+        assert_eq!(
+            admit_to_webview(VisibilityTier::Focused, true, &mut gate, 0),
+            WebviewAdmission::Now
+        );
+    }
+
+    /// The headline Phase 5 property: an `unwatched` session emits nothing to
+    /// the webview no matter how far ahead or behind flow control is.
+    #[test]
+    fn unwatched_tier_never_emits_to_the_webview() {
+        let mut gate = EmissionGate::new();
+        for gap in [0, 1, FLOW_LOW_WATERMARK, FLOW_HIGH_WATERMARK * 100] {
+            assert_eq!(
+                admit_to_webview(VisibilityTier::Unwatched, true, &mut gate, gap),
+                WebviewAdmission::Skip
+            );
+        }
+    }
+
+    /// The reader's exit flush is ungated on purpose: after the child exits no
+    /// further chunk can reveal a gap, so the last frame must land in every
+    /// tier — including `unwatched`, whose pane may mount moments later.
+    #[test]
+    fn the_exit_flush_ships_in_every_tier() {
+        let mut gate = EmissionGate::new();
+        for tier in [
+            VisibilityTier::Focused,
+            VisibilityTier::Background,
+            VisibilityTier::Unwatched,
+        ] {
+            assert_eq!(
+                admit_to_webview(tier, false, &mut gate, FLOW_HIGH_WATERMARK * 100),
+                WebviewAdmission::Now,
+                "{tier:?}"
+            );
+        }
+    }
+
+    /// Tier transitions in both directions, driven through the same state a
+    /// live session uses. `focused` after `unwatched` must not inherit a paused
+    /// gate — the `unwatched` stretch never touched it.
+    #[test]
+    fn tier_transitions_switch_the_admission_immediately() {
+        let state = VisibilityState::new();
+        let mut gate = EmissionGate::new();
+        let decide = |state: &VisibilityState, gate: &mut EmissionGate| {
+            admit_to_webview(state.tier(), true, gate, 0)
+        };
+
+        assert_eq!(decide(&state, &mut gate), WebviewAdmission::Now);
+        state.report("main", VisibilityTier::Background);
+        assert_eq!(decide(&state, &mut gate), WebviewAdmission::Hold);
+        state.report("main", VisibilityTier::Unwatched);
+        assert_eq!(decide(&state, &mut gate), WebviewAdmission::Skip);
+        state.report("main", VisibilityTier::Focused);
+        assert_eq!(decide(&state, &mut gate), WebviewAdmission::Now);
+    }
+
+    /// SSE, WS and the scrollback ring are served UPSTREAM of the tier
+    /// decision, so no tier can cost an external consumer a byte. This asserts
+    /// the ring half directly against the real teeing path; the SSE/WS half is
+    /// structural (`admit_to_webview` returns a webview-only verdict and the
+    /// reader serves both broadcasts before consulting it).
+    #[test]
+    fn every_tier_still_tees_every_byte_into_the_ring() {
+        for tier in [
+            VisibilityTier::Focused,
+            VisibilityTier::Background,
+            VisibilityTier::Unwatched,
+        ] {
+            let state = VisibilityState::new();
+            state.report("main", tier);
+            let ring = Arc::new(Mutex::new(VecDeque::new()));
+            let produced = Arc::new(AtomicU64::new(0));
+            let first = tee_into_scrollback(&ring, &produced, b"alpha");
+            let second = tee_into_scrollback(&ring, &produced, b"beta");
+            assert_eq!((first, second), (0, 5), "{tier:?}");
+            assert_eq!(produced.load(Ordering::Relaxed), 9, "{tier:?}");
+            let bytes: Vec<u8> = ring.lock().unwrap().iter().copied().collect();
+            assert_eq!(bytes, b"alphabeta", "{tier:?}");
+        }
     }
 
     #[test]
