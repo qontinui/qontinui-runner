@@ -98,7 +98,24 @@ jobs:
             exit 1
           fi
 
-          echo "Resolved version=${version} tag=v${version}"
+          # The resolved version MUST match the app version, because Tauri names
+          # every bundle from tauri.conf.json — not from this input. Releasing
+          # v1.0.8 against an app still pinned at 1.0.7 produces a release tagged
+          # v1.0.8 whose assets are all named ..._1.0.7_..., and the Windows
+          # updater manifest then advertises
+          #   .../download/v1.0.8/Qontinui.Runner_1.0.8_x64-setup.exe
+          # which 404s for every auto-updating client. Nothing downstream would
+          # catch it: the Windows hard gate and the asset report both match on
+          # `setup.exe` and are version-agnostic, so the release publishes green
+          # with a dead updater. Assert it here, where it is still cheap.
+          # This also guards the tag path against tagging without bumping.
+          app_version="$(jq -r .version src-tauri/tauri.conf.json)"
+          if [[ "${version}" != "${app_version}" ]]; then
+            echo "::error::Release version '${version}' does not match src-tauri/tauri.conf.json version '${app_version}'. Tauri names bundles from tauri.conf.json, so these must agree or the release ships mislabelled assets and a 404ing updater manifest. Bump tauri.conf.json (and Cargo.toml) first."
+            exit 1
+          fi
+
+          echo "Resolved version=${version} tag=v${version} (matches tauri.conf.json)"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "tag=v${version}" >> "$GITHUB_OUTPUT"
 
@@ -113,6 +130,12 @@ jobs:
           # the tag is created at the dispatched ref. Either way it agrees with
           # release_version, which publish-update-json looks the release up by.
           tag_name: ${{ steps.get_version.outputs.tag }}
+          # Without an explicit commitish the Releases API defaults
+          # target_commitish to the repository's DEFAULT branch, so a dispatch
+          # from any other branch would tag main's HEAD while the build job
+          # builds the dispatched ref — tag and shipped code silently diverge.
+          # Pin it to the ref this run is actually building.
+          commitish: ${{ github.sha }}
           release_name: Qontinui Runner v${{ steps.get_version.outputs.version }} (Beta)
           draft: true
           prerelease: true
