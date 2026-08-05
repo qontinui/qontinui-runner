@@ -1,0 +1,178 @@
+# TEMPORARY PROBE — Phase 0 of plan
+# 2026-08-05-runner-schemas-ref-declared-adaptation.
+#
+# This workflow is DELIBERATELY THROWAWAY. It exists to falsify two
+# assumptions the plan's whole design rests on, BEFORE any production YAML is
+# written. It must never be merged: the probe PR is closed and this file
+# deleted at the end of Phase 0.
+#
+# It is deliberately NOT in ci-integrity.yml's GATING list (it is a new file),
+# so `ci-integrity` should FIRE (its trigger is `.github/workflows/**`) and go
+# GREEN with "No gating workflow modified". Both halves are asserted — an
+# ABSENT ci-integrity check means the paths trigger does not behave as read,
+# and a RED one means the GATING matching is broader than it reads.
+name: zz-probe-declared-adaptation
+
+on:
+  pull_request:
+    branches: [main]
+
+# The exact least-privilege block §3.5 proposes adding to the six workflows
+# that currently have none. If the cross-repo read below works under THIS
+# block, §3.5's ruling is safe to apply.
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  probe:
+    name: Probe declared-adaptation preconditions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: "Target 1a: cross-repo read of a PUBLIC sibling's open PRs"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "PROBE-1A: reading qontinui-schemas open PRs with the default GITHUB_TOKEN"
+          set +e
+          out="$(gh api "repos/qontinui/qontinui-schemas/pulls?state=open&per_page=100" --jq 'length')"
+          rc=$?
+          set -e
+          echo "PROBE-1A-RC=${rc}"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::PROBE-1A FAILED (rc=${rc}) — §3.2's form-1 fallback and §3.5's permissions ruling are both wrong."
+            exit 1
+          fi
+          echo "PROBE-1A-COUNT=${out}"
+          echo "PROBE-1A=PASS"
+
+      - name: "Target 1b: same-repo read of THIS PR's own labels"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          echo "PROBE-1B: reading labels on ${REPO}#${PR_NUMBER}"
+          set +e
+          labels="$(gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" --jq '.[].name')"
+          rc=$?
+          set -e
+          echo "PROBE-1B-RC=${rc}"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::PROBE-1B FAILED (rc=${rc}) — the primary (form 2) self-read is unavailable."
+            exit 1
+          fi
+          echo "PROBE-1B-LABELS<<EOF"
+          printf '%s\n' "${labels}"
+          echo "EOF"
+          echo "PROBE-1B=PASS"
+
+      - name: "Target 1c: the PR-detail read Phase A validates on"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Resolve a live open schemas PR dynamically rather than hardcoding a
+          # number, so this probe keeps working as that repo's PR set churns.
+          set +e
+          n="$(gh api "repos/qontinui/qontinui-schemas/pulls?state=open&per_page=100" \
+                 --jq '[.[] | select(.base.ref == "main")][0].number')"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ] || [ -z "${n}" ] || [ "${n}" = "null" ]; then
+            echo "::error::PROBE-1C could not resolve an open main-based schemas PR (rc=${rc}, n='${n}')."
+            exit 1
+          fi
+          echo "PROBE-1C-TARGET=qontinui-schemas#${n}"
+          set +e
+          meta="$(gh api "repos/qontinui/qontinui-schemas/pulls/${n}" \
+                    --jq '.head.sha + " " + .head.ref + " " + .state + " " + .base.ref + " " + .head.repo.full_name')"
+          rc=$?
+          set -e
+          echo "PROBE-1C-RC=${rc}"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::PROBE-1C FAILED (rc=${rc}) — §3.4's validation read is unavailable."
+            exit 1
+          fi
+          echo "PROBE-1C-META=${meta}"
+          # head.repo.full_name is the field §3.4 adds and the schemas twin omits.
+          echo "PROBE-1C=PASS"
+          {
+            echo "probe_pr=${n}"
+            echo "probe_head_ref=$(printf '%s' "${meta}" | cut -d' ' -f2)"
+            echo "probe_head_sha=$(printf '%s' "${meta}" | cut -d' ' -f1)"
+          } >> "$GITHUB_OUTPUT"
+        id: detail
+
+      - name: "Target 2: does `git clone --depth 1 --branch <head.ref>` still resolve?"
+        env:
+          HEAD_REF: ${{ steps.detail.outputs.probe_head_ref }}
+          HEAD_SHA: ${{ steps.detail.outputs.probe_head_sha }}
+        run: |
+          set -euo pipefail
+          echo "PROBE-2: cloning qontinui-schemas at branch '${HEAD_REF}'"
+          # Phase A's entire contract depends on the declared PR's head.ref
+          # being a real branch on qontinui-schemas. Refname via env, never
+          # spliced — the same injection discipline action.yml:59-63 keeps.
+          cd "$(mktemp -d)"
+          set +e
+          git clone --depth 1 --branch "${HEAD_REF}" \
+            https://github.com/qontinui/qontinui-schemas.git probe-clone >/dev/null 2>&1
+          rc=$?
+          set -e
+          echo "PROBE-2-RC=${rc}"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::PROBE-2 FAILED — Phase A collapses into Phase B (SHA fetch) and the two phases merge."
+            exit 1
+          fi
+          got="$(git -C probe-clone rev-parse HEAD)"
+          echo "PROBE-2-CLONED-SHA=${got}"
+          echo "PROBE-2-DECLARED-SHA=${HEAD_SHA}"
+          if [ "${got}" != "${HEAD_SHA}" ]; then
+            echo "::warning::clone resolved ${got} but the API reported ${HEAD_SHA} — force-push race (the exact window Phase B closes)."
+          fi
+          echo "PROBE-2=PASS"
+
+      - name: "Target 2b: does the Phase B SHA fetch work from the BASE repo?"
+        env:
+          HEAD_SHA: ${{ steps.detail.outputs.probe_head_sha }}
+        run: |
+          set -euo pipefail
+          # Phase B replaces clone --branch with an explicit SHA fetch. Prove
+          # the shape works before committing to it.
+          echo "PROBE-2B: fetching ${HEAD_SHA} directly"
+          cd "$(mktemp -d)"
+          git init -q probe-fetch
+          cd probe-fetch
+          git remote add origin https://github.com/qontinui/qontinui-schemas.git
+          set +e
+          git fetch --depth 1 origin "${HEAD_SHA}" >/dev/null 2>&1
+          rc=$?
+          set -e
+          echo "PROBE-2B-RC=${rc}"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::PROBE-2B FAILED — Phase B's fetch-by-SHA shape does not work; re-derive Phase B."
+            exit 1
+          fi
+          git checkout -q FETCH_HEAD
+          echo "PROBE-2B-HEAD=$(git rev-parse HEAD)"
+          echo "PROBE-2B=PASS"
+
+      - name: "Target 3: rate-limit headroom (measure, do not estimate)"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "PROBE-3: rate limit for the default GITHUB_TOKEN"
+          gh api rate_limit --jq '.rate' | tee /tmp/rate.json
+          echo "PROBE-3-REMAINING=$(jq -r '.remaining' /tmp/rate.json)"
+          echo "PROBE-3-LIMIT=$(jq -r '.limit' /tmp/rate.json)"
+          echo "PROBE-3=PASS"
+
+      - name: Probe summary
+        run: echo "ALL PROBES PASSED — Phase 0 falsification targets 1, 2 and 3 recorded."
