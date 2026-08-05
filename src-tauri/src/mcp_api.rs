@@ -572,11 +572,80 @@ async fn health(
         pg_reachable,
     );
 
-    // One-way readiness flag flipped by the first successful UI Bridge IPC
-    // response (see `mcp::ui_bridge::request::ui_bridge_request_inner`).
-    // Distinguishes "Tauri shell is responsive" from "React app has actually
-    // mounted past App.tsx's loading screen and is processing UI Bridge IPC".
-    let frontend_ready = state.app_state.frontend_ready.load(Ordering::Relaxed);
+    // `frontendReady` is DERIVED, not latched (2026-08-05).
+    //
+    // It used to be `AppState::frontend_ready`, a one-way latch flipped by the
+    // first successful UI Bridge IPC response. Nothing inside the runner ever
+    // drives that path — the 3s `ui-bridge-ping`/`ui-bridge-pong` loop bypasses
+    // it, and the startup `ui_bridge_invoke_probe` uses its own invoke store —
+    // so on a perfectly healthy, idle runner the latch stayed `false` until
+    // some EXTERNAL client happened to call a `/ui-bridge/*` route. It measured
+    // "has anyone used the UI Bridge yet", not "is the frontend ready", and
+    // because it was one-way it was also wrong in the other direction: once
+    // true it stayed true through a dead WebView2 host.
+    //
+    // Worse, the two states were indistinguishable: a frontend that never
+    // loaded (2026-08-05 morning: every invoke probe logged "frontend did not
+    // reply within probe timeout") and a frontend serving a full 16-element
+    // snapshot both read `frontendReady: false`.
+    //
+    // `classify_frontend_state` already answers this exact question correctly
+    // and is IPC-free by construction, so it works precisely when the React
+    // tree is down. It was built for the identical defect on the UI-Bridge
+    // diagnostics routes ("`ready`/`sdk_connected` used to be `last_pong > 0`,
+    // a latch that flips true on the first pong and is never reset"); /health
+    // simply never adopted it. The pong is emitted from React
+    // (`useUIBridgeEventHandler.ts`), from the SAME `useEffect` that registers
+    // the `ui-bridge-request` listener — so a pong already proves both that the
+    // app mounted past the loading screen and that the UI-Bridge listener is
+    // wired. That is the whole distinction the latch claimed to draw, and the
+    // pong establishes it on a self-driving 3s loop instead of waiting on
+    // external traffic.
+    let main_window = {
+        use tauri::Manager;
+        state
+            .app_handle
+            .get_webview_window(qontinui_runner_lib::get_main_window_label())
+    };
+    let frontend_state = crate::mcp::ui_bridge::request::classify_frontend_state(
+        crate::mcp::ui_bridge::request::FrontendStateInputs {
+            window_exists: main_window.is_some(),
+            window_visible: main_window
+                .as_ref()
+                .and_then(|w| w.is_visible().ok())
+                .unwrap_or(false),
+            last_pong,
+            last_pong_age_ms: pong_age_ms,
+            console_error_count: console_errors,
+            process_uptime_ms: uptime_secs.saturating_mul(1000),
+            has_ui_error: ui_error_snapshot.is_some(),
+        },
+    );
+    // `Responsive` specifically, NOT `is_ready()`. The two diagnostics routes
+    // use `is_ready()` to answer a different question ("has the SDK ever
+    // connected and not since crashed"), and it is deliberately lenient:
+    // `last_pong > 0 && != TreeCrashed` reports READY for a `WindowMissing`
+    // frontend whose WebView is gone (asserted in `request.rs`'s
+    // `frontend_state_tests`). For `/health`'s `frontendReady` the useful
+    // question is "can the frontend serve a UI Bridge call right now", so every
+    // non-`Responsive` branch — missing window, booting, never ponged, crashed
+    // tree, gone silent — is not ready.
+    //
+    // This makes `frontendReady` strictly stronger than the sibling
+    // `responsive` field (a 15s pong-age test): it additionally requires that
+    // the WebView window exists and that React's error boundary is not holding
+    // a throw. Those are precisely the two failures a pong CANNOT see, because
+    // the SDK's pong loop survives under the error boundary's fallback.
+    let frontend_ready =
+        frontend_state == crate::mcp::ui_bridge::request::FrontendState::Responsive;
+
+    // The raw latch is preserved under an honest name rather than deleted: "a
+    // full UI-Bridge request/response round-trip has completed at least once
+    // since boot" is genuinely useful — it exercises the entire path end to end
+    // (request emitted → frontend handler ran → response decoded on the oneshot
+    // channel), which a pong does not. It just isn't readiness, and it can only
+    // ever become true if something external asks.
+    let ui_bridge_ipc_observed = state.app_state.frontend_ready.load(Ordering::Relaxed);
 
     // Build/deploy drift vs origin/main (plan 2026-07-03-runner-session-
     // tracking-drift-and-guardrails Phase 3 item 3). `mainSha` is
@@ -591,6 +660,14 @@ async fn health(
         "ready": last_pong > 0,
         "responsive": responsive,
         "frontendReady": frontend_ready,
+        // Why `frontendReady` is what it is. A bare boolean cannot separate
+        // "still booting" from "never mounted" from "mounted then crashed" from
+        // "went silent"; this names the branch that decided.
+        "frontendState": frontend_state.as_str(),
+        // "A UI-Bridge request/response round-trip has completed since boot."
+        // NOT readiness — externally driven and one-way. See the derivation
+        // comment above.
+        "uiBridgeIpcObserved": ui_bridge_ipc_observed,
         "lastHeartbeat": last_pong,
         "heartbeatAgeMs": pong_age_ms,
         "uptimeSeconds": uptime_secs,
@@ -673,6 +750,24 @@ async fn health(
         "ui_error": ui_error_json.clone(),
         "recent_crash": recent_crash_json.clone(),
     });
+
+    // Debug builds only: routes caught shipping a non-JSON error body, i.e.
+    // handlers that bypassed the canonical envelope. `count` is 0 on a healthy
+    // build; anything else is a handler bug with the offending routes listed.
+    //
+    // This is the surface that replaced `envelope_audit`'s panic. A panic was
+    // swallowed by `CatchPanicLayer` and left nothing a caller could assert on;
+    // this is queryable, cumulative, and survives the request that produced it.
+    #[cfg(debug_assertions)]
+    {
+        data.as_object_mut().unwrap().insert(
+            "envelopeViolations".to_string(),
+            serde_json::json!({
+                "count": crate::mcp::envelope_audit::violation_count(),
+                "recent": crate::mcp::envelope_audit::violations(),
+            }),
+        );
+    }
 
     if let Some((screenshot, width, height)) = diagnostic_screenshot {
         data.as_object_mut().unwrap().insert(
@@ -4692,17 +4787,19 @@ pub fn create_router(
     // Layer ordering (`.layer()` is bottom-up — last call = outermost):
     //
     //   [CatchPanicLayer]              ← outermost: panics → 500 JSON
-    //     [envelope_audit_middleware]  ← debug-only: panics if error is non-JSON
-    //       [envelope_rewrite_middleware] ← rewrites 4xx text/plain → JSON envelope
+    //     [envelope_audit_middleware]  ← debug-only: REPORTS non-JSON errors
+    //       [envelope_rewrite_middleware] ← rewrites 4xx/5xx text/plain → JSON
     //         [TraceLayer, CORS, BodyLimit, ...]
     //           [handlers]
     //
     // The panic layer must remain outermost so it can catch panics that
     // originate in any layer below, including the audit and envelope layers.
-    // The audit layer sits INSIDE CatchPanicLayer (panics are caught → 500
-    // JSON) and OUTSIDE envelope_rewrite (observes the post-rewrite response).
-    // A non-JSON error response after the rewrite is a definitive handler bug
-    // surfaced as a panic in debug builds; compiles away entirely in release.
+    // The audit layer sits OUTSIDE envelope_rewrite so it observes the
+    // post-rewrite response. A non-JSON error response after the rewrite is a
+    // definitive handler bug; as of 2026-08-05 the audit REPORTS it (ERROR log
+    // + violation registry) and forwards the response unchanged rather than
+    // panicking — see `mcp::envelope_audit` for why the panic was net-harmful.
+    // Compiles away entirely in release.
     //
     // The #[cfg(debug_assertions)] audit layer cannot be placed inline in a
     // method-chain call, so we use a let-rebind pattern:

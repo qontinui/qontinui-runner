@@ -38,6 +38,16 @@ thread_local! {
     /// other's dumps.
     static LAST_CRASH_DUMP: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
+
+    /// Path of the fixed `latest_crash.txt` alias this thread's panic hook
+    /// wrote most recently.
+    ///
+    /// `crash_dumps::is_crash_dump_filename` deliberately ignores this file, so
+    /// it never fooled the startup scan — but it IS the copy humans and agents
+    /// open by name, and it was the one artifact `retract_last_crash_dump` left
+    /// behind. A caught panic therefore kept advertising a crash indefinitely.
+    static LAST_LATEST_CRASH_ALIAS: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Downgrade the crash dump this thread's panic hook just wrote from
@@ -51,6 +61,20 @@ thread_local! {
 ///
 /// Returns `true` if a dump was actually renamed.
 pub fn retract_last_crash_dump(reason: &str) -> bool {
+    // Downgrade the fixed `latest_crash.txt` alias alongside the timestamped
+    // dump. Renamed rather than deleted so the forensics survive — under a name
+    // that says the process lived.
+    LAST_LATEST_CRASH_ALIAS.with(|cell| {
+        if let Some(alias) = cell.borrow_mut().take() {
+            let caught_alias = alias.with_file_name("latest_caught.txt");
+            if let Err(e) = std::fs::rename(&alias, &caught_alias) {
+                safe_eprintln(&format!(
+                    "Failed to downgrade caught-panic latest_crash alias {alias:?}: {e}"
+                ));
+            }
+        }
+    });
+
     LAST_CRASH_DUMP.with(|cell| {
         let Some(path) = cell.borrow_mut().take() else {
             return false;
@@ -403,10 +427,18 @@ pub fn write_crash_dump(location: &str, message: &str, backtrace: &str) {
         }
     }
 
-    // Also write to a fixed "latest_crash.txt" for easy access
+    // Also write to a fixed "latest_crash.txt" for easy access. Remember it so
+    // `retract_last_crash_dump` can downgrade this copy too when the panic
+    // turns out to have been caught — `latest_crash.txt` is the file a human or
+    // agent actually opens, and leaving a caught middleware assertion there
+    // reports a process death that never happened (live evidence
+    // 2026-08-05T15:28:10: the `crash_*.txt` was correctly retracted to
+    // `caught_*.txt`, but the byte-identical `latest_crash.txt` was not, and
+    // that stale copy is what a later investigation read as a crash).
     let latest_crash = crash_dir.join("latest_crash.txt");
     if let Ok(mut file) = std::fs::File::create(&latest_crash) {
         let _ = file.write_all(crash_content.as_bytes());
+        LAST_LATEST_CRASH_ALIAS.with(|cell| *cell.borrow_mut() = Some(latest_crash.clone()));
     }
 
     // Print to stderr as well (using safe write to avoid panic on closed pipe)

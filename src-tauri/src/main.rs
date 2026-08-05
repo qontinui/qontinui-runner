@@ -1131,7 +1131,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             crate::step_executor::handlers::ui_bridge::UiBridgeFailureTracker::new(),
         process_capture_manager: TokioMutex::new(None), // Initialized in setup()
         api_ready: AtomicBool::new(false),              // Set when MCP API server binds
-        frontend_ready: AtomicBool::new(false), // Set on first successful UI Bridge IPC response
+        // Set on the first successful UI Bridge IPC round-trip; published as
+        // `/health`'s `uiBridgeIpcObserved`. NOT frontend readiness.
+        frontend_ready: AtomicBool::new(false),
         // 0 = no UI has ever ponged. Advanced by the `ui-bridge-pong` listener.
         ui_bridge_last_pong: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         api_port: AtomicU16::new(crate::mcp::types::get_mcp_api_port()), // Updated when server binds

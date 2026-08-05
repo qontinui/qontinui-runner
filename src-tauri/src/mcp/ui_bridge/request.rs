@@ -140,7 +140,7 @@ pub(super) const TREE_CRASHED_HINT: &str = "React tree threw and the error bound
 /// the *ladder* is shared even though the two response bodies phrase their
 /// hints differently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum FrontendState {
+pub(crate) enum FrontendState {
     /// The Tauri main WebView window doesn't exist at all.
     WindowMissing,
     /// No pong yet, but the process is <3s old — probably still booting.
@@ -171,15 +171,34 @@ impl FrontendState {
     /// never reset — so on its own it cannot represent a tree that mounted and
     /// *then* died. [`FrontendState::TreeCrashed`] forces it back to false; a
     /// mounted-but-crashed tree is not ready.
-    pub(super) fn is_ready(self, last_pong: u64) -> bool {
+    pub(crate) fn is_ready(self, last_pong: u64) -> bool {
         last_pong > 0 && self != FrontendState::TreeCrashed
+    }
+
+    /// Stable wire name for this state.
+    ///
+    /// `/health` reports it as `frontendState` so a consumer can tell the
+    /// distinct reasons a frontend is not ready apart from each other — a
+    /// single boolean collapses "still booting", "never mounted", "mounted then
+    /// crashed" and "went silent" into one indistinguishable `false`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            FrontendState::WindowMissing => "window_missing",
+            FrontendState::Booting => "booting",
+            FrontendState::CrashedDuringMount => "crashed_during_mount",
+            FrontendState::WindowNotVisible => "window_not_visible",
+            FrontendState::NeverPonged => "never_ponged",
+            FrontendState::TreeCrashed => "tree_crashed",
+            FrontendState::Stale => "stale",
+            FrontendState::Responsive => "responsive",
+        }
     }
 }
 
 /// Inputs to [`classify_frontend_state`]. Grouped into a struct so the
 /// call sites can't transpose same-typed positional arguments.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct FrontendStateInputs {
+pub(crate) struct FrontendStateInputs {
     pub window_exists: bool,
     pub window_visible: bool,
     pub last_pong: u64,
@@ -194,7 +213,7 @@ pub(super) struct FrontendStateInputs {
 /// Pure and IPC-free by construction: every input is read from `ApiState` or
 /// the Tauri window handle, so this answers correctly even while the React
 /// tree is down (which is exactly when it matters).
-pub(super) fn classify_frontend_state(i: FrontendStateInputs) -> FrontendState {
+pub(crate) fn classify_frontend_state(i: FrontendStateInputs) -> FrontendState {
     if !i.window_exists {
         FrontendState::WindowMissing
     } else if i.last_pong == 0 && i.process_uptime_ms < 3000 {
@@ -710,12 +729,15 @@ async fn ui_bridge_request_inner(
     let timeout_duration = std::time::Duration::from_millis(get_ui_bridge_timeout_ms());
     match tokio::time::timeout(timeout_duration, rx).await {
         Ok(Ok(response)) => {
-            // First successful IPC response means the React frontend has
-            // mounted past `App.tsx`'s loading-screen branch and its
-            // ui-bridge-response listener is wired up. Flip the one-way
-            // readiness flag so /health can report `frontendReady: true`.
-            // (Stays true for the rest of the process lifetime — see
-            // `AppState::frontend_ready` doc.)
+            // A successful IPC response means a full UI Bridge round-trip has
+            // completed end to end. Flip the one-way latch, which `/health`
+            // publishes as `uiBridgeIpcObserved`.
+            //
+            // NOT readiness — `/health`'s `frontendReady` is derived from
+            // `classify_frontend_state` instead. This latch only ever flips
+            // when something EXTERNAL calls a `/ui-bridge/*` route, so it
+            // stayed false on healthy idle runners for as long as nobody
+            // asked. See the `AppState::frontend_ready` doc.
             state
                 .app_state
                 .frontend_ready
@@ -1073,6 +1095,70 @@ mod frontend_state_tests {
                 "{state:?} must not be ready with no pong"
             );
         }
+    }
+
+    /// `/health`'s `frontendReady` is `state == Responsive`, deliberately NOT
+    /// `is_ready()`.
+    ///
+    /// `is_ready()` is lenient by design for the two UI-Bridge diagnostics
+    /// routes — `missing_window_outranks_everything` above pins that a
+    /// `WindowMissing` frontend with a live pong latch still reports ready
+    /// there. A dead WebView window is emphatically NOT "the frontend can serve
+    /// a UI Bridge call right now", which is the question `/health` answers, so
+    /// this locks in that only `Responsive` qualifies.
+    #[test]
+    fn only_responsive_qualifies_as_health_frontend_ready() {
+        for state in [
+            FrontendState::WindowMissing,
+            FrontendState::Booting,
+            FrontendState::CrashedDuringMount,
+            FrontendState::WindowNotVisible,
+            FrontendState::NeverPonged,
+            FrontendState::TreeCrashed,
+            FrontendState::Stale,
+        ] {
+            assert_ne!(
+                state,
+                FrontendState::Responsive,
+                "{state:?} must not satisfy /health's frontendReady"
+            );
+        }
+
+        // The healthy fixture is the one state that does.
+        assert_eq!(
+            classify_frontend_state(healthy()),
+            FrontendState::Responsive
+        );
+
+        // And the trap this guards: WindowMissing is `is_ready` but NOT
+        // `Responsive`, so /health must never adopt `is_ready`.
+        let gone = FrontendStateInputs {
+            window_exists: false,
+            ..healthy()
+        };
+        let gone_state = classify_frontend_state(gone);
+        assert!(gone_state.is_ready(gone.last_pong));
+        assert_ne!(gone_state, FrontendState::Responsive);
+    }
+
+    /// `as_str` is a wire contract — `/health` publishes it as `frontendState`
+    /// and consumers branch on the literals. Renaming one silently breaks them.
+    #[test]
+    fn frontend_state_wire_names_are_stable() {
+        assert_eq!(FrontendState::WindowMissing.as_str(), "window_missing");
+        assert_eq!(FrontendState::Booting.as_str(), "booting");
+        assert_eq!(
+            FrontendState::CrashedDuringMount.as_str(),
+            "crashed_during_mount"
+        );
+        assert_eq!(
+            FrontendState::WindowNotVisible.as_str(),
+            "window_not_visible"
+        );
+        assert_eq!(FrontendState::NeverPonged.as_str(), "never_ponged");
+        assert_eq!(FrontendState::TreeCrashed.as_str(), "tree_crashed");
+        assert_eq!(FrontendState::Stale.as_str(), "stale");
+        assert_eq!(FrontendState::Responsive.as_str(), "responsive");
     }
 }
 
