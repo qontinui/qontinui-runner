@@ -33,7 +33,7 @@
 //! justifies noisy failures.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use tokio::process::Command;
@@ -64,6 +64,60 @@ struct RepoInfo {
     branches: Vec<BranchTrailer>,
 }
 
+/// How long a resolved `working_dir → git toplevel` mapping is trusted.
+///
+/// A session's cwd effectively never changes repo, so this only needs to be
+/// short enough that a moved/deleted checkout self-heals within a few minutes.
+const TOPLEVEL_TTL: Duration = Duration::from_secs(600);
+
+/// Bound on the cross-tick toplevel cache. Sessions come and go, so the map
+/// needs a ceiling; well above any realistic live-session count.
+const TOPLEVEL_CACHE_MAX: usize = 512;
+
+/// `working_dir → git toplevel`, cached ACROSS ticks (plan
+/// `2026-07-28-runner-many-sessions-performance` §7a/B8).
+///
+/// The per-tick `repo_cache` below cannot help here: it is keyed BY the
+/// toplevel, so it can only dedupe work that happens *after* the toplevel is
+/// known — the `git rev-parse --show-toplevel` subprocess that produces the key
+/// still ran once per open record per tick, i.e. N process spawns every 30s.
+///
+/// Invalidation: TTL'd, bounded, and a failed resolution drops the entry so a
+/// moved or deleted checkout re-resolves on the next tick rather than serving
+/// a stale root forever.
+#[derive(Default)]
+struct TopLevelCache {
+    entries: HashMap<String, (String, Instant)>,
+}
+
+impl TopLevelCache {
+    fn get(&self, working_dir: &str) -> Option<&str> {
+        let (toplevel, at) = self.entries.get(working_dir)?;
+        if at.elapsed() > TOPLEVEL_TTL {
+            return None;
+        }
+        Some(toplevel.as_str())
+    }
+
+    fn insert(&mut self, working_dir: String, toplevel: String) {
+        if self.entries.len() >= TOPLEVEL_CACHE_MAX {
+            // Drop everything expired; if that frees nothing, drop the whole
+            // map rather than growing without bound. Re-resolution is one
+            // subprocess per live session, not a correctness event.
+            self.entries
+                .retain(|_, (_, at)| at.elapsed() <= TOPLEVEL_TTL);
+            if self.entries.len() >= TOPLEVEL_CACHE_MAX {
+                self.entries.clear();
+            }
+        }
+        self.entries.insert(working_dir, (toplevel, Instant::now()));
+    }
+
+    fn invalidate(&mut self, working_dir: &str) {
+        self.entries.remove(working_dir);
+    }
+}
+
 /// Start the reconciler as a detached background task for the process
 /// lifetime (matching the lifecycle liveness-poll idiom in `main.rs`). Runs a
 /// best-effort pass immediately, then every [`POLL_INTERVAL`].
@@ -73,8 +127,9 @@ pub fn start(lifecycle_store: std::sync::Arc<SessionLifecycleStore>) {
             "session-PR reconciler started (interval: {}s)",
             POLL_INTERVAL.as_secs()
         );
+        let mut toplevels = TopLevelCache::default();
         loop {
-            if let Err(e) = run_tick(&lifecycle_store).await {
+            if let Err(e) = run_tick(&lifecycle_store, &mut toplevels).await {
                 debug!("session-PR reconciler tick error (continuing): {e}");
             }
             tokio::time::sleep(POLL_INTERVAL).await;
@@ -84,7 +139,10 @@ pub fn start(lifecycle_store: std::sync::Arc<SessionLifecycleStore>) {
 
 /// One reconcile pass. Returns `Err` only for a whole-tick precondition miss
 /// (no DB / no token); per-session/per-repo failures are logged and skipped.
-async fn run_tick(store: &SessionLifecycleStore) -> Result<(), String> {
+async fn run_tick(
+    store: &SessionLifecycleStore,
+    toplevels: &mut TopLevelCache,
+) -> Result<(), String> {
     if !crate::database::pg::pg_available() {
         return Err("PG unavailable".to_string());
     }
@@ -118,9 +176,19 @@ async fn run_tick(store: &SessionLifecycleStore) -> Result<(), String> {
     let mut repo_cache: HashMap<String, Option<RepoInfo>> = HashMap::new();
 
     for (session_id, working_dir) in records {
-        let Some(toplevel) = git_toplevel(&working_dir).await else {
-            debug!("session-PR reconciler: {working_dir} is not a git repo — skipping");
-            continue;
+        let toplevel = match toplevels.get(&working_dir) {
+            Some(cached) => cached.to_string(),
+            None => match git_toplevel(&working_dir).await {
+                Some(resolved) => {
+                    toplevels.insert(working_dir.clone(), resolved.clone());
+                    resolved
+                }
+                None => {
+                    toplevels.invalidate(&working_dir);
+                    debug!("session-PR reconciler: {working_dir} is not a git repo — skipping");
+                    continue;
+                }
+            },
         };
 
         if !repo_cache.contains_key(&toplevel) {
@@ -520,5 +588,39 @@ mod tests {
         let dt = parse_ts("2026-07-13T01:02:03Z").unwrap();
         assert_eq!(dt.to_rfc3339(), "2026-07-13T01:02:03+00:00");
         assert!(parse_ts("not-a-date").is_none());
+    }
+
+    /// The whole point of the cross-tick cache: N sessions sharing a checkout
+    /// resolve the toplevel ONCE, not once per session per 30s tick.
+    #[test]
+    fn toplevel_cache_serves_repeats_and_forgets_failures() {
+        let mut cache = TopLevelCache::default();
+        assert!(cache.get("D:/repo/sub").is_none(), "cold cache resolves");
+
+        cache.insert("D:/repo/sub".to_string(), "D:/repo".to_string());
+        assert_eq!(cache.get("D:/repo/sub"), Some("D:/repo"));
+        // A second session in the same cwd costs no subprocess.
+        assert_eq!(cache.get("D:/repo/sub"), Some("D:/repo"));
+        // A different cwd is still a miss.
+        assert!(cache.get("D:/other").is_none());
+
+        // A cwd that stops resolving (checkout moved/deleted) is forgotten so
+        // it re-resolves rather than serving a stale root forever.
+        cache.invalidate("D:/repo/sub");
+        assert!(cache.get("D:/repo/sub").is_none());
+    }
+
+    /// Bounded: the cache must not grow with churning session cwds.
+    #[test]
+    fn toplevel_cache_is_bounded() {
+        let mut cache = TopLevelCache::default();
+        for i in 0..(TOPLEVEL_CACHE_MAX * 2) {
+            cache.insert(format!("D:/wd/{i}"), "D:/repo".to_string());
+        }
+        assert!(
+            cache.entries.len() <= TOPLEVEL_CACHE_MAX,
+            "cache grew past its bound: {}",
+            cache.entries.len()
+        );
     }
 }

@@ -70,7 +70,7 @@ use uuid::Uuid;
 
 use crate::claude_session::coord_register::AiCoordRegistrar;
 
-use super::local_store::OutboxWriter;
+use super::local_store::{OutboxEvent, OutboxWriter};
 use super::redact::redact_secrets;
 use super::SessionEventKind;
 
@@ -175,32 +175,35 @@ impl TranscriptEmitter {
             .offsets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut offset = offsets.get(&session_id).copied().unwrap_or(0);
+        let mut events = Vec::new();
+        let mut end_offset = offsets.get(&session_id).copied().unwrap_or(0);
         for chunk in bytes.chunks(MAX_CHUNK_BYTES) {
-            let payload = json!({
-                "stream": TRANSCRIPT_STREAM,
-                "chunk_offset": offset,
-                "payload_b64": base64::engine::general_purpose::STANDARD.encode(chunk),
-            });
-            match self.outbox.record(
+            events.push(OutboxEvent::new(
                 self.machine_id,
                 session_id,
                 SessionEventKind::OutputChunk,
-                payload,
-            ) {
-                Ok(_) => {
-                    offset += chunk.len() as i64;
-                    offsets.insert(session_id, offset);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        task_run_id,
-                        session = %session_id,
-                        error = %e,
-                        "transcript_emitter: outbox append failed (best-effort) — chunk (and any remainder of this block) dropped locally"
-                    );
-                    break;
-                }
+                json!({
+                    "stream": TRANSCRIPT_STREAM,
+                    "chunk_offset": end_offset,
+                    "payload_b64": base64::engine::general_purpose::STANDARD.encode(chunk),
+                }),
+            ));
+            end_offset += chunk.len() as i64;
+        }
+        // One append + one fsync for the whole block, and all-or-nothing: a
+        // failure leaves the offset where it was, so the same chunks re-send
+        // next time (idempotent coord-side) rather than landing out of order.
+        match self.outbox.record_batch(events) {
+            Ok(_) => {
+                offsets.insert(session_id, end_offset);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    task_run_id,
+                    session = %session_id,
+                    error = %e,
+                    "transcript_emitter: outbox append failed (best-effort) — block dropped locally"
+                );
             }
         }
     }

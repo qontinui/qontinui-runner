@@ -11,19 +11,21 @@
 //! and [`CoordSync::start_heartbeat_task`] (the registry boots both at the
 //! end of `main.rs`'s `.setup()` closure):
 //!
-//! 1. **Drain loop** — reads unacked rows from the [`OutboxWriter`] in seq
+//! 1. **Drain loop** — reads undelivered rows from the [`OutboxWriter`] in seq
 //!    order, dispatches each to the right coord endpoint based on
-//!    `event_kind`, and ACKs by rewriting the JSONL line with `acked_at`.
-//!    Tick: 1s when there are unacked rows, 5s when caught up. Backs off
-//!    to 60s ceiling on repeated transport errors so coord-down sessions
-//!    don't burn the CPU.
+//!    `event_kind`, and ACKs them back into the outbox's drain cursor.
+//!    Records for one session go out serially (seq order is part of the
+//!    contract); up to [`MAX_CONCURRENT_PUSH_CHAINS`] different sessions are
+//!    pushed concurrently. Tick: 1s when there are undelivered rows, 5s when
+//!    caught up. Backs off to 60s ceiling on repeated transport errors so
+//!    coord-down sessions don't burn the CPU.
 //!
 //! 2. **Heartbeat loop** — every `QONTINUI_SESSION_HEARTBEAT_SECS`
 //!    (default 15s, plan §D13), iterates the [`SessionRegistry`] and emits
-//!    a heartbeat outbox row per active session. The drain loop then
-//!    PATCHes coord with `{heartbeat: true}` which refreshes
-//!    `last_heartbeat_at = now()` on coord-side. Stale-detection at 45s,
-//!    auto-close at 180s.
+//!    a heartbeat outbox row per active session — all of them in ONE batched
+//!    append covered by ONE fsync. The drain loop then PATCHes coord with
+//!    `{heartbeat: true}` which refreshes `last_heartbeat_at = now()` on
+//!    coord-side. Stale-detection at 45s, auto-close at 180s.
 //!
 //! ## Wire mapping
 //!
@@ -69,6 +71,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use chrono::Utc;
+use futures::stream::StreamExt;
 use reqwest::StatusCode;
 use serde::Serialize;
 use serde_json::{json, Value as JsonValue};
@@ -76,7 +79,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use super::dual_write::DualWriteGate;
-use super::local_store::{OutboxRecord, OutboxWriter};
+use super::local_store::{OutboxEvent, OutboxRecord, OutboxWriter};
 use super::{Intent, SessionEventKind, SessionRegistry, SessionState};
 
 // ---------------------------------------------------------------------------
@@ -490,6 +493,131 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// and Ack-dropped once its budget is spent.
 const HELPER_TASK_MAX_ATTEMPTS: u32 = 3;
 
+/// How many per-session push chains run at once (plan
+/// `2026-07-28-runner-many-sessions-performance` §7a/B6).
+///
+/// Records for one session MUST go out in seq order, so a session's records
+/// stay a serial chain; different sessions are independent and run
+/// concurrently. The bound is what keeps a coord outage from becoming N
+/// parallel retries: the first transport error trips a shared abort flag that
+/// every chain checks before its next push, so at most this many requests are
+/// ever in flight when the outage is noticed.
+const MAX_CONCURRENT_PUSH_CHAINS: usize = 8;
+
+/// What one per-session chain reports back to the drain tick.
+struct ChainOutcome {
+    succeeded: Vec<(Uuid, i64)>,
+    /// Updated helper-task attempt counters for this session's records.
+    attempts: HashMap<(Uuid, i64), u32>,
+    /// Keys whose helper-task budget should be forgotten (delivered/dropped).
+    cleared: Vec<(Uuid, i64)>,
+    had_transport_error: bool,
+}
+
+/// Push one session's records in seq order, stopping early once any chain has
+/// hit a transport error.
+async fn push_chain(
+    inner: Arc<CoordSyncInner>,
+    records: Vec<OutboxRecord>,
+    mut attempts: HashMap<(Uuid, i64), u32>,
+    abort: Arc<AtomicBool>,
+) -> ChainOutcome {
+    let mut out = ChainOutcome {
+        succeeded: Vec::with_capacity(records.len()),
+        attempts: HashMap::new(),
+        cleared: Vec::new(),
+        had_transport_error: false,
+    };
+
+    for rec in records {
+        if abort.load(Ordering::Relaxed) {
+            // Another chain hit a transport outage — do not add to the pile.
+            break;
+        }
+        match push_record(&inner, &rec).await {
+            PushOutcome::Acked => {
+                out.succeeded.push((rec.session_id, rec.seq));
+                out.cleared.push((rec.session_id, rec.seq));
+            }
+            PushOutcome::Conflict { row } => {
+                out.succeeded.push((rec.session_id, rec.seq));
+                handle_conflict(&inner, &rec, row).await;
+            }
+            PushOutcome::Transport(e) => {
+                // helper_task_created is BEST-EFFORT: it must never break
+                // the batch (session lifecycle events queued behind it
+                // would stall indefinitely). Skip it WITHOUT acking —
+                // `OutboxWriter::ack` marks exact (session_id, seq) pairs,
+                // so acking later records leaves this one pending — and
+                // keep draining. Retried on subsequent ticks up to
+                // HELPER_TASK_MAX_ATTEMPTS, then Ack-dropped with a warn.
+                if rec.event_kind == SessionEventKind::HelperTaskCreated.as_str() {
+                    let key = (rec.session_id, rec.seq);
+                    let entry = attempts.entry(key).or_insert(0);
+                    *entry += 1;
+                    if *entry >= HELPER_TASK_MAX_ATTEMPTS {
+                        tracing::warn!(
+                            session = %rec.session_id,
+                            seq = rec.seq,
+                            error = %e,
+                            "coord_sync: helper task push failed {HELPER_TASK_MAX_ATTEMPTS} \
+                             time(s) — dropping (best-effort)"
+                        );
+                        out.succeeded.push(key);
+                        out.cleared.push(key);
+                        attempts.remove(&key);
+                    } else {
+                        tracing::warn!(
+                            session = %rec.session_id,
+                            seq = rec.seq,
+                            attempt = *entry,
+                            error = %e,
+                            "coord_sync: helper task push failed — will retry \
+                             (best-effort; does not block the batch)"
+                        );
+                        out.had_transport_error = true;
+                    }
+                    continue;
+                }
+                tracing::warn!(
+                    session = %rec.session_id,
+                    seq = rec.seq,
+                    kind = %rec.event_kind,
+                    error = %e,
+                    "coord_sync: push failed; will retry"
+                );
+                out.had_transport_error = true;
+                // Stop the batch on transport error — preserves
+                // (session, seq) order on reconnect, and trips every other
+                // chain so an outage costs at most MAX_CONCURRENT_PUSH_CHAINS
+                // in-flight requests rather than one per pending record. The
+                // unACKed tail stays in the file for the next tick.
+                abort.store(true, Ordering::Relaxed);
+                break;
+            }
+            PushOutcome::PermanentFailure(reason) => {
+                // We treat 4xx (other than 409) as "the runner sent
+                // a bad record that coord refuses". ACK it locally
+                // so the queue moves forward — the dashboard will
+                // miss this event but the session itself isn't
+                // hostage to a corrupt row.
+                tracing::error!(
+                    session = %rec.session_id,
+                    seq = rec.seq,
+                    kind = %rec.event_kind,
+                    reason = %reason,
+                    "coord_sync: permanent failure — ACKing locally"
+                );
+                out.succeeded.push((rec.session_id, rec.seq));
+                out.cleared.push((rec.session_id, rec.seq));
+            }
+        }
+    }
+
+    out.attempts = attempts;
+    out
+}
+
 async fn run_drain_loop(inner: Arc<CoordSyncInner>) {
     tracing::info!(
         coord_url = %inner.coord_url,
@@ -518,83 +646,42 @@ async fn run_drain_loop(inner: Arc<CoordSyncInner>) {
         }
 
         let total = pending.len();
+
+        // Group into per-session chains. `pending()` returns records sorted by
+        // (session_id, seq), so each chain is already in seq order.
+        let mut chains: Vec<Vec<OutboxRecord>> = Vec::new();
+        for rec in pending {
+            match chains.last_mut() {
+                Some(chain) if chain[0].session_id == rec.session_id => chain.push(rec),
+                _ => chains.push(vec![rec]),
+            }
+        }
+
+        let abort = Arc::new(AtomicBool::new(false));
+        let outcomes: Vec<ChainOutcome> = futures::stream::iter(chains.into_iter().map(|chain| {
+            let session_attempts: HashMap<(Uuid, i64), u32> = helper_task_attempts
+                .iter()
+                .filter(|((sid, _), _)| *sid == chain[0].session_id)
+                .map(|(k, v)| (*k, *v))
+                .collect();
+            push_chain(inner.clone(), chain, session_attempts, abort.clone())
+        }))
+        .buffer_unordered(MAX_CONCURRENT_PUSH_CHAINS)
+        .collect()
+        .await;
+
         let mut succeeded: Vec<(Uuid, i64)> = Vec::with_capacity(total);
         let mut had_transport_error = false;
-
-        for rec in pending {
-            match push_record(&inner, &rec).await {
-                PushOutcome::Acked => {
-                    succeeded.push((rec.session_id, rec.seq));
-                    helper_task_attempts.remove(&(rec.session_id, rec.seq));
-                }
-                PushOutcome::Conflict { row } => {
-                    succeeded.push((rec.session_id, rec.seq));
-                    handle_conflict(&inner, &rec, row).await;
-                }
-                PushOutcome::Transport(e) => {
-                    // helper_task_created is BEST-EFFORT: it must never break
-                    // the batch (session lifecycle events queued behind it
-                    // would stall indefinitely). Skip it WITHOUT acking —
-                    // `OutboxWriter::ack` marks exact (session_id, seq) pairs,
-                    // so acking later records leaves this one pending — and
-                    // keep draining. Retried on subsequent ticks up to
-                    // HELPER_TASK_MAX_ATTEMPTS, then Ack-dropped with a warn.
-                    if rec.event_kind == SessionEventKind::HelperTaskCreated.as_str() {
-                        let key = (rec.session_id, rec.seq);
-                        let attempts = helper_task_attempts.entry(key).or_insert(0);
-                        *attempts += 1;
-                        if *attempts >= HELPER_TASK_MAX_ATTEMPTS {
-                            tracing::warn!(
-                                session = %rec.session_id,
-                                seq = rec.seq,
-                                error = %e,
-                                "coord_sync: helper task push failed {HELPER_TASK_MAX_ATTEMPTS} \
-                                 time(s) — dropping (best-effort)"
-                            );
-                            succeeded.push(key);
-                            helper_task_attempts.remove(&key);
-                        } else {
-                            tracing::warn!(
-                                session = %rec.session_id,
-                                seq = rec.seq,
-                                attempt = *attempts,
-                                error = %e,
-                                "coord_sync: helper task push failed — will retry \
-                                 (best-effort; does not block the batch)"
-                            );
-                            had_transport_error = true;
-                        }
-                        continue;
-                    }
-                    tracing::warn!(
-                        session = %rec.session_id,
-                        seq = rec.seq,
-                        kind = %rec.event_kind,
-                        error = %e,
-                        "coord_sync: push failed; will retry"
-                    );
-                    had_transport_error = true;
-                    // Stop the batch on transport error — preserves
-                    // (session, seq) order on reconnect. The unACKed
-                    // tail stays in the file for the next tick.
-                    break;
-                }
-                PushOutcome::PermanentFailure(reason) => {
-                    // We treat 4xx (other than 409) as "the runner sent
-                    // a bad record that coord refuses". ACK it locally
-                    // so the queue moves forward — the dashboard will
-                    // miss this event but the session itself isn't
-                    // hostage to a corrupt row.
-                    tracing::error!(
-                        session = %rec.session_id,
-                        seq = rec.seq,
-                        kind = %rec.event_kind,
-                        reason = %reason,
-                        "coord_sync: permanent failure — ACKing locally"
-                    );
-                    succeeded.push((rec.session_id, rec.seq));
-                    helper_task_attempts.remove(&(rec.session_id, rec.seq));
-                }
+        for outcome in outcomes {
+            succeeded.extend(outcome.succeeded);
+            had_transport_error |= outcome.had_transport_error;
+            for (key, attempts) in outcome.attempts {
+                helper_task_attempts.insert(key, attempts);
+            }
+            // Cleared wins over the carried counters: a record that delivered
+            // (or spent its budget) forgets its retry count, as before.
+            for key in outcome.cleared {
+                helper_task_attempts.remove(&key);
             }
         }
 
@@ -1220,18 +1307,29 @@ async fn run_heartbeat_loop(inner: Arc<CoordSyncInner>) {
 
         // Emit heartbeat outbox rows. The drain loop picks them up on
         // its next tick and PATCHes coord with `{heartbeat: true}`.
-        for id in to_heartbeat.keys() {
-            let payload = json!({
-                "id": id,
-                "at": now,
-            });
-            if let Err(e) =
-                inner
-                    .outbox
-                    .record(machine_id, *id, SessionEventKind::Heartbeat, payload)
-            {
+        //
+        // ONE batched append + ONE fsync for the whole sweep (plan
+        // `2026-07-28-runner-many-sessions-performance` §7a/B6). The per-row
+        // `record` loop this replaces cost one fsync per live session per
+        // tick. This is purely the runner's local write path — each session
+        // still gets its own row and its own `PATCH /sessions/:id`, so it
+        // carries no coord-side dependency (that is Phase 7b).
+        if !to_heartbeat.is_empty() {
+            let events: Vec<OutboxEvent> = to_heartbeat
+                .keys()
+                .map(|id| {
+                    OutboxEvent::new(
+                        machine_id,
+                        *id,
+                        SessionEventKind::Heartbeat,
+                        json!({ "id": id, "at": now }),
+                    )
+                })
+                .collect();
+            let count = events.len();
+            if let Err(e) = inner.outbox.record_batch(events) {
                 tracing::warn!(
-                    session = %id,
+                    sessions = count,
                     error = %e,
                     "coord_sync: heartbeat outbox write failed"
                 );
@@ -1384,6 +1482,10 @@ mod tests {
         next_post_conflict: bool,
         /// When >0, the next N POSTs return 500.
         next_post_5xx: usize,
+        /// When >0, the next N PATCHes return 500. Each attempt decrements it,
+        /// so `budget - remaining` counts how many pushes were actually
+        /// issued — which is how the bounded-parallel drain is asserted.
+        next_patch_5xx: usize,
         /// When true, every PATCH returns 404 (simulates a GC'd / missing
         /// coord row — drives the R2 resume 404-fallback path).
         patch_returns_404: bool,
@@ -1440,6 +1542,14 @@ mod tests {
                      AxumPath(id): AxumPath<Uuid>,
                      Json(body): Json<JsonValue>| async move {
                         let mut g = state.lock().await;
+                        if g.next_patch_5xx > 0 {
+                            g.next_patch_5xx -= 1;
+                            return (
+                                AxumStatus::INTERNAL_SERVER_ERROR,
+                                Json(json!({"error": "fake-5xx"})),
+                            )
+                                .into_response();
+                        }
                         g.patches.push((id, body.clone()));
                         if g.patch_returns_404 {
                             return (
@@ -1934,6 +2044,133 @@ mod tests {
             outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
         })
         .await;
+    }
+
+    /// Bounded-parallel drain, semantic half: a transport error stops the
+    /// failing session's chain at the FIRST failure (seq order on reconnect)
+    /// and trips the shared abort flag.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transport_error_stops_the_chain_and_trips_the_abort_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.next_patch_5xx = 100;
+
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let m = Uuid::new_v4();
+        let s = Uuid::new_v4();
+        let records: Vec<OutboxRecord> = (0..3)
+            .map(|_| {
+                outbox
+                    .record(m, s, SessionEventKind::Heartbeat, json!({}))
+                    .unwrap()
+            })
+            .collect();
+
+        let abort = Arc::new(AtomicBool::new(false));
+        let outcome = push_chain(coord.inner.clone(), records, HashMap::new(), abort.clone()).await;
+
+        assert!(outcome.had_transport_error);
+        assert!(
+            outcome.succeeded.is_empty(),
+            "nothing may be acked when the transport is down"
+        );
+        assert!(
+            abort.load(Ordering::Relaxed),
+            "a transport error must trip the shared abort flag"
+        );
+        assert_eq!(
+            100 - rec.lock().await.next_patch_5xx,
+            1,
+            "the chain must stop at the FIRST transport error, not push its tail"
+        );
+    }
+
+    /// The other half of the abort contract: a chain that starts after the
+    /// flag is set issues no requests at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_aborted_chain_issues_no_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.next_patch_5xx = 100;
+
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let m = Uuid::new_v4();
+        let s = Uuid::new_v4();
+        let records: Vec<OutboxRecord> = (0..3)
+            .map(|_| {
+                outbox
+                    .record(m, s, SessionEventKind::Heartbeat, json!({}))
+                    .unwrap()
+            })
+            .collect();
+
+        let abort = Arc::new(AtomicBool::new(true));
+        let outcome = push_chain(coord.inner.clone(), records, HashMap::new(), abort).await;
+
+        assert!(outcome.succeeded.is_empty());
+        assert!(!outcome.had_transport_error);
+        assert_eq!(
+            rec.lock().await.next_patch_5xx,
+            100,
+            "an already-aborted chain must not issue a single request"
+        );
+    }
+
+    /// Bounded-parallel drain, budget half: a coord outage with many pending
+    /// sessions must cost at most MAX_CONCURRENT_PUSH_CHAINS in-flight
+    /// requests, not one per pending record.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_coord_outage_bounds_in_flight_pushes() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.next_patch_5xx = 1000;
+
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        // 40 independent sessions, one undelivered row each.
+        let m = Uuid::new_v4();
+        let events: Vec<crate::session::local_store::OutboxEvent> = (0..40)
+            .map(|_| {
+                crate::session::local_store::OutboxEvent::new(
+                    m,
+                    Uuid::new_v4(),
+                    SessionEventKind::Heartbeat,
+                    json!({}),
+                )
+            })
+            .collect();
+        outbox.record_batch(events).unwrap();
+        assert_eq!(outbox.pending().unwrap().len(), 40);
+
+        let _drain = coord.start_drain_task();
+        // The first tick fires immediately, then backs off for TICK_BUSY (1s),
+        // so this samples exactly one tick.
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        let attempted = 1000 - rec.lock().await.next_patch_5xx;
+        assert!(
+            attempted <= MAX_CONCURRENT_PUSH_CHAINS,
+            "an outage must not fan out to one request per pending record: \
+             {attempted} issued for 40 pending rows"
+        );
+        // And nothing was acked — every row survives for the next tick.
+        assert_eq!(outbox.pending().unwrap().len(), 40);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
