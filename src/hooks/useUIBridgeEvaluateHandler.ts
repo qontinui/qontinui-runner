@@ -13,7 +13,7 @@
  *     | emit("ui-bridge:evaluate-request", { request_id, expression, await_promise, timeout_ms })
  *     v
  * This Hook
- *     | new Function("return " + expression)()  (security-gated)
+ *     | compileEvaluateExpression(expression)()  (security-gated)
  *     | awaitWithTimeout(result, PAGE_EVALUATE_PROMISE_TIMEOUT_MS)
  *     v
  * This Hook
@@ -44,7 +44,11 @@ import { emit, type Event } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { createLogger } from "@/lib/logger";
 import { getErrorMessage } from "@/lib/utils";
-import { awaitWithTimeout, PAGE_EVALUATE_PROMISE_TIMEOUT_MS } from "./ui-bridge-events/utils";
+import {
+  awaitWithTimeout,
+  compileEvaluateExpression,
+  PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
+} from "./ui-bridge-events/utils";
 import { acquireSingletonListener } from "./ui-bridge-events/singleton-listener";
 import { evaluateRequestDedupe } from "./ui-bridge-events/request-dedupe";
 
@@ -148,9 +152,11 @@ function rejectIfDangerous(expression: string, allowNetworkRequests: boolean): v
 
 /**
  * Evaluate a caller-supplied expression with the legacy page_evaluate
- * semantics: default-wrap as `return <expr>` so `document.title`-style
- * simple expressions evaluate to their value; fall back to raw function
- * body if the wrap produces a SyntaxError (e.g. caller wrote top-level
+ * semantics: {@link compileEvaluateExpression} wraps it as
+ * `return (<expr>\n)` so `document.title`-style simple expressions
+ * evaluate to their value (and a LEADING NEWLINE can't be swallowed by
+ * automatic semicolon insertion), falling back to a bare `return` wrap and
+ * then to a raw function body for statement-style input (top-level
  * `let`/`const` + explicit `return`). Top-level Promises (and any
  * thenable) are auto-awaited with a {@link PAGE_EVALUATE_PROMISE_TIMEOUT_MS}
  * cap so `(async () => ...)()` and `Promise.resolve(...)` patterns return
@@ -159,16 +165,7 @@ function rejectIfDangerous(expression: string, allowNetworkRequests: boolean): v
  * `usePageEvents.ts::page_evaluate` branch.
  */
 async function evaluateExpression(expression: string): Promise<unknown> {
-  let result: unknown;
-  try {
-    result = new Function("return " + expression)();
-  } catch (firstErr) {
-    if (firstErr instanceof SyntaxError) {
-      result = new Function(expression)();
-    } else {
-      throw firstErr;
-    }
-  }
+  const result = compileEvaluateExpression(expression)();
   return await awaitWithTimeout(result, PAGE_EVALUATE_PROMISE_TIMEOUT_MS);
 }
 

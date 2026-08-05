@@ -194,6 +194,78 @@ export function levenshtein(a: string, b: string): number {
 export const PAGE_EVALUATE_PROMISE_TIMEOUT_MS = 30_000;
 
 /**
+ * Compile a caller-supplied `page_evaluate` expression into a zero-arg
+ * function, WITHOUT executing it. Used by both `page_evaluate` call sites
+ * (`usePageEvents.ts` legacy IPC branch, `useUIBridgeEvaluateHandler.ts`
+ * tagged-event handler) so the wrapping rules can never drift between them.
+ *
+ * Why the parenthesised wrap (and why this is a bug fix, not a refactor):
+ *
+ * The naive wrap `new Function("return " + expression)` is broken for any
+ * expression that STARTS WITH A NEWLINE — the body becomes
+ *
+ * ```js
+ * return
+ * ({a:1})
+ * ```
+ *
+ * and automatic semicolon insertion terminates the `return` on the first
+ * line, so the function returns `undefined`. Critically it does NOT throw
+ * a SyntaxError, so the statement-style fallback below never fires and the
+ * caller gets `success: true` with an empty result — a SILENT FALSE GREEN
+ * that corrupts test evidence rather than merely losing it. Any driver
+ * that writes a multi-line expression the natural way (heredoc,
+ * triple-quoted string, template literal opening on the next line) hits it.
+ *
+ * Wrapping in parentheses makes the leading newline harmless (a newline
+ * inside a parenthesised expression is just whitespace) and, as a bonus,
+ * also fixes a leading line comment (`// note\nfoo()`). The `\n` before the
+ * closing paren guards the mirror case: a TRAILING line comment would
+ * otherwise swallow the `)`.
+ *
+ * Three compile attempts, most-specific first:
+ *
+ * 1. `return (<expr>\n)` — parenthesisable expressions. Newline- and
+ *    comment-safe at both ends. Covers the overwhelming majority.
+ * 2. `return <expr>` with leading whitespace stripped — expressions that
+ *    are valid after `return` but not inside parens, chiefly ones ending
+ *    in a semicolon (`document.title;`) or a trailing statement
+ *    (`foo(); bar()`). `trimStart()` is what keeps the ASI bug from
+ *    sneaking back in through this arm for a leading-newline expression
+ *    that also ends in `;`.
+ * 3. The raw expression as a function body — genuine statement-style input
+ *    with top-level `let`/`const` and an explicit `return`
+ *    (`let x = 1; return x + 1`), which is not parenthesisable at all.
+ *
+ * Compilation is deliberately separated from invocation. The previous code
+ * compiled-and-called inside one `try`, so an expression that merely THREW
+ * a `SyntaxError` at runtime (e.g. `JSON.parse("{")`) was misread as a
+ * failed wrap and re-executed as a raw body — a second execution of an
+ * expression the evaluate handler guarantees runs exactly once. Here a
+ * runtime throw of any type propagates to the caller's error envelope.
+ */
+export function compileEvaluateExpression(expression: string): () => unknown {
+  const candidates = [
+    "return (" + expression + "\n)",
+    "return " + expression.trimStart(),
+    expression,
+  ];
+  let lastSyntaxError: SyntaxError | undefined;
+  for (const body of candidates) {
+    try {
+      return new Function(body) as () => unknown;
+    } catch (err) {
+      if (err instanceof SyntaxError) {
+        lastSyntaxError = err;
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastSyntaxError ?? new SyntaxError("page_evaluate: expression failed to compile");
+}
+
+/**
  * Duck-typed thenable check. Spec-correct (matches what `await` itself
  * does): "thenable" is "has a callable `.then`". Catches cross-realm
  * Promises (e.g. iframes whose Promise constructor lives in a different

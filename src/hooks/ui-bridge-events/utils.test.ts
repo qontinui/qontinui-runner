@@ -18,6 +18,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   awaitWithTimeout,
+  compileEvaluateExpression,
   isThenable,
   isElementActionAllowed,
   PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
@@ -168,5 +169,83 @@ describe("isElementActionAllowed — execute_action per-element gate", () => {
 
   it("does NOT exempt hoverClick when click is absent", () => {
     expect(isElementActionAllowed(["focus", "blur", "hover"], "hoverClick")).toBe(false);
+  });
+});
+
+describe("compileEvaluateExpression — page_evaluate wrapping", () => {
+  it("evaluates a LEADING-NEWLINE expression instead of silently returning undefined", () => {
+    // THE REGRESSION. `new Function("return " + "\n({a:1})")` produces
+    //   return
+    //   ({a:1})
+    // and ASI terminates the `return`, yielding `undefined` -> serialised as
+    // `{}` under `success: true`. No SyntaxError is thrown, so the
+    // statement-style fallback never fires: a silent false green. Any caller
+    // writing a multi-line expression the natural way (heredoc, triple-quoted
+    // string, template literal opening on the next line) hits this.
+    expect(compileEvaluateExpression("\n({a:1})")()).toEqual({ a: 1 });
+  });
+
+  it.each([
+    ["\r\n({a:1})", { a: 1 }],
+    ["\n\n  ({a:1})", { a: 1 }],
+    ["\n  // leading comment\n  ({a:1})", { a: 1 }],
+  ])("evaluates leading-whitespace/comment variant %j", (expression, expected) => {
+    expect(compileEvaluateExpression(expression as string)()).toEqual(expected);
+  });
+
+  it("evaluates a trailing line comment without swallowing the closing paren", () => {
+    // Guards the mirror hazard introduced by the paren wrap itself: without
+    // the `\n` before `)`, `1 + 1 // done` would comment out the `)`.
+    expect(compileEvaluateExpression("1 + 1 // done")()).toBe(2);
+  });
+
+  it("still evaluates a bare object literal", () => {
+    expect(compileEvaluateExpression("({a:1})")()).toEqual({ a: 1 });
+  });
+
+  it.each(["document_title_placeholder;", "1 + 1;", "\n1 + 1;"])(
+    "still returns a value for the semicolon-terminated expression %j",
+    (expression) => {
+      const expr = expression.replace("document_title_placeholder", "2");
+      expect(compileEvaluateExpression(expr)()).toBe(2);
+    },
+  );
+
+  it("falls back to a raw function body for statement-style input", () => {
+    // Not parenthesisable and not valid after a bare `return` either — this
+    // is the case the original SyntaxError fallback existed for, and it must
+    // keep working after the paren wrap was added ahead of it.
+    expect(compileEvaluateExpression("let x = 1; return x + 1;")()).toBe(2);
+  });
+
+  it("preserves an expression that legitimately evaluates to undefined", () => {
+    // The success/failure contract must not conflate "returned undefined" with
+    // "failed": both arms return the value, errors throw.
+    expect(compileEvaluateExpression("undefined")()).toBeUndefined();
+    expect(compileEvaluateExpression("void 0")()).toBeUndefined();
+  });
+
+  it("throws SyntaxError when no wrapping arm can compile the input", () => {
+    expect(() => compileEvaluateExpression("function (")).toThrow(SyntaxError);
+  });
+
+  it("compiles WITHOUT executing, so a runtime SyntaxError can't double-execute", () => {
+    // `JSON.parse("{")` throws a SyntaxError at RUN time. The old
+    // compile-and-call-in-one-try shape misread that as a failed wrap and
+    // re-ran the expression as a raw body — a second execution of an
+    // expression the evaluate handler guarantees runs exactly once.
+    let calls = 0;
+    (globalThis as Record<string, unknown>).__compileProbe = () => {
+      calls += 1;
+      return JSON.parse("{");
+    };
+    try {
+      const fn = compileEvaluateExpression("globalThis.__compileProbe()");
+      expect(calls).toBe(0); // compilation alone must not run it
+      expect(() => fn()).toThrow(SyntaxError);
+      expect(calls).toBe(1); // exactly once, no fallback re-execution
+    } finally {
+      delete (globalThis as Record<string, unknown>).__compileProbe;
+    }
   });
 });
