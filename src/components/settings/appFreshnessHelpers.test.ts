@@ -18,7 +18,6 @@ import {
   buildPatchBody,
   effectiveAfterSave,
   formOf,
-  isDirty,
   isFalselyFresh,
   isKnownStrategy,
   isUpdateStrategy,
@@ -99,6 +98,14 @@ describe("isKnownStrategy", () => {
   it("is true for a recognised or absent strategy", () => {
     expect(isKnownStrategy(app())).toBe(true);
     expect(isKnownStrategy(app({ updateStrategy: "pull_build" }))).toBe(true);
+  });
+
+  it("makes an untouched rogue row NOT dirty, so Save cannot overwrite it", () => {
+    // Both sides of the comparison degrade identically, so the row reads
+    // clean. This is what makes the row's warning text say "this build cannot
+    // change the stored value" rather than promising an overwrite.
+    const rogue = app({ updateStrategy: "pull_build_and_deploy" });
+    expect(sameForm(effectiveAfterSave(rogue, formOf(rogue)), formOf(rogue))).toBe(true);
   });
 
   it("is false when formOf silently degraded the stored value", () => {
@@ -221,15 +228,20 @@ describe("effectiveAfterSave", () => {
   });
 });
 
-describe("isDirty", () => {
+/** What the panel computes: does saving change the stored row? */
+function dirty(a: RegisteredApp, f: AppFreshnessForm): boolean {
+  return !sameForm(effectiveAfterSave(a, f), formOf(a));
+}
+
+describe("dirty (effectiveAfterSave vs stored — the Save gate)", () => {
   it("is false for an untouched row", () => {
-    expect(isDirty(BUILT_APP, formOf(BUILT_APP))).toBe(false);
+    expect(dirty(BUILT_APP, formOf(BUILT_APP))).toBe(false);
   });
 
   it("is false for a no-op PATCH — clearing an already-stored command", () => {
     // Save must not offer an action that reports success and changes nothing.
     const cleared = form({ updateStrategy: "pull_build", buildCommand: "", startCommand: "" });
-    expect(isDirty(BUILT_APP, cleared)).toBe(false);
+    expect(dirty(BUILT_APP, cleared)).toBe(false);
   });
 
   it("is false for whitespace-only edits, which trim to the stored value", () => {
@@ -238,7 +250,7 @@ describe("isDirty", () => {
       buildCommand: "  npm run build  ",
       startCommand: "npm start",
     });
-    expect(isDirty(BUILT_APP, padded)).toBe(false);
+    expect(dirty(BUILT_APP, padded)).toBe(false);
   });
 
   it("is true for a real command change", () => {
@@ -247,17 +259,17 @@ describe("isDirty", () => {
       buildCommand: "make",
       startCommand: "npm start",
     });
-    expect(isDirty(BUILT_APP, edited)).toBe(true);
+    expect(dirty(BUILT_APP, edited)).toBe(true);
   });
 
   it("is true for a strategy change alone", () => {
     const switched = formOf({ ...BUILT_APP, updateStrategy: "pull_only" });
-    expect(isDirty(BUILT_APP, switched)).toBe(true);
+    expect(dirty(BUILT_APP, switched)).toBe(true);
   });
 
   it("is true when adding the first command to a bare app", () => {
     const bare = app({ updateStrategy: "pull_build" });
-    expect(isDirty(bare, form({ updateStrategy: "pull_build", buildCommand: "make" }))).toBe(true);
+    expect(dirty(bare, form({ updateStrategy: "pull_build", buildCommand: "make" }))).toBe(true);
   });
 });
 
@@ -267,16 +279,22 @@ describe("isFalselyFresh", () => {
     // the app fresh at the new SHA with nothing built — the same false-fresh
     // outcome the omit-blank rule prevents, reached via NULL/NULL.
     const bare = app({ updateStrategy: "pull_build" });
-    expect(isFalselyFresh(bare, form({ updateStrategy: "pull_build" }))).toBe(true);
+    expect(isFalselyFresh(effectiveAfterSave(bare, form({ updateStrategy: "pull_build" })))).toBe(
+      true,
+    );
   });
 
   it("is false when either command will be set", () => {
     const bare = app({ updateStrategy: "pull_build" });
-    expect(isFalselyFresh(bare, form({ updateStrategy: "pull_build", buildCommand: "make" }))).toBe(
-      false,
-    );
     expect(
-      isFalselyFresh(bare, form({ updateStrategy: "pull_build", startCommand: "npm start" })),
+      isFalselyFresh(
+        effectiveAfterSave(bare, form({ updateStrategy: "pull_build", buildCommand: "make" })),
+      ),
+    ).toBe(false);
+    expect(
+      isFalselyFresh(
+        effectiveAfterSave(bare, form({ updateStrategy: "pull_build", startCommand: "npm start" })),
+      ),
     ).toBe(false);
   });
 
@@ -284,11 +302,11 @@ describe("isFalselyFresh", () => {
     // The distinction the raw form cannot make: blank inputs on a configured
     // app are a no-op, not a wipe, so this is NOT the dangerous state.
     const cleared = form({ updateStrategy: "pull_build", buildCommand: "", startCommand: "" });
-    expect(isFalselyFresh(BUILT_APP, cleared)).toBe(false);
+    expect(isFalselyFresh(effectiveAfterSave(BUILT_APP, cleared))).toBe(false);
   });
 
   it("is false for pull_only regardless of commands", () => {
     // pull_only never claims a build happened, so an absent command is fine.
-    expect(isFalselyFresh(app(), form())).toBe(false);
+    expect(isFalselyFresh(effectiveAfterSave(app(), form()))).toBe(false);
   });
 });

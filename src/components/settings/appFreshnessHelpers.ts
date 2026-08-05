@@ -82,7 +82,13 @@ export function formOf(app: RegisteredApp): AppFreshnessForm {
 /**
  * Does this build recognise the app's stored strategy? `false` means
  * {@link formOf} degraded it, so the select is showing something other than
- * what is stored — and saving would overwrite the real value.
+ * what is stored.
+ *
+ * Note the row is then NOT dirty — both sides of the comparison degrade
+ * identically — so this build cannot change such a value at all. That is the
+ * safe outcome (silently downgrading a newer runner's strategy would be
+ * worse), and the UI must say so rather than warn about an overwrite that
+ * cannot happen.
  */
 export function isKnownStrategy(app: RegisteredApp): boolean {
   return app.updateStrategy === undefined || isUpdateStrategy(app.updateStrategy);
@@ -152,31 +158,19 @@ export function effectiveAfterSave(app: RegisteredApp, form: AppFreshnessForm): 
 }
 
 /**
- * Would saving actually change the stored row? Drives the Save button.
- *
- * False for a no-op PATCH — clearing an input whose command is already stored,
- * or adding trailing whitespace — so the panel never reports success for a
- * request that changed nothing.
- */
-export function isDirty(app: RegisteredApp, form: AppFreshnessForm): boolean {
-  return !sameForm(effectiveAfterSave(app, form), formOf(app));
-}
-
-/**
- * `pull_build` with no command that will actually run after saving.
+ * `pull_build` with no command that will actually run.
  *
  * The engine takes neither `if let Some` arm, returns `Ok(())`, and marks the
  * app `fresh` at the new SHA with nothing built — the exact false-fresh state
- * rule 1 of {@link buildPatchBody} exists to prevent, reached by NULL/NULL
+ * rule 1 of {@link buildPatchBody} exists to prevent, reached via NULL/NULL
  * instead of `""`. Declaring `pull_build` is the operator asserting "pulling
  * is not enough", so the panel refuses to save it rather than annotating it.
  *
- * Evaluated on the EFFECTIVE row: clearing both inputs on an app whose
+ * Takes the EFFECTIVE row, not the form: clearing both inputs on an app whose
  * commands are stored is not this state, because the omitted keys leave them
  * in place.
  */
-export function isFalselyFresh(app: RegisteredApp, form: AppFreshnessForm): boolean {
-  const effective = effectiveAfterSave(app, form);
+export function isFalselyFresh(effective: AppFreshnessForm): boolean {
   return (
     effective.updateStrategy === "pull_build" &&
     !effective.buildCommand.trim() &&
