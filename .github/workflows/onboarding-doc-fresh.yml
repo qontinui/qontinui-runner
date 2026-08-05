@@ -43,6 +43,27 @@ on:
   pull_request:
     branches: [main]
 
+# Least-privilege, stated explicitly rather than inherited.
+#
+# This workflow resolves the sibling qontinui-schemas ref. On a `pull_request`
+# event that resolution reads this PR's labels and the sibling's open PRs via
+# the API, so `pull-requests: read` is a real requirement here, not
+# boilerplate. (On every other event the resolver short-circuits to the default
+# branch and makes no API call at all — but the grant is stated once, at
+# workflow level, rather than per-job.)
+#
+# It USED to work by inheriting the repo-level `default_workflow_permissions`
+# (currently "read"), an operator-flippable setting that is INVISIBLE in this
+# file. Flipping it to `restricted` would have broken sibling resolution across
+# six workflows at once, with nothing in any diff to explain it. State it here.
+#
+# No job in this workflow needs a write scope; `contents: read` covers the
+# checkouts and the sibling clones. Narrow this further at your peril, and
+# widen it only for a job that genuinely writes.
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   detect:
     runs-on: ubuntu-latest
@@ -139,7 +160,8 @@ jobs:
       # cargo cannot even load the workspace manifest, so `cargo run` fails
       # before it ever reaches the doc emit. Pinned to the resolved ref for the
       # same reason ci.yml does it: a breaking types change must be able to go
-      # green as a same-named schemas+runner branch pair rather than deadlock.
+      # green as a DECLARED pair (a coord dep-edge label naming the schemas PR)
+      # rather than deadlock. Branch names resolve nothing.
       - name: Resolve sibling qontinui-schemas ref
         id: schemas-ref
         uses: ./.github/actions/resolve-schemas-ref

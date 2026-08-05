@@ -284,11 +284,17 @@ jobs:
       #
       # Deliberately NOT using .github/actions/resolve-schemas-ref here, unlike
       # every other schemas clone in this repo: a release must be built against
-      # published schemas, never against an unlanded feature branch. The action
-      # resolves on head_ref only and this workflow is tag-push /
-      # workflow_dispatch, so wiring it up would resolve to the default branch
-      # in practice — but state the intent explicitly rather than leaning on
-      # that, so the exclusion doesn't read as an oversight to be tidied up.
+      # LANDED schemas, never against an unlanded PR head.
+      #
+      # THE EXCLUSION IS A POLICY ABOUT RELEASE PROVENANCE — NOT a consequence
+      # of how the action is keyed. It is worth being precise about that,
+      # because the "in practice" version of this note goes stale every time the
+      # action's key changes, and a stale reason invites a future session to
+      # "tidy up" the exclusion. The action resolves only in a `pull_request`
+      # context; this workflow is tag-push / workflow_dispatch and has none, so
+      # wiring it up WOULD resolve to the default branch anyway — but that
+      # coincidence is not the reason, and if it ever stopped being true the
+      # exclusion would still stand.
       - name: Checkout sibling repos
         run: |
           cd "$GITHUB_WORKSPACE/.."

@@ -40,20 +40,24 @@ on:
   # qontinui-schemas/.github/workflows/schema-drift.yml already has, whose own
   # comment describes exactly this scenario in the opposite direction.
   #
-  # Safe by construction: `resolve-schemas-ref` keys on `github.head_ref`, which
-  # is empty on workflow_dispatch, so a dispatched run resolves the sibling to
+  # Safe by construction — STILL TRUE, now for a stronger reason.
+  # `resolve-schemas-ref` keys on `github.event.pull_request.number`, which is
+  # empty on workflow_dispatch, so a dispatched run resolves the sibling to
   # qontinui-schemas `main` — which is precisely what a post-land status refresh
-  # must compare against. Do NOT add a `|| github.ref_name` fallback to make
-  # dispatch "smarter"; see that action's header for why that is actively
-  # harmful on coord's merge-candidate pushes.
+  # must compare against. This used to rest on `github.head_ref` merely HAPPENING
+  # to be empty off a pull_request event; a PR number is empty off one BY
+  # DEFINITION, so the property no longer depends on a coincidence.
+  # Do NOT add a `|| github.ref_name` fallback to make dispatch "smarter"; see
+  # that action's header for why that is actively harmful on coord's
+  # merge-candidate pushes. That warning stands verbatim and in full force.
   #
-  # The corollary is a real limitation, so state it: because head_ref is empty
-  # on EVERY dispatch, dispatching this workflow on a FEATURE branch also
+  # The corollary is a real limitation, so state it: because the PR number is
+  # empty on EVERY dispatch, dispatching this workflow on a FEATURE branch also
   # resolves the sibling to schemas `main`. For a coordinated pair whose schemas
   # half has not landed yet, that verdict is misleading — it reds against a main
   # that does not know the new types. Dispatch is a main-refresh tool; for a
   # coordinated pair, use the `pull_request` run, which is the only trigger that
-  # can see the partner branch.
+  # can carry a declaration.
   workflow_dispatch:
   pull_request:
     branches: [main]
@@ -81,6 +85,27 @@ on:
       # is exactly how a drift check can rot into a vacuous green unnoticed.
       - ".github/workflows/qontinui-types-drift.yml"
       - ".github/actions/resolve-schemas-ref/**"
+
+# Least-privilege, stated explicitly rather than inherited.
+#
+# This workflow resolves the sibling qontinui-schemas ref. On a `pull_request`
+# event that resolution reads this PR's labels and the sibling's open PRs via
+# the API, so `pull-requests: read` is a real requirement here, not
+# boilerplate. (On every other event the resolver short-circuits to the default
+# branch and makes no API call at all — but the grant is stated once, at
+# workflow level, rather than per-job.)
+#
+# It USED to work by inheriting the repo-level `default_workflow_permissions`
+# (currently "read"), an operator-flippable setting that is INVISIBLE in this
+# file. Flipping it to `restricted` would have broken sibling resolution across
+# six workflows at once, with nothing in any diff to explain it. State it here.
+#
+# No job in this workflow needs a write scope; `contents: read` covers the
+# checkouts and the sibling clones. Narrow this further at your peril, and
+# widen it only for a job that genuinely writes.
+permissions:
+  contents: read
+  pull-requests: read
 
 env:
   # generate_types.sh runs `cargo build --bin export_schemas`, which compiles
