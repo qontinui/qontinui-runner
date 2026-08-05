@@ -231,6 +231,11 @@ struct DrainCursor {
     /// order. Rebuilt by every scan; drives the prefix advance on ack without
     /// re-reading the file.
     frontier: Vec<(u64, u64, AckKey)>,
+    /// This cursor came off disk and has not been checked against the file yet.
+    /// State built in memory this run is known to describe the current file;
+    /// state read from disk describes whatever file existed when it was written,
+    /// which may be a different one entirely.
+    unvalidated: bool,
 }
 
 impl DrainCursor {
@@ -239,6 +244,8 @@ impl DrainCursor {
         self.anchor = None;
         self.acked_ahead.clear();
         self.frontier.clear();
+        // Nothing left to validate.
+        self.unvalidated = false;
     }
 
     /// Bytes in the file that are already delivered and therefore reclaimable.
@@ -377,7 +384,9 @@ impl OutboxWriter {
         // keep the oversize file forever.
         {
             let _guard = writer.write_lock.lock().expect("outbox lock poisoned");
-            writer.enforce_cap_locked()?;
+            // Nothing is being returned to a caller here, so only the usual
+            // "never empty the file" single-row protection applies.
+            writer.enforce_cap_locked(1)?;
         }
         Ok(writer)
     }
@@ -470,8 +479,10 @@ impl OutboxWriter {
             // Bound the file HERE rather than relying on the drainer's post-ack
             // compaction — see the module note. A trim failure must not fail the
             // write: the record is already queued, and losing the event to keep
-            // the file small would invert the trade-off.
-            if let Err(e) = self.enforce_cap_locked() {
+            // the file small would invert the trade-off. The whole batch is
+            // protected from the trim, so this call can never delete a record
+            // we are about to return `Ok` for.
+            if let Err(e) = self.enforce_cap_locked(records.len()) {
                 warn!(
                     "outbox: cap enforcement failed ({}); file may be oversize",
                     e
@@ -584,10 +595,12 @@ impl OutboxWriter {
     /// (already delivered — free) and then the OLDEST unacked records
     /// (chronological append order makes the front the oldest).
     ///
-    /// Caller MUST hold `write_lock`. The newest record is never dropped, so a
-    /// single record larger than the trim target leaves the file marginally
+    /// Caller MUST hold `write_lock`. The `protect_newest_unacked` most recent
+    /// unacked records are never dropped — the caller's own just-appended batch,
+    /// so a `record_batch` can never return `Ok` for a row this trim deleted.
+    /// A batch larger than the trim target therefore leaves the file marginally
     /// over cap rather than emptying it.
-    fn enforce_cap_locked(&self) -> std::io::Result<()> {
+    fn enforce_cap_locked(&self, protect_newest_unacked: usize) -> std::io::Result<()> {
         let mut size = match std::fs::metadata(&self.path) {
             Ok(m) => m.len(),
             // No file yet / unreadable — nothing to bound.
@@ -599,9 +612,12 @@ impl OutboxWriter {
 
         // Delivered rows the drain cursor knows about are not stamped on disk
         // yet. Materialize them first so the trim below counts them as free
-        // space rather than reporting phantom event loss.
+        // space rather than reporting phantom event loss. VALIDATE the cursor
+        // first: this path runs at `open` (before any `pending`) and on the
+        // append path, so it must never trust a loaded-from-disk offset.
         let has_cursor_acks = {
-            let cur = self.cursor.lock().expect("outbox cursor poisoned");
+            let mut cur = self.cursor.lock().expect("outbox cursor poisoned");
+            self.validate_cursor_locked(&mut cur)?;
             cur.dead_bytes() > 0
         };
         if has_cursor_acks {
@@ -625,16 +641,25 @@ impl OutboxWriter {
         let sizes: Vec<u64> = kept.iter().map(serialized_len).collect();
         let mut live: u64 = sizes.iter().sum();
         let target = trim_target(self.max_bytes);
-        // Never drop the newest event — a single record bigger than the target
-        // leaves the file marginally over cap rather than emptying it.
-        let newest_unacked = kept.iter().rposition(|r| r.acked_at.is_none());
+        // Never drop the newest events — everything from here on is the
+        // caller's own just-appended batch, which it is about to be told is
+        // durable. A batch bigger than the target leaves the file marginally
+        // over cap rather than emptying it (and rather than lying).
+        let protect_from = kept
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.acked_at.is_none())
+            .map(|(i, _)| i)
+            .rev()
+            .take(protect_newest_unacked.max(1))
+            .last();
         let mut drop_flags = vec![false; kept.len()];
         let mut dropped_unacked = 0usize;
         for (i, rec) in kept.iter().enumerate() {
             if live <= target {
                 break;
             }
-            if rec.acked_at.is_some() || Some(i) == newest_unacked {
+            if rec.acked_at.is_some() || protect_from.is_some_and(|p| i >= p) {
                 continue;
             }
             drop_flags[i] = true;
@@ -692,31 +717,59 @@ impl OutboxWriter {
         self.scan_locked()
     }
 
-    /// Caller MUST hold `write_lock`. Validates the cursor against the file,
-    /// absorbs any already-acked prefix, rebuilds the frontier, and returns
-    /// the undelivered records at or after the cursor.
-    fn scan_locked(&self) -> std::io::Result<Vec<OutboxRecord>> {
-        let mut cur = self.cursor.lock().expect("outbox cursor poisoned");
-
+    /// Caller MUST hold `write_lock`. Applies the cursor's validity guards
+    /// against the file as it is RIGHT NOW and returns the file length.
+    ///
+    /// Every path that consults the cursor goes through here — the drain scan,
+    /// the ack fold, compaction and the cap trim — because a cursor loaded from
+    /// disk (or invalidated by an out-of-band truncation mid-run) must never be
+    /// trusted as a raw byte offset. Trusting one is silent event loss, not a
+    /// stale read.
+    fn validate_cursor_locked(&self, cur: &mut DrainCursor) -> std::io::Result<u64> {
         let len = match std::fs::metadata(&self.path) {
             Ok(m) => m.len(),
             Err(_) => {
                 cur.reset();
-                return Ok(Vec::new());
+                return Ok(0);
             }
         };
-
         // Guard 3 — the file shrank under us (truncation / external rewrite).
         if cur.offset > len {
             cur.reset();
         }
         // Guard 2 — the head of the file changed (compaction, rotation, an
         // `acked_at` stamp), so the offset no longer addresses what it did.
-        if cur.offset > 0 {
-            let anchor = read_anchor(&self.path)?;
-            if anchor.is_none() || anchor != cur.anchor {
+        // `acked_ahead` is covered as well as `offset`: it is applied by the
+        // prefix walk and the pending filter even at offset 0, and
+        // `(session_id, seq)` is NOT unique across a trim that dropped a
+        // session's rows and let its seq restart on reopen.
+        if cur.offset > 0 || !cur.acked_ahead.is_empty() {
+            if cur.unvalidated && cur.anchor.is_none() {
+                // Read off disk with state but no file identity — there is
+                // nothing to check it against, so it cannot be trusted.
                 cur.reset();
+            } else if cur.anchor.is_some() {
+                let anchor = read_anchor(&self.path)?;
+                if anchor.is_none() || anchor != cur.anchor {
+                    cur.reset();
+                }
             }
+            // An anchor-less cursor built in memory this run describes the file
+            // we are looking at by construction; the scan sets its anchor.
+        }
+        cur.unvalidated = false;
+        Ok(len)
+    }
+
+    /// Caller MUST hold `write_lock`. Validates the cursor against the file,
+    /// absorbs any already-acked prefix, rebuilds the frontier, and returns
+    /// the undelivered records at or after the cursor.
+    fn scan_locked(&self) -> std::io::Result<Vec<OutboxRecord>> {
+        let mut cur = self.cursor.lock().expect("outbox cursor poisoned");
+
+        let len = self.validate_cursor_locked(&mut cur)?;
+        if len == 0 && cur.offset == 0 && !self.path.exists() {
+            return Ok(Vec::new());
         }
 
         if cur.offset == len && cur.anchor.is_some() {
@@ -798,7 +851,7 @@ impl OutboxWriter {
         {
             let mut cur = self.cursor.lock().expect("outbox cursor poisoned");
             cur.advance_prefix();
-            self.persist_cursor_locked(&cur);
+            self.persist_cursor_locked(&cur, false);
         }
 
         self.maybe_compact_locked()
@@ -814,7 +867,8 @@ impl OutboxWriter {
     /// Caller MUST hold `write_lock`.
     fn maybe_compact_locked(&self) -> std::io::Result<()> {
         let dead = {
-            let cur = self.cursor.lock().expect("outbox cursor poisoned");
+            let mut cur = self.cursor.lock().expect("outbox cursor poisoned");
+            self.validate_cursor_locked(&mut cur)?;
             cur.dead_bytes()
         };
         if dead < COMPACT_MIN_DEAD_BYTES {
@@ -834,7 +888,11 @@ impl OutboxWriter {
         let scanned = read_from(&self.path, 0)?;
         let now = Utc::now();
         let records: Vec<OutboxRecord> = {
-            let cur = self.cursor.lock().expect("outbox cursor poisoned");
+            let mut cur = self.cursor.lock().expect("outbox cursor poisoned");
+            // This DELETES everything the cursor calls delivered, and it is
+            // reachable from `open` (via the cap trim) before any drain scan has
+            // run. Validate before trusting a byte offset read off disk.
+            self.validate_cursor_locked(&mut cur)?;
             scanned
                 .into_iter()
                 .map(|s| {
@@ -853,19 +911,22 @@ impl OutboxWriter {
 
     /// Caller MUST hold `write_lock`. Replaces the file's contents atomically.
     ///
-    /// The cursor is reset and persisted BEFORE the rename: a crash in the
-    /// window can then only leave a cursor that re-reads (safe, idempotent),
-    /// never one that skips (unsafe).
+    /// The cursor is zeroed and **durably** persisted before the rename. That
+    /// ordering is the whole guard: a crash in the window can then only leave a
+    /// cursor that re-reads (safe, idempotent), never one that skips. It has to
+    /// be an fsync, not just a rename — the anchor check cannot be relied on to
+    /// catch this case, because a compaction that keeps an already-stamped
+    /// seq-floor tombstone at the head leaves the first line byte-identical.
     fn rewrite_locked(&self, records: &[OutboxRecord]) -> std::io::Result<()> {
         {
             let mut cur = self.cursor.lock().expect("outbox cursor poisoned");
             cur.reset();
-            self.persist_cursor_locked(&cur);
+            self.persist_cursor_locked(&cur, true);
         }
         rewrite_all(&self.path, records)?;
-        // `rewrite_all` fsyncs the temp file before renaming it into place, so
-        // every surviving record — including any append this group-commit
-        // window had not yet synced — is now durable.
+        // `rewrite_all` fsyncs the temp file and fsyncs the directory after the
+        // rename, so every surviving record — including any append this
+        // group-commit window had not yet synced — is now durable.
         let target = {
             let st = self.commit.lock().expect("outbox commit poisoned");
             st.written
@@ -874,22 +935,62 @@ impl OutboxWriter {
         Ok(())
     }
 
-    /// Best-effort cursor persistence. Deliberately NOT fsynced: the cursor is
-    /// a hint, and an fsync per ack would undo the group commit. A lost or
-    /// stale cursor costs a re-scan plus an idempotent replay, never a skip.
-    fn persist_cursor_locked(&self, cur: &DrainCursor) {
+    /// Cursor persistence.
+    ///
+    /// On the ack path (`durable = false`) this is deliberately NOT fsynced:
+    /// the cursor is a hint, an fsync per ack would undo the group commit, and
+    /// a lost or stale cursor costs a re-scan plus an idempotent replay.
+    ///
+    /// On the rewrite path (`durable = true`) it MUST be fsynced before the
+    /// outbox rename, or "zeroed before the rename" is only program order and
+    /// carries no crash-recovery force. That fsync happens at most once per
+    /// compaction.
+    fn persist_cursor_locked(&self, cur: &DrainCursor, durable: bool) {
         let file = cur.to_file();
         let Ok(bytes) = serde_json::to_vec(&file) else {
             return;
         };
         let tmp = self.cursor_path.with_extension("cursor.tmp");
-        if std::fs::write(&tmp, &bytes).is_ok() {
-            if let Err(e) = std::fs::rename(&tmp, &self.cursor_path) {
-                warn!("outbox: drain cursor persist failed ({e}); will re-scan");
-                let _ = std::fs::remove_file(&tmp);
-            }
+        if let Err(e) = write_cursor_file(&tmp, &self.cursor_path, &bytes, durable) {
+            warn!("outbox: drain cursor persist failed ({e}); will re-scan");
+            let _ = std::fs::remove_file(&tmp);
         }
     }
+}
+
+/// Write the cursor sidecar atomically, optionally making it durable first.
+fn write_cursor_file(tmp: &Path, dest: &Path, bytes: &[u8], durable: bool) -> std::io::Result<()> {
+    {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(tmp)?;
+        f.write_all(bytes)?;
+        if durable {
+            f.sync_data()?;
+        }
+    }
+    std::fs::rename(tmp, dest)?;
+    if durable {
+        sync_parent_dir(dest);
+    }
+    Ok(())
+}
+
+/// Make a rename durable by fsyncing the containing directory.
+///
+/// A no-op on Windows, where `std::fs::File::open` on a directory fails and
+/// NTFS journals the rename's metadata itself.
+fn sync_parent_dir(path: &Path) {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// Counts a writer for as long as it is inside `record_batch`, so the commit
@@ -929,6 +1030,7 @@ fn load_cursor(cursor_path: &Path) -> DrainCursor {
         anchor: file.anchor,
         acked_ahead: file.acked_ahead.into_iter().collect(),
         frontier: Vec::new(),
+        unvalidated: true,
     }
 }
 
@@ -1117,6 +1219,10 @@ fn rewrite_all(path: &Path, records: &[OutboxRecord]) -> std::io::Result<()> {
         w.get_ref().sync_data()?;
     }
     std::fs::rename(tmp, path)?;
+    // The rewrite is what makes any not-yet-synced append durable (see
+    // `rewrite_locked`), so the rename itself has to survive a crash — an
+    // fsynced temp file that a lost rename never publishes is no use.
+    sync_parent_dir(path);
     Ok(())
 }
 
@@ -1717,6 +1823,162 @@ mod tests {
         let pending = outbox.pending().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].seq, r.seq);
+    }
+
+    /// A cursor loaded from disk that no longer addresses the file must never
+    /// reach the compaction's delete, which is only guarded by `scan_locked`
+    /// today. `open` reaches compaction through the cap trim BEFORE any drain
+    /// scan has run, so the guards have to live with the cursor, not the scan.
+    #[test]
+    fn a_stale_persisted_cursor_never_deletes_undelivered_records() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("outbox.jsonl");
+        let m = Uuid::new_v4();
+        let s = Uuid::new_v4();
+
+        // A real, undelivered backlog.
+        {
+            let outbox = OutboxWriter::open(&path).unwrap();
+            for _ in 0..40 {
+                outbox
+                    .record(
+                        m,
+                        s,
+                        SessionEventKind::Heartbeat,
+                        json!({ "pad": "x".repeat(200) }),
+                    )
+                    .unwrap();
+            }
+            assert_eq!(outbox.pending().unwrap().len(), 40);
+        }
+
+        // Forge the cursor a lost/unsynced write would leave behind: an offset
+        // covering most of the file, with an anchor from a DIFFERENT file.
+        let len = std::fs::metadata(&path).unwrap().len();
+        let forged = format!(
+            r#"{{"offset":{},"anchor":{{"first_line_len":10,"first_session":"{}","first_seq":999}},"acked_ahead":[]}}"#,
+            len - 300,
+            Uuid::new_v4()
+        );
+        std::fs::write(cursor_path_for(&path), forged).unwrap();
+
+        // Reopening with a tiny cap drives `enforce_cap_locked` →
+        // `compact_acked_locked` before any scan.
+        let outbox = OutboxWriter::open_with_max_bytes(&path, 4 * 1024).unwrap();
+        let pending = outbox.pending().unwrap();
+        assert!(
+            !pending.is_empty(),
+            "a stale cursor must not be able to mark the backlog delivered"
+        );
+        // Whatever the cap trim dropped is COUNTED as loss; nothing may vanish
+        // silently under the guise of compaction.
+        assert_eq!(
+            pending.len() + outbox.dropped_unacked() as usize,
+            40,
+            "every record must be either still pending or explicitly counted as \
+             dropped — never quietly compacted away"
+        );
+    }
+
+    /// Guard 2 used to be gated on `offset > 0`, so a persisted cursor with
+    /// `offset == 0` and a non-empty ack set — the ordinary out-of-order-ack
+    /// state — was applied to whatever file was on disk. `(session_id, seq)` is
+    /// not unique across a trim that lets a session's seq restart, so those
+    /// stale acks could filter out brand-new records.
+    #[test]
+    fn a_stale_ack_set_at_offset_zero_cannot_filter_new_records() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("outbox.jsonl");
+        let m = Uuid::new_v4();
+        let s = Uuid::new_v4();
+
+        {
+            let outbox = OutboxWriter::open(&path).unwrap();
+            outbox
+                .record(m, s, SessionEventKind::Started, json!({}))
+                .unwrap();
+        }
+        // A cursor from a previous life of this file: offset 0, acks naming
+        // seqs 1..3, anchor from a file that no longer exists.
+        let forged = format!(
+            r#"{{"offset":0,"anchor":{{"first_line_len":10,"first_session":"{}","first_seq":42}},"acked_ahead":[["{}",1],["{}",2],["{}",3]]}}"#,
+            Uuid::new_v4(),
+            s,
+            s,
+            s
+        );
+        std::fs::write(cursor_path_for(&path), forged).unwrap();
+
+        let outbox = OutboxWriter::open(&path).unwrap();
+        outbox
+            .record(m, s, SessionEventKind::Heartbeat, json!({}))
+            .unwrap();
+        outbox
+            .record(m, s, SessionEventKind::Closed, json!({}))
+            .unwrap();
+
+        let seqs: Vec<i64> = outbox.pending().unwrap().iter().map(|r| r.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![1, 2, 3],
+            "a stale ack set must not swallow records that merely reuse those seqs"
+        );
+    }
+
+    /// `record_batch` must never return `Ok` for a record its own cap trim
+    /// deleted inside the same call — a caller that advances a durable offset
+    /// on `Ok` (the transcript emitter does) would leave a permanent gap.
+    #[test]
+    fn record_batch_never_returns_ok_for_a_record_its_own_trim_dropped() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("outbox.jsonl");
+        let cap = 8 * 1024;
+        let outbox = OutboxWriter::open_with_max_bytes(&path, cap).unwrap();
+        let m = Uuid::new_v4();
+
+        // Fill well past the cap so the next batch definitely triggers a trim.
+        for _ in 0..80 {
+            outbox
+                .record(
+                    m,
+                    Uuid::new_v4(),
+                    SessionEventKind::Heartbeat,
+                    json!({ "pad": "x".repeat(200) }),
+                )
+                .unwrap();
+        }
+
+        // A 40-row sweep, exactly the heartbeat shape.
+        let sessions: Vec<Uuid> = (0..40).map(|_| Uuid::new_v4()).collect();
+        let events: Vec<OutboxEvent> = sessions
+            .iter()
+            .map(|s| {
+                OutboxEvent::new(
+                    m,
+                    *s,
+                    SessionEventKind::Heartbeat,
+                    json!({ "pad": "x".repeat(200) }),
+                )
+            })
+            .collect();
+        let written = outbox.record_batch(events).unwrap();
+        assert_eq!(written.len(), 40);
+
+        // Every record the call reported as written must still be on disk.
+        let on_disk: HashSet<(Uuid, i64)> = read_all(&path)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.session_id, r.seq))
+            .collect();
+        for rec in &written {
+            assert!(
+                on_disk.contains(&(rec.session_id, rec.seq)),
+                "record_batch returned Ok for session {} seq {}, which its own \
+                 cap trim deleted before returning",
+                rec.session_id,
+                rec.seq
+            );
+        }
     }
 
     /// Out-of-order acks (the drain loop skips a stuck helper-task row and
