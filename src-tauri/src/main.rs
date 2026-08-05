@@ -250,6 +250,11 @@ mod workflow_event_bus;
 mod workflow_generation;
 mod workflow_queue;
 mod workflow_state;
+// The single door to "where do the Qontinui repo checkouts live?" — the
+// `paths.workspace_root` setting, its one-time bridge migration, and the thin
+// wrapper over the shared `qontinui_types::paths` resolver. See
+// plans/2026-08-04-remove-hardcoded-machine-paths-from-product-code.md.
+mod workspace_paths;
 
 // Stream E (Flywheel) Step 11 — end-to-end integration test module. The
 // file-level `#![cfg(all(test, feature = "spec-authoring"))]` ensures it
@@ -1023,6 +1028,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Migrate plaintext API keys to secure keychain storage
     if let Err(e) = config_facade::migrate_api_keys_to_keychain() {
         warn!("API key migration to keychain failed (non-fatal): {}", e);
+    }
+
+    // Record, once, the workspace root this machine already resolves to, so the
+    // hardcoded `D:/qontinui-root` fallbacks can be deleted without changing
+    // behaviour on an existing install. Never overwrites a configured value and
+    // never invents a path. See `workspace_paths` and
+    // plans/2026-08-04-remove-hardcoded-machine-paths-from-product-code.md.
+    if let Err(e) = workspace_paths::persist_resolved_workspace_root() {
+        warn!("workspace root migration failed (non-fatal): {}", e);
     }
 
     // Architecture spec caching removed — all persistence now via PgDb.

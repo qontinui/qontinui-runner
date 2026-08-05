@@ -979,6 +979,41 @@ pub struct PathSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plans_archive_dir: Option<String>,
 
+    /// The **workspace root**: the directory holding the Qontinui repo
+    /// checkouts (`<root>/qontinui-runner`, `<root>/qontinui-coord`, …). The
+    /// census, the fleet publisher, the `.mcp.json` reconcile and canonical
+    /// checkout creation all resolve against it.
+    ///
+    /// Default (when None): resolved at runtime by
+    /// [`crate::workspace_paths::runner_workspace_root`] —
+    /// `$QONTINUI_ROOT` → `$QONTINUI_WORKSPACE_ROOT` → **this setting** → an
+    /// ancestor walk up from the running executable → `$HOME/qontinui-root`.
+    /// The two environment variables outrank this setting, matching the
+    /// precedence `plans_dir` already uses (a per-machine env override beats
+    /// the persisted setting).
+    ///
+    /// **Why this setting exists.** Qontinui is open source, so the product
+    /// binary must not carry the author's machine layout — the runner used to
+    /// hardcode `D:/qontinui-root` as a Windows fallback in four places. That
+    /// literal was the LIVE resolution path on the author's own machine, so
+    /// deleting it without a bridge would have taken the census, the fleet
+    /// publisher and worktree creation down together. This setting is that
+    /// bridge: [`crate::workspace_paths::persist_resolved_workspace_root`]
+    /// records, once, whatever the machine already resolves to, so removing
+    /// the literal changes nothing for an existing install. See
+    /// `2026-08-04-remove-hardcoded-machine-paths-from-product-code.md`.
+    ///
+    /// **Separator note.** A migration-written value on Windows carries native
+    /// separators (`D:\qontinui-root`), because it comes from the executable's
+    /// own path — where the deleted literal was forward-slashed
+    /// (`D:/qontinui-root`). Path *joins* are unaffected, but anything that
+    /// string-compares or reports this root should normalize first rather than
+    /// assume either form.
+    ///
+    /// Override example: `D:\qontinui-root`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
+
     /// When true, enforce workspace-scoped working directory resolution globally.
     /// Steps cannot resolve paths outside the workspace root.
     /// Default: false (permissive). Individual workflows can override via `strict_cwd`.
@@ -1019,6 +1054,7 @@ mod path_settings_tests {
             dev_logs_dir: Some("/w/.dev-logs".to_string()),
             plans_dir: Some("/w/plans".to_string()),
             plans_archive_dir: Some("/w/dev-notes/plans".to_string()),
+            workspace_root: Some("/w".to_string()),
             strict_mode: false,
         };
 
@@ -1031,6 +1067,7 @@ mod path_settings_tests {
             Some("/w/dev-notes/plans")
         );
         assert_eq!(parsed.dev_logs_dir.as_deref(), Some("/w/.dev-logs"));
+        assert_eq!(parsed.workspace_root.as_deref(), Some("/w"));
     }
 
     /// Settings persisted before the fields existed must still load — the
@@ -1043,6 +1080,30 @@ mod path_settings_tests {
         assert_eq!(parsed.plans_dir, None);
         assert_eq!(parsed.plans_archive_dir, None);
         assert!(parsed.strict_mode);
+    }
+
+    /// `workspace_root` defaults to unset and must not serialize when unset:
+    /// the resolver distinguishes "absent → fall through to the next rung" from
+    /// "configured to nothing", and an emitted `null`/`""` would collapse them.
+    /// A settings file written before this field existed must still load.
+    #[test]
+    fn workspace_root_defaults_unset_and_is_absent_from_the_serialized_form() {
+        let defaults = PathSettings::default();
+        assert_eq!(defaults.workspace_root, None);
+
+        let json = serde_json::to_value(&defaults).expect("PathSettings must serialize");
+        assert!(
+            !json
+                .as_object()
+                .expect("serializes as an object")
+                .contains_key("workspace_root"),
+            "unset workspace_root must be absent, got {json}"
+        );
+
+        let legacy: PathSettings =
+            serde_json::from_str(r#"{"dev_logs_dir":"/w/.dev-logs","strict_mode":false}"#)
+                .expect("legacy PathSettings JSON must still deserialize");
+        assert_eq!(legacy.workspace_root, None);
     }
 }
 
