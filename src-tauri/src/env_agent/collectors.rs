@@ -41,8 +41,11 @@ fn put(section: &mut Section, key: &str, value: impl Into<String>) {
 /// doesn't parse as a URL with a host. NEVER includes path/query/userinfo.
 ///
 /// This is the single choke point that guarantees a DSN password can't leak
-/// into the `services` section.
-fn sanitize_url(raw: &str) -> Option<String> {
+/// into the `services` section — and, since P2b slice 2, the same choke point
+/// the local apply redacts through ([`super::apply_services`]). One
+/// implementation, so the capture and the apply can never disagree about what
+/// counts as secret-free.
+pub(crate) fn sanitize_url(raw: &str) -> Option<String> {
     let mut parsed = url::Url::parse(raw).ok()?;
     // Structurally remove credentials. `set_username`/`set_password` return
     // Err only for cannot-be-a-base URLs (which have no host anyway, filtered

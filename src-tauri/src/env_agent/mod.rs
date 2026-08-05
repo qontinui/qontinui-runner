@@ -43,6 +43,8 @@
 //! POST so an operator can inspect "what would be pushed" even when the backend
 //! is unreachable.
 
+pub mod apply;
+pub mod apply_services;
 pub mod collectors;
 pub mod config;
 pub mod directive;
