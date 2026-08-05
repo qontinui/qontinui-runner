@@ -66,7 +66,7 @@ import {
   type RefObject,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { useWindowAssignments, MAIN_WINDOW_LABEL } from "./WindowAssignmentsContext";
+import { useWindowAssignments, ownedTabs, MAIN_WINDOW_LABEL } from "./WindowAssignmentsContext";
 import { subscribeTerminalOutputStream } from "../terminalEventDemux";
 import { hasRenderConsumer } from "../terminalRenderConsumers";
 
@@ -234,7 +234,7 @@ const PageSessionScope = memo(function PageSessionScope({
   // `tabs === allTabs` and every downstream consumer behaves byte-identically.
   // Read first so the window label flows into the terminal manager below
   // (Phase 2: the create-time pane key is tagged with the owning window).
-  const { windowLabel: myWindowLabel, isOwned, windowForPage } = useWindowAssignments();
+  const { windowLabel: myWindowLabel, isOwned } = useWindowAssignments();
 
   // ---- TerminalCore ----
   const terminalManager = useTerminalManager(pageId, myWindowLabel, defaultWorkingDir);
@@ -246,18 +246,13 @@ const PageSessionScope = memo(function PageSessionScope({
     renameTab,
     createTerminal,
   } = terminalManager;
-  // Pop-out-page binding takes precedence over the per-terminal owner map: when
-  // this whole page is detached into a window, that window renders ALL of the
-  // page's tabs and every other window renders NONE of them. Otherwise fall
-  // back to the per-terminal `isOwned` filter (single-terminal "send to
-  // window"; everything stays on "main" in the common single-window case).
-  const boundWindow = windowForPage(pageId);
-  const tabs = useMemo(() => {
-    if (boundWindow) {
-      return boundWindow === myWindowLabel ? allTabs : [];
-    }
-    return allTabs.filter((t) => isOwned(t.id));
-  }, [allTabs, isOwned, boundWindow, myWindowLabel]);
+  // Render exactly the tabs this window owns, using the SAME predicate that
+  // gates stdin in `TerminalInstance` — page-binding first (a page detached
+  // into a window claims ALL of its tabs, every other window claims NONE),
+  // then the per-terminal owner map (single-terminal "send to window";
+  // everything stays on "main" in the common single-window case). One
+  // predicate, one precedence: a tab that renders here is a tab that types.
+  const tabs = useMemo(() => ownedTabs(allTabs, isOwned, pageId), [allTabs, isOwned, pageId]);
 
   // A terminal created in a pop-out window must belong to THAT window, not the
   // default "main". Assign it immediately after creation (the broadcast event
