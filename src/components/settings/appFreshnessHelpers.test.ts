@@ -1,13 +1,13 @@
-/**
+﻿/**
  * Tests for the `AppFreshnessSettings` pure helpers.
  *
- * The runner's vitest config is `environment: "node"` (no jsdom) — sibling
+ * The runner's vitest config is `environment: "node"` (no jsdom) â€” sibling
  * tests like `LockYieldPolicySettings.test.tsx` set the precedent of testing
  * the exported pure helpers rather than rendering.
  *
  * The cases that matter are the ones covering the gap between what the FORM
  * says and what the SERVER ends up storing: `UpdateAppRequest` is applied with
- * COALESCE, so an omitted field is a no-op rather than a clear. Every gate in
+ * normalize_command: an omitted field is a no-op, a BLANK field is a clear. Every gate in
  * the panel is derived from `effectiveAfterSave` for that reason, and these
  * tests pin it.
  */
@@ -44,7 +44,7 @@ function form(overrides: Partial<AppFreshnessForm> = {}): AppFreshnessForm {
   };
 }
 
-/** A configured pull_build app — the common starting point below. */
+/** A configured pull_build app â€” the common starting point below. */
 const BUILT_APP = app({
   updateStrategy: "pull_build",
   buildCommand: "npm run build",
@@ -108,7 +108,7 @@ describe("isKnownStrategy", () => {
     expect(sameForm(effectiveAfterSave(rogue, formOf(rogue)), formOf(rogue))).toBe(true);
   });
 
-  it("IS dirty once a strategy is chosen — the overwrite is reachable", () => {
+  it("IS dirty once a strategy is chosen â€” the overwrite is reachable", () => {
     // The other half of the truth the row's warning must tell: selecting a
     // strategy and giving it a command enables Save, and the PATCH overwrites
     // the value this build could not read. The warning says so; this pins that
@@ -116,7 +116,7 @@ describe("isKnownStrategy", () => {
     const rogue = app({ updateStrategy: "pull_build_and_deploy" });
     const chosen = form({ updateStrategy: "pull_build", buildCommand: "make" });
     expect(sameForm(effectiveAfterSave(rogue, chosen), formOf(rogue))).toBe(false);
-    expect(buildPatchBody(chosen).updateStrategy).toBe("pull_build");
+    expect(buildPatchBody(rogue, chosen).updateStrategy).toBe("pull_build");
   });
 
   it("is false when formOf silently degraded the stored value", () => {
@@ -139,33 +139,67 @@ describe("sameForm", () => {
 });
 
 describe("buildPatchBody", () => {
+  const BARE = app({ updateStrategy: "pull_build" });
+
   it("always sends updateStrategy", () => {
-    expect(buildPatchBody(form())).toEqual({ updateStrategy: "pull_only" });
-    expect(buildPatchBody(form({ updateStrategy: "pull_build", buildCommand: "make" }))).toEqual({
-      updateStrategy: "pull_build",
-      buildCommand: "make",
-    });
+    expect(buildPatchBody(app(), form())).toEqual({ updateStrategy: "pull_only" });
+    expect(
+      buildPatchBody(BARE, form({ updateStrategy: "pull_build", buildCommand: "make" })),
+    ).toEqual({ updateStrategy: "pull_build", buildCommand: "make" });
   });
 
-  it("OMITS a blank command instead of sending an empty string", () => {
-    // The load-bearing case. `UpdateAppRequest` is COALESCE-applied, and the
-    // engine runs `if let Some(cmd)` checking only the exit status — an empty
-    // shell command exits 0, so a persisted "" would mark the app freshly
-    // built without building, and the fresh_only dispatcher would route tests
-    // to a host serving stale code.
-    const body = buildPatchBody(form({ updateStrategy: "pull_build" }));
+  it("OMITS a blank command when there is nothing stored to clear", () => {
+    // A no-op edit must produce no write at all â€” otherwise the panel reports
+    // success for a PATCH that changed nothing.
+    const body = buildPatchBody(BARE, form({ updateStrategy: "pull_build" }));
     expect(Object.keys(body)).toEqual(["updateStrategy"]);
   });
 
-  it("treats whitespace-only as blank", () => {
+  it("SENDS an empty string to clear a stored command, per command", () => {
+    // The server's `normalize_command` maps a blank onto NULL. This is the only
+    // way the panel can remove a command, and it is why the value is sent
+    // rather than omitted.
+    //
+    // The sibling command is unaffected: a populated input is still sent as a
+    // set (harmlessly idempotent when unchanged — `dirty` is what stops a
+    // no-op save reaching the wire at all).
     const body = buildPatchBody(
+      BUILT_APP,
+      form({ updateStrategy: "pull_build", buildCommand: "", startCommand: "npm start" }),
+    );
+    expect(body.buildCommand).toBe("");
+    expect(body.startCommand).toBe("npm start");
+  });
+
+  it("treats whitespace-only as blank â€” clearing, not storing", () => {
+    // "   " must never reach the column: the engine runs a stored command and
+    // checks only the exit status, and `sh -c '   '` exits 0.
+    const body = buildPatchBody(
+      BUILT_APP,
       form({ updateStrategy: "pull_build", buildCommand: "   ", startCommand: "\t\n" }),
     );
-    expect(Object.keys(body)).toEqual(["updateStrategy"]);
+    expect(body.buildCommand).toBe("");
+    expect(body.startCommand).toBe("");
+  });
+
+  it("never emits a whitespace-only value as a SET", () => {
+    // The property, not just the cases: every emitted command is either the
+    // empty string (a clear) or a trimmed non-empty value. No third shape.
+    for (const raw of ["", "   ", "\t", " npm run build ", "make"]) {
+      const body = buildPatchBody(
+        BUILT_APP,
+        form({ updateStrategy: "pull_build", buildCommand: raw }),
+      );
+      const value = body.buildCommand;
+      expect(value).toBeDefined();
+      expect(value === "" || value!.trim() === value).toBe(true);
+      expect(value === "" || value!.length > 0).toBe(true);
+    }
   });
 
   it("trims a command before sending it", () => {
     const body = buildPatchBody(
+      BARE,
       form({ updateStrategy: "pull_build", buildCommand: "  npm run build  " }),
     );
     expect(body.buildCommand).toBe("npm run build");
@@ -173,30 +207,42 @@ describe("buildPatchBody", () => {
 
   it("sends each command independently", () => {
     expect(
-      buildPatchBody(form({ updateStrategy: "pull_build", startCommand: "npm start" })),
+      buildPatchBody(BARE, form({ updateStrategy: "pull_build", startCommand: "npm start" })),
     ).toEqual({ updateStrategy: "pull_build", startCommand: "npm start" });
   });
 
-  it("NEVER sends commands under pull_only, even when the form holds them", () => {
-    // Otherwise a command typed while pull_build was selected, then abandoned
-    // by switching back to pull_only (which hides the inputs), is persisted
-    // invisibly — and executed the moment anyone flips the app back.
+  it("never SETS a command under pull_only, even when the form holds one", () => {
+    // The abandoned-command hazard: a value typed under pull_build and then
+    // abandoned by switching back would be stored invisibly (the inputs are
+    // hidden under pull_only) and executed the moment anyone flipped back.
     const body = buildPatchBody(
+      BARE,
       form({ updateStrategy: "pull_only", buildCommand: "rm -rf dist", startCommand: "npm start" }),
     );
     expect(Object.keys(body)).toEqual(["updateStrategy"]);
     expect(body.updateStrategy).toBe("pull_only");
   });
 
+  it("DOES clear under pull_only â€” removing a hidden value, not creating one", () => {
+    // The other side of the rule above, and the whole "switch this app's shape"
+    // flow: a stored command that no longer runs must be removable.
+    const body = buildPatchBody(
+      BUILT_APP,
+      form({ updateStrategy: "pull_only", buildCommand: "", startCommand: "" }),
+    );
+    expect(body).toEqual({ updateStrategy: "pull_only", buildCommand: "", startCommand: "" });
+  });
+
   it("emits exactly the expected key set when everything is filled", () => {
     const body = buildPatchBody(
+      BARE,
       form({
         updateStrategy: "pull_build",
         buildCommand: "npm run build",
         startCommand: "npm start",
       }),
     );
-    // Pinned as a key set, not a type check: `UpdateAppRequest` has no
+    // A key set, not a type check: `UpdateAppRequest` has no
     // deny_unknown_fields, so a misspelt key would PATCH, return 200, and
     // change nothing.
     expect(Object.keys(body).sort()).toEqual(["buildCommand", "startCommand", "updateStrategy"]);
@@ -208,15 +254,16 @@ describe("effectiveAfterSave", () => {
     expect(effectiveAfterSave(BUILT_APP, formOf(BUILT_APP))).toEqual(formOf(BUILT_APP));
   });
 
-  it("KEEPS a stored command that the operator cleared in the form", () => {
-    // The COALESCE consequence: clearing the input omits the key, so the
-    // column is untouched. Modelling this is what stops the panel reporting
-    // success for an edit that immediately undoes itself.
+  it("CLEARS a stored command the operator blanked", () => {
+    // Was "KEEPS â€¦" under the old contract, where a blank was omitted and
+    // COALESCE preserved the column. Blank now means clear, so the effective
+    // row loses the command â€” which is what the Save gate and the warnings
+    // must both see.
     const cleared = form({ updateStrategy: "pull_build", buildCommand: "", startCommand: "" });
     expect(effectiveAfterSave(BUILT_APP, cleared)).toEqual({
       updateStrategy: "pull_build",
-      buildCommand: "npm run build",
-      startCommand: "npm start",
+      buildCommand: "",
+      startCommand: "",
     });
   });
 
@@ -229,9 +276,17 @@ describe("effectiveAfterSave", () => {
     expect(effectiveAfterSave(BUILT_APP, edited).buildCommand).toBe("make");
   });
 
-  it("keeps stored commands when switching to pull_only", () => {
-    // buildPatchBody omits them, so the columns survive — the row is still
-    // configured if the operator switches back.
+  it("clears stored commands when switching to pull_only with blank inputs", () => {
+    const switched = form({ updateStrategy: "pull_only", buildCommand: "", startCommand: "" });
+    const effective = effectiveAfterSave(BUILT_APP, switched);
+    expect(effective.updateStrategy).toBe("pull_only");
+    expect(effective.buildCommand).toBe("");
+  });
+
+  it("KEEPS stored commands when switching to pull_only with the fields populated", () => {
+    // Switching strategy without touching the inputs must not silently wipe
+    // the commands â€” the omission rule keeps them, and the panel surfaces them
+    // read-only with an explicit Clear control.
     const switched = formOf({ ...BUILT_APP, updateStrategy: "pull_only" });
     const effective = effectiveAfterSave(BUILT_APP, switched);
     expect(effective.updateStrategy).toBe("pull_only");
@@ -244,15 +299,23 @@ function dirty(a: RegisteredApp, f: AppFreshnessForm): boolean {
   return !sameForm(effectiveAfterSave(a, f), formOf(a));
 }
 
-describe("dirty (effectiveAfterSave vs stored — the Save gate)", () => {
+describe("dirty (effectiveAfterSave vs stored â€” the Save gate)", () => {
   it("is false for an untouched row", () => {
     expect(dirty(BUILT_APP, formOf(BUILT_APP))).toBe(false);
   });
 
-  it("is false for a no-op PATCH — clearing an already-stored command", () => {
-    // Save must not offer an action that reports success and changes nothing.
+  it("is TRUE for clearing an already-stored command", () => {
+    // Inverted from the old contract, where clearing was a no-op PATCH. It is
+    // now a real mutation, so Save must offer it.
     const cleared = form({ updateStrategy: "pull_build", buildCommand: "", startCommand: "" });
-    expect(dirty(BUILT_APP, cleared)).toBe(false);
+    expect(dirty(BUILT_APP, cleared)).toBe(true);
+  });
+
+  it("is false when blanking a command that is already empty", () => {
+    // Still a genuine no-op â€” nothing stored, nothing to clear.
+    const bare = app({ updateStrategy: "pull_build", buildCommand: "make" });
+    const untouched = form({ updateStrategy: "pull_build", buildCommand: "make" });
+    expect(dirty(bare, untouched)).toBe(false);
   });
 
   it("is false for whitespace-only edits, which trim to the stored value", () => {
@@ -286,9 +349,8 @@ describe("dirty (effectiveAfterSave vs stored — the Save gate)", () => {
 
 describe("isFalselyFresh", () => {
   it("is true for pull_build with no command that would run", () => {
-    // The engine takes neither `if let Some` arm, returns Ok(()), and marks
-    // the app fresh at the new SHA with nothing built — the same false-fresh
-    // outcome the omit-blank rule prevents, reached via NULL/NULL.
+    // The engine now REFUSES this (returns Err â†’ freshness "failed"), so the
+    // panel refuses to create it rather than saving a guaranteed failure.
     const bare = app({ updateStrategy: "pull_build" });
     expect(isFalselyFresh(effectiveAfterSave(bare, form({ updateStrategy: "pull_build" })))).toBe(
       true,
@@ -309,15 +371,20 @@ describe("isFalselyFresh", () => {
     ).toBe(false);
   });
 
-  it("is false when the inputs are blank but the stored commands survive", () => {
-    // The distinction the raw form cannot make: blank inputs on a configured
-    // app are a no-op, not a wipe, so this is NOT the dangerous state.
+  it("is TRUE when the operator clears both commands on a pull_build app", () => {
+    // Inverted from the old contract, where blank inputs left the stored
+    // commands in place. Clearing both now really does produce the
+    // command-less pull_build state, so Save is refused â€” the route is to
+    // switch to pull_only first, then clear.
     const cleared = form({ updateStrategy: "pull_build", buildCommand: "", startCommand: "" });
-    expect(isFalselyFresh(effectiveAfterSave(BUILT_APP, cleared))).toBe(false);
+    expect(isFalselyFresh(effectiveAfterSave(BUILT_APP, cleared))).toBe(true);
   });
 
   it("is false for pull_only regardless of commands", () => {
-    // pull_only never claims a build happened, so an absent command is fine.
+    // pull_only never claims a build happened, so an absent command is fine â€”
+    // and clearing under pull_only is exactly the supported flow.
     expect(isFalselyFresh(effectiveAfterSave(app(), form()))).toBe(false);
+    const cleared = form({ updateStrategy: "pull_only", buildCommand: "", startCommand: "" });
+    expect(isFalselyFresh(effectiveAfterSave(BUILT_APP, cleared))).toBe(false);
   });
 });

@@ -31,6 +31,42 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Resolve an incoming optional command into the `(touch, value)` pair the
+/// UPDATE binds, applying the fleet-wide **blank-means-clear** contract.
+///
+/// Three states, which is one more than a bare `Option` can carry:
+///
+/// | Input | Returns | Meaning |
+/// |---|---|---|
+/// | `None` | `(false, None)` | absent — leave the column exactly as it is |
+/// | `Some("")` / `Some("   ")` | `(true, None)` | **clear** the column |
+/// | `Some("npm run build")` | `(true, Some(..))` | set it, trimmed |
+///
+/// Why blank means clear rather than being rejected: `qontinui-web` has shipped
+/// that semantic since the fleet UI landed (it writes `project.apps` directly
+/// via SQLAlchemy, `fleet_targets.py`), so this makes the runner's own API agree
+/// with the contract already in production instead of adding a third one.
+///
+/// Why a blank must never be *stored*: the auto-fresh engine runs
+/// `if let Some(cmd)` and checks only the exit status, and an empty shell
+/// command exits 0 on every platform — so a stored `""` marks the app freshly
+/// built having built nothing, and the `fresh_only` dispatcher then routes
+/// tests to a host serving the previous artifact. Normalizing here is what
+/// keeps that value out of the column.
+fn normalize_command(value: Option<&str>) -> (bool, Option<String>) {
+    match value {
+        None => (false, None),
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                (true, None)
+            } else {
+                (true, Some(trimmed.to_string()))
+            }
+        }
+    }
+}
+
 fn row_to_app(r: &tokio_postgres::Row) -> App {
     let auth_required: Option<bool> = r.try_get(6).ok();
     let red_threshold: Option<f64> = r.try_get::<_, Option<f64>>(7).ok().flatten();
@@ -167,6 +203,10 @@ impl PgDb {
         }
 
         let now = now_ms();
+        // Normalize on the registration door too, so a blank command cannot
+        // enter the table by either route (see `normalize_command`).
+        let (_, insert_build_command) = normalize_command(req.build_command.as_deref());
+        let (_, insert_start_command) = normalize_command(req.start_command.as_deref());
         let rows = txn
             .query(
                 "INSERT INTO project.apps \
@@ -187,8 +227,8 @@ impl PgDb {
                     &req.red_threshold,
                     &req.yellow_threshold,
                     &req.update_strategy,
-                    &req.build_command,
-                    &req.start_command,
+                    &insert_build_command,
+                    &insert_start_command,
                 ],
             )
             .await
@@ -236,6 +276,17 @@ impl PgDb {
 
         // COALESCE($n, column) → leave the column untouched when the param is
         // NULL. Single round-trip, no SELECT-then-UPDATE race.
+        //
+        // The two COMMAND columns cannot use COALESCE, because it collapses the
+        // three states this API has to express down to two. COALESCE falls
+        // through only on SQL NULL, so `Some("")` would be *stored* rather than
+        // clearing (verified: `COALESCE('', 'STORED')` → `''`) — and a stored
+        // empty command is executed by the auto-fresh engine, exits 0, and marks
+        // the app freshly built having built nothing. Each command therefore
+        // binds a (touch, value) PAIR and a CASE: `$8`/`$10` say whether to
+        // write at all, `$9`/`$11` carry the value. See `normalize_command`.
+        let (touch_build, build_command) = normalize_command(req.build_command.as_deref());
+        let (touch_start, start_command) = normalize_command(req.start_command.as_deref());
         let rows = conn
             .query(
                 "UPDATE project.apps \
@@ -245,8 +296,8 @@ impl PgDb {
                      red_threshold  = COALESCE($5, red_threshold), \
                      yellow_threshold = COALESCE($6, yellow_threshold), \
                      update_strategy  = COALESCE($7, update_strategy), \
-                     build_command    = COALESCE($8, build_command), \
-                     start_command    = COALESCE($9, start_command) \
+                     build_command    = CASE WHEN $8 THEN $9 ELSE build_command END, \
+                     start_command    = CASE WHEN $10 THEN $11 ELSE start_command END \
                  WHERE app_id = $1 \
                  RETURNING app_id, repo_root, ui_bridge_url, display_name, \
                            created_at_ms, last_seen_at_ms, auth_required, red_threshold, \
@@ -259,8 +310,10 @@ impl PgDb {
                     &req.red_threshold,
                     &req.yellow_threshold,
                     &req.update_strategy,
-                    &req.build_command,
-                    &req.start_command,
+                    &touch_build,
+                    &build_command,
+                    &touch_start,
+                    &start_command,
                 ],
             )
             .await
@@ -495,6 +548,137 @@ mod tests {
 
     async fn cleanup_app(pg: &PgDb, app_id: &str) {
         let _ = pg.delete_app(app_id).await;
+    }
+
+    /// An all-`None` `UpdateAppRequest` to mutate per test.
+    ///
+    /// `UpdateAppRequest` has no `Default` derive, and adding one to
+    /// `qontinui-schemas` would pull the cross-repo consumer gate into a change
+    /// that alters no wire format — so the builder lives here.
+    fn empty_update() -> UpdateAppRequest {
+        UpdateAppRequest {
+            ui_bridge_url: None,
+            display_name: None,
+            auth_required: None,
+            red_threshold: None,
+            yellow_threshold: None,
+            update_strategy: None,
+            build_command: None,
+            start_command: None,
+        }
+    }
+
+    // ---- normalize_command (pure — runs in CI, unlike the DB-gated tests) ----
+
+    #[test]
+    fn normalize_command_absent_leaves_column_alone() {
+        assert_eq!(normalize_command(None), (false, None));
+    }
+
+    #[test]
+    fn normalize_command_blank_clears() {
+        // The fleet-wide contract: blank means clear. qontinui-web has shipped
+        // this semantic since the fleet UI landed.
+        for blank in [
+            "", "   ", "	", "
+", " 	
+ ",
+        ] {
+            assert_eq!(
+                normalize_command(Some(blank)),
+                (true, None),
+                "{blank:?} must clear the column, not be stored"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_command_sets_trimmed() {
+        assert_eq!(
+            normalize_command(Some("  npm run build  ")),
+            (true, Some("npm run build".to_string()))
+        );
+    }
+
+    #[test]
+    fn normalize_command_never_yields_a_blank_value() {
+        // The property that matters: no input can produce a STORED blank. A
+        // stored blank is executed by the auto-fresh engine, exits 0, and marks
+        // the app freshly built having built nothing.
+        for input in [None, Some(""), Some("   "), Some(" x "), Some("npm start")] {
+            let (_, value) = normalize_command(input);
+            assert!(
+                value.as_deref().map(str::trim).map(str::is_empty) != Some(true),
+                "{input:?} produced a blank stored value"
+            );
+        }
+    }
+
+    /// DB-gated: prove all THREE update states against real SQL.
+    ///
+    /// The `CASE WHEN $n THEN ... ELSE column END` rewrite is exactly what a
+    /// struct-level test cannot cover — and the previous `COALESCE` shape gets
+    /// the "clear" case wrong while looking correct, because `COALESCE` falls
+    /// through only on NULL and `''` is not NULL.
+    #[tokio::test]
+    #[ignore = "requires PG via DATABASE_URL"]
+    async fn update_app_command_leave_clear_and_set() {
+        let pg = test_pg().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let app_id = unique_app_id("cmd");
+        pg.insert_app(&register_request(&app_id, &tmp))
+            .await
+            .expect("register");
+
+        // Set both commands.
+        let set = UpdateAppRequest {
+            update_strategy: Some("pull_build".to_string()),
+            build_command: Some("npm run build".to_string()),
+            start_command: Some("npm start".to_string()),
+            ..empty_update()
+        };
+        let app = pg.update_app(&app_id, &set).await.expect("set");
+        assert_eq!(app.build_command.as_deref(), Some("npm run build"));
+        assert_eq!(app.start_command.as_deref(), Some("npm start"));
+
+        // ABSENT → leave both alone.
+        let leave = UpdateAppRequest {
+            display_name: Some("Renamed".to_string()),
+            ..empty_update()
+        };
+        let app = pg.update_app(&app_id, &leave).await.expect("leave");
+        assert_eq!(app.display_name, "Renamed");
+        assert_eq!(
+            app.build_command.as_deref(),
+            Some("npm run build"),
+            "an absent field must not disturb the column"
+        );
+
+        // BLANK → clear, and clear INDEPENDENTLY of the sibling column.
+        let clear_build = UpdateAppRequest {
+            build_command: Some("   ".to_string()),
+            ..empty_update()
+        };
+        let app = pg.update_app(&app_id, &clear_build).await.expect("clear");
+        assert_eq!(
+            app.build_command, None,
+            "a blank must clear the column, never be stored"
+        );
+        assert_eq!(
+            app.start_command.as_deref(),
+            Some("npm start"),
+            "clearing one command must not touch the other"
+        );
+
+        // And a set value round-trips trimmed.
+        let retrim = UpdateAppRequest {
+            build_command: Some("  make  ".to_string()),
+            ..empty_update()
+        };
+        let app = pg.update_app(&app_id, &retrim).await.expect("re-set");
+        assert_eq!(app.build_command.as_deref(), Some("make"));
+
+        cleanup_app(&pg, &app_id).await;
     }
 
     #[tokio::test]
