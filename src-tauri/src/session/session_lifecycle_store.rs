@@ -2325,6 +2325,33 @@ mod tests {
         }
     }
 
+    /// Age fields on the persisted registry that no public mutator can reach
+    /// (`closed_at`, `last_seen_at`), the WAL-model-correct way.
+    ///
+    /// Under the write-ahead log a mutation lands as ONE appended delta and the
+    /// JSON snapshot is only rewritten on compaction, so the pre-WAL idiom —
+    /// read the snapshot, edit it, write it back — read a stale (or, on a store
+    /// that has never compacted, an absent) file and then had the un-folded
+    /// deltas replayed straight back over the edit on the next `open`.
+    /// [`SessionLifecycleStore::compact`] first makes the snapshot the
+    /// authoritative copy and truncates the WAL, so the edit is the last word:
+    /// reopening the path afterwards loads exactly the tampered map.
+    ///
+    /// Callers must reopen the store afterwards — `store`'s in-memory map is
+    /// deliberately NOT updated, matching the "aged on disk, then restarted"
+    /// scenario every caller is reproducing.
+    fn age_persisted_records(
+        store: &SessionLifecycleStore,
+        path: &Path,
+        edit: impl FnOnce(&mut HashMap<String, TerminalSessionRecord>),
+    ) {
+        store.compact();
+        let raw = std::fs::read(path).unwrap();
+        let mut m: HashMap<String, TerminalSessionRecord> = serde_json::from_slice(&raw).unwrap();
+        edit(&mut m);
+        std::fs::write(path, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+    }
+
     // ── Write-ahead log (Phase 6, B1) ───────────────────────────────────────
     //
     // A mutation costs ONE appended delta line instead of a whole-map JSON
@@ -3473,15 +3500,10 @@ mod tests {
         let now = Utc::now().timestamp_millis();
 
         // Age the stale pty-exit record's closed_at past the grace window.
-        {
-            let raw = std::fs::read(&path).unwrap();
-            let mut m: HashMap<String, TerminalSessionRecord> =
-                serde_json::from_slice(&raw).unwrap();
+        age_persisted_records(&store, &path, |m| {
             m.get_mut("stale-pty-exit-sess").unwrap().closed_at =
                 Some(now - RESTORABLE_PTY_EXIT_MS - 1000);
-            let bytes = serde_json::to_vec_pretty(&m).unwrap();
-            std::fs::write(&path, bytes).unwrap();
-        }
+        });
         let store = SessionLifecycleStore::open(&path).unwrap();
 
         let mut ids: Vec<String> = store
@@ -3660,29 +3682,15 @@ mod tests {
         store.record_close("recent-closed", "done");
         store.record_close("old-closed", "done");
 
-        // Hand-tamper timestamps via reload-mutate-rewrite would require
-        // internals; instead choose a `now` far in the future so the
-        // "old-closed" (closed_at ~ real now) is > 24h old, but tune the
-        // fresh ones to survive. We set last_seen far enough back below by
-        // re-recording with a manual now. Simpler: drive prune with a `now`
-        // chosen relative to the real timestamps we just wrote.
         let now = Utc::now().timestamp_millis();
 
-        // Push the records we want pruned into the past by re-writing the
-        // file directly through the store's open/close round-trip is awkward;
-        // instead assert behavior with synthetic far-future `now` after
-        // forcibly aging two records.
-        // Age `stale-open` and `old-closed` beyond their thresholds.
-        {
-            // Reload, mutate ages in-place, persist via a fresh store write.
-            let raw = std::fs::read(&path).unwrap();
-            let mut m: HashMap<String, TerminalSessionRecord> =
-                serde_json::from_slice(&raw).unwrap();
+        // No public mutator can push `last_seen_at`/`closed_at` into the past,
+        // so age `stale-open` and `old-closed` past their thresholds on disk
+        // and let the reopen below load them.
+        age_persisted_records(&store, &path, |m| {
             m.get_mut("stale-open").unwrap().last_seen_at = now - OPEN_STALE_MS - 1000;
             m.get_mut("old-closed").unwrap().closed_at = Some(now - CLOSED_RETENTION_MS - 1000);
-            let bytes = serde_json::to_vec_pretty(&m).unwrap();
-            std::fs::write(&path, bytes).unwrap();
-        }
+        });
 
         // Reopen so the store loads the aged timestamps, then prune. No
         // terminal is live, so retention alone decides.
@@ -3734,10 +3742,7 @@ mod tests {
 
         let now = Utc::now().timestamp_millis();
         // Age both closed rows past retention and the open row past stale.
-        {
-            let raw = std::fs::read(&path).unwrap();
-            let mut m: HashMap<String, TerminalSessionRecord> =
-                serde_json::from_slice(&raw).unwrap();
+        age_persisted_records(&store, &path, |m| {
             m.get_mut("closed-live-term").unwrap().closed_at =
                 Some(now - CLOSED_RETENTION_MS - 1_000);
             // An OLDER closed sibling under the same live terminal — only the
@@ -3747,8 +3752,7 @@ mod tests {
             m.get_mut("closed-gone-term").unwrap().closed_at =
                 Some(now - CLOSED_RETENTION_MS - 1_000);
             m.get_mut("open-live-term").unwrap().last_seen_at = now - OPEN_STALE_MS - 1_000;
-            std::fs::write(&path, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
-        }
+        });
 
         let store = SessionLifecycleStore::open(&path).unwrap();
         let live: HashSet<String> = ["term-live".to_string()].into_iter().collect();
@@ -4642,16 +4646,11 @@ mod tests {
 
         // Age `poll-dead-fresh` to now-30s (well inside grace) and
         // `poll-dead-stale` past the grace window.
-        {
-            let raw = std::fs::read(&path).unwrap();
-            let mut m: HashMap<String, TerminalSessionRecord> =
-                serde_json::from_slice(&raw).unwrap();
+        age_persisted_records(&store, &path, |m| {
             m.get_mut("poll-dead-fresh").unwrap().closed_at = Some(now - 30_000);
             m.get_mut("poll-dead-stale").unwrap().closed_at =
                 Some(now - RESTORABLE_POLL_DEAD_MS - 1000);
-            let bytes = serde_json::to_vec_pretty(&m).unwrap();
-            std::fs::write(&path, bytes).unwrap();
-        }
+        });
         let store = SessionLifecycleStore::open(&path).unwrap();
 
         let ids: Vec<String> = store
@@ -4884,13 +4883,9 @@ mod tests {
 
         // Age `last_seen_at` so a refresh would be unmistakable.
         let aged = before.last_seen_at - 600_000;
-        {
-            let raw = std::fs::read(&path).unwrap();
-            let mut m: HashMap<String, TerminalSessionRecord> =
-                serde_json::from_slice(&raw).unwrap();
+        age_persisted_records(&store, &path, |m| {
             m.get_mut("s1").unwrap().last_seen_at = aged;
-            std::fs::write(&path, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
-        }
+        });
         let store = SessionLifecycleStore::open(&path).unwrap();
 
         store.rebind_terminal("s1", "term-fresh", 5);
