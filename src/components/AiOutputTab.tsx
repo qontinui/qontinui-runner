@@ -339,7 +339,23 @@ export function AiOutputTab({
   // empty -> non-empty transition and survives every subsequent streamed line;
   // `checkAiStatus` reads the latest lines through `linesRef`.
   const hasLines = lines.length > 0;
-  useStableInterval(checkAiStatus, STATUS_POLL_INTERVAL_MS, hasLines, { fireOnEnable: true });
+  const checkAiStatusNow = useStableInterval(checkAiStatus, STATUS_POLL_INTERVAL_MS, hasLines, {
+    fireOnEnable: true,
+  });
+
+  // Turn-start re-fire — NOT per line (that storm is what §A5f removed).
+  // `fireOnEnable` only covers the empty -> non-empty edge, so in a session
+  // that already has output, a new turn left `isAiWorking` false for up to a
+  // full poll period: long enough for a second Enter to send a second prompt
+  // instead of queueing it as a hint against the running one. One new loop is
+  // exactly one turn starting, wherever it was started from.
+  const turnCount = loops.length;
+  const previousTurnCountRef = useRef(turnCount);
+  useEffect(() => {
+    const previous = previousTurnCountRef.current;
+    previousTurnCountRef.current = turnCount;
+    if (turnCount > previous) checkAiStatusNow();
+  }, [turnCount, checkAiStatusNow]);
 
   // When there are no lines, clear the working flag (deferred by a microtask so
   // the effect body itself doesn't call setState synchronously).
@@ -557,9 +573,7 @@ export function AiOutputTab({
         ref={containerRef}
         className="flex-1 min-h-0 overflow-auto bg-background/50 rounded-lg border border-border p-4 text-sm"
       >
-        {currentLoop && (
-          <AiMessageDisplay groups={currentGroups} mode="log" isAnimated virtualize />
-        )}
+        {currentLoop && <AiMessageDisplay groups={currentGroups} mode="log" isAnimated />}
       </div>
 
       {/* Prompt/Hint input */}

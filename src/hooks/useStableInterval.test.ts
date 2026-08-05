@@ -131,6 +131,39 @@ describe("StableIntervalController", () => {
     controller.dispose();
   });
 
+  it("fire() runs an out-of-band check WITHOUT re-arming or shifting the cadence", () => {
+    // The turn-start re-fire: `fireOnEnable` only covers the disabled→enabled
+    // edge, so a new turn in a session that already has output would otherwise
+    // leave `isAiWorking` poll-bound for a full second. This must stay cheap —
+    // if it re-armed, it would be the per-line storm A5f removed.
+    const controller = new StableIntervalController(1000);
+    const tick = vi.fn();
+    controller.setCallback(tick);
+    controller.setEnabled(true);
+    expect(controller.armCount).toBe(1);
+
+    vi.advanceTimersByTime(600);
+    controller.fire();
+    expect(tick).toHaveBeenCalledTimes(1);
+    expect(controller.armCount).toBe(1);
+
+    // The interval's own tick still lands on its original schedule.
+    vi.advanceTimersByTime(400);
+    expect(tick).toHaveBeenCalledTimes(2);
+    controller.dispose();
+  });
+
+  it("fire() after dispose is inert", () => {
+    const controller = new StableIntervalController(1000);
+    const tick = vi.fn();
+    controller.setCallback(tick);
+    controller.setEnabled(true);
+    controller.dispose();
+
+    controller.fire();
+    expect(tick).not.toHaveBeenCalled();
+  });
+
   it("dispose() stops everything", () => {
     const controller = new StableIntervalController(1000);
     const tick = vi.fn();

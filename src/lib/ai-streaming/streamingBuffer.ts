@@ -73,6 +73,54 @@ export function computeStreamWindow(
   };
 }
 
+/**
+ * Render a retained response for the transcript, prefixing the retention-cap
+ * notice when the head was trimmed.
+ *
+ * Every path that moves text out of the streaming buffer and into the message
+ * list goes through this — the normal ready/closed completion AND the abandon
+ * paths (a new turn starting over an in-flight one). Otherwise the abandon
+ * paths reset the buffer and take the trim record with them, so a response the
+ * operator can see is incomplete carries nothing saying why.
+ */
+export function formatRetainedResponse(text: string, droppedChars: number): string {
+  if (droppedChars <= 0) return text;
+  return (
+    `_[${droppedChars} earlier characters of this response were trimmed by ` +
+    `the streaming retention cap]_\n\n${text}`
+  );
+}
+
+/** A streaming buffer's observable size, as a view sees it between renders. */
+export interface StreamProgress {
+  /** Retained characters currently in the buffer. */
+  length: number;
+  /** Characters permanently dropped by the retention cap so far. */
+  droppedChars: number;
+}
+
+/**
+ * Should a "show earlier / show all" window collapse back to the default tail?
+ *
+ * A view can only tell turns apart by watching the buffer shrink — but there
+ * are TWO ways it shrinks, and only one of them is a new turn:
+ *
+ *  - **New turn.** The hook resets the buffer, so both the length and the
+ *    dropped count go to zero. Collapse: the widened window belonged to the
+ *    previous response.
+ *  - **Retention-cap trim.** The cap fires at 2,000,001 chars and trims back to
+ *    1,500,000 — a 500k SHRINK mid-stream, with the dropped count rising by
+ *    exactly that much. Collapsing here yanks a reader who clicked "Show all"
+ *    back to the 4096-char tail, in the middle of the response they asked to
+ *    see, for a reason that has nothing to do with them.
+ *
+ * The rising dropped count is what separates the two.
+ */
+export function shouldResetStreamWindow(previous: StreamProgress, next: StreamProgress): boolean {
+  if (next.droppedChars > previous.droppedChars) return false;
+  return next.length < previous.length;
+}
+
 export interface StreamingTextBufferOptions {
   /** Retention ceiling. Defaults to {@link STREAM_RETAIN_MAX_CHARS}. */
   maxChars?: number;

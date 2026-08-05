@@ -13,7 +13,7 @@
  * - Displays orchestrator agent messages with distinct styling
  */
 
-import React, { memo, useEffect, useMemo, useState, useCallback } from "react";
+import React, { memo, useMemo, useState, useCallback } from "react";
 import {
   Bot,
   BookOpen,
@@ -30,8 +30,8 @@ import {
   User,
   XCircle,
 } from "lucide-react";
-import { List, useDynamicRowHeight, useListRef, type RowComponentProps } from "react-window";
 import { cn } from "../../lib/utils";
+import { readSectionExpanded, setSectionExpanded } from "./sectionExpandedStore";
 import { MarkdownViewer } from "../MarkdownViewer";
 import { getAccentColors } from "@/design-system";
 import type { MessageGroup } from "./messageGrouping";
@@ -168,16 +168,6 @@ export function detectCurrentOrchestratorAgent(
 export type DisplayMode = "log" | "chat";
 
 /**
- * Below this many groups the plain DOM list is cheaper than a virtualized one
- * (no measurement, no absolute positioning). Above it, `virtualize` callers get
- * a windowed list (plan `2026-07-28-runner-many-sessions-performance.md` §A5e).
- */
-export const AI_MESSAGE_VIRTUALIZE_THRESHOLD = 30;
-
-/** Starting estimate for a message row before it has been measured. */
-const ESTIMATED_MESSAGE_HEIGHT_PX = 160;
-
-/**
  * Props for the AiMessageDisplay component.
  */
 export interface AiMessageDisplayProps {
@@ -189,13 +179,6 @@ export interface AiMessageDisplayProps {
   isAnimated?: boolean;
   /** Additional class name */
   className?: string;
-  /**
-   * Render through a windowed list once the conversation exceeds
-   * {@link AI_MESSAGE_VIRTUALIZE_THRESHOLD} groups. The component then owns its
-   * own scroll container and fills the height of its parent, so the caller must
-   * NOT wrap it in another `overflow-auto` box with intrinsic height.
-   */
-  virtualize?: boolean;
 }
 
 /**
@@ -498,12 +481,6 @@ const OrchestratorLogBlock = memo(function OrchestratorLogBlock({
 });
 
 /**
- * Module-level store for expanded AI response sections.
- * Persists across re-renders to prevent collapse on parent updates.
- */
-const expandedResponseStore = new Set<string>();
-
-/**
  * Generate a stable key for a response group.
  */
 function responseKey(group: MessageGroup): string {
@@ -533,7 +510,7 @@ function CollapsibleAiSection({
   defaultExpanded?: boolean;
 }) {
   const [isExpanded, setIsExpanded] = useState(() =>
-    expandedResponseStore.has(sectionKey) ? true : defaultExpanded,
+    readSectionExpanded(sectionKey, defaultExpanded),
   );
 
   const toggleExpanded = useCallback(
@@ -541,11 +518,7 @@ function CollapsibleAiSection({
       e.stopPropagation();
       setIsExpanded((prev) => {
         const next = !prev;
-        if (next) {
-          expandedResponseStore.add(sectionKey);
-        } else {
-          expandedResponseStore.delete(sectionKey);
-        }
+        setSectionExpanded(sectionKey, next);
         return next;
       });
     },
@@ -865,43 +838,26 @@ function computeResponseIndices(groups: MessageGroup[]): number[] {
   return indices;
 }
 
-interface MessageRowProps {
-  groups: MessageGroup[];
-  mode: DisplayMode;
-  isAnimated: boolean;
-  responseIndices: number[];
-}
-
-function MessageRow({
-  index,
-  style,
-  groups,
-  mode,
-  isAnimated,
-  responseIndices,
-}: RowComponentProps<MessageRowProps>) {
-  return (
-    <div style={style}>
-      <MessageBlock
-        group={groups[index]}
-        mode={mode}
-        isAnimated={isAnimated}
-        index={responseIndices[index]}
-      />
-    </div>
-  );
-}
-
 /**
  * AiMessageDisplay component.
  * Renders grouped AI messages with consistent styling.
+ *
+ * Plain DOM list, deliberately. The `virtualize` opt-in that shipped with plan
+ * `2026-07-28-runner-many-sessions-performance.md` §A5e was withdrawn before
+ * merge: its own numbers put the break-even at ~70 groups (a 30-group threshold
+ * against a 20-row overscan renders all 30 rows anyway), while it broke the
+ * bottom-pin — `useDynamicRowHeight` hands back the 160px default for rows the
+ * ResizeObserver has not measured yet, and the `scrollToRow` effect runs before
+ * it ever does — and it dropped the whole height map mid-stream whenever log
+ * eviction reached the head of the selected loop. Windowing is worth having,
+ * but it needs measurement-aware pinning and a scroll-independent expand store;
+ * that lands as its own PR rather than riding along with the O(n²) fixes.
  */
 function AiMessageDisplayImpl({
   groups,
   mode = "log",
   isAnimated = false,
   className,
-  virtualize = false,
 }: AiMessageDisplayProps) {
   // Extract all findings from response groups
   const allFindings = useMemo(() => {
@@ -916,56 +872,8 @@ function AiMessageDisplayImpl({
 
   const responseIndices = useMemo(() => computeResponseIndices(groups), [groups]);
 
-  const isVirtual = virtualize && groups.length >= AI_MESSAGE_VIRTUALIZE_THRESHOLD;
-
-  const listRef = useListRef(null);
-  // Reset the measurement cache when the conversation itself changes (switching
-  // sessions), not on every append.
-  const rowHeight = useDynamicRowHeight({
-    defaultRowHeight: ESTIMATED_MESSAGE_HEIGHT_PX,
-    key: groups.length > 0 ? groups[0].timestamp : 0,
-  });
-
-  const rowProps = useMemo<MessageRowProps>(
-    () => ({ groups, mode, isAnimated, responseIndices }),
-    [groups, mode, isAnimated, responseIndices],
-  );
-
-  // Preserve the pre-virtualization behaviour of the log view: newest message
-  // pinned to the bottom as content arrives.
-  useEffect(() => {
-    if (!isVirtual || groups.length === 0) return;
-    listRef.current?.scrollToRow({
-      index: groups.length - 1,
-      align: "end",
-      behavior: "instant",
-    });
-  }, [isVirtual, groups, listRef]);
-
   if (groups.length === 0) {
     return null;
-  }
-
-  if (isVirtual) {
-    return (
-      <div className={cn("flex flex-col min-h-0 h-full", className)}>
-        {/* Show findings summary at the top if there are any */}
-        {mode === "log" && allFindings.length > 0 && <FindingsSummary findings={allFindings} />}
-        {/* The findings banner is a fixed-height sibling, so the list takes the
-            REMAINING space rather than the full parent height. */}
-        <div className="flex-1 min-h-0">
-          <List
-            listRef={listRef}
-            rowCount={groups.length}
-            rowHeight={rowHeight}
-            rowComponent={MessageRow}
-            rowProps={rowProps}
-            overscanCount={20}
-            style={{ width: "100%", height: "100%" }}
-          />
-        </div>
-      </div>
-    );
   }
 
   return (
