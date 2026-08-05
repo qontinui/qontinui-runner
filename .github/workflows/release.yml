@@ -6,6 +6,15 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
+      # REQUIRED, and it cannot be defaulted away: on workflow_dispatch
+      # GITHUB_REF is refs/heads/<branch>, so there is no tag to derive a
+      # version from. Every workflow_dispatch run in this workflow's history
+      # (three, all 2026-07-06) failed for exactly that reason — see the
+      # "Resolve release version" step below.
+      version:
+        description: "Version to release, without the leading v (e.g. 1.0.8). The tag v<version> is created at the dispatched ref if it does not exist."
+        type: string
+        required: true
       include_bundled_python:
         description: "Bundle Python executor (zero-setup installation)"
         type: boolean
@@ -52,9 +61,46 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Get version from tag
+      # Resolve ONE version and derive the tag from it, so the two can never
+      # disagree.
+      #
+      # The old one-liner was `version=${GITHUB_REF#refs/tags/v}`. That is a
+      # prefix strip, not a match: on a tag push refs/tags/v1.0.6 correctly
+      # becomes 1.0.6, but on workflow_dispatch GITHUB_REF is refs/heads/main,
+      # the prefix does not match, and the value passes through UNSTRIPPED. The
+      # release was then named "Qontinui Runner vrefs/heads/main (Beta)" and
+      # publish-update-json looked up `gh release view "vrefs/heads/main"` ->
+      # "release not found" -> exit 1. Compounding it, `tag_name` was
+      # ${{ github.ref }}, so create-release would have tagged the release
+      # "refs/heads/main" — the two did not even agree with each other. All
+      # three workflow_dispatch runs in history failed this way (2026-07-06,
+      # runs 28759763447 / 28761370633 / 28764507838); the trigger has never
+      # once succeeded.
+      - name: Resolve release version
         id: get_version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+        env:
+          # Bound through env rather than spliced in with ${{ }}: a dispatch
+          # input is caller-supplied text, and interpolating it directly into a
+          # run block would make it shell code.
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            version="${GITHUB_REF#refs/tags/}"
+            version="${version#v}"
+          else
+            version="${INPUT_VERSION#v}"
+          fi
+
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Could not resolve a release version (got '${version}'). On a tag push the tag must look like vX.Y.Z; on workflow_dispatch pass the 'version' input, e.g. 1.0.8."
+            exit 1
+          fi
+
+          echo "Resolved version=${version} tag=v${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
 
       - name: Create Release
         id: create-release
@@ -62,7 +108,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ github.ref }}
+          # Derived from the resolved version, never from github.ref. On a tag
+          # push this is the tag that triggered the run; on workflow_dispatch
+          # the tag is created at the dispatched ref. Either way it agrees with
+          # release_version, which publish-update-json looks the release up by.
+          tag_name: ${{ steps.get_version.outputs.tag }}
           release_name: Qontinui Runner v${{ steps.get_version.outputs.version }} (Beta)
           draft: true
           prerelease: true
