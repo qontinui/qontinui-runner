@@ -2619,6 +2619,36 @@ pub struct SettingsFault {
 /// again, so the surface self-heals when the file becomes readable.
 static SETTINGS_FAULT: std::sync::RwLock<Option<SettingsFault>> = std::sync::RwLock::new(None);
 
+/// Process-global, in-memory-only tier override.
+///
+/// Set by [`crate::commands::auth::set_runner_tier`] on a runner that must not
+/// write the shared `settings.json` (a secondary — any supervisor-launched
+/// temp/named instance; see the FOOTGUN GUARD in [`load_settings_full`]). Before
+/// this existed, that branch logged "applying in-memory only" and then applied
+/// NOTHING: the command was a total no-op, `get_runner_tier` kept answering the
+/// old tier, and every tier-dependent state transition (notably the frontend's
+/// `isTier2` flip) was untestable on a temp runner — a green result there was
+/// vacuous.
+///
+/// It is applied as the LAST overlay in [`load_settings_full`], so an explicit
+/// runtime choice beats the spawn-time `QONTINUI_RUNNER_TIER` env overlay. It is
+/// never read by [`update_settings`] (which starts from the raw on-disk
+/// document), so it can never leak into a persisted file.
+static TIER_OVERRIDE: std::sync::RwLock<Option<RunnerTier>> = std::sync::RwLock::new(None);
+
+/// Apply a tier for the remainder of this process's lifetime WITHOUT touching
+/// any settings file. See [`TIER_OVERRIDE`].
+pub fn set_in_memory_tier(tier: RunnerTier) {
+    if let Ok(mut guard) = TIER_OVERRIDE.write() {
+        *guard = Some(tier);
+    }
+}
+
+/// The in-memory tier override, if one was set. See [`TIER_OVERRIDE`].
+fn in_memory_tier() -> Option<RunnerTier> {
+    TIER_OVERRIDE.read().ok().and_then(|g| *g)
+}
+
 fn record_settings_fault(fault: Option<SettingsFault>) {
     // `load_settings()` runs on hot paths (the relay loop re-reads every
     // iteration), and the overwhelmingly common case is "healthy, still
@@ -2853,13 +2883,28 @@ pub fn load_settings_full() -> LoadedSettings {
     }
     let is_secondary = crate::instance::is_secondary();
     if needs_persist && is_secondary {
-        info!(
-            "Skipping tier/local_user_id migration persist for secondary runner \
-             (instance={:?}) — would clobber the primary's shared settings.json; \
-             keeping the migration in-memory only (tier={:?})",
-            crate::instance::instance_name(),
-            settings.tier
-        );
+        // ONCE per process, at info!. This branch re-runs on every settings
+        // load (the relay loop re-reads every iteration), so it used to emit
+        // ~30 identical lines per 500-entry log window and bury real signal
+        // during debugging. The fact is process-invariant — a secondary never
+        // becomes a primary — so repeating it carries no information.
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        let mut first = false;
+        LOGGED.call_once(|| first = true);
+        if first {
+            info!(
+                "Skipping tier/local_user_id migration persist for secondary runner \
+                 (instance={:?}) — would clobber the primary's shared settings.json; \
+                 keeping the migration in-memory only (tier={:?}). Logged once per process.",
+                crate::instance::instance_name(),
+                settings.tier
+            );
+        } else {
+            tracing::debug!(
+                "Skipping tier/local_user_id migration persist for secondary runner (tier={:?})",
+                settings.tier
+            );
+        }
     }
     if should_persist_migration(needs_persist, is_secondary, provenance) {
         if let Err(e) = save_settings(&settings) {
@@ -2881,6 +2926,16 @@ pub fn load_settings_full() -> LoadedSettings {
     // state, so the only safe override is this in-memory overlay.
     if let Ok(raw) = std::env::var("QONTINUI_RUNNER_TIER") {
         apply_tier_env_overlay(&mut settings, &raw);
+    }
+
+    // Runtime in-memory tier override (`set_runner_tier` on a secondary).
+    // Applied LAST so an explicit runtime choice beats the spawn-time env
+    // overlay above — the operator/driver picked this tier after boot.
+    // In-memory only; `update_settings` reads the raw on-disk document, so
+    // this can never reach a settings file.
+    if let Some(t) = in_memory_tier() {
+        settings.tier = t;
+        settings.tier_initialized = true;
     }
 
     // One-shot post-upgrade detector: if Tier 2 + has a runner_token + the

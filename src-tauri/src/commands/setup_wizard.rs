@@ -28,9 +28,25 @@ use uuid::Uuid;
 /// also auto-skips.
 ///
 /// Operators running the runner directly never set this env var, so
-/// their wizard behaviour is unchanged. Manual dismissal is also
-/// available via the `setup-wizard` UI Bridge component's `complete`
-/// action (registered in `SetupWizard.tsx`).
+/// their wizard behaviour is unchanged.
+///
+/// **Reaching the wizard on a runner this bypassed** — the previous version of
+/// this comment offered the `setup-wizard` UI Bridge component's `complete`
+/// action as the escape hatch, which was exactly backwards: that action was
+/// registered inside `SetupWizard.tsx`, and `useUIComponent` only registers
+/// while its owner is MOUNTED, so in the one state where you needed it (this
+/// bypass — the wizard never mounts) the component did not exist. Two working
+/// routes now:
+///
+/// 1. `POST /ui-bridge/control/component/setup-wizard/action/go-to-step
+///    {"step": 0}` — the registration lives in `AppContent` (`src/App.tsx`)
+///    and is therefore live regardless of mount state, and `go-to-step` OPENS
+///    the wizard. Non-destructive: it flips in-memory view state only, leaving
+///    the persisted `setup_completed` alone.
+/// 2. Spawn the runner with the var cleared —
+///    `extra_env: { "QONTINUI_TEST_AUTO_LOGIN_EMAIL": "" }` — which is why the
+///    `.filter(|v| !v.is_empty())` below matters: an empty value does NOT
+///    bypass.
 #[tauri::command]
 pub fn check_setup_completed() -> Result<bool, String> {
     if std::env::var("QONTINUI_TEST_AUTO_LOGIN_EMAIL")

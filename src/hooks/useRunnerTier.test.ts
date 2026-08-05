@@ -79,6 +79,7 @@ describe("useRunnerTier (Phase 9 contract tripwires)", () => {
       tier: "qontinui_account",
       tierKnown: false,
       loading: false,
+      refreshing: false,
       error: "settings.json could not be read",
       refresh: async () => {},
     };
@@ -87,5 +88,41 @@ describe("useRunnerTier (Phase 9 contract tripwires)", () => {
     expect(shape.tierKnown).toBe(false);
     expect(shape.error).toBeTruthy();
     expect(shape.tier).toBe("qontinui_account");
+  });
+
+  // R1 (setup-wizard tier-step remount, P0). `loading` is folded into
+  // `AuthProvider.loading` → `App`'s `authLoading` → `resolveAuthGate`'s FIRST
+  // branch. Raising it for an event-driven RE-read is what flipped the gate off
+  // the wizard and remounted `<SetupWizard>` at step 0 on every tier choice.
+  // A re-read of an already-known tier must therefore be representable WITHOUT
+  // `loading`, which requires the two flags to be independent fields.
+  it("represents a re-read of a known tier without raising `loading`", () => {
+    const reReadInFlight: UseRunnerTierResult = {
+      tier: "qontinui_account",
+      tierKnown: true,
+      // The load-bearing pair: a re-read is in flight, but the global loading
+      // gate is NOT re-entered.
+      loading: false,
+      refreshing: true,
+      error: null,
+      refresh: async () => {},
+    };
+    expect(reReadInFlight.loading).toBe(false);
+    expect(reReadInFlight.refreshing).toBe(true);
+    expect(reReadInFlight.tierKnown).toBe(true);
+  });
+
+  it("keeps `loading` for the FIRST read, where the tier is genuinely unknown", () => {
+    const firstReadInFlight: UseRunnerTierResult = {
+      tier: "local", // placeholder, not a verdict
+      tierKnown: false,
+      loading: true,
+      refreshing: false,
+      error: null,
+      refresh: async () => {},
+    };
+    expect(firstReadInFlight.loading).toBe(true);
+    expect(firstReadInFlight.refreshing).toBe(false);
+    expect(firstReadInFlight.tierKnown).toBe(false);
   });
 });

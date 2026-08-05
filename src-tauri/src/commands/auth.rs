@@ -596,29 +596,96 @@ pub fn get_runner_tier() -> Result<String, String> {
     }
 }
 
+/// Wire response for [`set_runner_tier`].
+///
+/// The command used to return a bare `Ok(())`, which made "the tier was saved"
+/// and "the tier was silently discarded" indistinguishable to the frontend —
+/// on a secondary runner the whole command was a no-op. The two facts are now
+/// reported separately so a caller can tell them apart:
+///
+/// - `applied` — the tier is in effect for this process (`get_runner_tier` will
+///   answer with it).
+/// - `persisted` — the tier survives a restart, i.e. it was written to this
+///   instance's `settings.json`.
+/// - `reason` — why `persisted` is false, when it is.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SetRunnerTierResult {
+    /// The tier is in effect for the remainder of this process's lifetime.
+    pub applied: bool,
+    /// The tier was written to disk and survives a restart.
+    pub persisted: bool,
+    /// Why `persisted` is false. `None` when it is true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// Sets the current runner tier and persists. Used by the SetupWizard's
 /// TierStep and the AccountSettings sign-in completion handler.
+///
+/// On a **secondary** runner (any supervisor-launched temp/named instance) the
+/// tier is applied IN MEMORY ONLY and `persisted: false` is reported. Writing
+/// would target the primary's shared `settings.json` and silently demote a
+/// Tier-2 primary to whatever tier the temp runner picked — see the FOOTGUN
+/// GUARD in `settings::load_settings_full`. Applying in memory is what lets a
+/// temp runner exercise the same `isTier2` transition a primary does; without
+/// it every wizard test on a temp runner validated a path that changed neither
+/// disk nor memory.
+///
+/// `async fn`, not `pub fn`, on purpose: `tauri-macros` maps a NON-async
+/// command to its `ExecutionContext::Blocking` arm (`command/wrapper.rs:50`,
+/// `:116`), which emits `body_blocking` — the command body runs INLINE on the
+/// thread that dispatched the IPC message. That thread is the webview's UI
+/// thread (wry calls the custom-protocol handler straight from the
+/// `WebResourceRequested` event handler, `wry-0.55.0/src/webview2/mod.rs:1027`,
+/// with no thread hop), so the settings read/write below would block the whole
+/// UI for the duration of any OS stall on the config dir. `async` + an explicit
+/// `spawn_blocking` keeps the file I/O off it.
 #[tauri::command]
-pub fn set_runner_tier(tier: String) -> Result<(), String> {
+pub async fn set_runner_tier(tier: String) -> Result<SetRunnerTierResult, String> {
     let parsed = match tier.as_str() {
         "local" => settings::RunnerTier::Local,
         "local_provider" => settings::RunnerTier::LocalProvider,
         "qontinui_account" => settings::RunnerTier::QontinuiAccount,
         other => return Err(format!("invalid tier: {}", other)),
     };
-    if crate::instance::is_secondary() {
-        warn!(
-            "set_runner_tier: secondary runner — applying in-memory only, skipping save_settings"
-        );
-    } else {
-        // Provenance-checked write: refuses (loudly) rather than clobbering an
-        // unreadable settings.json with an all-defaults file that happens to
-        // carry the new tier.
-        settings::update_settings(|s| {
-            s.tier = parsed;
-            s.tier_initialized = true;
-        })?;
-    }
+    let is_secondary = crate::instance::is_secondary();
+    // Blocking file I/O (`fs::read_to_string`, `create_dir_all`, and the
+    // atomic write's `File::create`/`write_all`/`sync_all`/`rename`) off the
+    // UI thread. The in-memory branch is cheap but goes through the same hop
+    // so both arms have one shape.
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        if is_secondary {
+            // NOT a no-op any more: actually apply the tier for this process.
+            settings::set_in_memory_tier(parsed);
+            warn!(
+                "set_runner_tier: secondary runner — applied in memory only (tier={:?}), \
+                 skipping save_settings so the primary's shared settings.json is not clobbered",
+                parsed
+            );
+            Ok(SetRunnerTierResult {
+                applied: true,
+                persisted: false,
+                reason: Some("secondary_runner".to_string()),
+            })
+        } else {
+            // Provenance-checked write: refuses (loudly) rather than clobbering an
+            // unreadable settings.json with an all-defaults file that happens to
+            // carry the new tier.
+            settings::update_settings(|s| {
+                s.tier = parsed;
+                s.tier_initialized = true;
+            })
+            .map(|()| SetRunnerTierResult {
+                applied: true,
+                persisted: true,
+                reason: None,
+            })
+        }
+    })
+    .await
+    .map_err(|e| format!("set_runner_tier: settings task failed: {e}"))??;
+
     // Kick both the relay (so it picks up the new tier without a runner
     // restart) and the device-JWT refresher (Phase 2 of unified-devices
     // — promotion into Tier 2 should trigger a JWT refresh check, and
@@ -626,18 +693,16 @@ pub fn set_runner_tier(tier: String) -> Result<(), String> {
     // `next_action` predicate already handles the tier branching; we
     // just need to wake it.
     //
-    // Use `tauri::async_runtime::spawn`, NOT `tokio::spawn`: this command is
-    // a *synchronous* `#[tauri::command]`, which Tauri invokes on a worker
-    // thread that does NOT carry an entered Tokio runtime context. A bare
-    // `tokio::spawn` there panics with "there is no reactor running" (a
-    // non-unwinding panic that aborts the whole process). The Tauri async
-    // runtime handle is always available and routes to the same Tokio
-    // runtime the relay/refresher live on.
+    // Use `tauri::async_runtime::spawn`, NOT `tokio::spawn`: the Tauri async
+    // runtime handle is always available and routes to the same Tokio runtime
+    // the relay/refresher live on, whereas a bare `tokio::spawn` from a thread
+    // with no entered runtime context panics with "there is no reactor
+    // running" (a non-unwinding panic that aborts the whole process).
     tauri::async_runtime::spawn(async {
         crate::mcp::backend_relay::commands::kick_cloud_relay().await;
         crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
     });
-    Ok(())
+    Ok(result)
 }
 
 /// Wire response for [`cognito_sign_in`]. Mirrors the credentials/pair-code

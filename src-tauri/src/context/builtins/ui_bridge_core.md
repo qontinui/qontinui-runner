@@ -210,7 +210,8 @@ Prefer these primitives over `sleep N && re-discover`; they all already exist. E
 
 **Side-effect detection on clicks** — read before re-discovering:
 
-- `click` / `doubleClick` actions on non-input elements automatically run an `expectChange` DOM-diff detector. The action response includes `expectChange: { changed: boolean, added, removed, … }`. Read that instead of immediately calling `/control/snapshot` again; it'll usually tell you whether the click produced the side effect you expected.
+- `click` / `doubleClick` actions on non-input elements automatically run an `expectChange` DOM-diff detector. The action response includes `expectChange: { effectChanged: boolean, remounted: boolean, preElementCount, postElementCount, preSignature, postSignature, preGeneration, postGeneration, settleMs }`. Read that instead of immediately calling `/control/snapshot` again; it'll usually tell you whether the click produced the side effect you expected.
+- **`remounted: true` means the subtree was DESTROYED and REBUILT** even though it looks identical (same elements, same text — element IDs are deliberately preserved across remounts by the SDK registry). Any state living in that subtree is gone: a wizard's current step, a form draft, scroll position. Do NOT read `effectChanged: false` as "the click did nothing" without checking `remounted` — a same-shape remount used to be completely invisible here, which is how a wizard that reset itself on every click read as an inert button for an entire investigation.
 
 ### Common Patterns
 

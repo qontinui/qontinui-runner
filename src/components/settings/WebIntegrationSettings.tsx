@@ -40,6 +40,7 @@ import {
 } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import type { LogFunction } from "./types";
+import type { SetRunnerTierResult } from "@/hooks/useRunnerTier";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -564,11 +565,22 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
 
       if (configComplete) {
         try {
-          await invoke<void>("set_runner_tier", { tier: "qontinui_account" });
+          const tierResult = await invoke<SetRunnerTierResult>("set_runner_tier", {
+            tier: "qontinui_account",
+          });
           // Notify tier consumers (AuthProvider et al.) without waiting for
           // their poll cycle.
           window.dispatchEvent(new CustomEvent("runner-tier-changed"));
           onLog("success", "Runner promoted to Qontinui account tier — connecting…");
+          // `persisted: false` is a real outcome on a secondary runner (the
+          // write would clobber the primary's shared settings.json). Say so
+          // rather than letting "promoted" imply it survives a restart.
+          if (!tierResult.persisted) {
+            onLog(
+              "info",
+              `Tier promotion applies to this session only (${tierResult.reason ?? "not persisted"}) — it was not written to settings.json.`,
+            );
+          }
           // Re-read so the status banner picks up the (re)connecting relay.
           await refreshStatus();
         } catch (tierErr) {
@@ -668,8 +680,16 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
       // promotes defensively; doing it here keeps the UI responsive without
       // waiting for the next status poll.)
       try {
-        await invoke<void>("set_runner_tier", { tier: "qontinui_account" });
+        const tierResult = await invoke<SetRunnerTierResult>("set_runner_tier", {
+          tier: "qontinui_account",
+        });
         window.dispatchEvent(new CustomEvent("runner-tier-changed"));
+        if (!tierResult.persisted) {
+          onLog(
+            "info",
+            `Tier promotion applies to this session only (${tierResult.reason ?? "not persisted"}) — it was not written to settings.json.`,
+          );
+        }
       } catch (tierErr) {
         onLog("error", `Paired, but tier promotion failed: ${tierErr}`);
       }
