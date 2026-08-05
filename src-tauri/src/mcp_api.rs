@@ -1094,8 +1094,29 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// `coord_gate_list` / `coord_withdraw_gate` are the same story for `/gate-sweep`
 /// and `/gate`, which already document driving them over this proxy.
 ///
-/// `coord_write_prompt_document` stays OUT: policy authorship is tenant-gated and
-/// belongs to an operator, not a device nonce.
+/// `coord_write_prompt_document` is IN, and the reason it used to be out no longer
+/// holds. The old rationale — "policy authorship is tenant-gated and belongs to an
+/// operator, not a device nonce" — described a coord that no longer exists: coord
+/// deliberately grants this tool to device/agent principals
+/// (`coord::mcp::agent_tool_access`) precisely so a session can CLOSE a POLICY_GAP
+/// it found instead of recording one that waits on the operator, which was the
+/// bottleneck that made gaps accumulate faster than they could be hand-published.
+/// Withholding it HERE did not re-impose an operator gate; it silently removed a
+/// capability coord had already decided to grant, and the denial surfaced as a bare
+/// `-32601` that reads like "no such tool" rather than "your proxy withholds it".
+///
+/// Nor is the grant unguarded — coord enforces non-loosening server-side, so this
+/// proxy is not the thing standing between a device nonce and a weakened policy:
+/// `append` preserves the existing body verbatim, `create` only authors names that
+/// do not yet exist, `edit_clause` lands only a provable tightening or no-op and
+/// otherwise becomes a pending operator proposal, and the meta-policies
+/// (`session-protocol`, `security-and-autonomy`, `escalation-bar`) are refused
+/// outright in either direction. Tenant comes from the verified `CallerIdentity`,
+/// never an argument; every landed write is versioned, attributed and revertible.
+///
+/// Keep it in. If policy authorship should ever be operator-only again, that is a
+/// decision to make in coord's grant — one place, enforced for every transport —
+/// not by re-diverging this list from it.
 ///
 /// MUST stay sorted — membership is a `binary_search`.
 const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
@@ -1173,6 +1194,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_work_unit_remove_citation",
     "coord_work_unit_transition",
     "coord_work_unit_upsert",
+    "coord_write_prompt_document",
     "coord_yield",
 ];
 
@@ -5197,6 +5219,13 @@ mod coord_mcp_body_gate_tests {
             "coord_post_finding",
             "coord_send_message",
             "coord_query_health", // prefix family
+            // Policy authorship. Pinned here because this proxy previously
+            // withheld it while coord's own device/agent grant allowed it —
+            // a silent capability subtraction that made every device session
+            // unable to close a POLICY_GAP. Non-loosening is enforced
+            // coord-side, so re-excluding it here would re-open that gap
+            // rather than restore a gate.
+            "coord_write_prompt_document",
         ] {
             assert!(
                 gate(serde_json::json!({
