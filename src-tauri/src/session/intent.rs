@@ -275,4 +275,76 @@ mod tests {
         let back: Intent = serde_json::from_str(&json).unwrap();
         assert_eq!(back, with_page);
     }
+
+    // ── Phase 8 (many-sessions plan): the terminal create paths build
+    // `share_output` / `redact_secrets` from `settings.performance` instead
+    // of hardcoded literals. These pin that the STOCK settings reproduce the
+    // old literals exactly, and that the knob actually moves the intent.
+
+    /// Stock settings → the pre-Phase-8 literals: `share_output: true`,
+    /// `redact_secrets: None`, and therefore redaction ON.
+    #[test]
+    fn stock_performance_settings_reproduce_the_old_terminal_intent() {
+        let perf = crate::settings::PerformanceSettings::default();
+        let intent = Intent {
+            share_output: perf.share_terminal_output,
+            redact_secrets: perf.redact_terminal_secrets,
+            ..good_intent()
+        };
+        assert!(intent.share_output);
+        assert_eq!(intent.redact_secrets, None);
+        assert!(
+            intent.effective_redact_secrets(),
+            "redaction followed share_output before Phase 8 and must still"
+        );
+    }
+
+    /// Turning sharing off carries redaction with it (the documented
+    /// `effective_redact_secrets` default), and the intent still validates —
+    /// the knob changes what is declared to coord, never whether a terminal
+    /// may start.
+    #[test]
+    fn disabling_share_output_flips_the_redaction_default() {
+        let perf = crate::settings::PerformanceSettings {
+            share_terminal_output: false,
+            ..crate::settings::PerformanceSettings::default()
+        };
+        let intent = Intent {
+            share_output: perf.share_terminal_output,
+            redact_secrets: perf.redact_terminal_secrets,
+            ..good_intent()
+        };
+        assert!(!intent.share_output);
+        assert!(!intent.effective_redact_secrets());
+        intent.validate().expect("still a valid intent");
+    }
+
+    /// An explicit redaction setting pins the flag independently of sharing,
+    /// in both directions.
+    #[test]
+    fn explicit_redaction_setting_overrides_the_share_output_default() {
+        let force_on = crate::settings::PerformanceSettings {
+            share_terminal_output: false,
+            redact_terminal_secrets: Some(true),
+            ..crate::settings::PerformanceSettings::default()
+        };
+        let intent = Intent {
+            share_output: force_on.share_terminal_output,
+            redact_secrets: force_on.redact_terminal_secrets,
+            ..good_intent()
+        };
+        assert!(intent.effective_redact_secrets());
+
+        let force_off = crate::settings::PerformanceSettings {
+            share_terminal_output: true,
+            redact_terminal_secrets: Some(false),
+            ..crate::settings::PerformanceSettings::default()
+        };
+        let intent = Intent {
+            share_output: force_off.share_terminal_output,
+            redact_secrets: force_off.redact_terminal_secrets,
+            ..good_intent()
+        };
+        assert!(!intent.effective_redact_secrets());
+    }
 }

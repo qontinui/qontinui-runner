@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Check,
@@ -9,12 +9,31 @@ import {
   Copy,
   RefreshCw,
   FlaskConical,
+  Gauge,
+  ChevronDown,
+  ChevronRight,
 } from "lucide-react";
 import { instanceStorage } from "@/lib/instance-storage";
 import { SectionHeader } from "./SectionHeader";
 import { getStatusColors } from "@/design-system";
 import { useFeatureDisclosure } from "@/contexts/FeatureDisclosureContext";
 import type { DebugSettings, LogFunction } from "./types";
+import {
+  DEFAULT_PERF_CAPS,
+  getPerfCapsLoadState,
+  loadPerfCaps,
+  normalizePerfCaps,
+  setPerfCaps,
+  usePerfCaps,
+  type PerfCaps,
+  type PerfCapsLoadState,
+} from "@/lib/perfCaps";
+import {
+  PERF_CAP_FIELDS,
+  clampPerfCaps,
+  clampPerfField,
+  isOutOfRange,
+} from "./performanceCapsConfig";
 
 interface DeviceInfo {
   device_id: string;
@@ -67,6 +86,26 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
     instanceStorage.getItem("resume-summary-policy") === "summary" ? "summary" : "full",
   );
 
+  /*
+   * Performance & Caps (many-sessions plan Phase 8).
+   *
+   * Collapsed by default and parked at the bottom of the Advanced page: the
+   * discoverability gate wants these findable without adding a seventh
+   * top-level settings entry, and an operator who never opens the section
+   * sees one extra header line rather than eight extra inputs.
+   *
+   * `perfDraft` is a local edit buffer so typing never writes settings.json
+   * per keystroke; `perfCaps` stays the committed truth, which is also what
+   * "Discard changes" restores to.
+   */
+  const perfCaps = usePerfCaps();
+  const [perfOpen, setPerfOpen] = useState(false);
+  const [perfDraft, setPerfDraft] = useState<PerfCaps>(() => ({ ...DEFAULT_PERF_CAPS }));
+  const [perfLoadState, setPerfLoadState] = useState<PerfCapsLoadState>("unloaded");
+  const [perfSaving, setPerfSaving] = useState(false);
+  const [perfSaved, setPerfSaved] = useState(false);
+  const [perfError, setPerfError] = useState<string | null>(null);
+
   // Device info state
   const [deviceInfo, setDeviceInfo] = useState<DeviceInfo | null>(null);
   const [deviceInfoLoading, setDeviceInfoLoading] = useState(true);
@@ -113,18 +152,80 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
     }
   };
 
+  const perfSavedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  /**
+   * Read the caps and seed the edit buffer. Also the Retry affordance for a
+   * failed read — without it a panel that lost the race with app startup
+   * stays wrong until the whole settings page is remounted.
+   */
+  const loadPerfCapsIntoDraft = async () => {
+    const loaded = await loadPerfCaps();
+    // Seed the edit buffer from the committed values. Called on mount and on
+    // an explicit Retry only — re-seeding on every store change would wipe an
+    // in-progress edit the moment another surface saved.
+    setPerfDraft({ ...loaded });
+    setPerfLoadState(getPerfCapsLoadState());
+  };
+
   useEffect(() => {
     let cancelled = false;
     void Promise.resolve().then(() => {
       if (cancelled) return;
       void loadSettings();
       void loadDeviceInfo();
+      void loadPerfCaps().then((loaded) => {
+        if (cancelled) return;
+        setPerfDraft({ ...loaded });
+        setPerfLoadState(getPerfCapsLoadState());
+      });
     });
     return () => {
       cancelled = true;
+      if (perfSavedTimerRef.current !== null) clearTimeout(perfSavedTimerRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const setPerfField = (key: keyof PerfCaps, value: number | boolean | null) => {
+    setPerfSaved(false);
+    setPerfDraft((prev) => ({ ...prev, [key]: value }) as PerfCaps);
+  };
+
+  const perfDirty = (Object.keys(perfDraft) as Array<keyof PerfCaps>).some(
+    (k) => perfDraft[k] !== perfCaps[k],
+  );
+
+  const savePerfCaps = async () => {
+    try {
+      setPerfSaving(true);
+      setPerfError(null);
+      setPerfSaved(false);
+      // Clamp ONCE, here. Clamping per keystroke makes multi-digit entry
+      // impossible on a field whose minimum has more digits than the first
+      // character typed (scrollback's is 65536), so the inputs stay unclamped
+      // while editing and the bounds are enforced at the save.
+      const clamped = clampPerfCaps(perfDraft, PERF_CAP_FIELDS);
+      const stored = await invoke<unknown>("save_performance_settings", {
+        settings: clamped,
+      });
+      // Publish what the backend accepted rather than the draft.
+      const normalized = normalizePerfCaps(stored);
+      setPerfCaps(normalized);
+      setPerfDraft({ ...normalized });
+      setPerfLoadState(getPerfCapsLoadState());
+      setPerfSaved(true);
+      onLog("success", "Performance caps saved");
+      if (perfSavedTimerRef.current !== null) clearTimeout(perfSavedTimerRef.current);
+      perfSavedTimerRef.current = setTimeout(() => setPerfSaved(false), 3000);
+    } catch (err) {
+      console.error("Failed to save performance caps:", err);
+      setPerfError(`Failed to save performance caps: ${err}`);
+      onLog("error", `Failed to save performance caps: ${err}`);
+    } finally {
+      setPerfSaving(false);
+    }
+  };
 
   const copyToClipboard = async (text: string, fieldName: string) => {
     try {
@@ -201,7 +302,7 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
     <div className="space-y-6">
       <SectionHeader
         title="Advanced"
-        description="Developer and debugging options: device information, terminal backend, and large-session resume behavior."
+        description="Developer and debugging options: device information, performance caps, terminal backend, and large-session resume behavior."
         icon={<Wrench className="w-6 h-6" />}
       />
 
@@ -472,6 +573,227 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
             ))}
           </div>
         </div>
+      </div>
+
+      {/* Performance & Caps Section (many-sessions plan Phase 8) */}
+      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+        <button
+          type="button"
+          onClick={() => setPerfOpen((v) => !v)}
+          aria-expanded={perfOpen}
+          data-ui-bridge-id="settings.performance-caps-toggle"
+          className="w-full flex items-center justify-between text-left"
+        >
+          <span className="font-medium text-sm flex items-center gap-2">
+            <Gauge className="w-4 h-4 text-primary" />
+            Performance &amp; Caps
+          </span>
+          {perfOpen ? (
+            <ChevronDown className="w-4 h-4 text-muted-foreground" />
+          ) : (
+            <ChevronRight className="w-4 h-4 text-muted-foreground" />
+          )}
+        </button>
+
+        <p className="text-xs text-muted-foreground">
+          Tuning knobs for running many sessions at once. Every default matches the behavior the
+          runner had before these were configurable, so leaving this section alone changes nothing.
+          {!perfOpen && " Expand to adjust."}
+        </p>
+
+        {perfOpen && (
+          <div className="space-y-3" data-ui-bridge-id="settings.performance-caps">
+            {perfError && (
+              <div
+                className={`p-3 ${getStatusColors("error").bg} rounded-lg flex items-start gap-2`}
+              >
+                <X className={`w-4 h-4 ${getStatusColors("error").icon} shrink-0 mt-0.5`} />
+                <span className={`${getStatusColors("error").text} text-xs`}>{perfError}</span>
+              </div>
+            )}
+
+            {/*
+              Honesty: the panel must not present compiled-in defaults as "your
+              current configuration". While the read is in flight it says so;
+              if the read FAILED, it says that too, because settings.json may
+              hold values that differ from what is on screen — and saving from
+              here would then overwrite them.
+            */}
+            {perfLoadState === "unloaded" && (
+              <div
+                data-content-role="status"
+                data-content-label="loading performance caps"
+                className="text-xs text-muted-foreground italic"
+              >
+                Loading current values… (showing defaults meanwhile)
+              </div>
+            )}
+            {perfLoadState === "failed" && (
+              <div className="p-3 bg-yellow-500/10 rounded-lg space-y-2">
+                <div className="text-xs text-yellow-200/80">
+                  Could not read the current caps from the runner, so the values below are the
+                  built-in defaults — they may not match what is in settings.json. Saving would
+                  overwrite whatever is stored there.
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void loadPerfCapsIntoDraft()}
+                  className="px-3 py-1.5 rounded-md text-xs font-medium bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+                >
+                  Retry read
+                </button>
+              </div>
+            )}
+
+            {PERF_CAP_FIELDS.map((field) => (
+              <div
+                key={field.key}
+                className="space-y-1 p-3 rounded-lg bg-muted/30"
+                data-ui-bridge-id={`settings.perf-cap.${field.key}`}
+              >
+                <div className="text-sm font-medium">{field.label}</div>
+                <div className="text-xs text-muted-foreground">{field.description}</div>
+
+                {field.requiresRestart && (
+                  <div className="text-[11px] text-yellow-300/90">
+                    Takes effect after a runner restart.
+                  </div>
+                )}
+                {field.pendingPhase && (
+                  <div className="text-[11px] text-yellow-300/90">
+                    Stored now, but not consumed yet — this value only does something once{" "}
+                    {field.pendingPhase} lands.
+                  </div>
+                )}
+
+                {field.type === "number" && (
+                  <div className="flex items-center gap-2 pt-1 flex-wrap">
+                    <input
+                      type="number"
+                      min={field.min}
+                      max={field.max}
+                      value={perfDraft[field.key] as number}
+                      onChange={(e) => {
+                        // Unclamped while typing (see savePerfCaps). An empty
+                        // or partial entry leaves the draft alone rather than
+                        // snapping it, so a field can be cleared and retyped.
+                        const parsed = parseInt(e.target.value, 10);
+                        if (Number.isNaN(parsed) || parsed < 0) return;
+                        setPerfField(field.key, parsed);
+                      }}
+                      onBlur={() =>
+                        setPerfField(field.key, clampPerfField(field, perfDraft[field.key]))
+                      }
+                      className="w-32 px-2 py-1.5 bg-muted/50 rounded-md text-sm outline-hidden focus:ring-1 focus:ring-primary/50"
+                    />
+                    {field.unit && (
+                      <span className="text-xs text-muted-foreground">{field.unit}</span>
+                    )}
+                    {isOutOfRange(field, perfDraft[field.key]) && (
+                      <span className="text-[11px] text-yellow-300/90">
+                        outside {field.min}-{field.max}; will be adjusted on save
+                      </span>
+                    )}
+                  </div>
+                )}
+
+                {field.type === "boolean" && (
+                  <div className="pt-1">
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={perfDraft[field.key] === true}
+                      onClick={() => setPerfField(field.key, !(perfDraft[field.key] as boolean))}
+                      className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                        perfDraft[field.key] ? "bg-primary" : "bg-muted"
+                      }`}
+                    >
+                      <span
+                        className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                          perfDraft[field.key] ? "translate-x-4" : "translate-x-1"
+                        }`}
+                      />
+                    </button>
+                  </div>
+                )}
+
+                {field.type === "tristate" && (
+                  <div className="flex gap-2 pt-1">
+                    {(
+                      [
+                        [null, field.inheritLabel],
+                        [true, "Always redact"],
+                        [false, "Never redact"],
+                      ] as const
+                    ).map(([value, label]) => (
+                      <button
+                        key={String(value)}
+                        type="button"
+                        onClick={() => setPerfField(field.key, value)}
+                        className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                          perfDraft[field.key] === value
+                            ? "bg-primary text-primary-foreground"
+                            : "bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground"
+                        }`}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+
+            <div className="flex items-center justify-between gap-2">
+              {/*
+                Reversibility: one click back to the shipped defaults, and one
+                back to the last saved values. Neither writes anything until
+                Save, so both are undoable in turn.
+              */}
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => setPerfDraft({ ...DEFAULT_PERF_CAPS })}
+                  className="px-3 py-1.5 rounded-md text-xs font-medium bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+                >
+                  Reset to defaults
+                </button>
+                <button
+                  type="button"
+                  disabled={!perfDirty}
+                  onClick={() => setPerfDraft({ ...perfCaps })}
+                  className="px-3 py-1.5 rounded-md text-xs font-medium bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  Discard changes
+                </button>
+              </div>
+              <button
+                type="button"
+                onClick={savePerfCaps}
+                disabled={perfSaving || !perfDirty}
+                data-ui-bridge-id="settings.performance-caps-save"
+                className="px-6 py-2 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 text-sm"
+              >
+                {perfSaving ? (
+                  <>
+                    <div className="w-4 h-4 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin" />
+                    Saving...
+                  </>
+                ) : perfSaved ? (
+                  <>
+                    <Check className="w-4 h-4" />
+                    Saved!
+                  </>
+                ) : (
+                  <>
+                    <SettingsIcon className="w-4 h-4" />
+                    Save Caps
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Experimental Section */}
