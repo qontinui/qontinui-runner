@@ -5,7 +5,7 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Manager;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::claude_session::SessionManager;
 use crate::commands::CommandResponse;
@@ -13,6 +13,7 @@ use crate::error::AppError;
 use crate::session::pane_store::{PaneKey, PaneSessionStore};
 use crate::session::session_lifecycle_store::{SessionLifecycleStore, TerminalSessionRecord};
 use crate::session::{Intent, SessionKind, SessionRegistry};
+use crate::terminal::visibility::VisibilityTier;
 use crate::terminal::{strip_ansi, TerminalManager};
 
 /// The `(share_output, redact_secrets)` a terminal session declares to coord,
@@ -685,6 +686,49 @@ pub fn terminal_ack(
 
     session.ack(bytes_acked);
 
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: None,
+    })
+}
+
+/// Report this window's visibility tier for a set of terminals (Phase 5 of
+/// `plans/2026-07-28-runner-many-sessions-performance.md`, root cause A4).
+///
+/// Called by the frontend's window-wide reconciler
+/// (`terminalVisibilityTiers.ts`) on every zone/page/window change, grouped by
+/// tier so a whole layout change costs at most three IPC calls.
+///
+/// Reports are keyed by the CALLING WINDOW's label and merged most-visible-
+/// wins, so a terminal popped out into a `term-N` window is never taken dark by
+/// the main window's "nobody here is showing it". Ids this runner does not know
+/// are ignored rather than failing the batch: the reconciler groups ids that
+/// were live when it ran, and a terminal can close between the two.
+#[tauri::command]
+pub fn terminal_set_visibility(
+    window: tauri::Window,
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+    ids: Vec<String>,
+    tier: String,
+) -> Result<CommandResponse, String> {
+    let parsed = VisibilityTier::parse(&tier)
+        .ok_or_else(|| format!("Unknown terminal visibility tier: {}", tier))?;
+    let label = window.label();
+    let mut applied = 0usize;
+    for id in &ids {
+        if let Some(session) = terminal_manager.get(id) {
+            session.set_visibility(label, parsed);
+            applied += 1;
+        }
+    }
+    debug!(
+        window = %label,
+        tier = %parsed.as_str(),
+        requested = ids.len(),
+        applied,
+        "terminal visibility reported"
+    );
     Ok(CommandResponse {
         success: true,
         message: None,
