@@ -56,13 +56,58 @@ jobs:
           #   - the doctor source (CHECK_SPECS + render_onboarding_doc live here)
           #   - the bin that emits the doc
           #   - the checked-in generated doc itself
-          if git diff --name-only "$base_sha" "$head_sha" -- \
-              'src-tauri/src/coord_doctor.rs' \
-              'src-tauri/src/bin/coord_doctor.rs' \
-              'docs/runner-onboarding.md' \
-              | grep -q .; then
+          #
+          # Compare against the MERGE BASE, not the base branch tip.
+          # `base.sha` is main's tip when the event fired, so a two-dot
+          # `git diff "$base_sha" "$head_sha"` also reports main's own
+          # commits since the fork point as if this PR had made them.
+          # A single commit to coord_doctor.rs on main then fires this
+          # gate on every open PR whose head predates it, even though
+          # none of them touched a trigger path — and `onboarding-doc-
+          # fresh` is a REQUIRED check, so any drift in the generated
+          # doc makes all of them unlandable at once. This is the same
+          # defect #914 fixed in the two sibling freshness workflows
+          # this one is modelled on; it predates that PR and was missed.
+          #
+          # The checkout above uses fetch-depth: 0, which makes checkout
+          # fetch `+refs/heads/*` (carrying `base_sha`) on top of the PR
+          # merge ref (whose second parent carries `head_sha`, the only
+          # route for a fork PR) — so the merge base resolves locally.
+          # If it ever doesn't, fail loudly: a required verification must
+          # never be skipped because a git command quietly failed.
+          #
+          # `--all` because a criss-cross history can have more than one
+          # merge base and they can disagree. Union their diffs: with an
+          # ambiguous fork point, over-triggering wastes CI, whereas
+          # under-triggering ships real drift past a required check.
+          if ! merge_bases="$(git merge-base --all "$base_sha" "$head_sha")"; then
+            echo "::error::Cannot resolve a merge base for base $base_sha and head $head_sha; refusing to guess at the change set."
+            exit 1
+          fi
+          echo "Merge base(s) of base ($base_sha) and head ($head_sha): $(echo "$merge_bases" | tr '\n' ' ')"
+          # Capture instead of piping into `grep`: a `git diff` failure
+          # produces empty output, which through a pipe is
+          # indistinguishable from "nothing changed" and would silently
+          # skip a required verification.
+          changed=""
+          while IFS= read -r merge_base; do
+            if [ -n "$merge_base" ]; then
+              if ! from_base="$(git diff --name-only "$merge_base" "$head_sha" -- \
+                  'src-tauri/src/coord_doctor.rs' \
+                  'src-tauri/src/bin/coord_doctor.rs' \
+                  'docs/runner-onboarding.md')"; then
+                echo "::error::git diff against merge base $merge_base failed; cannot determine path-change scope."
+                exit 1
+              fi
+              if [ -n "$from_base" ]; then
+                changed="${changed}${from_base}"$'\n'
+              fi
+            fi
+          done <<< "$merge_bases"
+          if [ -n "$changed" ]; then
             echo "doc_relevant=true" >> "$GITHUB_OUTPUT"
-            echo "Onboarding-doc-relevant paths changed; running full verification."
+            echo "Onboarding-doc-relevant paths changed; running full verification:"
+            printf '%s' "$changed"
           else
             echo "doc_relevant=false" >> "$GITHUB_OUTPUT"
             echo "No relevant changes; verification will be skipped (required check satisfied trivially)."
