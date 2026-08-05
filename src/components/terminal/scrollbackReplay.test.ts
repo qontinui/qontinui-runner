@@ -4,6 +4,9 @@ import {
   isEmissionGap,
   resyncSliceStart,
   drainHeldChunks,
+  lostWindowBytes,
+  formatLostOutputMarker,
+  RESYNC_INCOMPLETE_MARKER,
 } from "./scrollbackReplay";
 
 const bytes = (...vals: number[]) => new Uint8Array(vals);
@@ -133,5 +136,44 @@ describe("drainHeldChunks", () => {
     expect(res.writable.map((w) => Array.from(w))).toEqual([[5]]);
     expect(res.reheld).toEqual([]);
     expect(res.writtenThrough).toBe(101);
+  });
+});
+
+describe("lostWindowBytes", () => {
+  it("reports nothing lost when the ring still covers where the pane left off", () => {
+    expect(lostWindowBytes({ startOffset: 0, endOffset: 1000 }, 400)).toBe(0);
+    // Exactly abutting: the ring's oldest byte is the next one this pane needs.
+    expect(lostWindowBytes({ startOffset: 400, endOffset: 1000 }, 400)).toBe(0);
+  });
+
+  it("reports the unrecoverable span when the ring rolled past the hole", () => {
+    // The pane wrote through 400; the backend's oldest retained byte is 900.
+    // Bytes [400, 900) exist nowhere any more.
+    expect(lostWindowBytes({ startOffset: 900, endOffset: 2000 }, 400)).toBe(500);
+  });
+
+  it("treats a cold pane as lossless — a ring starting above 0 is just history", () => {
+    // Nothing was ever written by this instance, so the ring not reaching back
+    // to offset 0 is the session predating the mount, not dropped output.
+    expect(lostWindowBytes({ startOffset: 5000, endOffset: 6000 }, 0)).toBe(0);
+  });
+});
+
+describe("loss markers", () => {
+  it("names the byte count and stays inside one line", () => {
+    const marker = formatLostOutputMarker(512);
+    expect(marker).toContain("512 bytes");
+    // Leading + trailing CRLF only: the notice must not wrap into the stream.
+    expect(marker.startsWith("\r\n")).toBe(true);
+    expect(marker.endsWith("\r\n")).toBe(true);
+    expect(marker.slice(2, -2)).not.toContain("\n");
+    // Resets SGR so the pane's own colours are not left tinted.
+    expect(marker).toContain("\x1b[0m");
+  });
+
+  it("the incomplete-resync marker is a distinct, self-terminating notice", () => {
+    expect(RESYNC_INCOMPLETE_MARKER).not.toBe(formatLostOutputMarker(0));
+    expect(RESYNC_INCOMPLETE_MARKER).toContain("\x1b[0m");
+    expect(RESYNC_INCOMPLETE_MARKER.endsWith("\r\n")).toBe(true);
   });
 });
