@@ -60,6 +60,39 @@ fn get_ai_output_log_path() -> PathBuf {
 /// Maximum AI output log file size before rotation (50 MB).
 const AI_OUTPUT_LOG_MAX_BYTES: u64 = 50 * 1024 * 1024;
 
+/// The single sidecar a rotated JSONL log is moved aside to: `<name>.1`.
+///
+/// One generation is kept. Canonical here so the writer ([`AiOutputSink`]) and
+/// every reader agree on the name.
+pub fn rotation_sidecar_path(path: &std::path::Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "ai-output.jsonl".to_string());
+    name.push_str(".1");
+    path.with_file_name(name)
+}
+
+/// The full read set for a rotated JSONL log, OLDEST GENERATION FIRST: the
+/// `.1` sidecar (when it exists) followed by the live file.
+///
+/// Rotation renames the live file aside instead of truncating it in place, so a
+/// reader that opens only the live path sees (near-)nothing immediately after a
+/// rotation even though every line still exists on disk. Concatenating the
+/// sidecar ahead of the live file restores the chronological stream. Returns
+/// only paths that exist, so the result may be empty.
+pub fn rotated_log_read_set(path: &std::path::Path) -> Vec<PathBuf> {
+    let mut set = Vec::with_capacity(2);
+    let sidecar = rotation_sidecar_path(path);
+    if sidecar.exists() {
+        set.push(sidecar);
+    }
+    if path.exists() {
+        set.push(path.to_path_buf());
+    }
+    set
+}
+
 /// Bound on the AI-output writer's queue. Deep enough to absorb a full
 /// streaming burst (a busy AI session emits a few hundred lines/sec) without
 /// ever blocking the emitting thread; a queue this deep only fills if the disk
@@ -74,7 +107,17 @@ enum AiLogMsg {
     Line(String),
     /// Close + delete the file and start a fresh one on the next line.
     Clear,
+    /// Barrier: every line queued before this one has been written and synced.
+    /// The worker acknowledges on the enclosed channel. Used by
+    /// [`flush_ai_output_log`] at process exit.
+    Flush(std::sync::mpsc::SyncSender<()>),
 }
+
+/// How long process exit waits for the AI-output writer to drain.
+///
+/// Deliberately short: a flush that cannot complete in this window means the
+/// disk is wedged, and blocking shutdown on it is worse than losing the tail.
+const AI_OUTPUT_LOG_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2_000);
 
 /// Sender half of the AI-output writer queue. Initialized on first use.
 static AI_OUTPUT_LOG_TX: std::sync::OnceLock<std::sync::mpsc::SyncSender<AiLogMsg>> =
@@ -119,15 +162,10 @@ impl AiOutputSink {
 
     /// Sidecar the live file is rotated into. Exactly one generation is kept —
     /// this replaces the old "keep the last 2000 lines" truncation, and keeps
-    /// strictly MORE history than it did.
+    /// strictly MORE history than it did. Readers pick it up via
+    /// [`rotated_log_read_set`].
     fn sidecar(&self) -> PathBuf {
-        let mut name = self
-            .path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "ai-output.jsonl".to_string());
-        name.push_str(".1");
-        self.path.with_file_name(name)
+        rotation_sidecar_path(&self.path)
     }
 
     fn ensure_open(&mut self) -> std::io::Result<()> {
@@ -191,6 +229,21 @@ impl AiOutputSink {
         self.written += needed;
     }
 
+    /// Push everything written so far all the way to disk. Called on the
+    /// [`AiLogMsg::Flush`] barrier at process exit; a no-op when the file was
+    /// never opened.
+    fn sync(&mut self) {
+        let Some(file) = self.file.as_mut() else {
+            return;
+        };
+        if let Err(e) = file.flush() {
+            warn!("Failed to flush AI output log: {}", e);
+        }
+        if let Err(e) = file.sync_all() {
+            warn!("Failed to sync AI output log to disk: {}", e);
+        }
+    }
+
     fn clear(&mut self) {
         self.file = None;
         self.written = 0;
@@ -210,7 +263,70 @@ fn ai_output_log_worker(rx: std::sync::mpsc::Receiver<AiLogMsg>) {
         match msg {
             AiLogMsg::Line(line) => sink.write_line(&line),
             AiLogMsg::Clear => sink.clear(),
+            AiLogMsg::Flush(ack) => {
+                sink.sync();
+                // The receiver is gone when the waiter timed out — the flush
+                // still happened, nobody is listening any more.
+                let _ = ack.send(());
+            }
         }
+    }
+}
+
+/// Drain the AI-output writer queue and wait (briefly) for it to land on disk.
+///
+/// Every append is queued to a background thread that owns the file handle, and
+/// the static sender never drops — so nothing else would ever make the worker
+/// return, and a quit or crash mid-burst silently loses the queued tail:
+/// exactly the part needed to diagnose the crash. Called from
+/// `RunEvent::Exit` and the force-exit watchdog. Same shape as the
+/// `tracing_appender` `WorkerGuard` the runner's file log already relies on.
+///
+/// No-ops when the writer was never started (nothing was ever logged), and
+/// never blocks longer than [`AI_OUTPUT_LOG_FLUSH_TIMEOUT`].
+pub fn flush_ai_output_log() {
+    // `get`, not `ai_output_log_tx()`: do not spawn a writer thread at exit
+    // just to flush a queue that does not exist.
+    let Some(tx) = AI_OUTPUT_LOG_TX.get() else {
+        return;
+    };
+    let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let deadline = std::time::Instant::now() + AI_OUTPUT_LOG_FLUSH_TIMEOUT;
+
+    // A blocking `send` would be bounded by the worker draining the queue —
+    // which is the very thing being waited on — so a wedged worker would hang
+    // shutdown forever. Retry `try_send` inside the same deadline instead: a
+    // full queue during a burst clears in milliseconds, a dead worker does not.
+    let mut pending = AiLogMsg::Flush(ack_tx);
+    loop {
+        match tx.try_send(pending) {
+            Ok(()) => break,
+            Err(std::sync::mpsc::TrySendError::Full(msg))
+                if std::time::Instant::now() < deadline =>
+            {
+                pending = msg;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => {
+                warn!(
+                    "Could not queue AI output log flush ({}) — queued lines may be lost",
+                    e
+                );
+                return;
+            }
+        }
+    }
+
+    // Always give the worker a real window even if queueing ate the budget.
+    let remaining = deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .max(std::time::Duration::from_millis(200));
+    match ack_rx.recv_timeout(remaining) {
+        Ok(()) => info!("AI output log flushed"),
+        Err(e) => warn!(
+            "AI output log did not flush within {:?} ({}) — queued lines may be lost",
+            AI_OUTPUT_LOG_FLUSH_TIMEOUT, e
+        ),
     }
 }
 
@@ -244,17 +360,72 @@ fn ai_output_log_tx() -> Option<&'static std::sync::mpsc::SyncSender<AiLogMsg>> 
 }
 
 /// Direct, synchronous append — the fallback used only when the writer thread
-/// could not be started at all.
+/// could not be started at all, or died.
+///
+/// Enforces the SAME 50 MB cap as [`AiOutputSink::write_line`]: without it a
+/// runner stuck in the fallback state grows the log without bound, since the
+/// writer thread that owns rotation is exactly what is missing here.
 fn append_ai_output_line_direct(line: &str) -> std::io::Result<()> {
-    let log_path = get_ai_output_log_path();
+    append_line_direct_at(&get_ai_output_log_path(), line, AI_OUTPUT_LOG_MAX_BYTES)
+}
+
+/// [`append_ai_output_line_direct`] against an explicit path + cap, so the
+/// rotation branch is testable without writing 50 MB.
+fn append_line_direct_at(
+    log_path: &std::path::Path,
+    line: &str,
+    max_bytes: u64,
+) -> std::io::Result<()> {
     if let Some(parent) = log_path.parent() {
         fs::create_dir_all(parent)?;
+    }
+    let len = fs::metadata(log_path).map(|m| m.len()).unwrap_or(0);
+    if len + line.len() as u64 + 1 > max_bytes {
+        let sidecar = rotation_sidecar_path(log_path);
+        let _ = fs::remove_file(&sidecar);
+        if let Err(e) = fs::rename(log_path, &sidecar) {
+            warn!(
+                "Failed to rotate AI output log (direct append path): {} — truncating instead",
+                e
+            );
+            let _ = fs::remove_file(log_path);
+        } else {
+            info!(
+                "AI output log reached {} bytes — rotated to {}",
+                max_bytes,
+                sidecar.display()
+            );
+        }
     }
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&log_path)?;
+        .open(log_path)?;
     writeln!(file, "{}", line)
+}
+
+/// Delete BOTH generations of the AI-output log without going through the
+/// writer queue — the fallback for [`clear_ai_output_log`] when the queue is
+/// unavailable.
+///
+/// Deleting only the live file would leave up to 50 MB of the previous run in
+/// the sidecar, which readers now concatenate — so the "cleared" log would
+/// still serve old output. Mirrors [`AiOutputSink::clear`].
+fn clear_ai_output_files_at(log_path: &std::path::Path) -> Result<(), String> {
+    if log_path.exists() {
+        if let Err(e) = fs::remove_file(log_path) {
+            error!("Failed to clear AI output log: {}", e);
+            return Err(format!("Failed to clear log: {}", e));
+        }
+    }
+    let sidecar = rotation_sidecar_path(log_path);
+    if sidecar.exists() {
+        if let Err(e) = fs::remove_file(&sidecar) {
+            error!("Failed to clear rotated AI output log: {}", e);
+            return Err(format!("Failed to clear rotated log: {}", e));
+        }
+    }
+    Ok(())
 }
 
 /// Append an AI output entry to the log file.
@@ -353,34 +524,17 @@ pub fn append_ai_output_log(entry: AiOutputEntry) -> CommandResponse {
 /// that closes and deletes it.
 #[tauri::command]
 pub fn clear_ai_output_log() -> CommandResponse {
-    match ai_output_log_tx() {
-        Some(tx) => {
-            if tx.send(AiLogMsg::Clear).is_err() {
-                let log_path = get_ai_output_log_path();
-                if log_path.exists() {
-                    if let Err(e) = fs::remove_file(&log_path) {
-                        error!("Failed to clear AI output log: {}", e);
-                        return CommandResponse {
-                            success: false,
-                            message: Some(format!("Failed to clear log: {}", e)),
-                            data: None,
-                        };
-                    }
-                }
-            }
-        }
-        None => {
-            let log_path = get_ai_output_log_path();
-            if log_path.exists() {
-                if let Err(e) = fs::remove_file(&log_path) {
-                    error!("Failed to clear AI output log: {}", e);
-                    return CommandResponse {
-                        success: false,
-                        message: Some(format!("Failed to clear log: {}", e)),
-                        data: None,
-                    };
-                }
-            }
+    let fallback_needed = match ai_output_log_tx() {
+        Some(tx) => tx.send(AiLogMsg::Clear).is_err(),
+        None => true,
+    };
+    if fallback_needed {
+        if let Err(message) = clear_ai_output_files_at(&get_ai_output_log_path()) {
+            return CommandResponse {
+                success: false,
+                message: Some(message),
+                data: None,
+            };
         }
     }
 
@@ -410,7 +564,10 @@ pub fn get_ai_output_log_path_cmd() -> CommandResponse {
 pub fn load_ai_output_log() -> CommandResponse {
     let log_path = get_ai_output_log_path();
 
-    if !log_path.exists() {
+    // Both generations, oldest first — a rotation must not blank the restored
+    // history (see `rotated_log_read_set`).
+    let read_set = rotated_log_read_set(&log_path);
+    if read_set.is_empty() {
         info!("No AI output log file exists, returning empty history");
         return CommandResponse {
             success: true,
@@ -421,45 +578,46 @@ pub fn load_ai_output_log() -> CommandResponse {
         };
     }
 
-    let file = match fs::File::open(&log_path) {
-        Ok(f) => f,
-        Err(e) => {
-            error!("Failed to open AI output log file: {}", e);
-            return CommandResponse {
-                success: false,
-                message: Some(format!("Failed to open log file: {}", e)),
-                data: None,
-            };
-        }
-    };
-
-    let reader = BufReader::new(file);
     let mut entries: Vec<AiOutputEntry> = Vec::new();
     let mut line_number = 0;
 
-    for line_result in reader.lines() {
-        line_number += 1;
-        match line_result {
-            Ok(line) => {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<AiOutputEntry>(&line) {
-                    Ok(entry) => entries.push(entry),
-                    Err(e) => {
-                        warn!(
-                            "Failed to parse AI output entry at line {}: {}",
-                            line_number, e
-                        );
-                        // Continue parsing other lines
+    for part in &read_set {
+        let file = match fs::File::open(part) {
+            Ok(f) => f,
+            Err(e) => {
+                error!("Failed to open AI output log file {}: {}", part.display(), e);
+                return CommandResponse {
+                    success: false,
+                    message: Some(format!("Failed to open log file: {}", e)),
+                    data: None,
+                };
+            }
+        };
+
+        for line_result in BufReader::new(file).lines() {
+            line_number += 1;
+            match line_result {
+                Ok(line) => {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    match serde_json::from_str::<AiOutputEntry>(&line) {
+                        Ok(entry) => entries.push(entry),
+                        Err(e) => {
+                            warn!(
+                                "Failed to parse AI output entry at line {}: {}",
+                                line_number, e
+                            );
+                            // Continue parsing other lines
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to read line {} from AI output log: {}",
-                    line_number, e
-                );
+                Err(e) => {
+                    warn!(
+                        "Failed to read line {} from AI output log: {}",
+                        line_number, e
+                    );
+                }
             }
         }
     }
@@ -1059,5 +1217,138 @@ mod ai_output_sink_tests {
         // The next line reopens a fresh file rather than wedging.
         sink.write_line("after-clear");
         assert_eq!(lines_in(&path), vec!["after-clear"]);
+    }
+
+    /// REGRESSION (PR #961 review F2). Rotation moves history into the sidecar;
+    /// every reader must consume the sidecar BEFORE the live file, or a
+    /// rotation orphans the older generation from the AI Output viewer and
+    /// `consolidate_ai_output`.
+    #[test]
+    fn rotated_read_set_is_sidecar_then_live_in_that_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ai-output.jsonl");
+
+        // Nothing on disk yet — an empty set, not a phantom path.
+        assert!(rotated_log_read_set(&path).is_empty());
+
+        let mut sink = AiOutputSink::new(path.clone());
+        sink.write_line("older");
+        // Only the live file exists.
+        assert_eq!(rotated_log_read_set(&path), vec![path.clone()]);
+
+        sink.written = AI_OUTPUT_LOG_MAX_BYTES;
+        sink.write_line("newer");
+
+        let sidecar = rotation_sidecar_path(&path);
+        assert_eq!(
+            rotated_log_read_set(&path),
+            vec![sidecar.clone(), path.clone()],
+            "the older generation must be read first"
+        );
+        // Concatenated in set order, the stream is chronological again.
+        let combined: Vec<String> = rotated_log_read_set(&path)
+            .iter()
+            .flat_map(|p| lines_in(p))
+            .collect();
+        assert_eq!(combined, vec!["older", "newer"]);
+    }
+
+    /// REGRESSION (PR #961 review F4). The direct-append fallback runs when the
+    /// writer thread is missing or dead — i.e. when nothing else can rotate —
+    /// so it must enforce the cap itself instead of growing without bound.
+    #[test]
+    fn direct_append_fallback_rotates_at_the_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ai-output.jsonl");
+        let sidecar = rotation_sidecar_path(&path);
+        // Tiny cap so the branch is reachable without writing 50 MB.
+        let cap = 12u64;
+
+        // Each append writes the line plus a newline: 5 bytes, then 5 more.
+        append_line_direct_at(&path, "aaaa", cap).expect("first append");
+        append_line_direct_at(&path, "bbbb", cap).expect("second append");
+        assert!(
+            !sidecar.exists(),
+            "10 bytes is under the 12-byte cap — nothing to rotate yet"
+        );
+
+        // 10 + 6 > 12 → rotate, then append into the fresh file.
+        append_line_direct_at(&path, "ccccc", cap).expect("rotating append");
+        assert_eq!(lines_in(&sidecar), vec!["aaaa", "bbbb"]);
+        assert_eq!(lines_in(&path), vec!["ccccc"]);
+        // Both generations remain readable, oldest first.
+        let combined: Vec<String> = rotated_log_read_set(&path)
+            .iter()
+            .flat_map(|p| lines_in(p))
+            .collect();
+        assert_eq!(combined, vec!["aaaa", "bbbb", "ccccc"]);
+    }
+
+    /// REGRESSION (PR #961 review F4). A fallback clear must remove the sidecar
+    /// too — otherwise "cleared" still serves the previous run's output,
+    /// because readers concatenate the sidecar.
+    #[test]
+    fn fallback_clear_removes_both_generations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ai-output.jsonl");
+        let mut sink = AiOutputSink::new(path.clone());
+        sink.write_line("old");
+        sink.written = AI_OUTPUT_LOG_MAX_BYTES;
+        sink.write_line("newer");
+        drop(sink); // release the handle so Windows can delete
+        let sidecar = rotation_sidecar_path(&path);
+        assert!(sidecar.exists() && path.exists());
+
+        clear_ai_output_files_at(&path).expect("fallback clear");
+        assert!(!path.exists());
+        assert!(!sidecar.exists());
+        assert!(rotated_log_read_set(&path).is_empty());
+    }
+
+    /// REGRESSION (PR #961 review F3). The writer thread's sender is a
+    /// process-lifetime static, so `recv` never returns on its own — a Flush
+    /// barrier is the only way to know queued lines have landed. This drives
+    /// the worker exactly as `flush_ai_output_log` does.
+    #[test]
+    fn flush_barrier_acks_only_after_queued_lines_are_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ai-output.jsonl");
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<AiLogMsg>(AI_OUTPUT_LOG_QUEUE_CAP);
+        let worker_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            // Same loop body as `ai_output_log_worker`, against a temp path.
+            let mut sink = AiOutputSink::new(worker_path);
+            while let Ok(msg) = rx.recv() {
+                match msg {
+                    AiLogMsg::Line(line) => sink.write_line(&line),
+                    AiLogMsg::Clear => sink.clear(),
+                    AiLogMsg::Flush(ack) => {
+                        sink.sync();
+                        let _ = ack.send(());
+                    }
+                }
+            }
+        });
+
+        for i in 0..500 {
+            tx.send(AiLogMsg::Line(format!("line-{}", i)))
+                .expect("queue");
+        }
+
+        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        tx.send(AiLogMsg::Flush(ack_tx)).expect("queue flush");
+        ack_rx
+            .recv_timeout(AI_OUTPUT_LOG_FLUSH_TIMEOUT)
+            .expect("flush must be acknowledged");
+
+        // The ack is a barrier: every queued line is on disk BEFORE it returns.
+        let lines = lines_in(&path);
+        assert_eq!(lines.len(), 500);
+        assert_eq!(lines[0], "line-0");
+        assert_eq!(lines[499], "line-499");
+
+        drop(tx);
+        worker.join().expect("worker exits when the sender drops");
     }
 }

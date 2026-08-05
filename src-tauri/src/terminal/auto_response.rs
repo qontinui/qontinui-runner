@@ -207,11 +207,11 @@ pub fn scan_grids_once() {
         let mut gate_guard = SCAN_GATE.lock().unwrap_or_else(|e| e.into_inner());
         let gate = gate_guard.get_or_insert_with(super::scan_gate::ScanGate::new);
         for (tid, session) in &sessions {
-            // Skip sessions that produced no output since the last pass: their
-            // grid text is identical, so `collect_rising_edges` would compute
-            // the same per-rule flags and find no rising edge. One relaxed
-            // atomic load instead of a grid lock + full screen render.
-            if !gate.should_scan(tid, session.total_bytes_produced()) {
+            // Skip sessions whose grid has not been mutated since the last
+            // pass: their grid text is identical, so `collect_rising_edges`
+            // would compute the same per-rule flags and find no rising edge.
+            // One atomic load instead of a grid lock + full screen render.
+            if !gate.should_scan(tid, session.grid_generation()) {
                 continue;
             }
             // Read the *rendered* screen text (rows joined by `\n`) — the grid

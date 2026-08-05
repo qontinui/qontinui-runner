@@ -249,14 +249,14 @@ pub fn scan_terminals_once() {
     }
 
     for (tid, session) in sessions {
-        // Skip sessions that produced no output since the last pass: the
-        // rendered screen is byte-identical, so the (pure) context-low
+        // Skip sessions whose grid has not been mutated since the last pass:
+        // the rendered screen is byte-identical, so the (pure) context-low
         // predicate would return exactly what it returned last tick. One
-        // relaxed atomic load instead of a grid lock + full screen render.
+        // atomic load instead of a grid lock + full screen render.
         {
             let mut gate_guard = SCAN_GATE.lock().unwrap_or_else(|e| e.into_inner());
             let gate = gate_guard.get_or_insert_with(super::scan_gate::ScanGate::new);
-            if !gate.should_scan(&tid, session.total_bytes_produced()) {
+            if !gate.should_scan(&tid, session.grid_generation()) {
                 continue;
             }
         }
