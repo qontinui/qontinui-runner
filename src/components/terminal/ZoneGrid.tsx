@@ -495,6 +495,7 @@ function ZoneGridInner({
       <HiddenTerminal
         key={tab.id}
         tab={tab}
+        pageId={pageId}
         terminalRef={terminalRefs.get(tab.id)}
         onExit={onExit}
         onFirstInput={onFirstInput}
@@ -556,6 +557,7 @@ function ZoneGridInner({
                 <TerminalInstance
                   ref={ref}
                   terminalId={zoneTab.id}
+                  pageId={pageId}
                   visible={isVisible}
                   isReconnecting={zoneTab.isReconnecting}
                   onReconnected={() => onReconnected(zoneTab.id)}
@@ -886,7 +888,11 @@ function ZoneCellInner({
   registerCell: (tabId: string, el: HTMLElement) => void;
   unregisterCell: (tabId: string) => void;
   focusedZone: number;
-  /** Owning terminal page — selects this cell's slice of the hot store. */
+  /**
+   * Owning terminal page — selects this cell's slice of the hot store, and
+   * feeds `TerminalInstance`'s stdin ownership gate (a page-bound pop-out
+   * claims its tabs by page, not through the `session_owner` map).
+   */
   pageId: string;
   sessionStates: Record<string, SessionState>;
   terminalRefs: Map<string, RefObject<TerminalInstanceHandle | null>>;
@@ -1322,6 +1328,7 @@ function ZoneCellInner({
                 <TerminalInstance
                   ref={terminalRefs.get(tab.id)}
                   terminalId={tab.id}
+                  pageId={pageId}
                   visible={!showCompactCard}
                   isReconnecting={tab.isReconnecting}
                   onReconnected={instanceHandlers.onReconnected}

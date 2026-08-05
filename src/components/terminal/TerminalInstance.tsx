@@ -68,6 +68,18 @@ export type ShellIntegrationEvent =
 interface TerminalInstanceProps {
   terminalId: string;
   visible: boolean;
+  /**
+   * The terminal page this instance belongs to. Feeds the stdin ownership
+   * gate: a page-bound pop-out window claims stdin for ALL of its page's tabs,
+   * including the ones that carry no `session_owner` entry (e.g. every tab
+   * after a restart, where the owner map is deliberately cleared).
+   *
+   * REQUIRED on purpose. A mount site that forgets it renders a terminal that
+   * is permanently stdin-dead in a page-bound pop-out — and nothing goes red,
+   * which is exactly the bug this prop exists to fix. Keeping it required puts
+   * that guarantee in `tsc` instead of in a test that scans source text.
+   */
+  pageId: string;
   /** Which terminal backend to use. Defaults to "xterm". */
   backendType?: BackendType;
   /** True when this instance is reconnecting to an existing Rust PTY session. */
@@ -203,6 +215,7 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
     {
       terminalId,
       visible,
+      pageId,
       backendType: backendTypeProp,
       isReconnecting,
       onReconnected,
@@ -249,9 +262,13 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
     // (output still double-renders identically — benign). Kept in a ref so the
     // long-lived onData/onBinary closures read the freshest value. Defaults to
     // owned (true) in the single-window / no-provider case.
+    //
+    // `pageId` is passed so the gate asks the SAME question the renderer asks:
+    // a page-bound pop-out owns every tab of its page, including tabs with no
+    // `session_owner` entry. Without it those tabs render but never type.
     const { isOwned } = useWindowAssignments();
     const isOwnedRef = useRef(true);
-    isOwnedRef.current = isOwned(terminalId);
+    isOwnedRef.current = isOwned(terminalId, pageId);
     /**
      * Most-recently reported title — guards `onTitleChange` against firing on
      * every title poll (~1s ack-timer cadence) when the title is unchanged.
