@@ -566,6 +566,7 @@ coord.tenant_github_accounts
 coord.tenant_merge_settings
 coord.tenant_policies
 coord.tenant_repo_profiles
+coord.tenant_repo_unenrollments
 coord.tenant_repos
 coord.tenants
 coord.test_coverage_map
