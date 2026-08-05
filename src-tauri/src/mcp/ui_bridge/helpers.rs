@@ -940,7 +940,10 @@ mod helpers_tests {
     fn same_shape_remount_is_detected() {
         let pre = snapshot_signature(&tier_step_snapshot(1000, "How will you use Qontinui?"));
         let post = snapshot_signature(&tier_step_snapshot(1017, "How will you use Qontinui?"));
-        assert_eq!(pre.content, post.content, "content is identical by construction");
+        assert_eq!(
+            pre.content, post.content,
+            "content is identical by construction"
+        );
         assert_ne!(pre.generation, post.generation);
         assert!(!post.unchanged_from(&pre), "a remount is a change");
         assert!(post.remounted_from(&pre));

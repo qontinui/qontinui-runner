@@ -463,7 +463,10 @@ mod tests {
         std::env::remove_var(VIEW_CONTROL_FLAG);
         let wrapped = with_view_control_capability(serde_json::json!([{ "name": "setup-wizard" }]));
         assert_eq!(wrapped["viewControlEnabled"], serde_json::json!(false));
-        assert_eq!(wrapped["views"][0]["name"], serde_json::json!("setup-wizard"));
+        assert_eq!(
+            wrapped["views"][0]["name"],
+            serde_json::json!("setup-wizard")
+        );
     }
 
     #[test]
