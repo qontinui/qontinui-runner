@@ -1,3 +1,0 @@
-# UIBridgeIntegrationPage
-
-_(notes)_
