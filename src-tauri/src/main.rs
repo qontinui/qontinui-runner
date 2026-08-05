@@ -2956,26 +2956,41 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // helper failed → classify Skips every matched record.
                         let tick_snapshot_ok = !snap.parent_map.is_empty();
 
+                        // Index the live terminals ONCE per tick (plan
+                        // 2026-07-28-runner-many-sessions-performance §7a/B8).
+                        // The match below used to be up to two full linear
+                        // scans of `live` per open record — O(records × live)
+                        // every 45s, which is exactly the shape that grows
+                        // quadratically with session count. Both maps keep the
+                        // FIRST live entry for a key, so the lookup result is
+                        // byte-identical to the `find()` it replaces.
+                        let mut live_by_id: StdHashMap<&str, &_> =
+                            StdHashMap::with_capacity(live.len());
+                        let mut live_by_triple: StdHashMap<(&str, &str, &str), &_> =
+                            StdHashMap::with_capacity(live.len());
+                        for info in &live {
+                            live_by_id.entry(info.id.as_str()).or_insert(info);
+                            live_by_triple
+                                .entry((
+                                    info.page_id.as_str(),
+                                    info.title.as_str(),
+                                    info.working_dir.as_str(),
+                                ))
+                                .or_insert(info);
+                        }
+
                         for rec in &open {
                             // Match the live terminal: by id first, then the
                             // (page_id, title, working_dir) triple as fallback.
-                            let info = live
-                                .iter()
-                                .find(|i| i.id == rec.terminal_id)
+                            let info = live_by_id
+                                .get(rec.terminal_id.as_str())
+                                .copied()
                                 .or_else(|| {
-                                    live.iter().find(|i| {
-                                        i.page_id == rec.page_id
-                                            && rec
-                                                .title
-                                                .as_deref()
-                                                .map(|t| t == i.title)
-                                                .unwrap_or(false)
-                                            && rec
-                                                .working_dir
-                                                .as_deref()
-                                                .map(|w| w == i.working_dir)
-                                                .unwrap_or(false)
-                                    })
+                                    let title = rec.title.as_deref()?;
+                                    let working_dir = rec.working_dir.as_deref()?;
+                                    live_by_triple
+                                        .get(&(rec.page_id.as_str(), title, working_dir))
+                                        .copied()
                                 });
 
                             let (live_is_alive, claude_present, snapshot_ok) = match info {
