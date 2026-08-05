@@ -352,6 +352,18 @@ impl WindowAssignments {
             .unwrap_or(false)
     }
 
+    /// Whether `label` is a PAGE-BOUND pop-out — a window that hosts an entire
+    /// terminal page and claims its tabs by `page_id`, not through the
+    /// `session_owner` map. Such a window is never "empty" in the sense the
+    /// auto-close / sweep paths mean: its tabs simply do not appear in
+    /// `session_owner`. Unknown labels are not page-bound.
+    pub fn is_page_bound(&self, label: &str) -> bool {
+        self.inner
+            .lock()
+            .map(|s| s.windows.get(label).is_some_and(|r| r.bound_page.is_some()))
+            .unwrap_or(false)
+    }
+
     /// Clear the entire `session_owner` map (reverting every session to the
     /// default `"main"`), persisting on change. Returns the number of entries
     /// dropped.
@@ -716,6 +728,31 @@ mod tests {
         assert!(
             !wa.has_assigned_sessions("term-999"),
             "unknown label is empty"
+        );
+    }
+
+    #[test]
+    fn is_page_bound_is_true_only_for_windows_with_a_bound_page() {
+        let (_d, wa) = store();
+        wa.ensure_main(1);
+        let bound = wa.create_window(None, None, Some("page-A".to_string()), 10);
+        let per_id = wa.create_window(None, None, None, 20);
+
+        assert!(
+            wa.is_page_bound(&bound.label),
+            "a window created with a bound_page IS page-bound"
+        );
+        assert!(
+            !wa.is_page_bound(&per_id.label),
+            "a plain per-id pop-out is NOT page-bound"
+        );
+        assert!(
+            !wa.is_page_bound(MAIN_WINDOW_LABEL),
+            "main's record carries bound_page: None, so it is not page-bound"
+        );
+        assert!(
+            !wa.is_page_bound("term-999"),
+            "an unknown label is not page-bound"
         );
     }
 
