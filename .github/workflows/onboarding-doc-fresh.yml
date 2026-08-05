@@ -18,13 +18,25 @@ name: onboarding doc freshness
 #                              doc.
 #   - `onboarding-doc-verify`: builds the coord_doctor bin, regenerates the doc,
 #                              and `git diff --exit-code`s it. Gated on detect.
-#   - `onboarding-doc-fresh` : required-check shim; always runs; reflects the
+#   - `onboarding-doc-fresh` : aggregator shim; always runs; reflects the
 #                              verify result, or trivially passes on
 #                              no-relevant-changes PRs.
 #
+# On "required": unlike the two workflows above, `onboarding-doc-fresh` is NOT
+# currently one of the required contexts in the `main-merge-gates` ruleset
+# (`schema-fresh` and `clorinde-fresh` are). Verified 2026-08-05 against
+# `gh api repos/qontinui/qontinui-runner/rulesets/16044811`. Note this repo has
+# no CLASSIC branch protection at all — `/branches/main/protection` returns 404,
+# which is NOT "ungated"; read the ruleset. The shim still matters, because
+# coord's merge predicate observes EVERY check, not only ruleset-required ones,
+# so a red one still stops the train. Keep the always-reports shape: it is what
+# lets this become a required context without re-introducing the deadlock below,
+# and it matches the siblings.
+#
 # We don't use a trigger-level `paths:` filter, because that would skip the
-# entire workflow (including the required shim) on non-relevant PRs and trip the
-# "ghost required check" deadlock. `workflow_dispatch` is kept for manual reruns.
+# entire workflow (including the shim) on non-relevant PRs, which for a REQUIRED
+# context is the "ghost required check" deadlock — a skipped-but-required check
+# sits pending forever. `workflow_dispatch` is kept for manual reruns.
 
 on:
   workflow_dispatch:
