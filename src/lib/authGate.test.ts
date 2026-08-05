@@ -73,14 +73,40 @@ describe("resolveAuthGate", () => {
     expect(resolveAuthGate({ ...signedIn, apiReady: false })).toBe("loading");
   });
 
-  it("runs the setup wizard before any auth gate", () => {
+  // The wizard is NOT a gate surface any more (see the note on `AuthGate`).
+  // `App` mounts it on `setupCompleted === false` alone, so the only thing this
+  // function still owes the wizard is: never divert a mid-setup runner to the
+  // sign-in screen.
+  it("suppresses the sign-in gate while first-run setup is incomplete", () => {
     expect(resolveAuthGate({ ...signedIn, setupCompleted: false, authenticated: false })).toBe(
-      "wizard",
+      "app",
     );
-    // …but never before auth has settled (the wizard must not flash either).
-    expect(resolveAuthGate({ ...signedIn, setupCompleted: false, authResolving: true })).toBe(
-      "loading",
-    );
+  });
+
+  it("never reports 'wizard' — the wizard is not an auth-gate surface", () => {
+    const gates = [
+      resolveAuthGate({ ...signedIn, setupCompleted: false }),
+      resolveAuthGate({ ...signedIn, setupCompleted: false, authenticated: false }),
+      resolveAuthGate({ ...signedIn, setupCompleted: false, isTier2: false }),
+    ];
+    for (const g of gates) {
+      expect(g).not.toBe("wizard");
+    }
+  });
+
+  // R1 — the P0 this file's wizard cases were rewritten for. A tier RE-read
+  // must not move the gate: it used to raise `AuthProvider.loading`, flip the
+  // gate off `"wizard"`, and unmount `<SetupWizard>` mid-flight, resetting the
+  // operator to step 0 every time they picked a tier. `useRunnerTier` now keeps
+  // re-reads on a separate `refreshing` flag that feeds NOTHING here, so with
+  // `setupCompleted === false` the verdict is stable.
+  it("stays on the wizard's surface while a tier RE-READ is in flight", () => {
+    const midSetup: AuthGateInput = { ...signedIn, setupCompleted: false, authenticated: false };
+    // A re-read no longer raises authLoading, so the gate does not move…
+    expect(resolveAuthGate(midSetup)).toBe("app");
+    // …and even if some other transient did raise it, the surface is an
+    // OVERLAY, never an early return — the wizard stays mounted underneath.
+    expect(resolveAuthGate({ ...midSetup, authLoading: true })).toBe("loading");
   });
 
   it("does not gate Tier 0/1 on authentication", () => {
@@ -117,7 +143,7 @@ describe("resolveAuthGate", () => {
       );
     });
 
-    it("holds even when setup looks incomplete (never guess a surface from an unknown tier)", () => {
+    it("holds even when setup is incomplete (never guess a surface from an unknown tier)", () => {
       expect(resolveAuthGate({ ...signedIn, tierUnknown: true, setupCompleted: false })).toBe(
         "tier-unknown",
       );

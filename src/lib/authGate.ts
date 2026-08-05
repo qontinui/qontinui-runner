@@ -23,7 +23,18 @@
  * enforced — and tested.
  */
 
-export type AuthGate = "loading" | "wizard" | "login" | "tier-unknown" | "app";
+/**
+ * NOTE — `"wizard"` is deliberately NOT a member.
+ *
+ * The first-run Setup Wizard used to be an auth-gate surface, which made its
+ * mounting a function of transient auth state: any flip to `"loading"` (a tier
+ * re-read, an `authResolving` blip from the `isTier2` change the wizard itself
+ * causes) replaced the wizard and remounted it fresh at step 0, silently
+ * discarding the operator's progress. Wizard mounting is now a function of
+ * `setupCompleted === false` ALONE (`App.tsx`), and the `"loading"` / `"login"`
+ * overlays cover it exactly as they cover the app tree. Do not re-add it here.
+ */
+export type AuthGate = "loading" | "login" | "tier-unknown" | "app";
 
 export interface AuthGateInput {
   /** `AuthProvider.loading` — in-flight auth work, force-cleared after 3s. */
@@ -69,10 +80,15 @@ export function resolveAuthGate(input: AuthGateInput): AuthGate {
   if (input.tierUnknown) {
     return "tier-unknown";
   }
-  // Wizard runs FIRST (of the tier-derived gates) so Tier 0/1 setup can happen
-  // without ever hitting the login screen.
+  // First-run setup still outranks the sign-in gate — Tier 0/1 setup must be
+  // able to complete without ever hitting the login screen — but the wizard is
+  // no longer a gate SURFACE. It is rendered from a stable position in `App`
+  // gated on `setupCompleted === false` alone, so no auth verdict can unmount
+  // it. `"app"` here means "no auth surface": the wizard covers the tree
+  // itself, and the `"loading"` / `"login"` overlays above still cover the
+  // wizard when they fire.
   if (input.setupCompleted === false) {
-    return "wizard";
+    return "app";
   }
   // Tier 0/1 get a synthesized local-guest auth, so they never land here.
   if (input.isTier2 && !input.authenticated) {

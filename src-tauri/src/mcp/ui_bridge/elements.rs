@@ -1166,7 +1166,9 @@ pub async fn ui_bridge_execute_action_handler(
     // mutations the action itself produces in flight). The snapshot is a
     // discover call with `interactive_only: false` to catch every element
     // that could have changed.
-    let pre_snapshot_signature: Option<(usize, u64)> = if expect_change.is_some() {
+    let pre_snapshot_signature: Option<super::helpers::SnapshotSignature> = if expect_change
+        .is_some()
+    {
         match ui_bridge_request_sync(
             &state,
             "discover",
@@ -1796,20 +1798,32 @@ pub async fn ui_bridge_execute_action_handler(
 
         let detector = match post_sig {
             Some(post) => {
-                let changed = post != pre_sig;
+                let changed = !post.unchanged_from(&pre_sig);
+                // A same-shape remount: the element set and everything it
+                // shows are identical, but the elements belong to a new mount.
+                // Reported explicitly because it is the case a driver is most
+                // likely to misread — the tree was destroyed and rebuilt, so
+                // any local state in it (a wizard's current step, a form's
+                // draft, scroll position) is GONE, even though the screen
+                // looks the same.
+                let remounted = post.remounted_from(&pre_sig);
                 serde_json::json!({
                     "supported": true,
                     "effectChanged": changed,
-                    "preElementCount": pre_sig.0,
-                    "postElementCount": post.0,
-                    "preSignature": pre_sig.1.to_string(),
-                    "postSignature": post.1.to_string(),
+                    "remounted": remounted,
+                    "preElementCount": pre_sig.count,
+                    "postElementCount": post.count,
+                    "preSignature": pre_sig.content.to_string(),
+                    "postSignature": post.content.to_string(),
+                    "preGeneration": pre_sig.generation.to_string(),
+                    "postGeneration": post.generation.to_string(),
                     "settleMs": settle_ms,
                 })
             }
             None => serde_json::json!({
                 "supported": false,
                 "effectChanged": null,
+                "remounted": null,
                 "reason": "post-snapshot failed",
             }),
         };
