@@ -108,6 +108,17 @@ describe("isKnownStrategy", () => {
     expect(sameForm(effectiveAfterSave(rogue, formOf(rogue)), formOf(rogue))).toBe(true);
   });
 
+  it("IS dirty once a strategy is chosen — the overwrite is reachable", () => {
+    // The other half of the truth the row's warning must tell: selecting a
+    // strategy and giving it a command enables Save, and the PATCH overwrites
+    // the value this build could not read. The warning says so; this pins that
+    // it is a real path and not a theoretical one.
+    const rogue = app({ updateStrategy: "pull_build_and_deploy" });
+    const chosen = form({ updateStrategy: "pull_build", buildCommand: "make" });
+    expect(sameForm(effectiveAfterSave(rogue, chosen), formOf(rogue))).toBe(false);
+    expect(buildPatchBody(chosen).updateStrategy).toBe("pull_build");
+  });
+
   it("is false when formOf silently degraded the stored value", () => {
     // This is what lets the row SAY it is misrepresenting the stored strategy
     // rather than quietly overwriting it on the next unrelated edit.
