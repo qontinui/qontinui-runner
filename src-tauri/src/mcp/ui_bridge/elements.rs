@@ -1166,31 +1166,30 @@ pub async fn ui_bridge_execute_action_handler(
     // mutations the action itself produces in flight). The snapshot is a
     // discover call with `interactive_only: false` to catch every element
     // that could have changed.
-    let pre_snapshot_signature: Option<super::helpers::SnapshotSignature> = if expect_change
-        .is_some()
-    {
-        match ui_bridge_request_sync(
-            &state,
-            "discover",
-            super::request::target_window_payload(
-                serde_json::json!({ "options": { "interactiveOnly": false } }),
-                window_label,
-            ),
-        )
-        .await
-        {
-            Ok(data) => Some(snapshot_signature(&data)),
-            Err(e) => {
-                warn!(
+    let pre_snapshot_signature: Option<super::helpers::SnapshotSignature> =
+        if expect_change.is_some() {
+            match ui_bridge_request_sync(
+                &state,
+                "discover",
+                super::request::target_window_payload(
+                    serde_json::json!({ "options": { "interactiveOnly": false } }),
+                    window_label,
+                ),
+            )
+            .await
+            {
+                Ok(data) => Some(snapshot_signature(&data)),
+                Err(e) => {
+                    warn!(
                     "execute_action: pre-snapshot failed for expectChange ({}); skipping detector",
                     e
                 );
-                None
+                    None
+                }
             }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
     // Merge flat top-level fields into params so actions like drag work with
     // both {"action":"drag","params":{"targetPosition":{...}}} and
