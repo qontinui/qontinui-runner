@@ -12,7 +12,7 @@ import type { AiMessage, AiSessionState } from "@qontinui/shared-types";
 import { parseOutputLog } from "@qontinui/workflow-utils";
 import { instanceStorage } from "@/lib/instance-storage";
 import { FrameBatchScheduler } from "@/lib/ai-streaming/frameBatchScheduler";
-import { StreamingTextBuffer } from "@/lib/ai-streaming/streamingBuffer";
+import { StreamingTextBuffer, formatRetainedResponse } from "@/lib/ai-streaming/streamingBuffer";
 
 /** Payload from the "ai-output" Tauri event. */
 interface AiOutputEvent {
@@ -78,13 +78,54 @@ export function useAiSession() {
     };
   }, [streamingBuffer]);
 
-  /** Drop any pending flush and clear the buffer + its rendered mirror. */
+  /**
+   * Drop any pending flush and clear the buffer + its rendered mirror.
+   *
+   * Discards the retained text AND the retention-cap drop count, so it is only
+   * correct where the transcript itself is being replaced (session switch,
+   * session reset). Anywhere an in-flight response is being ABANDONED, call
+   * {@link commitStreamingBuffer} first — otherwise the partial response and
+   * the record of what the cap trimmed off it both vanish with no trace.
+   */
   const resetStreaming = useCallback(() => {
     streamingFlushRef.current?.cancel();
     streamingBuffer.reset();
     setStreamingContent("");
     setStreamingDroppedChars(0);
   }, [streamingBuffer]);
+
+  /**
+   * Move whatever the streaming buffer holds into the transcript, then reset.
+   *
+   * Reading `.text` folds every pending append, so a batched flush that has not
+   * fired yet can never drop the tail of the response. A no-op on an empty
+   * buffer, which makes it safe to call speculatively before starting a turn.
+   */
+  const commitStreamingBuffer = useCallback(() => {
+    const bufferedText = streamingBuffer.text;
+    if (!bufferedText.trim()) {
+      resetStreaming();
+      return;
+    }
+    const content = formatRetainedResponse(bufferedText, streamingBuffer.droppedChars);
+    resetStreaming();
+    setMessages((prev) => {
+      // If the last message is also from AI (no user message in between),
+      // merge content into that message instead of creating a new bubble.
+      // This prevents a wall of repeated messages when Claude's agentic
+      // loop cycles multiple turns without user interaction.
+      const last = prev[prev.length - 1];
+      if (last && last.role === "ai") {
+        const merged = [...prev];
+        merged[merged.length - 1] = {
+          ...last,
+          content: last.content + "\n\n" + content,
+        };
+        return merged;
+      }
+      return [...prev, { role: "ai", content, timestamp: new Date().toISOString() }];
+    });
+  }, [resetStreaming, streamingBuffer]);
 
   // Keep refs in sync with state
   useEffect(() => {
@@ -267,30 +308,8 @@ export function useAiSession() {
       // Flush streaming buffer on transition to ready or closed.
       // Reading `.text` folds every pending append, so a batched flush that
       // hasn't fired yet can never drop the tail of the response.
-      const bufferedText = state === "ready" || state === "closed" ? streamingBuffer.text : "";
-      if ((state === "ready" || state === "closed") && bufferedText.trim()) {
-        const dropped = streamingBuffer.droppedChars;
-        const content =
-          dropped > 0
-            ? `_[${dropped} earlier characters of this response were trimmed by the streaming retention cap]_\n\n${bufferedText}`
-            : bufferedText;
-        resetStreaming();
-        setMessages((prev) => {
-          // If the last message is also from AI (no user message in between),
-          // merge content into that message instead of creating a new bubble.
-          // This prevents a wall of repeated messages when Claude's agentic
-          // loop cycles multiple turns without user interaction.
-          const last = prev[prev.length - 1];
-          if (last && last.role === "ai") {
-            const merged = [...prev];
-            merged[merged.length - 1] = {
-              ...last,
-              content: last.content + "\n\n" + content,
-            };
-            return merged;
-          }
-          return [...prev, { role: "ai", content, timestamp: new Date().toISOString() }];
-        });
+      if (state === "ready" || state === "closed") {
+        commitStreamingBuffer();
       }
 
       // Clear tool activity on state transitions
@@ -313,7 +332,7 @@ export function useAiSession() {
         unlisten();
       }
     };
-  }, [resetStreaming, streamingBuffer]);
+  }, [commitStreamingBuffer, streamingBuffer]);
 
   const switchSession = useCallback(
     async (newTaskRunId: string) => {
@@ -403,14 +422,17 @@ export function useAiSession() {
       const currentTaskRunId = taskRunIdRef.current;
       if (!currentTaskRunId || sessionStateRef.current === "restoring") return;
 
+      // Retire any response still in flight BEFORE the user's message, so an
+      // interrupted turn keeps its partial text and its retention-cap record
+      // instead of being reset out of existence. No-op on an empty buffer,
+      // which is the normal case.
+      commitStreamingBuffer();
+
       // Add user message to local state immediately
       setMessages((prev) => [
         ...prev,
         { role: "user", content, timestamp: new Date().toISOString() },
       ]);
-
-      // Reset streaming buffer for new AI response
-      resetStreaming();
 
       try {
         const response = await invoke<CommandResponse>("send_user_message", {
@@ -425,7 +447,7 @@ export function useAiSession() {
         console.error("[useAiSession] Failed to send message:", e);
       }
     },
-    [resetStreaming],
+    [commitStreamingBuffer],
   );
 
   const interrupt = useCallback(async () => {

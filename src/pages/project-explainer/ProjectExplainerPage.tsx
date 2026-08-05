@@ -17,6 +17,7 @@ import remarkGfm from "remark-gfm";
 import mermaid from "mermaid";
 import { getApiBase } from "@/lib/runner-api";
 import { useAiSession } from "@/hooks/useAiSession";
+import { StreamingMessageView } from "@/components/shared";
 import { useUIElement } from "@qontinui/ui-bridge";
 
 const EXPLAINER_ROOT = "src/specs/explainer";
@@ -460,7 +461,17 @@ function ExplainerAiPanel({ getContext }: { getContext: () => string }) {
         {session.streamingContent && (
           <div className="text-muted-foreground">
             <div className="text-[10px] uppercase tracking-wider mb-0.5">AI</div>
-            <div className="whitespace-pre-wrap break-words">{session.streamingContent}</div>
+            {/* Not a raw `{session.streamingContent}` render: that is the FULL
+                retained buffer, so a turn that trips `useAiSession`'s 2M
+                retention cap loses its head with nothing on screen saying so
+                (the completion marker only lands once the turn ends), and every
+                batched flush pushes up to 2MB into one DOM text node.
+                StreamingMessageView renders a bounded tail and surfaces the
+                trimmed-character count — same as the other four consumers. */}
+            <StreamingMessageView
+              content={session.streamingContent}
+              droppedChars={session.streamingDroppedChars}
+            />
           </div>
         )}
       </div>

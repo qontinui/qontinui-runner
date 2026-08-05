@@ -9,7 +9,6 @@ export {
   groupEntriesBySource,
   createIncrementalSourceGrouper,
   EMPTY_MESSAGE_GROUPS,
-  AI_MESSAGE_VIRTUALIZE_THRESHOLD,
   type AiMessageEntry,
   type MessageGroup,
   type IncrementalSourceGrouper,

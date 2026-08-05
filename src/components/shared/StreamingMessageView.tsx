@@ -18,6 +18,7 @@ import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { cn } from "../../lib/utils";
 import {
   computeStreamWindow,
+  shouldResetStreamWindow,
   STREAM_EARLIER_STEP_CHARS,
   STREAM_TAIL_CHARS,
 } from "../../lib/ai-streaming/streamingBuffer";
@@ -52,16 +53,19 @@ function StreamingMessageViewImpl({
   caretClassName = "bg-amber-400",
 }: StreamingMessageViewProps) {
   const [windowChars, setWindowChars] = useState(STREAM_TAIL_CHARS);
-  const previousLengthRef = useRef(content.length);
+  const previousProgressRef = useRef({ length: content.length, droppedChars });
 
-  // A shrinking buffer means a new turn started (the hook resets it to ""),
-  // so collapse back to the default tail.
+  // A shrinking buffer means a new turn started (the hook resets it to ""), so
+  // collapse back to the default tail — but the retention cap ALSO shrinks it
+  // mid-stream, and that must not snap a reader who clicked "Show all" back to
+  // the tail. `shouldResetStreamWindow` separates the two.
   useEffect(() => {
-    if (content.length < previousLengthRef.current) {
+    const next = { length: content.length, droppedChars };
+    if (shouldResetStreamWindow(previousProgressRef.current, next)) {
       setWindowChars(STREAM_TAIL_CHARS);
     }
-    previousLengthRef.current = content.length;
-  }, [content.length]);
+    previousProgressRef.current = next;
+  }, [content.length, droppedChars]);
 
   const showEarlier = useCallback(() => {
     setWindowChars((chars) => chars + STREAM_EARLIER_STEP_CHARS);

@@ -15,7 +15,7 @@
  * shell over it.
  */
 
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef } from "react";
 
 export interface StableIntervalOptions {
   /** Invoke the callback once immediately when the interval becomes enabled. */
@@ -110,13 +110,21 @@ export class StableIntervalController {
  * When `fireOnEnable` is set the callback also runs once on the enable
  * transition, deferred by a microtask so the effect body never calls `setState`
  * synchronously during commit.
+ *
+ * Returns a stable `fireNow` for events the poll cadence is too slow for — an
+ * out-of-band check that does NOT disturb the interval. `fireOnEnable` only
+ * covers the disabled→enabled edge, so anything that changes the polled state
+ * while the interval is already running (a new turn starting in a session that
+ * already has output) needs this, or it stays poll-bound for a full period.
+ * Like `fireOnEnable`, the call is deferred by a microtask so an effect body
+ * calling it never triggers a `setState` during commit.
  */
 export function useStableInterval(
   callback: () => void,
   intervalMs: number,
   enabled: boolean,
   options: StableIntervalOptions = {},
-): void {
+): () => void {
   const callbackRef = useRef(callback);
   useEffect(() => {
     callbackRef.current = callback;
@@ -153,4 +161,12 @@ export function useStableInterval(
       cancelled = true;
     };
   }, [enabled, fireOnEnable]);
+
+  return useCallback(() => {
+    const controller = controllerRef.current;
+    if (!controller) return;
+    // `dispose()` nulls the callback, so a fire that lands after unmount is
+    // inert — no cancellation bookkeeping needed here.
+    void Promise.resolve().then(() => controller.fire());
+  }, []);
 }

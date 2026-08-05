@@ -8,6 +8,8 @@ import { describe, it, expect } from "vitest";
 
 import {
   computeStreamWindow,
+  formatRetainedResponse,
+  shouldResetStreamWindow,
   STREAM_EARLIER_STEP_CHARS,
   STREAM_TAIL_CHARS,
   StreamingTextBuffer,
@@ -141,5 +143,78 @@ describe("computeStreamWindow — the 'show earlier' ladder", () => {
     expect(win.visible.endsWith("END")).toBe(true);
     expect(win.droppedChars).toBe(buffer.droppedChars);
     expect(win.hiddenChars).toBe(buffer.text.length - 10);
+  });
+});
+
+describe("shouldResetStreamWindow", () => {
+  it("collapses the window when a new turn resets the buffer", () => {
+    expect(
+      shouldResetStreamWindow({ length: 900_000, droppedChars: 0 }, { length: 0, droppedChars: 0 }),
+    ).toBe(true);
+  });
+
+  it("does NOT collapse when the retention cap trims the head mid-stream", () => {
+    // The exact numbers the cap produces: 2,000,001 chars trimmed back to
+    // 1,500,000, with 500,001 characters recorded as dropped. A reader who
+    // clicked "Show all" must not be yanked back to the 4096-char tail.
+    expect(
+      shouldResetStreamWindow(
+        { length: 2_000_001, droppedChars: 0 },
+        { length: 1_500_000, droppedChars: 500_001 },
+      ),
+    ).toBe(false);
+  });
+
+  it("does not collapse while the buffer only grows", () => {
+    expect(
+      shouldResetStreamWindow({ length: 100, droppedChars: 0 }, { length: 200, droppedChars: 0 }),
+    ).toBe(false);
+    expect(
+      shouldResetStreamWindow({ length: 100, droppedChars: 0 }, { length: 100, droppedChars: 0 }),
+    ).toBe(false);
+  });
+
+  it("collapses on the new turn AFTER an over-cap one (dropped count resets too)", () => {
+    expect(
+      shouldResetStreamWindow(
+        { length: 1_500_000, droppedChars: 500_001 },
+        { length: 0, droppedChars: 0 },
+      ),
+    ).toBe(true);
+  });
+
+  it("tracks a real cap sequence end to end", () => {
+    const buffer = new StreamingTextBuffer({ maxChars: 1000, trimToChars: 600 });
+    let progress = { length: buffer.length, droppedChars: buffer.droppedChars };
+
+    buffer.append("a".repeat(999));
+    let next = { length: buffer.length, droppedChars: buffer.droppedChars };
+    expect(shouldResetStreamWindow(progress, next)).toBe(false); // growth
+    progress = next;
+
+    buffer.append("b".repeat(100)); // trips the cap
+    next = { length: buffer.length, droppedChars: buffer.droppedChars };
+    expect(next.length).toBeLessThan(progress.length);
+    expect(next.droppedChars).toBeGreaterThan(0);
+    expect(shouldResetStreamWindow(progress, next)).toBe(false); // cap trim, not a turn
+    progress = next;
+
+    buffer.reset(); // new turn
+    next = { length: buffer.length, droppedChars: buffer.droppedChars };
+    expect(shouldResetStreamWindow(progress, next)).toBe(true);
+  });
+});
+
+describe("formatRetainedResponse", () => {
+  it("passes text through untouched when nothing was trimmed", () => {
+    expect(formatRetainedResponse("hello", 0)).toBe("hello");
+    expect(formatRetainedResponse("hello", -1)).toBe("hello");
+  });
+
+  it("prefixes the retention-cap notice with the trimmed count", () => {
+    const out = formatRetainedResponse("tail text", 500_001);
+    expect(out).toContain("500001");
+    expect(out).toContain("retention cap");
+    expect(out.endsWith("tail text")).toBe(true);
   });
 });
