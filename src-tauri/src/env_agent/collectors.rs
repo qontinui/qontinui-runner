@@ -41,8 +41,11 @@ fn put(section: &mut Section, key: &str, value: impl Into<String>) {
 /// doesn't parse as a URL with a host. NEVER includes path/query/userinfo.
 ///
 /// This is the single choke point that guarantees a DSN password can't leak
-/// into the `services` section.
-fn sanitize_url(raw: &str) -> Option<String> {
+/// into the `services` section — and, since P2b slice 2, the same choke point
+/// the local apply redacts through ([`super::apply_services`]). One
+/// implementation, so the capture and the apply can never disagree about what
+/// counts as secret-free.
+pub(crate) fn sanitize_url(raw: &str) -> Option<String> {
     let mut parsed = url::Url::parse(raw).ok()?;
     // Structurally remove credentials. `set_username`/`set_password` return
     // Err only for cannot-be-a-base URLs (which have no host anyway, filtered
@@ -429,6 +432,22 @@ fn version_of_within(
             Err(_) => return None,
         }
     }
+}
+
+/// Re-run the EXACT probe [`collect_versions`] uses, with an explicit budget.
+///
+/// The `versions` apply (P2b slice 3) verifies its own work by re-probing after
+/// driving a version manager. That verification is only worth anything if it
+/// asks the same question the capture asks — same command, same args, same cwd
+/// resolution — so it goes through this one function rather than a lookalike.
+/// The budget is a parameter because an apply can afford to wait longer than a
+/// 15-minute capture loop can.
+pub(crate) fn probe_tool_version(
+    cmd: &str,
+    cwd: Option<&Path>,
+    budget: Duration,
+) -> Option<String> {
+    version_of_within(cmd, &["--version"], cwd, budget)
 }
 
 /// Pull a `name = "x.y.z"` value out of a `[section]` of a Cargo.toml string.

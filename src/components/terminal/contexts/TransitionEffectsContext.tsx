@@ -11,6 +11,7 @@ import { useTerminalSession } from "./TerminalSessionContext";
 import { useZoneMetadata } from "./useZoneMetadata";
 import { useStateTransitionEffects } from "../useStateTransitionEffects";
 import { useWindowTitle } from "../useWindowTitle";
+import { getTerminalHotStore } from "../terminalHotStore";
 
 type TransitionEffectsReturn = ReturnType<typeof useStateTransitionEffects>;
 
@@ -30,9 +31,17 @@ export function TransitionEffectsProvider({ children }: TransitionEffectsProvide
   // TerminalCore + SessionState pair. `stateTracking` shape is
   // preserved via spread in `useTerminalSession()`'s value-object.
   const session = useTerminalSession();
-  const { tabs, createTerminal, zoneLayout, terminalRefs } = session;
+  const { tabs, createTerminal, zoneLayout, terminalRefs, pageId } = session;
   const stateTracking = session;
   const { labelsAndTags, addHistoryEvent } = useZoneMetadata();
+
+  // Stable lazy reader for the auto-approve branch — see
+  // `UseStateTransitionEffectsParams.getLastOutputLines`.
+  const hotStore = getTerminalHotStore(pageId);
+  const getLastOutputLines = useCallback(
+    (tabId: string) => hotStore.getLastOutputLines(tabId),
+    [hotStore],
+  );
 
   const handleRestartInZoneRef = useRef<(zoneIdx: number) => void>(() => {});
 
@@ -77,7 +86,7 @@ export function TransitionEffectsProvider({ children }: TransitionEffectsProvide
     prevSessionStatesRef: stateTracking.prevSessionStatesRef,
     tabs,
     assignments: zoneLayout.assignments,
-    lastOutputLines: stateTracking.lastOutputLines,
+    getLastOutputLines,
     terminalRefs: terminalRefs.current,
     stateEntryTimeRef: stateTracking.stateEntryTimeRef,
     stateTimeAccumRef: stateTracking.stateTimeAccum,

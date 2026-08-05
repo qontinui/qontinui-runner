@@ -25,6 +25,7 @@ import {
 } from "lucide-react";
 import { useAiSession } from "@/hooks/useAiSession";
 import { MarkdownViewer } from "@/components/MarkdownViewer";
+import { StreamingMessageView } from "@/components/shared/StreamingMessageView";
 import {
   SPEC_CREATION_INSTRUCTIONS,
   buildDetailedSpecContext,
@@ -42,6 +43,8 @@ function MessageBubble({
   role,
   content,
   specActions,
+  streaming = false,
+  droppedChars = 0,
 }: {
   role: "user" | "ai" | "system";
   content: string;
@@ -51,6 +54,14 @@ function MessageBubble({
     specId?: string | null;
     onApply: () => void;
   }>;
+  /**
+   * Render the body as a bounded plain-text tail instead of markdown. Used for
+   * the in-flight response, where a full markdown re-parse per streamed line is
+   * O(n²) (plan 2026-07-28 §A5a/A5b).
+   */
+  streaming?: boolean;
+  /** Characters dropped by the streaming retention cap, if any. */
+  droppedChars?: number;
 }) {
   if (role === "system") {
     return (
@@ -84,7 +95,16 @@ function MessageBubble({
             : "bg-white/[0.03] border border-white/5 text-foreground"
         }`}
       >
-        <MarkdownViewer content={content} />
+        {streaming ? (
+          <StreamingMessageView
+            content={content}
+            droppedChars={droppedChars}
+            caretClassName="bg-purple-400"
+            showCaret
+          />
+        ) : (
+          <MarkdownViewer content={content} />
+        )}
         {specActions && specActions.length > 0 && (
           <div className="mt-2 pt-2 border-t border-white/5 space-y-1">
             {specActions.map((action) => (
@@ -269,6 +289,7 @@ function extractSpecJsonFromMessage(
 function ChatMessageList({
   messages,
   streamingContent,
+  streamingDroppedChars,
   toolActivity,
   targetSpecId,
   onAddSpec,
@@ -276,6 +297,7 @@ function ChatMessageList({
 }: {
   messages: Array<{ role: "user" | "ai" | "system"; content: string }>;
   streamingContent: string | null;
+  streamingDroppedChars: number;
   toolActivity: string | null;
   targetSpecId: string | null;
   onAddSpec?: (spec: LoadedSpec) => void;
@@ -321,7 +343,14 @@ function ChatMessageList({
         );
       })}
 
-      {streamingContent && <MessageBubble role="ai" content={streamingContent} />}
+      {streamingContent && (
+        <MessageBubble
+          role="ai"
+          content={streamingContent}
+          streaming
+          droppedChars={streamingDroppedChars}
+        />
+      )}
 
       {toolActivity && (
         <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground/50 pl-7">
@@ -997,6 +1026,7 @@ Description: ${selectedSpec.config.description || ""}`;
         <ChatMessageList
           messages={session.messages}
           streamingContent={session.streamingContent}
+          streamingDroppedChars={session.streamingDroppedChars}
           toolActivity={session.toolActivity}
           targetSpecId={targetSpecId}
           onAddSpec={onAddSpec}

@@ -470,8 +470,12 @@ impl EventBroadcaster {
             return Err(format!("Failed to emit {} to Tauri: {}", event_name, e));
         }
 
-        // 2. Broadcast to WebSocket clients
+        // 2. Broadcast to WebSocket clients (skip the wrapper when nobody is
+        //    subscribed — `send` would be a no-op `Err` anyway).
         if let Some(broadcast_tx) = self.get_broadcast_channel() {
+            if broadcast_tx.receiver_count() == 0 {
+                return Ok(());
+            }
             let ws_event = serde_json::json!({
                 "channel": event_name,
                 "payload": payload
@@ -501,12 +505,37 @@ impl EventBroadcaster {
 /// `app_handle.emit()` and just need to also notify WebSocket clients.
 /// The frontend uses these notifications as triggers to refetch data via REST,
 /// so the payload content is less important than the channel name.
+/// Does anything currently subscribe to the WebSocket event channel?
+///
+/// Hot-path guard: with no WS client attached (the common desktop case — the
+/// channel exists for the mobile/remote relay) every `broadcast_ws_notification`
+/// call still built a fresh `json!` wrapper and, at the call sites, a full
+/// `serde_json::to_value` of the event first. Callers that pay a real
+/// serialization cost to construct `payload` should check this BEFORE building
+/// it; `broadcast_ws_notification` itself checks again so the wrapper is never
+/// built for nobody.
+///
+/// Returns `false` when the app state is unavailable — there is no channel to
+/// send on in that case either.
+pub fn ws_notification_has_receivers(app_handle: &AppHandle) -> bool {
+    app_handle
+        .try_state::<Arc<AppState>>()
+        .map(|state| state.event_broadcast.receiver_count() > 0)
+        .unwrap_or(false)
+}
+
 pub fn broadcast_ws_notification(
     app_handle: &AppHandle,
     channel: &str,
     payload: &serde_json::Value,
 ) {
     if let Some(state) = app_handle.try_state::<Arc<AppState>>() {
+        // Nobody is listening — skip building the wrapper entirely. `send` on
+        // a receiver-less broadcast channel is a no-op that returns `Err`, so
+        // this changes no observable behavior.
+        if state.event_broadcast.receiver_count() == 0 {
+            return;
+        }
         let ws_event = serde_json::json!({
             "channel": channel,
             "payload": payload

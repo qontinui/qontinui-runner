@@ -3582,7 +3582,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             dom_capture::DomCaptureLogger::clear_captures();
             // Clear logging.rs-managed files that FileLogger doesn't cover
             let dev_logs = crate::paths::get_dev_logs_dir();
-            for filename in ["runner-render.jsonl", "ai-output.jsonl"] {
+            // `ai-output.jsonl.1` is the rotation sidecar — readers now consume
+            // it, so a startup clear that skipped it would both leave up to
+            // 50 MB unreclaimed and resurrect the previous session's output.
+            for filename in [
+                "runner-render.jsonl",
+                "ai-output.jsonl",
+                "ai-output.jsonl.1",
+            ] {
                 let path = dev_logs.join(filename);
                 if path.exists() {
                     if let Err(e) = std::fs::remove_file(&path) {
@@ -4779,6 +4786,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                          {}s of the close handler returning — exiting process",
                         FORCE_EXIT_GRACE_SECS
                     );
+                    // `process::exit` never runs `RunEvent::Exit`, so drain the
+                    // AI-output writer here too — this path is exactly the one
+                    // whose tail explains the stall.
+                    commands::logging::flush_ai_output_log();
                     std::process::exit(0);
                 });
             }
@@ -4787,6 +4798,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Tauri application built successfully");
     app.run(|_, event| {
+        // The AI-output log is written by a background thread whose sender is a
+        // process-lifetime static, so nothing else ever drains it: without this
+        // barrier a quit mid-burst silently loses the queued tail — precisely
+        // the lines needed to explain why the session ended.
+        if let tauri::RunEvent::Exit = event {
+            commands::logging::flush_ai_output_log();
+            return;
+        }
         if let tauri::RunEvent::ExitRequested { api, .. } = event {
             // Dead-webview recovery (plan
             // 2026-08-01-runner-dead-webview-is-invisible-to-health, Phase 2)

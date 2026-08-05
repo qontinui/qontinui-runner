@@ -51,10 +51,13 @@ interface WindowAssignmentsValue {
   assignments: SessionOwnerMap;
   /** Owning window of a session, defaulting to "main". */
   ownerOf: (sessionId: string) => string;
-  /** Whether a session is owned by THIS window. */
-  isOwned: (sessionId: string) => boolean;
-  /** The window hosting a whole detached page, or null when the page is docked. */
-  windowForPage: (pageId: string) => string | null;
+  /**
+   * Whether THIS window owns `sessionId` — i.e. is the window that renders it
+   * and therefore the one that forwards its stdin. Pass the session's `pageId`
+   * so a page detached into a pop-out claims all of its tabs; omitting it
+   * yields the legacy owner-map-only answer.
+   */
+  isOwned: (sessionId: string, pageId?: string | null) => boolean;
   /** The page THIS window is bound to (pop-out-page windows only), else null. */
   boundPage: string | null;
 }
@@ -81,13 +84,70 @@ interface WindowAssignmentsSnapshot {
   windows?: Record<string, WindowRecordLite>;
 }
 
-/** Derive the `pageId → windowLabel` map from the window registry. */
-function bindingsFromWindows(windows: Record<string, WindowRecordLite>): Record<string, string> {
+/**
+ * Derive the `pageId → windowLabel` map from the window registry.
+ *
+ * Exported for unit tests: the runner's vitest environment is "node" (no DOM),
+ * so the provider itself cannot be rendered — the tests exercise this and
+ * `isOwnedBy` against a `get_window_assignments` snapshot instead.
+ */
+export function bindingsFromWindows(
+  windows: Record<string, WindowRecordLite>,
+): Record<string, string> {
   const map: Record<string, string> = {};
   for (const rec of Object.values(windows)) {
     if (rec.bound_page) map[rec.bound_page] = rec.label;
   }
   return map;
+}
+
+/** Owning window of a session, defaulting to "main". Pure form of `ownerOf`. */
+export function ownerOfSession(assignments: SessionOwnerMap, sessionId: string): string {
+  return assignments[sessionId] ?? MAIN_WINDOW_LABEL;
+}
+
+/**
+ * Pure form of `isOwned` — whether the window labelled `windowLabel` owns
+ * `sessionId`, i.e. is the window that renders it and therefore the one that
+ * forwards its stdin.
+ *
+ * Precedence mirrors the tab filter in `PageSessionScope` EXACTLY: a page
+ * detached into a pop-out claims all of its tabs by `pageId`, so the binding
+ * wins; only an unbound page falls back to the per-terminal owner map. Callers
+ * that omit `pageId` get the legacy owner-map-only answer.
+ *
+ * Qualifying by `pageId` (rather than "this window is page-bound, so it owns
+ * everything") is load-bearing: for any single consistent snapshot exactly one
+ * window answers `true`, so a keystroke is never double-sent. (Across windows,
+ * snapshots refresh independently — on mount and on `window-opened` /
+ * `window-closed` — so during that brief skew two windows can both answer
+ * `true`. Harmless for keystrokes, since OS focus is exclusive; it predates
+ * this predicate and is not introduced by it.)
+ */
+export function isOwnedBy(
+  windowLabel: string,
+  assignments: SessionOwnerMap,
+  pageBindings: Record<string, string>,
+  sessionId: string,
+  pageId?: string | null,
+): boolean {
+  const boundTo = pageId ? (pageBindings[pageId] ?? null) : null;
+  if (boundTo) return boundTo === windowLabel;
+  return ownerOfSession(assignments, sessionId) === windowLabel;
+}
+
+/**
+ * The tabs a window renders: exactly those it owns, by the SAME predicate that
+ * gates their stdin. Extracted so the renderer half of "one predicate, one
+ * precedence" is unit-testable — dropping `pageId` here makes a page-bound
+ * pop-out render nothing at all, and that must fail a test, not ship.
+ */
+export function ownedTabs<T extends { id: string }>(
+  tabs: readonly T[],
+  isOwned: (sessionId: string, pageId?: string | null) => boolean,
+  pageId: string,
+): T[] {
+  return tabs.filter((t) => isOwned(t.id, pageId));
 }
 
 export function WindowAssignmentsProvider({ children }: { children: ReactNode }) {
@@ -140,7 +200,7 @@ export function WindowAssignmentsProvider({ children }: { children: ReactNode })
     );
 
     // A window opening/closing changes the page-binding map — re-pull the
-    // registry so `windowForPage` (and the mirror) stay current in EVERY window.
+    // registry so the page bindings (and the mirror) stay current in EVERY window.
     const unlistenOpened = listen("window-opened", () => {
       if (mounted) void refresh();
     });
@@ -157,18 +217,23 @@ export function WindowAssignmentsProvider({ children }: { children: ReactNode })
   }, []);
 
   const ownerOf = useCallback(
-    (sessionId: string): string => assignments[sessionId] ?? MAIN_WINDOW_LABEL,
+    (sessionId: string): string => ownerOfSession(assignments, sessionId),
     [assignments],
   );
 
+  /**
+   * Whether THIS window owns `sessionId` — i.e. is the window that renders it
+   * and therefore the one that forwards its stdin.
+   *
+   * Precedence mirrors the tab filter in `PageSessionScope` EXACTLY: a page
+   * detached into a pop-out claims all of its tabs by `pageId`, so the binding
+   * wins; only an unbound page falls back to the per-terminal owner map.
+   * Callers that omit `pageId` get the legacy owner-map-only answer.
+   */
   const isOwned = useCallback(
-    (sessionId: string): boolean => ownerOf(sessionId) === windowLabel,
-    [ownerOf, windowLabel],
-  );
-
-  const windowForPage = useCallback(
-    (pageId: string): string | null => pageBindings[pageId] ?? null,
-    [pageBindings],
+    (sessionId: string, pageId?: string | null): boolean =>
+      isOwnedBy(windowLabel, assignments, pageBindings, sessionId, pageId),
+    [windowLabel, assignments, pageBindings],
   );
 
   const boundPage = useMemo<string | null>(() => {
@@ -179,8 +244,8 @@ export function WindowAssignmentsProvider({ children }: { children: ReactNode })
   }, [pageBindings, windowLabel]);
 
   const value = useMemo<WindowAssignmentsValue>(
-    () => ({ windowLabel, assignments, ownerOf, isOwned, windowForPage, boundPage }),
-    [windowLabel, assignments, ownerOf, isOwned, windowForPage, boundPage],
+    () => ({ windowLabel, assignments, ownerOf, isOwned, boundPage }),
+    [windowLabel, assignments, ownerOf, isOwned, boundPage],
   );
 
   return (
@@ -201,7 +266,6 @@ export function useWindowAssignments(): WindowAssignmentsValue {
       assignments: {},
       ownerOf: () => MAIN_WINDOW_LABEL,
       isOwned: () => true,
-      windowForPage: () => null,
       boundPage: null,
     }),
     [],

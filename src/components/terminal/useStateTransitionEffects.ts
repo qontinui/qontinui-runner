@@ -8,7 +8,15 @@ export interface UseStateTransitionEffectsParams {
   prevSessionStatesRef: React.MutableRefObject<Record<string, SessionState>>;
   tabs: Array<{ id: string; title: string; exitCode?: number | null }>;
   assignments: Record<number, string>;
-  lastOutputLines: Record<string, string[]>;
+  /**
+   * Lazy reader for a tab's last rendered lines. A stable function (backed by
+   * the page's terminal hot store) rather than the whole map: the auto-approve
+   * branch only reads lines at the instant a tab transitions to
+   * `needs-input`, so taking the map as a dependency re-ran this entire effect
+   * on every output frame for nothing (plan
+   * `2026-07-28-runner-many-sessions-performance` §0 A1).
+   */
+  getLastOutputLines: (tabId: string) => string[];
   terminalRefs: Map<string, React.RefObject<{ writeToTerminal: (data: string) => void } | null>>;
   stateEntryTimeRef: React.MutableRefObject<Record<string, number>>;
   stateTimeAccumRef: React.MutableRefObject<Record<SessionState, number>>;
@@ -45,7 +53,7 @@ export function useStateTransitionEffects(
     prevSessionStatesRef,
     tabs,
     assignments,
-    lastOutputLines,
+    getLastOutputLines,
     terminalRefs,
     stateEntryTimeRef,
     stateTimeAccumRef,
@@ -228,7 +236,7 @@ export function useStateTransitionEffects(
     // Auto-approve: check last output lines against patterns
     if (newFlashing.length > 0 && autoApprovePatterns.length > 0) {
       for (const tabId of newFlashing) {
-        const lines = lastOutputLines[tabId] ?? [];
+        const lines = getLastOutputLines(tabId);
         const lastFew = lines.slice(-5).join("\n");
         const matched = autoApprovePatterns.some((pattern) => {
           try {
@@ -330,7 +338,7 @@ export function useStateTransitionEffects(
     desktopNotify,
     assignments,
     autoApprovePatterns,
-    lastOutputLines,
+    getLastOutputLines,
     tabs,
     addHistoryEvent,
     autoRestart,

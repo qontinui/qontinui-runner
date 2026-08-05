@@ -1,7 +1,7 @@
 //! Pre-GUI CLI mode for the runner binary + the standalone `qontinui_profile`.
 //!
-//! The `env enroll` / `env capture` / `env pull` / `env show` / `env scope-root`
-//! subcommands are shared between:
+//! The `env enroll` / `env capture` / `env pull` / `env apply` / `env show` /
+//! `env scope-root` subcommands are shared between:
 //! - the standalone `bin/qontinui_profile.rs` (its `Cmd::Env` arm delegates to
 //!   [`run_env`]), and
 //! - the **main runner binary** — `main.rs` calls [`try_run_cli`] at the very top
@@ -26,8 +26,9 @@ use crate::env_agent::enroll::{self, EnrollParams};
 /// The `env` subcommand tree — the machine-side dev-environment capture agent.
 /// `enroll` binds this machine to a web environment via a per-machine API key;
 /// `capture` pushes a secret-free config envelope; `pull` previews what would
-/// change here to match the canonical machine; `show` prints enrollment state;
-/// `scope-root` declares which directory the toolchain probes measure.
+/// change here to match the canonical machine; `apply` reconciles this box
+/// toward it (dry-run by default); `show` prints enrollment state; `scope-root`
+/// declares which directory the toolchain probes measure.
 #[derive(Subcommand, Debug)]
 pub enum EnvCmd {
     /// Enroll this machine into a web environment via an enrollment code.
@@ -60,6 +61,33 @@ pub enum EnvCmd {
     /// the decision to apply is taken locally, later.
     Pull {
         /// Emit the plan as JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reconcile THIS machine toward the environment's canonical config.
+    ///
+    /// The decision is local: nothing is ever pushed onto a box from the
+    /// server. Dry-run by default — it prints exactly what it would write and
+    /// changes nothing until `--confirm` is given.
+    ///
+    /// Only sections the server marks `applyable` are eligible, and within them
+    /// only a fixed key set per section, so a backend that grows a section can
+    /// never widen what this runner writes.
+    Apply {
+        /// Actually write the changes. Without it this is a preview.
+        #[arg(long)]
+        confirm: bool,
+        /// Restrict the apply to these sections (repeatable). Default: every
+        /// section this runner supports.
+        #[arg(long = "section")]
+        sections: Vec<String>,
+        /// Target profile in `~/.qontinui/profiles.json` for the `services`
+        /// apply. Defaults to the active profile (`QONTINUI_ENV` → the file's
+        /// `active` → `dev`) — the same one the capture read, which is what
+        /// makes the drift actually clear.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Emit the report as JSON instead of human-readable text.
         #[arg(long)]
         json: bool,
     },
@@ -100,6 +128,12 @@ pub fn run_env(cmd: EnvCmd) -> u8 {
         } => cmd_env_enroll(&code, backend.as_deref(), environment.as_deref()),
         EnvCmd::Capture { dry_run } => cmd_env_capture(dry_run),
         EnvCmd::Pull { json } => cmd_env_pull(json),
+        EnvCmd::Apply {
+            confirm,
+            sections,
+            profile,
+            json,
+        } => cmd_env_apply(confirm, sections, profile, json),
         EnvCmd::Show => cmd_env_show(),
         EnvCmd::ScopeRoot { path, clear } => cmd_env_scope_root(path.as_deref(), clear),
     }
@@ -305,6 +339,59 @@ fn cmd_env_pull(as_json: bool) -> u8 {
                 }
             } else {
                 print!("{}", crate::env_agent::pull::render_plan(&plan));
+                0
+            }
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            1
+        }
+    }
+}
+
+/// `env apply` — pull canonical, then reconcile THIS box toward it.
+///
+/// Dry-run by default. `--confirm` is the local confirm the plan's P2b bullet
+/// requires: the box that owns the box decides, and it decides explicitly.
+///
+/// Exit code 0 covers both a dry run and a successful apply; a section this
+/// runner could not apply is reported in the body (with its reason) rather than
+/// failing the command, since one blocked section must not hide another
+/// section's successful reconcile.
+fn cmd_env_apply(
+    confirm: bool,
+    sections: Vec<String>,
+    profile: Option<String>,
+    as_json: bool,
+) -> u8 {
+    // Same PG-pool publish as capture/pull — without it the `db_schema`
+    // collector yields nothing and that section would wrongly look clean.
+    let active = crate::profiles::load();
+    if let Err(e) = crate::env_agent::publish_pg_pool_from_url(&active.database_url) {
+        eprintln!("note: db_schema collector unavailable — {e}");
+    }
+
+    let opts = crate::env_agent::apply::ApplyOptions {
+        confirm,
+        sections,
+        profile,
+    };
+    match crate::env_agent::apply::apply_blocking(&opts) {
+        Ok(report) => {
+            if as_json {
+                let v = crate::env_agent::apply::report_to_json(&report);
+                match serde_json::to_string_pretty(&v) {
+                    Ok(s) => {
+                        println!("{s}");
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("error: serialize report failed: {e}");
+                        2
+                    }
+                }
+            } else {
+                print!("{}", crate::env_agent::apply::render_report(&report));
                 0
             }
         }

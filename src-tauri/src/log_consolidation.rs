@@ -116,28 +116,38 @@ pub fn consolidate_ai_output(
     let dev_logs_dir = get_dev_logs_dir();
     let file_path = dev_logs_dir.join("ai-output.jsonl");
 
-    if !file_path.exists() {
+    use std::io::BufRead;
+
+    // Read BOTH generations, oldest first: rotation renames the live file aside
+    // to `ai-output.jsonl.1`, so opening only the live path returns
+    // (near-)nothing for history that is still on disk.
+    let read_set = crate::commands::logging::rotated_log_read_set(&file_path);
+    if read_set.is_empty() {
         return Ok(ConsolidatedAiOutput {
             chunks: vec![],
             total_entries: 0,
         });
     }
 
-    // Read and filter entries line-by-line to avoid loading entire file into memory
-    let file =
-        fs::File::open(&file_path).map_err(|e| format!("Failed to open ai-output.jsonl: {}", e))?;
-    let reader = std::io::BufReader::new(file);
+    // Read and filter entries line-by-line to avoid loading entire file into
+    // memory — the generations are chained lazily, not concatenated.
+    let mut lines_iter: Box<dyn Iterator<Item = std::io::Result<String>>> =
+        Box::new(std::iter::empty());
+    for part in &read_set {
+        let file = fs::File::open(part)
+            .map_err(|e| format!("Failed to open {}: {}", part.display(), e))?;
+        lines_iter = Box::new(lines_iter.chain(std::io::BufReader::new(file).lines()));
+    }
 
     let end = end_time.unwrap_or_else(Utc::now);
 
     // Parse entries with timestamp and source
-    use std::io::BufRead;
     let mut entries: Vec<ParsedEntry> = Vec::new();
     let mut failed_reads = 0usize;
     let mut failed_json_parses = 0usize;
     let mut failed_entry_parses = 0usize;
 
-    for line_result in reader.lines() {
+    for line_result in lines_iter {
         let line = match line_result {
             Ok(l) => l,
             Err(_) => {

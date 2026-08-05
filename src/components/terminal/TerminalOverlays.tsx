@@ -8,6 +8,42 @@ import {
   useTransitionEffects,
   useUIStateCx,
 } from "./contexts";
+import { useHotField } from "./useTerminalHotStore";
+
+/**
+ * Live two-zone output diff.
+ *
+ * Split into its own component so the `lastOutputLines` subscription is only
+ * mounted while the operator actually has the compare overlay open —
+ * subscribing in `TerminalOverlays` itself would re-render the overlay layer
+ * on every terminal output frame for nothing (plan Phase 1).
+ */
+function ZoneCompareOverlay({
+  pageId,
+  leftLabel,
+  rightLabel,
+  leftTabId,
+  rightTabId,
+  onClose,
+}: {
+  pageId: string;
+  leftLabel: string;
+  rightLabel: string;
+  leftTabId: string | undefined;
+  rightTabId: string | undefined;
+  onClose: () => void;
+}) {
+  const lastOutputLines = useHotField(pageId, "lastOutputLines");
+  return (
+    <ZoneDiffOverlay
+      leftLabel={leftLabel}
+      rightLabel={rightLabel}
+      leftLines={leftTabId ? (lastOutputLines[leftTabId] ?? []) : []}
+      rightLines={rightTabId ? (lastOutputLines[rightTabId] ?? []) : []}
+      onClose={onClose}
+    />
+  );
+}
 
 interface TerminalOverlaysProps {
   /** Callbacks from useZoneActions — kept as props until that hook moves to context */
@@ -19,7 +55,7 @@ const noop = () => {};
 export function TerminalOverlays({ onSortZones = noop, onExport = noop }: TerminalOverlaysProps) {
   const session = useTerminalSession();
   const { tabs, zoneLayout, terminalRefs } = session;
-  const { sessionStates, lastOutputLines, snapshots } = session;
+  const { sessionStates, snapshots, pageId } = session;
   const { labelsAndTags, incrementMetric, addHistoryEvent } = useZoneMetadata();
   const transitionEffects = useTransitionEffects();
   const { state: uiState, dispatch, toggleFocusMode } = useUIStateCx();
@@ -66,11 +102,12 @@ export function TerminalOverlays({ onSortZones = noop, onExport = noop }: Termin
           const tab1 = tabs.find((t) => t.id === zoneLayout.assignments[z1]);
           const tab2 = tabs.find((t) => t.id === zoneLayout.assignments[z2]);
           return (
-            <ZoneDiffOverlay
+            <ZoneCompareOverlay
+              pageId={pageId}
               leftLabel={`Zone ${z1 + 1}: ${tab1?.title ?? "empty"}`}
               rightLabel={`Zone ${z2 + 1}: ${tab2?.title ?? "empty"}`}
-              leftLines={tab1 ? (lastOutputLines[tab1.id] ?? []) : []}
-              rightLines={tab2 ? (lastOutputLines[tab2.id] ?? []) : []}
+              leftTabId={tab1?.id}
+              rightTabId={tab2?.id}
               onClose={() => snapshots.setDiffZones(null)}
             />
           );
