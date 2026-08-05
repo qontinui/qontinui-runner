@@ -93,11 +93,12 @@ describe("R1: every MainTabId has a renderer", () => {
 });
 
 describe("the landing tab", () => {
-  it("is the Terminal", () => {
-    // The runner is Terminal-first: the Home prompt page composes a
-    // verification-agentic loop workflow and now lives behind the "advanced"
-    // disclosure, so a cold start must not land there.
-    expect(DEFAULT_TAB_ID).toBe("terminal");
+  it("is Projects", () => {
+    // A cold start answers "what am I building and what state is it in" before
+    // it asks the user for a directory. It must also not land on the Home
+    // prompt page, which composes a verification-agentic loop workflow and
+    // lives behind the "advanced" disclosure.
+    expect(DEFAULT_TAB_ID).toBe("projects");
     expect(isValidTabId(DEFAULT_TAB_ID)).toBe(true);
   });
 
@@ -106,22 +107,28 @@ describe("the landing tab", () => {
     expect(migrateTabId("a-tab-that-never-existed")).toBe(DEFAULT_TAB_ID);
   });
 
-  it("does not swallow a legacy alias that migrates TO the landing tab", () => {
+  it("is distinguished from a legacy alias, not inferred from equality with it", () => {
     // The regression this locks: Sidebar.selectTab used to infer "unknown id"
-    // from `migrateTabId` returning the fallback. `run-plan` is a real legacy
-    // alias whose target IS the landing tab, so that inference would classify
-    // a legitimate click as unknown and silently drop it. `resolveExternalTabId`
-    // — which the sidebar now uses — distinguishes the two by returning null
-    // only for genuinely unknown ids.
-    expect(migrateTabId("run-plan")).toBe(DEFAULT_TAB_ID);
-    expect(resolveExternalTabId("run-plan")).toBe(DEFAULT_TAB_ID);
+    // from `migrateTabId` returning the fallback — which misclassifies any
+    // legacy alias whose target IS the landing tab as unknown and silently
+    // drops a legitimate click. `resolveExternalTabId` — which the sidebar now
+    // uses — distinguishes the two by returning null only for genuinely
+    // unknown ids.
+    //
+    // No live alias currently targets the landing tab (`run-plan` -> `terminal`
+    // did while `terminal` was the default; that coincidence lapsed when the
+    // default became `projects`). So assert the property directly rather than
+    // through whichever alias happens to collide: a real alias resolves to its
+    // own target, and only an unknown id is null.
+    expect(migrateTabId("run-plan")).toBe("terminal");
+    expect(resolveExternalTabId("run-plan")).toBe("terminal");
+    expect(resolveExternalTabId(DEFAULT_TAB_ID)).toBe(DEFAULT_TAB_ID);
     expect(resolveExternalTabId("a-tab-that-never-existed")).toBeNull();
   });
 });
 
 describe("R3: external tab ids are resolved, never cast", () => {
   it("accepts a live tab id verbatim", () => {
-    expect(resolveExternalTabId("memory-federation")).toBe("memory-federation");
     expect(resolveExternalTabId("settings-notifications")).toBe("settings-notifications");
     // A live id wins over its legacy-alias entry: an external caller asking for
     // `check-builder` means the Check Builder page, not the alias target.

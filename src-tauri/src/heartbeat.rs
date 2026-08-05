@@ -184,12 +184,55 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
             // round-trip (the bounded PG liveness probe lives only in the
             // `/health` handler), so it passes unknown rather than probing on
             // every tick.
+            //
+            // `ui_dead` is a REAL value here, not `None`. A dead WebView2 host
+            // is invisible to `ui_error` (the React error boundary cannot run)
+            // and to `recent_crash` (the dump scan is startup-only), and
+            // nothing polls `/health` on an end user's machine — this
+            // heartbeat is one of only two paths by which the failure is ever
+            // visible off-box. That is why `ui_bridge_last_pong` lives on
+            // `AppState`: this loop only ever holds an `Arc<AppState>`.
+            let ui_dead = crate::ui_error::ui_dead_now(&app_state.ui_bridge_last_pong);
             let base_status = crate::ui_error::compute_derived_status(
                 ui_error_snapshot.is_some(),
                 recent_crash_snapshot.is_some(),
+                Some(ui_dead),
                 crate::mcp_api::embedding_reachable_cached(),
                 None,
             );
+
+            // Phase 1b backstop → Phase 2 recovery. The `ProcessFailed` event
+            // is the precise, immediate detector, but it only fires where a
+            // WebView2 process actually died and the handler actually
+            // attached: not on macOS/Linux, and not if the subscription
+            // failed. This tick is the cross-platform net that catches a UI
+            // which stopped answering for any other reason (wedged renderer,
+            // hung main thread) — the failure the event cannot see.
+            //
+            // Spawned rather than awaited: `trigger_ui_recovery` sleeps
+            // through its backoff, and the heartbeat must keep publishing
+            // `derived_status: "errored"` to the fleet WHILE recovery is being
+            // attempted. Re-entry is safe and cheap — `RECOVERY_IN_PROGRESS`
+            // makes a second call a no-op, and the loop guard owns the attempt
+            // budget — so firing this on every stale tick costs nothing.
+            if ui_dead {
+                if let Some(handle) = crate::tauri_app_handle::current() {
+                    tokio::spawn(async move {
+                        let outcome = crate::webview_recovery::trigger_ui_recovery(
+                            &handle,
+                            crate::webview_recovery::RecoveryReason::HeartbeatStale,
+                        )
+                        .await;
+                        debug!(
+                            outcome = outcome.as_str(),
+                            "heartbeat staleness backstop: UI recovery attempt finished"
+                        );
+                    });
+                }
+                // No `AppHandle` yet means no Tauri runtime (still starting, or
+                // a unit-test context). Nothing to recover, so drop it silently
+                // — the same contract `tauri_app_handle::current()` documents.
+            }
 
             // Phase 5 — provisioning completeness gate. A runner is
             // provisioning-complete only once it holds a live coord device JWT

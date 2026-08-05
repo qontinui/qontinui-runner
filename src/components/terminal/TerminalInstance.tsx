@@ -1,9 +1,15 @@
-import { useEffect, useRef, useState, useCallback, forwardRef, useImperativeHandle } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  useCallback,
+  forwardRef,
+  memo,
+  useImperativeHandle,
+} from "react";
 import { FilePathLinkProvider } from "./FilePathLinkProvider";
 import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useUIBridgeOptional } from "@qontinui/ui-bridge";
-import type { TerminalOutputEvent, TerminalExitEvent } from "@qontinui/shared-types/tauri-events";
 import { createTerminalBackend } from "./backends";
 import type { BackendType, ITerminalBackend, TerminalSearchResults } from "./backends";
 import { TerminalFindBar } from "./TerminalFindBar";
@@ -20,20 +26,21 @@ import {
   isEmissionGap,
   resyncSliceStart,
   drainHeldChunks,
+  lostWindowBytes,
+  formatLostOutputMarker,
+  RESYNC_INCOMPLETE_MARKER,
   type OffsetChunk,
 } from "./scrollbackReplay";
 import { RenderAckAccumulator, ACK_FLOOR_INTERVAL_MS } from "./flowControl";
 import { useWindowAssignments } from "./contexts/WindowAssignmentsContext";
-
-/**
- * The runner's reader thread stamps each `terminal-output` event with the
- * chunk's absolute byte offset in the session's output stream (a runner-local
- * extension — the shared `TerminalOutputEvent` schema is deny_unknown_fields,
- * so the field rides outside it). Used to dedup the scrollback-ring replay
- * against live chunks; `undefined` (older runner build) degrades to the
- * pre-replay write-everything behavior.
- */
-type TerminalOutputPayload = TerminalOutputEvent & { offset?: number };
+import {
+  registerTerminalOutputHandler,
+  registerTerminalExitHandler,
+  type TerminalOutputPayload,
+} from "./terminalEventDemux";
+import { retainRenderConsumer } from "./terminalRenderConsumers";
+import { PaneVisibilityService, routeOutputChunk } from "./paneVisibilityService";
+import { setWebglSlotVisible } from "./backends/webglContextLru";
 
 export interface TerminalInstanceHandle {
   getSelection: () => string;
@@ -61,6 +68,18 @@ export type ShellIntegrationEvent =
 interface TerminalInstanceProps {
   terminalId: string;
   visible: boolean;
+  /**
+   * The terminal page this instance belongs to. Feeds the stdin ownership
+   * gate: a page-bound pop-out window claims stdin for ALL of its page's tabs,
+   * including the ones that carry no `session_owner` entry (e.g. every tab
+   * after a restart, where the owner map is deliberately cleared).
+   *
+   * REQUIRED on purpose. A mount site that forgets it renders a terminal that
+   * is permanently stdin-dead in a page-bound pop-out — and nothing goes red,
+   * which is exactly the bug this prop exists to fix. Keeping it required puts
+   * that guarantee in `tsc` instead of in a test that scans source text.
+   */
+  pageId: string;
   /** Which terminal backend to use. Defaults to "xterm". */
   backendType?: BackendType;
   /** True when this instance is reconnecting to an existing Rust PTY session. */
@@ -163,11 +182,40 @@ const TERMINAL_OPTIONS = {
  */
 const DEAD_TERMINAL_SCROLLBACK = 2000;
 
-export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInstanceProps>(
-  function TerminalInstanceInner(
+/**
+ * Title-poll cadence for a pane in the hidden ("quiet") visibility tier.
+ *
+ * Half the rate of the ~1 Hz poll a visible pane rides on its ack timer: the
+ * operator cannot read a hidden pane's output, but its tab title still labels
+ * it in the tab strip / unzoned chips / compact zone cards, so the title must
+ * stay fresh. Two seconds matches the freshness bar the plan sets for the
+ * other mount-independent signals (state chips, sparklines).
+ */
+const QUIET_TITLE_POLL_INTERVAL_MS = 2000;
+
+/**
+ * Ring-refetch attempts one `resyncFromRing` pass makes before giving up and
+ * marking the pane spliced. Each attempt costs one `terminal_get_scrollback`
+ * IPC; the loop only re-runs when the previous window fell short (a hole the
+ * fetch did not cover, or bytes dropped while it was in flight), so the common
+ * case is exactly one.
+ */
+const RESYNC_MAX_ATTEMPTS = 5;
+
+/**
+ * `memo(forwardRef(...))` (plan `2026-07-28-runner-many-sessions-performance`
+ * Phase 1). The xterm host is the single most expensive node in the zone tree
+ * and it re-rendered on every parent render — a state-duration tick, a
+ * sparkline update, any context churn. Its props are stabilized at the ZoneGrid
+ * call site (`instanceHandlers`), so the memo genuinely holds and the only
+ * re-renders left are real prop changes (visibility, reconnect state).
+ */
+const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanceProps>(
+  function TerminalInstanceRender(
     {
       terminalId,
       visible,
+      pageId,
       backendType: backendTypeProp,
       isReconnecting,
       onReconnected,
@@ -214,9 +262,13 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
     // (output still double-renders identically — benign). Kept in a ref so the
     // long-lived onData/onBinary closures read the freshest value. Defaults to
     // owned (true) in the single-window / no-provider case.
+    //
+    // `pageId` is passed so the gate asks the SAME question the renderer asks:
+    // a page-bound pop-out owns every tab of its page, including tabs with no
+    // `session_owner` entry. Without it those tabs render but never type.
     const { isOwned } = useWindowAssignments();
     const isOwnedRef = useRef(true);
-    isOwnedRef.current = isOwned(terminalId);
+    isOwnedRef.current = isOwned(terminalId, pageId);
     /**
      * Most-recently reported title — guards `onTitleChange` against firing on
      * every title poll (~1s ack-timer cadence) when the title is unchanged.
@@ -228,6 +280,16 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
     // pixel deltas (trackpads) accumulate here so slow scrolling advances
     // smoothly instead of snapping a whole line per tick. See `wheelScroll.ts`.
     const wheelScrollAccumRef = useRef(0);
+    /**
+     * Visibility tier for this pane (Phase 2 / A4). Owned by the init effect
+     * (it drives that effect's timers, observer and output routing) and read
+     * by the `visible`-prop effect below, which must NOT re-run the init
+     * effect — remounting a terminal on every maximize/compact toggle would
+     * cost far more than the throttling saves.
+     */
+    const paneServiceRef = useRef<PaneVisibilityService | null>(null);
+    const visibleRef = useRef(visible);
+    visibleRef.current = visible;
 
     // ── Find-in-terminal (VS Code Ctrl+F parity) ─────────────────────────
     // State drives the TerminalFindBar overlay; the refs mirror it so the
@@ -362,10 +424,12 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
 
       let disposed = false;
       const disposables: Array<{ dispose(): void }> = [];
-      let outputUnsub: UnlistenFn | null = null;
-      let exitUnsub: UnlistenFn | null = null;
+      let outputUnsub: (() => void) | null = null;
+      let exitUnsub: (() => void) | null = null;
       let ackTimer: ReturnType<typeof setInterval> | null = null;
+      let quietTitleTimer: ReturnType<typeof setInterval> | null = null;
       let observer: ResizeObserver | null = null;
+      let releaseRenderConsumer: (() => void) | null = null;
       let blockNativePaste: ((e: Event) => void) | null = null;
       let wheelScrollOverride: ((e: WheelEvent) => void) | null = null;
       let contextMenuCopyPaste: ((e: MouseEvent) => void) | null = null;
@@ -401,6 +465,8 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
       let nextExpectedOffset: number | null = null;
       let writtenThrough = 0;
       let resyncInFlight = false;
+      /** A resync was requested while one was already running (see `resyncFromRing`). */
+      let resyncAgainRequested = false;
       let resyncPending: OffsetChunk[] = [];
       // Phase 3 — render-based flow control. Tracks bytes the backend has
       // actually RENDERED (its `write` completion callback fired), not bytes
@@ -533,27 +599,74 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
        * retries; on exhaustion or fetch failure the leftovers are written
        * spliced rather than stranded (full-frame TUI redraws self-heal, and
        * the next remount's ring replay reconciles scrollback).
+       *
+       * Also the catch-up path when a hidden pane is revealed (Phase 2 / A4),
+       * which is why a request that arrives while a pass is in flight is
+       * QUEUED rather than dropped: the running pass is working from a ring
+       * snapshot taken before the newly-missed bytes existed, so silently
+       * declining would leave a hole that no later gap detection can see
+       * (`nextExpectedOffset` keeps advancing across drops, so the stream
+       * looks contiguous afterwards).
        */
       const resyncFromRing = async () => {
-        if (resyncInFlight) return;
+        if (resyncInFlight) {
+          resyncAgainRequested = true;
+          return;
+        }
         resyncInFlight = true;
+        // Set only on the one exit that PROVES the pane is caught up: a replay
+        // that covered every dropped byte AND left no held chunk behind a
+        // hole. Every other exit — a rejected fetch, an empty ring, a replay
+        // that stopped short of bytes dropped while it was in flight, the
+        // retry budget running out — falls through to the `finally`, which
+        // re-arms the pane and tells the operator the pane is spliced.
+        let caughtUp = false;
         try {
-          for (let attempt = 0; attempt < 5; attempt++) {
-            const ring = await invoke<{
+          for (let attempt = 0; attempt < RESYNC_MAX_ATTEMPTS; attempt++) {
+            let ring: {
               success: boolean;
               data: { data: string; startOffset: number; endOffset: number } | null;
-            }>("terminal_get_scrollback", { terminalId });
+            };
+            try {
+              ring = await invoke("terminal_get_scrollback", { terminalId });
+            } catch (e) {
+              console.warn(
+                `[Terminal ${terminalId}] emission-gap resync fetch failed (attempt ${attempt + 1}):`,
+                e,
+              );
+              continue;
+            }
             const b = backendRef.current;
-            if (disposed || !b || !ring.success || !ring.data) return;
+            if (disposed || !b) return;
+            if (!ring.success || !ring.data) {
+              console.warn(
+                `[Terminal ${terminalId}] scrollback ring unavailable for resync (attempt ${attempt + 1})`,
+              );
+              continue;
+            }
             const rawRing = atob(ring.data.data);
             const ringBytes = new Uint8Array(rawRing.length);
             for (let i = 0; i < rawRing.length; i++) {
               ringBytes[i] = rawRing.charCodeAt(i);
             }
-            const from = resyncSliceStart(
-              { startOffset: ring.data.startOffset, endOffset: ring.data.endOffset },
-              writtenThrough,
-            );
+            const ringWindow = {
+              startOffset: ring.data.startOffset,
+              endOffset: ring.data.endOffset,
+            };
+            // Ring overrun: the hole starts before the oldest byte the backend
+            // still holds, so those bytes are gone from every source and no
+            // retry can produce them. `resyncSliceStart` replays the whole
+            // ring, which would join the pane's last written byte straight to
+            // a later one — indistinguishable from continuous output. Say so
+            // in-band instead, and warn for the log.
+            const lost = lostWindowBytes(ringWindow, writtenThrough);
+            if (lost > 0) {
+              console.warn(
+                `[Terminal ${terminalId}] scrollback ring overran the missed window; ${lost} bytes of output are unrecoverable`,
+              );
+              b.write(formatLostOutputMarker(lost));
+            }
+            const from = resyncSliceStart(ringWindow, writtenThrough);
             const slice = ringBytes.subarray(from);
             if (slice.length > 0) {
               // Direct write (not the coalesce queue): any pre-gap staged
@@ -561,9 +674,14 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
               // post-gap chunks drain AFTER this, so stream order holds.
               b.write(slice);
             }
-            replayedThrough = Math.max(replayedThrough, ring.data.endOffset);
-            writtenThrough = Math.max(writtenThrough, ring.data.endOffset);
-            nextExpectedOffset = Math.max(nextExpectedOffset ?? 0, ring.data.endOffset);
+            replayedThrough = Math.max(replayedThrough, ringWindow.endOffset);
+            writtenThrough = Math.max(writtenThrough, ringWindow.endOffset);
+            nextExpectedOffset = Math.max(nextExpectedOffset ?? 0, ringWindow.endOffset);
+            // Clears the pane's "behind" flag only if this ring window reached
+            // every byte that was dropped. A chunk dropped while the fetch was
+            // in flight sits beyond this (older) snapshot — the next attempt's
+            // ring covers it.
+            const covered = paneService.noteResynced(replayedThrough);
 
             const drained = drainHeldChunks(resyncPending, writtenThrough, replayedThrough);
             resyncPending = drained.reheld;
@@ -573,14 +691,14 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
               coalesceLen += w.length;
             }
             if (drained.writable.length > 0) scheduleFlush();
-            if (drained.reheld.length === 0) return;
+            if (covered && drained.reheld.length === 0) {
+              caughtUp = true;
+              return;
+            }
             console.warn(
               `[Terminal ${terminalId}] emission gap persisted across resync (attempt ${attempt + 1}); retrying`,
             );
           }
-          console.warn(
-            `[Terminal ${terminalId}] emission-gap resync exhausted retries; accepting spliced output`,
-          );
         } catch (e) {
           console.warn(`[Terminal ${terminalId}] emission-gap resync failed:`, e);
         } finally {
@@ -600,96 +718,248 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
               writtenThrough = Math.max(writtenThrough, c.offset + c.bytes.length);
             }
           }
+          // A request that arrived mid-pass ran against a stale ring snapshot;
+          // run exactly one more pass to cover what it could not see. That
+          // pass is the retry, so don't declare the gap unrecovered yet.
+          const retryQueued = resyncAgainRequested && !disposed;
+          if (!caughtUp && !disposed && !retryQueued) {
+            // Stay armed so the next reveal tries again — and surface it, because
+            // what the operator is looking at right now has a hole in it.
+            paneService.noteResyncFailed();
+            console.warn(
+              `[Terminal ${terminalId}] emission-gap resync did not complete; output is spliced`,
+            );
+            backendRef.current?.write(RESYNC_INCOMPLETE_MARKER);
+          }
           resyncInFlight = false;
+          if (retryQueued) {
+            resyncAgainRequested = false;
+            void resyncFromRing();
+          }
         }
       };
 
-      const buildOutputListener = () =>
-        listen<TerminalOutputPayload>("terminal-output", (event) => {
-          if (event.payload.terminalId !== terminalId) return;
-          const raw = atob(event.payload.data);
-          const bytes = new Uint8Array(raw.length);
-          for (let i = 0; i < raw.length; i++) {
-            bytes[i] = raw.charCodeAt(i);
-          }
-          const offset = event.payload.offset;
+      // ── Visibility tier (Phase 2 / A4) ──────────────────────────────────
+      // Everything a pane costs while the operator cannot see it lives behind
+      // this service: the 250ms ack-floor timer (which also carries the
+      // every-4th-tick `terminal_grid_text` title poll), the ResizeObserver,
+      // and the xterm parse/write of every chunk. Hidden ⇒ all three stop and
+      // the page tap takes over acking; visible again ⇒ they restart and the
+      // ring replays whatever was missed.
+      // The lightweight title poll (Phase 2 of the rendering-robustness plan):
+      // title reporting used to ride on the retired periodic idle paint. Only
+      // when there is an `onTitleChange` consumer do we fetch the cheap text
+      // snapshot (`terminal_grid_text` does NOT clone the cell buffer, unlike
+      // `terminal_get_grid`) and report any new OSC 0/2 title.
+      // `reportTitleFromSnapshot` already dedups against the last value, so
+      // unchanged titles are free.
+      const pollTitle = () => {
+        if (!onTitleChangeRef.current) return;
+        invoke<{ success: boolean; data: { title?: string | null } | null }>("terminal_grid_text", {
+          terminalId,
+        })
+          .then((r) => {
+            if (!disposed && r.success && r.data) {
+              reportTitleFromSnapshot(r.data.title);
+            }
+          })
+          .catch(() => {
+            /* title poll best-effort; ignore failures */
+          });
+      };
+      let titlePollTick = 0;
+      const startAckTimer = () => {
+        if (ackTimer) return;
+        // Flow control floor + title poll. The primary ack is RENDER-based
+        // (Phase 3): the coalesced write's completion callback acks every
+        // ~AckSize rendered bytes. This timer is the floor — it drains a
+        // trailing sub-AckSize remainder so the last bytes of a burst still
+        // ack and the Rust reader resumes even when no further output arrives
+        // to trip the AckSize threshold. It carries the title poll every 4th
+        // tick (~1 Hz).
+        ackTimer = setInterval(() => {
+          // Drain any rendered-but-sub-AckSize remainder.
+          sendAck(renderAck.flush());
 
-          // Emission-gap detection: the backend gates webview emission (not
-          // the PTY read) under backpressure, so a dropped chunk surfaces as
-          // the next delivered chunk starting beyond the end of the last one.
-          // Only meaningful once the backend is ready — pre-ready holes are
-          // covered wholesale by the mount ring replay.
-          const gapDetected = backendReady && isEmissionGap(nextExpectedOffset, offset);
-          if (offset !== undefined) {
-            nextExpectedOffset = Math.max(nextExpectedOffset ?? 0, offset + bytes.length);
-          }
+          titlePollTick = (titlePollTick + 1) % 4;
+          if (titlePollTick === 0) pollTitle();
+        }, ACK_FLOOR_INTERVAL_MS);
+      };
+      const stopAckTimer = () => {
+        if (!ackTimer) return;
+        clearInterval(ackTimer);
+        ackTimer = null;
+      };
+      const startObserver = () => {
+        if (observer) return;
+        observer = new ResizeObserver(() => fitTerminal());
+        observer.observe(container);
+      };
+      const stopObserver = () => {
+        observer?.disconnect();
+        observer = null;
+      };
+      // A hidden pane keeps a HALF-RATE title poll and nothing else. The tab
+      // title is the one operator-visible signal a parked or compacted pane
+      // still owns — state chips and sparklines are fed by the page tap, but
+      // `onTitleChange` has no other source, so killing this outright would
+      // freeze the titles of every unassigned tab and every compact zone card
+      // at whatever they were when the pane mounted.
+      const startQuietTitleTimer = () => {
+        if (quietTitleTimer) return;
+        quietTitleTimer = setInterval(pollTitle, QUIET_TITLE_POLL_INTERVAL_MS);
+      };
+      const stopQuietTitleTimer = () => {
+        if (!quietTitleTimer) return;
+        clearInterval(quietTitleTimer);
+        quietTitleTimer = null;
+      };
 
-          if (!backendReady) {
-            // Backend not yet created — buffer the bytes; they'll be drained
-            // (and the idle timer primed) once the backend init completes.
-            pendingBytes.push({ bytes, offset });
-            return;
-          }
+      const paneService = new PaneVisibilityService(
+        {
+          enterActiveTier: () => {
+            startObserver();
+            startAckTimer();
+          },
+          leaveActiveTier: () => {
+            stopAckTimer();
+            stopObserver();
+          },
+          enterQuietTier: startQuietTitleTimer,
+          leaveQuietTier: stopQuietTitleTimer,
+          flushAck: () => sendAck(renderAck.flush()),
+          refit: () => {
+            // Schedule after layout so the container has actual dimensions.
+            setTimeout(() => {
+              if (disposed) return;
+              fitTerminal();
+              backendRef.current?.focus();
+            }, 16);
+          },
+          resync: () => {
+            void resyncFromRing();
+          },
+          setRenderConsumer: (active) => {
+            if (active) {
+              releaseRenderConsumer ??= retainRenderConsumer(terminalId);
+            } else {
+              releaseRenderConsumer?.();
+              releaseRenderConsumer = null;
+            }
+          },
+        },
+        visibleRef.current,
+      );
+      paneServiceRef.current = paneService;
 
-          if (!backendRef.current) return;
+      /**
+       * The per-terminal `terminal-output` handler. Registered with the
+       * window's single demuxed listener (Phase 2 / A3), so it is called only
+       * for THIS terminal's chunks — the id filter no longer runs after an
+       * IPC deserialize + dispatch that every mounted pane paid.
+       */
+      const handleOutputPayload = (payload: TerminalOutputPayload) => {
+        const raw = atob(payload.data);
+        const bytes = new Uint8Array(raw.length);
+        for (let i = 0; i < raw.length; i++) {
+          bytes[i] = raw.charCodeAt(i);
+        }
+        const offset = payload.offset;
 
-          if (gapDetected || resyncInFlight) {
-            // Hold post-gap chunks until the ring slice covering the hole is
-            // written so bytes land in stream order; the resync drain trims
-            // each held chunk against the advanced replay boundary.
-            resyncPending.push({ bytes, offset });
-            bytesReceivedRef.current += bytes.length;
-            if (gapDetected) void resyncFromRing();
-            return;
-          }
-          // A chunk emitted before the ring snapshot can still be DELIVERED
-          // after the replay (event delivery and invoke responses are not
-          // mutually ordered) — trim it to its unreplayed suffix so the
-          // boundary bytes aren't written twice. ack bookkeeping below stays on
-          // the full chunk: the content reached the terminal either way (via
-          // the ring), only the duplicate write is skipped.
-          //
-          // Session-state tracking is NOT fed from here anymore — the global
-          // `terminal-output` tap in `TerminalSessionContext` decodes + feeds
-          // `handleOutput` independently of this instance's mount state (Phase 2
-          // of the flow-grid virtualization plan). This listener is now purely
-          // the xterm write/render path.
-          const unreplayed = trimReplayedChunk({ bytes, offset }, replayedThrough);
-          if (unreplayed && unreplayed.length > 0) {
-            // Phase 4: stage the unreplayed suffix and flush once per microtask
-            // into a single coalesced backend.write() (offset-dedup already
-            // applied above, before coalescing). The render-ack accounts the
-            // coalesced length when its completion callback fires. Length
-            // guard: zero-length resume-marker events carry only an offset.
-            coalesceQueue.push(unreplayed);
-            coalesceLen += unreplayed.length;
-            scheduleFlush();
-          }
-          if (offset !== undefined) {
-            writtenThrough = Math.max(writtenThrough, offset + bytes.length);
-          }
-          bytesReceivedRef.current += bytes.length;
+        // Emission-gap detection: the backend gates webview emission (not
+        // the PTY read) under backpressure, so a dropped chunk surfaces as
+        // the next delivered chunk starting beyond the end of the last one.
+        // Only meaningful once the backend is ready — pre-ready holes are
+        // covered wholesale by the mount ring replay.
+        const gapDetected = backendReady && isEmissionGap(nextExpectedOffset, offset);
+        // Keep the "last observed chunk end" advancing in EVERY tier,
+        // including while hidden: it is what stops the first chunk after a
+        // reveal from being misread as a fresh emission gap.
+        if (offset !== undefined) {
+          nextExpectedOffset = Math.max(nextExpectedOffset ?? 0, offset + bytes.length);
+        }
+
+        const route = routeOutputChunk({
+          paused: paneService.paused,
+          backendReady,
+          gapDetected,
+          resyncInFlight,
         });
 
-      // Cold-mount path: attach the live `terminal-output` listener IMMEDIATELY
-      // — before any awaits — so we don't lose bytes during the backend's
-      // async init. Bytes arriving before backendReady are buffered into
-      // pendingBytes and drained once the backend is ready.
+        if (route === "drop") {
+          // Hidden pane: no parse, no write, no ack. `writtenThrough` stays
+          // put, so the reveal resync replays exactly this window from the
+          // ring. State chips/sparklines keep updating — they are fed by the
+          // page-level output tap, which is mount- and visibility-independent.
+          // The chunk's end offset is what makes the reveal resync provable:
+          // a replay only clears the flag once it has reached this far.
+          paneService.noteMissedOutput(offset === undefined ? undefined : offset + bytes.length);
+          bytesReceivedRef.current += bytes.length;
+          return;
+        }
+
+        if (route === "buffer") {
+          // Backend not yet created — buffer the bytes; they'll be drained
+          // (and the idle timer primed) once the backend init completes.
+          pendingBytes.push({ bytes, offset });
+          return;
+        }
+
+        if (!backendRef.current) return;
+
+        if (route === "hold") {
+          // Hold post-gap chunks until the ring slice covering the hole is
+          // written so bytes land in stream order; the resync drain trims
+          // each held chunk against the advanced replay boundary.
+          resyncPending.push({ bytes, offset });
+          bytesReceivedRef.current += bytes.length;
+          if (gapDetected) void resyncFromRing();
+          return;
+        }
+        // A chunk emitted before the ring snapshot can still be DELIVERED
+        // after the replay (event delivery and invoke responses are not
+        // mutually ordered) — trim it to its unreplayed suffix so the
+        // boundary bytes aren't written twice. ack bookkeeping below stays on
+        // the full chunk: the content reached the terminal either way (via
+        // the ring), only the duplicate write is skipped.
+        //
+        // Session-state tracking is NOT fed from here anymore — the global
+        // `terminal-output` tap in `TerminalSessionContext` decodes + feeds
+        // `handleOutput` independently of this instance's mount state (Phase 2
+        // of the flow-grid virtualization plan). This handler is now purely
+        // the xterm write/render path.
+        const unreplayed = trimReplayedChunk({ bytes, offset }, replayedThrough);
+        if (unreplayed && unreplayed.length > 0) {
+          // Phase 4: stage the unreplayed suffix and flush once per microtask
+          // into a single coalesced backend.write() (offset-dedup already
+          // applied above, before coalescing). The render-ack accounts the
+          // coalesced length when its completion callback fires. Length
+          // guard: zero-length resume-marker events carry only an offset.
+          coalesceQueue.push(unreplayed);
+          coalesceLen += unreplayed.length;
+          scheduleFlush();
+        }
+        if (offset !== undefined) {
+          writtenThrough = Math.max(writtenThrough, offset + bytes.length);
+        }
+        bytesReceivedRef.current += bytes.length;
+      };
+
+      // Cold-mount path: register the output handler IMMEDIATELY — before any
+      // awaits — so we don't lose bytes during the backend's async init.
+      // Registration is synchronous (the window's listener is already live, or
+      // is installed by this call), so unlike the old per-instance
+      // `await listen(...)` there is no attach window at all. Bytes arriving
+      // before backendReady are buffered into pendingBytes and drained once
+      // the backend is ready.
       //
       // Reconnect path (Layer 4 polish): the PTY survived the page reload and
       // the Rust grid already holds the full state. Live bytes during the
-      // catch-up window would race with paintGrid, so we DEFER the listener
-      // attach until after the bootstrap paintGrid resolves. See
+      // catch-up window would race with paintGrid, so we DEFER the handler
+      // registration until after the bootstrap paintGrid resolves. See
       // `plans/terminal-grid-bootstrap-redesign.md` Layer 4.
       if (!isReconnecting) {
-        (async () => {
-          const unsub = await buildOutputListener();
-          if (disposed) {
-            unsub();
-            return;
-          }
-          outputUnsub = unsub;
-        })();
+        outputUnsub = registerTerminalOutputHandler(terminalId, handleOutputPayload);
       }
 
       // Async init because backend creation may require WASM loading
@@ -697,6 +967,9 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         const backend = await createTerminalBackend(backendType, {
           ...TERMINAL_OPTIONS,
           gpuAcceleration,
+          // Pane identity for the WebGL context LRU (A9) — at most 8 panes
+          // hold a GL context, the rest render on Canvas.
+          instanceKey: terminalId,
         });
         if (disposed) {
           backend.dispose();
@@ -1229,16 +1502,7 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         // pendingBytes drain below is a no-op since nothing buffered while
         // the listener wasn't attached, but the structure stays uniform.
         if (isReconnecting && !outputUnsub) {
-          try {
-            const unsub = await buildOutputListener();
-            if (disposed) {
-              unsub();
-            } else {
-              outputUnsub = unsub;
-            }
-          } catch (e) {
-            console.warn(`[Terminal ${terminalId}] reconnect listener attach failed:`, e);
-          }
+          outputUnsub = registerTerminalOutputHandler(terminalId, handleOutputPayload);
         }
         if (disposed) return;
 
@@ -1253,61 +1517,33 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
           onReconnectedRef.current?.();
         }
 
-        // Listen for process exit
-        exitUnsub = await listen<TerminalExitEvent>("terminal-exit", (event) => {
-          if (event.payload.terminalId !== terminalId) return;
+        // Process-exit handler — demuxed alongside `terminal-output`, so a
+        // window installs one `terminal-exit` listener no matter how many
+        // panes are mounted. Runs in every visibility tier: a hidden pane
+        // must still record the exit and release its scrollback.
+        exitUnsub = registerTerminalExitHandler(terminalId, (payload) => {
           backend.write(
-            `\r\n\x1b[90m[Process exited with code ${event.payload.exitCode ?? "unknown"}]\x1b[0m\r\n`,
+            `\r\n\x1b[90m[Process exited with code ${payload.exitCode ?? "unknown"}]\x1b[0m\r\n`,
           );
           // Release the memory held by this now-dead pane. It will never emit
           // more output, so trim its scrollback to the tail — this is the
           // accumulator behind the WebView2 "out of memory" crash when many
           // finished sessions stay mounted. See DEAD_TERMINAL_SCROLLBACK.
           backend.setScrollback(DEAD_TERMINAL_SCROLLBACK);
-          onExitRef.current?.(event.payload.exitCode ?? null);
+          onExitRef.current?.(payload.exitCode ?? null);
         });
         if (disposed) return;
 
-        // Resize observer
-        observer = new ResizeObserver(() => fitTerminal());
-        observer.observe(container);
-
-        // Flow control floor + title poll. The primary ack is RENDER-based
-        // (Phase 3): the coalesced write's completion callback acks every
-        // ~AckSize rendered bytes. This timer is the floor — it drains a
-        // trailing sub-AckSize remainder so the last bytes of a burst still
-        // ack and the Rust reader resumes even when no further output arrives
-        // to trip the AckSize threshold.
-        //
-        // It also carries the lightweight title poll (Phase 2): title
-        // reporting used to ride on the retired periodic idle paint, so it now
-        // piggybacks this timer. Every ~1s (every 4th tick) — and only when
-        // there is an `onTitleChange` consumer — we fetch the cheap text
-        // snapshot (`terminal_grid_text` does NOT clone the cell buffer, unlike
-        // `terminal_get_grid`) and report any new OSC 0/2 title.
-        // `reportTitle` already dedups against the last value, so unchanged
-        // titles are free.
-        let titlePollTick = 0;
-        ackTimer = setInterval(() => {
-          // Drain any rendered-but-sub-AckSize remainder.
-          sendAck(renderAck.flush());
-
-          titlePollTick = (titlePollTick + 1) % 4;
-          if (titlePollTick === 0 && onTitleChangeRef.current) {
-            invoke<{ success: boolean; data: { title?: string | null } | null }>(
-              "terminal_grid_text",
-              { terminalId },
-            )
-              .then((r) => {
-                if (!disposed && r.success && r.data) {
-                  reportTitleFromSnapshot(r.data.title);
-                }
-              })
-              .catch(() => {
-                /* title poll best-effort; ignore failures */
-              });
-          }
-        }, ACK_FLOOR_INTERVAL_MS);
+        // Backend is live: the visibility tier may now run its services (the
+        // ResizeObserver + the ack-floor/title-poll timer). A pane that
+        // mounted hidden starts neither, and resyncs from the ring when it is
+        // first revealed.
+        paneService.markReady();
+        // Seed the WebGL LRU with this pane's real visibility — the backend
+        // claims its slot as visible (it has no visibility concept), and the
+        // `visible` effect below ran before the backend existed, so a pane
+        // that mounted hidden would otherwise outrank a watched one.
+        setWebglSlotVisible(terminalId, visibleRef.current);
 
         // OSC 633 shell integration handler
         disposables.push(
@@ -1336,9 +1572,10 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         // bytes reach the (about-to-be-disposed) backend rather than being
         // dropped. Harmless if nothing is staged.
         if (flushScheduled) flushCoalesced();
-        if (ackTimer) clearInterval(ackTimer);
+        // Stops the ack timer + observer and hands acking back to the page tap.
+        paneService.dispose();
+        if (paneServiceRef.current === paneService) paneServiceRef.current = null;
         if (fitTimerRef.current) clearTimeout(fitTimerRef.current);
-        observer?.disconnect();
         if (wheelScrollOverride) {
           container.removeEventListener("wheel", wheelScrollOverride, { capture: true });
         }
@@ -1372,18 +1609,28 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
       // eslint-disable-next-line react-hooks/exhaustive-deps -- uiBridge is stable context
     }, [terminalId, backendType, fitTerminal]);
 
-    // Re-fit and focus when visibility changes.
-    // Track previous visibility with a ref and trigger fit/focus on transition,
-    // avoiding a useEffect that merely simulates an event handler.
-    const prevVisibleRef = useRef(visible);
-    if (visible && !prevVisibleRef.current) {
-      // Schedule after layout so the container has actual dimensions
-      setTimeout(() => {
-        fitTerminal();
-        backendRef.current?.focus();
-      }, 16);
-    }
-    prevVisibleRef.current = visible;
+    /**
+     * Drive the visibility tier (Phase 2 / A4). Hidden ⇒ the pane stops its
+     * timers, its ResizeObserver and its xterm writes, and the page tap takes
+     * over flow-control acks; visible ⇒ they restart, the pane re-fits +
+     * focuses, and the ring replays whatever it missed.
+     *
+     * Deliberately keyed on `visible` alone, NOT on the flow-mode
+     * classification: `classifyTabs` marks every tab of a preset layout
+     * "assigned" (all mounted) and never consults viewport proximity, so a
+     * flow-mode-only tier would leave preset layouts — maximized single view,
+     * compact zone cards, `HiddenTerminal`'s off-grid parking — paying full
+     * cost for panes nobody can see.
+     *
+     * The WebGL LRU is told too: a hidden pane is the first candidate to be
+     * downgraded to Canvas when another pane needs a context, and a revealed
+     * one is promoted to most-recently-used. No-op on backends that hold no
+     * WebGL context (ghostty is Canvas 2D).
+     */
+    useEffect(() => {
+      paneServiceRef.current?.setVisible(visible);
+      setWebglSlotVisible(terminalId, visible);
+    }, [visible, terminalId]);
 
     return (
       // Wrapper exists so the find bar can overlay as a React-managed
@@ -1414,3 +1661,5 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
     );
   },
 );
+
+export const TerminalInstance = memo(TerminalInstanceInner);

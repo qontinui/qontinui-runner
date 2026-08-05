@@ -39,6 +39,7 @@ impl QueryRoot {
         let state = ctx.data::<Arc<ApiState>>()?;
         let uptime_secs = state.started_at.elapsed().as_secs();
         let last_pong = state
+            .app_state
             .ui_bridge_last_pong
             .load(std::sync::atomic::Ordering::Relaxed);
         let now_ms = now_epoch_ms();
@@ -724,6 +725,7 @@ async fn bridge_query(
 pub(crate) async fn build_health_snapshot(state: &Arc<ApiState>) -> UiBridgeHealth {
     let uptime_secs = state.started_at.elapsed().as_secs();
     let last_pong = state
+        .app_state
         .ui_bridge_last_pong
         .load(std::sync::atomic::Ordering::Relaxed);
     let now_ms = now_epoch_ms();

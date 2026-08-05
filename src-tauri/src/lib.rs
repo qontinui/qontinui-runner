@@ -40,6 +40,7 @@ pub mod fs_atomic;
 // that needs the encrypted token store outside the Tauri runtime). Both
 // modules are Tauri-free.
 pub mod auth;
+pub mod fs_perms;
 pub mod secure_storage;
 
 // Machine-side dev-environment capture agent (feat/devenv-environments). Runs
@@ -59,6 +60,12 @@ pub mod pair;
 // unified-Cognito-identity plan. Tauri-free (loopback + system browser); the
 // `cognito_sign_in` Tauri command in `commands::auth` drives it.
 pub mod cognito;
+
+// Claude Code process-topology env markers and the strip rule that governs
+// them (plan `2026-07-28-runner-transcript-persistence-env-leak`). One home for
+// the marker names so the spawn-site strips, the startup warning and the
+// `coord doctor` check can never disagree on the spelling.
+pub mod claude_env;
 
 // `coord doctor` self-check (plan 2026-06-13 Phase 4). Lifted into the lib so
 // BOTH the standalone `coord_doctor` bin and the in-app Tauri command

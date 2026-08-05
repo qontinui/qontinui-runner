@@ -322,7 +322,11 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     ProxyableCommand {
         name: "add_saved_project",
         description: "Append a project to the saved list. Idempotent by normalized path.",
-        args_schema: r#"{"type":"object","required":["project"],"properties":{"project":{"type":"object","required":["path","name","projectType","manifest"],"properties":{"path":{"type":"string"},"name":{"type":"string"},"projectType":{"type":"string"},"manifest":{"type":"string"}}}}}"#,
+        // `id` is optional: it carries `#[serde(default)]` and the Rust side
+        // mints a UUID when it arrives empty or absent. Every other field the
+        // Projects dashboard added is likewise optional, so this schema stays
+        // the minimal contract an automation caller must satisfy.
+        args_schema: r#"{"type":"object","required":["project"],"properties":{"project":{"type":"object","required":["path","name","projectType","manifest"],"properties":{"id":{"type":"string"},"path":{"type":"string"},"name":{"type":"string"},"projectType":{"type":"string"},"manifest":{"type":"string"}}}}}"#,
         response_schema: r#"{"type":"null"}"#,
         // Required `project` arg; empty-args probe would error.
         probe_with_empty_args: false,
@@ -330,10 +334,72 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     },
     ProxyableCommand {
         name: "remove_saved_project",
-        description: "Remove a saved project by path. No-op if the path isn't in the list.",
-        args_schema: r#"{"type":"object","required":["path"],"properties":{"path":{"type":"string"}}}"#,
+        description: "Remove a saved project by id. No-op if the id isn't in the list.",
+        args_schema: r#"{"type":"object","required":["id"],"properties":{"id":{"type":"string"}}}"#,
         response_schema: r#"{"type":"null"}"#,
-        // Required `path` arg; empty-args probe would error.
+        // Required `id` arg; empty-args probe would error.
+        probe_with_empty_args: false,
+        observe_projection: None,
+    },
+    ProxyableCommand {
+        name: "set_project_terminal_page",
+        // The Tauri arg is `page_id`; the wire name an invoke caller sends is
+        // the camelCase `pageId` (Tauri v2 camelCases command arguments), so
+        // that is what this schema declares.
+        description: "Bind the Terminal page a project activates onto (plan §7.2 step 1). `pageId` is a HINT, not a handle: pages live in the frontend's instanceStorage, which Rust cannot read, so this stores whatever id the frontend settled on without validating it. Pass `null` to unbind. Errors when no saved project has that id.",
+        args_schema: r#"{"type":"object","required":["id"],"properties":{"id":{"type":"string"},"pageId":{"type":["string","null"]}}}"#,
+        response_schema: r#"{"type":"null"}"#,
+        // Required `id` arg + it mutates the registry; an empty-args probe
+        // would error anyway, but mark it explicit.
+        probe_with_empty_args: false,
+        observe_projection: None,
+    },
+    // The dashboard's own backend join. Declared because an automation caller
+    // that can open the Projects page should be able to ask the SAME question
+    // the page asks — "what is this project doing right now?" — instead of
+    // scraping the rendered card for it. Missing since the dashboard shipped:
+    // the command was registered in `main.rs` but never declared here, so it was
+    // neither discoverable nor proxyable (found 2026-08-02 while verifying the
+    // dashboard through the UI Bridge on a temp runner).
+    ProxyableCommand {
+        name: "project_snapshot",
+        description: "Return the joined live view of ONE saved project by id: its managed processes (with state + port health), live and recent sessions, git branch/dirty-count/last-commits, pending questions, a traffic-light `health` with a plain-English `reason`, rolling 7-day spend, and `lastActivityMs`. This is the exact payload the Projects dashboard renders, computed server-side. `spend7dUsd` absent means NOT MEASURED — distinct from 0, which means measured and free. Errors when no saved project has that id.",
+        args_schema: r#"{"type":"object","required":["id"],"properties":{"id":{"type":"string"}}}"#,
+        response_schema: r#"{"type":"object","required":["project","processes","liveSessions","recentSessions","questions","health"],"properties":{"project":{"type":"object"},"processes":{"type":"array","items":{"type":"object"}},"liveSessions":{"type":"array"},"recentSessions":{"type":"array"},"git":{"type":["object","null"]},"questions":{"type":"array"},"health":{"type":"object"},"spend7dUsd":{"type":["number","null"]},"lastActivityMs":{"type":["integer","null"]}}}"#,
+        // Required `id` arg; an empty-args probe would error. Read-only.
+        probe_with_empty_args: false,
+        observe_projection: None,
+    },
+    ProxyableCommand {
+        name: "set_project_pinned",
+        description: "Pin or unpin a saved project. Pinned projects sort first in the grid and earn a sidebar row. Returns the value actually stored, so a caller can reconcile an optimistic toggle against the persisted truth. Errors when no saved project has that id.",
+        args_schema: r#"{"type":"object","required":["id","pinned"],"properties":{"id":{"type":"string"},"pinned":{"type":"boolean"}}}"#,
+        response_schema: r#"{"type":"boolean"}"#,
+        // Required args + it mutates the registry.
+        probe_with_empty_args: false,
+        observe_projection: None,
+    },
+    // Projects dashboard §7.1 step 3 — the Preview window. Declared here on
+    // purpose: the preview is a real webview, so it is itself a UI Bridge
+    // target, and an automation caller that can OPEN it can drive the site it
+    // shows ("show me my site" → "click that button for me") on one surface.
+    ProxyableCommand {
+        name: "open_project_preview",
+        // Tauri v2 camelCases command arguments, so the wire names are
+        // `projectId` / `url` / `title`.
+        description: "Open (or focus + re-navigate) the Preview webview window for a project, pointed at `url`. One window per project, keyed by project id — a second call reuses and raises the existing window rather than stacking another. Returns `true` when a new window was created, `false` when an existing one was reused; both are success. Only `http://` / `https://` are accepted — `file:`, `data:` and `javascript:` are refused, since the preview window is not governed by the app CSP.",
+        args_schema: r#"{"type":"object","required":["projectId","url"],"properties":{"projectId":{"type":"string"},"url":{"type":"string"},"title":{"type":["string","null"]}}}"#,
+        response_schema: r#"{"type":"boolean"}"#,
+        // Required args + it opens a window; an empty-args probe would error.
+        probe_with_empty_args: false,
+        observe_projection: None,
+    },
+    ProxyableCommand {
+        name: "close_project_preview",
+        description: "Close a project's Preview window. Returns `true` when a window was closed, `false` when none was open — closing an absent preview is not an error, so a caller can offer it unconditionally.",
+        args_schema: r#"{"type":"object","required":["projectId"],"properties":{"projectId":{"type":"string"}}}"#,
+        response_schema: r#"{"type":"boolean"}"#,
+        // Required `projectId` arg; empty-args probe would error.
         probe_with_empty_args: false,
         observe_projection: None,
     },

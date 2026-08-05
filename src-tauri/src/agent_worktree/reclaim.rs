@@ -52,6 +52,12 @@
 //! `is_dirty` worktree (coord also filters these), and G6 (below) SKIPS any
 //! worktree that is currently building.
 //!
+//! "Dirty" here is **reclaim-scoped** ([`super::dirty`]): real work only, with
+//! the runner's own untracked scaffolding (`.claude/`, `.coord-mcp-status`,
+//! `.mcp.json`) excluded. Plain porcelain non-emptiness made ~34% of agent
+//! worktrees permanently unreclaimable, because provisioning one is what made
+//! it "dirty".
+//!
 //! ## G6 — in-flight-build guard (runner-only)
 //!
 //! Before executing ANY instruction's steps for a worktree, the runner
@@ -101,6 +107,102 @@ const DEFAULT_PRUNE_INTERVAL_SECS: u64 = 86_400;
 /// before the backstop may even consider it. Override via
 /// `QONTINUI_WORKTREE_BACKSTOP_MAX_AGE_SECS`.
 const DEFAULT_BACKSTOP_MAX_AGE_SECS: u64 = 14 * 86_400;
+
+/// Default age floor for the empty-session-dir sweep — 1 hour. Allocation
+/// creates `<session-uuid>/` and only then runs a network fetch + `git
+/// worktree add`, so a *legitimately* empty session dir exists for as long as
+/// that takes. An hour is far beyond any allocation and far below the age of
+/// a real husk. Override via
+/// `QONTINUI_WORKTREE_EMPTY_SESSION_MIN_AGE_SECS`.
+const DEFAULT_EMPTY_SESSION_MIN_AGE_SECS: u64 = 3_600;
+
+/// After this many CONSECUTIVE failed pulls the poller stops warning at `warn`
+/// and starts reporting at `error` with a distinct marker. At the 300s default
+/// cadence this is ~25 minutes — long enough that an ordinary coord blip or
+/// deploy stays quiet, short enough that a genuine outage is loud the same
+/// hour rather than five days later.
+const RECLAIM_FAILURE_ESCALATION_STREAK: u64 = 5;
+
+// ---------------------------------------------------------------------------
+// Poller health — published so "the reaper is dead" is a READ, not an autopsy.
+// ---------------------------------------------------------------------------
+
+/// Consecutive failed pulls; reset to 0 by any success.
+static POLLER_CONSECUTIVE_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Unix seconds of the last SUCCESSFUL pull. 0 = never succeeded this process.
+static POLLER_LAST_SUCCESS_UNIX: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// The most recent failure message (already carries its source chain).
+static POLLER_LAST_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// A snapshot of the background poller's health.
+///
+/// This exists because of the 2026-07-28 → 08-01 outage: the poller failed
+/// every pull for five days while the endpoint that REPORTS on reclaim kept
+/// answering `coord_reachable: true` — because that field describes the
+/// reporting request the endpoint had just made, not the executor. A health
+/// signal that reports on its own inputs rather than on the subsystem's output
+/// cannot detect that subsystem being dead. These fields describe the EXECUTOR.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PollerHealth {
+    /// Consecutive failed pulls. `0` with a recent `last_success_unix` is the
+    /// only combination that means "the executor is working".
+    pub consecutive_failures: u64,
+    /// Unix seconds of the last successful pull; `None` = never, this process.
+    pub last_success_unix: Option<u64>,
+    /// Last failure, with its full cause chain. `None` while healthy.
+    pub last_error: Option<String>,
+}
+
+/// Read the poller's health. Cheap; safe from any thread.
+pub fn poller_health() -> PollerHealth {
+    let last_success = POLLER_LAST_SUCCESS_UNIX.load(std::sync::atomic::Ordering::Relaxed);
+    PollerHealth {
+        consecutive_failures: POLLER_CONSECUTIVE_FAILURES
+            .load(std::sync::atomic::Ordering::Relaxed),
+        last_success_unix: (last_success != 0).then_some(last_success),
+        last_error: POLLER_LAST_ERROR.lock().ok().and_then(|g| g.clone()),
+    }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Record a successful pull.
+fn note_poll_success() {
+    POLLER_CONSECUTIVE_FAILURES.store(0, std::sync::atomic::Ordering::Relaxed);
+    POLLER_LAST_SUCCESS_UNIX.store(now_unix(), std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut g) = POLLER_LAST_ERROR.lock() {
+        *g = None;
+    }
+}
+
+/// Record a failed pull and log it at a level that reflects the STREAK, not
+/// just the one tick. A lone failure is a blip; an unbroken run of them is an
+/// outage, and it must not keep reading as routine noise.
+fn note_poll_failure(err: &str) {
+    let streak = POLLER_CONSECUTIVE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if let Ok(mut g) = POLLER_LAST_ERROR.lock() {
+        *g = Some(err.to_string());
+    }
+    if streak >= RECLAIM_FAILURE_ESCALATION_STREAK {
+        let since = match POLLER_LAST_SUCCESS_UNIX.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => "never succeeded this process".to_string(),
+            t => format!("last success {}s ago", now_unix().saturating_sub(t)),
+        };
+        tracing::error!(
+            "worktree_reclaim: RECLAIM POLLER DOWN — {streak} consecutive failed pulls \
+             ({since}); NO worktree can be reclaimed while this persists: {err}"
+        );
+    } else {
+        warn!("worktree_reclaim: {err}");
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Wire types — coord serializes these.
@@ -391,6 +493,20 @@ fn unlink_junction(path: &Path) -> Result<(), String> {
 /// falls back to a plain `remove_dir_all`. Safe to call only AFTER every
 /// junction has been unlinked (the caller's plan guarantees the ordering).
 /// Idempotent: a missing dir is `Ok(())`.
+///
+/// ## INV-W5 — never recursively delete a real clone
+///
+/// The fallback is unconditional: it does not care WHY `git worktree remove`
+/// failed. On a repo root that command always fails ("is a main working tree"),
+/// so the `remove_dir_all` below would delete the whole clone, object store
+/// included. Neither dirty guard catches it — a clean clone is genuinely clean.
+///
+/// So prove the structure before destroying it, exactly as [`unlink_junction`]
+/// proves a path is a reparse point before unlinking: a linked worktree has
+/// `.git` as a FILE, a clone has it as a DIRECTORY. This guard is the last mile
+/// and covers every caller — coord-issued instructions, the coord-absent
+/// backstop sweep, and anything added later — so a classifier defect upstream
+/// can cost a wasted instruction but never a repository.
 pub(super) fn remove_worktree(path: &Path) -> Result<(), String> {
     if !path.exists() {
         debug!(
@@ -398,6 +514,15 @@ pub(super) fn remove_worktree(path: &Path) -> Result<(), String> {
             path.display()
         );
         return Ok(());
+    }
+    if super::census::is_git_clone_root(path) {
+        // Err, not a silent Ok: this must not be counted as a removal, and it
+        // must be loud enough to diagnose the upstream misclassification.
+        return Err(format!(
+            "refusing to remove {} — `.git` is a DIRECTORY, so this is a real \
+             clone, not a linked worktree (INV-W5)",
+            path.display()
+        ));
     }
     let path_str = path.to_string_lossy().to_string();
     // `git -C <wt> worktree remove --force <wt>` prunes the registration.
@@ -420,7 +545,70 @@ pub(super) fn remove_worktree(path: &Path) -> Result<(), String> {
             .map_err(|e| format!("remove worktree dir {}: {e}", path.display()))?;
         info!("worktree_reclaim: removed worktree dir {}", path.display());
     }
+    // A session dir we just emptied is garbage — prune it here so husks can
+    // never accumulate 1:1 with successful reclaims.
+    prune_empty_session_parent(path);
     Ok(())
+}
+
+/// Remove `worktree`'s parent when our removal just emptied it.
+///
+/// Session worktrees live at `<root>/<session-uuid>/<repo>`, so reclaiming the
+/// `<repo>` checkout leaves the `<session-uuid>` dir behind as an empty husk.
+/// Nothing else ever removed it on the coord-instructed path, so husks grew one
+/// per successful reclaim — 1,554 of them observed on the operator's box
+/// 2026-08-03 against only 28 populated dirs, which makes any directory-count
+/// measurement of "how many worktrees are left" wildly wrong.
+///
+/// Two guards, mirroring [`backstop_sweep`]'s existing hygiene step (which
+/// already did this for its own path — this brings the coord-instructed path
+/// to parity):
+///
+///  1. **Non-recursive `remove_dir`** — never `remove_dir_all`. It fails
+///     harmlessly when anything remains, so a sibling repo worktree for the
+///     same session (concurrently allocated, or simply not yet reclaimed) is
+///     never destroyed. That makes the operation inherently race-safe.
+///  2. **UUID-named parents only** — the same scope test `backstop_sweep`
+///     applies. The worktree root itself, `qontinui-root`, and operator
+///     scratch dirs are not UUID-named, so this can never walk up out of the
+///     session layer no matter what path a caller passes.
+///
+/// Best-effort by construction: every failure is expected traffic (non-empty,
+/// already gone, or held), so nothing here can fail a reclaim.
+fn prune_empty_session_parent(worktree: &Path) {
+    let Some(parent) = worktree.parent() else {
+        return;
+    };
+    if !is_session_uuid_dir(parent) {
+        debug!(
+            "worktree_reclaim: parent {} is not a session-uuid dir — not pruning",
+            parent.display()
+        );
+        return;
+    }
+    match std::fs::remove_dir(parent) {
+        Ok(()) => info!(
+            "worktree_reclaim: pruned empty session dir {}",
+            parent.display()
+        ),
+        Err(e) => debug!(
+            "worktree_reclaim: session dir {} not pruned ({e}) — expected when \
+             siblings remain",
+            parent.display()
+        ),
+    }
+}
+
+/// Is `path`'s final segment a session UUID?
+///
+/// The scope test every session-dir prune shares. The worktree root itself,
+/// `qontinui-root`, and operator scratch dirs are not UUID-named, so a prune
+/// keyed on this can never walk up out of the session layer no matter what
+/// path a caller passes.
+fn is_session_uuid_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| Uuid::parse_str(n).is_ok())
 }
 
 /// Create (or recreate) a junction at `link` pointing at `target`
@@ -504,7 +692,10 @@ fn create_junction(link: &Path, _target: &Path) -> Result<(), String> {
 }
 
 /// Re-verify dirtiness at execution time (defense in depth — the pull may
-/// be stale). `true` when `git status --porcelain` is non-empty.
+/// be stale). Reclaim-scoped: `git status --porcelain` MINUS the runner's own
+/// untracked scaffolding, via [`super::dirty::porcelain_is_dirty`] — the same
+/// predicate the census reports with, so the two can never disagree and
+/// strand a worktree as "clean per coord, dirty per the runner" forever.
 pub(super) fn worktree_is_dirty(path: &Path) -> bool {
     let path_str = match path.to_str() {
         Some(s) => s,
@@ -513,7 +704,10 @@ pub(super) fn worktree_is_dirty(path: &Path) -> bool {
     crate::process_helpers::no_window("git")
         .args(["-C", path_str, "status", "--porcelain"])
         .output()
-        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .map(|o| {
+            o.status.success()
+                && super::dirty::porcelain_is_dirty(&String::from_utf8_lossy(&o.stdout))
+        })
         .unwrap_or(false)
 }
 
@@ -819,6 +1013,105 @@ fn backstop_max_age_secs() -> u64 {
     )
 }
 
+/// Age floor for the empty-session-dir sweep.
+fn empty_session_min_age_secs() -> u64 {
+    parse_secs_env(
+        std::env::var("QONTINUI_WORKTREE_EMPTY_SESSION_MIN_AGE_SECS")
+            .ok()
+            .as_deref(),
+        DEFAULT_EMPTY_SESSION_MIN_AGE_SECS,
+    )
+}
+
+/// Prune session dirs that are ALREADY empty when the maintenance pass runs.
+///
+/// [`prune_empty_session_parent`] closes the husk trap going FORWARD, but only
+/// for a dir *this process* just emptied. Two husk classes it cannot reach:
+///
+///  1. **Pre-existing** — emptied by a build older than that prune, or while
+///     the runner was down. Their `<repo>` child is already gone, so
+///     `remove_worktree` will never run for them again and the forward-only
+///     prune can never see them. 10 such husks were on the operator's box
+///     2026-08-03 against 20 populated dirs.
+///  2. **Allocated, never populated** — [`super::allocate_and_materialize_with_claim`] creates
+///     `<session-uuid>/` *before* the locality fetch and `git worktree add`,
+///     so a failure in either leaves the empty parent behind. 494 of these
+///     were measured 2026-07-27 against a 6,666-dir root; no removal path is
+///     ever invoked for them at all.
+///
+/// Both classes had exactly one sweeper — [`backstop_sweep`]'s hygiene step —
+/// and that sweep returns early whenever coord has ever been live, which, now
+/// that reclaim is armed in production, is always. So the husk backlog was
+/// permanent in the steady state the fleet actually runs in. This pass runs
+/// UNCONDITIONALLY instead.
+///
+/// Unconditional is safe here because, unlike the backstop, this destroys
+/// nothing: `remove_dir` is non-recursive, so a dir holding ANY entry — a live
+/// worktree, a half-finished checkout, a stray file — fails harmlessly and is
+/// left alone. That also makes it inherently race-safe against a concurrent
+/// allocation rather than race-checked. No dirty guard is needed for the same
+/// reason: an empty dir has no work to lose. Two guards remain:
+///
+///  1. **UUID-named only** ([`is_session_uuid_dir`]) — the shared scope test.
+///  2. **An age floor** — allocation creates the parent and only then runs a
+///     network fetch, so a legitimately empty session dir exists for as long
+///     as that fetch takes. An unreadable mtime is never old enough
+///     (conservative, matching [`dir_age_secs`]'s contract).
+fn prune_empty_session_dirs() {
+    let Some(root) = session_worktree_root() else {
+        debug!("worktree_husk_prune: no session-worktree root resolved — skipping");
+        return;
+    };
+    let pruned = prune_empty_session_dirs_in(&root, empty_session_min_age_secs());
+    if pruned > 0 {
+        info!(
+            "worktree_husk_prune: pruned {pruned} empty session dir(s) under {}",
+            root.display()
+        );
+    }
+}
+
+/// Pure-ish core of [`prune_empty_session_dirs`]: `root` and the age floor are
+/// resolved by the caller so tests can drive a tempdir without mutating the
+/// process-global environment (which would be flaky under parallel tests —
+/// the same split [`super::canonical_paths`] uses). Returns the count pruned.
+fn prune_empty_session_dirs_in(root: &Path, min_age_secs: u64) -> usize {
+    let entries = match std::fs::read_dir(root) {
+        Ok(r) => r,
+        Err(_) => return 0, // root absent → nothing leaked
+    };
+    let mut pruned = 0usize;
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() || !is_session_uuid_dir(&dir) {
+            continue;
+        }
+        // Unmeasurable age is never old enough.
+        let Some(age) = dir_age_secs(&dir) else {
+            continue;
+        };
+        if age < min_age_secs {
+            continue;
+        }
+        // Non-recursive: succeeds ONLY if the dir is genuinely empty, so a
+        // populated session is never touched.
+        match std::fs::remove_dir(&dir) {
+            Ok(()) => {
+                debug!(
+                    "worktree_husk_prune: pruned empty session dir {}",
+                    dir.display()
+                );
+                pruned += 1;
+            }
+            Err(e) => debug!(
+                "worktree_husk_prune: {} not pruned ({e}) — expected when populated",
+                dir.display()
+            ),
+        }
+    }
+    pruned
+}
+
 /// The exact git argv (after the `git` binary) for a registration prune of
 /// `repo_root`. Pure — unit tests pin the invocation shape.
 fn prune_command_args(repo_root: &Path) -> Vec<String> {
@@ -871,9 +1164,8 @@ pub(super) fn prune_parent_repo(repo_root: &Path) {
 
 /// Enumerate every canonical repo checkout under the workspace root —
 /// reuses the census's discovery contract exactly (`qontinui_root()` for the
-/// root, [`super::census::is_canonical_repo_dir`] for the name filter, plus
-/// a `.git` presence check) so there is no second repo-discovery notion to
-/// drift from.
+/// root, [`super::census::is_canonical_repo_root`] for the repo-root test) so
+/// there is no second repo-discovery notion to drift from.
 fn enumerate_canonical_checkouts() -> Vec<PathBuf> {
     let Some(root) = super::census::qontinui_root() else {
         return Vec::new();
@@ -882,13 +1174,7 @@ fn enumerate_canonical_checkouts() -> Vec<PathBuf> {
     if let Ok(entries) = std::fs::read_dir(&root) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if super::census::is_canonical_repo_dir(name) && path.join(".git").exists() {
+            if path.is_dir() && super::census::is_canonical_repo_root(&path) {
                 out.push(path);
             }
         }
@@ -951,10 +1237,12 @@ pub(super) fn backstop_eligible(
 /// a coord-vetted instruction, NOT fine for an autonomous local delete).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackstopDirty {
-    /// `git status --porcelain` succeeded and was empty, OR the dir has no
-    /// `.git` at all (plain leaked dir — nothing to be dirty).
+    /// `git status --porcelain` succeeded and reported no real work (empty,
+    /// or only the runner's own untracked scaffolding — see
+    /// [`super::dirty`]), OR the dir has no `.git` at all (plain leaked dir —
+    /// nothing to be dirty).
     Clean,
-    /// `git status --porcelain` succeeded and was non-empty — WIP, never
+    /// `git status --porcelain` succeeded and reported real work — WIP, never
     /// delete.
     Dirty,
     /// A `.git` file/dir is present but `git status` failed (corrupt or
@@ -974,10 +1262,13 @@ fn backstop_dirty_verdict(path: &Path) -> BackstopDirty {
         .output()
     {
         Ok(o) if o.status.success() => {
-            if o.stdout.iter().all(|b| b.is_ascii_whitespace()) {
-                BackstopDirty::Clean
-            } else {
+            // Reclaim-scoped: the runner's own untracked scaffolding is not
+            // WIP. Without this the backstop is blocked by the very files it
+            // wrote when provisioning the worktree.
+            if super::dirty::porcelain_is_dirty(&String::from_utf8_lossy(&o.stdout)) {
                 BackstopDirty::Dirty
+            } else {
+                BackstopDirty::Clean
             }
         }
         // Status failed: only a dir with NO `.git` may be treated as clean;
@@ -1033,11 +1324,7 @@ fn backstop_sweep(coord_ever_live: bool) {
         }
         // Only session-UUID dirs are governed — anything else under the
         // root (operator scratch, unrelated tooling) is out of scope.
-        let is_session = session_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| Uuid::parse_str(n).is_ok());
-        if !is_session {
+        if !is_session_uuid_dir(&session_dir) {
             debug!(
                 "worktree_backstop: {} is not a session-uuid dir — out of scope",
                 session_dir.display()
@@ -1186,11 +1473,11 @@ pub(super) async fn fetch_pull() -> Result<Option<(Uuid, ReclaimPull)>, String> 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
-        .map_err(|e| format!("build reclaim http client: {e}"))?;
+        .map_err(|e| format!("build reclaim http client: {}", error_chain(&e)))?;
     let resp = crate::coord_http::coord_get(&client, &url)
         .send()
         .await
-        .map_err(|e| format!("GET {url}: {e}"))?;
+        .map_err(|e| format!("GET {url}: {}", error_chain(&e)))?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
@@ -1204,14 +1491,54 @@ pub(super) async fn fetch_pull() -> Result<Option<(Uuid, ReclaimPull)>, String> 
     Ok(Some((device_id, pull)))
 }
 
-/// One reclaim cycle: pull + execute. Returns `Ok(live_armed)` on a clean
-/// skip or a successful pull — the bool is `true` iff coord responded
-/// successfully AND at least one arming flag was on (the signal that flips
-/// the poller's monotonic `coord_ever_live`, permanently suppressing the
-/// Phase 4 backstop). `Err` only on a transport / non-2xx failure.
-pub async fn tick_once() -> Result<bool, String> {
+/// Render an error together with its FULL source chain.
+///
+/// `reqwest`'s `Display` prints only `error sending request for url (…)` and
+/// leaves the thing that actually explains the failure — the OS error, the DNS
+/// or TLS fault — reachable only via [`std::error::Error::source`]. A bare
+/// `format!("{e}")` therefore produces a line that names a symptom and no
+/// cause, which is not a diagnosable log entry.
+///
+/// This is not hypothetical. Between 2026-07-28 and 2026-08-01 the reclaim
+/// poller failed 100 % of its pulls for five days and emitted ~140 identical
+/// WARN lines per day, every one of them cause-free; the box reached coord
+/// fine over the same URL throughout, and the on-demand path calling THIS
+/// function succeeded the whole time. The outage was undiagnosable from the
+/// logs by construction.
+fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    use std::fmt::Write as _;
+    let mut out = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        let _ = write!(out, ": {cause}");
+        source = cause.source();
+    }
+    out
+}
+
+/// What one reclaim cycle actually did.
+///
+/// This used to be a bare `bool` meaning `live_armed`, which made a SUCCESSFUL
+/// pull with arming off (the default posture) indistinguishable from "no
+/// device_id configured — did nothing". Any health signal built on that bool
+/// would report a perfectly healthy unarmed poller as never having succeeded.
+/// The two cases are different facts, so they get different variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickOutcome {
+    /// No device_id / no coord_url — nothing was attempted. Not a success and
+    /// not a failure.
+    Skipped,
+    /// coord answered. `live_armed` is true iff at least one arming flag was
+    /// on — the signal that flips the poller's monotonic `coord_ever_live` and
+    /// permanently suppresses the Phase 4 backstop.
+    Pulled { live_armed: bool },
+}
+
+/// One reclaim cycle: pull + execute. `Err` only on a transport / non-2xx
+/// failure.
+pub async fn tick_once() -> Result<TickOutcome, String> {
     let Some((_device_id, pull)) = fetch_pull().await? else {
-        return Ok(false);
+        return Ok(TickOutcome::Skipped);
     };
     let live_armed = pull.rejunction_armed || pull.remove_armed;
 
@@ -1223,7 +1550,7 @@ pub async fn tick_once() -> Result<bool, String> {
     tokio::task::spawn_blocking(move || execute_pull(&pull))
         .await
         .map_err(|e| format!("reclaim execution panicked: {e}"))?;
-    Ok(live_armed)
+    Ok(TickOutcome::Pulled { live_armed })
 }
 
 /// Spawn the periodic reclaim poller. Interval from
@@ -1277,17 +1604,22 @@ pub fn spawn_reclaim() {
         loop {
             tick.tick().await;
             match tick_once().await {
-                Ok(true) => {
-                    if !coord_ever_live {
+                Ok(TickOutcome::Pulled { live_armed }) => {
+                    // coord answered: a success for health purposes whether or
+                    // not anything was armed.
+                    note_poll_success();
+                    if live_armed && !coord_ever_live {
                         info!(
                             "worktree_reclaim: coord live+armed — local backstop permanently \
                              suppressed for this poller session"
                         );
                     }
-                    coord_ever_live = true;
+                    coord_ever_live |= live_armed;
                 }
-                Ok(false) => {}
-                Err(e) => warn!("worktree_reclaim: {e}"),
+                // Nothing attempted (unconfigured). Not a success — it must not
+                // reset a failure streak — and not a failure either.
+                Ok(TickOutcome::Skipped) => {}
+                Err(e) => note_poll_failure(&e),
             }
 
             let interval = Duration::from_secs(prune_interval_secs());
@@ -1297,6 +1629,11 @@ pub fn spawn_reclaim() {
                 // Blocking pool: the pass runs git subprocesses + dir walks.
                 if let Err(e) = tokio::task::spawn_blocking(move || {
                     prune_all_canonical_checkouts();
+                    // Unconditional (unlike the backstop below): removing an
+                    // ALREADY-empty dir destroys nothing, and the backstop —
+                    // the only other sweeper — is suppressed whenever coord
+                    // is live, i.e. always in the armed steady state.
+                    prune_empty_session_dirs();
                     backstop_sweep(ever_live);
                 })
                 .await
@@ -1315,6 +1652,261 @@ pub fn spawn_reclaim() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The health signal must separate "idle" from "dead". This is the single
+    /// test that touches the poller-health statics; keep it that way, they are
+    /// process-global.
+    #[test]
+    fn poller_health_distinguishes_dead_from_healthy() {
+        // Fresh process state: never succeeded, no failures.
+        let h = poller_health();
+        assert_eq!(h.consecutive_failures, 0);
+        assert_eq!(h.last_success_unix, None);
+
+        for _ in 0..RECLAIM_FAILURE_ESCALATION_STREAK {
+            note_poll_failure("GET https://coord…: error sending request: os error 10054");
+        }
+        let h = poller_health();
+        assert_eq!(h.consecutive_failures, RECLAIM_FAILURE_ESCALATION_STREAK);
+        assert!(
+            h.last_error.as_deref().is_some_and(|e| e.contains("10054")),
+            "the cause chain must survive into the health signal"
+        );
+        // Still zero successes — the state the 5-day outage was actually in,
+        // and the one `coord_reachable: true` could not express.
+        assert_eq!(h.last_success_unix, None);
+
+        note_poll_success();
+        let h = poller_health();
+        assert_eq!(h.consecutive_failures, 0, "a success clears the streak");
+        assert!(h.last_success_unix.is_some());
+        assert_eq!(h.last_error, None);
+    }
+
+    /// `reqwest`'s Display names a symptom; the cause lives in `source()`.
+    #[test]
+    fn error_chain_includes_causes() {
+        #[derive(Debug)]
+        struct Inner;
+        impl std::fmt::Display for Inner {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "os error 10054")
+            }
+        }
+        impl std::error::Error for Inner {}
+
+        #[derive(Debug)]
+        struct Outer(Inner);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "error sending request for url")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let rendered = error_chain(&Outer(Inner));
+        assert_eq!(rendered, "error sending request for url: os error 10054");
+    }
+
+    /// INV-W5. A dir whose `.git` is a DIRECTORY is a real clone: refuse, and
+    /// prove the tree is still on disk afterwards. `git worktree remove` fails
+    /// on a repo root, and before this guard the unconditional `remove_dir_all`
+    /// fallback deleted the whole clone.
+    #[test]
+    fn remove_worktree_refuses_a_real_clone() {
+        let dir = tempfile::tempdir().unwrap();
+        let clone = dir.path().join("qontinui-coord-wt-prcreate-fix");
+        std::fs::create_dir_all(clone.join(".git")).unwrap();
+        std::fs::write(clone.join("src.rs"), b"work").unwrap();
+
+        let err = remove_worktree(&clone).expect_err("a real clone must not be removable");
+        assert!(err.contains("INV-W5"), "unexpected error: {err}");
+        assert!(clone.join(".git").is_dir(), "object store must survive");
+        assert!(clone.join("src.rs").exists(), "worktree files must survive");
+    }
+
+    /// The guard must not block the case reclaim actually exists for: a linked
+    /// worktree, whose `.git` is a FILE.
+    #[test]
+    fn remove_worktree_still_removes_a_linked_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("qontinui-coord-wt-real");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: /x/.git/worktrees/y").unwrap();
+
+        // `git worktree remove` fails here (not a registered worktree); the
+        // `remove_dir_all` fallback is what completes it — exactly the path
+        // INV-W5 must leave intact.
+        remove_worktree(&wt).expect("a linked worktree is still removable");
+        assert!(!wt.exists());
+    }
+
+    /// Build `<root>/<session-uuid>/<repo>` with `.git` as a FILE (a linked
+    /// worktree, the shape `remove_worktree` accepts).
+    fn session_worktree(root: &Path, session: &str, repo: &str) -> PathBuf {
+        let wt = root.join(session).join(repo);
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: /x/.git/worktrees/y").unwrap();
+        wt
+    }
+
+    /// The husk regression: reclaiming the only repo under a session dir must
+    /// leave NO empty `<session-uuid>` dir behind. Before this, husks grew one
+    /// per successful reclaim (1,554 observed vs 28 populated, 2026-08-03).
+    #[test]
+    fn removing_the_last_repo_prunes_the_empty_session_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = "019fbb21-e55d-7ef2-bbc1-5c371871e41b";
+        let wt = session_worktree(dir.path(), session, "qontinui-coord");
+
+        remove_worktree(&wt).expect("removable");
+
+        assert!(!wt.exists(), "repo dir removed");
+        assert!(
+            !dir.path().join(session).exists(),
+            "empty session dir must be pruned, not left as a husk"
+        );
+    }
+
+    /// Race safety: a sibling repo worktree under the same session must never
+    /// be destroyed. `remove_dir` is non-recursive, so a non-empty parent
+    /// simply fails and is left alone.
+    #[test]
+    fn session_dir_with_a_surviving_sibling_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = "019fbb22-ee8c-7193-9fb5-dfe211e55579";
+        let a = session_worktree(dir.path(), session, "qontinui-coord");
+        let b = session_worktree(dir.path(), session, "qontinui-runner");
+
+        remove_worktree(&a).expect("removable");
+
+        assert!(!a.exists(), "target removed");
+        assert!(b.exists(), "sibling worktree MUST survive");
+        assert!(
+            dir.path().join(session).exists(),
+            "session dir with a surviving sibling must not be pruned"
+        );
+    }
+
+    /// Scope guard: only UUID-named parents are governed, so the prune can
+    /// never walk up into the worktree root, `qontinui-root`, or an operator
+    /// scratch dir — no matter what path a caller passes.
+    #[test]
+    fn non_uuid_parent_is_never_pruned() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("qontinui-root");
+        let wt = parent.join("qr-wt-p2b");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: /x/.git/worktrees/y").unwrap();
+
+        remove_worktree(&wt).expect("removable");
+
+        assert!(!wt.exists(), "worktree removed");
+        assert!(
+            parent.exists(),
+            "a non-UUID parent must never be pruned even when empty"
+        );
+    }
+
+    /// Idempotent + harmless on the paths that are not session-shaped at all.
+    #[test]
+    fn prune_empty_session_parent_is_safe_on_odd_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        // Already-absent parent: no panic, no error.
+        prune_empty_session_parent(&dir.path().join("019fbb26-3b3b-7361-bd98-f11c7d4131e0/gone"));
+        // A path with no parent at all.
+        prune_empty_session_parent(Path::new("x"));
+        // Root-ish path.
+        prune_empty_session_parent(Path::new("/"));
+    }
+
+    // -----------------------------------------------------------------------
+    // The BACKLOG sweep — husks that already exist when the pass runs, which
+    // the forward-only `prune_empty_session_parent` can never reach.
+    // -----------------------------------------------------------------------
+
+    /// The gap `prune_empty_session_parent` leaves: a husk whose `<repo>`
+    /// child is ALREADY gone (emptied by an older build, by a removal that
+    /// happened while the runner was down, or by an allocation that created
+    /// the parent and never populated it). `remove_worktree` never runs for
+    /// these again, and the only other sweeper — `backstop_sweep` — is
+    /// suppressed whenever coord is live. So this pass must reach them.
+    #[test]
+    fn already_empty_session_dirs_are_pruned() {
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("019fbb27-1111-7111-8111-111111111111");
+        let b = root.path().join("019fbb28-2222-7222-8222-222222222222");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        // floor 0 — every dir is old enough.
+        assert_eq!(prune_empty_session_dirs_in(root.path(), 0), 2);
+        assert!(!a.exists(), "husk pruned");
+        assert!(!b.exists(), "husk pruned");
+    }
+
+    /// A populated session dir must survive untouched. `remove_dir` is
+    /// non-recursive, so this holds no matter what the dir contains — the
+    /// guard is the syscall itself, not a check that could go stale between
+    /// look and leap.
+    #[test]
+    fn populated_session_dir_survives_the_sweep() {
+        let root = tempfile::tempdir().unwrap();
+        let live = session_worktree(
+            root.path(),
+            "019fbb29-3333-7333-8333-333333333333",
+            "qontinui-runner",
+        );
+        let husk = root.path().join("019fbb2a-4444-7444-8444-444444444444");
+        std::fs::create_dir_all(&husk).unwrap();
+
+        assert_eq!(prune_empty_session_dirs_in(root.path(), 0), 1);
+        assert!(live.exists(), "a live worktree MUST survive");
+        assert!(!husk.exists(), "the husk beside it is still pruned");
+    }
+
+    /// Scope guard: a non-UUID child of the root is never touched, even when
+    /// empty — operator scratch dirs live beside the session dirs.
+    #[test]
+    fn non_uuid_dirs_are_never_swept() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = root.path().join("qr-wt-p2b");
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        assert_eq!(prune_empty_session_dirs_in(root.path(), 0), 0);
+        assert!(scratch.exists(), "a non-UUID dir must never be swept");
+    }
+
+    /// Race guard: allocation creates `<session-uuid>/` and only THEN runs a
+    /// network fetch + `git worktree add`, so a legitimately empty session dir
+    /// exists for as long as that takes. The age floor keeps the sweep off it.
+    #[test]
+    fn freshly_allocated_empty_session_dir_is_below_the_age_floor() {
+        let root = tempfile::tempdir().unwrap();
+        let allocating = root.path().join("019fbb2b-5555-7555-8555-555555555555");
+        std::fs::create_dir_all(&allocating).unwrap();
+
+        // Just created, so far below the 1h default floor.
+        assert_eq!(
+            prune_empty_session_dirs_in(root.path(), DEFAULT_EMPTY_SESSION_MIN_AGE_SECS),
+            0
+        );
+        assert!(
+            allocating.exists(),
+            "an in-flight allocation must not be swept out from under itself"
+        );
+    }
+
+    /// An absent root is "nothing leaked", not an error.
+    #[test]
+    fn sweep_on_an_absent_root_is_a_no_op() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(prune_empty_session_dirs_in(&root.path().join("gone"), 0), 0);
+    }
 
     fn instr(action: ReclaimAction, junctioned: &[&str], is_dirty: bool) -> ReclaimInstruction {
         ReclaimInstruction {

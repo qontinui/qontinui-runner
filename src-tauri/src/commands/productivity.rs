@@ -1962,6 +1962,95 @@ pub fn get_coord_http_base() -> String {
     coord_http_base_for_fleet()
 }
 
+/// Body for coord's `POST /agents/spawn`.
+///
+/// Extracted from [`spawn_from_plan`] purely so the wire contract is unit
+/// testable without an HTTP client or a Cognito bearer.
+///
+/// **Emit `work_unit_slug` and NOTHING ELSE for the slug.** Coord's
+/// `SpawnRequest` (qontinui-coord `src/agents_spawn.rs`) reads it as
+/// `#[serde(default, alias = "plan_slug")] work_unit_slug`, and serde treats
+/// an alias as the SAME field — so a body carrying BOTH spellings fails to
+/// deserialize with ``duplicate field `work_unit_slug` `` and coord answers
+/// 400. "Send both during the window" is the intuitive move here and it is
+/// exactly wrong; the dual window on this leg lives in coord's *accept*, not
+/// in the runner's emit.
+///
+/// (Note the asymmetry with the leg the runner READS: coord's `LaunchPayload`
+/// dual-*emits* both keys, which is why `agent_runtime::LaunchPayload` uses two
+/// real fields instead of an alias. Direction decides the shape.)
+///
+/// # The three shape fixes this function also carries
+///
+/// The body this command sent before was a copy of the **qontinui-web Spawn
+/// modal's** body, which is written for that app's proxy route — but
+/// `operations.py`'s `/agents/spawn` is a VERBATIM pass-through
+/// (`body: dict[str, Any]` → forwarded), so both writers were really posting
+/// straight at coord's `SpawnRequest`, and three fields did not match it.
+/// Coord extracts with `Json(req): Json<SpawnRequest>`, i.e. strict serde, so
+/// each one is a hard 422 before any handler logic runs:
+///
+/// 1. **`target_device_id` was absent.** It is a REQUIRED `uuid::Uuid` on
+///    `SpawnRequest` — no `#[serde(default)]`. The web modal sends `device_id`
+///    from a device picker; the runner modal has no picker, so the only
+///    meaning it can have here is *this* device, which is what we send.
+/// 2. **`repos` was `["name", …]`.** Coord wants `Vec<AllocateRepoSpec>`, i.e.
+///    `[{"repo": "name"}, …]`. `parent_sha` is `#[serde(default)]` and coord
+///    resolves it from `coord.canonical_repos` when omitted — which is the
+///    branch-off-clean-main behaviour we want — so it is deliberately not sent.
+/// 3. **`plan_phase` was a string.** Coord wants `Option<u32>`; see
+///    [`parse_plan_phase`].
+fn spawn_request_body(
+    target_device_id: &str,
+    work_unit_slug: &str,
+    plan_phase: Option<u32>,
+    repos: &[String],
+    intent: &str,
+    initial_prompt: &str,
+    declared_overlap_paths: &[String],
+) -> serde_json::Value {
+    let repo_specs: Vec<serde_json::Value> = repos
+        .iter()
+        .map(|r| serde_json::json!({ "repo": r }))
+        .collect();
+    serde_json::json!({
+        "target_device_id": target_device_id,
+        "work_unit_slug": work_unit_slug,
+        "plan_phase": plan_phase,
+        "repos": repo_specs,
+        "intent": intent,
+        "initial_prompt": initial_prompt,
+        "declared_overlap_paths": declared_overlap_paths,
+    })
+}
+
+/// The operator's free-text phase → coord's `Option<u32>`.
+///
+/// The modal's phase box has always been free text and its placeholder was
+/// `Phase 4`, so both `"4"` and `"Phase 4"` are shapes operators have actually
+/// typed — take the first run of digits from either. Empty/whitespace is a
+/// legitimate "no phase" (`plan_phase` is `Option` and purely informational on
+/// coord's side), so it maps to `None` rather than an error.
+///
+/// Anything else — `"final"`, `"IV"` — is a genuine mistake: it is returned as
+/// an `Err` so the operator is told, rather than silently spawning an agent
+/// with the phase dropped.
+fn parse_plan_phase(raw: &str) -> Result<Option<u32>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let digits: String = trimmed
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits
+        .parse::<u32>()
+        .map(Some)
+        .map_err(|_| format!("Phase must be a number (e.g. 4) — got {trimmed:?}."))
+}
+
 /// `spawn_from_plan` — authenticated POST to coord's `POST /agents/spawn`.
 ///
 /// Returns coord's spawn result as a permissive `serde_json::Value` (mirrors
@@ -1980,9 +2069,23 @@ pub fn get_coord_http_base() -> String {
 /// The bearer value is NEVER logged. Non-2xx responses surface as
 /// `Err(String)` including the status + body text so the Spawn modal shows
 /// a real error instead of a silent no-op.
+///
+/// **Wire key: `work_unit_slug`** (plan
+/// `2026-07-28-coord-post-plan-slug-surfaces-rename`, Stage 4a). Coord's
+/// `SpawnRequest` accepts it directly and still accepts the legacy
+/// `plan_slug` via `#[serde(alias)]` — see `spawn_request_body` for why
+/// this writer must send exactly ONE of the two.
+///
+/// `spawn_request_body` also documents the three body fields that did not
+/// match coord's `SpawnRequest` at all (missing `target_device_id`, bare-string
+/// `repos`, string `plan_phase`) and were 422ing every spawn before coord's
+/// handler ran.
+///
+/// The spawn targets **this** device: the runner's Spawn modal has no device
+/// picker (unlike qontinui-web's), so there is no other device it could mean.
 #[tauri::command]
 pub async fn spawn_from_plan(
-    plan_slug: String,
+    work_unit_slug: String,
     plan_phase: String,
     repos: Vec<String>,
     intent: String,
@@ -2008,14 +2111,23 @@ pub async fn spawn_from_plan(
                 .to_string()
         })?;
 
-    let body = serde_json::json!({
-        "plan_slug": plan_slug,
-        "plan_phase": plan_phase,
-        "repos": repos,
-        "intent": intent,
-        "initial_prompt": initial_prompt,
-        "declared_overlap_paths": declared_overlap_paths,
-    });
+    // Required by coord's `SpawnRequest` and previously omitted entirely.
+    // Same `AuthManager` the bearer came from, so no second storage read path.
+    let target_device_id = auth_manager.get_device_id().map_err(|e| {
+        format!("Cannot resolve this device's id (needed to target the spawn): {e}")
+    })?;
+
+    let plan_phase = parse_plan_phase(&plan_phase)?;
+
+    let body = spawn_request_body(
+        &target_device_id,
+        &work_unit_slug,
+        plan_phase,
+        &repos,
+        &intent,
+        &initial_prompt,
+        &declared_overlap_paths,
+    );
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -2392,5 +2504,161 @@ mod launch_intent_tests {
     fn append_add_dir_no_args_returns_command_unchanged() {
         let cmd = "claude --dangerously-skip-permissions".to_string();
         assert_eq!(append_claude_add_dir(cmd.clone(), &[]), cmd);
+    }
+}
+
+/// Wire-contract tests for the `POST /agents/spawn` body
+/// (plan `2026-07-28-coord-post-plan-slug-surfaces-rename`, Stage 4a).
+#[cfg(test)]
+mod spawn_request_body_tests {
+    use super::*;
+
+    fn body() -> serde_json::Value {
+        spawn_request_body(
+            "11111111-2222-3333-4444-555555555555",
+            "2026-07-28-some-unit",
+            Some(4),
+            &["qontinui-runner".to_string()],
+            "spawn-from-plan demo",
+            "You are Wave 4. Confirm receipt.",
+            &["src-tauri/src/commands/productivity.rs".to_string()],
+        )
+    }
+
+    #[test]
+    fn emits_the_post_rename_work_unit_slug_key() {
+        assert_eq!(body()["work_unit_slug"], "2026-07-28-some-unit");
+    }
+
+    /// THE contract test for this stage.
+    ///
+    /// Coord reads the slug as `#[serde(default, alias = "plan_slug")]
+    /// work_unit_slug`. An alias is the SAME field to serde, so a body
+    /// carrying both spellings fails with ``duplicate field
+    /// `work_unit_slug` `` → coord 400s and the Spawn modal shows an error
+    /// for every spawn. Re-adding `plan_slug` "for compatibility" is
+    /// therefore a break, not a safety net.
+    #[test]
+    fn never_emits_the_legacy_plan_slug_key_alongside_it() {
+        let b = body();
+        assert!(
+            b.get("plan_slug").is_none(),
+            "coord aliases plan_slug onto work_unit_slug — emitting both is a \
+             `duplicate field` 400, not a compatibility window: {b}"
+        );
+    }
+
+    #[test]
+    fn carries_the_remaining_spawn_fields_verbatim() {
+        let b = body();
+        assert_eq!(b["intent"], "spawn-from-plan demo");
+        assert_eq!(b["initial_prompt"], "You are Wave 4. Confirm receipt.");
+        assert_eq!(
+            b["declared_overlap_paths"],
+            serde_json::json!(["src-tauri/src/commands/productivity.rs"])
+        );
+    }
+
+    // ---- the three shape fixes ----
+
+    /// `SpawnRequest.target_device_id` is a REQUIRED `uuid::Uuid` — omitting
+    /// it made coord's `Json<SpawnRequest>` extractor 422 before any handler
+    /// logic ran, i.e. the Spawn modal could never succeed.
+    #[test]
+    fn includes_the_required_target_device_id() {
+        assert_eq!(
+            body()["target_device_id"],
+            "11111111-2222-3333-4444-555555555555"
+        );
+    }
+
+    /// Coord wants `Vec<AllocateRepoSpec>` (`{repo, parent_sha?}`), not bare
+    /// strings. `parent_sha` is omitted on purpose: coord then resolves the
+    /// parent from `coord.canonical_repos` (branch off clean origin/main)
+    /// instead of the caller guessing.
+    #[test]
+    fn shapes_repos_as_allocate_repo_specs_without_parent_sha() {
+        let b = spawn_request_body(
+            "dev",
+            "unit",
+            None,
+            &["qontinui-runner".to_string(), "qontinui-coord".to_string()],
+            "i",
+            "p",
+            &[],
+        );
+        assert_eq!(
+            b["repos"],
+            serde_json::json!([{"repo": "qontinui-runner"}, {"repo": "qontinui-coord"}])
+        );
+        assert!(
+            b["repos"][0].get("parent_sha").is_none(),
+            "parent_sha must be ABSENT so coord decides it, not null-pinned"
+        );
+    }
+
+    /// Coord wants `Option<u32>`; the body used to carry the operator's raw
+    /// string, which is the same hard 422.
+    #[test]
+    fn plan_phase_is_a_number_not_a_string() {
+        assert_eq!(body()["plan_phase"], 4);
+        assert!(body()["plan_phase"].is_number());
+    }
+
+    #[test]
+    fn absent_plan_phase_serializes_as_null() {
+        // `Option<u32>` + `#[serde(default)]` on coord's side: an explicit
+        // null and an absent key both deserialize to `None`.
+        let b = spawn_request_body("dev", "unit", None, &[], "i", "p", &[]);
+        assert!(b["plan_phase"].is_null());
+    }
+
+    #[test]
+    fn empty_repos_and_paths_serialize_as_empty_arrays() {
+        // The modal always sends arrays (possibly empty); coord rejects an
+        // empty `repos` with its own 400 ("repos[] must not be empty"), which
+        // is a clearer error than a client-side guess.
+        let b = spawn_request_body("dev", "unit", Some(1), &[], "i", "p", &[]);
+        assert_eq!(b["repos"], serde_json::json!([]));
+        assert_eq!(b["declared_overlap_paths"], serde_json::json!([]));
+    }
+}
+
+/// [`parse_plan_phase`] — the operator's free-text phase → coord's
+/// `Option<u32>`.
+#[cfg(test)]
+mod parse_plan_phase_tests {
+    use super::*;
+
+    #[test]
+    fn bare_number_parses() {
+        assert_eq!(parse_plan_phase("4"), Ok(Some(4)));
+        assert_eq!(parse_plan_phase("  12  "), Ok(Some(12)));
+    }
+
+    #[test]
+    fn the_placeholder_shape_parses() {
+        // The modal's placeholder was literally "Phase 4", so this is a
+        // spelling operators have been trained to type.
+        assert_eq!(parse_plan_phase("Phase 4"), Ok(Some(4)));
+        assert_eq!(parse_plan_phase("phase 3b"), Ok(Some(3)));
+    }
+
+    #[test]
+    fn empty_is_no_phase_not_an_error() {
+        assert_eq!(parse_plan_phase(""), Ok(None));
+        assert_eq!(parse_plan_phase("   "), Ok(None));
+    }
+
+    #[test]
+    fn non_numeric_is_a_named_error_not_a_silent_drop() {
+        let err = parse_plan_phase("final").unwrap_err();
+        assert!(err.contains("must be a number"), "unhelpful message: {err}");
+        assert!(err.contains("final"), "error must quote the input: {err}");
+    }
+
+    #[test]
+    fn overflowing_phase_is_an_error_not_a_wrap() {
+        assert!(parse_plan_phase("99999999999").is_err());
     }
 }

@@ -4,7 +4,8 @@ TypeScript integration for state detection in qontinui-runner. This service spaw
 
 ## File Location
 
-`/Users/jspinak/Documents/qontinui/qontinui-runner/src/services/StateDetectionService.ts`
+`qontinui-runner/src/services/StateDetectionService.ts` (relative to the
+workspace root)
 
 ## Overview
 

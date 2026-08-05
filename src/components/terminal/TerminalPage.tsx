@@ -56,6 +56,12 @@ import { useTabSessionIdCapture } from "./useTabSessionIdCapture";
 import { useSessionBoundEvents } from "./useSessionBoundEvents";
 import { buildSessionOpenArgs, type SessionOrigin } from "./sessionRecordArgs";
 import { buildAiLaunchCommand } from "./aiLaunchCommand";
+import {
+  getActiveProjectHint,
+  subscribeActiveProject,
+  type ActiveProjectHint,
+} from "./activeProject";
+import { markSeedConsumed, planSeedPrompt } from "./seedPrompt";
 import { rememberSessionId } from "./lastKnownSessionIds";
 import { useRegistryAwareness } from "./useRegistryAwareness";
 import { useMidSessionProbe, useMidSessionProbeEnabled } from "./useMidSessionProbe";
@@ -64,6 +70,10 @@ import { HoldingLockBanner, shouldShowHoldingBanner } from "./HoldingLockBanner"
 import { WaitingLockBanner } from "./WaitingLockBanner";
 import { DeconflictAdvisoryBanner } from "./DeconflictAdvisoryBanner";
 import { CoordWarningBanner } from "./CoordWarningBanner";
+import { ProjectFolderChip } from "./ProjectFolderChip";
+import { useApplyZoneProfile } from "./useApplyZoneProfile";
+import { useZoneProfileRestore } from "./useZoneProfileRestore";
+import { useHotField } from "./useTerminalHotStore";
 
 const logger = createLogger("TerminalPage");
 
@@ -123,7 +133,9 @@ function TerminalPageInner({
     pageId,
     zoneLayout,
     terminalRefs,
-    pendingProfileSessionsRef,
+    // NOTE: `pendingProfileSessionsRef` is no longer read here — the
+    // zone-profile application that parks sessions on it moved to
+    // `useApplyZoneProfile`, which reads it off the same context.
   } = session;
 
   // Result-card surface — the ResultCardProvider wraps TerminalPageInner
@@ -418,13 +430,13 @@ function TerminalPageInner({
     onSessionCountChange?.(tabs.length);
   }, [tabs.length, onSessionCountChange]);
 
-  const {
-    fileConflicts,
-    fileLockStates,
-    pendingYieldRequests,
-    pendingLongWaitSignals,
-    sessionPersistence,
-  } = session;
+  const { fileConflicts, sessionPersistence } = session;
+  // File-lock maps live in the page hot store (plan Phase 1) — the whole-map
+  // subscriptions here only fire on a REAL lock change, not on the 10 s poll
+  // tick, because the sweep now bails when nothing moved.
+  const fileLockStates = useHotField(pageId, "lockStates");
+  const pendingYieldRequests = useHotField(pageId, "pendingYieldRequests");
+  const pendingLongWaitSignals = useHotField(pageId, "pendingLongWaitSignals");
 
   // Re-key per-tab fileLockStates (keyed by tab.id) onto session ids so
   // SessionCard can render a "blocked on …" subtitle. session.sessionId
@@ -891,6 +903,7 @@ function TerminalPageInner({
     handleExportOutput,
     handleExportZone,
   } = useZoneActions({
+    pageId,
     tabs,
     dispatch,
     zoneLayout,
@@ -954,6 +967,15 @@ function TerminalPageInner({
   // to the pure `pickSpawnTenant` so the precedence contract is unit-testable.
   const resolveTenantForSpawn = (explicit?: string): string | undefined =>
     pickSpawnTenant({ explicit, spawnTenantId, activeTenantId });
+
+  // Zone-profile application, lifted out of the `ZoneProfilePicker`'s inline
+  // `onLoadProfile` so the SAME logic also backs restore-by-name. The picker
+  // below now just hands this callback through; `useZoneProfileRestore` wires
+  // the by-name path a project activation uses (plan §7.2 step 3) and
+  // registers the `terminal-restore-zone-profile` window-event bridge for
+  // callers outside this provider tree.
+  const applyZoneProfile = useApplyZoneProfile({ createAndAssignTerminal, resolveTenantForSpawn });
+  useZoneProfileRestore(applyZoneProfile);
 
   const handleQuickLaunch = async (count: number, autoCommand?: string): Promise<string[]> => {
     const totalTabs = tabs.length + count;
@@ -1086,6 +1108,47 @@ function TerminalPageInner({
     writeToTerminalById(terminalRefs.current, tabId, text);
   };
 
+  /*
+   * [Fix this] (projects-dashboard §8.4) — the terminal end of the activation
+   * hint's `seedPrompt`.
+   *
+   * The Projects page composes the failure description (it owns the health
+   * snapshot; the terminal side cannot read the project registry at all) and
+   * publishes it on the activation. Here we spawn ONE AI session seeded with
+   * it, reusing `spawnWithPromptText` so account selection, the launch-spec
+   * build and the session-id pinning stay on the single path `/spawn-ai`
+   * already uses.
+   *
+   * `planSeedPrompt` owns the replay guard, and it is load-bearing rather than
+   * defensive: the hint is cached and re-delivered on webview reload and on
+   * cross-window `storage` events, so keying on the prompt's PRESENCE would
+   * turn one click into a new agent every reload, against the user's own
+   * quota. The id is marked consumed BEFORE the spawn — a spawn that throws
+   * midway may still have started a session, and re-running it would be worse
+   * than skipping a fix the user can retry with another click.
+   */
+  // The ref keeps the subscription stable: `spawnWithPromptText` is rebuilt
+  // every render, so depending on it directly would tear down and re-add the
+  // listener continuously — and the mount-time `consume` would re-run each
+  // time, which only the replay guard would be saving us from.
+  const spawnSeedRef = useRef(spawnWithPromptText);
+  useEffect(() => {
+    spawnSeedRef.current = spawnWithPromptText;
+  });
+  useEffect(() => {
+    // Fire for the hint already cached at mount (the [Fix this] click happens
+    // on the Projects tab, and this page may only mount on the navigation that
+    // follows it), then for every subsequent activation.
+    const consume = (hint: ActiveProjectHint | null) => {
+      const seed = planSeedPrompt(hint);
+      if (!seed) return;
+      markSeedConsumed(seed.id);
+      void spawnSeedRef.current(seed.prompt);
+    };
+    consume(getActiveProjectHint());
+    return subscribeActiveProject(consume);
+  }, []);
+
   useTerminalCommands({
     spawnPlain: handleQuickLaunch,
     spawnAi: handleLaunchAiSession,
@@ -1159,6 +1222,10 @@ function TerminalPageInner({
 
         {showDocFinder && (
           <DocFinderModal
+            // The active terminal's cwd is the right place to start looking —
+            // and it is a real path on THIS machine, unlike the literal
+            // operator profile the modal used to fall back to.
+            defaultRoot={activeTab?.workingDir || undefined}
             onSelect={(filePath) => {
               handleOpenDocFile(filePath);
               setShowDocFinder(false);
@@ -1207,7 +1274,7 @@ function TerminalPageInner({
             outputSearch={uiState.outputSearch}
             onSearchChange={(v) => dispatch({ type: "SET_OUTPUT_SEARCH", payload: v })}
             onClose={() => dispatch({ type: "SET_SHOW_OUTPUT_SEARCH", payload: false })}
-            lastOutputLines={stateTracking.lastOutputLines}
+            pageId={pageId}
           />
         )}
 
@@ -1224,12 +1291,15 @@ function TerminalPageInner({
 
           <div className="flex-1 relative overflow-hidden">
             {tabs.length > 0 ? (
+              /* Every prop here is identity-stable (useZoneActions callbacks,
+                 the memoized handleExit, and useMidSessionProbe's stable
+                 `feed`), which is what makes ZoneGrid's React.memo hold. */
               <ZoneGrid
                 onZoneClick={handleZoneClick}
                 onZoneDoubleClick={handleZoneDoubleClick}
                 onExit={handleExit}
                 onExportZone={handleExportZone}
-                onUserInputLine={(tabId, input) => midSessionProbe.feed(tabId, input)}
+                onUserInputLine={midSessionProbe.feed}
               />
             ) : (
               <div className="h-full flex flex-col items-center justify-center text-[#565f89] gap-2">
@@ -1374,6 +1444,15 @@ function TerminalPageInner({
                 blocks input. */}
             <CoordWarningBanner activeTerminalId={activeId ?? undefined} />
 
+            {/* Projects dashboard §7.2 step 4 — activating a project must
+                never re-`cd` a live shell (an agent may be mid-edit). This
+                chip is the honest alternative: it reports how many live
+                terminals sit outside the active project's root and offers
+                [Move them] (open replacements, then close the originals) /
+                [Leave them]. Renders nothing when no project is active or
+                every terminal is already at the root. */}
+            <ProjectFolderChip />
+
             {/* Honest restore-status banner (Phase 5 + #548): restored tabs
                 whose `--resume` failed (operator retry), reconciled best-effort
                 matches (one-click confirm), and terminal-only / fresh-
@@ -1438,35 +1517,7 @@ function TerminalPageInner({
             zoneAssignments={zoneLayout.assignments}
             tabs={tabs}
             initialized={initialized}
-            onLoadProfile={async (profile) => {
-              zoneLayout.setLayoutId(profile.layoutId);
-              labelsAndTags.setZoneLabels(profile.labels);
-              labelsAndTags.setZoneNotes(profile.notes);
-              labelsAndTags.setPinnedZones(new Set(profile.pins));
-              transitionEffects.setAutoApprovePatterns(profile.autoApprovePatterns);
-              if (profile.sessions && profile.sessions.length > 0) {
-                pendingProfileSessionsRef.current = profile.sessions;
-                const existingTabCount = tabs.length;
-                const neededCount = profile.sessions.length;
-                const toCreate = Math.max(0, neededCount - existingTabCount);
-                for (let i = 0; i < toCreate; i++) {
-                  // These are brand-new blank terminals spawned NOW to fill the
-                  // profile's zones (not restored sessions carrying a stored
-                  // tenant), so they record the current acting tenant like any
-                  // other new spawn.
-                  await createAndAssignTerminal(undefined, undefined, resolveTenantForSpawn());
-                }
-                if (toCreate === 0) {
-                  const assignedTabs = new Set<string>();
-                  for (const s of profile.sessions) {
-                    const candidate = tabs.find((t) => !assignedTabs.has(t.id));
-                    if (!candidate) break;
-                    assignedTabs.add(candidate.id);
-                    zoneLayout.assignTabToZone(s.zoneIndex, candidate.id);
-                  }
-                }
-              }
-            }}
+            onLoadProfile={applyZoneProfile}
           />
         </div>
       </div>

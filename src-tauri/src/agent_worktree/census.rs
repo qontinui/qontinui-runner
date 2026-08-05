@@ -1097,15 +1097,37 @@ fn normalize_path_str(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-/// True iff `name` is a CANONICAL repo checkout dir (a repo root), not a
-/// worktree of one. A worktree dir is named `<repo>-wt-<slug>` (infix `-wt-`)
-/// or carries a `-wt` suffix (e.g. a cross-repo `qontinui-runner-xrepo-wt`);
-/// excluding both prevents a stray worktree dir with its own `.git` from being
-/// mis-treated as a repo root and re-listing a shared worktree under a phantom
-/// repo (which the coord `DISTINCT ON (device, repo, path)` read then keeps as a
-/// duplicate row).
-pub(crate) fn is_canonical_repo_dir(name: &str) -> bool {
-    name.starts_with("qontinui-") && !name.contains("-wt-") && !name.ends_with("-wt")
+/// True iff `path` holds a real git CLONE — i.e. `.git` is a DIRECTORY.
+///
+/// This is the STRUCTURAL distinction between a repo root and a linked
+/// worktree, and it holds whatever the dir is NAMED: `git worktree add` writes
+/// `.git` as a FILE containing a `gitdir:` pointer, while a clone keeps it as a
+/// directory holding the object store.
+///
+/// Naming is not a reliable proxy for it. On 2026-07-31 the census cleared
+/// `qontinui-coord-wt-prcreate-fix` — a 26.5 GB real clone — for removal purely
+/// because its name matched the worktree pattern. Every place that decides
+/// "repo root or worktree?" keys on this function instead.
+pub(crate) fn is_git_clone_root(path: &Path) -> bool {
+    path.join(".git").is_dir()
+}
+
+/// True iff `path` is a CANONICAL repo checkout (a repo root) rather than a
+/// worktree of one: a `qontinui-*` dir whose `.git` is a directory.
+///
+/// The test is structural [`is_git_clone_root`], not name-based. It subsumes
+/// the `-wt-` / `-wt` name exclusions this predicate used to carry: a genuine
+/// linked worktree has `.git` as a FILE and is excluded on that basis, so a
+/// stray worktree dir still cannot be mis-treated as a repo root (the phantom
+/// duplicate row under coord's `DISTINCT ON (device, repo, path)` read). What
+/// the name test got WRONG, and this one gets right, is the converse: a real
+/// clone that merely *looks* like a worktree is a repo root and is reported as
+/// one.
+pub(crate) fn is_canonical_repo_root(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name.starts_with("qontinui-"))
+        && is_git_clone_root(path)
 }
 
 /// Run `git -C <canonical> worktree list --porcelain` and return the
@@ -1133,6 +1155,13 @@ fn git_registered_worktrees(canonical: &Path) -> Vec<PathBuf> {
 /// Sibling `<repo>-wt-*` dirs in the parent dir, plus per-repo
 /// `.claude/worktrees/*` dirs. These catch worktrees not registered with
 /// the canonical repo's `git worktree list`.
+///
+/// Both scans are NAME- and LOCATION-based, so both must reject a real clone
+/// structurally: a dir named `<repo>-wt-<slug>` that carries its own object
+/// store is a separate repository, never a worktree of `repo`. Without that
+/// check the name match alone was enough to enter the reclaim candidate set —
+/// which is how `qontinui-coord-wt-prcreate-fix` (a 26.5 GB clone) came to be
+/// cleared for removal on 2026-07-31.
 fn sibling_and_claude_worktrees(root: &Path, canonical: &Path, repo: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
 
@@ -1141,7 +1170,7 @@ fn sibling_and_claude_worktrees(root: &Path, canonical: &Path, repo: &str) -> Ve
     if let Ok(entries) = std::fs::read_dir(root) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_dir() {
+            if !path.is_dir() || is_git_clone_root(&path) {
                 continue;
             }
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
@@ -1157,7 +1186,7 @@ fn sibling_and_claude_worktrees(root: &Path, canonical: &Path, repo: &str) -> Ve
     if let Ok(entries) = std::fs::read_dir(&claude_wts) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            if path.is_dir() && !is_git_clone_root(&path) {
                 out.push(path);
             }
         }
@@ -1305,9 +1334,13 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
         .and_then(|s| s.parse::<i64>().ok())
         .map(|committed| chrono::Utc::now().timestamp().saturating_sub(committed));
 
-    // is_dirty — non-empty `git status --porcelain`.
+    // is_dirty — reclaim-scoped: `git status --porcelain` MINUS the runner's
+    // own untracked scaffolding (`.claude/`, `.coord-mcp-status`, `.mcp.json`).
+    // Plain non-emptiness marked ~34% of agent worktrees dirty forever purely
+    // because the runner provisioned them, which made them permanently
+    // unreclaimable. See `super::dirty` for the full rationale and scope.
     let is_dirty = git_capture(worktree, &["status", "--porcelain"])
-        .map(|s| !s.trim().is_empty())
+        .map(|s| super::dirty::porcelain_is_dirty(&s))
         .unwrap_or(false);
 
     let (nm_present, nm_is_junction, nm_bytes) = measure_dir(&worktree.join("node_modules"));
@@ -1386,13 +1419,11 @@ fn enumerate_worktrees_with(root: &Path, on_row: &mut dyn FnMut(WorktreeCensus))
                 Some(n) => n.to_string(),
                 None => continue,
             };
-            // Canonical checkout: `qontinui-*` with a `.git`. Skip worktree
-            // dirs here — they're discovered as worktrees OF their repo, not
-            // as repos themselves.
-            if !is_canonical_repo_dir(&name) {
-                continue;
-            }
-            if path.join(".git").exists() {
+            // Canonical checkout: `qontinui-*` whose `.git` is a DIRECTORY.
+            // Linked worktrees are excluded structurally (their `.git` is a
+            // file) — they're discovered as worktrees OF their repo, not as
+            // repos themselves.
+            if is_canonical_repo_root(&path) {
                 repo_roots.push((name, path));
             }
         }
@@ -1570,20 +1601,95 @@ pub fn spawn_census() {
 mod tests {
     use super::*;
 
+    /// `<root>/<name>` with `.git` as a DIRECTORY — a real clone.
+    fn make_clone(root: &Path, name: &str) -> PathBuf {
+        let p = root.join(name);
+        std::fs::create_dir_all(p.join(".git")).unwrap();
+        p
+    }
+
+    /// `<root>/<name>` with `.git` as a FILE — a linked worktree.
+    fn make_worktree(root: &Path, name: &str) -> PathBuf {
+        let p = root.join(name);
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(
+            p.join(".git"),
+            "gitdir: D:/qontinui-root/x/.git/worktrees/y",
+        )
+        .unwrap();
+        p
+    }
+
     #[test]
-    fn canonical_repo_dir_excludes_worktree_dirs() {
+    fn clone_root_is_structural_not_name_based() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        assert!(is_git_clone_root(&make_clone(root, "qontinui-runner")));
+        assert!(!is_git_clone_root(&make_worktree(
+            root,
+            "qontinui-runner-wt-pnpm"
+        )));
+        // No `.git` at all — a plain dir is not a clone.
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+        assert!(!is_git_clone_root(&root.join("node_modules")));
+
+        // THE REGRESSION: a real clone whose NAME matches the worktree
+        // pattern. The old name-based predicate called this a worktree, which
+        // is what put a 26.5 GB clone into a cleared reclaim cohort.
+        assert!(is_git_clone_root(&make_clone(
+            root,
+            "qontinui-coord-wt-prcreate-fix"
+        )));
+    }
+
+    #[test]
+    fn canonical_repo_root_excludes_worktrees_and_includes_wt_named_clones() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
         // Real repo roots.
-        assert!(is_canonical_repo_dir("qontinui-runner"));
-        assert!(is_canonical_repo_dir("qontinui-coord"));
-        assert!(is_canonical_repo_dir("qontinui-supervisor"));
-        // `-wt-` infix worktrees.
-        assert!(!is_canonical_repo_dir("qontinui-runner-wt-pnpm"));
-        assert!(!is_canonical_repo_dir("qontinui-coord-wt-verify"));
-        // `-wt` SUFFIX dirs (the oddity: a stray cross-repo worktree dir with
-        // its own .git was mis-treated as a repo root → duplicate census rows).
-        assert!(!is_canonical_repo_dir("qontinui-runner-xrepo-wt"));
-        // Non-qontinui dirs.
-        assert!(!is_canonical_repo_dir("node_modules"));
+        assert!(is_canonical_repo_root(&make_clone(root, "qontinui-runner")));
+        assert!(is_canonical_repo_root(&make_clone(root, "qontinui-coord")));
+        // Linked worktrees — `.git` is a file.
+        assert!(!is_canonical_repo_root(&make_worktree(
+            root,
+            "qontinui-runner-wt-pnpm"
+        )));
+        assert!(!is_canonical_repo_root(&make_worktree(
+            root,
+            "qontinui-runner-xrepo-wt"
+        )));
+        // Non-qontinui dirs stay out of the governed set.
+        assert!(!is_canonical_repo_root(&make_clone(root, "node_modules")));
+        // A `-wt-`-NAMED real clone IS a repo root — the name no longer decides.
+        assert!(is_canonical_repo_root(&make_clone(
+            root,
+            "qontinui-coord-wt-prcreate-fix"
+        )));
+    }
+
+    #[test]
+    fn sibling_scan_skips_real_clones() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let canonical = make_clone(root, "qontinui-coord");
+
+        let real_wt = make_worktree(root, "qontinui-coord-wt-verify");
+        // Same naming shape, but a separate repository.
+        make_clone(root, "qontinui-coord-wt-prcreate-fix");
+
+        let found = sibling_and_claude_worktrees(root, &canonical, "qontinui-coord");
+        assert!(
+            found.contains(&real_wt),
+            "genuine sibling worktree must still be discovered"
+        );
+        assert!(
+            !found
+                .iter()
+                .any(|p| p.ends_with("qontinui-coord-wt-prcreate-fix")),
+            "a real clone must never be reported as a worktree of another repo"
+        );
     }
 
     #[test]
@@ -1806,6 +1912,55 @@ mod tests {
         let div = compute_canonical_base_divergence(path).expect("divergence Some");
         assert!(!div.is_empty(), "divergence string should be non-empty");
         assert!(div.starts_with("on:feature-x"), "got: {div}");
+    }
+
+    /// End-to-end at the census layer: a worktree holding ONLY the runner's
+    /// own untracked scaffolding must report `is_dirty: false`, while genuine
+    /// uncommitted work must still report `true`.
+    ///
+    /// The regression this pins: plain porcelain non-emptiness made every
+    /// provisioned agent worktree dirty forever, and since neither the census
+    /// nor the reclaim executor acts on a dirty worktree, ~34% of the backlog
+    /// (1,792 of 5,322 measured 2026-07-28) was permanently unreclaimable.
+    #[test]
+    fn capture_worktree_ignores_runner_scaffolding_but_not_real_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let wt = path.to_str().unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args([&["-C", wt], args].concat())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(path.join("a.txt"), b"x").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-q", "-m", "c1"]);
+        assert!(
+            !capture_worktree("qontinui-runner", path).is_dirty,
+            "a freshly committed tree is clean"
+        );
+
+        // Exactly what provisioning an agent worktree leaves behind.
+        std::fs::create_dir_all(path.join(".claude").join("agents")).unwrap();
+        std::fs::write(path.join(".claude").join("agents").join("r.md"), b"x").unwrap();
+        std::fs::write(path.join(".coord-mcp-status"), b"UNREACHABLE").unwrap();
+        std::fs::write(path.join(".mcp.json"), b"{}").unwrap();
+        assert!(
+            !capture_worktree("qontinui-runner", path).is_dirty,
+            "runner-written scaffolding alone must NOT read as dirty"
+        );
+
+        // A tracked modification still does.
+        std::fs::write(path.join("a.txt"), b"edited").unwrap();
+        assert!(
+            capture_worktree("qontinui-runner", path).is_dirty,
+            "a tracked modification must still read as dirty"
+        );
     }
 
     /// Ξ_Worktree P7.3 — `on:main` carve-out + ahead/behind formatting when

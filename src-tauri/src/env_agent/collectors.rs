@@ -41,8 +41,11 @@ fn put(section: &mut Section, key: &str, value: impl Into<String>) {
 /// doesn't parse as a URL with a host. NEVER includes path/query/userinfo.
 ///
 /// This is the single choke point that guarantees a DSN password can't leak
-/// into the `services` section.
-fn sanitize_url(raw: &str) -> Option<String> {
+/// into the `services` section — and, since P2b slice 2, the same choke point
+/// the local apply redacts through ([`super::apply_services`]). One
+/// implementation, so the capture and the apply can never disagree about what
+/// counts as secret-free.
+pub(crate) fn sanitize_url(raw: &str) -> Option<String> {
     let mut parsed = url::Url::parse(raw).ok()?;
     // Structurally remove credentials. `set_username`/`set_password` return
     // Err only for cannot-be-a-base URLs (which have no host anyway, filtered
@@ -212,25 +215,194 @@ pub async fn collect_db_schema() -> Option<Section> {
     }
 }
 
-/// Run a bounded `<cmd> --version` (3s budget) and return the trimmed first
-/// line of stdout (falling back to stderr). Returns `None` on spawn failure,
-/// timeout, or non-zero exit. Mirrors `fleet::detect_claude_code_now`'s bounded
-/// subprocess pattern.
-fn version_of(cmd: &str, args: &[&str]) -> Option<String> {
+/// Why a configured `scope_root` was NOT used. Every variant means the operator
+/// declared a capture scope and the agent measured somewhere else — the one
+/// situation where falling back silently would be worse than the stale value,
+/// because the resulting drift reading looks legitimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeRootRejection {
+    /// The value was empty or all whitespace — indistinguishable from unset.
+    Blank,
+    /// The value was a RELATIVE path. Rejected because resolving it against the
+    /// process's cwd would reintroduce the exact launch-dependence this whole
+    /// mechanism exists to remove: the probe would land somewhere different
+    /// depending on where the runner was started from.
+    Relative,
+    /// The path is absolute but is not an existing directory (missing, or a
+    /// file). Handing it back as a cwd would make every probe spawn fail and
+    /// silently zero the whole `versions` section.
+    NotADirectory,
+}
+
+impl ScopeRootRejection {
+    /// Operator-facing reason, used verbatim in the capture WARN and in
+    /// `env show`'s `scope_root_status`.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Blank => "value is empty",
+            Self::Relative => {
+                "path is relative — a relative scope root resolves against the runner's \
+                 launch directory, which is the non-determinism this setting exists to remove"
+            }
+            Self::NotADirectory => "path is not an existing directory",
+        }
+    }
+}
+
+/// The resolved capture scope plus, when applicable, the configured value that
+/// was dropped to reach it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeScope {
+    /// Directory the probes run in. `None` means "spawn without setting a cwd"
+    /// (inherit) — only reachable when there is no home directory at all.
+    pub root: Option<std::path::PathBuf>,
+    /// `Some` iff a `scope_root` was configured but NOT honoured.
+    pub rejected: Option<ScopeRootRejection>,
+}
+
+/// Pure resolution of the declared capture scope from a configured value.
+///
+/// Resolution order, first hit wins:
+/// 1. The configured `scope_root`, when it is non-blank, **absolute**, and an
+///    existing directory.
+/// 2. The user's home directory — the box's DEFAULT toolchain, i.e. what
+///    shim-based managers answer outside any project tree.
+/// 3. `None` (inherit). Only when there is no home directory at all.
+///
+/// An unusable configured value FALLS THROUGH rather than failing the capture:
+/// the collectors are fail-open by construction, and a stale config entry must
+/// not silently zero the whole `versions` section. It is reported via
+/// [`ProbeScope::rejected`] so the fall-through is never invisible.
+///
+/// **Deliberately NOT the compile-time `CARGO_MANIFEST_DIR`.** That path
+/// measures which source tree the binary was BUILT from, not the box — the same
+/// confusion that makes `runner_crate_version` and friends repo-derived rather
+/// than appliable. Anchoring the probe there would reintroduce that bug on the
+/// observed keys, which are the only ones a P2b apply can actually move.
+///
+/// **Deliberately NOT the inherited cwd.** That is the defect this exists to
+/// fix: it makes the captured version a function of how the runner was
+/// launched, so the drift oracle cannot be trusted to compare like with like.
+/// A relative configured path is rejected for the same reason — it is the
+/// inherited cwd wearing a configured value's clothes.
+pub fn resolve_probe_scope(configured: Option<&str>) -> ProbeScope {
+    let home = || dirs::home_dir().filter(|h| h.is_dir());
+    let Some(raw) = configured else {
+        return ProbeScope {
+            root: home(),
+            rejected: None,
+        };
+    };
+
+    let trimmed = raw.trim();
+    let rejection = if trimmed.is_empty() {
+        Some(ScopeRootRejection::Blank)
+    } else {
+        let path = std::path::PathBuf::from(trimmed);
+        if !path.is_absolute() {
+            Some(ScopeRootRejection::Relative)
+        } else if !path.is_dir() {
+            Some(ScopeRootRejection::NotADirectory)
+        } else {
+            return ProbeScope {
+                root: Some(path),
+                rejected: None,
+            };
+        }
+    };
+
+    ProbeScope {
+        root: home(),
+        rejected: rejection,
+    }
+}
+
+/// Resolve the declared capture scope from the on-disk config, WARNing when a
+/// configured value had to be dropped.
+///
+/// The warn is the point: a dropped scope root produces a capture that is
+/// perfectly well-formed and quietly measured somewhere the operator did not
+/// choose, so it cannot be caught by looking at the envelope. See
+/// [`resolve_probe_scope`] for the resolution order.
+pub fn probe_scope() -> ProbeScope {
+    let configured = super::config::EnvAgentConfig::load().and_then(|c| c.scope_root);
+    let scope = resolve_probe_scope(configured.as_deref());
+    if let Some(rejection) = scope.rejected {
+        tracing::warn!(
+            "env_agent: ignoring configured scope_root {:?} ({}) — probing in {} instead; \
+             fix with `qontinui-runner env scope-root --path <absolute-dir>`",
+            configured.as_deref().unwrap_or(""),
+            rejection.reason(),
+            scope
+                .root
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "the inherited working directory".to_string()),
+        );
+    }
+    scope
+}
+
+/// The directory the toolchain `--version` probes run in. Thin accessor over
+/// [`probe_scope`] for callers that only need the path.
+pub fn probe_scope_root() -> Option<std::path::PathBuf> {
+    probe_scope().root
+}
+
+/// Wall-clock budget for one `<cmd> --version` probe during CAPTURE.
+///
+/// Deliberately tight: capture runs on a 15-minute loop against three tools, and
+/// a wedged shim must cost the runner seconds, not minutes. A probe that exceeds
+/// it simply omits its key — the collectors are fail-open.
+const CAPTURE_PROBE_BUDGET: Duration = Duration::from_secs(3);
+
+/// Run a bounded `<cmd> --version` and return the trimmed first line of stdout
+/// (falling back to stderr). Returns `None` on spawn failure, timeout, or
+/// non-zero exit. Mirrors `fleet::detect_claude_code_now`'s bounded subprocess
+/// pattern.
+///
+/// `cwd` is the declared capture scope (see [`probe_scope_root`]). `None`
+/// inherits the parent's cwd — reserved for the no-home-directory case, since
+/// an inherited cwd is exactly what makes this probe non-deterministic.
+fn version_of(cmd: &str, args: &[&str], cwd: Option<&Path>) -> Option<String> {
+    version_of_within(cmd, args, cwd, CAPTURE_PROBE_BUDGET)
+}
+
+/// [`version_of`] with an explicit budget.
+///
+/// The budget is a parameter so the cwd-plumbing TESTS can use a generous one.
+/// They assert (rather than skip) that the probe produced output — the right
+/// call, since a silently-returning test prints the same `ok` as a real pass —
+/// but with the capture budget baked in, that assertion also fires whenever the
+/// machine is merely too busy to start a shell inside 3s. Observed on a box
+/// running ~20 concurrent cargo builds: two consecutive runs of the same binary
+/// failed on *different* tests of the pair, and passed on the run before.
+/// A test budget of [`TEST_PROBE_BUDGET`] keeps "the probe is broken" failing
+/// while letting "the box is slow" pass, so the assertion still means what it
+/// claims to.
+fn version_of_within(
+    cmd: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    budget: Duration,
+) -> Option<String> {
     use std::io::Read;
     use std::process::Stdio;
     use std::time::Instant;
 
     let started = Instant::now();
-    let mut child = crate::process_helpers::no_window(cmd)
+    let mut command = crate::process_helpers::no_window(cmd);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::piped());
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+    let mut child = command.spawn().ok()?;
 
-    let deadline = started + Duration::from_secs(3);
+    let deadline = started + budget;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -260,6 +432,22 @@ fn version_of(cmd: &str, args: &[&str]) -> Option<String> {
             Err(_) => return None,
         }
     }
+}
+
+/// Re-run the EXACT probe [`collect_versions`] uses, with an explicit budget.
+///
+/// The `versions` apply (P2b slice 3) verifies its own work by re-probing after
+/// driving a version manager. That verification is only worth anything if it
+/// asks the same question the capture asks — same command, same args, same cwd
+/// resolution — so it goes through this one function rather than a lookalike.
+/// The budget is a parameter because an apply can afford to wait longer than a
+/// 15-minute capture loop can.
+pub(crate) fn probe_tool_version(
+    cmd: &str,
+    cwd: Option<&Path>,
+    budget: Duration,
+) -> Option<String> {
+    version_of_within(cmd, &["--version"], cwd, budget)
 }
 
 /// Pull a `name = "x.y.z"` value out of a `[section]` of a Cargo.toml string.
@@ -355,13 +543,21 @@ pub fn collect_versions() -> Section {
     }
 
     // ---- bounded `--version` shells (optional, 3s budget each) ----
-    if let Some(v) = version_of("rustc", &["--version"]) {
+    //
+    // These three are the ONLY keys in this section that describe the box rather
+    // than the source tree the binary was built from, and (post web #808 /
+    // runner #818 derived-key filtering) the only ones a P2b apply can move. All
+    // three run in the DECLARED scope root so the answer does not depend on how
+    // the runner process was launched.
+    let scope = probe_scope_root();
+    let scope_ref = scope.as_deref();
+    if let Some(v) = version_of("rustc", &["--version"], scope_ref) {
         put(&mut section, "rustc", v);
     }
-    if let Some(v) = version_of("node", &["--version"]) {
+    if let Some(v) = version_of("node", &["--version"], scope_ref) {
         put(&mut section, "node", v);
     }
-    if let Some(v) = version_of("python", &["--version"]) {
+    if let Some(v) = version_of("python", &["--version"], scope_ref) {
         put(&mut section, "python", v);
     }
 
@@ -741,6 +937,193 @@ mod tests {
             !json.contains("supersecret123"),
             "secret value leaked into env_contract: {json}"
         );
+    }
+
+    // ---- probe scope root (declared capture scope) ----
+
+    /// Budget for the cwd-plumbing probes below.
+    ///
+    /// Generous ON PURPOSE. These tests assert the probe produced output rather
+    /// than skipping when it did not, which is correct — but that assertion is
+    /// only meaningful if a failure means "the probe is broken", not "the box
+    /// was too busy to start a shell in three seconds". The capture budget is a
+    /// production latency choice; borrowing it here made the pair flaky under
+    /// parallel load. Long enough that only a genuinely missing or wedged shell
+    /// trips it; short enough that a wedged one still fails the run promptly.
+    const TEST_PROBE_BUDGET: Duration = Duration::from_secs(60);
+
+    /// Spawn a shell that prints its own cwd, through `version_of`'s plumbing.
+    /// `version_of` returns the first stdout line, so `pwd` / `cd` round-trips.
+    fn cwd_probe(cwd: Option<&Path>) -> Option<String> {
+        #[cfg(windows)]
+        let (cmd, args) = ("cmd", ["/c", "cd"]);
+        #[cfg(not(windows))]
+        let (cmd, args) = ("sh", ["-c", "pwd"]);
+        version_of_within(cmd, &args, cwd, TEST_PROBE_BUDGET)
+    }
+
+    /// The load-bearing property: the probe runs in the directory it is GIVEN,
+    /// not the one the runner process happens to be sitting in. Without this,
+    /// `node`/`python`/`rustc` are a function of how the runner was launched and
+    /// the drift oracle they feed compares unlike with unlike.
+    #[test]
+    fn version_of_runs_in_the_supplied_scope_root() {
+        let dir = tempfile::tempdir().unwrap();
+        // Distinctive component: Windows may report an 8.3-shortened or
+        // case-differing prefix, so assert on the leaf rather than equality.
+        let scoped = dir.path().join("qontinui_scope_probe_marker");
+        std::fs::create_dir_all(&scoped).unwrap();
+
+        // Deliberately NOT a silent skip on `None`. Every platform this builds on
+        // ships the shell used here (`cmd` on Windows, `sh` elsewhere), so a
+        // `None` means the probe plumbing is broken — and a test that quietly
+        // returns instead would report the same "ok" as a real pass.
+        let out = cwd_probe(Some(&scoped)).expect("cwd probe produced no output — shell missing?");
+        assert!(
+            out.to_lowercase().contains("qontinui_scope_probe_marker"),
+            "probe did not run in the supplied scope root; reported cwd: {out}"
+        );
+    }
+
+    /// Two probes with DIFFERENT scope roots must report different cwds — the
+    /// direct expression of "capture is scope-determined". A probe that ignored
+    /// its cwd argument would pass the test above by accident if the process
+    /// already sat in the right place; this one cannot be passed that way.
+    #[test]
+    fn version_of_scope_root_actually_varies_the_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("scope_a");
+        let b = dir.path().join("scope_b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        let out_a = cwd_probe(Some(&a)).expect("cwd probe (a) produced no output");
+        let out_b = cwd_probe(Some(&b)).expect("cwd probe (b) produced no output");
+        assert_ne!(
+            out_a.to_lowercase(),
+            out_b.to_lowercase(),
+            "probe reported the same cwd for two different scope roots"
+        );
+        assert!(out_a.to_lowercase().ends_with("scope_a"), "got {out_a}");
+        assert!(out_b.to_lowercase().ends_with("scope_b"), "got {out_b}");
+    }
+
+    /// A configured scope root that does not exist must FALL THROUGH to the home
+    /// directory, not be returned and not abort the capture. The collectors are
+    /// fail-open: a stale config entry must never silently zero the `versions`
+    /// section, which is what returning a nonexistent cwd would do (every spawn
+    /// would fail and every observed key would go missing).
+    #[test]
+    fn probe_scope_root_falls_through_when_configured_path_is_missing() {
+        let _env_lock = env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let prior_home = std::env::var("HOME").ok();
+        let prior_profile = std::env::var("USERPROFILE").ok();
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("USERPROFILE", home.path());
+
+        // Enrolled config naming a scope root that is not there.
+        let qdir = home.path().join(".qontinui");
+        std::fs::create_dir_all(&qdir).unwrap();
+        let missing = home.path().join("definitely_not_created");
+        std::fs::write(
+            qdir.join("env-agent.json"),
+            serde_json::json!({
+                "backend_url": "http://localhost:8000",
+                "machine_id": "m",
+                "environment_id": "e",
+                "scope_root": missing.to_string_lossy(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let resolved = probe_scope_root();
+
+        match prior_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match prior_profile {
+            Some(v) => std::env::set_var("USERPROFILE", v),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+
+        let resolved = resolved.expect("should fall back to home, not return None");
+        assert_ne!(
+            resolved, missing,
+            "returned a nonexistent configured scope root"
+        );
+        assert!(resolved.is_dir(), "fallback must be a real directory");
+    }
+
+    /// An absolute, existing configured root is honoured verbatim and reports no
+    /// rejection — the baseline the reject cases below are measured against.
+    #[test]
+    fn resolve_probe_scope_honours_absolute_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope = resolve_probe_scope(Some(&dir.path().to_string_lossy()));
+        assert_eq!(scope.root.as_deref(), Some(dir.path()));
+        assert!(scope.rejected.is_none(), "got {:?}", scope.rejected);
+    }
+
+    /// A RELATIVE configured root must be rejected, not resolved.
+    ///
+    /// This is the hole the absolute-path check closes: `is_dir()` on a relative
+    /// path is evaluated against the runner's cwd, and handing that same relative
+    /// path to `current_dir()` resolves it against the spawned child's inherited
+    /// cwd — so a relative `scope_root` makes the probe launch-dependent again,
+    /// which is precisely the defect the declared capture scope exists to remove.
+    /// It has to be caught by SHAPE, because on the box where the operator typed
+    /// it the path very often does resolve, and the capture then looks correct.
+    #[test]
+    fn resolve_probe_scope_rejects_a_relative_configured_root() {
+        // `src` exists relative to the package root the tests run in, so the
+        // rejection here is decided by SHAPE (relative), not by the directory
+        // being absent — which is the distinction that matters: a relative path
+        // that resolves is the dangerous case, not the harmless one.
+        let scope = resolve_probe_scope(Some("src"));
+        assert_eq!(
+            scope.rejected,
+            Some(ScopeRootRejection::Relative),
+            "a relative scope root must be rejected as relative"
+        );
+        assert_ne!(
+            scope.root.as_deref(),
+            Some(Path::new("src")),
+            "the relative path must not be used as the probe cwd"
+        );
+    }
+
+    /// A blank value is indistinguishable from unset and must not be treated as
+    /// a path (`PathBuf::from("")` is neither absolute nor a directory, so it
+    /// would otherwise be misreported as `NotADirectory`).
+    #[test]
+    fn resolve_probe_scope_rejects_blank_as_blank() {
+        assert_eq!(
+            resolve_probe_scope(Some("   ")).rejected,
+            Some(ScopeRootRejection::Blank)
+        );
+    }
+
+    /// An absolute path that is a FILE, not a directory, must fall through the
+    /// same way a missing one does — a file cwd fails every spawn.
+    #[test]
+    fn resolve_probe_scope_rejects_an_absolute_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not_a_dir");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(
+            resolve_probe_scope(Some(&file.to_string_lossy())).rejected,
+            Some(ScopeRootRejection::NotADirectory)
+        );
+    }
+
+    /// No configured value is the common case and is NOT a rejection — only a
+    /// dropped declaration is, since that is the case an operator needs told.
+    #[test]
+    fn resolve_probe_scope_reports_no_rejection_when_unconfigured() {
+        assert!(resolve_probe_scope(None).rejected.is_none());
     }
 
     /// Secret-safety: a password-bearing DSN in the profile never leaks the

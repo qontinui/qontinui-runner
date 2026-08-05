@@ -111,13 +111,12 @@ pub fn save_ai_settings(
     max_tokens: u32,
     auto_refine_video_after_iterations: Option<u32>,
     interactive_sessions_enabled: Option<bool>,
-    memory_federation_enabled: Option<bool>,
     auto_migrate_on_token_exhaustion: Option<bool>,
     auto_continue_after_migration: Option<bool>,
 ) -> Result<CommandResponse, String> {
     info!(
-        "Saving AI settings: provider={}, execution_mode={}, timeout={}s, config_dir={:?}, account_selection={:?}, video_after_iterations={:?}, interactive={:?}, memory_federation={:?}",
-        provider, execution_mode, timeout_seconds, config_dir, account_selection_mode, auto_refine_video_after_iterations, interactive_sessions_enabled, memory_federation_enabled
+        "Saving AI settings: provider={}, execution_mode={}, timeout={}s, config_dir={:?}, account_selection={:?}, video_after_iterations={:?}, interactive={:?}",
+        provider, execution_mode, timeout_seconds, config_dir, account_selection_mode, auto_refine_video_after_iterations, interactive_sessions_enabled
     );
 
     let ai_provider = match provider.as_str() {
@@ -185,8 +184,6 @@ pub fn save_ai_settings(
         interactive_sessions_enabled: interactive_sessions_enabled
             .unwrap_or(existing_settings.interactive_sessions_enabled),
         ai_path_prediction_enabled: existing_settings.ai_path_prediction_enabled,
-        memory_federation_enabled: memory_federation_enabled
-            .unwrap_or(existing_settings.memory_federation_enabled),
     };
 
     settings::save_ai_settings(ai_settings).map_err(|e| {
@@ -281,7 +278,6 @@ pub fn save_gemini_settings(
         routing: existing_settings.routing,
         interactive_sessions_enabled: existing_settings.interactive_sessions_enabled,
         ai_path_prediction_enabled: existing_settings.ai_path_prediction_enabled,
-        memory_federation_enabled: existing_settings.memory_federation_enabled,
     };
 
     settings::save_ai_settings(ai_settings).map_err(|e| {
@@ -968,7 +964,6 @@ pub fn save_agentic_settings(
         routing: routing_config,
         interactive_sessions_enabled: existing_settings.interactive_sessions_enabled,
         ai_path_prediction_enabled: existing_settings.ai_path_prediction_enabled,
-        memory_federation_enabled: existing_settings.memory_federation_enabled,
     };
 
     settings::save_ai_settings(ai_settings).map_err(|e| {

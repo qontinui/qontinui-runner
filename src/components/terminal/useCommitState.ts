@@ -33,7 +33,7 @@
  * by polling and event resolution.
  */
 
-import { useState, useEffect, useRef, useMemo } from "react";
+import { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import type { TerminalTab } from "./useTerminalManager";
@@ -112,50 +112,87 @@ export function useCommitState(tabs: TerminalTab[]): Record<string, CommitState>
     };
   }, []);
 
-  // ── 30 s background poll for every tab with a claudeSessionId ────────────
-  // The interval is rebuilt on `tabs` changes so newly-spawned tabs start
-  // polling immediately and closed tabs stop. We snapshot the tab list
-  // inside the closure so the in-flight poll batch sees the same set its
-  // caller scheduled.
+  // ── Background probe ──────────────────────────────────────────
+  //
+  // Identity-stable so neither the interval below nor the new-session effect
+  // is torn down by a `tabs` mutation. `activeRef` gates the state write so a
+  // batch still in flight at unmount can't set state on a dead hook.
+  const activeRef = useRef(true);
   useEffect(() => {
-    let active = true;
-
-    const pollAll = async () => {
-      const snapshot = tabsRef.current.filter((t) => Boolean(t.claudeSessionId));
-      if (snapshot.length === 0) return;
-
-      const results = await Promise.allSettled(
-        snapshot.map(async (tab) => {
-          const taskRunId = tab.claudeSessionId;
-          if (!taskRunId) return null;
-          const resp = await invoke<CommandResponse>("get_session_commit_state", {
-            taskRunId,
-          });
-          if (!resp.success || !resp.data) return null;
-          return { tabId: tab.id, state: resp.data as CommitState };
-        }),
-      );
-
-      if (!active) return;
-
-      setRawStates((prev) => {
-        const next = { ...prev };
-        for (const r of results) {
-          if (r.status !== "fulfilled" || !r.value) continue;
-          next[r.value.tabId] = r.value.state;
-        }
-        return next;
-      });
-    };
-
-    // Fire once immediately so we don't wait 30 s for the first probe.
-    pollAll();
-    const interval = setInterval(pollAll, POLL_INTERVAL_MS);
+    activeRef.current = true;
     return () => {
-      active = false;
-      clearInterval(interval);
+      activeRef.current = false;
     };
-  }, [tabs]);
+  }, []);
+
+  const probeTabs = useCallback(async (batch: TerminalTab[]) => {
+    const snapshot = batch.filter((t) => Boolean(t.claudeSessionId));
+    if (snapshot.length === 0) return;
+
+    const results = await Promise.allSettled(
+      snapshot.map(async (tab) => {
+        const taskRunId = tab.claudeSessionId;
+        if (!taskRunId) return null;
+        const resp = await invoke<CommandResponse>("get_session_commit_state", {
+          taskRunId,
+        });
+        if (!resp.success || !resp.data) return null;
+        return { tabId: tab.id, state: resp.data as CommitState };
+      }),
+    );
+
+    if (!activeRef.current) return;
+
+    setRawStates((prev) => {
+      const next = { ...prev };
+      let dirty = false;
+      for (const r of results) {
+        if (r.status !== "fulfilled" || !r.value) continue;
+        next[r.value.tabId] = r.value.state;
+        dirty = true;
+      }
+      return dirty ? next : prev;
+    });
+  }, []);
+
+  // ── 30 s background poll ────────────────────────────────────
+  //
+  // The interval is STABLE (`[]` deps, tabs read through `tabsRef`). It used
+  // to depend on `tabs`, so every tab mutation — a rename, an `isAlive` flip,
+  // a spawn — tore the interval down and immediately re-fired the whole
+  // N-wide `get_session_commit_state` batch (plan §0 A10). Newly-spawned
+  // sessions still probe immediately; that is the targeted effect below,
+  // which asks only about the ids that are actually new.
+  useEffect(() => {
+    const tick = () => void probeTabs(tabsRef.current);
+    tick();
+    const interval = setInterval(tick, POLL_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, [probeTabs]);
+
+  // Probe brand-new Claude sessions right away rather than making them wait
+  // out the interval. Keyed on the SET of session ids (as a string), so a
+  // rename or liveness flip doesn't re-trigger it, and only the added ids are
+  // probed — never the whole fleet.
+  const sessionIdKey = useMemo(
+    () =>
+      tabs
+        .map((t) => t.claudeSessionId)
+        .filter((id): id is string => Boolean(id))
+        .sort()
+        .join(","),
+    [tabs],
+  );
+  const probedSessionIdsRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const known = probedSessionIdsRef.current;
+    const fresh = tabsRef.current.filter(
+      (t) => t.claudeSessionId && !known.has(t.claudeSessionId),
+    );
+    if (fresh.length === 0) return;
+    for (const tab of fresh) known.add(tab.claudeSessionId as string);
+    void probeTabs(fresh);
+  }, [sessionIdKey, probeTabs]);
 
   // Apply the 5-minute stale cap. The cap is recomputed on a 30 s tick
   // (matched to the poll interval) so a fresh probe can snap the UI back

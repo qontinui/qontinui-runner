@@ -1,0 +1,13 @@
+# .qontinui/config.yml — qontinui PR-merge policy (edit to override dashboard settings)
+version: 1
+framework: node
+merge:
+  confidence_threshold: 0.75
+  escalate_paths:
+  - package.json
+  - package-lock.json
+  - pnpm-lock.yaml
+  auto_merge_categories:
+  - docs
+  - test
+  - chore

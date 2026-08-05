@@ -6,6 +6,15 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
+      # REQUIRED, and it cannot be defaulted away: on workflow_dispatch
+      # GITHUB_REF is refs/heads/<branch>, so there is no tag to derive a
+      # version from. Every workflow_dispatch run in this workflow's history
+      # (three, all 2026-07-06) failed for exactly that reason — see the
+      # "Resolve release version" step below.
+      version:
+        description: "Version to release, without the leading v (e.g. 1.0.8). The tag v<version> is created at the dispatched ref if it does not exist."
+        type: string
+        required: true
       include_bundled_python:
         description: "Bundle Python executor (zero-setup installation)"
         type: boolean
@@ -52,9 +61,63 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Get version from tag
+      # Resolve ONE version and derive the tag from it, so the two can never
+      # disagree.
+      #
+      # The old one-liner was `version=${GITHUB_REF#refs/tags/v}`. That is a
+      # prefix strip, not a match: on a tag push refs/tags/v1.0.6 correctly
+      # becomes 1.0.6, but on workflow_dispatch GITHUB_REF is refs/heads/main,
+      # the prefix does not match, and the value passes through UNSTRIPPED. The
+      # release was then named "Qontinui Runner vrefs/heads/main (Beta)" and
+      # publish-update-json looked up `gh release view "vrefs/heads/main"` ->
+      # "release not found" -> exit 1. Compounding it, `tag_name` was
+      # ${{ github.ref }}, so create-release would have tagged the release
+      # "refs/heads/main" — the two did not even agree with each other. All
+      # three workflow_dispatch runs in history failed this way (2026-07-06,
+      # runs 28759763447 / 28761370633 / 28764507838); the trigger has never
+      # once succeeded.
+      - name: Resolve release version
         id: get_version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+        env:
+          # Bound through env rather than spliced in with ${{ }}: a dispatch
+          # input is caller-supplied text, and interpolating it directly into a
+          # run block would make it shell code.
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            version="${GITHUB_REF#refs/tags/}"
+            version="${version#v}"
+          else
+            version="${INPUT_VERSION#v}"
+          fi
+
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Could not resolve a release version (got '${version}'). On a tag push the tag must look like vX.Y.Z; on workflow_dispatch pass the 'version' input, e.g. 1.0.8."
+            exit 1
+          fi
+
+          # The resolved version MUST match the app version, because Tauri names
+          # every bundle from tauri.conf.json — not from this input. Releasing
+          # v1.0.8 against an app still pinned at 1.0.7 produces a release tagged
+          # v1.0.8 whose assets are all named ..._1.0.7_..., and the Windows
+          # updater manifest then advertises
+          #   .../download/v1.0.8/Qontinui.Runner_1.0.8_x64-setup.exe
+          # which 404s for every auto-updating client. Nothing downstream would
+          # catch it: the Windows hard gate and the asset report both match on
+          # `setup.exe` and are version-agnostic, so the release publishes green
+          # with a dead updater. Assert it here, where it is still cheap.
+          # This also guards the tag path against tagging without bumping.
+          app_version="$(jq -r .version src-tauri/tauri.conf.json)"
+          if [[ "${version}" != "${app_version}" ]]; then
+            echo "::error::Release version '${version}' does not match src-tauri/tauri.conf.json version '${app_version}'. Tauri names bundles from tauri.conf.json, so these must agree or the release ships mislabelled assets and a 404ing updater manifest. Bump tauri.conf.json (and Cargo.toml) first."
+            exit 1
+          fi
+
+          echo "Resolved version=${version} tag=v${version} (matches tauri.conf.json)"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
 
       - name: Create Release
         id: create-release
@@ -62,7 +125,17 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ github.ref }}
+          # Derived from the resolved version, never from github.ref. On a tag
+          # push this is the tag that triggered the run; on workflow_dispatch
+          # the tag is created at the dispatched ref. Either way it agrees with
+          # release_version, which publish-update-json looks the release up by.
+          tag_name: ${{ steps.get_version.outputs.tag }}
+          # Without an explicit commitish the Releases API defaults
+          # target_commitish to the repository's DEFAULT branch, so a dispatch
+          # from any other branch would tag main's HEAD while the build job
+          # builds the dispatched ref — tag and shipped code silently diverge.
+          # Pin it to the ref this run is actually building.
+          commitish: ${{ github.sha }}
           release_name: Qontinui Runner v${{ steps.get_version.outputs.version }} (Beta)
           draft: true
           prerelease: true
@@ -109,7 +182,39 @@ jobs:
           - platform: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             name: linux-x64
-          - platform: macos-latest
+          # NATIVE Intel image, deliberately not `macos-latest`.
+          #
+          # `macos-latest` is Apple Silicon (arm64), so building
+          # `x86_64-apple-darwin` there is a CROSS-compile — and this workspace
+          # cannot cross-compile it. The dependency chain
+          # `qontinui-runner -> git2 -> libgit2-sys / libssh2-sys -> openssl-sys`
+          # resolves OpenSSL through pkg-config in a build script, and pkg-config
+          # refuses to run cross ("pkg-config has not been configured to support
+          # cross-compilation"), so the leg died on every tagged release with
+          # `error: failed to run custom build command for openssl-sys v0.9.116`
+          # / "Could not find directory of OpenSSL installation" (v1.0.6 job
+          # 88059428655, v1.0.7 job 92082478456). The arm64 leg was always green
+          # precisely because it is native — pkg-config finds the image's own
+          # OpenSSL. `macos-15-intel` is a GA native x86_64 image, so the Intel
+          # leg becomes the same native build the arm64 leg already is.
+          #
+          # Do NOT "simplify" this back to macos-latest + git2/vendored-openssl.
+          # OpenSSL was only the FIRST blocker; vendoring it would not have been
+          # sufficient. tauri.conf.json's beforeBuildCommand runs
+          # scripts/bundle-profile-sidecar.mjs, which derives the sidecar target
+          # triple from `rustc -vV` HOST and states outright that cross-compile
+          # "is NOT handled". Cross-building on the arm64 image would therefore
+          # emit qontinui_profile-aarch64-apple-darwin while bundle.externalBin
+          # demands the -x86_64-apple-darwin name — a bundle failure waiting
+          # immediately behind the OpenSSL one. A native image fixes both at
+          # once, and vendoring OpenSSL would additionally have saddled the
+          # shipped binary with a statically linked copy for us to keep patched.
+          #
+          # EXPIRY: macos-15-intel / macos-26-intel are the last x86_64 macOS
+          # images GitHub will offer (announced through Aug 2027). Before then,
+          # either drop this leg or ship a universal binary from the arm64 leg
+          # (lipo / universal-apple-darwin).
+          - platform: macos-15-intel
             target: x86_64-apple-darwin
             name: macos-x64
           - platform: macos-latest
@@ -139,7 +244,34 @@ jobs:
     # GOAL: once a tagged release run shows macOS (x86_64 + aarch64) and Linux
     # build and bundle cleanly, DROP continue-on-error entirely (set it to false /
     # remove this expression) so every platform becomes a hard gate again.
-    continue-on-error: ${{ matrix.platform != 'windows-latest' }}
+    #
+    # 2026-08-05 — the two root causes that kept that GOAL out of reach are fixed
+    # in this change (Intel macOS moved to a native x86_64 image; the Linux leg
+    # got ci.yml's disk + swap + CARGO_BUILD_JOBS guards). continue-on-error is
+    # deliberately NOT flipped in the same change, because the GOAL above states
+    # an EVIDENCE bar — "once a tagged release run shows ... cleanly" — and that
+    # evidence cannot exist until a tag is pushed with these fixes in place.
+    # Flipping the gate on unproven fixes would trade "two platforms silently
+    # broken" for "no release can ship at all", which is strictly worse. The
+    # invisibility that let this rot for eight releases is addressed instead by
+    # the asset-completeness report in publish-update-json below, which surfaces
+    # a missing platform installer on every run without blocking it.
+    #
+    # FLIP CONDITION (do this, don't leave it open-ended): when a tagged release
+    # run shows all four legs green AND the release carries a .deb/.AppImage and
+    # both x64 + aarch64 .dmg, delete this expression. If a leg proves flaky
+    # rather than broken, gate the STABLE ones and leave only the flaky leg
+    # non-blocking — do not keep all three non-blocking because one is unreliable.
+    #
+    # Keyed on matrix.name, NOT on the runner image label. This expression
+    # decides which leg is the sole hard gate, so getting it wrong inverts the
+    # gate rather than merely skipping a step. `matrix.platform != 'windows-latest'`
+    # would silently evaluate TRUE for the Windows leg the moment that image is
+    # pinned or renamed (`windows-2025`) — exactly what just happened to the
+    # macOS Intel image — making Windows non-blocking and letting an assetless
+    # release publish. matrix.name is workflow-authored and stable; image labels
+    # churn. (`runner.os` is not available in a job-level expression.)
+    continue-on-error: ${{ matrix.name != 'windows-x64' }}
 
     steps:
       - uses: actions/checkout@v5
@@ -149,6 +281,14 @@ jobs:
       # in src-tauri/Cargo.toml). Without the sibling clone,
       # `cargo build` (invoked by `tauri build` below) fails to
       # resolve the path. Public org-owned repo, default github.token.
+      #
+      # Deliberately NOT using .github/actions/resolve-schemas-ref here, unlike
+      # every other schemas clone in this repo: a release must be built against
+      # published schemas, never against an unlanded feature branch. The action
+      # resolves on head_ref only and this workflow is tag-push /
+      # workflow_dispatch, so wiring it up would resolve to the default branch
+      # in practice — but state the intent explicitly rather than leaning on
+      # that, so the exclusion doesn't read as an oversight to be tidied up.
       - name: Checkout sibling repos
         run: |
           cd "$GITHUB_WORKSPACE/.."
@@ -181,11 +321,13 @@ jobs:
           toolchain: "1.95.0"
           targets: ${{ matrix.target }}
 
-      # GitHub's `macos-latest` image is Apple Silicon (arm64), so the Intel leg
-      # (`x86_64-apple-darwin`) needs its std added explicitly. `rustup target add`
-      # is run from the repo dir, so it respects the rust-toolchain.toml override
-      # and adds the target to the 1.95.0 toolchain that the build will use.
-      # Idempotent (no-op if already present, e.g. the native aarch64 leg) and
+      # Belt-and-braces: `rustup target add` is run from the repo dir, so it
+      # respects the rust-toolchain.toml override and adds the target to the
+      # 1.95.0 toolchain the build actually uses (dtolnay's `targets:` adds it to
+      # whatever toolchain IT installed, which is the same one here — but state
+      # it explicitly). Both macOS legs now run on an image whose native arch
+      # matches matrix.target, so this is a no-op in the normal case; it is kept
+      # as a cheap guard against a future image/target mismatch. Idempotent, and
       # gated to macOS so the Linux/Windows legs are untouched.
       - name: Add Rust target (macOS)
         if: runner.os == 'macOS'
@@ -205,6 +347,72 @@ jobs:
             libssl-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev
+
+      # ---- Linux OOM / disk guards ----------------------------------------
+      # The ubuntu leg has NEVER completed a release build. v1.0.6 (job
+      # 88059428656) died with
+      #   "##[error]The runner has received a shutdown signal. This can happen
+      #    when the runner service is stopped, or a manually started runner is
+      #    canceled."
+      # and v1.0.7 (job 92082478521) went silent for 9m31s mid-compile
+      # (18:19:08 -> 18:28:39) and was then cancelled. That is verbatim the
+      # signature ci.yml already documents for this exact workspace on this
+      # exact image: "on Linux the OOM-killer takes the runner agent down ->
+      # 'shutdown signal ... exit code 143'". ci.yml's ubuntu leg compiles this
+      # workspace successfully only BECAUSE of the two guards below; release.yml
+      # had neither, which is the whole difference. Keep them in sync with
+      # ci.yml — if one is retuned there, retune it here.
+      - name: Free disk space (Ubuntu)
+        if: matrix.platform == 'ubuntu-22.04'
+        uses: jlumbroso/free-disk-space@main
+        with:
+          # tool-cache stays: setup-node / setup-rust read from it.
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          # MUST stay false — `large-packages: true` cascade-removes the GTK/GDK
+          # apt libs the Tauri build links against (ci.yml observed "system
+          # library gdk-3.0 required by crate gdk-sys was not found").
+          large-packages: false
+          docker-images: true
+          # The swapfile step below manages swap itself.
+          swap-storage: false
+
+      - name: Add swapfile (Ubuntu — guard against link-time OOM)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          echo "=== free / df after swap setup ==="
+          free -h
+          df -h
+          # Second half of the guard: cap parallel rustc codegen so the peak is
+          # lower to begin with. ci.yml pins JOBS=1 on ubuntu for its `Run Rust
+          # tests` step on this same workspace.
+          #
+          # Cite that precisely, because ci.yml is NOT uniformly JOBS=1: its
+          # `Build Tauri app (development)` step runs at cargo's default
+          # parallelism without OOMing. That is not evidence this step is safe
+          # at the default, though — ci.yml's Tauri build is `--debug
+          # --no-bundle`, whereas this one is a bundling release build, whose
+          # per-crate codegen peak is the higher of the two. Since the Linux leg
+          # has never once completed here, there is no local evidence of what
+          # parallelism it survives at, so start conservative.
+          #
+          # If wall-clock becomes the problem rather than OOM, JOBS=2 is the
+          # next thing to try (that is the value ci.yml settled on for Windows)
+          # — do not just delete the cap. Note this also caps the sidecar build
+          # that tauri.conf.json's beforeBuildCommand kicks off, so the ubuntu
+          # leg serializes two cold compiles; there is no cargo cache here.
+          #
+          # Exported here rather than as a matrix-wide `env:` on the build step
+          # so the macOS/Windows legs — which already build clean — keep their
+          # default parallelism and are not slowed down.
+          echo "CARGO_BUILD_JOBS=1" >> "$GITHUB_ENV"
 
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
@@ -337,17 +545,32 @@ jobs:
         # The repo root is a cargo workspace, so build artifacts land in the
         # workspace-root target/ dir (target/<triple>/release/bundle), not
         # src-tauri/target/.
+        # Branch on RUNNER_OS, never on the matrix runner LABEL. The previous
+        # `matrix.platform == 'macos-latest'` comparison silently matched
+        # nothing the moment a macOS leg moved to a different image label
+        # (macos-15-intel) — no branch would run, the step would exit 0, and the
+        # upload would then fail on a checksums file that was never written. The
+        # explicit `*)` arm turns any future image change into a loud failure
+        # instead of a silent no-op.
         run: |
           cd target/${{ matrix.target }}/release/bundle
 
-          if [[ "${{ matrix.platform }}" == "ubuntu-22.04" ]]; then
-            sha256sum deb/*.deb appimage/*.AppImage > checksums-${{ matrix.name }}.txt
-          elif [[ "${{ matrix.platform }}" == "macos-latest" ]]; then
-            shasum -a 256 dmg/*.dmg > checksums-${{ matrix.name }}.txt
-          elif [[ "${{ matrix.platform }}" == "windows-latest" ]]; then
-            # NSIS-only build (see matrix.bundles) — no msi/ dir is produced.
-            certutil -hashfile nsis/*.exe SHA256 > checksums-${{ matrix.name }}.txt
-          fi
+          case "$RUNNER_OS" in
+            Linux)
+              sha256sum deb/*.deb appimage/*.AppImage > checksums-${{ matrix.name }}.txt
+              ;;
+            macOS)
+              shasum -a 256 dmg/*.dmg > checksums-${{ matrix.name }}.txt
+              ;;
+            Windows)
+              # NSIS-only build (see matrix.bundles) — no msi/ dir is produced.
+              certutil -hashfile nsis/*.exe SHA256 > checksums-${{ matrix.name }}.txt
+              ;;
+            *)
+              echo "::error::Unhandled RUNNER_OS '$RUNNER_OS' — no checksum recipe for this image."
+              exit 1
+              ;;
+          esac
 
       - name: Upload release assets (Linux)
         if: matrix.platform == 'ubuntu-22.04'
@@ -435,6 +658,72 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+
+      # VISIBILITY, not a gate. Every release from v1.0.0 through v1.0.7
+      # published green while the macOS x86_64 and Linux legs were failing —
+      # invisible precisely because the non-Windows legs are continue-on-error,
+      # so the RUN was green and nobody had a reason to look. v1.0.6 and v1.0.7
+      # each shipped with no Linux .deb/.AppImage and no Intel .dmg at all.
+      # This step makes the gap legible on the run itself (job-summary table +
+      # a warning annotation per missing platform) WITHOUT changing what gates
+      # the publish. It is `continue-on-error` so a bug in this reporting can
+      # never be the thing that blocks a release — the hard gate below is
+      # deliberately left untouched and remains the only merge-stopper.
+      - name: Report platform asset completeness
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Bound through env, not spliced in with ${{ }}: a tag name may contain
+          # backticks, $(), ; and | (git check-ref-format permits them), which
+          # inside double quotes would be command substitution.
+          RELEASE_VERSION: ${{ needs.create-release.outputs.release_version }}
+        run: |
+          {
+            echo "### Release asset completeness"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # `|| true`: this step runs under bash -e, so a failed `gh` would
+          # abort it at line 1 — no table, no warnings, nothing said. A silent
+          # green step reads exactly like "all four platforms present", which is
+          # the very invisibility this step exists to defeat. Say so instead.
+          names=$(gh release view "v${RELEASE_VERSION}" \
+            --repo "${{ github.repository }}" --json assets --jq '.assets[].name') || names=""
+
+          if [ -z "$names" ]; then
+            echo "::warning::Asset report unavailable — could not read the release 'v${RELEASE_VERSION}'. This is NOT a statement that assets are present; the check did not run."
+            echo "Asset report **unavailable** — \`gh release view\` returned nothing for \`v${RELEASE_VERSION}\`. This is not evidence the assets are present." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo "| Platform | Expected installer | Present |"
+            echo "|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          missing=""
+          check() {
+            if printf '%s\n' "$names" | grep -qiE "$2"; then
+              echo "| $1 | \`$2\` | yes |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "| $1 | \`$2\` | **NO** |" >> "$GITHUB_STEP_SUMMARY"
+              missing="${missing}${1} "
+            fi
+          }
+          # Patterns match Tauri's bundle naming, e.g.
+          # Qontinui.Runner_1.0.7_x64-setup.exe / _aarch64.dmg / _x64.dmg.
+          # Anchor the leading underscore so _x64.dmg cannot be confused with
+          # _aarch64.dmg (and vice versa).
+          check "windows-x64" '_x64-setup\.exe$'
+          check "macos-arm64" '_aarch64\.dmg$'
+          check "macos-x64"   '_x64\.dmg$'
+          check "linux-x64"   '\.(deb|AppImage)$'
+
+          for m in ${missing}; do
+            if [ "$m" != "windows-x64" ]; then
+              echo "::warning::No installer asset for ${m} — that platform's build leg did not produce one. Check the build job for ${m}; it is continue-on-error, so its failure does NOT show up as a red run."
+            fi
+          done
 
       # Hard gate: only proceed if the Windows installer actually built and
       # uploaded. Fails the job (leaving the release a draft) otherwise, so a

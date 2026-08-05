@@ -69,7 +69,12 @@ docs/TESTING_CHECKLIST.md
 python-bridge/test_*.py
 test_python_executor.sh
 python-bridge/test_full_communication.py
-docs/
+# Ignore docs/ contents (use docs/* not docs/ so a single file can be
+# re-included — git can't re-include under an excluded *directory*).
+docs/*
+# ...but the generated runner onboarding checklist IS tracked (Phase-5
+# anti-drift gate diffs it against a fresh `coord_doctor --onboarding-doc`).
+!docs/runner-onboarding.md
 
 # Configuration files
 configs/
@@ -156,3 +161,22 @@ target-wt/
 # MSYS/Cygwin crash dumps (bash.exe.stackdump, du.exe.stackdump, ...).
 # Build-environment noise on Windows dev boxes, never source.
 *.stackdump
+
+# coord-mcp device credential (nonce/JWT) written into the worktree as
+# .mcp.json at launch — a live credential, never commit it.
+# (Was only in .git/info/exclude — local-only, lost on fresh clone/CI.)
+.mcp.json
+
+# Vision capture scratch cache. The runner writes UI Bridge captures here at
+# RUNTIME, into its own repo root:
+#   src-tauri/src/mcp/ui_bridge/vision_routes.rs -> current_runner_path().join("tmp_vision_cache")
+# Leaving it untracked-but-not-ignored makes any checkout that has served a
+# capture permanently dirty, which silently disables dev-start's
+# Resolve-PrimaryTreeStaleness auto-fast-forward (it self-heals only a CLEAN
+# tree) — that is how a shared checkout drifts tens of commits behind main.
+tmp_vision_cache/
+
+# Perf-harness run artifacts (scripts/perf-harness.mjs). Run JSONs and rendered
+# markdown tables are measurements of a specific machine at a specific moment —
+# they belong in the plan doc or a PR comment, never in the tree.
+.perf-harness/

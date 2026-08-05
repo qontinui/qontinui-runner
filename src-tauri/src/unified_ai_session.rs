@@ -632,6 +632,35 @@ impl UnifiedAiSessionExecutor {
         let session_id = self.build_session_id(config);
         let start_time = std::time::Instant::now();
 
+        // Agent-registry spawn authorization (plan
+        // `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c, served
+        // clause `agent-spawn-authorization`). Every unified-workflow phase
+        // that runs AI (setup / agentic / completion) funnels through here and
+        // launches `claude` on the user's own account. It is request-scoped —
+        // the session dies with the workflow step that asked for it — so it is
+        // an `in_session_subagent`, not a standing spawn. Checked before any
+        // process, PID registration, or health-monitor handle exists, so a
+        // refusal unwinds nothing.
+        let authz = crate::agent_authorization::authorize_spawn(
+            None,
+            crate::agent_authorization::SpawnPath::InSessionSubagent,
+        )
+        .await;
+        if let Some(refusal) = authz.refusal() {
+            warn!("UNIFIED-AI-SESSION: {refusal}");
+            return AiSessionResult {
+                success: false,
+                output: String::new(),
+                duration_ms: start_time.elapsed().as_millis() as i64,
+                injected_steps: Vec::new(),
+                error: refusal,
+                input_tokens: None,
+                output_tokens: None,
+                tools_used: Vec::new(),
+                tools_rejected: Vec::new(),
+            };
+        }
+
         // Get workspace root
         let workspace_root = crate::mcp::shared::get_workspace_paths_internal()
             .map(|(root, _, _)| root.to_string_lossy().to_string())

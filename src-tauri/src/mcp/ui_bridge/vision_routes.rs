@@ -49,8 +49,13 @@ use crate::mcp::types::{api_error, ApiResponse, ApiState};
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RegionRequest {
-    pub x: u32,
-    pub y: u32,
+    /// Signed origin — mirrors [`Region`]. A caller may legitimately name a
+    /// rectangle whose top-left sits left of / above the frame origin (an
+    /// off-viewport element bbox, a secondary monitor in a virtual desktop).
+    /// Crop rejects such a region; annotate/redact clamp it to the frame.
+    pub x: i32,
+    pub y: i32,
+    /// Unsigned extent — a negative width/height is meaningless.
     #[serde(alias = "width")]
     pub w: u32,
     #[serde(alias = "height")]
@@ -705,7 +710,14 @@ fn normalized_to_region(
     if w == 0 || h == 0 {
         return None;
     }
-    Some(Region { x, y, w, h })
+    // A normalized rect is 0-1 by construction and clamped at 0 above, so the
+    // origin is always non-negative and fits the signed `Region` field.
+    Some(Region {
+        x: x as i32,
+        y: y as i32,
+        w,
+        h,
+    })
 }
 
 /// Resolve the optional crop region from a [`CaptureRequest`].
@@ -1431,7 +1443,13 @@ fn crop_in_place(
     frame: Frame,
     region: Region,
 ) -> Result<Frame, (StatusCode, Json<ApiResponse<()>>)> {
-    if !region.fits_in(frame.width, frame.height) {
+    // A crop must name a rectangle wholly inside the frame — `fits_in` rejects
+    // both an oversized region and a negative origin.
+    let Some((cx, cy, cw, ch)) = region
+        .fits_in(frame.width, frame.height)
+        .then(|| region.clamp_to_frame(frame.width, frame.height))
+        .flatten()
+    else {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(api_error(format!(
@@ -1439,9 +1457,11 @@ fn crop_in_place(
                 region, frame.width, frame.height
             ))),
         ));
-    }
+    };
+    // `clamp_to_frame` narrows the (now non-negative, in-bounds) signed origin
+    // to the u32 indices `crop_imm` requires.
     let dyn_img = image::DynamicImage::ImageRgba8(frame.buffer);
-    let cropped = dyn_img.crop_imm(region.x, region.y, region.w, region.h);
+    let cropped = dyn_img.crop_imm(cx, cy, cw, ch);
     Ok(Frame::from_rgba(cropped.to_rgba8(), frame.source))
 }
 
@@ -1533,8 +1553,10 @@ fn compute_pixel_delta(a: &Frame, b: &Frame) -> (RgbaImage, f64, Option<Region>)
         None
     } else {
         Some(Region {
-            x: min_x,
-            y: min_y,
+            // Buffer indices — always non-negative, so the cast into the
+            // signed `Region` origin is lossless.
+            x: min_x as i32,
+            y: min_y as i32,
             w: max_x.saturating_sub(min_x).saturating_add(1),
             h: max_y.saturating_sub(min_y).saturating_add(1),
         })
@@ -2255,8 +2277,11 @@ async fn vision_assert_handler(
                 .iter()
                 .map(|b| qontinui_vision_core::OcrBlockRef {
                     bbox: qontinui_vision_core::Region {
-                        x: b.bbox.x,
-                        y: b.bbox.y,
+                        // OCR blocks are detected INSIDE a frame, so their
+                        // origin is a buffer index and can never be negative —
+                        // `OcrBbox` stays u32 and the widening cast is lossless.
+                        x: b.bbox.x as i32,
+                        y: b.bbox.y as i32,
                         w: b.bbox.w,
                         h: b.bbox.h,
                     },

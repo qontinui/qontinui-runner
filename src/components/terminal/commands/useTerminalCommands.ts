@@ -58,6 +58,7 @@ import {
 } from "../liveClaudeSessions";
 import type { CommandAction, CommandResult, ResolverContext } from "./types";
 import { useCommandAction } from "./useCommandAction";
+import { getTerminalHotStore } from "../terminalHotStore";
 import { useOrchestrateCommand } from "./orchestrateCommand";
 
 /**
@@ -293,8 +294,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     closeTerminal,
     terminalRefs,
     sessionStates,
-    stateDurations,
-    lastOutputLines,
+    pageId,
     stateTimeAccum: stateTimeAccumRef,
     zoneLayout,
     workflowGen,
@@ -1155,10 +1155,12 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
           autoApproveCount: transitionEffects.autoApproveCount ?? 0,
           autoRestartCount: transitionEffects.autoRestartCount ?? 0,
           stateTimeAccum: stateTimeAccumRef.current,
-          lastOutputLines,
+          // Read the hot maps lazily at command time — subscribing would
+          // re-register every command action on each output frame.
+          lastOutputLines: getTerminalHotStore(pageId).getField("lastOutputLines"),
           assignments: zoneLayout.assignments,
           zoneLabels: labelsAndTags.zoneLabels,
-          stateDurations,
+          stateDurations: getTerminalHotStore(pageId).getField("stateDurations"),
         }),
       );
       return ok();
@@ -1235,6 +1237,11 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
         return fail("no-sessions", "no live Claude Code sessions found");
       }
 
+      // The Rust reader keeps nameless rows (old CLI builds) because they
+      // still prove liveness for the restore oracle — for DISPLAY, substitute
+      // a placeholder so the label/heading is never blank.
+      const displayName = (s: LiveClaudeSession) => s.name || "(unnamed)";
+
       // Group by account: resume commands are per-wrapper (clg/clh/clp/…), so
       // each block stays directly runnable as a unit.
       const byAccount = groupByAccount(sessions);
@@ -1249,10 +1256,10 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
         lines.push(`# ${label} (${list.length})`);
         sections.push({
           heading: `${label} (${list.length})`,
-          rows: list.map((s) => ({ label: s.name, value: s.resumeCommand })),
+          rows: list.map((s) => ({ label: displayName(s), value: s.resumeCommand })),
         });
         for (const s of list) {
-          lines.push(`# ${s.name}   [${s.status}]`);
+          lines.push(`# ${displayName(s)}   [${s.status}]`);
           lines.push(s.resumeCommand);
         }
         lines.push("");
@@ -1261,13 +1268,13 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
         lines.push(`# ${shared.size} session id(s) are shared by several live processes —`);
         lines.push("# resuming one of these ids will NOT bring back every window:");
         for (const [id, list] of shared) {
-          lines.push(`#   ${id}: ${list.map((s) => s.name).join(", ")}`);
+          lines.push(`#   ${id}: ${list.map(displayName).join(", ")}`);
         }
         sections.push({
           heading: `Shared session ids (${shared.size})`,
           rows: [...shared].map(([id, list]) => ({
             label: id,
-            value: list.map((s) => `${s.name} [pid ${s.pid}]`).join(", "),
+            value: list.map((s) => `${displayName(s)} [pid ${s.pid}]`).join(", "),
           })),
         });
       }

@@ -278,13 +278,56 @@ export function backfillClaudeSessionIds(
   return changed ? next : tabs;
 }
 
+/**
+ * Pure helper: resolve the `working_dir` argument for a spawn.
+ *
+ * Precedence is explicit-caller-value → the terminal PAGE's
+ * `defaultWorkingDir` (set when a project is activated, see
+ * `TerminalPageConfig.defaultWorkingDir`) → `null` (Rust picks its own
+ * default, the pre-project behavior). Blank / whitespace-only values on either
+ * input count as ABSENT, so an empty string from a form field falls through to
+ * the page default instead of spawning at "".
+ *
+ * WHY THE FALLBACK LIVES HERE (projects-dashboard plan §7.2 step 2): it must
+ * be applied BEFORE the value reaches the Rust `terminal_create` command. That
+ * command derives `intent_repo` from `working_dir`
+ * (`src-tauri/src/commands/terminal.rs:97-111`) and then hands it to
+ * `isolated_edit::acquire_for_terminal`, which under
+ * `QONTINUI_AGENT_WORKTREE_MODE` REASSIGNS `working_dir` to a freshly
+ * allocated isolated worktree (`:122-128`). Passing `undefined` and letting
+ * Rust guess is therefore not equivalent — the page default has to arrive as
+ * the `working_dir` argument or the repo intent (and any worktree allocation)
+ * is derived from the wrong directory.
+ *
+ * Exported so the precedence contract is unit-testable without React or Tauri.
+ */
+export function resolveSpawnWorkingDir(
+  explicit: string | undefined,
+  pageDefault: string | undefined,
+): string | null {
+  const clean = (v: string | undefined): string | undefined => {
+    const t = v?.trim();
+    return t ? t : undefined;
+  };
+  return clean(explicit) ?? clean(pageDefault) ?? null;
+}
+
 // `TerminalInfo` is imported from `@qontinui/shared-types/tauri-events` —
 // generated from the canonical Rust struct in
 // `qontinui-schemas/rust/src/terminal.rs`. Field names are camelCase via
 // `#[serde(rename_all = "camelCase")]`. Future serde renames break this
 // file at compile time instead of silently dropping events.
 
-export function useTerminalManager(pageId: string = "default", windowLabel: string = "main") {
+export function useTerminalManager(
+  pageId: string = "default",
+  windowLabel: string = "main",
+  /**
+   * This page's `defaultWorkingDir` (see `TerminalPageConfig`). Used by
+   * `createTerminal` whenever the caller passes no explicit `workingDir`, so
+   * every terminal spawned on a project-bound page opens at the project root.
+   */
+  defaultWorkingDir?: string,
+) {
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const nextTitleNum = useRef(1);
@@ -431,9 +474,86 @@ export function useTerminalManager(pageId: string = "default", windowLabel: stri
     };
   }, [markAsBypass]);
 
+  // Live terminal-page moves (plan `2026-07-18-runner-api-account-selection.md`
+  // Phase 5). `POST /terminals/{id}/move` mutates a terminal's page on the Rust
+  // side and emits `terminal-page-changed` { id, pageId }. Every page's manager
+  // is mounted simultaneously (session-provider lift), so each instance decides,
+  // from its OWN `pageId`, whether the move concerns it — the same
+  // unmount-source / mount-target model `WindowAssignmentsContext` uses for
+  // `session-assignment-changed`, and a sibling of the `terminal-created` ingest
+  // above:
+  //   - TARGET page (`event.pageId === pageId`) → adopt the tab (mount) if not
+  //     already present. The move event carries only `{ id, pageId }`, so we
+  //     fetch authoritative info via `terminal_list` (which reflects the
+  //     just-applied page move) and fold it in through `reduceCreatedTerminal`.
+  //   - SOURCE page (holds the tab, but is no longer its page) → evict the tab
+  //     (unmount) WITHOUT calling `terminal_close`: the PTY lives on and now
+  //     belongs to the target page.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    listen<{ id: string; pageId: string }>("terminal-page-changed", (event) => {
+      const { id, pageId: targetPageId } = event.payload;
+      if (!id) return;
+      const target = targetPageId || "default";
+      if (target === pageId) {
+        // Adopt onto THIS (target) page. `reduceCreatedTerminal` dedups by id,
+        // so an idempotent re-delivery for a tab we already hold is a no-op.
+        invoke<CommandResponse>("terminal_list")
+          .then((result) => {
+            if (!result.success || !result.data) return;
+            const terminals = (result.data as { terminals: TerminalInfo[] }).terminals;
+            const info = terminals.find((t) => t.id === id);
+            if (!info) return;
+            const pendingTaskRunId = pendingWorkerMarks.current.get(id);
+            if (pendingTaskRunId !== undefined) pendingWorkerMarks.current.delete(id);
+            const pendingBypass = pendingBypassMarks.current.has(id);
+            if (pendingBypass) pendingBypassMarks.current.delete(id);
+            setTabs((prev) => reduceCreatedTerminal(prev, info, pendingTaskRunId, pendingBypass));
+            ingestedIds.current.add(id);
+            setActiveId(id);
+            logger.info(`Terminal ${id} moved onto page ${pageId}`);
+          })
+          .catch((err) => {
+            logger.warn(`terminal-page-changed adopt failed for ${id}: ${err}`);
+          });
+      } else {
+        // Evict from THIS page if we hold it — do NOT close the PTY.
+        setTabs((prev) => {
+          if (!prev.some((t) => t.id === id)) return prev;
+          const closedIndex = prev.findIndex((t) => t.id === id);
+          const next = prev.filter((t) => t.id !== id);
+          setActiveId((currentActive) => {
+            if (currentActive !== id) return currentActive;
+            return next[Math.min(closedIndex, next.length - 1)]?.id ?? null;
+          });
+          ingestedIds.current.delete(id);
+          return next;
+        });
+      }
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, [pageId]);
+
   /**
    * Reconnect to existing Rust PTY sessions that survived a React remount.
-   * Returns the ordered list of reconnected tab IDs, or null if no sessions found.
+   *
+   * Return contract (P1 restore idempotence — the restore path aborts on
+   * `null`, so the two cases must never be conflated):
+   * - `string[]` (possibly EMPTY) — the backend terminal list was read
+   *   successfully; the array is the definitive ordered set of reconnected
+   *   tab ids for this page. `[]` means "definitely nothing to reconnect"
+   *   (e.g. a cold start), and the caller may safely cold-restore records.
+   * - `null` — INDETERMINATE: the list could not be read (invoke failed or
+   *   the response was unsuccessful/malformed). Callers must NOT treat this
+   *   as "nothing alive": cold-respawning `claude --resume` for records
+   *   whose previous terminal generation is still alive forks the live
+   *   sessions (measured 2026-07-23: 22 of 80 live session ids had >1 live
+   *   process). `useTerminalInitialization` aborts restore on `null` and
+   *   retries on the next activation.
    */
   const reconnectToExistingSessions = useCallback(async (): Promise<string[] | null> => {
     try {
@@ -441,7 +561,10 @@ export function useTerminalManager(pageId: string = "default", windowLabel: stri
       if (!result.success || !result.data) return null;
 
       const terminals = (result.data as { terminals: TerminalInfo[] }).terminals;
-      if (!terminals || terminals.length === 0) return null;
+      // Malformed payload (no `terminals` key) is indeterminate — never
+      // claim "definitely empty" off a shape we didn't understand.
+      if (!terminals) return null;
+      if (terminals.length === 0) return [];
 
       // `TerminalInfo` carries no Claude session id, so a reconnected tab
       // would otherwise come back with `claudeSessionId: undefined` and any
@@ -465,7 +588,9 @@ export function useTerminalManager(pageId: string = "default", windowLabel: stri
         invoke("terminal_close", { terminalId: t.id }).catch(() => {});
       }
 
-      if (alive.length === 0) return null;
+      // List read fine, nothing alive on this page — a DEFINITIVE empty
+      // result (cold start), not an indeterminate one.
+      if (alive.length === 0) return [];
 
       logger.info(`Reconnecting to ${alive.length} existing PTY session(s)`);
 
@@ -566,7 +691,11 @@ export function useTerminalManager(pageId: string = "default", windowLabel: stri
         const displayTitle = title ?? `Terminal ${nextTitleNum.current++}`;
         const result = await invoke<CommandResponse>("terminal_create", {
           title: displayTitle,
-          workingDir: workingDir ?? null,
+          // Page-default fallback applied HERE, before the Rust command sees
+          // it — `terminal_create` derives `intent_repo` from this value and
+          // may reassign it to an isolated worktree, so `null` is not
+          // equivalent to the page default. See `resolveSpawnWorkingDir`.
+          workingDir: resolveSpawnWorkingDir(workingDir, defaultWorkingDir),
           pageId: pageId !== "default" ? pageId : null,
           // F2/F3 — the tenant the operator picked for THIS spawn. Sent
           // EXPLICITLY (the caller resolves picker-choice ?? active pin) so
@@ -614,7 +743,7 @@ export function useTerminalManager(pageId: string = "default", windowLabel: stri
         return null;
       }
     },
-    [pageId, windowLabel],
+    [pageId, windowLabel, defaultWorkingDir],
   );
 
   const createPlanTab = useCallback((filePath: string): string => {

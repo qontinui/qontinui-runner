@@ -14,7 +14,10 @@
 //!   not hand it to a session, because the only alternatives were the five
 //!   fixed roles or a generic session that did not know what it was for.
 //!   (`POST /task-runs` takes a prompt but only inserts a row; it spawns
-//!   nothing, so it is not a substitute.)
+//!   nothing, so it is not a substitute.) Optional `account` and `cwd` pin the
+//!   Claude account and the directory the session starts in; omitting either
+//!   keeps the pre-existing defaults (global account resolution, the runner
+//!   process's cwd).
 //! - `POST /sessions/<id>/message` — HTTP wrapper around the
 //!   `send_user_message` Tauri command at
 //!   `commands::ai_session::send_user_message`.
@@ -80,12 +83,36 @@ pub struct SpawnSessionRequest {
     /// roles or a generic "respond helpfully" session that did not know what it
     /// was for, so the work had to be started by a human retyping it.
     ///
+    /// This is also the carrier for the context-exhaustion watcher's
+    /// handoff-summary prompt (session-autonomy-fabric Phase 7).
+    ///
     /// Ignored when `role` is set: a role's slash command IS its prompt, and
     /// silently concatenating the two would produce a session running a
     /// half-command. Supply `args` to parameterise a role instead — the 400
     /// below makes that explicit rather than letting the field vanish.
     #[serde(default)]
     pub prompt: Option<String>,
+    /// Optional per-request Claude account override — a friendly name
+    /// (`"hotmail"`, matching `derive_account_name`) OR a full roster
+    /// `config_dir` path. When set, the spawned session's `CLAUDE_CONFIG_DIR`
+    /// is pinned to that (validated) account instead of the global resolution.
+    /// Omitting it reproduces today's behaviour exactly.
+    #[serde(default)]
+    pub account: Option<String>,
+    /// Optional working directory the spawned session starts in.
+    ///
+    /// Without it every spawn starts in the RUNNER PROCESS's cwd — wherever
+    /// the exe happened to be launched from, which is nowhere the caller has
+    /// work. That is invisible for a role spawn (the slash command carries its
+    /// own context) but load-bearing for a seeded free-form `prompt`: the
+    /// context-exhaustion watcher's handoff summary tells the continuation to
+    /// run `git status` "in the working directory" and inspect worktrees,
+    /// which only means anything if the continuation actually starts in the
+    /// exhausted session's directory (session-autonomy-fabric Phase 7).
+    ///
+    /// Omitting it reproduces today's behaviour exactly.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 fn default_session_name() -> String {
@@ -102,6 +129,21 @@ pub struct SpawnSessionResponse {
     /// True when the role was recognised and the slash command was
     /// dispatched as the initial prompt; false for plain ad-hoc sessions.
     pub dispatched_slash_command: bool,
+    /// Set when the agent-registry decision was `warn_proceed`: the spawn went
+    /// ahead, but the caller is told which disposition fired. `None` on a plain
+    /// allow. (Denials and degrades never reach a response body — they are a
+    /// 403 with the reason.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spawn_authorization_warning: Option<String>,
+    /// The friendly account name pinned for this spawn, echoed back.
+    /// `None` when no `account` was requested (global resolution used).
+    pub account: Option<String>,
+    /// The config dir pinned as `CLAUDE_CONFIG_DIR`. `None` when no `account`
+    /// was requested.
+    pub config_dir: Option<String>,
+    /// A human-readable warning when the pinned account is currently
+    /// rate-limited (spawned anyway per the caller's explicit request).
+    pub cooldown_warning: Option<String>,
 }
 
 /// The new session's first user message.
@@ -132,6 +174,32 @@ fn initial_prompt_for(
                 .to_string(),
         },
     }
+}
+
+/// Resolve the caller's requested `cwd` into the directory the spawned session
+/// should start in.
+///
+/// `Ok(None)` ⇒ no usable request; the caller falls back to the runner
+/// process's cwd (the pre-existing behaviour). `Ok(Some(dir))` ⇒ start there.
+/// `Err(msg)` ⇒ 400.
+///
+/// Whitespace-only reads as absent, so a caller that builds the path by
+/// string-joining and ends up with `"  "` gets the honest fallback rather than
+/// a spawn in `"  "`. A named-but-nonexistent directory is a 400 rather than a
+/// silent fallback: a caller that asked for a cwd and got the runner's install
+/// directory instead would debug the wrong thing entirely — which is exactly
+/// the failure this field exists to remove.
+fn resolve_spawn_cwd(requested: Option<&str>) -> Result<Option<String>, String> {
+    let Some(cwd) = requested.map(str::trim).filter(|c| !c.is_empty()) else {
+        return Ok(None);
+    };
+    if !std::path::Path::new(cwd).is_dir() {
+        return Err(format!(
+            "`cwd` is not an existing directory: {cwd}. Omit the field to start the session in \
+             the runner's working directory."
+        ));
+    }
+    Ok(Some(cwd.to_string()))
 }
 
 async fn spawn_session(
@@ -171,6 +239,61 @@ async fn spawn_session(
         ));
     }
 
+    // Agent-registry spawn authorization (plan
+    // `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c, served clause
+    // `agent-spawn-authorization`). `/sessions/spawn` mints a session that
+    // OUTLIVES the request that asked for it, so it is a
+    // `standing_continuation`: a standing per-path opt-in, default OFF for a
+    // fresh user. The role (`auto-review`, `coordinate`, …) is the registry
+    // key when one was given; a plain spawn resolves against the per-path row.
+    let decision = crate::agent_authorization::authorize_spawn(
+        req.role.as_deref().filter(|r| !r.is_empty()),
+        crate::agent_authorization::SpawnPath::StandingContinuation,
+    )
+    .await;
+    if let Some(refusal) = decision.refusal() {
+        return Err((StatusCode::FORBIDDEN, refusal));
+    }
+    let authz_warning = match &decision {
+        crate::agent_authorization::SpawnDecision::Warn { reason } => Some(reason.clone()),
+        _ => None,
+    };
+
+    // Resolve an explicit per-request account override, if any. Fail with a
+    // clear 4xx BEFORE creating any state — bogus name → 400, logged-out → 409.
+    let resolved_account = match req.account.as_deref() {
+        Some(account) if !account.is_empty() => {
+            match crate::ai_provider::resolve_requested_account(account) {
+                Ok(resolved) => Some(resolved),
+                Err(e @ crate::ai_provider::AccountSelectError::NotInRoster { .. }) => {
+                    return Err((StatusCode::BAD_REQUEST, e.message()));
+                }
+                Err(e @ crate::ai_provider::AccountSelectError::NotLoggedIn { .. }) => {
+                    return Err((StatusCode::CONFLICT, e.message()));
+                }
+            }
+        }
+        _ => None,
+    };
+
+    // Echo fields + cooldown warning derived from the resolved account.
+    let resp_account = resolved_account.as_ref().map(|r| r.account_name.clone());
+    let resp_config_dir = resolved_account.as_ref().map(|r| r.config_dir.clone());
+    let resp_cooldown_warning = resolved_account.as_ref().and_then(|r| {
+        r.cooldown_remaining_secs.map(|secs| {
+            format!(
+                "account '{}' is rate-limited for another {}s; spawning anyway per explicit request",
+                r.account_name, secs
+            )
+        })
+    });
+
+    // Validate the requested cwd BEFORE creating any state, for the same
+    // reason the account override is resolved above: a bad path should 400
+    // cleanly, not leave an orphaned task-run row behind.
+    let requested_cwd =
+        resolve_spawn_cwd(req.cwd.as_deref()).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
     let task_run_id = uuid::Uuid::new_v4().to_string();
 
     let input = CreateTaskRunInput::new(&task_run_id, &req.task_name)
@@ -189,9 +312,11 @@ async fn spawn_session(
         .inner()
         .clone();
 
-    let working_dir = std::env::current_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| ".".to_string());
+    let working_dir = requested_cwd.unwrap_or_else(|| {
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string())
+    });
 
     // Build the initial prompt. For role-driven spawns the prompt IS the
     // slash command line — Claude Code resolves `/coordinate` against the
@@ -201,7 +326,10 @@ async fn spawn_session(
     let initial_prompt =
         initial_prompt_for(slash_command, req.args.as_deref(), req.prompt.as_deref());
 
-    let session_ctx = AiSessionContext::setup(&task_run_id, &req.task_name);
+    let mut session_ctx = AiSessionContext::setup(&task_run_id, &req.task_name);
+    if let Some(ref resolved) = resolved_account {
+        session_ctx.pinned_config_dir = Some(resolved.config_dir.clone());
+    }
 
     let dispatched = slash_command.is_some();
     let role_for_response = req.role.clone();
@@ -270,6 +398,10 @@ async fn spawn_session(
                 state: "ready".to_string(),
                 role: role_for_response,
                 dispatched_slash_command: dispatched,
+                spawn_authorization_warning: authz_warning,
+                account: resp_account,
+                config_dir: resp_config_dir,
+                cooldown_warning: resp_cooldown_warning,
             }))
         }
         Ok(Err(e)) => {
@@ -283,6 +415,10 @@ async fn spawn_session(
                 state: "error".to_string(),
                 role: role_for_response,
                 dispatched_slash_command: false,
+                spawn_authorization_warning: authz_warning,
+                account: resp_account,
+                config_dir: resp_config_dir,
+                cooldown_warning: resp_cooldown_warning,
             }))
         }
         Err(join_err) => {
@@ -296,6 +432,10 @@ async fn spawn_session(
                 state: "error".to_string(),
                 role: role_for_response,
                 dispatched_slash_command: false,
+                spawn_authorization_warning: authz_warning,
+                account: resp_account,
+                config_dir: resp_config_dir,
+                cooldown_warning: resp_cooldown_warning,
             }))
         }
     }
@@ -503,6 +643,58 @@ async fn list_history(
 }
 
 // =============================================================================
+// /sessions/tree-resets
+// =============================================================================
+
+/// Query params for `GET /sessions/tree-resets` — snake_case keys
+/// (`since_ms`, `min_mount_number`, `limit`), mapped onto
+/// [`crate::session::snapshot_history::TreeResetQuery`].
+#[derive(Debug, Default, Deserialize)]
+pub struct TreeResetsQuery {
+    pub since_ms: Option<i64>,
+    pub min_mount_number: Option<u32>,
+    pub limit: Option<usize>,
+}
+
+/// `GET /sessions/tree-resets` — the read side of the P0 tree-reset
+/// observability log.
+///
+/// `terminal_report_tree_reset` has appended a durable row per terminal-tree
+/// mount since P0, but nothing read the file: verifying that an auth flip no
+/// longer remounts the tree (the P2 fix) meant locating `tree-resets.jsonl`
+/// under the session-restore dir on the runner host by hand. This exposes it
+/// over the same API surface as `/sessions/history`.
+///
+/// Returns `{ treeResets, count, remountCount }`, chronological (oldest
+/// first). `remountCount` counts rows with `mountNumber > 1` — the
+/// genuine-REmount filter the report type documents, and the number that must
+/// stay flat across an auth flip for P2 to hold.
+///
+/// Read-only and infallible by construction: the reader fails open, so a
+/// runner that has never reported returns an empty list rather than an error,
+/// and there is no error arm to return at all (unlike `list_history`, which
+/// can fail to resolve the lifecycle store).
+async fn list_tree_resets(Query(q): Query<TreeResetsQuery>) -> Json<serde_json::Value> {
+    // Port-scoped path, matching the write side in `terminal_report_tree_reset`.
+    let port = crate::mcp::types::get_mcp_api_port();
+    let path = crate::session::snapshot_history::tree_reset_path_for_port(port);
+    let rows = crate::session::snapshot_history::read_tree_resets(
+        &path,
+        &crate::session::snapshot_history::TreeResetQuery {
+            since_ms: q.since_ms,
+            min_mount_number: q.min_mount_number,
+            limit: q.limit,
+        },
+    );
+    let remount_count = rows.iter().filter(|r| r.report.mount_number > 1).count();
+    Json(serde_json::json!({
+        "treeResets": rows,
+        "count": rows.len(),
+        "remountCount": remount_count,
+    }))
+}
+
+// =============================================================================
 // /sessions/<id>/continuation-verdict
 // =============================================================================
 
@@ -553,6 +745,49 @@ async fn continuation_verdict(
         serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
     let key = resolve_session_key(&state, &id, &hook_input);
     Json(crate::mcp::continuation_verdict::continuation_verdict(&key, &hook_input).await)
+}
+
+// =============================================================================
+// /sessions/<id>/context-low
+// =============================================================================
+
+/// `POST /sessions/{id}/context-low` — the PreCompact hook's landing pad
+/// (plan `2026-07-17-session-autonomy-fabric.md` Phase 7). `{id}` is the
+/// runner terminal id the hook script sends (`QONTINUI_TERMINAL_ID`, falling
+/// back to the Claude session id) — the same key space as the grid-scan
+/// watcher, so BOTH signals share one once-per-session debounce. Body = the
+/// raw Claude PreCompact payload (parsed LENIENTLY — empty/non-JSON reads as
+/// `{}` so a curl probe works). Always 200: the endpoint is fail-open by
+/// design (a broken watcher must never break a hook), and all policy lives in
+/// `terminal::context_watcher::on_precompact_signal` (flag-gated
+/// `QONTINUI_CONTEXT_HANDOFF`, default `off`).
+async fn context_low(Path(id): Path<String>, body: axum::body::Bytes) -> Json<serde_json::Value> {
+    let payload: serde_json::Value =
+        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+    let outcome = crate::terminal::context_watcher::on_precompact_signal(&id, &payload);
+    Json(serde_json::json!({
+        "fired": outcome.fired,
+        "mode": outcome.mode,
+        "reason": outcome.reason,
+        "session": id,
+    }))
+}
+
+// =============================================================================
+// /sessions/compliance-coverage
+// =============================================================================
+
+/// `GET /sessions/compliance-coverage` — the §A1a coverage bound: an honest,
+/// STATIC statement of which sessions the compliance check can see.
+///
+/// Consumed by the qontinui-web enforcement panel so the operator is told the
+/// boundary directly instead of inferring it. It is deliberately not a
+/// computed number — see
+/// [`crate::mcp::session_compliance::coverage_bound`] for why deriving it from
+/// the runner's `liveUntracked` tracking-health metric would be confidently
+/// wrong.
+async fn compliance_coverage() -> Json<crate::mcp::session_compliance::CoverageBound> {
+    Json(crate::mcp::session_compliance::coverage_bound())
 }
 
 // =============================================================================
@@ -609,6 +844,78 @@ mod tests {
             "/auto-review"
         );
     }
+
+    #[test]
+    fn the_context_handoff_watcher_payload_deserializes_verbatim() {
+        // Pins the exact body `terminal::context_watcher::spawn_continuation`
+        // POSTs (session-autonomy-fabric Phase 7). The field is snake_case
+        // `prompt` — this struct has no `rename_all` — and carries NO `role`,
+        // because the handler 400s on role+prompt. An earlier revision of the
+        // watcher sent `initial_prompt`, which silently deserialized to
+        // `prompt: None` and handed the continuation session the generic
+        // greeting instead of its handoff summary. This is that regression.
+        let req: SpawnSessionRequest =
+            serde_json::from_str(r#"{"task_name":"Continuation of x","prompt":"handoff summary"}"#)
+                .unwrap();
+        assert_eq!(req.prompt.as_deref(), Some("handoff summary"));
+        assert!(req.role.is_none());
+        assert_eq!(
+            initial_prompt_for(None, req.args.as_deref(), req.prompt.as_deref()),
+            "handoff summary"
+        );
+    }
+
+    // ── spawn cwd (session-autonomy-fabric Phase 7 follow-up) ──────────
+
+    #[test]
+    fn absent_cwd_defers_to_the_runner_process_dir() {
+        // `Ok(None)` is the "use the pre-existing default" signal, so every
+        // caller that never heard of this field behaves exactly as before.
+        assert_eq!(resolve_spawn_cwd(None), Ok(None));
+        assert_eq!(resolve_spawn_cwd(Some("")), Ok(None));
+        assert_eq!(resolve_spawn_cwd(Some("   ")), Ok(None));
+    }
+
+    #[test]
+    fn existing_cwd_is_accepted_and_trimmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        assert_eq!(resolve_spawn_cwd(Some(&path)), Ok(Some(path.clone())));
+        assert_eq!(
+            resolve_spawn_cwd(Some(&format!("  {path}  "))),
+            Ok(Some(path))
+        );
+    }
+
+    #[test]
+    fn nonexistent_cwd_is_a_400_not_a_silent_fallback() {
+        // The whole point of the field is that the session lands where the
+        // caller said. Falling back to the runner's install dir on a typo
+        // would reproduce the bug this fixes, one layer down.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-dir").to_string_lossy().to_string();
+        let err = resolve_spawn_cwd(Some(&missing)).unwrap_err();
+        assert!(err.contains(&missing), "error names the offending path");
+
+        // A FILE is not a working directory either.
+        let file = dir.path().join("f.txt");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(resolve_spawn_cwd(Some(&file.to_string_lossy())).is_err());
+    }
+
+    #[test]
+    fn spawn_request_deserializes_cwd_and_defaults_it_to_none() {
+        let req: SpawnSessionRequest = serde_json::from_str(
+            r#"{"task_name":"t","prompt":"p","cwd":"D:/qontinui-root","account":"hotmail"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.cwd.as_deref(), Some("D:/qontinui-root"));
+        assert_eq!(req.account.as_deref(), Some("hotmail"));
+
+        // Absent field defaults to None — existing callers are unaffected.
+        let req: SpawnSessionRequest = serde_json::from_str(r#"{"task_name":"t"}"#).unwrap();
+        assert!(req.cwd.is_none());
+    }
 }
 
 pub fn routes() -> Router<Arc<ApiState>> {
@@ -616,10 +923,13 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/sessions/spawn", post(spawn_session))
         .route("/sessions/{id}/message", post(send_message))
         .route("/sessions/history", get(list_history))
+        .route("/sessions/compliance-coverage", get(compliance_coverage))
+        .route("/sessions/tree-resets", get(list_tree_resets))
         .route("/sessions/{id}/touched-files", get(get_touched_files))
         .route("/sessions/{id}/transcript", get(get_transcript))
         .route(
             "/sessions/{id}/continuation-verdict",
             post(continuation_verdict),
         )
+        .route("/sessions/{id}/context-low", post(context_low))
 }

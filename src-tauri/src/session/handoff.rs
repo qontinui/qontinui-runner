@@ -932,9 +932,23 @@ fn build_child_intent(state: &HandoffState) -> Result<Intent, HandoffError> {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let redact_secrets = src.get("redact_secrets").and_then(|v| v.as_bool());
+    // Dual-read window: coord renamed the wire key `plan_slug` →
+    // `work_unit_slug`. Read the new name first and fall back to the legacy
+    // one so a source intent written by EITHER coord release materializes.
+    // (`Intent::plan_slug` — what the runner WRITES — is deliberately not
+    // renamed here; the writer leg switches in a later stage.)
+    // `.as_str()` must be applied BEFORE the fallback, not after. `.get()`
+    // returns `Some(Value::Null)` for a present-but-null key, so an
+    // `.or_else(...).and_then(as_str)` chain would treat an explicit
+    // `{"work_unit_slug": null, "plan_slug": "x"}` as "new key present" and
+    // drop the slug entirely instead of falling back. Coord emits explicit
+    // nulls on exactly this shape — its autonomous-dispatch metadata is built
+    // with `json!({"plan_slug": slug, "work_unit_slug": slug})`, which
+    // serializes `None` as `null` rather than omitting the key.
     let plan_slug = src
-        .get("plan_slug")
+        .get("work_unit_slug")
         .and_then(|v| v.as_str())
+        .or_else(|| src.get("plan_slug").and_then(|v| v.as_str()))
         .map(str::to_string);
     let correlation_topic = src
         .get("correlation_topic")
@@ -1092,6 +1106,84 @@ mod tests {
         assert!(intent.declared_paths.is_empty());
         assert!(!intent.share_output);
         intent.validate().unwrap();
+    }
+
+    /// `make_state` with an extra key spliced into the source intent JSON,
+    /// so the dual-read tests below differ ONLY in which slug key they carry.
+    fn state_with_intent_key(key: &str, value: &str) -> HandoffState {
+        let mut state = make_state("terminal_shell");
+        state
+            .intent
+            .as_object_mut()
+            .unwrap()
+            .insert(key.to_string(), json!(value));
+        state
+    }
+
+    #[test]
+    fn build_child_intent_reads_legacy_plan_slug_key() {
+        // Un-renamed coord (every coord shipping today) writes `plan_slug`.
+        let state = state_with_intent_key("plan_slug", "2026-07-28-some-unit");
+        let intent = build_child_intent(&state).unwrap();
+        assert_eq!(intent.plan_slug.as_deref(), Some("2026-07-28-some-unit"));
+    }
+
+    #[test]
+    fn build_child_intent_reads_new_work_unit_slug_key() {
+        // Post-rename coord writes `work_unit_slug`.
+        let state = state_with_intent_key("work_unit_slug", "2026-07-28-some-unit");
+        let intent = build_child_intent(&state).unwrap();
+        assert_eq!(intent.plan_slug.as_deref(), Some("2026-07-28-some-unit"));
+    }
+
+    #[test]
+    fn build_child_intent_prefers_work_unit_slug_over_plan_slug() {
+        // Both present (a coord mid-rename): the NEW key wins.
+        let mut state = state_with_intent_key("plan_slug", "old-name");
+        state
+            .intent
+            .as_object_mut()
+            .unwrap()
+            .insert("work_unit_slug".to_string(), json!("new-name"));
+        let intent = build_child_intent(&state).unwrap();
+        assert_eq!(intent.plan_slug.as_deref(), Some("new-name"));
+    }
+
+    #[test]
+    fn build_child_intent_absent_slug_is_none() {
+        let intent = build_child_intent(&make_state("terminal_shell")).unwrap();
+        assert_eq!(intent.plan_slug, None);
+    }
+
+    #[test]
+    fn build_child_intent_falls_back_when_new_key_is_explicitly_null() {
+        // Present-but-null is NOT the same as absent: `.get()` yields
+        // `Some(Value::Null)`, so a naive `.or_else(get).and_then(as_str)`
+        // chain would see "new key present", get `None` from `as_str`, and
+        // silently drop the slug. Coord emits this exact shape — its
+        // autonomous-dispatch metadata uses
+        // `json!({"plan_slug": slug, "work_unit_slug": slug})`, which writes
+        // `null` for a `None` rather than omitting the key.
+        let mut state = make_state("terminal_shell");
+        let obj = state.intent.as_object_mut().unwrap();
+        obj.insert("work_unit_slug".to_string(), serde_json::Value::Null);
+        obj.insert("plan_slug".to_string(), json!("2026-07-28-some-unit"));
+        let intent = build_child_intent(&state).unwrap();
+        assert_eq!(
+            intent.plan_slug.as_deref(),
+            Some("2026-07-28-some-unit"),
+            "an explicit null on the new key must fall back to the legacy key"
+        );
+    }
+
+    #[test]
+    fn build_child_intent_both_keys_null_is_none() {
+        let mut state = make_state("terminal_shell");
+        let obj = state.intent.as_object_mut().unwrap();
+        obj.insert("work_unit_slug".to_string(), serde_json::Value::Null);
+        obj.insert("plan_slug".to_string(), serde_json::Value::Null);
+        let intent = build_child_intent(&state).unwrap();
+        assert_eq!(intent.plan_slug, None);
     }
 
     #[test]

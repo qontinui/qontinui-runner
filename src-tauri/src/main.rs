@@ -10,6 +10,11 @@
 #![allow(clippy::too_many_arguments)]
 
 mod action_service;
+// Plan `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c — runner-side
+// enforcement of the coord agent registry at every spawn funnel site.
+// Implements the served clause `agent-spawn-authorization`
+// (`policy/production-and-cost`).
+mod agent_authorization;
 mod agent_claims;
 mod agent_daemons;
 mod agent_pusher;
@@ -85,6 +90,7 @@ mod fleet_commands;
 mod flow_control;
 mod follow_up;
 mod fs_atomic;
+mod fs_perms;
 mod git_status_subset;
 // D5 Phase 1 — Git Supervision Channel. Consumes git/spec events from the
 // existing `trigger_system` (via the `SupervisionProposal` action variant)
@@ -138,6 +144,10 @@ mod pm_detect;
 mod process_capture;
 mod process_helpers;
 mod productivity;
+/// Projects dashboard — the server-side join over the saved-project
+/// registry (`ProjectSnapshot`). See `commands::saved_projects` for the
+/// registry itself.
+mod projects;
 mod prompt_library;
 mod prompt_snippets;
 mod prompts;
@@ -224,6 +234,7 @@ mod vga;
 mod video_recorder;
 mod vision;
 mod wake_handler; // Phase F.1 — qontinui:// custom-URL deep-link wake handler
+mod webview_recovery; // Dead-webview detection (WebView2 ProcessFailed) + in-process recovery
 mod win32_compat;
 mod window_assignments;
 mod window_manager;
@@ -411,6 +422,23 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     job_object::init_job_object();
 
     info!("Starting Qontinui Runner v{}", env!("CARGO_PKG_VERSION"));
+
+    // Report inherited Claude Code process-topology markers
+    // (plan `2026-07-28-runner-transcript-persistence-env-leak` §5). The leak
+    // ran unnoticed for months because nothing watched for it; this line alone
+    // would have caught it. Spawn sites strip the markers, so panes are
+    // unaffected — this reports what THIS process inherited, which is the
+    // evidence of where the marker entered.
+    {
+        let inherited = qontinui_runner_lib::claude_env::inherited_session_markers();
+        if !inherited.is_empty() {
+            warn!(
+                markers = %inherited.join(","),
+                "{}",
+                qontinui_runner_lib::claude_env::inherited_markers_detail(&inherited)
+            );
+        }
+    }
 
     // Initialize Sentry for crash reporting (release builds only).
     // The guard must live for the entire application lifetime — when it drops, Sentry shuts down.
@@ -668,9 +696,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // supervisor health-probe killed the runner before it could come up
     // (the 2026-06 startup outage). Detaching it onto the publishers runtime
     // keeps coord-base latency entirely OFF the `/health`-bind critical path.
-    // The clone of `pg_db` for that thread is taken here so the borrow is
-    // resolved before `pg_db` is moved into later state.
-    let fleet_publish_pg = pg_db.clone();
+    //
+    // The clone below is taken here so the borrow is resolved before `pg_db` is
+    // moved into later state. It is no longer for the budget publish — that
+    // parameter was vestigial from the direct-PG era and unread since Phase 3
+    // moved the write to coord HTTP, so it is gone. The pool is still needed on
+    // that thread by `env_agent::publish_pg_pool`, which hands it to the
+    // lib-side `db_schema` collector.
+    let publishers_thread_pg = pg_db.clone();
 
     // fleet heartbeat — see plan §5 and fleet.rs::spawn_heartbeat.
     //
@@ -718,6 +751,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             };
             rt.block_on(async {
                 fleet::spawn_heartbeat();
+                // Budget re-assert rides THIS thread, not `fleet-publishers`,
+                // for the same reason the heartbeat does: the publisher
+                // runtime's sweeps block their only worker for minutes at a
+                // time. It is also the thread that demonstrably survived the
+                // 2026-07-28 incident window. See
+                // `fleet::spawn_budget_republisher` for why a one-shot boot
+                // publish left a clobbered capacity column stuck for six days.
+                fleet::spawn_budget_republisher(fleet::MachineRole::Agent);
                 // Park this thread's runtime forever so the spawned
                 // interval task keeps ticking for the runner's lifetime.
                 std::future::pending::<()>().await;
@@ -752,19 +793,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             };
             rt.block_on(async {
                 // STARTUP-RESILIENCE (§8): the one-shot DeviceBudget publish,
-                // moved OFF the boot critical path (see the `fleet_publish_pg`
+                // moved OFF the boot critical path (see the `publishers_thread_pg`
                 // comment up by the PG bootstrap). It's `await`-ed here on the
                 // publishers runtime so a coord 503 (its ~60-120s backoff
                 // ladder) can no longer delay `run_app()` reaching the MCP
-                // `/health` bind. Args are unchanged from the original
-                // synchronous call (`&fleet_pg`, `MachineRole::Agent`).
-                // Nothing downstream depends on its completion — it's a
-                // best-effort registry UPSERT; the periodic publishers /
-                // heartbeat below re-assert this device's presence regardless.
+                // `/health` bind. Nothing downstream depends on its
+                // completion — it's a best-effort registry UPSERT, and
+                // `fleet::spawn_budget_republisher` (on the heartbeat thread)
+                // re-asserts the budget columns thereafter, so a boot-time
+                // failure self-heals within one re-publish interval rather
+                // than persisting for the process's lifetime.
                 // It runs FIRST in this block so the initial registration
                 // still happens promptly once coord is reachable, before the
                 // periodic publishers begin their cadences.
-                fleet::publish_on_startup(&fleet_publish_pg, fleet::MachineRole::Agent).await;
+                // No-op on a secondary instance — see `budget_publish_allowed`.
+                fleet::publish_on_startup(fleet::MachineRole::Agent).await;
 
                 // Fleet auto-response rules: arm from the on-disk cache first
                 // (so a session that hit the transient rate-limit message during
@@ -815,7 +858,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // picked up), and logs+swallows push failures. NEVER awaited
                 // synchronously — kept off the boot critical path like the
                 // sibling publishers above.
-                qontinui_runner_lib::env_agent::publish_pg_pool(fleet_publish_pg.pool().clone());
+                qontinui_runner_lib::env_agent::publish_pg_pool(
+                    publishers_thread_pg.pool().clone(),
+                );
                 qontinui_runner_lib::env_agent::spawn_env_capture();
                 // Phase 3 — dispatched self-enroll: subscribe to coord's
                 // `events.devenv.enroll_requested.<device_id>` directive on its
@@ -863,6 +908,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // QONTINUI_WORKTREE_RECLAIM_INTERVAL_SECS). Same machine-
                 // wide, anonymous, device-keyed posture as the census.
                 agent_worktree::reclaim::spawn_reclaim();
+                // Phase 4 (2026-07-15-vscode-coord-git-credential-prompt) —
+                // one-shot best-effort sweep of stale credential-helper
+                // config files (%TEMP%/qontinui-git-cred-*.json older than
+                // 24h). Sessions normally remove their own file via the
+                // SessionRegistry::close funnel; the sweep reaps files
+                // orphaned by crashes/kills. Never fails or slows the boot.
+                credential_helper::spawn_startup_sweep();
                 // Scheduled-maintenance executor (Phase 1, plan
                 // 2026-06-08-coord-scheduled-maintenance-subsystem) — a
                 // sibling of the reclaim pull-loop. Periodically pulls
@@ -1080,6 +1132,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         process_capture_manager: TokioMutex::new(None), // Initialized in setup()
         api_ready: AtomicBool::new(false),              // Set when MCP API server binds
         frontend_ready: AtomicBool::new(false), // Set on first successful UI Bridge IPC response
+        // 0 = no UI has ever ponged. Advanced by the `ui-bridge-pong` listener.
+        ui_bridge_last_pong: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         api_port: AtomicU16::new(crate::mcp::types::get_mcp_api_port()), // Updated when server binds
         api_lan_bound: AtomicBool::new(false), // Derived from the actual bound address when server binds
         ai_pid_tracker: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -1359,7 +1413,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::backup::get_export_summary,
             commands::backup::get_import_preview,
             commands::backup::import_all_data,
-            commands::build_id::get_build_id,
             commands::checkpoint_browser::add_sample_checkpoints,
             commands::checkpoint_browser::clear_all_checkpoints,
             commands::checkpoint_browser::compare_orchestrator_checkpoints,
@@ -1554,7 +1607,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::execution_variables::get_resolved_execution_context,
             commands::execution_variables::save_execution_variables_settings,
             commands::execution_variables::test_env_var,
-            commands::federation::get_federation_reports,
             commands::extraction::create_extraction_session,
             commands::extraction::export_state_structure,
             commands::extraction::export_training_data,
@@ -1901,10 +1953,19 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::regression::save_regression_suite,
             repo_detection::register_repo_with_coord,
             repo_detection::tenant_for_repo,
+            commands::project_preview::close_project_preview,
+            commands::project_preview::open_project_preview,
             commands::saved_projects::add_saved_project,
+            commands::saved_projects::bind_project_processes,
+            commands::saved_projects::discover_projects,
             commands::saved_projects::list_saved_projects,
+            commands::saved_projects::project_snapshot,
             commands::saved_projects::remove_saved_project,
             commands::saved_projects::save_saved_projects,
+            commands::saved_projects::set_project_front_page,
+            commands::saved_projects::autoconfigure_project,
+            commands::saved_projects::set_project_pinned,
+            commands::saved_projects::set_project_terminal_page,
             commands::screenshot::capture_and_upload_screenshot,
             commands::screenshot::capture_screenshot,
             commands::screenshot::capture_screenshot_via_python,
@@ -2225,6 +2286,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .setup(|app| {
             info!("Tauri application setup starting");
 
+            // Announce the agent-registry break-glass ONCE, loudly, if it is
+            // set. A per-spawn warn in a busy log is not discoverable; an
+            // operator who exported this months ago otherwise has no signal
+            // that spawn authorization is off on this runner.
+            agent_authorization::log_break_glass_at_startup();
+
             // Boot-restore remediation item 1 — classify THIS boot (crash
             // recovery vs planned restart) exactly once, synchronously,
             // BEFORE the API server / frontend restore can race it.
@@ -2266,38 +2333,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // to the webview without taking an AppHandle parameter.
             tauri_app_handle::set(app.handle().clone());
 
-            // Plan 2026-05-22-memories-on-coord-cross-machine.md Phase 5.G,
-            // generalized by 2026-05-24-federation-verify-and-gitop.md
-            // Phase 4 — initialize the process-wide observable-bridge
-            // registry. Each bridge mediates a per-session pull / watch /
-            // reconcile lifecycle (memory federation; git-ops next). Init
-            // failure is non-fatal — the spawn sites iterate the registry
-            // and an empty registry short-circuits all federation.
+            // Plan 2026-05-24-federation-verify-and-gitop.md Phase 4 —
+            // initialize the process-wide observable-bridge registry.
+            // Each bridge mediates a per-session pull / watch / reconcile
+            // lifecycle (git-ops today; the memory category was retired
+            // by 2026-07-26-claude-session-memory-cutover-to-coord Phase
+            // 3a). Init failure is non-fatal — the spawn sites iterate
+            // the registry and an empty registry short-circuits all
+            // federation.
             {
                 let mut bridges: Vec<
                     std::sync::Arc<dyn qontinui_runner_lib::observable_bridge::RunnerObservableBridge>,
                 > = Vec::new();
-                match qontinui_runner_lib::observable_bridge::memory::MemoryBridge::new() {
-                    Ok(bridge) => {
-                        let arc = std::sync::Arc::new(bridge);
-                        // Keep the concrete Arc available as Tauri State
-                        // (e.g. for runner-shutdown `shutdown_all`), and
-                        // register it as a trait object for dispatch.
-                        app.manage(arc.clone());
-                        bridges.push(arc);
-                        info!("memory federation bridge initialized");
-                    }
-                    Err(e) => {
-                        warn!(
-                            "memory federation bridge init failed ({}); feature disabled this session",
-                            e
-                        );
-                    }
-                }
-                // GitOpBridge — the second observable category (`git_op`).
-                // Registered unconditionally (default ON), mirroring the
-                // memory bridge. Init failure is non-fatal and independent:
-                // a failed git bridge must not disable memory federation.
+                // GitOpBridge — the `git_op` observable category.
+                // Registered unconditionally (default ON). Init failure
+                // is non-fatal.
                 match qontinui_runner_lib::observable_bridge::git_ops::GitOpBridge::new() {
                     Ok(bridge) => {
                         let arc = std::sync::Arc::new(bridge);
@@ -2659,12 +2709,25 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // holds this store for the handle hook, and a strong closure
                 // capture would create a permanent Arc cycle. A csid the
                 // registrar never registered no-ops inside close_session.
+                //
+                // The same observer FINALIZES the session's POLICY_COMPLIANCE
+                // verdict (plan
+                // `2026-07-30-session-compliance-report-enforcement.md` §A1):
+                // detection keys on TURN end (exact, already wired through the
+                // Stop hook), and this single-fire close is the one moment the
+                // runner can say the verdict is settled rather than a
+                // mid-session snapshot. Coord's store is last-write-wins per
+                // session, so a close-time re-emit simply overwrites with the
+                // best-informed verdict. Weak store handle for the same
+                // reason as above — the store owns this closure.
                 {
                     let reg = std::sync::Arc::downgrade(&ai_coord_registrar);
+                    let store = std::sync::Arc::downgrade(&lifecycle_store);
                     lifecycle_store.attach_close_observer(move |csid| {
                         if let Some(r) = reg.upgrade() {
                             r.close_session(csid);
                         }
+                        mcp::session_compliance::finalize_on_close(csid, &store);
                     });
                 }
                 // Append-only session-snapshot HISTORY (session-restore
@@ -3303,6 +3366,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
 
+                // Record the headless decision for the dead-webview recovery
+                // path (plan 2026-08-01-runner-dead-webview-is-invisible-to-health,
+                // Phases 1a/2). A server-mode runner has NO webview, ever, so
+                // `ProcessFailed` subscription and window recreate must both be
+                // inert — it must never be conscripted into growing a window it
+                // was launched to not have.
+                webview_recovery::set_server_mode(server_mode);
+
                 // Always create the window programmatically. tauri.conf.json
                 // has "windows": [] so there's no declarative window.
                 // This lets us set data_directory() for test runners
@@ -3313,8 +3384,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // to a hidden 0x0 tool window here. See plan Phase 1.5 validation.
                 } else {
                     use crate::window_placement::WindowPlacement;
-
-                    let url = tauri::WebviewUrl::App("index.html".into());
 
                     // ── Resolve placement + decorations ────────────────
                     //
@@ -3413,84 +3482,31 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         WindowPlacement::Maximized
                     };
 
-                    let mut builder = tauri::WebviewWindowBuilder::new(app, "main", url)
-                        .title("Qontinui Runner")
-                        .inner_size(initial_size.0, initial_size.1)
-                        .min_inner_size(1200.0, 700.0)
-                        .fullscreen(false)
-                        .resizable(true)
-                        .decorations(resolved_decorations.unwrap_or(true))
-                        // Phase P2.2 of `tmp_plans/sw-cache-invalidation.md`:
-                        // mark the embedded index.html as `no-store` so a
-                        // webview that survives a binary swap can't serve a
-                        // stale shell whose <script src> tags point at
-                        // hashed asset filenames the new bundle no longer
-                        // contains. Hashed `/assets/*` responses pass
-                        // through with their default headers.
-                        .on_web_resource_request(asset_headers::stamp_no_store_on_index)
-                        // Keep the WebView2 renderer live when the window is
-                        // backgrounded / occluded / on another virtual desktop.
-                        // Without these flags Chromium throttles the page's
-                        // timers to ~1/min and, after ~5 min hidden, freezes it
-                        // entirely: the terminal panes then keep showing the
-                        // last-painted frame (a mid-turn spinner) while the
-                        // frontend's session-advancing loops (state polling,
-                        // auto-approve, auto-restart) stall — so an operator
-                        // returning to a backgrounded runner sees stale "busy"
-                        // frames and no overnight progress. The Rust backend is
-                        // never throttled; this only realigns the webview with
-                        // it. `CalculateNativeWinOcclusion` off is the key flag
-                        // for the frozen frame (Windows native-occlusion
-                        // detection otherwise marks an occluded window hidden
-                        // and stops compositing). NOTE: setting
-                        // additional_browser_args REPLACES wry's default
-                        // `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection`,
-                        // so those are re-listed here. Windows-only (no-op
-                        // elsewhere). A truly *minimized* window still can't
-                        // composite, but with these flags its JS keeps running
-                        // so state stays current and it repaints instantly on
-                        // restore.
-                        .additional_browser_args(
-                            "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,\
-                             CalculateNativeWinOcclusion,IntensiveWakeUpThrottling \
-                             --disable-background-timer-throttling \
-                             --disable-renderer-backgrounding \
-                             --disable-backgrounding-occluded-windows",
-                        );
+                    // The whole builder chain (title, sizes, decorations, the
+                    // `no-store` index header, the renderer-throttling browser
+                    // args, the isolated WebView2 profile, the
+                    // `window.__QONTINUI_PORT__` injection and the placement)
+                    // lives in ONE place — `webview_recovery::build_main_window`
+                    // — because the dead-webview recovery path has to build the
+                    // *same* window again after a WebView2 browser-process
+                    // death. Duplicating the chain there would let the
+                    // recovered window silently drift from the real one.
+                    let spec = webview_recovery::MainWindowSpec {
+                        data_dir: data_dir.clone(),
+                        initial_size,
+                        decorations: resolved_decorations.unwrap_or(true),
+                        placement,
+                        is_secondary,
+                    };
 
-                    if let Some(ref dir) = data_dir {
-                        builder = builder.data_directory(dir.clone());
-                    }
-
-                    // Inject the intended API port as a global so the frontend's
-                    // synchronous port-resolution fast-path (`window.__QONTINUI_PORT__`,
-                    // used by useFileLockTracking / useRegistryAwareness /
-                    // useMidSessionProbe / LaunchMenu / useSessionManager / etc.)
-                    // resolves to the *actual* runner port on temp/secondary instances
-                    // instead of silently falling through to the hardcoded 9876.
-                    // Without this, hooks on a temp runner route their reads at the
-                    // primary. The async `get_api_port` IPC + `setApiPort` path
-                    // remains the source of truth if the bound port differs from the
-                    // intended one (port-fallback rare case).
-                    let intended_api_port = crate::mcp::types::get_mcp_api_port();
-                    builder = builder.initialization_script(format!(
-                        "window.__QONTINUI_PORT__ = {};",
-                        intended_api_port
-                    ));
-
-                    builder = placement.configure_builder(builder);
-
-                    match builder.build() {
+                    match webview_recovery::build_main_window(app.handle(), &spec) {
                         Ok(win) => {
-                            placement.finalize(&win);
-                            let _ = win.show();
-                            let _ = win.set_focus();
-                            info!(
-                                "Main window created (secondary={}, isolated={}, placement={:?})",
-                                is_secondary,
-                                data_dir.is_some(),
-                                placement
-                            );
+                            // Phase 1a: subscribe to WebView2 `ProcessFailed` so a
+                            // browser/renderer process death is a PUSH notification
+                            // at the moment of failure rather than something only a
+                            // stale heartbeat can infer. Best-effort — a failure to
+                            // attach is logged and the heartbeat backstop covers it.
+                            webview_recovery::attach_process_failed_handler(&win);
                         }
                         Err(e) => {
                             error!("Failed to create main window: {}", e);
@@ -3566,7 +3582,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             dom_capture::DomCaptureLogger::clear_captures();
             // Clear logging.rs-managed files that FileLogger doesn't cover
             let dev_logs = crate::paths::get_dev_logs_dir();
-            for filename in ["runner-render.jsonl", "ai-output.jsonl"] {
+            // `ai-output.jsonl.1` is the rotation sidecar — readers now consume
+            // it, so a startup clear that skipped it would both leave up to
+            // 50 MB unreclaimed and resurrect the previous session's output.
+            for filename in [
+                "runner-render.jsonl",
+                "ai-output.jsonl",
+                "ai-output.jsonl.1",
+            ] {
                 let path = dev_logs.join(filename);
                 if path.exists() {
                     if let Err(e) = std::fs::remove_file(&path) {
@@ -3769,6 +3792,37 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     app.state::<Arc<commands::AppState>>().inner().clone();
                 tauri::async_runtime::spawn(async move {
                     crate::state_discovery::run_drift_detector(drift_app_state).await;
+                });
+            }
+
+            // Start the state-discovery derive loop. Derives states ONCE,
+            // GLOBALLY (spec_id = None → artifact written with spec_id NULL,
+            // which is what `spec_authoring::load_latest_global_artifact`
+            // selects) on a nightly cadence, after a one-hour initial delay so
+            // startup finishes first. Overridable via
+            // QONTINUI_STATE_DERIVE_{INTERVAL,INITIAL_DELAY}_SECS and
+            // QONTINUI_STATE_DERIVE_WINDOW_DAYS.
+            //
+            // This lives in the runner, not the dev-only supervisor: the
+            // supervisor's flywheel cron ran the identical global derivation
+            // once per registered app (N byte-identical artifacts per night)
+            // and only the operator has a supervisor at all, so no ordinary
+            // user ever got derivation. Same fire-and-forget contract as the
+            // drift detector above.
+            //
+            // EVERY instance runs this setup and the runner is explicitly
+            // multi-instance (secondaries on :9877+, same box, same Postgres),
+            // so the loop must not be trusted to be singular just because it is
+            // spawned once here. It guards itself: a Postgres advisory lock
+            // keeps one writer across instances *and* machines, and a
+            // persisted-cadence check off `state_discovery_artifacts` keeps the
+            // schedule wall-clock rather than restart-relative. See
+            // `state_discovery::derive::DERIVE_LOCK_KEY`.
+            {
+                let derive_app_state: Arc<commands::AppState> =
+                    app.state::<Arc<commands::AppState>>().inner().clone();
+                tauri::async_runtime::spawn(async move {
+                    crate::state_discovery::run_derive_loop(derive_app_state).await;
                 });
             }
 
@@ -4732,6 +4786,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                          {}s of the close handler returning — exiting process",
                         FORCE_EXIT_GRACE_SECS
                     );
+                    // `process::exit` never runs `RunEvent::Exit`, so drain the
+                    // AI-output writer here too — this path is exactly the one
+                    // whose tail explains the stall.
+                    commands::logging::flush_ai_output_log();
                     std::process::exit(0);
                 });
             }
@@ -4740,7 +4798,28 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Tauri application built successfully");
     app.run(|_, event| {
-        if let tauri::RunEvent::ExitRequested { .. } = event {
+        // The AI-output log is written by a background thread whose sender is a
+        // process-lifetime static, so nothing else ever drains it: without this
+        // barrier a quit mid-burst silently loses the queued tail — precisely
+        // the lines needed to explain why the session ended.
+        if let tauri::RunEvent::Exit = event {
+            commands::logging::flush_ai_output_log();
+            return;
+        }
+        if let tauri::RunEvent::ExitRequested { api, .. } = event {
+            // Dead-webview recovery (plan
+            // 2026-08-01-runner-dead-webview-is-invisible-to-health, Phase 2)
+            // destroys the main window and immediately rebuilds it. Tauri
+            // treats "the last window was destroyed" as an exit request, so
+            // letting this through mid-swap would terminate the process and
+            // every in-flight session — the plan's explicit non-goal. Veto the
+            // exit for exactly the duration of the swap; the flag is cleared by
+            // a Drop guard on every path, including failure.
+            if webview_recovery::window_swap_in_progress() {
+                info!("Exit request vetoed: a webview-recovery window swap is in flight");
+                api.prevent_exit();
+                return;
+            }
             info!("Application exit requested");
             // Phase 2: ensure the shutdown flag is set on ANY exit path (incl.
             // a programmatic `app.exit(0)` that didn't route through the main

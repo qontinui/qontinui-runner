@@ -392,10 +392,25 @@ impl AiCoordRegistrar {
             // Pinned plane: forward the SessionManager key so coord persists
             // `coord.sessions.task_run_id` for inject-target resolution.
             payload["task_run_id"] = json!(trid);
-        } else {
-            // Sniffed plane: no task run exists — forward the durable Claude
-            // session id instead (`rebuild_create_body` passes it through as
-            // a first-class field; coord tolerates its absence elsewhere).
+        }
+        // BOTH planes forward the durable Claude session id
+        // (`rebuild_create_body` passes it through as a first-class field;
+        // coord tolerates its absence elsewhere). This is what makes the
+        // session ADDRESSABLE: coord's `create_session` upserts
+        // `coord.agent_sessions(id = claude_code_session_id, device_id)`, and
+        // that row is what the mailbox scopes on and what the fabric's
+        // handle register must present as `agent_session_id`
+        // (`session_on_device`, fail-closed).
+        //
+        // It used to be sent on the SNIFFED plane only, so pinned/agentic
+        // sessions had a `coord.sessions` row and NO `coord.agent_sessions`
+        // row — unaddressable, and their handle register refused 403.
+        //
+        // Guarded on the anchor parsing as a UUID: coord types the field
+        // `Option<Uuid>`, so a non-uuid anchor would fail deserialization of
+        // the WHOLE create body and break session registration itself. A
+        // non-uuid anchor simply omits the field, exactly as before.
+        if uuid::Uuid::parse_str(claude_session_id.trim()).is_ok() {
             payload["claude_code_session_id"] = json!(claude_session_id);
         }
 
@@ -449,17 +464,25 @@ impl AiCoordRegistrar {
         Some(session_id)
     }
 
-    /// Fire the Phase-1 `fsh_` handle mint/rebind for
-    /// `claude_session_id ↔ session_id`, best-effort on a detached thread
-    /// (NEVER fails the caller; coord may not serve the route yet). Gated on
-    /// an ATTACHED lifecycle store (main.rs attaches at boot) — which also
-    /// keeps unit-test registrars (never attached) network-silent. Shared by
-    /// the fresh-registration path and the sniffed-plane R6-hit rebind
-    /// (review W3).
+    /// Fire the Phase-1 `fsh_` handle mint/rebind for `claude_session_id`,
+    /// best-effort on a detached thread (NEVER fails the caller; coord may not
+    /// serve the route yet). Gated on an ATTACHED lifecycle store (main.rs
+    /// attaches at boot) — which also keeps unit-test registrars (never
+    /// attached) network-silent. Shared by the fresh-registration path and the
+    /// sniffed-plane R6-hit rebind (review W3).
+    ///
+    /// `coord_session_id` is this boot's `coord.sessions.id` — carried for the
+    /// correlation log ONLY. It is deliberately NOT the wire
+    /// `agent_session_id`: coord gates that field fail-closed through
+    /// `session_on_device` against `coord.agent_sessions`, where the
+    /// per-boot `coord.sessions` uuid never appears, so presenting it earned a
+    /// `403` on every call and left the registry empty. The addressable id is
+    /// the anchor itself — see `session_handle`'s module docs for the
+    /// both-sides-of-the-wire proof.
     fn spawn_handle_register(
         &self,
         claude_session_id: &str,
-        session_id: Uuid,
+        coord_session_id: Uuid,
         task_run_id: Option<&str>,
         name: Option<String>,
     ) {
@@ -469,20 +492,41 @@ impl AiCoordRegistrar {
         self.inner
             .handle_hook_fires
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let Some(agent_session_id) =
+            super::session_handle::agent_session_id_for_anchor(claude_session_id)
+        else {
+            return; // non-uuid anchor — counted inside, never silent
+        };
         if let Some(store) = self.inner.lifecycle_store.get().cloned() {
-            let terminal_id = store
-                .get(claude_session_id)
-                .map(|r| r.terminal_id)
+            let record = store.get(claude_session_id);
+            let terminal_id = record
+                .as_ref()
+                .map(|r| r.terminal_id.clone())
                 .filter(|t| !t.trim().is_empty());
+            // §7's precondition: a live runner terminal backs this handle.
+            // The store's view is the honest one available here — an OPEN
+            // record with a terminal bound. A session with no record at all
+            // (an AI subprocess with no terminal-grid row) is NOT promptable.
+            let promptable = record
+                .as_ref()
+                .is_some_and(|r| r.state == "open" && !r.terminal_id.trim().is_empty());
+            debug!(
+                claude_session_id,
+                coord_session_id = %coord_session_id,
+                agent_session_id = %agent_session_id,
+                promptable,
+                "ai_coord_register: firing fabric handle register"
+            );
             super::session_handle::spawn_register(
                 store,
                 super::session_handle::HandleRegisterRequest {
                     claude_session_id: claude_session_id.to_string(),
-                    agent_session_id: session_id,
+                    agent_session_id,
                     task_run_id: task_run_id.map(str::to_string),
                     terminal_id,
                     name,
                     machine_id: Some(self.inner.machine_id),
+                    promptable,
                 },
             );
         }
@@ -952,7 +996,7 @@ fn flush_batch(
     let take = queue.len().min(MAX_AGENT_LOG_BATCH);
     let batch: Vec<LogEntry> = queue.drain(..take).collect();
 
-    // Best-effort bearer auth (mirrors the federation report path). The ingest
+    // Best-effort bearer auth (mirrors the git-op record path). The ingest
     // route resolves the tenant from the body `device_id`, so a missing token
     // is non-fatal — we just omit the header.
     let token = crate::auth::AuthManager::new()
@@ -1054,6 +1098,48 @@ mod tests {
         assert_eq!(pending[0].payload["task_run_id"], json!(trid));
         assert_eq!(pending[0].payload["kind"], json!("agentic"));
         assert_eq!(pending[0].payload["id"], json!(coord_id));
+    }
+
+    #[test]
+    fn pinned_register_also_forwards_claude_code_session_id() {
+        // The addressability fix: coord's `create_session` upserts
+        // `coord.agent_sessions(id = claude_code_session_id, device_id)`, and
+        // that row is what the mailbox scopes on AND what the fabric handle
+        // register must present as `agent_session_id`. Sending it only on the
+        // sniffed plane left pinned/agentic sessions unaddressable and their
+        // handle register refused 403.
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let trid = Uuid::new_v4().to_string();
+
+        reg.register_session(&trid, "purpose", None).unwrap();
+
+        let pending = reg.inner.outbox.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        // Pinned plane keeps its task_run_id AND now carries the anchor.
+        assert_eq!(pending[0].payload["task_run_id"], json!(trid));
+        assert_eq!(pending[0].payload["claude_code_session_id"], json!(trid));
+    }
+
+    #[test]
+    fn non_uuid_anchor_omits_claude_code_session_id() {
+        // coord types the field `Option<Uuid>`, so forwarding a non-uuid
+        // anchor would fail deserialization of the WHOLE create body and
+        // break session registration itself. Omit instead.
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+
+        reg.register_sniffed_session("not-a-uuid", "Terminal 9", None)
+            .unwrap();
+
+        let pending = reg.inner.outbox.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(
+            pending[0].payload.get("claude_code_session_id").is_none(),
+            "a non-uuid anchor must be omitted, not sent and rejected"
+        );
     }
 
     #[test]

@@ -64,9 +64,22 @@ use super::past_sessions::{account_from_config_dir, PastSessionAccount};
 struct RegistryFile {
     pid: u32,
     session_id: String,
-    /// Absent on very old CLI builds — such a row is unusable for display and
-    /// is dropped by [`parse_registry_file`].
+    /// Absent on very old CLI builds (or a registry write we caught before the
+    /// field landed). Such a row is degraded for DISPLAY but its `sessionId` +
+    /// `pid` still prove liveness, so [`parse_registry_file`] KEEPS it with an
+    /// empty name rather than dropping it — silently removing a live id from
+    /// the liveness oracle would let the restore path respawn (fork) it.
     name: Option<String>,
+    /// How Claude Code arrived at `name`. `"derived"` means *it* invented the
+    /// name from the cwd (`qontinui-root-ec`, `qontinui-coord-88`); an **absent**
+    /// key means an operator `/rename` (or a launch-time name) supplied it.
+    ///
+    /// Kept `Option` + `serde(default)` because most rows omit it entirely (12
+    /// of the 17 named rows on the operator's box on 2026-07-28), and because a
+    /// future CLI may add further variants. Consumers must treat any value
+    /// other than `"derived"` — including absent — as operator-chosen.
+    #[serde(default)]
+    name_source: Option<String>,
     cwd: Option<String>,
     #[serde(default)]
     kind: Option<String>,
@@ -85,7 +98,22 @@ pub struct LiveClaudeSession {
     /// The `--resume` key.
     pub session_id: String,
     /// The name shown in the session window and in `/resume`. Ground truth.
+    /// Empty when the registry file carried no `name` (very old CLI builds) —
+    /// the row is still a LIVE session and must count for liveness; display
+    /// callers substitute a placeholder.
     pub name: String,
+    /// Provenance of [`Self::name`], verbatim from the registry file
+    /// (`nameSource`). `Some("derived")` marks Claude Code's own
+    /// `<dir>-<2hex>` auto-derivation, which is *weaker* than the names the
+    /// runner's other surfaces already show — callers must not let such a name
+    /// preempt an existing one. `None` (the common case) and any other value
+    /// mean the name is operator-chosen and should win.
+    ///
+    /// Deliberately **not** filtered here: [`read_live_sessions`] is also the
+    /// backing read for the `/copy-names` listing, which wants every live
+    /// session regardless of provenance. The precedence decision belongs at the
+    /// display site.
+    pub name_source: Option<String>,
     /// OS process id that reported this entry.
     pub pid: u32,
     /// Account + CLI wrapper derived from the owning config dir.
@@ -106,11 +134,18 @@ pub struct LiveClaudeSession {
     pub resume_command: String,
 }
 
-/// Parse one registry file's bytes. Returns `None` when the JSON is malformed
-/// or carries no `name` — a nameless row cannot serve this module's purpose.
+/// Parse one registry file's bytes. Returns `None` only when the JSON is
+/// malformed or carries no usable `sessionId` — nothing to be live *as*.
+///
+/// A row WITHOUT a `name` is kept (empty-string name): this reader doubles as
+/// the restore path's liveness oracle, and for that purpose a sessionId-bearing
+/// row with a live pid IS a live session regardless of what it is called.
+/// Dropping it would silently remove a live id from the oracle and let the
+/// restore path respawn — fork — that session. Display callers (`/copy-names`)
+/// substitute a placeholder for the empty name.
 fn parse_registry_file(bytes: &str, config_dir: &Path) -> Option<LiveClaudeSession> {
     let raw: RegistryFile = serde_json::from_str(bytes).ok()?;
-    let name = raw.name?;
+    let name = raw.name.unwrap_or_default();
     if raw.session_id.is_empty() {
         return None;
     }
@@ -129,6 +164,7 @@ fn parse_registry_file(bytes: &str, config_dir: &Path) -> Option<LiveClaudeSessi
     Some(LiveClaudeSession {
         session_id: raw.session_id,
         name,
+        name_source: raw.name_source,
         pid: raw.pid,
         account,
         working_dir,
@@ -138,6 +174,30 @@ fn parse_registry_file(bytes: &str, config_dir: &Path) -> Option<LiveClaudeSessi
         updated_at: raw.updated_at.unwrap_or(0),
         resume_command,
     })
+}
+
+/// Extract the live-PID set from a process-table snapshot, FAILING CLOSED on
+/// an empty table.
+///
+/// The runner itself is always a live process, so on a healthy read the table
+/// can never be empty — emptiness means the snapshot helper failed (the same
+/// failure mode `main.rs`'s liveness poll guards with `tick_snapshot_ok`).
+/// Returning an empty set here would make [`read_live_sessions`] filter EVERY
+/// registry row out, and the command would report success + `[]` — which the
+/// frontend restore oracle reads as "definitively no live sessions" and
+/// respawns (forks) everything. An indeterminate read must surface as an
+/// error so the frontend maps it to `null` → skip-unknown instead.
+pub fn live_pids_from_snapshot(
+    snapshot: &crate::process_capture::process_tree::ProcessSnapshot,
+) -> Result<HashSet<u32>, String> {
+    if snapshot.names.is_empty() {
+        return Err(
+            "process-table snapshot came back empty (the runner itself is always live, so an \
+             empty table is a failed read) — session liveness is indeterminate"
+                .to_string(),
+        );
+    }
+    Ok(snapshot.names.keys().copied().collect())
 }
 
 /// Read every `<config_dir>/sessions/*.json`, keeping only entries whose PID is
@@ -222,18 +282,115 @@ mod tests {
     }
 
     #[test]
+    fn name_source_is_carried_through_verbatim() {
+        // The operator's box on 2026-07-28: 5 of 17 named rows look like this —
+        // Claude Code's own `<dir>-<2hex>` auto-derivation. The reader must
+        // surface the provenance (and must NOT drop the row) so the display
+        // sites can refuse to let it preempt a better name.
+        let derived = r#"{"pid":198780,"sessionId":"6c71bd20","cwd":"D:\\qontinui-root","kind":"interactive","entrypoint":"sdk-cli","name":"qontinui-coord-c7","nameSource":"derived"}"#;
+        let s = parse_registry_file(derived, Path::new("C:/claude/.claude-qontinui")).unwrap();
+        assert_eq!(s.name, "qontinui-coord-c7");
+        assert_eq!(s.name_source.as_deref(), Some("derived"));
+
+        // The other 12 carry no `nameSource` key at all and hold real operator
+        // names — absent means operator-chosen, not unknown.
+        let operator_named = r#"{"pid":1,"sessionId":"s","name":"worktree prune","cwd":"/x"}"#;
+        let s = parse_registry_file(operator_named, Path::new(".claude-gmail")).unwrap();
+        assert_eq!(s.name, "worktree prune");
+        assert_eq!(s.name_source, None);
+    }
+
+    #[test]
+    fn name_source_survives_the_json_round_trip_as_camel_case() {
+        // The frontend gate reads `nameSource`; a snake_case key there would
+        // silently disable it (every row would look operator-named).
+        let derived =
+            r#"{"pid":1,"sessionId":"s","name":"qontinui-root-ec","nameSource":"derived"}"#;
+        let s = parse_registry_file(derived, Path::new(".claude-gmail")).unwrap();
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["nameSource"], "derived");
+
+        let plain = r#"{"pid":1,"sessionId":"s","name":"worktree prune"}"#;
+        let s = parse_registry_file(plain, Path::new(".claude-gmail")).unwrap();
+        let json = serde_json::to_value(&s).unwrap();
+        assert!(json["nameSource"].is_null());
+    }
+
+    #[test]
+    fn derived_rows_are_still_listed() {
+        // `/copy-names` wants every live session; only the display sites apply
+        // the precedence gate.
+        let root = tmpdir("derived");
+        let acct = root.join(".claude-paktis");
+        fs::write(
+            acct.join("sessions").join("42.json"),
+            r#"{"pid":42,"sessionId":"d","name":"qontinui-root-ec","nameSource":"derived"}"#,
+        )
+        .unwrap();
+        let live: HashSet<u32> = [42].into_iter().collect();
+        let got = read_live_sessions(&[acct], &live);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name_source.as_deref(), Some("derived"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn unknown_future_keys_do_not_break_parsing() {
         let json = r#"{"pid":1,"sessionId":"s","name":"n","cwd":"/x","brandNewKey":{"a":[1,2]}}"#;
         assert!(parse_registry_file(json, Path::new(".claude-gmail")).is_some());
     }
 
     #[test]
-    fn rejects_nameless_and_malformed_rows() {
-        let nameless = r#"{"pid":1,"sessionId":"s","cwd":"/x"}"#;
-        assert!(parse_registry_file(nameless, Path::new(".claude-gmail")).is_none());
+    fn rejects_malformed_and_idless_rows() {
         assert!(parse_registry_file("{not json", Path::new(".claude-gmail")).is_none());
         let empty_id = r#"{"pid":1,"sessionId":"","name":"n"}"#;
         assert!(parse_registry_file(empty_id, Path::new(".claude-gmail")).is_none());
+    }
+
+    #[test]
+    fn keeps_nameless_rows_for_liveness() {
+        // A sessionId-bearing row with a live pid IS a live session even when
+        // `name` is absent (old CLI build). Dropping it fail-open would remove
+        // a live id from the restore oracle → respawn-while-alive fork.
+        let nameless = r#"{"pid":1,"sessionId":"s","cwd":"/x"}"#;
+        let s = parse_registry_file(nameless, Path::new(".claude-gmail")).unwrap();
+        assert_eq!(s.session_id, "s");
+        assert_eq!(s.name, "");
+        assert_eq!(s.resume_command, "cd '/x' && clg --resume s");
+    }
+
+    #[test]
+    fn nameless_row_with_live_pid_appears_in_read_live_sessions() {
+        let root = tmpdir("nameless");
+        let acct = root.join(".claude-paktis");
+        fs::write(
+            acct.join("sessions").join("42.json"),
+            r#"{"pid":42,"sessionId":"live-id","cwd":"/w","status":"idle"}"#,
+        )
+        .unwrap();
+
+        let live: HashSet<u32> = [42].into_iter().collect();
+        let got = read_live_sessions(&[acct], &live);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].session_id, "live-id");
+        assert_eq!(got[0].name, "");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn empty_process_snapshot_is_a_failed_read_not_an_empty_pid_set() {
+        // FAIL CLOSED: the runner itself is always live, so an empty table is
+        // impossible on a healthy read. success + [] would tell the frontend
+        // "definitively nothing alive" → respawn (fork) everything.
+        use crate::process_capture::process_tree::ProcessSnapshot;
+        let empty = ProcessSnapshot::default();
+        assert!(live_pids_from_snapshot(&empty).is_err());
+
+        let mut ok = ProcessSnapshot::default();
+        ok.names.insert(1234, "claude.exe".to_string());
+        let pids = live_pids_from_snapshot(&ok).unwrap();
+        assert!(pids.contains(&1234));
+        assert_eq!(pids.len(), 1);
     }
 
     #[test]

@@ -13,6 +13,84 @@
 //! present the identical bearer and feed the one auth-coverage metric.
 //!
 //! [`attach_device_auth`]: qontinui_runner_lib::auth::attach_device_auth
+//!
+//! # The shared client
+//!
+//! [`coord_client`] hands out ONE process-wide [`reqwest::Client`]. Every coord
+//! caller must use it rather than building its own.
+//!
+//! A `reqwest::Client` is not a handle onto shared machinery — it OWNS a
+//! connection pool and a DNS resolver. Building one per request therefore
+//! defeats keep-alive (a fresh TCP + TLS handshake every time) and, because
+//! reqwest's default `GaiResolver` resolves through blocking `getaddrinfo`
+//! dispatched onto tokio's blocking pool, spends a blocking-pool slot per
+//! request as well. With ~27 live agents heart-beating every 30s and
+//! `post_log_line` firing per agent log line, that pattern pinned the pool near
+//! its 512-thread ceiling and starved DNS resolution: requests exhausted their
+//! 5s timeout while still queued, and coord — answering this box in under half
+//! a second — was blamed for `operation timed out`.
+//!
+//! The client carries NO global timeout on purpose. Coord call sites want
+//! different deadlines (3s for log lines, 5s for polls and heartbeats, 10s for
+//! claim acquisition), so each sets its own via
+//! [`reqwest::RequestBuilder::timeout`]. A global timeout here would silently
+//! override them.
+
+use std::sync::OnceLock;
+use std::time::Duration;
+
+/// Process-wide coord HTTP client, built once on first use.
+///
+/// `None` iff the one-time build failed (a broken TLS backend); cached so a
+/// failure is not retried per request. Callers keep their existing
+/// warn-and-continue posture on `None`.
+static COORD_CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+
+/// The shared coord [`reqwest::Client`] — one connection pool and one resolver
+/// for the whole process.
+///
+/// Returns `None` only when the client could not be constructed at all, which
+/// in practice means the TLS backend failed to initialise. That is the same
+/// condition the old per-call `build()` sites reported, so callers that used to
+/// `warn!` and skip on a build error keep doing exactly that.
+///
+/// Set a per-request deadline on the builder — this client has no global one:
+///
+/// ```ignore
+/// let Some(client) = crate::coord_http::coord_client() else { return };
+/// let resp = client
+///     .post(&url)
+///     .timeout(Duration::from_secs(5))
+///     .json(&body)
+///     .send()
+///     .await?;
+/// ```
+pub fn coord_client() -> Option<&'static reqwest::Client> {
+    COORD_CLIENT
+        .get_or_init(|| {
+            // `pool_max_idle_per_host` caps retained idle sockets per coord
+            // host; the default is effectively unbounded, which under the old
+            // churn is how the runner accumulated hundreds of half-live
+            // connections. `pool_idle_timeout` keeps a warm connection across
+            // the 30s heartbeat tick so the steady state is zero handshakes.
+            match reqwest::Client::builder()
+                .pool_max_idle_per_host(32)
+                .pool_idle_timeout(Duration::from_secs(90))
+                .tcp_keepalive(Duration::from_secs(60))
+                .build()
+            {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!(
+                        "coord_http: shared coord client build failed ({e:#}); \
+                         coord calls will be skipped"
+                    );
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
 
 /// Build a coord GET request with the device-JWT bearer attached when one is
 /// available, otherwise return the builder unchanged.

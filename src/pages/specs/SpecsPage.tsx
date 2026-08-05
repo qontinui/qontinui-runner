@@ -573,12 +573,26 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
       specId: s.specId,
       config: s.config as SpecConfig,
     }));
-    const compilation = compileStateMachineFromSpecs(
-      inputs,
-      undefined,
-      undefined,
-      gitProposalsRef.current,
-    );
+    // `compileStateMachineFromSpecs` has one non-union exit: it THROWS on an
+    // observed/ai-fallback double-claim (an authoritative-source
+    // disagreement). The other two call sites already guard it; without this
+    // the Error would escape into a React event handler and take the page
+    // down on a button click.
+    let compilation: ReturnType<typeof compileStateMachineFromSpecs>;
+    try {
+      compilation = compileStateMachineFromSpecs(
+        inputs,
+        undefined,
+        undefined,
+        gitProposalsRef.current,
+      );
+    } catch (err) {
+      console.error(
+        "[Specs] State machine compilation failed — engine not updated:",
+        err instanceof Error ? err.message : err,
+      );
+      return;
+    }
 
     if (!compilation.compiled) {
       // Quarantined — persist the record and refuse to load into the engine.

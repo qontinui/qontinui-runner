@@ -35,6 +35,15 @@ use crate::claude_session::manager::SessionManager;
 use crate::claude_session::state::SessionState;
 use crate::orchestration_loop::ledger::{Subtask, SubtaskState};
 
+/// How long [`dispatch_subtask`] queues for a parallel fan-out admission slot.
+///
+/// Near-zero on purpose: the conductor's tick loop already retries, and
+/// `apply_tick` is sequential, so a long queue here freezes completions, gate
+/// registration and the stall fingerprint for the whole budget — once per
+/// queued dispatch. Small but non-zero so a slot released microseconds ago is
+/// still picked up in this tick rather than costing a whole 5s interval.
+const FANOUT_ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// In-process read of a worker's terminal/FSM state, as observed by the
 /// Phase-3 reconciler each tick.
 ///
@@ -208,6 +217,112 @@ pub async fn dispatch_subtask(
         "dispatch_subtask: run={} task_id={} -> task_run_id={} (repo={:?})",
         run_id, subtask.task_id, task_run_id, subtask.repo
     );
+
+    // Agent-registry spawn authorization (plan
+    // `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c, served clause
+    // `agent-spawn-authorization`). The orchestration loop dispatches one
+    // worker session per subtask — this is the workflow fan-out the clause
+    // names, so it is `parallel_fanout`: bounded-needs-declaration, not a
+    // standing spawn. Checked FIRST, before the worktree is acquired and the
+    // account is picked, so a refusal leaves no allocated worktree behind.
+    //
+    // `authorize_fanout_spawn_with_budget` (not `authorize_spawn`) because this
+    // class also carries a declared fan-out bound. The returned `FanoutSlot` is
+    // the admission ticket: it is held for the whole dispatch and released by
+    // its `Drop` on every exit path below, including the `?` returns and a
+    // panic.
+    //
+    // NOTE the near-zero wait budget. The conductor's tick loop IS the retry
+    // mechanism, and `apply_tick` is one sequential function — queueing here
+    // for the module's 120s default would stall completions, gate registration
+    // and the stall fingerprint for minutes at a time, once per queued
+    // dispatch. `SlotUnavailable` is handled below as "not this tick", which is
+    // the same degrade-to-sequential at tick granularity. The bound that
+    // actually shapes this run is applied a layer up, in the conductor's
+    // per-tick `effective_concurrency_cap`.
+    let fanout_slot = match crate::agent_authorization::authorize_fanout_spawn_with_budget(
+        None,
+        FANOUT_ADMISSION_WAIT,
+    )
+    .await
+    {
+        crate::agent_authorization::FanoutAdmission::Admitted { decision, slot } => {
+            if let crate::agent_authorization::SpawnDecision::SerializeToBound {
+                bound,
+                in_flight,
+            } = &decision
+            {
+                // The clause's degrade-to-sequential: the bound was full, this
+                // dispatch queued for a slot, and the work is proceeding. NOT a
+                // failure. Logged once per serialization, never per tick.
+                info!(
+                    "dispatch_subtask: {} serialized behind the parallel fan-out bound \
+                     (bound={bound}, in_flight={in_flight}) — proceeding sequentially",
+                    subtask.task_id
+                );
+            }
+            slot
+        }
+        crate::agent_authorization::FanoutAdmission::Refused(decision) => {
+            // Make the refusal TERMINAL for this subtask before returning.
+            //
+            // The conductor treats a dispatch `Err` as a transient failure and
+            // leaves the subtask `Submitted` so a later tick retries — on a 5s
+            // tick that turns a standing authorization decision into an infinite
+            // retry loop, one `warn!` per tick, with the orchestration run hung
+            // because `TickPlan::to_fail` only covers `Working` rows. An
+            // authorization refusal is a standing decision, not a transient fault:
+            // retrying cannot change it. Same lesson as the looping supervisor
+            // (which keeps a refusal out of its spawn-failure backoff) and
+            // `spawn_run_task` (which posts a terminal lifecycle outcome).
+            let mut refusal = decision
+                .refusal()
+                .unwrap_or_else(|| format!("spawn-authorization {}: refused", decision.label()));
+            // `degrade` and `block` are different user choices and must not read
+            // identically to whoever opens the failed subtask. `block` means the
+            // work is blocked; `degrade` means the user chose "no spawn — do it
+            // inline". The orchestrator has no inline mode (a subtask IS a
+            // worker session), so the row still goes Failed, but the recorded
+            // disposition is named and the operator is told what to do instead
+            // rather than being left with an undifferentiated refusal.
+            if matches!(
+                decision,
+                crate::agent_authorization::SpawnDecision::DegradeToInline { .. }
+            ) {
+                refusal.push_str(
+                    " — the recorded disposition is `degrade` (no spawn), and the orchestration \
+                     loop has no inline mode: run this subtask's work yourself, or enable the \
+                     agent-registry row to let the orchestrator dispatch a worker.",
+                );
+            }
+            warn!("dispatch_subtask: {} refused: {refusal}", subtask.task_id);
+            if let Err(e) = pg
+                .set_subtask_state(run_id, &subtask.task_id, SubtaskState::Failed)
+                .await
+            {
+                warn!(
+                    "dispatch_subtask: could not mark {} Failed after an authorization \
+                     refusal: {e}",
+                    subtask.task_id
+                );
+            }
+            return Err(refusal);
+        }
+        crate::agent_authorization::FanoutAdmission::SlotUnavailable { bound, waited, .. } => {
+            // TRANSIENT, deliberately unlike the refusal above: the bound is
+            // occupied, not the spawn forbidden. The clause says a bound breach
+            // must never become a task failure while sequential progress is
+            // still possible, so the subtask stays `Submitted` and a later tick
+            // retries once a slot frees.
+            return Err(format!(
+                "dispatch_subtask: {} not dispatched — the parallel fan-out bound ({bound}) \
+                 was fully occupied ({}ms). Transient: the subtask stays queued and a later \
+                 tick retries.",
+                subtask.task_id,
+                waited.as_millis()
+            ));
+        }
+    };
 
     // 1. Worktree allocation (best-effort, mirrors terminal_create). When
     //    `repo` is None the helper is a no-op and returns the default cwd.
@@ -399,6 +514,11 @@ pub async fn dispatch_subtask(
         "dispatch_subtask: worker live — run={} task_id={} task_run_id={}",
         run_id, subtask.task_id, task_run_id
     );
+    // Explicit so the release point is stated rather than inferred from scope
+    // end: the worker is live and registered, so the admission is over and the
+    // next queued dispatch may proceed. Every earlier exit path (the `?`
+    // returns above, or a panic) releases it the same way, via `Drop`.
+    drop(fanout_slot);
     Ok(task_run_id)
 }
 

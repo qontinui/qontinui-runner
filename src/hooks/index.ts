@@ -12,8 +12,12 @@ export type { UseActionLogViewOptions, UseActionLogViewResult } from "./useActio
 export { useDashboardState } from "./useDashboardState";
 export type { UseDashboardStateOptions, UseDashboardStateReturn } from "./useDashboardState";
 
-export { useLogManager } from "./useLogManager";
-export type { UseLogManagerResult } from "./useLogManager";
+export { useLogManager, useLogActions, useLogData } from "./useLogManager";
+export type {
+  UseLogManagerResult,
+  UseLogActionsResult,
+  UseLogDataResult,
+} from "./useLogManager";
 
 export { useUIState } from "./useUIState";
 export type { UseUIStateResult, LogTab } from "./useUIState";

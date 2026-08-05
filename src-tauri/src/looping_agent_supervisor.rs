@@ -365,12 +365,56 @@ async fn supervise_one(
     );
     log_posture_transition(&rec.def.id, &effective);
 
+    // Agent-registry spawn authorization (plan
+    // `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c, served clause
+    // `agent-spawn-authorization`). A looping agent is the archetypal spawn
+    // that OUTLIVES the request: it relaunches itself indefinitely on the
+    // user's own AI quota. Standing per-path opt-in, default OFF for a fresh
+    // user.
+    //
+    // Resolved here, applied in TWO precise places below — deliberately NOT by
+    // zeroing `effective`:
+    //   * Zeroing the posture would send `reconcile_slot_lease` down its
+    //     "clean stop" branch, RELEASING the fleet slot lease of an agent whose
+    //     tab is still alive. Another runner on a stale-but-valid registry
+    //     snapshot would then acquire the freed slot and spawn a second copy —
+    //     the #1025 double-spawn this lease exists to prevent, re-opened by a
+    //     fleet-wide decision that reaches runners at different times.
+    //   * So instead: `may_acquire` stops us taking a NEW lease, while an
+    //     existing hold keeps heart-beating for as long as the agent is
+    //     DESIRED RUNNING (the heartbeat branch is gated on `effective`, not
+    //     on tab liveness — which is resolved later in this fn — so a refused
+    //     agent whose tab has already exited also keeps its slot warm; that is
+    //     the safe direction during rollout skew, since a peer runner reading
+    //     the same tenant verdict is refused too and starves on nothing); and
+    //     the action gate below rewrites Spawn/Relaunch to None.
+    //
+    // A refusal therefore stops NEW spawns and relaunches without killing or
+    // orphaning a live session. That is the correct reading: the clause governs
+    // whether a spawn HAPPENS, and the runner-lifecycle clause forbids killing
+    // a live session to enforce it. `Action::Nudge` is left alone — continuing
+    // an existing conversation is not a spawn.
+    //
+    // Only asked when the agent is actually wanted running: an agent the
+    // operator has switched off can never spawn, so asking every tick would be
+    // a pointless coord read and pointless log volume.
+    let authz = if effective.running {
+        crate::agent_authorization::authorize_spawn(
+            Some(&rec.def.name),
+            crate::agent_authorization::SpawnPath::StandingContinuation,
+        )
+        .await
+    } else {
+        crate::agent_authorization::SpawnDecision::Allow
+    };
+    let authz_permits_spawn = authz.allows_spawn();
+
     // -- Slot lease reconciliation (claim-first — D3 / the #1025 lesson). --
     //
     // MUST happen BEFORE `policy::decide` is acted on: `gate_action` rewrites
     // any session-creating action to `None` unless we hold a lease, so the
     // lease state is an INPUT to acting, never a check performed afterwards.
-    let holds_lease = reconcile_slot_lease(app, rec, &effective).await;
+    let holds_lease = reconcile_slot_lease(app, rec, &effective, authz_permits_spawn).await;
 
     let (liveness, live) = resolve_live_session(app, rec);
 
@@ -437,6 +481,39 @@ async fn supervise_one(
     // fleet loses simultaneously — #1025), but "you already won the atomic
     // slot, therefore you may spawn".
     let action = lease::gate_action(policy::decide(&input), holds_lease);
+
+    // Phase 4c action gate. Applied AFTER `policy::decide` so a refusal cannot
+    // reach `Action::Relaunch`, which CLOSES the live tab before respawning —
+    // a refusal discovered inside `do_spawn` would kill a running agent and
+    // never restart it. `Nudge` and `None` pass through untouched.
+    let action = if authz_permits_spawn {
+        action
+    } else {
+        match action {
+            Action::Spawn(reason) => {
+                warn!(
+                    agent = %rec.def.id,
+                    ?reason,
+                    decision = authz.label(),
+                    "looping_agent_supervisor: spawn suppressed by the agent registry: {}",
+                    authz.reason().unwrap_or("no reason recorded")
+                );
+                Action::None
+            }
+            Action::Relaunch(reason) => {
+                warn!(
+                    agent = %rec.def.id,
+                    ?reason,
+                    decision = authz.label(),
+                    "looping_agent_supervisor: relaunch suppressed by the agent registry — \
+                     the existing tab is left running untouched: {}",
+                    authz.reason().unwrap_or("no reason recorded")
+                );
+                Action::None
+            }
+            other => other,
+        }
+    };
 
     match action {
         Action::None => {}
@@ -544,6 +621,7 @@ async fn reconcile_slot_lease(
     app: &tauri::AppHandle,
     rec: &LoopingAgentRecord,
     effective: &EffectiveDesired,
+    may_acquire: bool,
 ) -> bool {
     let agent_id = &rec.def.id;
 
@@ -609,6 +687,19 @@ async fn reconcile_slot_lease(
     }
 
     // -- Acquire: claim-first. The FIRST win is the permission to spawn. --
+    //
+    // Phase 4c: an agent-registry refusal stops us taking a NEW slot (it would
+    // starve the rest of the fleet of a slot nothing can use) but deliberately
+    // does NOT reach the release branch above — an agent whose tab is still
+    // alive keeps heart-beating the slot it already holds, so no peer runner
+    // can acquire it and spawn a second copy while this one lives.
+    if !may_acquire {
+        debug!(
+            agent = %agent_id,
+            "looping_agent_supervisor: agent-registry refusal — not acquiring a new slot lease"
+        );
+        return false;
+    }
     for slot in lease::candidate_slots(effective.slots, None) {
         let resource_key = lease::slot_resource_key(&tenant_id.to_string(), role, slot);
         let outcome = crate::looping_agent_coord::acquire_slot(
@@ -721,6 +812,34 @@ async fn do_spawn(
     is_relaunch: bool,
 ) {
     let now_ms = chrono::Utc::now().timestamp_millis();
+
+    // Agent-registry backstop. `supervise_one` folds the decision into the
+    // posture so a refusal never reaches here in the normal path; this covers
+    // any other caller. A refusal is deliberately NOT recorded as a spawn
+    // failure — authorization is a standing decision, not a transient fault,
+    // and feeding it into the escalating backoff would misreport it as a
+    // broken agent.
+    let authz = crate::agent_authorization::authorize_spawn(
+        Some(&def.name),
+        crate::agent_authorization::SpawnPath::StandingContinuation,
+    )
+    .await;
+    if !authz.allows_spawn() {
+        warn!(
+            agent = %def.id,
+            decision = authz.label(),
+            "looping_agent_supervisor: spawn refused by the agent registry: {}",
+            authz.reason().unwrap_or("no reason recorded")
+        );
+        return;
+    }
+    if let crate::agent_authorization::SpawnDecision::Warn { reason } = &authz {
+        warn!(
+            agent = %def.id,
+            "looping_agent_supervisor: spawning under a warn_proceed disposition: {reason}"
+        );
+    }
+
     match spawn_looping_agent_terminal(app, def, prompt).await {
         Ok((terminal_id, claude_session_id)) => {
             info!(
@@ -769,6 +888,19 @@ async fn spawn_looping_agent_terminal(
     def: &LoopingAgentDef,
     prompt: String,
 ) -> Result<(String, String), String> {
+    // Last-mile agent-registry gate (Phase 4c). `do_spawn` already checked,
+    // but this fn IS the spawn recipe — any future caller reaching it directly
+    // must not bypass the standing opt-in. The decision is served from the
+    // module's TTL cache, so the second check costs no extra coord round-trip.
+    let authz = crate::agent_authorization::authorize_spawn(
+        Some(&def.name),
+        crate::agent_authorization::SpawnPath::StandingContinuation,
+    )
+    .await;
+    if let Some(refusal) = authz.refusal() {
+        return Err(refusal);
+    }
+
     let terminal_manager = app
         .try_state::<Arc<crate::terminal::TerminalManager>>()
         .map(|s| s.inner().clone())

@@ -76,12 +76,49 @@ pub struct LaunchPayload {
     pub jwt_exp: i64,
     pub initial_prompt: String,
     pub claim_token: String,
+    /// Work unit this spawn belongs to, under the post-rename key.
+    ///
+    /// Read it through [`LaunchPayload::work_unit_slug`], never directly —
+    /// coord emits BOTH keys during the dual window and the accessor applies
+    /// the precedence.
+    ///
+    /// The `_new` suffix exists only to free the `work_unit_slug` *identifier*
+    /// for the accessor; the WIRE key is plain `work_unit_slug` via the
+    /// `rename`. Dropping that rename makes the runner silently look for a
+    /// `work_unit_slug_new` key coord never sends, so the new-key path goes
+    /// dead while the legacy fallback keeps it looking healthy.
+    #[serde(default, rename = "work_unit_slug")]
+    pub work_unit_slug_new: Option<String>,
+    /// The legacy key. **Two fields, deliberately NOT `#[serde(alias)]`.**
+    ///
+    /// An alias would make serde treat the two spellings as the SAME field, so
+    /// a body carrying both would fail with `duplicate field`. That hard-fail
+    /// is the right behaviour for a REQUEST coord receives (one caller sends
+    /// one name; both is genuinely ambiguous — see coord's `SpawnRequest`),
+    /// but it is exactly wrong here: this struct parses a payload coord
+    /// *deliberately* dual-emits during the rename window, so an alias would
+    /// reject every spawn from a renamed coord. Verified: coord's
+    /// `LaunchPayload` serializes `{"plan_slug":…,"work_unit_slug":…}`, which
+    /// an aliased field rejects with ``duplicate field `work_unit_slug` ``.
     #[serde(default)]
     pub plan_slug: Option<String>,
     #[serde(default)]
     pub plan_phase: Option<u32>,
     #[serde(default)]
     pub correlation_topic: Option<String>,
+}
+
+impl LaunchPayload {
+    /// The work-unit slug under either wire spelling, new key winning.
+    ///
+    /// Coord dual-emits `work_unit_slug` alongside the legacy `plan_slug` for
+    /// one release; after it drops the legacy key this collapses to a plain
+    /// read of `work_unit_slug_new` and the `plan_slug` field goes away.
+    pub fn work_unit_slug(&self) -> Option<&str> {
+        self.work_unit_slug_new
+            .as_deref()
+            .or(self.plan_slug.as_deref())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -899,8 +936,17 @@ async fn handle_message(txt: &str, device_id: uuid::Uuid) -> anyhow::Result<()> 
             } else if envelope_is_gate_continuation(&value) {
                 match parse_gate_continuation_payload(&value) {
                     Some(payload) => {
-                        // Outcome counts matter only on the poll path.
-                        let _ = dispatch_gate_continuation(payload, device_id);
+                        // DETACHED, deliberately: `dispatch_gate_continuation`
+                        // now awaits the agent-registry check, which can pay a
+                        // coord round-trip. `handle_message` runs INLINE in the
+                        // WS read loop, so awaiting it here would stall the pump
+                        // (missing keepalive ticks → coord drops the connection →
+                        // reconnect churn → replay storm). Same reason
+                        // `dispatch_condition_check` spawns detached. Outcome
+                        // counts matter only on the poll path, which still awaits.
+                        tokio::spawn(async move {
+                            let _ = dispatch_gate_continuation(payload, device_id).await;
+                        });
                     }
                     None => warn!(
                         "agent_runtime: gate-continuation envelope on {channel} had no \
@@ -1082,14 +1128,56 @@ fn spawn_run_task(payload: LaunchPayload) {
     let stop = tokio_util::sync::CancellationToken::new();
     agent_stops().lock().unwrap().insert(agent_id, stop.clone());
     tokio::spawn(async move {
+        // Agent-registry spawn authorization (plan
+        // `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c, served
+        // clause `agent-spawn-authorization`). This is coord's primary
+        // auto-dispatch funnel (`events.agent.spawn_requested.<device_id>`):
+        // coord hands the runner a full launch payload and the agent runs on
+        // the user's own AI quota, outliving the request entirely. Standing
+        // per-path opt-in, default OFF for a fresh user.
+        //
+        // Inside the task, not before it: `authorize_spawn` can pay a coord
+        // round-trip and both callers sit inline in the WS pump, which must
+        // keep serving keepalives. The stop-token entry is registered
+        // synchronously above (so an immediate stop request still finds the
+        // agent) and is removed here on refusal; nothing else has been
+        // created yet, so there is no other state to unwind.
+        let authz = crate::agent_authorization::authorize_spawn(
+            None,
+            crate::agent_authorization::SpawnPath::StandingContinuation,
+        )
+        .await;
+        if !authz.allows_spawn() {
+            let reason = format!(
+                "agent-registry spawn authorization refused this launch ({}): {}",
+                authz.label(),
+                authz.reason().unwrap_or("no reason recorded")
+            );
+            warn!("agent_runtime: coord spawn-request agent_id={agent_id} NOT launched — {reason}");
+            agent_stops().lock().unwrap().remove(&agent_id);
+            // Report a TERMINAL outcome to coord. `run_agent_subprocess` is the
+            // only thing that posts spawn_complete/spawn_failed, so returning
+            // silently would leave coord's agent row in `spawning` forever and
+            // re-dispatch the same request on every reconnect — an endless
+            // dispatch/refuse loop. Unlike the gate-continuation path (whose
+            // row must stay PENDING and re-listable), a launch payload has no
+            // deferral shape: the honest answer is "this device will not run
+            // it, and here is why".
+            report_spawn_failed(agent_id, &reason, None, 0, None).await;
+            return;
+        }
         if let Err(e) = run_agent_subprocess(payload, stop).await {
             error!("agent_runtime: run_agent_subprocess failed: {e:#}");
         }
         // Drop the registry entry once the run task is fully done.
         agent_stops().lock().unwrap().remove(&agent_id);
         // Drop the agent's live-token slot so its proxy nonce hard-fails closed
-        // (the agent process is gone; any lingering `.mcp.json` nonce must 401).
+        // (the agent process is gone; any lingering `.mcp.json` nonce must 401)
+        // — and revoke the nonce registration itself (credential-hygiene
+        // Task 5): a torn-down agent's nonce should disappear from the
+        // registry, not linger as a permanently-401ing entry.
         crate::coord_mcp::remove_agent_token(agent_id);
+        crate::coord_mcp::revoke_agent_proxy_nonces(agent_id);
         // Stop the per-agent durability + observability daemons (pusher/poller).
         crate::agent_daemons::stop_for_agent(agent_id);
     });
@@ -1759,7 +1847,8 @@ enum ConsumeTarget {
 /// **Claim-then-spawn-then-outcome** (the coord continuation contract). For a
 /// payload carrying a `gate_id` the whole dispatch is one async task that:
 ///
-/// 1. **Fast-path dedupe** (synchronous, before any I/O): [`claim_gate_dispatch`]
+/// 1. **Agent-registry authorization** (`agent-spawn-authorization`), then
+///    **fast-path dedupe**: [`claim_gate_dispatch`]
 ///    against the in-process set — a duplicate delivery (same `gate_id`) is
 ///    dropped here so a continuation delivered by both transports never even
 ///    starts a second task. This is the in-process guard; the network claim
@@ -1774,10 +1863,12 @@ enum ConsumeTarget {
 /// Absent `gate_id` (legacy coord) → no dedupe-by-id, no claim, no outcome:
 /// dispatch exactly once via [`spawn_gate_continuation_task`] (unchanged).
 ///
-/// Returns the synchronous fast-path outcome so the poll path can aggregate
-/// honest per-run counts for the coord self-report
-/// ([`post_continuation_poll_report`]); the WS fast-path ignores it.
-fn dispatch_gate_continuation(
+/// Returns the fast-path outcome so the poll path can aggregate honest per-run
+/// counts for the coord self-report ([`post_continuation_poll_report`]); the WS
+/// fast-path ignores it (and dispatches this fn detached, since the
+/// agent-registry check below may pay a coord round-trip and the WS read loop
+/// must keep serving keepalives).
+async fn dispatch_gate_continuation(
     payload: GateContinuationPayload,
     device_id: uuid::Uuid,
 ) -> DispatchOutcome {
@@ -1805,8 +1896,66 @@ fn dispatch_gate_continuation(
         );
         return DispatchOutcome::NotAddressedToSelf;
     }
+
+    // Agent-registry spawn authorization (plan
+    // `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c, served clause
+    // `agent-spawn-authorization`). A gate continuation / work-unit dispatch
+    // OUTLIVES the request that created it, so it is a `standing_continuation`:
+    // standing per-path opt-in, default OFF for a fresh user, never implied by
+    // a task. Checked HERE — after the addressed-to-self gate (so a
+    // continuation meant for another instance costs no lookup) and BEFORE the
+    // dedupe claim, so a denied continuation is never claimed and stays
+    // re-listable if the user later opts in.
+    //
+    // Note: an anchor key is a gate label, not a registry agent name, so this
+    // resolves against the per-path row. `crate::agent_authorization::SpawnDecision`
+    // is spelled out because this module has its OWN unrelated `SpawnDecision`
+    // (coord's claim verdict) — do not import it.
+    let authz = crate::agent_authorization::authorize_spawn(
+        None,
+        crate::agent_authorization::SpawnPath::StandingContinuation,
+    )
+    .await;
+    if !authz.allows_spawn() {
+        let reason = authz.reason().unwrap_or("no reason recorded").to_string();
+        warn!(
+            "agent_runtime: gate-continuation (gate_id={:?}, dispatch_id={:?}, source={}) \
+             NOT dispatched — {}: {}",
+            payload.gate_id,
+            payload.dispatch_id,
+            payload.source,
+            authz.label(),
+            reason
+        );
+        // Stamp a NON-CONSUMING reason so coord can see WHY the row is sitting
+        // pending, exactly as the `at_cap` / `duplicate_anchor` guards do. The
+        // row stays pending and re-listable (no consume claim is taken), but
+        // without this stamp coord sees a pending row with a null reason — the
+        // shape that stranded 51 continuations for two days.
+        if let Some(gate_id) = payload.gate_id {
+            if should_post_deferred_stamp(gate_id, std::time::Instant::now()) {
+                post_continuation_deferred(
+                    gate_id,
+                    device_id,
+                    format!("spawn_authorization_{}", authz.label()),
+                )
+                .await;
+            }
+        }
+        return DispatchOutcome::Denied;
+    }
+    if let crate::agent_authorization::SpawnDecision::Warn { reason } = &authz {
+        warn!(
+            "agent_runtime: gate-continuation (gate_id={:?}) proceeding under a \
+             warn_proceed disposition: {}",
+            payload.gate_id, reason
+        );
+    }
+
     if let Some(gate_id) = payload.gate_id {
-        // Synchronous fast-path: drop an in-process duplicate before any I/O.
+        // Fast-path dedupe: drop an in-process duplicate before any claim.
+        // (The agent-registry check above is the one I/O that precedes it — it
+        // must, so a refused dispatch never claims anything.)
         if !claim_gate_dispatch(gate_id) {
             debug!(
                 "agent_runtime: gate-continuation gate_id={gate_id} already dispatched; \
@@ -1836,7 +1985,9 @@ fn dispatch_gate_continuation(
         // frame AND the `pending-unit-dispatches` replay-poll path (both route
         // through here), so dedupe + ack happen regardless of arrival path.
         //
-        // Synchronous fast-path: drop an in-process duplicate before any I/O.
+        // Fast-path dedupe: drop an in-process duplicate before any claim.
+        // (The agent-registry check above is the one I/O that precedes it — it
+        // must, so a refused dispatch never claims anything.)
         if !claim_dispatch_dispatch(dispatch_id) {
             debug!(
                 "agent_runtime: unit-dispatch dispatch_id={dispatch_id} already dispatched; \
@@ -1888,6 +2039,11 @@ enum DispatchOutcome {
     AlreadyDispatched,
     /// Not addressed to this instance (the addressed instance spawns it).
     NotAddressedToSelf,
+    /// Refused by the agent registry (`agent-spawn-authorization`): the
+    /// tenant/user has not opted this device into standing continuations, or
+    /// has disabled them with a `block`/`degrade` disposition. No coord claim
+    /// is taken, so the row stays re-listable if the user opts in later.
+    Denied,
 }
 
 /// Poll coord for gate-continuation dispatches that landed while this runner was
@@ -1911,18 +2067,17 @@ async fn poll_pending_continuations(device_id: uuid::Uuid) {
     // Every fetch-failure exit below still self-reports (all-zeros +
     // `skip_reasons.fetch_failed`): coord must be able to tell "poll loop
     // alive but the pull route failing" apart from "poll loop dead".
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("agent_runtime: pending-continuations client build failed: {e:#}");
-            post_continuation_poll_report(device_id, PollRunCounts::fetch_failure()).await;
-            return;
-        }
+    let Some(client) = crate::coord_http::coord_client() else {
+        warn!("agent_runtime: pending-continuations: no shared coord client");
+        post_continuation_poll_report(device_id, PollRunCounts::fetch_failure()).await;
+        return;
     };
-    let resp = match client.get(&url).send().await {
+    let resp = match client
+        .get(&url)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             warn!("agent_runtime: pending-continuations GET failed (continuing): {e:#}");
@@ -1967,10 +2122,11 @@ async fn poll_pending_continuations(device_id: uuid::Uuid) {
         // shared seam dedupes + acks even if coord omitted it inside `payload`.
         let mut payload = row.payload;
         payload.gate_id = Some(row.gate_id);
-        match dispatch_gate_continuation(payload, device_id) {
+        match dispatch_gate_continuation(payload, device_id).await {
             DispatchOutcome::Dispatched => counts.dispatched_n += 1,
             DispatchOutcome::AlreadyDispatched => counts.already_dispatched += 1,
             DispatchOutcome::NotAddressedToSelf => counts.not_addressed_to_self += 1,
+            DispatchOutcome::Denied => counts.spawn_authorization_denied += 1,
         }
     }
     post_continuation_poll_report(device_id, counts).await;
@@ -1990,6 +2146,11 @@ struct PollRunCounts {
     dispatched_n: usize,
     already_dispatched: usize,
     not_addressed_to_self: usize,
+    /// Refused by the agent registry (`agent-spawn-authorization`). Counted
+    /// separately so coord can tell "the user has not opted this device into
+    /// standing continuations" apart from a dedupe drop or a dead poll loop —
+    /// the two look identical in `skipped_n` alone.
+    spawn_authorization_denied: usize,
     fetch_failed: bool,
 }
 
@@ -2023,6 +2184,12 @@ impl ContinuationPollReportBody {
         if counts.not_addressed_to_self > 0 {
             skip_reasons.insert("not_addressed_to_self", counts.not_addressed_to_self);
         }
+        if counts.spawn_authorization_denied > 0 {
+            skip_reasons.insert(
+                "spawn_authorization_denied",
+                counts.spawn_authorization_denied,
+            );
+        }
         if counts.fetch_failed {
             skip_reasons.insert("fetch_failed", 1);
         }
@@ -2048,18 +2215,18 @@ async fn post_continuation_poll_report(device_id: uuid::Uuid, counts: PollRunCou
         return;
     };
     let url = format!("{base}/coord/agents/continuation-poll-report");
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("agent_runtime: poll-report client build failed (continuing): {e:#}");
-            return;
-        }
+    let Some(client) = crate::coord_http::coord_client() else {
+        warn!("agent_runtime: poll-report: no shared coord client (continuing)");
+        return;
     };
     let body = ContinuationPollReportBody::new(device_id, counts);
-    match client.post(&url).json(&body).send().await {
+    match client
+        .post(&url)
+        .timeout(Duration::from_secs(5))
+        .json(&body)
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             debug!(
                 "agent_runtime: poll self-report posted (listed={} dispatched={} skipped={})",
@@ -2127,17 +2294,16 @@ async fn poll_pending_unit_dispatches(device_id: uuid::Uuid) {
         return;
     };
     let url = format!("{base}/coord/agents/pending-unit-dispatches?device_id={device_id}");
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("agent_runtime: pending-unit-dispatches client build failed: {e:#}");
-            return;
-        }
+    let Some(client) = crate::coord_http::coord_client() else {
+        warn!("agent_runtime: pending-unit-dispatches: no shared coord client");
+        return;
     };
-    let resp = match client.get(&url).send().await {
+    let resp = match client
+        .get(&url)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             warn!("agent_runtime: pending-unit-dispatches GET failed (continuing): {e:#}");
@@ -2185,7 +2351,7 @@ async fn poll_pending_unit_dispatches(device_id: uuid::Uuid) {
         let mut payload = row.payload;
         payload.dispatch_id = Some(row.dispatch_id);
         // Outcome counts are aggregated only on the gate-continuations poll.
-        let _ = dispatch_gate_continuation(payload, device_id);
+        let _ = dispatch_gate_continuation(payload, device_id).await;
     }
 }
 
@@ -2208,19 +2374,19 @@ async fn post_continuation_claim(gate_id: uuid::Uuid, device_id: uuid::Uuid) -> 
         return SpawnDecision::Spawn;
     };
     let url = format!("{base}/coord/gates/{gate_id}/continuation-consumed");
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return SpawnDecision::SpawnDespiteClaimError {
-                cause: format!("claim client build failed: {e:#}"),
-            };
-        }
+    let Some(client) = crate::coord_http::coord_client() else {
+        return SpawnDecision::SpawnDespiteClaimError {
+            cause: "no shared coord client".to_string(),
+        };
     };
     let body = ContinuationConsumedBody::claim(device_id);
-    match client.post(&url).json(&body).send().await {
+    match client
+        .post(&url)
+        .timeout(Duration::from_secs(5))
+        .json(&body)
+        .send()
+        .await
+    {
         Ok(resp) => {
             let status = resp.status().as_u16();
             // Body is needed only to distinguish the 409 cancelled shape; read
@@ -2248,20 +2414,18 @@ async fn post_continuation_outcome(
         return;
     };
     let url = format!("{base}/coord/gates/{gate_id}/continuation-consumed");
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(
-                "agent_runtime: continuation-outcome client build failed gate_id={gate_id}: {e:#}"
-            );
-            return;
-        }
+    let Some(client) = crate::coord_http::coord_client() else {
+        warn!("agent_runtime: continuation-outcome: no shared coord client gate_id={gate_id}");
+        return;
     };
     let body = ContinuationConsumedBody::outcome(device_id, spawned, detail);
-    match client.post(&url).json(&body).send().await {
+    match client
+        .post(&url)
+        .timeout(Duration::from_secs(5))
+        .json(&body)
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             debug!(
                 "agent_runtime: continuation-outcome posted gate_id={gate_id} spawned={spawned}"
@@ -2339,21 +2503,21 @@ async fn post_continuation_deferred(gate_id: uuid::Uuid, device_id: uuid::Uuid, 
         return;
     };
     let url = format!("{base}/coord/gates/{gate_id}/continuation-deferred");
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            debug!(
-                "agent_runtime: continuation-deferred client build failed \
-                 gate_id={gate_id} (continuing): {e:#}"
-            );
-            return;
-        }
+    let Some(client) = crate::coord_http::coord_client() else {
+        debug!(
+            "agent_runtime: continuation-deferred: no shared coord client \
+             gate_id={gate_id} (continuing)"
+        );
+        return;
     };
     let body = ContinuationDeferredBody { device_id, reason };
-    match client.post(&url).json(&body).send().await {
+    match client
+        .post(&url)
+        .timeout(Duration::from_secs(5))
+        .json(&body)
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             debug!(
                 "agent_runtime: continuation-deferred posted gate_id={gate_id} reason={}",
@@ -2401,21 +2565,21 @@ async fn post_unit_dispatch_consumed(dispatch_id: uuid::Uuid, device_id: uuid::U
         return;
     };
     let url = format!("{base}/coord/agents/unit-dispatches/{dispatch_id}/consumed");
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(
-                "agent_runtime: unit-dispatch consume client build failed \
-                 dispatch_id={dispatch_id}: {e:#}"
-            );
-            return;
-        }
+    let Some(client) = crate::coord_http::coord_client() else {
+        warn!(
+            "agent_runtime: unit-dispatch consume: no shared coord client \
+             dispatch_id={dispatch_id}"
+        );
+        return;
     };
     let body = UnitDispatchConsumedBody { device_id };
-    match client.post(&url).json(&body).send().await {
+    match client
+        .post(&url)
+        .timeout(Duration::from_secs(5))
+        .json(&body)
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             debug!("agent_runtime: unit-dispatch consume posted dispatch_id={dispatch_id}");
         }
@@ -2589,6 +2753,39 @@ async fn run_gate_continuation_inner(
             release_local_dispatch_claim(consume_target);
             return Ok(());
         }
+    }
+
+    // Step 1b: agent-registry spawn authorization (plan
+    // `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c, served clause
+    // `agent-spawn-authorization`). Placed with the other LOCAL guards and
+    // BEFORE step 2's coord claim, for the same reason they are: a dispatch
+    // this gate refuses must NOT burn a coord-side claim (contract item 4). If
+    // it ran after the claim, a refusal would consume the gate row at coord,
+    // leave it un-re-listable, and strand the work permanently the moment the
+    // user opts in.
+    //
+    // `dispatch_gate_continuation` already checked at the delivery seam; this
+    // is the backstop for any re-entry that reaches the inner run directly.
+    // Both read the same TTL cache, so the second check costs no round-trip.
+    // On refusal: release the in-process claim and post NO lifecycle
+    // spawn-failure — an authorization refusal is a standing decision, not a
+    // spawn fault, and the `at_cap` precedent above is explicit that fake
+    // spawn failures pollute the lifecycle channel.
+    let authz = crate::agent_authorization::authorize_spawn(
+        None,
+        crate::agent_authorization::SpawnPath::StandingContinuation,
+    )
+    .await;
+    if !authz.allows_spawn() {
+        warn!(
+            "agent_runtime: gate-continuation refused by the agent registry ({}): {} \
+             (anchor_key={:?})",
+            authz.label(),
+            authz.reason().unwrap_or("no reason recorded"),
+            payload.anchor_key
+        );
+        release_local_dispatch_claim(consume_target);
+        return Ok(());
     }
 
     // Step 2: CLAIM-before-spawn (only with a gate_id / coord configured). Posted
@@ -2863,6 +3060,12 @@ async fn run_continuation_terminal(
     ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
 ) -> anyhow::Result<()> {
     use std::sync::Arc;
+
+    // NOTE: agent-registry spawn authorization for this path is enforced in
+    // `run_gate_continuation_inner` (step 1b), alongside the other local
+    // guards and BEFORE the coord consume claim. It deliberately does NOT run
+    // here: by this point the claim has been taken, so a refusal would consume
+    // the gate row at coord and strand the work. Do not add a check here.
 
     // Reach the managed Tauri state from this backend task via the process-
     // global AppHandle (set in main.rs::setup). If the runner has no Tauri
@@ -3168,6 +3371,27 @@ async fn run_condition_check_terminal(
                  (device-scoped WS filter already gated delivery)"
             ),
         }
+    }
+
+    // Agent-registry spawn authorization (plan
+    // `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c, served clause
+    // `agent-spawn-authorization`). A coord-dispatched condition check spawns
+    // an AI terminal that outlives the request that scheduled it — the same
+    // auto-dispatch class as a gate continuation, so it takes the same
+    // standing per-path opt-in.
+    let authz = crate::agent_authorization::authorize_spawn(
+        None,
+        crate::agent_authorization::SpawnPath::StandingContinuation,
+    )
+    .await;
+    if !authz.allows_spawn() {
+        warn!(
+            "agent_runtime: condition-check run_id={} NOT spawned — {}: {}",
+            payload.run_id,
+            authz.label(),
+            authz.reason().unwrap_or("no reason recorded")
+        );
+        return Ok(());
     }
 
     // A condition check is inherently operator-visible; there is no headless
@@ -4291,14 +4515,16 @@ async fn post_log_line(agent_id: uuid::Uuid, line: &LogLine) -> bool {
         return false;
     };
     let url = format!("{base}/agents/{agent_id}/log");
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
+    let Some(client) = crate::coord_http::coord_client() else {
+        return false;
     };
-    match client.post(&url).json(line).send().await {
+    match client
+        .post(&url)
+        .timeout(Duration::from_secs(3))
+        .json(line)
+        .send()
+        .await
+    {
         Ok(resp) => resp.status().is_success(),
         Err(_) => false,
     }
@@ -4341,11 +4567,11 @@ async fn heartbeat_once(payload: &LaunchPayload) -> anyhow::Result<()> {
         machine_id: payload.target_device_id.to_string(),
         ttl_seconds: 3600,
     };
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()?;
+    let client = crate::coord_http::coord_client()
+        .ok_or_else(|| anyhow::anyhow!("no shared coord client"))?;
     let resp = client
         .post(format!("{base}/claims/heartbeat"))
+        .timeout(Duration::from_secs(5))
         .json(&body)
         .send()
         .await?;
@@ -4382,14 +4608,16 @@ async fn report_spawn_complete(
         pr_context,
     };
     let url = format!("{base}/agents/{agent_id}/spawn-complete");
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return,
+    let Some(client) = crate::coord_http::coord_client() else {
+        return;
     };
-    match client.post(&url).json(&body).send().await {
+    match client
+        .post(&url)
+        .timeout(Duration::from_secs(5))
+        .json(&body)
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             info!("agent_runtime: spawn-complete posted agent_id={agent_id}");
         }
@@ -4429,14 +4657,16 @@ async fn report_spawn_failed(
         pr_context,
     };
     let url = format!("{base}/agents/{agent_id}/spawn-failed");
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return,
+    let Some(client) = crate::coord_http::coord_client() else {
+        return;
     };
-    match client.post(&url).json(&body).send().await {
+    match client
+        .post(&url)
+        .timeout(Duration::from_secs(5))
+        .json(&body)
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             warn!("agent_runtime: spawn-failed posted agent_id={agent_id} reason={reason}");
         }
@@ -4810,6 +5040,36 @@ mod tests {
         assert!(sid < flag, "--session-id must precede the injected flag");
     }
 
+    /// The real briefing injected on the direct-exec path carries the
+    /// attributable source marker as its FIRST line (attributability contract
+    /// on `terminal::runner_context` — incident coord #1242). Guards the
+    /// argv delivery path end-to-end: build the command with the actual
+    /// briefing and assert the `--append-system-prompt` value starts with it.
+    #[test]
+    fn continuation_command_system_prompt_carries_source_marker() {
+        let briefing = crate::terminal::runner_context(9876);
+        let cmd = build_continuation_claude_command(
+            "claude".to_string(),
+            "abc-123",
+            vec![],
+            "do the thing".to_string(),
+            Some(briefing),
+            &crate::claude_session::launch_spec::LaunchConfig::default(),
+        );
+        let flag = cmd
+            .iter()
+            .position(|a| a == "--append-system-prompt")
+            .expect("--append-system-prompt must be injected");
+        let prompt = cmd
+            .get(flag + 1)
+            .expect("the briefing text must immediately follow its flag");
+        assert!(
+            prompt.starts_with(crate::terminal::RUNNER_CONTEXT_SOURCE_MARKER),
+            "injected system prompt must start with the source marker, got: {}",
+            prompt.chars().take(80).collect::<String>()
+        );
+    }
+
     #[test]
     fn launch_payload_round_trips_through_envelope() {
         let payload = LaunchPayload {
@@ -4828,7 +5088,8 @@ mod tests {
             jwt_exp: 0,
             initial_prompt: "go".to_string(),
             claim_token: "agent:00000000-0000-0000-0000-000000000000".to_string(),
-            plan_slug: Some("readiness".to_string()),
+            work_unit_slug_new: Some("readiness".to_string()),
+            plan_slug: None,
             plan_phase: Some(4),
             correlation_topic: Some("my-coordination-topic".to_string()),
         };
@@ -4843,7 +5104,8 @@ mod tests {
                 "jwt_exp": payload.jwt_exp,
                 "initial_prompt": payload.initial_prompt,
                 "claim_token": payload.claim_token,
-                "plan_slug": payload.plan_slug,
+                // Legacy coord emit — the key coord still writes today.
+                "plan_slug": payload.work_unit_slug(),
                 "plan_phase": payload.plan_phase,
             }),
         }))
@@ -4856,6 +5118,94 @@ mod tests {
         assert_eq!(round_tripped.worktrees.len(), 1);
         assert_eq!(round_tripped.worktrees[0].repo, "qontinui-runner");
         assert_eq!(round_tripped.plan_phase, Some(4));
+        // Legacy `plan_slug` still resolves through the accessor.
+        assert_eq!(round_tripped.work_unit_slug(), Some("readiness"));
+    }
+
+    /// Minimal `LaunchPayload` body with the slug key left to the caller, so
+    /// the dual-read tests below differ ONLY in which key they carry.
+    fn launch_body_with(slug_keys: serde_json::Value) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "agent_id": uuid::Uuid::nil(),
+            "target_device_id": uuid::Uuid::nil(),
+            "worktrees": [],
+            "jwt": "tok",
+            "jwt_exp": 0,
+            "initial_prompt": "go",
+            "claim_token": "agent:00000000-0000-0000-0000-000000000000",
+        });
+        let map = body.as_object_mut().unwrap();
+        for (k, v) in slug_keys.as_object().unwrap() {
+            map.insert(k.clone(), v.clone());
+        }
+        body
+    }
+
+    #[test]
+    fn launch_payload_accepts_legacy_plan_slug_key() {
+        // Un-renamed coord (every coord shipping today) emits `plan_slug`.
+        let body = launch_body_with(serde_json::json!({ "plan_slug": "some-unit" }));
+        let p: LaunchPayload = serde_json::from_value(body).unwrap();
+        assert_eq!(p.work_unit_slug(), Some("some-unit"));
+    }
+
+    #[test]
+    fn launch_payload_accepts_new_work_unit_slug_key() {
+        // Post-rename coord emits `work_unit_slug`.
+        let body = launch_body_with(serde_json::json!({ "work_unit_slug": "some-unit" }));
+        let p: LaunchPayload = serde_json::from_value(body).unwrap();
+        assert_eq!(p.work_unit_slug(), Some("some-unit"));
+    }
+
+    /// THE cross-repo compatibility test.
+    ///
+    /// coord's Stage 2 `LaunchPayload` dual-emits BOTH keys for one release
+    /// (two real fields, each `skip_serializing_if`), so the body on the wire
+    /// is literally `{…,"plan_slug":"x","work_unit_slug":"x"}`. An earlier
+    /// draft of this struct used `#[serde(alias = "plan_slug")]`, which made
+    /// exactly that body fail with ``duplicate field `work_unit_slug` `` —
+    /// i.e. EVERY spawn from a renamed coord would have failed to parse.
+    /// This test is what keeps the two repos' windows compatible; if it is
+    /// ever "simplified" back to an alias, spawns break fleet-wide.
+    #[test]
+    fn launch_payload_accepts_coords_dual_emitted_both_keys() {
+        let body = launch_body_with(serde_json::json!({
+            "plan_slug": "2026-07-28-some-unit",
+            "work_unit_slug": "2026-07-28-some-unit",
+        }));
+        let p: LaunchPayload = serde_json::from_value(body)
+            .expect("coord dual-emits both keys — this MUST parse, not duplicate-field");
+        // Assert the NEW field specifically, not just the accessor. Coord emits
+        // the same value under both keys, so an accessor-only assertion would
+        // still pass with the new key entirely unwired (resolving through the
+        // legacy fallback) — it would not catch a missing
+        // `#[serde(rename = "work_unit_slug")]`, which is exactly the bug that
+        // reached this test once already.
+        assert_eq!(
+            p.work_unit_slug_new.as_deref(),
+            Some("2026-07-28-some-unit"),
+            "the post-rename key must be READ, not merely tolerated"
+        );
+        assert_eq!(p.work_unit_slug(), Some("2026-07-28-some-unit"));
+    }
+
+    #[test]
+    fn launch_payload_new_key_wins_when_both_disagree() {
+        // Defensive: if a mid-rename coord ever emits divergent values, the
+        // post-rename key is authoritative.
+        let body = launch_body_with(serde_json::json!({
+            "plan_slug": "old-name",
+            "work_unit_slug": "new-name",
+        }));
+        let p: LaunchPayload = serde_json::from_value(body).unwrap();
+        assert_eq!(p.work_unit_slug(), Some("new-name"));
+    }
+
+    #[test]
+    fn launch_payload_absent_slug_is_none() {
+        let body = launch_body_with(serde_json::json!({}));
+        let p: LaunchPayload = serde_json::from_value(body).unwrap();
+        assert_eq!(p.work_unit_slug(), None);
     }
 
     #[test]
@@ -5795,6 +6145,7 @@ mod tests {
                 dispatched_n: 2,
                 already_dispatched: 2,
                 not_addressed_to_self: 1,
+                spawn_authorization_denied: 0,
                 fetch_failed: false,
             },
         );
@@ -5810,6 +6161,30 @@ mod tests {
                     "already_dispatched": 2,
                     "not_addressed_to_self": 1,
                 },
+            })
+        );
+
+        // Agent-registry refusals get their OWN skip reason (Phase 4c), so
+        // coord can tell "the user has not opted this device into standing
+        // continuations" apart from a dedupe drop.
+        let denied = ContinuationPollReportBody::new(
+            dev,
+            PollRunCounts {
+                listed_n: 3,
+                dispatched_n: 0,
+                spawn_authorization_denied: 3,
+                ..Default::default()
+            },
+        );
+        let v = serde_json::to_value(&denied).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "device_id": "11111111-1111-1111-1111-111111111111",
+                "listed_n": 3,
+                "dispatched_n": 0,
+                "skipped_n": 3,
+                "skip_reasons": { "spawn_authorization_denied": 3 },
             })
         );
 

@@ -116,10 +116,60 @@ pub(super) fn filter_element_fields(
 }
 
 /// Cheap fingerprint of a discover snapshot for click-had-no-effect
-/// detection. Returns `(element_count, hash)` where `hash` is a stable
-/// hash over each element's `id`, `category`, and `state.textContent`.
-/// Two equal signatures = no observable DOM mutation between snapshots.
-pub(super) fn snapshot_signature(snapshot: &serde_json::Value) -> (usize, u64) {
+/// detection.
+///
+/// TWO independent hashes, deliberately not one:
+///
+/// - `content` folds each element's `id`, `category`, `state.textContent` and
+///   `state.ariaPressed` — what the element *shows*.
+/// - `generation` folds each element's `registeredAt`, the per-registration
+///   `Date.now()` the SDK registry stamps
+///   (`ui-bridge/packages/ui-bridge/src/core/registry.ts`) — WHICH MOUNT the
+///   element belongs to.
+///
+/// The split is what makes a same-shape REMOUNT visible. The registry
+/// deliberately preserves element IDs across a remount
+/// (`preserveIdAcrossRemount` + the recently-removed fingerprint cache), and a
+/// component that is destroyed and recreated in the same state renders
+/// identical text — so a content-only signature reported
+/// `effectChanged: false` for a click that had in fact torn the whole subtree
+/// down and rebuilt it. A driver trusting that concluded "the click was a
+/// no-op", the exact opposite of the truth (that is how the Setup Wizard's
+/// Tier-step remount stayed invisible through a whole investigation).
+/// `registeredAt` is re-stamped by a real unregister→register cycle, so the
+/// generation hash moves while the content hash does not.
+///
+/// Residual: `registeredAt` has millisecond resolution, so a remount that
+/// completes inside the same millisecond is still invisible. Every observed
+/// one has been ≥1ms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SnapshotSignature {
+    /// Number of elements in the snapshot.
+    pub count: usize,
+    /// Hash over what the elements show.
+    pub content: u64,
+    /// Hash over which mount the elements belong to.
+    pub generation: u64,
+}
+
+impl SnapshotSignature {
+    /// True when nothing observable differs — same elements, same content,
+    /// same mounts.
+    pub fn unchanged_from(&self, other: &Self) -> bool {
+        self == other
+    }
+
+    /// True when the elements are the same and show the same thing, but they
+    /// belong to a DIFFERENT mount — i.e. the subtree was unmounted and
+    /// recreated rather than left alone.
+    pub fn remounted_from(&self, other: &Self) -> bool {
+        self.count == other.count
+            && self.content == other.content
+            && self.generation != other.generation
+    }
+}
+
+pub(super) fn snapshot_signature(snapshot: &serde_json::Value) -> SnapshotSignature {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -128,30 +178,45 @@ pub(super) fn snapshot_signature(snapshot: &serde_json::Value) -> (usize, u64) {
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    let mut hasher = DefaultHasher::new();
+    let mut content = DefaultHasher::new();
+    let mut generation = DefaultHasher::new();
     for el in &elements {
         if let Some(s) = el.get("id").and_then(|v| v.as_str()) {
-            s.hash(&mut hasher);
+            s.hash(&mut content);
+            // The id is folded into BOTH hashes so a generation change is
+            // always attributable to a specific element rather than to a
+            // reordering of the array.
+            s.hash(&mut generation);
         }
         if let Some(s) = el.get("category").and_then(|v| v.as_str()) {
-            s.hash(&mut hasher);
+            s.hash(&mut content);
         }
         if let Some(s) = el
             .get("state")
             .and_then(|v| v.get("textContent"))
             .and_then(|v| v.as_str())
         {
-            s.hash(&mut hasher);
+            s.hash(&mut content);
         }
         if let Some(s) = el
             .get("state")
             .and_then(|v| v.get("ariaPressed"))
             .and_then(|v| v.as_bool())
         {
-            s.hash(&mut hasher);
+            s.hash(&mut content);
+        }
+        // Absent on a serializer that does not emit it — folded as a constant
+        // so such a snapshot simply never reports a remount, rather than
+        // reporting a spurious one.
+        if let Some(n) = el.get("registeredAt").and_then(|v| v.as_u64()) {
+            n.hash(&mut generation);
         }
     }
-    (elements.len(), hasher.finish())
+    SnapshotSignature {
+        count: elements.len(),
+        content: content.finish(),
+        generation: generation.finish(),
+    }
 }
 
 /// Count elements in a discover payload, handling the common shapes
@@ -813,8 +878,8 @@ where
 }
 
 #[cfg(test)]
-mod read_window_label_tests {
-    use super::read_window_label;
+mod helpers_tests {
+    use super::{read_window_label, snapshot_signature};
     use serde_json::json;
 
     #[test]
@@ -838,5 +903,82 @@ mod read_window_label_tests {
             read_window_label(&json!({ "windowLabel": "term-2" })),
             "term-2"
         );
+    }
+
+    // ---- snapshot_signature: remount detection (R7) -------------------
+
+    /// A four-button Tier step. `gen` stands in for the mount generation the
+    /// SDK stamps as `registeredAt`.
+    fn tier_step_snapshot(gen: u64, heading: &str) -> serde_json::Value {
+        json!({
+            "elements": [
+                { "id": "button-local", "category": "interactive", "registeredAt": gen,
+                  "state": { "textContent": "Local AI (Tier 0)" } },
+                { "id": "button-byo-key", "category": "interactive", "registeredAt": gen,
+                  "state": { "textContent": "Use my own API key (Tier 1)" } },
+                { "id": "button-tier2", "category": "interactive", "registeredAt": gen,
+                  "state": { "textContent": "Sign in to Qontinui (Tier 2)" } },
+                { "id": "heading", "category": "text", "registeredAt": gen,
+                  "state": { "textContent": heading } },
+            ]
+        })
+    }
+
+    #[test]
+    fn identical_snapshot_is_unchanged_and_not_remounted() {
+        let a = snapshot_signature(&tier_step_snapshot(1000, "How will you use Qontinui?"));
+        let b = snapshot_signature(&tier_step_snapshot(1000, "How will you use Qontinui?"));
+        assert!(b.unchanged_from(&a));
+        assert!(!b.remounted_from(&a));
+    }
+
+    /// THE case this split exists for: the wizard is torn down and rebuilt in
+    /// the same state. Element IDs are preserved by the registry and every
+    /// label is identical, so a content-only signature reported "nothing
+    /// happened" for a click that destroyed the operator's wizard progress.
+    #[test]
+    fn same_shape_remount_is_detected() {
+        let pre = snapshot_signature(&tier_step_snapshot(1000, "How will you use Qontinui?"));
+        let post = snapshot_signature(&tier_step_snapshot(1017, "How will you use Qontinui?"));
+        assert_eq!(
+            pre.content, post.content,
+            "content is identical by construction"
+        );
+        assert_ne!(pre.generation, post.generation);
+        assert!(!post.unchanged_from(&pre), "a remount is a change");
+        assert!(post.remounted_from(&pre));
+    }
+
+    /// A real step transition changes what is shown, so it is a change but NOT
+    /// a remount — a driver must be able to tell the two apart.
+    #[test]
+    fn content_change_is_not_reported_as_a_remount() {
+        let pre = snapshot_signature(&tier_step_snapshot(1000, "How will you use Qontinui?"));
+        let post = snapshot_signature(&tier_step_snapshot(1000, "Welcome to Qontinui"));
+        assert!(!post.unchanged_from(&pre));
+        assert!(!post.remounted_from(&pre));
+    }
+
+    #[test]
+    fn element_count_change_is_not_reported_as_a_remount() {
+        let pre = snapshot_signature(&tier_step_snapshot(1000, "How will you use Qontinui?"));
+        let post = snapshot_signature(&json!({ "elements": [] }));
+        assert!(!post.unchanged_from(&pre));
+        assert!(!post.remounted_from(&pre));
+    }
+
+    /// A serializer that does not emit `registeredAt` must never produce a
+    /// spurious remount verdict — it just falls back to content-only.
+    #[test]
+    fn missing_registered_at_never_reports_a_remount() {
+        let no_gen = json!({
+            "elements": [
+                { "id": "a", "category": "interactive", "state": { "textContent": "x" } }
+            ]
+        });
+        let pre = snapshot_signature(&no_gen);
+        let post = snapshot_signature(&no_gen);
+        assert!(post.unchanged_from(&pre));
+        assert!(!post.remounted_from(&pre));
     }
 }

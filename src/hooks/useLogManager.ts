@@ -20,7 +20,7 @@
  * ```
  */
 
-import { useState, useEffect, useCallback } from "react";
+import { useCallback, useSyncExternalStore } from "react";
 import { logManager, LogEntry, ImageRecognitionEntry, AiOutputEntry } from "../managers";
 import type { AiOutputLine, ActionLogEntry } from "../managers/logging";
 import type { LogSourceContent } from "../types/projectLogs";
@@ -88,32 +88,54 @@ export interface UseLogManagerResult {
   aiOutputLogCount: number;
 }
 
+/** Reactive slice of {@link UseLogManagerResult}. */
+export type UseLogDataResult = Pick<
+  UseLogManagerResult,
+  "logs" | "imageLogs" | "aiOutputLogs" | "logCount" | "imageLogCount" | "aiOutputLogCount"
+>;
+
+/** Non-reactive slice: every entry is an identity-stable callback. */
+export type UseLogActionsResult = Omit<
+  UseLogManagerResult,
+  keyof UseLogDataResult
+>;
+
+// Module-level so the `useSyncExternalStore` subscribe argument is stable.
+const subscribeToLogs = (onStoreChange: () => void) => logManager.subscribe(onStoreChange);
+const getGeneralLogs = () => logManager.getGeneralLogs();
+const getImageLogs = () => logManager.getImageLogs();
+const getAiOutputLogs = () => logManager.getAiOutputLogs();
+
 /**
- * Hook for accessing and managing application logs
+ * Subscribe to log CONTENT.
+ *
+ * Call this only in the panels that actually render logs. It used to be
+ * fused into `useLogManager()` at the App root, so a single AI output line
+ * re-rendered the entire app — including the always-mounted (CSS-hidden)
+ * terminal tree (plan `2026-07-28-runner-many-sessions-performance` §0 A2).
+ *
+ * Safe as a `useSyncExternalStore` source because `LogStore`'s getters now
+ * return cached arrays whose identity is stable between mutations.
  */
-export function useLogManager(): UseLogManagerResult {
-  const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [imageLogs, setImageLogs] = useState<ImageRecognitionEntry[]>([]);
-  const [aiOutputLogs, setAiOutputLogs] = useState<AiOutputEntry[]>([]);
+export function useLogData(): UseLogDataResult {
+  const logs = useSyncExternalStore(subscribeToLogs, getGeneralLogs);
+  const imageLogs = useSyncExternalStore(subscribeToLogs, getImageLogs);
+  const aiOutputLogs = useSyncExternalStore(subscribeToLogs, getAiOutputLogs);
+  return {
+    logs,
+    imageLogs,
+    aiOutputLogs,
+    logCount: logs.length,
+    imageLogCount: imageLogs.length,
+    aiOutputLogCount: aiOutputLogs.length,
+  };
+}
 
-  // Subscribe to log changes
-  useEffect(() => {
-    // Initial fetch
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- subscription to external log manager
-    setLogs(logManager.getGeneralLogs());
-    setImageLogs(logManager.getImageLogs());
-    setAiOutputLogs(logManager.getAiOutputLogs());
-
-    // Subscribe to changes
-    const unsubscribe = logManager.subscribe(() => {
-      setLogs(logManager.getGeneralLogs());
-      setImageLogs(logManager.getImageLogs());
-      setAiOutputLogs(logManager.getAiOutputLogs());
-    });
-
-    return unsubscribe;
-  }, []);
-
+/**
+ * Log MUTATION surface, with no subscription at all — safe to call from a
+ * component that must not re-render when a log line lands (the App root).
+ */
+export function useLogActions(): UseLogActionsResult {
   // Wrap manager methods
   const addLog = useCallback((level: LogEntry["level"], message: string) => {
     logManager.addLog(level, message);
@@ -183,9 +205,6 @@ export function useLogManager(): UseLogManagerResult {
   );
 
   return {
-    logs,
-    imageLogs,
-    aiOutputLogs,
     addLog,
     addImageLog,
     addAiOutputLog,
@@ -195,8 +214,14 @@ export function useLogManager(): UseLogManagerResult {
     clearAiOutputLogs,
     clearAllLogs,
     copyLogs,
-    logCount: logManager.getLogCount(),
-    imageLogCount: logManager.getImageLogCount(),
-    aiOutputLogCount: logManager.getAiOutputLogCount(),
   };
+}
+
+/**
+ * Actions + reactive data in one call. Convenience for panels that need
+ * both; anything on a hot render path should reach for `useLogActions()` or
+ * `useLogData()` directly so it only pays for what it uses.
+ */
+export function useLogManager(): UseLogManagerResult {
+  return { ...useLogData(), ...useLogActions() };
 }

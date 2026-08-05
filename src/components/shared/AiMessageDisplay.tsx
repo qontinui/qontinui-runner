@@ -13,7 +13,7 @@
  * - Displays orchestrator agent messages with distinct styling
  */
 
-import React, { useMemo, useState, useCallback } from "react";
+import React, { memo, useMemo, useState, useCallback } from "react";
 import {
   Bot,
   BookOpen,
@@ -31,8 +31,17 @@ import {
   XCircle,
 } from "lucide-react";
 import { cn } from "../../lib/utils";
+import { readSectionExpanded, setSectionExpanded } from "./sectionExpandedStore";
 import { MarkdownViewer } from "../MarkdownViewer";
 import { getAccentColors } from "@/design-system";
+import type { MessageGroup } from "./messageGrouping";
+
+export {
+  groupEntriesBySource,
+  createIncrementalSourceGrouper,
+  EMPTY_MESSAGE_GROUPS,
+} from "./messageGrouping";
+export type { AiMessageEntry, MessageGroup, IncrementalSourceGrouper } from "./messageGrouping";
 
 // ============================================================================
 // Orchestrator Source Constants
@@ -154,27 +163,6 @@ export function detectCurrentOrchestratorAgent(
 }
 
 /**
- * Entry type for AI messages.
- * Compatible with both AiOutputLine and AiOutputEntry.
- */
-export interface AiMessageEntry {
-  id: string;
-  timestamp: number;
-  line: string;
-  source: string; // "prompt", "claude", "response", "user_hint", "user_message", or orchestrator sources
-}
-
-/**
- * A group of consecutive entries from the same source.
- */
-export interface MessageGroup {
-  source: string;
-  entries: AiMessageEntry[];
-  timestamp: number;
-  combinedText: string;
-}
-
-/**
  * Display mode for the messages.
  */
 export type DisplayMode = "log" | "chat";
@@ -201,47 +189,6 @@ interface MessageBlockProps {
   mode: DisplayMode;
   isAnimated?: boolean;
   index: number;
-}
-
-/**
- * Groups consecutive entries by their source.
- * This is the core grouping logic used by both AiOutputTab and AiConversationWidget.
- */
-export function groupEntriesBySource<T extends AiMessageEntry>(entries: T[]): MessageGroup[] {
-  if (entries.length === 0) return [];
-
-  const groups: MessageGroup[] = [];
-  let currentGroup: MessageGroup | null = null;
-
-  for (const entry of entries) {
-    // Normalize source: "response" is treated as "claude"
-    const normalizedSource = entry.source === "response" ? "claude" : entry.source;
-
-    if (!currentGroup || currentGroup.source !== normalizedSource) {
-      // Finalize current group
-      if (currentGroup) {
-        groups.push(currentGroup);
-      }
-      // Start new group
-      currentGroup = {
-        source: normalizedSource,
-        entries: [entry],
-        timestamp: entry.timestamp,
-        combinedText: entry.line,
-      };
-    } else {
-      // Add to existing group
-      currentGroup.entries.push(entry);
-      currentGroup.combinedText += "\n" + entry.line;
-    }
-  }
-
-  // Don't forget the last group
-  if (currentGroup) {
-    groups.push(currentGroup);
-  }
-
-  return groups;
 }
 
 /**
@@ -322,7 +269,13 @@ function FindingsSummary({
 /**
  * Renders a prompt message in log mode.
  */
-function PromptLogBlock({ group, isAnimated }: { group: MessageGroup; isAnimated?: boolean }) {
+const PromptLogBlock = memo(function PromptLogBlock({
+  group,
+  isAnimated,
+}: {
+  group: MessageGroup;
+  isAnimated?: boolean;
+}) {
   const blueColors = getAccentColors("blue");
 
   return (
@@ -337,13 +290,19 @@ function PromptLogBlock({ group, isAnimated }: { group: MessageGroup; isAnimated
       <MarkdownViewer content={group.combinedText} isAnimated={isAnimated} />
     </div>
   );
-}
+});
 
 /**
  * Renders a user message in log mode.
  * Visually distinct from prompts with a "YOU" label and User icon.
  */
-function UserMessageLogBlock({ group, isAnimated }: { group: MessageGroup; isAnimated?: boolean }) {
+const UserMessageLogBlock = memo(function UserMessageLogBlock({
+  group,
+  isAnimated,
+}: {
+  group: MessageGroup;
+  isAnimated?: boolean;
+}) {
   const blueColors = getAccentColors("blue");
 
   return (
@@ -358,12 +317,18 @@ function UserMessageLogBlock({ group, isAnimated }: { group: MessageGroup; isAni
       <MarkdownViewer content={group.combinedText} isAnimated={isAnimated} />
     </div>
   );
-}
+});
 
 /**
  * Renders a user hint message in log mode.
  */
-function UserHintLogBlock({ group, isAnimated }: { group: MessageGroup; isAnimated?: boolean }) {
+const UserHintLogBlock = memo(function UserHintLogBlock({
+  group,
+  isAnimated,
+}: {
+  group: MessageGroup;
+  isAnimated?: boolean;
+}) {
   const purpleColors = getAccentColors("purple");
 
   return (
@@ -378,7 +343,7 @@ function UserHintLogBlock({ group, isAnimated }: { group: MessageGroup; isAnimat
       <MarkdownViewer content={group.combinedText} isAnimated={isAnimated} />
     </div>
   );
-}
+});
 
 // ============================================================================
 // Orchestrator Agent Log Blocks
@@ -431,7 +396,11 @@ function getOrchestratorAgentConfig(source: string) {
  * Renders an orchestrator agent message in log mode.
  * Each agent type has distinct styling for easy identification.
  */
-function OrchestratorLogBlock({ group }: { group: MessageGroup }) {
+const OrchestratorLogBlock = memo(function OrchestratorLogBlock({
+  group,
+}: {
+  group: MessageGroup;
+}) {
   const config = getOrchestratorAgentConfig(group.source);
   const { label, Icon, colors } = config;
 
@@ -509,13 +478,7 @@ function OrchestratorLogBlock({ group }: { group: MessageGroup }) {
       </div>
     </div>
   );
-}
-
-/**
- * Module-level store for expanded AI response sections.
- * Persists across re-renders to prevent collapse on parent updates.
- */
-const expandedResponseStore = new Set<string>();
+});
 
 /**
  * Generate a stable key for a response group.
@@ -547,7 +510,7 @@ function CollapsibleAiSection({
   defaultExpanded?: boolean;
 }) {
   const [isExpanded, setIsExpanded] = useState(() =>
-    expandedResponseStore.has(sectionKey) ? true : defaultExpanded,
+    readSectionExpanded(sectionKey, defaultExpanded),
   );
 
   const toggleExpanded = useCallback(
@@ -555,11 +518,7 @@ function CollapsibleAiSection({
       e.stopPropagation();
       setIsExpanded((prev) => {
         const next = !prev;
-        if (next) {
-          expandedResponseStore.add(sectionKey);
-        } else {
-          expandedResponseStore.delete(sectionKey);
-        }
+        setSectionExpanded(sectionKey, next);
         return next;
       });
     },
@@ -599,7 +558,7 @@ function CollapsibleAiSection({
 /**
  * Renders an AI response message in log mode.
  */
-function ResponseLogBlock({
+const ResponseLogBlock = memo(function ResponseLogBlock({
   group,
   isAnimated,
 }: {
@@ -614,7 +573,7 @@ function ResponseLogBlock({
       <MarkdownViewer content={group.combinedText} isAnimated={isAnimated} />
     </CollapsibleAiSection>
   );
-}
+});
 
 /**
  * Status type detection from message content.
@@ -693,7 +652,7 @@ function getStatusStyles(type: StatusType) {
 /**
  * Renders a status message as a banner.
  */
-function StatusBanner({ group }: { group: MessageGroup }) {
+const StatusBanner = memo(function StatusBanner({ group }: { group: MessageGroup }) {
   const statusType = detectStatusType(group.combinedText);
   const { colors, Icon } = getStatusStyles(statusType);
 
@@ -717,12 +676,12 @@ function StatusBanner({ group }: { group: MessageGroup }) {
       </span>
     </div>
   );
-}
+});
 
 /**
  * Renders a finding notification as a compact banner.
  */
-function FindingBanner({ group }: { group: MessageGroup }) {
+const FindingBanner = memo(function FindingBanner({ group }: { group: MessageGroup }) {
   const amberColors = getAccentColors("amber");
 
   // Extract finding info from text like "📋 Finding detected: [code_bug:medium] Title here"
@@ -746,12 +705,18 @@ function FindingBanner({ group }: { group: MessageGroup }) {
       {title && <span className="text-muted-foreground truncate flex-1">{title}</span>}
     </div>
   );
-}
+});
 
 /**
  * Renders a message bubble for chat mode.
  */
-function ChatBubble({ group, isAnimated }: { group: MessageGroup; isAnimated?: boolean }) {
+const ChatBubble = memo(function ChatBubble({
+  group,
+  isAnimated,
+}: {
+  group: MessageGroup;
+  isAnimated?: boolean;
+}) {
   const isUser = group.source === "prompt" || group.source === "user_message";
   const isHint = group.source === "user_hint";
   const isAi = !isUser && !isHint;
@@ -810,12 +775,17 @@ function ChatBubble({ group, isAnimated }: { group: MessageGroup; isAnimated?: b
       </div>
     </div>
   );
-}
+});
 
 /**
  * Renders a single message block based on mode.
  */
-function MessageBlock({ group, mode, isAnimated, index }: MessageBlockProps) {
+const MessageBlock = memo(function MessageBlock({
+  group,
+  mode,
+  isAnimated,
+  index,
+}: MessageBlockProps) {
   // Status messages are always rendered as banners regardless of mode
   if (group.source === "status") {
     return <StatusBanner group={group} />;
@@ -850,13 +820,40 @@ function MessageBlock({ group, mode, isAnimated, index }: MessageBlockProps) {
       // Unknown source - render as response
       return <ResponseLogBlock group={group} isAnimated={isAnimated} isFirst={false} />;
   }
+});
+
+/**
+ * Per-group "first response" index. `MessageBlock` uses it only to decide
+ * `isFirst`, so it is derived once per `groups` identity rather than by
+ * mutating a counter inside the render loop (which a windowed list, that
+ * renders rows out of order, would get wrong).
+ */
+function computeResponseIndices(groups: MessageGroup[]): number[] {
+  const indices = new Array<number>(groups.length);
+  let responseIndex = 0;
+  for (let i = 0; i < groups.length; i++) {
+    const isResponse = groups[i].source === "claude" || groups[i].source === "response";
+    indices[i] = isResponse ? responseIndex++ : 0;
+  }
+  return indices;
 }
 
 /**
  * AiMessageDisplay component.
  * Renders grouped AI messages with consistent styling.
+ *
+ * Plain DOM list, deliberately. The `virtualize` opt-in that shipped with plan
+ * `2026-07-28-runner-many-sessions-performance.md` §A5e was withdrawn before
+ * merge: its own numbers put the break-even at ~70 groups (a 30-group threshold
+ * against a 20-row overscan renders all 30 rows anyway), while it broke the
+ * bottom-pin — `useDynamicRowHeight` hands back the 160px default for rows the
+ * ResizeObserver has not measured yet, and the `scrollToRow` effect runs before
+ * it ever does — and it dropped the whole height map mid-stream whenever log
+ * eviction reached the head of the selected loop. Windowing is worth having,
+ * but it needs measurement-aware pinning and a scroll-independent expand store;
+ * that lands as its own PR rather than riding along with the O(n²) fixes.
  */
-export function AiMessageDisplay({
+function AiMessageDisplayImpl({
   groups,
   mode = "log",
   isAnimated = false,
@@ -873,34 +870,36 @@ export function AiMessageDisplay({
     return findings;
   }, [groups]);
 
+  const responseIndices = useMemo(() => computeResponseIndices(groups), [groups]);
+
   if (groups.length === 0) {
     return null;
   }
-
-  // Track if we've seen a response yet (for "first response" header)
-  let responseIndex = 0;
 
   return (
     <div className={cn("flex flex-col", className)}>
       {/* Show findings summary at the top if there are any */}
       {mode === "log" && allFindings.length > 0 && <FindingsSummary findings={allFindings} />}
 
-      {groups.map((group, index) => {
-        const isResponse = group.source === "claude" || group.source === "response";
-        const effectiveIndex = isResponse ? responseIndex++ : 0;
-
-        return (
-          <MessageBlock
-            key={`${group.source}-${group.timestamp}-${index}`}
-            group={group}
-            mode={mode}
-            isAnimated={isAnimated}
-            index={effectiveIndex}
-          />
-        );
-      })}
+      {groups.map((group, index) => (
+        <MessageBlock
+          key={`${group.source}-${group.timestamp}-${index}`}
+          group={group}
+          mode={mode}
+          isAnimated={isAnimated}
+          index={responseIndices[index]}
+        />
+      ))}
     </div>
   );
 }
+
+/**
+ * Memoised: `groups` is produced by an incremental grouper that keeps its array
+ * identity when nothing changed, so an unrelated parent re-render (typing in the
+ * prompt box, a status poll landing) must not re-render every `ReactMarkdown` in
+ * the conversation.
+ */
+export const AiMessageDisplay = memo(AiMessageDisplayImpl);
 
 export default AiMessageDisplay;

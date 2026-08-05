@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 import { readDir, readTextFile } from "@tauri-apps/plugin-fs";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { FileText, Search, X, FolderOpen, Brain, Loader2 } from "lucide-react";
+import { pathSeparatorFor, normalizeRoot, joinPath, relativeToRoot } from "./docFinderPaths";
 
 /* ── Types ────────────────────────────────────────────────────────────── */
 
@@ -39,7 +40,17 @@ const SKIP_DIRS = new Set([
   ".next",
   ".dev-logs",
 ]);
-const DEFAULT_ROOT = "C:\\Users\\jspin\\Documents\\qontinui-root";
+/**
+ * Last-resort root when the caller passes no `defaultRoot`.
+ *
+ * This was a literal `C:\Users\<account>\Documents\qontinui-root`, which
+ * resolved on exactly one machine — everywhere else the finder opened on a
+ * non-existent directory and scanned nothing. Callers should pass
+ * `defaultRoot` (TerminalPage supplies the active tab's working directory);
+ * this empty value keeps the input editable and the scan a no-op until a real
+ * root is known, rather than pointing confidently at someone else's profile.
+ */
+const DEFAULT_ROOT = "";
 
 const SEARCH_ITEM_HEIGHT = 50;
 const CONTENT_ITEM_HEIGHT = 66;
@@ -49,7 +60,11 @@ const VIRTUAL_BUFFER = 10;
 
 async function scanForDocs(root: string, maxDepth = 5, maxFiles = 1000): Promise<ScannedFile[]> {
   const results: ScannedFile[] = [];
-  const normalizedRoot = root.replace(/\//g, "\\").replace(/\\$/, "");
+  // The separator comes from the root, not from an assumption: since the root
+  // is the active terminal's working directory it is platform-native, and
+  // forcing backslashes broke the scan outright on Linux. See docFinderPaths.
+  const sep = pathSeparatorFor(root);
+  const normalizedRoot = normalizeRoot(root, sep);
 
   // BFS queue: [dirPath, depth]
   const queue: [string, number][] = [[normalizedRoot, 0]];
@@ -64,7 +79,7 @@ async function scanForDocs(root: string, maxDepth = 5, maxFiles = 1000): Promise
         if (results.length >= maxFiles) break;
         const name = entry.name;
         if (!name) continue;
-        const fullPath = `${dir}\\${name}`;
+        const fullPath = joinPath(dir, name, sep);
 
         if (entry.isDirectory) {
           if (!SKIP_DIRS.has(name) && !name.startsWith(".")) {
@@ -76,7 +91,7 @@ async function scanForDocs(root: string, maxDepth = 5, maxFiles = 1000): Promise
             results.push({
               name,
               path: fullPath,
-              relativePath: fullPath.slice(normalizedRoot.length + 1),
+              relativePath: relativeToRoot(normalizedRoot, fullPath, sep),
             });
           }
         }
@@ -225,6 +240,15 @@ export function DocFinderModal({ onSelect, onClose, defaultRoot }: DocFinderModa
   const runScan = useCallback(async (scanRoot: string) => {
     setIsScanning(true);
     setScanError(null);
+    // No root at all: scanForDocs("") would readDir("") and swallow the error,
+    // leaving "No document files found in " with a dangling empty path. Say
+    // what is actually wrong and point at the recovery.
+    if (!scanRoot) {
+      setScannedFiles([]);
+      setScanError('No root directory selected — click "Change" to pick one.');
+      setIsScanning(false);
+      return;
+    }
     try {
       const files = await scanForDocs(scanRoot);
       files.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
@@ -606,8 +630,11 @@ function SearchTab({
       {/* Root selector */}
       <div className="px-3 pb-2 flex items-center gap-2 text-[11px]">
         <span className="text-[#565f89] shrink-0">Root:</span>
-        <span className="text-[#a9b1d6] truncate" title={root}>
-          {truncatePath(root)}
+        <span
+          className={root ? "text-[#a9b1d6] truncate" : "text-[#565f89] italic truncate"}
+          title={root || "no root selected"}
+        >
+          {root ? truncatePath(root) : "(none selected)"}
         </span>
         <button
           onClick={onChangeRoot}

@@ -154,6 +154,91 @@ fn matches_existing(existing: &UiError, message: &str, digest: Option<&str>) -> 
 }
 
 // ---------------------------------------------------------------------------
+// UI liveness predicate
+// ---------------------------------------------------------------------------
+
+/// Diagnostics rung: how long since the last frontend pong before the
+/// UI-Bridge diagnostics surfaces call the frontend `Stale`.
+///
+/// This is the pre-existing 30s threshold that
+/// `crate::mcp::ui_bridge::request::classify_frontend_state` has always
+/// applied — extracted here so there is exactly one definition of it.
+pub const UI_STALE_AFTER_MS: u64 = 30_000;
+
+/// Status rung: how long since the last frontend pong before
+/// [`compute_derived_status`] calls the UI dead and reports `errored`.
+///
+/// Deliberately slacker than [`UI_STALE_AFTER_MS`] because this rung can
+/// trigger recovery, and a status that flaps would drive a recovery loop.
+/// Rust emits `ui-bridge-ping` unconditionally every 3s (`mcp_api.rs`
+/// startup wiring) and the frontend answers `ui-bridge-pong`, so `last_pong`
+/// advances on its own whenever any UI is alive. 90s is therefore **30
+/// consecutive missed pings** — far outside anything a GC pause or a busy
+/// main thread can produce.
+///
+/// The ordering `UI_STALE_AFTER_MS < UI_DEAD_AFTER_MS` is load-bearing: the
+/// two calibrations may only ever escalate in one direction, so diagnostics
+/// say `Stale` well before status says dead. A drift-guard test locks it in.
+pub const UI_DEAD_AFTER_MS: u64 = 90_000;
+
+/// Was a UI alive, and has it stopped checking in?
+///
+/// The single shared staleness predicate over the `ui_bridge_last_pong`
+/// atomic. Both the diagnostics ladder (`classify_frontend_state`, at
+/// [`UI_STALE_AFTER_MS`]) and the status ladder ([`compute_derived_status`],
+/// at [`UI_DEAD_AFTER_MS`]) call it, so the two surfaces cannot drift into
+/// disagreeing about whether the same frontend is alive.
+///
+/// # The `last_pong == 0` guard
+///
+/// `last_pong == 0` means **no UI has ever checked in**, which is not the
+/// same thing as a UI that died — so it returns `false` (not stale). Three
+/// real cases live in that window:
+///
+/// 1. **Server mode.** `QONTINUI_SERVER_MODE` (`launch_env.rs`,
+///    `LaunchEnv::server_mode`) makes `main.rs:3319` log "Skipping main
+///    window creation (server mode)" and skip the `WebviewWindowBuilder`
+///    branch entirely. Such a runner never mounts a webview, never pongs,
+///    and holds `last_pong == 0` for its whole process lifetime. This is the
+///    primary real-world reason the guard exists: without it every
+///    server-mode instance would report `errored` forever.
+/// 2. **Boot.** Every windowed runner spends its first seconds here, before
+///    React mounts and the SDK answers the first ping.
+/// 3. **Failed window creation.** If the window never came up there is
+///    nothing to declare dead; the `WindowMissing` / `NeverPonged` rungs of
+///    `classify_frontend_state` describe that case far better than a
+///    staleness verdict would.
+///
+/// `after_ms` picks the calibration; pass one of the two constants above
+/// rather than a literal.
+pub fn ui_stale(last_pong: u64, pong_age_ms: u64, after_ms: u64) -> bool {
+    last_pong > 0 && pong_age_ms > after_ms
+}
+
+/// [`ui_stale`] at [`UI_DEAD_AFTER_MS`], reading the pong stamp straight off
+/// `AppState::ui_bridge_last_pong` and the age off the wall clock.
+///
+/// For the status sinks (the heartbeat loops) that do not already have a
+/// `pong_age_ms` in scope, so the NTP-safe age arithmetic is written once.
+/// `last_pong` is a wall-clock stamp, so a backwards clock step (NTP
+/// correction, sleep/resume) can leave it AHEAD of now; `saturating_sub` reads
+/// a pong from the "future" as age 0 — maximally fresh, the honest answer —
+/// where a plain subtraction would underflow and panic.
+pub fn ui_dead_now(last_pong: &std::sync::atomic::AtomicU64) -> bool {
+    let last_pong = last_pong.load(std::sync::atomic::Ordering::Relaxed);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let pong_age_ms = if last_pong > 0 {
+        now_ms.saturating_sub(last_pong)
+    } else {
+        0
+    };
+    ui_stale(last_pong, pong_age_ms, UI_DEAD_AFTER_MS)
+}
+
+// ---------------------------------------------------------------------------
 // Derived-status helper
 // ---------------------------------------------------------------------------
 
@@ -166,6 +251,24 @@ fn matches_existing(existing: &UiError, message: &str, digest: Option<&str>) -> 
 /// * `has_ui_error` — true when a React `ErrorBoundary` report is outstanding.
 /// * `has_recent_crash` — true when a fresh Rust crash dump was surfaced at
 ///   startup (non-unwinding panics abort before React sees them).
+/// * `ui_dead` — the frontend was alive and has stopped checking in, i.e.
+///   [`ui_stale`] at [`UI_DEAD_AFTER_MS`]. `None` = this sink cannot tell
+///   (treated as unknown, never as dead). `Some(true)` = errored.
+///
+///   This is `errored`, not `degraded`, on purpose. `degraded` is already the
+///   occupied meaning for "a subsystem is out but the app still works"
+///   (embedding service, PG) — a desktop app whose window is dead is not that
+///   case, and overloading the class would make `degraded` mean two unrelated
+///   things. `errored` is also the only class that routes to a
+///   recovery-eligible state, so it is what makes an automated response
+///   expressible at all. Consumers that care whether the automation paths
+///   survived can still read `ui_error` / `recent_crash` / `responsive`,
+///   which are all published alongside this field.
+///
+///   The failure this input exists for: a WebView2 browser-process crash
+///   kills the UI host while the Rust backend keeps serving, so `ui_error`
+///   (set by the React error boundary) is structurally unavailable and
+///   `/health` reported `healthy` with a dead window for 19 hours.
 /// * `embedding_reachable` — `None` until the first probe has run (treated as
 ///   unknown, not degraded — avoids false positives during boot). `Some(true)`
 ///   = healthy. `Some(false)` = degraded.
@@ -176,16 +279,21 @@ fn matches_existing(existing: &UiError, message: &str, digest: Option<&str>) -> 
 ///   degraded, so `/health` stops reporting "healthy" while every PG-backed
 ///   panel is dead (iter4 B-5).
 ///
-/// All three heartbeat sinks (`/health`, operations heartbeat, web-backend
-/// heartbeat) call this so their `derived_status` stays in lockstep. Only the
-/// `/health` handler passes a probed `pg_reachable`; the others pass `None`.
+/// All four sinks (`/health`, the operations heartbeat, the web-backend
+/// heartbeat relay, and the UI-Bridge diagnostics surfaces) call this so their
+/// `derived_status` stays in lockstep. Only the `/health` handler passes a
+/// probed `pg_reachable`; the others pass `None`. All four DO pass a real
+/// `ui_dead` — the heartbeat sinks especially, since nothing polls `/health`
+/// on an end user's machine and the heartbeats are the only path by which a
+/// dead UI is ever visible off-box.
 pub fn compute_derived_status(
     has_ui_error: bool,
     has_recent_crash: bool,
+    ui_dead: Option<bool>,
     embedding_reachable: Option<bool>,
     pg_reachable: Option<bool>,
 ) -> &'static str {
-    if has_ui_error || has_recent_crash {
+    if has_ui_error || has_recent_crash || matches!(ui_dead, Some(true)) {
         "errored"
     } else if matches!(embedding_reachable, Some(false)) || matches!(pg_reachable, Some(false)) {
         "degraded"
@@ -330,15 +438,15 @@ mod tests {
     #[test]
     fn derived_status_errored_wins_over_everything() {
         assert_eq!(
-            compute_derived_status(true, false, Some(true), Some(true)),
+            compute_derived_status(true, false, Some(false), Some(true), Some(true)),
             "errored"
         );
         assert_eq!(
-            compute_derived_status(true, true, Some(false), Some(false)),
+            compute_derived_status(true, true, Some(false), Some(false), Some(false)),
             "errored"
         );
         assert_eq!(
-            compute_derived_status(false, true, Some(true), Some(true)),
+            compute_derived_status(false, true, Some(false), Some(true), Some(true)),
             "errored"
         );
     }
@@ -346,7 +454,7 @@ mod tests {
     #[test]
     fn derived_status_degraded_when_embedding_unreachable() {
         assert_eq!(
-            compute_derived_status(false, false, Some(false), Some(true)),
+            compute_derived_status(false, false, Some(false), Some(false), Some(true)),
             "degraded"
         );
     }
@@ -356,7 +464,7 @@ mod tests {
         // iter4 B-5: PG down while everything else is fine → degraded, so
         // /health can no longer report "healthy" over a dead data layer.
         assert_eq!(
-            compute_derived_status(false, false, Some(true), Some(false)),
+            compute_derived_status(false, false, Some(false), Some(true), Some(false)),
             "degraded"
         );
     }
@@ -364,7 +472,7 @@ mod tests {
     #[test]
     fn derived_status_healthy_when_embedding_reachable() {
         assert_eq!(
-            compute_derived_status(false, false, Some(true), Some(true)),
+            compute_derived_status(false, false, Some(false), Some(true), Some(true)),
             "healthy"
         );
     }
@@ -372,7 +480,10 @@ mod tests {
     #[test]
     fn derived_status_unknown_embedding_is_healthy_not_degraded() {
         // Boot-time: probe hasn't run yet. Avoid false-positive degraded.
-        assert_eq!(compute_derived_status(false, false, None, None), "healthy");
+        assert_eq!(
+            compute_derived_status(false, false, None, None, None),
+            "healthy"
+        );
     }
 
     #[test]
@@ -380,8 +491,140 @@ mod tests {
         // No PG probe (heartbeat sinks, or no PG configured) must not
         // false-positive to degraded.
         assert_eq!(
-            compute_derived_status(false, false, Some(true), None),
+            compute_derived_status(false, false, Some(false), Some(true), None),
             "healthy"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // UI liveness (`ui_stale` + the `ui_dead` input)
+    // -----------------------------------------------------------------------
+
+    /// Wall-clock stamp standing in for a frontend that has ponged at least
+    /// once. Only its non-zero-ness matters to [`ui_stale`].
+    const SOME_PONG: u64 = 1_700_000_000_000;
+
+    #[test]
+    fn ui_stale_never_seen_is_not_stale_headless_server_mode_guard() {
+        // `last_pong == 0` means no UI has EVER checked in. The highest-
+        // consequence case is `QONTINUI_SERVER_MODE`: `main.rs:3319` skips
+        // main-window creation entirely, so such a runner never mounts a
+        // webview and holds `last_pong == 0` for its whole process lifetime.
+        // Without this guard EVERY server-mode instance would be classified
+        // `errored` forever — the worst regression this change could cause.
+        // Boot (pre-first-pong) and failed window creation land here too.
+        for age in [0, 1, UI_STALE_AFTER_MS + 1, UI_DEAD_AFTER_MS + 1, u64::MAX] {
+            assert!(
+                !ui_stale(0, age, UI_STALE_AFTER_MS),
+                "last_pong == 0 must never read as stale (age {age})"
+            );
+            assert!(
+                !ui_stale(0, age, UI_DEAD_AFTER_MS),
+                "last_pong == 0 must never read as dead (age {age})"
+            );
+        }
+        assert_eq!(
+            compute_derived_status(false, false, Some(false), Some(true), Some(true)),
+            "healthy",
+            "a runner that never mounted a webview is healthy, not errored"
+        );
+    }
+
+    #[test]
+    fn derived_status_healthy_when_ui_alive_and_fresh() {
+        assert!(!ui_stale(SOME_PONG, 500, UI_DEAD_AFTER_MS));
+        assert_eq!(
+            compute_derived_status(false, false, Some(false), Some(true), Some(true)),
+            "healthy"
+        );
+    }
+
+    #[test]
+    fn derived_status_errored_when_ui_was_alive_then_went_stale() {
+        assert!(ui_stale(SOME_PONG, UI_DEAD_AFTER_MS + 1, UI_DEAD_AFTER_MS));
+        assert_eq!(
+            compute_derived_status(false, false, Some(true), Some(true), Some(true)),
+            "errored"
+        );
+    }
+
+    #[test]
+    fn derived_status_dead_ui_outranks_degraded_pg() {
+        // A dead window is not "a subsystem is out but the app works".
+        assert_eq!(
+            compute_derived_status(false, false, Some(true), Some(true), Some(false)),
+            "errored"
+        );
+        assert_eq!(
+            compute_derived_status(false, false, Some(true), Some(false), Some(false)),
+            "errored"
+        );
+    }
+
+    #[test]
+    fn derived_status_unknown_ui_liveness_is_unchanged_from_before() {
+        // `None` = this sink cannot tell. Guards the pre-change behavior for
+        // any non-probing caller: identical verdicts to `Some(false)`.
+        assert_eq!(
+            compute_derived_status(false, false, None, Some(true), Some(true)),
+            "healthy"
+        );
+        assert_eq!(
+            compute_derived_status(false, false, None, Some(false), None),
+            "degraded"
+        );
+        assert_eq!(
+            compute_derived_status(true, false, None, Some(true), Some(true)),
+            "errored"
+        );
+    }
+
+    /// The 2026-08-01 incident payload, replayed verbatim. This case reads
+    /// `healthy` on `origin/main` — that is the whole defect.
+    ///
+    /// WebView2's browser process died (`msedgewebview2.exe`, `msedge.dll`
+    /// `STATUS_BREAKPOINT`). The window went blank while the Rust backend kept
+    /// serving, so `ui_error` was null (a crashed browser process cannot run
+    /// the React error boundary) and `recent_crash` was null (the startup-only
+    /// Rust dump scanner cannot see a mid-run WebView2 Crashpad dump). The one
+    /// signal that stayed correct was `last_pong`: set, then ~16 minutes stale.
+    #[test]
+    fn derived_status_regression_2026_08_01_dead_webview_read_healthy() {
+        let pong_age_ms = 16 * 60 * 1_000; // ~16 min, as observed
+        let ui_dead = ui_stale(SOME_PONG, pong_age_ms, UI_DEAD_AFTER_MS);
+        assert!(ui_dead, "a 16-minute-old pong is well past the dead rung");
+        assert_eq!(
+            compute_derived_status(
+                false,         // ui_error: null
+                false,         // recent_crash: null
+                Some(ui_dead), // the only signal that stayed correct
+                Some(true),    // embedding service fine
+                Some(true),    // PG fine
+            ),
+            "errored",
+            "the dead-webview incident must no longer report healthy"
+        );
+    }
+
+    #[test]
+    fn ui_stale_thresholds_cannot_drift_past_each_other() {
+        // The invariant the single-predicate refactor exists to protect: the
+        // diagnostics rung must always fire BEFORE the status rung, so the two
+        // surfaces can only escalate in one direction. The paired
+        // `FrontendState::Stale`-vs-`derived_status`-healthy half of this
+        // guard lives in `mcp::ui_bridge::request`'s tests, where
+        // `classify_frontend_state` is in scope.
+        assert!(
+            UI_STALE_AFTER_MS < UI_DEAD_AFTER_MS,
+            "diagnostics must escalate before status"
+        );
+        let between = (UI_STALE_AFTER_MS + UI_DEAD_AFTER_MS) / 2;
+        assert!(ui_stale(SOME_PONG, between, UI_STALE_AFTER_MS));
+        assert!(!ui_stale(SOME_PONG, between, UI_DEAD_AFTER_MS));
+        assert_eq!(
+            compute_derived_status(false, false, Some(false), Some(true), Some(true)),
+            "healthy",
+            "an age between the two rungs is stale for diagnostics, not dead"
         );
     }
 

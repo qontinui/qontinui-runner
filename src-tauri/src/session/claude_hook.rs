@@ -49,9 +49,20 @@ const HOOK_SCRIPT: &str = include_str!("../../resources/session-restore/claude_s
 /// flag-gated `QONTINUI_STOP_HOOK_CONTINUATION` default `off`, so shipping the
 /// hook to every session is behaviorally inert until the flag is armed.
 const STOP_HOOK_SCRIPT: &str = include_str!("../../resources/session-restore/claude_stop_hook.sh");
+/// PreCompact-hook script template (bundled) — the context-exhaustion signal
+/// (plan `2026-07-17-session-autonomy-fabric.md` Phase 7). Same posture as
+/// the Stop hook: a dumb curl reading its seam from env
+/// (`QONTINUI_TERMINAL_ID`, `QONTINUI_RUNNER_API_PORT`) and the PreCompact
+/// payload from stdin; all policy lives in the runner's
+/// `POST /sessions/{id}/context-low` endpoint — flag-gated
+/// `QONTINUI_CONTEXT_HANDOFF` default `off`, so shipping the hook to every
+/// session is behaviorally inert until the flag is armed.
+const PRECOMPACT_HOOK_SCRIPT: &str =
+    include_str!("../../resources/session-restore/claude_precompact_hook.sh");
 /// Settings template (bundled). `@@HOOK_SCRIPT@@` → the absolute path of the
 /// materialized SessionStart hook script; `@@STOP_HOOK_SCRIPT@@` → the
-/// materialized Stop hook script.
+/// materialized Stop hook script; `@@PRECOMPACT_HOOK_SCRIPT@@` → the
+/// materialized PreCompact hook script.
 const HOOK_SETTINGS: &str =
     include_str!("../../resources/session-restore/claude_hook_settings.json");
 
@@ -59,6 +70,8 @@ const HOOK_SETTINGS: &str =
 const HOOK_SCRIPT_NAME: &str = "claude_session_hook.sh";
 /// File name of the materialized Stop-hook script.
 const STOP_HOOK_SCRIPT_NAME: &str = "claude_stop_hook.sh";
+/// File name of the materialized PreCompact-hook script.
+const PRECOMPACT_HOOK_SCRIPT_NAME: &str = "claude_precompact_hook.sh";
 /// File name of the materialized `--settings` file.
 const HOOK_SETTINGS_NAME: &str = "claude_hook_settings.json";
 
@@ -115,14 +128,27 @@ pub fn materialize(base_dir: &Path) -> Option<PathBuf> {
     }
     set_executable(&stop_script_path);
 
+    // PreCompact hook (context-exhaustion handoff, session-autonomy-fabric
+    // Phase 7) — same carrier, same fail-open posture.
+    let precompact_script_path = base_dir.join(PRECOMPACT_HOOK_SCRIPT_NAME);
+    if let Err(e) = std::fs::write(&precompact_script_path, PRECOMPACT_HOOK_SCRIPT.as_bytes()) {
+        tracing::warn!(error = %e, path = %precompact_script_path.display(), "session-restore: claude precompact-hook script write failed");
+        return None;
+    }
+    set_executable(&precompact_script_path);
+
     // Substitute the scripts' absolute paths into the settings `command`s.
     // JSON needs backslashes escaped (a Windows path) so the settings file
     // stays valid JSON Claude can parse.
     let script_for_json = script_path.to_string_lossy().replace('\\', "\\\\");
     let stop_script_for_json = stop_script_path.to_string_lossy().replace('\\', "\\\\");
+    let precompact_script_for_json = precompact_script_path
+        .to_string_lossy()
+        .replace('\\', "\\\\");
     let settings = HOOK_SETTINGS
         .replace("@@HOOK_SCRIPT@@", &script_for_json)
-        .replace("@@STOP_HOOK_SCRIPT@@", &stop_script_for_json);
+        .replace("@@STOP_HOOK_SCRIPT@@", &stop_script_for_json)
+        .replace("@@PRECOMPACT_HOOK_SCRIPT@@", &precompact_script_for_json);
     let settings_path = base_dir.join(HOOK_SETTINGS_NAME);
     if let Err(e) = std::fs::write(&settings_path, settings.as_bytes()) {
         tracing::warn!(error = %e, path = %settings_path.display(), "session-restore: claude hook settings write failed");
@@ -225,6 +251,34 @@ mod tests {
         assert!(stop_text.contains("QONTINUI_RUNNER_API_PORT"));
         assert!(stop_text.contains("QONTINUI_TERMINAL_ID"));
         assert!(stop_text.contains("stop_hook_active"));
+
+        // The SAME settings file registers the PreCompact context-exhaustion
+        // hook (session-autonomy-fabric Phase 7) pointing at the materialized
+        // precompact script — one carrier now delivers SessionStart + Stop +
+        // PreCompact + pre-approval.
+        let precompact_script_path = tmp.path().join(PRECOMPACT_HOOK_SCRIPT_NAME);
+        assert!(
+            precompact_script_path.exists(),
+            "precompact-hook script materialized"
+        );
+        assert!(
+            !settings_text.contains("@@PRECOMPACT_HOOK_SCRIPT@@"),
+            "precompact placeholder substituted"
+        );
+        let precompact_cmd = v["hooks"]["PreCompact"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            precompact_cmd.contains(PRECOMPACT_HOOK_SCRIPT_NAME),
+            "PreCompact command runs our precompact-hook script"
+        );
+
+        // The precompact script POSTs to the context-low route, reads the
+        // seam env, and never blocks the compaction (exit 0 everywhere).
+        let precompact_text = std::fs::read_to_string(&precompact_script_path).unwrap();
+        assert!(precompact_text.contains("/context-low"));
+        assert!(precompact_text.contains("QONTINUI_RUNNER_API_PORT"));
+        assert!(precompact_text.contains("QONTINUI_TERMINAL_ID"));
 
         // The DELIVERY never writes to / reads from the user's config: both
         // materialized files live under the runner's own app-data dir (the

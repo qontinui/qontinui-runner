@@ -1149,9 +1149,17 @@ async fn run_heartbeat_sender<S>(
         // `pg_reachable = None`: the web-backend heartbeat relay does not run
         // a DB round-trip; the bounded PG liveness probe lives only in the
         // `/health` handler.
+        //
+        // `ui_dead` is NOT `None` here, and that matters: nothing polls
+        // `/health` on an end user's machine, so this relay (and the
+        // operations heartbeat) are the only paths by which a dead UI is ever
+        // visible off-box. Passing `None` would fix the status precisely where
+        // it was already observable and leave it broken everywhere else.
+        let ui_dead = crate::ui_error::ui_dead_now(&api_state.app_state.ui_bridge_last_pong);
         let derived_status = crate::ui_error::compute_derived_status(
             ui_error_snapshot.is_some(),
             recent_crash_snapshot.is_some(),
+            Some(ui_dead),
             crate::mcp_api::embedding_reachable_cached(),
             None,
         )
@@ -2004,17 +2012,39 @@ pub(crate) fn existing_relay_session_workdir(task_run_id: &str) -> Option<String
 
 async fn handle_chat_create(api_state: &Arc<ApiState>, data: &Value) -> Option<Value> {
     info!("Handling chat_create command");
-    let task_name = data
-        .get("task_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Remote Chat");
-    let initial_prompt = data
-        .get("prompt")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    // The WS relay (`runner_chat_ws.py`) nests the frontend's fields under
+    // `params`, while the REST path sends them top-level — read either.
+    let params = data.get("params");
+    let field = |name: &str| -> Option<String> {
+        data.get(name)
+            .or_else(|| params.and_then(|p| p.get(name)))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
+    let task_name = field("task_name").unwrap_or_else(|| "Remote Chat".to_string());
+    let initial_prompt = field("prompt");
+    // Agent-registry spawn authorization (plan
+    // `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c, served clause
+    // `agent-spawn-authorization`). The mobile app asking for a chat is the
+    // same request-scoped shape as the runner API's ad-hoc session, so it is
+    // an `in_session_subagent`. Checked BEFORE the task-run row is inserted so
+    // a refusal leaves no orphan record. `None` for the agent name:
+    // `task_name` is a free-form title, not a registry agent key.
+    let authz = crate::agent_authorization::authorize_spawn(
+        None,
+        crate::agent_authorization::SpawnPath::InSessionSubagent,
+    )
+    .await;
+    if let Some(refusal) = authz.refusal() {
+        return Some(serde_json::json!({
+            "type": "chat_created",
+            "error": refusal
+        }));
+    }
+
     let task_run_id = uuid::Uuid::new_v4().to_string();
 
-    let create_input = crate::database::CreateTaskRunInput::new(&task_run_id, task_name)
+    let create_input = crate::database::CreateTaskRunInput::new(&task_run_id, &task_name)
         .with_prompt("Remote AI session")
         .with_workflow_type("chat");
     let create_result = api_state
@@ -2032,7 +2062,7 @@ async fn handle_chat_create(api_state: &Arc<ApiState>, data: &Value) -> Option<V
 
     let bg_state = api_state.clone();
     let bg_task_run_id = task_run_id.clone();
-    let bg_task_name = task_name.to_string();
+    let bg_task_name = task_name.clone();
     tokio::spawn(async move {
         let session_manager: Option<Arc<crate::claude_session::SessionManager>> = bg_state
             .app_handle

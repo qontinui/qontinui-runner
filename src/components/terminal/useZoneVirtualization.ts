@@ -1,11 +1,18 @@
 import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
 
 /**
- * One viewport of overscan in every direction: a cell up to a full screen away
- * from the scroll container is already "near", so it cold-mounts BEFORE it
- * scrolls into view and the operator never sees an empty tile.
+ * Half a viewport of overscan in every direction: a cell up to half a screen
+ * away from the scroll container is already "near", so it cold-mounts BEFORE
+ * it scrolls into view and the operator never sees an empty tile.
+ *
+ * This is an `IntersectionObserver` rootMargin, so the live band is
+ * viewport + 2×margin — 2× the viewport at 50%, down from 3× at the original
+ * 100% (plan `2026-07-28-runner-many-sessions-performance` Phase 2 / A9).
+ * Halving it trims the live-pane count by roughly a third; the hard limit on
+ * GPU contexts is the WebGL LRU (`backends/webglContextLru.ts`), which caps
+ * them regardless of how many panes are mounted.
  */
-const OVERSCAN_ROOT_MARGIN = "100% 0px";
+const OVERSCAN_ROOT_MARGIN = "50% 0px";
 
 /**
  * Coalesce window for observer callbacks. Scrolling fires a burst of

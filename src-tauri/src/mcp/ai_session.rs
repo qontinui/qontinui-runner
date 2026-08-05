@@ -93,6 +93,13 @@ pub struct RunPromptRequest {
     pub content: Option<String>,
 
     // Common options
+    /// Optional per-request Claude account override — a friendly name
+    /// (`"hotmail"`, matching `derive_account_name`) OR a full roster
+    /// `config_dir` path. When set, the spawned session's `CLAUDE_CONFIG_DIR`
+    /// is pinned to that (validated) account. Omitting it reproduces the
+    /// random logged-in-account default byte-for-byte.
+    #[serde(default)]
+    pub account: Option<String>,
     /// Optional session_id override (auto-generated if not provided)
     #[serde(default)]
     pub session_id: Option<String>,
@@ -164,6 +171,18 @@ pub struct RunPromptResponse {
     pub state_file: String,
     pub log_file: String,
     pub pid: Option<u32>,
+    /// The friendly account name pinned for this spawn, echoed back.
+    /// `None` when no `account` was requested (default random-pick used).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// The config dir pinned as `CLAUDE_CONFIG_DIR`. `None` when no `account`
+    /// was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_dir: Option<String>,
+    /// Warning when the pinned account is currently rate-limited (spawned
+    /// anyway per the caller's explicit request).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_warning: Option<String>,
 }
 
 // ============================================================================
@@ -1735,6 +1754,37 @@ pub async fn run_prompt(
     // plan). Captured before mutation so they can be plumbed into the
     // spawn-independent-claude.py invocation below. Each is forwarded as an
     // optional CLI flag the Python wrapper passes verbatim to `claude`.
+    // Resolve an explicit per-request account override, if any. Fail with a
+    // clear 4xx BEFORE spawning — bogus name → 400, logged-out → 409. The
+    // resolved config dir is forwarded to spawn-independent-claude.py as
+    // `--config-dir`, so the direct-spawn path pins the same validated account
+    // the `/sessions/spawn` path does.
+    let resolved_account = match request.account.as_deref() {
+        Some(account) if !account.is_empty() => {
+            match crate::ai_provider::resolve_requested_account(account) {
+                Ok(resolved) => Some(resolved),
+                Err(e @ crate::ai_provider::AccountSelectError::NotInRoster { .. }) => {
+                    return Err((StatusCode::BAD_REQUEST, Json(api_error(e.message()))));
+                }
+                Err(e @ crate::ai_provider::AccountSelectError::NotLoggedIn { .. }) => {
+                    return Err((StatusCode::CONFLICT, Json(api_error(e.message()))));
+                }
+            }
+        }
+        _ => None,
+    };
+    let remote_config_dir_for_spawn = resolved_account.as_ref().map(|r| r.config_dir.clone());
+    let resp_account = resolved_account.as_ref().map(|r| r.account_name.clone());
+    let resp_config_dir = resolved_account.as_ref().map(|r| r.config_dir.clone());
+    let resp_cooldown_warning = resolved_account.as_ref().and_then(|r| {
+        r.cooldown_remaining_secs.map(|secs| {
+            format!(
+                "account '{}' is rate-limited for another {}s; spawning anyway per explicit request",
+                r.account_name, secs
+            )
+        })
+    });
+
     let remote_working_directory = request.working_directory.clone();
     let remote_model = request.model.clone();
     let remote_allowed_tools = request
@@ -1879,8 +1929,26 @@ pub async fn run_prompt(
 
     // Prepend runner-triggered context and supervisor instructions
     // This tells the AI session how to safely restart the runner if needed
+    // Attributability marker for the rules block below — same contract as
+    // `terminal::RUNNER_CONTEXT_SOURCE_MARKER` (incident coord #1242). This
+    // block is the one that MANDATES and FORBIDS ("do NOT restart the runner
+    // directly"), so it must name its own origin even more than the advisory
+    // briefing does. Distinct `/ai_session` path component: a reader must be
+    // able to tell WHICH runner-injected text a rule came from.
+    const RULES_SOURCE_MARKER: &str = concat!(
+        "[source: ",
+        env!("CARGO_PKG_NAME"),
+        "/ai_session@",
+        env!("CARGO_PKG_VERSION"),
+        "+",
+        env!("QONTINUI_GIT_SHA"),
+        "]"
+    );
+
     let supervisor_available = super::auto_continue::check_supervisor_available();
-    let runner_context = if supervisor_available {
+    // NOT `terminal::runner_context` — this is a separate, runner-triggered
+    // rules block about supervisor-mediated restarts.
+    let supervisor_rules_block = if supervisor_available {
         r#"## IMPORTANT: Runner-Triggered Session Context
 
 You are being run BY the qontinui-runner. You are a child process of the runner.
@@ -1934,7 +2002,7 @@ Tell the user: "The qontinui-runner needs to be restarted manually to apply chan
 "#
     };
 
-    enhanced_prompt = format!("{}{}", runner_context, enhanced_prompt);
+    enhanced_prompt = format!("{RULES_SOURCE_MARKER}\n{supervisor_rules_block}{enhanced_prompt}");
 
     // RemoteAgent: surface declared MCP connection refs in the prompt
     // header. Phase D does not yet merge these into a per-call MCP config
@@ -2173,6 +2241,10 @@ If your task requires running visual automation, use the Runner API to execute w
         let remote_model_for_spawn = remote_model.clone();
         let remote_allowed_tools_for_spawn = remote_allowed_tools.clone();
         let remote_max_turns_for_spawn = remote_max_turns;
+        let remote_config_dir_for_spawn = remote_config_dir_for_spawn.clone();
+        let resp_account_for_spawn = resp_account.clone();
+        let resp_config_dir_for_spawn = resp_config_dir.clone();
+        let resp_cooldown_warning_for_spawn = resp_cooldown_warning.clone();
         let result = tokio::task::spawn_blocking(move || {
             let (workspace_root, dev_logs_path, scripts_path) = get_workspace_paths_internal()?;
             let spawn_script = scripts_path.join("spawn-independent-claude.py");
@@ -2249,6 +2321,10 @@ If your task requires running visual automation, use the Runner API to execute w
                 spawn_args.push(std::ffi::OsStr::new("--max-turns"));
                 spawn_args.push(std::ffi::OsStr::new(mt.as_str()));
             }
+            if let Some(ref cd) = remote_config_dir_for_spawn {
+                spawn_args.push(std::ffi::OsStr::new("--config-dir"));
+                spawn_args.push(std::ffi::OsStr::new(cd.as_str()));
+            }
 
             // Spawn Claude independently using the spawn script
             // Use spawn_python_with_console to ensure Claude CLI gets a console window
@@ -2269,6 +2345,9 @@ If your task requires running visual automation, use the Runner API to execute w
                             state_file: state_file.to_string_lossy().to_string(),
                             log_file: log_file.to_string_lossy().to_string(),
                             pid: Some(child.id()),
+                            account: resp_account_for_spawn,
+                            config_dir: resp_config_dir_for_spawn,
+                            cooldown_warning: resp_cooldown_warning_for_spawn,
                         },
                         log_file,
                         dev_logs_path,

@@ -777,6 +777,20 @@ impl SessionRegistry {
     }
 
     fn close(&self, id: Uuid) -> Result<(), SessionError> {
+        // Phase 4 (2026-07-15-vscode-coord-git-credential-prompt) — tear
+        // down the per-session git credential material (repo-local
+        // credential.helper unset + token config file removal, which is
+        // also the refresh loop's exit signal). This runs FIRST,
+        // unconditionally: cleanup is idempotent and must happen even on a
+        // double-close or an already-removed session. `close` is the
+        // single narrowest funnel — every teardown path (terminal_close,
+        // the PTY exit watchers, session_close, SessionHandle::close)
+        // reaches it via close_by_id/close. The id here is the coord
+        // session UUID, the same value the install sites stringify
+        // (`sid.to_string()` in commands/terminal.rs + productivity.rs),
+        // so `id.to_string()` reproduces the exact registry key.
+        crate::credential_helper::cleanup_credential_helper(&id.to_string());
+
         // Snapshot the transport handle + transport ref under the lock,
         // then drop the lock before calling transport.close (which may
         // block on subprocess teardown).

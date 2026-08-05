@@ -1,6 +1,6 @@
 import { useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { useUIComponent } from "@qontinui/ui-bridge";
+import { Info } from "lucide-react";
 import { StepIndicator } from "./StepIndicator";
 import { TierStep } from "./TierStep";
 import { WelcomeStep } from "./WelcomeStep";
@@ -10,7 +10,7 @@ import { DevServicesStep } from "./DevServicesStep";
 import { AiProviderStep } from "./AiProviderStep";
 import { ClaudeConfigStep } from "./ClaudeConfigStep";
 
-const STEPS = [
+export const SETUP_WIZARD_STEPS = [
   "Tier",
   "Welcome",
   "Projects",
@@ -19,6 +19,9 @@ const STEPS = [
   "AI Provider",
   "Claude Sessions",
 ];
+
+/** Local alias so the (many) in-file references stay short. */
+const STEPS = SETUP_WIZARD_STEPS;
 
 interface Project {
   path: string;
@@ -45,22 +48,39 @@ interface ProcessConfig {
 }
 
 interface SetupWizardProps {
-  onComplete: () => void;
+  /**
+   * The step to show. LIFTED to `AppContent` (with `onStepChange`) so the
+   * `setup-wizard` UI-Bridge component — whose `go-to-step` action mutates it —
+   * can be registered there and stay addressable even while this component is
+   * unmounted. `useUIComponent` only registers while its owner is mounted, so a
+   * registration inside the wizard was unreachable in exactly the state a
+   * driver needed it: a runner that auto-bypassed the wizard.
+   */
+  currentStep: number;
+  onStepChange: (step: number) => void;
+  /**
+   * Marks setup complete (persists via `complete_setup`) and dismisses the
+   * wizard. Also lifted, for the same reason — it backs the component's
+   * `complete` action.
+   */
+  onComplete: () => void | Promise<void>;
 }
 
-export function SetupWizard({ onComplete }: SetupWizardProps) {
-  const [currentStep, setCurrentStep] = useState(0);
+export function SetupWizard({ currentStep, onStepChange, onComplete }: SetupWizardProps) {
   const [, setWorkspacePath] = useState("");
+  // Wizard-level, non-blocking advisory raised by a step (see the banner
+  // below). Kept here so it survives the step transition that raised it.
+  const [notice, setNotice] = useState<string | null>(null);
   const [selectedProjects, setSelectedProjects] = useState<Project[]>([]);
   const [selectedProcessConfigs, setSelectedProcessConfigs] = useState<ProcessConfig[]>([]);
 
   const goNext = useCallback(() => {
-    setCurrentStep((s) => Math.min(s + 1, STEPS.length - 1));
-  }, []);
+    onStepChange(Math.min(currentStep + 1, STEPS.length - 1));
+  }, [currentStep, onStepChange]);
 
   const goBack = useCallback(() => {
-    setCurrentStep((s) => Math.max(s - 1, 0));
-  }, []);
+    onStepChange(Math.max(currentStep - 1, 0));
+  }, [currentStep, onStepChange]);
 
   const handleAiProviderComplete = useCallback(
     (_aiConfig: { provider: string } | null) => {
@@ -70,96 +90,61 @@ export function SetupWizard({ onComplete }: SetupWizardProps) {
     [goNext],
   );
 
+  // Saves what only THIS component knows (the process configs the user picked)
+  // and then hands off to the lifted `onComplete`, which owns the
+  // `complete_setup` persist + dismissal. A failed config save must not block
+  // completion — the user can configure processes later.
   const finishSetup = useCallback(async () => {
-    try {
-      // Save process configs
-      for (const config of selectedProcessConfigs) {
-        await invoke("save_process_config", { config });
-      }
-
-      // Mark setup as completed
-      await invoke("complete_setup");
-      onComplete();
-    } catch (err) {
-      console.error("Failed to complete setup:", err);
-      // Still complete even if save fails - user can configure later
+    for (const config of selectedProcessConfigs) {
       try {
-        await invoke("complete_setup");
-      } catch {
-        // Ignore
+        await invoke("save_process_config", { config });
+      } catch (err) {
+        console.error("Failed to save process config during setup:", err);
       }
-      onComplete();
     }
+    await onComplete();
   }, [selectedProcessConfigs, onComplete]);
 
-  // UI Bridge: expose programmatic wizard control so test runs and
-  // automation can dismiss the wizard without driving 7 steps of OS
-  // dialogs. `scope: 'global'` so the component is discoverable even
-  // when the wizard isn't the active route (matters less in practice
-  // since the wizard owns the whole viewport when shown, but keeps the
-  // discovery contract explicit for `/control/components` callers who
-  // are spawning a fresh temp runner and haven't navigated anywhere
-  // yet). The `complete` action calls the same `finishSetup` flow that
-  // the Claude-Sessions "Finish" button does, so persisted state ends
-  // up identical to a real user completion (`complete_setup` Tauri
-  // command writes `settings.setup_completed=true`, plus any process
-  // configs the user picked).
-  //
-  // Operators who set the supervisor-forwarded
-  // `QONTINUI_TEST_AUTO_LOGIN_EMAIL` env var don't need this action at
-  // all — `check_setup_completed` returns true on the Rust side and
-  // the wizard never mounts. This component-action is the second
-  // discovery vector: useful for non-supervisor automation (e.g. a
-  // CI smoke from outside the supervisor's spawn lane) and for
-  // operators who want to dismiss the wizard from a UI Bridge driver
-  // without restarting the runner.
-  useUIComponent({
-    id: "setup-wizard",
-    name: "Setup Wizard",
-    description:
-      "First-launch onboarding wizard. Use 'complete' to dismiss programmatically " +
-      "without driving 7 step interactions; equivalent to clicking through every step's " +
-      "default + 'Finish'. Use 'go-to-step' to jump directly to a specific step (0-6).",
-    scope: "global",
-    actions: [
-      {
-        id: "complete",
-        label: "Complete Setup",
-        description:
-          "Mark setup complete and dismiss the wizard. Persists via the same " +
-          "`complete_setup` Tauri command the user-driven 'Finish' button uses.",
-        handler: async () => {
-          await finishSetup();
-          return { success: true };
-        },
-      },
-      {
-        id: "go-to-step",
-        label: "Jump to Step",
-        description:
-          "Set the wizard's current step. Values 0-6 correspond to: " +
-          "Tier, Welcome, Projects, Processes, Dev Services, AI Provider, Claude Sessions.",
-        paramSchema: { step: "number (0-6)" },
-        handler: (params?: unknown) => {
-          const { step } = (params ?? {}) as { step?: number };
-          if (typeof step !== "number" || step < 0 || step >= STEPS.length) {
-            throw new Error(
-              `go-to-step requires { step: number } where 0 <= step < ${STEPS.length}`,
-            );
-          }
-          setCurrentStep(step);
-          return { success: true, step };
-        },
-      },
-    ],
-  });
+  // NOTE: the `setup-wizard` UI-Bridge component registration used to live
+  // here. It has moved UP to `AppContent` (`src/App.tsx`), beside the
+  // `registerOpenableView` call, because `useUIComponent` only registers while
+  // its owner is mounted — so a registration here was absent in exactly the
+  // state a driver needed it (a runner whose `check_setup_completed` returned
+  // true, e.g. any supervisor temp runner with `QONTINUI_TEST_AUTO_LOGIN_EMAIL`
+  // set, where the wizard never mounts). `scope: "global"` does not survive an
+  // unmount. The step state and the completion callback the two actions mutate
+  // are lifted for the same reason (see the props above).
 
   return (
     <div className="min-h-screen bg-background grid-dots flex flex-col items-center justify-center p-4">
       <div className="card w-full max-w-2xl p-8">
         <StepIndicator steps={STEPS} currentStep={currentStep} />
 
-        {currentStep === 0 && <TierStep onNext={goNext} />}
+        {/*
+          Wizard-level advisory banner. Lives HERE, not in the step that raises
+          it: a step that reports "this only applies to your session" also
+          advances the wizard in the same tick, so a notice rendered inside it
+          would be unmounted before anyone could read it.
+        */}
+        {notice && (
+          <div
+            id="setup-wizard-notice"
+            role="status"
+            className="flex items-start gap-2 p-3 mb-4 rounded-md bg-muted/40 border border-border/50"
+          >
+            <Info className="w-4 h-4 text-muted-foreground shrink-0 mt-0.5" />
+            <div className="text-xs text-muted-foreground flex-1 min-w-0">{notice}</div>
+            <button
+              onClick={() => setNotice(null)}
+              aria-label="Dismiss notice"
+              className="text-muted-foreground hover:text-foreground shrink-0"
+            >
+              &times;
+            </button>
+          </div>
+        )}
+
+        {currentStep === 0 && <TierStep onNext={goNext} onNotice={setNotice} />}
 
         {currentStep === 1 && <WelcomeStep onNext={goNext} />}
 

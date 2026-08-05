@@ -446,15 +446,6 @@ pub struct AiSettings {
     /// regex extractor is always on regardless of this flag.
     #[serde(default = "default_ai_path_prediction_enabled")]
     pub ai_path_prediction_enabled: bool,
-    /// Federate Claude memory writes through coord. When true (default),
-    /// each spawned Claude session pulls the tenant memory pool before
-    /// spawn, runs a file watcher during the session that pushes
-    /// changes to coord, and reconciles on session end. When false,
-    /// each session is local-only (the per-account memory dir is
-    /// untouched by the runner). UI surface for this is deferred —
-    /// flip via direct settings edit.
-    #[serde(default = "default_memory_federation_enabled")]
-    pub memory_federation_enabled: bool,
 }
 
 fn default_interactive_sessions_enabled() -> bool {
@@ -462,10 +453,6 @@ fn default_interactive_sessions_enabled() -> bool {
 }
 
 fn default_ai_path_prediction_enabled() -> bool {
-    true
-}
-
-fn default_memory_federation_enabled() -> bool {
     true
 }
 
@@ -490,7 +477,6 @@ impl Default for AiSettings {
             routing: RoutingConfig::default(),
             interactive_sessions_enabled: default_interactive_sessions_enabled(),
             ai_path_prediction_enabled: default_ai_path_prediction_enabled(),
-            memory_federation_enabled: default_memory_federation_enabled(),
         }
     }
 }
@@ -1397,6 +1383,33 @@ mod cloud_sync_tests {
 }
 
 #[cfg(test)]
+mod memory_link_expansion_tests {
+    use super::*;
+
+    /// Plan `2026-07-29-memory-link-expansion-retrieval-arm` Phase 3: the
+    /// link-expansion retrieval arm ships default-OFF until the recall-efficacy
+    /// harness can measure it. Both a fresh install (`Settings::default()`) and
+    /// an upgrading settings.json missing the key must land on `false`.
+    #[test]
+    fn memory_link_expansion_defaults_off() {
+        assert!(!Settings::default().memory_link_expansion_enabled);
+        let parsed: Settings = serde_json::from_str("{}").expect("empty object must deserialize");
+        assert!(!parsed.memory_link_expansion_enabled);
+    }
+
+    /// An explicit opt-in round-trips through serialization, so the flag can be
+    /// flipped on once the harness lands.
+    #[test]
+    fn memory_link_expansion_explicit_value_round_trips() {
+        let parsed: Settings = serde_json::from_str(r#"{"memory_link_expansion_enabled": true}"#)
+            .expect("must deserialize");
+        assert!(parsed.memory_link_expansion_enabled);
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert!(json.contains("\"memory_link_expansion_enabled\":true"));
+    }
+}
+
+#[cfg(test)]
 mod session_metadata_sync_tests {
     use super::*;
 
@@ -2130,6 +2143,17 @@ pub struct Settings {
     /// Back-compat: missing key in an existing settings.json loads as empty.
     #[serde(default)]
     pub saved_projects: Vec<SavedProject>,
+    /// `SavedProject.id` of the currently-active project, or `None` when the
+    /// user has not picked one yet.
+    ///
+    /// Deliberately server-side rather than in the frontend's
+    /// port-namespaced `instanceStorage`: only `settings.json` lets the
+    /// runner restore (and optionally auto-start) the last project at boot
+    /// before any frontend has mounted, lets the MCP/HTTP API answer "which
+    /// project is current" so an agent's tools inherit the root, and
+    /// survives a cleared WebView2 profile.
+    #[serde(default)]
+    pub active_project_id: Option<String>,
     /// Trace API gate (Section 5b of the UI Bridge redesign). When enabled,
     /// `/trace/...` routes are mounted on the runner's HTTP API and the
     /// runner persists causal traces to `project.ui_bridge_events` (requires
@@ -2199,6 +2223,21 @@ pub struct Settings {
     /// play for this field.
     #[serde(default)]
     pub ci_node: CiNodeSettings,
+    /// Ask the cloud memory endpoint (`POST /api/v1/memory/query`) for the
+    /// link-expansion retrieval arm — the third RRF arm that one-hop-expands
+    /// over `coord.memory_links` (plan
+    /// `2026-07-29-memory-link-expansion-retrieval-arm`, Phase 4).
+    ///
+    /// Default FALSE, deliberately: that plan's Phase 3 ships the arm
+    /// default-off and turns it on only once the efficacy harness in
+    /// `2026-07-29-memory-recall-efficacy-benchmark` can measure whether it
+    /// helps recall or just adds noise — and that plan is still DRAFT. Sending
+    /// `link_expansion: true` unconditionally would default an unmeasured
+    /// ranking change ON, which is exactly what Phase 3 forbids. The flag makes
+    /// the wire-through shippable now and flippable later. A missing key in an
+    /// existing settings.json loads as false.
+    #[serde(default)]
+    pub memory_link_expansion_enabled: bool,
 }
 
 fn default_session_metadata_sync_enabled() -> bool {
@@ -2298,23 +2337,13 @@ impl Default for LockYieldPolicySettings {
 /// wizard's project picker). Persisted to `settings.json` under the
 /// `saved_projects` key.
 ///
-/// Serialized as camelCase on the wire so JS/TS consumers (wizard, UI Bridge
-/// Integration panel) can bind directly. The struct is deliberately loose —
-/// `project_type` is a free-form string so new frameworks do not require a
-/// schema change.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SavedProject {
-    /// Absolute path to the project root.
-    pub path: String,
-    /// Human-friendly display name (usually the directory basename).
-    pub name: String,
-    /// Framework/language tag, e.g. "react", "python", "rust", "node".
-    /// Kept loose (String) so future frameworks need no schema change.
-    pub project_type: String,
-    /// Manifest file that identified the project (e.g. "package.json").
-    pub manifest: String,
-}
+/// The canonical definition now lives in `qontinui-schemas`
+/// (`qontinui_types::projects::SavedProject`) so the TypeScript and Python
+/// bindings are generated rather than hand-mirrored — the struct grew from 4
+/// fields to 16 with the Projects dashboard, which is exactly where a
+/// hand-mirror starts lying. Re-exported here so `settings::SavedProject`
+/// keeps working for every existing consumer.
+pub use qontinui_types::projects::SavedProject;
 
 // ============================================================================
 // World State Verifier Settings
@@ -2590,6 +2619,36 @@ pub struct SettingsFault {
 /// again, so the surface self-heals when the file becomes readable.
 static SETTINGS_FAULT: std::sync::RwLock<Option<SettingsFault>> = std::sync::RwLock::new(None);
 
+/// Process-global, in-memory-only tier override.
+///
+/// Set by [`crate::commands::auth::set_runner_tier`] on a runner that must not
+/// write the shared `settings.json` (a secondary — any supervisor-launched
+/// temp/named instance; see the FOOTGUN GUARD in [`load_settings_full`]). Before
+/// this existed, that branch logged "applying in-memory only" and then applied
+/// NOTHING: the command was a total no-op, `get_runner_tier` kept answering the
+/// old tier, and every tier-dependent state transition (notably the frontend's
+/// `isTier2` flip) was untestable on a temp runner — a green result there was
+/// vacuous.
+///
+/// It is applied as the LAST overlay in [`load_settings_full`], so an explicit
+/// runtime choice beats the spawn-time `QONTINUI_RUNNER_TIER` env overlay. It is
+/// never read by [`update_settings`] (which starts from the raw on-disk
+/// document), so it can never leak into a persisted file.
+static TIER_OVERRIDE: std::sync::RwLock<Option<RunnerTier>> = std::sync::RwLock::new(None);
+
+/// Apply a tier for the remainder of this process's lifetime WITHOUT touching
+/// any settings file. See [`TIER_OVERRIDE`].
+pub fn set_in_memory_tier(tier: RunnerTier) {
+    if let Ok(mut guard) = TIER_OVERRIDE.write() {
+        *guard = Some(tier);
+    }
+}
+
+/// The in-memory tier override, if one was set. See [`TIER_OVERRIDE`].
+fn in_memory_tier() -> Option<RunnerTier> {
+    TIER_OVERRIDE.read().ok().and_then(|g| *g)
+}
+
 fn record_settings_fault(fault: Option<SettingsFault>) {
     // `load_settings()` runs on hot paths (the relay loop re-reads every
     // iteration), and the overwhelmingly common case is "healthy, still
@@ -2824,13 +2883,28 @@ pub fn load_settings_full() -> LoadedSettings {
     }
     let is_secondary = crate::instance::is_secondary();
     if needs_persist && is_secondary {
-        info!(
-            "Skipping tier/local_user_id migration persist for secondary runner \
-             (instance={:?}) — would clobber the primary's shared settings.json; \
-             keeping the migration in-memory only (tier={:?})",
-            crate::instance::instance_name(),
-            settings.tier
-        );
+        // ONCE per process, at info!. This branch re-runs on every settings
+        // load (the relay loop re-reads every iteration), so it used to emit
+        // ~30 identical lines per 500-entry log window and bury real signal
+        // during debugging. The fact is process-invariant — a secondary never
+        // becomes a primary — so repeating it carries no information.
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        let mut first = false;
+        LOGGED.call_once(|| first = true);
+        if first {
+            info!(
+                "Skipping tier/local_user_id migration persist for secondary runner \
+                 (instance={:?}) — would clobber the primary's shared settings.json; \
+                 keeping the migration in-memory only (tier={:?}). Logged once per process.",
+                crate::instance::instance_name(),
+                settings.tier
+            );
+        } else {
+            tracing::debug!(
+                "Skipping tier/local_user_id migration persist for secondary runner (tier={:?})",
+                settings.tier
+            );
+        }
     }
     if should_persist_migration(needs_persist, is_secondary, provenance) {
         if let Err(e) = save_settings(&settings) {
@@ -2852,6 +2926,16 @@ pub fn load_settings_full() -> LoadedSettings {
     // state, so the only safe override is this in-memory overlay.
     if let Ok(raw) = std::env::var("QONTINUI_RUNNER_TIER") {
         apply_tier_env_overlay(&mut settings, &raw);
+    }
+
+    // Runtime in-memory tier override (`set_runner_tier` on a secondary).
+    // Applied LAST so an explicit runtime choice beats the spawn-time env
+    // overlay above — the operator/driver picked this tier after boot.
+    // In-memory only; `update_settings` reads the raw on-disk document, so
+    // this can never reach a settings file.
+    if let Some(t) = in_memory_tier() {
+        settings.tier = t;
+        settings.tier_initialized = true;
     }
 
     // One-shot post-upgrade detector: if Tier 2 + has a runner_token + the
@@ -3537,6 +3621,19 @@ pub fn save_saved_projects(projects: Vec<SavedProject>) -> Result<(), String> {
     update_settings(|settings| settings.saved_projects = projects)
 }
 
+/// Get the `SavedProject.id` of the active project, if one is selected.
+pub fn get_active_project_id() -> Option<String> {
+    load_settings()
+        .active_project_id
+        .filter(|id| !id.trim().is_empty())
+}
+
+/// Set (or clear, with `None`) the active project.
+pub fn save_active_project_id(id: Option<String>) -> Result<(), String> {
+    let normalized = id.filter(|s| !s.trim().is_empty());
+    update_settings(|settings| settings.active_project_id = normalized)
+}
+
 // ============================================================================
 // Helper Task Queue accessors
 // ============================================================================
@@ -3563,6 +3660,12 @@ pub fn get_cloud_sync_enabled() -> bool {
 /// Persist the cloud session sync consent flag.
 pub fn save_cloud_sync_enabled(enabled: bool) -> Result<(), String> {
     update_settings(|settings| settings.cloud_sync_enabled = enabled)
+}
+
+/// Get the cloud memory link-expansion arm flag. Default false — see
+/// [`Settings::memory_link_expansion_enabled`].
+pub fn get_memory_link_expansion_enabled() -> bool {
+    load_settings().memory_link_expansion_enabled
 }
 
 /// Get the session metadata sync consent flag (gate 2). Default true.

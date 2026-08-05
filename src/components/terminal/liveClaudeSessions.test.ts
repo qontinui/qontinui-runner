@@ -1,8 +1,18 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+const mockInvoke = vi.fn();
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: (...args: unknown[]) => mockInvoke(...args),
+}));
 
 import {
+  DERIVED_NAME_SOURCE,
   extractLiveSessions,
+  extractLiveSessionsStrict,
+  fetchLiveClaudeSessionIds,
   groupByAccount,
+  isOperatorNamed,
+  registryNamesBySessionId,
   sharedSessionIds,
   type LiveClaudeSession,
 } from "./liveClaudeSessions";
@@ -45,6 +55,156 @@ describe("extractLiveSessions", () => {
   });
 });
 
+describe("isOperatorNamed (the nameSource gate)", () => {
+  it("rejects Claude Code's own derived cwd slug", () => {
+    // The regression this gate exists to prevent: `qontinui-root-ec` is WORSE
+    // than the transcript/plan-title name the card already shows, so letting it
+    // through would make the feature a net downgrade.
+    expect(isOperatorNamed(mk({ name: "qontinui-root-ec", nameSource: "derived" }))).toBe(false);
+    expect(
+      isOperatorNamed(mk({ name: "qontinui-coord-88", nameSource: DERIVED_NAME_SOURCE })),
+    ).toBe(false);
+  });
+
+  it("accepts a row with NO nameSource key — the absent-key majority", () => {
+    // 12 of the 17 named rows on the operator's box (2026-07-28) omit the key
+    // entirely and carry real `/rename` names. Absent must read as trustworthy,
+    // or the gate silently disables the whole feature.
+    const s = mk({ name: "worktree prune" });
+    delete (s as { nameSource?: unknown }).nameSource;
+    expect(isOperatorNamed(s)).toBe(true);
+    expect(isOperatorNamed(mk({ name: "worktree prune", nameSource: undefined }))).toBe(true);
+    // A runner binary predating the field can also send an explicit null.
+    expect(isOperatorNamed(mk({ name: "worktree prune", nameSource: null }))).toBe(true);
+  });
+
+  it("accepts an unrecognized future nameSource", () => {
+    // One-sided by design: only `"derived"` is disqualifying. Guessing wrong
+    // about a future variant costs us nothing worse than today's behaviour.
+    expect(isOperatorNamed(mk({ name: "n", nameSource: "launch-flag" }))).toBe(true);
+  });
+
+  it("rejects a blank name whatever its provenance", () => {
+    expect(isOperatorNamed(mk({ name: "" }))).toBe(false);
+    expect(isOperatorNamed(mk({ name: "   " }))).toBe(false);
+  });
+
+  it("degrades rather than throwing when `name` is missing entirely", () => {
+    // Same defensiveness `groupByAccount` applies to `account`: the payload
+    // reaches us through an unchecked cast and this runs during render.
+    const s = mk();
+    delete (s as { name?: unknown }).name;
+    expect(isOperatorNamed(s)).toBe(false);
+  });
+});
+
+describe("registryNamesBySessionId", () => {
+  it("indexes operator-named rows and omits derived ones", () => {
+    const got = registryNamesBySessionId([
+      mk({ sessionId: "good", name: "worktree prune" }),
+      mk({ sessionId: "slug", name: "qontinui-root-ec", nameSource: "derived" }),
+    ]);
+    expect(got.get("good")).toBe("worktree prune");
+    // A MISS is the contract: the caller keeps whatever it shows today.
+    expect(got.has("slug")).toBe(false);
+  });
+
+  it("lets an operator-named process win over a derived sibling on the same id", () => {
+    // 22 of 80 ids had several live processes on 2026-07-23; only one of them
+    // may carry the operator's name.
+    const got = registryNamesBySessionId([
+      mk({ sessionId: "dup", pid: 10, name: "qontinui-web-0c", nameSource: "derived" }),
+      mk({ sessionId: "dup", pid: 11, name: "P3 window name" }),
+    ]);
+    expect(got.get("dup")).toBe("P3 window name");
+  });
+
+  it("picks the most recently updated process when several share an id", () => {
+    const got = registryNamesBySessionId([
+      mk({ sessionId: "dup", pid: 10, name: "older window", updatedAt: 1_000 }),
+      mk({ sessionId: "dup", pid: 11, name: "newer window", updatedAt: 2_000 }),
+    ]);
+    expect(got.get("dup")).toBe("newer window");
+  });
+
+  it("does not let a rename hand the card a SIBLING process's name", () => {
+    // The trap a name-ordered tiebreak falls into. `read_live_sessions` sorts
+    // account → name → pid, so renaming the selected process can re-sort the
+    // pair and silently switch which window the card describes.
+    const before = registryNamesBySessionId([
+      mk({ sessionId: "dup", pid: 10, name: "aaa", updatedAt: 5_000 }),
+      mk({ sessionId: "dup", pid: 11, name: "zzz", updatedAt: 1_000 }),
+    ]);
+    expect(before.get("dup")).toBe("aaa");
+
+    // Operator renames pid 10 (the active one) to "zzz2". Sorted by name it is
+    // now SECOND — a first-wins tiebreak would show pid 11's "zzz" and the
+    // rename would look like it did nothing.
+    const after = registryNamesBySessionId([
+      mk({ sessionId: "dup", pid: 11, name: "zzz", updatedAt: 1_000 }),
+      mk({ sessionId: "dup", pid: 10, name: "zzz2", updatedAt: 6_000 }),
+    ]);
+    expect(after.get("dup")).toBe("zzz2");
+  });
+
+  it("keeps the first row when updatedAt ties, so the result is deterministic", () => {
+    // Includes the 0 the Rust reader substitutes when the registry omits the
+    // field — a whole-fleet tie must not flicker between polls.
+    const got = registryNamesBySessionId([
+      mk({ sessionId: "dup", pid: 10, name: "first", updatedAt: 0 }),
+      mk({ sessionId: "dup", pid: 11, name: "second", updatedAt: 0 }),
+    ]);
+    expect(got.get("dup")).toBe("first");
+  });
+
+  it("falls back to startedAt when updatedAt is missing, so the tiebreak never reverts to name order", () => {
+    // If a CLI build stops emitting `updatedAt`, the Rust reader substitutes 0
+    // for every row. Without the `startedAt` fallback they would all tie, and
+    // the winner would revert to read_live_sessions order — account, then
+    // NAME, then pid. Name order is precisely the bug the tiebreak exists to
+    // prevent, so this asserts the second anchor actually carries the decision.
+    //
+    // Reader order puts "aaa" first; startedAt says "zzz" is the live one.
+    const got = registryNamesBySessionId([
+      mk({ sessionId: "dup", pid: 10, name: "aaa", updatedAt: 0, startedAt: 1_000 }),
+      mk({ sessionId: "dup", pid: 11, name: "zzz", updatedAt: 0, startedAt: 9_000 }),
+    ]);
+    expect(got.get("dup")).toBe("zzz");
+  });
+
+  it("trims the stored name", () => {
+    // The gate tolerates padding; the card renders into a truncating span
+    // where it would be visible.
+    const got = registryNamesBySessionId([mk({ sessionId: "s", name: "  worktree prune  " })]);
+    expect(got.get("s")).toBe("worktree prune");
+  });
+
+  it("ignores rows with no session id, and is empty for no input", () => {
+    expect(registryNamesBySessionId([mk({ sessionId: "" })]).size).toBe(0);
+    expect(registryNamesBySessionId([]).size).toBe(0);
+  });
+});
+
+describe("extractLiveSessionsStrict (liveness polarity)", () => {
+  it("accepts the {sessions:[…]} envelope and a bare array", () => {
+    expect(extractLiveSessionsStrict({ sessions: [mk()] })).toHaveLength(1);
+    expect(extractLiveSessionsStrict([mk()])).toHaveLength(1);
+    expect(extractLiveSessionsStrict({ sessions: [] })).toEqual([]);
+    expect(extractLiveSessionsStrict([])).toEqual([]);
+  });
+
+  it("maps any other shape to null (indeterminate), never []", () => {
+    // A shape surprise flowing through the tolerant extractor becomes [] =
+    // "definitively no live sessions" → the restore path forks everything.
+    expect(extractLiveSessionsStrict(null)).toBeNull();
+    expect(extractLiveSessionsStrict(undefined)).toBeNull();
+    expect(extractLiveSessionsStrict("nope")).toBeNull();
+    expect(extractLiveSessionsStrict({})).toBeNull();
+    expect(extractLiveSessionsStrict({ session: [mk()] })).toBeNull(); // renamed key
+    expect(extractLiveSessionsStrict({ sessions: "not-an-array" })).toBeNull();
+  });
+});
+
 describe("sharedSessionIds", () => {
   it("reports ids held by more than one live process", () => {
     // The restore-duplication symptom: one session id, several live processes,
@@ -65,6 +225,78 @@ describe("sharedSessionIds", () => {
 
   it("is empty for no sessions", () => {
     expect(sharedSessionIds([]).size).toBe(0);
+  });
+});
+
+describe("fetchLiveClaudeSessionIds (P1 restore-idempotence liveness source)", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+  });
+
+  it("returns the deduped set of live session ids", async () => {
+    mockInvoke.mockResolvedValueOnce({
+      success: true,
+      message: null,
+      data: {
+        sessions: [
+          // Two live processes on ONE id — the exact duplication symptom;
+          // the set collapses them.
+          mk({ sessionId: "dup", pid: 10 }),
+          mk({ sessionId: "dup", pid: 11 }),
+          mk({ sessionId: "solo", pid: 12 }),
+        ],
+      },
+    });
+    const ids = await fetchLiveClaudeSessionIds();
+    expect(mockInvoke).toHaveBeenCalledWith("terminal_claude_session_list_live");
+    expect(ids).not.toBeNull();
+    expect([...ids!].sort()).toEqual(["dup", "solo"]);
+  });
+
+  it("returns an EMPTY set (not null) when no process is live", async () => {
+    // Empty-and-known must stay distinguishable from unreadable: an empty set
+    // allows respawns, null forbids them.
+    mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: { sessions: [] } });
+    const ids = await fetchLiveClaudeSessionIds();
+    expect(ids).not.toBeNull();
+    expect(ids!.size).toBe(0);
+  });
+
+  it("returns null (indeterminate → fail closed) when the invoke rejects", async () => {
+    mockInvoke.mockRejectedValueOnce(new Error("ipc down"));
+    expect(await fetchLiveClaudeSessionIds()).toBeNull();
+  });
+
+  it("returns null on an unsuccessful or payload-less response", async () => {
+    mockInvoke.mockResolvedValueOnce({ success: false, message: "boom", data: null });
+    expect(await fetchLiveClaudeSessionIds()).toBeNull();
+    mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: null });
+    expect(await fetchLiveClaudeSessionIds()).toBeNull();
+  });
+
+  it("returns null (indeterminate) on a misshapen payload — never an empty set", async () => {
+    // `data: {}` (no sessions key), a renamed key, and a non-array `sessions`
+    // must all fail CLOSED: [] would green-light respawning every session.
+    mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: {} });
+    expect(await fetchLiveClaudeSessionIds()).toBeNull();
+    mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: { session: [mk()] } });
+    expect(await fetchLiveClaudeSessionIds()).toBeNull();
+    mockInvoke.mockResolvedValueOnce({
+      success: true,
+      message: null,
+      data: { sessions: "not-an-array" },
+    });
+    expect(await fetchLiveClaudeSessionIds()).toBeNull();
+  });
+
+  it("ignores rows without a usable sessionId instead of throwing", async () => {
+    mockInvoke.mockResolvedValueOnce({
+      success: true,
+      message: null,
+      data: { sessions: [mk({ sessionId: "ok" }), { pid: 1 }, null, mk({ sessionId: "" })] },
+    });
+    const ids = await fetchLiveClaudeSessionIds();
+    expect([...ids!]).toEqual(["ok"]);
   });
 });
 

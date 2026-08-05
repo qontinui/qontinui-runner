@@ -41,6 +41,7 @@ import {
   UserCircle2,
   Loader2,
   AlertCircle,
+  AlertTriangle,
   Stethoscope,
   CheckCircle2,
   XCircle,
@@ -64,6 +65,10 @@ interface DoctorCheck {
   ok: boolean;
   detail: string;
   fix: string;
+  // A failed ADVISORY check is a warning, not a blocker — it does not affect
+  // `overall_ok`. Absent on the wire for blocking checks (serde skips `false`),
+  // so treat undefined as false.
+  advisory?: boolean;
 }
 interface DoctorReport {
   checks: DoctorCheck[];
@@ -97,7 +102,9 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
     try {
       const report = await invoke<DoctorReport>("coord_doctor_run");
       setDoctor(report);
-      const firstFail = report.checks.find((c) => !c.ok);
+      // Only a BLOCKING failure explains a not-ok verdict; an advisory red
+      // leaves `overall_ok` true, so naming one here would misreport why.
+      const firstFail = report.checks.find((c) => !c.ok && !c.advisory);
       onLog(
         report.overall_ok ? "success" : "info",
         report.overall_ok
@@ -314,11 +321,20 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
                 >
                   {c.ok ? (
                     <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0 text-green-400" />
+                  ) : c.advisory ? (
+                    <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0 text-amber-300" />
                   ) : (
                     <XCircle className="w-4 h-4 mt-0.5 shrink-0 text-red-400" />
                   )}
                   <div className="min-w-0">
-                    <div className="font-mono text-foreground">{c.name}</div>
+                    <div className="font-mono text-foreground">
+                      {c.name}
+                      {!c.ok && c.advisory && (
+                        <span className="ml-1.5 font-sans text-[10px] uppercase tracking-wide text-amber-300/80">
+                          warning
+                        </span>
+                      )}
+                    </div>
                     <div className="text-muted-foreground break-words">{c.detail}</div>
                     {!c.ok && (
                       <div className="mt-0.5 text-amber-300/90 break-words">Fix: {c.fix}</div>

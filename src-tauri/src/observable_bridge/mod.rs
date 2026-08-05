@@ -1,38 +1,35 @@
 //! Federated observable categories — runner-mediated coord bridges.
 //!
-//! Plan: `2026-05-22-memories-on-coord-cross-machine.md`.
+//! Plan: `2026-05-22-memories-on-coord-cross-machine.md`, generalized by
+//! `2026-05-24-federation-verify-and-gitop.md`. The original memory
+//! category was retired by
+//! `2026-07-26-claude-session-memory-cutover-to-coord` Phase 3a — coord
+//! is now the single writer for Claude-session memory and the local
+//! memory dir is a one-way coord→file cache rendered outside the runner.
 //!
 //! ## Pattern
 //!
-//! Every federated agent observable (memories first, git-ops next, more
-//! later) follows the same shape:
+//! Every federated agent observable follows the same shape:
 //!
 //!   Agent (Claude session, ...) writes/reads via local convention
 //!     → Runner bridges on session boundary + during session
 //!     → Coord HTTP API (per-category routes)
 //!     → Single tenant-scoped store, fleet-wide
-//!     → Fan-out: pulls into other runners' next session prep
 //!
 //! The [`RunnerObservableBridge`] trait abstracts this lifecycle.
-//! [`MemoryBridge`] is the reference implementation. A second category
-//! (`GitOpBridge`) implements the same trait — the trait is
-//! category-generic: it carries no memory-specific types. Bridge-internal
-//! concerns (the memory watcher's `push` + its `ObservableChange` change
-//! type) live inside [`memory`], not on the shared interface, because a
-//! git-op change has nothing structurally in common with a memory upsert.
+//! `GitOpBridge` is the sole implementation today. The trait is
+//! category-generic: how a bridge detects local changes and what a
+//! change looks like stay bridge-internal.
 
 use anyhow::Result;
 use async_trait::async_trait;
 use once_cell::sync::OnceCell;
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
 
 pub mod git_ops;
 pub mod git_ops_client;
-pub mod memory;
-pub mod memory_client;
 
 /// Process-wide registry of every enabled observable bridge, set once at
 /// runner init by `main.rs::setup`. Spawn-site call paths
@@ -72,44 +69,14 @@ pub struct SessionContext {
     pub tenant_id: Uuid,
     pub device_id: Uuid,
     pub account_name: String,
-    pub memory_dir: PathBuf,
-    /// The working directory the session spawned in. `MemoryBridge`
-    /// derives `memory_dir` from it upstream and does not read this
-    /// field; `GitOpBridge` reads it to locate `<working_dir>/.git/`.
+    /// The working directory the session spawned in. `GitOpBridge`
+    /// reads it to locate `<working_dir>/.git/`.
     pub working_dir: PathBuf,
     pub session_id: Uuid,
-    /// Snapshot of `memory_dir` taken immediately after `pull` completed.
-    /// Used by `reconcile` to diff against final state at session end.
-    /// `None` until `pull` runs.
-    pub post_pull_snapshot: Option<DirSnapshot>,
-    /// Count of files pulled from coord during the `pull` phase.
-    /// Populated by `MemoryBridge::pull`; read by `reconcile` to fill
-    /// the `ReconcileReport.pulled` field.
-    pub pulled_count: u32,
 }
 
-/// A single file's identity in a memory directory snapshot.
-/// `name` is the file basename without `.md`; `sha256` is hex.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FileFingerprint {
-    pub name: String,
-    pub sha256: String,
-}
-
-/// All `.md` files in a memory directory at a point in time.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct DirSnapshot {
-    pub files: Vec<FileFingerprint>,
-}
-
-impl DirSnapshot {
-    pub fn get(&self, name: &str) -> Option<&FileFingerprint> {
-        self.files.iter().find(|f| f.name == name)
-    }
-}
-
-/// Aggregate counts from a `reconcile` pass — useful for UI banner.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Aggregate counts from a `reconcile` pass.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ReconcileReport {
     pub pushed: u32,
     pub pulled: u32,
@@ -122,22 +89,17 @@ pub struct ReconcileReport {
 
 /// The trait every federated observable category implements.
 ///
-/// The interface is category-generic: it carries no memory-specific
-/// types. How a bridge detects local changes during a session (a file
-/// watcher, a git hook, …) and how it represents those changes are
-/// bridge-internal — they never cross this trait. `MemoryBridge`'s
-/// `push` + `ObservableChange` live inside [`memory`] for exactly this
-/// reason.
+/// The interface is category-generic. How a bridge detects local
+/// changes during a session (a file watcher, a git hook, …) and how it
+/// represents those changes are bridge-internal — they never cross this
+/// trait.
 #[async_trait]
 pub trait RunnerObservableBridge: Send + Sync {
     /// Stable category name — used as the `coord.<category>` table name
-    /// and the dashboard route segment. Memories: `"memory"`. Git-ops:
-    /// `"git_op"`.
+    /// and the dashboard route segment. Git-ops: `"git_op"`.
     fn category(&self) -> &'static str;
 
     /// Spawn-time: pull the tenant pool from coord, materialize locally.
-    /// May record per-session baseline state on `ctx` (e.g.
-    /// `post_pull_snapshot`) for `reconcile` to diff against.
     async fn pull(&self, ctx: &mut SessionContext) -> Result<()>;
 
     /// During-session: start watching for local changes and push them to
@@ -162,63 +124,4 @@ pub trait RunnerObservableBridge: Send + Sync {
     /// baseline, push anything the watcher missed, return aggregate
     /// counts.
     async fn reconcile(&self, ctx: &SessionContext) -> Result<ReconcileReport>;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn file_fingerprint_equality() {
-        let a = FileFingerprint {
-            name: "feedback_demo".to_string(),
-            sha256: "abc123".to_string(),
-        };
-        let b = FileFingerprint {
-            name: "feedback_demo".to_string(),
-            sha256: "abc123".to_string(),
-        };
-        let c = FileFingerprint {
-            name: "feedback_demo".to_string(),
-            sha256: "def456".to_string(),
-        };
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-    }
-
-    #[test]
-    fn dir_snapshot_get_finds_existing() {
-        let snap = DirSnapshot {
-            files: vec![
-                FileFingerprint {
-                    name: "alpha".to_string(),
-                    sha256: "h1".to_string(),
-                },
-                FileFingerprint {
-                    name: "beta".to_string(),
-                    sha256: "h2".to_string(),
-                },
-            ],
-        };
-        let found = snap.get("beta").expect("beta should be present");
-        assert_eq!(found.sha256, "h2");
-    }
-
-    #[test]
-    fn dir_snapshot_get_returns_none_for_missing() {
-        let snap = DirSnapshot {
-            files: vec![FileFingerprint {
-                name: "alpha".to_string(),
-                sha256: "h1".to_string(),
-            }],
-        };
-        assert!(snap.get("missing").is_none());
-    }
-
-    #[test]
-    fn dir_snapshot_default_is_empty() {
-        let snap = DirSnapshot::default();
-        assert!(snap.files.is_empty());
-        assert!(snap.get("anything").is_none());
-    }
 }

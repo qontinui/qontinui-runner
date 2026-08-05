@@ -19,7 +19,9 @@ import type { TaskRun } from "@/types/aiData";
 import type { UseLogManagerResult } from "@/hooks/useLogManager";
 import type { UseUIStateResult } from "@/hooks/useUIState";
 import type { UseModalStateResult } from "@/hooks/useModalState";
-import type { UseLogFilterResult } from "@/hooks/useLogFilter";
+import { useLogFilter } from "@/hooks/useLogFilter";
+import type { ImageRecognitionEntry } from "@/managers/LogManager";
+import { useLogActions, useLogData } from "@/hooks/useLogManager";
 import type { UseProjectLogsReturn } from "@/hooks/project-logs";
 import type { useProjectSelection } from "@/hooks/useProjectSelection";
 import type { MainTabId, LogSubTab } from "./tab-types";
@@ -150,10 +152,8 @@ const ProjectExplainerPage = lazy(() =>
     default: m.ProjectExplainerPage,
   })),
 );
-const MemoryFederationPage = lazy(() =>
-  import("../MemoryFederationPage").then((m) => ({
-    default: m.MemoryFederationPage,
-  })),
+const ProjectsPage = lazy(() =>
+  import("../projects").then((m) => ({ default: m.ProjectsPage })),
 );
 
 /** Register the active page with UI Bridge for AI discoverability */
@@ -198,22 +198,136 @@ interface GlobalLogSourceSettings {
   }>;
 }
 
+/**
+ * Log-subscribing leaf panels.
+ *
+ * These exist so `useLogData()` — the only reactive log subscription left —
+ * is mounted ONLY inside the branch that renders logs. Previously the app
+ * root held it and every log line re-rendered the whole tree, terminal panes
+ * included (plan `2026-07-28-runner-many-sessions-performance` §0 A2).
+ */
+function RunImagePanel({
+  onImageRowClick,
+  onNavigateToActive,
+}: {
+  onImageRowClick: (entry: ImageRecognitionEntry) => void;
+  onNavigateToActive: () => void;
+}) {
+  const { imageLogs, imageLogCount } = useLogData();
+  return (
+    <div data-page-id="run-image" className="h-full overflow-hidden">
+      <RunSelectionProvider>
+        <RunPageLayout
+          title="Image Recognition"
+          icon={Image}
+          badgeCount={imageLogCount}
+          onNavigateToActive={onNavigateToActive}
+        >
+          <div className="h-full p-4 overflow-hidden">
+            <div className="h-full card overflow-hidden">
+              <RunImageRecognitionTab
+                imageLogs={imageLogs}
+                onImageRowClick={onImageRowClick}
+                imageLogCount={imageLogCount}
+              />
+            </div>
+          </div>
+        </RunPageLayout>
+      </RunSelectionProvider>
+    </div>
+  );
+}
+
+function AiOutputPanel({ onNavigateToLibrary }: { onNavigateToLibrary: () => void }) {
+  const { aiOutputLogs } = useLogData();
+  const { addAiOutputLog, clearAiOutputLogs } = useLogActions();
+  return (
+    <AiTab
+      aiOutputLines={aiOutputLogs}
+      onClearAiOutput={clearAiOutputLogs}
+      onAddAiOutputLine={(line) =>
+        addAiOutputLog(
+          line.line,
+          line.source,
+          line.actionId,
+          line.taskRunId,
+          line.sessionId,
+          line.sessionName,
+          line.phase,
+          line.phaseIteration,
+        )
+      }
+      onNavigateToLibrary={onNavigateToLibrary}
+    />
+  );
+}
+
+function LogsPanel({
+  uiState,
+  modalState,
+  actionLogViewData,
+  actionLogLoading,
+  actionLogError,
+  clearActionLogs,
+  clearAllLogs,
+  handleCopyLogs,
+  activeLogSubTab,
+  setActiveLogSubTab,
+}: {
+  uiState: UseUIStateResult;
+  modalState: UseModalStateResult;
+  actionLogViewData: ActionLogViewData | null;
+  actionLogLoading: boolean;
+  actionLogError: string | null;
+  clearActionLogs: () => Promise<void>;
+  clearAllLogs: () => Promise<void>;
+  handleCopyLogs: () => Promise<void>;
+  activeLogSubTab: LogSubTab;
+  setActiveLogSubTab: (tab: LogSubTab) => void;
+}) {
+  const { logs, imageLogs, logCount, imageLogCount } = useLogData();
+  const { clearGeneralLogs, clearImageLogs } = useLogActions();
+  const { logLevel, setLogLevel, filteredLogs } = useLogFilter(logs);
+  return (
+    <LogsTab
+      logs={logs}
+      filteredLogs={filteredLogs}
+      logLevel={logLevel}
+      onLogLevelChange={setLogLevel}
+      showLogFilter={uiState.showLogFilter}
+      onToggleLogFilter={uiState.setShowLogFilter}
+      imageLogs={imageLogs}
+      onImageRowClick={modalState.openImageModal}
+      actionLogData={actionLogViewData}
+      actionLogLoading={actionLogLoading}
+      actionLogError={actionLogError}
+      onActionRowClick={modalState.openActionModal}
+      logCount={logCount}
+      imageLogCount={imageLogCount}
+      actionCount={actionLogViewData?.visible_count || 0}
+      onClearGeneralLogs={clearGeneralLogs}
+      onClearImageLogs={clearImageLogs}
+      onClearActionLogs={clearActionLogs}
+      onClearAllLogs={clearAllLogs}
+      onCopyLogs={handleCopyLogs}
+      copySuccess={uiState.copySuccess}
+      activeSubTab={activeLogSubTab}
+      onSubTabChange={setActiveLogSubTab}
+    />
+  );
+}
+
 export interface TabContentProps {
   activeTab: MainTabId;
   setActiveTab: (tab: MainTabId) => void;
+  /**
+   * Only the identity-stable log ACTIONS are threaded through. The reactive
+   * slices (`logs`, `imageLogs`, `aiOutputLogs`, their counts and the level
+   * filter) are subscribed inside the three panels that render them, so a log
+   * line no longer re-renders the app root and, through it, the always-mounted
+   * terminal tree (plan `2026-07-28-runner-many-sessions-performance` §0 A2).
+   */
   addLog: UseLogManagerResult["addLog"];
-  addAiOutputLog: UseLogManagerResult["addAiOutputLog"];
-  logs: UseLogManagerResult["logs"];
-  imageLogs: UseLogManagerResult["imageLogs"];
-  aiOutputLogs: UseLogManagerResult["aiOutputLogs"];
-  clearGeneralLogs: UseLogManagerResult["clearGeneralLogs"];
-  clearImageLogs: UseLogManagerResult["clearImageLogs"];
-  clearAiOutputLogs: UseLogManagerResult["clearAiOutputLogs"];
-  logCount: number;
-  imageLogCount: number;
-  filteredLogs: UseLogFilterResult["filteredLogs"];
-  logLevel: UseLogFilterResult["logLevel"];
-  setLogLevel: UseLogFilterResult["setLogLevel"];
   uiState: UseUIStateResult;
   modalState: UseModalStateResult;
   actionLogViewData: ActionLogViewData | null;
@@ -244,18 +358,6 @@ export function TabContent({
   activeTab,
   setActiveTab,
   addLog,
-  addAiOutputLog,
-  logs,
-  imageLogs,
-  aiOutputLogs,
-  clearGeneralLogs,
-  clearImageLogs,
-  clearAiOutputLogs,
-  logCount,
-  imageLogCount,
-  filteredLogs,
-  logLevel,
-  setLogLevel,
   uiState,
   modalState,
   actionLogViewData,
@@ -352,6 +454,20 @@ export function TabContent({
             description="Queue and manage multiple workflow executions"
           />
           <WorkflowQueueTab onNavigateToActive={() => setActiveTab("active")} onLog={addLog} />
+        </div>
+      );
+
+    case "projects":
+      return (
+        <div data-page-id="projects" className="h-full overflow-hidden">
+          <PageRegistration
+            id="projects"
+            name="Projects"
+            description="What you're building, and what state each project is in"
+          />
+          <Suspense fallback={<LazyFallback />}>
+            <ProjectsPage onNavigateToTerminal={() => setActiveTab("terminal")} />
+          </Suspense>
         </div>
       );
 
@@ -592,26 +708,10 @@ export function TabContent({
 
     case "run-image":
       return (
-        <div data-page-id="run-image" className="h-full overflow-hidden">
-          <RunSelectionProvider>
-            <RunPageLayout
-              title="Image Recognition"
-              icon={Image}
-              badgeCount={imageLogCount}
-              onNavigateToActive={() => setActiveTab("active")}
-            >
-              <div className="h-full p-4 overflow-hidden">
-                <div className="h-full card overflow-hidden">
-                  <RunImageRecognitionTab
-                    imageLogs={imageLogs}
-                    onImageRowClick={modalState.openImageModal}
-                    imageLogCount={imageLogCount}
-                  />
-                </div>
-              </div>
-            </RunPageLayout>
-          </RunSelectionProvider>
-        </div>
+        <RunImagePanel
+          onImageRowClick={modalState.openImageModal}
+          onNavigateToActive={() => setActiveTab("active")}
+        />
       );
 
     case "run-findings":
@@ -675,23 +775,7 @@ export function TabContent({
               onNavigateToActive={() => setActiveTab("active")}
             >
               <ErrorBoundary componentName="AiTab">
-                <AiTab
-                  aiOutputLines={aiOutputLogs}
-                  onClearAiOutput={clearAiOutputLogs}
-                  onAddAiOutputLine={(line) =>
-                    addAiOutputLog(
-                      line.line,
-                      line.source,
-                      line.actionId,
-                      line.taskRunId,
-                      line.sessionId,
-                      line.sessionName,
-                      line.phase,
-                      line.phaseIteration,
-                    )
-                  }
-                  onNavigateToLibrary={() => setActiveTab("library")}
-                />
+                <AiOutputPanel onNavigateToLibrary={() => setActiveTab("library")} />
               </ErrorBoundary>
             </RunPageLayout>
           </RunSelectionProvider>
@@ -758,23 +842,7 @@ export function TabContent({
       return (
         <div data-page-id="ai" className="h-full overflow-hidden">
           <ErrorBoundary componentName="AiTab">
-            <AiTab
-              aiOutputLines={aiOutputLogs}
-              onClearAiOutput={clearAiOutputLogs}
-              onAddAiOutputLine={(line) =>
-                addAiOutputLog(
-                  line.line,
-                  line.source,
-                  line.actionId,
-                  line.taskRunId,
-                  line.sessionId,
-                  line.sessionName,
-                  line.phase,
-                  line.phaseIteration,
-                )
-              }
-              onNavigateToLibrary={() => setActiveTab("library")}
-            />
+            <AiOutputPanel onNavigateToLibrary={() => setActiveTab("library")} />
           </ErrorBoundary>
         </div>
       );
@@ -786,30 +854,17 @@ export function TabContent({
           className="flex-1 flex flex-col min-h-0 p-4 h-full overflow-hidden"
         >
           <div className="flex-1 flex flex-col min-h-0 card overflow-hidden">
-            <LogsTab
-              logs={logs}
-              filteredLogs={filteredLogs}
-              logLevel={logLevel}
-              onLogLevelChange={setLogLevel}
-              showLogFilter={uiState.showLogFilter}
-              onToggleLogFilter={uiState.setShowLogFilter}
-              imageLogs={imageLogs}
-              onImageRowClick={modalState.openImageModal}
-              actionLogData={actionLogViewData}
+            <LogsPanel
+              uiState={uiState}
+              modalState={modalState}
+              actionLogViewData={actionLogViewData}
               actionLogLoading={actionLogLoading}
               actionLogError={actionLogError}
-              onActionRowClick={modalState.openActionModal}
-              logCount={logCount}
-              imageLogCount={imageLogCount}
-              actionCount={actionLogViewData?.visible_count || 0}
-              onClearGeneralLogs={clearGeneralLogs}
-              onClearImageLogs={clearImageLogs}
-              onClearActionLogs={clearActionLogs}
-              onClearAllLogs={clearAllLogs}
-              onCopyLogs={handleCopyLogs}
-              copySuccess={uiState.copySuccess}
-              activeSubTab={activeLogSubTab}
-              onSubTabChange={setActiveLogSubTab}
+              clearActionLogs={clearActionLogs}
+              clearAllLogs={clearAllLogs}
+              handleCopyLogs={handleCopyLogs}
+              activeLogSubTab={activeLogSubTab}
+              setActiveLogSubTab={setActiveLogSubTab}
             />
           </div>
         </div>
@@ -1227,20 +1282,6 @@ export function TabContent({
             description="UI Bridge regression suites — run a suite, walk live registry assertions, and review coverage"
           />
           <RegressionTabPage />
-        </div>
-      );
-
-    case "memory-federation":
-      return (
-        <div data-page-id="memory-federation" className="h-full overflow-hidden">
-          <PageRegistration
-            id="memory-federation"
-            name="Memory Federation"
-            description="Cross-machine memory federation reconcile reports and health dashboard"
-          />
-          <Suspense fallback={<LazyFallback />}>
-            <MemoryFederationPage />
-          </Suspense>
         </div>
       );
 

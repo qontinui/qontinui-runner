@@ -77,12 +77,24 @@ jobs:
       #     silently passes, so SDK-vs-runner drift would not be flagged.
       # qontinui-schemas, qontinui-web, and ui-bridge are public org-owned
       # repos; the default github.token authenticates the clone, no PAT needed.
+      #
+      # The schemas clone is pinned to the ref resolved below rather than the
+      # default branch, so a breaking types change can go green as a
+      # same-named schemas+runner branch pair instead of deadlocking. See
+      # .github/actions/resolve-schemas-ref/action.yml for the full rationale.
+      - name: Resolve sibling qontinui-schemas ref
+        id: schemas-ref
+        uses: ./.github/actions/resolve-schemas-ref
+
       - name: Checkout sibling repos
         run: |
           cd "$GITHUB_WORKSPACE/.."
-          git clone --depth 1 https://github.com/qontinui/qontinui-schemas.git
+          : "${SCHEMAS_REF:?resolve-schemas-ref produced no output}"
+          git clone --depth 1 --branch "$SCHEMAS_REF" https://github.com/qontinui/qontinui-schemas.git
           git clone --depth 1 https://github.com/qontinui/qontinui-web.git
           git clone --depth 1 https://github.com/qontinui/ui-bridge.git
+        env:
+          SCHEMAS_REF: ${{ steps.schemas-ref.outputs.ref }}
         shell: bash
 
       - name: Setup pnpm
@@ -477,13 +489,21 @@ jobs:
       - uses: actions/checkout@v5
 
       # Rust path-dep on ../../qontinui-schemas/rust + the SDK↔runner manifest
-      # diff test read; same rationale as the `test` job's sibling checkout.
+      # diff test read; same rationale as the `test` job's sibling checkout,
+      # including the same-named-branch resolution for the schemas clone.
+      - name: Resolve sibling qontinui-schemas ref
+        id: schemas-ref
+        uses: ./.github/actions/resolve-schemas-ref
+
       - name: Checkout sibling repos
         run: |
           cd "$GITHUB_WORKSPACE/.."
-          git clone --depth 1 https://github.com/qontinui/qontinui-schemas.git
+          : "${SCHEMAS_REF:?resolve-schemas-ref produced no output}"
+          git clone --depth 1 --branch "$SCHEMAS_REF" https://github.com/qontinui/qontinui-schemas.git
           git clone --depth 1 https://github.com/qontinui/qontinui-web.git
           git clone --depth 1 https://github.com/qontinui/ui-bridge.git
+        env:
+          SCHEMAS_REF: ${{ steps.schemas-ref.outputs.ref }}
         shell: bash
 
       - name: Setup pnpm
@@ -651,12 +671,21 @@ jobs:
 
       # cargo audit walks the workspace and resolves path: deps. The runner's
       # src-tauri/Cargo.toml depends on `qontinui-types` from a sibling repo.
-      # Same multi-checkout pattern as the test job. Frontend link: deps have
+      # Same multi-checkout pattern as the test job — including the
+      # same-named-branch resolution, so `cargo audit` resolves the path dep
+      # against the very tree the `test` job compiled. Frontend link: deps have
       # moved to npm so ui-bridge no longer needs cloning here.
+      - name: Resolve sibling qontinui-schemas ref
+        id: schemas-ref
+        uses: ./.github/actions/resolve-schemas-ref
+
       - name: Checkout sibling repos
         run: |
           cd "$GITHUB_WORKSPACE/.."
-          git clone --depth 1 https://github.com/qontinui/qontinui-schemas.git
+          : "${SCHEMAS_REF:?resolve-schemas-ref produced no output}"
+          git clone --depth 1 --branch "$SCHEMAS_REF" https://github.com/qontinui/qontinui-schemas.git
+        env:
+          SCHEMAS_REF: ${{ steps.schemas-ref.outputs.ref }}
 
       - name: Run security audit on Rust dependencies
         # Cargo.lock lives at the workspace root (./Cargo.lock), not under
@@ -680,6 +709,72 @@ jobs:
         # not parse untrusted network XML through these paths (build-time
         # manifests/plists). These are the ONLY two quick-xml advisories in
         # the DB as of 2026-07-02. Revisit when tauri/gtk bump to >= 0.41.
+        #
+        # --ignore RUSTSEC-2026-0118 + RUSTSEC-2026-0119: two hickory-proto
+        # 0.25.2 advisories, reached via reqwest's `hickory-dns` feature (the
+        # async resolver that keeps DNS off tokio's blocking pool). reqwest
+        # 0.13 pins hickory-resolver 0.25.2, so neither is upgradable from
+        # here. Neither is reachable in THIS build:
+        #
+        #   0118 (NSEC3 closest-encloser proof enters an unbounded loop on
+        #   cross-zone responses; "No fixed upgrade is available!") lives in
+        #   DNSSEC validation, which is NOT COMPILED IN. Verified with
+        #   `cargo tree -e features -i hickory-proto`: the enabled feature set
+        #   is exactly {futures-io, std, tokio} and contains no `dnssec*`
+        #   feature, so the validation path does not exist in the binary.
+        #
+        #   0119 (CPU exhaustion from O(n²) name compression) is in message
+        #   ENCODING — i.e. queries we construct for hostnames WE configure
+        #   (coord, localhost, api). Triggering it needs control of the names
+        #   being encoded, which already implies control of runner config.
+        #
+        # Re-check both if a `dnssec` feature is ever enabled on hickory-proto,
+        # or if the runner starts resolving attacker-supplied hostnames.
+        # Revisit when reqwest bumps hickory-resolver to >= 0.26.1.
+        #
+        # --ignore RUSTSEC-2026-0235: rkyv 0.7.46, out-of-bounds reads from
+        # insufficient archive validation on archives containing Rc/Arc.
+        # Disclosed 2026-05-13, published to the RustSec DB 2026-08-04, and it
+        # immediately red-ed the `security` check on EVERY open runner PR
+        # (e.g. #954, #955 — neither of which changes Cargo.lock). main only
+        # read green because its last `security` run predated the publication,
+        # and would have gone red on its next one.
+        #
+        # NOT UPGRADABLE FROM HERE. The advisory's fix is >= 0.8.17, a
+        # semver-MAJOR bump, so `cargo update -p rkyv` cannot reach it. rkyv
+        # enters the lock through exactly one edge:
+        #
+        #   qontinui-runner -> qontinui-db (src-tauri/clorinde)
+        #                   -> rust_decimal 1.42.0 -> rkyv 0.7.46
+        #
+        # rust_decimal declares `rkyv = { version = "0.7.46", optional = true }`,
+        # and no published rust_decimal — through the current latest, 1.42.1 —
+        # takes rkyv >= 0.8 as a NORMAL dependency: every release pins a
+        # `^0.7.x` range that resolves to 0.7.46, and 0.8.x appears there only
+        # as a dev-dependency (`rkyv-0_8`), which never enters our lock. So no
+        # reachable version of the intermediate crate moves us off the 0.7
+        # line, and the 0.7 line has no patched release (0.7.46 is its last).
+        #
+        # NOT REACHABLE — the crate is not merely unused at runtime, it is
+        # NEVER COMPILED. rkyv is gated behind rust_decimal's optional `rkyv`
+        # feature; qontinui-db enables only `db-postgres`, so the feature is
+        # never activated. Verified on this tree:
+        #
+        #   $ cargo tree -i rkyv --target all --all-features
+        #   warning: nothing to print.
+        #
+        # It is in Cargo.lock solely because Cargo resolves optional deps into
+        # the lockfile regardless of feature activation — the same reason
+        # `borsh` (rust_decimal's other unactivated optional dep) is pinned
+        # there and equally never built — and cargo-audit reads the lockfile
+        # without feature awareness. No rkyv code ships in any runner artifact,
+        # so no rkyv archive is ever deserialized by the runner.
+        #
+        # REVIEW BY 2026-11-04 (or sooner on either trigger): drop this ignore
+        # the moment rust_decimal ships a release depending on rkyv >= 0.8.17,
+        # and RE-ASSESS IMMEDIATELY if anything ever enables rust_decimal's
+        # `rkyv`/`rkyv-safe` feature — that would make the vulnerable code real
+        # and this justification void. Tracking: qontinui/qontinui-runner#956.
         run: |
           # --locked: install cargo-audit against its OWN bundled Cargo.lock.
           # Without it, cargo resolves cargo-audit's transitive deps to latest
@@ -688,7 +783,7 @@ jobs:
           # and reds this job on every PR (an upstream ecosystem drift, not a
           # runner vulnerability). --locked pins to cargo-audit's tested deps.
           cargo install cargo-audit --locked
-          cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
+          cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119 --ignore RUSTSEC-2026-0235
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4

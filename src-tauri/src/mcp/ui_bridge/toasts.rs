@@ -62,6 +62,7 @@ pub async fn ui_bridge_control_toasts_handler(
     // Short-circuit when the SDK isn't connected. Matches the plan: "if the
     // SDK isn't connected, return an empty list with success: true."
     let last_pong = state
+        .app_state
         .ui_bridge_last_pong
         .load(std::sync::atomic::Ordering::Relaxed);
     if last_pong == 0 {

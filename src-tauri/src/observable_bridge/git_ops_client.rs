@@ -1,10 +1,11 @@
 //! Thin HTTP wrapper around coord's `/coord/git-ops/*` routes used by
 //! [`crate::observable_bridge::git_ops::GitOpBridge`].
 //!
-//! Mirrors [`super::memory_client`] exactly — there is no central
-//! `coord_client` crate in the runner, so each observable bridge passes
-//! its own long-lived `reqwest::Client` so TLS keepalives amortize across
-//! the per-session call chain (a session emits many `record` POSTs).
+//! Mirrors the ad-hoc idiom from `fleet.rs::register_with_coord` — there
+//! is no central `coord_client` crate in the runner, so each observable
+//! bridge passes its own long-lived `reqwest::Client` so TLS keepalives
+//! amortize across the per-session call chain (a session emits many
+//! `record` POSTs).
 //!
 //! The bridge only ever *records* ops; it never lists/pulls git state
 //! (coord does not dictate the working tree — see `GitOpBridge::pull`,
@@ -16,8 +17,8 @@ use std::time::Duration;
 use uuid::Uuid;
 
 /// Per-call timeout. `record` writes one append-only row — it should land
-/// well under this. Matches `memory_client`'s 10s budget for single-row
-/// POSTs.
+/// well under this. Matches `fleet::publish_budget`'s 10s budget for
+/// single-row POSTs.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Coord's tenant-scoping header. Coord's `TenantId` extractor
@@ -25,14 +26,13 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// from this header — it does NOT parse the Bearer JWT. Without this
 /// header every call 403s with `tenant_not_resolved`. The bridge resolves
 /// `tenant_id` locally (paired_user.json / OAuth claim) and sends it here;
-/// the Bearer token is retained (commented, like `memory_client`) for
-/// forward-compat with the future authenticated path.
+/// the Bearer token is retained for forward-compat with the future
+/// authenticated path.
 const TENANT_HEADER: &str = "X-Qontinui-Tenant-Id";
 
-/// Build the long-lived reqwest client the bridge reuses across calls.
-/// Identical posture to [`super::memory_client::build_client`]: a pooled
-/// client with a 300s idle timeout + 60s TCP keepalive so the TLS
-/// connection survives between a session's git ops.
+/// Build the long-lived reqwest client the bridge reuses across calls:
+/// a pooled client with a 300s idle timeout + 60s TCP keepalive so the
+/// TLS connection survives between a session's git ops.
 pub fn build_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
@@ -42,11 +42,16 @@ pub fn build_client() -> Result<reqwest::Client> {
         .context("observable_bridge::git_ops_client: reqwest client build")
 }
 
-/// Resolve the coord HTTP base from the active profile's `coord_url`.
-/// Delegates to [`super::memory_client::coord_http_base`] so the
-/// `wss://…/ws` → `https://…` normalization lives in one place.
+/// Resolve the coord HTTP base. Delegates to the shared resolver in
+/// `crate::profiles` so the `wss://…/ws` → `https://…` normalization
+/// (and the `COORD_HTTP_URL` env override) lives in one place.
+///
+/// Preserves `None` when nothing is configured (Option-family contract).
 pub fn coord_http_base() -> Option<String> {
-    super::memory_client::coord_http_base()
+    match crate::profiles::resolve_coord_base() {
+        crate::profiles::CoordBase::Configured(base) => Some(base),
+        _ => None,
+    }
 }
 
 /// `POST /coord/git-ops/record` — append one git op to the tenant feed.

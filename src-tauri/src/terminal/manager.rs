@@ -178,6 +178,51 @@ impl TerminalManager {
         Ok(())
     }
 
+    /// Move a terminal session onto a different page and emit a
+    /// `terminal-page-changed` Tauri event so other webview windows (and the
+    /// backend relay's WS subscribers) re-mount the tab under its new page.
+    ///
+    /// Phase 5 of the runner-API account-selection plan
+    /// (`2026-07-18-runner-api-account-selection.md`): the
+    /// `POST /terminals/{id}/move` surface routes here. Mirrors
+    /// [`Self::set_title`] — same lookup / mutate / durable-flush / double-emit
+    /// shape. The move is also flushed to the lifecycle registry so a restart
+    /// restores the pane on its CURRENT page, not the spawn-time one.
+    pub fn set_page(
+        &self,
+        id: &str,
+        page_id: String,
+        app_handle: &AppHandle,
+    ) -> Result<(), String> {
+        let session = self
+            .get(id)
+            .ok_or_else(|| format!("Terminal session not found: {}", id))?;
+        session.set_page(page_id.clone());
+        // Durable-page sync: mirror the move into the lifecycle registry so a
+        // restart restores the pane under its CURRENT page. No-ops cleanly when
+        // the terminal has no open record or the store isn't managed.
+        {
+            use tauri::Manager;
+            if let Some(store) = app_handle
+                .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+            {
+                store.update_page_by_terminal(id, &page_id);
+            }
+        }
+        let payload = serde_json::json!({ "id": id, "pageId": page_id });
+        if let Err(e) = app_handle.emit("terminal-page-changed", &payload) {
+            error!("Failed to emit terminal-page-changed: {}", e);
+        }
+        // Mirror to the backend WS relay so remote viewers stay consistent
+        // (same pattern as set_title's terminal-title-changed mirror).
+        crate::event_system::broadcast_ws_notification(
+            app_handle,
+            "terminal-page-changed",
+            &payload,
+        );
+        Ok(())
+    }
+
     /// Like [`Self::set_title`], but silently drops the update when the
     /// terminal is registered with a `WorkerSession` in `session_manager`.
     /// Used by the `terminal_set_title` Tauri command to pin `Worker N`

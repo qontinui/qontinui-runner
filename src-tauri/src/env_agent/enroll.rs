@@ -163,6 +163,7 @@ pub fn run_enroll(params: EnrollParams) -> Result<EnrollOutcome, String> {
         machine_id: parsed.machine_id.clone(),
         environment_id: environment_id.clone(),
         enrolled_at: Some(chrono::Utc::now().to_rfc3339()),
+        scope_root: carried_forward_scope_root(EnvAgentConfig::load()),
     };
     cfg.save()
         .map_err(|e| format!("enrolled + key stored, but writing env-agent.json failed: {e}"))?;
@@ -172,6 +173,21 @@ pub fn run_enroll(params: EnrollParams) -> Result<EnrollOutcome, String> {
         environment_id,
         backend_url: backend,
     })
+}
+
+/// The `scope_root` an enroll must write, given whatever config was already on
+/// disk: the PRIOR value, carried forward unchanged.
+///
+/// Enroll rewrites `env-agent.json` **wholesale**, so returning `None` here
+/// would silently erase an operator's declared capture scope on every
+/// re-enroll. The symptom would not be an error — it would be a box quietly
+/// re-measuring a different toolchain and reporting drift nobody could explain.
+///
+/// Split out from [`run_enroll`] purely so this is reachable by a test: the
+/// carry-forward sits AFTER the enroll POST, so no test that stops at
+/// validation can observe it.
+fn carried_forward_scope_root(prior: Option<EnvAgentConfig>) -> Option<String> {
+    prior.and_then(|p| p.scope_root)
 }
 
 /// Resolve the web backend base URL for the enroll POST. Order:
@@ -262,6 +278,42 @@ pub fn local_machine_identity() -> LocalMachineIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Re-enroll must PRESERVE a declared capture scope. Enroll replaces the
+    /// whole config file, so a regression here erases the operator's
+    /// `scope_root` — and because the erased state is a perfectly valid config,
+    /// the only visible symptom is the box silently re-measuring a different
+    /// toolchain. That is worth a test even though the helper is one line.
+    #[test]
+    fn enroll_carries_a_declared_scope_root_forward() {
+        let prior = EnvAgentConfig {
+            backend_url: "http://h:8000".to_string(),
+            machine_id: "m".to_string(),
+            environment_id: "e".to_string(),
+            enrolled_at: Some("2026-06-22T00:00:00Z".to_string()),
+            scope_root: Some("D:/qontinui-root".to_string()),
+        };
+        assert_eq!(
+            carried_forward_scope_root(Some(prior)).as_deref(),
+            Some("D:/qontinui-root"),
+        );
+    }
+
+    /// A first enroll (no config on disk) and a re-enroll of a box that never
+    /// declared a scope both yield `None` — the field stays absent rather than
+    /// being invented.
+    #[test]
+    fn enroll_leaves_scope_root_unset_when_there_was_none() {
+        assert!(carried_forward_scope_root(None).is_none());
+        assert!(carried_forward_scope_root(Some(EnvAgentConfig {
+            backend_url: "http://h:8000".to_string(),
+            machine_id: "m".to_string(),
+            environment_id: "e".to_string(),
+            enrolled_at: None,
+            scope_root: None,
+        }))
+        .is_none());
+    }
 
     #[test]
     fn resolve_backend_prefers_explicit_and_trims_slash() {

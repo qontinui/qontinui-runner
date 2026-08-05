@@ -12,14 +12,14 @@
  *   2. `deriveGithubPickerView` — the loading → error → signed_out →
  *      not_connected → connected precedence, including the regression case
  *      where a thrown auth error must NOT collapse to the Connect-GitHub CTA.
+ *   3. `isAuthLoadError` — which failures the error view offers sign-in for.
  */
 
 import { describe, it, expect } from "vitest";
 
-import { classifyLoadError, deriveGithubPickerView } from "./GithubRepoPicker";
+import { classifyLoadError, deriveGithubPickerView, isAuthLoadError } from "./GithubRepoPicker";
 
-const HEADLINE_401 =
-  "Your Qontinui sign-in has expired. Re-open Settings → Account and sign in again.";
+const HEADLINE_401 = "Your Qontinui sign-in has expired. Sign in again to continue.";
 const HEADLINE_403 =
   "Your account isn't authorized for this workspace's GitHub connection. (Couldn't resolve your tenant.)";
 const HEADLINE_NETWORK = "Couldn't reach Qontinui. Check your connection and retry.";
@@ -44,12 +44,45 @@ describe("classifyLoadError", () => {
     expect(classifyLoadError("Backend returned 500: boom")).toBe(HEADLINE_GENERIC);
   });
 
+  it("never points at Settings → Account, which the wizard cannot reach", () => {
+    // The wizard renders BEFORE the LoginScreen, so any instruction to visit
+    // Settings is unreachable advice at this point in onboarding. Every headline
+    // must be actionable from inside the wizard itself.
+    const raws = [
+      "Backend returned 401: unauthorized",
+      "Backend returned 403: tenant_not_resolved",
+      "Failed to reach Qontinui backend: connection refused",
+      "Backend returned 500: boom",
+    ];
+    for (const raw of raws) {
+      expect(classifyLoadError(raw)).not.toMatch(/Settings/);
+    }
+  });
+
   it("checks 401 before 403 (deterministic precedence)", () => {
     // A message that mentions both codes must resolve to the 401 headline,
     // proving the most-specific-first ordering is stable.
     const raw = "Backend returned 401: token expired (was previously 403)";
     expect(classifyLoadError(raw)).toBe(HEADLINE_401);
     expect(classifyLoadError(raw)).not.toBe(HEADLINE_403);
+  });
+});
+
+describe("isAuthLoadError", () => {
+  it("is true for a 401 — the user can clear it by signing in again", () => {
+    expect(isAuthLoadError("Backend returned 401: unauthorized")).toBe(true);
+  });
+
+  it("is false for 403 / network / server faults — signing in would not help", () => {
+    expect(isAuthLoadError("Backend returned 403: tenant_not_resolved")).toBe(false);
+    expect(isAuthLoadError("Failed to reach Qontinui backend: connection refused")).toBe(false);
+    expect(isAuthLoadError("Backend returned 500: boom")).toBe(false);
+  });
+
+  it("agrees with classifyLoadError on which failure is the expired-session one", () => {
+    const raw = "Backend returned 401: token expired";
+    expect(isAuthLoadError(raw)).toBe(true);
+    expect(classifyLoadError(raw)).toBe(HEADLINE_401);
   });
 });
 

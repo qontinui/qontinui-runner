@@ -4,7 +4,7 @@
     "@dagrejs/dagre": "^3.0.0",
     "@monaco-editor/react": "^4.7.0",
     "@qontinui/design-tokens": "^1.0.0",
-    "@qontinui/navigation": "^0.3.1",
+    "@qontinui/navigation": "^0.4.0",
     "@qontinui/shared-types": "^0.6.0",
     "@qontinui/ui-bridge": "^0.22.0",
     "@qontinui/ui-bridge-auto": "^0.1.7",
@@ -104,6 +104,8 @@
     "validate:ws-actions": "node scripts/validate-ws-actions.mjs",
     "coverage-diff": "node scripts/coverage-diff.mjs",
     "coverage-diff:test": "node --test scripts/__tests__/coverage-diff.test.mjs",
+    "perf-harness": "node scripts/perf-harness.mjs",
+    "perf-harness:test": "node --test scripts/__tests__/perf-harness-lib.test.mjs",
     "vocab:gen": "node scripts/validate-ws-actions.mjs --emit-doc ui-bridge/docs-site/docs/wrappers/action-vocabulary.md",
     "vocab:check": "node scripts/validate-ws-actions.mjs --check-doc ui-bridge/docs-site/docs/wrappers/action-vocabulary.md",
     "dev": "vite",
@@ -130,7 +132,7 @@
   "pnpm": {
     "overrides": {
       "@qontinui/shared-types": "^0.6.0",
-      "dompurify": ">=3.4.11",
+      "dompurify": ">=3.4.12",
       "esbuild": ">=0.28.1",
       "@babel/core": "^7.29.6",
       "shell-quote": ">=1.8.4"

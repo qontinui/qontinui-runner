@@ -105,6 +105,34 @@ export class LogStore {
   private listeners = new Set<StoreListener>();
 
   /**
+   * Cached copies handed to consumers. `null` means "rebuild on next read".
+   *
+   * The getters used to allocate a fresh array on EVERY call, so a React
+   * subscriber's `setState` could never bail on identity and every log line
+   * re-rendered its whole subtree — and a `useSyncExternalStore` consumer
+   * would loop forever. Caching gives them a stable identity between
+   * mutations (plan `2026-07-28-runner-many-sessions-performance` §0 A2).
+   *
+   * Invalidation is eager (on mutation) but rebuilding is lazy (on read), so
+   * a synchronous read straight after a mutation still sees fresh data even
+   * though the NOTIFICATION is deferred by {@link NOTIFY_DEBOUNCE_MS}.
+   */
+  private generalSnapshot: LogEntry[] | null = null;
+  private imageSnapshot: ImageRecognitionEntry[] | null = null;
+  private aiOutputSnapshot: AiOutputEntry[] | null = null;
+
+  /**
+   * Trailing debounce for listener notification.
+   *
+   * `notifyListeners` was a bare synchronous fan-out called from 9 mutation
+   * sites, so a burst of AI output produced one full app re-render per line.
+   * Coalescing on a 100 ms trailing timer caps that at 10 Hz while staying
+   * well inside "feels live" for a log pane.
+   */
+  private static readonly NOTIFY_DEBOUNCE_MS = 100;
+  private notifyTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /**
    * Add a general log entry
    */
   addGeneralLog(entry: LogEntry): void {
@@ -112,7 +140,7 @@ export class LogStore {
     if (this.generalLogs.length > MAX_GENERAL_LOGS) {
       this.generalLogs = evictOldest(this.generalLogs, MAX_GENERAL_LOGS);
     }
-    this.notifyListeners();
+    this.invalidate("general");
   }
 
   /**
@@ -130,7 +158,7 @@ export class LogStore {
       }
       this.imageLogs = evictOldest(this.imageLogs, MAX_IMAGE_LOGS);
     }
-    this.notifyListeners();
+    this.invalidate("image");
   }
 
   /**
@@ -141,7 +169,7 @@ export class LogStore {
     if (this.aiOutputLogs.length > MAX_AI_OUTPUT_LOGS) {
       this.aiOutputLogs = evictOldest(this.aiOutputLogs, MAX_AI_OUTPUT_LOGS);
     }
-    this.notifyListeners();
+    this.invalidate("ai");
   }
 
   /**
@@ -156,7 +184,7 @@ export class LogStore {
       this.aiOutputLogs = this.aiOutputLogs.slice(-MAX_AI_OUTPUT_LOGS);
     }
     if (entries.length > 0) {
-      this.notifyListeners();
+      this.invalidate("ai");
     }
   }
 
@@ -164,21 +192,24 @@ export class LogStore {
    * Get all general logs (returns a copy for React state compatibility)
    */
   getGeneralLogs(): LogEntry[] {
-    return [...this.generalLogs];
+    if (!this.generalSnapshot) this.generalSnapshot = [...this.generalLogs];
+    return this.generalSnapshot;
   }
 
   /**
    * Get all image logs (returns a copy for React state compatibility)
    */
   getImageLogs(): ImageRecognitionEntry[] {
-    return [...this.imageLogs];
+    if (!this.imageSnapshot) this.imageSnapshot = [...this.imageLogs];
+    return this.imageSnapshot;
   }
 
   /**
    * Get all AI output logs (returns a copy for React state compatibility)
    */
   getAiOutputLogs(): AiOutputEntry[] {
-    return [...this.aiOutputLogs];
+    if (!this.aiOutputSnapshot) this.aiOutputSnapshot = [...this.aiOutputLogs];
+    return this.aiOutputSnapshot;
   }
 
   /**
@@ -186,7 +217,7 @@ export class LogStore {
    */
   clearGeneralLogs(): void {
     this.generalLogs = [];
-    this.notifyListeners();
+    this.invalidate("general");
   }
 
   /**
@@ -194,7 +225,7 @@ export class LogStore {
    */
   clearImageLogs(): void {
     this.imageLogs = [];
-    this.notifyListeners();
+    this.invalidate("image");
   }
 
   /**
@@ -202,7 +233,7 @@ export class LogStore {
    */
   clearAiOutputLogs(): void {
     this.aiOutputLogs = [];
-    this.notifyListeners();
+    this.invalidate("ai");
   }
 
   /**
@@ -235,6 +266,39 @@ export class LogStore {
     return () => {
       this.listeners.delete(listener);
     };
+  }
+
+  /**
+   * Flush any pending listener notification immediately.
+   *
+   * Callers that need the UI to reflect a mutation synchronously (tests, a
+   * teardown path) can drain the debounce rather than waiting on the timer.
+   */
+  flushNotifications(): void {
+    if (this.notifyTimer === null) return;
+    clearTimeout(this.notifyTimer);
+    this.notifyTimer = null;
+    this.notifyListeners();
+  }
+
+  /**
+   * Drop the cached snapshot for the mutated bucket and schedule a
+   * (coalesced) notification.
+   */
+  private invalidate(bucket: "general" | "image" | "ai"): void {
+    if (bucket === "general") this.generalSnapshot = null;
+    else if (bucket === "image") this.imageSnapshot = null;
+    else this.aiOutputSnapshot = null;
+    this.scheduleNotify();
+  }
+
+  /** Trailing-edge coalescing: first mutation arms the timer, later ones ride it. */
+  private scheduleNotify(): void {
+    if (this.notifyTimer !== null) return;
+    this.notifyTimer = setTimeout(() => {
+      this.notifyTimer = null;
+      this.notifyListeners();
+    }, LogStore.NOTIFY_DEBOUNCE_MS);
   }
 
   /**

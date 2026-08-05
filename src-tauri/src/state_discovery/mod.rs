@@ -14,6 +14,7 @@ pub mod fingerprint;
 pub mod invalidate;
 
 pub use capture::enqueue_observation;
+pub use derive::run_derive_loop;
 pub use drift::run_drift_detector;
 pub use fingerprint::stable_element_fingerprint;
 

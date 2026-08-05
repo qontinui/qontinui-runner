@@ -18,7 +18,8 @@ import { ShareToMobileButton } from "./ClipboardSync";
 // ALL lines are processed, not just filtered ones displayed in this component.
 import { groupEntriesIntoLoops, type AiOutputLine } from "../types/aiLoop";
 import { useAiTaskPolling } from "../hooks";
-import { AiMessageDisplay, groupEntriesBySource } from "./shared";
+import { AiMessageDisplay, createIncrementalSourceGrouper } from "./shared";
+import { useStableInterval } from "../hooks/useStableInterval";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 export type { AiOutputLine } from "../types/aiLoop";
@@ -34,6 +35,8 @@ interface AiOutputTabProps {
 
 // Stable empty array for default prop to avoid creating new references on each render
 const EMPTY_LINES: AiOutputLine[] = [];
+// Stable empty entry list for the grouper when no loop is selected
+const EMPTY_ENTRIES: AiOutputLine[] = [];
 
 // Time threshold (ms) to consider AI as "recently active"
 const AI_ACTIVITY_THRESHOLD_MS = 5000;
@@ -57,6 +60,11 @@ export function AiOutputTab({
   const [hintQueued, setHintQueued] = useState(false);
   const [queuedHint, setQueuedHint] = useState("");
   const lastLineTimestampRef = useRef<number>(0);
+  // `lines` is read by the status poll through a ref so neither the poll
+  // callback nor the interval that drives it depends on the array identity.
+  // Before this, every streamed line tore down and re-armed the 1 s interval
+  // AND fired an immediate fetch + IPC — see plan 2026-07-28 §A5f.
+  const linesRef = useRef<AiOutputLine[]>(lines);
 
   // Drag-to-scroll state for session list
   const [isDragging, setIsDragging] = useState(false);
@@ -99,6 +107,19 @@ export function AiOutputTab({
     if (loops.length === 0) return null;
     return loops.find((loop) => loop.id === effectiveLoopId) ?? loops[loops.length - 1];
   }, [loops, effectiveLoopId]);
+
+  // Group the selected loop's entries ONCE per entry-list change instead of on
+  // every render. The grouper appends the new entries onto the previous result,
+  // so a streamed line costs O(1) rather than a full re-group, and unchanged
+  // groups keep their object identity so the memoised message blocks below
+  // don't re-render. Calling `groupEntriesBySource` inline in JSX (as this did)
+  // also produced a fresh array identity every render, which defeated
+  // `AiMessageDisplay`'s own memoisation — plan 2026-07-28 §A5c.
+  const [grouper] = useState(createIncrementalSourceGrouper);
+  const currentGroups = useMemo(
+    () => grouper.group(currentLoop?.entries ?? EMPTY_ENTRIES),
+    [grouper, currentLoop],
+  );
 
   // Build conversation history from lines
   const buildConversationHistory = useCallback(() => {
@@ -257,8 +278,10 @@ export function AiOutputTab({
     }
   }, []);
 
-  // Track the most recent line timestamp
+  // Track the most recent line timestamp and keep the poll's line ref fresh.
+  // Cheap: no interval or subscription is re-armed by this.
   useEffect(() => {
+    linesRef.current = lines;
     if (lines.length > 0) {
       const lastLine = lines[lines.length - 1];
       lastLineTimestampRef.current = lastLine.timestamp;
@@ -298,7 +321,8 @@ export function AiOutputTab({
       const timeSinceLastLine = now - lastLineTimestampRef.current;
       const hasRecentActivity = timeSinceLastLine < AI_ACTIVITY_THRESHOLD_MS;
       const isExecutorRunning = state === "Running";
-      const lastLine = lines.length > 0 ? lines[lines.length - 1] : null;
+      const currentLines = linesRef.current;
+      const lastLine = currentLines.length > 0 ? currentLines[currentLines.length - 1] : null;
       const isStreamingResponse = lastLine?.source === "claude";
 
       // Show as working if: has running tasks AND (recent activity OR executor running)
@@ -309,35 +333,42 @@ export function AiOutputTab({
       console.warn("[AiOutputTab] Failed to get executor status:", error);
       setIsAiWorking(false);
     }
-  }, [lines]);
+  }, []);
 
-  // Poll executor status when we have lines. When there are no lines, reset
-  // the working flag inside the async IIFE so the effect body itself doesn't
-  // call setState synchronously.
+  // Poll executor status while we have lines. The interval is armed once on the
+  // empty -> non-empty transition and survives every subsequent streamed line;
+  // `checkAiStatus` reads the latest lines through `linesRef`.
+  const hasLines = lines.length > 0;
+  const checkAiStatusNow = useStableInterval(checkAiStatus, STATUS_POLL_INTERVAL_MS, hasLines, {
+    fireOnEnable: true,
+  });
+
+  // Turn-start re-fire — NOT per line (that storm is what §A5f removed).
+  // `fireOnEnable` only covers the empty -> non-empty edge, so in a session
+  // that already has output, a new turn left `isAiWorking` false for up to a
+  // full poll period: long enough for a second Enter to send a second prompt
+  // instead of queueing it as a hint against the running one. One new loop is
+  // exactly one turn starting, wherever it was started from.
+  const turnCount = loops.length;
+  const previousTurnCountRef = useRef(turnCount);
   useEffect(() => {
+    const previous = previousTurnCountRef.current;
+    previousTurnCountRef.current = turnCount;
+    if (turnCount > previous) checkAiStatusNow();
+  }, [turnCount, checkAiStatusNow]);
+
+  // When there are no lines, clear the working flag (deferred by a microtask so
+  // the effect body itself doesn't call setState synchronously).
+  useEffect(() => {
+    if (hasLines) return;
     let cancelled = false;
-    if (lines.length === 0) {
-      void Promise.resolve().then(() => {
-        if (!cancelled) setIsAiWorking(false);
-      });
-      return () => {
-        cancelled = true;
-      };
-    }
-
-    // Check immediately (via microtask so the effect body itself doesn't
-    // synchronously trigger setState inside checkAiStatus).
     void Promise.resolve().then(() => {
-      if (!cancelled) void checkAiStatus();
+      if (!cancelled) setIsAiWorking(false);
     });
-
-    // Then poll periodically
-    const interval = setInterval(checkAiStatus, STATUS_POLL_INTERVAL_MS);
     return () => {
       cancelled = true;
-      clearInterval(interval);
     };
-  }, [lines, checkAiStatus]);
+  }, [hasLines]);
 
   // Auto-scroll to bottom when new lines arrive in current loop
   useEffect(() => {
@@ -542,13 +573,7 @@ export function AiOutputTab({
         ref={containerRef}
         className="flex-1 min-h-0 overflow-auto bg-background/50 rounded-lg border border-border p-4 text-sm"
       >
-        {currentLoop && (
-          <AiMessageDisplay
-            groups={groupEntriesBySource(currentLoop.entries)}
-            mode="log"
-            isAnimated
-          />
-        )}
+        {currentLoop && <AiMessageDisplay groups={currentGroups} mode="log" isAnimated />}
       </div>
 
       {/* Prompt/Hint input */}

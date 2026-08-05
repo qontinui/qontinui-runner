@@ -38,8 +38,8 @@ pub fn export_all_schemas() -> Value {
         execution as qe, findings as qfn, functional_spec as qfs, geometry as qg, git_ops as qgo,
         helper_task as qht, ir as qir, mcp_config as qmc, memory as qmem,
         orchestration_config as qoc, priorities_profile as qpp, process_management as qpm,
-        rag as qr, runner as qrn, scheduler as qs, spec_api_events as qsae, spec_check as qsc,
-        state_machine as qsm, targets as qt, task_run as qtr, terminal as qtm,
+        projects as qprj, rag as qr, runner as qrn, scheduler as qs, spec_api_events as qsae,
+        spec_check as qsc, state_machine as qsm, targets as qt, task_run as qtr, terminal as qtm,
         ticket_system as qts, tree_events as qte, ui_bridge as qub, verification as qv,
         worker_output as qwo, workflow as qw, workflow_step as qws,
     };
@@ -369,6 +369,18 @@ pub fn export_all_schemas() -> Value {
     add!("OutputLine", qpm::OutputLine);
     add!("ProcessConfig", qpm::ProcessConfig);
     add!("ProcessStatus", qpm::ProcessStatus);
+
+    // ── qontinui-types: projects (Projects dashboard) ──
+    add!("SavedProject", qprj::SavedProject);
+    add!("ProjectSnapshot", qprj::ProjectSnapshot);
+    add!("ProcessStatusLite", qprj::ProcessStatusLite);
+    add!("SessionSource", qprj::SessionSource);
+    add!("SessionLite", qprj::SessionLite);
+    add!("GitCommitLite", qprj::GitCommitLite);
+    add!("GitLite", qprj::GitLite);
+    add!("PendingQuestion", qprj::PendingQuestion);
+    add!("HealthLevel", qprj::HealthLevel);
+    add!("HealthLite", qprj::HealthLite);
 
     // ── qontinui-types: findings ──
     add!("FindingCategory", qfn::FindingCategory);
@@ -854,7 +866,12 @@ mod tests {
             obj.contains_key("HelperAnswer"),
             "Missing HelperAnswer schema"
         );
-        assert_eq!(obj.len(), 531, "Expected 531 schema entries");
+        // 531 + the 10 Projects-dashboard types registered above (SavedProject,
+        // ProjectSnapshot, ProcessStatusLite, SessionSource, SessionLite,
+        // GitCommitLite, GitLite, PendingQuestion, HealthLevel, HealthLite).
+        // Independently corroborated by the codegen, which reports
+        // "Processing 541 top-level types" and emits 541 .d.ts files.
+        assert_eq!(obj.len(), 541, "Expected 541 schema entries");
 
         // Sanity-check that qontinui_types re-exports are present
         assert!(

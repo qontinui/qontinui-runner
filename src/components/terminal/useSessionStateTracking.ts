@@ -1,8 +1,25 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import type { SessionState } from "./useZoneLayout";
 import { detectSessionState } from "./sessionStateDetector";
+import { getTerminalHotStore } from "./terminalHotStore";
+
+/** Element-wise equality for the sparkline ring buffers. */
+function sameNumbers(a: number[] | undefined, b: number[]): boolean {
+  if (!a || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
 
 export interface UseSessionStateTrackingParams {
+  /**
+   * Terminal page that owns these tabs. Hot per-tab data (`lastOutputLines`,
+   * `activityData`, `stateDurations`) is published into that page's
+   * {@link getTerminalHotStore} instead of React state, so one output frame
+   * no longer re-renders every `useTerminalSession()` consumer.
+   */
+  pageId: string;
   tabs: Array<{
     id: string;
     isAlive: boolean;
@@ -30,15 +47,18 @@ export interface UseSessionStateTrackingParams {
   seedLastOutput?: Record<string, number>;
 }
 
+/**
+ * Cold (non-per-frame) tracking surface. The hot maps — `lastOutputLines`,
+ * `activityData`, `stateDurations` — deliberately do NOT appear here: they
+ * live in the page's {@link getTerminalHotStore} and are read through
+ * `useHotField` / `useTabHotSlice`.
+ */
 export interface UseSessionStateTrackingReturn {
   sessionStates: Record<string, SessionState>;
   setSessionStates: React.Dispatch<React.SetStateAction<Record<string, SessionState>>>;
-  lastOutputLines: Record<string, string[]>;
   staleTabs: Set<string>;
-  stateDurations: Record<string, string>;
   stateTimeAccum: React.MutableRefObject<Record<SessionState, number>>;
   stateEntryTimeRef: React.MutableRefObject<Record<string, number>>;
-  activityData: Record<string, number[]>;
   prevSessionStatesRef: React.MutableRefObject<Record<string, SessionState>>;
   handleExit: (terminalId: string, exitCode: number | null) => void;
   handleOutput: (tabId: string, text: string) => void;
@@ -47,18 +67,18 @@ export interface UseSessionStateTrackingReturn {
 export function useSessionStateTracking(
   params: UseSessionStateTrackingParams,
 ): UseSessionStateTrackingReturn {
-  const { tabs, processOutput, getBufferLines, seedLastOutput } = params;
+  const { pageId, tabs, processOutput, getBufferLines, seedLastOutput } = params;
   const getBufferLinesRef = useRef(getBufferLines);
   useEffect(() => {
     getBufferLinesRef.current = getBufferLines;
   }, [getBufferLines]);
 
+  const hotStore = getTerminalHotStore(pageId);
+
   // ── State ─────────────────────────────────────────────────────────────────
 
   const [sessionStates, setSessionStates] = useState<Record<string, SessionState>>({});
-  const [lastOutputLines, setLastOutputLines] = useState<Record<string, string[]>>({});
   const [staleTabs, setStaleTabs] = useState<Set<string>>(new Set());
-  const [stateDurations, setStateDurations] = useState<Record<string, string>>({});
 
   // ── Refs ───────────────────────────────────────────────────────────────────
 
@@ -76,8 +96,6 @@ export function useSessionStateTracking(
 
   // Activity sparkline: ring buffer of output byte counts per 2s interval per tab
   const activityBuffersRef = useRef<Record<string, number[]>>({});
-  // State snapshot of activity buffers, updated on the 2s tick interval
-  const [activityDataSnapshot, setActivityDataSnapshot] = useState<Record<string, number[]>>({});
 
   // ── Idle / stale detection interval (2s) ──────────────────────────────────
 
@@ -161,13 +179,9 @@ export function useSessionStateTracking(
       return next;
     });
 
-    setLastOutputLines((prev) => {
-      const deadKeys = Object.keys(prev).filter((id) => !tabIdSet.has(id));
-      if (deadKeys.length === 0) return prev;
-      const next = { ...prev };
-      for (const key of deadKeys) delete next[key];
-      return next;
-    });
+    // Drop every hot-store entry (output lines, sparkline, duration, lock
+    // state) belonging to a tab that no longer exists.
+    hotStore.retainTabs(tabIdSet);
 
     // Clean up refs too
     for (const id of Object.keys(lastOutputTimeRef.current)) {
@@ -182,7 +196,7 @@ export function useSessionStateTracking(
     for (const id of Object.keys(activityBuffersRef.current)) {
       if (!tabIdSet.has(id)) delete activityBuffersRef.current[id];
     }
-  }, [tabs]);
+  }, [tabs, hotStore]);
 
   // ── Duration formatting interval (10s) ────────────────────────────────────
 
@@ -199,32 +213,50 @@ export function useSessionStateTracking(
 
     const update = () => {
       const now = Date.now();
+      // Reuse the previously-published string for every tab whose formatted
+      // duration is unchanged, so the store's identity check bails out and no
+      // consumer re-renders. Without this the sweep published a brand-new
+      // object every 10 s whether or not any label had actually ticked over.
+      const published = hotStore.getField("stateDurations");
       const durations: Record<string, string> = {};
       for (const [tabId, entryTime] of Object.entries(stateEntryTimeRef.current)) {
-        durations[tabId] = formatDuration(now - entryTime);
+        const formatted = formatDuration(now - entryTime);
+        const prev = published[tabId];
+        durations[tabId] = prev === formatted ? prev : formatted;
       }
-      setStateDurations(durations);
+      hotStore.setField("stateDurations", durations);
     };
 
     update();
     const interval = setInterval(update, 10000);
     return () => clearInterval(interval);
-  }, []); // Stable interval — duration updates independently of state changes
+  }, [hotStore]); // Stable interval — duration updates independently of state changes
 
   // ── Activity sparkline tick interval (2s) ─────────────────────────────────
 
   useEffect(() => {
     const interval = setInterval(() => {
       const buffers = activityBuffersRef.current;
+      const published = hotStore.getField("activityData");
+      const next: Record<string, number[]> = {};
       for (const tabId of Object.keys(buffers)) {
-        // Push current accumulator and reset; keep last 30 points
-        buffers[tabId] = [...(buffers[tabId] ?? []), 0].slice(-30);
+        // Push current accumulator and reset; keep last 30 points. The ref
+        // buffer always rotates (otherwise later output would land in an
+        // already-elapsed 2 s bucket) — only PUBLISHING is conditional.
+        const rotated = [...(buffers[tabId] ?? []), 0].slice(-30);
+        buffers[tabId] = rotated;
+        const prev = published[tabId];
+        // Reuse the published array when the values are identical (an idle
+        // tab whose ring is already full of zeros), so the store's identity
+        // check bails and no sparkline re-renders. Publish a COPY otherwise:
+        // `handleOutput` mutates the ref buffer's last slot in place, and a
+        // published snapshot must not change under its consumers.
+        next[tabId] = prev && sameNumbers(prev, rotated) ? prev : [...rotated];
       }
-      // Update the state snapshot so consumers re-render with latest data
-      setActivityDataSnapshot({ ...buffers });
+      hotStore.setField("activityData", next);
     }, 2000);
     return () => clearInterval(interval);
-  }, []);
+  }, [hotStore]);
 
   // ── Callbacks ─────────────────────────────────────────────────────────────
 
@@ -271,7 +303,7 @@ export function useSessionStateTracking(
       if (bufferReader) {
         const lines = bufferReader(tabId, 20);
         if (lines.length > 0) {
-          setLastOutputLines((prev) => ({ ...prev, [tabId]: lines }));
+          hotStore.setTabOutputLines(tabId, lines);
         }
       } else {
         // Fallback: strip ANSI and accumulate from raw output
@@ -289,36 +321,38 @@ export function useSessionStateTracking(
           .replace(/\r/g, "");
         const newLines = stripped.split("\n").filter((l) => l.trim().length > 0);
         if (newLines.length > 0) {
-          setLastOutputLines((prev) => {
-            const existing = prev[tabId] ?? [];
-            const combined = [...existing, ...newLines];
-            const deduped: string[] = [];
-            for (const line of combined) {
-              if (deduped.length === 0 || line !== deduped[deduped.length - 1]) {
-                deduped.push(line);
-              }
+          const existing = hotStore.getLastOutputLines(tabId);
+          const combined = [...existing, ...newLines];
+          const deduped: string[] = [];
+          for (const line of combined) {
+            if (deduped.length === 0 || line !== deduped[deduped.length - 1]) {
+              deduped.push(line);
             }
-            return { ...prev, [tabId]: deduped.slice(-20) };
-          });
+          }
+          hotStore.setTabOutputLines(tabId, deduped.slice(-20));
         }
       }
 
       processOutput?.(tabId, text);
     },
-    [processOutput],
+    [processOutput, hotStore],
   );
 
-  return {
-    sessionStates,
-    setSessionStates,
-    lastOutputLines,
-    staleTabs,
-    stateDurations,
-    stateTimeAccum,
-    stateEntryTimeRef,
-    activityData: activityDataSnapshot,
-    prevSessionStatesRef,
-    handleExit,
-    handleOutput,
-  };
+  // Memoize the return so the value object's identity only changes when
+  // something in it actually changed. Previously this was a bare object
+  // literal, which made the whole `TerminalSessionContext` value churn on
+  // every render of the page scope (plan §0 A1).
+  return useMemo(
+    () => ({
+      sessionStates,
+      setSessionStates,
+      staleTabs,
+      stateTimeAccum,
+      stateEntryTimeRef,
+      prevSessionStatesRef,
+      handleExit,
+      handleOutput,
+    }),
+    [sessionStates, staleTabs, handleExit, handleOutput],
+  );
 }

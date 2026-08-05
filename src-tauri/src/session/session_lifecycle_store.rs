@@ -708,9 +708,17 @@ impl SessionLifecycleStore {
 
     /// Mark an open session closed. No-op (no error) if the session is
     /// absent or already closed.
+    ///
+    /// Credential hygiene (Task 5): when this close ends the LAST open session
+    /// for its workdir, the workdir's coord-mcp proxy nonce is revoked and its
+    /// app-data session-restore config is reaped
+    /// ([`crate::coord_mcp::release_workdir_on_session_close`]) — a closed
+    /// session's credential must not stay live. Skipped for account-migration
+    /// closes (the session continues under a new record with the same workdir)
+    /// and when a sibling open session still shares the workdir.
     pub fn record_close(&self, claude_session_id: &str, reason: &str) {
         let now = Utc::now().timestamp_millis();
-        let snapshot = {
+        let (snapshot, closed_workdir) = {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
                 Err(e) => {
@@ -718,15 +726,16 @@ impl SessionLifecycleStore {
                     return;
                 }
             };
-            match m.get_mut(claude_session_id) {
+            let workdir = match m.get_mut(claude_session_id) {
                 Some(rec) if rec.state == "open" => {
                     rec.state = "closed".to_string();
                     rec.closed_at = Some(now);
                     rec.close_reason = Some(reason.to_string());
+                    rec.working_dir.clone()
                 }
                 _ => return, // absent or already closed — nothing to flush
-            }
-            m.clone()
+            };
+            (m.clone(), workdir)
         };
         self.persist(&snapshot);
         self.snapshot_change(&snapshot);
@@ -736,6 +745,22 @@ impl SessionLifecycleStore {
         // the production observer enqueues a coord `Closed` outbox row.
         if let Some(obs) = self.close_observer.get() {
             (obs.0)(claude_session_id);
+        }
+
+        // Credential hygiene: drop the coord-mcp device nonce bound to this
+        // workdir once no OPEN record still uses it. Runs after the observer
+        // notify above so a real close is always reported to coord, even when
+        // the migration early-return below keeps the nonce alive.
+        if reason == crate::terminal::account_migration::CLOSE_REASON_MIGRATED {
+            return; // the session lives on under a new record — keep its nonce
+        }
+        if let Some(wd) = closed_workdir {
+            let workdir_still_in_use = snapshot
+                .values()
+                .any(|r| r.state == "open" && r.working_dir.as_deref() == Some(wd.as_str()));
+            if !workdir_still_in_use {
+                crate::coord_mcp::release_workdir_on_session_close(&wd);
+            }
         }
     }
 
@@ -835,6 +860,38 @@ impl SessionLifecycleStore {
             }
             rec.terminal_id = terminal_id.to_string();
             rec.zone_index = zone_index;
+            m.clone()
+        };
+        self.persist(&snapshot);
+        self.snapshot_change(&snapshot);
+    }
+
+    /// Mirror a terminal-page move into the durable registry, resolved by
+    /// `terminal_id`. The `POST /terminals/{id}/move` surface mutates the
+    /// in-memory `TerminalSession.page_id`; without this flush the durable
+    /// record stays frozen at the spawn-time page, so a restart would restore
+    /// the pane on its original page rather than where the operator moved it.
+    /// Sibling of [`Self::update_title_by_terminal`]. No-op (no write) if no
+    /// open record references the terminal, or the page is already current.
+    pub fn update_page_by_terminal(&self, terminal_id: &str, page_id: &str) {
+        let snapshot = {
+            let mut m = match self.map.lock() {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = %e, "session_lifecycle_store: lock poisoned on update_page_by_terminal");
+                    return;
+                }
+            };
+            let Some(rec) = m
+                .values_mut()
+                .find(|r| r.state == "open" && r.terminal_id == terminal_id)
+            else {
+                return; // no open record hosts this terminal — nothing to flush
+            };
+            if rec.page_id == page_id {
+                return; // already current — nothing to flush
+            }
+            rec.page_id = page_id.to_string();
             m.clone()
         };
         self.persist(&snapshot);

@@ -79,6 +79,23 @@ pub async fn run_fix_agent(
     timeout_secs: u64,
     stop_rx: &watch::Receiver<bool>,
 ) -> Result<bool, String> {
+    // Agent-registry spawn authorization (plan
+    // `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c, served clause
+    // `agent-spawn-authorization`). This launches the `claude` CLI on the
+    // user's own AI account from an autonomous loop. It is `--print` — a
+    // one-shot that dies with the step that asked for it — so it is an
+    // `in_session_subagent` (implied-by-task, bounded), not a standing spawn.
+    // Checked before the prompt file is written so a refusal leaves no
+    // artifacts behind.
+    let authz = crate::agent_authorization::authorize_spawn(
+        Some("orchestration-fix-agent"),
+        crate::agent_authorization::SpawnPath::InSessionSubagent,
+    )
+    .await;
+    if let Some(refusal) = authz.refusal() {
+        return Err(refusal);
+    }
+
     // Write prompt to temp file
     let prompt_file = std::env::temp_dir().join("qontinui-orchestration-fix-prompt.md");
     tokio::fs::write(&prompt_file, prompt)
@@ -102,6 +119,8 @@ pub async fn run_fix_agent(
         model,
     ])
     .env_remove("CLAUDECODE")
+    // Same rule, sibling marker — see `session::transport::claude_cli` docs.
+    .env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV)
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
 

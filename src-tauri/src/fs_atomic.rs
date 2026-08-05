@@ -65,6 +65,90 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
     result
 }
 
+/// [`atomic_write`], but the file is owner-only from the moment it exists.
+///
+/// For credential stores, `atomic_write` followed by a permission fix is NOT
+/// equivalent to this. Two things go wrong with that ordering:
+///
+/// 1. `atomic_write` creates its temp with `File::create`, i.e. default umask
+///    (typically `0644`) / parent-inherited ACL. The ciphertext is therefore
+///    other-user-readable for the WHOLE write, not merely for a sliver after
+///    the rename.
+/// 2. The rename installs a NEW inode. If the post-hoc hardening then fails, a
+///    store that was `0600` from the previous save is left world-readable —
+///    the failure path silently DE-hardens a file that was already safe.
+///
+/// Hardening the temp before the rename removes both: the bytes are never
+/// visible to another user, and a hardening failure aborts the write instead of
+/// publishing a loosened file. The rename itself preserves the temp's
+/// permissions on both platforms (POSIX rename keeps the inode's mode;
+/// `MoveFileExW` keeps the file's explicit DACL).
+pub fn atomic_write_owner_only(path: &Path, data: &[u8]) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "atomic_write_owner_only: path has no parent directory",
+        )
+    })?;
+    let file_name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "atomic_write_owner_only: path has no UTF-8 file name",
+        )
+    })?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(
+        "{}.tmp.{}.{}.{}",
+        file_name,
+        std::process::id(),
+        seq,
+        nanos
+    ));
+
+    let result = (|| -> io::Result<()> {
+        // Unix: create at 0600 so the bytes are never group/other-readable.
+        // Windows has no create-mode equivalent, so the DACL is stamped on the
+        // temp immediately after creation and before any rename.
+        #[cfg(unix)]
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?
+        };
+        #[cfg(not(unix))]
+        let mut f = fs::File::create(&tmp)?;
+
+        #[cfg(windows)]
+        crate::fs_perms::restrict_to_owner(&tmp)?;
+
+        f.write_all(data)?;
+        f.flush()?;
+        f.sync_all()?;
+        drop(f);
+
+        // Belt-and-braces on unix: `mode()` applies only on create, and this
+        // path always creates, but re-asserting costs one syscall and makes the
+        // guarantee independent of that subtlety.
+        #[cfg(unix)]
+        crate::fs_perms::restrict_to_owner(&tmp)?;
+
+        fs::rename(&tmp, path)
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

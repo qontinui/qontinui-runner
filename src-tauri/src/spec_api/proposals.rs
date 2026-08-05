@@ -43,12 +43,11 @@ use crate::mcp::types::ApiState;
 use crate::spec_api::apps::AppErrorExt;
 use crate::spec_api::events;
 use crate::spec_api::responses::SpecError;
-// Converts an on-disk page id (`account-billing`) back to its pathname
-// (`/account/billing`). Owned by `spec_api::slug` alongside its inverse: the
-// copy that lived here recognised only `index` for the root page while the
-// slugger emits `root`, so `root` mapped to `/root` and this scan reported the
-// index page as un-spec'd.
-use crate::spec_api::slug::spec_id_to_pathname;
+// The single spelling of the index page's spec id. Owned by `spec_api::slug`
+// alongside both directions of the pathname ↔ spec-id mapping: the copy that
+// lived here recognised only `index` for the root page while the slugger emits
+// `root`, so the two ids shadowed each other on disk.
+use crate::spec_api::slug::INDEX_SPEC_ID;
 use crate::spec_api::storage;
 use qontinui_types::spec_api_events::SpecApiEvent;
 
@@ -650,6 +649,7 @@ fn authoring_error_reason(
         EmptyArtifact => "empty-artifact",
         NoPageObservations { .. } => "no-page-observations",
         NoActiveStates { .. } => "no-active-states",
+        ObservedButUnclustered { .. } => "observed-but-unclustered",
         MalformedAiOutput(_) => "malformed-ai-output",
         AiDispatchFailed(_) => "ai-dispatch-failed",
         ExistingSpecMissing(_) => "existing-spec-missing",
@@ -667,17 +667,28 @@ fn authoring_error_detail(
         }
         EmptyArtifact => "discovery artifact has zero states".to_string(),
         NoPageObservations { page_label } => format!(
-            "no observations labelled for page '{}' — the page has not been \
-             visited in the window, or capture is not labelling it",
+            "no observations labelled for page '{}' — the page has never been \
+             visited, or capture is not labelling it",
             page_label
         ),
         NoActiveStates {
             page_label,
             total_states,
         } => format!(
-            "none of the {} discovered states were fully present in any \
-             observation of page '{}'",
-            total_states, page_label
+            "page '{}' has been observed since the newest discovery artifact was derived, \
+             and none of its observations is in that artifact's render-set, so none of its \
+             {} states can be shown active here — re-derive to pick the page's newer visits up",
+            page_label, total_states
+        ),
+        ObservedButUnclustered {
+            page_label,
+            total_states,
+        } => format!(
+            "page '{}' has observations, all of them older than the newest discovery \
+             artifact, and that derivation clustered none of them into its {} states — \
+             re-deriving will not change this; the observations most likely carry no \
+             fingerprints, so they can never enter an artifact",
+            page_label, total_states
         ),
         MalformedAiOutput(s) => format!("malformed AI output: {}", s),
         AiDispatchFailed(s) => format!("AI dispatch failed: {}", s),
@@ -1084,8 +1095,11 @@ fn mint_proposal_id() -> String {
 /// Heuristic v1.0: strip the conventional source-tree prefix
 /// (`src/pages/...`, `src/app/...`, `app/...`), drop the file extension and
 /// the `index` leaf, lowercase, and slugify by joining the remaining
-/// segments with `-`. Files outside these prefixes return `None` (the
-/// caller drops them — patch routing is best-effort).
+/// segments with `-`. A bare `index` at the root becomes
+/// [`INDEX_SPEC_ID`] (`root`), matching what
+/// [`crate::spec_api::slug::pathname_to_spec_id`] emits for `/`. Files
+/// outside these prefixes return `None` (the caller drops them — patch
+/// routing is best-effort).
 ///
 /// Sibling-module symmetry: keeps the slug shape identical to the
 /// `pathname_to_spec_id` helper owned by `workflow_generation::spec_authoring`.
@@ -1129,11 +1143,12 @@ fn infer_target_spec_id(_app_id: &str, elem: &RegisteredElement) -> Option<Strin
     }
 
     // Drop trailing `index` (e.g. `account/billing/index.tsx` →
-    // `account/billing`). Index-at-root maps to "index".
+    // `account/billing`). Index-at-root maps to `INDEX_SPEC_ID` (`root`) —
+    // the one spelling `spec_api::slug` recognises for the `/` pathname.
     let trimmed: Vec<String> = if segments.last().map(|s| s.as_str()) == Some("index") {
         let n = segments.len();
         if n == 1 {
-            return Some("index".to_string());
+            return Some(INDEX_SPEC_ID.to_string());
         }
         segments.into_iter().take(n - 1).collect()
     } else {
@@ -1166,6 +1181,46 @@ mod tests {
 
     // `spec_id_to_pathname` behaviour is owned and tested by
     // `spec_api::slug`, together with its inverse.
+
+    /// Only the variant that actually means "your visits postdate the
+    /// derivation" may prescribe a re-derive.
+    ///
+    /// Regression guard for a diagnosis that asserted a cause it had not
+    /// measured: an empty page/artifact intersection used to map to
+    /// `NoActiveStates` unconditionally, so a page whose observations carry no
+    /// fingerprints — skipped by `derive::load_observations`, and therefore
+    /// unable to enter ANY artifact — was told to re-derive forever.
+    #[test]
+    fn only_the_stale_artifact_diagnosis_prescribes_a_re_derive() {
+        use crate::workflow_generation::spec_authoring::AuthoringError;
+
+        let stale = AuthoringError::NoActiveStates {
+            page_label: "account-billing".into(),
+            total_states: 3,
+        };
+        let unclustered = AuthoringError::ObservedButUnclustered {
+            page_label: "account-billing".into(),
+            total_states: 3,
+        };
+
+        assert_ne!(
+            authoring_error_reason(&stale),
+            authoring_error_reason(&unclustered),
+            "the two causes must be machine-distinguishable, not just worded differently"
+        );
+
+        let stale_detail = authoring_error_detail(&stale);
+        assert!(
+            stale_detail.contains("re-derive"),
+            "the stale-artifact case is the one a re-derive fixes: {stale_detail}"
+        );
+
+        let unclustered_detail = authoring_error_detail(&unclustered);
+        assert!(
+            unclustered_detail.contains("re-deriving will not change this"),
+            "the unclustered case must say re-deriving won't help: {unclustered_detail}"
+        );
+    }
 
     #[test]
     fn infer_target_spec_id_strips_src_pages() {
@@ -1222,9 +1277,12 @@ mod tests {
             line: 12,
             suggested_assertion: String::new(),
         };
+        // Must be the slugger's spelling of `/` (`root`), not the literal
+        // `index` leaf — the two used to be accepted interchangeably and so
+        // shadowed each other under `specs/pages/`.
         assert_eq!(
             infer_target_spec_id("qontinui-runner", &elem).as_deref(),
-            Some("index")
+            Some(INDEX_SPEC_ID)
         );
     }
 

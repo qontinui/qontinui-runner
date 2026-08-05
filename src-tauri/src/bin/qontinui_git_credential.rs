@@ -2,8 +2,26 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 
+use base64::Engine as _;
+
+/// Decision logging is opt-in via `QONTINUI_GIT_CRED_DEBUG=1`. This helper
+/// runs on EVERY git credential lookup in registered repos and git surfaces
+/// helper stderr straight to users, so the default must be silent.
+fn debug_enabled() -> bool {
+    std::env::var("QONTINUI_GIT_CRED_DEBUG").ok().as_deref() == Some("1")
+}
+
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if debug_enabled() {
+            eprintln!("qontinui-git-credential: {}", format_args!($($arg)*));
+        }
+    };
+}
+
 #[derive(Default)]
 struct Config {
+    coord_url: String,
     push_token: String,
     repos: Vec<String>,
 }
@@ -13,6 +31,11 @@ fn load_config(path: &str) -> Result<Config, String> {
     let v: serde_json::Value =
         serde_json::from_str(&data).map_err(|e| format!("parse config {path}: {e}"))?;
     Ok(Config {
+        coord_url: v
+            .get("coord_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
         push_token: v
             .get("push_token")
             .and_then(|v| v.as_str())
@@ -47,6 +70,43 @@ fn parse_stdin_pairs() -> HashMap<String, String> {
         }
     }
     pairs
+}
+
+/// Extract `(scheme, host)` from the coord base URL. The host keeps its port
+/// verbatim (`"localhost:9870"`) — the request-host comparison is exact,
+/// port included. Any non-http(s) or hostless URL is `None`.
+fn extract_coord_host_and_scheme(coord_url: &str) -> Option<(&str, &str)> {
+    let (scheme, rest) = if let Some(rest) = coord_url.strip_prefix("https://") {
+        ("https", rest)
+    } else if let Some(rest) = coord_url.strip_prefix("http://") {
+        ("http", rest)
+    } else {
+        return None;
+    };
+    let host = rest.split('/').next().unwrap_or(rest);
+    if host.is_empty() {
+        None
+    } else {
+        Some((scheme, host))
+    }
+}
+
+/// Best-effort JWT expiry for debug logging: if the push token looks like a
+/// JWT whose payload segment base64url-decodes to JSON with a numeric `exp`,
+/// return it. Any failure at any step is `None` — this must never affect the
+/// emit decision, and there is no signature verification (logging only).
+fn jwt_exp(token: &str) -> Option<i64> {
+    let mut parts = token.split('.');
+    let (_header, payload) = (parts.next()?, parts.next()?);
+    let _signature = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.as_bytes())
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    v.get("exp")?.as_i64()
 }
 
 /// Normalize a git-credential request `path` into a repo-slug candidate:
@@ -135,6 +195,85 @@ fn resolve_registered_slug<'a>(repos: &'a [String], candidate: &str) -> Option<&
     }
 }
 
+/// Pure decision core: given the parsed config and the request pairs, return
+/// the full output block to print (`Some`) or `None` for a silent
+/// fall-through to the next helper. Split from `main()` so tests exercise
+/// every exit path without spawning processes.
+fn respond(config: &Config, pairs: &HashMap<String, String>) -> Option<String> {
+    if config.push_token.is_empty() {
+        debug_log!("skip: empty config (no push_token)");
+        return None;
+    }
+
+    // Host scoping. The runner sets `credential.useHttpPath=true` per repo,
+    // so git sends `path=` to this helper for EVERY host a registered repo
+    // talks to — github.com included. The registered-repo check alone would
+    // therefore hand coord credentials to non-coord hosts. Only answer when
+    // the request host equals the coord host exactly (port included, e.g.
+    // "localhost:9870"); everything else falls through to the next helper.
+    let (_scheme, coord_host) = match extract_coord_host_and_scheme(&config.coord_url) {
+        Some(pair) => pair,
+        None => {
+            debug_log!(
+                "skip: config coord_url missing or unparseable ({:?})",
+                config.coord_url
+            );
+            return None;
+        }
+    };
+    let request_host = match pairs.get("host") {
+        Some(h) => h.as_str(),
+        None => {
+            debug_log!("skip: request has no host attribute");
+            return None;
+        }
+    };
+    if request_host != coord_host {
+        debug_log!("skip: request host {request_host} is not the coord host {coord_host}");
+        return None;
+    }
+
+    let candidate = match pairs.get("path") {
+        Some(p) => normalize_request_path(p),
+        None => {
+            debug_log!("skip: request has no path attribute");
+            return None;
+        }
+    };
+
+    // The resolved slug drives ONLY the decision to answer — the credential
+    // description git asked about is never rewritten (see below).
+    let slug = match resolve_registered_slug(&config.repos, candidate) {
+        Some(s) => s,
+        None => {
+            // Not a coord-registered repo; no output so git falls through.
+            debug_log!("skip: {candidate} is not a coord-registered repo");
+            return None;
+        }
+    };
+
+    if debug_enabled() {
+        match jwt_exp(&config.push_token) {
+            Some(exp) => {
+                debug_log!(
+                    "emit: coord credentials for host {request_host} repo {slug} (token exp {exp})"
+                )
+            }
+            None => debug_log!("emit: coord credentials for host {request_host} repo {slug}"),
+        }
+    }
+
+    // Emit ONLY the credentials. protocol/host/path are deliberately omitted:
+    // git treats missing attributes as unchanged, so the request's own
+    // description stays intact — rewriting it (e.g. to a normalized
+    // `path=git/<slug>.git`) would pollute chained credential stores with a
+    // description that differs from what git actually asked about.
+    Some(format!(
+        "username=x-access-token\npassword={}\n\n",
+        config.push_token
+    ))
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
 
@@ -180,34 +319,13 @@ fn main() -> ExitCode {
         }
     };
 
-    if config.push_token.is_empty() {
-        return ExitCode::SUCCESS;
-    }
-
     let pairs = parse_stdin_pairs();
 
-    let candidate = match pairs.get("path") {
-        Some(p) => normalize_request_path(p),
-        None => return ExitCode::SUCCESS,
-    };
-
-    // The resolved slug drives ONLY the decision to answer — the credential
-    // description git asked about is never rewritten (see below).
-    if resolve_registered_slug(&config.repos, candidate).is_none() {
-        // Not a coord-registered repo; exit with no output so git falls through.
-        return ExitCode::SUCCESS;
+    if let Some(output) = respond(&config, &pairs) {
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        let _ = out.write_all(output.as_bytes());
     }
-
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    // Emit ONLY the credentials. protocol/host/path are deliberately omitted:
-    // git treats missing attributes as unchanged, so the request's own
-    // description stays intact — rewriting it (e.g. to a normalized
-    // `path=git/<slug>.git`) would pollute chained credential stores with a
-    // description that differs from what git actually asked about.
-    let _ = writeln!(out, "username=x-access-token");
-    let _ = writeln!(out, "password={}", config.push_token);
-    let _ = writeln!(out);
 
     ExitCode::SUCCESS
 }
@@ -331,6 +449,157 @@ mod tests {
             resolve_registered_slug(&repos, candidate),
             Some("qontinui/foo.git")
         );
+    }
+
+    #[test]
+    fn extract_coord_host_https() {
+        let (scheme, host) = extract_coord_host_and_scheme("https://coord.qontinui.io").unwrap();
+        assert_eq!(scheme, "https");
+        assert_eq!(host, "coord.qontinui.io");
+    }
+
+    #[test]
+    fn extract_coord_host_http_with_port() {
+        let (scheme, host) = extract_coord_host_and_scheme("http://localhost:9870").unwrap();
+        assert_eq!(scheme, "http");
+        assert_eq!(host, "localhost:9870");
+        // Trailing slash / path segments never leak into the host.
+        let (_, host) = extract_coord_host_and_scheme("http://localhost:9870/").unwrap();
+        assert_eq!(host, "localhost:9870");
+        let (_, host) = extract_coord_host_and_scheme("https://coord.qontinui.io/coord").unwrap();
+        assert_eq!(host, "coord.qontinui.io");
+    }
+
+    #[test]
+    fn extract_coord_host_invalid() {
+        assert!(extract_coord_host_and_scheme("ftp://foo").is_none());
+        assert!(extract_coord_host_and_scheme("coord.qontinui.io").is_none());
+        assert!(extract_coord_host_and_scheme("https://").is_none());
+        assert!(extract_coord_host_and_scheme("").is_none());
+    }
+
+    fn test_config(coord_url: &str) -> Config {
+        Config {
+            coord_url: coord_url.to_string(),
+            push_token: "tok-123".to_string(),
+            repos: vec!["qontinui/qontinui-coord".to_string()],
+        }
+    }
+
+    fn pairs(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    const CRED_BLOCK: &str = "username=x-access-token\npassword=tok-123\n\n";
+
+    #[test]
+    fn respond_github_host_registered_repo_falls_through() {
+        // The live bug this closes: useHttpPath=true makes git send `path=`
+        // for github.com too — a registered slug there must NOT get coord
+        // credentials.
+        let config = test_config("https://coord.qontinui.io");
+        let req = pairs(&[
+            ("protocol", "https"),
+            ("host", "github.com"),
+            ("path", "qontinui/qontinui-coord.git"),
+        ]);
+        assert_eq!(respond(&config, &req), None);
+    }
+
+    #[test]
+    fn respond_coord_host_registered_repo_emits() {
+        let config = test_config("https://coord.qontinui.io");
+        let req = pairs(&[
+            ("protocol", "https"),
+            ("host", "coord.qontinui.io"),
+            ("path", "git/qontinui/qontinui-coord.git"),
+        ]);
+        assert_eq!(respond(&config, &req).as_deref(), Some(CRED_BLOCK));
+    }
+
+    #[test]
+    fn respond_coord_host_unregistered_repo_falls_through() {
+        let config = test_config("https://coord.qontinui.io");
+        let req = pairs(&[
+            ("host", "coord.qontinui.io"),
+            ("path", "git/other-org/other.git"),
+        ]);
+        assert_eq!(respond(&config, &req), None);
+    }
+
+    #[test]
+    fn respond_missing_host_falls_through() {
+        let config = test_config("https://coord.qontinui.io");
+        let req = pairs(&[("path", "git/qontinui/qontinui-coord.git")]);
+        assert_eq!(respond(&config, &req), None);
+    }
+
+    #[test]
+    fn respond_missing_path_falls_through() {
+        let config = test_config("https://coord.qontinui.io");
+        let req = pairs(&[("host", "coord.qontinui.io")]);
+        assert_eq!(respond(&config, &req), None);
+    }
+
+    #[test]
+    fn respond_port_bearing_host_matches_exactly() {
+        let config = test_config("http://localhost:9870");
+        let req = pairs(&[
+            ("host", "localhost:9870"),
+            ("path", "git/qontinui/qontinui-coord.git"),
+        ]);
+        assert_eq!(respond(&config, &req).as_deref(), Some(CRED_BLOCK));
+
+        // Mismatched or missing port is a different host — fall through.
+        for host in ["localhost:9871", "localhost"] {
+            let req = pairs(&[("host", host), ("path", "git/qontinui/qontinui-coord.git")]);
+            assert_eq!(respond(&config, &req), None, "host {host} must not match");
+        }
+    }
+
+    #[test]
+    fn respond_empty_or_unparseable_coord_url_fails_closed() {
+        // A config without coord_url (or with a non-http(s) one) can't be
+        // host-scoped — never emit.
+        for coord_url in ["", "ftp://coord.qontinui.io"] {
+            let config = test_config(coord_url);
+            let req = pairs(&[
+                ("host", "coord.qontinui.io"),
+                ("path", "git/qontinui/qontinui-coord.git"),
+            ]);
+            assert_eq!(respond(&config, &req), None, "coord_url {coord_url:?}");
+        }
+    }
+
+    #[test]
+    fn respond_empty_push_token_falls_through() {
+        let mut config = test_config("https://coord.qontinui.io");
+        config.push_token = String::new();
+        let req = pairs(&[
+            ("host", "coord.qontinui.io"),
+            ("path", "git/qontinui/qontinui-coord.git"),
+        ]);
+        assert_eq!(respond(&config, &req), None);
+    }
+
+    #[test]
+    fn jwt_exp_is_best_effort() {
+        // Well-formed JWT-shaped token with a numeric exp.
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"exp":1767225600,"sub":"push"}"#);
+        let token = format!("eyJhbGciOiJIUzI1NiJ9.{payload}.sig");
+        assert_eq!(jwt_exp(&token), Some(1767225600));
+
+        // Anything else decodes to None without erroring.
+        assert_eq!(jwt_exp("opaque-token"), None);
+        assert_eq!(jwt_exp("a.b"), None);
+        assert_eq!(jwt_exp("a.!!!.c"), None);
+        assert_eq!(jwt_exp("a.b.c.d"), None);
+        let no_exp = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"sub":"x"}"#);
+        assert_eq!(jwt_exp(&format!("h.{no_exp}.s")), None);
     }
 
     #[test]

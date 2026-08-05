@@ -426,7 +426,7 @@ async fn health(
     axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
 ) -> Json<serde_json::Value> {
     let uptime_secs = state.started_at.elapsed().as_secs();
-    let last_pong = state.ui_bridge_last_pong.load(Ordering::Relaxed);
+    let last_pong = state.app_state.ui_bridge_last_pong.load(Ordering::Relaxed);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -558,9 +558,16 @@ async fn health(
     // downgrade. Depends on B-1's pool timeout — plus a 2s ceiling here — so
     // the probe itself can never hang the handler.
     let pg_reachable = pg_liveness_probe().await;
+    // A dead WebView2 host leaves the Rust backend serving happily, so neither
+    // `ui_error` (React error boundary) nor `recent_crash` (startup-only dump
+    // scan) can see it. `last_pong` can — it advances off the unconditional 3s
+    // ping loop for as long as any UI is alive.
+    let ui_dead =
+        crate::ui_error::ui_stale(last_pong, pong_age_ms, crate::ui_error::UI_DEAD_AFTER_MS);
     let derived_status = crate::ui_error::compute_derived_status(
         ui_error_snapshot.is_some(),
         recent_crash_snapshot.is_some(),
+        Some(ui_dead),
         embedding_reachable_cached(),
         pg_reachable,
     );
@@ -614,6 +621,14 @@ async fn health(
         // chains missed (plain shell, or a session that never sniffed/
         // registered).
         "selfId": self_id_health_snapshot(),
+        // Session-fabric Phase 3: how each `POST /coord/session-handles/register`
+        // ended, since this process booted. coord records nothing for a
+        // REFUSED bind, so a systematically-denied registry (the wrong
+        // `agent_session_id` id space — see `claude_session::session_handle`)
+        // is only visible here: `denied` climbing with `minted`/`rebound`
+        // flat means every handle is being dropped, which reads identically
+        // to "coord has not deployed the route" from the outside.
+        "sessionHandles": crate::claude_session::session_handle::health_snapshot(),
         "ai": {
             "configured": ai_configured,
             "running": ai_running,
@@ -624,13 +639,22 @@ async fn health(
         // by build.rs via QONTINUI_GIT_SHA. Manual-test sessions can assert
         // the temp runner is actually running the commit under debug.
         "gitSha": env!("QONTINUI_GIT_SHA"),
-        // Compile-time build identifier (`<git-sha-short>-<unix-ms>`) baked
-        // into the binary by build.rs. Vite bakes the same value into
-        // index.html as `<meta name="build-id">`. The shared
-        // `useBuildIdWatcher` hook polls this endpoint and fires its
-        // onBuildIdChange callback when the page's meta tag diverges from
-        // the running binary's value — the only divergence vector is a
-        // mid-session binary swap behind the live webview.
+        // Compile-time build PROVENANCE: which Vite dist this binary
+        // embedded. `build.rs` reads `dist/build-id.txt` (written by
+        // `vite.config.ts`, format `<git-sha-short>-<unix-ms>`) and re-emits
+        // it, so this value names the exact frontend bundle inside the exe.
+        // A build made without a prior `pnpm run build` reports the explicit
+        // `unstamped-<git-sha>` sentinel instead.
+        //
+        // NOT a staleness signal. This is a compile-time constant of the
+        // running process, as is the `<meta name="build-id">` tag in the
+        // embedded HTML — replacing the exe on disk changes neither, so
+        // comparing them can only ever detect a BUILD-time inconsistency,
+        // never a live binary swap. The runner's refresh banner made exactly
+        // that comparison and was a permanent false positive; it was deleted
+        // (plan 2026-07-28-runner-build-id-banner-permanent-false-positive).
+        // For "is this runner out of date", use `buildDrift` below — it is
+        // the only field here that can change while the window is open.
         "buildId": env!("RUNNER_BUILD_ID"),
         // origin/main's current SHA + drift verdict vs the embedded gitSha
         // (see `crate::build_drift`). All-null until the first background
@@ -672,9 +696,11 @@ async fn health(
             "framework": "tauri",
             "capabilities": ["control", "renderLog", "debug"],
         },
-        // Top-level mirror of `data.buildId` so the shared
-        // `useBuildIdWatcher` hook (qontinui/ui-bridge/react) can read
-        // the field directly from the response root without an adapter.
+        // Top-level mirror of `data.buildId` so fleet consumers (the
+        // supervisor's health cache, manual-test sessions asserting "this
+        // temp runner is the commit I'm debugging") can read the field from
+        // the response root without descending into `data`. Same provenance
+        // semantics — and same non-semantics — as `data.buildId` above.
         "buildId": env!("RUNNER_BUILD_ID"),
         // Phase 3J.2 — top-level mirrors of `derived_status` and `ui_error`
         // so supervisor/fleet consumers can read them without descending into
@@ -869,7 +895,7 @@ fn resolve_caller_session_id(
         .try_state::<Arc<crate::claude_session::SessionManager>>()
         .and_then(|sm| sm.task_run_id_for_workdir(&workdir));
     match task_run_id {
-        // Primary chain hit — semantics unchanged from Phase 0/#841.
+        // Primary chain hit.
         Some(task_run_id) => {
             let Some(registrar) = state
                 .app_handle
@@ -877,8 +903,16 @@ fn resolve_caller_session_id(
             else {
                 return (None, SelfIdOutcome::NoSession);
             };
+            // The registrar lookup is the REGISTERED-ness FILTER, not the
+            // value: it proves this session actually registered with coord
+            // (and so has a `coord.agent_sessions` row), but the id it holds
+            // is the per-boot `coord.sessions.id`, which is the wrong id
+            // space for this header — see `anchor_as_caller_session`.
             match registrar.session_id_for(&task_run_id) {
-                Some(sid) => (Some(sid), SelfIdOutcome::Injected),
+                Some(_) => match anchor_as_caller_session(&task_run_id) {
+                    Some(sid) => (Some(sid), SelfIdOutcome::Injected),
+                    None => (None, SelfIdOutcome::NoSession),
+                },
                 None => (None, SelfIdOutcome::NoSession),
             }
         }
@@ -914,9 +948,35 @@ fn resolve_caller_via_lifecycle(state: &Arc<ApiState>, workdir: &str) -> Option<
         .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()?;
     let records = store.open_records(); // snapshot under the store lock
     let target_canon = std::fs::canonicalize(workdir).ok();
+    // The closure stays the REGISTERED-ness filter (it still consults the
+    // registrar, so phantom spawn-time shell records that never registered
+    // are still excluded); `select_lifecycle_caller` now yields the record's
+    // own ANCHOR as the caller id rather than the registrar's value.
     select_lifecycle_caller(&records, workdir, target_canon.as_deref(), |csid| {
-        registrar.session_id_for(csid)
+        registrar.session_id_for(csid).is_some()
     })
+}
+
+/// The caller-session id to put on `X-Coord-Caller-Session` for a session
+/// anchored on `claude_session_id`.
+///
+/// coord validates this header with `agent_sessions::session_on_device`
+/// (fail-closed) before trusting it, so it MUST be a `coord.agent_sessions.id`
+/// bound to this device — which is the durable anchor, NOT the per-boot
+/// `coord.sessions.id` that `AiCoordRegistrar` mints and holds in its R4
+/// index. coord's `create_session` upserts
+/// `coord.agent_sessions(id = claude_code_session_id, device_id)` from the
+/// anchor the runner publishes, so the anchor is the id that exists in that
+/// table.
+///
+/// Shipping the registrar's value instead is why the Phase-0 chain could not
+/// work even fully armed: the header arrived, failed `session_on_device`, and
+/// coord silently fell back to its fuzzy `recent_session_for_device` guess —
+/// visible only as `coord_self_id_resolution_total{outcome="injected_invalid"}`.
+/// That is a DIFFERENT failure from the 2026-07-22 arm-collapse (the header
+/// never being SENT at all).
+fn anchor_as_caller_session(claude_session_id: &str) -> Option<uuid::Uuid> {
+    uuid::Uuid::parse_str(claude_session_id.trim()).ok()
 }
 
 /// Pure candidate selection for the lifecycle fallback (unit-testable without
@@ -939,7 +999,7 @@ fn select_lifecycle_caller(
     records: &[crate::session::session_lifecycle_store::TerminalSessionRecord],
     workdir: &str,
     target_canon: Option<&std::path::Path>,
-    resolve: impl Fn(&str) -> Option<uuid::Uuid>,
+    is_registered: impl Fn(&str) -> bool,
 ) -> Option<uuid::Uuid> {
     let mut best: Option<(i64, &str, uuid::Uuid)> = None;
     for rec in records {
@@ -949,7 +1009,13 @@ fn select_lifecycle_caller(
         if !lifecycle_workdir_matches(dir, workdir, target_canon) {
             continue;
         }
-        let Some(sid) = resolve(&rec.claude_session_id) else {
+        if !is_registered(&rec.claude_session_id) {
+            continue;
+        }
+        // The ANCHOR is the caller id (see `anchor_as_caller_session`); a
+        // record whose anchor is not a uuid cannot name a
+        // `coord.agent_sessions` row, so it is not a candidate.
+        let Some(sid) = anchor_as_caller_session(&rec.claude_session_id) else {
             continue;
         };
         let candidate = (rec.last_seen_at, rec.claude_session_id.as_str(), sid);
@@ -978,6 +1044,245 @@ fn lifecycle_workdir_matches(
         Some(tc) => std::fs::canonicalize(record_dir).ok().as_deref() == Some(tc),
         None => false,
     }
+}
+
+/// JSON-RPC methods the loopback `/coord-mcp` proxy forwards (credential-
+/// hygiene Task 4). Everything else is rejected BEFORE any bearer is read or
+/// any byte reaches coord. The MCP handshake + tool surface is exactly:
+/// `initialize` / `notifications/*` housekeeping / `ping` / `tools/list` /
+/// `tools/call` — and `tools/call` is further gated per tool name by
+/// [`coord_mcp_tool_is_allowed`]. Sorted for `binary_search`.
+const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
+    "initialize",
+    "notifications/cancelled",
+    "notifications/initialized",
+    "notifications/progress",
+    "ping",
+    "tools/call",
+    "tools/list",
+];
+
+/// Coord MCP tools a proxied session may invoke (credential-hygiene Task 4).
+///
+/// Same posture as the sibling [`ClaimsReadTarget`] / [`CoordWriteTarget`]
+/// enums: the per-session nonce authenticates a *session*, not an operator,
+/// so its authority is an ENUMERATED set — the legitimate session-coordination
+/// surface (introspection reads + the coordination writes: declare-intent,
+/// work-unit upsert/transition, gate register/attest, claims, expectations,
+/// findings/messaging/memory, orient/status/conflict-check/blockers). A leaked
+/// nonce must not reach anything beyond that with the runner's device
+/// identity. Coord is being hardened server-side in parallel; this list is
+/// defense-in-depth, not the sole authority.
+///
+/// DELIBERATELY EXCLUDED (add only with a security rationale): the onboarding
+/// / enrollment family (`coord_onboard_*`, `coord_onboarding_doctor`),
+/// privilege escalation (`coord_attest_escalate_override`), merge authority
+/// (`coord_request_merge`, `coord_cancel_merge`, `coord_pr_merge_verdict`,
+/// `coord_pr_merge_profile`), code publication (`coord_create_pr`,
+/// `coord_push_to_branch` — sessions open PRs via the dedicated
+/// `/vcs/pull-requests` loopback route, not this proxy), reservations
+/// (`coord_migration_reserve`, `coord_reserve_resource`), and policy/state
+/// mutation (`coord_request_policy`, `coord_flag_state`, `coord_flag_states`).
+///
+/// LOAD-BEARING, do not strip as "reads nobody uses": `coord_list_prompt_documents`
+/// and `coord_get_prompt_document` are how the fleet reads served POLICY, and the
+/// `/policy` skill's transport cascade calls them through THIS proxy (a
+/// `tools/call` POST to `/coord-mcp` with the `.mcp.json` nonce). Every session is
+/// required to read policy before substantive work, so omitting them does not fail
+/// loudly — `/policy` silently falls through to its last-resort `qontinui-dev-notes`
+/// mirrors and the fleet starts booting off stale policy with nothing surfaced.
+/// `coord_gate_list` / `coord_withdraw_gate` are the same story for `/gate-sweep`
+/// and `/gate`, which already document driving them over this proxy.
+///
+/// `coord_write_prompt_document` is IN, and the reason it used to be out no longer
+/// holds. The old rationale — "policy authorship is tenant-gated and belongs to an
+/// operator, not a device nonce" — described a coord that no longer exists: coord
+/// deliberately grants this tool to device/agent principals
+/// (`coord::mcp::agent_tool_access`) precisely so a session can CLOSE a POLICY_GAP
+/// it found instead of recording one that waits on the operator, which was the
+/// bottleneck that made gaps accumulate faster than they could be hand-published.
+/// Withholding it HERE did not re-impose an operator gate; it silently removed a
+/// capability coord had already decided to grant, and the denial surfaced as a bare
+/// `-32601` that reads like "no such tool" rather than "your proxy withholds it".
+///
+/// Nor is the grant unguarded — coord enforces non-loosening server-side, so this
+/// proxy is not the thing standing between a device nonce and a weakened policy:
+/// `append` preserves the existing body verbatim, `create` only authors names that
+/// do not yet exist, `edit_clause` lands only a provable tightening or no-op and
+/// otherwise becomes a pending operator proposal, and the meta-policies
+/// (`session-protocol`, `security-and-autonomy`, `escalation-bar`) are refused
+/// outright in either direction. Tenant comes from the verified `CallerIdentity`,
+/// never an argument; every landed write is versioned, attributed and revertible.
+///
+/// Keep it in. If policy authorship should ever be operator-only again, that is a
+/// decision to make in coord's grant — one place, enforced for every transport —
+/// not by re-diverging this list from it.
+///
+/// MUST stay sorted — membership is a `binary_search`.
+const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
+    "coord_ack_message",
+    "coord_am_i_clear",
+    "coord_ask_question",
+    "coord_attest_gate",
+    "coord_blockers",
+    "coord_build_info",
+    "coord_can",
+    "coord_change_conflict",
+    "coord_check_gate_predicate",
+    "coord_check_install_safety",
+    "coord_check_publish_safety",
+    "coord_claim_acquire",
+    "coord_claim_check",
+    "coord_claim_heartbeat",
+    "coord_claim_release",
+    "coord_conflict_check",
+    "coord_declare_intent",
+    "coord_diagnose",
+    "coord_diff_impact",
+    "coord_edit_predict",
+    "coord_edit_predict_and_check",
+    "coord_edit_verify",
+    "coord_expectation_checkin",
+    "coord_expectation_close",
+    "coord_expectation_register",
+    "coord_explain_isolation_decision",
+    "coord_explain_pr_close",
+    "coord_explain_ref_event",
+    "coord_explain_worktree",
+    "coord_find_references",
+    "coord_gate_doctor",
+    "coord_gate_inspect",
+    "coord_gate_list",
+    "coord_gate_status",
+    "coord_get_answer",
+    "coord_get_prompt_document",
+    "coord_inbox",
+    "coord_is_commit_live",
+    "coord_is_merge_safe",
+    "coord_layering_triage",
+    "coord_list_prompt_documents",
+    "coord_list_worktrees",
+    "coord_memory_record",
+    "coord_memory_search",
+    "coord_merge_order",
+    "coord_migration_queue",
+    "coord_orient",
+    "coord_post_finding",
+    "coord_pr_status",
+    "coord_predict_resource_collisions",
+    "coord_recent_errors",
+    "coord_recent_findings",
+    "coord_record_decision",
+    "coord_register_gate",
+    "coord_report_status",
+    "coord_request_handoff",
+    "coord_resolve_origin",
+    "coord_resolve_pr_author_session",
+    "coord_resolve_session",
+    "coord_secret_presence",
+    "coord_send_message",
+    "coord_signature",
+    "coord_slo_metrics",
+    "coord_symbol_lookup",
+    "coord_twin_catalog",
+    "coord_typecheck_file",
+    "coord_who_is_working_on",
+    "coord_withdraw_gate",
+    "coord_work_unit_add_citation",
+    "coord_work_unit_list",
+    "coord_work_unit_list_citations",
+    "coord_work_unit_remove_citation",
+    "coord_work_unit_transition",
+    "coord_work_unit_upsert",
+    "coord_write_prompt_document",
+    "coord_yield",
+];
+
+/// Read-only tool FAMILIES allowed by prefix. `coord_query_*` is coord's
+/// naming convention for its read-only twin/drift/state queries (~25 tools,
+/// all reads); enumerating each would drift out of date with every new query
+/// while adding no authority a session doesn't already have via the other
+/// reads.
+const COORD_MCP_ALLOWED_TOOL_PREFIXES: &[&str] = &["coord_query_"];
+
+fn coord_mcp_tool_is_allowed(name: &str) -> bool {
+    COORD_MCP_ALLOWED_TOOLS.binary_search(&name).is_ok()
+        || COORD_MCP_ALLOWED_TOOL_PREFIXES
+            .iter()
+            .any(|p| name.starts_with(p))
+}
+
+/// A gate rejection: the JSON-RPC `id` to echo (Null when unparseable) plus a
+/// human-actionable message.
+struct CoordMcpBodyRejection {
+    id: serde_json::Value,
+    message: String,
+}
+
+/// Allowlist gate over the `/coord-mcp` proxy's JSON-RPC body (credential-
+/// hygiene Task 4): the `method` must be in [`COORD_MCP_ALLOWED_METHODS`] and
+/// a `tools/call` must name an allowed tool ([`coord_mcp_tool_is_allowed`]).
+/// Batch (array) bodies are validated per element — one bad element rejects
+/// the whole request (coord's `/mcp` is single-shot per POST anyway). Pure
+/// over its input so the rejection matrix is unit-testable.
+fn coord_mcp_body_gate(body: &[u8]) -> Result<(), CoordMcpBodyRejection> {
+    let parsed: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(CoordMcpBodyRejection {
+                id: serde_json::Value::Null,
+                message: format!("request body is not valid JSON-RPC: {e}"),
+            });
+        }
+    };
+    match &parsed {
+        serde_json::Value::Array(elems) => {
+            if elems.is_empty() {
+                return Err(CoordMcpBodyRejection {
+                    id: serde_json::Value::Null,
+                    message: "empty JSON-RPC batch".to_string(),
+                });
+            }
+            for elem in elems {
+                coord_mcp_request_gate_one(elem)?;
+            }
+            Ok(())
+        }
+        _ => coord_mcp_request_gate_one(&parsed),
+    }
+}
+
+/// Gate ONE JSON-RPC request object. See [`coord_mcp_body_gate`].
+fn coord_mcp_request_gate_one(req: &serde_json::Value) -> Result<(), CoordMcpBodyRejection> {
+    let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let reject = |message: String| {
+        Err(CoordMcpBodyRejection {
+            id: id.clone(),
+            message,
+        })
+    };
+    let method = match req.get("method").and_then(|m| m.as_str()) {
+        Some(m) => m,
+        None => return reject("JSON-RPC request has no string `method`".to_string()),
+    };
+    if COORD_MCP_ALLOWED_METHODS.binary_search(&method).is_err() {
+        return reject(format!(
+            "JSON-RPC method {method:?} is not on the /coord-mcp proxy allowlist"
+        ));
+    }
+    if method == "tools/call" {
+        let tool = match req.pointer("/params/name").and_then(|n| n.as_str()) {
+            Some(t) => t,
+            None => return reject("tools/call has no string `params.name`".to_string()),
+        };
+        if !coord_mcp_tool_is_allowed(tool) {
+            return reject(format!(
+                "tool {tool:?} is not on the /coord-mcp proxy allowlist for \
+                 device/agent sessions"
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn coord_mcp_proxy_handler(
@@ -1021,6 +1326,32 @@ async fn coord_mcp_proxy_handler(
                 .into_response();
         }
     };
+
+    // Credential-hygiene Task 4: allowlist the JSON-RPC method + tool BEFORE
+    // any token I/O — a nonce authenticates a *session*, not an operator, so a
+    // request outside the enumerated coordination surface is never forwarded
+    // (mirrors the sibling ClaimsReadTarget/CoordWriteTarget posture). -32601
+    // ("method not found") deliberately does not disclose whether the tool
+    // exists upstream.
+    if let Err(reject) = coord_mcp_body_gate(&body) {
+        warn!(
+            "coord-mcp proxy: refused non-allowlisted JSON-RPC request: {}",
+            reject.message
+        );
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": reject.id,
+                "error": {
+                    "code": -32601,
+                    "message": reject.message,
+                    "data": { "code": "COORD_MCP_PROXY_METHOD_NOT_ALLOWED" },
+                },
+            })),
+        )
+            .into_response();
+    }
 
     // Pick the bearer by principal:
     //  - Device → the live device JWT read from AuthManager (filesystem I/O, so
@@ -1661,11 +1992,22 @@ async fn coord_claims_by_resource_handler(
 }
 
 /// The ONLY coord WRITE routes the nonce-gated device-JWT forwarder may reach:
-/// the two gate writes (plan 2026-06-15-coord-mcp-live-token-write-forwarder,
+/// the gate attest write (plan 2026-06-15-coord-mcp-live-token-write-forwarder,
 /// Phase 1), the claim-anchored gate register (plan
 /// 2026-07-21-gate-cascade-step3-proxy-rebase, Phase 1b), plus the work-unit
 /// registry writes (device-session coord surface hardening follow-up). The
 /// write sibling of [`ClaimsReadTarget`].
+///
+/// There is deliberately NO plan-anchored gate-register variant. Coord's
+/// `POST /coord/plans/{slug}/register-gate` was DELETED with the rest of the
+/// `/coord/plans*` surface (coord P4 Phase 3), so a forwarder aimed at it could
+/// only ever 404 whatever the body. Its live replacement is
+/// [`CoordWriteTarget::WorkUnitRegisterGate`] below — note the bodies are NOT
+/// interchangeable: the removed plan route took coord's `PlanGateRequest`
+/// (plan-lifecycle `status`/`title`, run through the plan status vocabulary),
+/// while the work-unit route takes `UnitGateRequest` (no `status`/`title`;
+/// work-unit statuses are opaque). Removed by plan
+/// 2026-08-03-gate-class-producers-and-clearance-rules-inert (P4).
 ///
 /// Every work-unit variant maps to coord's device-JWT `work_units_agent_authed`
 /// sub-router (layered with `require_jwt`, which accepts the device bearer):
@@ -1694,8 +2036,6 @@ async fn coord_claims_by_resource_handler(
 /// variant would never authenticate through this device-JWT path anyway.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CoordWriteTarget {
-    /// `POST {coord}/coord/plans/{slug}/register-gate`
-    RegisterPlanGate { slug: String },
     /// `POST {coord}/coord/gates/{gate_id}/attest`
     AttestGate { gate_id: String },
     /// `POST {coord}/coord/gates/register-agent` — coord's device-authed
@@ -1742,8 +2082,7 @@ impl CoordWriteTarget {
     fn validate(&self) -> Result<(), (u16, &'static str, String)> {
         match self {
             CoordWriteTarget::RegisterGate | CoordWriteTarget::WorkUnitUpsert => Ok(()),
-            CoordWriteTarget::RegisterPlanGate { slug }
-            | CoordWriteTarget::WorkUnitTransition { slug }
+            CoordWriteTarget::WorkUnitTransition { slug }
             | CoordWriteTarget::WorkUnitRegisterGate { slug }
             | CoordWriteTarget::WorkUnitSetDeps { slug } => {
                 if slug_is_valid(slug) {
@@ -1781,9 +2120,6 @@ impl CoordWriteTarget {
 fn write_upstream_url(base: &str, target: &CoordWriteTarget) -> String {
     let base = base.trim_end_matches('/');
     match target {
-        CoordWriteTarget::RegisterPlanGate { slug } => {
-            format!("{base}/coord/plans/{slug}/register-gate")
-        }
         CoordWriteTarget::AttestGate { gate_id } => {
             format!("{base}/coord/gates/{gate_id}/attest")
         }
@@ -1805,7 +2141,6 @@ fn write_upstream_url(base: &str, target: &CoordWriteTarget) -> String {
     }
 }
 
-/// `POST /coord-mcp/gates/register-plan/{slug}` +
 /// `POST /coord-mcp/gates/register` +
 /// `POST /coord-mcp/gates/{gate_id}/attest` +
 /// `POST /coord-mcp/work-units/{upsert | {slug}/transition |
@@ -1817,7 +2152,7 @@ fn write_upstream_url(base: &str, target: &CoordWriteTarget) -> String {
 /// 2026-07-21-gate-cascade-step3-proxy-rebase, Phase 1b).
 ///
 /// Why: a device session's `.mcp.json` carries no bearer anymore (live-token
-/// proxy, runner #546) — only the per-session loopback nonce. The plan-ready,
+/// proxy, runner #546) — only the per-session loopback nonce. The gate-register,
 /// gate-attest, and work-unit registry flows need to POST against coord's
 /// device-authed write routes, so this lets those callers reuse the nonce:
 /// same gate, same live `AuthManager` device-JWT injection, same coord-base
@@ -2029,15 +2364,6 @@ async fn forward_coord_write_post(
             )
                 .into_response()
         })
-}
-
-/// `POST /coord-mcp/gates/register-plan/{slug}` — see [`coord_write_proxy_handler`].
-async fn coord_register_plan_gate_handler(
-    axum::extract::Path(slug): axum::extract::Path<String>,
-    headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
-) -> axum::response::Response {
-    coord_write_proxy_handler(CoordWriteTarget::RegisterPlanGate { slug }, headers, body).await
 }
 
 /// `POST /coord-mcp/gates/register` — see [`coord_write_proxy_handler`].
@@ -2755,7 +3081,6 @@ pub fn create_router(
         ui_bridge_pending_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         ui_bridge_circuit_breaker: Arc::new(crate::mcp::ui_bridge::UiBridgeCircuitBreaker::new()),
         ui_bridge_semaphore: Arc::new(tokio::sync::Semaphore::new(6)),
-        ui_bridge_last_pong: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ui_bridge_ready: Arc::new(tokio::sync::Notify::new()),
         ui_bridge_dedup: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         ui_bridge_console_error_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -3186,7 +3511,7 @@ pub fn create_router(
 
     // Set up UI Bridge pong listener for frontend liveness tracking
     {
-        let last_pong = api_state.ui_bridge_last_pong.clone();
+        let last_pong = api_state.app_state.ui_bridge_last_pong.clone();
         let ready = api_state.ui_bridge_ready.clone();
         let handle = app_handle.clone();
 
@@ -3423,6 +3748,17 @@ pub fn create_router(
             // rotation just happened (the exact incident this plan fixes).
             let restored = crate::coord_mcp::restore_proxy_nonces_from_store();
 
+            // Credential-hygiene Task 5 — reap stale app-data session-restore
+            // coord-mcp configs (dead port, or our port with an
+            // unregistered/expired nonce). AFTER the restore so the registered
+            // set is authoritative; on a blocking thread because it does TCP
+            // liveness probes + file I/O.
+            let reaped = tokio::task::spawn_blocking(move || {
+                crate::coord_mcp::reap_stale_session_restore_configs(reconcile_bound_port)
+            })
+            .await
+            .unwrap_or(0);
+
             // Phase 3c — reconcile live session `.mcp.json` ports. Pull the live
             // session workdirs from the managed lifecycle store (open records).
             use tauri::Manager;
@@ -3469,6 +3805,7 @@ pub fn create_router(
             });
             info!(
                 "coord_mcp boot reconcile: restored {restored} persisted nonce(s), \
+                 reaped {reaped} stale session-restore config(s), \
                  rewrote {session_rewritten} session config(s), root self-heal = {root_action:?} \
                  (instance {reconcile_instance}, bound port :{reconcile_bound_port})"
             );
@@ -4064,6 +4401,18 @@ pub fn create_router(
         // here before its hard taskkill so in-flight turns flush, dirty
         // worktrees are stashed to refs/wip/*, and coord claims persist.
         .route("/drain", post(drain_handler))
+        // Manually trigger the dead-webview recovery ladder (plan
+        // 2026-08-01-runner-dead-webview-is-invisible-to-health, Phase 2). An
+        // operator/debug affordance ONLY — the shipped detection path is the
+        // push `ProcessFailed` event plus the heartbeat backstop. It exists
+        // because nothing on this API could reach the webview before:
+        // `ui_bridge_reload_webview` is a `#[tauri::command]` that is absent
+        // from the invoke allowlist, so /reload, /ui/reload, /ui-bridge/reload
+        // and /api/reload all 404.
+        .route(
+            "/ui/recover",
+            post(crate::webview_recovery::recover_ui_handler),
+        )
         // Loopback live-token proxy for coord /mcp — device-provisioned
         // sessions' `.mcp.json` points here so each MCP request carries a
         // freshly-read device JWT instead of a 4h-TTL snapshot. Nonce-gated
@@ -4100,11 +4449,10 @@ pub fn create_router(
         // Same gate + live device-JWT injection as /coord-mcp, but allowlisted
         // to EXACTLY these enumerated device-authed coord write routes with a
         // validated dynamic segment — never a generic path passthrough (see
-        // `CoordWriteTarget`).
-        .route(
-            "/coord-mcp/gates/register-plan/{slug}",
-            post(coord_register_plan_gate_handler),
-        )
+        // `CoordWriteTarget`). NOTE: there is no `gates/register-plan/{slug}`
+        // route — coord deleted its `/coord/plans/{slug}/register-gate` upstream
+        // (coord P4 Phase 3), so the forwarder was removed too rather than left
+        // as a guaranteed-404 shim; use the work-unit register-gate route below.
         // Claim-anchored register (plan 2026-07-21-gate-cascade-step3-proxy-rebase
         // Phase 1b): forwards to coord's device-authed
         // `POST /coord/gates/register-agent` — the REST twin of MCP
@@ -4712,89 +5060,258 @@ mod self_id_chain_tests {
         }
     }
 
+    /// Anchors are real uuids in every selection test now: the selected
+    /// caller id IS the record's anchor (a `coord.agent_sessions` id), so a
+    /// placeholder like `"match"` is no longer a valid fixture.
+    const ANCHOR_A: &str = "aaaaaaaa-0000-4000-8000-000000000001";
+    const ANCHOR_B: &str = "bbbbbbbb-0000-4000-8000-000000000002";
+
+    fn uuid_of(s: &str) -> uuid::Uuid {
+        uuid::Uuid::parse_str(s).expect("fixture anchor must be a uuid")
+    }
+
     #[test]
-    fn lifecycle_selection_picks_the_matching_registered_record() {
-        let sid = uuid::Uuid::new_v4();
+    fn lifecycle_selection_yields_the_anchor_not_the_registrar_value() {
+        // THE id-space fix: coord validates `X-Coord-Caller-Session` with
+        // `session_on_device` against `coord.agent_sessions`, where the
+        // registrar's per-boot `coord.sessions` uuid never appears. The
+        // selected id must therefore be the record's own anchor.
         let records = vec![
-            rec("other-dir", Some("D:/elsewhere"), 50),
-            rec("match", Some("D:/repo"), 10),
+            rec(ANCHOR_B, Some("D:/elsewhere"), 50),
+            rec(ANCHOR_A, Some("D:/repo"), 10),
         ];
-        let got = select_lifecycle_caller(&records, "D:/repo", None, |csid| {
-            (csid == "match").then_some(sid)
-        });
-        assert_eq!(got, Some(sid));
+        let got = select_lifecycle_caller(&records, "D:/repo", None, |csid| csid == ANCHOR_A);
+        assert_eq!(got, Some(uuid_of(ANCHOR_A)));
     }
 
     #[test]
     fn lifecycle_selection_skips_unregistered_records() {
         // A workdir-matching record whose session never registered (phantom
         // spawn-time shell record, pre-Phase-3 session) must not resolve —
-        // the resolver closure is the registration filter.
-        let records = vec![rec("phantom", Some("D:/repo"), 99)];
-        let got = select_lifecycle_caller(&records, "D:/repo", None, |_| None);
+        // the closure remains the registration filter even though it no
+        // longer supplies the value.
+        let records = vec![rec(ANCHOR_A, Some("D:/repo"), 99)];
+        let got = select_lifecycle_caller(&records, "D:/repo", None, |_| false);
         assert_eq!(got, None, "unregistered record must not inject");
+    }
+
+    #[test]
+    fn lifecycle_selection_skips_non_uuid_anchors() {
+        // An anchor that is not a uuid cannot name a `coord.agent_sessions`
+        // row, so it is not a candidate even when registered.
+        let records = vec![rec("not-a-uuid", Some("D:/repo"), 99)];
+        let got = select_lifecycle_caller(&records, "D:/repo", None, |_| true);
+        assert_eq!(got, None, "non-uuid anchor must not inject");
     }
 
     #[test]
     fn lifecycle_selection_prefers_most_recently_seen_on_shared_workdir() {
         // Interactive sessions can share a workdir; the workdir-scoped
         // most-recent pick is the deterministic tie-break.
-        let old_sid = uuid::Uuid::new_v4();
-        let new_sid = uuid::Uuid::new_v4();
         let records = vec![
-            rec("older", Some("D:/repo"), 100),
-            rec("newer", Some("D:/repo"), 200),
+            rec(ANCHOR_A, Some("D:/repo"), 100),
+            rec(ANCHOR_B, Some("D:/repo"), 200),
         ];
-        let got = select_lifecycle_caller(&records, "D:/repo", None, |csid| match csid {
-            "older" => Some(old_sid),
-            "newer" => Some(new_sid),
-            _ => None,
-        });
-        assert_eq!(got, Some(new_sid));
+        let got = select_lifecycle_caller(&records, "D:/repo", None, |_| true);
+        assert_eq!(got, Some(uuid_of(ANCHOR_B)));
 
         // If the newer record is unregistered, the older registered one wins.
-        let got = select_lifecycle_caller(&records, "D:/repo", None, |csid| {
-            (csid == "older").then_some(old_sid)
-        });
-        assert_eq!(got, Some(old_sid));
+        let got = select_lifecycle_caller(&records, "D:/repo", None, |csid| csid == ANCHOR_A);
+        assert_eq!(got, Some(uuid_of(ANCHOR_A)));
     }
 
     #[test]
     fn lifecycle_selection_equal_timestamps_break_deterministically() {
-        let a = uuid::Uuid::new_v4();
-        let b = uuid::Uuid::new_v4();
         let records = vec![
-            rec("aaaa", Some("D:/repo"), 100),
-            rec("bbbb", Some("D:/repo"), 100),
+            rec(ANCHOR_A, Some("D:/repo"), 100),
+            rec(ANCHOR_B, Some("D:/repo"), 100),
         ];
-        let resolve = |csid: &str| match csid {
-            "aaaa" => Some(a),
-            "bbbb" => Some(b),
-            _ => None,
-        };
-        let got1 = select_lifecycle_caller(&records, "D:/repo", None, resolve);
+        let got1 = select_lifecycle_caller(&records, "D:/repo", None, |_| true);
         // Reversed input order must yield the same pick (lexicographically
         // greatest claude_session_id on a timestamp tie).
         let reversed: Vec<_> = records.iter().rev().cloned().collect();
-        let got2 = select_lifecycle_caller(&reversed, "D:/repo", None, resolve);
+        let got2 = select_lifecycle_caller(&reversed, "D:/repo", None, |_| true);
         assert_eq!(got1, got2, "selection must be input-order independent");
-        assert_eq!(got1, Some(b));
+        assert_eq!(got1, Some(uuid_of(ANCHOR_B)));
+    }
+
+    #[test]
+    fn anchor_as_caller_session_accepts_only_uuids() {
+        assert_eq!(
+            super::anchor_as_caller_session(ANCHOR_A),
+            Some(uuid_of(ANCHOR_A))
+        );
+        assert_eq!(
+            super::anchor_as_caller_session(&format!("  {ANCHOR_A}  ")),
+            Some(uuid_of(ANCHOR_A)),
+            "surrounding whitespace is tolerated"
+        );
+        assert_eq!(super::anchor_as_caller_session("not-a-uuid"), None);
+        assert_eq!(super::anchor_as_caller_session(""), None);
     }
 
     #[test]
     fn lifecycle_selection_misses_cleanly() {
         // No records / no workdir match / recordless working_dir → None
         // (header simply absent, as today).
-        let sid = uuid::Uuid::new_v4();
         assert_eq!(
-            select_lifecycle_caller(&[], "D:/repo", None, |_| Some(sid)),
+            select_lifecycle_caller(&[], "D:/repo", None, |_| true),
             None
         );
-        let records = vec![rec("x", None, 10), rec("y", Some("D:/other"), 10)];
+        let records = vec![rec(ANCHOR_A, None, 10), rec(ANCHOR_B, Some("D:/other"), 10)];
         assert_eq!(
-            select_lifecycle_caller(&records, "D:/repo", None, |_| Some(sid)),
+            select_lifecycle_caller(&records, "D:/repo", None, |_| true),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod coord_mcp_body_gate_tests {
+    use super::{
+        coord_mcp_body_gate, coord_mcp_tool_is_allowed, COORD_MCP_ALLOWED_METHODS,
+        COORD_MCP_ALLOWED_TOOLS,
+    };
+
+    fn gate(v: serde_json::Value) -> Result<(), (serde_json::Value, String)> {
+        coord_mcp_body_gate(v.to_string().as_bytes()).map_err(|r| (r.id, r.message))
+    }
+
+    /// Both membership tables are sorted — `binary_search` correctness.
+    #[test]
+    fn allowlist_tables_are_sorted() {
+        assert!(
+            COORD_MCP_ALLOWED_METHODS.windows(2).all(|w| w[0] < w[1]),
+            "COORD_MCP_ALLOWED_METHODS must be sorted + deduped"
+        );
+        assert!(
+            COORD_MCP_ALLOWED_TOOLS.windows(2).all(|w| w[0] < w[1]),
+            "COORD_MCP_ALLOWED_TOOLS must be sorted + deduped"
+        );
+    }
+
+    /// The MCP handshake + the legitimate coordination surface forwards.
+    #[test]
+    fn allows_handshake_and_coordination_tools() {
+        for method in [
+            "initialize",
+            "tools/list",
+            "ping",
+            "notifications/initialized",
+        ] {
+            assert!(
+                gate(serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":{}}))
+                    .is_ok(),
+                "{method} must pass the gate"
+            );
+        }
+        for tool in [
+            "coord_declare_intent",
+            "coord_who_is_working_on",
+            "coord_work_unit_upsert",
+            "coord_work_unit_transition",
+            "coord_register_gate",
+            "coord_attest_gate",
+            "coord_orient",
+            "coord_report_status",
+            "coord_conflict_check",
+            "coord_blockers",
+            "coord_post_finding",
+            "coord_send_message",
+            "coord_query_health", // prefix family
+            // Policy authorship. Pinned here because this proxy previously
+            // withheld it while coord's own device/agent grant allowed it —
+            // a silent capability subtraction that made every device session
+            // unable to close a POLICY_GAP. Non-loosening is enforced
+            // coord-side, so re-excluding it here would re-open that gap
+            // rather than restore a gate.
+            "coord_write_prompt_document",
+        ] {
+            assert!(
+                gate(serde_json::json!({
+                    "jsonrpc":"2.0","id":2,"method":"tools/call",
+                    "params":{"name":tool,"arguments":{}}
+                }))
+                .is_ok(),
+                "{tool} must pass the gate"
+            );
+        }
+    }
+
+    /// Non-allowlisted tools are refused with the request's id echoed —
+    /// including the deliberately-excluded privileged families.
+    #[test]
+    fn rejects_privileged_and_unknown_tools() {
+        for tool in [
+            "coord_onboard_enroll_installation",
+            "coord_attest_escalate_override",
+            "coord_request_merge",
+            "coord_cancel_merge",
+            "coord_create_pr",
+            "coord_push_to_branch",
+            "coord_migration_reserve",
+            "coord_request_policy",
+            "coord_flag_state",
+            "totally_made_up_tool",
+        ] {
+            let (id, msg) = gate(serde_json::json!({
+                "jsonrpc":"2.0","id":7,"method":"tools/call",
+                "params":{"name":tool,"arguments":{}}
+            }))
+            .expect_err(&format!("{tool} must be refused"));
+            assert_eq!(id, serde_json::json!(7), "the request id is echoed");
+            assert!(msg.contains(tool), "message names the refused tool: {msg}");
+            assert!(!coord_mcp_tool_is_allowed(tool));
+        }
+    }
+
+    /// Non-allowlisted METHODS are refused — the generic-passthrough hole this
+    /// gate closes (resources/prompts/logging/arbitrary methods).
+    #[test]
+    fn rejects_non_allowlisted_methods_and_malformed_bodies() {
+        for method in [
+            "resources/read",
+            "prompts/get",
+            "logging/setLevel",
+            "shutdown",
+        ] {
+            assert!(
+                gate(serde_json::json!({"jsonrpc":"2.0","id":1,"method":method})).is_err(),
+                "{method} must be refused"
+            );
+        }
+        // No method at all.
+        assert!(gate(serde_json::json!({"jsonrpc":"2.0","id":1})).is_err());
+        // tools/call with no tool name.
+        assert!(gate(
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}})
+        )
+        .is_err());
+        // Not JSON at all.
+        let err = coord_mcp_body_gate(b"not json {").unwrap_err();
+        assert_eq!(err.id, serde_json::Value::Null);
+    }
+
+    /// A batch is validated per element: one disallowed element rejects the
+    /// whole request (and an empty batch is refused outright).
+    #[test]
+    fn batch_bodies_are_validated_per_element() {
+        assert!(gate(serde_json::json!([
+            {"jsonrpc":"2.0","id":1,"method":"tools/list"},
+            {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"coord_orient"}},
+        ]))
+        .is_ok());
+        let (id, _) = gate(serde_json::json!([
+            {"jsonrpc":"2.0","id":1,"method":"tools/list"},
+            {"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"coord_request_merge"}},
+        ]))
+        .unwrap_err();
+        assert_eq!(
+            id,
+            serde_json::json!(9),
+            "the offending element's id is echoed"
+        );
+        assert!(gate(serde_json::json!([])).is_err(), "empty batch refused");
     }
 }
 
@@ -5060,7 +5577,7 @@ mod coord_claims_proxy_tests {
 #[cfg(test)]
 mod coord_write_proxy_tests {
     use super::{
-        coord_attest_gate_handler, coord_register_gate_handler, coord_register_plan_gate_handler,
+        coord_attest_gate_handler, coord_register_gate_handler,
         coord_work_unit_register_gate_handler, coord_work_unit_set_deps_handler,
         coord_work_unit_transition_handler, coord_work_unit_upsert_handler,
         forward_coord_write_post, gate_id_is_valid, slug_is_valid, write_upstream_url,
@@ -5071,7 +5588,6 @@ mod coord_write_proxy_tests {
 
     // Concrete route templates (axum 0.8 `{param}` form) registered in the real router.
     const WRITE_ROUTES: &[&str] = &[
-        "/coord-mcp/gates/register-plan/{slug}",
         "/coord-mcp/gates/register",
         "/coord-mcp/gates/{gate_id}/attest",
         "/coord-mcp/work-units/upsert",
@@ -5081,7 +5597,6 @@ mod coord_write_proxy_tests {
     ];
     // Concrete request paths used to hit those routes in tests.
     const WRITE_REQUEST_PATHS: &[&str] = &[
-        "/coord-mcp/gates/register-plan/2026-06-15-some-plan",
         "/coord-mcp/gates/register",
         "/coord-mcp/gates/123e4567-e89b-12d3-a456-426614174000/attest",
         "/coord-mcp/work-units/upsert",
@@ -5092,13 +5607,12 @@ mod coord_write_proxy_tests {
 
     fn write_router() -> Router {
         Router::new()
-            .route(WRITE_ROUTES[0], post(coord_register_plan_gate_handler))
-            .route(WRITE_ROUTES[1], post(coord_register_gate_handler))
-            .route(WRITE_ROUTES[2], post(coord_attest_gate_handler))
-            .route(WRITE_ROUTES[3], post(coord_work_unit_upsert_handler))
-            .route(WRITE_ROUTES[4], post(coord_work_unit_transition_handler))
-            .route(WRITE_ROUTES[5], post(coord_work_unit_register_gate_handler))
-            .route(WRITE_ROUTES[6], post(coord_work_unit_set_deps_handler))
+            .route(WRITE_ROUTES[0], post(coord_register_gate_handler))
+            .route(WRITE_ROUTES[1], post(coord_attest_gate_handler))
+            .route(WRITE_ROUTES[2], post(coord_work_unit_upsert_handler))
+            .route(WRITE_ROUTES[3], post(coord_work_unit_transition_handler))
+            .route(WRITE_ROUTES[4], post(coord_work_unit_register_gate_handler))
+            .route(WRITE_ROUTES[5], post(coord_work_unit_set_deps_handler))
     }
 
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {
@@ -5142,15 +5656,6 @@ mod coord_write_proxy_tests {
     /// a trailing-slash base.
     #[test]
     fn write_upstream_url_builds_fixed_coord_routes() {
-        assert_eq!(
-            write_upstream_url(
-                "https://coord.example.test",
-                &CoordWriteTarget::RegisterPlanGate {
-                    slug: "2026-06-15-some-plan".to_string()
-                },
-            ),
-            "https://coord.example.test/coord/plans/2026-06-15-some-plan/register-gate"
-        );
         assert_eq!(
             write_upstream_url(
                 "https://coord.example.test/",
@@ -5211,12 +5716,12 @@ mod coord_write_proxy_tests {
     /// `Ok` for a good one.
     #[test]
     fn target_validate_rejects_bad_segments() {
-        assert!(CoordWriteTarget::RegisterPlanGate {
-            slug: "2026-06-15-some-plan".to_string()
+        assert!(CoordWriteTarget::WorkUnitRegisterGate {
+            slug: "2026-07-03-some-unit".to_string()
         }
         .validate()
         .is_ok());
-        let err = CoordWriteTarget::RegisterPlanGate {
+        let err = CoordWriteTarget::WorkUnitRegisterGate {
             slug: "../etc".to_string(),
         }
         .validate()
@@ -5329,7 +5834,7 @@ mod coord_write_proxy_tests {
         let addr = listener.local_addr().unwrap();
         let app: Router = Router::new()
             .route(
-                "/coord/plans/{slug}/register-gate",
+                "/coord/work-units/{slug}/register-gate",
                 post(
                     |headers: axum::http::HeaderMap, body: axum::body::Bytes| async move {
                         let auth = headers
@@ -5369,14 +5874,14 @@ mod coord_write_proxy_tests {
         // Happy path: body forwarded verbatim, synthetic bearer + JSON ct injected.
         let url = write_upstream_url(
             &base,
-            &CoordWriteTarget::RegisterPlanGate {
-                slug: "2026-06-15-some-plan".to_string(),
+            &CoordWriteTarget::WorkUnitRegisterGate {
+                slug: "2026-07-03-some-unit".to_string(),
             },
         );
         let resp = forward_coord_write_post(
             &url,
             "test-device-jwt",
-            axum::body::Bytes::from_static(br#"{"resource_key":"plans/p"}"#),
+            axum::body::Bytes::from_static(br#"{"resource_key":"work-units/u"}"#),
             qontinui_runner_lib::profiles::CoordBaseSource::Profile,
         )
         .await;
@@ -5384,7 +5889,7 @@ mod coord_write_proxy_tests {
         let v = body_json(resp).await;
         assert_eq!(v["echo_auth"], "Bearer test-device-jwt");
         assert_eq!(v["echo_ct"], "application/json");
-        assert_eq!(v["echo_body"], r#"{"resource_key":"plans/p"}"#);
+        assert_eq!(v["echo_body"], r#"{"resource_key":"work-units/u"}"#);
 
         // Non-200 coord verdict: status + body verbatim, not reshaped.
         let url = write_upstream_url(
@@ -5421,8 +5926,8 @@ mod coord_write_proxy_tests {
 
         let url = write_upstream_url(
             &format!("http://127.0.0.1:{port}"),
-            &CoordWriteTarget::RegisterPlanGate {
-                slug: "2026-06-15-some-plan".to_string(),
+            &CoordWriteTarget::WorkUnitRegisterGate {
+                slug: "2026-07-03-some-unit".to_string(),
             },
         );
         let resp = forward_coord_write_post(

@@ -364,9 +364,20 @@ pub struct Survey {
     pub device_id: Option<Uuid>,
     /// `false` when coord could not be reached — the panel says so instead of
     /// implying "nothing to clean".
+    ///
+    /// SCOPE: this describes the pull THIS REQUEST just made. It says nothing
+    /// about the background poller, which is the only thing that can actually
+    /// remove a worktree. Read [`Survey::poller`] for that. The distinction is
+    /// not academic — from 2026-07-28 to 08-01 this field read `true` on every
+    /// request while the poller failed 100 % of its pulls for five days, and a
+    /// reader who took `coord_reachable` as evidence the reclaim pipeline was
+    /// alive would have been wrong for the whole window.
     pub coord_reachable: bool,
     /// Present when `coord_reachable == false`.
     pub coord_error: Option<String>,
+    /// Health of the BACKGROUND POLLER — the executor. A subsystem's health
+    /// signal must report on its OUTPUT, not on the inputs of whoever asked.
+    pub poller: reclaim::PollerHealth,
     /// Echo of coord's arming flags — informational only. The on-demand path
     /// deliberately does NOT depend on them.
     pub remove_armed: bool,
@@ -570,6 +581,7 @@ fn assemble_survey(
             device_id: coord_device_id,
             coord_reachable,
             coord_error,
+            poller: reclaim::poller_health(),
             remove_armed,
             rejunction_armed,
             canonical_excluded: 0,
@@ -614,6 +626,7 @@ fn assemble_survey(
         device_id: Some(snapshot.req.device_id),
         coord_reachable,
         coord_error,
+        poller: reclaim::poller_health(),
         remove_armed,
         rejunction_armed,
         canonical_excluded,

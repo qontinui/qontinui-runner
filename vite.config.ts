@@ -10,11 +10,18 @@ import { version } from "./package.json";
 // build-id: the value is baked into the embedded index.html as
 // `<meta name="build-id">` AND written to `dist/build-id.txt`, which
 // `build.rs` reads back when stamping `RUNNER_BUILD_ID` into the binary.
-// This guarantees the meta tag and the cargo-baked env match for any
-// freshly-built binary, so `useBuildIdWatcher` only fires on a real
-// mid-session binary swap (not on every cold spawn — Vite and cargo used
-// to capture independent timestamps tens of seconds apart, which produced
-// false positives on every fresh build).
+//
+// The point of the read-back is BUILD PROVENANCE: the binary reports the
+// identity of the dist it actually embedded, rather than a value invented
+// at cargo time that matches no dist anywhere. `/health`'s `buildId` is
+// only meaningful because of it, and the supervisor's pre-cargo gate
+// refuses to build without `dist/build-id.txt` for the same reason.
+//
+// It is NOT a staleness signal. Both the meta tag and the cargo env are
+// compile-time constants of one process, so comparing them cannot detect a
+// live binary swap — only a build-time inconsistency. The banner that made
+// that comparison was a permanent false positive and was deleted (plan
+// 2026-07-28-runner-build-id-banner-permanent-false-positive).
 function computeBuildId(): string {
   let sha = "unknown";
   try {
@@ -34,8 +41,8 @@ export default defineConfig({
     react(),
     tailwindcss(),
     // Inject `<meta name="build-id" content="...">` into the served HTML so
-    // `useBuildIdWatcher` (consumed by BuildRefreshBanner) has a stable
-    // initial value to compare against `invoke('get_build_id')`. Runs in
+    // the embedded bundle carries its own identity — readable from the
+    // document when diagnosing which dist an exe shipped. Runs in
     // `transformIndexHtml` (early) so the strip-module-attrs and
     // extract-css-from-bundle plugins later in this list don't have to know
     // about it.
@@ -54,10 +61,10 @@ export default defineConfig({
         return html.replace("</head>", `    ${tag}\n  </head>`);
       },
       // Emit dist/build-id.txt so `build.rs` can read the same value Vite
-      // baked into the meta tag. Without this, Vite and cargo would each
-      // capture an independent `Date.now()` and the resulting RUNNER_BUILD_ID
-      // would never match the meta tag — the banner would fire on every
-      // fresh spawn rather than only on real mid-session binary swaps.
+      // baked into the meta tag. Without this, Vite and cargo each capture an
+      // independent `Date.now()` and the binary's RUNNER_BUILD_ID names no
+      // real dist — which is exactly the degraded state the `unstamped-<sha>`
+      // sentinel in build.rs now reports out loud instead of hiding.
       generateBundle() {
         this.emitFile({
           type: "asset",

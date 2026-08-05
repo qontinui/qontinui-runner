@@ -1,7 +1,7 @@
 //! Pre-GUI CLI mode for the runner binary + the standalone `qontinui_profile`.
 //!
-//! The `env enroll` / `env capture` / `env pull` / `env show` subcommands are
-//! shared between:
+//! The `env enroll` / `env capture` / `env pull` / `env apply` / `env show` /
+//! `env scope-root` subcommands are shared between:
 //! - the standalone `bin/qontinui_profile.rs` (its `Cmd::Env` arm delegates to
 //!   [`run_env`]), and
 //! - the **main runner binary** — `main.rs` calls [`try_run_cli`] at the very top
@@ -26,7 +26,9 @@ use crate::env_agent::enroll::{self, EnrollParams};
 /// The `env` subcommand tree — the machine-side dev-environment capture agent.
 /// `enroll` binds this machine to a web environment via a per-machine API key;
 /// `capture` pushes a secret-free config envelope; `pull` previews what would
-/// change here to match the canonical machine; `show` prints enrollment state.
+/// change here to match the canonical machine; `apply` reconciles this box
+/// toward it (dry-run by default); `show` prints enrollment state; `scope-root`
+/// declares which directory the toolchain probes measure.
 #[derive(Subcommand, Debug)]
 pub enum EnvCmd {
     /// Enroll this machine into a web environment via an enrollment code.
@@ -62,9 +64,58 @@ pub enum EnvCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Reconcile THIS machine toward the environment's canonical config.
+    ///
+    /// The decision is local: nothing is ever pushed onto a box from the
+    /// server. Dry-run by default — it prints exactly what it would write and
+    /// changes nothing until `--confirm` is given.
+    ///
+    /// Only sections the server marks `applyable` are eligible, and within them
+    /// only a fixed key set per section, so a backend that grows a section can
+    /// never widen what this runner writes.
+    Apply {
+        /// Actually write the changes. Without it this is a preview.
+        #[arg(long)]
+        confirm: bool,
+        /// Restrict the apply to these sections (repeatable). Default: every
+        /// section this runner supports.
+        #[arg(long = "section")]
+        sections: Vec<String>,
+        /// Target profile in `~/.qontinui/profiles.json` for the `services`
+        /// apply. Defaults to the active profile (`QONTINUI_ENV` → the file's
+        /// `active` → `dev`) — the same one the capture read, which is what
+        /// makes the drift actually clear.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Emit the report as JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print enrollment state (from env-agent.json) + whether a machine key is
     /// stored.
     Show,
+    /// Declare the **capture scope** — the directory the toolchain `--version`
+    /// probes (`node`/`python`/`rustc`) run in.
+    ///
+    /// Unset (the default) measures the box's DEFAULT toolchain from the home
+    /// directory: what shim-based managers (rustup's default toolchain, `nvm
+    /// alias default`, `pyenv global`) answer outside any project tree. Point it
+    /// at a project root to measure that tree instead.
+    ///
+    /// Without this command the field was settable only by hand-editing
+    /// `~/.qontinui/env-agent.json`.
+    ScopeRoot {
+        /// Directory to probe in. A relative path is resolved against the
+        /// current working directory HERE, at set time — where it means what
+        /// you typed — and stored absolute, because a relative path in the
+        /// config file would resolve against the runner's launch directory
+        /// instead and reintroduce the launch-dependence this setting removes.
+        #[arg(long, conflicts_with = "clear")]
+        path: Option<String>,
+        /// Clear the declared scope, reverting to the home-directory default.
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
 /// Run an `env` subcommand. Returns a process exit code (0/1/2).
@@ -77,8 +128,92 @@ pub fn run_env(cmd: EnvCmd) -> u8 {
         } => cmd_env_enroll(&code, backend.as_deref(), environment.as_deref()),
         EnvCmd::Capture { dry_run } => cmd_env_capture(dry_run),
         EnvCmd::Pull { json } => cmd_env_pull(json),
+        EnvCmd::Apply {
+            confirm,
+            sections,
+            profile,
+            json,
+        } => cmd_env_apply(confirm, sections, profile, json),
         EnvCmd::Show => cmd_env_show(),
+        EnvCmd::ScopeRoot { path, clear } => cmd_env_scope_root(path.as_deref(), clear),
     }
+}
+
+/// Resolve an operator-supplied scope root to a stored value: trimmed, made
+/// absolute against the CURRENT working directory, and checked to be a real
+/// directory.
+///
+/// Relative input is accepted and absolutized rather than rejected — at the
+/// operator's shell a relative path is unambiguous, and resolving it once here
+/// is what keeps the *stored* value absolute. (The probe-side resolver rejects a
+/// relative value outright, since by then the only cwd available is the
+/// runner's launch directory, which means nothing to the operator.)
+fn resolve_scope_root_arg(path: &str) -> Result<String, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("--path requires a non-empty directory".to_string());
+    }
+    let candidate = PathBuf::from(trimmed);
+    let absolute = if candidate.is_absolute() {
+        candidate
+    } else {
+        let cwd = std::env::current_dir()
+            .map_err(|e| format!("could not resolve the current directory for {trimmed:?}: {e}"))?;
+        cwd.join(candidate)
+    };
+    if !absolute.is_dir() {
+        return Err(format!(
+            "{} is not an existing directory",
+            absolute.display()
+        ));
+    }
+    Ok(absolute.display().to_string())
+}
+
+/// `env scope-root` — declare (or clear) the capture scope.
+///
+/// Validates the directory HERE rather than letting the capture discover it is
+/// unusable 15 minutes later: the probe path is fail-open by design, so a bad
+/// value there degrades to a WARN and a silently different measurement. This is
+/// the one place the operator can be told "no" synchronously.
+fn cmd_env_scope_root(path: Option<&str>, clear: bool) -> u8 {
+    let Some(mut cfg) = EnvAgentConfig::load() else {
+        eprintln!(
+            "error: no ~/.qontinui/env-agent.json — run `qontinui-runner env enroll --code <code>` first"
+        );
+        return 1;
+    };
+
+    // Neither flag: report the current setting rather than silently no-op.
+    if path.is_none() && !clear {
+        match cfg.scope_root.as_deref() {
+            Some(v) => println!("scope_root = {v}"),
+            None => println!("scope_root is unset (probing the home directory by default)"),
+        }
+        return 0;
+    }
+
+    let new_value = match path {
+        Some(p) => match resolve_scope_root_arg(p) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 2;
+            }
+        },
+        None => None,
+    };
+
+    cfg.scope_root = new_value.clone();
+    if let Err(e) = cfg.save() {
+        eprintln!("error: writing env-agent.json failed: {e}");
+        return 1;
+    }
+    match new_value {
+        Some(v) => println!("scope_root = {v}"),
+        None => println!("scope_root cleared (probing the home directory by default)"),
+    }
+    0
 }
 
 /// The operator-facing note printed when this machine has no usable local
@@ -214,6 +349,77 @@ fn cmd_env_pull(as_json: bool) -> u8 {
     }
 }
 
+/// `env apply` — pull canonical, then reconcile THIS box toward it.
+///
+/// Dry-run by default. `--confirm` is the local confirm the plan's P2b bullet
+/// requires: the box that owns the box decides, and it decides explicitly.
+///
+/// Exit code 0 covers both a dry run and a successful apply; a section this
+/// runner could not apply is reported in the body (with its reason) rather than
+/// failing the command, since one blocked section must not hide another
+/// section's successful reconcile.
+fn cmd_env_apply(
+    confirm: bool,
+    sections: Vec<String>,
+    profile: Option<String>,
+    as_json: bool,
+) -> u8 {
+    // Same PG-pool publish as capture/pull — without it the `db_schema`
+    // collector yields nothing and that section would wrongly look clean.
+    let active = crate::profiles::load();
+    if let Err(e) = crate::env_agent::publish_pg_pool_from_url(&active.database_url) {
+        eprintln!("note: db_schema collector unavailable — {e}");
+    }
+
+    let opts = crate::env_agent::apply::ApplyOptions {
+        confirm,
+        sections,
+        profile,
+    };
+    match crate::env_agent::apply::apply_blocking(&opts) {
+        Ok(report) => {
+            if as_json {
+                let v = crate::env_agent::apply::report_to_json(&report);
+                match serde_json::to_string_pretty(&v) {
+                    Ok(s) => {
+                        println!("{s}");
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("error: serialize report failed: {e}");
+                        2
+                    }
+                }
+            } else {
+                print!("{}", crate::env_agent::apply::render_report(&report));
+                0
+            }
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            1
+        }
+    }
+}
+
+/// Human-readable state of the declared capture scope, for `env show`.
+///
+/// Reported because the probe-side fall-through is deliberately SILENT in the
+/// envelope: a dropped `scope_root` still produces a well-formed capture, just
+/// measured somewhere the operator did not choose. Without a readout there is
+/// no way to tell a honoured declaration from an ignored one.
+fn scope_root_status(configured: Option<&str>) -> String {
+    let scope = crate::env_agent::collectors::resolve_probe_scope(configured);
+    match (scope.rejected, configured) {
+        (Some(rejection), _) => format!("ignored ({}) — using the default", rejection.reason()),
+        (None, Some(_)) => "configured".to_string(),
+        (None, None) if scope.root.is_some() => "default (home directory)".to_string(),
+        (None, None) => {
+            "no home directory — probes inherit the runner's working directory".to_string()
+        }
+    }
+}
+
 fn cmd_env_show() -> u8 {
     let cfg = EnvAgentConfig::load();
     let key_stored = crate::secure_storage::SecureStorage::new()
@@ -231,6 +437,16 @@ fn cmd_env_show() -> u8 {
             "enrolled_at": c.enrolled_at,
             "machine_key_stored": key_stored,
             "config_path": EnvAgentConfig::path().map(|p| p.display().to_string()),
+            // The declared capture scope, as configured AND as actually
+            // resolved — these differ whenever a stale/relative value was
+            // dropped, which is exactly what an operator needs to see.
+            "scope_root": c.scope_root,
+            "scope_root_status": scope_root_status(c.scope_root.as_deref()),
+            "probe_scope_root": crate::env_agent::collectors::resolve_probe_scope(
+                c.scope_root.as_deref(),
+            )
+            .root
+            .map(|p| p.display().to_string()),
         }),
         None => json!({
             "enrolled": false,
@@ -844,6 +1060,76 @@ pub fn uninstall_identity_shim_from_user_path() -> Result<CliPathOutcome, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- env scope-root ----
+
+    /// An absolute existing directory is stored verbatim.
+    #[test]
+    fn scope_root_arg_accepts_an_absolute_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let stored = resolve_scope_root_arg(&dir.path().to_string_lossy()).unwrap();
+        assert!(PathBuf::from(&stored).is_dir(), "got {stored}");
+        assert!(PathBuf::from(&stored).is_absolute(), "got {stored}");
+    }
+
+    /// A RELATIVE argument is absolutized against the caller's cwd rather than
+    /// rejected — the operator's shell is the one place a relative path is
+    /// unambiguous — and what gets STORED is absolute. Storing the relative form
+    /// would push resolution to the runner's launch directory, which is the
+    /// launch-dependence the scope root exists to remove.
+    #[test]
+    fn scope_root_arg_absolutizes_a_relative_directory() {
+        let stored =
+            resolve_scope_root_arg("src").expect("`src` exists relative to the crate root");
+        let stored = PathBuf::from(stored);
+        assert!(stored.is_absolute(), "stored value must be absolute");
+        assert!(stored.ends_with("src"), "got {}", stored.display());
+    }
+
+    /// A nonexistent path is refused SYNCHRONOUSLY. The probe path is fail-open
+    /// and would merely warn and measure elsewhere, so this is the only moment
+    /// the operator can be told their path is wrong.
+    #[test]
+    fn scope_root_arg_rejects_a_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("definitely_not_created");
+        let err = resolve_scope_root_arg(&missing.to_string_lossy()).unwrap_err();
+        assert!(err.contains("not an existing directory"), "got: {err}");
+    }
+
+    /// A file is not a directory — a file cwd fails every probe spawn.
+    #[test]
+    fn scope_root_arg_rejects_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a_file");
+        std::fs::write(&file, b"x").unwrap();
+        let err = resolve_scope_root_arg(&file.to_string_lossy()).unwrap_err();
+        assert!(err.contains("not an existing directory"), "got: {err}");
+    }
+
+    #[test]
+    fn scope_root_arg_rejects_blank() {
+        let err = resolve_scope_root_arg("   ").unwrap_err();
+        assert!(err.contains("non-empty"), "got: {err}");
+    }
+
+    /// `env show` must distinguish a HONOURED declaration from an IGNORED one.
+    /// Both leave the same `scope_root` string in the file, so a status that
+    /// only echoed the config would report a dropped scope as if it were live.
+    #[test]
+    fn scope_root_status_distinguishes_honoured_from_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            scope_root_status(Some(&dir.path().to_string_lossy())),
+            "configured"
+        );
+
+        let ignored = scope_root_status(Some("relative/path"));
+        assert!(ignored.starts_with("ignored ("), "got: {ignored}");
+        assert!(ignored.contains("relative"), "got: {ignored}");
+
+        assert!(scope_root_status(None).starts_with("default"));
+    }
 
     /// The note must fire ONLY on a genuinely missing/unreadable `machine.json`.
     /// It used to key off the enroll wire field `machine_id`, which is now `None`

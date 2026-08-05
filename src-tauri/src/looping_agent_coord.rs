@@ -65,11 +65,26 @@ fn cache() -> &'static RwLock<DesiredCache> {
     DESIRED_CACHE.get_or_init(|| RwLock::new(DesiredCache::default()))
 }
 
-fn http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(HTTP_TIMEOUT)
-        .build()
-        .map_err(|e| format!("build http client: {e}"))
+/// The module's coord client, built once.
+///
+/// Every call site here shares one uniform [`HTTP_TIMEOUT`], so the deadline
+/// stays baked into the client and callers are unchanged. What must NOT happen
+/// is rebuilding it per request: a `reqwest::Client` owns a connection pool and
+/// a DNS resolver, so per-call construction means a TLS handshake and a
+/// blocking-pool DNS slot every time — the churn that starved coord requests
+/// into spurious timeouts. See [`crate::coord_http::coord_client`].
+fn http_client() -> Result<&'static reqwest::Client, String> {
+    static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(HTTP_TIMEOUT)
+                .pool_idle_timeout(Duration::from_secs(90))
+                .build()
+                .ok()
+        })
+        .as_ref()
+        .ok_or_else(|| "build http client".to_string())
 }
 
 fn coord_base() -> Result<String, String> {

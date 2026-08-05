@@ -27,11 +27,16 @@ import {
   PAST_SESSIONS_RETRY_ID,
   PAST_SESSIONS_VIEW_ELEMENT,
   PAST_SESSION_CARD_ELEMENT,
+  UNNAMED_PAST_SESSION,
   groupByCohort,
   pastSessionCopyId,
+  pastSessionDisplayName,
   pastSessionResumeId,
+  pastSessionTooltip,
   pastSessionsCohortToggleId,
 } from "./PastSessionsView";
+import { registryNamesBySessionId } from "./liveClaudeSessions";
+import type { LiveClaudeSession } from "./liveClaudeSessions";
 import type { PastSession } from "./usePastSessions";
 
 const SOURCE = readFileSync(
@@ -57,6 +62,97 @@ function makeSession(claudeSessionId: string, cohortId: number, lastSeenAt: numb
     cohortId,
   };
 }
+
+/**
+ * A live-registry row for `claudeSessionId`. Only the fields the name gate
+ * reads matter here; the rest mirror the operator's ground-truth shape.
+ */
+function makeLiveRow(
+  claudeSessionId: string,
+  name: string,
+  nameSource?: string,
+): LiveClaudeSession {
+  return {
+    sessionId: claudeSessionId,
+    name,
+    nameSource,
+    pid: 2804,
+    account: { label: "gmail", wrapper: "clg" },
+    workingDir: "D:/qontinui-root",
+    status: "idle",
+    kind: "interactive",
+    startedAt: 1784712055852,
+    updatedAt: 1784770342016,
+    resumeCommand: `clg --resume ${claudeSessionId}`,
+  };
+}
+
+describe("pastSessionDisplayName", () => {
+  it("prefers the live window name over the transcript-derived resumeName", () => {
+    const session = makeSession("live-1", 1, 1000);
+    const names = registryNamesBySessionId([makeLiveRow("live-1", "P3 window name")]);
+    expect(pastSessionDisplayName(session, names)).toBe("P3 window name");
+    // Not the value the card renders today.
+    expect(pastSessionDisplayName(session, names)).not.toBe(session.resumeName);
+  });
+
+  it("does NOT let a derived cwd slug preempt the existing name", () => {
+    // The gate. `qontinui-root-ec` is Claude Code's own `<dir>-<2hex>`
+    // auto-derivation and is strictly worse than the name already on the card,
+    // so this row must lose despite being live.
+    const session = makeSession("live-2", 1, 1000);
+    const names = registryNamesBySessionId([makeLiveRow("live-2", "qontinui-root-ec", "derived")]);
+    expect(pastSessionDisplayName(session, names)).toBe(session.resumeName);
+  });
+
+  it("lets a row with an ABSENT nameSource win", () => {
+    // The absent-key majority — 12 of 17 named rows on the operator's box.
+    const session = makeSession("live-3", 1, 1000);
+    const row = makeLiveRow("live-3", "worktree prune");
+    delete (row as { nameSource?: unknown }).nameSource;
+    expect(pastSessionDisplayName(session, registryNamesBySessionId([row]))).toBe("worktree prune");
+  });
+
+  it("keeps a CLOSED session's resumeName — the live/dead asymmetry", () => {
+    // The registry only ever describes running processes, so a closed session
+    // is always a lookup miss. It must keep rendering exactly what it renders
+    // today, never blank.
+    const closed = makeSession("closed-1", 1, 1000);
+    expect(closed.state).toBe("closed");
+    const namesForOtherSessions = registryNamesBySessionId([
+      makeLiveRow("some-other-live-session", "P3 window name"),
+    ]);
+    expect(pastSessionDisplayName(closed, namesForOtherSessions)).toBe(closed.resumeName);
+    expect(pastSessionDisplayName(closed, new Map())).toBe(closed.resumeName);
+  });
+
+  it("falls back to the unnamed placeholder only when nothing has a name", () => {
+    const nameless = { ...makeSession("nameless", 1, 1000), resumeName: "" };
+    expect(pastSessionDisplayName(nameless, new Map())).toBe(UNNAMED_PAST_SESSION);
+    // …and a live registry name rescues even a nameless row.
+    const names = registryNamesBySessionId([makeLiveRow("nameless", "recovered")]);
+    expect(pastSessionDisplayName(nameless, names)).toBe("recovered");
+  });
+});
+
+describe("pastSessionTooltip", () => {
+  it("always names the session id", () => {
+    expect(pastSessionTooltip(makeSession("s1", 1, 1000), new Map())).toContain("s1");
+  });
+
+  it("keeps the transcript name reachable when the window name displaced it", () => {
+    const session = makeSession("live-4", 1, 1000);
+    const names = registryNamesBySessionId([makeLiveRow("live-4", "P3 window name")]);
+    const t = pastSessionTooltip(session, names);
+    expect(t).toContain("P3 window name");
+    expect(t).toContain(`transcript name: ${session.resumeName}`);
+  });
+
+  it("does not repeat the name when nothing displaced it", () => {
+    const closed = makeSession("closed-2", 1, 1000);
+    expect(pastSessionTooltip(closed, new Map())).not.toContain("transcript name:");
+  });
+});
 
 describe("past-session control ids", () => {
   it("keys copy/resume on the claude session id", () => {

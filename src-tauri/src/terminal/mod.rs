@@ -9,11 +9,13 @@ pub mod auto_response;
 pub mod auto_response_fleet;
 pub mod claude_resume_sniff;
 pub mod commit_report;
+pub mod context_watcher;
 pub mod coord_warn;
 pub mod grid;
 pub mod interceptor;
 pub mod manager;
 pub mod output_scan;
+mod scan_gate;
 pub mod session;
 pub mod transcript;
 pub mod transcript_watcher;
@@ -22,6 +24,26 @@ pub mod usage_limit;
 pub mod vt_sanitize;
 
 pub use manager::TerminalManager;
+
+/// The attributable source marker prefixed to [`runner_context`]'s briefing.
+///
+/// Shape: `[source: <package>/runner_context@<version>+<git-sha>]`. The git SHA
+/// comes from `QONTINUI_GIT_SHA` (baked by `build.rs`, the same stamp `/health`
+/// and the fleet drift check report) because `CARGO_PKG_VERSION` alone moves
+/// only once per release — every locally-built runner on the fleet would
+/// otherwise claim the same version. On a source-tarball build with no git the
+/// SHA component is the literal `unknown`.
+///
+/// Exposed so consumers can recognize the marker without retyping the literal.
+pub const RUNNER_CONTEXT_SOURCE_MARKER: &str = concat!(
+    "[source: ",
+    env!("CARGO_PKG_NAME"),
+    "/runner_context@",
+    env!("CARGO_PKG_VERSION"),
+    "+",
+    env!("QONTINUI_GIT_SHA"),
+    "]"
+);
 
 /// The canonical "you are inside the Qontinui Runner" briefing appended to the
 /// system prompt of every `claude` session the runner hosts.
@@ -48,6 +70,15 @@ pub use manager::TerminalManager;
 /// invariant (a prompt must never cross tenants) and is deferred to the vetted
 /// session-identity fabric plan. Only tenant-agnostic protocol guidance lives
 /// here.
+///
+/// Attributable source marker (part of the contract): the FIRST line of the
+/// appended briefing is always [`RUNNER_CONTEXT_SOURCE_MARKER`]. An instruction
+/// with no attributable source cannot mandate or forbid agent behavior (e.g.
+/// spawns — incident coord #1242), so every consumer of this briefing can trace
+/// it back to this function and the build that emitted it. Both delivery paths
+/// above inherit the marker automatically because they render from this single
+/// function. Note this is the first line of the text the runner *appends* — the
+/// harness's own system prompt still precedes it.
 pub fn runner_context(api_port: u16) -> String {
     // Coord HTTP base for the tool-less fallback links. Resolved the same way
     // every coord proxy route resolves it (COORD_HTTP_URL env → active
@@ -55,7 +86,8 @@ pub fn runner_context(api_port: u16) -> String {
     // runner's own coord client.
     let coord_url = crate::coord_mcp::coord_base_url();
     format!(
-        "You are running inside the Qontinui Runner — an autonomous multi-agent \
+        "{RUNNER_CONTEXT_SOURCE_MARKER}
+You are running inside the Qontinui Runner — an autonomous multi-agent \
 development environment. Runner HTTP API: http://127.0.0.1:{api_port}.
 
 You work autonomously. No human is watching this session; do not wait for \
@@ -88,7 +120,7 @@ record your own scope.
 
 If context runs low, act BEFORE exhaustion: request a handoff \
 (coord_request_handoff) or spawn a continuation session seeded with a \
-summary via POST http://127.0.0.1:{api_port}/sessions/spawn."
+summary via POST http://127.0.0.1:{api_port}/sessions/spawn.",
     )
 }
 
@@ -130,4 +162,38 @@ pub fn strip_ansi(text: &str) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{runner_context, RUNNER_CONTEXT_SOURCE_MARKER};
+
+    /// The attributability contract: the briefing's FIRST line is always the
+    /// source marker naming this package, its version and the build's git SHA,
+    /// so any consumer of the injected system prompt can trace the instruction
+    /// back to its origin (incident coord #1242).
+    #[test]
+    fn runner_context_starts_with_attributable_source_marker() {
+        let briefing = runner_context(9876);
+        assert_eq!(
+            briefing.lines().next(),
+            Some(RUNNER_CONTEXT_SOURCE_MARKER),
+            "the source marker must be the first line of the briefing"
+        );
+    }
+
+    /// The marker must actually discriminate builds — a bare package/version
+    /// stamp moves only once per release, so every locally-built runner on the
+    /// fleet would attribute to the same string. Guards the `+<git-sha>`
+    /// component against being dropped back to `CARGO_PKG_VERSION` alone.
+    #[test]
+    fn source_marker_carries_build_identity() {
+        let expected = format!(
+            "[source: {}/runner_context@{}+{}]",
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+            env!("QONTINUI_GIT_SHA"),
+        );
+        assert_eq!(RUNNER_CONTEXT_SOURCE_MARKER, expected);
+    }
 }

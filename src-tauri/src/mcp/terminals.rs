@@ -13,7 +13,8 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::{SinkExt, StreamExt};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tauri::Manager;
 use tracing::{debug, error, info, warn};
@@ -56,6 +57,14 @@ pub struct CreateTerminalRequest {
     /// interactive/UI-created terminals (no session to attribute).
     #[serde(default)]
     pub agent_session_id: Option<uuid::Uuid>,
+    /// Optional per-request Claude account override — a friendly name
+    /// (`"hotmail"`, matching `derive_account_name`) OR a full roster
+    /// `config_dir` path. When set, `CLAUDE_CONFIG_DIR` is pre-seeded into
+    /// the PTY env so a bare `claude` in the terminal is pinned to that
+    /// (validated) account without a shell launcher. Omitting it leaves the
+    /// PTY env untouched (existing behaviour).
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 /// Request body for writing data to a terminal.
@@ -70,6 +79,53 @@ pub struct WriteTerminalRequest {
 pub struct ResizeTerminalRequest {
     pub cols: u16,
     pub rows: u16,
+}
+
+/// Request body for moving a terminal onto a different page
+/// (`POST /terminals/{id}/move`). The wire field is `pageId` (camelCase).
+/// `page_id` is required in practice — a missing/empty value returns 400.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveTerminalRequest {
+    #[serde(default)]
+    pub page_id: Option<String>,
+}
+
+// ============================================================================
+// Response Types — GET /terminal-pages
+// ============================================================================
+
+/// One terminal's membership entry within a page group.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalPageEntry {
+    pub id: String,
+    pub title: String,
+    pub is_alive: bool,
+}
+
+/// A page and the live terminals parked on it.
+///
+/// SCOPE (v1): membership only — `pageId` + the terminals on it. Human-readable
+/// tab labels ("Page 1…N") and left-to-right order are frontend-only state and
+/// are NOT known to the Rust backend (page metadata is never persisted
+/// server-side; only `page_id` strings are). A `label`/`order` field is a
+/// follow-up requiring the frontend to register page metadata to the backend
+/// (e.g. a future `PUT /terminal-pages/{id}` `{ label, order }`); do not invent
+/// a server-side label heuristic here.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalPageGroup {
+    pub page_id: String,
+    pub terminal_count: usize,
+    pub terminals: Vec<TerminalPageEntry>,
+}
+
+/// Response for `GET /terminal-pages` — page-centric grouping of live terminals.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalPagesResponse {
+    pub pages: Vec<TerminalPageGroup>,
 }
 
 /// Query params for `GET /terminals/{id}/buffer` (and its `/output` alias).
@@ -165,7 +221,32 @@ pub async fn create_terminal_handler(
     // configured plan directories), derived from the live context before it is
     // parked on the session; each var is omitted when it does not resolve.
     // See `agent_worktree::session_env`.
-    let extra_env = crate::agent_worktree::session_env::session_extra_env(isolated_ctx.as_ref());
+    let mut extra_env_vec: Vec<(String, String)> =
+        crate::agent_worktree::session_env::session_extra_env(isolated_ctx.as_ref())
+            .unwrap_or_default();
+
+    // Per-request account pin: resolve → validate → pre-seed CLAUDE_CONFIG_DIR
+    // onto the PTY env (merged with the session env above, not replacing it).
+    // Bogus name → 400, logged-out → 409 — same contract as /sessions/spawn.
+    if let Some(account) = request.account.as_deref().filter(|a| !a.is_empty()) {
+        match crate::ai_provider::resolve_requested_account(account) {
+            Ok(resolved) => {
+                extra_env_vec.push(("CLAUDE_CONFIG_DIR".to_string(), resolved.config_dir));
+            }
+            Err(e @ crate::ai_provider::AccountSelectError::NotInRoster { .. }) => {
+                return Err((StatusCode::BAD_REQUEST, Json(api_error(e.message()))));
+            }
+            Err(e @ crate::ai_provider::AccountSelectError::NotLoggedIn { .. }) => {
+                return Err((StatusCode::CONFLICT, Json(api_error(e.message()))));
+            }
+        }
+    }
+
+    let extra_env = if extra_env_vec.is_empty() {
+        None
+    } else {
+        Some(extra_env_vec)
+    };
 
     match terminal_manager.create(
         request.title,
@@ -377,6 +458,88 @@ pub async fn resize_terminal_handler(
     }))))
 }
 
+/// Move a terminal onto a different page (`POST /terminals/{id}/move`).
+///
+/// Body: `{ "pageId": "<id>" }`. Delegates to
+/// [`TerminalManager::set_page`], which mutates the in-memory session,
+/// mirrors the move into the durable lifecycle registry, and emits a
+/// `terminal-page-changed` event so the grid re-mounts the tab. Mirrors the
+/// error mapping of the sibling handlers (400 on missing/empty `pageId`, 404
+/// on unknown terminal).
+pub async fn move_terminal_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Json(request): Json<MoveTerminalRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let terminal_manager = get_terminal_manager(&state);
+    let app_handle = state.app_handle.clone();
+
+    let page_id = request.page_id.filter(|p| !p.is_empty()).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(api_error("pageId is required and must be non-empty")),
+        )
+    })?;
+
+    info!("HTTP: Moving terminal {} to page {}", id, page_id);
+
+    terminal_manager
+        .set_page(&id, page_id.clone(), &app_handle)
+        .map_err(|e| {
+            error!("HTTP: Failed to move terminal {}: {}", id, e);
+            (
+                StatusCode::NOT_FOUND,
+                Json(api_error(format!("Terminal not found: {}", id))),
+            )
+        })?;
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "moved": true,
+        "id": id,
+        "pageId": page_id,
+    }))))
+}
+
+/// List live terminals grouped by page (`GET /terminal-pages`).
+///
+/// Reuses the exact data source as [`list_terminals_handler`] —
+/// `terminal_manager.list()` — and groups the entries by their `page_id`.
+/// Includes the literal `"default"` page group when any terminal is parked
+/// there (the orphaned-tab case that motivated this endpoint). A
+/// `BTreeMap<String, _>` keyed by page id yields deterministic (lexical)
+/// ordering across calls.
+pub async fn list_terminal_pages_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let terminal_manager = get_terminal_manager(&state);
+    let terminals = terminal_manager.list();
+
+    let mut grouped: BTreeMap<String, Vec<TerminalPageEntry>> = BTreeMap::new();
+    for info in terminals {
+        grouped
+            .entry(info.page_id.clone())
+            .or_default()
+            .push(TerminalPageEntry {
+                id: info.id,
+                title: info.title,
+                is_alive: info.is_alive,
+            });
+    }
+
+    let pages: Vec<TerminalPageGroup> = grouped
+        .into_iter()
+        .map(|(page_id, terminals)| TerminalPageGroup {
+            page_id,
+            terminal_count: terminals.len(),
+            terminals,
+        })
+        .collect();
+
+    Ok(Json(ApiResponse::success(serde_json::json!(
+        TerminalPagesResponse { pages }
+    ))))
+}
+
 /// Close a terminal session.
 pub async fn close_terminal_handler(
     State(state): State<Arc<ApiState>>,
@@ -577,6 +740,8 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             "/terminals",
             get(list_terminals_handler).post(create_terminal_handler),
         )
+        // Page-centric grouping of live terminals (which sessions on which page).
+        .route("/terminal-pages", get(list_terminal_pages_handler))
         .route("/terminals/{id}/write", post(write_terminal_handler))
         .route("/terminals/{id}/buffer", get(get_buffer_handler))
         // Alias — the cheatsheet and intuition both reach for `/output`.
@@ -584,6 +749,8 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         .route("/terminals/{id}/output", get(get_buffer_handler))
         .route("/terminals/{id}/submit-prompt", post(submit_prompt_handler))
         .route("/terminals/{id}/resize", post(resize_terminal_handler))
+        // Move a terminal onto a different page (axum 0.8 `{id}` brace syntax).
+        .route("/terminals/{id}/move", post(move_terminal_handler))
         .route("/terminals/{id}/ws", get(ws_terminal_handler))
         .route("/terminals/{id}", delete(close_terminal_handler))
 }
