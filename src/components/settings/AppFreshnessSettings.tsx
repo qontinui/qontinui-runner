@@ -42,10 +42,10 @@ import {
   buildPatchBody,
   effectiveAfterSave,
   formOf,
-  isDirty,
   isFalselyFresh,
   isKnownStrategy,
   isUpdateStrategy,
+  sameForm,
   type AppFreshnessForm,
   type AppListResponse,
   type RegisteredApp,
@@ -132,11 +132,25 @@ export function AppFreshnessSettings({ onLog }: AppFreshnessSettingsProps) {
         // The handler returns the updated `App`. Apply it to THIS row only —
         // re-listing would rebuild every form and discard unsaved edits the
         // operator has made to other rows.
-        const updated: RegisteredApp = await resp.json();
+        const updated: RegisteredApp | undefined = await resp.json();
+        if (updated?.appId !== app.appId) {
+          // A 200 whose body isn't the app we patched (proxy interception, a
+          // future shape change) would otherwise write a junk `forms[undefined]`
+          // entry and leave the row looking unsaved. Fall back to a full read
+          // rather than trusting the cast.
+          await load();
+          return;
+        }
         setApps((prev) =>
           prev ? prev.map((a) => (a.appId === updated.appId ? updated : a)) : prev,
         );
-        setForms((prev) => ({ ...prev, [updated.appId]: formOf(updated) }));
+        setForms((prev) => {
+          // Only reset the row if the operator hasn't kept typing during the
+          // request — otherwise the response snaps their in-flight edit back.
+          const current = prev[updated.appId];
+          if (current && !sameForm(current, form)) return prev;
+          return { ...prev, [updated.appId]: formOf(updated) };
+        });
         onLog("success", `Updated auto-fresh config for app "${app.appId}"`);
         setError(null);
       } catch (err) {
@@ -151,7 +165,7 @@ export function AppFreshnessSettings({ onLog }: AppFreshnessSettingsProps) {
         });
       }
     },
-    [forms, onLog],
+    [forms, load, onLog],
   );
 
   return (
@@ -196,9 +210,19 @@ export function AppFreshnessSettings({ onLog }: AppFreshnessSettingsProps) {
           {apps.map((app) => {
             const form = forms[app.appId];
             if (!form) return null;
+            const stored = formOf(app);
             const effective = effectiveAfterSave(app, form);
-            const falselyFresh = isFalselyFresh(app, form);
-            const dirty = isDirty(app, form);
+            const falselyFresh = isFalselyFresh(effective);
+            const dirty = !sameForm(effective, stored);
+            // Commands that survive the save but are NOT visible in their input
+            // (the operator cleared it). Naming them is the only view they have
+            // of a stored command they just deleted from the box.
+            const retained = (
+              [
+                ["build", form.buildCommand.trim() ? "" : effective.buildCommand],
+                ["start", form.startCommand.trim() ? "" : effective.startCommand],
+              ] as Array<[string, string]>
+            ).filter(([, value]) => value.length > 0);
             const saving = savingAppIds.has(app.appId);
             const isBuild = form.updateStrategy === "pull_build";
             return (
@@ -239,9 +263,9 @@ export function AppFreshnessSettings({ onLog }: AppFreshnessSettingsProps) {
                     <AlertTriangle className="w-3 h-3 mt-0.5 shrink-0" />
                     <span>
                       Stored strategy <code className="font-mono">{app.updateStrategy}</code> is not
-                      recognised by this build; the selector below shows{" "}
-                      <code className="font-mono">pull_only</code> instead. Saving will overwrite
-                      the stored value.
+                      recognised by this build, so the selector below shows{" "}
+                      <code className="font-mono">pull_only</code> instead. This build cannot change
+                      the stored value — update the runner, or PATCH the registry directly.
                     </span>
                   </p>
                 )}
@@ -305,11 +329,23 @@ export function AppFreshnessSettings({ onLog }: AppFreshnessSettingsProps) {
                     <p className="text-xs text-muted-foreground">
                       Commands run in the app&apos;s repo root via the platform shell. Clearing a
                       field does not clear the stored command — the registry API has no way to unset
-                      one — so a blank field is left as-is
-                      {effective.buildCommand || effective.startCommand
-                        ? " (this app keeps the commands shown above)."
-                        : "."}
+                      one — so a blank field is left as-is.
                     </p>
+                    {retained.length > 0 && (
+                      <p
+                        className="text-xs text-muted-foreground"
+                        data-testid="app-freshness-retained"
+                      >
+                        Saving keeps{" "}
+                        {retained.map(([label, value], i) => (
+                          <span key={label}>
+                            {i > 0 && ", "}
+                            {label} <code className="font-mono">{value}</code>
+                          </span>
+                        ))}
+                        .
+                      </p>
+                    )}
                   </div>
                 )}
               </div>
