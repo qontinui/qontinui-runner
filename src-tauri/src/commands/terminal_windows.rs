@@ -280,14 +280,29 @@ pub async fn close_empty_terminal_windows(
     Ok(sweep_empty_pop_out_windows(&app, assignments.inner()))
 }
 
+/// Whether `owner` (a non-main window) should be torn down now that one of its
+/// sessions has exited cleanly. Pure — no `AppHandle`, so it is unit-testable.
+fn should_close_owner_window(assignments: &WindowAssignments, owner: &str) -> bool {
+    !assignments.has_assigned_sessions(owner) && !assignments.is_page_bound(owner)
+}
+
 /// P1 (close-on-clean-exit) — invoked from the terminal session's PTY-exit
 /// waiter the instant a session's child exits. On a CLEAN exit (`Some(0)`)
 /// only, if the session's owning window is a `term-N` pop-out that now hosts NO
 /// other live session, close that window (the predictable terminal-emulator
 /// close-on-exit behaviour) and prune its record so boot-restore won't
 /// resurrect it. A non-zero / unknown exit NEVER auto-closes (honesty: a failed
-/// session stays visible). `"main"` is never auto-closed. Multi-tab pop-outs are
-/// never closed by one tab's exit (the emptiness check sees the sibling tabs).
+/// session stays visible). Multi-tab pop-outs are never closed by one tab's exit
+/// (the emptiness check sees the sibling tabs).
+///
+/// Two window kinds are NEVER auto-closed: `"main"`, and PAGE-BOUND pop-outs.
+/// A page-bound window claims its terminals by `page_id`, not through the
+/// `session_owner` map, so an empty `session_owner` map does NOT mean an empty
+/// window — it hosts a whole page that outlives any single session, and even its
+/// last tab exiting must leave the window (and the operator's grid layout)
+/// standing. Only the OS title-bar close dismisses one. See
+/// [`should_close_owner_window`], and the same carve-out in
+/// [`sweep_empty_pop_out_windows`] / `WindowAssignments::prune_empty_pop_outs`.
 ///
 /// `terminal_id` is the session id used as the `window_assignments` owner key
 /// (the same id the frontend passes to `assign_session_to_window`).
@@ -321,8 +336,10 @@ pub fn auto_close_owner_window_if_empty(
             tracing::warn!(error = %e, "auto_close_owner_window_if_empty: failed to emit reassignment");
         }
     }
-    if assignments.has_assigned_sessions(&owner) {
-        // Another live tab remains in the pop-out — leave it open.
+    if !should_close_owner_window(assignments, &owner) {
+        // Another live tab remains in the pop-out, OR it is a page-bound window
+        // (its tabs are claimed by page_id, not the session_owner map, so an
+        // empty owner map does NOT mean an empty window). Leave it open.
         return;
     }
     // The owner pop-out is now empty: destroy the OS window and prune the
@@ -496,4 +513,69 @@ pub fn handle_window_close(app: &tauri::AppHandle, label: &str) -> bool {
         "Closed pop-out terminal window"
     );
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn store() -> (tempfile::TempDir, WindowAssignments) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("window-assignments.json");
+        let wa = WindowAssignments::open(&path).unwrap();
+        (dir, wa)
+    }
+
+    #[test]
+    fn page_bound_popout_is_never_closed_even_when_its_last_session_exits() {
+        // Regression: a page-bound pop-out claims its tabs by `page_id`, not
+        // through `session_owner`, so an empty owner map does NOT mean an empty
+        // window. Before the guard this returned `true` and destroyed the
+        // operator's window (and grid layout) on a clean `exit`.
+        let (_d, wa) = store();
+        wa.ensure_main(1);
+        let bound = wa.create_window(None, None, Some("page-A".to_string()), 10);
+        wa.assign_session("sess-A", &bound.label);
+        // The exit waiter reassigns the dead session to main immediately before
+        // consulting the guard, leaving the owner map empty.
+        wa.assign_session("sess-A", MAIN_WINDOW_LABEL);
+        assert!(!wa.has_assigned_sessions(&bound.label));
+
+        assert!(
+            !should_close_owner_window(&wa, &bound.label),
+            "a page-bound pop-out stays open even with no assigned sessions"
+        );
+    }
+
+    #[test]
+    fn plain_popout_still_closes_when_its_last_session_exits() {
+        // The fix must not disable close-on-clean-exit for ordinary pop-outs —
+        // that is the behaviour the helper exists for.
+        let (_d, wa) = store();
+        wa.ensure_main(1);
+        let w = wa.create_window(None, None, None, 10);
+        wa.assign_session("sess-A", &w.label);
+        wa.assign_session("sess-A", MAIN_WINDOW_LABEL); // the exit reassign
+
+        assert!(
+            should_close_owner_window(&wa, &w.label),
+            "an emptied per-id pop-out is still torn down on clean exit"
+        );
+    }
+
+    #[test]
+    fn popout_with_a_surviving_sibling_session_stays_open() {
+        let (_d, wa) = store();
+        wa.ensure_main(1);
+        let w = wa.create_window(None, None, None, 10);
+        wa.assign_session("sess-A", &w.label);
+        wa.assign_session("sess-B", &w.label);
+        wa.assign_session("sess-A", MAIN_WINDOW_LABEL); // sess-A exited
+
+        assert!(
+            !should_close_owner_window(&wa, &w.label),
+            "sess-B still renders here, so one tab's exit must not close it"
+        );
+    }
 }
