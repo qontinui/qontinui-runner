@@ -1971,6 +1971,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::screenshot::capture_screenshot_via_python,
             commands::screenshot::get_screenshot_monitors,
             commands::screenshots::list_screenshots,
+            commands::performance_settings::get_performance_settings,
+            commands::performance_settings::save_performance_settings,
             commands::script_emitter::emit_extraction_script,
             commands::script_emitter::emit_scripted_output_event,
             commands::scripted_output_settings::get_scripted_output_settings,

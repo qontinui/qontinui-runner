@@ -70,6 +70,8 @@ import { HoldingLockBanner, shouldShowHoldingBanner } from "./HoldingLockBanner"
 import { WaitingLockBanner } from "./WaitingLockBanner";
 import { DeconflictAdvisoryBanner } from "./DeconflictAdvisoryBanner";
 import { CoordWarningBanner } from "./CoordWarningBanner";
+import { SessionCountBanner } from "./SessionCountBanner";
+import { loadPerfCaps } from "@/lib/perfCaps";
 import { ProjectFolderChip } from "./ProjectFolderChip";
 import { useApplyZoneProfile } from "./useApplyZoneProfile";
 import { useZoneProfileRestore } from "./useZoneProfileRestore";
@@ -506,6 +508,15 @@ function TerminalPageInner({
   }, [fileLockStates]);
 
   const activeTab = useMemo(() => tabs.find((t) => t.id === activeId), [tabs, activeId]);
+
+  // Kick the one-shot load of the operator-tunable performance caps
+  // (many-sessions plan Phase 8). Deliberately NOT `usePerfCaps()` here: this
+  // page is the render-cost hot spot the plan is about, and the only consumer
+  // of a cap on it is `SessionCountBanner`, which subscribes for itself.
+  useEffect(() => {
+    void loadPerfCaps();
+  }, []);
+
   const activeLockState = activeId ? fileLockStates?.[activeId] : undefined;
   // Phase 3 — pull per-tab incoming yield requests so the holding
   // banner can shift into request-mode and we can surface the request
@@ -1258,6 +1269,15 @@ function TerminalPageInner({
           recentAlert={fileConflicts.recentAlert}
           onDismissAlert={fileConflicts.dismissAlert}
         />
+
+        {/* Many-sessions plan Phase 8 — soft advisory past
+            `settings.performance.max_sessions_warn` (default 30). Warn only:
+            §5 of that plan rejects a hard session cap, so this never gates a
+            spawn and nothing reads it on a create path. Dismissible, and
+            re-arms once the count drops back under the threshold. The banner
+            reads the threshold from the caps store itself, so this page does
+            not subscribe to it. */}
+        <SessionCountBanner sessionCount={tabs.length} />
 
         {uiState.showTimeline && zoneLayout.isMultiZone && (
           <ZoneTimeline

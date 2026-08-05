@@ -15,6 +15,20 @@ use crate::session::session_lifecycle_store::{SessionLifecycleStore, TerminalSes
 use crate::session::{Intent, SessionKind, SessionRegistry};
 use crate::terminal::{strip_ansi, TerminalManager};
 
+/// The `(share_output, redact_secrets)` a terminal session declares to coord,
+/// from `settings.performance` (many-sessions plan Phase 8).
+///
+/// Both terminal create paths — the interactive one and the gate-continuation
+/// one — go through this single function rather than reading the settings
+/// separately, so the two can never drift into declaring different sharing
+/// postures for what is, to coord, the same kind of session. Before Phase 8
+/// both sites hardcoded `(true, None)`, which is exactly what the stock
+/// settings still produce.
+fn intent_sharing_from_settings() -> (bool, Option<bool>) {
+    let perf = crate::settings::get_performance_settings();
+    (perf.share_terminal_output, perf.redact_terminal_secrets)
+}
+
 /// Create a new terminal session.
 ///
 /// Phase 2 of `plans/2026-05-28-isolate-session-edit-work-in-worktrees.md`:
@@ -166,6 +180,7 @@ pub async fn terminal_create(
     let purpose = title
         .filter(|t| t.trim().len() >= 3)
         .unwrap_or_else(|| "Terminal shell session".to_string());
+    let (share_output, redact_secrets) = intent_sharing_from_settings();
     let intent = Intent {
         kind: SessionKind::TerminalShell,
         purpose,
@@ -180,8 +195,8 @@ pub async fn terminal_create(
             .map(std::path::PathBuf::from)
             .into_iter()
             .collect(),
-        share_output: true,
-        redact_secrets: None,
+        share_output,
+        redact_secrets,
         // The tenant the spawn picker (F2) / `--tenant` flag (F3) chose for
         // this tab. `None` → the registry stamps the device default
         // (default-for-new-sessions), which is the pre-F2 behavior.
@@ -1568,6 +1583,7 @@ pub(crate) fn create_terminal_session_backend(
     } else {
         "Gate continuation terminal session".to_string()
     };
+    let (share_output, redact_secrets) = intent_sharing_from_settings();
     let intent = Intent {
         kind: SessionKind::TerminalShell,
         purpose,
@@ -1579,8 +1595,8 @@ pub(crate) fn create_terminal_session_backend(
         // `coord.sessions.intent` so coord learns the placement.
         page_id: page_id.clone(),
         declared_paths: vec![std::path::PathBuf::from(&working_dir)],
-        share_output: true,
-        redact_secrets: None,
+        share_output,
+        redact_secrets,
         // Gate-continuation terminal — device-default binding; the registry
         // stamps machine.json's default-for-new-sessions.
         tenant_id: None,
@@ -2306,5 +2322,34 @@ mod tests {
             open[0].provider,
             crate::session::session_lifecycle_store::DEFAULT_PROVIDER
         );
+    }
+
+    // ── Phase 8: both create sites declare sharing from the setting ──────
+
+    /// Stock settings reproduce the literals both create sites hardcoded
+    /// before Phase 8. This is the back-compat guarantee for the coord
+    /// intent, stated as a test rather than as a comment.
+    #[test]
+    fn intent_sharing_defaults_to_the_pre_phase8_literals() {
+        let _guard = crate::settings::perf_test_lock();
+        crate::settings::set_performance_cache(crate::settings::PerformanceSettings::default());
+        assert_eq!(intent_sharing_from_settings(), (true, None));
+    }
+
+    /// The knob actually moves what both sites will declare — reverting
+    /// either site to a hardcoded `true` would leave this failing.
+    #[test]
+    fn intent_sharing_follows_the_setting() {
+        let _guard = crate::settings::perf_test_lock();
+        crate::settings::set_performance_cache(crate::settings::PerformanceSettings {
+            share_terminal_output: false,
+            redact_terminal_secrets: Some(true),
+            ..crate::settings::PerformanceSettings::default()
+        });
+        assert_eq!(intent_sharing_from_settings(), (false, Some(true)));
+
+        // Leave the process cache stocked so a later test in this binary
+        // does not inherit a hostile posture.
+        crate::settings::set_performance_cache(crate::settings::PerformanceSettings::default());
     }
 }
