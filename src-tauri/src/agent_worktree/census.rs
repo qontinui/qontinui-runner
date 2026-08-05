@@ -1565,6 +1565,13 @@ fn warn_on_low_disk(volumes: &[VolumeReport]) {
 /// empty for the whole multi-hour walk, and its server-side persist blew the
 /// old 15s client timeout).
 pub fn spawn_census() {
+    // Device-keyed machine state: a secondary's walk would overwrite the
+    // machine's worktree inventory with its own view, and the reclaim/reaper
+    // path acts on whichever landed last. Same rule as the fleet publishers —
+    // see `fleet::machine_state_publish_allowed`.
+    if !crate::fleet::machine_state_publish_allowed(crate::instance::owns_shared_root_state()) {
+        return;
+    }
     let secs: u64 = std::env::var("QONTINUI_WORKTREE_CENSUS_INTERVAL_SECS")
         .ok()
         .and_then(|s| s.parse().ok())

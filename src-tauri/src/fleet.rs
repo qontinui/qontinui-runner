@@ -508,7 +508,30 @@ fn write_last_budget_cache(body: &DeviceBudgetRequest, device_id: &str) {
 ///
 /// Pure so the decision is testable without touching process-global env, which
 /// races the parallel test harness.
-fn budget_publish_allowed(owns_shared_root_state: bool) -> bool {
+///
+/// ## Scope: every machine-scoped writer, not only the budget
+///
+/// The budget was the writer that caused the 2026-07-28 outage, but it is not
+/// the only one addressing the shared `coord.devices` row. Three more send
+/// machine-scoped state and are gated on this same predicate:
+///
+/// * the device **heartbeat** — machine-scoped end to end. `served_git_sha` is
+///   the sharpest field on it: coord's `runner_served_sha` gate predicate reads
+///   that column, so a secondary built from a different ref makes coord believe
+///   the MACHINE serves that build. `claude_code_available` gates auditor spawn
+///   routing, and the capture/monitor counters are per-process.
+/// * the **tree publisher** — `coord.primary_trees` rows keyed by this device,
+///   describing repos walked from `QONTINUI_ROOT`.
+/// * the **worktree census** — `POST /coord/worktree-census/{device_id}`,
+///   device-keyed by its own module doc. A secondary's walk would overwrite the
+///   machine's inventory with its own view, and reclaim/reaper decisions act on
+///   whichever landed last. Nothing is lost by gating: the primary's walk sees
+///   the same filesystem, including worktrees a secondary created.
+///
+/// Deliberately ONE predicate rather than one per writer. The lesson of the
+/// outage it fixes is that a rule keyed in a single place gets missed by the
+/// next mechanism that needs it.
+pub(crate) fn machine_state_publish_allowed(owns_shared_root_state: bool) -> bool {
     owns_shared_root_state
 }
 
@@ -533,17 +556,17 @@ fn budget_publish_allowed(owns_shared_root_state: bool) -> bool {
 /// runs on the `fleet-heartbeat` thread, which holds no `PgDb`.
 ///
 /// **Only the instance that owns shared machine-wide state publishes.** See
-/// [`budget_publish_allowed`] for why a secondary must not.
+/// [`machine_state_publish_allowed`] for why a secondary must not.
 pub async fn publish_budget(
     role: MachineRole,
     resources: Resources,
     disk_reserved_gb: u64,
 ) -> Result<(), String> {
-    if !budget_publish_allowed(crate::instance::owns_shared_root_state()) {
+    if !machine_state_publish_allowed(crate::instance::owns_shared_root_state()) {
         info!(
             instance = ?crate::instance::instance_name(),
             "fleet::publish_budget: this runner is a SECONDARY instance — skipping budget publish \
-             so it cannot clobber the shared device row (see `budget_publish_allowed`)."
+             so it cannot clobber the shared device row (see `machine_state_publish_allowed`)."
         );
         return Ok(());
     }
@@ -682,7 +705,7 @@ fn budget_republish_secs() -> u64 {
 ///
 /// A periodic re-assert bounds that damage to one interval. The other half —
 /// stopping a sibling instance from writing the wrong value in the first place —
-/// is [`budget_publish_allowed`], which is also why this is a no-op on a
+/// is [`machine_state_publish_allowed`], which is also why this is a no-op on a
 /// secondary: re-asserting on a 10-minute timer from an instance that must not
 /// write at all would just flap the column against the primary's republisher.
 ///
@@ -691,7 +714,7 @@ fn budget_republish_secs() -> u64 {
 /// that block that runtime for minutes at a time (the 2026-06-03 heartbeat
 /// starvation) cannot stall the re-assert either.
 pub fn spawn_budget_republisher(role: MachineRole) {
-    if !budget_publish_allowed(crate::instance::owns_shared_root_state()) {
+    if !machine_state_publish_allowed(crate::instance::owns_shared_root_state()) {
         info!(
             instance = ?crate::instance::instance_name(),
             "fleet::budget_republisher: SECONDARY instance — not starting. Only the instance that \
@@ -1074,6 +1097,13 @@ fn is_false(b: &bool) -> bool {
 /// [`claude_code_probe`] (cached 60s). Failures are reported as
 /// `Err(String)` so the caller can log them; the loop never panics.
 pub async fn heartbeat_to_coord() -> Result<(), String> {
+    // The register payload is machine-scoped end to end — see
+    // `machine_state_publish_allowed`. A secondary has nothing honest to
+    // contribute here (the primary keeps `last_seen_at` fresh), so it stays off
+    // the wire entirely rather than sending a partial payload.
+    if !machine_state_publish_allowed(crate::instance::owns_shared_root_state()) {
+        return Ok(());
+    }
     let device = match load_device_file() {
         Some(d) => d,
         None => {
@@ -3003,6 +3033,11 @@ pub async fn publish_tree_state() -> Result<(), String> {
 /// above. Failures `warn!` and retry on the next tick; the loop never
 /// panics.
 pub fn spawn_tree_publisher() {
+    // `coord.primary_trees` rows are keyed by this device and describe the repos
+    // on the BOX, so they are machine-scoped by the same definition the budget is.
+    if !machine_state_publish_allowed(crate::instance::owns_shared_root_state()) {
+        return;
+    }
     let secs: u64 = std::env::var("COORD_TREE_PUBLISH_INTERVAL_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -3534,6 +3569,39 @@ fn execute_build_and_restart(app: &qontinui_types::apps::App, app_id: &str) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Source of THIS file, split so a pin never scans the test module — a
+    /// call site written inside a test would otherwise satisfy "the writer is
+    /// guarded" while production code had none, and a negative assertion would
+    /// match its own string literal.
+    fn prod_src() -> &'static str {
+        const SRC: &str = include_str!("fleet.rs");
+        SRC.split_once(
+            "
+#[cfg(test)]",
+        )
+        .map(|(before, _)| before)
+        .unwrap_or(SRC)
+    }
+
+    /// Every machine-scoped writer must consult the guard.
+    ///
+    /// Pinned at the SOURCE level because the predicate reads `QONTINUI_PORT`,
+    /// which other harness threads mutate — an env-driven assertion here would
+    /// flake, as `instance::primary_keeps_the_unscoped_path` records. What this
+    /// catches is the regression that matters: a writer added or refactored
+    /// without the guard travelling with it.
+    #[test]
+    fn every_machine_scoped_writer_consults_the_guard() {
+        let src = prod_src();
+        let guarded = src
+            .matches("machine_state_publish_allowed(crate::instance::owns_shared_root_state())")
+            .count();
+        assert!(
+            guarded >= 4,
+            "expected the budget publish, the republisher, the heartbeat and the              tree publisher to be gated in fleet.rs (census is gated in its own              module); found {guarded} guarded call site(s)"
+        );
+    }
     use crate::test_env::{env_lock, EnvVarRestore};
 
     // ---- periodic budget re-publish ----
@@ -3587,11 +3655,11 @@ mod tests {
     #[test]
     fn only_the_shared_state_owner_publishes_the_budget() {
         assert!(
-            budget_publish_allowed(true),
+            machine_state_publish_allowed(true),
             "the primary owns the machine's device row and must keep publishing"
         );
         assert!(
-            !budget_publish_allowed(false),
+            !machine_state_publish_allowed(false),
             "a secondary must never write the shared device row — this is the \
              2026-07-28 six-day shadow-lane outage"
         );
@@ -3604,13 +3672,13 @@ mod tests {
     /// is strictly harder to diagnose than the original bug.
     ///
     /// This pins the coupling that makes that impossible — both entry points
-    /// funnel through `budget_publish_allowed`, so a secondary contributes no
+    /// funnel through `machine_state_publish_allowed`, so a secondary contributes no
     /// writes at all rather than half of them.
     #[test]
     fn republisher_and_boot_publish_share_one_ownership_predicate() {
         for owns in [true, false] {
             assert_eq!(
-                budget_publish_allowed(owns),
+                machine_state_publish_allowed(owns),
                 owns,
                 "both call sites must gate on shared-state ownership alone"
             );
