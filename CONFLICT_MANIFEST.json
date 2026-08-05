@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "base_sha": "11bd74a612cb50ede8cb1c3a8f7a6ccbd65c5f7c",
+  "ours_sha": "7f8e1d3db6fa682235e4fdbf99b62ec8cc537b86",
+  "theirs_sha": "16d0d78db61d29b365c532b20bc251a6c7294d08",
+  "entries": [
+    {
+      "path": "src-tauri/src/env_agent/apply.rs",
+      "base_oid": null,
+      "ours_oid": "d7cc1359b6f6e373582337d11c3f76082d0e63fb",
+      "theirs_oid": "2de51547a08ada93b2da91bec67476313e7f5ccc",
+      "base_path": null,
+      "ours_path": "src-tauri/src/env_agent/apply.rs.ours",
+      "theirs_path": "src-tauri/src/env_agent/apply.rs.theirs",
+      "hunks": [
+        "<<<<<<< HEAD\nuse super::pull::{ApplyPlan, SectionPlan, SectionPolicy};\nuse super::{apply_services, apply_versions};\n=======\nuse super::apply_services;\nuse super::pull::{ApplyPlan, SectionPlan, SectionPolicy};\n>>>>>>> bb54bf39 (feat(env_agent): reconcile this box's services topology toward canonical (P2b slice 2))\n",
+        "<<<<<<< HEAD\n        apply_versions::VERSIONS_SECTION => {\n            let out = apply_versions::apply_section(section, opts.confirm);\n            audit_if_applied(&out);\n            out\n        }\n=======\n>>>>>>> bb54bf39 (feat(env_agent): reconcile this box's services topology toward canonical (P2b slice 2))\n"
+      ]
+    },
+    {
+      "path": "src-tauri/src/env_agent/mod.rs",
+      "base_oid": "6b20af59bc2d5fdc1f57f7fc889debd3da9df69f",
+      "ours_oid": "740b6debe093ab8da4efe0bc8b9144fbd230a6d0",
+      "theirs_oid": "ecce2aea88eefba21ad0132928f94959377d125f",
+      "base_path": "src-tauri/src/env_agent/mod.rs.base",
+      "ours_path": "src-tauri/src/env_agent/mod.rs.ours",
+      "theirs_path": "src-tauri/src/env_agent/mod.rs.theirs",
+      "hunks": [
+        "<<<<<<< HEAD\npub mod apply_versions;\n=======\n>>>>>>> bb54bf39 (feat(env_agent): reconcile this box's services topology toward canonical (P2b slice 2))\n"
+      ]
+    }
+  ]
+}
