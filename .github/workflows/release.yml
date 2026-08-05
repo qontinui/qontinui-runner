@@ -123,10 +123,24 @@ jobs:
           # 88059428655, v1.0.7 job 92082478456). The arm64 leg was always green
           # precisely because it is native — pkg-config finds the image's own
           # OpenSSL. `macos-15-intel` is a GA native x86_64 image, so the Intel
-          # leg becomes the same native build the arm64 leg already is. That
-          # avoids forcing `git2/vendored-openssl` on the shipped binary, which
-          # would statically link a vendored OpenSSL we would then have to keep
-          # patched ourselves.
+          # leg becomes the same native build the arm64 leg already is.
+          #
+          # Do NOT "simplify" this back to macos-latest + git2/vendored-openssl.
+          # OpenSSL was only the FIRST blocker; vendoring it would not have been
+          # sufficient. tauri.conf.json's beforeBuildCommand runs
+          # scripts/bundle-profile-sidecar.mjs, which derives the sidecar target
+          # triple from `rustc -vV` HOST and states outright that cross-compile
+          # "is NOT handled". Cross-building on the arm64 image would therefore
+          # emit qontinui_profile-aarch64-apple-darwin while bundle.externalBin
+          # demands the -x86_64-apple-darwin name — a bundle failure waiting
+          # immediately behind the OpenSSL one. A native image fixes both at
+          # once, and vendoring OpenSSL would additionally have saddled the
+          # shipped binary with a statically linked copy for us to keep patched.
+          #
+          # EXPIRY: macos-15-intel / macos-26-intel are the last x86_64 macOS
+          # images GitHub will offer (announced through Aug 2027). Before then,
+          # either drop this leg or ship a universal binary from the arm64 leg
+          # (lipo / universal-apple-darwin).
           - platform: macos-15-intel
             target: x86_64-apple-darwin
             name: macos-x64
@@ -175,7 +189,16 @@ jobs:
     # both x64 + aarch64 .dmg, delete this expression. If a leg proves flaky
     # rather than broken, gate the STABLE ones and leave only the flaky leg
     # non-blocking — do not keep all three non-blocking because one is unreliable.
-    continue-on-error: ${{ matrix.platform != 'windows-latest' }}
+    #
+    # Keyed on matrix.name, NOT on the runner image label. This expression
+    # decides which leg is the sole hard gate, so getting it wrong inverts the
+    # gate rather than merely skipping a step. `matrix.platform != 'windows-latest'`
+    # would silently evaluate TRUE for the Windows leg the moment that image is
+    # pinned or renamed (`windows-2025`) — exactly what just happened to the
+    # macOS Intel image — making Windows non-blocking and letting an assetless
+    # release publish. matrix.name is workflow-authored and stable; image labels
+    # churn. (`runner.os` is not available in a job-level expression.)
+    continue-on-error: ${{ matrix.name != 'windows-x64' }}
 
     steps:
       - uses: actions/checkout@v5
@@ -295,10 +318,27 @@ jobs:
           free -h
           df -h
           # Second half of the guard: cap parallel rustc codegen so the peak is
-          # lower to begin with (ci.yml uses JOBS=1 on ubuntu for this same
-          # workspace). Exported here rather than as a matrix-wide `env:` on the
-          # build step so the macOS/Windows legs — which already build clean —
-          # keep their default parallelism and are not slowed down.
+          # lower to begin with. ci.yml pins JOBS=1 on ubuntu for its `Run Rust
+          # tests` step on this same workspace.
+          #
+          # Cite that precisely, because ci.yml is NOT uniformly JOBS=1: its
+          # `Build Tauri app (development)` step runs at cargo's default
+          # parallelism without OOMing. That is not evidence this step is safe
+          # at the default, though — ci.yml's Tauri build is `--debug
+          # --no-bundle`, whereas this one is a bundling release build, whose
+          # per-crate codegen peak is the higher of the two. Since the Linux leg
+          # has never once completed here, there is no local evidence of what
+          # parallelism it survives at, so start conservative.
+          #
+          # If wall-clock becomes the problem rather than OOM, JOBS=2 is the
+          # next thing to try (that is the value ci.yml settled on for Windows)
+          # — do not just delete the cap. Note this also caps the sidecar build
+          # that tauri.conf.json's beforeBuildCommand kicks off, so the ubuntu
+          # leg serializes two cold compiles; there is no cargo cache here.
+          #
+          # Exported here rather than as a matrix-wide `env:` on the build step
+          # so the macOS/Windows legs — which already build clean — keep their
+          # default parallelism and are not slowed down.
           echo "CARGO_BUILD_JOBS=1" >> "$GITHUB_ENV"
 
       - name: Install frontend dependencies
@@ -560,13 +600,30 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Bound through env, not spliced in with ${{ }}: a tag name may contain
+          # backticks, $(), ; and | (git check-ref-format permits them), which
+          # inside double quotes would be command substitution.
+          RELEASE_VERSION: ${{ needs.create-release.outputs.release_version }}
         run: |
-          names=$(gh release view "v${{ needs.create-release.outputs.release_version }}" \
-            --repo "${{ github.repository }}" --json assets --jq '.assets[].name')
-
           {
             echo "### Release asset completeness"
             echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # `|| true`: this step runs under bash -e, so a failed `gh` would
+          # abort it at line 1 — no table, no warnings, nothing said. A silent
+          # green step reads exactly like "all four platforms present", which is
+          # the very invisibility this step exists to defeat. Say so instead.
+          names=$(gh release view "v${RELEASE_VERSION}" \
+            --repo "${{ github.repository }}" --json assets --jq '.assets[].name') || names=""
+
+          if [ -z "$names" ]; then
+            echo "::warning::Asset report unavailable — could not read the release 'v${RELEASE_VERSION}'. This is NOT a statement that assets are present; the check did not run."
+            echo "Asset report **unavailable** — \`gh release view\` returned nothing for \`v${RELEASE_VERSION}\`. This is not evidence the assets are present." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
             echo "| Platform | Expected installer | Present |"
             echo "|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
