@@ -100,8 +100,8 @@ pub fn awas_action_to_ui_bridge_element(
         },
         state: ElementState {
             // AWAS elements don't have real-time state
-            visible: true,  // Assumed available if in manifest
-            enabled: true,  // Assumed enabled
+            visible: true, // Assumed available if in manifest
+            enabled: true, // Assumed enabled
             // No live DOM ref behind a manifest-declared action, so neither
             // the native `disabled` property nor `aria-disabled` is
             // observable. Both stay `false`, which is the fold consistent
