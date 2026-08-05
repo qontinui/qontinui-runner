@@ -700,6 +700,71 @@ mod tests {
         assert_eq!(chosen.as_deref(), Some("/refreshable"));
     }
 
+    /// G1 REGRESSION, end-to-end through the REAL credential filter
+    /// (`oauth_refresh::has_valid_credentials`, which IS what
+    /// [`pick_best_account`] injects).
+    ///
+    /// An account whose refresh grant the token endpoint has REVOKED still
+    /// holds a non-empty `refreshToken` string on disk forever. If the
+    /// credential predicate answers off that string's presence, `LeastUsage`
+    /// selection will pin the DEAD account over a healthy one whenever it ranks
+    /// better on headroom — every spawn under it then 401-zombies. The revoked
+    /// account must be filtered out before ranking ever happens.
+    #[test]
+    fn revoked_account_is_never_selected_over_a_healthy_one() {
+        fn write_creds(dir: &std::path::Path, refresh_token: &str, expires_at_ms: i64) {
+            let body = serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": "sk-oauth-test",
+                    "refreshToken": refresh_token,
+                    "expiresAt": expires_at_ms,
+                    "scopes": ["user:inference"],
+                }
+            });
+            std::fs::write(dir.join(".credentials.json"), body.to_string()).expect("write creds");
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        let revoked_dir = tempfile::tempdir().expect("tempdir");
+        let healthy_dir = tempfile::tempdir().expect("tempdir");
+        // Expired access token + a refresh token the server has revoked.
+        write_creds(revoked_dir.path(), "rt-revoked", now_ms - 60_000);
+        // Comfortably live.
+        write_creds(healthy_dir.path(), "rt-live", now_ms + 3_600_000);
+
+        let revoked = revoked_dir.path().to_string_lossy().to_string();
+        let healthy = healthy_dir.path().to_string_lossy().to_string();
+        super::super::oauth_refresh::mark_grant_revoked_for_test(&revoked);
+
+        let d = dirs(&[revoked.as_str(), healthy.as_str()]);
+        let chosen = pick_from(
+            &d,
+            // The REAL filter — not a stub.
+            |x| super::super::oauth_refresh::has_valid_credentials(x),
+            |_| false,
+            // The revoked account ranks BEST on headroom, so it wins the
+            // LeastUsage comparison the moment it survives the validity filter.
+            |x| {
+                if x == revoked {
+                    Some((false, -0.90))
+                } else {
+                    Some((false, 0.20))
+                }
+            },
+            |_| false,
+            |_| None,
+        );
+        assert_eq!(
+            chosen.as_deref(),
+            Some(healthy.as_str()),
+            "a revoked account must be filtered out before ranking — otherwise LeastUsage pins \
+             the dead account over the healthy one"
+        );
+    }
+
     #[test]
     fn no_valid_account_returns_none() {
         let d = dirs(&["/a", "/b"]);

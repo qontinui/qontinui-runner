@@ -27,6 +27,26 @@
 //! `claude_session_id -> record`), rewritten atomically via temp-file +
 //! rename. Missing / corrupt file → empty map (a fresh registry is the safe
 //! default; the poll re-discovers live sessions).
+//!
+//! Durability is a **write-ahead log of per-record deltas** compacted into that
+//! snapshot — see [`LifecycleDelta`] and [`SessionLifecycleStore::compact`].
+//!
+//! ## Durability scope — PROCESS crash, not power loss
+//!
+//! The WAL survives the runner process dying: an appended line is one
+//! `write_all` into an append-mode handle, so a crash can only truncate the
+//! tail (which [`replay_wal`] drops), and compaction writes the snapshot before
+//! truncating the log, so a crash in between replays deltas the snapshot
+//! already holds — idempotent.
+//!
+//! It is deliberately NOT power-loss durable. Appends are **not `fsync`ed**:
+//! they sit in the OS page cache, so a host power cut or kernel panic can lose
+//! recently appended deltas even though the `write_all` returned. That is the
+//! accepted trade — an `fsync` per mutation would put a disk flush back on the
+//! terminal spawn path, which is exactly the cost this design removed, and the
+//! failure mode is bounded (a session record loses at most its latest state and
+//! the liveness poll re-discovers live sessions). Do not read the crash-safety
+//! ordering above as a power-loss guarantee.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -318,6 +338,17 @@ struct WalWriter {
     file: Option<std::fs::File>,
     /// Deltas appended since the last successful compaction.
     appends: usize,
+    /// A mutation landed in the in-memory map but did NOT reach the WAL
+    /// (serialize failure, open failure, `write_all` failure, poisoned lock).
+    ///
+    /// Without this the store would be silently dirty-but-uncounted: the map is
+    /// already mutated, `appends` never moved, and `compact_if_dirty` gates on
+    /// `appends > 0` — so if that mutation were the LAST one before a crash it
+    /// would be lost outright. (The whole-map rewrite this replaced had no such
+    /// hole: the next mutation's rewrite carried the earlier one along.) Cleared
+    /// by a successful [`SessionLifecycleStore::compact`], which writes the
+    /// whole map and therefore captures it.
+    dirty: bool,
 }
 
 /// Durable map of `claude_session_id -> TerminalSessionRecord`.
@@ -1720,7 +1751,9 @@ impl SessionLifecycleStore {
     ///
     /// Best-effort exactly like the whole-map rewrite it replaces: a write
     /// failure is logged, not propagated — the in-memory map still reflects the
-    /// mutation for this process.
+    /// mutation for this process. EVERY such failure sets
+    /// [`WalWriter::dirty`], so the idle compaction still folds the map to disk
+    /// rather than leaving the mutation dirty-but-uncounted.
     #[must_use = "a full WAL must be compacted once the map lock is released"]
     fn wal_append(
         &self,
@@ -1733,6 +1766,9 @@ impl SessionLifecycleStore {
         let mut w = match self.wal.lock() {
             Ok(w) => w,
             Err(e) => {
+                // A poisoned WAL lock is unrecoverable for BOTH the append and
+                // the compaction that would rescue it, so there is no dirty flag
+                // to usefully set here — the map stays authoritative in memory.
                 warn!(error = %e, "session_lifecycle_store: WAL lock poisoned — mutation kept in memory only");
                 return false;
             }
@@ -1746,6 +1782,7 @@ impl SessionLifecycleStore {
                 Ok(()) => buf.push(b'\n'),
                 Err(e) => {
                     warn!(error = %e, "session_lifecycle_store: WAL serialize failed — delta dropped");
+                    w.dirty = true;
                     return false;
                 }
             }
@@ -1763,13 +1800,19 @@ impl SessionLifecycleStore {
                         path = %self.wal_path.display(),
                         "session_lifecycle_store: WAL open failed — mutation kept in memory only"
                     );
+                    w.dirty = true;
                     return false;
                 }
             }
         }
-        let Some(file) = w.file.as_mut() else {
+        if w.file.is_none() {
+            // Unreachable in practice (the block above either opened the file or
+            // returned), but the dirty flag makes the impossible case honest
+            // rather than silently uncounted.
+            w.dirty = true;
             return false;
-        };
+        }
+        let file = w.file.as_mut().expect("WAL handle present (checked above)");
         if let Err(e) = file.write_all(&buf) {
             warn!(
                 error = %e,
@@ -1779,6 +1822,7 @@ impl SessionLifecycleStore {
             // Drop the handle so the next append re-opens rather than keeping
             // writing through a broken descriptor.
             w.file = None;
+            w.dirty = true;
             return false;
         }
         w.appends += deltas.len();
@@ -1818,7 +1862,10 @@ impl SessionLifecycleStore {
             return; // keep the WAL: it is still the durable record
         }
         // Snapshot is on disk and renamed into place — the WAL is now redundant.
+        // The rewrite serialized the WHOLE map, so it also captured any mutation
+        // that failed to reach the WAL (see [`WalWriter::dirty`]).
         w.file = None;
+        w.dirty = false;
         match std::fs::File::create(&self.wal_path) {
             Ok(_) => w.appends = 0,
             Err(e) => warn!(
@@ -1829,11 +1876,15 @@ impl SessionLifecycleStore {
         }
     }
 
-    /// Fold the WAL into the snapshot when it has anything in it. Called from
-    /// the liveness poll's heartbeat so an idle runner converges on a compact
-    /// snapshot without any mutation ever paying an O(N) rewrite.
+    /// Fold the WAL into the snapshot when there is anything to fold. Called
+    /// from the liveness poll's heartbeat so an idle runner converges on a
+    /// compact snapshot without any mutation ever paying an O(N) rewrite.
+    ///
+    /// "Anything to fold" is appended deltas OR a mutation that never reached
+    /// the WAL at all ([`WalWriter::dirty`]) — gating on `appends` alone would
+    /// silently drop the latter.
     fn compact_if_dirty(&self) {
-        let dirty = matches!(self.wal.lock(), Ok(w) if w.appends > 0);
+        let dirty = matches!(self.wal.lock(), Ok(w) if w.appends > 0 || w.dirty);
         if dirty {
             self.compact();
         }
