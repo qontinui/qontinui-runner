@@ -1,3 +1,0 @@
-# RunImageRecognitionTab
-
-_(notes)_
