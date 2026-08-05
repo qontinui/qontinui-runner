@@ -249,6 +249,39 @@ impl ScopeRootRejection {
     }
 }
 
+/// WHICH kind of scope a capture's toolchain probes ran in.
+///
+/// The PATH is not comparable across boxes — a Windows home directory and a
+/// Linux one differ while meaning exactly the same thing — but the KIND is.
+/// That is what makes it safe to ship in the envelope and to compare: two
+/// boxes both on [`Self::Default`] measured the same concept (their default
+/// toolchain), whereas a [`Self::Declared`] box measured one specific tree and
+/// is not describing the same quantity at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeScopeKind {
+    /// An operator-declared `scope_root` was honoured — the numbers describe
+    /// that tree, not the box.
+    Declared,
+    /// The home directory: the box's DEFAULT toolchain, i.e. what shim-based
+    /// managers answer outside any project tree. Also the outcome when a
+    /// configured value had to be dropped.
+    Default,
+    /// No home directory at all, so the probes inherited the runner's cwd.
+    /// Not comparable with anything.
+    Inherited,
+}
+
+impl ProbeScopeKind {
+    /// The stable wire string carried in `versions.probe_scope_kind`.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Declared => "declared",
+            Self::Default => "default",
+            Self::Inherited => "inherited",
+        }
+    }
+}
+
 /// The resolved capture scope plus, when applicable, the configured value that
 /// was dropped to reach it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,6 +291,8 @@ pub struct ProbeScope {
     pub root: Option<std::path::PathBuf>,
     /// `Some` iff a `scope_root` was configured but NOT honoured.
     pub rejected: Option<ScopeRootRejection>,
+    /// Which KIND of scope this is — the part that is comparable across boxes.
+    pub kind: ProbeScopeKind,
 }
 
 /// Pure resolution of the declared capture scope from a configured value.
@@ -288,8 +323,10 @@ pub struct ProbeScope {
 pub fn resolve_probe_scope(configured: Option<&str>) -> ProbeScope {
     let home = || dirs::home_dir().filter(|h| h.is_dir());
     let Some(raw) = configured else {
+        let root = home();
         return ProbeScope {
-            root: home(),
+            kind: kind_for(&root),
+            root,
             rejected: None,
         };
     };
@@ -307,13 +344,32 @@ pub fn resolve_probe_scope(configured: Option<&str>) -> ProbeScope {
             return ProbeScope {
                 root: Some(path),
                 rejected: None,
+                kind: ProbeScopeKind::Declared,
             };
         }
     };
 
+    // A REJECTED configured value lands on the home directory, so it reports
+    // `default` — which is the truth about what was measured. The rejection
+    // itself is reported separately (`rejected`, the capture WARN, `env show`);
+    // conflating the two here would make the provenance lie about the
+    // measurement in order to preserve the operator's intent.
+    let root = home();
     ProbeScope {
-        root: home(),
+        kind: kind_for(&root),
+        root,
         rejected: rejection,
+    }
+}
+
+/// Classify a root that came from the FALLBACK chain. An honoured declaration
+/// is stamped [`ProbeScopeKind::Declared`] at its own return site and never
+/// reaches here.
+fn kind_for(root: &Option<std::path::PathBuf>) -> ProbeScopeKind {
+    if root.is_some() {
+        ProbeScopeKind::Default
+    } else {
+        ProbeScopeKind::Inherited
     }
 }
 
@@ -549,7 +605,16 @@ pub fn collect_versions() -> Section {
     // runner #818 derived-key filtering) the only ones a P2b apply can move. All
     // three run in the DECLARED scope root so the answer does not depend on how
     // the runner process was launched.
-    let scope = probe_scope_root();
+    let scope = probe_scope();
+    // Capture PROVENANCE. The three keys below are only comparable across boxes
+    // that measured the same KIND of scope; without this the drift oracle
+    // silently compares a project tree's toolchain against another box's
+    // default one and calls the difference drift. The runner's `versions` apply
+    // refuses on a mismatch rather than installing a version that was observed
+    // somewhere else. The PATH is deliberately NOT emitted: it differs between
+    // any two boxes while meaning the same thing, and it is operator-local.
+    put(&mut section, "probe_scope_kind", scope.kind.wire());
+    let scope = scope.root;
     let scope_ref = scope.as_deref();
     if let Some(v) = version_of("rustc", &["--version"], scope_ref) {
         put(&mut section, "rustc", v);
