@@ -43,12 +43,6 @@
 //! POST so an operator can inspect "what would be pushed" even when the backend
 //! is unreachable.
 
-pub mod apply;
-pub mod apply_services;
-<<<<<<< HEAD
-pub mod apply_versions;
-=======
->>>>>>> bb54bf39 (feat(env_agent): reconcile this box's services topology toward canonical (P2b slice 2))
 pub mod collectors;
 pub mod config;
 pub mod directive;
