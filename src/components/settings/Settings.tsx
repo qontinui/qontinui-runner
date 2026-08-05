@@ -32,6 +32,7 @@ import { LockYieldPolicySettings } from "./LockYieldPolicySettings";
 import { SecuritySettings } from "./SecuritySettings";
 import { AccountSettings } from "./AccountSettings";
 import { CiRunnerSettings } from "./CiRunnerSettings";
+import { AppFreshnessSettings } from "./AppFreshnessSettings";
 import { DevenvEnrollSettings } from "./DevenvEnrollSettings";
 import { DevLoopSettings } from "./DevLoopSettings";
 import {
@@ -226,6 +227,8 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
         return <ContainerSettings onLog={onLog} />;
       case "ci-runner":
         return <CiRunnerSettings onLog={onLog} />;
+      case "app-freshness":
+        return <AppFreshnessSettings onLog={onLog} />;
       case "security":
         return <SecuritySettings onLog={onLog} />;
       case "lock-yield":

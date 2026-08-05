@@ -53,6 +53,7 @@ export type SettingsTab =
   | "containers"
   | "security"
   | "ci-runner"
+  | "app-freshness"
   | "lock-yield"
   | "advanced"
   | "updates";
@@ -140,6 +141,10 @@ export const SETTINGS_TABS: readonly SettingsTabDef[] = [
   { id: "otel", label: "OpenTelemetry" },
   { id: "containers", label: "Container Isolation" },
   { id: "ci-runner", label: "CI Runner" },
+  // Per-app build/start commands for the auto-fresh engine. Behind the
+  // `advanced` disclosure: it configures the fleet-fresh routing machinery,
+  // which a Terminal-first user has never seen.
+  { id: "app-freshness", label: "App Freshness", requires: ["advanced"] },
   { id: "security", label: "Security" },
   { id: "lock-yield", label: "Lock-yield Policy" },
   { id: "advanced", label: "Debug" },
@@ -255,6 +260,7 @@ export const SETTINGS_SUB_TAB_TO_MAIN_TAB = {
   otel: "settings-otel",
   containers: "settings-containers",
   "ci-runner": "settings-ci-runner",
+  "app-freshness": "settings-app-freshness",
   security: "settings-security",
   "lock-yield": "settings-lock-yield",
   advanced: "settings-debug",
