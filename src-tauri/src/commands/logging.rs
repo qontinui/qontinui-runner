@@ -585,7 +585,11 @@ pub fn load_ai_output_log() -> CommandResponse {
         let file = match fs::File::open(part) {
             Ok(f) => f,
             Err(e) => {
-                error!("Failed to open AI output log file {}: {}", part.display(), e);
+                error!(
+                    "Failed to open AI output log file {}: {}",
+                    part.display(),
+                    e
+                );
                 return CommandResponse {
                     success: false,
                     message: Some(format!("Failed to open log file: {}", e)),
