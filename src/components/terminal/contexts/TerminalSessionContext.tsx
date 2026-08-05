@@ -67,7 +67,10 @@ import {
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useWindowAssignments, ownedTabs, MAIN_WINDOW_LABEL } from "./WindowAssignmentsContext";
-import { subscribeTerminalOutputStream } from "../terminalEventDemux";
+import {
+  subscribeTerminalOutputStream,
+  subscribeTerminalActivityStream,
+} from "../terminalEventDemux";
 import { hasRenderConsumer } from "../terminalRenderConsumers";
 
 import { useTerminalManager } from "../useTerminalManager";
@@ -521,6 +524,11 @@ const PageSessionScope = memo(function PageSessionScope({
     coalescerRef.current.retain(ids);
   }, [tabs]);
 
+  const handleActivityDigestRef = useRef(stateTracking.handleActivityDigest);
+  useEffect(() => {
+    handleActivityDigestRef.current = stateTracking.handleActivityDigest;
+  }, [stateTracking.handleActivityDigest]);
+
   useEffect(() => {
     const coalescer = coalescerRef.current;
     let rafHandle: ReturnType<typeof requestAnimationFrame> | null = null;
@@ -586,13 +594,25 @@ const PageSessionScope = memo(function PageSessionScope({
       scheduleFlush();
     });
 
+    // Phase 5 — the runner's activity digest, the state-tracking feed for tabs
+    // it has gone quiet on. Live from THIS commit; the proxy-ack above is
+    // removed only once it is, or state tracking for unmounted tabs would
+    // regress to nothing in between. Applied straight through (no coalescing):
+    // it is already capped at ≤1 Hz per session server-side, and it carries a
+    // whole rendered screen tail rather than an incremental slice.
+    const unlistenActivity = subscribeTerminalActivityStream((payload) => {
+      if (!tabIdSetRef.current.has(payload.terminalId)) return;
+      handleActivityDigestRef.current(payload.terminalId, payload.bytesDelta, payload.lines);
+    });
+
     return () => {
       if (rafHandle !== null) cancelAnimationFrame(rafHandle);
       if (timeoutHandle !== null) clearTimeout(timeoutHandle);
       // Do NOT flush on teardown: the scope only unmounts when its whole page is
       // removed, so its tracker + tabs are going away too — a trailing sub-frame
-      // update would target unmounted state. Just release the listener.
+      // update would target unmounted state. Just release the listeners.
       unlisten();
+      unlistenActivity();
     };
   }, []);
 

@@ -155,6 +155,35 @@ export function subscribeTerminalOutputStream(
   );
 }
 
+/**
+ * The runner's ≤1 Hz activity digest for a terminal it has stopped emitting
+ * output for (visibility tier `unwatched`; plan Phase 5 / A4).
+ *
+ * `bytesDelta` is what the PTY produced since the previous digest for this
+ * terminal; `lines` is the trailing non-empty rows of the runner's own rendered
+ * VT grid.
+ */
+export interface TerminalActivityPayload {
+  terminalId: string;
+  totalBytesProduced: number;
+  bytesDelta: number;
+  lines: string[];
+}
+
+/**
+ * Subscribe to the whole `terminal-activity` stream for this window — the
+ * state-tracking feed for tabs no pane is mounted for. One `listen()` per
+ * window via the same singleton listener the output demux uses.
+ */
+export function subscribeTerminalActivityStream(
+  handler: (payload: TerminalActivityPayload) => void,
+): () => void {
+  return acquireSingletonListener<TerminalActivityPayload>(
+    "terminal-activity",
+    (event: Event<TerminalActivityPayload>) => handler(event.payload),
+  );
+}
+
 /** Test-only: registration counts per demux. */
 export function __terminalDemuxStats(): {
   output: { terminals: number; handlers: number; listening: boolean };
