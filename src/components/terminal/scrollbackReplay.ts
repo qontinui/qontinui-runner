@@ -90,6 +90,48 @@ export function resyncSliceStart(ring: RingWindow, writtenThrough: number): numb
   return writtenThrough - ring.startOffset;
 }
 
+/**
+ * How many bytes a resync can NEVER recover: the span between what this pane
+ * has written and the oldest byte the backend's ring still holds.
+ *
+ * When a pane stays hidden (or a flow-control drop persists) longer than the
+ * ring's capacity, the head of the missed window has already rolled out of the
+ * ring. `resyncSliceStart` then replays the whole ring — correct, but it joins
+ * the pane's last written byte to a LATER one with nothing marking the seam.
+ * The caller uses this count to write an explicit marker instead, because a
+ * silent join is indistinguishable from continuous output.
+ *
+ * `writtenThrough <= 0` means this instance has never written a stamped byte
+ * (cold mount): the ring starting above 0 is just session history, not loss.
+ */
+export function lostWindowBytes(ring: RingWindow, writtenThrough: number): number {
+  if (writtenThrough <= 0) return 0;
+  if (writtenThrough >= ring.startOffset) return 0;
+  return ring.startOffset - writtenThrough;
+}
+
+/**
+ * The in-band notice written into the pane when {@link lostWindowBytes} is
+ * non-zero. Plain ASCII on purpose — an emoji or box-drawing glyph renders at
+ * an ambiguous cell width and can shear the line on a narrow pane.
+ */
+export function formatLostOutputMarker(lostBytes: number): string {
+  return (
+    `\r\n\x1b[1;33m[qontinui] ${lostBytes} bytes of output were lost here — ` +
+    `the scrollback ring rolled past them while this pane was hidden\x1b[0m\r\n`
+  );
+}
+
+/**
+ * The in-band notice written into the pane when a resync gives up without
+ * having covered the whole missed window (retries exhausted, or the ring
+ * fetch kept failing). The pane is left ARMED, so a later reveal retries — but
+ * what is on screen right now is spliced and must say so.
+ */
+export const RESYNC_INCOMPLETE_MARKER =
+  "\r\n\x1b[1;33m[qontinui] output resync did not complete — some output may be " +
+  "missing above\x1b[0m\r\n";
+
 /** Result of draining held post-gap chunks after a ring resync write. */
 export interface HeldDrainResult {
   /** Trimmed, non-empty chunks safe to write now, in stream order. */

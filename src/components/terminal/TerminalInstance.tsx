@@ -26,6 +26,9 @@ import {
   isEmissionGap,
   resyncSliceStart,
   drainHeldChunks,
+  lostWindowBytes,
+  formatLostOutputMarker,
+  RESYNC_INCOMPLETE_MARKER,
   type OffsetChunk,
 } from "./scrollbackReplay";
 import { RenderAckAccumulator, ACK_FLOOR_INTERVAL_MS } from "./flowControl";
@@ -177,6 +180,15 @@ const DEAD_TERMINAL_SCROLLBACK = 2000;
  * other mount-independent signals (state chips, sparklines).
  */
 const QUIET_TITLE_POLL_INTERVAL_MS = 2000;
+
+/**
+ * Ring-refetch attempts one `resyncFromRing` pass makes before giving up and
+ * marking the pane spliced. Each attempt costs one `terminal_get_scrollback`
+ * IPC; the loop only re-runs when the previous window fell short (a hole the
+ * fetch did not cover, or bytes dropped while it was in flight), so the common
+ * case is exactly one.
+ */
+const RESYNC_MAX_ATTEMPTS = 5;
 
 /**
  * `memo(forwardRef(...))` (plan `2026-07-28-runner-many-sessions-performance`
@@ -585,29 +597,59 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
           return;
         }
         resyncInFlight = true;
+        // Set only on the one exit that PROVES the pane is caught up: a replay
+        // that covered every dropped byte AND left no held chunk behind a
+        // hole. Every other exit — a rejected fetch, an empty ring, a replay
+        // that stopped short of bytes dropped while it was in flight, the
+        // retry budget running out — falls through to the `finally`, which
+        // re-arms the pane and tells the operator the pane is spliced.
+        let caughtUp = false;
         try {
-          for (let attempt = 0; attempt < 5; attempt++) {
-            const ring = await invoke<{
+          for (let attempt = 0; attempt < RESYNC_MAX_ATTEMPTS; attempt++) {
+            let ring: {
               success: boolean;
               data: { data: string; startOffset: number; endOffset: number } | null;
-            }>("terminal_get_scrollback", { terminalId });
+            };
+            try {
+              ring = await invoke("terminal_get_scrollback", { terminalId });
+            } catch (e) {
+              console.warn(
+                `[Terminal ${terminalId}] emission-gap resync fetch failed (attempt ${attempt + 1}):`,
+                e,
+              );
+              continue;
+            }
             const b = backendRef.current;
             if (disposed || !b) return;
             if (!ring.success || !ring.data) {
-              // Nothing was replayed — keep the pane marked as behind so the
-              // next reveal retries instead of splicing silently.
-              paneService.noteMissedOutput();
-              return;
+              console.warn(
+                `[Terminal ${terminalId}] scrollback ring unavailable for resync (attempt ${attempt + 1})`,
+              );
+              continue;
             }
             const rawRing = atob(ring.data.data);
             const ringBytes = new Uint8Array(rawRing.length);
             for (let i = 0; i < rawRing.length; i++) {
               ringBytes[i] = rawRing.charCodeAt(i);
             }
-            const from = resyncSliceStart(
-              { startOffset: ring.data.startOffset, endOffset: ring.data.endOffset },
-              writtenThrough,
-            );
+            const ringWindow = {
+              startOffset: ring.data.startOffset,
+              endOffset: ring.data.endOffset,
+            };
+            // Ring overrun: the hole starts before the oldest byte the backend
+            // still holds, so those bytes are gone from every source and no
+            // retry can produce them. `resyncSliceStart` replays the whole
+            // ring, which would join the pane's last written byte straight to
+            // a later one — indistinguishable from continuous output. Say so
+            // in-band instead, and warn for the log.
+            const lost = lostWindowBytes(ringWindow, writtenThrough);
+            if (lost > 0) {
+              console.warn(
+                `[Terminal ${terminalId}] scrollback ring overran the missed window; ${lost} bytes of output are unrecoverable`,
+              );
+              b.write(formatLostOutputMarker(lost));
+            }
+            const from = resyncSliceStart(ringWindow, writtenThrough);
             const slice = ringBytes.subarray(from);
             if (slice.length > 0) {
               // Direct write (not the coalesce queue): any pre-gap staged
@@ -615,12 +657,14 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
               // post-gap chunks drain AFTER this, so stream order holds.
               b.write(slice);
             }
-            replayedThrough = Math.max(replayedThrough, ring.data.endOffset);
-            writtenThrough = Math.max(writtenThrough, ring.data.endOffset);
-            nextExpectedOffset = Math.max(nextExpectedOffset ?? 0, ring.data.endOffset);
-            // The ring window is now in the buffer: whatever this pane dropped
-            // while hidden has been replayed.
-            paneService.noteResynced();
+            replayedThrough = Math.max(replayedThrough, ringWindow.endOffset);
+            writtenThrough = Math.max(writtenThrough, ringWindow.endOffset);
+            nextExpectedOffset = Math.max(nextExpectedOffset ?? 0, ringWindow.endOffset);
+            // Clears the pane's "behind" flag only if this ring window reached
+            // every byte that was dropped. A chunk dropped while the fetch was
+            // in flight sits beyond this (older) snapshot — the next attempt's
+            // ring covers it.
+            const covered = paneService.noteResynced(replayedThrough);
 
             const drained = drainHeldChunks(resyncPending, writtenThrough, replayedThrough);
             resyncPending = drained.reheld;
@@ -630,19 +674,16 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
               coalesceLen += w.length;
             }
             if (drained.writable.length > 0) scheduleFlush();
-            if (drained.reheld.length === 0) return;
+            if (covered && drained.reheld.length === 0) {
+              caughtUp = true;
+              return;
+            }
             console.warn(
               `[Terminal ${terminalId}] emission gap persisted across resync (attempt ${attempt + 1}); retrying`,
             );
           }
-          console.warn(
-            `[Terminal ${terminalId}] emission-gap resync exhausted retries; accepting spliced output`,
-          );
         } catch (e) {
           console.warn(`[Terminal ${terminalId}] emission-gap resync failed:`, e);
-          // Stay armed: a failed fetch replayed nothing, so the next reveal
-          // must try again rather than assume the pane is caught up.
-          paneService.noteMissedOutput();
         } finally {
           // Never strand held chunks: on success the loop drained them all;
           // on retry exhaustion or fetch failure, write what remains even
@@ -660,10 +701,21 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
               writtenThrough = Math.max(writtenThrough, c.offset + c.bytes.length);
             }
           }
-          resyncInFlight = false;
           // A request that arrived mid-pass ran against a stale ring snapshot;
-          // run exactly one more pass to cover what it could not see.
-          if (resyncAgainRequested && !disposed) {
+          // run exactly one more pass to cover what it could not see. That
+          // pass is the retry, so don't declare the gap unrecovered yet.
+          const retryQueued = resyncAgainRequested && !disposed;
+          if (!caughtUp && !disposed && !retryQueued) {
+            // Stay armed so the next reveal tries again — and surface it, because
+            // what the operator is looking at right now has a hole in it.
+            paneService.noteResyncFailed();
+            console.warn(
+              `[Terminal ${terminalId}] emission-gap resync did not complete; output is spliced`,
+            );
+            backendRef.current?.write(RESYNC_INCOMPLETE_MARKER);
+          }
+          resyncInFlight = false;
+          if (retryQueued) {
             resyncAgainRequested = false;
             void resyncFromRing();
           }
@@ -822,7 +874,9 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
           // put, so the reveal resync replays exactly this window from the
           // ring. State chips/sparklines keep updating — they are fed by the
           // page-level output tap, which is mount- and visibility-independent.
-          paneService.noteMissedOutput();
+          // The chunk's end offset is what makes the reveal resync provable:
+          // a replay only clears the flag once it has reached this far.
+          paneService.noteMissedOutput(offset === undefined ? undefined : offset + bytes.length);
           bytesReceivedRef.current += bytes.length;
           return;
         }

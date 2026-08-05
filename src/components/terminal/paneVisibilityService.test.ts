@@ -20,6 +20,9 @@ import {
   resyncSliceStart,
   trimReplayedChunk,
   isEmissionGap,
+  lostWindowBytes,
+  formatLostOutputMarker,
+  RESYNC_INCOMPLETE_MARKER,
   type OffsetChunk,
 } from "./scrollbackReplay";
 
@@ -142,11 +145,110 @@ describe("PaneVisibilityService", () => {
     expect(calls).toContain("resync");
 
     // Once the replay lands, reveals are free again.
-    svc.noteResynced();
+    expect(svc.noteResynced(0)).toBe(true);
+    expect(svc.behind).toBe(false);
     svc.setVisible(false);
     calls.length = 0;
     svc.setVisible(true);
     expect(calls).not.toContain("resync");
+  });
+
+  it("does NOT clear the gap flag for a replay that stops short of the dropped window", () => {
+    // The silent-splice path the pre-PR review caught. A pane dropped output
+    // through absolute offset 4096; the ring snapshot the resync got back had
+    // been taken earlier and only reaches 3000. Clearing the flag here would
+    // splice bytes [3000, 4096) out permanently — `nextExpectedOffset` keeps
+    // advancing across drops, so no later gap detection can ever see them.
+    const { hooks, calls } = makeHooks();
+    const svc = new PaneVisibilityService(hooks, true);
+    svc.markReady();
+    svc.setVisible(false);
+    svc.noteMissedOutput(1024);
+    svc.noteMissedOutput(4096);
+    svc.setVisible(true);
+    expect(calls).toContain("resync");
+
+    expect(svc.noteResynced(3000)).toBe(false);
+    expect(svc.behind).toBe(true);
+
+    // Still armed: the next reveal retries instead of assuming it is caught up.
+    svc.setVisible(false);
+    calls.length = 0;
+    svc.setVisible(true);
+    expect(calls).toContain("resync");
+
+    // A newer ring covers the remainder — only now is the pane caught up.
+    expect(svc.noteResynced(4096)).toBe(true);
+    expect(svc.behind).toBe(false);
+    svc.setVisible(false);
+    calls.length = 0;
+    svc.setVisible(true);
+    expect(calls).not.toContain("resync");
+  });
+
+  it("re-arms when a chunk is dropped WHILE the replay is in flight", () => {
+    // Reveal fires a resync; the pane is hidden again before the ring fetch
+    // resolves and drops more output. The in-flight replay covers only the
+    // older window, so it must not report the pane caught up.
+    const { hooks } = makeHooks();
+    const svc = new PaneVisibilityService(hooks, true);
+    svc.markReady();
+    svc.setVisible(false);
+    svc.noteMissedOutput(1000);
+    svc.setVisible(true); // resync issued against a ring ending at 1000
+
+    svc.setVisible(false);
+    svc.noteMissedOutput(2000); // dropped while the fetch was in flight
+
+    expect(svc.noteResynced(1000)).toBe(false);
+    expect(svc.behind).toBe(true);
+    expect(svc.noteResynced(2000)).toBe(true);
+    expect(svc.behind).toBe(false);
+  });
+
+  it("a failed resync leaves the pane armed for the next reveal", () => {
+    const { hooks, calls } = makeHooks();
+    const svc = new PaneVisibilityService(hooks, true);
+    svc.markReady();
+    svc.setVisible(false);
+    svc.noteMissedOutput(512);
+    svc.setVisible(true);
+    expect(calls).toContain("resync");
+
+    svc.noteResyncFailed(); // IPC rejected / ring unavailable / retries spent
+    expect(svc.behind).toBe(true);
+
+    svc.setVisible(false);
+    calls.length = 0;
+    svc.setVisible(true);
+    expect(calls).toContain("resync");
+    // The extent is unchanged, so the window it must still cover is intact.
+    expect(svc.noteResynced(511)).toBe(false);
+    expect(svc.noteResynced(512)).toBe(true);
+  });
+
+  it("reports caught up for a pane that never dropped anything", () => {
+    // The emission-gap path on a VISIBLE pane: the tier dropped nothing, so a
+    // resync run for a flow-control hole must not be forced to prove coverage.
+    const { hooks } = makeHooks();
+    const svc = new PaneVisibilityService(hooks, true);
+    svc.markReady();
+    expect(svc.behind).toBe(false);
+    expect(svc.noteResynced(0)).toBe(true);
+  });
+
+  it("clears on any completed replay when the dropped extent is unknown", () => {
+    // Unstamped chunks (a runner build predating offset stamping) leave no
+    // extent to prove — the pre-offset behavior is the only option.
+    const { hooks } = makeHooks();
+    const svc = new PaneVisibilityService(hooks, true);
+    svc.markReady();
+    svc.setVisible(false);
+    svc.noteMissedOutput(); // no offset
+    svc.setVisible(true);
+    expect(svc.behind).toBe(true);
+    expect(svc.noteResynced(0)).toBe(true);
+    expect(svc.behind).toBe(false);
   });
 
   it("resyncs at markReady when the pane was revealed mid-init after dropping", () => {
@@ -228,6 +330,10 @@ interface StreamChunk {
 class PaneModel {
   /** Everything "rendered", in write order. */
   readonly rendered: number[] = [];
+  /** In-band operator notices written into the pane, in order. */
+  readonly markers: string[] = [];
+  /** Set to make the next ring fetch reject, as the IPC can. */
+  ringFetchFails = false;
   private writtenThrough = 0;
   private replayedThrough = 0;
   private nextExpectedOffset: number | null = null;
@@ -269,7 +375,7 @@ class PaneModel {
       resyncInFlight: this.resyncInFlight,
     });
     if (route === "drop") {
-      this.service.noteMissedOutput();
+      this.service.noteMissedOutput(chunk.offset + chunk.bytes.length);
       return;
     }
     if (route === "hold") {
@@ -286,22 +392,44 @@ class PaneModel {
     this.service.setVisible(visible);
   }
 
-  /** The reveal path: ring fetch → missed slice → drain held chunks. */
+  /**
+   * The reveal path, mirroring `TerminalInstance.resyncFromRing` one attempt
+   * at a time: ring fetch → loss marker → missed slice → drain held chunks →
+   * either "caught up" or an in-band notice that it is not.
+   */
   private resyncFromRing(): void {
     this.resyncInFlight = true;
-    const from = resyncSliceStart(this.ring, this.writtenThrough);
-    const slice = this.ring.bytes.slice(from);
-    if (slice.length > 0) this.write(Uint8Array.from(slice));
-    this.replayedThrough = Math.max(this.replayedThrough, this.ring.endOffset);
-    this.writtenThrough = Math.max(this.writtenThrough, this.ring.endOffset);
-    this.nextExpectedOffset = Math.max(this.nextExpectedOffset ?? 0, this.ring.endOffset);
-    this.service.noteResynced();
+    try {
+      if (this.ringFetchFails) {
+        this.service.noteResyncFailed();
+        this.markers.push(RESYNC_INCOMPLETE_MARKER);
+        return;
+      }
+      // Ring overrun: bytes between where this pane stopped and the ring's
+      // oldest retained byte are gone for good. Never join silently.
+      const lost = lostWindowBytes(this.ring, this.writtenThrough);
+      if (lost > 0) this.markers.push(formatLostOutputMarker(lost));
 
-    const drained = drainHeldChunks(this.held, this.writtenThrough, this.replayedThrough);
-    this.held = drained.reheld;
-    this.writtenThrough = drained.writtenThrough;
-    for (const w of drained.writable) this.write(w);
-    this.resyncInFlight = false;
+      const from = resyncSliceStart(this.ring, this.writtenThrough);
+      const slice = this.ring.bytes.slice(from);
+      if (slice.length > 0) this.write(Uint8Array.from(slice));
+      this.replayedThrough = Math.max(this.replayedThrough, this.ring.endOffset);
+      this.writtenThrough = Math.max(this.writtenThrough, this.ring.endOffset);
+      this.nextExpectedOffset = Math.max(this.nextExpectedOffset ?? 0, this.ring.endOffset);
+      const covered = this.service.noteResynced(this.replayedThrough);
+
+      const drained = drainHeldChunks(this.held, this.writtenThrough, this.replayedThrough);
+      this.held = drained.reheld;
+      this.writtenThrough = drained.writtenThrough;
+      for (const w of drained.writable) this.write(w);
+      // This model runs a single attempt, so anything short is final here.
+      if (!covered || drained.reheld.length > 0) {
+        this.service.noteResyncFailed();
+        this.markers.push(RESYNC_INCOMPLETE_MARKER);
+      }
+    } finally {
+      this.resyncInFlight = false;
+    }
   }
 
   private write(bytes: Uint8Array): void {
@@ -371,13 +499,13 @@ describe("hidden → visible resync is gap-free", () => {
     expect(pane.rendered).toEqual(all);
   });
 
-  it("replays the whole ring when the hole predates it, without duplicating", () => {
+  it("replays the whole ring when the hole predates it, and MARKS the loss", () => {
     const stream = makeStream(16, 12);
     const all = flatten(stream);
     // Tiny ring: the pane stayed hidden far longer than the ring's capacity,
     // so the earliest missed bytes are genuinely gone (backend-side loss, the
-    // documented `resyncSliceStart` case) — but nothing may be duplicated and
-    // the tail must be exact.
+    // documented `resyncSliceStart` case) — nothing may be duplicated, the
+    // tail must be exact, and the seam must NOT be a silent join.
     const ring = ringOver(all, 64);
     const pane = new PaneModel(ring, true);
 
@@ -391,6 +519,53 @@ describe("hidden → visible resync is gap-free", () => {
     // Rendered content is a subsequence of the stream with no repeats of the
     // boundary bytes: the live prefix ends at 32 and the ring starts at 128.
     expect(pane.rendered).toHaveLength(96);
+    // Bytes [32, 128) are gone — the operator is told, in the pane, how many.
+    expect(pane.markers).toEqual([formatLostOutputMarker(96)]);
+    // The loss is not a reason to keep retrying: the ring reached the end of
+    // the dropped window, so the pane is caught up with what still exists.
+    expect(pane.service.behind).toBe(false);
+  });
+
+  it("stays armed and marks the pane when the replay stops short of the drop", () => {
+    // The ring snapshot was taken before the last dropped chunks existed —
+    // the replay runs, but it does not catch the pane up. Clearing the flag
+    // here was the silent splice the pre-PR review found.
+    const stream = makeStream(16, 8);
+    const all = flatten(stream);
+    const ring = ringOver(all.slice(0, 64), 4096); // covers [0, 64) only
+    const pane = new PaneModel(ring, true);
+
+    for (const c of stream.slice(0, 2)) pane.push(c);
+    pane.setVisible(false);
+    for (const c of stream.slice(2)) pane.push(c); // dropped through offset 128
+    pane.setVisible(true);
+
+    expect(pane.rendered).toEqual(all.slice(0, 64));
+    expect(pane.service.behind).toBe(true);
+    expect(pane.markers).toEqual([RESYNC_INCOMPLETE_MARKER]);
+  });
+
+  it("stays armed and marks the pane when the ring fetch fails", () => {
+    const stream = makeStream(16, 6);
+    const all = flatten(stream);
+    const pane = new PaneModel(ringOver(all, 4096), true);
+
+    for (const c of stream.slice(0, 2)) pane.push(c);
+    pane.setVisible(false);
+    for (const c of stream.slice(2)) pane.push(c);
+    pane.ringFetchFails = true;
+    pane.setVisible(true);
+
+    expect(pane.rendered).toEqual(all.slice(0, 32)); // nothing replayed
+    expect(pane.service.behind).toBe(true);
+    expect(pane.markers).toEqual([RESYNC_INCOMPLETE_MARKER]);
+
+    // The next reveal retries — and now it lands, gap-free.
+    pane.ringFetchFails = false;
+    pane.setVisible(false);
+    pane.setVisible(true);
+    expect(pane.service.behind).toBe(false);
+    expect(pane.rendered).toEqual(all);
   });
 
   it("keeps rendering normally when the pane is never hidden", () => {

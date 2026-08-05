@@ -119,8 +119,10 @@ export interface PaneVisibilityHooks {
  *     rendered bytes of a burst never ack and the reader stays paused);
  *   - a resync is issued on reveal ONLY when output was actually dropped (so
  *     revealing an idle pane costs zero IPC) and the "dropped" flag survives
- *     until the replay actually lands, so a declined or failed resync is
- *     retried on the next reveal instead of leaving a silent splice;
+ *     until a replay actually COVERS the dropped window — measured by stream
+ *     offset, not by the replay merely having run — so a declined, failed or
+ *     short replay is retried on the next reveal instead of leaving a silent
+ *     splice;
  *   - the render-consumer registration follows VISIBILITY ALONE, not
  *     readiness. A visible pane owns its acks from the moment it mounts: it
  *     buffers pre-ready bytes and writes them itself, so if the page tap also
@@ -134,6 +136,13 @@ export class PaneVisibilityService {
   private tier: PaneTier = "none";
   private consumerActive = false;
   private missedOutput = false;
+  /**
+   * Exclusive end offset of the furthest chunk dropped since the pane was last
+   * caught up. A replay clears {@link missedOutput} only once it has reached
+   * at least this far — see {@link noteResynced}. `0` means "extent unknown"
+   * (unstamped chunks), which any completed replay clears.
+   */
+  private missedThrough = 0;
   private disposed = false;
 
   constructor(
@@ -155,14 +164,60 @@ export class PaneVisibilityService {
     return this.tier;
   }
 
-  /** A chunk was dropped because the pane is hidden; reveal must resync. */
-  noteMissedOutput(): void {
+  /**
+   * A chunk was dropped because the pane is hidden; reveal must resync.
+   *
+   * `endOffset` is the exclusive end of the dropped chunk in the session's
+   * absolute output stream. Recording it is what makes {@link noteResynced}
+   * able to tell a COMPLETED replay from one that merely ran: a chunk dropped
+   * while the ring fetch was in flight sits beyond that (already-taken)
+   * snapshot, so a replay of it does not catch the pane up. Omit it only for
+   * unstamped chunks (a runner build predating offset stamping), where the
+   * extent is unknowable and any completed replay clears the flag — the
+   * pre-offset behavior.
+   */
+  noteMissedOutput(endOffset?: number): void {
+    this.missedOutput = true;
+    if (endOffset !== undefined && endOffset > this.missedThrough) {
+      this.missedThrough = endOffset;
+    }
+  }
+
+  /**
+   * A ring replay completed, putting the stream through absolute offset
+   * `replayedThrough` into the pane's buffer. Returns whether the pane is now
+   * caught up.
+   *
+   * The flag clears ONLY when the replay actually reached every byte that was
+   * dropped. Clearing it on any replay produced a silent splice: chunks
+   * dropped between the ring snapshot and its arrival were marked missed, then
+   * immediately un-marked by the replay of an older window — and nothing can
+   * re-detect them afterwards, because `nextExpectedOffset` keeps advancing
+   * across drops so the live stream looks contiguous. A `false` return means
+   * the caller must retry (a newer ring covers the remainder) or surface the
+   * gap.
+   */
+  noteResynced(replayedThrough: number): boolean {
+    if (!this.missedOutput) return true;
+    if (replayedThrough < this.missedThrough) return false;
+    this.missedOutput = false;
+    this.missedThrough = 0;
+    return true;
+  }
+
+  /**
+   * The replay could not be completed — the IPC rejected, the ring came back
+   * empty, or the retry budget ran out. Keeps the pane armed so the next
+   * reveal tries again; it does NOT advance the missed extent, because no new
+   * bytes were dropped.
+   */
+  noteResyncFailed(): void {
     this.missedOutput = true;
   }
 
-  /** The ring replay landed — the pane is caught up with the stream again. */
-  noteResynced(): void {
-    this.missedOutput = false;
+  /** True while output is known to be missing from this pane's buffer. */
+  get behind(): boolean {
+    return this.missedOutput;
   }
 
   /** The backend finished async init: timers may now run. */
