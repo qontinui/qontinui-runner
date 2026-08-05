@@ -3,10 +3,12 @@
 //! ## Two surfaces
 //!
 //! * **`envelope_rewrite_middleware`** — global `axum::middleware::from_fn` that
-//!   intercepts any `4xx text/plain` response produced by axum's built-in
-//!   extractors and rewrites it as a `application/json` [`ApiResponse`] with a
-//!   machine-readable `code`. This is the catch-all: all existing handlers get
-//!   correct envelopes without any per-handler migration.
+//!   intercepts any `4xx`/`5xx` `text/plain` (or Content-Type-less) response —
+//!   whether produced by axum's built-in extractors or by a handler's
+//!   `(StatusCode, String)` error arm — and rewrites it as an
+//!   `application/json` [`ApiResponse`] with a machine-readable `code`. This is
+//!   the catch-all: all existing handlers get correct envelopes without any
+//!   per-handler migration.
 //!
 //! * **`UiBridgeJson<T>`** — an opt-in `FromRequest` extractor that wraps
 //!   `axum::Json<T>` and maps each [`JsonRejection`] variant to the correct
@@ -19,9 +21,10 @@
 //!
 //! ```text
 //! [CatchPanicLayer]           <- outermost: converts panics → 500 JSON
-//!   [envelope_rewrite_middleware]  <- rewrites 4xx text/plain → JSON envelope
-//!     [TraceLayer, CORS, ...]
-//!       [handlers]
+//!   [envelope_audit_middleware]    <- debug-only: REPORTS non-JSON errors
+//!     [envelope_rewrite_middleware]  <- rewrites 4xx/5xx text/plain → JSON
+//!       [TraceLayer, CORS, ...]
+//!         [handlers]
 //! ```
 //!
 //! Async-graphql emits `application/json` for its own errors, so the
@@ -74,6 +77,11 @@ const CODE_INVALID_REQUEST: &str = "INVALID_REQUEST";
 const CODE_PAYLOAD_TOO_LARGE: &str = "PAYLOAD_TOO_LARGE";
 const CODE_BAD_REQUEST: &str = "BAD_REQUEST";
 const CODE_METHOD_NOT_ALLOWED: &str = "METHOD_NOT_ALLOWED";
+const CODE_INTERNAL_ERROR: &str = "INTERNAL_ERROR";
+const CODE_NOT_IMPLEMENTED: &str = "NOT_IMPLEMENTED";
+const CODE_BAD_GATEWAY: &str = "BAD_GATEWAY";
+const CODE_SERVICE_UNAVAILABLE: &str = "SERVICE_UNAVAILABLE";
+const CODE_GATEWAY_TIMEOUT: &str = "GATEWAY_TIMEOUT";
 
 // ─── Envelope helpers ─────────────────────────────────────────────────────────
 
@@ -250,12 +258,12 @@ fn envelope_422_with_hints<T: RequestHints>(
 
 // ─── Global rewrite middleware ────────────────────────────────────────────────
 
-/// Axum middleware that rewrites non-JSON `4xx` responses into the canonical
-/// JSON error envelope.
+/// Axum middleware that rewrites non-JSON `4xx` **and `5xx`** responses into
+/// the canonical JSON error envelope.
 ///
 /// ## Safety boundary
 ///
-/// `4xx` responses with a `text/plain` Content-Type OR with an empty/missing
+/// Error responses with a `text/plain` Content-Type OR with an empty/missing
 /// Content-Type are rewritten. The empty/missing case is what axum's built-in
 /// method router emits for a **405 Method Not Allowed** (e.g. a `GET` against a
 /// POST-only route like `/ui-bridge/control/page/read-value`): a bare response
@@ -265,7 +273,23 @@ fn envelope_422_with_hints<T: RequestHints>(
 ///
 /// `application/json` responses (including async-graphql errors and handlers
 /// that already return `Json<ApiResponse<..>>`) pass through untouched, as do
-/// 2xx/3xx/5xx responses.
+/// 2xx/3xx responses and error responses declaring any other concrete
+/// Content-Type (`text/html`, `text/event-stream`, …) — those are deliberate
+/// non-JSON surfaces, not envelope escapes.
+///
+/// ## Why 5xx is covered
+///
+/// The overwhelmingly common handler signature in this crate is
+/// `Result<Json<ApiResponse<T>>, (StatusCode, String)>` (156 occurrences across
+/// 28 modules as of this change). Axum renders the `(StatusCode, String)` error
+/// arm as `text/plain; charset=utf-8`, so **every** handler failure — almost
+/// always a 500 — produced a bare plain-text body that escaped the envelope.
+/// Restricting this middleware to `is_client_error()` meant the audit layer
+/// asserted an invariant the rewrite never established: live evidence
+/// 2026-08-05T15:28:10, `GET /task-runs` 500 `text/plain` from
+/// `task_runs::list_task_runs`'s `.map_err(|e| (INTERNAL_SERVER_ERROR, e))`.
+/// Covering 5xx here fixes the whole class at once instead of migrating 156
+/// call sites.
 ///
 /// ## Body size cap
 ///
@@ -277,8 +301,8 @@ pub async fn envelope_rewrite_middleware(req: Request, next: Next) -> Response {
 
     let status = response.status();
 
-    // Pass through non-4xx responses immediately.
-    if !status.is_client_error() {
+    // Pass through anything that isn't an error response.
+    if !status.is_client_error() && !status.is_server_error() {
         return response;
     }
 
@@ -347,14 +371,70 @@ pub async fn envelope_rewrite_middleware(req: Request, next: Next) -> Response {
                 original_msg.into_owned()
             },
         ),
-        _ => (
-            CODE_BAD_REQUEST,
+        // ─── 5xx ──────────────────────────────────────────────────────────
+        // The `(StatusCode, String)` handler-error idiom lands here: the
+        // String IS the diagnostic, so it is preserved verbatim as `message`
+        // and only the wire shape changes.
+        StatusCode::INTERNAL_SERVER_ERROR => (
+            CODE_INTERNAL_ERROR,
             if original_msg.is_empty() {
-                format!("Client error ({})", status.as_u16())
+                "Internal server error".to_string()
             } else {
                 original_msg.into_owned()
             },
         ),
+        StatusCode::NOT_IMPLEMENTED => (
+            CODE_NOT_IMPLEMENTED,
+            if original_msg.is_empty() {
+                "Not implemented".to_string()
+            } else {
+                original_msg.into_owned()
+            },
+        ),
+        StatusCode::BAD_GATEWAY => (
+            CODE_BAD_GATEWAY,
+            if original_msg.is_empty() {
+                "Bad gateway".to_string()
+            } else {
+                original_msg.into_owned()
+            },
+        ),
+        StatusCode::SERVICE_UNAVAILABLE => (
+            CODE_SERVICE_UNAVAILABLE,
+            if original_msg.is_empty() {
+                "Service unavailable".to_string()
+            } else {
+                original_msg.into_owned()
+            },
+        ),
+        StatusCode::GATEWAY_TIMEOUT => (
+            CODE_GATEWAY_TIMEOUT,
+            if original_msg.is_empty() {
+                "Gateway timeout".to_string()
+            } else {
+                original_msg.into_owned()
+            },
+        ),
+        _ => {
+            let code = if status.is_server_error() {
+                CODE_INTERNAL_ERROR
+            } else {
+                CODE_BAD_REQUEST
+            };
+            let fallback = if status.is_server_error() {
+                format!("Server error ({})", status.as_u16())
+            } else {
+                format!("Client error ({})", status.as_u16())
+            };
+            (
+                code,
+                if original_msg.is_empty() {
+                    fallback
+                } else {
+                    original_msg.into_owned()
+                },
+            )
+        }
     };
 
     let envelope = ApiResponse::<()>::error_with_code(message, code);
@@ -542,6 +622,166 @@ mod tests {
         );
         assert_eq!(body["success"], false);
         assert_eq!(body["code"], "METHOD_NOT_ALLOWED");
+    }
+
+    // ── 5xx coverage (2026-08-05) ────────────────────────────────────────────
+
+    /// Build a router whose handler uses the crate's dominant error idiom,
+    /// `Result<Json<..>, (StatusCode, String)>`. Axum renders that error arm as
+    /// `text/plain`, which is precisely what escaped the rewrite.
+    fn tuple_error_router(status: StatusCode, msg: &'static str) -> Router {
+        Router::new()
+            .route(
+                "/boom",
+                axum::routing::get(move || async move {
+                    Err::<Json<ApiResponse<()>>, (StatusCode, String)>((status, msg.to_string()))
+                }),
+            )
+            .layer(middleware::from_fn(envelope_rewrite_middleware))
+    }
+
+    async fn get_boom(app: Router) -> (StatusCode, String, serde_json::Value) {
+        let req = Request::builder()
+            .method("GET")
+            .uri("/boom")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (status, content_type, json)
+    }
+
+    /// THE regression for the 2026-08-05T15:28:10 crash dump: `GET /task-runs`
+    /// returned a 500 as `text/plain` because `envelope_rewrite_middleware`
+    /// short-circuited on `!status.is_client_error()`, so no 5xx was ever
+    /// enveloped. The audit layer then reported a violation the rewrite had
+    /// never promised to prevent.
+    #[tokio::test]
+    async fn plain_text_500_is_rewritten_to_json_envelope() {
+        let (status, content_type, body) = get_boom(tuple_error_router(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Database error: connection refused",
+        ))
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "status preserved"
+        );
+        assert!(
+            content_type.starts_with("application/json"),
+            "500 must be rewritten to JSON, got Content-Type {content_type:?}"
+        );
+        assert_eq!(body["success"], false);
+        assert_eq!(body["code"], "INTERNAL_ERROR");
+        assert_eq!(
+            body["error"], "Database error: connection refused",
+            "the handler's diagnostic string must survive the rewrite verbatim"
+        );
+    }
+
+    /// Each mapped 5xx keeps its status and gets its own machine-readable code.
+    #[tokio::test]
+    async fn mapped_5xx_statuses_get_distinct_codes() {
+        for (status, expected_code) in [
+            (StatusCode::NOT_IMPLEMENTED, "NOT_IMPLEMENTED"),
+            (StatusCode::BAD_GATEWAY, "BAD_GATEWAY"),
+            (StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE"),
+            (StatusCode::GATEWAY_TIMEOUT, "GATEWAY_TIMEOUT"),
+        ] {
+            let (got, content_type, body) = get_boom(tuple_error_router(status, "upstream")).await;
+            assert_eq!(got, status, "status must be preserved");
+            assert!(content_type.starts_with("application/json"));
+            assert_eq!(body["code"], expected_code, "for status {status}");
+        }
+    }
+
+    /// An unmapped 5xx (e.g. 507) still gets enveloped under INTERNAL_ERROR
+    /// rather than falling into the old client-error fallback.
+    #[tokio::test]
+    async fn unmapped_5xx_falls_back_to_internal_error() {
+        let (status, content_type, body) =
+            get_boom(tuple_error_router(StatusCode::INSUFFICIENT_STORAGE, "")).await;
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+        assert!(content_type.starts_with("application/json"));
+        assert_eq!(body["code"], "INTERNAL_ERROR");
+        assert_eq!(body["error"], "Server error (507)");
+    }
+
+    /// A handler that already returns a JSON 5xx must not be double-wrapped.
+    #[tokio::test]
+    async fn already_json_5xx_passes_through_unchanged() {
+        async fn explicit_json_500() -> impl IntoResponse {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<()>::error("explicit handler 500")),
+            )
+        }
+
+        let app = Router::new()
+            .route("/json-500", axum::routing::get(explicit_json_500))
+            .layer(middleware::from_fn(envelope_rewrite_middleware));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/json-500")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            body["code"].is_null(),
+            "already-JSON 5xx must not be rewritten"
+        );
+        assert_eq!(body["error"], "explicit handler 500");
+    }
+
+    /// Error responses declaring a concrete non-plain Content-Type (SSE, HTML)
+    /// are deliberate surfaces, not envelope escapes — they must pass through.
+    #[tokio::test]
+    async fn non_plain_content_type_5xx_is_not_rewritten() {
+        async fn html_500() -> impl IntoResponse {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                "<html>oops</html>",
+            )
+        }
+
+        let app = Router::new()
+            .route("/html-500", axum::routing::get(html_500))
+            .layer(middleware::from_fn(envelope_rewrite_middleware));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/html-500")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8"),
+        );
     }
 
     // ── Phase A3 tests: per-type hints on 422 ────────────────────────────────
