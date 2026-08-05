@@ -36,8 +36,8 @@ function makeHooks() {
     flushAck: vi.fn(() => void calls.push("flushAck")),
     refit: vi.fn(() => void calls.push("refit")),
     resync: vi.fn(() => void calls.push("resync")),
-    setRenderConsumer: vi.fn((active: boolean) =>
-      calls.push(active ? "consumer:on" : "consumer:off"),
+    setVisibilityTier: vi.fn((tier: "focused" | "background" | null) =>
+      calls.push(`tier:${tier ?? "none"}`),
     ),
   };
   return { hooks, calls };
@@ -70,16 +70,17 @@ describe("routeOutputChunk", () => {
 });
 
 describe("PaneVisibilityService", () => {
-  it("claims the render-ack consumer at mount, before the backend is ready", () => {
+  it("declares `focused` to the runner at mount, before the backend is ready", () => {
     // Load-bearing: a visible pane buffers pre-backend bytes and writes them
-    // itself, so the page tap must NOT proxy-ack them too — a double ack
-    // permanently disables that session's emission backpressure.
+    // itself, so the runner must serve it at full rate from the moment it
+    // mounts — coalescing or withholding during the up-to-~1s init would
+    // delay bytes the pane is about to render.
     const { hooks, calls } = makeHooks();
     const svc = new PaneVisibilityService(hooks, true);
-    expect(calls).toEqual(["consumer:on"]);
+    expect(calls).toEqual(["tier:focused"]);
     expect(svc.currentTier).toBe("none");
     svc.markReady();
-    expect(calls).toEqual(["consumer:on", "active:on"]);
+    expect(calls).toEqual(["tier:focused", "active:on"]);
     expect(svc.currentTier).toBe("active");
   });
 
@@ -91,9 +92,11 @@ describe("PaneVisibilityService", () => {
     expect(svc.currentTier).toBe("quiet");
     // No ack timer, no ResizeObserver — just the slow title poll.
     expect(hooks.enterActiveTier).not.toHaveBeenCalled();
-    // ...and the page tap owns its flow-control acks, since it renders nothing.
-    expect(hooks.setRenderConsumer).not.toHaveBeenCalled();
-    expect(calls).toEqual(["quiet:on"]);
+    // ...and it declares `background`, not nothing: a mounted-but-hidden pane
+    // must NOT fall through to `unwatched`, because the page tap still feeds
+    // its state chip from the stream the runner would otherwise stop sending.
+    expect(hooks.setVisibilityTier).toHaveBeenCalledWith("background");
+    expect(calls).toEqual(["tier:background", "quiet:on"]);
   });
 
   it("flushes the ack remainder BEFORE stopping the timer that would have drained it", () => {
@@ -102,7 +105,7 @@ describe("PaneVisibilityService", () => {
     svc.markReady();
     calls.length = 0;
     svc.setVisible(false);
-    expect(calls).toEqual(["flushAck", "active:off", "quiet:on", "consumer:off"]);
+    expect(calls).toEqual(["flushAck", "active:off", "quiet:on", "tier:background"]);
     expect(svc.paused).toBe(true);
   });
 
@@ -115,14 +118,14 @@ describe("PaneVisibilityService", () => {
     svc.setVisible(false);
     calls.length = 0;
     svc.setVisible(true);
-    expect(calls).toEqual(["quiet:off", "active:on", "consumer:on", "refit"]);
+    expect(calls).toEqual(["quiet:off", "active:on", "tier:focused", "refit"]);
 
     // Hidden while streaming: the dropped window must be replayed.
     svc.setVisible(false);
     svc.noteMissedOutput();
     calls.length = 0;
     svc.setVisible(true);
-    expect(calls).toEqual(["quiet:off", "active:on", "consumer:on", "resync", "refit"]);
+    expect(calls).toEqual(["quiet:off", "active:on", "tier:focused", "resync", "refit"]);
   });
 
   it("stays armed until the replay actually lands", () => {
@@ -256,9 +259,12 @@ describe("PaneVisibilityService", () => {
     const svc = new PaneVisibilityService(hooks, false);
     svc.noteMissedOutput(); // chunk arrived while hidden and pre-ready
     svc.setVisible(true); // revealed before the backend finished loading
-    expect(calls).toEqual(["consumer:on"]); // still no timers
+    // Mounted hidden then revealed pre-ready: `background` at construction,
+    // then `focused` — the runner is told the truth at each step even though
+    // no timer has started yet.
+    expect(calls).toEqual(["tier:background", "tier:focused"]);
     svc.markReady();
-    expect(calls).toEqual(["consumer:on", "active:on", "resync"]);
+    expect(calls).toEqual(["tier:background", "tier:focused", "active:on", "resync"]);
   });
 
   it("ignores redundant visibility updates", () => {
@@ -271,23 +277,23 @@ describe("PaneVisibilityService", () => {
     expect(calls).toEqual([]);
     svc.setVisible(false);
     svc.setVisible(false);
-    expect(calls).toEqual(["flushAck", "active:off", "quiet:on", "consumer:off"]);
+    expect(calls).toEqual(["flushAck", "active:off", "quiet:on", "tier:background"]);
   });
 
-  it("dispose stops everything and hands acking back to the page tap", () => {
+  it("dispose stops everything and drops the tier declaration", () => {
     const { hooks, calls } = makeHooks();
     const svc = new PaneVisibilityService(hooks, true);
     svc.markReady();
     calls.length = 0;
     svc.dispose();
-    expect(calls).toEqual(["flushAck", "active:off", "consumer:off"]);
+    expect(calls).toEqual(["flushAck", "active:off", "tier:none"]);
     expect(svc.currentTier).toBe("none");
     // Post-dispose transitions are inert — nothing may restart a timer on an
     // unmounted pane.
     svc.setVisible(false);
     svc.setVisible(true);
     svc.markReady();
-    expect(calls).toEqual(["flushAck", "active:off", "consumer:off"]);
+    expect(calls).toEqual(["flushAck", "active:off", "tier:none"]);
     expect(hooks.enterQuietTier).not.toHaveBeenCalled();
   });
 
@@ -297,7 +303,7 @@ describe("PaneVisibilityService", () => {
     svc.markReady();
     calls.length = 0;
     svc.dispose();
-    expect(calls).toEqual(["quiet:off"]);
+    expect(calls).toEqual(["quiet:off", "tier:none"]);
     expect(hooks.flushAck).not.toHaveBeenCalled();
   });
 
@@ -305,7 +311,7 @@ describe("PaneVisibilityService", () => {
     const { hooks, calls } = makeHooks();
     const svc = new PaneVisibilityService(hooks, true);
     svc.dispose();
-    expect(calls).toEqual(["consumer:on", "consumer:off"]);
+    expect(calls).toEqual(["tier:focused", "tier:none"]);
     expect(hooks.enterActiveTier).not.toHaveBeenCalled();
     expect(hooks.enterQuietTier).not.toHaveBeenCalled();
   });
@@ -354,7 +360,7 @@ class PaneModel {
         flushAck: () => {},
         refit: () => {},
         resync: () => this.resyncFromRing(),
-        setRenderConsumer: () => {},
+        setVisibilityTier: () => {},
       },
       visible,
     );

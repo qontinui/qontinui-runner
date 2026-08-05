@@ -183,19 +183,26 @@ export function reconcileNow(): void {
   // dangerous one.
   for (const id of declarations.keys()) owned.add(id);
 
+  // Tabs the runner has been told about that nothing owns any more — the whole
+  // page scope unmounted, taking its roster AND its panes in one commit. They
+  // must be pushed to `unwatched` before being forgotten: the runner holds the
+  // last tier it heard, so silently dropping a tab last reported `focused`
+  // would leave it served at full rate with nothing on this side watching it.
+  const orphaned = [...sent.keys()].filter((id) => !owned.has(id));
+
   const groups = new Map<VisibilityTier, string[]>();
-  for (const id of owned) {
-    const tier = effectiveTier(id);
-    if (sent.get(id) === tier) continue;
+  const add = (tier: VisibilityTier, id: string) => {
     const group = groups.get(tier);
     if (group) group.push(id);
     else groups.set(tier, [id]);
+  };
+  for (const id of owned) {
+    const tier = effectiveTier(id);
+    if (sent.get(id) === tier) continue;
+    add(tier, id);
   }
-
-  // Forget tabs that are gone so a terminal id that comes back (a restored
-  // session rebinding to its old id) is re-declared rather than assumed.
-  for (const id of [...sent.keys()]) {
-    if (!owned.has(id)) sent.delete(id);
+  for (const id of orphaned) {
+    if (sent.get(id) !== "unwatched") add("unwatched", id);
   }
 
   for (const [tier, ids] of groups) {
@@ -212,6 +219,11 @@ export function reconcileNow(): void {
       }
     });
   }
+
+  // Forget tabs that are gone so a terminal id that comes back (a restored
+  // session rebinding to its old id) is re-declared rather than assumed. After
+  // the push, so the final `unwatched` above is actually sent.
+  for (const id of orphaned) sent.delete(id);
 }
 
 /** Test-only: the tiers this module believes the runner is on. */
