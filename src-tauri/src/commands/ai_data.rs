@@ -99,13 +99,46 @@ fn get_dev_logs_dir() -> PathBuf {
     crate::paths::get_dev_logs_dir()
 }
 
+/// Read a rotated JSONL log as one chronological string: the `.1` rotation
+/// sidecar (the older generation) followed by the live file.
+///
+/// `AiOutputSink` rotates by RENAMING the live file aside rather than
+/// truncating it in place, so a reader that opens only the live path returns
+/// (near-)nothing immediately after a rotation, for data that is still on disk.
+/// Logs that never rotate have no sidecar and this reads exactly the one file.
+fn read_rotated_jsonl_to_string(path: &Path) -> Result<String, String> {
+    let mut combined = String::new();
+    for part in crate::commands::logging::rotated_log_read_set(path) {
+        let chunk = fs::read_to_string(&part)
+            .map_err(|e| format!("Failed to read {}: {}", part.display(), e))?;
+        if chunk.is_empty() {
+            continue;
+        }
+        // Defensive: a generation whose final line was cut short must not be
+        // glued onto the first line of the next one.
+        if !combined.is_empty() && !combined.ends_with('\n') {
+            combined.push('\n');
+        }
+        combined.push_str(&chunk);
+    }
+    Ok(combined)
+}
+
+/// Count the non-empty lines across a rotated JSONL log's generations.
+fn count_rotated_jsonl_lines(path: &Path) -> usize {
+    crate::commands::logging::rotated_log_read_set(path)
+        .iter()
+        .map(|part| {
+            fs::read_to_string(part)
+                .map(|c| c.lines().filter(|l| !l.trim().is_empty()).count())
+                .unwrap_or(0)
+        })
+        .sum()
+}
+
 /// Read JSONL log file and return entries.
 fn read_jsonl_file(path: &PathBuf, limit: usize) -> Result<Vec<serde_json::Value>, String> {
-    if !path.exists() {
-        return Ok(vec![]);
-    }
-
-    let content = fs::read_to_string(path).map_err(|e| format!("Failed to read file: {}", e))?;
+    let content = read_rotated_jsonl_to_string(path)?;
 
     let mut entries: Vec<serde_json::Value> = content
         .lines()
@@ -145,7 +178,8 @@ pub async fn read_jsonl_logs_for_viewer(
     };
 
     let file_path = dev_logs_dir.join(filename);
-    let file_exists = file_path.exists();
+    // A rotated log whose live file was just renamed aside still HAS data.
+    let file_exists = !crate::commands::logging::rotated_log_read_set(&file_path).is_empty();
     let file_path_str = file_path.to_string_lossy().to_string();
 
     match read_jsonl_file(&file_path, limit) {
@@ -224,11 +258,7 @@ fn read_jsonl_file_in_time_range(
     start_time: DateTime<Utc>,
     end_time: Option<DateTime<Utc>>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    if !path.exists() {
-        return Ok(vec![]);
-    }
-
-    let content = fs::read_to_string(path).map_err(|e| format!("Failed to read file: {}", e))?;
+    let content = read_rotated_jsonl_to_string(path)?;
     let end = end_time.unwrap_or_else(Utc::now);
 
     let entries: Vec<serde_json::Value> = content
@@ -296,7 +326,8 @@ pub async fn read_jsonl_logs_for_task_run(
     };
 
     let file_path = dev_logs_dir.join(filename);
-    let file_exists = file_path.exists();
+    // A rotated log whose live file was just renamed aside still HAS data.
+    let file_exists = !crate::commands::logging::rotated_log_read_set(&file_path).is_empty();
     let file_path_str = file_path.to_string_lossy().to_string();
 
     match read_jsonl_file_in_time_range(&file_path, start_time, end_time) {
@@ -383,7 +414,10 @@ pub async fn get_consolidated_ai_output(
     let dev_logs_dir = get_dev_logs_dir();
     let file_path = dev_logs_dir.join("ai-output.jsonl");
 
-    if !file_path.exists() {
+    // Read and filter entries across BOTH generations (rotation sidecar first).
+    let content = read_rotated_jsonl_to_string(&file_path)?;
+
+    if content.is_empty() {
         return Ok(AiDataResponse::ok(ConsolidatedAiOutputResult {
             chunks: vec![],
             total_entries: 0,
@@ -392,10 +426,6 @@ pub async fn get_consolidated_ai_output(
             end_time: task_run.completed_at.clone(),
         }));
     }
-
-    // Read and filter entries
-    let content =
-        fs::read_to_string(&file_path).map_err(|e| format!("Failed to read file: {}", e))?;
 
     let end = end_time.unwrap_or_else(Utc::now);
 
@@ -524,14 +554,10 @@ pub async fn get_jsonl_logs_summary() -> Result<AiDataResponse<JsonlLogsSummary>
 
     fn get_file_info(dir: &Path, filename: &str) -> JsonlLogFileInfo {
         let path = dir.join(filename);
-        let exists = path.exists();
-        let count = if exists {
-            fs::read_to_string(&path)
-                .map(|c| c.lines().filter(|l| !l.trim().is_empty()).count())
-                .unwrap_or(0)
-        } else {
-            0
-        };
+        // Count across the rotation sidecar too, so the summary doesn't drop to
+        // ~0 the moment a log rotates.
+        let exists = !crate::commands::logging::rotated_log_read_set(&path).is_empty();
+        let count = count_rotated_jsonl_lines(&path);
         JsonlLogFileInfo {
             file_path: path.to_string_lossy().to_string(),
             file_exists: exists,

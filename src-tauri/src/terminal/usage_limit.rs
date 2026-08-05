@@ -144,11 +144,11 @@ pub fn scan_grids_once() {
         let gate = gate_guard.get_or_insert_with(super::scan_gate::ScanGate::new);
         let now = Instant::now();
         for (tid, session) in &sessions {
-            // Skip sessions that produced no output since the last pass — the
-            // rendered screen is byte-identical, so a limit message frozen on
-            // an idle terminal is not re-detected. One relaxed atomic load
+            // Skip sessions whose grid has not been mutated since the last
+            // pass — the rendered screen is byte-identical, so a limit message
+            // frozen on an idle terminal is not re-detected. One atomic load
             // instead of a grid lock + full screen render.
-            if !gate.should_scan(tid, session.total_bytes_produced()) {
+            if !gate.should_scan(tid, session.grid_generation()) {
                 continue;
             }
             // Read the *rendered* screen text (rows joined by `\n`). The grid is
