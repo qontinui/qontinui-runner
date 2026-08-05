@@ -446,7 +446,9 @@ pub struct DoctorInputs {
 ///    as `ai_provider::oauth_refresh::default_location_has_valid_credentials`).
 /// 2. Tier — `settings.json::tier == "qontinui_account"`, tri-state so an
 ///    unreadable settings.json reports as UNKNOWN rather than `local`.
-/// 2b. Credential store readable — a store read ERROR is reported as itself, ahead of every bearer-consuming check it would otherwise misdiagnose.
+///    2b. Credential store readable — a store read ERROR is reported as
+///    itself, ahead of every bearer-consuming check it would otherwise
+///    misdiagnose.
 /// 3. Paired + signed in — `paired_user.json`
 ///    (`pair::read_paired_user_id_from_disk`) + a bearer in the access-token
 ///    slot (`auth::AuthManager::get_access_token`).
