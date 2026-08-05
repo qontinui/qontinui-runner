@@ -1,3 +1,0 @@
-# ActivityTimelinePanel
-
-_(notes)_
