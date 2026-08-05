@@ -137,7 +137,12 @@ export function AppFreshnessSettings({ onLog }: AppFreshnessSettingsProps) {
           // A 200 whose body isn't the app we patched (proxy interception, a
           // future shape change) would otherwise write a junk `forms[undefined]`
           // entry and leave the row looking unsaved. Fall back to a full read
-          // rather than trusting the cast.
+          // rather than trusting the cast — and say so, or a click that got a
+          // 200 produces no feedback at all.
+          onLog(
+            "warning",
+            `App "${app.appId}" saved, but the runner returned an unexpected body — re-reading the registry.`,
+          );
           await load();
           return;
         }
@@ -264,8 +269,9 @@ export function AppFreshnessSettings({ onLog }: AppFreshnessSettingsProps) {
                     <span>
                       Stored strategy <code className="font-mono">{app.updateStrategy}</code> is not
                       recognised by this build, so the selector below shows{" "}
-                      <code className="font-mono">pull_only</code> instead. This build cannot change
-                      the stored value — update the runner, or PATCH the registry directly.
+                      <code className="font-mono">pull_only</code> instead. Choosing a strategy here
+                      and saving <strong>will overwrite</strong> the stored value, and this build
+                      cannot restore it — update the runner, or PATCH the registry directly.
                     </span>
                   </p>
                 )}
