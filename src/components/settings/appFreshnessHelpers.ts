@@ -103,36 +103,53 @@ export function sameForm(a: AppFreshnessForm, b: AppFreshnessForm): boolean {
 }
 
 /**
- * Build the `PATCH /apps/:app_id` body for a form.
+ * Build the `PATCH /apps/:app_id` body for a form, given the app it edits.
  *
- * `UpdateAppRequest` is applied server-side with `COALESCE($n, column)`
- * (`database/pg/apps.rs`), so an omitted field leaves the column untouched.
- * Two rules follow, both API facts rather than choices made here:
+ * The server normalizes each command with `normalize_command`
+ * (`database/pg/apps.rs`) onto three states, and this function is what selects
+ * between them:
  *
- * 1. **An empty command is never sent.** The auto-fresh engine runs
- *    `if let Some(cmd) = app.build_command` and checks only the exit status
- *    (`fleet.rs::execute_build_and_restart`); an empty shell command exits 0
- *    on every platform. Persisting `""` would mark an app freshly built
- *    without having built anything, and the `fresh_only` dispatcher would then
- *    route tests to a host serving stale code. Omitting the field is the only
- *    safe encoding of "I left this blank" — and it means a command **cannot be
- *    cleared** through this endpoint, which the panel states rather than
- *    pretending otherwise.
- * 2. **Commands are only sent under `pull_build`.** Otherwise a command typed
- *    while `pull_build` was selected, then abandoned by switching back to
- *    `pull_only`, would be persisted invisibly — the inputs are hidden under
- *    `pull_only` — and executed the moment anyone flipped the app back.
+ * | Emitted | Server does |
+ * |---|---|
+ * | key omitted | leaves the column exactly as it is |
+ * | `""` | **clears** the column |
+ * | `"npm run build"` | stores it, trimmed |
+ *
+ * Two rules, both about not persisting something the operator cannot see:
+ *
+ * 1. **A blank is sent only as a deliberate clear** — when the input is blank
+ *    AND the stored value is not. Blanking an already-empty command emits
+ *    nothing, so a no-op edit never produces a write.
+ * 2. **Under `pull_only`, a *set* is omitted but a *clear* is sent.** The
+ *    command inputs are hidden under `pull_only`, so persisting a value typed
+ *    under `pull_build` and then abandoned would store a command the operator
+ *    cannot see — which the engine would run the moment anyone flipped the app
+ *    back. Clearing has the opposite risk profile: it removes a hidden value
+ *    rather than creating one, and it is the whole point of the "switch this
+ *    app's shape" flow, so it is allowed through.
  *
  * `updateStrategy` is always sent: it has a value in every state, and it is
  * what decides whether the commands run at all.
+ *
+ * Takes `app` because rule 1 cannot be evaluated from the form alone — "is
+ * there anything to clear?" is a question about the stored row.
  */
-export function buildPatchBody(form: AppFreshnessForm): AppFreshnessPatch {
+export function buildPatchBody(app: RegisteredApp, form: AppFreshnessForm): AppFreshnessPatch {
   const body: AppFreshnessPatch = { updateStrategy: form.updateStrategy };
-  if (form.updateStrategy !== "pull_build") return body;
-  const build = form.buildCommand.trim();
-  const start = form.startCommand.trim();
-  if (build) body.buildCommand = build;
-  if (start) body.startCommand = start;
+  const stored = formOf(app);
+  const isBuild = form.updateStrategy === "pull_build";
+
+  const resolve = (input: string, storedValue: string): string | undefined => {
+    const trimmed = input.trim();
+    if (trimmed) return isBuild ? trimmed : undefined;
+    // Blank input: a clear, but only if there is something stored to clear.
+    return storedValue.trim() ? "" : undefined;
+  };
+
+  const build = resolve(form.buildCommand, stored.buildCommand);
+  const start = resolve(form.startCommand, stored.startCommand);
+  if (build !== undefined) body.buildCommand = build;
+  if (start !== undefined) body.startCommand = start;
   return body;
 }
 
@@ -149,9 +166,12 @@ export function buildPatchBody(form: AppFreshnessForm): AppFreshnessPatch {
  */
 export function effectiveAfterSave(app: RegisteredApp, form: AppFreshnessForm): AppFreshnessForm {
   const stored = formOf(app);
-  const patch = buildPatchBody(form);
+  const patch = buildPatchBody(app, form);
   return {
     updateStrategy: patch.updateStrategy,
+    // `??` is correct for all three states: an omitted key is `undefined` and
+    // falls through to the stored value, while an emitted `""` is NOT nullish
+    // and therefore yields the cleared value.
     buildCommand: patch.buildCommand ?? stored.buildCommand,
     startCommand: patch.startCommand ?? stored.startCommand,
   };
@@ -160,15 +180,15 @@ export function effectiveAfterSave(app: RegisteredApp, form: AppFreshnessForm): 
 /**
  * `pull_build` with no command that will actually run.
  *
- * The engine takes neither `if let Some` arm, returns `Ok(())`, and marks the
- * app `fresh` at the new SHA with nothing built — the exact false-fresh state
- * rule 1 of {@link buildPatchBody} exists to prevent, reached via NULL/NULL
- * instead of `""`. Declaring `pull_build` is the operator asserting "pulling
- * is not enough", so the panel refuses to save it rather than annotating it.
+ * The engine now REFUSES this configuration outright
+ * (`fleet.rs::execute_build_and_restart` returns `Err`, so the app records
+ * `failed` rather than `fresh`), and the panel refuses to create it — declaring
+ * `pull_build` is the operator asserting "pulling is not enough", so an
+ * apparently-successful save that guarantees a failed refresh is worse than a
+ * blocked button.
  *
- * Takes the EFFECTIVE row, not the form: clearing both inputs on an app whose
- * commands are stored is not this state, because the omitted keys leave them
- * in place.
+ * Takes the EFFECTIVE row, not the form: what matters is what will be stored
+ * after the PATCH, not what the inputs currently show.
  */
 export function isFalselyFresh(effective: AppFreshnessForm): boolean {
   return (
