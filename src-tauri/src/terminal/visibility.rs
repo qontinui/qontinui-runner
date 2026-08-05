@@ -22,8 +22,9 @@
 //! (`GET /terminals/{id}/stream`), the WS relay used by the mobile client and
 //! the coord output pipe all ride the same per-chunk call and receive every
 //! chunk, in order, byte-identical, in every tier. External consumers keep
-//! their contract — see `WebviewEmitter::emit` in [`super::session`], where
-//! the mirror legs are dispatched before the tier is consulted at all.
+//! their contract — see `admit_to_webview` in [`super::session`], which returns
+//! a webview-only verdict and is consulted only after the mirror legs have been
+//! dispatched.
 //!
 //! The scrollback ring is likewise untiered: `tee_into_scrollback` runs on the
 //! read, upstream of emission, so an `unwatched` session accumulates exactly
@@ -46,7 +47,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
@@ -220,6 +221,120 @@ impl VisibilityState {
         let mut v: Vec<String> = map.keys().cloned().collect();
         v.sort();
         v
+    }
+}
+
+/// The accumulated webview window of a `background` session.
+///
+/// A background session's chunks are appended here instead of being emitted,
+/// and leave as ONE `terminal-output` event once the window is due. Both the
+/// reader thread (on the next chunk) and the sweeper (when the session went
+/// quiet mid-window) drain it through the same mutex, which is also what keeps
+/// this session's webview events in stream order.
+///
+/// Pure and clock-injected so the cadence is unit-testable without a PTY.
+pub struct BackgroundHold {
+    pending: Vec<u8>,
+    /// Absolute stream offset of the FIRST held byte — the replay boundary the
+    /// frontend dedups a scrollback fetch against, exactly as for a coalesced
+    /// sync frame.
+    pending_offset: u64,
+    last_flush: Instant,
+}
+
+impl BackgroundHold {
+    pub fn new(now: Instant) -> Self {
+        Self {
+            pending: Vec::new(),
+            pending_offset: 0,
+            last_flush: now,
+        }
+    }
+
+    /// Accumulate one chunk into the open window.
+    pub fn push(&mut self, payload: &[u8], offset: u64) {
+        if self.pending.is_empty() {
+            self.pending_offset = offset;
+        }
+        self.pending.extend_from_slice(payload);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// Whether the held window should leave now: the ≥250 ms spacing elapsed,
+    /// or the byte cap tripped (flush early rather than ship one huge event).
+    pub fn is_due(&self, now: Instant) -> bool {
+        if self.pending.is_empty() {
+            return false;
+        }
+        self.pending.len() >= BACKGROUND_HOLD_BYTE_CAP
+            || now.saturating_duration_since(self.last_flush) >= BACKGROUND_FLUSH_INTERVAL
+    }
+
+    /// Take the held window if it is due, restarting the spacing clock.
+    pub fn take_if_due(&mut self, now: Instant) -> Option<(Vec<u8>, u64)> {
+        if !self.is_due(now) {
+            return None;
+        }
+        self.take_now(now)
+    }
+
+    /// Take the held window unconditionally — the tier changed out of
+    /// `background`, so held bytes must ship before anything emitted under the
+    /// new tier or the webview would see them out of order.
+    pub fn take_now(&mut self, now: Instant) -> Option<(Vec<u8>, u64)> {
+        self.last_flush = now;
+        if self.pending.is_empty() {
+            return None;
+        }
+        Some((std::mem::take(&mut self.pending), self.pending_offset))
+    }
+}
+
+/// Per-session cadence gate for [`ACTIVITY_EVENT`].
+///
+/// Clock- and counter-injected: `due` is a pure function of "how many bytes has
+/// the PTY produced since the last digest" and "how long ago was it", so the
+/// ≤1 Hz budget is unit-testable without a PTY or a Tauri app.
+pub struct ActivityDigestState {
+    last_emit: Instant,
+    last_total: u64,
+}
+
+impl ActivityDigestState {
+    pub fn new(now: Instant) -> Self {
+        Self {
+            last_emit: now,
+            last_total: 0,
+        }
+    }
+
+    /// Bytes to report if a digest is due, else `None`.
+    ///
+    /// An idle session is skipped WITHOUT restarting the clock: a session that
+    /// says nothing for a minute and then speaks gets its digest on the very
+    /// next sweep rather than waiting out a fresh interval.
+    pub fn take_if_due(&mut self, now: Instant, total_produced: u64) -> Option<u64> {
+        if total_produced <= self.last_total {
+            return None;
+        }
+        if now.saturating_duration_since(self.last_emit) < ACTIVITY_DIGEST_INTERVAL {
+            return None;
+        }
+        let delta = total_produced - self.last_total;
+        self.last_total = total_produced;
+        self.last_emit = now;
+        Some(delta)
+    }
+
+    /// Re-baseline without emitting — used when a session leaves `unwatched`,
+    /// so the first digest after it goes dark again reports only bytes
+    /// produced since then rather than everything the tap already consumed.
+    pub fn rebaseline(&mut self, now: Instant, total_produced: u64) {
+        self.last_total = total_produced;
+        self.last_emit = now;
     }
 }
 
@@ -422,5 +537,133 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(state.retain_windows(&live), VisibilityTier::Unwatched);
+    }
+
+    // ---- background hold window ----
+
+    /// The headline `background` property: a burst of chunks inside one 250 ms
+    /// window leaves as exactly ONE event, byte-for-byte the concatenation,
+    /// stamped at the FIRST held byte's offset.
+    #[test]
+    fn background_hold_coalesces_a_burst_into_one_flush() {
+        let t0 = Instant::now();
+        let mut hold = BackgroundHold::new(t0);
+        hold.push(b"alpha", 100);
+        hold.push(b"beta", 105);
+        hold.push(b"gamma", 109);
+        assert!(hold.take_if_due(t0 + Duration::from_millis(249)).is_none());
+
+        let (payload, offset) = hold
+            .take_if_due(t0 + Duration::from_millis(250))
+            .expect("the 250 ms window elapsed");
+        assert_eq!(payload, b"alphabetagamma");
+        assert_eq!(offset, 100, "stamped at the first held byte");
+        assert!(hold.is_empty());
+    }
+
+    /// Spacing is measured from the previous FLUSH, so a session talking
+    /// continuously still costs at most one event per interval.
+    #[test]
+    fn background_hold_spacing_restarts_from_each_flush() {
+        let t0 = Instant::now();
+        let mut hold = BackgroundHold::new(t0);
+        hold.push(b"one", 0);
+        let t1 = t0 + Duration::from_millis(300);
+        assert!(hold.take_if_due(t1).is_some());
+
+        hold.push(b"two", 3);
+        assert!(
+            hold.take_if_due(t1 + Duration::from_millis(200)).is_none(),
+            "only 200 ms since the last flush"
+        );
+        assert!(hold.take_if_due(t1 + Duration::from_millis(260)).is_some());
+    }
+
+    /// A firehose must not buffer unboundedly waiting for the clock.
+    #[test]
+    fn background_hold_flushes_early_on_the_byte_cap() {
+        let t0 = Instant::now();
+        let mut hold = BackgroundHold::new(t0);
+        hold.push(&vec![b'x'; BACKGROUND_HOLD_BYTE_CAP], 0);
+        let (payload, _) = hold
+            .take_if_due(t0)
+            .expect("the byte cap trips regardless of elapsed time");
+        assert_eq!(payload.len(), BACKGROUND_HOLD_BYTE_CAP);
+    }
+
+    /// An empty window is never "due" — the sweeper must do nothing for a
+    /// quiet background session.
+    #[test]
+    fn background_hold_is_never_due_while_empty() {
+        let t0 = Instant::now();
+        let mut hold = BackgroundHold::new(t0);
+        assert!(!hold.is_due(t0 + Duration::from_secs(60)));
+        assert!(hold.take_if_due(t0 + Duration::from_secs(60)).is_none());
+    }
+
+    /// A tier change out of `background` ships held bytes immediately, so
+    /// nothing emitted under the new tier can overtake them.
+    #[test]
+    fn background_hold_take_now_ignores_the_clock() {
+        let t0 = Instant::now();
+        let mut hold = BackgroundHold::new(t0);
+        hold.push(b"held", 7);
+        let (payload, offset) = hold.take_now(t0).expect("unconditional");
+        assert_eq!(payload, b"held");
+        assert_eq!(offset, 7);
+        assert!(hold.take_now(t0).is_none(), "nothing left to ship");
+    }
+
+    // ---- activity digest cadence ----
+
+    #[test]
+    fn activity_digest_is_capped_at_one_per_second() {
+        let t0 = Instant::now();
+        let mut st = ActivityDigestState::new(t0);
+        // Produced bytes but the interval hasn't elapsed.
+        assert_eq!(st.take_if_due(t0 + Duration::from_millis(999), 500), None);
+        assert_eq!(
+            st.take_if_due(t0 + Duration::from_millis(1000), 500),
+            Some(500)
+        );
+        // Immediately after, more bytes — still rate-limited.
+        assert_eq!(st.take_if_due(t0 + Duration::from_millis(1250), 900), None);
+        assert_eq!(
+            st.take_if_due(t0 + Duration::from_millis(2000), 900),
+            Some(400),
+            "delta since the PREVIOUS digest, not since spawn"
+        );
+    }
+
+    /// An idle session emits nothing and does not consume its interval, so the
+    /// first byte after a long silence is reported on the next sweep.
+    #[test]
+    fn activity_digest_skips_idle_without_restarting_the_clock() {
+        let t0 = Instant::now();
+        let mut st = ActivityDigestState::new(t0);
+        for i in 1..=10 {
+            assert_eq!(st.take_if_due(t0 + Duration::from_secs(i), 0), None);
+        }
+        assert_eq!(
+            st.take_if_due(t0 + Duration::from_secs(10), 42),
+            Some(42),
+            "no waiting out a fresh interval after silence"
+        );
+    }
+
+    /// Leaving `unwatched` re-baselines, so the next dark window reports only
+    /// what it actually missed rather than replaying the tap-fed stretch.
+    #[test]
+    fn activity_digest_rebaseline_drops_the_tap_fed_stretch() {
+        let t0 = Instant::now();
+        let mut st = ActivityDigestState::new(t0);
+        assert_eq!(st.take_if_due(t0 + Duration::from_secs(1), 100), Some(100));
+        // Tier upgraded; the page tap consumed the next 5000 bytes.
+        st.rebaseline(t0 + Duration::from_secs(2), 5100);
+        assert_eq!(
+            st.take_if_due(t0 + Duration::from_secs(3), 5150),
+            Some(50),
+            "only the bytes produced since the re-baseline"
+        );
     }
 }

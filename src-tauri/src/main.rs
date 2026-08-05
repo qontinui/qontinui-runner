@@ -876,6 +876,17 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // `terminal::usage_limit`.
                 terminal::usage_limit::spawn_grid_scan_loop();
 
+                // Visibility sweeper (Phase 5 of
+                // `plans/2026-07-28-runner-many-sessions-performance.md`).
+                // Settles the two deferred jobs the visibility tiers own —
+                // flushing a held `background` window and emitting the ≤1 Hz
+                // `terminal-activity` digest for `unwatched` sessions — when a
+                // session goes QUIET, which is exactly when the reader thread
+                // is parked in a blocking PTY read and can only act on the
+                // next byte. Also prunes visibility reports from closed
+                // pop-out windows. See `terminal::visibility`.
+                terminal::visibility::spawn_sweeper();
+
                 // Plan 2026-05-19-coordinator-production-readiness.md
                 // Phase 1 — periodic primary-tree state publisher. These
                 // four tasks share one worker thread; they're all
@@ -2170,6 +2181,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal::terminal_session_record_open,
             commands::terminal::terminal_session_rebind_terminal,
             commands::terminal::terminal_set_title,
+            commands::terminal::terminal_set_visibility,
             commands::terminal::terminal_write,
             commands::terminal_analysis::analyze_architecture,
             commands::terminal_analysis::analyze_change_impact,
