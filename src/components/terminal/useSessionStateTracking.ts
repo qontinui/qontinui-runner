@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import type { SessionState } from "./useZoneLayout";
 import { detectSessionState } from "./sessionStateDetector";
+import { applyActivityDigest } from "./activityDigestTracking";
 import { getTerminalHotStore } from "./terminalHotStore";
 
 /** Element-wise equality for the sparkline ring buffers. */
@@ -62,6 +63,12 @@ export interface UseSessionStateTrackingReturn {
   prevSessionStatesRef: React.MutableRefObject<Record<string, SessionState>>;
   handleExit: (terminalId: string, exitCode: number | null) => void;
   handleOutput: (tabId: string, text: string) => void;
+  /**
+   * Feed tracking from the runner's `terminal-activity` digest instead of from
+   * the output stream — the path for tabs at visibility tier `unwatched`, for
+   * which the runner emits no `terminal-output` at all (plan Phase 5 / A4).
+   */
+  handleActivityDigest: (tabId: string, bytesDelta: number, lines: string[]) => void;
 }
 
 export function useSessionStateTracking(
@@ -338,6 +345,58 @@ export function useSessionStateTracking(
     [processOutput, hotStore],
   );
 
+  /**
+   * Feed state tracking from the runner's `terminal-activity` digest — the
+   * replacement feed for tabs the runner has stopped emitting output for
+   * (visibility tier `unwatched`; plan Phase 5 / A4).
+   *
+   * It carries what the tap used to derive from raw bytes, but better:
+   *  - `bytesDelta` is what the PTY actually produced, so an unwatched tab's
+   *    sparkline stays comparable with a focused tab's (the digest's own text
+   *    length would not be);
+   *  - `lines` is the RENDERED server-side VT grid, which resolves cursor
+   *    motion, line rewrites and full-frame TUI redraws — strictly more
+   *    faithful than the regex ANSI-strip fallback an unmounted tab used to
+   *    get, since no xterm buffer exists to read for these tabs.
+   *
+   * Deliberately NOT routed through `handleOutput`: that would double-count
+   * `text.length` into the sparkline and try to read a buffer that isn't there.
+   */
+  const handleActivityDigest = useCallback(
+    (tabId: string, bytesDelta: number, lines: string[]) => {
+      const { outputLines, detectorText } = applyActivityDigest(
+        {
+          lastOutputTime: lastOutputTimeRef.current,
+          activityBuffers: activityBuffersRef.current,
+        },
+        tabId,
+        bytesDelta,
+        lines,
+        Date.now(),
+      );
+
+      if (outputLines) {
+        hotStore.setTabOutputLines(tabId, outputLines);
+      }
+      if (detectorText.length === 0) return;
+
+      // The rendered screen tail is what a state chip keys off, so run the
+      // same detector the tap runs — on the digest instead of on raw bytes.
+      const bypassPermissions =
+        tabsRef.current.find((t) => t.id === tabId)?.bypassPermissions === true;
+      setSessionStates((prev) => {
+        const current = prev[tabId] ?? "idle";
+        const detected = detectSessionState(detectorText, current, { bypassPermissions });
+        if (detected && detected !== current) {
+          return { ...prev, [tabId]: detected };
+        }
+        return prev;
+      });
+      processOutput?.(tabId, detectorText);
+    },
+    [processOutput, hotStore],
+  );
+
   // Memoize the return so the value object's identity only changes when
   // something in it actually changed. Previously this was a bare object
   // literal, which made the whole `TerminalSessionContext` value churn on
@@ -352,7 +411,8 @@ export function useSessionStateTracking(
       prevSessionStatesRef,
       handleExit,
       handleOutput,
+      handleActivityDigest,
     }),
-    [sessionStates, staleTabs, handleExit, handleOutput],
+    [sessionStates, staleTabs, handleExit, handleOutput, handleActivityDigest],
   );
 }
