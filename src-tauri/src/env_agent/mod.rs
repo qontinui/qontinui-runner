@@ -45,6 +45,7 @@
 
 pub mod apply;
 pub mod apply_services;
+pub mod apply_versions;
 pub mod collectors;
 pub mod config;
 pub mod directive;

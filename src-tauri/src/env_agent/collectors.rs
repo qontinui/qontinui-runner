@@ -434,6 +434,22 @@ fn version_of_within(
     }
 }
 
+/// Re-run the EXACT probe [`collect_versions`] uses, with an explicit budget.
+///
+/// The `versions` apply (P2b slice 3) verifies its own work by re-probing after
+/// driving a version manager. That verification is only worth anything if it
+/// asks the same question the capture asks — same command, same args, same cwd
+/// resolution — so it goes through this one function rather than a lookalike.
+/// The budget is a parameter because an apply can afford to wait longer than a
+/// 15-minute capture loop can.
+pub(crate) fn probe_tool_version(
+    cmd: &str,
+    cwd: Option<&Path>,
+    budget: Duration,
+) -> Option<String> {
+    version_of_within(cmd, &["--version"], cwd, budget)
+}
+
 /// Pull a `name = "x.y.z"` value out of a `[section]` of a Cargo.toml string.
 /// Tiny hand-roll to avoid a toml-parse dependency in the hot path; tolerant of
 /// missing keys (returns `None`). Looks only within the requested top-level
