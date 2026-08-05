@@ -932,11 +932,21 @@ fn build_child_intent(state: &HandoffState) -> Result<Intent, HandoffError> {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let redact_secrets = src.get("redact_secrets").and_then(|v| v.as_bool());
-    // Dual-read window: coord renamed the wire key `plan_slug` →
-    // `work_unit_slug`. Read the new name first and fall back to the legacy
-    // one so a source intent written by EITHER coord release materializes.
+    // Dual-read: coord renamed the wire key `plan_slug` → `work_unit_slug`.
+    // Read the new name first and fall back to the legacy one so a source
+    // intent written by EITHER coord release materializes.
     // (`Intent::plan_slug` — what the runner WRITES — is deliberately not
     // renamed here; the writer leg switches in a later stage.)
+    //
+    // ** THE `plan_slug` FALLBACK IS PERMANENT. DO NOT "CLEAN IT UP". **
+    // This is not a migration window that eventually closes. `src` is a
+    // persisted `coord.sessions.intent` JSONB blob, and Phase 5 of plan
+    // `2026-07-30-coord-web-plan-slug-wire-key-retirement` decided (a) LEAVE
+    // the historical blobs unmigrated: every session row written before the
+    // rename carries only `plan_slug`, and those rows never expire. Deleting
+    // the fallback would silently hand `None` to every handoff off a
+    // pre-rename session — a quiet degradation, not an error. The three-line
+    // fallback is the entire cost of never having to rewrite that table.
     // `.as_str()` must be applied BEFORE the fallback, not after. `.get()`
     // returns `Some(Value::Null)` for a present-but-null key, so an
     // `.or_else(...).and_then(as_str)` chain would treat an explicit
