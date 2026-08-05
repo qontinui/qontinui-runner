@@ -38,7 +38,7 @@ import {
   registerTerminalExitHandler,
   type TerminalOutputPayload,
 } from "./terminalEventDemux";
-import { retainRenderConsumer } from "./terminalRenderConsumers";
+import { declarePaneTier } from "./terminalVisibilityTiers";
 import { PaneVisibilityService, routeOutputChunk } from "./paneVisibilityService";
 import { setWebglSlotVisible } from "./backends/webglContextLru";
 
@@ -429,7 +429,7 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
       let ackTimer: ReturnType<typeof setInterval> | null = null;
       let quietTitleTimer: ReturnType<typeof setInterval> | null = null;
       let observer: ResizeObserver | null = null;
-      let releaseRenderConsumer: (() => void) | null = null;
+      let paneTierDeclaration: ReturnType<typeof declarePaneTier> | null = null;
       let blockNativePaste: ((e: Event) => void) | null = null;
       let wheelScrollOverride: ((e: WheelEvent) => void) | null = null;
       let contextMenuCopyPaste: ((e: MouseEvent) => void) | null = null;
@@ -839,12 +839,18 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
           resync: () => {
             void resyncFromRing();
           },
-          setRenderConsumer: (active) => {
-            if (active) {
-              releaseRenderConsumer ??= retainRenderConsumer(terminalId);
+          // Phase 5 — tell the runner what this pane is worth. `null` on
+          // unmount drops the declaration; with no pane anywhere declaring it,
+          // the reconciler pushes `unwatched` and the runner stops emitting
+          // `terminal-output` for the terminal altogether.
+          setVisibilityTier: (tier) => {
+            if (tier === null) {
+              paneTierDeclaration?.release();
+              paneTierDeclaration = null;
+            } else if (paneTierDeclaration) {
+              paneTierDeclaration.update(tier);
             } else {
-              releaseRenderConsumer?.();
-              releaseRenderConsumer = null;
+              paneTierDeclaration = declarePaneTier(terminalId, tier);
             }
           },
         },

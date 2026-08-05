@@ -218,3 +218,97 @@ describe("reconcile", () => {
     expect(calls()).toEqual([["unwatched", ["a"]]]);
   });
 });
+
+/**
+ * The bridge that actually produces the declarations in production: every
+ * `TerminalInstance` owns a `PaneVisibilityService`, and its `setVisibilityTier`
+ * hook is the ONLY thing that declares. Driving the real service here proves
+ * the two halves agree — a unit test of the reconciler alone would still pass
+ * if the pane wired the hook backwards.
+ */
+describe("PaneVisibilityService drives the reconciler", () => {
+  const bridgeHooks = (terminalId: string) => {
+    let handle: ReturnType<typeof declarePaneTier> | null = null;
+    return {
+      enterActiveTier: () => {},
+      leaveActiveTier: () => {},
+      enterQuietTier: () => {},
+      leaveQuietTier: () => {},
+      flushAck: () => {},
+      refit: () => {},
+      resync: () => {},
+      setVisibilityTier: (tier: "focused" | "background" | null) => {
+        if (tier === null) {
+          handle?.release();
+          handle = null;
+        } else if (handle) {
+          handle.update(tier);
+        } else {
+          handle = declarePaneTier(terminalId, tier);
+        }
+      },
+    };
+  };
+
+  it("maps mount/visibility/unmount onto focused, background and unwatched", async () => {
+    const { PaneVisibilityService } = await import("./paneVisibilityService");
+    publishRoster("page-1", ["t1"]);
+
+    const pane = new PaneVisibilityService(bridgeHooks("t1"), true);
+    pane.markReady();
+    reconcileNow();
+    expect(effectiveTier("t1")).toBe("focused");
+
+    // Hidden, still mounted: the page tap keeps feeding its state chip, so the
+    // runner must keep emitting — just coalesced.
+    pane.setVisible(false);
+    reconcileNow();
+    expect(effectiveTier("t1")).toBe("background");
+
+    pane.setVisible(true);
+    reconcileNow();
+    expect(effectiveTier("t1")).toBe("focused");
+
+    // Unmounted: nothing renders it and nothing taps it, so the runner stops.
+    pane.dispose();
+    reconcileNow();
+    expect(effectiveTier("t1")).toBe("unwatched");
+    expect(__sentTiers()).toEqual({ t1: "unwatched" });
+  });
+
+  it("keeps a terminal served while ANY window's pane still shows it", async () => {
+    const { PaneVisibilityService } = await import("./paneVisibilityService");
+    publishRoster("page-1", ["t1"]);
+    const docked = new PaneVisibilityService(bridgeHooks("t1"), false);
+    const popout = new PaneVisibilityService(bridgeHooks("t1"), true);
+    docked.markReady();
+    popout.markReady();
+    reconcileNow();
+    expect(effectiveTier("t1")).toBe("focused");
+
+    popout.dispose();
+    reconcileNow();
+    expect(effectiveTier("t1")).toBe("background");
+
+    docked.dispose();
+    reconcileNow();
+    expect(effectiveTier("t1")).toBe("unwatched");
+  });
+
+  it("takes a whole page to unwatched when its scope unmounts", async () => {
+    const { PaneVisibilityService } = await import("./paneVisibilityService");
+    publishRoster("page-1", ["t1", "t2"]);
+    const pane = new PaneVisibilityService(bridgeHooks("t1"), true);
+    pane.markReady();
+    reconcileNow();
+    mockInvoke.mockClear();
+
+    pane.dispose();
+    releaseRoster("page-1");
+    reconcileNow();
+    expect(effectiveTier("t1")).toBe("unwatched");
+    expect(effectiveTier("t2")).toBe("unwatched");
+    // t2 was already unwatched and t1 just became so — one grouped call.
+    expect(calls()).toEqual([["unwatched", ["t1"]]]);
+  });
+});

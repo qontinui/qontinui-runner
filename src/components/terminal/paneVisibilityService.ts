@@ -16,8 +16,9 @@
  *   - live chunks are dropped instead of parsed/written (see
  *     {@link routeOutputChunk}); state chips and sparklines keep updating
  *     because they are fed by the page-level output tap, not by the pane,
- *   - the pane deregisters as the terminal's render-ack consumer so the tap
- *     proxy-acks for it and backend emission never wedges.
+ *   - it declares itself `background` to the runner (Phase 5), which coalesces
+ *     that terminal's webview emission to ≥250 ms flushes and stops gating it
+ *     on render-acks nothing is going to send.
  * On becoming visible again it re-fits, restarts the timers, and replays the
  * window it missed from the Rust scrollback ring (`terminal_get_scrollback`,
  * which also resets flow control) — so the operator sees gap-free content.
@@ -104,10 +105,20 @@ export interface PaneVisibilityHooks {
    */
   resync(): void;
   /**
-   * Register/unregister this pane as the terminal's render-ack consumer.
-   * While false, the page tap proxy-acks for the terminal.
+   * Declare what this pane is worth to the runner (Phase 5 / A4 backend half):
+   * `"focused"` while visible, `"background"` while mounted-but-hidden, `null`
+   * on unmount. The window-wide reconciler merges every pane's declaration and
+   * pushes the result through `terminal_set_visibility`; a terminal no pane
+   * declares becomes `unwatched` and the runner stops emitting for it entirely.
+   *
+   * This SUPERSEDES the render-consumer registration it replaced. That flag
+   * existed for exactly one consumer — the page tap, which proxy-acked bytes
+   * for terminals nothing was rendering so the runner's emission gate would not
+   * wedge. The tier carries the same fact (visible ⇔ rendering ⇔ acking) to the
+   * side that can actually act on it, so the runner rate-limits hidden panes
+   * itself instead of being kept open by synthetic acks.
    */
-  setRenderConsumer(active: boolean): void;
+  setVisibilityTier(tier: "focused" | "background" | null): void;
 }
 
 /**
@@ -123,18 +134,17 @@ export interface PaneVisibilityHooks {
  *     offset, not by the replay merely having run — so a declined, failed or
  *     short replay is retried on the next reveal instead of leaving a silent
  *     splice;
- *   - the render-consumer registration follows VISIBILITY ALONE, not
- *     readiness. A visible pane owns its acks from the moment it mounts: it
- *     buffers pre-ready bytes and writes them itself, so if the page tap also
- *     proxy-acked them during the (up to ~1 s) backend init the terminal would
- *     be double-acked and its emission backpressure disabled for the rest of
- *     the session.
+ *   - the runner-facing tier declaration follows MOUNT + VISIBILITY alone, not
+ *     readiness. A visible pane owns its acks from the moment it mounts (it
+ *     buffers pre-ready bytes and writes them itself), so declaring anything
+ *     less than `focused` during the up-to-~1 s backend init would have the
+ *     runner coalescing — or withholding — bytes the pane is about to render.
  */
 export class PaneVisibilityService {
   private visible: boolean;
   private ready = false;
   private tier: PaneTier = "none";
-  private consumerActive = false;
+  private declaredTier: "focused" | "background" | null = null;
   private missedOutput = false;
   /**
    * Exclusive end offset of the furthest chunk dropped since the pane was last
@@ -260,10 +270,15 @@ export class PaneVisibilityService {
       else if (nextTier === "quiet") this.hooks.enterQuietTier();
     }
 
-    const wantConsumer = !this.disposed && this.visible;
-    if (wantConsumer !== this.consumerActive) {
-      this.consumerActive = wantConsumer;
-      this.hooks.setRenderConsumer(wantConsumer);
+    // Declared from MOUNT, not from readiness: a pane that exists is worth
+    // serving even while its backend spins up (it buffers pre-ready bytes and
+    // writes them itself), and a mounted-but-hidden pane must declare
+    // `background` rather than disappear into `unwatched` — the page tap still
+    // feeds its state chip from the stream.
+    const nextDeclared = this.disposed ? null : this.visible ? "focused" : "background";
+    if (nextDeclared !== this.declaredTier) {
+      this.declaredTier = nextDeclared;
+      this.hooks.setVisibilityTier(nextDeclared);
     }
 
     if (this.tier === "active" && this.missedOutput) this.hooks.resync();

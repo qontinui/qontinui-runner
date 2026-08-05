@@ -71,7 +71,7 @@ import {
   subscribeTerminalOutputStream,
   subscribeTerminalActivityStream,
 } from "../terminalEventDemux";
-import { hasRenderConsumer } from "../terminalRenderConsumers";
+import { publishRoster, releaseRoster } from "../terminalVisibilityTiers";
 
 import { useTerminalManager } from "../useTerminalManager";
 import { useZoneLayout } from "../useZoneLayout";
@@ -522,7 +522,18 @@ const PageSessionScope = memo(function PageSessionScope({
     tabIdSetRef.current = ids;
     // Drop decoders/buffers for tabs that closed so they don't accumulate.
     coalescerRef.current.retain(ids);
-  }, [tabs]);
+    // Phase 5 — publish this scope's roster to the window-wide visibility
+    // reconciler. A DECLARATION alone can never produce `unwatched`; the
+    // absence of one has to, and the reconciler can only notice an absence for
+    // ids it knows exist. Without the roster a tab whose pane just unmounted
+    // would simply stop being mentioned and keep its old tier forever.
+    publishRoster(pageId, [...ids]);
+  }, [tabs, pageId]);
+
+  // Release the roster when the whole page scope goes away, so its tabs stop
+  // being considered (and the runner is not left holding tiers for ids that no
+  // window owns).
+  useEffect(() => () => releaseRoster(pageId), [pageId]);
 
   const handleActivityDigestRef = useRef(stateTracking.handleActivityDigest);
   useEffect(() => {
@@ -532,28 +543,14 @@ const PageSessionScope = memo(function PageSessionScope({
   useEffect(() => {
     const coalescer = coalescerRef.current;
     let rafHandle: ReturnType<typeof requestAnimationFrame> | null = null;
-    // Proxy-ack accumulator for tabs NOTHING is rendering — no mounted
-    // TerminalInstance (virtualized-offscreen or non-active page) or a
-    // mounted-but-HIDDEN one, which stops writing to xterm and stops its ack
-    // timer under the Phase-2 visibility tier. The backend gates webview
-    // emission on acked bytes (see session.rs EmissionGate); with nobody
-    // render-acking, emission for the tab would stop at the high watermark,
-    // and THIS tap — the consumer that keeps session-state tracking
-    // mount-independent — would go blind. The tap is a real consumer, so it
-    // acks the bytes it consumed, but ONLY while no pane is rendering the tab
-    // (a rendering pane's render-based acks must not be double-counted); see
-    // `terminalRenderConsumers.ts`. Acks batch per rAF flush so the invoke
-    // rate is one call per tab per frame at most.
-    const pendingAcks = new Map<string, number>();
 
-    // rAF suspends in occluded/minimized windows (WebView2), which would
-    // starve the proxy-acks below — the gap would cross the high watermark
-    // and emission (and with it this tap's state-tracking feed) would pause
-    // until window restore. Pair every rAF schedule with a setTimeout floor
-    // so the flush fires even without paint ticks; whichever fires first
-    // cancels the other.
+    // rAF suspends in occluded/minimized windows (WebView2), which would leave
+    // consumed bytes sitting in the coalescer until window restore — the state
+    // chips of every tab on a backgrounded window would freeze. Pair every rAF
+    // schedule with a setTimeout floor so the flush fires even without paint
+    // ticks; whichever fires first cancels the other.
     let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
-    const ACK_FLUSH_FLOOR_MS = 200;
+    const TAP_FLUSH_FLOOR_MS = 200;
 
     const flush = () => {
       if (rafHandle !== null) {
@@ -568,38 +565,38 @@ const PageSessionScope = memo(function PageSessionScope({
       for (const [tabId, text] of coalescer.drain()) {
         fn(tabId, text);
       }
-      for (const [tabId, bytesAcked] of pendingAcks) {
-        invoke("terminal_ack", { terminalId: tabId, bytesAcked }).catch(() => {});
-      }
-      pendingAcks.clear();
     };
     const scheduleFlush = () => {
       if (rafHandle !== null || timeoutHandle !== null) return;
       rafHandle = requestAnimationFrame(flush);
-      timeoutHandle = setTimeout(flush, ACK_FLUSH_FLOOR_MS);
+      timeoutHandle = setTimeout(flush, TAP_FLUSH_FLOOR_MS);
     };
 
     // Shares the window's ONE `terminal-output` listener with the per-terminal
     // demux (Phase 2 / A3) instead of installing a second global tap.
+    //
+    // The proxy-ack this tap used to send is GONE (Phase 5). It existed because
+    // the runner gated webview emission on render-acks that a tab with nothing
+    // rendering it could never produce, so without a synthetic ack the stream —
+    // and with it this tap's state-tracking feed — wedged at the high
+    // watermark. The runner now knows the tier itself: `unwatched` emits
+    // nothing at all (so there is nothing left to ack, and the digest tap below
+    // feeds tracking instead), and `background` is rate-limited server-side
+    // rather than ack-gated. Only a `focused` tab is ack-gated now, and a
+    // focused tab has a rendering pane sending real acks.
     const unlisten = subscribeTerminalOutputStream((payload) => {
       const tid = payload.terminalId;
       // Drop events for tabs this scope doesn't own (another page/window) or
       // doesn't know about — exactly one scope owns any given terminalId.
       if (!tabIdSetRef.current.has(tid)) return;
-      const bytes = base64ToBytes(payload.data);
-      coalescer.push(tid, bytes);
-      if (bytes.length > 0 && !hasRenderConsumer(tid)) {
-        pendingAcks.set(tid, (pendingAcks.get(tid) ?? 0) + bytes.length);
-      }
+      coalescer.push(tid, base64ToBytes(payload.data));
       scheduleFlush();
     });
 
-    // Phase 5 — the runner's activity digest, the state-tracking feed for tabs
-    // it has gone quiet on. Live from THIS commit; the proxy-ack above is
-    // removed only once it is, or state tracking for unmounted tabs would
-    // regress to nothing in between. Applied straight through (no coalescing):
-    // it is already capped at ≤1 Hz per session server-side, and it carries a
-    // whole rendered screen tail rather than an incremental slice.
+    // Phase 5 — the state-tracking feed for tabs the runner has gone quiet on.
+    // Applied straight through (no coalescing): it is already capped at ≤1 Hz
+    // per session server-side, and it carries a whole rendered screen tail
+    // rather than an incremental slice, so batching would only delay it.
     const unlistenActivity = subscribeTerminalActivityStream((payload) => {
       if (!tabIdSetRef.current.has(payload.terminalId)) return;
       handleActivityDigestRef.current(payload.terminalId, payload.bytesDelta, payload.lines);
