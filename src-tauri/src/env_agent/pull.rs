@@ -155,7 +155,10 @@ pub enum Change {
 }
 
 impl Change {
-    fn key(&self) -> &str {
+    /// The section key this change is about. Public because the section apply
+    /// modules match on specific keys — `apply_versions` reads the capture
+    /// provenance key straight off the diff.
+    pub fn key(&self) -> &str {
         match self {
             Change::Missing { key, .. }
             | Change::Differs { key, .. }

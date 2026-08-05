@@ -135,6 +135,81 @@ impl Tool {
     }
 }
 
+/// The capture-provenance key `collect_versions` emits: which KIND of scope the
+/// toolchain probes ran in (`default` / `declared` / `inherited`).
+pub const PROBE_SCOPE_KEY: &str = "probe_scope_kind";
+
+/// Why canonical's toolchain numbers cannot be compared with this box's.
+///
+/// This closes the residual slice 1a left open and handed to slice 3: after
+/// #936 each box is self-consistent across runs, but two boxes that measured
+/// DIFFERENT scopes still had their `node`/`python`/`rustc` compared as
+/// like-for-like. Since "drift clears" is this slice's success oracle, acting
+/// on that comparison would mean installing a version that was observed
+/// somewhere else — converging a number while diverging the thing it describes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeMismatch {
+    /// Both sides reported a scope kind and they differ.
+    Differs { local: String, canonical: String },
+    /// Canonical reports a scope kind and this box does not.
+    LocalMissing { canonical: String },
+    /// This box reports one and canonical does not — canonical was captured by
+    /// a runner predating scope provenance.
+    CanonicalMissing,
+}
+
+impl ScopeMismatch {
+    /// Operator-facing reason, used verbatim as the skip reason.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::Differs { local, canonical } => format!(
+                "canonical measured its toolchain in a `{canonical}` scope and this box measures \
+                 a `{local}` one — the two numbers do not describe the same thing, so installing \
+                 canonical's would converge the reading while diverging the box. Align the scopes \
+                 (`env scope-root`) first."
+            ),
+            Self::LocalMissing { canonical } => format!(
+                "canonical reports a `{canonical}` capture scope but this box reports none, so \
+                 the two toolchain readings cannot be shown comparable."
+            ),
+            Self::CanonicalMissing => "canonical was captured by a runner that predates capture \
+                 scope provenance, so its toolchain readings cannot be shown comparable with \
+                 this box's — re-run `env capture` on the canonical machine."
+                .to_string(),
+        }
+    }
+}
+
+/// Decide whether canonical's `versions` numbers are comparable with this
+/// box's, from the section DIFF. **Pure — unit-tested.**
+///
+/// Reads `section.changes` rather than [`SectionPlan::actionable`] on purpose:
+/// the provenance key is server-classified as derived (it is reported, never an
+/// apply action), so `actionable()` correctly filters it out — but this check
+/// needs to SEE it. The absence of a change for the key means both sides
+/// reported the same value, which is the comparable case.
+pub fn scope_mismatch(section: &SectionPlan) -> Option<ScopeMismatch> {
+    section.changes.iter().find_map(|c| match c {
+        Change::Differs {
+            key,
+            local,
+            canonical,
+        } if key == PROBE_SCOPE_KEY => Some(ScopeMismatch::Differs {
+            local: local.clone(),
+            canonical: canonical.clone(),
+        }),
+        Change::Missing { key, canonical } if key == PROBE_SCOPE_KEY => {
+            Some(ScopeMismatch::LocalMissing {
+                canonical: canonical.clone(),
+            })
+        }
+        Change::Extra { key, .. } if key == PROBE_SCOPE_KEY => {
+            Some(ScopeMismatch::CanonicalMissing)
+        }
+        _ => None,
+    })
+}
+
 /// A version manager this runner knows how to drive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Manager {
@@ -319,6 +394,25 @@ pub fn plan_versions(
 ) -> VersionsPlan {
     let mut plan = VersionsPlan::default();
     let scope_is_default = scope_is_default(scope);
+
+    // Comparability gate. When the two boxes measured different scopes, EVERY
+    // toolchain key in this section is unsound to act on — so the whole section
+    // reports and changes nothing, rather than each key failing separately for
+    // a reason that is really one fact about the pair of captures.
+    if let Some(mismatch) = scope_mismatch(section) {
+        let reason = mismatch.reason();
+        for change in section.actionable() {
+            if let Some(tool) = Tool::from_key(change.key()) {
+                plan.skipped.push(SkipRecord {
+                    key: tool.key().to_string(),
+                    reason: reason.clone(),
+                });
+            }
+        }
+        plan.notes.push(reason);
+        plan.skipped.sort_by(|a, b| a.key.cmp(&b.key));
+        return plan;
+    }
 
     for change in section.actionable() {
         let (key, local, canonical) = match change {
@@ -696,6 +790,7 @@ mod tests {
                 "/some/project"
             })),
             rejected: None,
+            kind: collectors::ProbeScopeKind::Declared,
         }
     }
 
@@ -703,6 +798,7 @@ mod tests {
         ProbeScope {
             root: dirs::home_dir(),
             rejected: None,
+            kind: collectors::ProbeScopeKind::Default,
         }
     }
 
@@ -750,6 +846,114 @@ mod tests {
         let a = Tool::Rustc.parse_version("rustc 1.95.0 (aaaa 2026-01-05)");
         let b = Tool::Rustc.parse_version("rustc 1.95.0 (bbbb 2026-01-06)");
         assert_eq!(a, b);
+    }
+
+    // ------------------------------------------------------------------
+    // Scope comparability — the residual slice 1a handed to this slice
+    // ------------------------------------------------------------------
+
+    /// Two boxes that measured DIFFERENT scopes are not measuring the same
+    /// quantity, so no toolchain key in the section may be acted on. Installing
+    /// canonical's number would converge the READING while diverging the box.
+    #[test]
+    fn a_scope_mismatch_refuses_the_whole_section() {
+        let section = versions_section(
+            json!({"node": "v24.14.0", "rustc": "rustc 1.95.0 (a b)",
+                   "probe_scope_kind": "declared"}),
+            json!({"node": "v20.9.0", "rustc": "rustc 1.80.0 (c d)",
+                   "probe_scope_kind": "default"}),
+            json!(["probe_scope_kind"]),
+        );
+        assert_eq!(
+            scope_mismatch(&section),
+            Some(ScopeMismatch::Differs {
+                local: "default".to_string(),
+                canonical: "declared".to_string(),
+            })
+        );
+        let plan = plan_versions(&section, &|_| Some(Manager::Volta), &home_scope());
+        assert!(plan.actions.is_empty(), "got {:?}", plan.actions);
+        // Both toolchain keys are reported with the reason — not silently gone.
+        let keys: Vec<&str> = plan.skipped.iter().map(|s| s.key.as_str()).collect();
+        assert_eq!(keys, vec!["node", "rustc"]);
+        assert!(plan.skipped[0]
+            .reason
+            .contains("do not describe the same thing"));
+        assert_eq!(plan.notes.len(), 1);
+    }
+
+    /// The gate reads the raw diff, NOT `actionable()`. The provenance key is
+    /// server-classified as derived — so `actionable()` correctly filters it
+    /// out — and a gate built on `actionable()` would therefore never fire.
+    /// This is the regression that would silently reopen the residual.
+    #[test]
+    fn the_gate_sees_a_key_that_actionable_filters_out() {
+        let section = versions_section(
+            json!({"node": "v24.14.0", "probe_scope_kind": "declared"}),
+            json!({"node": "v20.9.0", "probe_scope_kind": "default"}),
+            json!(["probe_scope_kind"]),
+        );
+        // Derived ⇒ absent from actionable()…
+        let actionable: Vec<&str> = section.actionable().iter().map(|c| c.key()).collect();
+        assert_eq!(actionable, vec!["node"]);
+        // …but present in the raw diff, which is what the gate reads.
+        assert!(scope_mismatch(&section).is_some());
+    }
+
+    /// Matching scopes are the comparable case and must NOT be gated — this is
+    /// the ordinary fleet configuration (every box on its default toolchain).
+    #[test]
+    fn matching_scopes_do_not_gate_the_apply() {
+        let section = versions_section(
+            json!({"node": "v24.14.0", "probe_scope_kind": "default"}),
+            json!({"node": "v20.9.0", "probe_scope_kind": "default"}),
+            json!(["probe_scope_kind"]),
+        );
+        // Identical values ⇒ no Change at all for the key ⇒ comparable.
+        assert_eq!(scope_mismatch(&section), None);
+        let plan = plan_versions(&section, &|_| Some(Manager::Volta), &home_scope());
+        assert_eq!(plan.actions.len(), 1);
+        assert_eq!(plan.actions[0].tool, Tool::Node);
+    }
+
+    /// A canonical captured by a runner predating scope provenance cannot be
+    /// shown comparable, so it is refused with an actionable instruction rather
+    /// than assumed compatible.
+    #[test]
+    fn canonical_without_provenance_is_refused_with_an_instruction() {
+        let section = versions_section(
+            json!({"node": "v24.14.0"}),
+            json!({"node": "v20.9.0", "probe_scope_kind": "default"}),
+            json!([]),
+        );
+        assert_eq!(
+            scope_mismatch(&section),
+            Some(ScopeMismatch::CanonicalMissing)
+        );
+        let plan = plan_versions(&section, &|_| Some(Manager::Volta), &home_scope());
+        assert!(plan.actions.is_empty());
+        assert!(plan.skipped[0].reason.contains("re-run `env capture`"));
+    }
+
+    /// …and the mirror case: canonical reports a scope this box does not.
+    #[test]
+    fn local_without_provenance_is_refused() {
+        let section = versions_section(
+            json!({"node": "v24.14.0", "probe_scope_kind": "default"}),
+            json!({"node": "v20.9.0"}),
+            json!(["probe_scope_kind"]),
+        );
+        assert_eq!(
+            scope_mismatch(&section),
+            Some(ScopeMismatch::LocalMissing {
+                canonical: "default".to_string()
+            })
+        );
+        assert!(
+            plan_versions(&section, &|_| Some(Manager::Volta), &home_scope())
+                .actions
+                .is_empty()
+        );
     }
 
     // ------------------------------------------------------------------
