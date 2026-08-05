@@ -111,6 +111,55 @@ describe("handleEvaluateRequest", () => {
     }
   });
 
+  it("round-trips a LEADING-NEWLINE expression instead of emitting an empty result", async () => {
+    // Regression: `new Function("return " + expression)` on `"\n({a:1})"`
+    // compiled to `return\n({a:1})`, ASI closed the `return`, and the handler
+    // emitted `success: true` with `result: {}` — a SILENT FALSE GREEN, since
+    // no SyntaxError was thrown to trigger the statement-style fallback. Every
+    // driver that writes a multi-line expression the natural way (heredoc,
+    // triple-quoted string, template literal opening on the next line) hit it.
+    const deps = makeDeps();
+    const handled = await handleEvaluateRequest(
+      { request_id: "nl", expression: "\n({a:1})" },
+      deps,
+    );
+    expect(handled).toBe(true);
+    // Object results ride the envelope raw (primitives get boxed as
+    // `{value: x}`), so pre-fix this emitted `result: {}` — the boxed
+    // `{value: undefined}` — under `ok: true`, indistinguishable from an
+    // expression that legitimately returned an empty object.
+    expect(deps.emit).toHaveBeenCalledWith("ui-bridge:evaluate-response", {
+      request_id: "nl",
+      ok: true,
+      result: { success: true, result: { a: 1 } },
+    });
+  });
+
+  it("round-trips a multi-line leading-newline expression with statements inside an IIFE", async () => {
+    const deps = makeDeps();
+    const expression = "\n(() => {\n  const a = 1;\n  return { a };\n})()\n";
+    await handleEvaluateRequest({ request_id: "nl-multi", expression }, deps);
+    const [, payload] = deps.emit.mock.calls[0];
+    expect(payload).toEqual({
+      request_id: "nl-multi",
+      ok: true,
+      result: { success: true, result: { a: 1 } },
+    });
+  });
+
+  it("still reaches the statement-style fallback for top-level let + explicit return", async () => {
+    const deps = makeDeps();
+    await handleEvaluateRequest(
+      { request_id: "stmt", expression: "let x = 1; return x + 1;" },
+      deps,
+    );
+    expect(deps.emit).toHaveBeenCalledWith("ui-bridge:evaluate-response", {
+      request_id: "stmt",
+      ok: true,
+      result: { success: true, result: { value: 2 } },
+    });
+  });
+
   it("emits the discriminated {value,type} shape when unwrap=true", async () => {
     const deps = makeDeps();
     await handleEvaluateRequest({ request_id: "u1", expression: "42", unwrap: true }, deps);
