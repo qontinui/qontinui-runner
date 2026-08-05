@@ -2907,6 +2907,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                         let open = poll_lifecycle_store.open_records();
                         let live = poll_tm.list();
+
+                        // Keep the SHARED always-on identity shim dir alive
+                        // while any terminal is running. Materializing it is the
+                        // only other liveness source, and that only fires on a
+                        // NEW terminal spawn — so on a long-lived automation box
+                        // (panes open, no new pane for >24h) the dir every live
+                        // pane has PATH-prepended would age out and be reaped,
+                        // and the next `claude` launched would resolve the real
+                        // binary, lose its `--session-id` pin, and become
+                        // silently unrestorable. Costs one `stat` per tick.
+                        if !live.is_empty() {
+                            install_effects_producer::intercept::shim_materializer::touch_identity_liveness(
+                                &std::env::temp_dir(),
+                            );
+                        }
                         // Terminal ids live RIGHT NOW — prune() keeps every
                         // record whose terminal still lives, so retention
                         // clocks only start once the terminal itself is gone

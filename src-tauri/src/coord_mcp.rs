@@ -820,7 +820,19 @@ struct NoncePersistQueue {
     flushing: bool,
     /// The last snapshot actually written, so an unchanged map costs nothing.
     last_written: Option<HashMap<String, String>>,
+    /// Consecutive failed write attempts for the CURRENT pending snapshot.
+    /// Bounds the failure re-queue (see [`flush_nonce_persist_once`]) so a
+    /// permanently broken store retries a few times instead of spinning the
+    /// flush thread — and its warn — every debounce window forever. Reset by a
+    /// successful write and by a NEWER snapshot arriving.
+    failed_attempts: u32,
 }
+
+/// How many times a failed nonce write is re-queued before the snapshot is
+/// abandoned. Losing it is the store's designed failure mode (an unrestored
+/// nonce 401s and the next provisioning re-mints), so a few retries buy back
+/// the transient case without turning a permanent failure into a busy loop.
+const NONCE_PERSIST_MAX_ATTEMPTS: u32 = 3;
 
 static NONCE_PERSIST: once_cell::sync::Lazy<std::sync::Mutex<NoncePersistQueue>> =
     once_cell::sync::Lazy::new(|| std::sync::Mutex::new(NoncePersistQueue::default()));
@@ -845,6 +857,9 @@ fn enqueue_nonce_persist(snapshot: HashMap<String, String>) {
             return; // already durable and nothing newer queued
         }
         q.pending = Some(snapshot);
+        // A newer snapshot supersedes whatever was failing — give it a full
+        // retry budget of its own.
+        q.failed_attempts = 0;
         if q.flushing {
             false
         } else {
@@ -885,6 +900,12 @@ fn flush_nonce_persist_loop() {
 }
 
 /// Write whatever snapshot is pending (if any) to the encrypted store.
+///
+/// On a write failure the snapshot is put BACK on the queue rather than
+/// dropped: `pending` was `take`n and `last_written` was not updated, so
+/// without the re-queue the only thing that could ever retry it is another
+/// nonce registration happening to land — a transient store error would
+/// otherwise silently lose the newest bindings until the next spawn.
 fn flush_nonce_persist_once() {
     let snapshot = match NONCE_PERSIST.lock() {
         Ok(mut q) => match q.pending.take() {
@@ -893,18 +914,41 @@ fn flush_nonce_persist_once() {
         },
         Err(_) => return,
     };
+    // Re-queue `snapshot` for another attempt, but never over a NEWER one a
+    // concurrent `enqueue_nonce_persist` has already parked, and only while the
+    // retry budget lasts.
+    fn requeue(snapshot: HashMap<String, String>) {
+        let Ok(mut q) = NONCE_PERSIST.lock() else {
+            return;
+        };
+        if q.pending.is_some() {
+            return; // a newer snapshot already supersedes this one
+        }
+        q.failed_attempts = q.failed_attempts.saturating_add(1);
+        if q.failed_attempts >= NONCE_PERSIST_MAX_ATTEMPTS {
+            warn!(
+                attempts = q.failed_attempts,
+                "coord_mcp: giving up persisting proxy nonces — the next provisioning re-mints"
+            );
+            return;
+        }
+        q.pending = Some(snapshot);
+    }
     match crate::secure_storage::SecureStorage::new() {
         Ok(store) => {
             if let Err(e) = store.store_coord_mcp_nonces(&snapshot) {
                 warn!("coord_mcp: failed to persist proxy nonces: {e}");
+                requeue(snapshot);
                 return;
             }
             if let Ok(mut q) = NONCE_PERSIST.lock() {
                 q.last_written = Some(snapshot);
+                q.failed_attempts = 0;
             }
         }
         Err(e) => {
             warn!("coord_mcp: secure storage unavailable, proxy nonces not persisted: {e}");
+            requeue(snapshot);
         }
     }
 }

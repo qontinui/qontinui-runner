@@ -23,10 +23,17 @@ const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const REFRESH_LEAD_MS: i64 = 10 * 60 * 1000;
 
 /// Minimum spacing between background refresh ATTEMPTS for one credentials
-/// file. A refresh that fails (offline, revoked grant, 5xx) must not turn every
+/// file. A refresh that fails transiently (offline, 5xx) must not turn every
 /// subsequent spawn into another token POST.
-#[cfg_attr(test, allow(dead_code))]
 const REFRESH_RETRY_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Ceiling for the exponential backoff applied after a HARD failure (the token
+/// endpoint rejected the grant itself). A permanently revoked grant must never
+/// keep POSTing `platform.claude.com` once a minute for the process lifetime,
+/// but it must still be re-probed occasionally: the server can un-revoke
+/// nothing, yet a 400 misclassified from a transient edge response would
+/// otherwise strand the account until restart. 6 hours.
+const REFRESH_HARD_FAIL_BACKOFF_CAP: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Per-credentials-file background-refresh bookkeeping.
 #[cfg_attr(test, allow(dead_code))]
@@ -34,12 +41,132 @@ const REFRESH_RETRY_BACKOFF: Duration = Duration::from_secs(60);
 struct RefreshState {
     in_flight: bool,
     last_attempt: Option<Instant>,
+    /// Fingerprint ([`token_fingerprint`]) of the refresh token the token
+    /// endpoint rejected with a hard `invalid_grant`-class failure (400/401).
+    ///
+    /// Keyed by the TOKEN, not just the path, so the verdict self-heals: a
+    /// re-login (or a server-side rotation) writes a different refresh token
+    /// into the same file, whose fingerprint no longer matches, and the account
+    /// is live again with no restart. Keying on the path alone would make one
+    /// revocation permanent for the process lifetime.
+    hard_failed_token: Option<u64>,
+    /// Consecutive hard failures for [`Self::hard_failed_token`] — drives the
+    /// exponential backoff in [`retry_backoff`].
+    hard_failures: u32,
 }
 
 /// Background refresh state, keyed by credentials path.
-#[cfg_attr(test, allow(dead_code))]
 static REFRESH_STATE: once_cell::sync::Lazy<Mutex<HashMap<PathBuf, RefreshState>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Spacing before the next refresh attempt for `entry`: the flat
+/// [`REFRESH_RETRY_BACKOFF`] while nothing has hard-failed, doubling per
+/// consecutive hard failure up to [`REFRESH_HARD_FAIL_BACKOFF_CAP`].
+///
+/// Pure so the escalation is unit-testable without any network or timing.
+fn retry_backoff(hard_failures: u32) -> Duration {
+    if hard_failures == 0 {
+        return REFRESH_RETRY_BACKOFF;
+    }
+    let factor = 1u32.checked_shl(hard_failures.min(16)).unwrap_or(u32::MAX);
+    REFRESH_RETRY_BACKOFF
+        .checked_mul(factor)
+        .unwrap_or(REFRESH_HARD_FAIL_BACKOFF_CAP)
+        .min(REFRESH_HARD_FAIL_BACKOFF_CAP)
+}
+
+/// Stable fingerprint of a refresh token. Only ever compared against another
+/// fingerprint — the token itself is never stored in the refresh state, so a
+/// state dump can't leak a credential. `0` means "no token".
+fn token_fingerprint(token: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    if token.is_empty() {
+        return 0;
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    token.hash(&mut h);
+    // Never collide with the "no token" sentinel.
+    match h.finish() {
+        0 => 1,
+        v => v,
+    }
+}
+
+/// Record that the token endpoint rejected the grant behind `creds_path`
+/// (400/401 `invalid_grant`-class): the refresh token on disk is DEAD and no
+/// amount of retrying revives it. Bumps the consecutive-hard-failure counter
+/// that [`retry_backoff`] escalates on.
+fn mark_hard_failure(creds_path: &Path, token_fp: u64) {
+    if token_fp == 0 {
+        return;
+    }
+    let Ok(mut state) = REFRESH_STATE.lock() else {
+        return;
+    };
+    let entry = state.entry(creds_path.to_path_buf()).or_default();
+    if entry.hard_failed_token == Some(token_fp) {
+        entry.hard_failures = entry.hard_failures.saturating_add(1);
+    } else {
+        entry.hard_failed_token = Some(token_fp);
+        entry.hard_failures = 1;
+    }
+    warn!(
+        path = %creds_path.display(),
+        attempts = entry.hard_failures,
+        "OAuth refresh: the grant was REJECTED (logout elsewhere, password change, revoked or \
+         rotated refresh token) — this account is reported INVALID until it is re-authenticated"
+    );
+}
+
+/// Clear any recorded hard failure for `creds_path` — a refresh succeeded, so
+/// whatever grant is on disk now works.
+fn clear_hard_failure(creds_path: &Path) {
+    let Ok(mut state) = REFRESH_STATE.lock() else {
+        return;
+    };
+    if let Some(entry) = state.get_mut(creds_path) {
+        entry.hard_failed_token = None;
+        entry.hard_failures = 0;
+    }
+}
+
+/// Has the grant CURRENTLY on disk at `creds_path` been rejected by the token
+/// endpoint? `token_fp` is the fingerprint of the refresh token the file holds
+/// right now ([`CredsSnapshot::refresh_token_fp`]), so a re-login clears the
+/// verdict implicitly.
+fn grant_hard_failed(creds_path: &Path, token_fp: u64) -> bool {
+    if token_fp == 0 {
+        return false;
+    }
+    let Ok(state) = REFRESH_STATE.lock() else {
+        // A poisoned state map must never demote a live account.
+        return false;
+    };
+    state
+        .get(creds_path)
+        .is_some_and(|e| e.hard_failed_token == Some(token_fp))
+}
+
+/// Whether the token endpoint's rejection means the GRANT is dead rather than
+/// the request having failed transiently.
+///
+/// `invalid_grant` is the RFC 6749 §5.2 code for "the refresh token is expired,
+/// revoked, malformed, or was issued to another client" — exactly the logout-
+/// elsewhere / password-change / revoked-grant / already-rotated cases. A bare
+/// 401 with no parseable body is treated the same way: the endpoint refused to
+/// authenticate the grant. Everything else (429, 5xx, network) stays transient.
+fn is_hard_grant_failure(status_code: u16, body: &str) -> bool {
+    if !matches!(status_code, 400 | 401) {
+        return false;
+    }
+    if body.contains("invalid_grant") || body.contains("invalid_client") {
+        return true;
+    }
+    // A 401 is an authentication verdict on the grant even without a body we
+    // can parse; a bodyless 400 is a malformed-request signal we do NOT want to
+    // convert into "the operator's account is dead".
+    status_code == 401
+}
 
 /// Ask for a background OAuth refresh of `creds_path` and return IMMEDIATELY.
 ///
@@ -88,10 +215,11 @@ fn spawn_background_refresh(creds_path: &Path) {
         if entry.in_flight {
             return;
         }
-        if entry
-            .last_attempt
-            .is_some_and(|t| t.elapsed() < REFRESH_RETRY_BACKOFF)
-        {
+        // Escalating spacing: flat 60s while failures look transient, doubling
+        // per consecutive HARD failure so a permanently revoked grant stops
+        // hammering the token endpoint once a minute forever.
+        let backoff = retry_backoff(entry.hard_failures);
+        if entry.last_attempt.is_some_and(|t| t.elapsed() < backoff) {
             return;
         }
         entry.in_flight = true;
@@ -165,6 +293,9 @@ pub(crate) fn refresh_credentials_blocking(creds_path: &Path) -> Option<String> 
             return None;
         }
     };
+    // Identifies the grant this attempt is about, so a rejection is recorded
+    // against THIS token rather than against the file (see `mark_hard_failure`).
+    let token_fp = token_fingerprint(&refresh_token);
 
     info!("OAuth refresh: requesting new access token");
 
@@ -229,6 +360,14 @@ pub(crate) fn refresh_credentials_blocking(creds_path: &Path) -> Option<String> 
 
     if !success {
         warn!("OAuth refresh: server returned {}: {}", status_code, body);
+        // A rejection of the GRANT itself (revoked / rotated / logged out
+        // elsewhere) is terminal for this refresh token: record it so the
+        // credential predicates stop reporting the account valid off the mere
+        // PRESENCE of a refreshToken string on disk, and so the retry spacing
+        // escalates instead of POSTing once a minute forever.
+        if is_hard_grant_failure(status_code, &body) {
+            mark_hard_failure(creds_path, token_fp);
+        }
         return None;
     }
 
@@ -247,6 +386,10 @@ pub(crate) fn refresh_credentials_blocking(creds_path: &Path) -> Option<String> 
             return None;
         }
     };
+
+    // The grant works — clear any recorded hard failure so an account that was
+    // re-authenticated (or whose rejection was misclassified) is live again.
+    clear_hard_failure(creds_path);
 
     let expires_in_secs = token_response["expires_in"].as_i64().unwrap_or(86400);
     let now_ms = SystemTime::now()
@@ -302,16 +445,28 @@ pub(crate) fn refresh_credentials_blocking(creds_path: &Path) -> Option<String> 
 pub(crate) fn try_ensure_valid_credentials(config_dir: Option<&str>) {
     if let Some(path) = find_creds_path(config_dir) {
         let snap = read_creds_snapshot(&path);
-        if snap.needs_refresh(now_ms()) && snap.has_refresh_token {
+        if snap.needs_refresh(now_ms()) && snap.refreshable(&path) {
             debug!("OAuth token expiring — requesting background refresh (spawn is not blocked)");
             request_background_refresh(&path);
         }
     }
 }
 
+/// Test-only seam: record the refresh token CURRENTLY held by
+/// `<config_dir>/.credentials.json` as server-rejected, exactly as a background
+/// refresh that came back `invalid_grant` would. Lets the credential-selection
+/// regression tests exercise the revoked-account path with no network.
+#[cfg(test)]
+pub(crate) fn mark_grant_revoked_for_test(config_dir: &str) {
+    let creds_path = PathBuf::from(config_dir).join(".credentials.json");
+    let snap = read_creds_snapshot(&creds_path);
+    mark_hard_failure(&creds_path, snap.refresh_token_fp);
+}
+
 /// Whether `config_dir` has live, usable Claude OAuth credentials: a
 /// `.credentials.json` exists *in that exact dir* AND the token is either
-/// unexpired or successfully refreshed in place.
+/// unexpired or still refreshable (a `refreshToken` the token endpoint has not
+/// rejected — see [`creds_path_is_valid`]).
 ///
 /// This is the highest-precedence account-selection filter (see
 /// [`super::account_usage::pick_best_account`]): selection must never pin a
@@ -380,27 +535,39 @@ fn macos_keychain_has_claude_credentials() -> bool {
 /// PROACTIVELY within [`REFRESH_LEAD_MS`] of expiry so a live account is
 /// normally refreshed long before any spawn could care.
 ///
-/// The verdict is unchanged in both directions that matter:
+/// The verdict, relative to the pre-Phase-6 blocking predicate:
 /// - unexpired → valid (as before);
 /// - expired with NO `refreshToken` → invalid, deterministically and with no
 ///   network call (as before — the old inline refresh returned `None` there);
-/// - expired WITH a `refreshToken` → valid, where before it was "valid iff the
-///   inline refresh succeeded". The account is the one the operator has, the
-///   refresh is already in flight, and a lost race surfaces the provider's own
-///   auth prompt instead of an "no authenticated Claude account" abort.
+/// - expired WITH a `refreshToken` the token endpoint has NOT rejected → valid.
+///   Before, this was "valid iff the inline refresh succeeded". The account is
+///   the one the operator has, the refresh is already in flight, and a lost race
+///   surfaces the provider's own auth prompt instead of an "no authenticated
+///   Claude account" abort;
+/// - expired with a refresh token the server REJECTED (`invalid_grant` — logout
+///   elsewhere, password change, revoked or already-rotated grant) → INVALID.
+///   This arm is what keeps the non-blocking answer FALSIFIABLE. A revoked
+///   refresh token is still a non-empty string on disk forever, so without it
+///   the predicate would report a dead account valid for the process lifetime —
+///   and since it is `pick_best_account`'s highest-precedence filter, a dead
+///   account would be selectable OVER a healthy one, and the autonomous flows
+///   gated on `default_location_has_valid_credentials` would march into a 401
+///   loop. The rejection is observed by the BACKGROUND refresh, so the spawn
+///   path still never touches the network.
 fn creds_path_is_valid(creds_path: &Path) -> bool {
     if !creds_path.exists() {
         return false;
     }
     let snap = read_creds_snapshot(creds_path);
     let now = now_ms();
-    if snap.needs_refresh(now) && snap.has_refresh_token {
+    let refreshable = snap.refreshable(creds_path);
+    if snap.needs_refresh(now) && refreshable {
         request_background_refresh(creds_path);
     }
-    !snap.is_expired(now) || snap.has_refresh_token
+    !snap.is_expired(now) || refreshable
 }
 
-/// The two facts every credential decision here needs, read in ONE parse.
+/// The facts every credential decision here needs, read in ONE parse.
 ///
 /// Deliberately lenient: an unreadable or unparsable file, or one with no
 /// `expiresAt`, yields `expires_at_ms == 0` — "expiry unknown", treated as NOT
@@ -411,6 +578,10 @@ fn creds_path_is_valid(creds_path: &Path) -> bool {
 struct CredsSnapshot {
     expires_at_ms: i64,
     has_refresh_token: bool,
+    /// Fingerprint of the refresh token currently on disk (`0` = none). Lets
+    /// the hard-failure verdict be keyed to the exact grant that was rejected,
+    /// so a re-login self-heals — see [`RefreshState::hard_failed_token`].
+    refresh_token_fp: u64,
 }
 
 impl CredsSnapshot {
@@ -422,6 +593,13 @@ impl CredsSnapshot {
     fn needs_refresh(&self, now_ms: i64) -> bool {
         self.expires_at_ms != 0 && now_ms >= self.expires_at_ms - REFRESH_LEAD_MS
     }
+
+    /// Is there a refresh token that could actually bring this account back?
+    /// A token the server has already rejected cannot — see
+    /// [`grant_hard_failed`].
+    fn refreshable(&self, creds_path: &Path) -> bool {
+        self.has_refresh_token && !grant_hard_failed(creds_path, self.refresh_token_fp)
+    }
 }
 
 fn read_creds_snapshot(creds_path: &Path) -> CredsSnapshot {
@@ -432,11 +610,14 @@ fn read_creds_snapshot(creds_path: &Path) -> CredsSnapshot {
         return CredsSnapshot::default();
     };
     let oauth = &json["claudeAiOauth"];
+    let refresh_token_fp = oauth["refreshToken"]
+        .as_str()
+        .map(token_fingerprint)
+        .unwrap_or(0);
     CredsSnapshot {
         expires_at_ms: oauth["expiresAt"].as_i64().unwrap_or(0),
-        has_refresh_token: oauth["refreshToken"]
-            .as_str()
-            .is_some_and(|t| !t.is_empty()),
+        has_refresh_token: refresh_token_fp != 0,
+        refresh_token_fp,
     }
 }
 
@@ -480,6 +661,19 @@ mod tests {
     /// Background-refresh requests recorded instead of performed under test
     /// (see [`request_background_refresh`]).
     pub(super) static REFRESH_REQUESTS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    /// Serializes every test that touches [`REFRESH_REQUESTS`]. The log is
+    /// process-global while `cargo test` runs tests in parallel threads, so
+    /// without this a peer test's queued refresh lands inside another test's
+    /// drain-and-assert and the exact-contents assertions flake.
+    static REFRESH_LOG_GUARD: Mutex<()> = Mutex::new(());
+
+    /// Hold for the duration of any test that queues or inspects refresh
+    /// requests. Recovers from a poisoned guard (a panicking test must not
+    /// cascade into every sibling).
+    fn refresh_log_guard() -> std::sync::MutexGuard<'static, ()> {
+        REFRESH_LOG_GUARD.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     /// Drain the recorded refresh requests.
     fn taken_refresh_requests() -> Vec<PathBuf> {
@@ -536,6 +730,7 @@ mod tests {
 
     #[test]
     fn has_valid_credentials_false_when_expired_and_no_refresh_token() {
+        let _log = refresh_log_guard();
         // Empty refreshToken → nothing can bring the account back, so an
         // expired, unrefreshable account is rejected deterministically and no
         // refresh is even requested (no live HTTP in this unit test).
@@ -554,6 +749,7 @@ mod tests {
     /// inline token POST whose result decided the verdict.
     #[test]
     fn expired_but_refreshable_is_valid_and_only_queues_a_background_refresh() {
+        let _log = refresh_log_guard();
         let _ = taken_refresh_requests();
         let (guard, path) = dir_with_creds(past_ms(), "rt-present");
         assert!(
@@ -574,6 +770,7 @@ mod tests {
     /// a spawn never meets a hard-expired token in the first place.
     #[test]
     fn near_expiry_token_is_valid_and_queues_a_proactive_refresh() {
+        let _log = refresh_log_guard();
         let _ = taken_refresh_requests();
         let soon = now_ms() + REFRESH_LEAD_MS / 2;
         let (guard, path) = dir_with_creds(soon, "rt-present");
@@ -587,6 +784,7 @@ mod tests {
     /// A comfortably-live token must not generate any refresh traffic at all.
     #[test]
     fn healthy_token_queues_no_refresh() {
+        let _log = refresh_log_guard();
         let _ = taken_refresh_requests();
         let (_guard, path) = dir_with_creds(future_ms(), "rt-present");
         assert!(has_valid_credentials(&path));
@@ -597,11 +795,127 @@ mod tests {
     /// UNKNOWN, which is not "expired", so the account is not demoted.
     #[test]
     fn unparsable_credentials_are_not_treated_as_expired() {
+        let _log = refresh_log_guard();
         let _ = taken_refresh_requests();
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join(".credentials.json"), b"{not json").expect("write");
         assert!(has_valid_credentials(&dir.path().to_string_lossy()));
         assert!(taken_refresh_requests().is_empty());
+    }
+
+    /// G1 REGRESSION. A refresh token the server has REVOKED (logout
+    /// elsewhere, password change, grant revoked, already-rotated) is still a
+    /// non-empty string on disk forever. The non-blocking predicate must
+    /// therefore not answer off its mere PRESENCE: once the background refresh
+    /// has observed the `invalid_grant`, the expired account is INVALID.
+    #[test]
+    fn expired_account_with_a_revoked_grant_is_invalid() {
+        let _log = refresh_log_guard();
+        let _ = taken_refresh_requests();
+        let (_guard, path) = dir_with_creds(past_ms(), "rt-revoked");
+        // Live until the server rejects the grant...
+        assert!(has_valid_credentials(&path));
+        let _ = taken_refresh_requests();
+
+        // ...which is exactly what a background refresh returning 400
+        // `invalid_grant` records.
+        mark_grant_revoked_for_test(&path);
+
+        assert!(
+            !has_valid_credentials(&path),
+            "a revoked grant must not keep reporting the account valid — it would be selected \
+             over a healthy account and 401-zombie every spawn under it"
+        );
+        assert!(
+            taken_refresh_requests().is_empty(),
+            "a permanently revoked grant must not keep POSTing the token endpoint"
+        );
+    }
+
+    /// The revocation verdict is keyed to the GRANT, not the file: a re-login
+    /// writes a different refresh token into the same path and the account is
+    /// usable again with no restart.
+    #[test]
+    fn re_login_clears_a_revoked_grant_verdict() {
+        let _log = refresh_log_guard();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_string_lossy().to_string();
+        let write_creds = |token: &str| {
+            let body = serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": "sk-oauth-test",
+                    "refreshToken": token,
+                    "expiresAt": past_ms(),
+                    "scopes": ["user:inference"],
+                }
+            });
+            std::fs::write(dir.path().join(".credentials.json"), body.to_string()).expect("write");
+        };
+
+        write_creds("rt-dead");
+        mark_grant_revoked_for_test(&path);
+        assert!(!has_valid_credentials(&path), "revoked grant ⇒ invalid");
+
+        // The operator re-authenticates: a NEW refresh token lands in the same
+        // file. The old verdict must not stick to the path.
+        write_creds("rt-fresh-after-relogin");
+        assert!(
+            has_valid_credentials(&path),
+            "a re-login must clear the revocation — keying the verdict on the path alone would \
+             strand the account for the process lifetime"
+        );
+    }
+
+    /// An UNEXPIRED access token stays usable even after its refresh grant was
+    /// revoked: the token itself is still accepted until it expires. Only the
+    /// expired-and-unrefreshable combination is invalid.
+    #[test]
+    fn unexpired_token_survives_a_revoked_refresh_grant() {
+        let _log = refresh_log_guard();
+        let (_guard, path) = dir_with_creds(future_ms(), "rt-revoked-but-token-live");
+        mark_grant_revoked_for_test(&path);
+        assert!(has_valid_credentials(&path));
+    }
+
+    /// Only a rejection of the GRANT is terminal. A 429/5xx/offline failure is
+    /// transient and must never demote the account.
+    #[test]
+    fn only_grant_rejections_count_as_hard_failures() {
+        assert!(is_hard_grant_failure(400, r#"{"error":"invalid_grant"}"#));
+        assert!(is_hard_grant_failure(401, r#"{"error":"invalid_grant"}"#));
+        assert!(is_hard_grant_failure(400, r#"{"error":"invalid_client"}"#));
+        assert!(
+            is_hard_grant_failure(401, ""),
+            "a bare 401 rejects the grant"
+        );
+        assert!(
+            !is_hard_grant_failure(400, r#"{"error":"invalid_request"}"#),
+            "a malformed request is our bug, not a dead account"
+        );
+        for status in [429u16, 500, 502, 503] {
+            assert!(
+                !is_hard_grant_failure(status, "whatever"),
+                "{status} is transient"
+            );
+        }
+    }
+
+    /// A permanently revoked grant must back off exponentially, not POST the
+    /// token endpoint once a minute for the process lifetime.
+    #[test]
+    fn hard_failures_back_off_exponentially_up_to_a_cap() {
+        assert_eq!(retry_backoff(0), REFRESH_RETRY_BACKOFF);
+        assert_eq!(retry_backoff(1), REFRESH_RETRY_BACKOFF * 2);
+        assert_eq!(retry_backoff(4), REFRESH_RETRY_BACKOFF * 16);
+        // Monotonic, and capped rather than overflowing.
+        let mut prev = retry_backoff(0);
+        for n in 1..64u32 {
+            let cur = retry_backoff(n);
+            assert!(cur >= prev, "backoff must not shrink at {n}");
+            assert!(cur <= REFRESH_HARD_FAIL_BACKOFF_CAP, "capped at {n}");
+            prev = cur;
+        }
+        assert_eq!(retry_backoff(u32::MAX), REFRESH_HARD_FAIL_BACKOFF_CAP);
     }
 
     #[test]
