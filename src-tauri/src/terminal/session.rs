@@ -3159,6 +3159,7 @@ mod tests {
             &session.scrollback_buffer,
             &session.total_bytes_produced,
             prompt,
+            SCROLLBACK_CAPACITY,
         );
         assert!(
             {
