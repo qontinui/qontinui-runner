@@ -10,6 +10,30 @@ import type { RegisteredElement } from "@qontinui/ui-bridge";
 import type { ExternalElement } from "../../types/ui-bridge-types";
 
 /**
+ * The SDK's §4.6 content/value-axis string brand, derived STRUCTURALLY from a
+ * field the SDK already declares rather than imported by name. ui-bridge does
+ * not re-export `Scrubbed` (nor any of its minters) from a public entry point,
+ * and the brand key is a module-private `unique symbol`, so a consumer can
+ * neither name nor mint it. Deriving the alias from the wire type also keeps
+ * this file compiling against BOTH the published `@qontinui/ui-bridge@0.22.0`
+ * (where the field is a plain `string`, so this collapses to `string`) and
+ * ui-bridge `main` (where it is `Scrubbed<string>`).
+ */
+type ScrubbedString = NonNullable<DiscoveredElement["label"]>;
+
+/**
+ * Brand a string that is ALREADY scrubbed — the consumer-side counterpart of
+ * ui-bridge's internal `trustDeveloperContent`. The only values that may pass
+ * through here are (a) developer-authored registration labels, which §4.6
+ * exempts by design, and (b) fields that crossed the wire from an external UI
+ * Bridge app which applied §4.6 at its own boundary. It must NEVER wrap a raw
+ * DOM content read that has not been through a redaction-aware source.
+ */
+function asScrubbed(raw: string | undefined): ScrubbedString | undefined {
+  return raw as ScrubbedString | undefined;
+}
+
+/**
  * Convert a RegisteredElement from the runner's UI Bridge registry
  * to a DiscoveredElement that SpecExecutor can evaluate assertions against.
  */
@@ -18,10 +42,17 @@ export function registeredToDiscovered(el: RegisteredElement): DiscoveredElement
   return {
     id: el.id,
     type: el.type,
-    label: el.label,
+    // Developer-authored on the registration, not scraped from the DOM — the
+    // documented §4.6 boundary exemption.
+    label: asScrubbed(el.label),
     tagName: el.element?.tagName?.toLowerCase() ?? el.type,
     role: el.element?.getAttribute?.("role") ?? undefined,
-    accessibleName: el.element?.getAttribute?.("aria-label") ?? undefined,
+    // Prefer the state's accessible name: the SDK computes it with the W3C
+    // accessible-name algorithm AND scrubs it against the §4.6 redaction
+    // boundary. The raw `aria-label` read is only a fallback for elements
+    // whose custom `getState` does not populate it.
+    accessibleName:
+      state.accessibleName ?? asScrubbed(el.element?.getAttribute?.("aria-label") ?? undefined),
     actions: [...el.actions],
     state,
     registered: true,
@@ -31,22 +62,27 @@ export function registeredToDiscovered(el: RegisteredElement): DiscoveredElement
 /**
  * Convert an ExternalElement (from SDK app or legacy extension via UI Bridge HTTP API)
  * to a DiscoveredElement that SpecExecutor can evaluate assertions against.
+ *
+ * Every content/value-bearing field here crossed the wire from an external UI
+ * Bridge app that already applied §4.6 at its own boundary, so the runner
+ * re-brands rather than re-scrubs (it holds no live element to derive a
+ * redaction verdict from).
  */
 export function externalToDiscovered(ext: ExternalElement): DiscoveredElement {
   return {
     id: ext.id,
     type: ext.type || ext.tagName,
-    label: ext.label || ext.text || ext.accessibleName,
+    label: asScrubbed(ext.label || ext.text || ext.accessibleName),
     tagName: ext.tagName,
     role: ext.role || ext.accessibility?.role,
-    accessibleName: ext.accessibleName || ext.accessibility?.accessibleName,
+    accessibleName: asScrubbed(ext.accessibleName || ext.accessibility?.accessibleName),
     actions: ext.actions || [],
     state: {
       visible: ext.visible,
       enabled: ext.enabled,
       focused: ext.focused,
-      textContent: ext.text || ext.accessibleName || ext.accessibility?.accessibleName,
-      value: ext.value,
+      textContent: asScrubbed(ext.text || ext.accessibleName || ext.accessibility?.accessibleName),
+      value: asScrubbed(ext.value),
       checked: ext.checked,
       rect: ext.bounds
         ? {
