@@ -548,41 +548,48 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    route). Best-effort: a 404 = nothing pending; a 409 `already_consumed` = a spawn
    already happened (report it, don't pretend the cancel landed). (canonical spec:
    `_gate-registration` → "Continuation cancel + refresh".)
-4. **Register** via the transport cascade in the blockquote above (the work unit
+4. **Set the work unit's registry status** — the prerequisite for step 5's
+   `ready_status`. This is the "Set the work unit's registry status" block below
+   (read current → attempt `vetted` → fall back to `vetted_unattested`); do it
+   here, before registering, and carry the status that landed into step 5. It is
+   written out after this list only because it is long.
+5. **Register** via the transport cascade in the blockquote above (the work unit
    was already upserted in step 1, so `register-gate` will find it): prefer MCP
    `coord_register_gate`; when a raw device JWT is held, the direct device-authed
    `POST $COORD_HTTP_URL/coord/work-units/<plan stem>/register-gate` (resolves
    tenant from the device JWT; body `{predicate, phase_name (required),
-   continuation_spawn?, clearance_audience?}` — `slug` comes from the path, the
+   continuation_spawn?, clearance_audience?, gate_class?}` — `slug` comes from the path, the
    predicate carries the `work_unit_id` UUID from step 1). `register-gate` does NOT
    upsert — if step 1 was skipped it 404s `work_unit_not_found`. The acting-user
    token works on the same route when no device identity is held. The legacy
    operator-only `/coord/plans/upsert` + `/coord/gates/register` are removed (coord
    P4) — do not fall back to them.
-   - **Predicate:** `{"kind": "unit_ready", "work_unit_id": "<uuid from step 1>", "ready_status": "vetted_unattested"}`
+   - **Predicate:** `{"kind": "unit_ready", "work_unit_id": "<uuid from step 1>", "ready_status": "<the status the registry step below ACTUALLY landed>"}`
      — coord auto-clears it when the work unit's `status` column reaches
      `ready_status` AND every other gate anchored to this unit is cleared. (The
      `register-gate` endpoint accepts any **predicate-cleared** kind; only
      `operator_approval` — a human decision — is rejected 403, so it can never
      become a work-queue-as-decision fallback.)
 
-     > ⚠️ **`ready_status` MUST NOT be `"vetted"` — that gate can never clear.**
-     > `ready_status` is compared by exact `!=` against `coord.work_units.status`,
-     > and `vetted` is an **Attested** status: coord refuses it unless the attester
-     > differs from the unit's recorded owner. Step 1's upsert makes THIS session
-     > the owner (ownership is claimed by the first non-attesting write — creation
-     > counts, even with no `status` field), so the only session positioned to
-     > stamp `vetted` is the one session forbidden from doing it. A
-     > `ready_status: "vetted"` gate therefore pins open forever — it fails OPEN,
-     > not `failed`, so nothing alerts until the ~7-day rot sweep.
+     > ⚠️ **Do the registry transition FIRST, then register the gate with the status
+     > that landed.** `ready_status` is compared by exact `!=` against
+     > `coord.work_units.status`, so a gate keyed on a status the unit will never
+     > reach pins open forever — and it fails **OPEN**, not `failed`, so no
+     > `gate_unclearable_terminal` alert fires and nothing surfaces it until the
+     > ~7-day stale-open sweep.
      >
-     > `vetted_unattested` is a **Free** status (any unrecognised string is Free and
-     > written unconditionally), so this session can actually write it in the
-     > registry-transition step below, and the gate clears. It also says only what
-     > is true: this session did the vetting, and nobody independent has attested it.
-     > Do NOT substitute `in_progress` — that is what `/implement-plan` Step 0.5
-     > writes, and reusing it makes "vetted, waiting to start" and "already being
-     > implemented" indistinguishable.
+     > That is exactly what a hardcoded `ready_status: "vetted"` used to do here.
+     > `vetted` is an **Attested** status: coord refuses it unless the attester's
+     > actor key differs from the unit's recorded owner, and step 1's upsert makes
+     > THIS session the owner (ownership is claimed by the first non-attesting
+     > write — creation counts, even with no `status` field). So the session that
+     > registers the gate was the one actor barred from satisfying it.
+     >
+     > Ordering the transition first removes the guesswork: `vetted` when the
+     > attestation genuinely lands, `vetted_unattested` when it is refused. Never
+     > `in_progress` — that is what `/implement-plan` Step 0.5 writes, and reusing
+     > it makes "vetted, waiting to start" and "already being implemented"
+     > indistinguishable.
    - **Anchor:** the plan (work unit). The `work_unit_id` comes from the step-1
      upsert; pass `phase_name` (the plan title, or a synthetic label like
      `"vet→implement handoff"` for a whole-plan gate — `phase_name` is **required**,
@@ -623,7 +630,7 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    - **`clearance_audience`:** `unit_ready` auto-clears by predicate, so audience
      is moot for *clearing*; register consistently with the model (default
      `operator`) — the typed predicate, not a human, is what clears it.
-5. **Masked-tool honesty + verification:** if `coord_register_gate` reads as
+6. **Masked-tool honesty + verification:** if `coord_register_gate` reads as
    unknown/method-not-found (per-agent allow-set masking) fall back to the
    device-authed HTTP routes (upsert → register-gate), and NEVER report a gate
    registered/refreshed without a returned `gate_id`.
@@ -638,46 +645,94 @@ work-unit surface hasn't landed — report the gate as NOT registered with the
 reason, rather than silently registering an `operator_approval` fallback that would
 re-create the work-queue-as-decision antipattern.)
 
-**Set the work unit's registry status — to `vetted_unattested`, NOT `vetted`.**
+**Set the work unit's registry status — attempt `vetted`, fall back on refusal.**
 When you stamp VETTED in the plan file, transition the coord work-unit registry so
-the `unit_ready` predicate above can see it:
+the `unit_ready` predicate above has something to match. Do this BEFORE registering
+the gate, and key the gate on whichever status lands.
+
+**Step A — read the current status first. It may already be past you.**
+
+`GET $COORD_HTTP_URL/coord/work-units/<plan stem>`. If `status` is already
+`vetted`, `ready`, `in_progress` or `shipped`, **write nothing and skip to the gate
+registration**, keying `ready_status` on what you just read. §5.4 is a re-runnable
+refresh path, and a blind write here would DEMOTE a unit a peer already attested —
+destroying the attestation and, with it, the `ready` derivation this whole ordering
+exists to protect.
+
+**Step B — attempt the real thing.**
 
 ```
 POST $COORD_HTTP_URL/coord/work-units/<plan stem>/transition
-     {to_status:"vetted_unattested", by_actor:"<this session>"}
+     {to_status:"vetted", by_actor:"<this session>"}
 ```
 
-(or the step-1 upsert carrying `status:"vetted_unattested"`). The registry is
-directly writable — there is no longer a plan-ingest worker mirroring the plan
-directory — so this explicit transition is what marks the unit ready. The plan
-`.md` VETTED stamp + its commit/push remain the operator-private artifact record.
-(A repo that is NOT coord sole-authority lands its PRs via normal GitHub flow.)
+Attempt this even though it usually fails, because when it DOES land it is
+strictly better: `vetted` is the documented lifecycle status, and coord's derive
+worker promotes `vetted` + all-gates-cleared → the derived status `ready`. No
+agent-reachable route produces `ready` any other way (the operator-transition route
+can set it directly, but that is not yours). It lands when the attester is
+genuinely not the owner — a different device, or a peer holding a real agent JWT —
+and it is also the path the graduated-self-attestation relaxation
+(`policies/lifecycle_autonomy.rs`) would open if the fleet ever arms it.
 
-**Do NOT `POST … {to_status:"vetted"}` — it will 403, by design.** `vetted` is an
-Attested status and coord enforces separation of duties: the attester's actor key
-must differ from the unit's recorded owner. Step 1's upsert made this session the
-owner, so this session is precisely the one actor forbidden from writing `vetted`.
-The refusal is `403 self_attestation_forbidden` and it is **not** a transport
-problem, not a credential problem, and not a coord bug — do not run
-`/coord-revive`, do not retry on another door, and do not report the vet as failed.
+**Step C — on a 403, fall back and move on.**
 
-Two further facts, so you do not burn a cycle looking for a way around it:
+```
+POST $COORD_HTTP_URL/coord/work-units/<plan stem>/transition
+     {to_status:"vetted_unattested", from_status:"<what Step A read>", by_actor:"<this session>"}
+```
+
+Send `from_status` as a CAS guard so a peer attestation that landed between your
+read and this write cannot be clobbered; on a conflict, re-read and re-apply Step
+A's skip rule rather than forcing.
+
+Three 403 codes are expected here and NONE is a failure of the vet:
+
+- **`self_attestation_forbidden`** — `vetted` is an Attested status and coord
+  enforces separation of duties: the attester's actor key must differ from the
+  unit's recorded owner. Step 1's upsert made this session the owner, so this
+  session is the one actor barred from writing it.
+- **`owner_unresolved`** — the unit has no recorded owner at all (a row predating
+  the ownership widening, or one created by a token carrying no device id). SoD
+  cannot be evaluated, so it is refused rather than passed vacuously. An ordinary
+  Free transition claims ownership and un-strands it.
+- **`attester_unresolved`** — YOUR token derives no actor key, i.e. it carries a
+  `tenant_id` but no `device_id`. This is the one you will hit on the acting-user
+  service token (transport tier 3 above), and it is the one case graduation can
+  never relax. Fall back the same way, but say in your report that the attestation
+  was not merely refused — it was **unattemptable from this door**, and would need
+  a device- or agent-identified caller even to be evaluated.
+
+None of the three is a transport problem, a credential problem, or a coord bug — do
+not run `/coord-revive`, do not retry on another door, and do not report the vet as
+failed. Two facts so you do not burn a cycle looking for a way around it:
 
 - **The actor key is `device:<uuid>`** (or `device:<uuid>:agent:<uuid>` for an
-  agent JWT). It carries **no session id**. So a *different session on this
-  machine* and a *subagent you spawn* both share your actor key and are equally
-  refused — "get a peer to attest" only works from a **different device**, or from
-  a peer holding a genuine agent JWT. On a one-device fleet there is no such peer.
-- **The only in-fleet way through is the operator route**
-  (`POST /coord/work-units/:slug/operator-transition`, admin/operator bearer),
-  which deliberately skips the SoD check. That is the operator's lever, not yours:
-  routing your own vet through it would defeat the very control it bypasses.
+  agent JWT), and it carries **no session id**. So a *different session on this
+  machine* and a *subagent you spawn* share your actor key and are refused
+  identically. A qualifying attester means a **different device**, or a peer
+  holding a genuine agent JWT — note the same operator holding BOTH token shapes
+  does satisfy the check, since `device:<d>:agent:<a>` and `device:<d>` are
+  unequal strings.
+- **The operator route** (`POST /coord/work-units/:slug/operator-transition`,
+  admin/operator bearer) deliberately skips the SoD check. That is the operator's
+  lever, not yours: routing your own vet through it would defeat the control it
+  bypasses.
 
-So treat independent attestation as **owed, not blocked**. Record in your report
-that the unit sits at `vetted_unattested` and that a `→ vetted` attestation is
-outstanding. The plan is still fully dispatchable — the `unit_ready` gate clears on
-`vetted_unattested`, and `/implement-plan` keys off the plan file's VETTED stamp,
-not the registry status.
+**What the fallback costs, stated plainly.** A unit left at `vetted_unattested`
+never derives `ready`, because that derivation matches the literal `vetted`. You
+keep dispatch (the `unit_ready` gate clears) and lose one derived observation.
+`shipped` is unaffected — it derives from PR citations, independent of the
+from-status. Treat the attestation as **owed, not blocked**: say in your report
+that the unit sits at `vetted_unattested` and a `→ vetted` attestation is
+outstanding. The plan is fully dispatchable meanwhile, and `/implement-plan` gates
+on the plan file's VETTED stamp — it never reads the registry status.
+
+The registry is directly writable — there is no longer a plan-ingest worker
+mirroring the plan directory — so this explicit transition is what marks the unit
+ready. The plan `.md` VETTED stamp + its commit/push remain the operator-private
+artifact record. (A repo that is NOT coord sole-authority lands its PRs via normal
+GitHub flow.)
 
 ### 5.5. Offer to register a coord gate for a flagged-but-not-fixed item
 
