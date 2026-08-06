@@ -43,6 +43,7 @@ use serde_json::{Map, Value};
 use super::apply::{AppliedChange, SectionApply, SectionStatus, SkipRecord};
 use super::collectors::sanitize_url;
 use super::pull::{Change, SectionPlan};
+use crate::profiles::{TierRead, QONTINUI_ACCOUNT_TIER};
 
 /// The envelope section this module applies.
 pub const SERVICES_SECTION: &str = "services";
@@ -216,7 +217,11 @@ pub fn repoint_url(local: &str, canonical: &str) -> Result<String, String> {
 /// pull's diff for `services`; only [`SectionPlan::actionable`] changes are
 /// considered, so a non-applyable policy, an `Extra` local key and a repo-derived
 /// key are all already excluded before this function sees them.
-pub fn plan_services(section: &SectionPlan, profile_obj: &Map<String, Value>) -> ServicePlan {
+pub fn plan_services(
+    section: &SectionPlan,
+    profile_obj: &Map<String, Value>,
+    tier: &TierRead,
+) -> ServicePlan {
     let mut plan = ServicePlan::default();
     let mut wants_blob_credentials = false;
 
@@ -239,6 +244,14 @@ pub fn plan_services(section: &SectionPlan, profile_obj: &Map<String, Value>) ->
             });
             continue;
         };
+
+        if let Some(reason) = hosted_coord_url_refusal(key, canonical, tier) {
+            plan.skipped.push(ServiceSkip {
+                key: key.to_string(),
+                reason,
+            });
+            continue;
+        }
 
         let path = field.json_path();
         let current = read_path(profile_obj, &path);
@@ -300,6 +313,57 @@ pub fn plan_services(section: &SectionPlan, profile_obj: &Map<String, Value>) ->
     plan.edits.sort_by(|a, b| a.key.cmp(&b.key));
     plan.skipped.sort_by(|a, b| a.key.cmp(&b.key));
     plan
+}
+
+/// Refuse to point a HOSTED runner's `coord_url` at a loopback coordinator.
+///
+/// Found by the pre-PR self-review of this slice. `coord_url` is not like the
+/// other topology keys: coord is a SHARED service, and `profiles.rs` documents
+/// at length what happens when a hosted runner reaches the wrong one — a
+/// `qontinui_account` runner pointed at dev-localhost "loses gates, work units,
+/// fleet coordination and the merge train, with no error anywhere". That is
+/// precisely why `profiles::apply_tier_policy` resolves an UNSET
+/// coord_url to production for a hosted runner.
+///
+/// An apply can defeat that protection from the other side. If the canonical
+/// machine is a developer box, its captured `coord_url` is
+/// `ws://localhost:9870`; copying that into a hosted runner's profile makes the
+/// value *configured*, so the tier policy never fires and the severance is
+/// silent — the exact failure mode the tier policy exists to prevent, arrived at
+/// by a different route.
+///
+/// Deliberately narrow: only `coord_url`, only on a runner whose tier is KNOWN
+/// hosted, only when canonical's host is loopback. A loopback `database_url` or
+/// `redis_url` is normal and correct dev topology (each box runs its own
+/// Postgres) and is untouched by this. An unknown/unreadable tier does NOT
+/// trigger the refusal — this guard exists to stop a specific silent breakage,
+/// not to become a second, quieter policy engine.
+fn hosted_coord_url_refusal(key: &str, canonical: &str, tier: &TierRead) -> Option<String> {
+    if key != "coord_url" {
+        return None;
+    }
+    if tier.known() != Some(QONTINUI_ACCOUNT_TIER) {
+        return None;
+    }
+    if !is_loopback_url(canonical) {
+        return None;
+    }
+    Some(format!(
+        "canonical's coordinator is {canonical}, but this runner's tier is          `{QONTINUI_ACCOUNT_TIER}` — writing a loopback coord_url here would silently sever it          from gates, work units and the merge train. Reporting only; set COORD_HTTP_URL or fix          canonical's coord_url if this really is intended."
+    ))
+}
+
+/// True when a URL's host is a loopback address.
+fn is_loopback_url(raw: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(raw) else {
+        return false;
+    };
+    match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
 }
 
 /// True when the profile's stored value already carries the proposed topology.
@@ -553,7 +617,11 @@ pub fn apply_section(
         }
     };
 
-    let plan = plan_services(section, &target.profile_obj());
+    let plan = plan_services(
+        section,
+        &target.profile_obj(),
+        &crate::profiles::read_runner_tier(),
+    );
     let mut out = SectionApply {
         section: name.to_string(),
         status: SectionStatus::NothingToDo,
@@ -724,6 +792,7 @@ mod tests {
         let plan = plan_services(
             &section,
             &profile(json!({"database_url": "postgres://user:pw@old:5432/mydb"})),
+            &TierRead::Absent,
         );
         assert_eq!(plan.edits.len(), 1);
         let edit = &plan.edits[0];
@@ -741,7 +810,7 @@ mod tests {
             json!({"port_backend_8000": "listening", "port_redis_6379": "listening"}),
             json!({"port_backend_8000": "closed", "port_redis_6379": "closed"}),
         );
-        let plan = plan_services(&section, &profile(json!({})));
+        let plan = plan_services(&section, &profile(json!({})), &TierRead::Absent);
         assert!(plan.edits.is_empty(), "got {:?}", plan.edits);
         assert_eq!(plan.skipped.len(), 2);
         assert!(plan.skipped[0].reason.contains("liveness observation"));
@@ -755,7 +824,7 @@ mod tests {
             json!({"future_service_url": "https://new"}),
             json!({"future_service_url": "https://old"}),
         );
-        let plan = plan_services(&section, &profile(json!({})));
+        let plan = plan_services(&section, &profile(json!({})), &TierRead::Absent);
         assert!(plan.edits.is_empty());
         assert_eq!(plan.skipped[0].key, "future_service_url");
     }
@@ -787,6 +856,7 @@ mod tests {
         let plan = plan_services(
             &section,
             &profile(json!({"database_url": "postgres://u:p@old:5432/db"})),
+            &TierRead::Absent,
         );
         assert!(plan.edits.is_empty());
     }
@@ -801,6 +871,7 @@ mod tests {
         let plan = plan_services(
             &section,
             &profile(json!({"database_url": "host=localhost password=secret dbname=q"})),
+            &TierRead::Absent,
         );
         assert!(plan.edits.is_empty());
         assert_eq!(plan.skipped.len(), 1);
@@ -812,7 +883,7 @@ mod tests {
     #[test]
     fn missing_local_key_is_added_from_canonical() {
         let section = services_section(json!({"redis_url": "redis://new:6380"}), json!({}));
-        let plan = plan_services(&section, &profile(json!({})));
+        let plan = plan_services(&section, &profile(json!({})), &TierRead::Absent);
         assert_eq!(plan.edits.len(), 1);
         assert_eq!(plan.edits[0].proposed, "redis://new:6380");
         assert!(!plan.edits[0].preserved_local_parts);
@@ -827,7 +898,7 @@ mod tests {
                    "blob_endpoint": "http://new:9000"}),
             json!({}),
         );
-        let plan = plan_services(&section, &profile(json!({})));
+        let plan = plan_services(&section, &profile(json!({})), &TierRead::Absent);
         let paths: Vec<Vec<String>> = plan.edits.iter().map(|e| e.path.clone()).collect();
         assert!(paths.contains(&vec!["blob".to_string(), "kind".to_string()]));
         assert!(paths.contains(&vec!["blob".to_string(), "endpoint".to_string()]));
@@ -849,8 +920,117 @@ mod tests {
         let plan = plan_services(
             &section,
             &profile(json!({"blob": {"endpoint": "http://new:9000"}})),
+            &TierRead::Absent,
         );
         assert!(plan.edits.is_empty(), "got {:?}", plan.edits);
+    }
+
+    // ------------------------------------------------------------------
+    // The hosted-runner coord_url guard (found by this slice's self-review)
+    // ------------------------------------------------------------------
+
+    /// A hosted (`qontinui_account`) runner must never have its coord_url
+    /// re-pointed at a loopback coordinator. `profiles.rs` documents the
+    /// consequence: it loses gates, work units, fleet coordination and the merge
+    /// train, with NO error anywhere. The tier policy protects the UNSET case;
+    /// this protects the applied case.
+    #[test]
+    fn hosted_runner_refuses_a_loopback_coord_url() {
+        let section = services_section(
+            json!({"coord_url": "ws://localhost:9870"}),
+            json!({"coord_url": "wss://coord.qontinui.io"}),
+        );
+        let plan = plan_services(
+            &section,
+            &profile(json!({"coord_url": "wss://coord.qontinui.io/ws"})),
+            &TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string()),
+        );
+        assert!(plan.edits.is_empty(), "got {:?}", plan.edits);
+        assert_eq!(plan.skipped.len(), 1);
+        assert!(plan.skipped[0].reason.contains("silently sever"));
+    }
+
+    /// The guard is narrow on every axis. A NON-hosted runner may follow
+    /// canonical to a local coord — that is ordinary dev topology.
+    #[test]
+    fn non_hosted_runner_may_follow_canonical_to_a_local_coord() {
+        let section = services_section(
+            json!({"coord_url": "ws://localhost:9870"}),
+            json!({"coord_url": "ws://other:9870"}),
+        );
+        for tier in [
+            TierRead::Known("local".to_string()),
+            TierRead::Absent,
+            // An UNREADABLE tier must not trigger the refusal either: this guard
+            // stops one specific silent breakage, it is not a second policy
+            // engine.
+            TierRead::Unknown("io error".to_string()),
+        ] {
+            let plan = plan_services(
+                &section,
+                &profile(json!({"coord_url": "ws://other:9870/ws"})),
+                &tier,
+            );
+            assert_eq!(plan.edits.len(), 1, "tier {tier:?}");
+            assert_eq!(plan.edits[0].proposed, "ws://localhost:9870/ws");
+        }
+    }
+
+    /// A hosted runner following canonical to a REAL coordinator is fine — only
+    /// loopback is refused.
+    #[test]
+    fn hosted_runner_may_follow_canonical_to_a_real_coord() {
+        let section = services_section(
+            json!({"coord_url": "wss://coord.qontinui.io"}),
+            json!({"coord_url": "wss://old.example"}),
+        );
+        let plan = plan_services(
+            &section,
+            &profile(json!({"coord_url": "wss://old.example/ws"})),
+            &TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string()),
+        );
+        assert_eq!(plan.edits.len(), 1);
+        assert_eq!(plan.edits[0].proposed, "wss://coord.qontinui.io/ws");
+    }
+
+    /// A loopback `database_url` is normal, correct dev topology — every box
+    /// runs its own Postgres — and must NOT be caught by the coord_url guard.
+    #[test]
+    fn guard_does_not_touch_other_loopback_keys() {
+        let section = services_section(
+            json!({"database_url": "postgres://localhost:5433"}),
+            json!({"database_url": "postgres://localhost:5432"}),
+        );
+        let plan = plan_services(
+            &section,
+            &profile(json!({"database_url": "postgres://u:pw@localhost:5432/qontinui_db"})),
+            &TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string()),
+        );
+        assert_eq!(plan.edits.len(), 1);
+        assert_eq!(
+            plan.edits[0].proposed,
+            "postgres://u:pw@localhost:5433/qontinui_db"
+        );
+    }
+
+    #[test]
+    fn loopback_detection_covers_the_usual_spellings() {
+        for raw in [
+            "ws://localhost:9870",
+            "ws://LOCALHOST:9870",
+            "http://127.0.0.1:9870",
+            "http://127.5.5.5:9870",
+            "http://[::1]:9870",
+        ] {
+            assert!(is_loopback_url(raw), "{raw} should read as loopback");
+        }
+        for raw in [
+            "wss://coord.qontinui.io",
+            "http://10.0.0.4:9870",
+            "not a url",
+        ] {
+            assert!(!is_loopback_url(raw), "{raw} should NOT read as loopback");
+        }
     }
 
     // ------------------------------------------------------------------
@@ -901,7 +1081,7 @@ mod tests {
             }),
         );
         let profile_obj = profile(original["profiles"]["dev"].clone());
-        let plan = plan_services(&section, &profile_obj);
+        let plan = plan_services(&section, &profile_obj, &TierRead::Absent);
 
         let mut root = original.clone();
         edit_root(&mut root, "dev", &plan.edits).unwrap();

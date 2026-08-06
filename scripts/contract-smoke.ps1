@@ -91,6 +91,28 @@ $SLOW_ROUTES = @{
 }
 
 # ---------------------------------------------------------------------------
+# Accepted status codes. The smoke asserts "the route is registered AND its
+# handler ran", so a 2xx passes and so does a 4xx that is the handler's own
+# validation rejecting our placeholder fixture (400/405/409/415/422).
+# EVERYTHING ELSE IS A FAIL -- notably every 5xx (the handler is registered but
+# broken) and 401/403 (registered but gated). The rule this replaces was
+# "anything that is not 404 passes", which recorded 500 / 401 / 503 as PASS and
+# made the gate structurally incapable of seeing a broken-but-registered route.
+# 404 is deliberately NOT listed here: it keeps its own body-aware classifier
+# in the route loop (route-matched-but-resource-missing vs unregistered).
+# ---------------------------------------------------------------------------
+$DEFAULT_OK_STATUS = @(200, 201, 202, 204, 400, 405, 409, 415, 422)
+
+# Per-route overrides for routes whose CORRECT smoke response falls outside the
+# default set. Keyed by "<METHOD> <PATH>" exactly as it appears in
+# UI_BRIDGE_ROUTES; the value REPLACES the default set for that route (it does
+# not extend it). Add an entry here -- with a reason -- rather than widening
+# $DEFAULT_OK_STATUS, so one route's quirk can never silently green-light every
+# other route. A route that cannot be probed at all belongs in $SKIP_ROUTES.
+$EXPECTED_STATUS = @{
+}
+
+# ---------------------------------------------------------------------------
 # -Profile ci skip set. EXACTLY the two model-loading routes: extract loads
 # PaddleOCR and describe loads a VLM, both via llama-swap — which does not run
 # in CI. Their shape contracts are covered by the non-model probes; the model
@@ -109,8 +131,9 @@ if ($Profile -eq "ci") {
 # ---------------------------------------------------------------------------
 # Per-route fixture bodies. For routes with bodyRequired: true we send a
 # minimal valid-shape body where one is needed to exercise the parser; for
-# the rest, an empty {} is fine -- we only assert "route is registered" by
-# checking status != 404. Validation 4xx (other than 404) counts as PASS.
+# the rest, an empty {} is fine -- we only assert "route is registered and its
+# handler ran", i.e. the status lands in $DEFAULT_OK_STATUS (validation 4xx
+# counts as PASS; 5xx / auth statuses do not).
 # ---------------------------------------------------------------------------
 $BODY_FIXTURES = @{
     "POST /control/element/:id/action"        = '{"action":"click"}'
@@ -400,6 +423,81 @@ function Start-DirectRunner {
 }
 
 # ---------------------------------------------------------------------------
+# Kill a process and every descendant of it, children first.
+#
+# `Stop-Process -Id <parent>` kills ONLY the parent: Windows re-parents the
+# survivors to the OS rather than cascading, so the runner's WebView2 host
+# processes and embedded CLI outlive the run and keep the temp WebView2 profile
+# locked. We therefore walk Win32_Process.ParentProcessId ourselves.
+#
+# The walk is strictly DOWNWARD from $RootPid — it can never climb to an
+# ancestor, which is why this does not use a tree-kill flag (`taskkill /T`):
+# on this box a mis-aimed tree kill would take out live editor/agent sessions.
+# Two further guards: a visited set (PID reuse can make the parent graph
+# cyclic), and a creation-time check so a recycled PID whose process predates
+# the root is not adopted into the tree.
+# ---------------------------------------------------------------------------
+function Stop-ProcessTree {
+    param([int]$RootPid)
+
+    $all = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop |
+        Select-Object ProcessId, ParentProcessId, Name, CreationDate)
+
+    $root = $all | Where-Object { $_.ProcessId -eq $RootPid } | Select-Object -First 1
+    if (-not $root) { return 0 }
+    $rootCreated = $root.CreationDate
+
+    $byParent = @{}
+    foreach ($p in $all) {
+        $ppid = [int]$p.ParentProcessId
+        if (-not $byParent.ContainsKey($ppid)) { $byParent[$ppid] = @() }
+        $byParent[$ppid] += $p
+    }
+
+    # Breadth-first collect of descendants. Ordered deepest-last so the reverse
+    # is a safe kill order (a child dies before the parent that supervises it).
+    $ordered = New-Object System.Collections.Generic.List[Object]
+    $visited = @{ $RootPid = $true }
+    $queue = New-Object System.Collections.Generic.Queue[int]
+    $queue.Enqueue($RootPid)
+    while ($queue.Count -gt 0) {
+        $cur = $queue.Dequeue()
+        if (-not $byParent.ContainsKey($cur)) { continue }
+        foreach ($child in $byParent[$cur]) {
+            $cpid = [int]$child.ProcessId
+            if ($cpid -le 4) { continue }                 # System / Idle
+            if ($cpid -eq $PID) { continue }              # never ourselves
+            if ($visited.ContainsKey($cpid)) { continue }
+            # PID reuse: a "child" that started before the root is a stale
+            # parent-id pointing at a recycled PID, not our process.
+            if ($rootCreated -and $child.CreationDate -and $child.CreationDate -lt $rootCreated) { continue }
+            $visited[$cpid] = $true
+            $ordered.Add($child)
+            $queue.Enqueue($cpid)
+        }
+    }
+
+    $killed = 0
+    for ($i = $ordered.Count - 1; $i -ge 0; $i--) {
+        $target = $ordered[$i]
+        try {
+            Stop-Process -Id ([int]$target.ProcessId) -Force -ErrorAction Stop
+            $killed++
+        } catch {
+            # Already gone (it may have died with a sibling) — not an error.
+            Write-Host "  note: could not stop $($target.Name) ($($target.ProcessId)): $($_.Exception.Message)"
+        }
+    }
+    try {
+        Stop-Process -Id $RootPid -Force -ErrorAction Stop
+        $killed++
+    } catch {
+        Write-Host "  note: could not stop root pid ${RootPid}: $($_.Exception.Message)"
+    }
+    return $killed
+}
+
+# ---------------------------------------------------------------------------
 # Dump everything we captured from a direct-exe runner — its redirected
 # stdout/stderr plus any *.log files the runner wrote under its temp tree
 # (notably runner-panic.log, written on an early-init panic / exit code 2).
@@ -646,6 +744,13 @@ try {
             Record "SKIP" $r.Method $r.Path $SKIP_ROUTES[$r.Key]
             continue
         }
+        # Per-route try/catch. $ErrorActionPreference = "Stop" makes ANY error
+        # in this body terminating, and an escape would unwind straight past the
+        # summary block -- the script would exit 1 having recorded no FAIL row
+        # and printed no totals, which reads exactly like a harness/invocation
+        # problem instead of the route failure it is. Catch here so the failing
+        # route gets a row and the remaining routes still run.
+        try {
         $url = $runnerBase + (Substitute-Params $r.Path)
         $body = $null
         if ($r.BodyRequired) {
@@ -661,7 +766,7 @@ try {
         $probeTimeout = 10
         if ($SLOW_ROUTES.ContainsKey($r.Key)) { $probeTimeout = $SLOW_ROUTES[$r.Key] }
         $res = Invoke-Probe -Method $r.Method -Url $url -Body $body -TimeoutSec $probeTimeout
-        $status = $res[0]
+        $status = [int]$res[0]
         if ($status -eq 0) {
             Record "FAIL" $r.Method $r.Path "connection error: $($res[1])"
             $exitCode = 1
@@ -693,7 +798,20 @@ try {
                 $exitCode = 1
             }
         } else {
-            Record "PASS" $r.Method $r.Path "$status"
+            # Accept only statuses in the route's expected set. Anything else --
+            # every 5xx, 401/403, and any other unlisted code -- is a FAIL.
+            $okSet = $DEFAULT_OK_STATUS
+            if ($EXPECTED_STATUS.ContainsKey($r.Key)) { $okSet = @($EXPECTED_STATUS[$r.Key]) }
+            if ($okSet -contains $status) {
+                Record "PASS" $r.Method $r.Path "$status"
+            } else {
+                Record "FAIL" $r.Method $r.Path "$status (expected one of: $($okSet -join ','))"
+                $exitCode = 1
+            }
+        }
+        } catch {
+            Record "FAIL" $r.Method $r.Path "probe threw: $($_.Exception.Message)"
+            $exitCode = 1
         }
     }
 
@@ -881,20 +999,27 @@ try {
         Record "FAIL" "POST" "/vision/capture (shape)" "exception: $($_.Exception.Message)"
         $exitCode = 1
     }
+} catch {
+    # Backstop for anything in the probe block that is NOT already caught (the
+    # warm-up, the route loop and each shape probe have their own catch). Without
+    # this the terminating error escapes past the summary and the script exits 1
+    # with no FAIL row and no totals -- indistinguishable from a bad invocation.
+    Record "FAIL" "-" "(smoke harness)" "unhandled: $($_.Exception.Message)"
+    $exitCode = 1
 } finally {
     # Always stop the temp runner so a probe failure doesn't leak it.
     Write-Host ""
     Write-Host "Stopping runner $runnerId ..."
     if ($directRunner) {
-        # DirectExe mode: Stop-Process the launched exe (and any children it
-        # spawned, e.g. the embedded webview / Claude CLI).
+        # DirectExe mode: kill the launched exe AND everything it spawned. The
+        # runner forks WebView2 host processes and an embedded CLI; killing the
+        # parent alone orphans them (re-parented to the OS), so each CI run used
+        # to leak a handful of live processes holding the temp WebView2 profile.
         try {
-            if ($directRunner.Process -and -not $directRunner.Process.HasExited) {
-                Stop-Process -Id $directRunner.Process.Id -Force -ErrorAction Stop
-            }
-            Write-Host "Runner stopped."
+            $killed = Stop-ProcessTree -RootPid $directRunner.Process.Id
+            Write-Host "Runner stopped ($killed process(es) in tree)."
         } catch {
-            Write-Host "WARNING: Stop-Process failed: $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-Host "WARNING: Stop-ProcessTree failed: $($_.Exception.Message)" -ForegroundColor Yellow
         }
     } else {
         try {
@@ -922,5 +1047,12 @@ Write-Host ("Smoke: {0} pass / {1} total, {2} skip" -f $pass, $total, $skip)
 if ($fail -gt 0) {
     Write-Host ("FAIL count: {0}" -f $fail) -ForegroundColor Red
 }
+
+# Completion sentinel. A caller (CI, a harness, a human reading a captured log)
+# can distinguish "the smoke ran to the end and this is its verdict" from "the
+# process died somewhere upstream" only if the script says so explicitly -- a
+# bare exit code cannot carry that. Absence of this line means the run did NOT
+# complete, whatever the exit code says.
+Write-Host ("SMOKE-COMPLETE exit={0} pass={1} fail={2} skip={3}" -f $exitCode, $pass, $fail, $skip)
 
 exit $exitCode
