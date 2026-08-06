@@ -628,7 +628,7 @@ fn deliver_compliance_nudge(
     }
     // Compare-and-set: two Stops racing for one session must not both deliver.
     // Losing the claim means another turn already sent it — allow this stop.
-    if !crate::mcp::session_compliance::mark_nudged(&nudge.session_id) {
+    if !crate::mcp::session_compliance::mark_nudged(&nudge.session_id, nudge.max_attempts) {
         return None;
     }
     cap_registry().record(session_key, now);
@@ -1066,6 +1066,9 @@ mod tests {
         ComplianceNudge {
             session_id: session.to_string(),
             prompt: "produce the block".to_string(),
+            // 1 keeps these cases on the historical once-per-session cap, so
+            // they still assert what they were written to assert.
+            max_attempts: 1,
         }
     }
 
@@ -1086,7 +1089,7 @@ mod tests {
         assert_eq!(v.mode, "off");
         assert_eq!(v.prompt.as_deref(), Some("produce the block"));
         // Delivery consumed the session's single claim.
-        assert!(!crate::mcp::session_compliance::mark_nudged(key));
+        assert!(!crate::mcp::session_compliance::mark_nudged(key, 1));
     }
 
     #[test]
@@ -1100,7 +1103,7 @@ mod tests {
         // The once-per-session claim must NOT have been burned by a nudge the
         // cap swallowed — a later turn is still allowed to deliver it.
         assert!(
-            crate::mcp::session_compliance::mark_nudged(key),
+            crate::mcp::session_compliance::mark_nudged(key, 1),
             "cap suppression must leave the session's nudge claim unconsumed"
         );
     }
@@ -1108,7 +1111,7 @@ mod tests {
     #[test]
     fn a_session_already_nudged_is_not_nudged_again() {
         let key = "cv-already-nudged";
-        assert!(crate::mcp::session_compliance::mark_nudged(key));
+        assert!(crate::mcp::session_compliance::mark_nudged(key, 1));
         assert!(deliver_compliance_nudge(key, Some(nudge_for(key)), Mode::On).is_none());
     }
 }

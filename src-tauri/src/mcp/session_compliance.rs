@@ -120,7 +120,7 @@
 //! per-path opt-in that does not exist. When coord's config says `reopen`,
 //! this module does nothing — see [`Applicability::nudge_allowed`].
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, Weak};
@@ -615,9 +615,18 @@ async fn post_compliance(
     let (base, jwt) = coord_client_parts().ok()?;
     let client = http_client().ok()?;
     let url = format!("{base}/coord/sessions/{claude_session_id}/compliance");
+    // The nudge count is the runner's to report: coord cannot see a nudge, only
+    // the POST that follows one. It is the count as of THIS post, so a nudge
+    // delivered later in the same turn lands in the next post — and the
+    // session-close post carries the final total. Older coord builds ignore
+    // unknown fields, so sending these before the coord side lands is inert
+    // rather than an error.
+    let (nudge_attempts, last_nudged_at) = nudge_state_for(claude_session_id);
     let body = serde_json::json!({
         "report": report.cloned().unwrap_or(Value::Null),
         "absent_reason": absent_reason.map(Value::from).unwrap_or(Value::Null),
+        "nudge_attempts": nudge_attempts,
+        "last_nudged_at": last_nudged_at.map(Value::from).unwrap_or(Value::Null),
     });
     let resp = client
         .post(&url)
@@ -648,39 +657,97 @@ pub struct ComplianceNudge {
     /// Claude session id — the key [`mark_nudged`] consumes on delivery.
     pub session_id: String,
     pub prompt: String,
+    /// The cap this candidate was authorised against, carried so the delivery
+    /// site's compare-and-set checks the SAME number the eligibility check
+    /// used. The config is not in scope where delivery happens, and re-reading
+    /// it there would let a config change between decision and delivery apply
+    /// a different cap than the one that granted the nudge.
+    pub max_attempts: u32,
 }
 
-/// Sessions already nudged, process-global and in-memory — the same posture
-/// [`crate::mcp::continuation_verdict`]'s hourly cap registry takes. A runner
-/// restart resets it, which can only re-grant a nudge that was never
-/// delivered-and-answered; it can never produce a second nudge inside one run.
-static NUDGED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-
-fn nudged() -> &'static Mutex<HashSet<String>> {
-    NUDGED.get_or_init(|| Mutex::new(HashSet::new()))
+/// What this run has actually delivered to one session.
+///
+/// `attempts` is the OBSERVATION the operator surface reports, distinct from
+/// the `max_attempts` POLICY it is checked against. Keeping the two apart is
+/// what makes it possible to notice the cap was exceeded rather than assume it
+/// held — see the note on the restart window below.
+#[derive(Debug, Clone, Default)]
+struct NudgeState {
+    attempts: u32,
+    /// RFC3339, set on each delivery. `None` ⇔ `attempts == 0`; it exists so a
+    /// nudge can be correlated with the turn that provoked it, which a bare
+    /// counter cannot do.
+    last_at: Option<String>,
 }
 
-/// Has this session already been nudged? A poisoned lock reads as "yes"
-/// (fail-safe: never nudge on a broken guard).
-fn already_nudged(session_id: &str) -> bool {
+/// Per-session nudge state, process-global and in-memory — the same posture
+/// [`crate::mcp::continuation_verdict`]'s hourly cap registry takes.
+///
+/// This was a `HashSet<String>` of "sessions already nudged", which capped
+/// delivery at exactly one per session and ignored the configured
+/// `max_attempts` entirely: the setting was parsed and never read, so raising
+/// it to 3 changed nothing. It is a `HashMap` now so the cap is the operator's
+/// number rather than a hard-coded 1, and so the count can be reported to
+/// coord — without it, an `unverified/absent` verdict cannot distinguish
+/// "nudged and ignored" from "never nudged", which are opposite conclusions
+/// about whether the mechanism works.
+///
+/// A runner restart still resets it. That can only re-grant a nudge that was
+/// never delivered-and-answered, and within one run the cap holds. But a
+/// session spanning a restart CAN exceed `max_attempts` overall, and the
+/// honest consequence is that the count reported to coord is this run's, not
+/// the session's lifetime total.
+static NUDGED: OnceLock<Mutex<HashMap<String, NudgeState>>> = OnceLock::new();
+
+fn nudged() -> &'static Mutex<HashMap<String, NudgeState>> {
+    NUDGED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// How many nudges this run has delivered to the session. A poisoned lock
+/// reads as `u32::MAX` — fail-safe, since every caller compares it against a
+/// cap and the saturated value can never be under one.
+fn nudge_attempts_for(session_id: &str) -> u32 {
     match nudged().lock() {
-        Ok(g) => g.contains(session_id),
-        Err(_) => true,
+        Ok(g) => g.get(session_id).map_or(0, |s| s.attempts),
+        Err(_) => u32::MAX,
     }
 }
 
-/// Claim the session's single nudge. Returns `true` when THIS caller won the
-/// claim, `false` when the session was already marked (or the guard is
+/// The state to report to coord: attempts so far, and when the last one went
+/// out. Poisoned reads as `(0, None)` rather than the saturated sentinel —
+/// this feeds an operator-visible count, and `u32::MAX` nudges is a lie where
+/// "we cannot tell" should read as the default.
+fn nudge_state_for(session_id: &str) -> (u32, Option<String>) {
+    match nudged().lock() {
+        Ok(g) => g
+            .get(session_id)
+            .map(|s| (s.attempts, s.last_at.clone()))
+            .unwrap_or((0, None)),
+        Err(_) => (0, None),
+    }
+}
+
+/// Claim one nudge against `max_attempts`. Returns `true` when THIS caller won
+/// the claim, `false` when the session is already at the cap (or the guard is
 /// poisoned). Called by the continuation-verdict handler at the moment it emits
 /// the block, not when the candidate is computed — a candidate the cap
 /// swallowed must stay eligible.
 ///
 /// Compare-and-set rather than a separate check-then-set: two Stops racing for
-/// the same session must not both deliver.
+/// the same session must not both deliver. `max_attempts: 0` therefore means
+/// never nudge, which the old set-based cap could not express.
 #[must_use]
-pub fn mark_nudged(session_id: &str) -> bool {
+pub fn mark_nudged(session_id: &str, max_attempts: u32) -> bool {
     match nudged().lock() {
-        Ok(mut g) => g.insert(session_id.to_string()),
+        Ok(mut g) => {
+            let entry = g.entry(session_id.to_string()).or_default();
+            if entry.attempts >= max_attempts {
+                return false;
+            }
+            entry.attempts += 1;
+            entry.last_at = Some(chrono::Utc::now().to_rfc3339());
+            true
+        }
         Err(_) => false,
     }
 }
@@ -883,9 +950,12 @@ async fn observe_turn_end_inner(hook_input: &Value) -> Option<ComplianceNudge> {
     //    verdict — so emit it DETACHED and return immediately, and the hook
     //    never waits on coord. That is the whole fleet under the report-only
     //    default, and every repeat turn of an already-nudged session.
+    // The cap is the operator's configured number, not a hard-coded 1. This
+    // read is advisory — `mark_nudged` re-checks it under the lock at delivery,
+    // which is the point two racing Stops are actually serialised.
     let nudge_possible = applicability.nudge_allowed(&config.mode)
         && !crate::mcp::continuation_verdict::stop_hook_active_from(hook_input)
-        && !already_nudged(session_id);
+        && nudge_attempts_for(session_id) < config.max_attempts;
     if !nudge_possible {
         let sid = session_id.to_string();
         tauri::async_runtime::spawn(async move {
@@ -910,6 +980,7 @@ async fn observe_turn_end_inner(hook_input: &Value) -> Option<ComplianceNudge> {
     Some(ComplianceNudge {
         session_id: session_id.to_string(),
         prompt: nudge_text(&verdict),
+        max_attempts: config.max_attempts,
     })
 }
 
