@@ -9,6 +9,7 @@ export { SelfHealingSettings } from "./SelfHealingSettings";
 export { OtelSettings } from "./OtelSettings";
 export { ContainerSettings } from "./ContainerSettings";
 export { CiRunnerSettings } from "./CiRunnerSettings";
+export { AppFreshnessSettings } from "./AppFreshnessSettings";
 export { SecuritySettings } from "./SecuritySettings";
 export { ExecutionVariablesSettings } from "./ExecutionVariablesSettings";
 export { SectionHeader } from "./SectionHeader";

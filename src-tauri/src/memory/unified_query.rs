@@ -615,8 +615,21 @@ async fn retrieve_tenant_memory(query: &str, limit: usize) -> Vec<MemoryResult> 
         }
     };
 
+    // Read the link-expansion flag HERE, not inside the endpoint-parameterized
+    // core, which stays env/profile-free so tests can point it at a fake server.
+    let link_expansion = crate::settings::get_memory_link_expansion_enabled();
+
     let client = tenant_query_client();
-    retrieve_tenant_memory_at(client, &base, &bearer, query, limit, query_embedding).await
+    retrieve_tenant_memory_at(
+        client,
+        &base,
+        &bearer,
+        query,
+        limit,
+        query_embedding,
+        link_expansion,
+    )
+    .await
 }
 
 /// Hard latency ceiling for the tenant-memory arm — the fan-out must not
@@ -640,6 +653,11 @@ fn tenant_query_client() -> &'static reqwest::Client {
 /// `query_embedding` is the locally-computed query vector. `None` (local
 /// embedder unavailable) omits the field, leaving the server to answer
 /// FTS-only.
+///
+/// `link_expansion` asks the server for its third (link-expansion) RRF arm.
+/// It is a PARAMETER rather than a settings read so this function stays
+/// env/profile-free; the caller [`retrieve_tenant_memory`] resolves it from
+/// `settings::get_memory_link_expansion_enabled()` (default false).
 pub(crate) async fn retrieve_tenant_memory_at(
     client: &reqwest::Client,
     base: &str,
@@ -647,6 +665,7 @@ pub(crate) async fn retrieve_tenant_memory_at(
     query: &str,
     limit: usize,
     query_embedding: Option<Vec<f32>>,
+    link_expansion: bool,
 ) -> Vec<MemoryResult> {
     use crate::database::embedding_client::EMBEDDING_MODEL_TAG;
 
@@ -654,6 +673,7 @@ pub(crate) async fn retrieve_tenant_memory_at(
     let mut body = serde_json::json!({
         "query_text": query,
         "limit": limit.clamp(1, 50),
+        "link_expansion": link_expansion,
     });
     if let Some(embedding) = query_embedding {
         body["query_embedding"] = serde_json::json!(embedding);
@@ -713,13 +733,20 @@ pub(crate) async fn retrieve_tenant_memory_at(
             let content = h.get("content").and_then(|v| v.as_str()).unwrap_or("");
             let rrf = h.get("rrf_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
             // Preserve the server-side RRF provenance: which per-store ranks
-            // (vector / FTS) produced the hit maps onto found_by.
+            // (vector / FTS / link) produced the hit maps onto found_by.
             let mut found_by = Vec::new();
             if h.get("vector_rank").is_some_and(|v| !v.is_null()) {
                 found_by.push(RetrievalStrategy::EmbeddingSimilarity);
             }
             if h.get("fts_rank").is_some_and(|v| !v.is_null()) {
                 found_by.push(RetrievalStrategy::FullTextSearch);
+            }
+            // A hit reached purely by an edge over `coord.memory_links` has both
+            // other ranks null; without this check the fallback below would
+            // report it as a lexical hit that never happened. Checked BEFORE the
+            // fallback for exactly that reason.
+            if h.get("link_rank").is_some_and(|v| !v.is_null()) {
+                found_by.push(RetrievalStrategy::GraphTraversal);
             }
             if found_by.is_empty() {
                 found_by.push(RetrievalStrategy::FullTextSearch);
@@ -1652,7 +1679,7 @@ mod tenant_memory_arm_tests {
         );
         let base = spawn_server(app).await;
         let results =
-            retrieve_tenant_memory_at(&client(), &base, "test.jwt", "login", 8, None).await;
+            retrieve_tenant_memory_at(&client(), &base, "test.jwt", "login", 8, None, false).await;
 
         assert_eq!(results.len(), 2);
         let top = &results[0];
@@ -1682,7 +1709,8 @@ mod tenant_memory_arm_tests {
         );
         let base = spawn_server(app).await;
         let started = std::time::Instant::now();
-        let results = retrieve_tenant_memory_at(&client(), &base, "test.jwt", "q", 8, None).await;
+        let results =
+            retrieve_tenant_memory_at(&client(), &base, "test.jwt", "q", 8, None, false).await;
         assert!(results.is_empty(), "timeout must degrade to local-only");
         assert!(
             started.elapsed() < Duration::from_secs(4),
@@ -1704,7 +1732,7 @@ mod tenant_memory_arm_tests {
         );
         let base = spawn_server(app).await;
         assert!(
-            retrieve_tenant_memory_at(&client(), &base, "test.jwt", "q", 8, None)
+            retrieve_tenant_memory_at(&client(), &base, "test.jwt", "q", 8, None, false)
                 .await
                 .is_empty()
         );
@@ -1715,7 +1743,8 @@ mod tenant_memory_arm_tests {
             "test.jwt",
             "q",
             8,
-            None
+            None,
+            false
         )
         .await
         .is_empty());
@@ -1749,7 +1778,16 @@ mod tenant_memory_arm_tests {
     async fn sends_locally_computed_query_embedding_with_model_tag() {
         let (base, seen) = spawn_body_recorder().await;
         let embedding: Vec<f32> = (0..384).map(|i| i as f32 * 0.01).collect();
-        retrieve_tenant_memory_at(&client(), &base, "test.jwt", "login", 8, Some(embedding)).await;
+        retrieve_tenant_memory_at(
+            &client(),
+            &base,
+            "test.jwt",
+            "login",
+            8,
+            Some(embedding),
+            false,
+        )
+        .await;
 
         let g = seen.lock().await;
         assert_eq!(g.len(), 1);
@@ -1773,7 +1811,7 @@ mod tenant_memory_arm_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn omits_query_embedding_when_local_embed_unavailable() {
         let (base, seen) = spawn_body_recorder().await;
-        retrieve_tenant_memory_at(&client(), &base, "test.jwt", "login", 8, None).await;
+        retrieve_tenant_memory_at(&client(), &base, "test.jwt", "login", 8, None, false).await;
 
         let g = seen.lock().await;
         assert_eq!(g.len(), 1, "the query must still go out, FTS-only");
@@ -1783,5 +1821,157 @@ mod tenant_memory_arm_tests {
         );
         assert!(g[0].get("embedding_model").is_none());
         assert_eq!(g[0]["query_text"], "login");
+    }
+
+    // ---- Link-expansion arm (plan
+    // `2026-07-29-memory-link-expansion-retrieval-arm`, Phase 4) ----
+
+    /// The arm is a REQUEST FIELD, and it must ride the wire in both states —
+    /// the `false` case is the one that keeps the arm default-off (Phase 3),
+    /// so it is asserted explicitly rather than by omission.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sends_link_expansion_false_when_the_flag_is_off() {
+        let (base, seen) = spawn_body_recorder().await;
+        retrieve_tenant_memory_at(&client(), &base, "test.jwt", "login", 8, None, false).await;
+
+        let g = seen.lock().await;
+        assert_eq!(g.len(), 1);
+        assert_eq!(
+            g[0]["link_expansion"],
+            json!(false),
+            "flag off ⇒ the server must be told NOT to expand"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sends_link_expansion_true_when_the_flag_is_on() {
+        let (base, seen) = spawn_body_recorder().await;
+        retrieve_tenant_memory_at(&client(), &base, "test.jwt", "login", 8, None, true).await;
+
+        let g = seen.lock().await;
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0]["link_expansion"], json!(true));
+    }
+
+    /// A hit reached PURELY by an edge has `vector_rank` and `fts_rank` null.
+    /// Before Phase 4 the fallback relabelled it as a lexical hit; it must now
+    /// report `GraphTraversal` and nothing else.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn link_only_hit_is_graph_traversal_not_a_fabricated_fts_hit() {
+        let app = Router::new().route(
+            "/api/v1/memory/query",
+            post(|| async {
+                (
+                    AxumStatus::OK,
+                    Json(json!({"hits": [
+                        {
+                            "memory_id": "33333333-3333-4333-8333-333333333333",
+                            "title": "Linked neighbour",
+                            "content": "Reached only by a depends_on edge",
+                            "kind": "reference",
+                            "created_at": "2026-07-03T00:00:00Z",
+                            "rrf_score": 0.016,
+                            "vector_rank": null,
+                            "fts_rank": null,
+                            "link_rank": 1
+                        }
+                    ]})),
+                )
+                    .into_response()
+            }),
+        );
+        let base = spawn_server(app).await;
+        let results =
+            retrieve_tenant_memory_at(&client(), &base, "test.jwt", "q", 8, None, true).await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].found_by,
+            vec![RetrievalStrategy::GraphTraversal],
+            "link-only hits are marked as such"
+        );
+        assert!(
+            !results[0]
+                .found_by
+                .contains(&RetrievalStrategy::FullTextSearch),
+            "the fallback must not fabricate a lexical hit that never happened"
+        );
+    }
+
+    /// A hit found by BOTH the semantic arm and the link arm carries both
+    /// provenances — the link check adds to `found_by`, it does not replace.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vector_and_link_hit_carries_both_provenances() {
+        let app = Router::new().route(
+            "/api/v1/memory/query",
+            post(|| async {
+                (
+                    AxumStatus::OK,
+                    Json(json!({"hits": [
+                        {
+                            "memory_id": "44444444-4444-4444-8444-444444444444",
+                            "title": "Both arms",
+                            "content": "Semantically close AND linked",
+                            "kind": "fact",
+                            "created_at": "2026-07-04T00:00:00Z",
+                            "rrf_score": 0.032,
+                            "vector_rank": 2,
+                            "fts_rank": null,
+                            "link_rank": 3
+                        }
+                    ]})),
+                )
+                    .into_response()
+            }),
+        );
+        let base = spawn_server(app).await;
+        let results =
+            retrieve_tenant_memory_at(&client(), &base, "test.jwt", "q", 8, None, true).await;
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0]
+            .found_by
+            .contains(&RetrievalStrategy::EmbeddingSimilarity));
+        assert!(results[0]
+            .found_by
+            .contains(&RetrievalStrategy::GraphTraversal));
+        assert!(
+            !results[0]
+                .found_by
+                .contains(&RetrievalStrategy::FullTextSearch),
+            "no fts_rank ⇒ no lexical provenance"
+        );
+    }
+
+    /// Regression guard on the pre-existing fallback: a hit with NO ranks at
+    /// all (an older backend that omits the fields entirely) still reports
+    /// `FullTextSearch`, exactly as before Phase 4.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hit_with_no_ranks_still_falls_back_to_full_text_search() {
+        let app = Router::new().route(
+            "/api/v1/memory/query",
+            post(|| async {
+                (
+                    AxumStatus::OK,
+                    Json(json!({"hits": [
+                        {
+                            "memory_id": "55555555-5555-4555-8555-555555555555",
+                            "title": "No provenance",
+                            "content": "Server sent no rank fields",
+                            "kind": "fact",
+                            "created_at": "2026-07-05T00:00:00Z",
+                            "rrf_score": 0.016
+                        }
+                    ]})),
+                )
+                    .into_response()
+            }),
+        );
+        let base = spawn_server(app).await;
+        let results =
+            retrieve_tenant_memory_at(&client(), &base, "test.jwt", "q", 8, None, false).await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].found_by, vec![RetrievalStrategy::FullTextSearch]);
     }
 }

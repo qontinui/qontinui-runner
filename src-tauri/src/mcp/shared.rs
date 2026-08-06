@@ -203,9 +203,14 @@ pub fn emit_ai_output(
         warn!("Failed to emit AI output event: {}", e);
     }
 
-    // Also broadcast to WebSocket clients
-    if let Ok(json) = serde_json::to_value(&event) {
-        crate::event_system::broadcast_ws_notification(app_handle, "ai-output", &json);
+    // Also broadcast to WebSocket clients. `to_value` is a full serialization
+    // of the event per line — skip it outright when no WS client is attached
+    // (the common desktop case; the channel exists for the mobile relay).
+    let ws_live = crate::event_system::ws_notification_has_receivers(app_handle);
+    if ws_live {
+        if let Ok(json) = serde_json::to_value(&event) {
+            crate::event_system::broadcast_ws_notification(app_handle, "ai-output", &json);
+        }
     }
 
     // Emit the structured ai-output-chunk event for the streaming widget.
@@ -221,8 +226,14 @@ pub fn emit_ai_output(
             if let Err(e) = app_handle.emit(chunk_event_name, &chunk_event) {
                 warn!("Failed to emit ai-output-chunk event: {}", e);
             }
-            if let Ok(json) = serde_json::to_value(&chunk_event) {
-                crate::event_system::broadcast_ws_notification(app_handle, chunk_event_name, &json);
+            if ws_live {
+                if let Ok(json) = serde_json::to_value(&chunk_event) {
+                    crate::event_system::broadcast_ws_notification(
+                        app_handle,
+                        chunk_event_name,
+                        &json,
+                    );
+                }
             }
         }
     }

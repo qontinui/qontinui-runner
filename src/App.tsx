@@ -33,10 +33,9 @@ import {
 import {
   useApiReady,
   useActionLogView,
-  useLogManager,
+  useLogActions,
   useUIState,
   useModalState,
-  useLogFilter,
   useProjectSelection,
   useProjectLogs,
   useBackgroundActivities,
@@ -56,7 +55,6 @@ import { useAccountMigrationNotifications } from "./hooks/useAccountMigrationNot
 import { useStateMachineRegistration } from "./hooks/useStateMachineRegistration";
 
 import { ToastContainer } from "./components/ToastContainer";
-import { BuildRefreshBanner } from "./components/BuildRefreshBanner";
 import { AutoUpdateChecker } from "./components/AutoUpdateChecker";
 import { ConflictModal } from "./components/ConflictModal";
 import { StolenBanner } from "./components/StolenBanner";
@@ -68,7 +66,7 @@ import ActionDetailModal from "./components/ActionDetailModal";
 import ImageDetailModal from "./components/ImageDetailModal";
 import { LoginScreen } from "./components/LoginScreen";
 import { TierUnavailableScreen } from "./components/TierUnavailableScreen";
-import { SetupWizard } from "./components/setup-wizard";
+import { SetupWizard, SETUP_WIZARD_STEPS } from "./components/setup-wizard";
 import { registerOpenableView } from "./lib/openable-views";
 import { resolveAuthGate } from "./lib/authGate";
 import { setAuthOverlay, useAuthOverlay } from "./lib/authOverlayStore";
@@ -99,7 +97,7 @@ import { useTaskRuns } from "./hooks/useAiData";
 import { loadDiscoveredSpecs } from "./lib/ui-bridge/use-discovered-specs";
 import { getGlobalSpecStore } from "@qontinui/ui-bridge/specs";
 import { autoPopulateCtr, getGlobalCtr } from "@qontinui/ui-bridge/ctr";
-import { getGlobalRegistry } from "@qontinui/ui-bridge";
+import { getGlobalRegistry, useUIComponent } from "@qontinui/ui-bridge";
 
 import { instanceStorage } from "@/lib/instance-storage";
 import { ACTIVE_TAB_STORAGE_KEY, DEFAULT_TAB_ID, TAB_LIST } from "@/components/app/tab-types";
@@ -161,6 +159,89 @@ function AppContent() {
       }),
     [],
   );
+
+  // Wizard step state, LIFTED out of `SetupWizard` (see its props). Two
+  // reasons, both load-bearing:
+  //   1. The `setup-wizard` UI-Bridge component below mutates it, and that
+  //      registration has to live HERE — `useUIComponent` only registers while
+  //      its owner is mounted, so registering inside the wizard left the
+  //      component undiscoverable in exactly the state a driver needs it: a
+  //      runner that auto-bypassed the wizard (`check_setup_completed` returns
+  //      true whenever `QONTINUI_TEST_AUTO_LOGIN_EMAIL` is set, which the
+  //      supervisor forwards to every temp runner). `scope: "global"` does not
+  //      survive an unmount.
+  //   2. It keeps the operator's progress even across a wizard remount.
+  const [wizardStep, setWizardStep] = useState(0);
+
+  // Persist "setup is done" and dismiss the wizard. Owns the `complete_setup`
+  // call so the UI-Bridge `complete` action and the wizard's own Finish button
+  // land on the same path. Dismisses even when the persist fails — refusing to
+  // leave the wizard is worse than a setup flag that has to be re-written.
+  const completeWizard = useCallback(async () => {
+    try {
+      await invoke("complete_setup");
+    } catch (err) {
+      console.error("Failed to persist setup completion:", err);
+    }
+    setSetupCompleted(true);
+  }, []);
+
+  // UI Bridge: programmatic wizard control, so a test run or automation can
+  // reach and dismiss the first-run wizard without driving 7 steps of OS
+  // dialogs. Registered at `AppContent` — NOT inside `SetupWizard` — so both
+  // actions stay addressable whether or not the wizard is currently mounted.
+  useUIComponent({
+    id: "setup-wizard",
+    name: "Setup Wizard",
+    description:
+      "First-launch onboarding wizard. Use 'complete' to dismiss programmatically " +
+      "without driving 7 step interactions. Use 'go-to-step' to jump to a specific " +
+      "step (0-6) — this also OPENS the wizard if it is currently dismissed, which " +
+      "is how you reach first-run surfaces on a runner that auto-bypassed setup " +
+      "(any supervisor temp runner, unless spawned with " +
+      'extra_env: { QONTINUI_TEST_AUTO_LOGIN_EMAIL: "" }).',
+    scope: "global",
+    actions: [
+      {
+        id: "complete",
+        label: "Complete Setup",
+        description:
+          "Mark setup complete and dismiss the wizard. Persists via the same " +
+          "`complete_setup` Tauri command the user-driven 'Finish' button uses. " +
+          "Does NOT save process configs — a programmatic caller has picked none.",
+        handler: async () => {
+          await completeWizard();
+          return { success: true };
+        },
+      },
+      {
+        id: "go-to-step",
+        label: "Jump to Step",
+        description:
+          "Open the wizard at a specific step. Values 0-6 correspond to: " +
+          "Tier, Welcome, Projects, Processes, Dev Services, AI Provider, Claude Sessions. " +
+          "NON-DESTRUCTIVE: opening flips in-memory view state only; the persisted " +
+          "`setup_completed` setting is untouched.",
+        paramSchema: { step: "number (0-6)" },
+        handler: (params?: unknown) => {
+          const { step } = (params ?? {}) as { step?: number };
+          if (
+            typeof step !== "number" ||
+            !Number.isInteger(step) ||
+            step < 0 ||
+            step >= SETUP_WIZARD_STEPS.length
+          ) {
+            throw new Error(
+              `go-to-step requires { step: number } where 0 <= step < ${SETUP_WIZARD_STEPS.length}`,
+            );
+          }
+          setWizardStep(step);
+          setSetupCompleted(false);
+          return { success: true, step };
+        },
+      },
+    ],
+  });
 
   const { data: recentTaskRuns = [] } = useTaskRuns(1);
   const lastRun = recentTaskRuns.length > 0 ? recentTaskRuns[0] : null;
@@ -291,19 +372,17 @@ function AppContent() {
   // sync setState in useEffect to clear on tab-switch (set-state-in-effect).
   const editWorkflowId = activeTab === "unified-workflow-builder" ? rawEditWorkflowId : null;
 
+  // Actions only — deliberately NOT `useLogManager()`. Subscribing to log
+  // CONTENT here re-rendered the entire app (terminal tree included) on every
+  // AI/log line; the three panels that render logs subscribe themselves via
+  // `useLogData()` (plan `2026-07-28-runner-many-sessions-performance` §0 A2).
   const {
-    logs,
-    imageLogs,
-    aiOutputLogs,
     addLog,
-    addAiOutputLog,
     clearGeneralLogs,
     clearImageLogs,
     clearAiOutputLogs,
     copyLogs,
-    logCount,
-    imageLogCount,
-  } = useLogManager();
+  } = useLogActions();
 
   const {
     viewData: actionLogViewData,
@@ -316,7 +395,6 @@ function AppContent() {
 
   const uiState = useUIState();
   const modalState = useModalState();
-  const { logLevel, setLogLevel, filteredLogs } = useLogFilter(logs);
   const projectSelection = useProjectSelection();
   const projectLogs = useProjectLogs();
   const globalLogSources = useGlobalLogSources();
@@ -539,10 +617,30 @@ function AppContent() {
   // the old early returns were what let restore respawn `claude --resume`
   // over still-alive sessions after a blip.
   const presentation = resolveAuthGatePresentation(gate);
-  const authOverlay = presentation.mode === "overlay" ? presentation.surface : null;
+
+  // First-run setup wizard. Its mounting is a function of `setupCompleted ===
+  // false` and NOTHING ELSE — never of an auth verdict. It used to be a gate
+  // surface rendered from an early return, which made every transient auth
+  // flip destroy it: choosing a tier dispatches `runner-tier-changed` (tier
+  // re-read → `"loading"`) and, on a primary runner, flips `isTier2`, re-arming
+  // AuthProvider's mount probe (`authResolving` → `"loading"` for seconds).
+  // Each one replaced the wizard and remounted it fresh at step 0, so every
+  // click on the Tier step looked like it did nothing. Keep this condition
+  // free of auth inputs.
+  const wizardOpen = setupCompleted === false;
+
+  const authOverlay =
+    // While the wizard owns the viewport, auth has nothing to say to the
+    // operator: they cannot sign in from here, and covering the wizard with
+    // "Checking authentication…" reproduces the very symptom this fix is for
+    // (the wizard would survive underneath, but the screen would still blank).
+    // `resolveAuthGate` already returns `"app"` for a settled state while
+    // setup is incomplete; this additionally suppresses the transient
+    // `"loading"` overlay, which is ordered above every tier-derived branch.
+    wizardOpen ? null : presentation.mode === "overlay" ? presentation.surface : null;
 
   // Publish the overlay state for sibling trees rendered OUTSIDE AppContent
-  // (AppWithTutorials' fixed-position siblings, BuildRefreshBanner) so they
+  // (AppWithTutorials' fixed-position siblings, BackgroundTaskPill) so they
   // go `inert` in lockstep with the main tree — otherwise Tab from the
   // LoginScreen walks into their invisible controls.
   //
@@ -570,9 +668,7 @@ function AppContent() {
     overlayRef.current?.focus();
   }, [authOverlay]);
 
-  // The two surfaces that still REPLACE the tree rather than overlay it (see
-  // authGatePresentation.ts for why each one has nothing worth keeping
-  // mounted underneath):
+  // The ONE surface that still REPLACES the tree rather than overlaying it:
   //
   //   - `tier-unknown` — NO-DOWNGRADE hold. The runner tier could not be
   //     determined (settings.json unreadable, read retries exhausted). We must
@@ -582,17 +678,11 @@ function AppContent() {
   //     and explain; AuthProvider's useRunnerTier re-reads on
   //     `runner-tier-changed` (the Retry button), so the screen leaves on its
   //     own once settings.json is readable again.
-  //   - `wizard` — Runner-tier-decoupling Phase 1: the wizard runs FIRST (of
-  //     the tier-derived gates) so Tier 0/1 setup can happen without ever
-  //     hitting the login screen. It renders pre-setup, when no terminal tree
-  //     exists yet. The SetupWizard dispatches `runner-tier-changed` after
-  //     writing the tier; useRunnerTier re-reads and the appropriate gate
-  //     fires below.
+  //
+  // The setup wizard used to be the second one. It is not a gate surface any
+  // more — see `wizardOpen` below and the doc block in authGatePresentation.ts.
   if (presentation.mode === "early-return") {
-    if (presentation.surface === "tier-unknown") {
-      return <TierUnavailableScreen error={auth.tierError} />;
-    }
-    return <SetupWizard onComplete={() => setSetupCompleted(true)} />;
+    return <TierUnavailableScreen error={auth.tierError} />;
   }
   const loadingMessage = auth.devAutoLoginPending
     ? "Signing in..."
@@ -621,7 +711,7 @@ function AppContent() {
           out, yet stays mounted so terminal PTYs and the restore guard
           survive every auth flip.
         */}
-        <div className="contents" inert={authOverlay !== null}>
+        <div className="contents" inert={authOverlay !== null || wizardOpen}>
           <RunnerPageContext activeTab={activeTab} />
           <UIBridgeHooks
             activeTab={activeTab}
@@ -665,18 +755,6 @@ function AppContent() {
                   activeTab={activeTab}
                   setActiveTab={setActiveTab}
                   addLog={addLog}
-                  addAiOutputLog={addAiOutputLog}
-                  logs={logs}
-                  imageLogs={imageLogs}
-                  aiOutputLogs={aiOutputLogs}
-                  clearGeneralLogs={clearGeneralLogs}
-                  clearImageLogs={clearImageLogs}
-                  clearAiOutputLogs={clearAiOutputLogs}
-                  logCount={logCount}
-                  imageLogCount={imageLogCount}
-                  filteredLogs={filteredLogs}
-                  logLevel={logLevel}
-                  setLogLevel={setLogLevel}
                   uiState={uiState}
                   modalState={modalState}
                   actionLogViewData={actionLogViewData}
@@ -887,6 +965,22 @@ function AppContent() {
             with the tree now but stays covered on the loading/login surfaces,
             preserving its "never shown while signed out" behavior).
         */}
+        {/*
+          First-run setup wizard — a STABLE position in the returned tree, so
+          nothing but `setupCompleted` flipping can mount or unmount it. Same
+          full-viewport opaque-cover construction as the auth surfaces above
+          (the tree behind is `inert`), one z-layer below them so an auth
+          surface would still win if both were ever up at once.
+        */}
+        {wizardOpen && (
+          <div className="fixed inset-0 z-[19000] overflow-auto bg-background">
+            <SetupWizard
+              currentStep={wizardStep}
+              onStepChange={setWizardStep}
+              onComplete={completeWizard}
+            />
+          </div>
+        )}
         {authOverlay === "loading" && (
           <div
             ref={overlayRef}
@@ -969,8 +1063,8 @@ function AppWithTutorials() {
             OUTSIDE AppContent's inert wrapper, so they take the same inert
             guard via the overlay store — without it they stay in the tab
             order (invisible but Enter-activatable) while an auth overlay is
-            up. This also intentionally hides BuildRefreshBanner-class fixed
-            UI behind the login surface; the operator handles updates after
+            up. This also intentionally hides notification-class fixed UI
+            behind the login surface; the operator handles updates after
             signing in.
           */}
           <AuthOverlayInertBoundary>
@@ -1146,17 +1240,6 @@ function TauriEventNamesLoader() {
 export default function App() {
   return (
     <ApolloProvider client={getGraphQLClient()}>
-      {/*
-        BuildRefreshBanner sits outside UIBridgeProvider so it keeps watching
-        even if the bridge tears down (e.g. during navigation/error states).
-        Banner is hidden by default and only renders the toast when
-        `invoke('get_build_id')` reports a value different from the
-        `<meta name="build-id">` baked into the embedded index.html — i.e.
-        the runner exe was swapped while this webview stayed open.
-      */}
-      <AuthOverlayInertBoundary>
-        <BuildRefreshBanner />
-      </AuthOverlayInertBoundary>
       {/* Launch-time auto-update check: prompts + installs a newer signed
           release on startup. Renders nothing; fail-open. */}
       <AutoUpdateChecker />

@@ -407,6 +407,8 @@ impl InstanceManager {
 
         // Critical: remove CLAUDECODE env var so Claude CLI can start inside the instance
         cmd.env_remove("CLAUDECODE");
+        // Same rule, sibling marker — see `session::transport::claude_cli` docs.
+        cmd.env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV);
 
         // Create the process in a new process group (Windows)
         #[cfg(target_os = "windows")]

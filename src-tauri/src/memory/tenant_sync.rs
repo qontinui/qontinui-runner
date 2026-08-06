@@ -40,6 +40,21 @@
 //! returns to `pending`, so deferring it loses nothing. A write holds no lease
 //! — deferring it just queues local data forever.
 //!
+//! ## Anchors ride the same payload
+//!
+//! Plan `2026-07-29-memory-anchored-derived-records` (Phase 2, runner leg)
+//! adds [`TenantMemoryRecord::anchors`] — typed references to the ground truth
+//! a record asserts something about ([`MemoryAnchor`]). The emitter stamps the
+//! array into the outbox payload at enqueue time, so the drain carries it to
+//! `POST /api/v1/memory/records` with no further handling. It is ALWAYS
+//! written, `[]` when empty, because the backend column is `NOT NULL DEFAULT
+//! '[]'::jsonb`.
+//!
+//! The sibling column `anchor_state` is **writer-inaccessible**: it is derived
+//! by coord's anchor watcher and the backend answers `422` to any writer that
+//! supplies it. The runner therefore never sends it, and there is no field for
+//! it on the outbound type.
+//!
 //! ## Gates + posture
 //!
 //! 1. **Consent gate (hard)** — `Settings.cloud_sync_enabled` (default
@@ -94,6 +109,29 @@ pub const MAX_CONTENT_BYTES: usize = 32 * 1024;
 /// Server-side title cap (characters).
 pub const MAX_TITLE_CHARS: usize = 512;
 
+/// Server-side cap on anchors per record.
+///
+/// **Keep in lockstep with `MAX_ANCHORS_PER_RECORD` in
+/// `qontinui-web/backend/app/schemas/memory.py`.** Lowering it there without
+/// lowering it here costs whole batches — see [`sanitize_anchors`] for why.
+pub const MAX_ANCHORS: usize = 16;
+
+/// Per-field caps mirroring the `Field(max_length=…)` on each anchor variant
+/// in `qontinui-web/backend/app/schemas/memory.py`. Pydantic's `max_length`
+/// on a `str` counts CHARACTERS, so these are compared in `chars()`, the same
+/// unit as [`MAX_TITLE_CHARS`] — not bytes.
+pub const MAX_ANCHOR_REPO_CHARS: usize = 256;
+/// See [`MAX_ANCHOR_REPO_CHARS`].
+pub const MAX_ANCHOR_PATH_CHARS: usize = 1024;
+/// See [`MAX_ANCHOR_REPO_CHARS`].
+pub const MAX_ANCHOR_SHA_CHARS: usize = 64;
+/// See [`MAX_ANCHOR_REPO_CHARS`].
+pub const MAX_ANCHOR_REVISION_CHARS: usize = 256;
+/// See [`MAX_ANCHOR_REPO_CHARS`].
+pub const MAX_ANCHOR_OBJECT_CHARS: usize = 512;
+/// See [`MAX_ANCHOR_REPO_CHARS`].
+pub const MAX_ANCHOR_NAME_CHARS: usize = 256;
+
 /// Memory kinds accepted by the web API (mirrors the `MemoryKind` literal +
 /// the `coord_memory_records` CHECK constraint).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +159,129 @@ impl MemoryRecordKind {
     }
 }
 
+/// One typed reference to the ground truth a memory record asserts something
+/// about (plan `2026-07-29-memory-anchored-derived-records`, §3.1). Each
+/// variant is chosen because coord can already resolve it over a seam it
+/// operates today, so a record's truth can be invalidated by the artifact
+/// rather than decayed by the clock.
+///
+/// The `#[serde(tag = "type")]` shape is the wire contract: it must match the
+/// backend's Pydantic discriminated union on `MemoryRecordIn.anchors`
+/// byte-for-byte, e.g. `{"type":"pr","repo":"qontinui-runner","number":832}`.
+///
+/// **Five variants, deliberately — there is no `symbol`.** It was cut in
+/// vetting: coord's `symbol_claims` are coordination claims about who is
+/// *editing* a symbol, not a symbol index, and coord has no parser for any
+/// fleet language, so the resolver would be larger than the rest of the plan.
+/// A record wanting symbol granularity anchors the [`MemoryAnchor::Blob`].
+/// Add a variant when a record needs it, **with** a coord-side resolver.
+///
+/// `anchor_state` is deliberately absent and must stay absent: it is the
+/// watcher's derived roll-up (`none`/`fresh`/`moved`/`gone`), writer-
+/// inaccessible by design, and the backend answers `422` to any writer that
+/// supplies it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MemoryAnchor {
+    /// A file at a git blob sha. `GET /repos/{repo}/contents/{path}` returns
+    /// that sha in the same response, so resolving costs one existing call.
+    Blob {
+        repo: String,
+        path: String,
+        sha: String,
+    },
+    /// A pull request, resolved against coord's PR twin.
+    Pr { repo: String, number: u64 },
+    /// An alembic revision, resolved against `coord.migration_revisions`.
+    Migration { revision: String },
+    /// A schema object (`coord.memory_records.access_count`), resolved via the
+    /// `coord_query_schema_object` path.
+    Schema { object: String },
+    /// A catalogued feature flag, resolved against coord's flag registry.
+    Flag { name: String },
+}
+
+impl MemoryAnchor {
+    /// Why the backend would reject this anchor with a `422`, or `None` when
+    /// it is acceptable. Mirrors the per-field `Field(min_length=1,
+    /// max_length=…)` / `Field(ge=1)` constraints on the Pydantic union in
+    /// `qontinui-web/backend/app/schemas/memory.py`.
+    ///
+    /// Deliberately the SAME predicate as the server's, not a stricter one: a
+    /// runner that rejected more than the backend would silently withhold
+    /// anchors the store would have accepted.
+    fn rejection_reason(&self) -> Option<String> {
+        fn text(field: &str, value: &str, max: usize) -> Option<String> {
+            if value.is_empty() {
+                return Some(format!(
+                    "`{field}` is empty (backend requires min_length=1)"
+                ));
+            }
+            // Characters, not bytes — Pydantic's `max_length` counts code
+            // points, so a byte-length check would reject valid non-ASCII.
+            let n = value.chars().count();
+            if n > max {
+                return Some(format!("`{field}` is {n} chars (backend max {max})"));
+            }
+            None
+        }
+        match self {
+            MemoryAnchor::Blob { repo, path, sha } => text("repo", repo, MAX_ANCHOR_REPO_CHARS)
+                .or_else(|| text("path", path, MAX_ANCHOR_PATH_CHARS))
+                .or_else(|| text("sha", sha, MAX_ANCHOR_SHA_CHARS)),
+            MemoryAnchor::Pr { repo, number } => {
+                text("repo", repo, MAX_ANCHOR_REPO_CHARS).or_else(|| {
+                    (*number == 0).then(|| "`number` is 0 (backend requires ge=1)".to_string())
+                })
+            }
+            MemoryAnchor::Migration { revision } => {
+                text("revision", revision, MAX_ANCHOR_REVISION_CHARS)
+            }
+            MemoryAnchor::Schema { object } => text("object", object, MAX_ANCHOR_OBJECT_CHARS),
+            MemoryAnchor::Flag { name } => text("name", name, MAX_ANCHOR_NAME_CHARS),
+        }
+    }
+}
+
+/// Drop anchors the backend would reject, and clamp the array to
+/// [`MAX_ANCHORS`].
+///
+/// **A rejected anchor costs the whole BATCH, not just its record.** The
+/// backend answers a malformed record with `422`, and
+/// [`TenantMemorySync::flush_once`] classifies any non-429 4xx as permanent
+/// and ack-drops the entire batch (up to [`MAX_BATCH`] records) so the queue
+/// can move. So one empty string or a 17th anchor would silently destroy up to
+/// 100 unrelated memory records. Filtering here makes that unreachable.
+///
+/// Dropping beats clamping for the string fields: a truncated `sha` or `path`
+/// is a *wrong* anchor that the watcher would resolve to the wrong artifact
+/// (or mark `gone`), which is worse than an absent one. Only the array LENGTH
+/// is clamped. Every drop is logged at warn — losing an anchor is otherwise
+/// silent, and this is the only place it becomes visible.
+fn sanitize_anchors(anchors: Vec<MemoryAnchor>) -> Vec<MemoryAnchor> {
+    let mut kept: Vec<MemoryAnchor> = Vec::with_capacity(anchors.len().min(MAX_ANCHORS));
+    for anchor in anchors {
+        if let Some(reason) = anchor.rejection_reason() {
+            tracing::warn!(
+                %reason,
+                anchor = ?anchor,
+                "tenant_sync: dropping an invalid anchor — shipping it would 422 the \
+                 whole batch, which the drain ack-drops"
+            );
+            continue;
+        }
+        if kept.len() >= MAX_ANCHORS {
+            tracing::warn!(
+                cap = MAX_ANCHORS,
+                "tenant_sync: anchor list exceeds the server cap — dropping the overflow"
+            );
+            break;
+        }
+        kept.push(anchor);
+    }
+    kept
+}
+
 /// One tenant-memory record as produced by a local writer. Scope defaults
 /// server-side to `tenant`; the runner only writes tenant-scoped copies.
 #[derive(Debug, Clone)]
@@ -133,6 +294,12 @@ pub struct TenantMemoryRecord {
     /// Provenance JSON (`{device_id?, task_run_id?, repo?, …}`). The emitter
     /// stamps `device_id` automatically when absent.
     pub source: JsonValue,
+    /// Ground truth this record's truth is owned by. Empty (the default) means
+    /// an ordinary narrative record that keeps today's time-decay lifecycle;
+    /// a non-empty array makes the record decay-exempt and invalidated by the
+    /// coord anchor watcher instead. Always serialized — the backend column is
+    /// `NOT NULL DEFAULT '[]'::jsonb`, so this ships `[]`, never `null`.
+    pub anchors: Vec<MemoryAnchor>,
 }
 
 impl TenantMemoryRecord {
@@ -147,6 +314,7 @@ impl TenantMemoryRecord {
             kind,
             importance: 0.5,
             source: json!({}),
+            anchors: Vec::new(),
         }
     }
 
@@ -157,6 +325,18 @@ impl TenantMemoryRecord {
 
     pub fn with_source(mut self, source: JsonValue) -> Self {
         self.source = source;
+        self
+    }
+
+    /// Bind this record to the ground truth it asserts something about. See
+    /// [`MemoryAnchor`] for why the vocabulary is closed at five types.
+    ///
+    /// Infallible, matching the module's posture that a memory write never
+    /// fails its caller: anchors the backend would reject are dropped here
+    /// (with a warn) rather than surfaced as an error, because the alternative
+    /// — shipping them — costs the whole batch. See [`sanitize_anchors`].
+    pub fn with_anchors(mut self, anchors: Vec<MemoryAnchor>) -> Self {
+        self.anchors = sanitize_anchors(anchors);
         self
     }
 }
@@ -284,6 +464,17 @@ impl TenantMemorySync {
             "kind": record.kind.as_str(),
             "importance": record.importance.clamp(0.0, 1.0),
             "source": source,
+            // Always present, `[]` when empty — the backend column is
+            // `NOT NULL DEFAULT '[]'::jsonb` and a `null` would be rejected.
+            // Anchors are structural references, never prose, so they bypass
+            // the redaction sweep that title/content go through.
+            //
+            // Re-sanitized here, not just in `with_anchors`: `anchors` is a
+            // pub field like every other on the record, so a writer can assign
+            // it directly and bypass the builder. This is the last gate before
+            // the durable outbox write, so it is the one that has to hold.
+            // Idempotent, so paying it twice costs nothing.
+            "anchors": sanitize_anchors(record.anchors),
         });
 
         if let Err(e) = self.outbox.record(
@@ -886,6 +1077,365 @@ mod tests {
         assert_eq!(p["kind"], "observation");
     }
 
+    /// The anchor vocabulary is a WIRE CONTRACT with the backend's Pydantic
+    /// discriminated union (`MemoryRecordIn.anchors`). Pin the exact JSON of
+    /// every variant — a serde attribute drift here surfaces as a `422` batch
+    /// drop in production, which the drain ack-drops silently.
+    #[test]
+    fn anchor_variants_serialize_to_the_backend_discriminated_union() {
+        let cases: Vec<(MemoryAnchor, JsonValue)> = vec![
+            (
+                MemoryAnchor::Blob {
+                    repo: "qontinui-web".into(),
+                    path: "backend/app/services/memory_store.py".into(),
+                    sha: "e3b0c44298fc1c149afbf4c8996fb924".into(),
+                },
+                json!({
+                    "type": "blob",
+                    "repo": "qontinui-web",
+                    "path": "backend/app/services/memory_store.py",
+                    "sha": "e3b0c44298fc1c149afbf4c8996fb924",
+                }),
+            ),
+            (
+                MemoryAnchor::Pr {
+                    repo: "qontinui-runner".into(),
+                    number: 832,
+                },
+                json!({"type": "pr", "repo": "qontinui-runner", "number": 832}),
+            ),
+            (
+                MemoryAnchor::Migration {
+                    revision: "coord_memory_links".into(),
+                },
+                json!({"type": "migration", "revision": "coord_memory_links"}),
+            ),
+            (
+                MemoryAnchor::Schema {
+                    object: "coord.memory_records.access_count".into(),
+                },
+                json!({"type": "schema", "object": "coord.memory_records.access_count"}),
+            ),
+            (
+                MemoryAnchor::Flag {
+                    name: "merge_rollout".into(),
+                },
+                json!({"type": "flag", "name": "merge_rollout"}),
+            ),
+        ];
+        assert_eq!(
+            cases.len(),
+            5,
+            "the vocabulary is five types — `symbol` was cut in vetting because coord \
+             has no symbol index; a sixth type needs a coord-side resolver, not just \
+             a variant here"
+        );
+        for (anchor, want) in cases {
+            assert_eq!(
+                serde_json::to_value(&anchor).unwrap(),
+                want,
+                "wire shape drift for {anchor:?}"
+            );
+        }
+
+        // `anchor_state` is the watcher's derived roll-up — the backend 422s a
+        // writer that supplies it, so it must appear nowhere on this type.
+        let all = json!(vec![MemoryAnchor::Flag {
+            name: "merge_rollout".into()
+        }])
+        .to_string();
+        assert!(
+            !all.contains("anchor_state"),
+            "the runner must never send anchor_state: {all}"
+        );
+
+        // NOT `null` — the backend column is `NOT NULL DEFAULT '[]'::jsonb`.
+        let empty: Vec<MemoryAnchor> = Vec::new();
+        assert_eq!(serde_json::to_value(&empty).unwrap(), json!([]));
+    }
+
+    /// A valid anchor must survive validation completely untouched — the whole
+    /// point of dropping rather than clamping is that what ships is either the
+    /// author's exact anchor or nothing.
+    #[test]
+    fn valid_anchors_round_trip_through_validation_unchanged() {
+        let valid = vec![
+            MemoryAnchor::Blob {
+                repo: "qontinui-web".into(),
+                path: "backend/app/services/memory_store.py".into(),
+                sha: "e3b0c44298fc1c149afbf4c8996fb924".into(),
+            },
+            MemoryAnchor::Pr {
+                repo: "qontinui-runner".into(),
+                number: 832,
+            },
+            MemoryAnchor::Migration {
+                revision: "coord_memory_links".into(),
+            },
+            MemoryAnchor::Schema {
+                object: "coord.memory_records.access_count".into(),
+            },
+            MemoryAnchor::Flag {
+                name: "merge_rollout".into(),
+            },
+        ];
+        let record = TenantMemoryRecord::new("t", "c", MemoryRecordKind::Reference)
+            .with_anchors(valid.clone());
+        assert_eq!(
+            record.anchors, valid,
+            "validation must not mutate or drop a valid anchor set"
+        );
+        // …and still serializes to the exact wire shape pinned above.
+        assert_eq!(
+            serde_json::to_value(&record.anchors).unwrap()[1],
+            json!({"type": "pr", "repo": "qontinui-runner", "number": 832})
+        );
+
+        // Boundary values are VALID, not rejected: exactly at each cap.
+        let at_cap = vec![
+            MemoryAnchor::Blob {
+                repo: "r".repeat(MAX_ANCHOR_REPO_CHARS),
+                path: "p".repeat(MAX_ANCHOR_PATH_CHARS),
+                sha: "s".repeat(MAX_ANCHOR_SHA_CHARS),
+            },
+            MemoryAnchor::Pr {
+                repo: "r".into(),
+                number: 1,
+            },
+            MemoryAnchor::Schema {
+                object: "o".repeat(MAX_ANCHOR_OBJECT_CHARS),
+            },
+        ];
+        assert_eq!(
+            sanitize_anchors(at_cap.clone()),
+            at_cap,
+            "the caps are inclusive — an anchor exactly at the limit is valid"
+        );
+    }
+
+    /// Every constraint the backend enforces, enforced here FIRST. This is not
+    /// a validation nit: a `422` makes `flush_once` ack-drop the whole batch,
+    /// so one bad anchor would silently destroy up to `MAX_BATCH` unrelated
+    /// records on the memory write path.
+    #[test]
+    fn invalid_anchors_are_dropped_before_they_can_422_the_batch() {
+        let ok = MemoryAnchor::Flag {
+            name: "merge_rollout".into(),
+        };
+        let rejected = vec![
+            (
+                "empty blob repo",
+                MemoryAnchor::Blob {
+                    repo: String::new(),
+                    path: "a/b.py".into(),
+                    sha: "abc".into(),
+                },
+            ),
+            (
+                "empty blob path",
+                MemoryAnchor::Blob {
+                    repo: "qontinui-web".into(),
+                    path: String::new(),
+                    sha: "abc".into(),
+                },
+            ),
+            (
+                "empty blob sha",
+                MemoryAnchor::Blob {
+                    repo: "qontinui-web".into(),
+                    path: "a/b.py".into(),
+                    sha: String::new(),
+                },
+            ),
+            (
+                "sha over 64 chars",
+                MemoryAnchor::Blob {
+                    repo: "qontinui-web".into(),
+                    path: "a/b.py".into(),
+                    sha: "s".repeat(MAX_ANCHOR_SHA_CHARS + 1),
+                },
+            ),
+            (
+                "path over cap",
+                MemoryAnchor::Blob {
+                    repo: "qontinui-web".into(),
+                    path: "p".repeat(MAX_ANCHOR_PATH_CHARS + 1),
+                    sha: "abc".into(),
+                },
+            ),
+            (
+                "repo over cap",
+                MemoryAnchor::Blob {
+                    repo: "r".repeat(MAX_ANCHOR_REPO_CHARS + 1),
+                    path: "a/b.py".into(),
+                    sha: "abc".into(),
+                },
+            ),
+            (
+                "empty pr repo",
+                MemoryAnchor::Pr {
+                    repo: String::new(),
+                    number: 832,
+                },
+            ),
+            (
+                "pr number 0",
+                MemoryAnchor::Pr {
+                    repo: "qontinui-runner".into(),
+                    number: 0,
+                },
+            ),
+            (
+                "empty revision",
+                MemoryAnchor::Migration {
+                    revision: String::new(),
+                },
+            ),
+            (
+                "revision over cap",
+                MemoryAnchor::Migration {
+                    revision: "r".repeat(MAX_ANCHOR_REVISION_CHARS + 1),
+                },
+            ),
+            (
+                "empty object",
+                MemoryAnchor::Schema {
+                    object: String::new(),
+                },
+            ),
+            (
+                "object over cap",
+                MemoryAnchor::Schema {
+                    object: "o".repeat(MAX_ANCHOR_OBJECT_CHARS + 1),
+                },
+            ),
+            (
+                "empty name",
+                MemoryAnchor::Flag {
+                    name: String::new(),
+                },
+            ),
+            (
+                "name over cap",
+                MemoryAnchor::Flag {
+                    name: "n".repeat(MAX_ANCHOR_NAME_CHARS + 1),
+                },
+            ),
+        ];
+        for (label, bad) in rejected {
+            assert!(
+                bad.rejection_reason().is_some(),
+                "{label} must be rejected: {bad:?}"
+            );
+            // The valid neighbour survives — one bad anchor drops itself, not
+            // the record's other anchors.
+            assert_eq!(
+                sanitize_anchors(vec![bad, ok.clone()]),
+                vec![ok.clone()],
+                "{label}: only the invalid anchor may be dropped"
+            );
+        }
+    }
+
+    /// The array cap is clamped, not rejected — mirrors
+    /// `MAX_ANCHORS_PER_RECORD` in `qontinui-web/backend/app/schemas/memory.py`.
+    #[test]
+    fn anchor_list_is_clamped_to_the_server_cap() {
+        assert_eq!(MAX_ANCHORS, 16, "must track MAX_ANCHORS_PER_RECORD");
+        let many: Vec<MemoryAnchor> = (0..MAX_ANCHORS + 4)
+            .map(|i| MemoryAnchor::Flag {
+                name: format!("flag_{i}"),
+            })
+            .collect();
+        let kept = sanitize_anchors(many.clone());
+        assert_eq!(kept.len(), MAX_ANCHORS, "a 17th anchor would 422 the batch");
+        assert_eq!(
+            kept.as_slice(),
+            &many[..MAX_ANCHORS],
+            "the clamp keeps the FIRST anchors in order, not an arbitrary subset"
+        );
+
+        // Invalid entries are dropped before the cap is counted, so a full 16
+        // valid anchors still all make it in when an earlier one was rejected.
+        let mut mixed = vec![MemoryAnchor::Flag {
+            name: String::new(),
+        }];
+        mixed.extend(many.iter().take(MAX_ANCHORS).cloned());
+        assert_eq!(sanitize_anchors(mixed).len(), MAX_ANCHORS);
+    }
+
+    /// `anchors` is a `pub` field, so a writer can assign it directly and skip
+    /// `with_anchors`. `enqueue` is the last gate before the durable write, so
+    /// it must re-validate — otherwise the builder is only a suggestion.
+    #[test]
+    fn enqueue_revalidates_anchors_assigned_around_the_builder() {
+        let dir = tempdir().unwrap();
+        let (sync, outbox) = make_sync(dir.path(), true, Some("test.jwt"));
+        let mut smuggled = record("bypass", "assigned the field directly");
+        smuggled.anchors = vec![
+            MemoryAnchor::Pr {
+                repo: "qontinui-runner".into(),
+                number: 0,
+            },
+            MemoryAnchor::Flag {
+                name: "merge_rollout".into(),
+            },
+        ];
+        sync.enqueue(smuggled);
+
+        let pending = outbox.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].payload["anchors"],
+            json!([{"type": "flag", "name": "merge_rollout"}]),
+            "an anchor that bypassed the builder must still be filtered before \
+             it reaches the outbox"
+        );
+    }
+
+    /// The enqueued payload is what the drain ships verbatim, so the anchors
+    /// must be stamped at enqueue time — and defaulted to `[]`, never absent
+    /// or `null`, for every existing writer that sets none.
+    #[test]
+    fn enqueue_carries_anchors_and_defaults_to_an_empty_array() {
+        let dir = tempdir().unwrap();
+        let (sync, outbox) = make_sync(dir.path(), true, Some("test.jwt"));
+        sync.enqueue(record("plain", "no anchors here"));
+        sync.enqueue(
+            record("anchored", "asserts something about a file").with_anchors(vec![
+                MemoryAnchor::Blob {
+                    repo: "qontinui-runner".into(),
+                    path: "src-tauri/src/memory/tenant_sync.rs".into(),
+                    sha: "deadbeef".into(),
+                },
+                MemoryAnchor::Flag {
+                    name: "merge_rollout".into(),
+                },
+            ]),
+        );
+
+        let pending = outbox.pending().unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(
+            pending[0].payload["anchors"],
+            json!([]),
+            "an anchorless writer must ship `[]`, not null and not absent"
+        );
+        assert_eq!(
+            pending[1].payload["anchors"],
+            json!([
+                {
+                    "type": "blob",
+                    "repo": "qontinui-runner",
+                    "path": "src-tauri/src/memory/tenant_sync.rs",
+                    "sha": "deadbeef",
+                },
+                {"type": "flag", "name": "merge_rollout"},
+            ]),
+            "anchors must reach the outbox payload in order and unmodified"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn flush_batches_pending_records_with_bearer() {
         let dir = tempdir().unwrap();
@@ -910,6 +1460,11 @@ mod tests {
             assert_eq!(r["kind"], "episode");
             assert!(r["importance"].is_number());
             assert_eq!(r["source"]["task_run_id"], "tr-1");
+            assert_eq!(
+                r["anchors"],
+                json!([]),
+                "anchors must survive the drain — the column is NOT NULL"
+            );
         }
         assert_eq!(g.auth_headers[0].as_deref(), Some("Bearer test.jwt"));
         drop(g);

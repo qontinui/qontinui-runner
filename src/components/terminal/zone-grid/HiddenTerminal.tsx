@@ -8,6 +8,7 @@ import type { TerminalTab } from "../useTerminalManager";
 
 export function HiddenTerminal({
   tab,
+  pageId,
   terminalRef,
   onExit,
   onFirstInput,
@@ -17,6 +18,12 @@ export function HiddenTerminal({
   onTitleChange,
 }: {
   tab: TerminalTab;
+  /**
+   * Owning terminal page — feeds `TerminalInstance`'s stdin ownership gate.
+   * Required, like the prop it forwards: a hidden tab that loses `pageId` is
+   * silently stdin-dead in a page-bound pop-out with nothing to catch it.
+   */
+  pageId: string;
   terminalRef: RefObject<TerminalInstanceHandle | null> | undefined;
   onExit: (terminalId: string, exitCode: number | null) => void;
   onFirstInput: (terminalId: string, input: string) => void;
@@ -30,6 +37,7 @@ export function HiddenTerminal({
       <TerminalInstance
         ref={terminalRef}
         terminalId={tab.id}
+        pageId={pageId}
         visible={false}
         isReconnecting={tab.isReconnecting}
         onReconnected={() => onReconnected(tab.id)}

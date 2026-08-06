@@ -3,7 +3,7 @@
 //! Provides optional OTLP trace export via a tracing-subscriber layer.
 //! When disabled (the default), no collector connection is attempted and the
 //! runner behaves exactly as before.  When enabled, traces are exported over
-//! gRPC (tonic) to the configured OTLP endpoint.
+//! HTTP (reqwest) to the configured OTLP endpoint.
 //!
 //! # Graceful degradation
 //! If initialisation fails (e.g. the collector is unreachable) the runner
@@ -68,9 +68,9 @@ fn default_service_name() -> String {
 // Guard – ensures the provider is shut down when the application exits
 // ---------------------------------------------------------------------------
 
-/// Keeps the OTel [`TracerProvider`] alive and shuts it down on drop.
+/// Keeps the OTel [`SdkTracerProvider`] alive and shuts it down on drop.
 pub struct OtelGuard {
-    _provider: Option<opentelemetry_sdk::trace::TracerProvider>,
+    _provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
 }
 
 impl Drop for OtelGuard {
@@ -135,7 +135,7 @@ fn try_init_otel(
         OtelGuard,
         tracing_opentelemetry::OpenTelemetryLayer<
             tracing_subscriber::Registry,
-            opentelemetry_sdk::trace::Tracer,
+            opentelemetry_sdk::trace::SdkTracer,
         >,
     ),
     Box<dyn std::error::Error>,
@@ -143,7 +143,7 @@ fn try_init_otel(
     use opentelemetry::trace::TracerProvider;
     use opentelemetry::KeyValue;
     use opentelemetry_otlp::WithExportConfig;
-    use opentelemetry_sdk::trace::{self as sdktrace, Sampler};
+    use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
     use opentelemetry_sdk::Resource;
 
     // Build the OTLP span exporter (HTTP via reqwest)
@@ -161,14 +161,23 @@ fn try_init_otel(
         Sampler::TraceIdRatioBased(config.sampling_rate)
     };
 
-    // Build the TracerProvider
-    let provider = sdktrace::TracerProvider::builder()
-        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+    // Build the TracerProvider.
+    //
+    // Since 0.28 the batch span processor owns its own background thread, so
+    // `with_batch_exporter` no longer takes a runtime argument (and the
+    // `rt-tokio` feature is gone). `Resource` is likewise builder-constructed
+    // now rather than `Resource::new(vec![..])`.
+    let provider = SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
         .with_sampler(sampler)
-        .with_resource(Resource::new(vec![
-            KeyValue::new("service.name", config.service_name.clone()),
-            KeyValue::new("service.version", env!("CARGO_PKG_VERSION").to_string()),
-        ]))
+        .with_resource(
+            Resource::builder()
+                .with_attributes(vec![
+                    KeyValue::new("service.name", config.service_name.clone()),
+                    KeyValue::new("service.version", env!("CARGO_PKG_VERSION").to_string()),
+                ])
+                .build(),
+        )
         .build();
 
     let tracer = provider.tracer("qontinui-runner");

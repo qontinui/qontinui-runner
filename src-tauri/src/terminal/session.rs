@@ -77,11 +77,19 @@ fn tee_into_scrollback(
     data: &[u8],
 ) -> u64 {
     if let Ok(mut sb) = scrollback.lock() {
-        for &byte in data {
-            if sb.len() >= SCROLLBACK_CAPACITY {
-                sb.pop_front();
+        // Slice append, not byte-by-byte: `extend` copies the run in one go and
+        // a single up-front `drain` makes room, instead of a bounds check +
+        // `pop_front` per byte on every chunk of every session.
+        if data.len() >= SCROLLBACK_CAPACITY {
+            // The chunk alone overflows the ring — keep only its tail.
+            sb.clear();
+            sb.extend(&data[data.len() - SCROLLBACK_CAPACITY..]);
+        } else {
+            let overflow = (sb.len() + data.len()).saturating_sub(SCROLLBACK_CAPACITY);
+            if overflow > 0 {
+                sb.drain(..overflow);
             }
-            sb.push_back(byte);
+            sb.extend(data);
         }
         total_produced.fetch_add(data.len() as u64, Ordering::Relaxed)
     } else {
@@ -89,6 +97,37 @@ fn tee_into_scrollback(
         // monotonic counter truthful even though buffering failed.
         total_produced.fetch_add(data.len() as u64, Ordering::Relaxed)
     }
+}
+
+/// Feed `data` through the VT parser into the session's cell grid, then bump
+/// the session's grid-generation counter.
+///
+/// THE ORDER IS LOAD-BEARING. The counter moves only AFTER the grid lock has
+/// been released, so any observer that reads generation `g` and *then* takes
+/// the grid lock is guaranteed to render a screen that has already absorbed
+/// every byte counted up to `g`. Bumping before (or inside) the advance — which
+/// is what gating on `total_bytes_produced` effectively did, since that counter
+/// moves in `tee_into_scrollback` well before this call — lets a scanner record
+/// a watermark for bytes the grid has not yet drawn, and then skip forever once
+/// the terminal goes idle and the counter stops moving. See the `terminal::scan_gate` module docs.
+///
+/// The counter is bumped even when the grid lock is poisoned: an extra scan is
+/// always safe, a missed one is not.
+///
+/// Shared with the scan-gate regression test so both drive the identical path.
+fn advance_grid(
+    grid: &Arc<Mutex<Grid>>,
+    grid_generation: &Arc<AtomicU64>,
+    parser: &mut vte::Parser,
+    data: &[u8],
+) {
+    if let Ok(mut g) = grid.lock() {
+        let mut perf = GridPerformer::new(&mut g);
+        parser.advance(&mut perf, data);
+    }
+    // Release: pairs with the Acquire load in `TerminalSession::grid_generation`
+    // so observing this value implies the grid mutation above is visible.
+    grid_generation.fetch_add(1, Ordering::Release);
 }
 
 /// Flow-control watermarks (bytes), mirroring VS Code's `FlowControlConstants`
@@ -387,6 +426,12 @@ pub struct TerminalSession {
     scrollback_buffer: Arc<Mutex<VecDeque<u8>>>,
     /// Monotonic counter of all bytes ever produced by the PTY.
     total_bytes_produced: Arc<AtomicU64>,
+    /// Monotonic counter of grid mutations, bumped AFTER the mutation is
+    /// visible (see [`advance_grid`] and [`Self::resize`]). This — not
+    /// `total_bytes_produced` — is what the periodic grid scanners gate on;
+    /// see the `terminal::scan_gate` module docs for why the ordering is
+    /// load-bearing.
+    grid_generation: Arc<AtomicU64>,
     /// Unix timestamp in milliseconds when the session was created.
     created_at: u64,
     /// Broadcast channel for HTTP/SSE subscribers to receive base64-encoded output chunks.
@@ -498,6 +543,14 @@ impl TerminalSession {
 
         // Remove CLAUDECODE env var so Claude CLI works inside the terminal
         cmd.env_remove("CLAUDECODE");
+        // Same reason, same class of marker: CLAUDE_CODE_CHILD_SESSION says
+        // "you are a nested session". A PTY tab is a TOP-LEVEL session, but the
+        // runner inherits the marker from whatever launched it (typically the
+        // supervisor, which inherits it from a Claude Code session) and would
+        // otherwise pass it to every `claude` typed into a pane. Defense in
+        // depth — the supervisor strips it at the runner spawn, this covers a
+        // runner started by any other means.
+        cmd.env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV);
 
         // Set TERM for proper color/capability support.
         // xterm.js is a full xterm-compatible terminal, so use xterm-256color on all
@@ -568,6 +621,12 @@ impl TerminalSession {
         // set on the child env below. `get_effective_config_dir` runs only when
         // no caller pin — identical to the prior behavior.
         let effective_claude_config_dir: Option<String> = caller_config_dir_value.or_else(|| {
+            // Phase 0 instrumentation: this is B3/B5 — an uncached
+            // `settings.json` read + double parse, plus a possible INLINE
+            // blocking OAuth refresh POST inside `get_effective_config_dir`.
+            let _span =
+                tracing::debug_span!("terminal_spawn.resolve_config_dir", terminal_id = %id)
+                    .entered();
             let ai_settings = crate::settings::get_ai_settings();
             crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli)
         });
@@ -581,15 +640,23 @@ impl TerminalSession {
         // spawn (zero transcript race — the §3b determinism mechanism). Runs
         // AFTER caller `extra_env` so the identity dir wins on PATH. Fail-open:
         // any failure injects nothing and the terminal still spawns.
-        Self::apply_identity_seam(
-            &mut cmd,
-            &id,
-            &app_handle,
-            &cwd,
-            &title,
-            &page_id,
-            effective_claude_config_dir.clone(),
-        );
+        {
+            // Phase 0 instrumentation: the identity seam is the largest single
+            // block of synchronous I/O on the spawn path (hook files, coord-mcp
+            // provisioning, shim materialization, the lifecycle-store record).
+            // The inner segments carry their own child spans.
+            let _span =
+                tracing::debug_span!("terminal_spawn.identity_seam", terminal_id = %id).entered();
+            Self::apply_identity_seam(
+                &mut cmd,
+                &id,
+                &app_handle,
+                &cwd,
+                &title,
+                &page_id,
+                effective_claude_config_dir.clone(),
+            );
+        }
 
         // ---- Install-interception PATH-shim seam (plan §4 Phase 1) ----------
         // Behind the master flag `QONTINUI_INSTALL_INTERCEPT_ENABLED` (default
@@ -650,6 +717,7 @@ impl TerminalSession {
         let emission_skipped = Arc::new(AtomicBool::new(false));
         let scrollback_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(SCROLLBACK_CAPACITY)));
         let total_bytes_produced = Arc::new(AtomicU64::new(0));
+        let grid_generation = Arc::new(AtomicU64::new(0));
         let grid = Arc::new(Mutex::new(Grid::new(cols, rows)));
         let (output_tx, _) = broadcast::channel::<String>(256);
         let created_at = SystemTime::now()
@@ -683,6 +751,7 @@ impl TerminalSession {
         let reader_total_bytes = total_bytes_produced.clone();
         let reader_output_tx = output_tx.clone();
         let reader_grid = grid.clone();
+        let reader_grid_generation = grid_generation.clone();
         let reader_osc_title_tx = first_osc_title_tx.clone();
         let reader_handle = thread::Builder::new()
             .name(format!("terminal-reader-{}", &id))
@@ -729,29 +798,58 @@ impl TerminalSession {
                 // flush passes `gated: false` — the dying terminal's final
                 // frame is bounded (≤ SYNC_FLUSH_BYTE_CAP) and there may be
                 // no future chunk to reveal a gap after it.
+                //
+                // Consumer gating (perf): each of the three legs is checked
+                // BEFORE the shared base64 encode, so a chunk nobody can
+                // receive — webview emission paused by flow control, no SSE
+                // subscriber, no WS relay client — costs zero encoding and
+                // zero allocation. Previously the encode AND a full `String`
+                // clone for the SSE send ran unconditionally on every chunk of
+                // every session. The flow-control decision itself is unchanged;
+                // it is only evaluated earlier in the same call.
                 let emit_impl = |payload: &[u8], offset: u64, gated: bool| {
-                    let encoded = STANDARD.encode(payload);
-                    // Broadcast to HTTP/SSE subscribers (ignore if no receivers)
-                    let _ = reader_output_tx.send(encoded.clone());
-                    // Broadcast to backend relay for remote mobile access
-                    crate::event_system::broadcast_ws_notification(
-                        &reader_app,
-                        "terminal-output",
-                        &serde_json::json!({
-                            "terminal_id": &reader_id,
-                            "data": &encoded,
-                        }),
-                    );
-
                     // Webview delivery is the only backpressure-gated leg.
-                    if gated {
+                    let to_webview = if gated {
                         let sent = reader_bytes_sent.load(Ordering::Relaxed);
                         let acked = reader_bytes_acked.load(Ordering::Relaxed);
                         let gap = sent.saturating_sub(acked);
-                        if !emission_gate.borrow_mut().should_emit(gap) {
+                        if emission_gate.borrow_mut().should_emit(gap) {
+                            true
+                        } else {
                             reader_emission_skipped.store(true, Ordering::Relaxed);
-                            return;
+                            false
                         }
+                    } else {
+                        true
+                    };
+                    let to_sse = reader_output_tx.receiver_count() > 0;
+                    let to_ws = crate::event_system::ws_notification_has_receivers(&reader_app);
+                    if !to_webview && !to_sse && !to_ws {
+                        return;
+                    }
+
+                    let encoded = STANDARD.encode(payload);
+
+                    // Broadcast to HTTP/SSE subscribers (skipped when none —
+                    // the `send` would drop the value anyway, and the clone is
+                    // a full copy of the base64 payload).
+                    if to_sse {
+                        let _ = reader_output_tx.send(encoded.clone());
+                    }
+                    // Broadcast to backend relay for remote mobile access
+                    if to_ws {
+                        crate::event_system::broadcast_ws_notification(
+                            &reader_app,
+                            "terminal-output",
+                            &serde_json::json!({
+                                "terminal_id": &reader_id,
+                                "data": &encoded,
+                            }),
+                        );
+                    }
+
+                    if !to_webview {
+                        return;
                     }
                     let event = TerminalOutputWire {
                         terminal_id: &reader_id,
@@ -812,10 +910,12 @@ impl TerminalSession {
                                 .ok()
                                 .map(|g| g.title().is_none())
                                 .unwrap_or(false);
-                            if let Ok(mut g) = reader_grid.lock() {
-                                let mut perf = GridPerformer::new(&mut g);
-                                parser.advance(&mut perf, &data);
-                            }
+                            advance_grid(
+                                &reader_grid,
+                                &reader_grid_generation,
+                                &mut parser,
+                                &data,
+                            );
                             if title_was_none {
                                 let title_is_now_some = reader_grid
                                     .lock()
@@ -1023,6 +1123,7 @@ impl TerminalSession {
             emission_skipped,
             scrollback_buffer,
             total_bytes_produced,
+            grid_generation,
             created_at,
             output_tx,
             grid,
@@ -1415,7 +1516,14 @@ impl TerminalSession {
         // (identity still rides the spawn-time --session-id pin; only the
         // confirmation hook is absent).
         let hook_dir = crate::session::claude_hook::session_restore_dir();
-        match crate::session::claude_hook::materialize(&hook_dir) {
+        // Phase 0 instrumentation: 4 hook files + 3 `set_executable` calls per
+        // spawn, with no content/mtime skip.
+        let hook_span =
+            tracing::debug_span!("terminal_spawn.claude_hook_materialize", terminal_id = %terminal_id)
+                .entered();
+        let hook_result = crate::session::claude_hook::materialize(&hook_dir);
+        drop(hook_span);
+        match hook_result {
             Some(settings_path) => {
                 cmd.env(
                     crate::session::claude_hook::CLAUDE_SETTINGS_ENV,
@@ -1457,28 +1565,43 @@ impl TerminalSession {
         // self-identification resolvable — the proxy maps `nonce → terminal_id
         // → the open lifecycle record → claude_session_id`, all 1:1, where the
         // workdir leg is 1:N and could only ever guess.
-        if crate::coord_mcp::workdir_declares_coord_mcp(cwd) {
-            info!(
-                terminal_id = %terminal_id,
-                "coord-mcp: cwd already declares coord-mcp — skipping --mcp-config injection"
-            );
-        } else if let Some(cfg_path) =
-            crate::coord_mcp::provision_coord_mcp_config_file(cwd, Some(terminal_id))
         {
-            cmd.env(
-                crate::coord_mcp::MCP_CONFIG_ENV,
-                cfg_path.to_string_lossy().as_ref(),
-            );
-            info!(
-                terminal_id = %terminal_id,
-                path = %cfg_path.display(),
-                "coord-mcp: QONTINUI_MCP_CONFIG injected for universal --mcp-config delivery"
-            );
+            // Phase 0 instrumentation: `.mcp.json` read+parse and, on the
+            // provisioning branch, a nonce registration that re-encrypts the
+            // WHOLE secure-storage token store (B2).
+            let _span =
+                tracing::debug_span!("terminal_spawn.coord_mcp_provision", terminal_id = %terminal_id)
+                    .entered();
+            if crate::coord_mcp::workdir_declares_coord_mcp(cwd) {
+                info!(
+                    terminal_id = %terminal_id,
+                    "coord-mcp: cwd already declares coord-mcp — skipping --mcp-config injection"
+                );
+            } else if let Some(cfg_path) =
+                crate::coord_mcp::provision_coord_mcp_config_file(cwd, Some(terminal_id))
+            {
+                cmd.env(
+                    crate::coord_mcp::MCP_CONFIG_ENV,
+                    cfg_path.to_string_lossy().as_ref(),
+                );
+                info!(
+                    terminal_id = %terminal_id,
+                    path = %cfg_path.display(),
+                    "coord-mcp: QONTINUI_MCP_CONFIG injected for universal --mcp-config delivery"
+                );
+            }
         }
 
         // 3. Materialize the always-on identity shims + prepend their dir.
+        // Phase 0 instrumentation: 4 rendered scripts + 2 exe copies + a
+        // hardlink, per terminal, with no caching (B2).
         let base_dir = std::env::temp_dir();
-        match shim_materializer::materialize_identity(&base_dir, terminal_id) {
+        let shim_span =
+            tracing::debug_span!("terminal_spawn.shim_materialize", terminal_id = %terminal_id)
+                .entered();
+        let identity = shim_materializer::materialize_identity(&base_dir, terminal_id);
+        drop(shim_span);
+        match identity {
             Some(identity_dir) => {
                 let current_path = std::env::var("PATH").ok();
                 let new_path =
@@ -1509,6 +1632,12 @@ impl TerminalSession {
         if let Some(store) = app_handle
             .try_state::<std::sync::Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
         {
+            // Phase 0 instrumentation: B1 — a full-map clone + whole-file JSON
+            // rewrite + a full-registry snapshot-history line, i.e. the O(N)
+            // term in spawn latency.
+            let _span =
+                tracing::debug_span!("terminal_spawn.record_open", terminal_id = %terminal_id)
+                    .entered();
             crate::commands::terminal::record_pinned_session_open(
                 store.inner(),
                 pinned.clone(),
@@ -1711,6 +1840,12 @@ impl TerminalSession {
         if let Ok(mut g) = self.grid.lock() {
             g.resize(cols, rows);
         }
+        // A resize rewrites rendered text (rows are truncated/padded) without a
+        // single byte reaching the parser, so the byte counter does not move —
+        // bump the grid generation so the scanners re-read the new screen.
+        // AFTER the lock is released, for the same ordering reason as
+        // `advance_grid`.
+        self.grid_generation.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
@@ -1746,6 +1881,40 @@ impl TerminalSession {
                 }
             }
         }
+    }
+
+    /// Monotonic count of every byte this session's PTY has ever produced.
+    ///
+    /// Bumped by the reader thread inside `tee_into_scrollback`, i.e. BEFORE
+    /// the bytes reach the VT parser — so it is a "bytes accepted" counter, not
+    /// a "screen updated" counter. It is reported to the frontend and used for
+    /// replay offsets. Do NOT gate grid scanning on it: use
+    /// [`Self::grid_generation`], which moves only once the grid has actually
+    /// absorbed the bytes (see the `terminal::scan_gate` module docs).
+    pub fn total_bytes_produced(&self) -> u64 {
+        self.total_bytes_produced.load(Ordering::Relaxed)
+    }
+
+    /// Monotonic count of mutations to this session's rendered cell grid.
+    ///
+    /// LOCK-FREE by construction: a single atomic load, no grid lock. The
+    /// periodic full-fleet grid scanners (`auto_response`, `usage_limit`,
+    /// `context_watcher`) use it as a change detector so they can skip a
+    /// session whose screen cannot have moved since their last pass. Going via
+    /// [`Self::info`] instead would take the title lock AND the exit-code lock
+    /// per session per tick, which is exactly the contention the skip exists to
+    /// avoid.
+    ///
+    /// The counter is bumped only AFTER the mutation is visible to any
+    /// subsequent grid-lock holder ([`advance_grid`], [`Self::resize`]), which
+    /// is the property the scan gate needs: a value read here and used as a
+    /// watermark can never cover a change the following render will miss. A
+    /// stale read is therefore safe in the only direction that matters — it
+    /// costs one extra scan on the next tick, never a skipped one.
+    ///
+    /// Acquire pairs with the Release bumps at the two mutation sites.
+    pub fn grid_generation(&self) -> u64 {
+        self.grid_generation.load(Ordering::Acquire)
     }
 
     /// Get terminal info for the frontend.
@@ -2134,6 +2303,7 @@ mod tests {
             emission_skipped: Arc::new(AtomicBool::new(false)),
             scrollback_buffer: Arc::new(Mutex::new(VecDeque::new())),
             total_bytes_produced: Arc::new(AtomicU64::new(0)),
+            grid_generation: Arc::new(AtomicU64::new(0)),
             created_at: 0,
             output_tx,
             grid: Arc::new(Mutex::new(Grid::new(80, 24))),
@@ -2821,5 +2991,111 @@ mod tests {
         // And it stays open afterwards until High is crossed again.
         assert!(gate.should_emit(FLOW_HIGH_WATERMARK));
         assert!(!gate.should_emit(FLOW_HIGH_WATERMARK + 1));
+    }
+
+    /// REGRESSION (scan-gate watermark, PR #961 review F1).
+    ///
+    /// Replays the exact reader-loop interleaving that permanently wedged the
+    /// grid scanners: the reader tees a chunk into the scrollback ring — which
+    /// bumps `total_bytes_produced` — and is preempted BEFORE it takes the grid
+    /// lock. A scanner tick lands in that window, then the reader completes the
+    /// parser advance, and the terminal blocks on input so no further byte ever
+    /// arrives.
+    ///
+    /// With the byte counter as the gate, the mid-window tick records a
+    /// watermark covering bytes the grid has not drawn, renders the pre-advance
+    /// screen, and every later tick compares equal and skips — the prompt is
+    /// never seen. With `grid_generation`, the mid-window tick correctly sees
+    /// no change, and the post-advance tick MUST scan.
+    #[test]
+    fn counted_but_unparsed_chunk_does_not_let_the_gate_skip_the_next_scan() {
+        use super::super::scan_gate::ScanGate;
+
+        let session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        let mut parser = vte::Parser::new();
+
+        // Two independent gates driven from the same session, so the test
+        // compares the OLD signal against the NEW one on identical history.
+        let mut byte_gate = ScanGate::new();
+        let mut gen_gate = ScanGate::new();
+
+        // Tick 0: first sighting — always scans, and primes both watermarks.
+        assert!(byte_gate.should_scan("t", session.total_bytes_produced()));
+        assert!(gen_gate.should_scan("t", session.grid_generation()));
+        // Tick 1: genuinely idle — both correctly skip.
+        assert!(!byte_gate.should_scan("t", session.total_bytes_produced()));
+        assert!(!gen_gate.should_scan("t", session.grid_generation()));
+
+        // Reader step 1: the chunk that paints the auto-response prompt is teed
+        // into the ring + byte counter. The grid has NOT absorbed it yet.
+        let prompt = b"Do you want to proceed? (y/n)";
+        tee_into_scrollback(
+            &session.scrollback_buffer,
+            &session.total_bytes_produced,
+            prompt,
+        );
+        assert!(
+            {
+                let g = session.grid.lock().unwrap();
+                !g.text_snapshot().text.contains("proceed")
+            },
+            "precondition: the grid must not yet show the prompt"
+        );
+
+        // A scanner tick lands in the preemption window.
+        let byte_scanned_midwindow = byte_gate.should_scan("t", session.total_bytes_produced());
+        let gen_scanned_midwindow = gen_gate.should_scan("t", session.grid_generation());
+        assert!(
+            byte_scanned_midwindow,
+            "the byte counter moved, so the old gate scanned here — and \
+             recorded a watermark for bytes the grid had not drawn"
+        );
+        assert!(
+            !gen_scanned_midwindow,
+            "the grid did not move, so the generation gate skips — nothing to see yet"
+        );
+
+        // Reader step 2: the preempted advance completes.
+        advance_grid(&session.grid, &session.grid_generation, &mut parser, prompt);
+        assert!(
+            {
+                let g = session.grid.lock().unwrap();
+                g.text_snapshot().text.contains("proceed")
+            },
+            "the grid now shows the prompt"
+        );
+
+        // The terminal is now blocked on input: no further bytes will arrive,
+        // so `total_bytes_produced` is frozen at the mid-window value.
+        assert!(
+            !byte_gate.should_scan("t", session.total_bytes_produced()),
+            "THE BUG: the byte-counter gate skips the tick that would have \
+             seen the prompt, and keeps skipping forever"
+        );
+        assert!(
+            gen_gate.should_scan("t", session.grid_generation()),
+            "THE FIX: the generation counter moved after the advance, so the \
+             prompt is scanned"
+        );
+        // ...and once scanned, the session settles back to skipping.
+        assert!(!gen_gate.should_scan("t", session.grid_generation()));
+    }
+
+    /// A resize rewrites rendered text without any byte reaching the parser, so
+    /// the byte counter cannot see it. The generation counter must.
+    #[test]
+    fn resize_bumps_the_grid_generation() {
+        let session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        let before = session.grid_generation();
+        session.resize(100, 40).expect("noop master resize");
+        assert!(
+            session.grid_generation() > before,
+            "resize must rearm the scan gate"
+        );
+        assert_eq!(
+            session.total_bytes_produced(),
+            0,
+            "no byte reached the parser — the old gate signal is blind to this"
+        );
     }
 }

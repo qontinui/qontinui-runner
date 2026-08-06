@@ -135,6 +135,9 @@ pub async fn terminal_create(
     // context before it is parked on the session; each var is omitted when it
     // does not resolve. See `agent_worktree::session_env`.
     let extra_env = crate::agent_worktree::session_env::session_extra_env(isolated_ctx.as_ref());
+    // Phase 0 instrumentation: the whole blocking spawn (PTY open, identity
+    // seam, child exec). Its child spans break the interior down.
+    let create_span = tracing::debug_span!("terminal_spawn.manager_create").entered();
     let info = terminal_manager.create(
         title.clone(),
         working_dir.clone(),
@@ -145,6 +148,7 @@ pub async fn terminal_create(
         command,
         extra_env,
     )?;
+    drop(create_span);
 
     // Park the isolated edit context on the terminal session so its
     // heartbeat + claim live as long as the PTY. Cleared in `close()`.
@@ -191,9 +195,32 @@ pub async fn terminal_create(
     // stale one. Either way the pane ends with a live coord session id.
     let registry = session_registry.inner().clone();
     let persisted = pane_store.get(&pane_key);
+    // Phase 0 instrumentation: the coord-registration segment of spawn
+    // latency. `register_external` is synchronous and does no HTTP (it queues
+    // an outbox row, contending on the process-global outbox `write_lock` +
+    // fsync); `resume_external` additionally does a live `PATCH /sessions/:id`
+    // probe. The span separates the two in the log.
     let registration: Result<uuid::Uuid, crate::session::SessionError> = match persisted {
-        Some(prior_id) => registry.resume_external(prior_id, intent).await,
-        None => registry.register_external(intent),
+        Some(prior_id) => {
+            use tracing::Instrument;
+            registry
+                .resume_external(prior_id, intent)
+                .instrument(tracing::debug_span!(
+                    "terminal_spawn.coord_register",
+                    terminal_id = %info.id,
+                    resume = true
+                ))
+                .await
+        }
+        None => {
+            let _span = tracing::debug_span!(
+                "terminal_spawn.coord_register",
+                terminal_id = %info.id,
+                resume = false
+            )
+            .entered();
+            registry.register_external(intent)
+        }
     };
 
     let mut coord_session_id: Option<uuid::Uuid> = None;

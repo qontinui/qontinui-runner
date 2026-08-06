@@ -232,6 +232,12 @@ fn view_control_enabled() -> bool {
 ///
 /// IPC-bridge route: the registry lives in React (`src/lib/openable-views.ts`),
 /// so this funnels through `ui_bridge_request_sync`.
+///
+/// The response also advertises whether the *opening* half is enabled
+/// (`viewControlEnabled` + the flag name + the exact instruction). Without it a
+/// driver learned the requirement only by taking a 403 from
+/// `POST /control/view/open` — the designed escape hatch was off by default AND
+/// undiscoverable, so nothing pointed at either the route or the flag.
 pub async fn ui_bridge_views_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<Value>>, (StatusCode, Json<ApiResponse<()>>)> {
@@ -250,7 +256,52 @@ pub async fn ui_bridge_views_handler(
         )
     })?;
 
-    Ok(Json(ApiResponse::success(result)))
+    Ok(Json(ApiResponse::success(with_view_control_capability(
+        result,
+    ))))
+}
+
+/// Fold the view-control capability advertisement into a `GET /ui-bridge/views`
+/// payload, preserving whatever shape the React side answered with.
+///
+/// Pure (apart from the env read inside `view_control_enabled`) so the shape is
+/// unit-testable without a running bridge.
+fn with_view_control_capability(views: Value) -> Value {
+    let enabled = view_control_enabled();
+    let capability = serde_json::json!({
+        "viewControlEnabled": enabled,
+        "viewControlFlag": VIEW_CONTROL_FLAG,
+        "viewControlInstruction": if enabled {
+            format!(
+                "POST /ui-bridge/control/view/open is ENABLED ({}=1). Body: {{\"name\": \"<view>\"}}.",
+                VIEW_CONTROL_FLAG
+            )
+        } else {
+            format!(
+                "POST /ui-bridge/control/view/open is DISABLED and will 403. \
+                 Set {}=1 in the runner's environment to enable it (for a supervisor \
+                 temp runner: spawn with extra_env: {{\"{}\": \"1\"}}). This discovery \
+                 route works regardless.",
+                VIEW_CONTROL_FLAG, VIEW_CONTROL_FLAG
+            )
+        },
+    });
+    let capability_obj = capability.as_object().cloned().unwrap_or_default();
+
+    match views {
+        // Usual shape: an object of view metadata — merge the capability keys
+        // in beside it.
+        Value::Object(mut m) => {
+            m.extend(capability_obj);
+            Value::Object(m)
+        }
+        // A bare array of views — wrap it rather than lose it.
+        other => {
+            let mut m = capability_obj;
+            m.insert("views".to_string(), other);
+            Value::Object(m)
+        }
+    }
 }
 
 /// `POST /ui-bridge/control/view/open` — body `{ "name": "setup-wizard" }`
@@ -377,6 +428,45 @@ mod tests {
         assert!(view_control_enabled(), "explicit opt-in enables it");
 
         std::env::remove_var(VIEW_CONTROL_FLAG);
+    }
+
+    // R9: the views payload must TELL a driver that the opening half exists
+    // and how to enable it, instead of leaving them to discover the
+    // requirement by taking a 403 from view/open.
+    #[test]
+    fn views_payload_advertises_the_view_control_capability() {
+        let _env_lock = env_lock();
+
+        std::env::remove_var(VIEW_CONTROL_FLAG);
+        let disabled = with_view_control_capability(serde_json::json!({ "views": [] }));
+        assert_eq!(disabled["viewControlEnabled"], serde_json::json!(false));
+        assert_eq!(
+            disabled["viewControlFlag"],
+            serde_json::json!(VIEW_CONTROL_FLAG)
+        );
+        let instruction = disabled["viewControlInstruction"].as_str().unwrap();
+        assert!(instruction.contains(VIEW_CONTROL_FLAG));
+        assert!(instruction.contains("403"));
+        // The views themselves survive the merge.
+        assert!(disabled.get("views").is_some());
+
+        std::env::set_var(VIEW_CONTROL_FLAG, "1");
+        let enabled = with_view_control_capability(serde_json::json!({ "views": [] }));
+        assert_eq!(enabled["viewControlEnabled"], serde_json::json!(true));
+
+        std::env::remove_var(VIEW_CONTROL_FLAG);
+    }
+
+    #[test]
+    fn views_payload_wraps_a_bare_array_without_losing_it() {
+        let _env_lock = env_lock();
+        std::env::remove_var(VIEW_CONTROL_FLAG);
+        let wrapped = with_view_control_capability(serde_json::json!([{ "name": "setup-wizard" }]));
+        assert_eq!(wrapped["viewControlEnabled"], serde_json::json!(false));
+        assert_eq!(
+            wrapped["views"][0]["name"],
+            serde_json::json!("setup-wizard")
+        );
     }
 
     #[test]

@@ -91,7 +91,13 @@ export function useChangeTrackingEvents(
                     elements: snap.elements.map((e) => ({
                       id: e.id,
                       type: e.type,
-                      label: e.label ?? "",
+                      // Pass the snapshot's own label through unchanged. It is
+                      // already §4.6-scrubbed by the SDK, and `ControlSnapshot`
+                      // declares the field OPTIONAL — the old `?? ""` fallback
+                      // both minted an unbranded raw string and contradicted
+                      // the SDK's presence-preserving contract, under which an
+                      // empty content string means ABSENT.
+                      label: e.label,
                       actions: e.actions,
                       state: e.state,
                       registeredAt: e.registeredAt,
@@ -315,7 +321,13 @@ export function useChangeTrackingEvents(
                     elements: snap.elements.map((e) => ({
                       id: e.id,
                       type: e.type,
-                      label: e.label ?? "",
+                      // Pass the snapshot's own label through unchanged. It is
+                      // already §4.6-scrubbed by the SDK, and `ControlSnapshot`
+                      // declares the field OPTIONAL — the old `?? ""` fallback
+                      // both minted an unbranded raw string and contradicted
+                      // the SDK's presence-preserving contract, under which an
+                      // empty content string means ABSENT.
+                      label: e.label,
                       actions: e.actions,
                       state: e.state,
                       registeredAt: e.registeredAt,

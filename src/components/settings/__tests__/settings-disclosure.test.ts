@@ -76,6 +76,9 @@ describe("settings sub-nav disclosure gating", () => {
       "playwright",
       "discovery",
       "execution-variables",
+      // Per-app build/start commands for the auto-fresh engine — it configures
+      // the fleet-fresh routing machinery, which is advanced-only surface.
+      "app-freshness",
     ]);
   });
 

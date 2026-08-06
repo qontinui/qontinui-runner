@@ -650,13 +650,22 @@ async fn health(
         // by build.rs via QONTINUI_GIT_SHA. Manual-test sessions can assert
         // the temp runner is actually running the commit under debug.
         "gitSha": env!("QONTINUI_GIT_SHA"),
-        // Compile-time build identifier (`<git-sha-short>-<unix-ms>`) baked
-        // into the binary by build.rs. Vite bakes the same value into
-        // index.html as `<meta name="build-id">`. The shared
-        // `useBuildIdWatcher` hook polls this endpoint and fires its
-        // onBuildIdChange callback when the page's meta tag diverges from
-        // the running binary's value — the only divergence vector is a
-        // mid-session binary swap behind the live webview.
+        // Compile-time build PROVENANCE: which Vite dist this binary
+        // embedded. `build.rs` reads `dist/build-id.txt` (written by
+        // `vite.config.ts`, format `<git-sha-short>-<unix-ms>`) and re-emits
+        // it, so this value names the exact frontend bundle inside the exe.
+        // A build made without a prior `pnpm run build` reports the explicit
+        // `unstamped-<git-sha>` sentinel instead.
+        //
+        // NOT a staleness signal. This is a compile-time constant of the
+        // running process, as is the `<meta name="build-id">` tag in the
+        // embedded HTML — replacing the exe on disk changes neither, so
+        // comparing them can only ever detect a BUILD-time inconsistency,
+        // never a live binary swap. The runner's refresh banner made exactly
+        // that comparison and was a permanent false positive; it was deleted
+        // (plan 2026-07-28-runner-build-id-banner-permanent-false-positive).
+        // For "is this runner out of date", use `buildDrift` below — it is
+        // the only field here that can change while the window is open.
         "buildId": env!("RUNNER_BUILD_ID"),
         // origin/main's current SHA + drift verdict vs the embedded gitSha
         // (see `crate::build_drift`). All-null until the first background
@@ -698,9 +707,11 @@ async fn health(
             "framework": "tauri",
             "capabilities": ["control", "renderLog", "debug"],
         },
-        // Top-level mirror of `data.buildId` so the shared
-        // `useBuildIdWatcher` hook (qontinui/ui-bridge/react) can read
-        // the field directly from the response root without an adapter.
+        // Top-level mirror of `data.buildId` so fleet consumers (the
+        // supervisor's health cache, manual-test sessions asserting "this
+        // temp runner is the commit I'm debugging") can read the field from
+        // the response root without descending into `data`. Same provenance
+        // semantics — and same non-semantics — as `data.buildId` above.
         "buildId": env!("RUNNER_BUILD_ID"),
         // Phase 3J.2 — top-level mirrors of `derived_status` and `ui_error`
         // so supervisor/fleet consumers can read them without descending into
@@ -1641,8 +1652,29 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// `coord_gate_list` / `coord_withdraw_gate` are the same story for `/gate-sweep`
 /// and `/gate`, which already document driving them over this proxy.
 ///
-/// `coord_write_prompt_document` stays OUT: policy authorship is tenant-gated and
-/// belongs to an operator, not a device nonce.
+/// `coord_write_prompt_document` is IN, and the reason it used to be out no longer
+/// holds. The old rationale — "policy authorship is tenant-gated and belongs to an
+/// operator, not a device nonce" — described a coord that no longer exists: coord
+/// deliberately grants this tool to device/agent principals
+/// (`coord::mcp::agent_tool_access`) precisely so a session can CLOSE a POLICY_GAP
+/// it found instead of recording one that waits on the operator, which was the
+/// bottleneck that made gaps accumulate faster than they could be hand-published.
+/// Withholding it HERE did not re-impose an operator gate; it silently removed a
+/// capability coord had already decided to grant, and the denial surfaced as a bare
+/// `-32601` that reads like "no such tool" rather than "your proxy withholds it".
+///
+/// Nor is the grant unguarded — coord enforces non-loosening server-side, so this
+/// proxy is not the thing standing between a device nonce and a weakened policy:
+/// `append` preserves the existing body verbatim, `create` only authors names that
+/// do not yet exist, `edit_clause` lands only a provable tightening or no-op and
+/// otherwise becomes a pending operator proposal, and the meta-policies
+/// (`session-protocol`, `security-and-autonomy`, `escalation-bar`) are refused
+/// outright in either direction. Tenant comes from the verified `CallerIdentity`,
+/// never an argument; every landed write is versioned, attributed and revertible.
+///
+/// Keep it in. If policy authorship should ever be operator-only again, that is a
+/// decision to make in coord's grant — one place, enforced for every transport —
+/// not by re-diverging this list from it.
 ///
 /// MUST stay sorted — membership is a `binary_search`.
 const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
@@ -1720,6 +1752,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_work_unit_remove_citation",
     "coord_work_unit_transition",
     "coord_work_unit_upsert",
+    "coord_write_prompt_document",
     "coord_yield",
 ];
 
@@ -2517,11 +2550,22 @@ async fn coord_claims_by_resource_handler(
 }
 
 /// The ONLY coord WRITE routes the nonce-gated device-JWT forwarder may reach:
-/// the two gate writes (plan 2026-06-15-coord-mcp-live-token-write-forwarder,
+/// the gate attest write (plan 2026-06-15-coord-mcp-live-token-write-forwarder,
 /// Phase 1), the claim-anchored gate register (plan
 /// 2026-07-21-gate-cascade-step3-proxy-rebase, Phase 1b), plus the work-unit
 /// registry writes (device-session coord surface hardening follow-up). The
 /// write sibling of [`ClaimsReadTarget`].
+///
+/// There is deliberately NO plan-anchored gate-register variant. Coord's
+/// `POST /coord/plans/{slug}/register-gate` was DELETED with the rest of the
+/// `/coord/plans*` surface (coord P4 Phase 3), so a forwarder aimed at it could
+/// only ever 404 whatever the body. Its live replacement is
+/// [`CoordWriteTarget::WorkUnitRegisterGate`] below — note the bodies are NOT
+/// interchangeable: the removed plan route took coord's `PlanGateRequest`
+/// (plan-lifecycle `status`/`title`, run through the plan status vocabulary),
+/// while the work-unit route takes `UnitGateRequest` (no `status`/`title`;
+/// work-unit statuses are opaque). Removed by plan
+/// 2026-08-03-gate-class-producers-and-clearance-rules-inert (P4).
 ///
 /// Every work-unit variant maps to coord's device-JWT `work_units_agent_authed`
 /// sub-router (layered with `require_jwt`, which accepts the device bearer):
@@ -2550,8 +2594,6 @@ async fn coord_claims_by_resource_handler(
 /// variant would never authenticate through this device-JWT path anyway.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CoordWriteTarget {
-    /// `POST {coord}/coord/plans/{slug}/register-gate`
-    RegisterPlanGate { slug: String },
     /// `POST {coord}/coord/gates/{gate_id}/attest`
     AttestGate { gate_id: String },
     /// `POST {coord}/coord/gates/register-agent` — coord's device-authed
@@ -2598,8 +2640,7 @@ impl CoordWriteTarget {
     fn validate(&self) -> Result<(), (u16, &'static str, String)> {
         match self {
             CoordWriteTarget::RegisterGate | CoordWriteTarget::WorkUnitUpsert => Ok(()),
-            CoordWriteTarget::RegisterPlanGate { slug }
-            | CoordWriteTarget::WorkUnitTransition { slug }
+            CoordWriteTarget::WorkUnitTransition { slug }
             | CoordWriteTarget::WorkUnitRegisterGate { slug }
             | CoordWriteTarget::WorkUnitSetDeps { slug } => {
                 if slug_is_valid(slug) {
@@ -2637,9 +2678,6 @@ impl CoordWriteTarget {
 fn write_upstream_url(base: &str, target: &CoordWriteTarget) -> String {
     let base = base.trim_end_matches('/');
     match target {
-        CoordWriteTarget::RegisterPlanGate { slug } => {
-            format!("{base}/coord/plans/{slug}/register-gate")
-        }
         CoordWriteTarget::AttestGate { gate_id } => {
             format!("{base}/coord/gates/{gate_id}/attest")
         }
@@ -2661,7 +2699,6 @@ fn write_upstream_url(base: &str, target: &CoordWriteTarget) -> String {
     }
 }
 
-/// `POST /coord-mcp/gates/register-plan/{slug}` +
 /// `POST /coord-mcp/gates/register` +
 /// `POST /coord-mcp/gates/{gate_id}/attest` +
 /// `POST /coord-mcp/work-units/{upsert | {slug}/transition |
@@ -2673,7 +2710,7 @@ fn write_upstream_url(base: &str, target: &CoordWriteTarget) -> String {
 /// 2026-07-21-gate-cascade-step3-proxy-rebase, Phase 1b).
 ///
 /// Why: a device session's `.mcp.json` carries no bearer anymore (live-token
-/// proxy, runner #546) — only the per-session loopback nonce. The plan-ready,
+/// proxy, runner #546) — only the per-session loopback nonce. The gate-register,
 /// gate-attest, and work-unit registry flows need to POST against coord's
 /// device-authed write routes, so this lets those callers reuse the nonce:
 /// same gate, same live `AuthManager` device-JWT injection, same coord-base
@@ -2885,15 +2922,6 @@ async fn forward_coord_write_post(
             )
                 .into_response()
         })
-}
-
-/// `POST /coord-mcp/gates/register-plan/{slug}` — see [`coord_write_proxy_handler`].
-async fn coord_register_plan_gate_handler(
-    axum::extract::Path(slug): axum::extract::Path<String>,
-    headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
-) -> axum::response::Response {
-    coord_write_proxy_handler(CoordWriteTarget::RegisterPlanGate { slug }, headers, body).await
 }
 
 /// `POST /coord-mcp/gates/register` — see [`coord_write_proxy_handler`].
@@ -4979,11 +5007,10 @@ pub fn create_router(
         // Same gate + live device-JWT injection as /coord-mcp, but allowlisted
         // to EXACTLY these enumerated device-authed coord write routes with a
         // validated dynamic segment — never a generic path passthrough (see
-        // `CoordWriteTarget`).
-        .route(
-            "/coord-mcp/gates/register-plan/{slug}",
-            post(coord_register_plan_gate_handler),
-        )
+        // `CoordWriteTarget`). NOTE: there is no `gates/register-plan/{slug}`
+        // route — coord deleted its `/coord/plans/{slug}/register-gate` upstream
+        // (coord P4 Phase 3), so the forwarder was removed too rather than left
+        // as a guaranteed-404 shim; use the work-unit register-gate route below.
         // Claim-anchored register (plan 2026-07-21-gate-cascade-step3-proxy-rebase
         // Phase 1b): forwards to coord's device-authed
         // `POST /coord/gates/register-agent` — the REST twin of MCP
@@ -6112,6 +6139,13 @@ mod coord_mcp_body_gate_tests {
             "coord_post_finding",
             "coord_send_message",
             "coord_query_health", // prefix family
+            // Policy authorship. Pinned here because this proxy previously
+            // withheld it while coord's own device/agent grant allowed it —
+            // a silent capability subtraction that made every device session
+            // unable to close a POLICY_GAP. Non-loosening is enforced
+            // coord-side, so re-excluding it here would re-open that gap
+            // rather than restore a gate.
+            "coord_write_prompt_document",
         ] {
             assert!(
                 gate(serde_json::json!({
@@ -6463,7 +6497,7 @@ mod coord_claims_proxy_tests {
 #[cfg(test)]
 mod coord_write_proxy_tests {
     use super::{
-        coord_attest_gate_handler, coord_register_gate_handler, coord_register_plan_gate_handler,
+        coord_attest_gate_handler, coord_register_gate_handler,
         coord_work_unit_register_gate_handler, coord_work_unit_set_deps_handler,
         coord_work_unit_transition_handler, coord_work_unit_upsert_handler,
         forward_coord_write_post, gate_id_is_valid, slug_is_valid, write_upstream_url,
@@ -6474,7 +6508,6 @@ mod coord_write_proxy_tests {
 
     // Concrete route templates (axum 0.8 `{param}` form) registered in the real router.
     const WRITE_ROUTES: &[&str] = &[
-        "/coord-mcp/gates/register-plan/{slug}",
         "/coord-mcp/gates/register",
         "/coord-mcp/gates/{gate_id}/attest",
         "/coord-mcp/work-units/upsert",
@@ -6484,7 +6517,6 @@ mod coord_write_proxy_tests {
     ];
     // Concrete request paths used to hit those routes in tests.
     const WRITE_REQUEST_PATHS: &[&str] = &[
-        "/coord-mcp/gates/register-plan/2026-06-15-some-plan",
         "/coord-mcp/gates/register",
         "/coord-mcp/gates/123e4567-e89b-12d3-a456-426614174000/attest",
         "/coord-mcp/work-units/upsert",
@@ -6495,13 +6527,12 @@ mod coord_write_proxy_tests {
 
     fn write_router() -> Router {
         Router::new()
-            .route(WRITE_ROUTES[0], post(coord_register_plan_gate_handler))
-            .route(WRITE_ROUTES[1], post(coord_register_gate_handler))
-            .route(WRITE_ROUTES[2], post(coord_attest_gate_handler))
-            .route(WRITE_ROUTES[3], post(coord_work_unit_upsert_handler))
-            .route(WRITE_ROUTES[4], post(coord_work_unit_transition_handler))
-            .route(WRITE_ROUTES[5], post(coord_work_unit_register_gate_handler))
-            .route(WRITE_ROUTES[6], post(coord_work_unit_set_deps_handler))
+            .route(WRITE_ROUTES[0], post(coord_register_gate_handler))
+            .route(WRITE_ROUTES[1], post(coord_attest_gate_handler))
+            .route(WRITE_ROUTES[2], post(coord_work_unit_upsert_handler))
+            .route(WRITE_ROUTES[3], post(coord_work_unit_transition_handler))
+            .route(WRITE_ROUTES[4], post(coord_work_unit_register_gate_handler))
+            .route(WRITE_ROUTES[5], post(coord_work_unit_set_deps_handler))
     }
 
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {
@@ -6545,15 +6576,6 @@ mod coord_write_proxy_tests {
     /// a trailing-slash base.
     #[test]
     fn write_upstream_url_builds_fixed_coord_routes() {
-        assert_eq!(
-            write_upstream_url(
-                "https://coord.example.test",
-                &CoordWriteTarget::RegisterPlanGate {
-                    slug: "2026-06-15-some-plan".to_string()
-                },
-            ),
-            "https://coord.example.test/coord/plans/2026-06-15-some-plan/register-gate"
-        );
         assert_eq!(
             write_upstream_url(
                 "https://coord.example.test/",
@@ -6614,12 +6636,12 @@ mod coord_write_proxy_tests {
     /// `Ok` for a good one.
     #[test]
     fn target_validate_rejects_bad_segments() {
-        assert!(CoordWriteTarget::RegisterPlanGate {
-            slug: "2026-06-15-some-plan".to_string()
+        assert!(CoordWriteTarget::WorkUnitRegisterGate {
+            slug: "2026-07-03-some-unit".to_string()
         }
         .validate()
         .is_ok());
-        let err = CoordWriteTarget::RegisterPlanGate {
+        let err = CoordWriteTarget::WorkUnitRegisterGate {
             slug: "../etc".to_string(),
         }
         .validate()
@@ -6732,7 +6754,7 @@ mod coord_write_proxy_tests {
         let addr = listener.local_addr().unwrap();
         let app: Router = Router::new()
             .route(
-                "/coord/plans/{slug}/register-gate",
+                "/coord/work-units/{slug}/register-gate",
                 post(
                     |headers: axum::http::HeaderMap, body: axum::body::Bytes| async move {
                         let auth = headers
@@ -6772,14 +6794,14 @@ mod coord_write_proxy_tests {
         // Happy path: body forwarded verbatim, synthetic bearer + JSON ct injected.
         let url = write_upstream_url(
             &base,
-            &CoordWriteTarget::RegisterPlanGate {
-                slug: "2026-06-15-some-plan".to_string(),
+            &CoordWriteTarget::WorkUnitRegisterGate {
+                slug: "2026-07-03-some-unit".to_string(),
             },
         );
         let resp = forward_coord_write_post(
             &url,
             "test-device-jwt",
-            axum::body::Bytes::from_static(br#"{"resource_key":"plans/p"}"#),
+            axum::body::Bytes::from_static(br#"{"resource_key":"work-units/u"}"#),
             qontinui_runner_lib::profiles::CoordBaseSource::Profile,
         )
         .await;
@@ -6787,7 +6809,7 @@ mod coord_write_proxy_tests {
         let v = body_json(resp).await;
         assert_eq!(v["echo_auth"], "Bearer test-device-jwt");
         assert_eq!(v["echo_ct"], "application/json");
-        assert_eq!(v["echo_body"], r#"{"resource_key":"plans/p"}"#);
+        assert_eq!(v["echo_body"], r#"{"resource_key":"work-units/u"}"#);
 
         // Non-200 coord verdict: status + body verbatim, not reshaped.
         let url = write_upstream_url(
@@ -6824,8 +6846,8 @@ mod coord_write_proxy_tests {
 
         let url = write_upstream_url(
             &format!("http://127.0.0.1:{port}"),
-            &CoordWriteTarget::RegisterPlanGate {
-                slug: "2026-06-15-some-plan".to_string(),
+            &CoordWriteTarget::WorkUnitRegisterGate {
+                slug: "2026-07-03-some-unit".to_string(),
             },
         );
         let resp = forward_coord_write_post(

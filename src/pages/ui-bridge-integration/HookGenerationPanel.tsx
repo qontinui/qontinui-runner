@@ -25,6 +25,7 @@ import {
 } from "lucide-react";
 import { useAiSession } from "@/hooks/useAiSession";
 import { MarkdownViewer } from "@/components/MarkdownViewer";
+import { StreamingMessageView } from "@/components/shared/StreamingMessageView";
 import {
   buildHookGenPrompt,
   buildHookRegenPrompt,
@@ -2134,10 +2135,17 @@ export function HookGenerationPanel({
               </div>
             ))}
 
-          {/* Streaming content */}
+          {/* Streaming content — bounded plain tail while in flight; the
+              completed message renders full markdown above once the turn ends.
+              (plan 2026-07-28 §A5a/A5b: a full-buffer markdown re-parse per
+              streamed line is O(n²).) */}
           {session.streamingContent && (
             <div className="text-xs text-muted-foreground bg-white/[0.02] rounded p-2 mb-2 max-h-[200px] overflow-y-auto">
-              <MarkdownViewer content={session.streamingContent} />
+              <StreamingMessageView
+                content={session.streamingContent}
+                droppedChars={session.streamingDroppedChars}
+                caretClassName="bg-primary"
+              />
             </div>
           )}
 

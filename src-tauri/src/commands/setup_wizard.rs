@@ -28,9 +28,25 @@ use uuid::Uuid;
 /// also auto-skips.
 ///
 /// Operators running the runner directly never set this env var, so
-/// their wizard behaviour is unchanged. Manual dismissal is also
-/// available via the `setup-wizard` UI Bridge component's `complete`
-/// action (registered in `SetupWizard.tsx`).
+/// their wizard behaviour is unchanged.
+///
+/// **Reaching the wizard on a runner this bypassed** — the previous version of
+/// this comment offered the `setup-wizard` UI Bridge component's `complete`
+/// action as the escape hatch, which was exactly backwards: that action was
+/// registered inside `SetupWizard.tsx`, and `useUIComponent` only registers
+/// while its owner is MOUNTED, so in the one state where you needed it (this
+/// bypass — the wizard never mounts) the component did not exist. Two working
+/// routes now:
+///
+/// 1. `POST /ui-bridge/control/component/setup-wizard/action/go-to-step
+///    {"step": 0}` — the registration lives in `AppContent` (`src/App.tsx`)
+///    and is therefore live regardless of mount state, and `go-to-step` OPENS
+///    the wizard. Non-destructive: it flips in-memory view state only, leaving
+///    the persisted `setup_completed` alone.
+/// 2. Spawn the runner with the var cleared —
+///    `extra_env: { "QONTINUI_TEST_AUTO_LOGIN_EMAIL": "" }` — which is why the
+///    `.filter(|v| !v.is_empty())` below matters: an empty value does NOT
+///    bypass.
 #[tauri::command]
 pub fn check_setup_completed() -> Result<bool, String> {
     if std::env::var("QONTINUI_TEST_AUTO_LOGIN_EMAIL")
@@ -129,14 +145,35 @@ pub async fn suggest_workspace_sources_for_setup(workspace_path: String) -> Resu
 // scrubbed from the cloned repo's `.git/config`.
 
 /// Resolve the runner's Cognito bearer for authenticated web-backend calls.
-/// `None` when the user isn't signed in (Tier 0/1 or no Cognito session).
-/// Shared with `commands::new_project`, which talks to the same
-/// `/api/v1/operations/github/*` proxy surface.
+/// `None` only when the runner holds no Cognito credential at all (Tier 0/1, or
+/// never signed in). Shared with `commands::new_project`, which talks to the
+/// same `/api/v1/operations/github/*` proxy surface.
+///
+/// Two sources, in order:
+///  1. [`ensure_fresh_cognito_bearer`] — refreshes first when the stored access
+///     token is stale. It yields `None` when the *refresh token* is missing.
+///  2. The STORED Cognito access token. A missing refresh token does NOT mean
+///     "not signed in": the app-wide verdict is
+///     `has_valid_device_jwt || has_cognito_session` (`commands::auth`'s
+///     `has_local_signed_in_session`), so gating on the refresh token alone made
+///     a signed-in runner render "Sign in required" here while Settings →
+///     Account said "signed in". If this fallback token has expired the backend
+///     answers 401, which the caller surfaces as "your sign-in has expired" —
+///     an accurate message, unlike the false not-signed-in state it replaces.
+///
+/// [`ensure_fresh_cognito_bearer`]: crate::mcp::device_jwt_refresher::ensure_fresh_cognito_bearer
 pub(crate) async fn cognito_bearer() -> Option<String> {
     let auth_manager = crate::auth::AuthManager::new();
     crate::mcp::device_jwt_refresher::ensure_fresh_cognito_bearer(&auth_manager)
         .await
         .filter(|t| !t.trim().is_empty())
+        .or_else(|| {
+            auth_manager
+                .get_oauth_access_token()
+                .ok()
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+        })
 }
 
 /// List the GitHub repositories the signed-in user's connected GitHub App

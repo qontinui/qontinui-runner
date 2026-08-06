@@ -1383,6 +1383,33 @@ mod cloud_sync_tests {
 }
 
 #[cfg(test)]
+mod memory_link_expansion_tests {
+    use super::*;
+
+    /// Plan `2026-07-29-memory-link-expansion-retrieval-arm` Phase 3: the
+    /// link-expansion retrieval arm ships default-OFF until the recall-efficacy
+    /// harness can measure it. Both a fresh install (`Settings::default()`) and
+    /// an upgrading settings.json missing the key must land on `false`.
+    #[test]
+    fn memory_link_expansion_defaults_off() {
+        assert!(!Settings::default().memory_link_expansion_enabled);
+        let parsed: Settings = serde_json::from_str("{}").expect("empty object must deserialize");
+        assert!(!parsed.memory_link_expansion_enabled);
+    }
+
+    /// An explicit opt-in round-trips through serialization, so the flag can be
+    /// flipped on once the harness lands.
+    #[test]
+    fn memory_link_expansion_explicit_value_round_trips() {
+        let parsed: Settings = serde_json::from_str(r#"{"memory_link_expansion_enabled": true}"#)
+            .expect("must deserialize");
+        assert!(parsed.memory_link_expansion_enabled);
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert!(json.contains("\"memory_link_expansion_enabled\":true"));
+    }
+}
+
+#[cfg(test)]
 mod session_metadata_sync_tests {
     use super::*;
 
@@ -2196,6 +2223,21 @@ pub struct Settings {
     /// play for this field.
     #[serde(default)]
     pub ci_node: CiNodeSettings,
+    /// Ask the cloud memory endpoint (`POST /api/v1/memory/query`) for the
+    /// link-expansion retrieval arm — the third RRF arm that one-hop-expands
+    /// over `coord.memory_links` (plan
+    /// `2026-07-29-memory-link-expansion-retrieval-arm`, Phase 4).
+    ///
+    /// Default FALSE, deliberately: that plan's Phase 3 ships the arm
+    /// default-off and turns it on only once the efficacy harness in
+    /// `2026-07-29-memory-recall-efficacy-benchmark` can measure whether it
+    /// helps recall or just adds noise — and that plan is still DRAFT. Sending
+    /// `link_expansion: true` unconditionally would default an unmeasured
+    /// ranking change ON, which is exactly what Phase 3 forbids. The flag makes
+    /// the wire-through shippable now and flippable later. A missing key in an
+    /// existing settings.json loads as false.
+    #[serde(default)]
+    pub memory_link_expansion_enabled: bool,
 }
 
 fn default_session_metadata_sync_enabled() -> bool {
@@ -2577,6 +2619,36 @@ pub struct SettingsFault {
 /// again, so the surface self-heals when the file becomes readable.
 static SETTINGS_FAULT: std::sync::RwLock<Option<SettingsFault>> = std::sync::RwLock::new(None);
 
+/// Process-global, in-memory-only tier override.
+///
+/// Set by [`crate::commands::auth::set_runner_tier`] on a runner that must not
+/// write the shared `settings.json` (a secondary — any supervisor-launched
+/// temp/named instance; see the FOOTGUN GUARD in [`load_settings_full`]). Before
+/// this existed, that branch logged "applying in-memory only" and then applied
+/// NOTHING: the command was a total no-op, `get_runner_tier` kept answering the
+/// old tier, and every tier-dependent state transition (notably the frontend's
+/// `isTier2` flip) was untestable on a temp runner — a green result there was
+/// vacuous.
+///
+/// It is applied as the LAST overlay in [`load_settings_full`], so an explicit
+/// runtime choice beats the spawn-time `QONTINUI_RUNNER_TIER` env overlay. It is
+/// never read by [`update_settings`] (which starts from the raw on-disk
+/// document), so it can never leak into a persisted file.
+static TIER_OVERRIDE: std::sync::RwLock<Option<RunnerTier>> = std::sync::RwLock::new(None);
+
+/// Apply a tier for the remainder of this process's lifetime WITHOUT touching
+/// any settings file. See [`TIER_OVERRIDE`].
+pub fn set_in_memory_tier(tier: RunnerTier) {
+    if let Ok(mut guard) = TIER_OVERRIDE.write() {
+        *guard = Some(tier);
+    }
+}
+
+/// The in-memory tier override, if one was set. See [`TIER_OVERRIDE`].
+fn in_memory_tier() -> Option<RunnerTier> {
+    TIER_OVERRIDE.read().ok().and_then(|g| *g)
+}
+
 fn record_settings_fault(fault: Option<SettingsFault>) {
     // `load_settings()` runs on hot paths (the relay loop re-reads every
     // iteration), and the overwhelmingly common case is "healthy, still
@@ -2811,13 +2883,28 @@ pub fn load_settings_full() -> LoadedSettings {
     }
     let is_secondary = crate::instance::is_secondary();
     if needs_persist && is_secondary {
-        info!(
-            "Skipping tier/local_user_id migration persist for secondary runner \
-             (instance={:?}) — would clobber the primary's shared settings.json; \
-             keeping the migration in-memory only (tier={:?})",
-            crate::instance::instance_name(),
-            settings.tier
-        );
+        // ONCE per process, at info!. This branch re-runs on every settings
+        // load (the relay loop re-reads every iteration), so it used to emit
+        // ~30 identical lines per 500-entry log window and bury real signal
+        // during debugging. The fact is process-invariant — a secondary never
+        // becomes a primary — so repeating it carries no information.
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        let mut first = false;
+        LOGGED.call_once(|| first = true);
+        if first {
+            info!(
+                "Skipping tier/local_user_id migration persist for secondary runner \
+                 (instance={:?}) — would clobber the primary's shared settings.json; \
+                 keeping the migration in-memory only (tier={:?}). Logged once per process.",
+                crate::instance::instance_name(),
+                settings.tier
+            );
+        } else {
+            tracing::debug!(
+                "Skipping tier/local_user_id migration persist for secondary runner (tier={:?})",
+                settings.tier
+            );
+        }
     }
     if should_persist_migration(needs_persist, is_secondary, provenance) {
         if let Err(e) = save_settings(&settings) {
@@ -2839,6 +2926,16 @@ pub fn load_settings_full() -> LoadedSettings {
     // state, so the only safe override is this in-memory overlay.
     if let Ok(raw) = std::env::var("QONTINUI_RUNNER_TIER") {
         apply_tier_env_overlay(&mut settings, &raw);
+    }
+
+    // Runtime in-memory tier override (`set_runner_tier` on a secondary).
+    // Applied LAST so an explicit runtime choice beats the spawn-time env
+    // overlay above — the operator/driver picked this tier after boot.
+    // In-memory only; `update_settings` reads the raw on-disk document, so
+    // this can never reach a settings file.
+    if let Some(t) = in_memory_tier() {
+        settings.tier = t;
+        settings.tier_initialized = true;
     }
 
     // One-shot post-upgrade detector: if Tier 2 + has a runner_token + the
@@ -3563,6 +3660,12 @@ pub fn get_cloud_sync_enabled() -> bool {
 /// Persist the cloud session sync consent flag.
 pub fn save_cloud_sync_enabled(enabled: bool) -> Result<(), String> {
     update_settings(|settings| settings.cloud_sync_enabled = enabled)
+}
+
+/// Get the cloud memory link-expansion arm flag. Default false — see
+/// [`Settings::memory_link_expansion_enabled`].
+pub fn get_memory_link_expansion_enabled() -> bool {
+    load_settings().memory_link_expansion_enabled
 }
 
 /// Get the session metadata sync consent flag (gate 2). Default true.

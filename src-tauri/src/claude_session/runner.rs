@@ -479,6 +479,8 @@ fn run_claude_session_inline(
         // Remove CLAUDECODE env var to prevent "nested session" detection.
         // The runner spawns Claude CLI as an automation tool, not as a nested session.
         .env_remove("CLAUDECODE")
+        // Same rule, sibling marker — see `session::transport::claude_cli` docs.
+        .env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV)
         .env("QONTINUI_TRACE_ID", uuid::Uuid::new_v4().to_string())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

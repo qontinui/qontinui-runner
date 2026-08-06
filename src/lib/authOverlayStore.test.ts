@@ -5,7 +5,7 @@ import { getSnapshot, setAuthOverlay, subscribe } from "./authOverlayStore";
 /**
  * P2 (auth-gate overlay): this store is what makes the fixed-position siblings
  * rendered OUTSIDE `AppContent` — the tutorial/demo/prompt overlays,
- * `BackgroundTaskPill`, `BuildRefreshBanner` — go `inert` in lockstep with the
+ * `BackgroundTaskPill` — go `inert` in lockstep with the
  * main tree. A missed publish leaves those siblings in the tab order while the
  * login overlay is up (invisible but Enter-activatable), which is the exact
  * leak the store was added to close.

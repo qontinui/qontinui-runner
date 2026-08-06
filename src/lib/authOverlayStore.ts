@@ -5,8 +5,8 @@ import type { AuthGateOverlay } from "./authGatePresentation";
  * Module-level broadcast of the current auth-overlay surface (P2 auth-gate
  * overlay). `AppContent` computes the gate (it owns `setupCompleted` and the
  * auth context) and publishes here; sibling trees that render OUTSIDE
- * `AppContent` — the tutorial/demo/prompt overlays, `BackgroundTaskPill`,
- * `BuildRefreshBanner` — subscribe so they can go `inert` in lockstep with
+ * `AppContent` — the tutorial/demo/prompt overlays, `BackgroundTaskPill` —
+ * subscribe so they can go `inert` in lockstep with
  * the main tree. Without this, those fixed-position siblings stay
  * keyboard-reachable (Tab from the LoginScreen walks into their invisible
  * controls) even though the opaque z-20000 overlay wins hit-testing.

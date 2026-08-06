@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useReducer, useRef, useEffect } from "react";
+import { memo, useCallback, useMemo, useReducer, useRef, useEffect } from "react";
 import {
   Maximize2,
   Check,
@@ -100,7 +100,11 @@ function createInitialState(zoneLabel?: string, note?: string): CompactCardState
   };
 }
 
-export function CompactZoneCard({
+/**
+ * Memoized: the compact card renders a session's last 20 lines plus a
+ * sparkline, so it is on the hot path for every streaming pane (plan Phase 1).
+ */
+function CompactZoneCardInner({
   tab,
   state,
   zoneIndex,
@@ -614,6 +618,8 @@ export function CompactZoneCard({
     </div>
   );
 }
+
+export const CompactZoneCard = memo(CompactZoneCardInner);
 
 function QuickSwitchDropdown({
   zoneIndex,

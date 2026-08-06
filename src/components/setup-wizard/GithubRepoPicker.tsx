@@ -14,13 +14,26 @@ import {
   Download,
   AlertCircle,
   ExternalLink,
+  LogIn,
 } from "lucide-react";
+
+/** Web backend the Cognito-bound device JWT is minted against. Must match
+ *  `LoginScreen`'s constant — the picker drives the SAME `cognito_sign_in`
+ *  command, just from inside the wizard. */
+const DEFAULT_BACKEND_URL = "https://api.qontinui.io";
+
+/** `true` when a raw `github_list_repos` failure is an authentication failure the
+ *  user can clear by signing in again (as opposed to a network/tenant/backend
+ *  fault). Drives whether the error view offers the sign-in button. */
+export function isAuthLoadError(raw: string): boolean {
+  return raw.includes("401");
+}
 
 /** Map a raw `github_list_repos` failure message to a specific, actionable headline.
  *  Order matters: check the most specific signals first. */
 export function classifyLoadError(raw: string): string {
-  if (raw.includes("401")) {
-    return "Your Qontinui sign-in has expired. Re-open Settings → Account and sign in again.";
+  if (isAuthLoadError(raw)) {
+    return "Your Qontinui sign-in has expired. Sign in again to continue.";
   }
   if (raw.includes("403")) {
     return "Your account isn't authorized for this workspace's GitHub connection. (Couldn't resolve your tenant.)";
@@ -91,8 +104,16 @@ interface GithubRepoPickerProps {
  * key, lists the tenant's installation repos, and mints a repo-scoped short-TTL
  * clone token. The runner never stores a long-lived GitHub credential.
  *
- * Three gate states drive the UI: not signed in → sign-in hint; signed in but
+ * Three gate states drive the UI: not signed in → sign-in button; signed in but
  * the App isn't installed → "connect your GitHub" CTA; connected → the picker.
+ *
+ * The sign-in button matters more than it looks: the wizard renders BEFORE the
+ * LoginScreen (`App.tsx` short-circuits on `setupCompleted === false`), so on a
+ * fresh install nothing in the wizard had ever established a Cognito session and
+ * this step's only advice was "Settings → Account" — a screen unreachable until
+ * setup finishes. That made "Clone from GitHub" impossible to complete on first
+ * run. Signing in here drives the same `cognito_sign_in` command LoginScreen
+ * does (which also promotes the runner to Tier 2), then re-loads the repo list.
  *
  * After a repo clones, we scan its root (`scan_workspace_for_setup`, depth 1) to
  * detect the project type/manifest so it flows into the rest of the wizard like
@@ -117,6 +138,11 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
   const [cloneProgress, setCloneProgress] = useState<string | null>(null);
   const [clonedRepos, setClonedRepos] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
+
+  /** In-flight `cognito_sign_in`, and its failure message. Owned by the
+   *  signed_out / auth-error views only. */
+  const [signingIn, setSigningIn] = useState(false);
+  const [signInError, setSignInError] = useState<string | null>(null);
 
   const loadRepos = useCallback(async (): Promise<RepoListResponse | null> => {
     setLoading(true);
@@ -237,6 +263,27 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
     }
   }, []);
 
+  /**
+   * Sign in to Qontinui without leaving the wizard (Cognito Hosted-UI PKCE in
+   * the system browser — the same `cognito_sign_in` command LoginScreen drives).
+   * The command promotes the runner to Tier 2 server-side; we dispatch
+   * `runner-tier-changed` so AuthProvider re-checks, then re-load the repo list
+   * so the picker advances to not_connected / connected on its own.
+   */
+  const signIn = useCallback(async () => {
+    setSigningIn(true);
+    setSignInError(null);
+    try {
+      await invoke("cognito_sign_in", { backendUrl: DEFAULT_BACKEND_URL });
+      window.dispatchEvent(new CustomEvent("runner-tier-changed"));
+      await loadRepos();
+    } catch (err) {
+      setSignInError(`${err}`);
+    } finally {
+      setSigningIn(false);
+    }
+  }, [loadRepos]);
+
   const cloneSelected = useCallback(async () => {
     if (selectedRepos.length === 0 || !destParent) return;
     setCloning(true);
@@ -326,22 +373,37 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
             <Loader2 className="w-4 h-4" />
             Retry
           </button>
+          {/* An expired session can't be retried away — offer the fix itself.
+              Same reason as the signed_out view: "Settings → Account" does not
+              exist yet while the wizard owns the viewport. */}
+          {isAuthLoadError(loadError ?? "") && (
+            <SignInButton signingIn={signingIn} onSignIn={signIn} />
+          )}
         </div>
+        {signInError && (
+          <p className="text-xs text-red-300 break-words whitespace-pre-wrap">{signInError}</p>
+        )}
       </div>
     );
   }
 
   if (view === "signed_out") {
     return (
-      <div className="panel border-amber-500/30 bg-amber-500/10 p-4 max-w-xl mx-auto w-full flex gap-3">
-        <AlertCircle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
-        <div className="text-sm">
-          <div className="font-medium mb-1">Sign in required</div>
-          <p className="text-muted-foreground">
-            Sign in to your Qontinui account (Settings → Account) to browse and clone your GitHub
-            repositories.
-          </p>
+      <div className="panel border-amber-500/30 bg-amber-500/10 p-4 max-w-xl mx-auto w-full flex flex-col gap-3">
+        <div className="flex gap-3">
+          <AlertCircle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+          <div className="text-sm">
+            <div className="font-medium mb-1">Sign in to browse your repositories</div>
+            <p className="text-muted-foreground">
+              Cloning from GitHub uses your Qontinui account. A secure browser window opens to sign
+              in, then returns you here — you can also skip this step and clone later.
+            </p>
+          </div>
         </div>
+        <SignInButton signingIn={signingIn} onSignIn={signIn} />
+        {signInError && (
+          <p className="text-xs text-red-300 break-words whitespace-pre-wrap">{signInError}</p>
+        )}
       </div>
     );
   }
@@ -486,5 +548,37 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
         )}
       </button>
     </div>
+  );
+}
+
+/** The wizard's in-place "Sign in to Qontinui" CTA, shared by the signed_out and
+ *  expired-session views so both offer the identical affordance. */
+function SignInButton({
+  signingIn,
+  onSignIn,
+}: {
+  signingIn: boolean;
+  onSignIn: () => Promise<void>;
+}) {
+  return (
+    <button
+      type="button"
+      className="btn-primary flex items-center gap-2 self-start"
+      onClick={() => void onSignIn()}
+      disabled={signingIn}
+      data-testid="wizard-github-sign-in"
+    >
+      {signingIn ? (
+        <>
+          <Loader2 className="w-4 h-4 animate-spin" />
+          Opening browser…
+        </>
+      ) : (
+        <>
+          <LogIn className="w-4 h-4" />
+          Sign in to Qontinui
+        </>
+      )}
+    </button>
   );
 }

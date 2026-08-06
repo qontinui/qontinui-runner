@@ -54,6 +54,14 @@ Verifies: a one-shot tools/list JSON-RPC round-trips 200 against the configured 
 
 **Fix:** coord unreachable
 
+### 9. No inherited Claude session markers (`no_inherited_session_markers`) — ADVISORY
+
+Verifies: this runner process did NOT inherit Claude Code's process-topology markers (CLAUDECODE, CLAUDE_CODE_CHILD_SESSION) from whatever launched it — a marked runner is mislabelled as a nested session
+
+Advisory: a failure here is a **warning**, not a blocker — it does not stop gate registration and does not fail the report. It also runs even when an earlier check went red.
+
+**Fix:** restart the runner from a shell without the markers (via dev-start.ps1 / the supervisor); spawns are stripped either way
+
 ---
 
-`coord doctor` runs these checks live and **stops at the first failure**, naming that one link plus its fix. Run it from **Settings → Account** in the runner app, or headless via the `coord_doctor` bin (`cargo run --bin coord_doctor`). Green on all eight ⇒ this runner can set gates.
+`coord doctor` runs these checks live. The **blocking** checks stop at the first failure, naming that one link plus its fix; **advisory** checks always run and only ever warn. Run it from **Settings → Account** in the runner app, or headless via the `coord_doctor` bin (`cargo run --bin coord_doctor`). Green on all of them ⇒ this runner can set gates.
