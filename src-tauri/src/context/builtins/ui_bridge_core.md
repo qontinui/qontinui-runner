@@ -181,7 +181,7 @@ Prefer these primitives over `sleep N && re-discover`; they all already exist. E
 
 **Waits** — use instead of fixed sleeps:
 
-- `POST /ui-bridge/control/wait-for-element-state` — wait until a known element id becomes `visible` / `enabled` / `focused`. 100 ms polling. Body: `{ id, state, timeout_ms }`. Use when you already have a registered element id.
+- `POST /ui-bridge/control/wait-for-element-state` — wait until a known element id becomes `visible` / `enabled` / `disabled` / `ariaDisabled` / `focused`. 100 ms polling. Body: `{ id, state, timeout_ms }`. Use when you already have a registered element id. `enabled` is the derived fold `!(disabled || ariaDisabled)`; wait on `disabled` or `ariaDisabled` when you need to distinguish the native attribute from the ARIA one. Note the camelCase `ariaDisabled` — `aria_disabled` is rejected with `error_detail.code = "INVALID_STATE"`.
 - `POST /ui-bridge/control/wait-for-route` — wait until the current route matches a glob (`**` supported). Body: `{ pattern, timeout_ms }`. Use after a navigation trigger when the route is the observable signal.
 - `POST /ui-bridge/ai/wait-for-element-condition` — structured-selector wait: `{ condition: 'present'|'visible'|'clickable'|'text-matches', target: { id|title|aria_label|text|type }, timeout_ms }`. Use when you don't have a registered id yet. Returns 408 on timeout.
 

@@ -235,7 +235,10 @@ pub enum UiBridgeErrorCode {
     /// LLM fallback.
     MissingParam,
     /// The `state` parameter on a `wait-for-element-state` request is not
-    /// one of the recognised enum values (`visible|enabled|focused`).
+    /// one of the recognised enum values. The list is not repeated here —
+    /// `intents::ALLOWED_STATES` is the single source of truth, and a prose
+    /// copy is exactly how this drifted past the ui-bridge #144
+    /// `disabled`/`ariaDisabled` split.
     /// Issued as a flat HTTP 400 with `context.allowed_states: [...]` so
     /// callers can self-correct without parsing prose. Loop iter-2 item 3 —
     /// mirrors the `tab/activate` -> `knownTabs` and the action-name gate's
@@ -402,7 +405,8 @@ impl UiBridgeError {
     }
 
     /// Reject `wait-for-element-state` when the `state` parameter is not in
-    /// the recognised enum (`visible|enabled|focused`). Loop iter-2 item 3 —
+    /// the recognised enum — see `intents::ALLOWED_STATES`, which the caller
+    /// passes in as `allowed`. Loop iter-2 item 3 —
     /// previously returned an `api_error(prose)` envelope with no machine-
     /// readable code, making the error indistinguishable from any other
     /// transport failure. Now: HTTP 400 with `error_detail.code:

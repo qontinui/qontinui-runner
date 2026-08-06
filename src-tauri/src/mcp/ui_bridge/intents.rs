@@ -259,12 +259,42 @@ pub async fn ui_bridge_wait_for_targets_handler(
     wrap_ipc_result(ui_bridge_request_sync(&state, "wait_for_targets", payload).await)
 }
 
+/// State names `wait-for-element-state` accepts, in `ElementState` field
+/// order.
+///
+/// `disabled` / `ariaDisabled` are the two independent interactivity signals
+/// that ui-bridge PR #144 split out of the derived `enabled` fold
+/// (`enabled == !(disabled || ariaDisabled)`). The canonical
+/// `qontinui_types::ui_bridge::ElementState` is `#[serde(rename_all =
+/// "camelCase")]` and every SDK serializer emits its object-literal keys
+/// verbatim, so the driver-facing spelling is `ariaDisabled` — NOT
+/// `aria_disabled`.
+pub(super) const ALLOWED_STATES: &[&str] =
+    &["visible", "enabled", "disabled", "ariaDisabled", "focused"];
+
+/// Map a driver-supplied state name to the field polled on the registered
+/// element's `state` block. `None` for anything not in [`ALLOWED_STATES`].
+///
+/// Each accepted name is its own field name on the wire, so this is identity
+/// over the allow-list — but it stays an explicit match so a name can only be
+/// accepted if it also resolves, and so both lists cannot drift apart.
+pub(super) fn resolve_state_field(state_name: &str) -> Option<&'static str> {
+    match state_name {
+        "visible" => Some("visible"),
+        "enabled" => Some("enabled"),
+        "disabled" => Some("disabled"),
+        "ariaDisabled" => Some("ariaDisabled"),
+        "focused" => Some("focused"),
+        _ => None,
+    }
+}
+
 /// POST /ui-bridge/control/wait-for-element-state
 ///
 /// Convenience wrapper around `wait_for_element` for the common case of
-/// "wait until element <id> is visible / enabled / focused". Polls the
-/// element registry every ~100ms until the state matches or the timeout
-/// elapses.
+/// "wait until element <id> is visible / enabled / disabled / ariaDisabled /
+/// focused". Polls the element registry every ~100ms until the state matches
+/// or the timeout elapses.
 pub async fn ui_bridge_wait_for_element_state_handler(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<serde_json::Value>>,
@@ -308,13 +338,10 @@ pub async fn ui_bridge_wait_for_element_state_handler(
     // `context.allowed_states` enum so callers can self-correct without
     // parsing prose. Previously emitted `api_error(prose)` with no code,
     // making the error indistinguishable from a generic transport failure.
-    const ALLOWED_STATES: &[&str] = &["visible", "enabled", "focused"];
-    let state_field = match state_name.as_str() {
-        "visible" => "visible",
-        "enabled" => "enabled",
-        "focused" => "focused",
-        other => {
-            let detail = UiBridgeError::invalid_state(other, ALLOWED_STATES);
+    let state_field = match resolve_state_field(&state_name) {
+        Some(field) => field,
+        None => {
+            let detail = UiBridgeError::invalid_state(&state_name, ALLOWED_STATES);
             let msg = detail.message.clone();
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -596,11 +623,14 @@ mod invalid_state_envelope_tests {
     //! without parsing the prose `error` field. The handler-side wiring
     //! (`api_error_detailed(msg, detail)` + HTTP 400) is too IPC-coupled
     //! for a pure unit test; this test guards the envelope contract.
-    use super::UiBridgeError;
+    use super::{resolve_state_field, UiBridgeError, ALLOWED_STATES};
     use crate::mcp::types::api_error_detailed;
     use crate::mcp::ui_bridge::types::UiBridgeErrorCode;
 
-    const ALLOWED: &[&str] = &["visible", "enabled", "focused"];
+    /// The handler's own allow-list — NOT a copy. A local duplicate is how
+    /// this test stayed green while the handler rejected the post-#144
+    /// `disabled`/`ariaDisabled` names.
+    const ALLOWED: &[&str] = ALLOWED_STATES;
 
     #[test]
     fn invalid_state_constructor_sets_code_and_context() {
@@ -614,7 +644,9 @@ mod invalid_state_envelope_tests {
             "message echoes the rejected value"
         );
         assert!(
-            detail.message.contains("visible|enabled|focused"),
+            detail
+                .message
+                .contains("visible|enabled|disabled|ariaDisabled|focused"),
             "message lists the allowed states pipe-separated"
         );
         let ctx = detail
@@ -634,7 +666,53 @@ mod invalid_state_envelope_tests {
             .and_then(|v| v.as_array())
             .expect("context.allowed_states must be an array");
         let names: Vec<&str> = allowed_arr.iter().filter_map(|v| v.as_str()).collect();
-        assert_eq!(names, vec!["visible", "enabled", "focused"]);
+        assert_eq!(
+            names,
+            vec!["visible", "enabled", "disabled", "ariaDisabled", "focused"]
+        );
+    }
+
+    /// ui-bridge PR #144 split `ElementState.enabled` into `disabled` +
+    /// `ariaDisabled`, and schemas PR #128 landed both on the canonical Rust
+    /// `ElementState`. A driver must be able to `waitFor` either one: the
+    /// allow-list has to accept the name AND `resolve_state_field` has to
+    /// resolve it, or the handler 400s on a name the schema declares.
+    #[test]
+    fn post_144_disabled_states_are_accepted_and_resolve() {
+        for name in ["disabled", "ariaDisabled"] {
+            assert!(
+                ALLOWED_STATES.contains(&name),
+                "'{name}' must be in ALLOWED_STATES"
+            );
+            assert_eq!(
+                resolve_state_field(name),
+                Some(name),
+                "'{name}' must resolve to the identically-spelled ElementState field"
+            );
+        }
+    }
+
+    /// The wire spelling is camelCase (`ElementState` is
+    /// `#[serde(rename_all = "camelCase")]`), so the Rust-side `aria_disabled`
+    /// must NOT be accepted — silently taking it would poll a field the
+    /// bridge never emits and time out instead of 400ing.
+    #[test]
+    fn snake_case_aria_disabled_is_rejected() {
+        assert!(!ALLOWED_STATES.contains(&"aria_disabled"));
+        assert_eq!(resolve_state_field("aria_disabled"), None);
+    }
+
+    /// Every accepted name resolves, and nothing resolves that is not
+    /// accepted — the drift this test module previously failed to catch.
+    #[test]
+    fn allow_list_and_resolver_agree() {
+        for name in ALLOWED_STATES {
+            assert!(
+                resolve_state_field(name).is_some(),
+                "allowed state '{name}' does not resolve to a field"
+            );
+        }
+        assert_eq!(resolve_state_field("banana"), None);
     }
 
     #[test]
