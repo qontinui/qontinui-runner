@@ -2,8 +2,8 @@
  * Honest restore-status banner — the single per-tab surface that tells the
  * user the TRUTH about what a boot-restore did or could not do (session-restore
  * redesign Phase 5 "honest capability tiers", building on issue #548 Phase 3).
- * It distinguishes the four restore outcomes that are NOT a silent, fully
- * restored conversation:
+ * It distinguishes the restore outcomes that are NOT a silent, fully restored
+ * conversation:
  *
  *   1. RESUME FAILED (`resumeFailed`) — a `--resume` WAS typed (the runner
  *      knows the id + the provider resumes the full conversation) but the
@@ -11,23 +11,20 @@
  *      "Retry resume" re-runs the same type-and-verify path. The durable record
  *      keeps its restore-pending marker so the liveness poll can't flip it
  *      `poll-dead` while the operator decides.
- *   2. RECONCILED — confirm a best-effort match (`resumeQuarantined`) — the id
- *      was recovered by a transcript/process-anchored BACKSTOP, not pinned by
- *      the runner, so it MIGHT name another tool's session. Nothing was resumed
- *      automatically; the user confirms the best-effort match with one click
- *      (which runs the normal verified resume). Presented as a match-to-confirm,
- *      never as a guaranteed restore.
- *   3. TERMINAL-ONLY / fresh conversation (`restoreTerminalOnly`) — the terminal
- *      + cwd were restored but the CONVERSATION was NOT. Two causes land here,
- *      so the copy states the OUTCOME and not a cause: the provider's
+ *   2. TERMINAL-ONLY / fresh conversation (`restoreTerminalOnly`) — the terminal
+ *      + cwd were restored but the CONVERSATION was NOT. Three causes land
+ *      here, so the copy states the OUTCOME and not a cause: the provider's
  *      `restoreTier()` is `"terminal-only"` (it can re-open the terminal but
- *      cannot `--resume` a chat by id), OR the session has no transcript on disk
+ *      cannot `--resume` a chat by id), the session has no transcript on disk
  *      (it started but never accumulated messages, so there is no conversation
- *      to resume — see `classifyRestoreAction`'s transcript gate). Naming either
- *      cause would be wrong for the other, and the banner aggregates terminals
- *      so it cannot attribute per-tab. Informational + dismissible — the user
- *      must SEE the conversation is fresh and is never misled into thinking it
- *      came back. There is nothing to retry.
+ *      to resume — see `classifyRestoreAction`'s transcript gate), or the id
+ *      was only recovered by a transcript/process-anchored BACKSTOP guess (not
+ *      pinned by the runner) — too weak to act on, so it is treated as no
+ *      match found rather than offered up for a best-effort confirm. Naming
+ *      any one cause would be wrong for the others, and the banner aggregates
+ *      terminals so it cannot attribute per-tab. Informational + dismissible —
+ *      the user must SEE the conversation is fresh and is never misled into
+ *      thinking it came back. There is nothing to retry.
  *
  * An auto-resumed (silent, conversation restored) tab and a plain shell surface
  * in NONE of the lists — exactly the no-clutter common case.
@@ -37,12 +34,12 @@
  * advisory column).
  */
 
-import { AlertTriangle, HelpCircle, MessageSquareDashed, Play, RotateCcw, X } from "lucide-react";
+import { AlertTriangle, MessageSquareDashed, RotateCcw, X } from "lucide-react";
 import type { TerminalTab } from "./useTerminalManager";
 
 export interface ResumeFailedBannerProps {
   tabs: TerminalTab[];
-  /** Re-run (or confirm-and-run) the type-and-verify resume for one tab. */
+  /** Re-run the type-and-verify resume for one tab. */
   onRetryResume: (tabId: string) => void;
   /**
    * Dismiss the informational "fresh conversation" (terminal-only) note for one
@@ -59,24 +56,13 @@ export function failedResumeTabs(tabs: TerminalTab[]): TerminalTab[] {
 }
 
 /**
- * The quarantined (reconciled-binding, awaiting best-effort confirm) tabs this
- * banner surfaces — exported for unit tests. A tab that later FAILS its
- * confirmed resume moves to the failed list, never both.
- */
-export function quarantinedResumeTabs(tabs: TerminalTab[]): TerminalTab[] {
-  return tabs.filter((t) => t.resumeQuarantined && !t.resumeFailed && t.isAlive !== false);
-}
-
-/**
  * The terminal-only ("fresh conversation") tabs this banner surfaces — exported
- * for unit tests. A tab whose resume failed or is awaiting confirm takes
- * precedence over the informational note (it's actionable), so those are
- * excluded here to keep one tab in one section.
+ * for unit tests. A tab whose resume failed takes precedence over the
+ * informational note (it's actionable), so those are excluded here to keep
+ * one tab in one section.
  */
 export function terminalOnlyRestoreTabs(tabs: TerminalTab[]): TerminalTab[] {
-  return tabs.filter(
-    (t) => t.restoreTerminalOnly && !t.resumeFailed && !t.resumeQuarantined && t.isAlive !== false,
-  );
+  return tabs.filter((t) => t.restoreTerminalOnly && !t.resumeFailed && t.isAlive !== false);
 }
 
 export function ResumeFailedBanner({
@@ -85,9 +71,8 @@ export function ResumeFailedBanner({
   onDismissTerminalOnly,
 }: ResumeFailedBannerProps) {
   const failed = failedResumeTabs(tabs);
-  const quarantined = quarantinedResumeTabs(tabs);
   const terminalOnly = terminalOnlyRestoreTabs(tabs);
-  if (failed.length === 0 && quarantined.length === 0 && terminalOnly.length === 0) return null;
+  if (failed.length === 0 && terminalOnly.length === 0) return null;
 
   return (
     <div
@@ -130,51 +115,8 @@ export function ResumeFailedBanner({
         </div>
       )}
 
-      {quarantined.length > 0 && (
-        <div className={`flex items-start gap-2 ${failed.length > 0 ? "mt-2" : ""}`}>
-          <HelpCircle className="w-3.5 h-3.5 shrink-0 mt-0.5 text-[#e0af68]" />
-          <div className="flex-1 min-w-0">
-            <div className="text-[12px] font-semibold text-[#c0caf5] leading-snug">
-              {quarantined.length === 1
-                ? "Best-effort match — confirm to restore this session?"
-                : `${quarantined.length} best-effort matches — confirm to restore?`}
-            </div>
-            <div className="text-[10px] text-[#a9b1d6] leading-snug mt-0.5">
-              The runner did not pin these session ids — it matched them from transcript timing as a
-              backstop, so a match MIGHT belong to another tool's session. Nothing was resumed
-              automatically; confirm to restore the matched conversation.
-            </div>
-            <ul className="mt-1.5 space-y-1">
-              {quarantined.map((t) => (
-                <li
-                  key={t.id}
-                  data-ui-bridge-id="terminal.resume-quarantined-banner-item"
-                  data-terminal-id={t.id}
-                  className="flex items-center gap-2 text-[11px] leading-snug"
-                >
-                  <span className="text-[#c0caf5] font-medium truncate flex-1">{t.title}</span>
-                  <button
-                    type="button"
-                    data-ui-bridge-id="terminal.resume-quarantined-confirm"
-                    data-terminal-id={t.id}
-                    onClick={() => onRetryResume(t.id)}
-                    className="flex items-center gap-1 px-1.5 py-0.5 rounded border border-[#e0af68]/40 text-[#e0af68] hover:bg-[#e0af68]/15 text-[10px]"
-                    title="Restore the matched session and verify the provider UI handshake"
-                  >
-                    <Play className="w-2.5 h-2.5" />
-                    Restore match
-                  </button>
-                </li>
-              ))}
-            </ul>
-          </div>
-        </div>
-      )}
-
       {terminalOnly.length > 0 && (
-        <div
-          className={`flex items-start gap-2 ${failed.length > 0 || quarantined.length > 0 ? "mt-2" : ""}`}
-        >
+        <div className={`flex items-start gap-2 ${failed.length > 0 ? "mt-2" : ""}`}>
           <MessageSquareDashed className="w-3.5 h-3.5 shrink-0 mt-0.5 text-[#7aa2f7]" />
           <div className="flex-1 min-w-0">
             <div className="text-[12px] font-semibold text-[#c0caf5] leading-snug">

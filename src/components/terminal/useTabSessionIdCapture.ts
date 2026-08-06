@@ -13,8 +13,9 @@
  * the runner's `--session-id`), where the frontend doesn't know the id up
  * front. Its single live caller is `TerminalPage.handleLaunchAiSession`'s
  * custom-command branch; it binds origin `"reconciled"` (a freshest-mtime guess
- * that can name a foreign session — hence quarantined on restore, not
- * auto-resumed). Do NOT add new callers — pin the id at spawn instead.
+ * that can name a foreign session — hence restored terminal-only, never
+ * auto-resumed or offered up for a best-effort confirm). Do NOT add new
+ * callers — pin the id at spawn instead.
  *
  * Today, `useShellIntegration.ts:135` only sets `claudeSessionId` on
  * the resume path (`handleResumeSession`). For initial spawns, the

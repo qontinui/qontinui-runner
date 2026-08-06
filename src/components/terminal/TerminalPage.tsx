@@ -837,18 +837,17 @@ function TerminalPageInner({
   });
 
   // Operator-clickable retry for a restored tab whose resume verification
-  // failed (Phase 3, #548) AND the one-click confirm for quarantined
-  // guessed-binding tabs (boot-restore item 5): re-run the same
-  // type-and-verify path. The durable restore-pending marker is still set
-  // from the restore, so the liveness poll keeps protecting the open record
-  // while this runs. On VERIFIED handshake the OPEN record is re-asserted
-  // under this live terminal id (item 3 — the restore no longer re-asserts
-  // before verification, so the verified branch owns it).
+  // failed (Phase 3, #548): re-run the same type-and-verify path. The durable
+  // restore-pending marker is still set from the restore, so the liveness
+  // poll keeps protecting the open record while this runs. On VERIFIED
+  // handshake the OPEN record is re-asserted under this live terminal id
+  // (item 3 — the restore no longer re-asserts before verification, so the
+  // verified branch owns it).
   const handleRetryResume = useCallback(
     (tabId: string) => {
       const tab = tabsRef.current.find((t) => t.id === tabId);
       if (!tab?.claudeSessionId) return;
-      updateTab(tabId, { resumeFailed: false, resumeQuarantined: false, isReconnecting: true });
+      updateTab(tabId, { resumeFailed: false, isReconnecting: true });
       void runVerifiedResume({
         terminalRefs: terminalRefs.current,
         tabId,
@@ -1052,8 +1051,8 @@ function TerminalPageInner({
           // `--session-id` pin) — the id is unknown up front, so fall back to
           // the mtime-capture poll. This is the ONE remaining last-resort caller
           // of `startSessionIdCapture`; it binds origin "reconciled" (a
-          // freshest-mtime guess), so restore quarantines it rather than
-          // auto-resuming. Every pinned path above records authoritatively.
+          // freshest-mtime guess), so restore treats it as terminal-only rather
+          // than auto-resuming. Every pinned path above records authoritatively.
           const tab = tabs.find((t) => t.id === tabId);
           startSessionIdCapture(tabId, tab?.workingDir ?? "", spawnAt, configDir);
         }
