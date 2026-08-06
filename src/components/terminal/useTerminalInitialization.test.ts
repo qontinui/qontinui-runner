@@ -510,7 +510,8 @@ describe("runVerifiedResume", () => {
 // `origin === "authoritative" && confirmed`. A CONFIRMED authoritative record
 // auto-resumes with NO operator click; an authoritative-but-PROVISIONAL record
 // is a phantom shell → terminal-only restore (no resume, no banner);
-// reconciled/absent origins stay quarantined behind the one-click confirm.
+// reconciled/absent origins are too weak to act on and restore terminal-only
+// as well — the runner does nothing further with a guessed id.
 describe("classifyRestoreAction (Phase 4 confirmed-authoritative auto-resume gate)", () => {
   it("CONFIRMED authoritative binding auto-resumes with no operator click", () => {
     expect(
@@ -528,27 +529,27 @@ describe("classifyRestoreAction (Phase 4 confirmed-authoritative auto-resume gat
     );
   });
 
-  it("reconciled binding is quarantined (backstop guess can name a foreign session)", () => {
+  it("reconciled binding restores terminal-only (backstop guess can name a foreign session, too weak to act on)", () => {
     expect(classifyRestoreAction({ claudeSessionId: "sess-1", origin: "reconciled" })).toBe(
-      "quarantine",
+      "terminal-only",
     );
   });
 
-  it("a confirmed RECONCILED row is still quarantined (confirmation upgrades only authoritative rows)", () => {
+  it("a confirmed RECONCILED row is still terminal-only (confirmation upgrades only authoritative/observed rows)", () => {
     expect(
       classifyRestoreAction({
         claudeSessionId: "sess-1",
         origin: "reconciled",
         confirmedAt: 1_700_000_000_000,
       }),
-    ).toBe("quarantine");
+    ).toBe("terminal-only");
   });
 
-  it("absent origin (pre-field record) reads as reconciled ⇒ quarantined", () => {
-    expect(classifyRestoreAction({ claudeSessionId: "sess-1" })).toBe("quarantine");
+  it("absent origin (pre-field record) reads as reconciled ⇒ terminal-only", () => {
+    expect(classifyRestoreAction({ claudeSessionId: "sess-1" })).toBe("terminal-only");
   });
 
-  it("shell-unsafe session ids are skipped outright, never typed or quarantined", () => {
+  it("shell-unsafe session ids are skipped outright, never typed", () => {
     expect(
       classifyRestoreAction({
         claudeSessionId: "bad; rm -rf /",

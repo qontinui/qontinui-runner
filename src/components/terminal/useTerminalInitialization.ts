@@ -447,14 +447,14 @@ function isValidSessionId(id: string): boolean {
  *        never wrote a transcript and `--resume` can only fail. Distinct from
  *        (1): the record is genuinely confirmed, so no reconcile prune covers
  *        it, and it survives every boot until the row is closed.
- * - `"quarantine"`: a `"reconciled"` (or pre-field / any other) origin — a
- *   backstop-recovered id that can name a FOREIGN session. The tab is created so
- *   layout is preserved, but no resume is typed; the operator confirms via a
- *   one-click `ResumeFailedBanner`. (Reserved for genuinely uncertain identity,
- *   NOT for never-confirmed authoritative/observed rows — those are
- *   `terminal-only`.)
+ *   A `"reconciled"` (or pre-field / any other) origin — a backstop-recovered
+ *   id that can name a FOREIGN session — lands here too: it is NOT proof
+ *   strong enough to type a resume or to ask the operator to confirm a guess.
+ *   The tab is created so layout is preserved, but nothing is done with the
+ *   guessed id beyond that — an honest, click-free "fresh conversation"
+ *   restore, identical to any other unresumable row.
  * - `"skip-invalid"`: the recorded id fails shell-safety validation — never
- *   typed, never quarantined (nothing actionable).
+ *   typed, nothing actionable.
  *
  * The auto-resume GATE lives here on the frontend as
  * `(origin === "authoritative" || origin === "observed") && confirmed &&
@@ -467,7 +467,7 @@ function isValidSessionId(id: string): boolean {
  * (cold boot, no live process) still can't be auto-resumed. Pure + exported so
  * the gate is unit-testable without React.
  */
-export type RestoreAction = "auto-resume" | "terminal-only" | "quarantine" | "skip-invalid";
+export type RestoreAction = "auto-resume" | "terminal-only" | "skip-invalid";
 
 export function classifyRestoreAction(
   rec: Pick<
@@ -502,8 +502,9 @@ export function classifyRestoreAction(
       : "terminal-only";
   }
   // Reconciled / pre-field origin: a backstop guess that can name a foreign
-  // session — quarantine behind the one-click confirm.
-  return "quarantine";
+  // session — not strong enough to act on. Restore the terminal only, same as
+  // any other unresumable row; do nothing further with the guessed id.
+  return "terminal-only";
 }
 
 /** Validate config dir paths — reject shell metacharacters. */
@@ -535,7 +536,6 @@ interface UseTerminalInitializationParams {
       claudeConfigDir?: string;
       isReconnecting?: boolean;
       resumeFailed?: boolean;
-      resumeQuarantined?: boolean;
       restoreTerminalOnly?: boolean;
     }>,
   ) => void;
@@ -873,13 +873,12 @@ export function useTerminalInitialization({
             // the drain loop after the resume command is written. Phase 4:
             // CONFIRMED authoritative rows of a FULL-tier provider auto-resume
             // with NO operator click. A `terminal-only` row restores
-            // terminal+cwd only — no resume, no quarantine banner — and is
+            // terminal+cwd only — no resume, no confirm banner — and is
             // surfaced HONESTLY (Phase 5) via the `restoreTerminalOnly` flag so
-            // the user sees the conversation was NOT restored (phantom shell, or
-            // a terminal-only-tier provider). Quarantined (reconciled) rows can
-            // name a foreign session — surface a one-click best-effort confirm.
+            // the user sees the conversation was NOT restored (phantom shell, a
+            // terminal-only-tier provider, or a reconciled/backstop-guessed id
+            // that isn't strong enough to act on).
             isReconnecting: restoreAction === "auto-resume",
-            resumeQuarantined: restoreAction === "quarantine",
             // Honest "fresh conversation" note (Phase 5) ONLY for a CONFIRMED
             // terminal-only restore — i.e. a real provider session existed here
             // but its conversation could not be resumed by id: either the
@@ -897,7 +896,7 @@ export function useTerminalInitialization({
           //
           // Only the auto-resume track re-asserts `terminalId` (deferred to
           // `runVerifiedResume` via `recordOpen`, on a VERIFIED handshake).
-          // Every `terminal-only` / `quarantine` record therefore kept pointing
+          // Every `terminal-only` record therefore kept pointing
           // at the dead pre-restart terminal id — so the NEXT restore pass
           // couldn't see the tab it had already made for that record, took the
           // cold path again, and spawned another PTY. Each pass leaked one
@@ -924,17 +923,16 @@ export function useTerminalInitialization({
           }
 
           // Restore-pending marker only protects rows whose resume the drain
-          // will actually attempt (auto-resume) or that await an operator retry
-          // (quarantine). A `terminal-only` phantom has no resume to verify, so
-          // marking it would leave the marker permanently SET — skip it.
-          if (restoreAction === "auto-resume" || restoreAction === "quarantine") {
+          // will actually attempt (auto-resume). A `terminal-only` phantom has
+          // no resume to verify, so marking it would leave the marker
+          // permanently SET — skip it.
+          if (restoreAction === "auto-resume") {
             // Durable, backend-owned restore-pending marker (Phase 3, #548):
             // from here until the resume handshake is VERIFIED the liveness
-            // poll must never flip this record `poll-dead` — a failed (or
-            // quarantined-awaiting-confirm) restore leaves the `open` record
-            // intact for the next attempt. Cleared in `runVerifiedResume` on
-            // verified handshake (and self-healed by the poll once it sees
-            // the session confidently alive).
+            // poll must never flip this record `poll-dead` — a failed restore
+            // leaves the `open` record intact for the next attempt. Cleared in
+            // `runVerifiedResume` on verified handshake (and self-healed by
+            // the poll once it sees the session confidently alive).
             invoke("terminal_session_mark_restore_pending", {
               claudeSessionId: rec.claudeSessionId,
             }).catch((err) => {
@@ -946,9 +944,9 @@ export function useTerminalInitialization({
           }
 
           if (restoreAction !== "skip-invalid") {
-            // auto-resume, quarantined AND terminal-only tabs get their saved
-            // scrollback replayed by the drain; ONLY auto-resume entries type a
-            // resume (`isClaudeSession` gates the typing in the drain loop).
+            // auto-resume AND terminal-only tabs get their saved scrollback
+            // replayed by the drain; ONLY auto-resume entries type a resume
+            // (`isClaudeSession` gates the typing in the drain loop).
             pendingRestores.push({
               tabId,
               scrollbackPath:

@@ -97,7 +97,7 @@ describe("classifyRestoreAction — restore-tier gate (Phase 5)", () => {
     ).toBe("terminal-only");
   });
 
-  it("reconciled origin is quarantined regardless of provider tier", () => {
+  it("reconciled origin restores terminal-only regardless of provider tier", () => {
     expect(
       classifyRestoreAction({
         claudeSessionId: "sess-1",
@@ -105,7 +105,7 @@ describe("classifyRestoreAction — restore-tier gate (Phase 5)", () => {
         confirmedAt: 1,
         provider: "full-provider",
       }),
-    ).toBe("quarantine");
+    ).toBe("terminal-only");
   });
 });
 
@@ -166,6 +166,6 @@ describe("classifyRestoreAction — transcript gate", () => {
         provider: "full-provider",
         transcriptExists: true,
       }),
-    ).toBe("quarantine");
+    ).toBe("terminal-only");
   });
 });
