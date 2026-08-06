@@ -1,3 +1,0 @@
-# TestResultsTab
-
-_(notes)_

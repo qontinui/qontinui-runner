@@ -338,7 +338,6 @@ struct WalWriter {
     file: Option<std::fs::File>,
     /// Deltas appended since the last successful compaction.
     appends: usize,
-<<<<<<< HEAD
     /// A mutation landed in the in-memory map but did NOT reach the WAL
     /// (serialize failure, open failure, `write_all` failure, poisoned lock).
     ///
@@ -350,8 +349,6 @@ struct WalWriter {
     /// by a successful [`SessionLifecycleStore::compact`], which writes the
     /// whole map and therefore captures it.
     dirty: bool,
-=======
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
 }
 
 /// Durable map of `claude_session_id -> TerminalSessionRecord`.
@@ -1754,13 +1751,9 @@ impl SessionLifecycleStore {
     ///
     /// Best-effort exactly like the whole-map rewrite it replaces: a write
     /// failure is logged, not propagated — the in-memory map still reflects the
-<<<<<<< HEAD
     /// mutation for this process. EVERY such failure sets
     /// [`WalWriter::dirty`], so the idle compaction still folds the map to disk
     /// rather than leaving the mutation dirty-but-uncounted.
-=======
-    /// mutation for this process.
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
     #[must_use = "a full WAL must be compacted once the map lock is released"]
     fn wal_append(
         &self,
@@ -1773,12 +1766,9 @@ impl SessionLifecycleStore {
         let mut w = match self.wal.lock() {
             Ok(w) => w,
             Err(e) => {
-<<<<<<< HEAD
                 // A poisoned WAL lock is unrecoverable for BOTH the append and
                 // the compaction that would rescue it, so there is no dirty flag
                 // to usefully set here — the map stays authoritative in memory.
-=======
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
                 warn!(error = %e, "session_lifecycle_store: WAL lock poisoned — mutation kept in memory only");
                 return false;
             }
@@ -1792,10 +1782,7 @@ impl SessionLifecycleStore {
                 Ok(()) => buf.push(b'\n'),
                 Err(e) => {
                     warn!(error = %e, "session_lifecycle_store: WAL serialize failed — delta dropped");
-<<<<<<< HEAD
                     w.dirty = true;
-=======
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
                     return false;
                 }
             }
@@ -1813,15 +1800,11 @@ impl SessionLifecycleStore {
                         path = %self.wal_path.display(),
                         "session_lifecycle_store: WAL open failed — mutation kept in memory only"
                     );
-<<<<<<< HEAD
                     w.dirty = true;
-=======
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
                     return false;
                 }
             }
         }
-<<<<<<< HEAD
         if w.file.is_none() {
             // Unreachable in practice (the block above either opened the file or
             // returned), but the dirty flag makes the impossible case honest
@@ -1830,11 +1813,6 @@ impl SessionLifecycleStore {
             return false;
         }
         let file = w.file.as_mut().expect("WAL handle present (checked above)");
-=======
-        let Some(file) = w.file.as_mut() else {
-            return false;
-        };
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
         if let Err(e) = file.write_all(&buf) {
             warn!(
                 error = %e,
@@ -1844,10 +1822,7 @@ impl SessionLifecycleStore {
             // Drop the handle so the next append re-opens rather than keeping
             // writing through a broken descriptor.
             w.file = None;
-<<<<<<< HEAD
             w.dirty = true;
-=======
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
             return false;
         }
         w.appends += deltas.len();
@@ -1887,14 +1862,10 @@ impl SessionLifecycleStore {
             return; // keep the WAL: it is still the durable record
         }
         // Snapshot is on disk and renamed into place — the WAL is now redundant.
-<<<<<<< HEAD
         // The rewrite serialized the WHOLE map, so it also captured any mutation
         // that failed to reach the WAL (see [`WalWriter::dirty`]).
         w.file = None;
         w.dirty = false;
-=======
-        w.file = None;
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
         match std::fs::File::create(&self.wal_path) {
             Ok(_) => w.appends = 0,
             Err(e) => warn!(
@@ -1905,7 +1876,6 @@ impl SessionLifecycleStore {
         }
     }
 
-<<<<<<< HEAD
     /// Fold the WAL into the snapshot when there is anything to fold. Called
     /// from the liveness poll's heartbeat so an idle runner converges on a
     /// compact snapshot without any mutation ever paying an O(N) rewrite.
@@ -1915,13 +1885,6 @@ impl SessionLifecycleStore {
     /// silently drop the latter.
     fn compact_if_dirty(&self) {
         let dirty = matches!(self.wal.lock(), Ok(w) if w.appends > 0 || w.dirty);
-=======
-    /// Fold the WAL into the snapshot when it has anything in it. Called from
-    /// the liveness poll's heartbeat so an idle runner converges on a compact
-    /// snapshot without any mutation ever paying an O(N) rewrite.
-    fn compact_if_dirty(&self) {
-        let dirty = matches!(self.wal.lock(), Ok(w) if w.appends > 0);
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
         if dirty {
             self.compact();
         }
@@ -2362,7 +2325,6 @@ mod tests {
         }
     }
 
-<<<<<<< HEAD
     /// Age fields on the persisted registry that no public mutator can reach
     /// (`closed_at`, `last_seen_at`), the WAL-model-correct way.
     ///
@@ -2390,8 +2352,6 @@ mod tests {
         std::fs::write(path, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
     }
 
-=======
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
     // ── Write-ahead log (Phase 6, B1) ───────────────────────────────────────
     //
     // A mutation costs ONE appended delta line instead of a whole-map JSON

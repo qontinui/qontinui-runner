@@ -426,33 +426,6 @@ pub async fn get_ai_session_state(
     }
 }
 
-/// Undo the COORD-side side effects `create_ai_session` performs before the
-/// task-run insert has been awaited, when that insert then fails.
-///
-/// Two things now run unconditionally between building the insert future and
-/// polling it: `register_session` (hoisted ahead of the spawn because the
-/// minted coord session id seeds the agent_logs emitter) and
-/// `AgentLogEmitter::start` (which spawns a drain thread). Before the insert
-/// and the spawn were run concurrently, the command returned on a failed
-/// insert BEFORE either happened. Without this teardown an unreachable
-/// Postgres leaves coord holding a registered session for a `task_run_id`
-/// that has no row, plus a live drain thread, for the process lifetime.
-///
-/// Idempotent in both arms: `close_session` no-ops on a `task_run_id` that was
-/// never registered (index miss — e.g. the registration gate is off), and the
-/// emitter is `None` whenever the agent-logs gate is off or its id was
-/// unresolvable.
-fn teardown_coord_session_for_failed_task_run(
-    registrar: &crate::claude_session::coord_register::AiCoordRegistrar,
-    emitter: Option<&crate::claude_session::coord_register::AgentLogEmitter>,
-    task_run_id: &str,
-) {
-    registrar.close_session(task_run_id);
-    if let Some(emitter) = emitter {
-        emitter.close();
-    }
-}
-
 /// Create a standalone AI session.
 ///
 /// Creates a task run record in the database, spawns a Claude CLI session
@@ -502,18 +475,19 @@ pub async fn create_ai_session(
         });
     }
 
-    // 1. Create the task-run record in PG — CONCURRENTLY with the spawn below
-    // (Phase 6, B7), not before it. The row is keyed by a `task_run_id` this
-    // command already minted, so nothing in the spawn depends on the INSERT
-    // having landed; serializing them simply added a full database round-trip
-    // to the front of every AI-session open. The future is polled to completion
-    // alongside the spawn in the `join!` further down, and a failed insert still
-    // fails the command (tearing the spawned session back down) so the
-    // "no task run ⇒ no session" contract is unchanged.
+    // 1. Create task run record in DB
     let input = CreateTaskRunInput::new(task_run_id.clone(), name.clone())
         .with_prompt("AI session")
         .with_workflow_type("chat");
-    let create_task_run = app_state.pg_db().create_task_run(&input);
+    let create_ok = app_state.pg_db().create_task_run(&input).await.is_ok();
+
+    if !create_ok {
+        return Ok(CommandResponse {
+            success: false,
+            message: Some("Failed to create task run record".to_string()),
+            data: None,
+        });
+    }
 
     // Session-automation Phase 0 (R1) — register the authenticated session into
     // coord.sessions carrying its task_run_id, so it is visible + addressable +
@@ -533,11 +507,6 @@ pub async fn create_ai_session(
     // strict no-op threaded through spawn.
     let agent_log_emitter =
         coord_session_id.and_then(crate::claude_session::coord_register::AgentLogEmitter::start);
-    // Kept behind for the failed-insert teardown below: the emitter is MOVED
-    // into the spawn closure, but a failed task-run insert has to stop its
-    // drain thread too (see the `create_result.is_err()` arm). Cloning the
-    // handle is cheap — it is a channel sender plus three ids.
-    let emitter_for_teardown = agent_log_emitter.clone();
 
     // 2. Spawn and wait for session to be ready.
     // ClaudeSession::spawn blocks until the CLI completes its init handshake,
@@ -547,7 +516,7 @@ pub async fn create_ai_session(
     let handle = app_handle.clone();
     let trid = task_run_id.clone();
     let name_for_ctx = name.clone();
-    let spawn_task = tokio::task::spawn_blocking(move || {
+    let spawn_result = tokio::task::spawn_blocking(move || {
         let working_dir = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string());
@@ -603,38 +572,8 @@ pub async fn create_ai_session(
                 Err(e)
             }
         }
-    });
-
-    // The PG insert and the CLI spawn are independent — run them together and
-    // pay `max(db, spawn)` instead of `db + spawn`.
-    let (create_result, spawn_result) = tokio::join!(create_task_run, spawn_task);
-
-    if create_result.is_err() {
-        // Contract preserved: no task-run row ⇒ no session. The spawn may have
-        // succeeded in parallel, so tear it back down rather than leaking a live
-        // CLI child bound to a row that does not exist.
-        if let Some(session) = session_manager.remove(&task_run_id) {
-            if let Err(e) = session.close() {
-                warn!(
-                    "create_ai_session: failed to close the session spawned alongside a failed \
-                     task-run insert ({task_run_id}): {e}"
-                );
-            }
-        }
-<<<<<<< HEAD
-        teardown_coord_session_for_failed_task_run(
-            &ai_coord_registrar,
-            emitter_for_teardown.as_ref(),
-            &task_run_id,
-        );
-=======
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
-        return Ok(CommandResponse {
-            success: false,
-            message: Some("Failed to create task run record".to_string()),
-            data: None,
-        });
-    }
+    })
+    .await;
 
     // 3. Best-effort emergent-task row so the deconflicter/banner have
     // somewhere to attach. Runs in the outer async context (PG access is
@@ -2464,80 +2403,5 @@ mod resume_tests {
     fn recovery_event_name_is_stable() {
         // The frontend `useSessionRecovery` hook listens on this exact name.
         assert_eq!(SESSION_RECOVERY_SUMMARY_EVENT, "session-recovery-summary");
-    }
-}
-
-#[cfg(test)]
-mod failed_task_run_teardown_tests {
-    use super::*;
-    use crate::claude_session::coord_register::AiCoordRegistrar;
-    use crate::session::local_store::OutboxWriter;
-    use crate::test_env::env_lock;
-
-    fn registrar() -> (AiCoordRegistrar, tempfile::TempDir) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let outbox =
-            Arc::new(OutboxWriter::open(dir.path().join("outbox.jsonl")).expect("outbox open"));
-        (AiCoordRegistrar::new(outbox, uuid::Uuid::new_v4()), dir)
-    }
-
-    /// G3 REGRESSION. `create_ai_session` now registers the coord session and
-    /// starts the agent_logs emitter BEFORE the task-run INSERT is awaited (the
-    /// insert and the CLI spawn run concurrently in a `join!`). A failed insert
-    /// must therefore tear the coord session down as well as the CLI session —
-    /// otherwise coord holds a registered session for a `task_run_id` whose row
-    /// never existed, and its log drain thread stays alive for the process
-    /// lifetime.
-    #[test]
-    fn failed_task_run_insert_leaves_no_coord_session() {
-        let _env = env_lock();
-        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
-        let (reg, _dir) = registrar();
-        let task_run_id = uuid::Uuid::new_v4().to_string();
-
-        // Exactly what the command does before the `join!`.
-        let coord_session_id = reg
-            .register_session(&task_run_id, "New Chat", None)
-            .expect("registration enabled by default");
-        assert_eq!(reg.session_id_for(&task_run_id), Some(coord_session_id));
-        assert_eq!(
-            reg.task_run_id_for(&coord_session_id).as_deref(),
-            Some(task_run_id.as_str())
-        );
-
-        // PG is unreachable → `create_task_run` errs → this arm runs.
-        teardown_coord_session_for_failed_task_run(&reg, None, &task_run_id);
-
-        assert_eq!(
-            reg.session_id_for(&task_run_id),
-            None,
-            "a failed task-run insert must not leave a coord session registered against a \
-             task_run_id that has no row"
-        );
-        assert_eq!(
-            reg.task_run_id_for(&coord_session_id),
-            None,
-            "the reverse mapping must be evicted too — a dangling coord id resolves to nothing"
-        );
-    }
-
-    /// The teardown is idempotent and safe on the paths where nothing was
-    /// registered (kill switch off, unresolvable id) and on a repeat call.
-    #[test]
-    fn teardown_is_idempotent_and_safe_when_nothing_was_registered() {
-        let _env = env_lock();
-        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
-        let (reg, _dir) = registrar();
-        let task_run_id = uuid::Uuid::new_v4().to_string();
-
-        // Never registered — must not panic.
-        teardown_coord_session_for_failed_task_run(&reg, None, &task_run_id);
-
-        reg.register_session(&task_run_id, "New Chat", None)
-            .expect("registration enabled by default");
-        teardown_coord_session_for_failed_task_run(&reg, None, &task_run_id);
-        // Repeat close of an already-closed session.
-        teardown_coord_session_for_failed_task_run(&reg, None, &task_run_id);
-        assert_eq!(reg.session_id_for(&task_run_id), None);
     }
 }

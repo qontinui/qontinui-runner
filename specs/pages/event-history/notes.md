@@ -1,3 +1,0 @@
-# EventHistoryPage
-
-_(notes)_

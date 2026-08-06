@@ -274,22 +274,12 @@ pub fn materialize(
 /// reaper now actually runs ([`maybe_sweep_stale`]), and staleness across a
 /// runner update is an explicit check ([`identity_build_tag`]).
 pub fn materialize_identity(base_dir: &Path) -> Option<PathBuf> {
-<<<<<<< HEAD
-=======
-    // Q5(b): the orphan reaper used to be invoked ONLY from `materialize`, the
-    // flag-gated install-intercept path — dark by default — so identity dirs
-    // leaked forever. It now hangs off THIS always-on path (rate-limited), which
-    // is the only one every terminal actually takes.
-    maybe_sweep_stale(base_dir);
-
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
     let dir = base_dir.join(format!("{IDENTITY_DIR_PREFIX}{}", identity_build_tag()));
     let marker = dir.join(IDENTITY_MARKER);
 
     // FAST PATH — a complete dir for THIS build already exists. Zero writes:
     // no scripts, no exe copies, no hardlink. This is what every spawn after the
     // first one costs.
-<<<<<<< HEAD
     //
     // The orphan sweep runs AFTER this, never before it: liveness is refreshed
     // here, so sweeping first would let the very dir this call is about to
@@ -299,10 +289,6 @@ pub fn materialize_identity(base_dir: &Path) -> Option<PathBuf> {
     if let Ok(md) = std::fs::metadata(&marker) {
         refresh_identity_liveness(&marker, &md);
         maybe_sweep_stale(base_dir);
-=======
-    if let Ok(md) = std::fs::metadata(&marker) {
-        refresh_identity_liveness(&marker, &md);
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
         return Some(dir);
     }
 
@@ -350,7 +336,6 @@ pub fn materialize_identity(base_dir: &Path) -> Option<PathBuf> {
         dir = %dir.display(),
         "session-restore: materialized the shared identity shim dir for this runner build"
     );
-<<<<<<< HEAD
     // Q5(b): the orphan reaper used to be invoked ONLY from `materialize`, the
     // flag-gated install-intercept path — dark by default — so identity dirs
     // leaked forever. It now hangs off THIS always-on path (rate-limited), which
@@ -383,11 +368,6 @@ pub fn touch_identity_liveness(base_dir: &Path) {
     }
 }
 
-=======
-    Some(dir)
-}
-
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
 /// Content/version tag for the identity shim dir — the Q5(c) staleness check
 /// that had NO equivalent before.
 ///
@@ -1201,7 +1181,6 @@ mod tests {
              still running its shims"
         );
 
-<<<<<<< HEAD
         // The sweep owns the identity dir's end-of-life, but never THIS
         // process's own — see `sweep_never_reaps_this_builds_own_identity_dir`.
         // A foreign build's identity dir at zero max-age still goes.
@@ -1303,11 +1282,6 @@ mod tests {
                 .exists(),
             "the touch must never CREATE the dir — materialize owns that"
         );
-=======
-        // sweep_stale still owns its end-of-life at zero max-age.
-        sweep_stale(tmp.path(), Duration::from_secs(0));
-        assert!(!identity.exists(), "stale identity dir swept");
->>>>>>> 9fd59e6d (perf: make terminal spawn O(1) in session count)
     }
 
     /// Every terminal of one runner build reuses ONE content-addressed identity
